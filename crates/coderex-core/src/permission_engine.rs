@@ -284,7 +284,7 @@ pub struct AutoApproveHook {
 impl AutoApproveHook {
     /// Create a hook that auto-approves the given tool names.
     #[must_use]
-    pub fn for_tools(tool_names: Vec<String>) -> Self {
+    pub const fn for_tools(tool_names: Vec<String>) -> Self {
         Self { tool_names }
     }
 }

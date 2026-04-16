@@ -47,7 +47,7 @@ impl LongTermStore {
         entry.access_count += 1;
         entry.updated_at = Utc::now();
         let updated = serde_json::to_string(&entry)
-            .map_err(|e| std::io::Error::other(e))?;
+            .map_err(std::io::Error::other)?;
         std::fs::write(&path, updated)?;
         Ok(Some(entry))
     }
@@ -76,7 +76,7 @@ impl LongTermStore {
         };
 
         let serialized = serde_json::to_string_pretty(&entry)
-            .map_err(|e| std::io::Error::other(e))?;
+            .map_err(std::io::Error::other)?;
         std::fs::write(&path, serialized)
     }
 

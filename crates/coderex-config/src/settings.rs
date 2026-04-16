@@ -134,12 +134,12 @@ impl ConfigService {
 
         let user = self
             .load_user_config()
-            .inspect_err(|e| tracing::debug!("user config not loaded: {e}")).unwrap_or_else(|_| None)
+            .inspect_err(|e| tracing::debug!("user config not loaded: {e}")).unwrap_or(None)
             .unwrap_or_default();
 
         let project = self
             .load_project_config()
-            .inspect_err(|e| tracing::debug!("project config not loaded: {e}")).unwrap_or_else(|_| None)
+            .inspect_err(|e| tracing::debug!("project config not loaded: {e}")).unwrap_or(None)
             .unwrap_or_default();
 
         let merged = defaults.merge(&user).merge(&project);

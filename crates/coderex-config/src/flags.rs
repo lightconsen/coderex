@@ -98,10 +98,8 @@ impl FeatureFlags {
     /// Delegates to `from_str` with the env var value.
     #[must_use]
     pub fn from_env() -> Self {
-        match std::env::var("CODEREX_FEATURE_FLAGS") {
-            Ok(val) => Self::parse(&val),
-            Err(_) => Self::default(),
-        }
+        std::env::var("CODEREX_FEATURE_FLAGS")
+            .map_or_else(|_| Self::default(), |val| Self::parse(&val))
     }
 
     /// Derive the CapabilitySet from feature flags.

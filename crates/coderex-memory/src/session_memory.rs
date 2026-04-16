@@ -82,21 +82,24 @@ impl SessionMemoryStore {
         session_id: Uuid,
         category: FactCategory,
     ) -> Vec<SessionFact> {
-        let read_guard = self.facts.read();
-        match read_guard.get(&session_id) {
-            Some(facts) => facts.iter().filter(|f| f.category == category).cloned().collect(),
-            None => Vec::new(),
-        }
+        self.facts
+            .read()
+            .get(&session_id)
+            .map(|facts| facts.iter().filter(|f| f.category == category).cloned().collect())
+            .unwrap_or_default()
     }
 
     /// Persist all facts to disk for a session.
     pub fn persist(&self, session_id: Uuid) -> std::io::Result<()> {
         let dir = self.session_dir(session_id);
         std::fs::create_dir_all(&dir)?;
-        let facts = self.facts.read();
-        if let Some(session_facts) = facts.get(&session_id) {
-            let serialized = serde_json::to_string_pretty(session_facts)
-                .map_err(|e| std::io::Error::other(e))?;
+        let facts = {
+            let guard = self.facts.read();
+            guard.get(&session_id).cloned()
+        };
+        if let Some(session_facts) = facts {
+            let serialized = serde_json::to_string_pretty(&session_facts)
+                .map_err(std::io::Error::other)?;
             std::fs::write(dir.join("facts.json"), serialized)?;
         }
         Ok(())

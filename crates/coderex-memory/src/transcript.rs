@@ -112,6 +112,78 @@ impl TranscriptStore {
         }
         Ok(messages)
     }
+
+    /// Write a compact boundary marker to the transcript.
+    ///
+    /// Appends a special marker message indicating where compact occurred.
+    pub fn write_compact_boundary(&self, session_id: &str) -> Result<(), TranscriptError> {
+        let boundary_msg = Message::system(
+            "<coderex_compact_boundary>\n\
+            Context was compacted at this point.\n\
+            Earlier conversation history has been removed.\n\
+            </coderex_compact_boundary>",
+        );
+        self.append(session_id, &boundary_msg)
+    }
+
+    /// Rewrite the transcript, keeping only messages from a given index onward.
+    ///
+    /// Uses a temp file + atomic rename for crash safety.
+    pub fn truncate_before(
+        &self,
+        session_id: &str,
+        keep_from_index: usize,
+    ) -> Result<(), TranscriptError> {
+        let path = self.session_path(session_id);
+        if !path.exists() {
+            return Ok(());
+        }
+
+        let messages = self.read_all(session_id)?;
+        if keep_from_index >= messages.len() {
+            // Nothing to keep — truncate to empty
+            std::fs::write(&path, "")?;
+            return Ok(());
+        }
+
+        // Write kept messages to a temp file
+        let temp_path = path.with_extension("jsonl.tmp");
+        let mut file = std::fs::File::create(&temp_path)?;
+        for msg in &messages[keep_from_index..] {
+            let line = serde_json::to_string(msg)?;
+            writeln!(file, "{line}")?;
+        }
+
+        // Atomically rename
+        std::fs::rename(&temp_path, &path)?;
+        Ok(())
+    }
+
+    /// Rewrite the transcript with a new set of messages (full replace).
+    ///
+    /// Uses a temp file + atomic rename for crash safety.
+    pub fn rewrite(
+        &self,
+        session_id: &str,
+        messages: &[Message],
+    ) -> Result<(), TranscriptError> {
+        let path = self.session_path(session_id);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+
+        // Write to a temp file
+        let temp_path = path.with_extension("jsonl.tmp");
+        let mut file = std::fs::File::create(&temp_path)?;
+        for msg in messages {
+            let line = serde_json::to_string(msg)?;
+            writeln!(file, "{line}")?;
+        }
+
+        // Atomically rename
+        std::fs::rename(&temp_path, &path)?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -200,5 +272,74 @@ mod tests {
         let messages = store.read_all("session_rt").unwrap();
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].role, coderex_core::types::Role::Tool);
+    }
+
+    #[test]
+    fn write_compact_boundary_appends_marker() {
+        let (store, _tmp) = temp_store();
+        store.append("session_b", &Message::user("hello")).unwrap();
+        store.write_compact_boundary("session_b").unwrap();
+
+        let messages = store.read_all("session_b").unwrap();
+        assert_eq!(messages.len(), 2);
+        let boundary = &messages[1];
+        assert!(matches!(boundary.role, coderex_core::types::Role::System));
+        if let coderex_core::types::MessageContent::Text(s) = &boundary.content {
+            assert!(s.contains("<coderex_compact_boundary>"));
+        } else {
+            panic!("expected text content");
+        }
+    }
+
+    #[test]
+    fn truncate_before_removes_messages_before_index() {
+        let (store, _tmp) = temp_store();
+        store.append("session_t", &Message::user("first")).unwrap();
+        store.append("session_t", &Message::assistant("second")).unwrap();
+        store.append("session_t", &Message::user("third")).unwrap();
+
+        store.truncate_before("session_t", 1).unwrap();
+
+        let messages = store.read_all("session_t").unwrap();
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].role, coderex_core::types::Role::Assistant);
+        assert_eq!(messages[1].role, coderex_core::types::Role::User);
+    }
+
+    #[test]
+    fn truncate_before_preserves_messages_at_and_after_index() {
+        let (store, _tmp) = temp_store();
+        store.append("session_p", &Message::user("a")).unwrap();
+        store.append("session_p", &Message::assistant("b")).unwrap();
+        store.append("session_p", &Message::user("c")).unwrap();
+        store.append("session_p", &Message::assistant("d")).unwrap();
+
+        store.truncate_before("session_p", 2).unwrap();
+
+        let messages = store.read_all("session_p").unwrap();
+        assert_eq!(messages.len(), 2);
+        // Should be "c" and "d" — messages at index 2 and 3
+        if let coderex_core::types::MessageContent::Text(s) = &messages[0].content {
+            assert_eq!(s, "c");
+        }
+        if let coderex_core::types::MessageContent::Text(s) = &messages[1].content {
+            assert_eq!(s, "d");
+        }
+    }
+
+    #[test]
+    fn rewrite_produces_correct_transcript() {
+        let (store, _tmp) = temp_store();
+        let new_messages = vec![
+            Message::user("rewritten"),
+            Message::assistant("ok"),
+        ];
+        store.rewrite("session_r", &new_messages).unwrap();
+
+        let messages = store.read_all("session_r").unwrap();
+        assert_eq!(messages.len(), 2);
+        if let coderex_core::types::MessageContent::Text(s) = &messages[0].content {
+            assert_eq!(s, "rewritten");
+        }
     }
 }

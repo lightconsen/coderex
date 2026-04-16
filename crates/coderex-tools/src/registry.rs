@@ -153,6 +153,27 @@ impl ToolRegistry {
         self.dynamic_mcp.read().get(name).map(Arc::clone)
     }
 
+    /// List all registered tools with their names and trait objects.
+    #[allow(clippy::significant_drop_tightening)]
+    pub fn list_tools(&self) -> Vec<(String, BoxedTool)> {
+        let mut tools: Vec<(String, BoxedTool)> = self
+            .baseline
+            .iter()
+            .map(|(k, v)| (k.clone(), Arc::clone(v)))
+            .collect();
+        tools.extend(
+            self.gated
+                .iter()
+                .map(|(k, v)| (k.clone(), Arc::clone(v))),
+        );
+        let mcp = self.dynamic_mcp.read();
+        tools.extend(
+            mcp.iter()
+                .map(|(k, v)| (k.clone(), Arc::clone(v))),
+        );
+        tools
+    }
+
     /// Get all tool names available in the given context.
     ///
     /// Applies tier filtering, context allowlists, and deny rules.

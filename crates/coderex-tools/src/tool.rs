@@ -7,6 +7,9 @@ use std::collections::HashMap;
 use std::fmt;
 use std::sync::Arc;
 
+/// Key type for shared state in `ToolContext.extra`.
+pub type SharedState = Box<dyn std::any::Any + Send + Sync>;
+
 /// How a tool should behave when interrupted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InterruptBehavior {
@@ -83,8 +86,8 @@ pub struct ToolContext<'a> {
     pub execution_context: ExecutionContext,
     /// Working directory for the tool.
     pub cwd: &'a std::path::Path,
-    /// Additional context values (e.g., API keys, session ID).
-    pub extra: Arc<HashMap<String, String>>,
+    /// Additional shared state (e.g., task stores, registries).
+    pub extra: Arc<HashMap<String, SharedState>>,
 }
 
 impl fmt::Debug for ToolContext<'_> {
@@ -112,7 +115,7 @@ impl<'a> ToolContext<'a> {
 
     /// Add extra context values.
     #[must_use]
-    pub fn with_extra(mut self, extra: HashMap<String, String>) -> Self {
+    pub fn with_extra(mut self, extra: HashMap<String, SharedState>) -> Self {
         self.extra = Arc::new(extra);
         self
     }

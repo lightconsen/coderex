@@ -1,4 +1,76 @@
-//! Built-in tools: EchoTool and NoOpTool.
+//! Built-in tools: EchoTool, NoOpTool, and all baseline tool implementations.
+
+mod ask_user_question_tool;
+mod bash_tool;
+mod brief_tool;
+mod config_tool;
+mod cron_create_tool;
+mod cron_delete_tool;
+mod cron_list_tool;
+mod edit_tool;
+mod enter_plan_mode_tool;
+mod exit_plan_mode_tool;
+mod feature_gated_tools;
+mod glob_tool;
+mod grep_tool;
+mod mcp_auth_tool;
+mod notebook_edit_tool;
+mod read_tool;
+mod remote_trigger_tool;
+mod repl_tool;
+mod agent_tool;
+mod send_message_tool;
+mod skill_tool;
+mod sleep_tool;
+mod structured_output_tool;
+mod synthetic_output_tool;
+mod task_create_tool;
+mod task_get_tool;
+mod task_list_tool;
+mod task_output_tool;
+mod task_stop_tool;
+mod task_update_tool;
+mod tool_search_tool;
+mod todo_write_tool;
+mod web_fetch_tool;
+mod web_search_tool;
+mod write_tool;
+
+pub use ask_user_question_tool::AskUserQuestionTool;
+pub use agent_tool::AgentTool;
+pub use bash_tool::BashTool;
+pub use brief_tool::BriefTool;
+pub use config_tool::ConfigTool;
+pub use cron_create_tool::CronCreateTool;
+pub use cron_delete_tool::CronDeleteTool;
+pub use cron_list_tool::CronListTool;
+pub use edit_tool::EditTool;
+pub use enter_plan_mode_tool::EnterPlanModeTool;
+pub use exit_plan_mode_tool::ExitPlanModeTool;
+pub use feature_gated_tools::register_feature_gated_tools;
+pub use glob_tool::GlobTool;
+pub use grep_tool::GrepTool;
+pub use mcp_auth_tool::McpAuthTool;
+pub use notebook_edit_tool::NotebookEditTool;
+pub use read_tool::ReadTool;
+pub use remote_trigger_tool::RemoteTriggerTool;
+pub use repl_tool::ReplTool;
+pub use send_message_tool::SendMessageTool;
+pub use skill_tool::SkillTool;
+pub use sleep_tool::SleepTool;
+pub use structured_output_tool::StructuredOutputTool;
+pub use synthetic_output_tool::SyntheticOutputTool;
+pub use task_create_tool::TaskCreateTool;
+pub use task_get_tool::TaskGetTool;
+pub use task_list_tool::TaskListTool;
+pub use task_output_tool::TaskOutputTool;
+pub use task_stop_tool::TaskStopTool;
+pub use task_update_tool::TaskUpdateTool;
+pub use tool_search_tool::ToolSearchTool;
+pub use todo_write_tool::TodoWriteTool;
+pub use web_fetch_tool::WebFetchTool;
+pub use web_search_tool::WebSearchTool;
+pub use write_tool::WriteTool;
 
 use crate::context::{ToolError, ToolOutput};
 use crate::tool::{Tool, ToolContext, ToolDescriptor, ToolInput, ToolTier};
@@ -90,6 +162,50 @@ impl Tool for NoOpTool {
             is_display: false,
         })
     }
+}
+
+/// Register all baseline built-in tools into the given registry.
+pub fn register_builtin_tools(reg: &mut crate::registry::ToolRegistry) {
+    use std::sync::Arc;
+    reg.register(Arc::new(ReadTool));
+    reg.register(Arc::new(WriteTool));
+    reg.register(Arc::new(EditTool));
+    reg.register(Arc::new(NotebookEditTool));
+    reg.register(Arc::new(BashTool));
+    reg.register(Arc::new(SleepTool));
+    reg.register(Arc::new(GlobTool));
+    reg.register(Arc::new(GrepTool));
+    reg.register(Arc::new(WebFetchTool));
+    reg.register(Arc::new(WebSearchTool));
+    reg.register(Arc::new(TodoWriteTool));
+    reg.register(Arc::new(AskUserQuestionTool));
+    reg.register(Arc::new(ToolSearchTool));
+    reg.register(Arc::new(TaskCreateTool));
+    reg.register(Arc::new(TaskGetTool));
+    reg.register(Arc::new(TaskListTool));
+    reg.register(Arc::new(TaskUpdateTool));
+    reg.register(Arc::new(TaskOutputTool));
+    reg.register(Arc::new(TaskStopTool));
+    reg.register(Arc::new(EnterPlanModeTool));
+    reg.register(Arc::new(ExitPlanModeTool));
+    reg.register(Arc::new(CronCreateTool));
+    reg.register(Arc::new(CronDeleteTool));
+    reg.register(Arc::new(CronListTool));
+    reg.register(Arc::new(BriefTool));
+    reg.register(Arc::new(ConfigTool));
+    reg.register(Arc::new(SkillTool));
+    reg.register(Arc::new(StructuredOutputTool));
+    reg.register(Arc::new(ReplTool));
+    reg.register(Arc::new(SyntheticOutputTool));
+    reg.register(Arc::new(SendMessageTool));
+    reg.register(Arc::new(AgentTool));
+    reg.register(Arc::new(RemoteTriggerTool));
+    reg.register(Arc::new(McpAuthTool));
+    reg.register(Arc::new(EchoTool));
+    reg.register(Arc::new(NoOpTool));
+
+    // Feature-gated tools
+    register_feature_gated_tools(reg);
 }
 
 #[cfg(test)]
