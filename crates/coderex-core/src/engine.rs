@@ -10,14 +10,20 @@
 
 use tokio::sync::mpsc;
 use tokio::time::Instant;
+use std::collections::HashMap;
 
 use crate::types::{EngineEvent, Message, ModelId, ToolCall, ToolResult, UsageSummary};
 use crate::budget::TokenBudget;
 use crate::cost::CostTracker;
 use crate::permission_engine::{PermissionEngine, PermissionResponse};
-use crate::permissions::PermissionResult;
-use crate::api_client::{ApiClient, ApiResponse};
+use crate::permissions::{PermissionMode, PermissionResult};
+use crate::api_client::{ApiClient, ApiResponse, StreamEvent};
 use crate::state::SessionState;
+use crate::prompt::{AssembledContext, CompactConfig, PromptCompiler, PromptContext};
+use crate::compact::{self, CompactResult, CompactStrategy};
+use crate::stop_hook::{self, StopHookContext, StopHookDecision};
+use crate::hook_executor::{HookExecutor, HookFireResult, NoOpHookExecutor};
+use crate::elicitation::{ElicitationHandler, ElicitationResult, ReplElicitationHandler};
 
 // ─── Structured Output Validation ───────────────────────────────────────────
 
@@ -48,7 +54,7 @@ pub struct StructuredOutputValidator {
 impl StructuredOutputValidator {
     /// Create a new validator with the given schema.
     #[must_use]
-    pub fn new(schema: serde_json::Value) -> Self {
+    pub const fn new(schema: serde_json::Value) -> Self {
         Self {
             schema,
             max_retries: 3,
@@ -82,14 +88,14 @@ impl StructuredOutputValidator {
             }
         };
 
-        match self.validate_value(&value, &self.schema) {
+        match Self::validate_value(&value, &self.schema) {
             Ok(()) => ValidationResult::Valid(value),
             Err(error) => ValidationResult::Invalid { error, retries },
         }
     }
 
     /// Recursively validate a JSON value against a schema.
-    fn validate_value(&self, value: &serde_json::Value, schema: &serde_json::Value) -> Result<(), String> {
+    fn validate_value(value: &serde_json::Value, schema: &serde_json::Value) -> Result<(), String> {
         let Some(schema_obj) = schema.as_object() else {
             return Ok(());
         };
@@ -97,7 +103,7 @@ impl StructuredOutputValidator {
         // Type check
         if let Some(expected_type) = schema_obj.get("type") {
             if let Some(type_str) = expected_type.as_str() {
-                self.check_type(value, type_str)?;
+                Self::check_type(value, type_str)?;
             }
         }
 
@@ -116,7 +122,7 @@ impl StructuredOutputValidator {
                 if let Some(obj) = value.as_object() {
                     for (key, prop_schema) in props {
                         if let Some(val) = obj.get(key) {
-                            self.validate_value(val, prop_schema)?;
+                            Self::validate_value(val, prop_schema)?;
                         }
                     }
                 }
@@ -142,7 +148,7 @@ impl StructuredOutputValidator {
     }
 
     /// Check if a value matches the expected JSON type.
-    fn check_type(&self, value: &serde_json::Value, expected: &str) -> Result<(), String> {
+    fn check_type(value: &serde_json::Value, expected: &str) -> Result<(), String> {
         let actual = match value {
             serde_json::Value::Null => "null",
             serde_json::Value::Bool(_) => "boolean",
@@ -163,6 +169,109 @@ impl StructuredOutputValidator {
         format!(
             "Your previous response did not match the required JSON schema. Error: {error}. Please respond with ONLY valid JSON matching the schema."
         )
+    }
+}
+
+// ─── Streaming Tool Call Assembler ──────────────────────────────────────────
+
+/// Accumulates streaming tool call deltas into complete tool calls.
+///
+/// During streaming, tool calls arrive incrementally:
+/// 1. `ToolCallBlockStart` gives id + name
+/// 2. `ToolCallInputDelta` gives JSON fragments
+/// 3. `ToolCallBlockEnd` gives complete JSON (or assembler builds it)
+#[derive(Debug, Clone)]
+pub struct StreamingToolCallAssembler {
+    /// Accumulating tool call buffers: id -> (name, input_json_builder).
+    pending: HashMap<String, (String, String)>,
+    /// Completed tool calls.
+    completed: Vec<ToolCall>,
+    /// Text content accumulated alongside tool calls.
+    text_content: String,
+    /// Whether any tool calls have been seen.
+    has_tool_calls: bool,
+}
+
+impl StreamingToolCallAssembler {
+    /// Create a new assembler.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            pending: HashMap::new(),
+            completed: Vec::new(),
+            text_content: String::new(),
+            has_tool_calls: false,
+        }
+    }
+
+    /// Process a stream event and return any completed tool calls.
+    ///
+    /// Returns `Vec<ToolCall>` when a tool call is fully assembled.
+    /// Also returns `true` if the stream has ended (no more events expected).
+    pub fn process_event(&mut self, event: StreamEvent) -> Vec<ToolCall> {
+        match event {
+            StreamEvent::TextDelta(text) => {
+                self.text_content.push_str(&text);
+                Vec::new()
+            }
+            StreamEvent::ToolCallBlockStart { id, name } => {
+                self.has_tool_calls = true;
+                self.pending.insert(id, (name, String::new()));
+                Vec::new()
+            }
+            StreamEvent::ToolCallInputDelta { id, delta } => {
+                if let Some((_, builder)) = self.pending.get_mut(&id) {
+                    builder.push_str(&delta);
+                }
+                Vec::new()
+            }
+            StreamEvent::ToolCallBlockEnd { id, input } => {
+                let completed = if let Some((name, _)) = self.pending.remove(&id) {
+                    let call = ToolCall { id, name, input };
+                    self.completed.push(call.clone());
+                    vec![call]
+                } else {
+                    Vec::new()
+                };
+                completed
+            }
+            StreamEvent::StreamEnd => {
+                // Finalize any pending tool calls from accumulated JSON
+                let mut calls = Vec::new();
+                for (id, (name, builder)) in self.pending.drain() {
+                    let input: serde_json::Value =
+                        serde_json::from_str(&builder).unwrap_or(serde_json::json!({}));
+                    let call = ToolCall { id, name, input };
+                    self.completed.push(call.clone());
+                    calls.push(call);
+                }
+                calls
+            }
+            StreamEvent::UsageSummary(_) | StreamEvent::Error(_) => Vec::new(),
+        }
+    }
+
+    /// Get the accumulated text content.
+    #[must_use]
+    pub fn text(&self) -> &str {
+        &self.text_content
+    }
+
+    /// Check if any tool calls have been seen.
+    #[must_use]
+    pub const fn has_tool_calls(&self) -> bool {
+        self.has_tool_calls
+    }
+
+    /// Get completed tool calls (consumes them).
+    pub fn take_completed(&mut self) -> Vec<ToolCall> {
+        std::mem::take(&mut self.completed)
+    }
+}
+
+impl Default for StreamingToolCallAssembler {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -282,6 +391,19 @@ pub struct ResolvedPermission {
     pub response: PermissionResponse,
 }
 
+/// A pending elevation request awaiting user response.
+#[derive(Debug, Clone)]
+pub struct PendingElevation {
+    /// The tool call ID that needs elevation.
+    pub tool_call_id: String,
+    /// Tool name.
+    pub tool_name: String,
+    /// JSON input arguments.
+    pub input: serde_json::Value,
+    /// Request ID for the event.
+    pub request_id: String,
+}
+
 /// A resolved elicitation response.
 #[derive(Debug, Clone)]
 pub struct ResolvedElicitation {
@@ -348,6 +470,8 @@ pub struct TurnRuntime {
     pub pending_tool_calls: Vec<PendingToolCall>,
     /// Pending permission request.
     pub pending_permission: Option<ResolvedPermission>,
+    /// Pending elevation request awaiting user response.
+    pub pending_elevation: Option<PendingElevation>,
     /// Pending elicitation request.
     pub pending_elicitation: Option<ResolvedElicitation>,
     /// Token budget tracker.
@@ -363,12 +487,13 @@ pub struct TurnRuntime {
 impl TurnRuntime {
     /// Create a new turn runtime.
     #[must_use]
-    pub fn new(budget: TokenBudget) -> Self {
+    pub const fn new(budget: TokenBudget) -> Self {
         Self {
             state: TurnState::Initialize,
             messages: Vec::new(),
             pending_tool_calls: Vec::new(),
             pending_permission: None,
+            pending_elevation: None,
             pending_elicitation: None,
             budget,
             recovery_count: 0,
@@ -382,6 +507,7 @@ impl TurnRuntime {
         self.state = TurnState::Initialize;
         self.pending_tool_calls.clear();
         self.pending_permission = None;
+        self.pending_elevation = None;
         self.pending_elicitation = None;
         self.budget.reset_turn();
     }
@@ -471,6 +597,14 @@ pub struct QueryEngine {
     denied_tools: Vec<DeniedToolCall>,
     /// Schema validator for structured output.
     structured_output: Option<StructuredOutputValidator>,
+    /// Prompt compiler for system prompt assembly.
+    prompt_compiler: PromptCompiler,
+    /// Compact configuration.
+    compact_config: CompactConfig,
+    /// Hook executor for firing lifecycle hooks.
+    hooks: Box<dyn HookExecutor + Send + Sync>,
+    /// Handler for elicitation requests.
+    elicitation_handler: Box<dyn ElicitationHandler + Send + Sync>,
 }
 
 /// A denied tool call that should be summarized in the next turn.
@@ -492,6 +626,7 @@ impl QueryEngine {
         permission_engine: PermissionEngine,
         event_tx: mpsc::UnboundedSender<EngineEvent>,
     ) -> Self {
+        let config = CompactConfig::default();
         Self {
             api_client,
             model,
@@ -502,7 +637,93 @@ impl QueryEngine {
             current_turn: 0,
             denied_tools: Vec::new(),
             structured_output: None,
+            prompt_compiler: PromptCompiler::new(config),
+            compact_config: config,
+            hooks: Box::new(NoOpHookExecutor),
+            elicitation_handler: Box::new(ReplElicitationHandler),
         }
+    }
+
+    /// Set the elicitation handler.
+    pub fn set_elicitation_handler(
+        &mut self,
+        handler: Box<dyn ElicitationHandler + Send + Sync>,
+    ) {
+        self.elicitation_handler = handler;
+    }
+
+    /// Set the hook executor for lifecycle hooks.
+    pub fn set_hooks(&mut self, hooks: Box<dyn HookExecutor + Send + Sync>) {
+        self.hooks = hooks;
+    }
+
+    /// Handle an elicitation request using the configured elicitation handler.
+    ///
+    /// Transitions the turn to `AwaitElicitation`, sends the elicitation via
+    /// the handler, and stores the response.
+    async fn handle_elicitation(
+        &mut self,
+        turn: &mut TurnRuntime,
+        request_id: String,
+        message: String,
+    ) -> ElicitationResult {
+        turn.transition_to(TurnState::AwaitElicitation);
+
+        // Emit elicitation event
+        let _ = self.event_tx.send(EngineEvent::ElicitationRequest {
+            id: request_id.clone(),
+            message: message.clone(),
+        });
+
+        // Use the elicitation handler
+        let question = crate::elicitation::ElicitationQuestion {
+            question: message,
+            header: "Query".into(),
+            options: vec![
+                crate::elicitation::ElicitationOption {
+                    label: "Continue".into(),
+                    description: "Proceed with the current approach".into(),
+                },
+                crate::elicitation::ElicitationOption {
+                    label: "Clarify".into(),
+                    description: "Provide additional clarification".into(),
+                },
+            ],
+            multi_select: false,
+        };
+
+        let result = self.elicitation_handler.request(vec![question]).await;
+
+        // Store the response
+        match &result {
+            ElicitationResult::Responded(resp) => {
+                turn.pending_elicitation = Some(ResolvedElicitation {
+                    request_id,
+                    response: resp.other_text.clone().or_else(|| resp.selected.first().cloned()),
+                });
+            }
+            ElicitationResult::Cancelled | ElicitationResult::TimedOut => {
+                turn.pending_elicitation = Some(ResolvedElicitation {
+                    request_id,
+                    response: None,
+                });
+            }
+        }
+
+        result
+    }
+
+    /// Fire a hook event and return the result.
+    async fn fire_hook(&self, event_name: &str, input: &str, context: &std::collections::HashMap<String, String>) -> HookFireResult {
+        self.hooks.fire_hook(event_name, input, context).await
+    }
+
+    /// Fire the TurnEnd hook.
+    async fn fire_turn_end_hook(&self, turn_number: u32, stop_reason: &str) -> HookFireResult {
+        let mut ctx = std::collections::HashMap::new();
+        ctx.insert("turn_number".to_string(), turn_number.to_string());
+        ctx.insert("stop_reason".to_string(), stop_reason.to_string());
+        self.hooks.fire_hook("TurnEnd", &format!("turn_{turn_number}"), &ctx).await
     }
 
     /// Set the JSON schema for structured output validation.
@@ -586,6 +807,65 @@ impl QueryEngine {
         Ok(turn.terminal_reason.unwrap_or(TerminalReason::Completed))
     }
 
+    /// Submit a user message and run the full turn loop using streaming API.
+    ///
+    /// This is the streaming variant — tokens are emitted as they arrive,
+    /// and tool calls are assembled incrementally during the stream.
+    pub async fn submit_streaming(
+        &mut self,
+        prompt: String,
+        options: SubmitOptions,
+    ) -> Result<TerminalReason, String> {
+        let budget = if options.task_budget_tokens > 0 {
+            let mut budget = TokenBudget::with_defaults();
+            budget.thresholds.max_tokens_per_session = options.task_budget_tokens;
+            budget
+        } else {
+            TokenBudget::with_defaults()
+        };
+
+        let mut turn = TurnRuntime::new(budget);
+        let mut turn_number = self.current_turn + 1;
+
+        // Add user message
+        self.session.messages.push(Message::user(prompt.clone()));
+
+        // Main turn loop
+        loop {
+            if options.max_turns > 0 && turn_number > options.max_turns {
+                turn.terminate(TerminalReason::MaxTurnsReached);
+                break;
+            }
+
+            self.cost_tracker.start_turn();
+            turn.reset();
+
+            // Execute the turn using streaming
+            match self.execute_turn_streaming(&mut turn, &options, turn_number).await {
+                Ok(reason) => {
+                    self.current_turn = turn_number;
+                    if matches!(reason, TerminalReason::Completed | TerminalReason::TokenLimitStop) {
+                        break;
+                    }
+                    turn_number += 1;
+                }
+                Err(e) => {
+                    turn.terminate(TerminalReason::Error(e.clone()));
+                    self.current_turn = turn_number;
+                    return Err(e);
+                }
+            }
+
+            if turn.state.is_terminal() {
+                if let Some(reason) = turn.terminal_reason.take() {
+                    return Ok(reason);
+                }
+            }
+        }
+
+        Ok(turn.terminal_reason.unwrap_or(TerminalReason::Completed))
+    }
+
     /// Execute a single turn through the state machine.
     async fn execute_turn(
         &mut self,
@@ -597,11 +877,22 @@ impl QueryEngine {
 
         // Phase 1: Initialize → BuildContext
         turn.transition_to(TurnState::BuildContext);
-        self.build_context(turn, options)?;
+        self.build_context(turn, options);
 
         // Phase 2: BuildContext → RunPreSubmitHooks
         turn.transition_to(TurnState::RunPreSubmitHooks);
-        // TODO: run pre-submit hooks
+
+        // Fire UserPromptSubmit hook
+        let user_prompt = options
+            .custom_system_prompt
+            .as_deref()
+            .unwrap_or_else(|| options.append_system_prompt.as_deref().unwrap_or(""));
+        let ctx = std::collections::HashMap::new();
+        let hook_result = self.fire_hook("UserPromptSubmit", user_prompt, &ctx).await;
+        if hook_result.stop {
+            turn.terminate(TerminalReason::Completed);
+            return Ok(TerminalReason::Completed);
+        }
 
         // Phase 3: RunPreSubmitHooks → StartRequest
         turn.transition_to(TurnState::StartRequest);
@@ -626,12 +917,45 @@ impl QueryEngine {
             // No tool calls — turn is complete
             turn.transition_to(TurnState::EvaluateContinuation);
             if !turn.budget.should_continue() {
+                // Try compact recovery before giving up
+                if turn.recovery_count < self.compact_config.max_recovery_retries {
+                    turn.transition_to(TurnState::CompactRecovery);
+                    if let Err(e) = self.run_compact_recovery(turn, options, turn_number).await {
+                        turn.terminate(TerminalReason::Error(e.clone()));
+                        return Ok(TerminalReason::Error(e));
+                    }
+                    // Retry the request with compacted context
+                    turn.transition_to(TurnState::StartRequest);
+                    let api_response = self.send_request(turn, options).await?;
+                    turn.budget.record_tokens(&api_response.usage);
+                    self.cost_tracker.record_usage(&api_response.usage, &self.model);
+                    let content = self.validate_structured_output(api_response.content.clone());
+                    let assistant_msg = Message::assistant(content);
+                    turn.messages.push(assistant_msg);
+
+                    // After recovery retry, check if we still need to compact
+                    if !turn.budget.should_continue() {
+                        turn.terminate(TerminalReason::BudgetExhausted);
+                        return Ok(TerminalReason::BudgetExhausted);
+                    }
+
+                    turn.transition_to(TurnState::Finalize);
+                    self.cost_tracker.end_turn(turn_number, &api_response.usage, &self.model);
+                    let _ = self.fire_turn_end_hook(turn_number, &api_response.stop_reason).await;
+
+                    if api_response.stop_reason == "max_tokens" {
+                        return Ok(TerminalReason::TokenLimitStop);
+                    }
+                    return Ok(TerminalReason::Completed);
+                }
+
                 turn.terminate(TerminalReason::BudgetExhausted);
                 return Ok(TerminalReason::BudgetExhausted);
             }
 
             turn.transition_to(TurnState::Finalize);
             self.cost_tracker.end_turn(turn_number, &api_response.usage, &self.model);
+            let _ = self.fire_turn_end_hook(turn_number, &api_response.stop_reason).await;
 
             if api_response.stop_reason == "max_tokens" {
                 return Ok(TerminalReason::TokenLimitStop);
@@ -658,16 +982,158 @@ impl QueryEngine {
         // Phase 7: Evaluate continuation
         turn.transition_to(TurnState::EvaluateContinuation);
         if !turn.budget.should_continue() {
-            turn.terminate(TerminalReason::BudgetExhausted);
-            self.cost_tracker.end_turn(turn_number, &api_response.usage, &self.model);
-            return Ok(TerminalReason::BudgetExhausted);
+            // Try compact recovery before giving up
+            if turn.recovery_count < self.compact_config.max_recovery_retries {
+                turn.transition_to(TurnState::CompactRecovery);
+                if let Err(e) = self.run_compact_recovery(turn, options, turn_number).await {
+                    turn.terminate(TerminalReason::Error(e.clone()));
+                    self.cost_tracker.end_turn(turn_number, &api_response.usage, &self.model);
+                    return Ok(TerminalReason::Error(e));
+                }
+                // After compact, tool results are still pending — the caller
+                // will start the next turn with the compacted context
+            } else {
+                turn.terminate(TerminalReason::BudgetExhausted);
+                self.cost_tracker.end_turn(turn_number, &api_response.usage, &self.model);
+                return Ok(TerminalReason::BudgetExhausted);
+            }
         }
 
         turn.transition_to(TurnState::Finalize);
         self.cost_tracker.end_turn(turn_number, &api_response.usage, &self.model);
+        let _ = self.fire_turn_end_hook(turn_number, &api_response.stop_reason).await;
 
         // If we have tool results, the model needs another turn
         // Return Completed here — the caller will start the next turn
+        Ok(TerminalReason::Completed)
+    }
+
+    /// Execute a single turn using the streaming API.
+    ///
+    /// This variant uses `create_message_streaming()` for real-time token
+    /// streaming and the `StreamingToolCallAssembler` to incrementally
+    /// parse tool calls from the response.
+    ///
+    /// Key difference from `execute_turn`:
+    /// - Text is streamed and emitted as it arrives
+    /// - Tool calls are assembled incrementally during the stream
+    /// - Early tool execution is possible (tool calls can be executed
+    ///   as they complete, before the full response is received)
+    async fn execute_turn_streaming(
+        &mut self,
+        turn: &mut TurnRuntime,
+        options: &SubmitOptions,
+        turn_number: u32,
+    ) -> Result<TerminalReason, String> {
+        let _start = Instant::now();
+
+        // Phase 1: Initialize → BuildContext
+        turn.transition_to(TurnState::BuildContext);
+        self.build_context(turn, options);
+
+        // Phase 2: BuildContext → RunPreSubmitHooks
+        turn.transition_to(TurnState::RunPreSubmitHooks);
+
+        // Fire UserPromptSubmit hook
+        let user_prompt = options
+            .custom_system_prompt
+            .as_deref()
+            .unwrap_or_else(|| options.append_system_prompt.as_deref().unwrap_or(""));
+        let ctx = std::collections::HashMap::new();
+        let hook_result = self.fire_hook("UserPromptSubmit", user_prompt, &ctx).await;
+        if hook_result.stop {
+            turn.terminate(TerminalReason::Completed);
+            return Ok(TerminalReason::Completed);
+        }
+
+        // Phase 3: RunPreSubmitHooks → StartRequest → StreamAssistant
+        turn.transition_to(TurnState::StartRequest);
+        turn.transition_to(TurnState::StreamAssistant);
+
+        // Streaming request
+        let (content, tool_calls, usage) = self.send_request_streaming(turn, options).await?;
+
+        // Record budget and cost
+        turn.budget.record_tokens(&usage);
+        self.cost_tracker.record_usage(&usage, &self.model);
+
+        // Save assistant message
+        let assistant_msg = Message::assistant(content.clone());
+        turn.messages.push(assistant_msg);
+
+        if tool_calls.is_empty() {
+            // No tool calls — turn complete
+            turn.transition_to(TurnState::EvaluateContinuation);
+            if !turn.budget.should_continue() {
+                if turn.recovery_count < self.compact_config.max_recovery_retries {
+                    turn.transition_to(TurnState::CompactRecovery);
+                    if let Err(e) = self.run_compact_recovery(turn, options, turn_number).await {
+                        turn.terminate(TerminalReason::Error(e.clone()));
+                        return Ok(TerminalReason::Error(e));
+                    }
+                    turn.transition_to(TurnState::StartRequest);
+                    let (content, _tool_calls, usage) =
+                        self.send_request_streaming(turn, options).await?;
+                    turn.budget.record_tokens(&usage);
+                    self.cost_tracker.record_usage(&usage, &self.model);
+                    turn.messages.push(Message::assistant(content));
+
+                    if !turn.budget.should_continue() {
+                        turn.terminate(TerminalReason::BudgetExhausted);
+                        return Ok(TerminalReason::BudgetExhausted);
+                    }
+
+                    turn.transition_to(TurnState::Finalize);
+                    self.cost_tracker.end_turn(turn_number, &usage, &self.model);
+                    let _ = self.fire_turn_end_hook(turn_number, "end_turn").await;
+                    return Ok(TerminalReason::Completed);
+                }
+                turn.terminate(TerminalReason::BudgetExhausted);
+                return Ok(TerminalReason::BudgetExhausted);
+            }
+            turn.transition_to(TurnState::Finalize);
+            self.cost_tracker.end_turn(turn_number, &usage, &self.model);
+            let _ = self.fire_turn_end_hook(turn_number, "end_turn").await;
+            return Ok(TerminalReason::Completed);
+        }
+
+        // Phase 5: Execute tools
+        turn.pending_tool_calls = tool_calls
+            .iter()
+            .map(PendingToolCall::from)
+            .collect();
+
+        turn.transition_to(TurnState::ExecuteTools);
+        let tool_results = self.execute_tool_calls(turn, options).await?;
+
+        // Phase 6: Apply tool results
+        turn.transition_to(TurnState::ApplyToolResults);
+        for result in &tool_results {
+            let msg = Message::tool(result.clone());
+            self.session.messages.push(msg);
+        }
+
+        // Phase 7: Evaluate continuation
+        turn.transition_to(TurnState::EvaluateContinuation);
+        if !turn.budget.should_continue() {
+            if turn.recovery_count < self.compact_config.max_recovery_retries {
+                turn.transition_to(TurnState::CompactRecovery);
+                if let Err(e) = self.run_compact_recovery(turn, options, turn_number).await {
+                    turn.terminate(TerminalReason::Error(e.clone()));
+                    self.cost_tracker.end_turn(turn_number, &usage, &self.model);
+                    return Ok(TerminalReason::Error(e));
+                }
+            } else {
+                turn.terminate(TerminalReason::BudgetExhausted);
+                self.cost_tracker.end_turn(turn_number, &usage, &self.model);
+                return Ok(TerminalReason::BudgetExhausted);
+            }
+        }
+
+        turn.transition_to(TurnState::Finalize);
+        self.cost_tracker.end_turn(turn_number, &usage, &self.model);
+        let _ = self.fire_turn_end_hook(turn_number, "end_turn").await;
+
         Ok(TerminalReason::Completed)
     }
 
@@ -699,9 +1165,29 @@ impl QueryEngine {
         &mut self,
         turn: &mut TurnRuntime,
         options: &SubmitOptions,
-    ) -> Result<(), String> {
-        // Start with existing session messages
-        turn.messages = self.session.messages.clone();
+    ) {
+        // Assemble context using PromptCompiler
+        let ctx = PromptContext {
+            cwd: self.session.cwd.as_path(),
+            available_tools: &[],
+            denied_tools: &self.denied_tools,
+            model: &self.model,
+            budget: &turn.budget,
+        };
+        let assembled: AssembledContext = self.prompt_compiler.assemble(&ctx);
+
+        let denied_count = self.denied_tools.len();
+
+        // Prepend context messages (CLAUDE.md wrapped as user message)
+        for msg in &assembled.context_messages {
+            turn.messages.push(msg.clone());
+        }
+
+        // Add system prompt
+        turn.messages.push(Message::system(assembled.system_prompt));
+
+        // Add session conversation messages (after system context)
+        turn.messages.extend(self.session.messages.iter().cloned());
 
         // Inject denied tool call summaries from previous turns
         if !self.denied_tools.is_empty() {
@@ -728,19 +1214,115 @@ impl QueryEngine {
         }
 
         tracing::debug!(
-            "BuildContext: {} messages loaded ({} denied tools injected)",
+            "BuildContext: {} messages, {} estimated tokens ({} denied tools injected)",
             turn.messages.len(),
-            self.denied_tools.len()
+            assembled.estimated_tokens,
+            denied_count,
         );
+    }
+
+    /// Run compact recovery when context is too large.
+    #[allow(clippy::unused_async)]
+    async fn run_compact_recovery(
+        &self,
+        turn: &mut TurnRuntime,
+        _options: &SubmitOptions,
+        _turn_number: u32,
+    ) -> Result<(), String> {
+        // Estimate current token count
+        let estimated_tokens = PromptCompiler::estimate_message_tokens(&turn.messages);
+
+        // Select compact strategy
+        let stop_reason = "end_turn"; // default — would come from last API response
+        let strategy = compact::select_compact_strategy(
+            stop_reason,
+            estimated_tokens,
+            self.compact_config.auto_compact_threshold,
+            self.compact_config.reactive_compact_threshold,
+            turn.budget.is_near_limit(),
+        );
+
+        // Execute Stop hook with dead loop protection
+        let hook_ctx = StopHookContext {
+            recovery_count: turn.recovery_count,
+            max_recovery_retries: self.compact_config.max_recovery_retries,
+            estimated_tokens,
+            compact_strategy: strategy,
+            stop_reason: stop_reason.to_string(),
+        };
+        let decision = stop_hook::evaluate_stop_hook(&hook_ctx);
+
+        match decision {
+            StopHookDecision::Terminate { reason } => {
+                tracing::warn!("Stop hook: {}", reason);
+                return Err(reason);
+            }
+            StopHookDecision::Continue { .. } => {
+                tracing::info!(
+                    "CompactRecovery: applying {:?} strategy (estimated {} tokens, recovery #{})",
+                    strategy,
+                    estimated_tokens,
+                    turn.recovery_count + 1,
+                );
+            }
+        }
+
+        // Fire PreCompact hook
+        let mut ctx = std::collections::HashMap::new();
+        ctx.insert("strategy".to_string(), format!("{strategy:?}"));
+        ctx.insert("estimated_tokens".to_string(), estimated_tokens.to_string());
+        let _ = self.fire_hook("PreCompact", "compact_recovery", &ctx).await;
+
+        // Apply the compact strategy
+        let result: CompactResult = match strategy {
+            CompactStrategy::Micro => compact::micro_compact(&turn.messages, 5),
+            CompactStrategy::Auto => {
+                compact::auto_compact(&turn.messages, self.compact_config.auto_compact_threshold)
+            }
+            CompactStrategy::Reactive => {
+                compact::reactive_compact(&turn.messages, 3)
+            }
+            CompactStrategy::Snip => {
+                compact::snip_compact(&turn.messages, self.compact_config.snip_target_tokens)
+            }
+        };
+
+        // Check if compact boundary was inserted
+        if result.boundary_inserted {
+            // Emit compact boundary event
+            let _ = self.event_tx.send(EngineEvent::CompactBoundary);
+            tracing::debug!("CompactRecovery: boundary marker inserted");
+        }
+
+        // Update turn messages with compacted messages
+        let messages_remaining = result.messages.len();
+        turn.messages = result.messages;
+
+        // Increment recovery count
+        turn.recovery_count += 1;
+
+        // Fire PostCompact hook
+        let mut ctx = std::collections::HashMap::new();
+        ctx.insert("tokens_removed".to_string(), result.tokens_removed.to_string());
+        ctx.insert("messages_remaining".to_string(), messages_remaining.to_string());
+        let _ = self.fire_hook("PostCompact", "compact_complete", &ctx).await;
+
+        tracing::debug!(
+            "CompactRecovery: {} tokens removed, {} messages remaining",
+            result.tokens_removed,
+            turn.messages.len(),
+        );
+
         Ok(())
     }
 
     /// Format denied tool calls into a system prompt summary.
     fn format_denied_tools_summary(&self) -> String {
+        use std::fmt::Write;
         let mut summary =
             String::from("The following tool calls from the previous turn were denied:\n");
         for denied in &self.denied_tools {
-            summary.push_str(&format!("- `{}`: {}\n", denied.name, denied.reason));
+            let _ = writeln!(summary, "- `{}`: {}", denied.name, denied.reason);
         }
         summary.push_str("Please do not attempt these tool calls again in the same way. Adjust your approach accordingly.");
         summary
@@ -782,6 +1364,106 @@ impl QueryEngine {
             .send(EngineEvent::TextDelta(response.content.clone()));
 
         Ok(response)
+    }
+
+    /// Send the request using streaming API.
+    ///
+    /// Returns the assembled tool calls and accumulated text content.
+    async fn send_request_streaming(
+        &self,
+        turn: &TurnRuntime,
+        _options: &SubmitOptions,
+    ) -> Result<(String, Vec<ToolCall>, UsageSummary), String> {
+        use futures::StreamExt;
+
+        let system = turn
+            .messages
+            .iter()
+            .filter(|m| matches!(m.role, crate::types::Role::System))
+            .filter_map(|m| match &m.content {
+                crate::types::MessageContent::Text(t) => Some(t.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n\n");
+
+        let messages: Vec<serde_json::Value> = turn
+            .messages
+            .iter()
+            .filter(|m| !matches!(m.role, crate::types::Role::System))
+            .filter_map(|m| serde_json::to_value(m).ok())
+            .collect();
+
+        let mut stream = self
+            .api_client
+            .create_message_streaming(&system, &messages, &self.model, 4096)
+            .await;
+
+        let mut assembler = StreamingToolCallAssembler::new();
+        let mut usage = UsageSummary {
+            input_tokens: 0,
+            output_tokens: 0,
+            cache_read_tokens: 0,
+            cache_creation_tokens: 0,
+        };
+        let mut text_so_far = String::new();
+
+        while let Some(event) = stream.next().await {
+            match event.clone() {
+                StreamEvent::TextDelta(text) => {
+                    text_so_far.push_str(&text);
+                    let _ = self.event_tx.send(EngineEvent::TextDelta(text));
+                }
+                StreamEvent::ToolCallBlockStart { ref id, ref name } => {
+                    let _ = self.event_tx.send(EngineEvent::ToolCallStart {
+                        id: id.clone(),
+                        name: name.clone(),
+                    });
+                }
+                StreamEvent::ToolCallBlockEnd { .. } => {
+                    // Tool call completed during streaming — emit event
+                    // (actual execution happens after stream ends or during)
+                    let _ = self.event_tx.send(EngineEvent::ToolCallEnd {
+                        id: String::new(),
+                        result: ToolResult {
+                            tool_call_id: String::new(),
+                            output: "tool call assembled from stream".to_string(),
+                            is_error: false,
+                        },
+                    });
+                }
+                StreamEvent::ToolCallInputDelta { ref id, ref delta } => {
+                    // Incremental tool call input — assembler handles accumulation
+                    tracing::trace!("tool call input delta for {id}: {} bytes", delta.len());
+                }
+                StreamEvent::UsageSummary(u) => {
+                    usage = u;
+                }
+                StreamEvent::StreamEnd => {
+                    // Finalize pending tool calls
+                }
+                StreamEvent::Error(e) => {
+                    return Err(format!("streaming error: {e}"));
+                }
+            }
+
+            // Process event through assembler
+            let newly_completed = assembler.process_event(event);
+            if !newly_completed.is_empty() {
+                // In a full implementation, these could be executed immediately
+                // while the stream is still running (early execution).
+                // For now, we collect them for execution after the stream ends.
+            }
+        }
+
+        let tool_calls = {
+            let mut calls = assembler.take_completed();
+            // Also check for newly completed from stream end
+            calls.extend(assembler.process_event(StreamEvent::StreamEnd));
+            calls
+        };
+
+        Ok((text_so_far, tool_calls, usage))
     }
 
     /// Extract tool calls from the assistant response text.
@@ -828,6 +1510,29 @@ impl QueryEngine {
                 name: call.name.clone(),
             });
 
+            // Fire PreToolUse hook
+            let mut ctx = std::collections::HashMap::new();
+            ctx.insert("tool_call_id".to_string(), call.id.clone());
+            ctx.insert("tool_input".to_string(), call.input.to_string());
+            let pre_hook = self.fire_hook("PreToolUse", &call.name, &ctx).await;
+            if pre_hook.stop {
+                self.denied_tools.push(DeniedToolCall {
+                    name: call.name.clone(),
+                    reason: "pre-use hook stopped execution".to_string(),
+                });
+                let result = ToolResult {
+                    tool_call_id: call.id.clone(),
+                    output: "tool execution stopped by hook".to_string(),
+                    is_error: true,
+                };
+                let _ = self.event_tx.send(EngineEvent::ToolCallEnd {
+                    id: call.id.clone(),
+                    result: result.clone(),
+                });
+                results.push(result);
+                continue;
+            }
+
             // Check permission
             let (_request, perm_result) = self
                 .permission_engine
@@ -847,11 +1552,18 @@ impl QueryEngine {
                         output: format!("tool '{}' executed (stub)", call.name),
                         is_error: false,
                     };
+
+                    // Fire PostToolUse hook on success
+                    let mut ctx = std::collections::HashMap::new();
+                    ctx.insert("tool_call_id".to_string(), call.id.clone());
+                    ctx.insert("tool_output_len".to_string(), result.output.len().to_string());
+                    let _ = self.fire_hook("PostToolUse", &call.name, &ctx).await;
+
+                    results.push(result.clone());
                     let _ = self.event_tx.send(EngineEvent::ToolCallEnd {
                         id: call.id.clone(),
-                        result: result.clone(),
+                        result,
                     });
-                    results.push(result);
                 }
                 PermissionResult::Ask { reason } | PermissionResult::AskForSession { reason } => {
                     let _ = self.event_tx.send(EngineEvent::PermissionRequest {
@@ -869,6 +1581,13 @@ impl QueryEngine {
                         output: format!("tool '{}' denied by user", call.name),
                         is_error: true,
                     };
+
+                    // Fire PostToolUseFail hook
+                    let mut ctx = std::collections::HashMap::new();
+                    ctx.insert("tool_call_id".to_string(), call.id.clone());
+                    ctx.insert("reason".to_string(), reason.clone());
+                    let _ = self.fire_hook("PostToolUseFail", &call.name, &ctx).await;
+
                     results.push(result);
                 }
                 PermissionResult::Deny { reason } => {
@@ -882,13 +1601,32 @@ impl QueryEngine {
                         output: format!("tool '{}' denied", call.name),
                         is_error: true,
                     };
+
+                    // Fire PostToolUseFail hook
+                    let mut ctx = std::collections::HashMap::new();
+                    ctx.insert("tool_call_id".to_string(), call.id.clone());
+                    ctx.insert("reason".to_string(), reason.clone());
+                    let _ = self.fire_hook("PostToolUseFail", &call.name, &ctx).await;
+
                     results.push(result);
                 }
                 PermissionResult::Elevated { reason } => {
-                    self.denied_tools.push(DeniedToolCall {
-                        name: call.name.clone(),
+                    // Emit elevation request event
+                    let elevation_id = format!("elev_{}", call.id);
+                    let _ = self.event_tx.send(EngineEvent::ElevationRequest {
+                        id: elevation_id.clone(),
+                        tool: call.name.clone(),
                         reason: reason.clone(),
                     });
+
+                    // Store pending elevation so caller can handle it
+                    turn.pending_elevation = Some(PendingElevation {
+                        tool_call_id: call.id.clone(),
+                        tool_name: call.name.clone(),
+                        input: call.input.clone(),
+                        request_id: elevation_id,
+                    });
+
                     let result = ToolResult {
                         tool_call_id: call.id.clone(),
                         output: format!("tool '{}' requires elevated permissions", call.name),
@@ -903,8 +1641,111 @@ impl QueryEngine {
         Ok(results)
     }
 
+    /// Resolve a pending elevation request and retry the tool call with elevated permissions.
+    ///
+    /// After the user approves elevation, this temporarily grants bypass-level
+    /// permissions for the specific tool call and re-executes it.
+    pub async fn resolve_elevation(
+        &mut self,
+        turn: &mut TurnRuntime,
+        approved: bool,
+    ) -> Result<Option<ToolResult>, String> {
+        let Some(elevation) = turn.pending_elevation.take() else {
+            return Ok(None);
+        };
+
+        if !approved {
+            // User denied elevation — treat as permanent denial
+            self.denied_tools.push(DeniedToolCall {
+                name: elevation.tool_name.clone(),
+                reason: "elevation denied by user".to_string(),
+            });
+            return Ok(Some(ToolResult {
+                tool_call_id: elevation.tool_call_id.clone(),
+                output: format!("tool '{}' elevation denied", elevation.tool_name),
+                is_error: true,
+            }));
+        }
+
+        // Temporarily switch to BypassPermissions for the elevated call
+        let checker = self.permission_engine.checker();
+        let prev_mode = {
+            let mut c = checker.lock().unwrap();
+            let prev = c.mode();
+            c.set_mode(PermissionMode::BypassPermissions);
+            prev
+        };
+
+        // Emit tool call start
+        let _ = self.event_tx.send(EngineEvent::ToolCallStart {
+            id: elevation.tool_call_id.clone(),
+            name: elevation.tool_name.clone(),
+        });
+
+        // Fire PreToolUse hook
+        let mut ctx = std::collections::HashMap::new();
+        ctx.insert("tool_call_id".to_string(), elevation.tool_call_id.clone());
+        ctx.insert("tool_input".to_string(), elevation.input.to_string());
+        let pre_hook = self.fire_hook("PreToolUse", &elevation.tool_name, &ctx).await;
+        if pre_hook.stop {
+            // Restore mode
+            {
+                let mut c = checker.lock().unwrap();
+                c.set_mode(prev_mode);
+            }
+            return Ok(Some(ToolResult {
+                tool_call_id: elevation.tool_call_id.clone(),
+                output: "elevated tool execution stopped by hook".to_string(),
+                is_error: true,
+            }));
+        }
+
+        // Re-run permission check (should now pass with BypassPermissions)
+        let (_request, perm_result) = self
+            .permission_engine
+            .evaluate(
+                &elevation.tool_name,
+                elevation.input.to_string(),
+                None,
+                std::collections::HashMap::new(),
+            )
+            .await
+            .map_err(|e| format!("permission check failed: {e}"))?;
+
+        // Restore original mode
+        {
+            let mut c = checker.lock().unwrap();
+            c.set_mode(prev_mode);
+        }
+
+        let result = match perm_result {
+            PermissionResult::Allow | PermissionResult::AllowForPath { .. } => ToolResult {
+                tool_call_id: elevation.tool_call_id.clone(),
+                output: format!("tool '{}' executed with elevated permissions (stub)", elevation.tool_name),
+                is_error: false,
+            },
+            _ => {
+                self.denied_tools.push(DeniedToolCall {
+                    name: elevation.tool_name.clone(),
+                    reason: "elevated permission check still denied".to_string(),
+                });
+                ToolResult {
+                    tool_call_id: elevation.tool_call_id.clone(),
+                    output: format!("tool '{}' elevated execution denied", elevation.tool_name),
+                    is_error: true,
+                }
+            }
+        };
+
+        let _ = self.event_tx.send(EngineEvent::ToolCallEnd {
+            id: elevation.tool_call_id.clone(),
+            result: result.clone(),
+        });
+        Ok(Some(result))
+    }
+
     /// Get the current cost tracker (shared reference).
-    pub fn cost_tracker(&self) -> &CostTracker {
+    pub const fn cost_tracker(&self) -> &CostTracker {
         &self.cost_tracker
     }
 
@@ -915,7 +1756,7 @@ impl QueryEngine {
     }
 
     /// Get the session state (read-only).
-    pub fn session(&self) -> &SessionState {
+    pub const fn session(&self) -> &SessionState {
         &self.session
     }
 
@@ -932,7 +1773,6 @@ mod tests {
     use crate::api_client::StreamEvent;
     use crate::permission_engine::PermissionEngine;
     use crate::permissions::{PermissionChecker, PermissionMode};
-    use futures::Stream;
 
     fn make_test_engine() -> (
         QueryEngine,
@@ -1289,5 +2129,168 @@ mod tests {
         });
         engine.clear_denied_tools();
         assert!(engine.denied_tools().is_empty());
+    }
+
+    // ─── Elevation Flow ────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn resolve_elevation_approved_succeeds_with_bypass() {
+        let (mut engine, _rx, _session) = make_test_engine();
+        let budget = TokenBudget::with_defaults();
+        let mut turn = TurnRuntime::new(budget);
+        turn.pending_elevation = Some(PendingElevation {
+            tool_call_id: "tc_elev".into(),
+            tool_name: "bash".into(),
+            input: serde_json::json!({"command": "whoami"}),
+            request_id: "elev_tc_elev".into(),
+        });
+
+        let result = engine.resolve_elevation(&mut turn, true).await;
+        assert!(result.is_ok());
+        let result = result.unwrap();
+        assert!(result.is_some());
+        let r = result.unwrap();
+        assert!(!r.is_error);
+    }
+
+    #[tokio::test]
+    async fn resolve_elevation_denied_returns_error() {
+        let (mut engine, _rx, _session) = make_test_engine();
+        let budget = TokenBudget::with_defaults();
+        let mut turn = TurnRuntime::new(budget);
+        turn.pending_elevation = Some(PendingElevation {
+            tool_call_id: "tc_elev".into(),
+            tool_name: "write".into(),
+            input: serde_json::json!({}),
+            request_id: "elev_tc_elev".into(),
+        });
+
+        let result = engine.resolve_elevation(&mut turn, false).await;
+        assert!(result.is_ok());
+        let result = result.unwrap().unwrap();
+        assert!(result.is_error);
+    }
+
+    #[tokio::test]
+    async fn resolve_elevation_no_pending_returns_none() {
+        let (mut engine, _rx, _session) = make_test_engine();
+        let budget = TokenBudget::with_defaults();
+        let mut turn = TurnRuntime::new(budget);
+
+        let result = engine.resolve_elevation(&mut turn, true).await;
+        assert!(result.is_ok());
+        assert!(result.unwrap().is_none());
+    }
+
+    #[test]
+    fn pending_elevation_struct_fields() {
+        let elev = PendingElevation {
+            tool_call_id: "tc_1".into(),
+            tool_name: "bash".into(),
+            input: serde_json::json!({}),
+            request_id: "elev_1".into(),
+        };
+        assert_eq!(elev.tool_call_id, "tc_1");
+        assert_eq!(elev.tool_name, "bash");
+    }
+
+    // ─── Streaming Tool Call Assembler ─────────────────────────────────────
+
+    #[test]
+    fn streaming_assembler_accumulates_text() {
+        let mut assembler = StreamingToolCallAssembler::new();
+        assembler.process_event(StreamEvent::TextDelta("Hello".into()));
+        assembler.process_event(StreamEvent::TextDelta(" world".into()));
+        assert_eq!(assembler.text(), "Hello world");
+    }
+
+    #[test]
+    fn streaming_assembler_assembles_tool_call_from_deltas() {
+        let mut assembler = StreamingToolCallAssembler::new();
+        assembler.process_event(StreamEvent::ToolCallBlockStart {
+            id: "tc_1".into(),
+            name: "read".into(),
+        });
+        assembler.process_event(StreamEvent::ToolCallInputDelta {
+            id: "tc_1".into(),
+            delta: r#"{"path":"test.txt"}"#.into(),
+        });
+        let completed = assembler.process_event(StreamEvent::ToolCallBlockEnd {
+            id: "tc_1".into(),
+            input: serde_json::json!({"path": "test.txt"}),
+        });
+        assert_eq!(completed.len(), 1);
+        assert_eq!(completed[0].name, "read");
+        assert_eq!(assembler.has_tool_calls(), true);
+    }
+
+    #[test]
+    fn streaming_assembler_finalizes_pending_on_stream_end() {
+        let mut assembler = StreamingToolCallAssembler::new();
+        assembler.process_event(StreamEvent::ToolCallBlockStart {
+            id: "tc_2".into(),
+            name: "bash".into(),
+        });
+        assembler.process_event(StreamEvent::ToolCallInputDelta {
+            id: "tc_2".into(),
+            delta: r#"{"command":"ls"}"#.into(),
+        });
+        // StreamEnd finalizes pending tool calls
+        let finalized = assembler.process_event(StreamEvent::StreamEnd);
+        assert_eq!(finalized.len(), 1);
+        assert_eq!(finalized[0].name, "bash");
+    }
+
+    #[test]
+    fn streaming_assembler_no_tool_calls_for_text_only() {
+        let mut assembler = StreamingToolCallAssembler::new();
+        assembler.process_event(StreamEvent::TextDelta("text only".into()));
+        assert!(!assembler.has_tool_calls());
+        assert!(assembler.take_completed().is_empty());
+    }
+
+    #[test]
+    fn streaming_assembler_takes_completed() {
+        let mut assembler = StreamingToolCallAssembler::new();
+        assembler.process_event(StreamEvent::ToolCallBlockStart {
+            id: "tc_1".into(),
+            name: "read".into(),
+        });
+        let _c = assembler.process_event(StreamEvent::ToolCallBlockEnd {
+            id: "tc_1".into(),
+            input: serde_json::json!({}),
+        });
+        // take_completed returns already-completed calls
+        let taken = assembler.take_completed();
+        assert_eq!(taken.len(), 1);
+        // Second take is empty
+        assert!(assembler.take_completed().is_empty());
+    }
+
+    // ─── Elicitation Integration ───────────────────────────────────────────
+
+    #[tokio::test]
+    async fn handle_elicitation_stores_response() {
+        let (mut engine, _rx, _session) = make_test_engine();
+        let budget = TokenBudget::with_defaults();
+        let mut turn = TurnRuntime::new(budget);
+
+        let result = engine.handle_elicitation(
+            &mut turn,
+            "elic_1".into(),
+            "Which approach?".into(),
+        ).await;
+        // Default handler returns Cancelled
+        assert!(matches!(result, ElicitationResult::Cancelled));
+        // Turn state should be AwaitElicitation
+        assert_eq!(turn.state, TurnState::AwaitElicitation);
+    }
+
+    #[test]
+    fn query_engine_has_default_elicitation_handler() {
+        let (mut engine, _rx, _session) = make_test_engine();
+        // Can set a custom handler
+        engine.set_elicitation_handler(Box::new(crate::elicitation::SdkElicitationHandler));
+        // Handler was set without error
     }
 }

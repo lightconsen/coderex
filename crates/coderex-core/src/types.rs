@@ -173,6 +173,15 @@ pub enum EngineEvent {
         /// Prompt message.
         message: String,
     },
+    /// An elevation request needs user input (elevated privileges required).
+    ElevationRequest {
+        /// Unique request identifier.
+        id: String,
+        /// Tool name requiring elevation.
+        tool: String,
+        /// Reason for elevation.
+        reason: String,
+    },
     /// The session has ended.
     SessionEnd,
 }

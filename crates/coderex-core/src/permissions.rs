@@ -8,8 +8,10 @@ use thiserror::Error;
 
 /// Permission mode controlling how tool approvals work.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Default)]
 pub enum PermissionMode {
     /// Default: ask before dangerous operations.
+    #[default]
     Default,
     /// Accept edits without asking, but still approve dangerous tools.
     AcceptEdits,
@@ -23,28 +25,23 @@ pub enum PermissionMode {
     Auto,
 }
 
-impl Default for PermissionMode {
-    fn default() -> Self {
-        Self::Default
-    }
-}
 
 impl PermissionMode {
     /// Returns true if this mode is fully read-only.
     #[must_use]
-    pub fn is_read_only(self) -> bool {
+    pub const fn is_read_only(self) -> bool {
         matches!(self, Self::Plan)
     }
 
     /// Returns true if this mode auto-approves all operations.
     #[must_use]
-    pub fn bypasses_all(self) -> bool {
+    pub const fn bypasses_all(self) -> bool {
         matches!(self, Self::BypassPermissions)
     }
 
     /// Returns true if this mode auto-denies all operations.
     #[must_use]
-    pub fn denies_all(self) -> bool {
+    pub const fn denies_all(self) -> bool {
         matches!(self, Self::DontAsk)
     }
 }
@@ -85,7 +82,7 @@ pub enum PermissionResult {
 impl PermissionResult {
     /// Returns true if the operation can proceed without user input.
     #[must_use]
-    pub fn is_allowed(&self) -> bool {
+    pub const fn is_allowed(&self) -> bool {
         matches!(
             self,
             Self::Allow | Self::AllowForPath { .. } | Self::AskForSession { .. }
@@ -144,6 +141,8 @@ struct CompiledRule {
 #[allow(missing_debug_implementations)]
 pub struct PermissionChecker {
     mode: PermissionMode,
+    /// Saved mode for prePlanMode save/restore.
+    saved_mode: Option<PermissionMode>,
     rules: Vec<CompiledRule>,
     /// Session-level cached approvals: tool_name -> whether approved.
     session_approvals: HashMap<String, bool>,
@@ -157,6 +156,7 @@ impl PermissionChecker {
     pub fn new(mode: PermissionMode) -> Self {
         Self {
             mode,
+            saved_mode: None,
             rules: Vec::new(),
             session_approvals: HashMap::new(),
             dangerous_tools: vec![
@@ -170,8 +170,27 @@ impl PermissionChecker {
     }
 
     /// Set the permission mode.
-    pub fn set_mode(&mut self, mode: PermissionMode) {
+    pub const fn set_mode(&mut self, mode: PermissionMode) {
         self.mode = mode;
+    }
+
+    /// Save the current mode and switch to Plan mode.
+    ///
+    /// Use before entering PlanMode; pair with `exit_plan_mode()` to restore.
+    pub fn enter_plan_mode(&mut self) {
+        self.saved_mode = Some(self.mode);
+        self.mode = PermissionMode::Plan;
+    }
+
+    /// Restore the mode saved before entering Plan mode.
+    ///
+    /// Returns the restored mode, or `None` if no mode was saved.
+    pub fn exit_plan_mode(&mut self) -> Option<PermissionMode> {
+        let prev = self.saved_mode.take();
+        if let Some(saved) = prev {
+            self.mode = saved;
+        }
+        prev
     }
 
     /// Get the current permission mode.
@@ -237,19 +256,18 @@ impl PermissionChecker {
 
         // Check for explicit deny rules first (deny takes priority)
         for rule in &self.rules {
-            if rule.action == PermissionAction::Deny {
-                if self.rule_matches(rule, tool_name, path_str.as_deref()) {
+            if rule.action == PermissionAction::Deny
+                && Self::rule_matches(rule, tool_name, path_str.as_deref()) {
                     return PermissionResult::Deny {
-                        reason: self.rule_reason(rule, tool_name),
+                        reason: Self::rule_reason(rule, tool_name),
                     };
                 }
-            }
         }
 
         // Check for explicit allow rules
         for rule in &self.rules {
-            if rule.action == PermissionAction::Allow {
-                if self.rule_matches(rule, tool_name, path_str.as_deref()) {
+            if rule.action == PermissionAction::Allow
+                && Self::rule_matches(rule, tool_name, path_str.as_deref()) {
                     if rule.path_matchers.is_empty() {
                         return PermissionResult::Allow;
                     }
@@ -261,18 +279,16 @@ impl PermissionChecker {
                             .collect(),
                     };
                 }
-            }
         }
 
         // Check for ask rules
         for rule in &self.rules {
-            if rule.action == PermissionAction::Ask {
-                if self.rule_matches(rule, tool_name, path_str.as_deref()) {
+            if rule.action == PermissionAction::Ask
+                && Self::rule_matches(rule, tool_name, path_str.as_deref()) {
                     return PermissionResult::Ask {
-                        reason: self.rule_reason(rule, tool_name),
+                        reason: Self::rule_reason(rule, tool_name),
                     };
                 }
-            }
         }
 
         // Default: dangerous tools require approval, safe tools allowed
@@ -354,7 +370,7 @@ impl PermissionChecker {
     }
 
     /// Check if a rule matches the given tool and path.
-    fn rule_matches(&self, rule: &CompiledRule, tool_name: &str, path: Option<&str>) -> bool {
+    fn rule_matches(rule: &CompiledRule, tool_name: &str, path: Option<&str>) -> bool {
         let name_matches = rule.tool_name.is_empty() || rule.tool_name == tool_name;
         if !name_matches {
             return false;
@@ -375,7 +391,7 @@ impl PermissionChecker {
     }
 
     /// Generate a human-readable reason from a rule.
-    fn rule_reason(&self, rule: &CompiledRule, tool_name: &str) -> String {
+    fn rule_reason(rule: &CompiledRule, tool_name: &str) -> String {
         if !rule.description.is_empty() {
             rule.description.clone()
         } else if rule.tool_name.is_empty() {
@@ -565,5 +581,38 @@ mod tests {
             checker.check("read", Some(Path::new("/etc/passwd"))),
             PermissionResult::Deny { .. }
         ));
+    }
+
+    #[test]
+    fn enter_plan_mode_saves_and_restores_mode() {
+        let mut checker = PermissionChecker::new(PermissionMode::Default);
+        checker.enter_plan_mode();
+        assert!(matches!(checker.mode(), PermissionMode::Plan));
+        // Plan mode denies write/bash
+        assert!(matches!(checker.check("bash", None), PermissionResult::Deny { .. }));
+
+        let restored = checker.exit_plan_mode();
+        assert!(restored.is_some());
+        assert!(matches!(restored.unwrap(), PermissionMode::Default));
+        // Restored mode: dangerous tools require approval
+        assert!(matches!(checker.check("bash", None), PermissionResult::Ask { .. }));
+    }
+
+    #[test]
+    fn exit_plan_mode_without_enter_returns_none() {
+        let mut checker = PermissionChecker::new(PermissionMode::BypassPermissions);
+        let restored = checker.exit_plan_mode();
+        assert!(restored.is_none());
+        // Mode unchanged
+        assert!(matches!(checker.mode(), PermissionMode::BypassPermissions));
+    }
+
+    #[test]
+    fn enter_plan_mode_preserves_original_mode() {
+        let mut checker = PermissionChecker::new(PermissionMode::Auto);
+        checker.enter_plan_mode();
+        assert!(matches!(checker.mode(), PermissionMode::Plan));
+        checker.exit_plan_mode();
+        assert!(matches!(checker.mode(), PermissionMode::Auto));
     }
 }

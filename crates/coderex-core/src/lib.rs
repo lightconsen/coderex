@@ -16,9 +16,37 @@ pub mod cost;
 pub mod permissions;
 pub mod permission_engine;
 pub mod sandbox;
+pub mod file_traversal;
+pub mod fuzzy_matcher;
+pub mod markdown;
+pub mod syntax;
+pub mod scheduler;
+pub mod prompt;
+pub mod compact;
+pub mod stop_hook;
+pub mod hook_executor;
+pub mod elicitation;
+
+pub use file_traversal::{FileIterator, TraversalConfig, TraversalError, collect_files, count_files, traverse};
+pub use fuzzy_matcher::{FuzzyMatch, FuzzyMatcher, fuzzy_search};
+pub use markdown::{MarkdownConfig, MarkdownError, extract_frontmatter, markdown_to_commonmark, markdown_to_html, strip_markdown};
+pub use syntax::{SyntaxError, SyntaxHighlighter, Token};
+pub use scheduler::{CronError, CronSchedule, next_cron_time, validate_cron};
+pub use prompt::{AssembledContext, CompactConfig, PromptBlock, PromptCompiler, PromptContext};
+pub use compact::{
+    CompactResult, CompactStrategy, auto_compact, compact_boundary_message, insert_compact_boundary,
+    micro_compact, reactive_compact, select_compact_strategy, should_auto_compact,
+    should_reactive_compact, snip_compact,
+};
 
 pub use runtime::{Runtime, RuntimeHandle, UiEvent};
 pub use engine::{
-    DeniedToolCall, QueryEngine, StructuredOutputValidator, SubmitOptions, TerminalReason,
-    TurnProgress, TurnRuntime, TurnState, ValidationResult,
+    DeniedToolCall, PendingElevation, PendingToolCall, QueryEngine, StreamingToolCallAssembler,
+    StructuredOutputValidator, SubmitOptions, TerminalReason, TurnProgress, TurnRuntime, TurnState,
+    ValidationResult,
+};
+
+pub use elicitation::{
+    ElicitationHandler, ElicitationOption, ElicitationQuestion, ElicitationResponse,
+    ElicitationResult, ReplElicitationHandler, SdkElicitationHandler,
 };

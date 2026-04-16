@@ -215,6 +215,10 @@ impl Runtime {
                 tracing::debug!("engine: elicitation: {message}");
                 // TODO: show elicitation prompt
             }
+            EngineEvent::ElevationRequest { ref tool, ref reason, .. } => {
+                tracing::debug!("engine: elevation request: {tool} ({reason})");
+                // TODO: show elevation dialog
+            }
             EngineEvent::SessionEnd => {
                 tracing::info!("engine: session ended");
                 // TODO: finalize UI state

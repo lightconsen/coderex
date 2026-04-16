@@ -2,6 +2,7 @@
 
 use crate::types::{ModelId, UsageSummary};
 use futures::Stream;
+use futures::StreamExt;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::pin::Pin;
@@ -112,6 +113,27 @@ pub struct ApiResponse {
 pub enum StreamEvent {
     /// A text delta chunk.
     TextDelta(String),
+    /// A tool call block start.
+    ToolCallBlockStart {
+        /// Tool call ID.
+        id: String,
+        /// Tool name.
+        name: String,
+    },
+    /// A tool call input delta.
+    ToolCallInputDelta {
+        /// Tool call ID.
+        id: String,
+        /// JSON input delta fragment.
+        delta: String,
+    },
+    /// A tool call block completed.
+    ToolCallBlockEnd {
+        /// Tool call ID.
+        id: String,
+        /// Complete JSON input.
+        input: serde_json::Value,
+    },
     /// Token usage summary (emitted at end of stream).
     UsageSummary(UsageSummary),
     /// Stream completed.
@@ -294,21 +316,190 @@ impl ApiClient for AnthropicApiClient {
 
     async fn create_message_streaming(
         &self,
-        _system: &str,
-        _messages: &[serde_json::Value],
-        _model: &ModelId,
-        _max_tokens: u32,
+        system: &str,
+        messages: &[serde_json::Value],
+        model: &ModelId,
+        max_tokens: u32,
     ) -> Pin<Box<dyn Stream<Item = StreamEvent> + Send + '_>> {
-        // TODO: implement SSE streaming with reqwest
-        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<StreamEvent>();
-        let _ = tx.send(StreamEvent::StreamEnd);
-        Box::pin(futures::stream::unfold(rx, |mut rx| async move {
-            rx.recv().await.map(|item| (item, rx))
-        }))
+        if self.config.api_key.is_empty() {
+            return Box::pin(futures::stream::once(async {
+                StreamEvent::Error(ApiError::Auth(
+                    "ANTHROPIC_API_KEY environment variable is not set".into(),
+                ))
+            }));
+        }
+
+        let url = format!(
+            "{}/v1/messages",
+            self.config.base_url.strip_suffix('/').unwrap_or(&self.config.base_url)
+        );
+
+        let model_name = Self::resolve_model(model).to_string();
+        let body = serde_json::json!({
+            "model": model_name,
+            "system": system,
+            "messages": messages,
+            "max_tokens": max_tokens,
+            "stream": true,
+        });
+
+        let api_key = self.config.api_key.clone();
+        let client = self.client.clone();
+
+        Box::pin(futures::stream::once(async move {
+            let response = client
+                .post(&url)
+                .header("x-api-key", &api_key)
+                .header("anthropic-version", "2023-06-01")
+                .header("content-type", "application/json")
+                .json(&body)
+                .send()
+                .await;
+
+            match response {
+                Ok(resp) => {
+                    let status = resp.status().as_u16();
+                    if status >= 400 {
+                        let err_text = resp.text().await.unwrap_or_default();
+                        return futures::stream::once(async move {
+                            StreamEvent::Error(ApiError::Response {
+                                status,
+                                message: err_text,
+                            })
+                        })
+                        .chain(futures::stream::once(async move { StreamEvent::StreamEnd }))
+                        .boxed();
+                    }
+
+                    parse_sse_stream(resp.bytes_stream()).boxed()
+                }
+                Err(e) => futures::stream::once(async move { StreamEvent::Error(ApiError::from(e)) })
+                    .chain(futures::stream::once(async move { StreamEvent::StreamEnd }))
+                    .boxed(),
+            }
+        })
+        .flatten())
     }
 }
 
-/// Check if an error is retryable (transient).
+/// Parse an SSE byte stream into `StreamEvent`s.
+///
+/// Anthropic SSE format:
+/// ```text
+/// event: message_start
+/// data: {"type":"message_start","message":{...}}
+///
+/// event: content_block_delta
+/// data: {"type":"content_block_delta","delta":{"type":"text_delta","text":"..."}}
+///
+/// event: message_delta
+/// data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{...}}
+///
+/// event: message_stop
+/// data: {"type":"message_stop"}
+/// ```
+fn parse_sse_stream(
+    stream: impl futures::Stream<Item = Result<bytes::Bytes, reqwest::Error>> + Send + 'static,
+) -> impl futures::Stream<Item = StreamEvent> + Send + 'static {
+    use futures::StreamExt;
+
+    // Wrap in Pin so we can use it with unfold state
+    let pinned = Box::pin(stream);
+
+    futures::stream::unfold(
+        (pinned, String::new()),
+        |(mut inner, mut buffer)| async move {
+            loop {
+                // Check if we have a complete message in the buffer
+                if let Some(pos) = find_sse_message_boundary(&buffer) {
+                    let message = buffer[..pos].to_string();
+                    buffer.drain(..=pos);
+
+                    if let Some(event) = parse_sse_message(&message) {
+                        return Some((event, (inner, buffer)));
+                    }
+                    // Skip unparseable messages, continue loop
+                    continue;
+                }
+
+                // Need more data — pull from the inner stream
+                match inner.next().await {
+                    Some(Ok(chunk)) => {
+                        let chunk_str =
+                            std::str::from_utf8(&chunk).unwrap_or("");
+                        buffer.push_str(chunk_str);
+                    }
+                    Some(Err(e)) => {
+                        return Some((
+                            StreamEvent::Error(ApiError::from(e)),
+                            (inner, buffer),
+                        ));
+                    }
+                    None => {
+                        // Stream exhausted
+                        return None;
+                    }
+                }
+            }
+        },
+    )
+    .chain(futures::stream::once(async move {
+        StreamEvent::StreamEnd
+    }))
+}
+
+/// Find the position of the next SSE message boundary (`\n\n` or `\r\n\r\n`).
+fn find_sse_message_boundary(buffer: &str) -> Option<usize> {
+    buffer
+        .as_bytes()
+        .windows(2)
+        .position(|w| w == b"\n\n")
+        .map(|pos| pos + 1) // include one newline
+}
+
+/// Parse a single SSE message block into a `StreamEvent`.
+fn parse_sse_message(message: &str) -> Option<StreamEvent> {
+    // Extract the `data:` line
+    let data_line = message
+        .lines()
+        .find(|line| line.starts_with("data: "))?;
+    let json_str = data_line.strip_prefix("data: ")?;
+
+    let value: serde_json::Value = serde_json::from_str(json_str).ok()?;
+    let event_type = value.get("type").and_then(|v| v.as_str())?;
+
+    match event_type {
+        "content_block_delta" => {
+            let text = value
+                .get("delta")
+                .and_then(|d| d.get("text"))
+                .and_then(|t| t.as_str())
+                .unwrap_or("");
+            if text.is_empty() {
+                None
+            } else {
+                Some(StreamEvent::TextDelta(text.to_string()))
+            }
+        }
+        "message_delta" => {
+            #[allow(clippy::cast_possible_truncation)]
+            let usage = value.get("usage").map(|u| UsageSummary {
+                input_tokens: u.get("input_tokens").and_then(serde_json::Value::as_u64).unwrap_or(0) as usize,
+                output_tokens: u.get("output_tokens").and_then(serde_json::Value::as_u64).unwrap_or(0) as usize,
+                cache_read_tokens: u
+                    .get("cache_read_input_tokens")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0) as usize,
+                cache_creation_tokens: u
+                    .get("cache_creation_input_tokens")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0) as usize,
+            });
+            usage.map(StreamEvent::UsageSummary)
+        }
+        _ => None,
+    }
+}
 fn is_retryable(error: &ApiError) -> bool {
     match error {
         ApiError::Http(msg) => {
