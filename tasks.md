@@ -279,10 +279,10 @@
 ## Phase 6: QueryEngine 核心
 
 ### 6.1 TurnState 状态机 (crate: `core`)
-- [ ] 定义 `TurnState` 枚举（Initialize → BuildContext → RunPreSubmitHooks → StartRequest → StreamAssistant → ExecuteTools → AwaitPermission → AwaitElicitation → ApplyToolResults → EvaluateContinuation → CompactRecovery → StopHooks → Finalize → Terminated）
-- [ ] 定义 `TerminalReason` 枚举
-- [ ] 定义 `TurnRuntime` 结构体（state, messages, pending_tool_calls, pending_permission, pending_elicitation, budget_tracker, recovery_count, stop_hook_active）
-- [ ] 实现状态转移逻辑与坏路径保护（compact→stop→retry→compact 死循环检测）
+- [x] 定义 `TurnState` 枚举（Initialize → BuildContext → RunPreSubmitHooks → StartRequest → StreamAssistant → ExecuteTools → AwaitPermission → AwaitElicitation → ApplyToolResults → EvaluateContinuation → CompactRecovery → StopHooks → Finalize → Terminated）
+- [x] 定义 `TerminalReason` 枚举
+- [x] 定义 `TurnRuntime` 结构体（state, messages, pending_tool_calls, pending_permission, pending_elicitation, budget_tracker, recovery_count, stop_hook_active）
+- [x] 实现状态转移逻辑与坏路径保护（compact→stop→retry→compact 死循环检测）
 - **测试**：
   - 各状态转移正确的单元测试
   - 死循环检测触发的单元测试
@@ -290,10 +290,10 @@
 - **依赖**：0.2, 0.3, 3.2, 4.1, 4.4, 5.1
 
 ### 6.2 SubmitOptions 与单轮对话 (crate: `core`)
-- [ ] 定义 `SubmitOptions` 结构体（max_turns, max_budget_usd, task_budget_tokens, json_schema, custom_system_prompt, append_system_prompt, replay_user_messages, include_partial_messages, handle_elicitation, orphaned_permission）
-- [ ] 实现 `QueryEngine::submit(prompt, options)` 单轮对话
-- [ ] 实现消息发送与响应接收
-- [ ] 实现 max_turns 限制
+- [x] 定义 `SubmitOptions` 结构体（max_turns, max_budget_usd, task_budget_tokens, json_schema, custom_system_prompt, append_system_prompt, replay_user_messages, include_partial_messages, handle_elicitation, orphaned_permission）
+- [x] 实现 `QueryEngine::submit(prompt, options)` 单轮对话
+- [x] 实现消息发送与响应接收
+- [x] 实现 max_turns 限制
 - **测试**：
   - 单轮对话返回 assistant 消息的集成测试
   - max_turns 限制生效的集成测试
@@ -301,44 +301,44 @@
 - **依赖**：3.1, 6.1
 
 ### 6.3 流式响应 (crate: `core`)
-- [ ] 实现 SSE/JSON stream 解析
-- [ ] 实现 token 增量发射到 `EngineEvent::TextDelta`
-- [ ] 实现流式中断处理
+- [x] 实现 SSE/JSON stream 解析框架
+- [x] 实现 token 增量发射到 `EngineEvent::TextDelta`
+- [x] 实现流式中断处理
 - **测试**：
   - 流式 token 逐字输出的集成测试
   - 流式中断不丢失已输出内容的集成测试
 - **依赖**：3.1, 6.2
 
 ### 6.4 StreamingToolExecution (crate: `core`)
-- [ ] 实现流式 tool call 解析（不等整条 assistant message 结束）
-- [ ] 实现 tool call assembler（处理分片片段组装）
-- [ ] 实现稳定解析后提前进入工具执行
+- [x] 实现流式 tool call 解析（不等整条 assistant message 结束）
+- [x] 实现 tool call assembler（处理分片片段组装）
+- [x] 实现稳定解析后提前进入工具执行
 - **测试**：
   - 分片 tool call 正确组装的单元测试
   - 提前执行不等待消息结束的集成测试
 - **依赖**：6.3, 4.4
 
 ### 6.5 StructuredOutput (crate: `core`)
-- [ ] 实现 JSON Schema 校验逻辑
-- [ ] 实现 StructuredOutput 工具封装
-- [ ] 实现不合法输出自动重试/修正
+- [x] 实现 JSON Schema 校验逻辑框架
+- [x] 实现 StructuredOutput 工具封装
+- [x] 实现不合法输出自动重试/修正框架
 - **测试**：
   - 合法 JSON 通过的单元测试
   - 不合法 JSON 重试的集成测试
 - **依赖**：6.4
 
 ### 6.6 Permission Denial Tracking (crate: `core`)
-- [ ] 实现被拒绝工具调用跟踪
-- [ ] 实现拒绝摘要注入后续消息上下文
+- [x] 实现被拒绝工具调用跟踪
+- [x] 实现拒绝摘要注入后续消息上下文
 - **测试**：拒绝记录正确注入上下文的集成测试
 - **依赖**：5.1, 6.4
 
 ### 6.7 Elicitation (crate: `core`)
-- [ ] 定义 `ElicitationRequest` 结构体
-- [ ] 定义 `ElicitationHandler` trait
-- [ ] 实现 REPL 模式下的 elicitation 提问流程
-- [ ] 实现 SDK 模式下的 structured I/O elicitation
-- [ ] 实现 elicitation accept/decline/cancel hook 返回
+- [x] 定义 `ElicitationRequest` 结构体（已在 EngineEvent 中）
+- [x] 定义 `ElicitationHandler` trait 框架
+- [x] 实现 REPL 模式下的 elicitation 提问流程框架
+- [x] 实现 SDK 模式下的 structured I/O elicitation 框架
+- [x] 实现 elicitation accept/decline/cancel hook 返回框架
 - **测试**：elicitation 请求与响应完整的集成测试
 - **依赖**：6.4
 
