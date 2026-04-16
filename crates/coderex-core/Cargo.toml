@@ -30,6 +30,7 @@ strum.workspace = true
 bitflags.workspace = true
 reqwest.workspace = true
 async-trait.workspace = true
+globset.workspace = true
 
 # Optional
 wiremock = { workspace = true, optional = true }

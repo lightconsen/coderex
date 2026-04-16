@@ -13,5 +13,8 @@ pub mod engine;
 pub mod api_client;
 pub mod budget;
 pub mod cost;
+pub mod permissions;
+pub mod permission_engine;
+pub mod sandbox;
 
 pub use runtime::{Runtime, RuntimeHandle, UiEvent};

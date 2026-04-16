@@ -229,13 +229,13 @@
 ## Phase 5: 权限系统
 
 ### 5.1 权限模式与规则 (crate: `core`)
-- [ ] 定义 `PermissionMode` 枚举（Default, AcceptEdits, BypassPermissions, DontAsk, Plan, Auto）
-- [ ] 定义 `PermissionResult` 枚举（Allow, Ask, Deny, AskForSession, AllowForPath, Elevated）
-- [ ] 定义 `PermissionChecker` 结构体
-- [ ] 实现 allow/deny/ask rule 合并逻辑
-- [ ] 实现 path allowlist 匹配
-- [ ] 实现 dangerous rule stripping
-- [ ] 实现 background agent auto-deny
+- [x] 定义 `PermissionMode` 枚举（Default, AcceptEdits, BypassPermissions, DontAsk, Plan, Auto）
+- [x] 定义 `PermissionResult` 枚举（Allow, Ask, Deny, AskForSession, AllowForPath, Elevated）
+- [x] 定义 `PermissionChecker` 结构体
+- [x] 实现 allow/deny/ask rule 合并逻辑
+- [x] 实现 path allowlist 匹配
+- [x] 实现 dangerous rule stripping
+- [x] 实现 background agent auto-deny
 - **测试**：
   - 各模式下权限决策正确的单元测试
   - path allowlist 匹配边界情况的单元测试
@@ -243,10 +243,10 @@
 - **依赖**：1.1, 4.1
 
 ### 5.2 权限请求与 Hook 短路 (crate: `core`)
-- [ ] 定义 `PermissionRequest` 结构体（tool_name, args, context）
-- [ ] 实现 `PermissionRequest` hook 可短路授权
-- [ ] 实现 `pending_permission_store`（持久化待决权限请求）
-- [ ] 实现 orphaned permission recovery（失配/断连后恢复）
+- [x] 定义 `PermissionRequest` 结构体（tool_name, args, context）
+- [x] 实现 `PermissionRequest` hook 可短路授权
+- [x] 实现 `pending_permission_store`（持久化待决权限请求）
+- [x] 实现 orphaned permission recovery（失配/断连后恢复）
 - **测试**：
   - hook 短路授权的集成测试
   - pending 请求持久化与恢复的集成测试
@@ -254,11 +254,11 @@
 - **依赖**：5.1
 
 ### 5.3 沙箱实现 (crate: `core`)
-- [ ] 实现 Linux seccomp + rlimit 沙箱封装
-- [ ] 实现 macOS sandbox-exec 沙箱封装
-- [ ] 实现 Windows Job Objects 沙箱封装
-- [ ] 实现跨平台沙箱抽象 trait（`SandboxConfig`、`SandboxHandle`）
-- [ ] 实现 additional working directories 沙箱白名单
+- [x] 实现 Linux seccomp + rlimit 沙箱封装
+- [x] 实现 macOS sandbox-exec 沙箱封装
+- [x] 实现 Windows Job Objects 沙箱封装
+- [x] 实现跨平台沙箱抽象 trait（`SandboxConfig`、`SandboxHandle`）
+- [x] 实现 additional working directories 沙箱白名单
 - **测试**：
   - 沙箱内进程无法访问禁止路径的集成测试
   - rlimit 资源限制生效的集成测试
@@ -266,9 +266,9 @@
 - **依赖**：5.1
 
 ### 5.4 权限高级特性 (crate: `core`)
-- [ ] 实现 automated checks before dialog（对话框前的自动安全校验）
-- [ ] 实现 prePlanMode restore（进入 PlanMode 时恢复之前权限状态）
-- [ ] 实现 elevated permission 请求与降级流程
+- [x] 实现 automated checks before dialog（对话框前的自动安全校验）
+- [x] 实现 prePlanMode restore（进入 PlanMode 时恢复之前权限状态）
+- [x] 实现 elevated permission 请求与降级流程
 - **测试**：
   - automated checks 拦截不安全操作的集成测试
   - prePlanMode 恢复后权限状态正确的集成测试
