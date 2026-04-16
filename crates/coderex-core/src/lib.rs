@@ -19,5 +19,6 @@ pub mod sandbox;
 
 pub use runtime::{Runtime, RuntimeHandle, UiEvent};
 pub use engine::{
-    QueryEngine, SubmitOptions, TerminalReason, TurnProgress, TurnRuntime, TurnState,
+    DeniedToolCall, QueryEngine, StructuredOutputValidator, SubmitOptions, TerminalReason,
+    TurnProgress, TurnRuntime, TurnState, ValidationResult,
 };

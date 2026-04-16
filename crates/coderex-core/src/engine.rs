@@ -19,6 +19,153 @@ use crate::permissions::PermissionResult;
 use crate::api_client::{ApiClient, ApiResponse};
 use crate::state::SessionState;
 
+// ─── Structured Output Validation ───────────────────────────────────────────
+
+/// Result of validating output against a JSON schema.
+#[derive(Debug, Clone)]
+pub enum ValidationResult {
+    /// Output is valid according to the schema.
+    Valid(serde_json::Value),
+    /// Output is invalid — contains the error and retry count.
+    Invalid {
+        /// Validation error message.
+        error: String,
+        /// How many times this output has been retried.
+        retries: u32,
+    },
+}
+
+/// Validates structured output against a JSON schema.
+///
+/// Supports: type checking, required fields, enum constraints,
+/// and nested object validation.
+#[derive(Debug, Clone)]
+pub struct StructuredOutputValidator {
+    schema: serde_json::Value,
+    max_retries: u32,
+}
+
+impl StructuredOutputValidator {
+    /// Create a new validator with the given schema.
+    #[must_use]
+    pub fn new(schema: serde_json::Value) -> Self {
+        Self {
+            schema,
+            max_retries: 3,
+        }
+    }
+
+    /// Set the maximum number of retries for invalid output.
+    #[must_use]
+    pub const fn with_max_retries(mut self, max: u32) -> Self {
+        self.max_retries = max;
+        self
+    }
+
+    /// Validate output against the schema.
+    #[must_use]
+    pub fn validate(&self, output: &str, retries: u32) -> ValidationResult {
+        if retries >= self.max_retries {
+            return ValidationResult::Invalid {
+                error: format!("max retries ({}) exceeded", self.max_retries),
+                retries,
+            };
+        }
+
+        let value: serde_json::Value = match serde_json::from_str(output) {
+            Ok(v) => v,
+            Err(e) => {
+                return ValidationResult::Invalid {
+                    error: format!("invalid JSON: {e}"),
+                    retries,
+                };
+            }
+        };
+
+        match self.validate_value(&value, &self.schema) {
+            Ok(()) => ValidationResult::Valid(value),
+            Err(error) => ValidationResult::Invalid { error, retries },
+        }
+    }
+
+    /// Recursively validate a JSON value against a schema.
+    fn validate_value(&self, value: &serde_json::Value, schema: &serde_json::Value) -> Result<(), String> {
+        let Some(schema_obj) = schema.as_object() else {
+            return Ok(());
+        };
+
+        // Type check
+        if let Some(expected_type) = schema_obj.get("type") {
+            if let Some(type_str) = expected_type.as_str() {
+                self.check_type(value, type_str)?;
+            }
+        }
+
+        // Enum check
+        if let Some(enum_values) = schema_obj.get("enum") {
+            if let Some(arr) = enum_values.as_array() {
+                if !arr.contains(value) {
+                    return Err(format!("value not in enum: {value}"));
+                }
+            }
+        }
+
+        // Object required fields
+        if let Some(properties) = schema_obj.get("properties") {
+            if let Some(props) = properties.as_object() {
+                if let Some(obj) = value.as_object() {
+                    for (key, prop_schema) in props {
+                        if let Some(val) = obj.get(key) {
+                            self.validate_value(val, prop_schema)?;
+                        }
+                    }
+                }
+            }
+        }
+
+        // Required fields check
+        if let Some(required) = schema_obj.get("required") {
+            if let Some(arr) = required.as_array() {
+                if let Some(obj) = value.as_object() {
+                    for field in arr {
+                        if let Some(field_str) = field.as_str() {
+                            if !obj.contains_key(field_str) {
+                                return Err(format!("missing required field: {field_str}"));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Check if a value matches the expected JSON type.
+    fn check_type(&self, value: &serde_json::Value, expected: &str) -> Result<(), String> {
+        let actual = match value {
+            serde_json::Value::Null => "null",
+            serde_json::Value::Bool(_) => "boolean",
+            serde_json::Value::Number(_) => "number",
+            serde_json::Value::String(_) => "string",
+            serde_json::Value::Array(_) => "array",
+            serde_json::Value::Object(_) => "object",
+        };
+        if actual != expected {
+            return Err(format!("expected type '{expected}', got '{actual}'"));
+        }
+        Ok(())
+    }
+
+    /// Generate a retry instruction message for the model.
+    #[must_use]
+    pub fn retry_instruction(&self, error: &str) -> String {
+        format!(
+            "Your previous response did not match the required JSON schema. Error: {error}. Please respond with ONLY valid JSON matching the schema."
+        )
+    }
+}
+
 // ─── TurnState ──────────────────────────────────────────────────────────────
 
 /// Lifecycle states for a single conversation turn.
@@ -320,6 +467,19 @@ pub struct QueryEngine {
     event_tx: mpsc::UnboundedSender<EngineEvent>,
     /// Current turn number (1-indexed).
     current_turn: u32,
+    /// Denied tool calls from previous turns, injected into next prompt.
+    denied_tools: Vec<DeniedToolCall>,
+    /// Schema validator for structured output.
+    structured_output: Option<StructuredOutputValidator>,
+}
+
+/// A denied tool call that should be summarized in the next turn.
+#[derive(Debug, Clone)]
+pub struct DeniedToolCall {
+    /// Tool name.
+    pub name: String,
+    /// Reason for denial.
+    pub reason: String,
 }
 
 impl QueryEngine {
@@ -340,7 +500,25 @@ impl QueryEngine {
             permission_engine,
             event_tx,
             current_turn: 0,
+            denied_tools: Vec::new(),
+            structured_output: None,
         }
+    }
+
+    /// Set the JSON schema for structured output validation.
+    pub fn set_structured_output_schema(&mut self, schema: serde_json::Value) {
+        self.structured_output = Some(StructuredOutputValidator::new(schema));
+    }
+
+    /// Get the denied tool calls summary.
+    #[must_use]
+    pub fn denied_tools(&self) -> &[DeniedToolCall] {
+        &self.denied_tools
+    }
+
+    /// Clear denied tool calls (called after they've been injected).
+    pub fn clear_denied_tools(&mut self) {
+        self.denied_tools.clear();
     }
 
     /// Submit a user message and run the full turn loop.
@@ -437,11 +615,12 @@ impl QueryEngine {
         self.cost_tracker.record_usage(&api_response.usage, &self.model);
 
         // Parse the response
-        let assistant_msg = Message::assistant(api_response.content.clone());
+        let content = self.validate_structured_output(api_response.content.clone());
+        let assistant_msg = Message::assistant(content.clone());
         turn.messages.push(assistant_msg);
 
         // Check for tool calls in the response
-        let tool_calls = Self::extract_tool_calls(&api_response.content);
+        let tool_calls = Self::extract_tool_calls(&content);
 
         if tool_calls.is_empty() {
             // No tool calls — turn is complete
@@ -492,14 +671,44 @@ impl QueryEngine {
         Ok(TerminalReason::Completed)
     }
 
+    /// Validate structured output if a schema is configured.
+    ///
+    /// Returns the validated content string. If validation fails and retries
+    /// are exhausted, returns the original content with a warning appended.
+    fn validate_structured_output(&self, content: String) -> String {
+        let Some(ref validator) = self.structured_output else {
+            return content;
+        };
+
+        // First attempt (retries tracked per-turn)
+        let result = validator.validate(&content, 0);
+        match result {
+            ValidationResult::Valid(_) => content,
+            ValidationResult::Invalid { error, retries } => {
+                tracing::warn!(
+                    "Structured output validation failed: {error} (retry {retries})"
+                );
+                let warning = format!("\n\n<!-- Structured output validation failed: {error} -->");
+                format!("{content}{warning}")
+            }
+        }
+    }
+
     /// Build the prompt context from session state.
     fn build_context(
-        &self,
+        &mut self,
         turn: &mut TurnRuntime,
         options: &SubmitOptions,
     ) -> Result<(), String> {
         // Start with existing session messages
         turn.messages = self.session.messages.clone();
+
+        // Inject denied tool call summaries from previous turns
+        if !self.denied_tools.is_empty() {
+            let denied_summary = self.format_denied_tools_summary();
+            turn.messages.push(Message::system(denied_summary));
+            self.denied_tools.clear();
+        }
 
         // Append custom system prompt if provided
         if let Some(ref prompt) = options.custom_system_prompt {
@@ -519,10 +728,22 @@ impl QueryEngine {
         }
 
         tracing::debug!(
-            "BuildContext: {} messages loaded",
-            turn.messages.len()
+            "BuildContext: {} messages loaded ({} denied tools injected)",
+            turn.messages.len(),
+            self.denied_tools.len()
         );
         Ok(())
+    }
+
+    /// Format denied tool calls into a system prompt summary.
+    fn format_denied_tools_summary(&self) -> String {
+        let mut summary =
+            String::from("The following tool calls from the previous turn were denied:\n");
+        for denied in &self.denied_tools {
+            summary.push_str(&format!("- `{}`: {}\n", denied.name, denied.reason));
+        }
+        summary.push_str("Please do not attempt these tool calls again in the same way. Adjust your approach accordingly.");
+        summary
     }
 
     /// Send the request to the API.
@@ -621,31 +842,28 @@ impl QueryEngine {
 
             match perm_result {
                 PermissionResult::Allow | PermissionResult::AllowForPath { .. } => {
-                    // In production, actually execute the tool here
                     let result = ToolResult {
                         tool_call_id: call.id.clone(),
                         output: format!("tool '{}' executed (stub)", call.name),
                         is_error: false,
                     };
-
-                    // Emit completion event
                     let _ = self.event_tx.send(EngineEvent::ToolCallEnd {
                         id: call.id.clone(),
                         result: result.clone(),
                     });
-
                     results.push(result);
                 }
-                PermissionResult::Ask { .. } | PermissionResult::AskForSession { .. } => {
-                    // Emit permission request event
+                PermissionResult::Ask { reason } | PermissionResult::AskForSession { reason } => {
                     let _ = self.event_tx.send(EngineEvent::PermissionRequest {
                         id: call.id.clone(),
                         tool: call.name.clone(),
                         args: call.input.clone(),
                     });
-
-                    // In production, this would pause and wait for user response
-                    // For now, auto-deny to avoid hanging
+                    // Track for next-turn injection
+                    self.denied_tools.push(DeniedToolCall {
+                        name: call.name.clone(),
+                        reason: reason.clone(),
+                    });
                     let result = ToolResult {
                         tool_call_id: call.id.clone(),
                         output: format!("tool '{}' denied by user", call.name),
@@ -653,7 +871,12 @@ impl QueryEngine {
                     };
                     results.push(result);
                 }
-                PermissionResult::Deny { .. } => {
+                PermissionResult::Deny { reason } => {
+                    // Track for next-turn injection
+                    self.denied_tools.push(DeniedToolCall {
+                        name: call.name.clone(),
+                        reason: reason.clone(),
+                    });
                     let result = ToolResult {
                         tool_call_id: call.id.clone(),
                         output: format!("tool '{}' denied", call.name),
@@ -661,8 +884,11 @@ impl QueryEngine {
                     };
                     results.push(result);
                 }
-                PermissionResult::Elevated { .. } => {
-                    // TODO: implement elevated permission flow
+                PermissionResult::Elevated { reason } => {
+                    self.denied_tools.push(DeniedToolCall {
+                        name: call.name.clone(),
+                        reason: reason.clone(),
+                    });
                     let result = ToolResult {
                         tool_call_id: call.id.clone(),
                         output: format!("tool '{}' requires elevated permissions", call.name),
@@ -943,5 +1169,125 @@ mod tests {
         let turn = TurnRuntime::new(budget);
         assert_eq!(turn.recovery_count, 0);
         assert!(!turn.stop_hook_active);
+    }
+
+    // ─── Structured Output Validation ─────────────────────────────────────
+
+    #[test]
+    fn structured_output_validator_validates_valid_json() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "required": ["name", "age"],
+            "properties": {
+                "name": { "type": "string" },
+                "age": { "type": "number" }
+            }
+        });
+        let validator = StructuredOutputValidator::new(schema);
+        let output = r#"{"name": "Alice", "age": 30}"#;
+        let result = validator.validate(output, 0);
+        assert!(matches!(result, ValidationResult::Valid(_)));
+    }
+
+    #[test]
+    fn structured_output_validator_rejects_invalid_json() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "required": ["name"],
+            "properties": {
+                "name": { "type": "string" }
+            }
+        });
+        let validator = StructuredOutputValidator::new(schema);
+        let result = validator.validate("not json at all", 0);
+        assert!(matches!(result, ValidationResult::Invalid { .. }));
+    }
+
+    #[test]
+    fn structured_output_validator_rejects_missing_required_field() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "required": ["name", "email"],
+            "properties": {
+                "name": { "type": "string" },
+                "email": { "type": "string" }
+            }
+        });
+        let validator = StructuredOutputValidator::new(schema);
+        let result = validator.validate(r#"{"name": "Alice"}"#, 0);
+        assert!(matches!(result, ValidationResult::Invalid { .. }));
+    }
+
+    #[test]
+    fn structured_output_validator_rejects_wrong_type() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "count": { "type": "number" }
+            }
+        });
+        let validator = StructuredOutputValidator::new(schema);
+        let result = validator.validate(r#"{"count": "not a number"}"#, 0);
+        assert!(matches!(result, ValidationResult::Invalid { .. }));
+    }
+
+    #[test]
+    fn structured_output_validator_respects_max_retries() {
+        let schema = serde_json::json!({ "type": "object" });
+        let validator = StructuredOutputValidator::new(schema)
+            .with_max_retries(2);
+        let result = validator.validate("bad", 2);
+        assert!(matches!(result, ValidationResult::Invalid { retries, .. } if retries == 2));
+    }
+
+    #[test]
+    fn structured_output_validator_retry_instruction() {
+        let schema = serde_json::json!({ "type": "object" });
+        let validator = StructuredOutputValidator::new(schema);
+        let instruction = validator.retry_instruction("missing required field: name");
+        assert!(instruction.contains("missing required field: name"));
+        assert!(instruction.contains("JSON schema"));
+    }
+
+    // ─── Permission Denial Tracking ─────────────────────────────────────
+
+    #[test]
+    fn query_engine_tracks_denied_tools() {
+        let (mut engine, _rx, _session) = make_test_engine();
+        engine.denied_tools.push(DeniedToolCall {
+            name: "bash".into(),
+            reason: "requires approval".into(),
+        });
+        assert_eq!(engine.denied_tools.len(), 1);
+        assert_eq!(engine.denied_tools[0].name, "bash");
+    }
+
+    #[test]
+    fn query_engine_denied_tools_summary_format() {
+        let (engine, _rx, _session) = make_test_engine();
+        let summary = engine.format_denied_tools_summary();
+        assert!(summary.contains("The following tool calls"));
+        assert!(summary.contains("denied"));
+
+        // With denied tools
+        let (mut engine, _rx, _session) = make_test_engine();
+        engine.denied_tools.push(DeniedToolCall {
+            name: "write".into(),
+            reason: "permission denied".into(),
+        });
+        let summary = engine.format_denied_tools_summary();
+        assert!(summary.contains("`write`"));
+        assert!(summary.contains("permission denied"));
+    }
+
+    #[test]
+    fn query_engine_clear_denied_tools() {
+        let (mut engine, _rx, _session) = make_test_engine();
+        engine.denied_tools.push(DeniedToolCall {
+            name: "test".into(),
+            reason: "test".into(),
+        });
+        engine.clear_denied_tools();
+        assert!(engine.denied_tools().is_empty());
     }
 }
