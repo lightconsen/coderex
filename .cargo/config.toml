@@ -1,0 +1,16 @@
+[build]
+# Incremental compilation for faster re-builds during development
+incremental = true
+
+[target.x86_64-unknown-linux-gnu]
+rustflags = ["-C", "link-arg=-fuse-ld=lld"]
+
+[target.aarch64-apple-darwin]
+# Use the built-in ld64 on macOS; lld doesn't support Mach-O
+rustflags = []
+
+[target.x86_64-apple-darwin]
+rustflags = []
+
+# Speed up compilation by sharing generics across crates
+# Requires nightly: rustflags = ["-Z", "share-generics=y"]

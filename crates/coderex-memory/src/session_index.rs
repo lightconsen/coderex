@@ -1,0 +1,274 @@
+//! SQLite session metadata index.
+
+use chrono::{DateTime, Utc};
+use rusqlite::params;
+use rusqlite::Connection;
+use std::path::Path;
+use thiserror::Error;
+
+/// Errors from session index operations.
+#[derive(Debug, Error)]
+pub enum SessionIndexError {
+    /// A database error occurred.
+    #[error("database error: {0}")]
+    Database(#[from] rusqlite::Error),
+}
+
+/// Session metadata for the index.
+#[derive(Debug, Clone)]
+pub struct SessionMeta {
+    /// Unique session identifier.
+    pub session_id: String,
+    /// Path to the project directory.
+    pub project_path: String,
+    /// AI-generated title.
+    pub ai_title: Option<String>,
+    /// User-assigned tag.
+    pub tag: Option<String>,
+    /// Associated PR URL.
+    pub pr_url: Option<String>,
+    /// When the session was created.
+    pub created_at: DateTime<Utc>,
+    /// When the session was last active.
+    pub last_active_at: DateTime<Utc>,
+    /// Total cost in USD.
+    pub total_cost_usd: f64,
+    /// Total token count.
+    pub total_tokens: i64,
+}
+
+/// Session metadata index for fast listing and search.
+#[derive(Debug)]
+pub struct SessionIndex {
+    conn: Connection,
+}
+
+impl SessionIndex {
+    /// Open or create the session index at the given path.
+    pub fn open(path: &Path) -> Result<Self, SessionIndexError> {
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let conn = Connection::open(path)?;
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS sessions (
+                session_id TEXT PRIMARY KEY,
+                project_path TEXT NOT NULL,
+                ai_title TEXT,
+                tag TEXT,
+                pr_url TEXT,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                last_active_at DATETIME,
+                total_cost_usd REAL DEFAULT 0.0,
+                total_tokens INTEGER DEFAULT 0
+            );
+            CREATE INDEX IF NOT EXISTS idx_project_path ON sessions(project_path);
+            CREATE INDEX IF NOT EXISTS idx_last_active ON sessions(last_active_at DESC);",
+        )?;
+        Ok(Self { conn })
+    }
+
+    /// Create or update a session entry.
+    pub fn create(&self, meta: &SessionMeta) -> Result<(), SessionIndexError> {
+        self.conn.execute(
+            "INSERT OR REPLACE INTO sessions (
+                session_id, project_path, ai_title, tag, pr_url,
+                created_at, last_active_at, total_cost_usd, total_tokens
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![
+                meta.session_id,
+                meta.project_path,
+                meta.ai_title,
+                meta.tag,
+                meta.pr_url,
+                meta.created_at.to_rfc3339(),
+                meta.last_active_at.to_rfc3339(),
+                meta.total_cost_usd,
+                meta.total_tokens,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Update the last-active timestamp for a session.
+    pub fn update_last_active(
+        &self,
+        session_id: &str,
+        last_active: &DateTime<Utc>,
+    ) -> Result<(), SessionIndexError> {
+        self.conn.execute(
+            "UPDATE sessions SET last_active_at = ?1 WHERE session_id = ?2",
+            params![last_active.to_rfc3339(), session_id],
+        )?;
+        Ok(())
+    }
+
+    /// Update cost and token counts for a session.
+    pub fn update_cost_and_tokens(
+        &self,
+        session_id: &str,
+        cost: f64,
+        tokens: i64,
+    ) -> Result<(), SessionIndexError> {
+        self.conn.execute(
+            "UPDATE sessions SET total_cost_usd = ?1, total_tokens = ?2 WHERE session_id = ?3",
+            params![cost, tokens, session_id],
+        )?;
+        Ok(())
+    }
+
+    /// List the most recent sessions.
+    pub fn list_recent(&self, limit: usize) -> Result<Vec<SessionMeta>, SessionIndexError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT * FROM sessions ORDER BY last_active_at DESC LIMIT ?1",
+        )?;
+        let rows = stmt.query_map([limit], row_to_meta)?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    /// List all sessions for a project.
+    pub fn list_by_project(&self, project_path: &str) -> Result<Vec<SessionMeta>, SessionIndexError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT * FROM sessions WHERE project_path = ?1 ORDER BY last_active_at DESC",
+        )?;
+        let rows = stmt.query_map([project_path], row_to_meta)?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    /// Get a single session by ID.
+    pub fn get(&self, session_id: &str) -> Result<Option<SessionMeta>, SessionIndexError> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT * FROM sessions WHERE session_id = ?1")?;
+        let row = stmt.query_row([session_id], row_to_meta);
+        match row {
+            Ok(meta) => Ok(Some(meta)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+}
+
+/// Convert a database row to `SessionMeta`.
+fn row_to_meta(row: &rusqlite::Row) -> rusqlite::Result<SessionMeta> {
+    let parse_dt = |s: String| -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339(&s).map_or_else(|_| Utc::now(), |dt| dt.with_timezone(&Utc))
+    };
+    Ok(SessionMeta {
+        session_id: row.get(0)?,
+        project_path: row.get(1)?,
+        ai_title: row.get(2)?,
+        tag: row.get(3)?,
+        pr_url: row.get(4)?,
+        created_at: parse_dt(row.get(5)?),
+        last_active_at: parse_dt(row.get(6)?),
+        total_cost_usd: row.get(7)?,
+        total_tokens: row.get(8)?,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_index() -> (SessionIndex, tempfile::TempDir) {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("sessions.db");
+        let index = SessionIndex::open(&path).unwrap();
+        (index, tmp)
+    }
+
+    fn test_meta(id: &str) -> SessionMeta {
+        SessionMeta {
+            session_id: id.into(),
+            project_path: "/test/project".into(),
+            ai_title: Some("Test Session".into()),
+            tag: None,
+            pr_url: None,
+            created_at: Utc::now(),
+            last_active_at: Utc::now(),
+            total_cost_usd: 0.0,
+            total_tokens: 0,
+        }
+    }
+
+    #[test]
+    fn create_and_get_returns_same_data() {
+        let (index, _tmp) = temp_index();
+        let meta = test_meta("test_1");
+        index.create(&meta).unwrap();
+
+        let retrieved = index.get("test_1").unwrap().unwrap();
+        assert_eq!(retrieved.session_id, "test_1");
+        assert_eq!(retrieved.project_path, "/test/project");
+        assert_eq!(retrieved.ai_title, Some("Test Session".into()));
+    }
+
+    #[test]
+    fn update_last_active_changes_value() {
+        let (index, _tmp) = temp_index();
+        let meta = test_meta("test_2");
+        index.create(&meta).unwrap();
+
+        let new_time = Utc::now() + chrono::Duration::hours(1);
+        index.update_last_active("test_2", &new_time).unwrap();
+
+        let retrieved = index.get("test_2").unwrap().unwrap();
+        assert!(retrieved.last_active_at >= new_time);
+    }
+
+    #[test]
+    fn list_recent_returns_ordered_by_last_active() {
+        let (index, _tmp) = temp_index();
+
+        let mut meta1 = test_meta("recent_1");
+        meta1.last_active_at = Utc::now() - chrono::Duration::hours(2);
+        index.create(&meta1).unwrap();
+
+        let mut meta2 = test_meta("recent_2");
+        meta2.last_active_at = Utc::now();
+        index.create(&meta2).unwrap();
+
+        let recent = index.list_recent(10).unwrap();
+        assert_eq!(recent.len(), 2);
+        assert_eq!(recent[0].session_id, "recent_2");
+        assert_eq!(recent[1].session_id, "recent_1");
+    }
+
+    #[test]
+    fn list_by_project_filters_correctly() {
+        let (index, _tmp) = temp_index();
+
+        let mut meta1 = test_meta("proj_a_1");
+        meta1.project_path = "/project/a".into();
+        index.create(&meta1).unwrap();
+
+        let mut meta2 = test_meta("proj_b_1");
+        meta2.project_path = "/project/b".into();
+        index.create(&meta2).unwrap();
+
+        let sessions_a = index.list_by_project("/project/a").unwrap();
+        assert_eq!(sessions_a.len(), 1);
+        assert_eq!(sessions_a[0].session_id, "proj_a_1");
+
+        let sessions_b = index.list_by_project("/project/b").unwrap();
+        assert_eq!(sessions_b.len(), 1);
+        assert_eq!(sessions_b[0].session_id, "proj_b_1");
+    }
+
+    #[test]
+    fn create_on_existing_session_id_replaces() {
+        let (index, _tmp) = temp_index();
+
+        let mut meta = test_meta("replace_1");
+        meta.ai_title = Some("First".into());
+        index.create(&meta).unwrap();
+
+        let mut meta2 = test_meta("replace_1");
+        meta2.ai_title = Some("Second".into());
+        index.create(&meta2).unwrap();
+
+        let retrieved = index.get("replace_1").unwrap().unwrap();
+        assert_eq!(retrieved.ai_title, Some("Second".into()));
+    }
+}

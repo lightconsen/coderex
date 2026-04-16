@@ -1,0 +1,30 @@
+[package]
+name = "coderex-ui"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Terminal UI — ratatui rendering, input handling, overlays, themes, Vim mode"
+
+[lints]
+workspace = true
+
+[features]
+default = []
+voice = []
+buddy = []
+
+[dependencies]
+coderex-core = { path = "../coderex-core" }
+
+ratatui.workspace = true
+crossterm.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+unicode-segmentation.workspace = true
+unicode-width.workspace = true
+compact_str.workspace = true
+strum.workspace = true

@@ -1,0 +1,43 @@
+[package]
+name = "coderex-cli"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "CLI binary — startup orchestrator, REPL loop, CLI subcommands"
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "coderex"
+path = "src/main.rs"
+
+[dependencies]
+coderex-core = { path = "../coderex-core" }
+coderex-tools = { path = "../coderex-tools" }
+coderex-agents = { path = "../coderex-agents" }
+coderex-commands = { path = "../coderex-commands" }
+coderex-hooks = { path = "../coderex-hooks" }
+coderex-memory = { path = "../coderex-memory" }
+coderex-mcp = { path = "../coderex-mcp" }
+coderex-plugins = { path = "../coderex-plugins" }
+coderex-bridge = { path = "../coderex-bridge" }
+coderex-server = { path = "../coderex-server" }
+coderex-ui = { path = "../coderex-ui" }
+coderex-sdk = { path = "../coderex-sdk" }
+coderex-config = { path = "../coderex-config" }
+
+clap.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+thiserror.workspace = true
+anyhow.workspace = true
+home.workspace = true
+
+[dev-dependencies]
+assert_cmd.workspace = true
+predicates.workspace = true
+tempfile.workspace = true

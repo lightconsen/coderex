@@ -1,0 +1,23 @@
+[package]
+name = "coderex-plugins"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Plugin loader, skill system, and marketplace reconciliation"
+
+[lints]
+workspace = true
+
+[dependencies]
+coderex-core = { path = "../coderex-core" }
+coderex-commands = { path = "../coderex-commands" }
+
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+dashmap.workspace = true
+home.workspace = true

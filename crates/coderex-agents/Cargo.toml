@@ -1,0 +1,20 @@
+[package]
+name = "coderex-agents"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Sub-agent types and AgentManager for CodeRex"
+
+[lints]
+workspace = true
+
+[dependencies]
+coderex-core = { path = "../coderex-core" }
+
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+serde.workspace = true
+strum.workspace = true
