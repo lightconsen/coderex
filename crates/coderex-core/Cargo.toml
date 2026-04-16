@@ -28,6 +28,8 @@ derive_builder.workspace = true
 futures.workspace = true
 strum.workspace = true
 bitflags.workspace = true
+reqwest.workspace = true
+async-trait.workspace = true
 
 # Optional
 wiremock = { workspace = true, optional = true }

@@ -1,6 +1,27 @@
-//! Tool execution context and error types.
+//! Tool execution context, error types, and output.
 
 use thiserror::Error;
+
+/// Execution context that filters which tools are available.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ExecutionContext {
+    /// Standard interactive session.
+    Normal,
+    /// Async agent running in background.
+    AsyncAgent,
+    /// Coordinator managing multiple sub-agents.
+    CoordinatorMode,
+    /// Multi-agent team in a single process.
+    InProcessTeam,
+    /// Plan mode: read-only, no mutations.
+    PlanMode,
+    /// REPL-only: limited to command interface.
+    ReplOnly,
+    /// Headless SDK integration.
+    HeadlessSdk,
+    /// Remote bridge to external tool server.
+    RemoteBridge,
+}
 
 /// Errors that can occur during tool execution.
 #[derive(Debug, Error)]

@@ -10,5 +10,8 @@ pub mod types;
 pub mod state;
 pub mod runtime;
 pub mod engine;
+pub mod api_client;
+pub mod budget;
+pub mod cost;
 
 pub use runtime::{Runtime, RuntimeHandle, UiEvent};

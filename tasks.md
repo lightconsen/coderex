@@ -145,38 +145,38 @@
 ## Phase 3: API 客户端与预算
 
 ### 3.1 Anthropic API 客户端 (crate: `core`)
-- [ ] 定义 `ApiClient` trait（`create_message`, `create_message_streaming`）
-- [ ] 实现 `AnthropicApiClient`：基于 `reqwest`，支持 API key 认证
-- [ ] 实现请求重试逻辑（指数退避、最大重试次数可配置）
-- [ ] 实现模型路由（根据 ModelId 选择正确端点）
+- [x] 定义 `ApiClient` trait（`create_message`, `create_message_streaming`）
+- [x] 实现 `AnthropicApiClient`：基于 `reqwest`，支持 API key 认证
+- [x] 实现请求重试逻辑（指数退避、最大重试次数可配置）
+- [x] 实现模型路由（根据 ModelId 选择正确端点）
 - **测试**：
   - mock server 下正确发送请求格式的单元测试
   - 重试逻辑行为的集成测试
-  - API key 缺失时报错的单元测试
+  - API key 缺失时报错的单元测试（6 tests）
 - **依赖**：1.1, 0.2
 
 ### 3.2 TokenBudget (crate: `core`)
-- [ ] 定义 `TokenBudget` 结构体（continuation_count, last_delta_tokens, last_global_turn_tokens, started_at, thresholds）
-- [ ] 实现 `record_tokens(usage)` 方法
-- [ ] 实现 `is_near_limit() -> bool` 判断消耗比例
-- [ ] 实现 `is_diminishing_returns() -> bool` 判断连续 continuation 收益递减
-- [ ] 实现 `should_continue() -> bool` 综合判断
+- [x] 定义 `TokenBudget` 结构体（continuation_count, last_delta_tokens, last_global_turn_tokens, started_at, thresholds）
+- [x] 实现 `record_tokens(usage)` 方法
+- [x] 实现 `is_near_limit() -> bool` 判断消耗比例
+- [x] 实现 `is_diminishing_returns() -> bool` 判断连续 continuation 收益递减
+- [x] 实现 `should_continue() -> bool` 综合判断
 - **测试**：
   - 阈值判断边界条件的单元测试
   - 收益递减逻辑的单元测试
-  - budget 耗尽时正确停止的集成测试
+  - budget 耗尽时正确停止的集成测试（11 tests）
 - **依赖**：0.2, 3.1
 
 ### 3.3 CostTracker (crate: `core`)
-- [ ] 定义 `CostTracker` 结构体
-- [ ] 实现模型定价表（input/output/cache_read/cache_creation 每 token 价格）
-- [ ] 实现 `record_usage(usage, model) -> cost` 计算
-- [ ] 实现 per-turn / per-session / per-agent / per-task cost 累计
-- [ ] 实现 `get_total_cost()`, `get_turn_cost()` 查询
+- [x] 定义 `CostTracker` 结构体
+- [x] 实现模型定价表（input/output/cache_read/cache_creation 每 token 价格）
+- [x] 实现 `record_usage(usage, model) -> cost` 计算
+- [x] 实现 per-turn / per-session / per-agent / per-task cost 累计
+- [x] 实现 `get_total_cost()`, `get_turn_cost()` 查询
 - **测试**：
   - 不同模型定价计算正确的单元测试
   - 累计成本不丢失的单元测试
-  - `/cost` 输出格式正确的集成测试
+  - `/cost` 输出格式正确的集成测试（11 tests）
 - **依赖**：0.2, 3.1, 3.2
 
 ---
@@ -184,44 +184,44 @@
 ## Phase 4: 工具系统基础
 
 ### 4.1 Tool Trait 与注册表 (crate: `tools`)
-- [ ] 定义 `ToolTier` 枚举（Baseline, FeatureGated, DynamicMcp, Internal）
-- [ ] 定义 `Tool` trait（name, tier, input_schema, output_schema, requires_approval, is_enabled, is_read_only, is_concurrency_safe, interrupt_behavior, execute）
-- [ ] 定义 `InterruptBehavior` 枚举
-- [ ] 定义 `ToolExecutionContext` 结构体
-- [ ] 定义 `ToolError` 枚举
-- [ ] 定义 `ToolOutput` 结构体
-- [ ] 实现 `ToolRegistry`（baseline + gated + dynamic_mcp + context_allowlists + deny_rules）
+- [x] 定义 `ToolTier` 枚举（Baseline, FeatureGated, DynamicMcp, Internal）
+- [x] 定义 `Tool` trait（name, tier, input_schema, output_schema, requires_approval, is_enabled, is_read_only, is_concurrency_safe, interrupt_behavior, execute）
+- [x] 定义 `InterruptBehavior` 枚举
+- [x] 定义 `ToolContext` 结构体
+- [x] 定义 `ToolError` 枚举
+- [x] 定义 `ToolOutput` 结构体
+- [x] 实现 `ToolRegistry`（baseline + gated + dynamic_mcp + context_allowlists + deny_rules）
 - **测试**：
   - 工具注册与按 tier 查询的单元测试
   - context allowlist 过滤正确的单元测试
-  - deny rule 拦截的单元测试
+  - deny rule 拦截的单元测试（7 tests）
 - **依赖**：0.2, 1.2
 
 ### 4.2 执行上下文矩阵 (crate: `tools`)
-- [ ] 定义 `ExecutionContext` 枚举（Normal, AsyncAgent, CoordinatorMode, InProcessTeam, PlanMode, ReplOnly, HeadlessSdk, RemoteBridge）
-- [ ] 实现 `ToolRegistry::available_tools(context) -> Vec<&dyn Tool>` 过滤
-- [ ] 实现 PlanMode 只允许读工具的规则
-- [ ] 实现 AsyncAgent 避免 UI 依赖工具的规则
-- [ ] 实现 CoordinatorMode 只允许调度工具的规则
-- **测试**：各执行上下文下工具列表正确的单元测试
+- [x] 定义 `ExecutionContext` 枚举（Normal, AsyncAgent, CoordinatorMode, InProcessTeam, PlanMode, ReplOnly, HeadlessSdk, RemoteBridge）
+- [x] 实现 `ToolRegistry::available_tool_names(context)` 过滤
+- [x] 实现 PlanMode 只允许读工具的规则
+- [x] 实现 AsyncAgent 避免 UI 依赖工具的规则
+- [x] 实现 CoordinatorMode 只允许调度工具的规则
+- **测试**：各执行上下文下工具列表正确的单元测试（3 tests）
 - **依赖**：4.1
 
 ### 4.3 EchoTool / NoOpTool (crate: `tools`)
-- [ ] 实现 `EchoTool`：返回输入的 JSON 参数
-- [ ] 实现 `NoOpTool`：返回空成功
-- **测试**：执行结果符合预期的单元测试
+- [x] 实现 `EchoTool`：返回输入的 JSON 参数
+- [x] 实现 `NoOpTool`：返回空成功
+- **测试**：执行结果符合预期的单元测试（5 tests）
 - **依赖**：4.1
 
 ### 4.4 工具执行器 (crate: `tools`)
-- [ ] 定义 `StreamingToolExecutor` 结构体
-- [ ] 实现 `execute_single(tool_call, ctx)` 方法
-- [ ] 实现并发安全工具的并行执行
-- [ ] 实现非并发安全工具的串行执行
-- [ ] 实现执行超时控制
+- [x] 定义 `ToolExecutor` 结构体
+- [x] 实现 `execute_single(tool, input, ctx)` 方法
+- [x] 实现并发安全工具的并行执行
+- [x] 实现非并发安全工具的串行执行
+- [x] 实现执行超时控制
 - **测试**：
   - 工具执行结果正确传递的单元测试
   - 超时中止的集成测试
-  - 并发安全与不安全工具调度正确的集成测试
+  - 并发安全与不安全工具调度正确的集成测试（3 tests）
 - **依赖**：4.1, 4.2
 
 ---
