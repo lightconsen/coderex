@@ -11,7 +11,7 @@ description = "Memory system — JSONL transcripts, SQLite index, long-term memo
 workspace = true
 
 [dependencies]
-coderex-core = { path = "../coderex-core" }
+coderex-core = { path = "../core" }
 
 thiserror.workspace = true
 tokio.workspace = true

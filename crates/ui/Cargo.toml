@@ -16,7 +16,7 @@ voice = []
 buddy = []
 
 [dependencies]
-coderex-core = { path = "../coderex-core" }
+coderex-core = { path = "../core" }
 
 ratatui.workspace = true
 crossterm.workspace = true

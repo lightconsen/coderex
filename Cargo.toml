@@ -1,19 +1,19 @@
 [workspace]
 members = [
-    "crates/coderex-core",
-    "crates/coderex-tools",
-    "crates/coderex-agents",
-    "crates/coderex-commands",
-    "crates/coderex-hooks",
-    "crates/coderex-memory",
-    "crates/coderex-mcp",
-    "crates/coderex-plugins",
-    "crates/coderex-bridge",
-    "crates/coderex-server",
-    "crates/coderex-ui",
-    "crates/coderex-sdk",
-    "crates/coderex-config",
-    "crates/coderex-cli",
+    "crates/core",
+    "crates/tools",
+    "crates/agents",
+    "crates/commands",
+    "crates/hooks",
+    "crates/memory",
+    "crates/mcp",
+    "crates/plugins",
+    "crates/bridge",
+    "crates/server",
+    "crates/ui",
+    "crates/sdk",
+    "crates/config",
+    "crates/cli",
 ]
 resolver = "2"
 

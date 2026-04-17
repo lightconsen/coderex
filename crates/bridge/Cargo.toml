@@ -1,26 +1,29 @@
 [package]
-name = "coderex-commands"
+name = "coderex-bridge"
 version = "0.1.0"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Slash command registry and all built-in commands"
+description = "Bridge remote session system — work poller, spawner, permission router, archive"
 
 [lints]
 workspace = true
 
 [dependencies]
-coderex-core = { path = "../coderex-core" }
-coderex-config = { path = "../coderex-config" }
+coderex-core = { path = "../core" }
 
 thiserror.workspace = true
+tokio.workspace = true
 tracing.workspace = true
+async-trait.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+tokio-tungstenite.workspace = true
+reqwest.workspace = true
 strum.workspace = true
-compact_str.workspace = true
-walkdir.workspace = true
+uuid.workspace = true
+chrono.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

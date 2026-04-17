@@ -1,18 +1,18 @@
 [package]
-name = "coderex-mcp"
+name = "coderex-plugins"
 version = "0.1.0"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "MCP server lifecycle, tool discovery, resources, OAuth, elicitation"
+description = "Plugin loader, skill system, and marketplace reconciliation"
 
 [lints]
 workspace = true
 
 [dependencies]
-coderex-core = { path = "../coderex-core" }
-coderex-tools = { path = "../coderex-tools" }
+coderex-core = { path = "../core" }
+coderex-commands = { path = "../commands" }
 
 thiserror.workspace = true
 tokio.workspace = true
@@ -20,11 +20,8 @@ tracing.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 dashmap.workspace = true
-tokio-tungstenite.workspace = true
-oauth2.workspace = true
+home.workspace = true
 reqwest.workspace = true
-url.workspace = true
-chrono.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

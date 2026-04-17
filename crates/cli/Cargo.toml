@@ -15,19 +15,19 @@ name = "coderex"
 path = "src/main.rs"
 
 [dependencies]
-coderex-core = { path = "../coderex-core" }
-coderex-tools = { path = "../coderex-tools" }
-coderex-agents = { path = "../coderex-agents" }
-coderex-commands = { path = "../coderex-commands" }
-coderex-hooks = { path = "../coderex-hooks" }
-coderex-memory = { path = "../coderex-memory" }
-coderex-mcp = { path = "../coderex-mcp" }
-coderex-plugins = { path = "../coderex-plugins" }
-coderex-bridge = { path = "../coderex-bridge" }
-coderex-server = { path = "../coderex-server" }
-coderex-ui = { path = "../coderex-ui" }
-coderex-sdk = { path = "../coderex-sdk" }
-coderex-config = { path = "../coderex-config" }
+coderex-core = { path = "../core" }
+coderex-tools = { path = "../tools" }
+coderex-agents = { path = "../agents" }
+coderex-commands = { path = "../commands" }
+coderex-hooks = { path = "../hooks" }
+coderex-memory = { path = "../memory" }
+coderex-mcp = { path = "../mcp" }
+coderex-plugins = { path = "../plugins" }
+coderex-bridge = { path = "../bridge" }
+coderex-server = { path = "../server" }
+coderex-ui = { path = "../ui" }
+coderex-sdk = { path = "../sdk" }
+coderex-config = { path = "../config" }
 
 clap.workspace = true
 tokio.workspace = true

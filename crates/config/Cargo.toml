@@ -15,7 +15,7 @@ default = []
 enterprise = []
 
 [dependencies]
-coderex-core = { path = "../coderex-core" }
+coderex-core = { path = "../core" }
 
 thiserror.workspace = true
 tokio.workspace = true

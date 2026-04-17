@@ -11,8 +11,8 @@ description = "Tool trait, registry, execution, and all built-in tools"
 workspace = true
 
 [dependencies]
-coderex-core = { path = "../coderex-core" }
-coderex-config = { path = "../coderex-config" }
+coderex-core = { path = "../core" }
+coderex-config = { path = "../config" }
 
 serde.workspace = true
 serde_json.workspace = true

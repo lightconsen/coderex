@@ -11,7 +11,7 @@ description = "SDK for headless/structured I/O — event streams, permission tra
 workspace = true
 
 [dependencies]
-coderex-core = { path = "../coderex-core" }
+coderex-core = { path = "../core" }
 
 serde.workspace = true
 serde_json.workspace = true
