@@ -10,6 +10,10 @@ description = "Configuration system — settings loading, feature flags, capabil
 [lints]
 workspace = true
 
+[features]
+default = []
+enterprise = []
+
 [dependencies]
 coderex-core = { path = "../coderex-core" }
 

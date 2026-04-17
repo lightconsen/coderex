@@ -1,6 +1,24 @@
-//! CodeRex terminal UI — ratatui-based REPL interface.
+//! Terminal UI — ratatui rendering, input handling, overlays, themes, Vim mode.
 
 #![warn(missing_docs)]
 
+pub mod input;
+pub mod keybindings;
+pub mod message_list;
+pub mod notification_center;
+pub mod overlay;
+pub mod search;
+pub mod selector;
 pub mod state;
+pub mod statusline;
+pub mod statusline_setup;
 pub mod terminal;
+pub mod themes;
+pub mod vim;
+pub mod export;
+
+#[cfg(feature = "voice")]
+pub mod voice;
+
+#[cfg(feature = "buddy")]
+pub mod buddy;

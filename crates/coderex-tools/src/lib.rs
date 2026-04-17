@@ -17,7 +17,7 @@ pub use context::{ExecutionContext, ToolError, ToolOutput};
 pub use builtins::{
     AgentTool, AskUserQuestionTool, BashTool, BriefTool, ConfigTool, CronCreateTool, CronDeleteTool,
     CronListTool, EchoTool, EditTool, EnterPlanModeTool, ExitPlanModeTool, GlobTool, GrepTool,
-    McpAuthTool, NoOpTool, NotebookEditTool, ReadTool, RemoteTriggerTool, ReplTool, SendMessageTool,
+    LspTool, McpAuthTool, NoOpTool, NotebookEditTool, PowerShellTool, ReadTool, RemoteTriggerTool, ReplTool, SendMessageTool,
     SkillTool, SleepTool, StructuredOutputTool, SyntheticOutputTool, TaskCreateTool, TaskGetTool,
     TaskListTool, TaskOutputTool, TaskStopTool, TaskUpdateTool, TodoWriteTool, ToolSearchTool,
     WebFetchTool, WebSearchTool, WriteTool,

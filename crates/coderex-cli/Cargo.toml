@@ -41,3 +41,21 @@ home.workspace = true
 assert_cmd.workspace = true
 predicates.workspace = true
 tempfile.workspace = true
+compact_str.workspace = true
+ratatui.workspace = true
+crossterm.workspace = true
+serde_json.workspace = true
+
+# ─── Release Tier Features ──────────────────────────────────────────────────
+# Each tier enables everything below it.
+#
+#   cargo build --features core          # QueryEngine + baseline tools
+#   cargo build --features full          # core + bridge/server/plugins
+#   cargo build --features enterprise    # full + managed settings/team/trusted device
+#
+
+[features]
+default = ["core"]
+core = []
+full = ["core"]
+enterprise = ["full", "coderex-config/enterprise"]

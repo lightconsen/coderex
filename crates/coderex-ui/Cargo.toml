@@ -28,3 +28,8 @@ unicode-segmentation.workspace = true
 unicode-width.workspace = true
 compact_str.workspace = true
 strum.workspace = true
+regex.workspace = true
+chrono = { workspace = true, features = ["serde"] }
+
+[dev-dependencies]
+tempfile.workspace = true

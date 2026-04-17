@@ -1,5 +1,13 @@
 //! UI state — separate from business kernel for immediate-mode rendering.
 
+use crate::input::InputBuffer;
+use crate::message_list::MessageView;
+use crate::overlay::OverlayStack;
+use crate::search::SearchState;
+use crate::selector::MessageSelector;
+use crate::statusline::Statusline;
+use crate::statusline_setup::StatuslineSetup;
+
 /// The active view mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ViewMode {
@@ -13,35 +21,16 @@ pub enum ViewMode {
     CommandPalette,
     /// Help overlay view.
     HelpOverlay,
-}
-
-/// Type of overlay displayed on top of the main UI.
-#[derive(Debug, Clone)]
-pub enum OverlayType {
-    /// Permission dialog overlay.
-    PermissionDialog {
-        /// The tool name requesting permission.
-        tool: String,
-        /// The arguments passed to the tool.
-        args: String,
-    },
-    /// Notification overlay.
-    Notification {
-        /// The notification message.
-        message: String,
-    },
-    /// Command palette overlay.
-    CommandPalette {
-        /// The current search query.
-        query: String,
-    },
-}
-
-/// A notification to display.
-#[derive(Debug, Clone)]
-pub struct Notification {
-    /// The notification message text.
-    pub message: String,
+    /// Search mode.
+    Search,
+    /// Voice recording mode.
+    #[cfg(feature = "voice")]
+    VoiceRecording,
+    /// Buddy companion panel.
+    #[cfg(feature = "buddy")]
+    BuddyPanel,
+    /// Statusline setup wizard.
+    StatuslineSetup,
 }
 
 /// UI state, owned exclusively by the rendering thread.
@@ -49,42 +38,35 @@ pub struct Notification {
 pub struct UiState {
     /// Currently active view.
     pub active_view: ViewMode,
-    /// User input buffer.
-    pub input_buffer: String,
-    /// Cursor position in the input buffer.
-    pub cursor_position: usize,
-    /// Active overlay layers.
-    pub overlays: Vec<OverlayType>,
-    /// Vertical scroll offset.
-    pub scroll_offset: usize,
-    /// Pending notifications.
-    pub notifications: Vec<Notification>,
-    /// Companion/buddy state.
-    pub companion: Option<CompanionState>,
-}
-
-/// Companion/buddy state.
-#[derive(Debug, Clone)]
-pub struct CompanionState {
-    /// The companion sprite identifier.
-    pub sprite: String,
-    /// The companion's current mood.
-    pub mood: String,
+    /// Input buffer for user typing.
+    pub input: InputBuffer,
+    /// Message list with virtualization.
+    pub messages: MessageView,
+    /// Overlay stack.
+    pub overlays: OverlayStack,
+    /// Search state.
+    pub search: SearchState,
+    /// Message selector (for multi-select mode).
+    pub selector: Option<MessageSelector>,
+    /// Statusline data.
+    pub statusline: Statusline,
+    /// Statusline setup wizard state.
+    pub statusline_setup: StatuslineSetup,
 }
 
 impl UiState {
     /// Create a new UiState with defaults.
     #[must_use]
-    #[allow(clippy::missing_const_for_fn)]
     pub fn new() -> Self {
         Self {
             active_view: ViewMode::MainRepl,
-            input_buffer: String::new(),
-            cursor_position: 0,
-            overlays: Vec::new(),
-            scroll_offset: 0,
-            notifications: Vec::new(),
-            companion: None,
+            input: InputBuffer::new(),
+            messages: MessageView::new(1000),
+            overlays: OverlayStack::new(),
+            search: SearchState::new(),
+            selector: None,
+            statusline: Statusline::new(),
+            statusline_setup: StatuslineSetup::new(),
         }
     }
 }

@@ -26,6 +26,11 @@ pub mod compact;
 pub mod stop_hook;
 pub mod hook_executor;
 pub mod elicitation;
+pub mod task;
+pub mod worktree;
+pub mod team;
+pub mod coordinator;
+pub mod team_context;
 
 pub use file_traversal::{FileIterator, TraversalConfig, TraversalError, collect_files, count_files, traverse};
 pub use fuzzy_matcher::{FuzzyMatch, FuzzyMatcher, fuzzy_search};
@@ -50,3 +55,27 @@ pub use elicitation::{
     ElicitationHandler, ElicitationOption, ElicitationQuestion, ElicitationResponse,
     ElicitationResult, ReplElicitationHandler, SdkElicitationHandler,
 };
+
+pub use task::{
+    TaskError, TaskHandle, TaskKind, TaskManager, TaskState,
+};
+
+pub use worktree::{
+    WorktreeConfig, WorktreeError, WorktreeManager, WorktreeResult, enter_worktree, exit_worktree,
+};
+
+pub use team::{
+    MemberStatus, SharedTask, Team, TeamError, TeamManager, TeamMember,
+};
+
+pub use coordinator::{
+    CoordinatorError, CoordinatorPhase, CoordinatorState, coordinator_tool_whitelist,
+    is_coordinator_tool,
+};
+
+pub use team_context::{
+    ActivityEntry, Note, SessionPointer, SessionPointerStore, TeamContext, WorkItem,
+};
+
+#[cfg(test)]
+pub mod test_utils;

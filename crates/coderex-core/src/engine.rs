@@ -24,6 +24,7 @@ use crate::compact::{self, CompactResult, CompactStrategy};
 use crate::stop_hook::{self, StopHookContext, StopHookDecision};
 use crate::hook_executor::{HookExecutor, HookFireResult, NoOpHookExecutor};
 use crate::elicitation::{ElicitationHandler, ElicitationResult, ReplElicitationHandler};
+use std::path::PathBuf;
 
 // ─── Structured Output Validation ───────────────────────────────────────────
 
@@ -605,6 +606,10 @@ pub struct QueryEngine {
     hooks: Box<dyn HookExecutor + Send + Sync>,
     /// Handler for elicitation requests.
     elicitation_handler: Box<dyn ElicitationHandler + Send + Sync>,
+    /// Optional transcript base path. When set, compact updates the
+    /// transcript file on disk by removing old messages and writing a
+    /// compact boundary marker.
+    transcript_path: Option<PathBuf>,
 }
 
 /// A denied tool call that should be summarized in the next turn.
@@ -641,6 +646,7 @@ impl QueryEngine {
             compact_config: config,
             hooks: Box::new(NoOpHookExecutor),
             elicitation_handler: Box::new(ReplElicitationHandler),
+            transcript_path: None,
         }
     }
 
@@ -655,6 +661,14 @@ impl QueryEngine {
     /// Set the hook executor for lifecycle hooks.
     pub fn set_hooks(&mut self, hooks: Box<dyn HookExecutor + Send + Sync>) {
         self.hooks = hooks;
+    }
+
+    /// Set the transcript base path for persisting compact boundaries.
+    ///
+    /// When set, compact recovery will update the transcript file on disk
+    /// by removing old messages and writing a compact boundary marker.
+    pub fn set_transcript_path(&mut self, path: PathBuf) {
+        self.transcript_path = Some(path);
     }
 
     /// Handle an elicitation request using the configured elicitation handler.
@@ -1298,6 +1312,24 @@ impl QueryEngine {
         let messages_remaining = result.messages.len();
         turn.messages = result.messages;
 
+        // Persist compact to transcript file on disk
+        if let Some(ref base_path) = self.transcript_path {
+            let session_id_str = self.session.session_id.to_string();
+            let transcript_file = base_path.join(format!("{session_id_str}.jsonl"));
+
+            // Write compacted messages to transcript
+            if let Err(e) = Self::write_transcript_replacement(&transcript_file, &turn.messages) {
+                tracing::warn!("Failed to update transcript after compact: {e}");
+            }
+
+            // Append boundary marker if one was inserted
+            if result.boundary_inserted {
+                if let Err(e) = Self::append_transcript_boundary(&transcript_file) {
+                    tracing::warn!("Failed to write compact boundary to transcript: {e}");
+                }
+            }
+        }
+
         // Increment recovery count
         turn.recovery_count += 1;
 
@@ -1314,6 +1346,44 @@ impl QueryEngine {
         );
 
         Ok(())
+    }
+
+    /// Write a full replacement to the transcript file with the given messages.
+    ///
+    /// Uses a temp file + atomic rename for crash safety.
+    fn write_transcript_replacement(
+        path: &PathBuf,
+        messages: &[Message],
+    ) -> std::io::Result<()> {
+        use std::io::Write;
+
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+
+        let temp_path = path.with_extension("jsonl.tmp");
+        let mut file = std::fs::File::create(&temp_path)?;
+        for msg in messages {
+            let line = serde_json::to_string(msg)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+            writeln!(file, "{line}")?;
+        }
+        std::fs::rename(&temp_path, path)
+    }
+
+    /// Append a compact boundary marker to the transcript file.
+    fn append_transcript_boundary(path: &PathBuf) -> std::io::Result<()> {
+        use std::io::Write;
+
+        let boundary = compact::compact_boundary_message();
+        let line = serde_json::to_string(&boundary)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)?;
+        writeln!(file, "{line}")
     }
 
     /// Format denied tool calls into a system prompt summary.
@@ -2292,5 +2362,79 @@ mod tests {
         // Can set a custom handler
         engine.set_elicitation_handler(Box::new(crate::elicitation::SdkElicitationHandler));
         // Handler was set without error
+    }
+
+    // ─── Transcript Persistence ────────────────────────────────────────────
+
+    #[test]
+    fn set_transcript_path_stores_path() {
+        let (mut engine, _rx, _session) = make_test_engine();
+        engine.set_transcript_path(PathBuf::from("/tmp/transcripts"));
+        // Path was set without error
+        assert!(engine.transcript_path.is_some());
+    }
+
+    #[test]
+    fn transcript_path_defaults_to_none() {
+        let (engine, _rx, _session) = make_test_engine();
+        assert!(engine.transcript_path.is_none());
+    }
+
+    #[test]
+    fn write_transcript_replacement_creates_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("test.jsonl");
+
+        let messages = vec![
+            Message::user("hello"),
+            Message::assistant("world"),
+        ];
+
+        QueryEngine::write_transcript_replacement(&path, &messages).unwrap();
+        assert!(path.exists());
+
+        // Verify content
+        let content = std::fs::read_to_string(&path).unwrap();
+        let lines: Vec<&str> = content.lines().collect();
+        assert_eq!(lines.len(), 2);
+    }
+
+    #[test]
+    fn write_transcript_replacement_overwrites() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("test.jsonl");
+
+        // Write initial messages
+        QueryEngine::write_transcript_replacement(&path, &[
+            Message::user("old1"),
+            Message::user("old2"),
+            Message::user("old3"),
+        ]).unwrap();
+
+        // Replace with fewer messages
+        QueryEngine::write_transcript_replacement(&path, &[
+            Message::user("new"),
+        ]).unwrap();
+
+        let content = std::fs::read_to_string(&path).unwrap();
+        let lines: Vec<&str> = content.lines().collect();
+        assert_eq!(lines.len(), 1);
+    }
+
+    #[test]
+    fn append_transcript_boundary_adds_marker() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("test.jsonl");
+
+        QueryEngine::write_transcript_replacement(&path, &[
+            Message::user("before"),
+        ]).unwrap();
+
+        QueryEngine::append_transcript_boundary(&path).unwrap();
+
+        let content = std::fs::read_to_string(&path).unwrap();
+        let lines: Vec<&str> = content.lines().collect();
+        assert_eq!(lines.len(), 2);
+        assert!(lines[1].contains("coderex_compact_boundary"));
     }
 }

@@ -103,6 +103,9 @@ bitflags = "2"
 # Cron
 cron = "0.15"
 
+# LSP protocol types
+lsp-types = "0.97"
+
 # Platform-specific
 libc = "0.2"
 
@@ -136,6 +139,15 @@ struct_excessive_bools = "allow"
 doc_markdown = "allow"
 
 # ─── Release Features ────────────────────────────────────────────────────────
+
+# ─── Release Tiers ───────────────────────────────────────────────────────────
+#
+# Feature flags control which subsystems are compiled into the binary.
+#
+#   cargo build --features release-tier=core      # QueryEngine + baseline tools
+#   cargo build --features release-tier=full      # core + bridge/server/plugins
+#   cargo build --features release-tier=enterprise # full + managed settings/team
+#
 
 [workspace.metadata.release]
 pre-release-commit-message = "chore: release v{{version}}"

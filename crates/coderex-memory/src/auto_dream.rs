@@ -1,0 +1,405 @@
+//! Auto dream — background session consolidation triggered by thresholds.
+//!
+//! When the number of sessions or elapsed time exceeds configured thresholds,
+//! a read-only "dream" sub-agent is spawned to analyze recent sessions and
+//! produce structured summaries that are written to the project memory directory.
+
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
+
+/// Configuration for auto dream triggering.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DreamConfig {
+    /// Trigger a dream after this many new sessions since last dream.
+    pub session_threshold: usize,
+    /// Trigger a dream after this much time since last dream (in hours).
+    pub time_threshold_hours: i64,
+    /// Whether auto dream is enabled.
+    pub enabled: bool,
+}
+
+impl Default for DreamConfig {
+    fn default() -> Self {
+        Self {
+            session_threshold: 10,
+            time_threshold_hours: 24,
+            enabled: true,
+        }
+    }
+}
+
+/// Result of a dream threshold check.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DreamCheckResult {
+    /// Thresholds not yet met.
+    NotReady,
+    /// Thresholds met — should spawn a dream agent.
+    ShouldDream {
+        /// Number of sessions since last dream.
+        sessions_since_last: usize,
+        /// Hours since last dream.
+        hours_since_last: i64,
+    },
+    /// A dream is already in progress.
+    InProgress,
+}
+
+/// A dream session record.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DreamSession {
+    /// When the dream started.
+    pub started_at: DateTime<Utc>,
+    /// When the dream completed (None if still running).
+    pub completed_at: Option<DateTime<Utc>>,
+    /// Number of sessions analyzed during this dream.
+    pub sessions_analyzed: usize,
+    /// Dream output/summary written to memory.
+    pub summary: String,
+    /// Whether the dream completed successfully.
+    pub success: bool,
+}
+
+/// Auto dream manager — tracks thresholds and manages dream sessions.
+#[derive(Debug)]
+pub struct AutoDream {
+    /// Project memory directory where dream artifacts are written.
+    pub memory_dir: PathBuf,
+    /// Current dream configuration.
+    pub config: DreamConfig,
+    /// Path to the dream state file.
+    pub state_path: PathBuf,
+}
+
+/// Persisted dream state for crash recovery.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct DreamState {
+    /// When the last successful dream completed.
+    last_dream_completed: Option<DateTime<Utc>>,
+    /// Number of sessions since last dream.
+    sessions_since_last_dream: usize,
+    /// List of completed dream sessions.
+    dream_history: Vec<DreamSession>,
+}
+
+impl Default for DreamState {
+    fn default() -> Self {
+        Self {
+            last_dream_completed: None,
+            sessions_since_last_dream: 0,
+            dream_history: Vec::new(),
+        }
+    }
+}
+
+impl AutoDream {
+    /// Create a new auto dream manager.
+    #[must_use]
+    pub fn new(memory_dir: PathBuf, config: DreamConfig) -> Self {
+        let state_path = memory_dir.join(".dream_state.json");
+        Self {
+            memory_dir: memory_dir.clone(),
+            config,
+            state_path,
+        }
+    }
+
+    /// Load or initialize dream state.
+    fn load_state(&self) -> DreamState {
+        if self.state_path.exists() {
+            if let Ok(content) = std::fs::read_to_string(&self.state_path) {
+                if let Ok(state) = serde_json::from_str::<DreamState>(&content) {
+                    return state;
+                }
+            }
+        }
+        DreamState::default()
+    }
+
+    /// Persist dream state to disk.
+    fn save_state(&self, state: &DreamState) -> std::io::Result<()> {
+        std::fs::create_dir_all(&self.memory_dir)?;
+        let serialized = serde_json::to_string_pretty(state)
+            .map_err(std::io::Error::other)?;
+        std::fs::write(&self.state_path, serialized)
+    }
+
+    /// Record a new session, incrementing the session counter.
+    pub fn record_session(&self) -> std::io::Result<()> {
+        let mut state = self.load_state();
+        state.sessions_since_last_dream += 1;
+        self.save_state(&state)
+    }
+
+    /// Check if dream thresholds are met.
+    ///
+    /// Returns `DreamCheckResult::ShouldDream` if either the session count
+    /// or elapsed time exceeds the configured threshold.
+    #[must_use]
+    pub fn check_threshold(&self) -> DreamCheckResult {
+        if !self.config.enabled {
+            return DreamCheckResult::NotReady;
+        }
+
+        let state = self.load_state();
+        let now = Utc::now();
+
+        let sessions_since = state.sessions_since_last_dream;
+        let hours_since = state
+            .last_dream_completed
+            .map(|t| now.signed_duration_since(t).num_hours())
+            .unwrap_or(i64::MAX);
+
+        let session_met = sessions_since >= self.config.session_threshold;
+        let time_met = hours_since >= self.config.time_threshold_hours;
+
+        if session_met || time_met {
+            DreamCheckResult::ShouldDream {
+                sessions_since_last: sessions_since,
+                hours_since_last: hours_since,
+            }
+        } else {
+            DreamCheckResult::NotReady
+        }
+    }
+
+    /// Start a new dream session.
+    ///
+    /// Records the start time and marks dream as in progress.
+    pub fn start_dream(&self) -> std::io::Result<DreamSession> {
+        let dream = DreamSession {
+            started_at: Utc::now(),
+            completed_at: None,
+            sessions_analyzed: 0,
+            summary: String::new(),
+            success: false,
+        };
+        Ok(dream)
+    }
+
+    /// Complete a dream session, writing the summary to the project memory directory.
+    ///
+    /// Writes the dream output to `<memory_dir>/dreams/<timestamp>.md`.
+    /// Resets the session counter on successful completion.
+    pub fn complete_dream(
+        &self,
+        mut dream: DreamSession,
+        summary: &str,
+        sessions_analyzed: usize,
+    ) -> std::io::Result<DreamSession> {
+        dream.completed_at = Some(Utc::now());
+        dream.summary = summary.to_string();
+        dream.sessions_analyzed = sessions_analyzed;
+        dream.success = true;
+
+        // Write dream artifact
+        let dreams_dir = self.memory_dir.join("dreams");
+        std::fs::create_dir_all(&dreams_dir)?;
+        let timestamp = dream.started_at.format("%Y%m%d_%H%M%S");
+        let artifact_path = dreams_dir.join(format!("{timestamp}.md"));
+        std::fs::write(&artifact_path, &dream.summary)?;
+
+        // Update state
+        let mut state = self.load_state();
+        state.last_dream_completed = dream.completed_at;
+        state.sessions_since_last_dream = 0;
+        state.dream_history.push(dream.clone());
+        // Keep only last 10 entries to prevent state file bloat
+        if state.dream_history.len() > 10 {
+            let drain_idx = state.dream_history.len() - 10;
+            state.dream_history.drain(..drain_idx);
+        }
+        self.save_state(&state)?;
+
+        Ok(dream)
+    }
+
+    /// Get the list of completed dream sessions.
+    #[must_use]
+    pub fn dream_history(&self) -> Vec<DreamSession> {
+        self.load_state().dream_history
+    }
+
+    /// Generate dream prompt content for the sub-agent.
+    ///
+    /// This produces the instructions that would be given to a read-only
+    /// forked agent to perform background session analysis and summarization.
+    #[must_use]
+    pub fn generate_dream_prompt(&self, session_summaries: &[&str]) -> String {
+        let mut prompt = String::from(
+            "You are analyzing recent coding sessions to produce a structured summary.\n\
+            Your task is to identify patterns, decisions, and learnings.\n\n\
+            Please produce the following sections:\n\n\
+            1. **Key Decisions** — important architectural or design decisions made\n\
+            2. **Code Patterns** — recurring patterns, conventions, or idioms observed\n\
+            3. **Unresolved Items** — TODOs, open questions, or incomplete work\n\
+            4. **Suggestions** — improvements or refactorings to consider\n\n"
+        );
+
+        prompt.push_str("Here are the recent session summaries:\n\n");
+        for (i, summary) in session_summaries.iter().enumerate() {
+            prompt.push_str(&format!("## Session {}\n{}\n\n", i + 1, summary));
+        }
+
+        prompt
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_dream() -> (AutoDream, tempfile::TempDir) {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = DreamConfig {
+            session_threshold: 3,
+            time_threshold_hours: 1,
+            enabled: true,
+        };
+        let dream = AutoDream::new(tmp.path().to_path_buf(), config);
+        (dream, tmp)
+    }
+
+    #[test]
+    fn record_session_increments_counter() {
+        let (dream, _tmp) = temp_dream();
+        dream.record_session().unwrap();
+        dream.record_session().unwrap();
+
+        let state = dream.load_state();
+        assert_eq!(state.sessions_since_last_dream, 2);
+    }
+
+    #[test]
+    fn check_threshold_not_ready() {
+        let (dream, _tmp) = temp_dream();
+        dream.record_session().unwrap();
+        // Only 1 session (threshold is 3), and set a fake recent dream completion
+        // so the time threshold doesn't trigger
+        let mut state = dream.load_state();
+        state.last_dream_completed = Some(Utc::now());
+        dream.save_state(&state).unwrap();
+
+        let result = dream.check_threshold();
+        assert!(matches!(result, DreamCheckResult::NotReady));
+    }
+
+    #[test]
+    fn check_threshold_session_count_triggers() {
+        let (dream, _tmp) = temp_dream();
+        dream.record_session().unwrap();
+        dream.record_session().unwrap();
+        dream.record_session().unwrap();
+
+        let result = dream.check_threshold();
+        assert!(matches!(result, DreamCheckResult::ShouldDream { sessions_since_last: 3, .. }));
+    }
+
+    #[test]
+    fn check_threshold_disabled() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = DreamConfig::default();
+        let _dream = AutoDream::new(tmp.path().to_path_buf(), config.clone());
+        let disabled_config = DreamConfig { enabled: false, ..config };
+        let dream2 = AutoDream::new(tmp.path().join("2"), disabled_config);
+
+        // Even with many sessions, disabled means not ready
+        for _ in 0..100 {
+            dream2.record_session().unwrap();
+        }
+        assert!(matches!(dream2.check_threshold(), DreamCheckResult::NotReady));
+    }
+
+    #[test]
+    fn complete_dream_resets_counter() {
+        let (dream, _tmp) = temp_dream();
+        for _ in 0..5 {
+            dream.record_session().unwrap();
+        }
+
+        let dream_session = dream.start_dream().unwrap();
+        dream.complete_dream(dream_session, "summary", 5).unwrap();
+
+        let state = dream.load_state();
+        assert_eq!(state.sessions_since_last_dream, 0);
+        assert!(state.last_dream_completed.is_some());
+    }
+
+    #[test]
+    fn dream_artifact_written() {
+        let (dream, tmp) = temp_dream();
+        let dream_session = dream.start_dream().unwrap();
+        dream.complete_dream(dream_session, "# Dream Summary\nKey finding: Rust", 3).unwrap();
+
+        let dreams_dir = tmp.path().join("dreams");
+        assert!(dreams_dir.exists());
+
+        let entries: Vec<_> = std::fs::read_dir(&dreams_dir).unwrap().collect();
+        assert_eq!(entries.len(), 1);
+
+        let entry = entries[0].as_ref().unwrap();
+        let content = std::fs::read_to_string(entry.path()).unwrap();
+        assert_eq!(content, "# Dream Summary\nKey finding: Rust");
+    }
+
+    #[test]
+    fn dream_history_limited_to_10() {
+        let (dream, _tmp) = temp_dream();
+
+        for i in 0..15 {
+            dream.record_session().unwrap();
+            dream.record_session().unwrap();
+            dream.record_session().unwrap();
+            let ds = dream.start_dream().unwrap();
+            dream.complete_dream(ds, &format!("Dream {}", i), 3).unwrap();
+        }
+
+        let history = dream.dream_history();
+        assert_eq!(history.len(), 10);
+    }
+
+    #[test]
+    fn generate_dream_prompt_contains_sessions() {
+        let (dream, _tmp) = temp_dream();
+        let prompt = dream.generate_dream_prompt(&["Session A: fixed auth bug", "Session B: added tests"]);
+        assert!(prompt.contains("Session A: fixed auth bug"));
+        assert!(prompt.contains("Session B: added tests"));
+        assert!(prompt.contains("Key Decisions"));
+        assert!(prompt.contains("Suggestions"));
+    }
+
+    #[test]
+    fn dream_state_persists() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = DreamConfig {
+            session_threshold: 5,
+            time_threshold_hours: 2,
+            enabled: true,
+        };
+        {
+            let dream = AutoDream::new(tmp.path().to_path_buf(), config.clone());
+            dream.record_session().unwrap();
+            dream.record_session().unwrap();
+        }
+
+        // Load in a new instance
+        let dream2 = AutoDream::new(tmp.path().to_path_buf(), config);
+        let state = dream2.load_state();
+        assert_eq!(state.sessions_since_last_dream, 2);
+    }
+
+    #[test]
+    fn check_threshold_time_based() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = DreamConfig {
+            session_threshold: 100, // High session threshold so time triggers first
+            time_threshold_hours: 0, // Trigger immediately if no previous dream
+            enabled: true,
+        };
+        let dream = AutoDream::new(tmp.path().to_path_buf(), config);
+
+        let result = dream.check_threshold();
+        // With no previous dream, hours_since_last = MAX which exceeds any threshold
+        assert!(matches!(result, DreamCheckResult::ShouldDream { .. }));
+    }
+}
