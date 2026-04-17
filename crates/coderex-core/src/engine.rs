@@ -439,6 +439,8 @@ pub struct SubmitOptions {
     pub handle_elicitation: bool,
     /// Recover orphaned permission requests from disk.
     pub orphaned_permission: bool,
+    /// Restrict tool execution to the given tool names for this submission.
+    pub allowed_tools_override: Option<Vec<String>>,
 }
 
 impl Default for SubmitOptions {
@@ -454,6 +456,7 @@ impl Default for SubmitOptions {
             include_partial_messages: false,
             handle_elicitation: true,
             orphaned_permission: false,
+            allowed_tools_override: None,
         }
     }
 }
@@ -610,6 +613,8 @@ pub struct QueryEngine {
     /// transcript file on disk by removing old messages and writing a
     /// compact boundary marker.
     transcript_path: Option<PathBuf>,
+    /// Usage summary from the most recent model request.
+    last_usage: Option<UsageSummary>,
 }
 
 /// A denied tool call that should be summarized in the next turn.
@@ -647,6 +652,7 @@ impl QueryEngine {
             hooks: Box::new(NoOpHookExecutor),
             elicitation_handler: Box::new(ReplElicitationHandler),
             transcript_path: None,
+            last_usage: None,
         }
     }
 
@@ -675,6 +681,7 @@ impl QueryEngine {
     ///
     /// Transitions the turn to `AwaitElicitation`, sends the elicitation via
     /// the handler, and stores the response.
+    #[allow(dead_code)]
     async fn handle_elicitation(
         &mut self,
         turn: &mut TurnRuntime,
@@ -754,6 +761,12 @@ impl QueryEngine {
     /// Clear denied tool calls (called after they've been injected).
     pub fn clear_denied_tools(&mut self) {
         self.denied_tools.clear();
+    }
+
+    /// Get the usage summary recorded for the most recent request.
+    #[must_use]
+    pub const fn last_usage(&self) -> Option<UsageSummary> {
+        self.last_usage
     }
 
     /// Submit a user message and run the full turn loop.
@@ -918,6 +931,7 @@ impl QueryEngine {
         // Record budget and cost
         turn.budget.record_tokens(&api_response.usage);
         self.cost_tracker.record_usage(&api_response.usage, &self.model);
+        self.last_usage = Some(api_response.usage);
 
         // Parse the response
         let content = self.validate_structured_output(api_response.content.clone());
@@ -943,6 +957,7 @@ impl QueryEngine {
                     let api_response = self.send_request(turn, options).await?;
                     turn.budget.record_tokens(&api_response.usage);
                     self.cost_tracker.record_usage(&api_response.usage, &self.model);
+                    self.last_usage = Some(api_response.usage);
                     let content = self.validate_structured_output(api_response.content.clone());
                     let assistant_msg = Message::assistant(content);
                     turn.messages.push(assistant_msg);
@@ -1070,6 +1085,7 @@ impl QueryEngine {
         // Record budget and cost
         turn.budget.record_tokens(&usage);
         self.cost_tracker.record_usage(&usage, &self.model);
+        self.last_usage = Some(usage);
 
         // Save assistant message
         let assistant_msg = Message::assistant(content.clone());
@@ -1090,6 +1106,7 @@ impl QueryEngine {
                         self.send_request_streaming(turn, options).await?;
                     turn.budget.record_tokens(&usage);
                     self.cost_tracker.record_usage(&usage, &self.model);
+                    self.last_usage = Some(usage);
                     turn.messages.push(Message::assistant(content));
 
                     if !turn.budget.should_continue() {
@@ -1569,11 +1586,36 @@ impl QueryEngine {
     async fn execute_tool_calls(
         &mut self,
         turn: &mut TurnRuntime,
-        _options: &SubmitOptions,
+        options: &SubmitOptions,
     ) -> Result<Vec<ToolResult>, String> {
         let mut results = Vec::new();
 
         for call in &turn.pending_tool_calls {
+            if let Some(ref allowed_tools) = options.allowed_tools_override {
+                if !allowed_tools.iter().any(|tool| tool == &call.name) {
+                    self.denied_tools.push(DeniedToolCall {
+                        name: call.name.clone(),
+                        reason: "tool is not in the allowed tools override".to_string(),
+                    });
+
+                    let result = ToolResult {
+                        tool_call_id: call.id.clone(),
+                        output: format!(
+                            "tool '{}' blocked: not in allowed tools override",
+                            call.name
+                        ),
+                        is_error: true,
+                    };
+
+                    let _ = self.event_tx.send(EngineEvent::ToolCallEnd {
+                        id: call.id.clone(),
+                        result: result.clone(),
+                    });
+                    results.push(result);
+                    continue;
+                }
+            }
+
             // Emit tool call start event
             let _ = self.event_tx.send(EngineEvent::ToolCallStart {
                 id: call.id.clone(),
@@ -2062,6 +2104,28 @@ mod tests {
         let results = results.unwrap();
         assert_eq!(results.len(), 1);
         assert!(!results[0].is_error);
+    }
+
+    #[tokio::test]
+    async fn execute_tool_calls_respects_allowed_tools_override() {
+        let (mut engine, _rx, _session) = make_test_engine();
+        let budget = TokenBudget::with_defaults();
+        let mut turn = TurnRuntime::new(budget);
+        turn.pending_tool_calls.push(PendingToolCall {
+            id: "tc_blocked".into(),
+            name: "write".into(),
+            input: serde_json::json!({"path": "blocked.txt"}),
+        });
+
+        let opts = SubmitOptions {
+            allowed_tools_override: Some(vec!["read".into()]),
+            ..SubmitOptions::default()
+        };
+
+        let results = engine.execute_tool_calls(&mut turn, &opts).await.unwrap();
+        assert_eq!(results.len(), 1);
+        assert!(results[0].is_error);
+        assert!(results[0].output.contains("blocked"));
     }
 
     #[test]

@@ -4,7 +4,7 @@
 //! beyond the current session, writing them to the project memory system.
 
 use crate::api_client::ApiClient;
-use crate::orchestrator::{OrchestratorError, run_side_query};
+use crate::orchestrator::{OrchestratorError, run_forked_agent, run_side_query};
 use crate::query_profiles::ModelProfile;
 
 /// Extracts long-term memories from recent conversation.
@@ -30,10 +30,12 @@ pub async fn extract_memories(
          [{{\"file\": \"user_preferences.md\", \"content\": \"...\"}}]"
     );
 
-    let result = run_side_query(
+    let result = run_forked_agent(
         api_client,
         system,
         &user,
+        Some(conversation),
+        Some(&["Write".to_string()]),
         &ModelProfile::Main.resolve(),
         1024,
     )

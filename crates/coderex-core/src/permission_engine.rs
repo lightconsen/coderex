@@ -269,6 +269,7 @@ pub struct NoOpPermissionHook;
 /// This hook does NOT short-circuit — it always returns `None` so the
 /// permission checker decides. It calls the AI to explain the risks
 /// of the tool call and logs the explanation for downstream use.
+#[allow(missing_debug_implementations)]
 pub struct ExplainPermissionHook {
     api_client: Box<dyn crate::api_client::ApiClient>,
 }

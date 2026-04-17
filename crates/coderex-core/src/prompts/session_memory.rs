@@ -4,7 +4,7 @@
 //! using an AI agent to maintain high-density, actionable technical content.
 
 use crate::api_client::ApiClient;
-use crate::orchestrator::{OrchestratorError, run_side_query};
+use crate::orchestrator::{OrchestratorError, run_forked_agent};
 use crate::query_profiles::ModelProfile;
 
 /// Updates session memory based on recent conversation.
@@ -28,10 +28,12 @@ pub async fn update_session_memory(
          Update the memory file above. Return the COMPLETE updated content."
     );
 
-    let result = run_side_query(
+    let result = run_forked_agent(
         api_client,
         system,
         &user,
+        Some(conversation_excerpt),
+        Some(&["Edit".to_string()]),
         &ModelProfile::Main.resolve(),
         1024,
     )
@@ -54,10 +56,12 @@ pub async fn create_session_memory(
          Include sections: Current State, Key Decisions, Open Questions, and File Changes."
     );
 
-    let result = run_side_query(
+    let result = run_forked_agent(
         api_client,
         system,
         &user,
+        Some(conversation_excerpt),
+        Some(&["Edit".to_string()]),
         &ModelProfile::Main.resolve(),
         512,
     )
