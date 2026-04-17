@@ -249,6 +249,7 @@ pub fn register(registry: &mut CommandRegistry) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::registry::CommandType;
     use coderex_core::types::ModelId;
 
     fn init_git_repo(path: &std::path::Path) {
@@ -275,6 +276,23 @@ mod tests {
             .expect("git commit failed");
     }
 
+    fn commit_all(path: &std::path::Path, message: &str) {
+        std::process::Command::new("git")
+            .args(["add", "-A"])
+            .current_dir(path)
+            .output()
+            .expect("git add failed");
+        std::process::Command::new("git")
+            .args(["commit", "--quiet", "-m", message])
+            .env("GIT_AUTHOR_NAME", "test")
+            .env("GIT_AUTHOR_EMAIL", "test@test.com")
+            .env("GIT_COMMITTER_NAME", "test")
+            .env("GIT_COMMITTER_EMAIL", "test@test.com")
+            .current_dir(path)
+            .output()
+            .expect("git commit failed");
+    }
+
     fn ctx_in_dir(dir: &std::path::Path) -> CommandContext {
         let branch = current_branch(dir);
         CommandContext {
@@ -282,6 +300,12 @@ mod tests {
             git_branch: branch,
             ..CommandContext::new("/src".into(), "s1".into(), "Test".into(), ModelId::sonnet())
         }
+    }
+
+    fn registry() -> CommandRegistry {
+        let mut registry = CommandRegistry::new();
+        register(&mut registry);
+        registry
     }
 
     #[test]
@@ -340,23 +364,55 @@ mod tests {
     fn review_shows_diff_info() {
         let tmp = tempfile::tempdir().unwrap();
         init_git_repo(tmp.path());
+        std::fs::write(tmp.path().join("README"), "updated\n").unwrap();
+        commit_all(tmp.path(), "update readme");
         let ctx = ctx_in_dir(tmp.path());
 
-        let reg = { let mut r = CommandRegistry::new(); register(&mut r); r };
+        let reg = registry();
         let result = reg.execute("review", &ctx, &[]);
         assert!(result.output.contains("Code Review"));
         assert!(result.output.contains("Branch"));
+        assert_eq!(result.prompt_profile, Some(PromptProfile::Reviewer));
+        let context = result.extra_context.expect("review should inject diff context");
+        assert!(context.contains("Review the current git diff"));
+        assert!(context.contains("Diff:"));
+        assert!(context.contains("README"));
+    }
+
+    #[test]
+    fn review_command_is_prompt_mode() {
+        let reg = registry();
+        let command = reg.find("review").expect("review command should exist");
+        assert_eq!(command.kind, CommandType::Prompt);
     }
 
     #[test]
     fn security_review_shows_info() {
         let tmp = tempfile::tempdir().unwrap();
         init_git_repo(tmp.path());
+        std::fs::write(tmp.path().join("README"), "updated\n").unwrap();
+        commit_all(tmp.path(), "update readme");
         let ctx = ctx_in_dir(tmp.path());
 
-        let reg = { let mut r = CommandRegistry::new(); register(&mut r); r };
+        let reg = registry();
         let result = reg.execute("security-review", &ctx, &[]);
         assert!(result.output.contains("Security Review"));
+        assert_eq!(result.prompt_profile, Some(PromptProfile::SecurityReviewer));
+        let context = result
+            .extra_context
+            .expect("security review should inject diff context");
+        assert!(context.contains("Perform a security review"));
+        assert!(context.contains("Diff:"));
+        assert!(context.contains("README"));
+    }
+
+    #[test]
+    fn security_review_command_is_prompt_mode() {
+        let reg = registry();
+        let command = reg
+            .find("security-review")
+            .expect("security-review command should exist");
+        assert_eq!(command.kind, CommandType::Prompt);
     }
 
     #[test]
