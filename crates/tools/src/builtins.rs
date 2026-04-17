@@ -12,6 +12,10 @@ mod enter_plan_mode_tool;
 mod exit_plan_mode_tool;
 mod feature_gated_tools;
 mod glob_tool;
+mod mcp_resource_tools;
+pub mod team_create_tool;
+mod team_delete_tool;
+mod worktree_tools;
 mod grep_tool;
 mod lsp_tool;
 mod mcp_auth_tool;
@@ -51,6 +55,13 @@ pub use enter_plan_mode_tool::EnterPlanModeTool;
 pub use exit_plan_mode_tool::ExitPlanModeTool;
 pub use feature_gated_tools::register_feature_gated_tools;
 pub use glob_tool::GlobTool;
+pub use mcp_resource_tools::{
+    ListMcpResourcesTool, McpResourceEntry, McpResourceHandle, ReadMcpResourceTool,
+    MCP_RESOURCE_HANDLE_KEY,
+};
+pub use team_create_tool::{TeamCreateTool, TeamManagerHandle, TEAM_MANAGER_KEY};
+pub use team_delete_tool::TeamDeleteTool;
+pub use worktree_tools::{EnterWorktreeTool, ExitWorktreeTool, WorktreeHandle, WORKTREE_HANDLE_KEY};
 pub use grep_tool::GrepTool;
 pub use lsp_tool::LspTool;
 pub use mcp_auth_tool::McpAuthTool;
@@ -209,6 +220,12 @@ pub fn register_builtin_tools(reg: &mut crate::registry::ToolRegistry) {
         bridge_url: "http://localhost:3000".into(),
     }));
     reg.register(Arc::new(McpAuthTool));
+    reg.register(Arc::new(TeamCreateTool));
+    reg.register(Arc::new(TeamDeleteTool));
+    reg.register(Arc::new(EnterWorktreeTool));
+    reg.register(Arc::new(ExitWorktreeTool));
+    reg.register(Arc::new(ListMcpResourcesTool));
+    reg.register(Arc::new(ReadMcpResourceTool));
     reg.register(Arc::new(EchoTool));
     reg.register(Arc::new(NoOpTool));
 
