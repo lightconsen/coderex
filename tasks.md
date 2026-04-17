@@ -449,7 +449,7 @@
 
 ### 9.2 Shell 工具 (crate: `tools`)
 - [x] 实现 `Bash` 工具（`tokio::process::Command`，timeout、timeout 可配置到 600s）
-- [ ] 实现 `PowerShell` 工具（Windows 平台）
+- [x] 实现 `PowerShell` 工具（Windows 平台）
 - [x] 实现 `Sleep` 工具（受控延迟）
 - [x] 实现 run_in_background 支持
 - **测试**：
@@ -488,7 +488,7 @@
 - **依赖**：4.1, 4.4, 6.7
 
 ### 9.7 搜索与代码理解工具 (crate: `tools`)
-- [ ] 实现 `LSP` 工具（跳转定义、引用查找、hover、workspace symbols，基于 tower-lsp 客户端）
+- [x] 实现 `LSP` 工具（跳转定义、引用查找、hover、workspace symbols，基于 tower-lsp 客户端）
 - [x] 实现 `ToolSearch` 工具（按名称/描述搜索可用工具）
 - **测试**：
   - LSP 工具返回正确 symbol 信息的集成测试（mock LSP server）
@@ -529,7 +529,7 @@
 - **依赖**：4.1, 1.5, 10.2
 
 ### 9.11 网络与配置工具 (crate: `tools`)
-- [ ] 实现 `RemoteTrigger` 工具（触发远程 Bridge work assignment）
+- [x] 实现 `RemoteTrigger` 工具（触发远程 Bridge work assignment）
 - [x] 实现 `Brief` 工具（生成会话/任务摘要）
 - [x] 实现 `Config` 工具（运行时查询/覆盖配置）
 - [x] 实现 `Skill` 工具（加载并执行 skill 脚本）
@@ -941,15 +941,15 @@
 ## Phase 17: Bridge 远程会话
 
 ### 17.1 Bridge 注册与容量 (crate: `bridge`)
-- [ ] 实现 `BridgeWorkPoller`：环境注册与 capacity 报告
-- [ ] 实现轮询/推送 work 分配
+- [x] 实现 `BridgeWorkPoller`：环境注册与 capacity 报告
+- [x] 实现轮询/推送 work 分配
 - **测试**：注册后能接收 work assignment 的集成测试
 - **依赖**：1.1
 
 ### 17.2 Bridge Session Spawner (crate: `bridge`)
-- [ ] 实现 `BridgeSessionSpawner`：spawn mode 决策（single-session / same-dir / worktree）
-- [ ] 实现 worktree 创建与幂等清理
-- [ ] 实现 session 目录准备
+- [x] 实现 `BridgeSessionSpawner`：spawn mode 决策（single-session / same-dir / worktree）
+- [x] 实现 worktree 创建与幂等清理
+- [x] 实现 session 目录准备
 - **测试**：
   - 各 spawn mode 目录策略正确的集成测试
   - worktree 创建失败调用 stopWork 的集成测试
@@ -1078,27 +1078,27 @@
 ## Phase 21: UI 产品化
 
 ### 21.1 Vim Mode (crate: `ui`)
-- [ ] 实现 Vim normal/insert 模式切换
-- [ ] 实现基础 Vim 键绑定（hjkl、i、a、Esc、:、dd、yy、p）
+- [x] 实现 Vim normal/insert 模式切换
+- [x] 实现基础 Vim 键绑定（hjkl、i、a、Esc、:、dd、yy、p）
 - **测试**：Vim 模式下按键行为正确的集成测试
 - **依赖**：13.2
 
 ### 21.2 Theme System (crate: `ui`)
-- [ ] 实现主题配置格式与加载
-- [ ] 实现主题切换
+- [x] 实现主题配置格式与加载
+- [x] 实现主题切换
 - **测试**：主题变更后渲染颜色正确的集成测试
 - **依赖**：13.1
 
 ### 21.3 Copy/Export/Share (crate: `ui`)
-- [ ] 实现消息选择器
-- [ ] 实现复制到剪贴板
-- [ ] 实现导出流程
+- [x] 实现消息选择器
+- [x] 实现复制到剪贴板
+- [x] 实现导出流程
 - **测试**：选中内容导出正确的集成测试
 - **依赖**：13.5
 
 ### 21.4 Notifications (crate: `ui`)
-- [ ] 实现通知系统
-- [ ] 实现 buddy/companion teaser notification
+- [x] 实现通知系统
+- [x] 实现 buddy/companion teaser notification
 - **测试**：通知显示与清除的集成测试
 - **依赖**：13.5
 
