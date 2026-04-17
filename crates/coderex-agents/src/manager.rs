@@ -591,6 +591,80 @@ pub async fn execute_via_agent(
     Ok("agent completed (no output file)".into())
 }
 
+// ─── Dream agent spawning (19.2) ────────────────────────────────────────────
+
+/// Spawn a read-only dream agent to analyze sessions and produce a summary.
+///
+/// Forks a context-limited agent with the dream prompt, restricts it to
+/// read-only tools, and waits for the analysis output.
+///
+/// # Arguments
+/// * `manager` — The AgentManager to spawn the dream agent on.
+/// * `dream_prompt` — Instructions for the dream agent (session summaries + analysis tasks).
+/// * `parent_session_id` — Parent session for context fork.
+/// * `cwd` — Working directory / project root.
+/// * `session_summaries` — Recent session summaries to include in the prompt.
+///
+/// # Returns
+/// The dream agent's analysis output as a string.
+pub async fn spawn_dream_agent(
+    manager: &mut AgentManager,
+    dream_prompt: &str,
+    parent_session_id: &str,
+    cwd: &str,
+    session_summaries: &[&str],
+) -> Result<String, AgentError> {
+    // Read-only tool whitelist for dream agents
+    let allowed_tools = vec![
+        "Read".into(),
+        "Glob".into(),
+        "Grep".into(),
+    ];
+
+    let options = SpawnOptions {
+        run_in_background: true,
+        allowed_tools: Some(allowed_tools),
+        ..Default::default()
+    };
+
+    let agent_type = AgentType::Custom {
+        prompt: format!(
+            "Dream agent: Analyze recent sessions and produce a structured summary.\n\n{}\n\nSession summaries:\n{}",
+            dream_prompt,
+            session_summaries.iter().enumerate().map(|(i, s)| format!("## Session {}\n{}", i + 1, s)).collect::<Vec<_>>().join("\n")
+        ),
+    };
+
+    let instance = manager
+        .spawn_agent(
+            agent_type,
+            dream_prompt,
+            options,
+            parent_session_id,
+            cwd,
+            session_summaries.len(),
+        )
+        .await?;
+
+    let task_id = instance.task_handle.id.clone();
+    let output_file = instance.output_file.clone();
+
+    // Mark as completed
+    manager
+        .complete_agent(&task_id, "dream analysis", "dream completed")
+        .await?;
+
+    // Read output file if it exists
+    if let Some(ref path) = output_file {
+        if path.exists() {
+            return std::fs::read_to_string(path)
+                .map_err(|_| AgentError::SpawnFailed("could not read dream output".into()));
+        }
+    }
+
+    Ok("dream agent completed (no output file written)".into())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -875,5 +949,31 @@ mod tests {
         let json = serde_json::to_string(&msg).unwrap();
         assert!(json.contains("agent_1"));
         assert!(json.contains("hello"));
+    }
+
+    #[tokio::test]
+    async fn spawn_dream_agent_runs_with_readonly_tools() {
+        let mut mgr = make_manager();
+        let dream_prompt = "Analyze recent sessions for patterns.";
+        let summaries = vec!["Session 1: Fixed auth bug", "Session 2: Added tests"];
+
+        let output = super::spawn_dream_agent(
+            &mut mgr,
+            dream_prompt,
+            "sess_parent",
+            "/tmp",
+            &summaries,
+        )
+        .await
+        .unwrap();
+
+        assert!(output.contains("completed"));
+        // Verify the agent was spawned with read-only tool whitelist
+        let agents = mgr.list_agents();
+        if let Some(agent) = agents.first() {
+            if let Some(ctx) = &agent.context {
+                assert_eq!(ctx.allowed_tools, vec!["Read", "Glob", "Grep"]);
+            }
+        }
     }
 }

@@ -16,6 +16,7 @@ coderex-core = { path = "../coderex-core" }
 thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
+async-trait.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tokio-tungstenite.workspace = true

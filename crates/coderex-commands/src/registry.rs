@@ -199,6 +199,8 @@ pub struct SlashCommand {
     pub bridge_safe: bool,
     /// Override allowed tools when this command runs.
     pub allowed_tools_override: Option<Vec<String>>,
+    /// Whether this command should be executed via a sub-agent backend (10.5).
+    pub uses_agent_backend: bool,
     /// The handler function.
     pub handler: CommandHandler,
 }
@@ -213,6 +215,7 @@ impl std::fmt::Debug for SlashCommand {
             .field("remote_safe", &self.remote_safe)
             .field("bridge_safe", &self.bridge_safe)
             .field("allowed_tools_override", &self.allowed_tools_override)
+            .field("uses_agent_backend", &self.uses_agent_backend)
             .finish_non_exhaustive()
     }
 }
@@ -235,6 +238,7 @@ impl SlashCommand {
             remote_safe,
             bridge_safe,
             allowed_tools_override: None,
+            uses_agent_backend: false,
             handler,
         }
     }
@@ -254,6 +258,7 @@ impl SlashCommand {
             remote_safe: true,
             bridge_safe: true,
             allowed_tools_override: None,
+            uses_agent_backend: false,
             handler,
         }
     }
@@ -273,6 +278,7 @@ impl SlashCommand {
             remote_safe: true,
             bridge_safe: true,
             allowed_tools_override: None,
+            uses_agent_backend: false,
             handler,
         }
     }
@@ -291,8 +297,15 @@ impl SlashCommand {
             remote_safe: false,
             bridge_safe: false,
             allowed_tools_override: None,
+            uses_agent_backend: false,
             handler,
         }
+    }
+
+    /// Mark this command to be executed via a sub-agent backend.
+    pub const fn with_agent_backend(mut self) -> Self {
+        self.uses_agent_backend = true;
+        self
     }
 }
 
@@ -555,6 +568,16 @@ mod tests {
         let json = serde_json::to_string(&r).unwrap();
         assert!(json.contains("hello"));
         assert!(json.contains("state_changed"));
+    }
+
+    #[test]
+    fn with_agent_backend() {
+        let cmd = SlashCommand::local("test", "test", true, true, true,
+            Arc::new(|_, _| CommandResult::success("ok")));
+        assert!(!cmd.uses_agent_backend);
+
+        let cmd = cmd.with_agent_backend();
+        assert!(cmd.uses_agent_backend);
     }
 
     #[test]

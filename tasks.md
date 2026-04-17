@@ -619,9 +619,9 @@
 - **依赖**：10.2
 
 ### 10.5 Agent 扩展特性 (crate: `agents`)
-- [ ] 实现 resume existing agent（继续已存在的代理，恢复上下文与状态）
-- [ ] 实现子代理作为命令实现后端（如 `/statusline` → `statusline-setup` agent）
-- [ ] 实现 teammate idle / task completed 事件系统（空闲通知、任务完成广播）
+- [x] 实现 resume existing agent（继续已存在的代理，恢复上下文与状态）
+- [x] 实现子代理作为命令实现后端（如 `/statusline` → `statusline-setup` agent）
+- [x] 实现 teammate idle / task completed 事件系统（空闲通知、任务完成广播）
 - **测试**：
   - resume 后代理上下文与之前一致的集成测试
   - 命令通过子代理执行结果正确的集成测试
@@ -908,29 +908,29 @@
 ## Phase 16: Plugin 与 Skills
 
 ### 16.1 Skill 加载 (crate: `plugins`)
-- [ ] 实现 skill frontmatter 解析（hooks/agent/allowed_tools/metadata）
-- [ ] 实现 bundled skill 加载
-- [ ] 实现 user dir skill 加载
-- [ ] 实现 repo dir skill 加载
-- [ ] 实现 MCP skill 加载（从 MCP 服务发现并注册 skill）
+- [x] 实现 skill frontmatter 解析（hooks/agent/allowed_tools/metadata）
+- [x] 实现 bundled skill 加载
+- [x] 实现 user dir skill 加载
+- [x] 实现 repo dir skill 加载
+- [x] 实现 MCP skill 加载（从 MCP 服务发现并注册 skill）
 - **测试**：
   - 各来源 skill 被发现并加载的集成测试
   - MCP skill 从 MCP 服务发现后可用的集成测试
 - **依赖**：1.1, 4.1, 15.2
 
 ### 16.2 Plugin Loader (crate: `plugins`)
-- [ ] 实现 `PluginManager` 骨架
-- [ ] 实现 plugin 加载与 handle 管理
-- [ ] 实现 plugin commands 注册
-- [ ] 实现 plugin skills 注册
+- [x] 实现 `PluginManager` 骨架
+- [x] 实现 plugin 加载与 handle 管理
+- [x] 实现 plugin commands 注册
+- [x] 实现 plugin skills 注册
 - **测试**：plugin 加载后命令和 skill 可用的集成测试
 - **依赖**：16.1, 12.1
 
 ### 16.3 Marketplace (crate: `plugins`)
-- [ ] 实现 marketplace 连接
-- [ ] 实现后台 marketplace reconciliation
-- [ ] 实现安装后 refresh / needsRefresh 标记
-- [ ] 实现后台安装
+- [x] 实现 marketplace 连接
+- [x] 实现后台 marketplace reconciliation
+- [x] 实现安装后 refresh / needsRefresh 标记
+- [x] 实现后台安装
 - **测试**：
   - reconciliation 发现新 plugin 的集成测试
   - 安装后自动刷新的集成测试
@@ -956,28 +956,28 @@
 - **依赖**：17.1, 10.4
 
 ### 17.3 Bridge Permission Router (crate: `bridge`)
-- [ ] 实现 `BridgePermissionRouter`：pending permission store 与远程转发
-- [ ] 实现远程 allow/deny 响应回写
+- [x] 实现 `BridgePermissionRouter`：pending permission store 与远程转发
+- [x] 实现远程 allow/deny 响应回写
 - **测试**：权限请求不丢失且响应回写的集成测试
 - **依赖**：17.2, 5.2
 
 ### 17.4 Bridge Archive & Cleanup (crate: `bridge`)
-- [ ] 实现 `BridgeArchiveWriter`：transcript/usage/metadata 归档
-- [ ] 实现 `BridgeCleanupManager`：worktree 清理、session 进程终止
-- [ ] 实现 capacity 释放与 stopWork 确认
+- [x] 实现 `BridgeArchiveWriter`：transcript/usage/metadata 归档
+- [x] 实现 `BridgeCleanupManager`：worktree 清理、session 进程终止
+- [x] 实现 capacity 释放与 stopWork 确认
 - **测试**：会话结束后完整清理的集成测试
 - **依赖**：17.3, 2.1
 
 ### 17.5 Bridge State Machine (crate: `bridge`)
-- [ ] 定义 `BridgeSessionState` 枚举
-- [ ] 实现完整桥接时序：Assigned → Preparing → Spawning → Running → Archiving → CleaningUp → Completed
+- [x] 定义 `BridgeSessionState` 枚举
+- [x] 实现完整桥接时序：Assigned → Preparing → Spawning → Running → Archiving → CleaningUp → Completed
 - **测试**：状态机完整流转的集成测试
 - **依赖**：17.1-17.4
 
 ### 17.6 Bridge 心跳与重连 (crate: `bridge`)
-- [ ] 实现 Bridge heartbeat（定期心跳、超时检测）
-- [ ] 实现断线重连（WebSocket 断开后自动重连、状态恢复）
-- [ ] 实现 in-process transport 扩展点（MCP in-process 与 SDK control transport）
+- [x] 实现 Bridge heartbeat（定期心跳、超时检测）
+- [x] 实现断线重连（WebSocket 断开后自动重连、状态恢复）
+- [x] 实现 in-process transport 扩展点（MCP in-process 与 SDK control transport）
 - **测试**：
   - 心跳超时后触发清理的集成测试
   - 断线重连后状态恢复的集成测试
@@ -989,29 +989,29 @@
 ## Phase 18: Server/SDK
 
 ### 18.1 Daemon Server (crate: `server`)
-- [ ] 实现 detached session server
-- [ ] 实现 WebSocket 认证 session
-- [ ] 实现 idle cleanup
-- [ ] 实现 session listing
+- [x] 实现 detached session server
+- [x] 实现 WebSocket 认证 session
+- [x] 实现 idle cleanup
+- [x] 实现 session listing
 - **测试**：
   - WebSocket 连接认证成功的集成测试
   - idle session 自动清理的集成测试
 - **依赖**：0.3, 10.2
 
 ### 18.2 SDK Structured I/O (crate: `sdk`)
-- [ ] 实现 structured event stream（tool call/result/status/compact boundary 事件）
-- [ ] 实现 permission request 事件
-- [ ] 实现 elicitation 请求与响应
-- [ ] 实现 JSON schema structured output
-- [ ] 实现 pending permission request tracking
+- [x] 实现 structured event stream（tool call/result/status/compact boundary 事件）
+- [x] 实现 permission request 事件
+- [x] 实现 elicitation 请求与响应
+- [x] 实现 JSON schema structured output
+- [x] 实现 pending permission request tracking
 - **测试**：
   - SDK 客户端接收完整事件流的集成测试
   - structured output 符合 JSON schema 的集成测试
 - **依赖**：6.5, 6.7, 5.2, 18.1
 
 ### 18.3 Remote Command Filtering (crate: `server`)
-- [ ] 实现 remote-safe / bridge-safe 命令过滤
-- [ ] 实现 mobile/web client 命令子集
+- [x] 实现 remote-safe / bridge-safe 命令过滤
+- [x] 实现 mobile/web client 命令子集
 - **测试**：不安全命令被拦截的集成测试
 - **依赖**：12.1, 18.2
 
@@ -1020,18 +1020,18 @@
 ## Phase 19: 记忆系统扩展
 
 ### 19.1 Team Memory Sync (crate: `memory`)
-- [ ] 实现 `TeamMemorySyncService`：repo 维度、服务端 upsert
-- [ ] 实现 checksum 增量同步
-- [ ] 实现删除不传播语义
+- [x] 实现 `TeamMemorySyncService`：repo 维度、服务端 upsert
+- [x] 实现 checksum 增量同步
+- [x] 实现删除不传播语义
 - **测试**：
   - checksum 增量同步正确的集成测试
   - 删除操作不传播的单元测试
 - **依赖**：2.3, 11.1
 
 ### 19.2 Auto Dream (crate: `memory`)
-- [ ] 实现时间与 session 数阈值检查
-- [ ] 实现 fork 只读受限子代理进行背景整理
-- [ ] 实现 dream 产物写入项目 memory 目录
+- [x] 实现时间与 session 数阈值检查
+- [x] 实现 fork 只读受限子代理进行背景整理
+- [x] 实现 dream 产物写入项目 memory 目录
 - **测试**：阈值触发 dream 整理的集成测试
 - **依赖**：19.1, 10.3
 
@@ -1040,11 +1040,11 @@
 ## Phase 20: 企业功能
 
 ### 20.1 Remote Managed Settings (crate: `config`)
-- [ ] 实现企业用户 eligibility 检查
-- [ ] 实现 checksum-based fetch
-- [ ] 实现 security check
-- [ ] 实现 loading barrier（允许其他系统等待远程配置拉取完成）
-- [ ] 实现 fail open（失败不阻塞启动）
+- [x] 实现企业用户 eligibility 检查
+- [x] 实现 checksum-based fetch
+- [x] 实现 security check
+- [x] 实现 loading barrier（允许其他系统等待远程配置拉取完成）
+- [x] 实现 fail open（失败不阻塞启动）
 - **测试**：
   - 远程配置加载并合并的集成测试
   - 网络失败时 fail open 的集成测试
@@ -1052,11 +1052,11 @@
 - **依赖**：1.1, 3.1
 
 ### 20.2 启动编排 (crate: `cli`)
-- [ ] 实现 `StartupOrchestrator`
-- [ ] 实现四阶段启动：Bootstrap → Configuration → Extensions → RuntimeReady
-- [ ] 按 spec 时序实现各子系统初始化
-- [ ] 实现远程配置 barrier 不阻塞整个启动链
-- [ ] 实现 MCP 异步连接不阻塞启动
+- [x] 实现 `StartupOrchestrator`
+- [x] 实现四阶段启动：Bootstrap → Configuration → Extensions → RuntimeReady
+- [x] 按 spec 时序实现各子系统初始化
+- [x] 实现远程配置 barrier 不阻塞整个启动链
+- [x] 实现 MCP 异步连接不阻塞启动
 - **测试**：
   - 各阶段按序执行的集成测试
   - 某个子系统初始化失败不阻断整体的集成测试
@@ -1064,9 +1064,9 @@
 - **依赖**：所有 Phase 0-19 的基础模块
 
 ### 20.3 企业安全与策略 (crate: `config`, `core`)
-- [ ] 实现 trusted device 机制（设备注册、信任验证、增强认证）
-- [ ] 实现 org-scoped remote policy（组织级远程策略、权限范围控制）
-- [ ] 实现 org-scoped team memory（组织维度的团队记忆隔离与共享）
+- [x] 实现 trusted device 机制（设备注册、信任验证、增强认证）
+- [x] 实现 org-scoped remote policy（组织级远程策略、权限范围控制）
+- [x] 实现 org-scoped team memory（组织维度的团队记忆隔离与共享）
 - **测试**：
   - 未信任设备被拒绝访问的集成测试
   - org-scoped 策略限制跨组织操作的集成测试

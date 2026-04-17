@@ -77,5 +77,4 @@ pub use team_context::{
     ActivityEntry, Note, SessionPointer, SessionPointerStore, TeamContext, WorkItem,
 };
 
-#[cfg(test)]
 pub mod test_utils;

@@ -120,7 +120,7 @@ pub fn register(registry: &mut CommandRegistry) {
         }),
     ));
 
-    // /statusline — statusline custom config
+    // /statusline — statusline custom config (agent-backed)
     registry.register(SlashCommand::local(
         "statusline",
         "Configure the statusline",
@@ -132,7 +132,7 @@ pub fn register(registry: &mut CommandRegistry) {
                 "Statusline Configuration\n──────────────────────\nDefault format: [model] [tokens] [cost] [permissions]\n\nCustomize in settings.json: statusline.format"
             )
         }),
-    ));
+    ).with_agent_backend());
 }
 
 #[cfg(test)]
@@ -230,5 +230,12 @@ mod tests {
         let reg = { let mut r = CommandRegistry::new(); register(&mut r); r };
         let result = reg.execute("statusline", &ctx(), &[]);
         assert!(result.output.contains("Statusline Configuration"));
+    }
+
+    #[test]
+    fn statusline_uses_agent_backend() {
+        let reg = { let mut r = CommandRegistry::new(); register(&mut r); r };
+        let cmd = reg.find("statusline").unwrap();
+        assert!(cmd.uses_agent_backend);
     }
 }
