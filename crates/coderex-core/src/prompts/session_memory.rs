@@ -4,8 +4,9 @@
 //! using an AI agent to maintain high-density, actionable technical content.
 
 use crate::api_client::ApiClient;
-use crate::orchestrator::{OrchestratorError, run_forked_agent};
-use crate::query_profiles::ModelProfile;
+use crate::orchestrator::{
+    BackgroundFeatureKind, BackgroundFeatureRequest, OrchestratorError, run_background_feature,
+};
 
 /// Updates session memory based on recent conversation.
 ///
@@ -28,14 +29,16 @@ pub async fn update_session_memory(
          Update the memory file above. Return the COMPLETE updated content."
     );
 
-    let result = run_forked_agent(
+    let result = run_background_feature(
         api_client,
-        system,
-        &user,
-        Some(conversation_excerpt),
-        Some(&["Edit".to_string()]),
-        &ModelProfile::Main.resolve(),
-        1024,
+        BackgroundFeatureRequest {
+            kind: BackgroundFeatureKind::SessionMemoryUpdate,
+            system_prompt: system.to_string(),
+            user_prompt: user,
+            parent_context: Some(conversation_excerpt.to_string()),
+            allowed_tools: Some(vec!["Edit".into()]),
+            max_tokens: 1024,
+        },
     )
     .await?;
 
@@ -56,14 +59,16 @@ pub async fn create_session_memory(
          Include sections: Current State, Key Decisions, Open Questions, and File Changes."
     );
 
-    let result = run_forked_agent(
+    let result = run_background_feature(
         api_client,
-        system,
-        &user,
-        Some(conversation_excerpt),
-        Some(&["Edit".to_string()]),
-        &ModelProfile::Main.resolve(),
-        512,
+        BackgroundFeatureRequest {
+            kind: BackgroundFeatureKind::SessionMemoryUpdate,
+            system_prompt: system.to_string(),
+            user_prompt: user,
+            parent_context: Some(conversation_excerpt.to_string()),
+            allowed_tools: Some(vec!["Edit".into()]),
+            max_tokens: 512,
+        },
     )
     .await?;
 

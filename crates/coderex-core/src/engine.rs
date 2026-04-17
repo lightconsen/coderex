@@ -1592,7 +1592,10 @@ impl QueryEngine {
 
         for call in &turn.pending_tool_calls {
             if let Some(ref allowed_tools) = options.allowed_tools_override {
-                if !allowed_tools.iter().any(|tool| tool == &call.name) {
+                if !allowed_tools
+                    .iter()
+                    .any(|tool| tool.eq_ignore_ascii_case(&call.name))
+                {
                     self.denied_tools.push(DeniedToolCall {
                         name: call.name.clone(),
                         reason: "tool is not in the allowed tools override".to_string(),

@@ -103,22 +103,116 @@ pub const AGENT_SUMMARY_SYSTEM: &str =
      Use present continuous tense (e.g., 'Reading runAgent.ts', 'Fixing null check in validate.ts'). \
      Mention file or function names, not branch names.";
 
-// ─── Prompt Profile System Prompt Generators ────────────────────────────────
+// ─── Prompt Profile Registry ───────────────────────────────────────────────
 
 use crate::query_profiles::PromptProfile;
+
+/// Prompt profile definition used by the profile registry.
+#[derive(Debug, Clone, Copy)]
+pub struct PromptProfileSpec {
+    /// System prompt text for this profile.
+    pub system_prompt: &'static str,
+    /// Whether the default agent prompt should be included when composing.
+    pub include_default_agent: bool,
+    /// Default allowed tools for this profile, if it constrains tools.
+    pub default_allowed_tools: &'static [&'static str],
+}
+
+/// Get the prompt profile spec for a given profile.
+#[must_use]
+pub const fn prompt_profile_spec(profile: PromptProfile) -> PromptProfileSpec {
+    match profile {
+        PromptProfile::DefaultAgent => PromptProfileSpec {
+            system_prompt: DEFAULT_AGENT_SYSTEM,
+            include_default_agent: false,
+            default_allowed_tools: &[],
+        },
+        PromptProfile::Advisor => PromptProfileSpec {
+            system_prompt: ADVISOR_SYSTEM,
+            include_default_agent: true,
+            default_allowed_tools: &[],
+        },
+        PromptProfile::BugHunter => PromptProfileSpec {
+            system_prompt: BUG_HUNTER_SYSTEM,
+            include_default_agent: true,
+            default_allowed_tools: &["Read", "Grep"],
+        },
+        PromptProfile::Reviewer => PromptProfileSpec {
+            system_prompt: REVIEWER_SYSTEM,
+            include_default_agent: true,
+            default_allowed_tools: &["Read", "Grep"],
+        },
+        PromptProfile::SecurityReviewer => PromptProfileSpec {
+            system_prompt: SECURITY_REVIEWER_SYSTEM,
+            include_default_agent: true,
+            default_allowed_tools: &["Read", "Grep"],
+        },
+        PromptProfile::MemoryUpdater => PromptProfileSpec {
+            system_prompt: MEMORY_UPDATER_SYSTEM,
+            include_default_agent: false,
+            default_allowed_tools: &["Edit"],
+        },
+        PromptProfile::TitleGenerator => PromptProfileSpec {
+            system_prompt: SESSION_TITLE_SYSTEM,
+            include_default_agent: false,
+            default_allowed_tools: &[],
+        },
+        PromptProfile::PermissionExplainer => PromptProfileSpec {
+            system_prompt: PERMISSION_EXPLAIN_SYSTEM,
+            include_default_agent: false,
+            default_allowed_tools: &[],
+        },
+    }
+}
 
 /// Get the system prompt for a given profile.
 #[must_use]
 pub fn system_prompt_for_profile(profile: PromptProfile) -> &'static str {
-    match profile {
-        PromptProfile::DefaultAgent => DEFAULT_AGENT_SYSTEM,
-        PromptProfile::Advisor => ADVISOR_SYSTEM,
-        PromptProfile::BugHunter => BUG_HUNTER_SYSTEM,
-        PromptProfile::Reviewer => REVIEWER_SYSTEM,
-        PromptProfile::MemoryUpdater => MEMORY_UPDATER_SYSTEM,
-        PromptProfile::TitleGenerator => SESSION_TITLE_SYSTEM,
-        PromptProfile::PermissionExplainer => PERMISSION_EXPLAIN_SYSTEM,
+    prompt_profile_spec(profile).system_prompt
+}
+
+/// Compose multiple prompt profiles into one effective system prompt.
+#[must_use]
+pub fn compose_system_prompt_for_profiles(profiles: &[PromptProfile]) -> String {
+    if profiles.is_empty() {
+        return DEFAULT_AGENT_SYSTEM.to_string();
     }
+
+    let mut sections = Vec::new();
+    let needs_default = profiles.iter().any(|profile| prompt_profile_spec(*profile).include_default_agent)
+        && !profiles.contains(&PromptProfile::DefaultAgent);
+
+    if needs_default {
+        sections.push(DEFAULT_AGENT_SYSTEM);
+    }
+
+    for profile in profiles {
+        let prompt = prompt_profile_spec(*profile).system_prompt;
+        if !sections.contains(&prompt) {
+            sections.push(prompt);
+        }
+    }
+
+    sections.join("\n\n")
+}
+
+/// Compute the default allowed tools implied by a set of prompt profiles.
+#[must_use]
+pub fn default_allowed_tools_for_profiles(profiles: &[PromptProfile]) -> Option<Vec<String>> {
+    let mut tools = Vec::new();
+
+    for profile in profiles {
+        for tool in prompt_profile_spec(*profile).default_allowed_tools {
+            if !tools
+                .iter()
+                .any(|existing: &String| existing.eq_ignore_ascii_case(tool))
+            {
+                tools.push((*tool).to_string());
+            }
+        }
+    }
+
+    if tools.is_empty() { None } else { Some(tools) }
 }
 
 const DEFAULT_AGENT_SYSTEM: &str =
@@ -142,6 +236,11 @@ const REVIEWER_SYSTEM: &str =
      maintainability, performance, security, and adherence to conventions. \
      Provide constructive feedback with specific examples and suggestions.";
 
+const SECURITY_REVIEWER_SYSTEM: &str =
+    "You are a security review specialist. Review code and diffs for injection risks, \
+     authn/authz flaws, data exposure, unsafe shelling out, insecure defaults, \
+     and trust-boundary mistakes. Prioritize concrete security findings and mitigations.";
+
 const MEMORY_UPDATER_SYSTEM: &str =
     "You are a session memory maintenance agent. Update the session memory \
      file based on the conversation. Write high-density, actionable technical \
@@ -158,6 +257,7 @@ mod tests {
             PromptProfile::Advisor,
             PromptProfile::BugHunter,
             PromptProfile::Reviewer,
+            PromptProfile::SecurityReviewer,
             PromptProfile::MemoryUpdater,
             PromptProfile::TitleGenerator,
             PromptProfile::PermissionExplainer,
@@ -187,5 +287,26 @@ mod tests {
         let prompt = compact_summary_user_prompt("Focus on the auth changes.");
         assert!(prompt.contains("summarize"));
         assert!(prompt.contains("auth changes"));
+    }
+
+    #[test]
+    fn composed_profiles_include_default_once() {
+        let prompt = compose_system_prompt_for_profiles(&[
+            PromptProfile::Advisor,
+            PromptProfile::Reviewer,
+        ]);
+        assert!(prompt.contains("expert software engineer and coding agent"));
+        assert!(prompt.contains("senior technical advisor"));
+        assert!(prompt.contains("code review specialist"));
+    }
+
+    #[test]
+    fn default_allowed_tools_accumulate_without_duplicates() {
+        let tools = default_allowed_tools_for_profiles(&[
+            PromptProfile::Reviewer,
+            PromptProfile::SecurityReviewer,
+        ])
+        .unwrap();
+        assert_eq!(tools, vec!["Read", "Grep"]);
     }
 }

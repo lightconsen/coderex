@@ -19,8 +19,8 @@ use tokio::sync::mpsc;
 /// Session-level state that persists across turns.
 #[derive(Debug, Default)]
 struct SessionEffects {
-    /// Active prompt profile from a mode command.
-    prompt_profile: Option<PromptProfile>,
+    /// Active prompt profiles from mode commands.
+    prompt_profiles: Vec<PromptProfile>,
     /// Additional system prompt text appended by commands.
     append_system_prompt: Option<String>,
     /// Allowed tools override (None = use defaults).
@@ -187,8 +187,10 @@ impl ReplLoop {
     fn build_submit_options(&self) -> SubmitOptions {
         let mut options = SubmitOptions::default();
 
-        if let Some(profile) = self.session_effects.prompt_profile {
-            options.custom_system_prompt = Some(prompts::system_prompt_for_profile(profile).to_string());
+        if !self.session_effects.prompt_profiles.is_empty() {
+            options.custom_system_prompt = Some(
+                prompts::compose_system_prompt_for_profiles(&self.session_effects.prompt_profiles),
+            );
         }
 
         if let Some(ref prompt) = self.session_effects.append_system_prompt {
@@ -197,6 +199,10 @@ impl ReplLoop {
 
         if let Some(ref tools) = self.session_effects.allowed_tools_override {
             options.allowed_tools_override = Some(tools.clone());
+        } else if let Some(default_tools) =
+            prompts::default_allowed_tools_for_profiles(&self.session_effects.prompt_profiles)
+        {
+            options.allowed_tools_override = Some(default_tools);
         }
 
         if !self.session_effects.extra_context.is_empty() {
@@ -216,7 +222,9 @@ impl ReplLoop {
     /// Apply effects from a CommandResult to session state.
     fn apply_command_effects(&mut self, result: &CommandResult) {
         if let Some(profile) = result.prompt_profile {
-            self.session_effects.prompt_profile = Some(profile);
+            if !self.session_effects.prompt_profiles.contains(&profile) {
+                self.session_effects.prompt_profiles.push(profile);
+            }
         }
 
         if let Some(ref prompt) = result.append_system_prompt {
@@ -460,7 +468,7 @@ mod tests {
     #[test]
     fn session_effects_default() {
         let effects = SessionEffects::default();
-        assert!(effects.prompt_profile.is_none());
+        assert!(effects.prompt_profiles.is_empty());
         assert!(effects.append_system_prompt.is_none());
         assert!(effects.allowed_tools_override.is_none());
         assert!(effects.extra_context.is_empty());
@@ -473,20 +481,22 @@ mod tests {
         let result = CommandResult::success("advisor mode")
             .with_prompt_profile(coderex_core::query_profiles::PromptProfile::Advisor);
         loop_obj.apply_command_effects(&result);
-        assert_eq!(
-            loop_obj.session_effects.prompt_profile,
-            Some(coderex_core::query_profiles::PromptProfile::Advisor)
-        );
+        assert_eq!(loop_obj.session_effects.prompt_profiles.len(), 1);
+        assert_eq!(loop_obj.session_effects.prompt_profiles[0], coderex_core::query_profiles::PromptProfile::Advisor);
     }
 
     #[test]
     fn build_submit_options_includes_effects() {
         let mut loop_obj = ReplLoop::new("/src".into(), ModelId::sonnet());
-        loop_obj.session_effects.prompt_profile =
-            Some(coderex_core::query_profiles::PromptProfile::Advisor);
+        loop_obj.session_effects.prompt_profiles = vec![
+            coderex_core::query_profiles::PromptProfile::Advisor,
+            coderex_core::query_profiles::PromptProfile::Reviewer,
+        ];
         let options = loop_obj.build_submit_options();
         assert!(options.custom_system_prompt.is_some());
         let prompt = options.custom_system_prompt.unwrap();
         assert!(prompt.contains("senior technical advisor"));
+        assert!(prompt.contains("code review specialist"));
+        assert_eq!(options.allowed_tools_override.unwrap(), vec!["Read", "Grep"]);
     }
 }

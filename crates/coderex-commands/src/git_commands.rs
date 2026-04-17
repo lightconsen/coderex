@@ -1,6 +1,7 @@
 //! Git/PR commands: /commit, /commit-push-pr, /review, /security-review, /autofix-pr, /pr_comments, /branch.
 
 use crate::registry::{CommandContext, CommandRegistry, CommandResult, SlashCommand};
+use coderex_core::query_profiles::PromptProfile;
 use std::sync::Arc;
 
 /// Run a git command in the given directory.
@@ -127,11 +128,9 @@ pub fn register(registry: &mut CommandRegistry) {
     ));
 
     // /review — code review helper
-    registry.register(SlashCommand::local(
+    registry.register(SlashCommand::prompt(
         "review",
         "Code review helper",
-        true,
-        true,
         true,
         Arc::new(|ctx: &CommandContext, _args: &[String]| {
             let dir = std::path::Path::new(&ctx.cwd);
@@ -139,17 +138,19 @@ pub fn register(registry: &mut CommandRegistry) {
             let branch = current_branch(dir);
             let diff_lines = diff.lines().count();
             CommandResult::success(format!(
-                "Code Review\n───────────\nBranch: {branch}\nRecent changes: {diff_lines} lines\n\nAnalyzing recent changes for:\n- Code quality\n- Best practices\n- Potential bugs\n- Style consistency\n\n(Use an AI model to review the actual diff)"
+                "Code Review\n───────────\nBranch: {branch}\nRecent changes: {diff_lines} lines\n\nReview mode activated for the current diff. Ask the agent to review the changes or continue with a follow-up question."
             ))
+            .with_context(format!(
+                "Review the current git diff on branch '{branch}'.\n\nDiff:\n{diff}"
+            ))
+            .with_prompt_profile(PromptProfile::Reviewer)
         }),
     ));
 
     // /security-review — security review helper
-    registry.register(SlashCommand::local(
+    registry.register(SlashCommand::prompt(
         "security-review",
         "Security review helper",
-        true,
-        true,
         true,
         Arc::new(|ctx: &CommandContext, _args: &[String]| {
             let dir = std::path::Path::new(&ctx.cwd);
@@ -157,8 +158,12 @@ pub fn register(registry: &mut CommandRegistry) {
             let branch = current_branch(dir);
             let diff_lines = diff.lines().count();
             CommandResult::success(format!(
-                "Security Review\n───────────────\nBranch: {branch}\nRecent changes: {diff_lines} lines\n\nChecking for:\n- Injection vulnerabilities\n- Authentication/authorization issues\n- Data exposure\n- Unsafe dependencies\n\n(Use an AI model to analyze the diff for security issues)"
+                "Security Review\n───────────────\nBranch: {branch}\nRecent changes: {diff_lines} lines\n\nSecurity review mode activated for the current diff. Ask the agent to analyze the changes or continue with a follow-up question."
             ))
+            .with_context(format!(
+                "Perform a security review of the current git diff on branch '{branch}'.\n\nDiff:\n{diff}"
+            ))
+            .with_prompt_profile(PromptProfile::SecurityReviewer)
         }),
     ));
 

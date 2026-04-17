@@ -55,6 +55,10 @@ pub enum BackgroundFeatureKind {
     CodebaseOverview,
     /// Generate a README.
     ReadmeGeneration,
+    /// Update session memory in the background.
+    SessionMemoryUpdate,
+    /// Extract long-term memories in the background.
+    MemoryExtraction,
 }
 
 /// Request shape for background feature execution.
@@ -157,8 +161,8 @@ impl Orchestrator {
     pub async fn run_side_query(&self, request: &QueryRequest) -> Result<QueryResult, OrchestratorError> {
         let model = self.resolve_model(&request.model_profile);
         let system = request.custom_system_prompt
-            .as_deref()
-            .unwrap_or_else(|| crate::prompts::system_prompt_for_profile(request.prompt_profile));
+            .clone()
+            .unwrap_or_else(|| crate::prompts::compose_system_prompt_for_profiles(&[request.prompt_profile]));
 
         let mut user_text = request.user_prompt.clone();
         if let Some(ref append) = request.append_system_prompt {
@@ -194,8 +198,8 @@ impl Orchestrator {
         // Force lightweight model regardless of request
         let model = ModelProfile::Lightweight.resolve();
         let system = request.custom_system_prompt
-            .as_deref()
-            .unwrap_or_else(|| crate::prompts::system_prompt_for_profile(request.prompt_profile));
+            .clone()
+            .unwrap_or_else(|| crate::prompts::compose_system_prompt_for_profiles(&[request.prompt_profile]));
 
         let messages = Self::build_messages(&request.user_prompt);
         let max_tokens = if request.max_tokens > 0 {
@@ -446,13 +450,15 @@ async fn run_engine_query(
     let mut options = SubmitOptions::default();
     if let Some(ref prompt) = request.custom_system_prompt {
         options.custom_system_prompt = Some(prompt.clone());
-    } else if request.prompt_profile != PromptProfile::DefaultAgent {
+    } else {
         options.custom_system_prompt = Some(
-            crate::prompts::system_prompt_for_profile(request.prompt_profile).to_string(),
+            crate::prompts::compose_system_prompt_for_profiles(&[request.prompt_profile]),
         );
     }
     options.append_system_prompt = request.append_system_prompt.clone();
-    options.allowed_tools_override = request.allowed_tools.clone();
+    options.allowed_tools_override = request.allowed_tools.clone().or_else(|| {
+        crate::prompts::default_allowed_tools_for_profiles(&[request.prompt_profile])
+    });
 
     if request.stream {
         engine
@@ -505,6 +511,8 @@ fn background_feature_label(kind: BackgroundFeatureKind) -> &'static str {
         BackgroundFeatureKind::MagicDocs => "magic_docs",
         BackgroundFeatureKind::CodebaseOverview => "codebase_overview",
         BackgroundFeatureKind::ReadmeGeneration => "readme_generation",
+        BackgroundFeatureKind::SessionMemoryUpdate => "session_memory_update",
+        BackgroundFeatureKind::MemoryExtraction => "memory_extraction",
     }
 }
 

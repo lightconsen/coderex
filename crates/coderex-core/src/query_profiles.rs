@@ -39,7 +39,7 @@ impl ModelProfile {
 // ─── Prompt Profile ─────────────────────────────────────────────────────────
 
 /// Selects which system prompt profile to use.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, serde::Serialize, serde::Deserialize)]
 pub enum PromptProfile {
     /// Default agent system prompt (general coding).
     #[default]
@@ -50,6 +50,8 @@ pub enum PromptProfile {
     BugHunter,
     /// Reviewer mode — code review and analysis.
     Reviewer,
+    /// Security reviewer mode — security-focused diff and code review.
+    SecurityReviewer,
     /// Memory updater — focused on session memory maintenance.
     MemoryUpdater,
     /// Title generator — short session title from conversation.
