@@ -11,6 +11,10 @@ use coderex_core::state::SessionState;
 use coderex_core::permissions::{PermissionChecker, PermissionMode};
 use coderex_core::api_client::ApiClient;
 use coderex_core::types::{EngineEvent, Message};
+use coderex_tools::{
+    register_builtin_tools, ExecutionConfig, ExecutionContext, RegistryToolDispatcher,
+    ToolExecutor as ToolsExecutor, ToolRegistry,
+};
 use std::collections::HashMap;
 use std::io::{BufRead, Write};
 use std::sync::Arc;
@@ -102,6 +106,19 @@ impl ReplLoop {
             permission_engine,
             event_tx,
         );
+
+        let mut engine = engine;
+        let mut registry = ToolRegistry::new();
+        register_builtin_tools(&mut registry);
+        let registry = Arc::new(registry);
+        let inner_executor = Arc::new(ToolsExecutor::new(ExecutionConfig::default()));
+        let dispatcher = RegistryToolDispatcher::new(
+            registry,
+            inner_executor,
+            ExecutionContext::Normal,
+            std::path::PathBuf::from(&cwd),
+        );
+        engine.set_tool_executor(Box::new(dispatcher));
 
         Self {
             commands,

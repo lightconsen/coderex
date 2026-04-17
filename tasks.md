@@ -82,7 +82,7 @@
 - **依赖**：1.2
 
 ### 1.5 基础设施 crate 集成 (workspace)
-- [ ] 集成 `tower-lsp` 客户端封装（LSP 跳转定义、引用、hover、workspace symbols）
+- [x] 集成 LSP 客户端封装（基于 `lsp-types` 的 stdio JSON-RPC 客户端，支持跳转定义、引用、hover、workspace symbols；`tower-lsp` 为服务端框架，这里改用直接 `lsp-types` 方案）
 - [x] 集成 `ignore` + `walkdir`（gitignore 兼容文件遍历）
 - [x] 集成 `nucleo-matcher` 或 `fuzzy-matcher`（命令、skills、themes 模糊搜索）
 - [x] 集成 `comrak`（Markdown 解析与渲染）

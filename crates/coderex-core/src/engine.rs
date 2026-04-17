@@ -23,6 +23,7 @@ use crate::prompt::{AssembledContext, CompactConfig, PromptCompiler, PromptConte
 use crate::compact::{self, CompactResult, CompactStrategy};
 use crate::stop_hook::{self, StopHookContext, StopHookDecision};
 use crate::hook_executor::{HookExecutor, HookFireResult, NoOpHookExecutor};
+use crate::tool_executor::{NoOpToolExecutor, ToolExecutor};
 use crate::elicitation::{ElicitationHandler, ElicitationResult, ReplElicitationHandler};
 use std::path::PathBuf;
 
@@ -607,6 +608,8 @@ pub struct QueryEngine {
     compact_config: CompactConfig,
     /// Hook executor for firing lifecycle hooks.
     hooks: Box<dyn HookExecutor + Send + Sync>,
+    /// Tool executor for dispatching tool calls.
+    tools: Box<dyn ToolExecutor + Send + Sync>,
     /// Handler for elicitation requests.
     elicitation_handler: Box<dyn ElicitationHandler + Send + Sync>,
     /// Optional transcript base path. When set, compact updates the
@@ -650,6 +653,7 @@ impl QueryEngine {
             prompt_compiler: PromptCompiler::new(config),
             compact_config: config,
             hooks: Box::new(NoOpHookExecutor),
+            tools: Box::new(NoOpToolExecutor),
             elicitation_handler: Box::new(ReplElicitationHandler),
             transcript_path: None,
             last_usage: None,
@@ -667,6 +671,11 @@ impl QueryEngine {
     /// Set the hook executor for lifecycle hooks.
     pub fn set_hooks(&mut self, hooks: Box<dyn HookExecutor + Send + Sync>) {
         self.hooks = hooks;
+    }
+
+    /// Set the tool executor for tool call dispatch.
+    pub fn set_tool_executor(&mut self, tools: Box<dyn ToolExecutor + Send + Sync>) {
+        self.tools = tools;
     }
 
     /// Set the transcript base path for persisting compact boundaries.
@@ -1662,11 +1671,11 @@ impl QueryEngine {
 
             match perm_result {
                 PermissionResult::Allow | PermissionResult::AllowForPath { .. } => {
-                    let result = ToolResult {
-                        tool_call_id: call.id.clone(),
-                        output: format!("tool '{}' executed (stub)", call.name),
-                        is_error: false,
-                    };
+                    let outcome = self
+                        .tools
+                        .execute(&call.id, &call.name, &call.input)
+                        .await;
+                    let result = outcome.result;
 
                     // Fire PostToolUse hook on success
                     let mut ctx = std::collections::HashMap::new();
@@ -1834,11 +1843,13 @@ impl QueryEngine {
         }
 
         let result = match perm_result {
-            PermissionResult::Allow | PermissionResult::AllowForPath { .. } => ToolResult {
-                tool_call_id: elevation.tool_call_id.clone(),
-                output: format!("tool '{}' executed with elevated permissions (stub)", elevation.tool_name),
-                is_error: false,
-            },
+            PermissionResult::Allow | PermissionResult::AllowForPath { .. } => {
+                let outcome = self
+                    .tools
+                    .execute(&elevation.tool_call_id, &elevation.tool_name, &elevation.input)
+                    .await;
+                outcome.result
+            }
             _ => {
                 self.denied_tools.push(DeniedToolCall {
                     name: elevation.tool_name.clone(),
@@ -1899,8 +1910,32 @@ mod tests {
         let perm_engine = PermissionEngine::new(checker);
         let session = SessionState::new(std::path::PathBuf::from("/tmp/test"));
         let api = MockApiClient;
-        let engine = QueryEngine::new(Box::new(api), ModelId::sonnet(), session.clone(), perm_engine, tx);
+        let mut engine =
+            QueryEngine::new(Box::new(api), ModelId::sonnet(), session.clone(), perm_engine, tx);
+        engine.set_tool_executor(Box::new(StubOkToolExecutor));
         (engine, rx, session)
+    }
+
+    /// Test-only tool executor that echoes back a successful result so
+    /// permission/elevation flow tests can observe the allow path.
+    struct StubOkToolExecutor;
+
+    #[async_trait::async_trait]
+    impl crate::tool_executor::ToolExecutor for StubOkToolExecutor {
+        async fn execute(
+            &self,
+            tool_call_id: &str,
+            tool_name: &str,
+            _input: &serde_json::Value,
+        ) -> crate::tool_executor::ToolDispatchOutcome {
+            crate::tool_executor::ToolDispatchOutcome {
+                result: ToolResult {
+                    tool_call_id: tool_call_id.to_string(),
+                    output: format!("stub ok: {tool_name}"),
+                    is_error: false,
+                },
+            }
+        }
     }
 
     // ─── Mock API Client ─────────────────────────────────────────────

@@ -7,6 +7,7 @@ mod registry;
 mod context;
 mod builtins;
 mod executor;
+mod dispatcher;
 mod todo_store;
 mod task_store;
 mod cron_scheduler;
@@ -24,6 +25,7 @@ pub use builtins::{
     register_builtin_tools,
 };
 pub use executor::{ToolExecutor, ExecutionConfig};
+pub use dispatcher::RegistryToolDispatcher;
 pub use todo_store::{TodoItem, TodoStatus, TodoStore, TODO_STORE_KEY};
 pub use task_store::{TaskRecord, TaskStatus, TaskStore, TASK_STORE_KEY};
 pub use cron_scheduler::{CronJob, CronScheduler, CRON_SCHEDULER_KEY};

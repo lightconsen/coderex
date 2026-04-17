@@ -25,6 +25,7 @@ pub mod prompt;
 pub mod compact;
 pub mod stop_hook;
 pub mod hook_executor;
+pub mod tool_executor;
 pub mod elicitation;
 pub mod task;
 pub mod worktree;

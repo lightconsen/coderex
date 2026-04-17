@@ -66,19 +66,15 @@ pub struct WorktreeState {
 
 /// Application-wide state.
 ///
-/// Fields are placeholders until their respective crates are implemented.
+/// Concrete subsystem state (settings, tasks, MCP, plugins, agents, UI,
+/// todos, notifications, coordinator, bridge) lives in dedicated crates
+/// (`coderex-config`, `coderex-agents`, `coderex-mcp`, `coderex-plugins`,
+/// `coderex-bridge`, etc.). Those subsystems are held by the CLI/REPL
+/// runtime, not here, to keep `coderex-core` free of circular dependencies.
+/// This struct only tracks engine-level global state that is independent
+/// of any subsystem crate.
 #[derive(Debug)]
 pub struct AppState {
-    // TODO: settings: coderex_config::Settings,
-    // TODO: tasks: IndexMap<TaskId, TaskInfo>,
-    // TODO: mcp: McpState,
-    // TODO: plugins: PluginState,
-    // TODO: agents: AgentState,
-    // TODO: ui: UiState,
-    // TODO: todos: Vec<TodoItem>,
-    // TODO: notifications: Vec<Notification>,
-    // TODO: coordinator: Option<CoordinatorState>,
-    // TODO: bridge: BridgeState,
     /// Current model being used.
     pub main_loop_model: ModelId,
 }
