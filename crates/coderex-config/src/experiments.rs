@@ -179,6 +179,16 @@ mod tests {
     use super::*;
     use wiremock::{matchers::method, Mock, MockServer, ResponseTemplate};
 
+    fn test_client() -> reqwest::Client {
+        // Disable env proxy so tests against a local MockServer aren't routed
+        // through developer HTTP proxies (e.g. Privoxy picked up from
+        // `HTTP_PROXY` / `ALL_PROXY` environment variables).
+        reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .expect("build no-proxy reqwest client")
+    }
+
     #[tokio::test]
     async fn stub_source_returns_empty_map() {
         let source = StubExperimentSource;
@@ -196,7 +206,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let source = HttpExperimentSource::new(server.uri());
+        let source = HttpExperimentSource::with_client(server.uri(), test_client());
         let result = source.fetch_experiments().await.unwrap();
 
         assert_eq!(result.len(), 2);
@@ -213,7 +223,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let source = HttpExperimentSource::new(server.uri());
+        let source = HttpExperimentSource::with_client(server.uri(), test_client());
         let result = source.fetch_experiments().await;
 
         assert!(result.is_err());
@@ -230,7 +240,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let source = HttpExperimentSource::new(server.uri());
+        let source = HttpExperimentSource::with_client(server.uri(), test_client());
         let result = source.fetch_experiments().await;
 
         assert!(result.is_err());
@@ -250,7 +260,7 @@ mod tests {
 
         let tmp = tempfile::tempdir().unwrap();
         let cache_path = tmp.path().join("experiments.json");
-        let http = HttpExperimentSource::new(server.uri());
+        let http = HttpExperimentSource::with_client(server.uri(), test_client());
         let cached = CachedExperimentSource::new(http, cache_path.clone(), std::time::Duration::from_secs(60));
 
         // First fetch hits HTTP

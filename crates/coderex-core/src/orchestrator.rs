@@ -472,13 +472,20 @@ async fn run_engine_query(
             .map_err(OrchestratorError::Config)?;
     }
 
-    let content = collect_text_output(&mut event_rx);
     let usage = engine.last_usage().unwrap_or(UsageSummary {
         input_tokens: 0,
         output_tokens: 0,
         cache_read_tokens: 0,
         cache_creation_tokens: 0,
     });
+
+    // Drop the engine so its `event_tx` clone is released. This closes the
+    // channel once all in-flight sends have been delivered, allowing
+    // `recv().await` to drain reliably even if a slow turn is still flushing
+    // events by the time `submit{_streaming}` returns.
+    drop(engine);
+
+    let content = collect_text_output(&mut event_rx).await;
 
     Ok(QueryResult {
         content,
@@ -489,10 +496,10 @@ async fn run_engine_query(
     })
 }
 
-fn collect_text_output(event_rx: &mut mpsc::UnboundedReceiver<EngineEvent>) -> String {
+async fn collect_text_output(event_rx: &mut mpsc::UnboundedReceiver<EngineEvent>) -> String {
     let mut content = String::new();
 
-    while let Ok(event) = event_rx.try_recv() {
+    while let Some(event) = event_rx.recv().await {
         if let EngineEvent::TextDelta(delta) = event {
             content.push_str(&delta);
         }
