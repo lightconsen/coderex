@@ -87,19 +87,20 @@ impl BridgeSessionSpawner {
     }
 
     async fn spawn_worktree(&self, config: SpawnConfig) -> Result<SpawnResult, String> {
-        let _branch = config.branch.as_deref().unwrap_or("main");
+        let branch = config.branch.as_deref().unwrap_or("main");
         let worktree_path = self.worktree_base.join(&config.session_id);
 
-        // Create worktree (stub — would run `git worktree add`)
         if !worktree_path.exists() {
-            // In a real implementation:
-            // std::process::Command::new("git")
-            //     .args(["worktree", "add", worktree_path.to_str().unwrap(), branch])
-            //     .current_dir(&self.repo_root)
-            //     .output()
-            //     .map_err(|e| format!("git worktree failed: {e}"))?;
-            std::fs::create_dir_all(&worktree_path)
-                .map_err(|e| format!("failed to create worktree dir: {e}"))?;
+            std::process::Command::new("git")
+                .args([
+                    "worktree",
+                    "add",
+                    worktree_path.to_str().unwrap(),
+                    branch,
+                ])
+                .current_dir(&self.repo_root)
+                .output()
+                .map_err(|e| format!("git worktree add failed: {e}"))?;
         }
 
         self.prepare_session_dir(&config.session_id).await?;
@@ -123,14 +124,15 @@ impl BridgeSessionSpawner {
     pub fn cleanup_worktree(&self, session_id: &str) -> Result<(), String> {
         let worktree_path = self.worktree_base.join(session_id);
         if worktree_path.exists() {
-            // In a real implementation:
-            // std::process::Command::new("git")
-            //     .args(["worktree", "remove", worktree_path.to_str().unwrap()])
-            //     .current_dir(&self.repo_root)
-            //     .output()
-            //     .map_err(|e| format!("git worktree remove failed: {e}"))?;
-            std::fs::remove_dir_all(&worktree_path)
-                .map_err(|e| format!("failed to remove worktree: {e}"))?;
+            std::process::Command::new("git")
+                .args([
+                    "worktree",
+                    "remove",
+                    worktree_path.to_str().unwrap(),
+                ])
+                .current_dir(&self.repo_root)
+                .output()
+                .map_err(|e| format!("git worktree remove failed: {e}"))?;
         }
         Ok(())
     }
@@ -140,6 +142,8 @@ impl BridgeSessionSpawner {
 mod tests {
     use super::*;
 
+    use std::path::Path;
+
     fn temp_dirs() -> (PathBuf, PathBuf, PathBuf) {
         let base = tempfile::tempdir().unwrap().keep();
         (
@@ -147,6 +151,29 @@ mod tests {
             base.join("worktrees"),
             base.join("sessions"),
         )
+    }
+
+    fn init_git_repo(path: &Path) {
+        std::process::Command::new("git")
+            .args(["init", "--quiet"])
+            .current_dir(path)
+            .output()
+            .expect("git init failed");
+        std::fs::write(path.join("README"), "root").unwrap();
+        std::process::Command::new("git")
+            .args(["add", "README"])
+            .current_dir(path)
+            .output()
+            .expect("git add failed");
+        std::process::Command::new("git")
+            .args(["commit", "--quiet", "-m", "init"])
+            .env("GIT_AUTHOR_NAME", "test")
+            .env("GIT_AUTHOR_EMAIL", "test@test.com")
+            .env("GIT_COMMITTER_NAME", "test")
+            .env("GIT_COMMITTER_EMAIL", "test@test.com")
+            .current_dir(path)
+            .output()
+            .expect("git commit failed");
     }
 
     #[test]
@@ -170,6 +197,7 @@ mod tests {
     fn spawn_worktree_creates_dir() {
         let (repo, wt, sess) = temp_dirs();
         std::fs::create_dir_all(&repo).unwrap();
+        init_git_repo(&repo);
         std::fs::create_dir_all(&wt).unwrap();
         std::fs::create_dir_all(&sess).unwrap();
         let spawner = BridgeSessionSpawner::new(repo, wt, sess);
@@ -178,7 +206,7 @@ mod tests {
             session_id: "s1".into(),
             work_dir: PathBuf::from("/tmp"),
             mode: SpawnMode::Worktree,
-            branch: Some("feature".into()),
+            branch: Some("HEAD".to_string()),
         };
         let result = rt.block_on(spawner.spawn(config)).unwrap();
         assert!(result.worktree_created);
@@ -189,9 +217,20 @@ mod tests {
     fn cleanup_worktree_removes_dir() {
         let (repo, wt, sess) = temp_dirs();
         std::fs::create_dir_all(&repo).unwrap();
-        std::fs::create_dir_all(wt.join("s1")).unwrap();
+        init_git_repo(&repo);
+        std::fs::create_dir_all(&wt).unwrap();
         std::fs::create_dir_all(&sess).unwrap();
         let spawner = BridgeSessionSpawner::new(repo, wt.clone(), sess);
+        // Create a worktree first so cleanup has something to remove
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let config = SpawnConfig {
+            session_id: "s1".into(),
+            work_dir: PathBuf::from("/tmp"),
+            mode: SpawnMode::Worktree,
+            branch: Some("HEAD".to_string()),
+        };
+        rt.block_on(spawner.spawn(config)).unwrap();
+        assert!(wt.join("s1").exists());
         spawner.cleanup_worktree("s1").unwrap();
         assert!(!wt.join("s1").exists());
     }

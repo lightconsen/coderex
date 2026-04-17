@@ -3,12 +3,13 @@
 use crate::context::{ToolError, ToolOutput};
 use crate::tool::{Tool, ToolContext, ToolDescriptor, ToolInput, ToolTier};
 use async_trait::async_trait;
-use std::sync::Arc;
-use std::collections::HashMap;
 
 /// Trigger remote Bridge work assignment.
 #[derive(Debug)]
-pub struct RemoteTriggerTool;
+pub struct RemoteTriggerTool {
+    /// Base URL of the Bridge control plane (e.g. "https://bridge.example.com").
+    pub bridge_url: String,
+}
 
 #[async_trait]
 impl Tool for RemoteTriggerTool {
@@ -20,7 +21,8 @@ impl Tool for RemoteTriggerTool {
                 "type": "object",
                 "required": ["assignment_id"],
                 "properties": {
-                    "assignment_id": { "type": "string", "description": "Work assignment ID to trigger" }
+                    "assignment_id": { "type": "string", "description": "Work assignment ID to trigger" },
+                    "bridge_url": { "type": "string", "description": "Override Bridge control plane URL" }
                 }
             }),
             output_schema: serde_json::json!({
@@ -40,16 +42,42 @@ impl Tool for RemoteTriggerTool {
 
     async fn execute(&self, input: ToolInput, _ctx: ToolContext<'_>) -> Result<ToolOutput, ToolError> {
         let assignment_id = extract_string(&input.arguments, "assignment_id")?;
+        let bridge_url = extract_string(&input.arguments, "bridge_url")
+            .unwrap_or_else(|_| self.bridge_url.clone());
 
-        // In a real implementation, this would make an HTTP request
-        // to the Bridge service to trigger the work assignment.
-        Ok(ToolOutput {
-            output: serde_json::json!({
-                "triggered": true,
-                "status": format!("assignment {assignment_id} triggered")
-            }).to_string(),
-            is_display: true,
-        })
+        let url = format!("{bridge_url}/api/assignments/{assignment_id}/trigger");
+        let client = reqwest::Client::new();
+        let response = client
+            .post(&url)
+            .header("Content-Type", "application/json")
+            .body(serde_json::json!({ "assignment_id": assignment_id }).to_string())
+            .send()
+            .await
+            .map_err(|e| ToolError::Io(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                format!("HTTP request failed: {e}"),
+            )))?;
+
+        let status = response.status();
+        let body = response.text().await.map_err(|e| ToolError::Io(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            format!("failed to read response: {e}"),
+        )))?;
+
+        if status.is_success() {
+            Ok(ToolOutput {
+                output: serde_json::json!({
+                    "triggered": true,
+                    "status": format!("assignment {assignment_id} triggered"),
+                    "response": body
+                }).to_string(),
+                is_display: true,
+            })
+        } else {
+            Err(ToolError::InvalidInput {
+                message: format!("Bridge returned {status}: {body}"),
+            })
+        }
     }
 }
 
@@ -67,21 +95,18 @@ mod tests {
     use super::*;
     use crate::tool::ToolContext;
     use crate::context::ExecutionContext;
-    use std::collections::HashMap;
     use std::path::Path;
-    use std::sync::Arc;
 
     fn test_ctx() -> ToolContext<'static> {
-        ToolContext {
-            execution_context: ExecutionContext::Normal,
-            cwd: Path::new("/tmp"),
-            extra: Arc::new(HashMap::new()),
-        }
+        ToolContext::new(ExecutionContext::Normal, Path::new("/tmp"))
     }
 
     #[tokio::test]
-    async fn remote_trigger_returns_triggered() {
-        let output = RemoteTriggerTool
+    async fn remote_trigger_fails_without_server() {
+        let tool = RemoteTriggerTool {
+            bridge_url: "http://localhost:0".into(),
+        };
+        let result = tool
             .execute(
                 ToolInput {
                     call_id: "1".into(),
@@ -90,14 +115,16 @@ mod tests {
                 },
                 test_ctx(),
             )
-            .await
-            .unwrap();
-        assert!(output.output.contains("triggered"));
+            .await;
+        assert!(result.is_err());
     }
 
     #[tokio::test]
     async fn remote_trigger_missing_id() {
-        let result = RemoteTriggerTool
+        let tool = RemoteTriggerTool {
+            bridge_url: "http://localhost:0".into(),
+        };
+        let result = tool
             .execute(
                 ToolInput {
                     call_id: "1".into(),
@@ -108,5 +135,16 @@ mod tests {
             )
             .await;
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn remote_trigger_descriptor() {
+        let tool = RemoteTriggerTool {
+            bridge_url: "http://example.com".into(),
+        };
+        let desc = tool.descriptor();
+        assert_eq!(desc.name, "RemoteTrigger");
+        assert!(matches!(desc.tier, ToolTier::Baseline));
+        assert!(!desc.is_read_only);
     }
 }

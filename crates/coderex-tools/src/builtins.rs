@@ -205,7 +205,9 @@ pub fn register_builtin_tools(reg: &mut crate::registry::ToolRegistry) {
     reg.register(Arc::new(SyntheticOutputTool));
     reg.register(Arc::new(SendMessageTool));
     reg.register(Arc::new(AgentTool));
-    reg.register(Arc::new(RemoteTriggerTool));
+    reg.register(Arc::new(RemoteTriggerTool {
+        bridge_url: "http://localhost:3000".into(),
+    }));
     reg.register(Arc::new(McpAuthTool));
     reg.register(Arc::new(EchoTool));
     reg.register(Arc::new(NoOpTool));

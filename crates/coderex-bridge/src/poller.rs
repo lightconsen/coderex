@@ -43,6 +43,14 @@ pub struct CapacityReport {
     pub git_root: Option<String>,
 }
 
+/// Registration request sent to the control plane.
+#[derive(Debug, Clone, Serialize)]
+struct RegisterRequest {
+    env_id: String,
+    max_concurrent: usize,
+    capabilities: Vec<String>,
+}
+
 /// Polls or receives work assignments from the remote control plane.
 #[derive(Debug)]
 pub struct BridgeWorkPoller {
@@ -50,6 +58,8 @@ pub struct BridgeWorkPoller {
     pub env_id: String,
     /// Maximum concurrent sessions.
     pub max_concurrent: usize,
+    /// Control plane base URL.
+    pub control_plane_url: String,
     /// Pending work assignments.
     pending: Vec<WorkAssignment>,
     /// Active session count.
@@ -63,16 +73,47 @@ impl BridgeWorkPoller {
         Self {
             env_id,
             max_concurrent,
+            control_plane_url: "http://localhost:3000".into(),
+            pending: Vec::new(),
+            active_sessions: 0,
+        }
+    }
+
+    /// Create a new work poller with a custom control plane URL.
+    #[must_use]
+    pub fn with_url(env_id: String, max_concurrent: usize, control_plane_url: String) -> Self {
+        Self {
+            env_id,
+            max_concurrent,
+            control_plane_url,
             pending: Vec::new(),
             active_sessions: 0,
         }
     }
 
     /// Register this environment with the control plane.
-    #[allow(clippy::unused_async)]
     pub async fn register(&self) -> Result<(), String> {
-        // TODO: HTTP registration with control plane
-        Ok(())
+        let client = reqwest::Client::new();
+        let url = format!("{}/api/environments/register", self.control_plane_url);
+        let body = RegisterRequest {
+            env_id: self.env_id.clone(),
+            max_concurrent: self.max_concurrent,
+            capabilities: vec!["worktree".into(), "single_session".into(), "same_dir".into()],
+        };
+        let response = client
+            .post(&url)
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| format!("registration request failed: {e}"))?;
+
+        if response.status().is_success() {
+            Ok(())
+        } else {
+            let status = response.status();
+            let text = response.text().await.unwrap_or_default();
+            Err(format!("registration returned {status}: {text}"))
+        }
     }
 
     /// Report current capacity.
@@ -188,10 +229,22 @@ mod tests {
     }
 
     #[test]
-    fn register_succeeds() {
+    fn register_fails_without_server() {
         let poller = BridgeWorkPoller::new("env1".into(), 5);
         let rt = tokio::runtime::Runtime::new().unwrap();
-        assert!(rt.block_on(poller.register()).is_ok());
+        let result = rt.block_on(poller.register());
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn with_url_constructor() {
+        let poller = BridgeWorkPoller::with_url(
+            "env2".into(),
+            10,
+            "https://control.example:8443".into(),
+        );
+        assert_eq!(poller.control_plane_url, "https://control.example:8443");
+        assert_eq!(poller.max_concurrent, 10);
     }
 
     #[test]
