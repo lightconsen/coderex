@@ -264,6 +264,51 @@ impl PermissionEngine {
 #[derive(Debug)]
 pub struct NoOpPermissionHook;
 
+/// A hook that generates AI-powered risk explanations for permission requests.
+///
+/// This hook does NOT short-circuit — it always returns `None` so the
+/// permission checker decides. It calls the AI to explain the risks
+/// of the tool call and logs the explanation for downstream use.
+pub struct ExplainPermissionHook {
+    api_client: Box<dyn crate::api_client::ApiClient>,
+}
+
+impl ExplainPermissionHook {
+    /// Create a new hook with the given API client.
+    #[must_use]
+    pub fn new(api_client: Box<dyn crate::api_client::ApiClient>) -> Self {
+        Self { api_client }
+    }
+}
+
+#[async_trait]
+impl PermissionHook for ExplainPermissionHook {
+    async fn evaluate(
+        &self,
+        request: &PermissionRequest,
+        _mode: crate::permissions::PermissionMode,
+    ) -> Result<Option<PermissionResult>, PermissionRequestError> {
+        // Generate explanation — logged for downstream use.
+        // In a real implementation this would emit an event the UI subscribes to.
+        let explanation = crate::prompts::explain_permission(
+            self.api_client.as_ref(),
+            &request.tool_name,
+            &request.arguments,
+        )
+        .await
+        .unwrap_or_else(|e| format!("[explanation unavailable: {e}]"));
+
+        tracing::info!(
+            tool = %request.tool_name,
+            explanation = %explanation,
+            "permission explanation generated"
+        );
+
+        // Always pass through — let the checker decide
+        Ok(None)
+    }
+}
+
 #[async_trait]
 impl PermissionHook for NoOpPermissionHook {
     async fn evaluate(
@@ -333,6 +378,7 @@ impl PermissionHook for BackgroundAgentDenyHook {
 mod tests {
     use super::*;
     use crate::permissions::{PermissionChecker, PermissionMode};
+    use crate::types::ModelId;
 
     fn make_request(tool: &str) -> PermissionRequest {
         PermissionRequest {
@@ -493,5 +539,58 @@ mod tests {
             let c = guard.lock().unwrap();
             assert!(matches!(c.mode(), PermissionMode::BypassPermissions));
         }
+    }
+
+    #[tokio::test]
+    async fn explain_permission_hook_passes_through() {
+        use crate::api_client::{ApiClient, ApiResponse, StreamEvent};
+        use crate::types::UsageSummary;
+        use futures::Stream;
+        use std::pin::Pin;
+
+        #[derive(Clone)]
+        struct MockApiClient;
+
+        #[async_trait::async_trait]
+        impl ApiClient for MockApiClient {
+            fn clone_box(&self) -> Box<dyn ApiClient> {
+                Box::new(self.clone())
+            }
+
+            async fn create_message(
+                &self,
+                _system: &str,
+                _messages: &[serde_json::Value],
+                _model: &ModelId,
+                _max_tokens: u32,
+            ) -> Result<ApiResponse, crate::api_client::ApiError> {
+                Ok(ApiResponse {
+                    content: "This tool could modify system files.".into(),
+                    usage: UsageSummary {
+                        input_tokens: 100,
+                        output_tokens: 20,
+                        cache_read_tokens: 0,
+                        cache_creation_tokens: 0,
+                    },
+                    stop_reason: "end_turn".into(),
+                })
+            }
+
+            async fn create_message_streaming(
+                &self,
+                _system: &str,
+                _messages: &[serde_json::Value],
+                _model: &ModelId,
+                _max_tokens: u32,
+            ) -> Pin<Box<dyn Stream<Item = StreamEvent> + Send + '_>> {
+                Box::pin(futures::stream::empty())
+            }
+        }
+
+        let hook = ExplainPermissionHook::new(Box::new(MockApiClient));
+        let request = make_request("Write");
+        let result = hook.evaluate(&request, PermissionMode::Default).await.unwrap();
+        // Should always pass through (not short-circuit)
+        assert!(result.is_none());
     }
 }

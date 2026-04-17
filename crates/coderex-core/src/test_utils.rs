@@ -84,6 +84,10 @@ impl MockApiClient {
 
 #[async_trait::async_trait]
 impl ApiClient for MockApiClient {
+    fn clone_box(&self) -> Box<dyn ApiClient> {
+        Box::new(self.clone())
+    }
+
     async fn create_message(
         &self,
         system: &str,

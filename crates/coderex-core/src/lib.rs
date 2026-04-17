@@ -31,6 +31,9 @@ pub mod worktree;
 pub mod team;
 pub mod coordinator;
 pub mod team_context;
+pub mod orchestrator;
+pub mod query_profiles;
+pub mod prompts;
 
 pub use file_traversal::{FileIterator, TraversalConfig, TraversalError, collect_files, count_files, traverse};
 pub use fuzzy_matcher::{FuzzyMatch, FuzzyMatcher, fuzzy_search};
@@ -75,6 +78,14 @@ pub use coordinator::{
 
 pub use team_context::{
     ActivityEntry, Note, SessionPointer, SessionPointerStore, TeamContext, WorkItem,
+};
+
+pub use query_profiles::{
+    ModelProfile, PromptProfile, QueryKind, QueryRequest,
+};
+pub use orchestrator::{
+    Orchestrator, OrchestratorError, QueryResult,
+    run_lightweight_query, run_side_query, run_forked_agent,
 };
 
 pub mod test_utils;

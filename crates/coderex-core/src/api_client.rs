@@ -148,6 +148,9 @@ pub enum StreamEvent {
 /// or mocking for tests.
 #[async_trait::async_trait]
 pub trait ApiClient: Send + Sync {
+    /// Clone the trait object into a boxed clone.
+    fn clone_box(&self) -> Box<dyn ApiClient>;
+
     /// Send a non-streaming message to the API.
     async fn create_message(
         &self,
@@ -232,6 +235,13 @@ impl AnthropicApiClient {
 
 #[async_trait::async_trait]
 impl ApiClient for AnthropicApiClient {
+    fn clone_box(&self) -> Box<dyn ApiClient> {
+        Box::new(AnthropicApiClient {
+            config: self.config.clone(),
+            client: self.client.clone(),
+        })
+    }
+
     async fn create_message(
         &self,
         system: &str,

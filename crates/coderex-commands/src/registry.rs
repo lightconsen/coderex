@@ -4,6 +4,7 @@
 //! `CommandContext`, and `CommandRegistry` with availability matrix.
 
 use coderex_core::permissions::PermissionMode;
+use coderex_core::query_profiles::PromptProfile;
 use coderex_core::types::ModelId;
 use serde::Serialize;
 use std::collections::HashMap;
@@ -37,6 +38,12 @@ pub struct CommandResult {
     pub suppress_output: bool,
     /// Additional context to inject into the session.
     pub extra_context: Option<String>,
+    /// System prompt to append for mode switching.
+    pub append_system_prompt: Option<String>,
+    /// Prompt profile to switch the agent behavior.
+    pub prompt_profile: Option<PromptProfile>,
+    /// Override allowed tool names for this session.
+    pub allowed_tools_override: Option<Vec<String>>,
 }
 
 impl CommandResult {
@@ -47,6 +54,9 @@ impl CommandResult {
             state_changed: false,
             suppress_output: false,
             extra_context: None,
+            append_system_prompt: None,
+            prompt_profile: None,
+            allowed_tools_override: None,
         }
     }
 
@@ -57,6 +67,9 @@ impl CommandResult {
             state_changed: false,
             suppress_output: false,
             extra_context: None,
+            append_system_prompt: None,
+            prompt_profile: None,
+            allowed_tools_override: None,
         }
     }
 
@@ -75,6 +88,24 @@ impl CommandResult {
     /// Add extra context to the session.
     pub fn with_context(mut self, ctx: impl Into<String>) -> Self {
         self.extra_context = Some(ctx.into());
+        self
+    }
+
+    /// Set a system prompt to append (for mode switching).
+    pub fn with_append_system_prompt(mut self, prompt: impl Into<String>) -> Self {
+        self.append_system_prompt = Some(prompt.into());
+        self
+    }
+
+    /// Set the prompt profile to switch agent behavior.
+    pub fn with_prompt_profile(mut self, profile: PromptProfile) -> Self {
+        self.prompt_profile = Some(profile);
+        self
+    }
+
+    /// Override the allowed tool set for this session.
+    pub fn with_allowed_tools_override(mut self, tools: Vec<String>) -> Self {
+        self.allowed_tools_override = Some(tools);
         self
     }
 }

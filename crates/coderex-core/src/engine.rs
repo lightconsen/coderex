@@ -1864,6 +1864,10 @@ mod tests {
 
     #[async_trait::async_trait]
     impl ApiClient for MockApiClient {
+        fn clone_box(&self) -> Box<dyn ApiClient> {
+            Box::new(MockApiClient)
+        }
+
         async fn create_message(
             &self,
             _system: &str,

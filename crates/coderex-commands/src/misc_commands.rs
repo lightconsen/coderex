@@ -1,6 +1,7 @@
 //! Miscellaneous commands: /advisor, /btw, /good-claude, /stickers, /bughunter, /issue, /env, /diff, /oauth-refresh, /backfill-sessions.
 
 use crate::registry::{CommandContext, CommandRegistry, CommandResult, SlashCommand};
+use coderex_core::query_profiles::PromptProfile;
 use std::sync::Arc;
 
 /// Register miscellaneous commands.
@@ -13,6 +14,8 @@ pub fn register(registry: &mut CommandRegistry) {
         Arc::new(|_ctx: &CommandContext, _args: &[String]| {
             CommandResult::success("Advisor mode activated.\n(Ask me anything about your project)")
                 .with_context("You are now in advisor mode. Provide guidance and recommendations rather than directly implementing changes.")
+                .with_prompt_profile(PromptProfile::Advisor)
+                .with_append_system_prompt("You are a senior technical advisor. Focus on guidance, architecture advice, and recommendations. Explain your reasoning and suggest approaches with trade-offs.")
         }),
     ));
 
@@ -67,6 +70,8 @@ pub fn register(registry: &mut CommandRegistry) {
         Arc::new(|_ctx: &CommandContext, _args: &[String]| {
             CommandResult::success("Bug Hunter mode activated.\n(Systematically searching for bugs in the codebase)")
                 .with_context("You are now in bug hunter mode. Systematically review the codebase for bugs, edge cases, and potential issues.")
+                .with_prompt_profile(PromptProfile::BugHunter)
+                .with_append_system_prompt("You are a bug hunting specialist. Systematically review code for bugs, edge cases, security issues, and potential failures. Be thorough and methodical.")
         }),
     ));
 
@@ -175,6 +180,8 @@ mod tests {
         let result = reg.execute("advisor", &ctx(), &[]);
         assert!(result.output.contains("Advisor mode"));
         assert!(result.extra_context.is_some());
+        assert_eq!(result.prompt_profile, Some(PromptProfile::Advisor));
+        assert!(result.append_system_prompt.is_some());
     }
 
     #[test]
@@ -211,6 +218,8 @@ mod tests {
         let result = reg.execute("bughunter", &ctx(), &[]);
         assert!(result.output.contains("Bug Hunter"));
         assert!(result.extra_context.is_some());
+        assert_eq!(result.prompt_profile, Some(PromptProfile::BugHunter));
+        assert!(result.append_system_prompt.is_some());
     }
 
     #[test]

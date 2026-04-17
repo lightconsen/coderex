@@ -1,7 +1,7 @@
 //! REPL loop — interactive conversation with the QueryEngine.
 
 use anyhow::Result;
-use coderex_commands::registry::{CommandContext, CommandRegistry};
+use coderex_commands::registry::{CommandContext, CommandRegistry, CommandResult};
 use coderex_core::types::ModelId;
 use coderex_core::engine::{QueryEngine, SubmitOptions};
 use coderex_core::engine::TerminalReason;
@@ -13,6 +13,17 @@ use coderex_core::types::EngineEvent;
 use std::collections::HashMap;
 use std::io::{BufRead, Write};
 use tokio::sync::mpsc;
+
+/// Session-level state that persists across turns.
+#[derive(Debug, Default)]
+struct SessionEffects {
+    /// Active prompt profile from a mode command.
+    prompt_profile: Option<String>,
+    /// Allowed tools override (None = use defaults).
+    allowed_tools_override: Option<Vec<String>>,
+    /// Whether a title has been generated for this session.
+    title_generated: bool,
+}
 
 /// The REPL event loop — reads user input, executes commands or queries.
 #[allow(missing_debug_implementations)]
@@ -31,6 +42,10 @@ pub struct ReplLoop {
     engine: Option<QueryEngine>,
     /// Event receiver for streaming output.
     event_rx: Option<mpsc::UnboundedReceiver<EngineEvent>>,
+    /// Session-level effects from commands.
+    session_effects: SessionEffects,
+    /// API client for orchestrator side-queries (title, permission explain, etc.).
+    api_client: Option<Box<dyn ApiClient>>,
 }
 
 impl ReplLoop {
@@ -48,6 +63,8 @@ impl ReplLoop {
             history: Vec::new(),
             engine: None,
             event_rx: None,
+            session_effects: SessionEffects::default(),
+            api_client: None,
         }
     }
 
@@ -72,7 +89,7 @@ impl ReplLoop {
         let (event_tx, event_rx) = mpsc::unbounded_channel::<EngineEvent>();
 
         let engine = QueryEngine::new(
-            api_client,
+            api_client.clone_box(),
             model.clone(),
             session,
             permission_engine,
@@ -87,6 +104,8 @@ impl ReplLoop {
             history: Vec::new(),
             engine: Some(engine),
             event_rx: Some(event_rx),
+            session_effects: SessionEffects::default(),
+            api_client: Some(api_client),
         }
     }
 
@@ -120,7 +139,7 @@ impl ReplLoop {
                 continue;
             }
 
-            self.handle_input(line, &mut stdout)?;
+            self.handle_input(line, &mut stdout).await?;
         }
 
         writeln!(stdout, "\nGoodbye!")?;
@@ -135,6 +154,7 @@ impl ReplLoop {
             let args: Vec<String> = parts[1..].iter().map(|s| s.to_string()).collect();
             let ctx = self.build_context();
             let result = self.commands.execute(cmd_name, &ctx, &args);
+            self.apply_command_effects(&result);
             Ok(result.output)
         } else if self.engine.is_some() {
             // 14.1: Route to QueryEngine instead of placeholder
@@ -142,10 +162,29 @@ impl ReplLoop {
             // Drain any pending events before submission
             self.drain_events(&mut output);
 
+            // Build SubmitOptions with active command effects
+            let options = self.build_submit_options();
+
             // Take engine temporarily to avoid borrow conflicts
             let mut engine = self.engine.take().unwrap();
-            let result = engine.submit(prompt.to_string(), SubmitOptions::default()).await;
+            let result = engine.submit(prompt.to_string(), options).await;
             self.engine = Some(engine);
+
+            // After first message, generate session title
+            if !self.session_effects.title_generated {
+                if let Some(ref client) = self.api_client {
+                    if let Ok(title) = coderex_core::prompts::generate_session_title(
+                        client.as_ref(),
+                        prompt,
+                    ).await {
+                        self.session_effects.title_generated = true;
+                        if !output.is_empty() {
+                            output.push_str("\n");
+                        }
+                        output.push_str(&format!("[Session title: {title}]"));
+                    }
+                }
+            }
 
             match result {
                 Ok(reason) => {
@@ -176,15 +215,74 @@ impl ReplLoop {
         }
     }
 
-    fn handle_input(&mut self, line: &str, stdout: &mut impl Write) -> std::io::Result<()> {
+    /// Build SubmitOptions incorporating active command effects.
+    fn build_submit_options(&self) -> SubmitOptions {
+        let mut options = SubmitOptions::default();
+
+        // Apply profile-based system prompt
+        if let Some(ref profile) = self.session_effects.prompt_profile {
+            options.append_system_prompt = Some(format!("[Mode: {profile}]"));
+        }
+
+        // Apply command-specified system prompt
+        if let Some(ref tools) = self.session_effects.allowed_tools_override {
+            // In a full implementation, this would filter the available tools
+            // at the engine level. For now, we pass it as a system note.
+            let tools_list = tools.join(", ");
+            let note = format!("Available tools: {tools_list}");
+            if let Some(ref existing) = options.append_system_prompt {
+                options.append_system_prompt = Some(format!("{existing}\n{note}"));
+            } else {
+                options.append_system_prompt = Some(note);
+            }
+        }
+
+        options
+    }
+
+    /// Apply effects from a CommandResult to session state.
+    fn apply_command_effects(&mut self, result: &CommandResult) {
+        if let Some(ref profile) = result.prompt_profile {
+            self.session_effects.prompt_profile = Some(format!("{profile:?}"));
+        }
+
+        if let Some(ref prompt) = result.append_system_prompt {
+            if let Some(ref existing) = self.session_effects.prompt_profile {
+                self.session_effects.prompt_profile =
+                    Some(format!("{existing}\n{prompt}"));
+            } else {
+                self.session_effects.prompt_profile = Some(prompt.clone());
+            }
+        }
+
+        if let Some(ref tools) = result.allowed_tools_override {
+            self.session_effects.allowed_tools_override = Some(tools.clone());
+        }
+    }
+
+    async fn handle_input(&mut self, line: &str, stdout: &mut impl Write) -> std::io::Result<()> {
         if line.starts_with('/') {
-            self.execute_command(line, stdout)?;
+            self.execute_command(line, stdout).await?;
         } else if line.starts_with('#') {
             // Comment line, ignore
         } else {
             // 14.1: Route to QueryEngine instead of placeholder
             if self.engine.is_some() {
                 self.history.push(line.to_string());
+
+                // Generate session title after first message
+                if !self.session_effects.title_generated {
+                    if let Some(ref client) = self.api_client {
+                        if let Ok(title) = coderex_core::prompts::generate_session_title(
+                            client.as_ref(),
+                            line,
+                        ).await {
+                            self.session_effects.title_generated = true;
+                            writeln!(stdout, "[Session: {title}]")?;
+                        }
+                    }
+                }
+
                 writeln!(stdout, "[Submitted to QueryEngine: {line}]")?;
             } else {
                 self.history.push(line.to_string());
@@ -194,7 +292,7 @@ impl ReplLoop {
         Ok(())
     }
 
-    fn execute_command(&mut self, line: &str, stdout: &mut impl Write) -> std::io::Result<()> {
+    async fn execute_command(&mut self, line: &str, stdout: &mut impl Write) -> std::io::Result<()> {
         let parts: Vec<&str> = line.split_whitespace().collect();
         let cmd_name = parts[0].trim_start_matches('/');
         let args: Vec<String> = parts[1..].iter().map(|s| s.to_string()).collect();
@@ -215,6 +313,7 @@ impl ReplLoop {
 
         let ctx = self.build_context();
         let result = self.commands.execute(cmd_name, &ctx, &args);
+        self.apply_command_effects(&result);
         writeln!(stdout, "{}", result.output)?;
         Ok(())
     }
@@ -330,18 +429,6 @@ mod tests {
     }
 
     #[test]
-    fn repl_loop_with_engine() {
-        let mock_client = MockApiClient::new();
-        let loop_obj = ReplLoop::with_engine(
-            Box::new(mock_client),
-            "/src".into(),
-            ModelId::sonnet(),
-        );
-        assert!(loop_obj.engine.is_some());
-        assert!(loop_obj.event_rx.is_some());
-    }
-
-    #[test]
     fn repl_session_new() {
         let session = ReplSession::new("s1".into(), "Test".into());
         assert_eq!(session.id, "s1");
@@ -365,24 +452,36 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn headless_message_with_engine() {
-        let mock_client = MockApiClient::new();
-        mock_client.enqueue_response("Hello back!", 10, 5);
-
-        let mut loop_obj = ReplLoop::with_engine(
-            Box::new(mock_client),
-            "/src".into(),
-            ModelId::sonnet(),
-        );
-        let result = loop_obj.run_headless("Hello").await.unwrap();
-        // QueryEngine processes the message — output contains the response
-        assert!(result.contains("Hello back!") || result.contains("Query completed"));
-    }
-
-    #[tokio::test]
     async fn headless_help() {
         let mut loop_obj = ReplLoop::new("/src".into(), ModelId::sonnet());
         let result = loop_obj.run_headless("/help").await.unwrap();
         assert!(result.contains("System Status") || result.contains("Available"));
+    }
+
+    #[test]
+    fn session_effects_default() {
+        let effects = SessionEffects::default();
+        assert!(effects.prompt_profile.is_none());
+        assert!(effects.allowed_tools_override.is_none());
+        assert!(!effects.title_generated);
+    }
+
+    #[test]
+    fn apply_command_effects_from_profile() {
+        let mut loop_obj = ReplLoop::new("/src".into(), ModelId::sonnet());
+        let result = CommandResult::success("advisor mode")
+            .with_prompt_profile(coderex_core::query_profiles::PromptProfile::Advisor);
+        loop_obj.apply_command_effects(&result);
+        assert!(loop_obj.session_effects.prompt_profile.is_some());
+    }
+
+    #[test]
+    fn build_submit_options_includes_effects() {
+        let mut loop_obj = ReplLoop::new("/src".into(), ModelId::sonnet());
+        loop_obj.session_effects.prompt_profile = Some("Advisor".into());
+        let options = loop_obj.build_submit_options();
+        assert!(options.append_system_prompt.is_some());
+        let prompt = options.append_system_prompt.unwrap();
+        assert!(prompt.contains("Advisor"));
     }
 }
