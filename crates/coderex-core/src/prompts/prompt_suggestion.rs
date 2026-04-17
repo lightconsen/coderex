@@ -4,7 +4,9 @@
 //! state, helping users stay productive without needing to think about what to ask next.
 
 use crate::api_client::ApiClient;
-use crate::orchestrator::{OrchestratorError, run_lightweight_query};
+use crate::orchestrator::{
+    BackgroundFeatureKind, BackgroundFeatureRequest, OrchestratorError, run_background_feature,
+};
 
 /// Suggests follow-up prompts based on the conversation state.
 ///
@@ -28,11 +30,16 @@ pub async fn suggest_prompts(
          Return a JSON array like: [\"prompt 1\", \"prompt 2\"]"
     );
 
-    let result = run_lightweight_query(
+    let result = run_background_feature(
         api_client,
-        system,
-        &user,
-        256,
+        BackgroundFeatureRequest {
+            kind: BackgroundFeatureKind::PromptSuggestion,
+            system_prompt: system.to_string(),
+            user_prompt: user,
+            parent_context: Some(conversation_summary.to_string()),
+            allowed_tools: None,
+            max_tokens: 256,
+        },
     )
     .await?;
 
@@ -65,11 +72,16 @@ pub async fn suggest_next_action(
          What is the next step? Answer in 1-2 sentences."
     );
 
-    let result = run_lightweight_query(
+    let result = run_background_feature(
         api_client,
-        system,
-        &user,
-        128,
+        BackgroundFeatureRequest {
+            kind: BackgroundFeatureKind::NextActionSuggestion,
+            system_prompt: system.to_string(),
+            user_prompt: user,
+            parent_context: Some(format!("Task: {current_task}")),
+            allowed_tools: None,
+            max_tokens: 128,
+        },
     )
     .await?;
 

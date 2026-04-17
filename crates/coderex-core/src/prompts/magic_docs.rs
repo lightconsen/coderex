@@ -4,8 +4,9 @@
 //! using a background AI agent with read-only tool access.
 
 use crate::api_client::ApiClient;
-use crate::orchestrator::{OrchestratorError, run_side_query};
-use crate::query_profiles::ModelProfile;
+use crate::orchestrator::{
+    BackgroundFeatureKind, BackgroundFeatureRequest, OrchestratorError, run_background_feature,
+};
 
 /// Generates documentation for a specific file or code snippet.
 ///
@@ -34,12 +35,16 @@ pub async fn generate_docs_for_code(
          Include: purpose, parameters, return value, and examples where applicable."
     );
 
-    let result = run_side_query(
+    let result = run_background_feature(
         api_client,
-        system,
-        &user,
-        &ModelProfile::Main.resolve(),
-        1024,
+        BackgroundFeatureRequest {
+            kind: BackgroundFeatureKind::MagicDocs,
+            system_prompt: system.to_string(),
+            user_prompt: user,
+            parent_context: Some(code_content.to_string()),
+            allowed_tools: Some(vec!["Read".into()]),
+            max_tokens: 1024,
+        },
     )
     .await?;
 
@@ -66,12 +71,16 @@ pub async fn generate_codebase_overview(
          Provide an overview of the architecture, main components, and how they interact."
     );
 
-    let result = run_side_query(
+    let result = run_background_feature(
         api_client,
-        system,
-        &user,
-        &ModelProfile::Main.resolve(),
-        1024,
+        BackgroundFeatureRequest {
+            kind: BackgroundFeatureKind::CodebaseOverview,
+            system_prompt: system.to_string(),
+            user_prompt: user,
+            parent_context: Some(file_listing.to_string()),
+            allowed_tools: Some(vec!["Read".into()]),
+            max_tokens: 1024,
+        },
     )
     .await?;
 
@@ -104,12 +113,16 @@ pub async fn generate_readme(
          Generate a complete README in markdown."
     );
 
-    let result = run_side_query(
+    let result = run_background_feature(
         api_client,
-        system,
-        &user,
-        &ModelProfile::Main.resolve(),
-        1024,
+        BackgroundFeatureRequest {
+            kind: BackgroundFeatureKind::ReadmeGeneration,
+            system_prompt: system.to_string(),
+            user_prompt: user,
+            parent_context: Some(file_structure.to_string()),
+            allowed_tools: Some(vec!["Read".into()]),
+            max_tokens: 1024,
+        },
     )
     .await?;
 

@@ -84,8 +84,8 @@ pub use query_profiles::{
     ModelProfile, PromptProfile, QueryKind, QueryRequest,
 };
 pub use orchestrator::{
-    Orchestrator, OrchestratorError, QueryResult,
-    run_lightweight_query, run_side_query, run_forked_agent,
+    BackgroundFeatureKind, BackgroundFeatureRequest, Orchestrator, OrchestratorError, QueryResult,
+    run_background_feature, run_lightweight_query, run_side_query, run_forked_agent,
 };
 
 pub mod test_utils;

@@ -4,7 +4,9 @@
 //! team view, status updates, and away summaries.
 
 use crate::api_client::ApiClient;
-use crate::orchestrator::{OrchestratorError, run_lightweight_query};
+use crate::orchestrator::{
+    BackgroundFeatureKind, BackgroundFeatureRequest, OrchestratorError, run_background_feature,
+};
 
 /// Generates a short summary of what an agent is doing.
 ///
@@ -24,11 +26,16 @@ pub async fn summarize_agent_activity(
          Summarize what the agent is currently doing in 3-5 words."
     );
 
-    let result = run_lightweight_query(
+    let result = run_background_feature(
         api_client,
-        system,
-        &user,
-        64,
+        BackgroundFeatureRequest {
+            kind: BackgroundFeatureKind::AgentSummary,
+            system_prompt: system.to_string(),
+            user_prompt: user,
+            parent_context: Some(agent_activity.to_string()),
+            allowed_tools: None,
+            max_tokens: 64,
+        },
     )
     .await?;
 
@@ -57,11 +64,16 @@ pub async fn generate_away_summary(
          Provide a brief summary of what happened."
     );
 
-    let result = run_lightweight_query(
+    let result = run_background_feature(
         api_client,
-        system,
-        &user,
-        256,
+        BackgroundFeatureRequest {
+            kind: BackgroundFeatureKind::AwaySummary,
+            system_prompt: system.to_string(),
+            user_prompt: user,
+            parent_context: Some(events_text),
+            allowed_tools: None,
+            max_tokens: 256,
+        },
     )
     .await?;
 
@@ -88,11 +100,16 @@ pub async fn generate_team_status(
         .join("\n");
     let user = format!("Format this team status update:\n\n{input}");
 
-    let result = run_lightweight_query(
+    let result = run_background_feature(
         api_client,
-        system,
-        &user,
-        256,
+        BackgroundFeatureRequest {
+            kind: BackgroundFeatureKind::TeamStatus,
+            system_prompt: system.to_string(),
+            user_prompt: user,
+            parent_context: Some(input),
+            allowed_tools: None,
+            max_tokens: 256,
+        },
     )
     .await?;
 

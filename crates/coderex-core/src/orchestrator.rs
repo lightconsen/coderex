@@ -36,6 +36,44 @@ pub struct QueryResult {
     pub cache_creation_tokens: usize,
 }
 
+/// Kinds of background features that run on the forked-agent/background lane.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BackgroundFeatureKind {
+    /// Short activity summary for a sub-agent.
+    AgentSummary,
+    /// Summary of what happened while the user was away.
+    AwaySummary,
+    /// Team-wide status aggregation.
+    TeamStatus,
+    /// Suggest follow-up prompts.
+    PromptSuggestion,
+    /// Suggest the next best task action.
+    NextActionSuggestion,
+    /// Generate code documentation.
+    MagicDocs,
+    /// Generate a codebase overview.
+    CodebaseOverview,
+    /// Generate a README.
+    ReadmeGeneration,
+}
+
+/// Request shape for background feature execution.
+#[derive(Debug, Clone)]
+pub struct BackgroundFeatureRequest {
+    /// The background feature being executed.
+    pub kind: BackgroundFeatureKind,
+    /// System prompt for the background worker.
+    pub system_prompt: String,
+    /// User prompt describing the task.
+    pub user_prompt: String,
+    /// Optional parent context inherited from the foreground session.
+    pub parent_context: Option<String>,
+    /// Optional tool whitelist for the background worker.
+    pub allowed_tools: Option<Vec<String>>,
+    /// Maximum output tokens.
+    pub max_tokens: u32,
+}
+
 /// Errors from orchestrator operations.
 #[derive(Debug, thiserror::Error)]
 pub enum OrchestratorError {
@@ -347,6 +385,37 @@ pub async fn run_forked_agent(
     run_engine_query(api_client, &request).await
 }
 
+/// Run a background feature through the shared background/forked-agent lane.
+pub async fn run_background_feature(
+    api_client: &dyn ApiClient,
+    request: BackgroundFeatureRequest,
+) -> Result<QueryResult, OrchestratorError> {
+    let BackgroundFeatureRequest {
+        kind,
+        system_prompt,
+        user_prompt,
+        parent_context,
+        allowed_tools,
+        max_tokens,
+    } = request;
+
+    let decorated_system = format!(
+        "{system_prompt}\n\nBackground feature: {}",
+        background_feature_label(kind)
+    );
+
+    run_forked_agent(
+        api_client,
+        &decorated_system,
+        &user_prompt,
+        parent_context.as_deref(),
+        allowed_tools.as_deref(),
+        &ModelProfile::Background.resolve(),
+        max_tokens,
+    )
+    .await
+}
+
 /// Run the main agent loop through a real QueryEngine execution path.
 pub async fn run_main_agent_with_engine(
     api_client: &dyn ApiClient,
@@ -424,6 +493,19 @@ fn collect_text_output(event_rx: &mut mpsc::UnboundedReceiver<EngineEvent>) -> S
     }
 
     content
+}
+
+fn background_feature_label(kind: BackgroundFeatureKind) -> &'static str {
+    match kind {
+        BackgroundFeatureKind::AgentSummary => "agent_summary",
+        BackgroundFeatureKind::AwaySummary => "away_summary",
+        BackgroundFeatureKind::TeamStatus => "team_status",
+        BackgroundFeatureKind::PromptSuggestion => "prompt_suggestion",
+        BackgroundFeatureKind::NextActionSuggestion => "next_action_suggestion",
+        BackgroundFeatureKind::MagicDocs => "magic_docs",
+        BackgroundFeatureKind::CodebaseOverview => "codebase_overview",
+        BackgroundFeatureKind::ReadmeGeneration => "readme_generation",
+    }
 }
 
 #[cfg(test)]
@@ -592,5 +674,27 @@ mod tests {
         )
         .await;
         assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn background_feature_uses_background_model() {
+        let api = MockApiClient::new();
+        api.enqueue_response("background result", 10, 5);
+
+        let request = BackgroundFeatureRequest {
+            kind: BackgroundFeatureKind::PromptSuggestion,
+            system_prompt: "You are a suggestion assistant.".into(),
+            user_prompt: "Suggest a next prompt".into(),
+            parent_context: Some("User is refactoring auth".into()),
+            allowed_tools: None,
+            max_tokens: 128,
+        };
+
+        let result = run_background_feature(&api, request).await;
+        assert!(result.is_ok());
+
+        let calls = api.call_log();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].2, ModelProfile::Background.resolve().0);
     }
 }
