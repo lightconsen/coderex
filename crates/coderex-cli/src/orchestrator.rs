@@ -7,8 +7,10 @@ use coderex_config::{LoadingBarrier, RemoteManagedSettings, RemoteManagedSetting
 use coderex_core::types::ModelId;
 use coderex_core::api_client::{AnthropicApiClient, ApiClient, ApiConfig};
 use crate::cli::Cli;
+use std::io::IsTerminal;
 
 /// Duration (ms) to wait for remote settings before timing out and failing open.
+#[cfg(feature = "enterprise")]
 const REMOTE_SETTINGS_TIMEOUT_MS: u64 = 5000;
 
 /// Resolved settings and state passed between startup phases.
@@ -437,6 +439,10 @@ impl StartupOrchestrator {
 
     #[allow(clippy::unused_async)]
     async fn run_repl(&self, cwd: &str, model: ModelId) -> Result<()> {
+        if !std::io::stdin().is_terminal() {
+            bail!("interactive REPL requires a terminal on stdin");
+        }
+
         let mut repl = if let Some(api_client) = Self::try_create_api_client() {
             crate::repl::ReplLoop::with_engine(api_client, cwd.to_string(), model)
         } else {
@@ -519,15 +525,7 @@ impl StartupOrchestrator {
 
     #[allow(clippy::unused_async)]
     async fn run_resume(&self, cwd: &str, session_id: &str, model: ModelId) -> Result<()> {
-        use coderex_memory::transcript::TranscriptStore;
-
-        let transcript_dir = std::path::Path::new(cwd).join(".claude/transcripts");
-        let store = TranscriptStore::new(transcript_dir.clone());
-        let messages = store.read_all_skip_first_prompt(session_id)?;
-
-        if messages.is_empty() {
-            bail!("No transcript found for session '{session_id}' in {transcript_dir:?}");
-        }
+        let messages = Self::load_resume_messages(cwd, session_id)?;
 
         tracing::info!(
             "Resuming session {session_id}: {} messages loaded",
@@ -555,6 +553,10 @@ impl StartupOrchestrator {
             }
         }
 
+        if !std::io::stdin().is_terminal() {
+            bail!("resume requires an interactive terminal on stdin");
+        }
+
         // Enter REPL with the resumed context
         let mut repl = if let Some(api_client) = Self::try_create_api_client() {
             crate::repl::ReplLoop::with_engine(api_client, cwd.to_string(), model)
@@ -562,6 +564,23 @@ impl StartupOrchestrator {
             crate::repl::ReplLoop::new(cwd.to_string(), model)
         };
         repl.run_interactive().await
+    }
+
+    fn load_resume_messages(
+        cwd: &str,
+        session_id: &str,
+    ) -> Result<Vec<coderex_core::types::Message>> {
+        use coderex_memory::transcript::TranscriptStore;
+
+        let transcript_dir = std::path::Path::new(cwd).join(".claude/transcripts");
+        let store = TranscriptStore::new(transcript_dir.clone());
+        let messages = store.read_all_skip_first_prompt(session_id)?;
+
+        if messages.is_empty() {
+            bail!("No transcript found for session '{session_id}' in {transcript_dir:?}");
+        }
+
+        Ok(messages)
     }
 }
 
@@ -668,19 +687,19 @@ mod tests {
         assert!(result.is_none());
     }
 
-    #[tokio::test]
-    async fn resume_fails_for_missing_transcript() {
-        let orch = StartupOrchestrator::new();
-        let result = orch
-            .run_resume("/nonexistent", "nonexistent_session", ModelId::sonnet())
-            .await;
+    #[test]
+    fn resume_fails_for_missing_transcript() {
+        let result = StartupOrchestrator::load_resume_messages(
+            "/nonexistent",
+            "nonexistent_session",
+        );
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(err.to_string().contains("No transcript found"));
     }
 
-    #[tokio::test]
-    async fn resume_loads_existing_transcript() {
+    #[test]
+    fn resume_loads_existing_transcript() {
         let tmp = tempfile::tempdir().unwrap();
         let cwd = tmp.path().to_string_lossy().to_string();
 
@@ -701,22 +720,11 @@ mod tests {
             )
             .unwrap();
 
-        let orch = StartupOrchestrator::new();
-        // run_resume enters REPL which is interactive, so we can't fully test it
-        // but we can verify the transcript loading part works by checking no error
-        // occurs before REPL starts. We'll use a non-interactive approach:
-        // The function will fail at run_interactive() since stdin is not a terminal
-        // in tests, but that's expected — the key is transcript loading works.
-        let result = orch.run_resume(&cwd, "sess_1", ModelId::sonnet()).await;
-        // May fail at REPL level due to non-interactive stdin, but not at transcript level
-        // In CI with piped stdin, this will hit EOF quickly and return Ok
-        // We just verify it doesn't bail with "No transcript found"
-        if let Err(ref e) = result {
-            assert!(
-                !e.to_string().contains("No transcript found"),
-                "should have found transcript"
-            );
-        }
+        let messages = StartupOrchestrator::load_resume_messages(&cwd, "sess_1")
+            .expect("resume should load transcript messages");
+        assert_eq!(messages.len(), 2);
+        assert!(matches!(messages[0].role, coderex_core::types::Role::User));
+        assert!(matches!(messages[1].role, coderex_core::types::Role::Assistant));
     }
 
     #[test]
