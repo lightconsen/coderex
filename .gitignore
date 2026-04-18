@@ -3,5 +3,10 @@
 *.pdb
 Cargo.lock
 
+
 cc-src/
 claurst/
+kimi-cli/
+qwen-code/
+gemini-cli/
+start.kimi.sh
