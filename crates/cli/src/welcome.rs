@@ -3,17 +3,30 @@
 use std::io::Write;
 
 const T_REX: &str = r#"
-        ___
-       /   \
-      | o o |
-      |  >  |    CodeRex
-       \___/
-      __| |__
-     /       \
-    |  |   |  |
-    |__|   |__|
-      |     |
-      |_____|"#;
+                              .-.
+                    ,        ( {o\
+                    {\    /   ~o   }
+                     \`  '-'/    ~ |
+                    {.'   ~   ~  /}
+                     `.    ~  ~ /
+                    .'  ~  ~   `}.
+                   /    ~     ~  `}
+                  {      ~     ~  /)
+                  |`-._  ~    ~  /
+                  |    `-._     ~(
+                  |        `--.__/)
+                  {         `--._/
+                   |  |  |  |   |
+                   |  |  |  |   |
+                   |  |  |  |   |
+                   |  |  |  |   |
+                   |  |  |  |   |
+                   |__|__|__|___|
+                   |__|__|__|___|
+                   \____________/
+                    \__________/
+                     \________/
+"#;
 
 /// Print the welcome screen with ASCII T-Rex logo and session information.
 pub fn print_welcome_screen<W: Write>(
@@ -27,7 +40,7 @@ pub fn print_welcome_screen<W: Write>(
 
     writeln!(out, "{T_REX}")?;
     writeln!(out)?;
-    writeln!(out, "  v{version}  |  model: {model}")?;
+    writeln!(out, "  CodeRex  v{version}  |  model: {model}")?;
     writeln!(out, "  cwd: {cwd}")?;
     writeln!(out, "  api: {api_status}")?;
     writeln!(out)?;
