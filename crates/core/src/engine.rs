@@ -1445,7 +1445,24 @@ impl QueryEngine {
             .messages
             .iter()
             .filter(|m| !matches!(m.role, crate::types::Role::System))
-            .filter_map(|m| serde_json::to_value(m).ok())
+            .filter_map(|m| {
+                let role_str = match m.role {
+                    crate::types::Role::User => "user",
+                    crate::types::Role::Assistant => "assistant",
+                    crate::types::Role::Tool => "tool",
+                    _ => return None,
+                };
+                let content = match &m.content {
+                    crate::types::MessageContent::Text(t) => serde_json::Value::String(t.clone()),
+                    crate::types::MessageContent::ToolCall(tc) => serde_json::json!([
+                        {"type": "tool_use", "id": &tc.id, "name": &tc.name, "input": &tc.input}
+                    ]),
+                    crate::types::MessageContent::ToolResult(tr) => serde_json::json!([
+                        {"type": "tool_result", "tool_use_id": &tr.tool_call_id, "content": &tr.output}
+                    ]),
+                };
+                Some(serde_json::json!({"role": role_str, "content": content}))
+            })
             .collect();
 
         let response = self
@@ -1487,7 +1504,24 @@ impl QueryEngine {
             .messages
             .iter()
             .filter(|m| !matches!(m.role, crate::types::Role::System))
-            .filter_map(|m| serde_json::to_value(m).ok())
+            .filter_map(|m| {
+                let role_str = match m.role {
+                    crate::types::Role::User => "user",
+                    crate::types::Role::Assistant => "assistant",
+                    crate::types::Role::Tool => "tool",
+                    _ => return None,
+                };
+                let content = match &m.content {
+                    crate::types::MessageContent::Text(t) => serde_json::Value::String(t.clone()),
+                    crate::types::MessageContent::ToolCall(tc) => serde_json::json!([
+                        {"type": "tool_use", "id": &tc.id, "name": &tc.name, "input": &tc.input}
+                    ]),
+                    crate::types::MessageContent::ToolResult(tr) => serde_json::json!([
+                        {"type": "tool_result", "tool_use_id": &tr.tool_call_id, "content": &tr.output}
+                    ]),
+                };
+                Some(serde_json::json!({"role": role_str, "content": content}))
+            })
             .collect();
 
         let mut stream = self
@@ -1506,9 +1540,9 @@ impl QueryEngine {
 
         while let Some(event) = stream.next().await {
             match event.clone() {
-                StreamEvent::TextDelta(text) => {
-                    text_so_far.push_str(&text);
-                    let _ = self.event_tx.send(EngineEvent::TextDelta(text));
+                StreamEvent::TextDelta(ref text) => {
+                    text_so_far.push_str(text);
+                    let _ = self.event_tx.send(EngineEvent::TextDelta(text.clone()));
                 }
                 StreamEvent::ToolCallBlockStart { ref id, ref name } => {
                     let _ = self.event_tx.send(EngineEvent::ToolCallStart {
@@ -1532,13 +1566,13 @@ impl QueryEngine {
                     // Incremental tool call input — assembler handles accumulation
                     tracing::trace!("tool call input delta for {id}: {} bytes", delta.len());
                 }
-                StreamEvent::UsageSummary(u) => {
-                    usage = u;
+                StreamEvent::UsageSummary(ref u) => {
+                    usage = u.clone();
                 }
                 StreamEvent::StreamEnd => {
                     // Finalize pending tool calls
                 }
-                StreamEvent::Error(e) => {
+                StreamEvent::Error(ref e) => {
                     return Err(format!("streaming error: {e}"));
                 }
             }

@@ -128,9 +128,11 @@ impl StartupOrchestrator {
 
         tracing::info!("CodeRex ready");
 
-        // Determine model: settings → CODEREX_MODEL env → default
-        let model = self.ctx.model.clone()
-            .or_else(|| std::env::var("CODEREX_MODEL").ok().filter(|m| !m.is_empty()).map(ModelId))
+        // Determine model: CODEREX_MODEL env → settings → default
+        let model = std::env::var("CODEREX_MODEL").ok()
+            .filter(|m| !m.is_empty())
+            .map(ModelId)
+            .or_else(|| self.ctx.model.clone())
             .unwrap_or_else(ModelId::sonnet);
 
         // Route based on CLI args

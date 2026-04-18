@@ -200,6 +200,12 @@ impl AnthropicApiClient {
         &model.0
     }
 
+    /// Returns true if this is the official Anthropic API.
+    fn is_anthropic_api(&self) -> bool {
+        let url = self.config.base_url.strip_suffix('/').unwrap_or(&self.config.base_url);
+        url == "https://api.anthropic.com"
+    }
+
     /// Execute a request with retry logic.
     async fn with_retry<F, Fut, T>(&self, operation: F) -> Result<T, ApiError>
     where
@@ -271,12 +277,20 @@ impl ApiClient for AnthropicApiClient {
 
         let response = self
             .with_retry(|| async {
-                let resp = self
+                let mut req = self
                     .client
                     .post(&url)
-                    .header("x-api-key", &self.config.api_key)
-                    .header("anthropic-version", "2023-06-01")
-                    .header("content-type", "application/json")
+                    .header("content-type", "application/json");
+
+                if self.is_anthropic_api() {
+                    req = req
+                        .header("x-api-key", &self.config.api_key)
+                        .header("anthropic-version", "2023-06-01");
+                } else {
+                    req = req.header("Authorization", format!("Bearer {}", &self.config.api_key));
+                }
+
+                let resp = req
                     .json(&body)
                     .send()
                     .await
@@ -345,26 +359,31 @@ impl ApiClient for AnthropicApiClient {
         );
 
         let model_name = Self::resolve_model(model).to_string();
+        let api_key = self.config.api_key.clone();
+        let is_anthropic = self.is_anthropic_api();
         let body = serde_json::json!({
-            "model": model_name,
+            "model": model_name.clone(),
             "system": system,
             "messages": messages,
             "max_tokens": max_tokens,
             "stream": true,
         });
-
-        let api_key = self.config.api_key.clone();
         let client = self.client.clone();
 
         Box::pin(futures::stream::once(async move {
-            let response = client
+            let mut req = client
                 .post(&url)
-                .header("x-api-key", &api_key)
-                .header("anthropic-version", "2023-06-01")
-                .header("content-type", "application/json")
-                .json(&body)
-                .send()
-                .await;
+                .header("content-type", "application/json");
+
+            if is_anthropic {
+                req = req
+                    .header("x-api-key", &api_key)
+                    .header("anthropic-version", "2023-06-01");
+            } else {
+                req = req.header("Authorization", format!("Bearer {}", &api_key));
+            }
+
+            let response = req.json(&body).send().await;
 
             match response {
                 Ok(resp) => {
@@ -413,14 +432,12 @@ fn parse_sse_stream(
 ) -> impl futures::Stream<Item = StreamEvent> + Send + 'static {
     use futures::StreamExt;
 
-    // Wrap in Pin so we can use it with unfold state
     let pinned = Box::pin(stream);
 
     futures::stream::unfold(
         (pinned, String::new()),
         |(mut inner, mut buffer)| async move {
             loop {
-                // Check if we have a complete message in the buffer
                 if let Some(pos) = find_sse_message_boundary(&buffer) {
                     let message = buffer[..pos].to_string();
                     buffer.drain(..=pos);
@@ -428,11 +445,9 @@ fn parse_sse_stream(
                     if let Some(event) = parse_sse_message(&message) {
                         return Some((event, (inner, buffer)));
                     }
-                    // Skip unparseable messages, continue loop
                     continue;
                 }
 
-                // Need more data — pull from the inner stream
                 match inner.next().await {
                     Some(Ok(chunk)) => {
                         let chunk_str =
@@ -446,7 +461,6 @@ fn parse_sse_stream(
                         ));
                     }
                     None => {
-                        // Stream exhausted
                         return None;
                     }
                 }
@@ -469,11 +483,11 @@ fn find_sse_message_boundary(buffer: &str) -> Option<usize> {
 
 /// Parse a single SSE message block into a `StreamEvent`.
 fn parse_sse_message(message: &str) -> Option<StreamEvent> {
-    // Extract the `data:` line
+    // Extract the `data:` line (accept both "data: " and "data:")
     let data_line = message
         .lines()
-        .find(|line| line.starts_with("data: "))?;
-    let json_str = data_line.strip_prefix("data: ")?;
+        .find(|line| line.starts_with("data:"))?;
+    let json_str = data_line.strip_prefix("data:").map(|s| s.trim_start())?;
 
     let value: serde_json::Value = serde_json::from_str(json_str).ok()?;
     let event_type = value.get("type").and_then(|v| v.as_str())?;
