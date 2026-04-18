@@ -140,8 +140,13 @@ impl ReplLoop {
         let stdout = std::io::stdout();
         let mut stdout = stdout.lock();
 
-        writeln!(stdout, "CodeRex REPL — type /help for commands, Ctrl+D to exit")?;
-        writeln!(stdout)?;
+        crate::welcome::print_welcome_screen(
+            &mut stdout,
+            env!("CARGO_PKG_VERSION"),
+            &self.model.0,
+            &self.cwd,
+            self.engine.is_some(),
+        )?;
 
         loop {
             if !self.running {

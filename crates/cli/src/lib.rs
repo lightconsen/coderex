@@ -4,6 +4,7 @@ pub mod cli;
 pub mod orchestrator;
 pub mod repl;
 pub mod tracing_setup;
+pub mod welcome;
 
 pub use cli::{parse_args, Cli, Command};
 pub use repl::ReplLoop;
