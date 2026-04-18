@@ -24,6 +24,7 @@ use crate::compact::{self, CompactResult, CompactStrategy};
 use crate::stop_hook::{self, StopHookContext, StopHookDecision};
 use crate::hook_executor::{HookExecutor, HookFireResult, NoOpHookExecutor};
 use crate::tool_executor::{NoOpToolExecutor, ToolExecutor};
+use crate::tool_scheduler;
 use crate::elicitation::{ElicitationHandler, ElicitationResult, ReplElicitationHandler};
 use std::path::PathBuf;
 
@@ -1631,172 +1632,22 @@ impl QueryEngine {
         turn: &mut TurnRuntime,
         options: &SubmitOptions,
     ) -> Result<Vec<ToolResult>, String> {
-        let mut results = Vec::new();
+        let outcome = tool_scheduler::run_tool_calls(
+            &turn.pending_tool_calls,
+            self.tools.as_ref(),
+            &mut self.permission_engine,
+            self.hooks.as_ref(),
+            options,
+            &self.event_tx,
+            &mut self.denied_tools,
+        )
+        .await?;
 
-        for call in &turn.pending_tool_calls {
-            if let Some(ref allowed_tools) = options.allowed_tools_override {
-                if !allowed_tools
-                    .iter()
-                    .any(|tool| tool.eq_ignore_ascii_case(&call.name))
-                {
-                    self.denied_tools.push(DeniedToolCall {
-                        name: call.name.clone(),
-                        reason: "tool is not in the allowed tools override".to_string(),
-                    });
-
-                    let result = ToolResult {
-                        tool_call_id: call.id.clone(),
-                        output: format!(
-                            "tool '{}' blocked: not in allowed tools override",
-                            call.name
-                        ),
-                        is_error: true,
-                    };
-
-                    let _ = self.event_tx.send(EngineEvent::ToolCallEnd {
-                        id: call.id.clone(),
-                        result: result.clone(),
-                    });
-                    results.push(result);
-                    continue;
-                }
-            }
-
-            // Emit tool call start event
-            let _ = self.event_tx.send(EngineEvent::ToolCallStart {
-                id: call.id.clone(),
-                name: call.name.clone(),
-            });
-
-            // Fire PreToolUse hook
-            let mut ctx = std::collections::HashMap::new();
-            ctx.insert("tool_call_id".to_string(), call.id.clone());
-            ctx.insert("tool_input".to_string(), call.input.to_string());
-            let pre_hook = self.fire_hook("PreToolUse", &call.name, &ctx).await;
-            if pre_hook.stop {
-                self.denied_tools.push(DeniedToolCall {
-                    name: call.name.clone(),
-                    reason: "pre-use hook stopped execution".to_string(),
-                });
-                let result = ToolResult {
-                    tool_call_id: call.id.clone(),
-                    output: "tool execution stopped by hook".to_string(),
-                    is_error: true,
-                };
-                let _ = self.event_tx.send(EngineEvent::ToolCallEnd {
-                    id: call.id.clone(),
-                    result: result.clone(),
-                });
-                results.push(result);
-                continue;
-            }
-
-            // Check permission
-            let (_request, perm_result) = self
-                .permission_engine
-                .evaluate(
-                    &call.name,
-                    call.input.to_string(),
-                    None,
-                    std::collections::HashMap::new(),
-                )
-                .await
-                .map_err(|e| format!("permission check failed: {e}"))?;
-
-            match perm_result {
-                PermissionResult::Allow | PermissionResult::AllowForPath { .. } => {
-                    let outcome = self
-                        .tools
-                        .execute(&call.id, &call.name, &call.input)
-                        .await;
-                    let result = outcome.result;
-
-                    // Fire PostToolUse hook on success
-                    let mut ctx = std::collections::HashMap::new();
-                    ctx.insert("tool_call_id".to_string(), call.id.clone());
-                    ctx.insert("tool_output_len".to_string(), result.output.len().to_string());
-                    let _ = self.fire_hook("PostToolUse", &call.name, &ctx).await;
-
-                    results.push(result.clone());
-                    let _ = self.event_tx.send(EngineEvent::ToolCallEnd {
-                        id: call.id.clone(),
-                        result,
-                    });
-                }
-                PermissionResult::Ask { reason } | PermissionResult::AskForSession { reason } => {
-                    let _ = self.event_tx.send(EngineEvent::PermissionRequest {
-                        id: call.id.clone(),
-                        tool: call.name.clone(),
-                        args: call.input.clone(),
-                    });
-                    // Track for next-turn injection
-                    self.denied_tools.push(DeniedToolCall {
-                        name: call.name.clone(),
-                        reason: reason.clone(),
-                    });
-                    let result = ToolResult {
-                        tool_call_id: call.id.clone(),
-                        output: format!("tool '{}' denied by user", call.name),
-                        is_error: true,
-                    };
-
-                    // Fire PostToolUseFail hook
-                    let mut ctx = std::collections::HashMap::new();
-                    ctx.insert("tool_call_id".to_string(), call.id.clone());
-                    ctx.insert("reason".to_string(), reason.clone());
-                    let _ = self.fire_hook("PostToolUseFail", &call.name, &ctx).await;
-
-                    results.push(result);
-                }
-                PermissionResult::Deny { reason } => {
-                    // Track for next-turn injection
-                    self.denied_tools.push(DeniedToolCall {
-                        name: call.name.clone(),
-                        reason: reason.clone(),
-                    });
-                    let result = ToolResult {
-                        tool_call_id: call.id.clone(),
-                        output: format!("tool '{}' denied", call.name),
-                        is_error: true,
-                    };
-
-                    // Fire PostToolUseFail hook
-                    let mut ctx = std::collections::HashMap::new();
-                    ctx.insert("tool_call_id".to_string(), call.id.clone());
-                    ctx.insert("reason".to_string(), reason.clone());
-                    let _ = self.fire_hook("PostToolUseFail", &call.name, &ctx).await;
-
-                    results.push(result);
-                }
-                PermissionResult::Elevated { reason } => {
-                    // Emit elevation request event
-                    let elevation_id = format!("elev_{}", call.id);
-                    let _ = self.event_tx.send(EngineEvent::ElevationRequest {
-                        id: elevation_id.clone(),
-                        tool: call.name.clone(),
-                        reason: reason.clone(),
-                    });
-
-                    // Store pending elevation so caller can handle it
-                    turn.pending_elevation = Some(PendingElevation {
-                        tool_call_id: call.id.clone(),
-                        tool_name: call.name.clone(),
-                        input: call.input.clone(),
-                        request_id: elevation_id,
-                    });
-
-                    let result = ToolResult {
-                        tool_call_id: call.id.clone(),
-                        output: format!("tool '{}' requires elevated permissions", call.name),
-                        is_error: true,
-                    };
-                    results.push(result);
-                }
-            }
+        if let Some(elevation) = outcome.pending_elevation {
+            turn.pending_elevation = Some(elevation);
         }
-
         turn.pending_tool_calls.clear();
-        Ok(results)
+        Ok(outcome.results)
     }
 
     /// Resolve a pending elevation request and retry the tool call with elevated permissions.
