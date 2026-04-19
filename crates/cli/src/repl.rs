@@ -6,7 +6,8 @@ use coderex_core::types::ModelId;
 use coderex_core::engine::{QueryEngine, SubmitOptions, TerminalReason};
 use coderex_core::permission_engine::{ExplainPermissionHook, PermissionEngine};
 use coderex_core::prompts;
-use coderex_core::query_profiles::PromptProfile;
+use coderex_core::orchestrator::{BackgroundFeatureKind, BackgroundFeatureRequest};
+use coderex_core::query_profiles::{ModelProfile, PromptProfile, QueryKind, QueryRequest};
 use coderex_core::state::SessionState;
 use coderex_core::permissions::{PermissionChecker, PermissionMode};
 use coderex_core::api_client::ApiClient;
@@ -56,6 +57,8 @@ pub struct ReplLoop {
     session_effects: SessionEffects,
     /// API client for orchestrator side-queries (title, permission explain, etc.).
     api_client: Option<Box<dyn ApiClient>>,
+    /// Orchestrator for routing AI calls through product-level entry points.
+    orchestrator: Option<coderex_core::orchestrator::Orchestrator>,
 }
 
 impl ReplLoop {
@@ -75,6 +78,7 @@ impl ReplLoop {
             event_rx: None,
             session_effects: SessionEffects::default(),
             api_client: None,
+            orchestrator: None,
         }
     }
 
@@ -120,6 +124,8 @@ impl ReplLoop {
         );
         engine.set_tool_executor(Box::new(dispatcher));
 
+        let orchestrator = coderex_core::orchestrator::Orchestrator::new(api_client.clone_box());
+
         Self {
             commands,
             model,
@@ -130,6 +136,7 @@ impl ReplLoop {
             event_rx: Some(event_rx),
             session_effects: SessionEffects::default(),
             api_client: Some(api_client),
+            orchestrator: Some(orchestrator),
         }
     }
 
@@ -486,7 +493,12 @@ impl ReplLoop {
                     }
 
                     match result {
-                        Ok(_) => {}
+                        Ok(_) => {
+                            // Trigger background features after successful turn
+                            let prompt_text =
+                                self.history.last().map(|s| s.as_str()).unwrap_or("");
+                            self.trigger_background_features(prompt_text).await;
+                        }
                         Err(e) => {
                             ui_state.messages.push(Message {
                                 role: MessageRole::System,
@@ -540,28 +552,59 @@ impl ReplLoop {
         }
     }
 
+    /// Build a QueryRequest for the main agent from current session effects.
+    fn build_query_request_for_main_agent(&self) -> QueryRequest {
+        QueryRequest {
+            kind: QueryKind::MainAgent,
+            user_prompt: String::new(), // filled at submit time
+            custom_system_prompt: None,
+            append_system_prompt: self.session_effects.append_system_prompt.clone(),
+            prompt_profile: self
+                .session_effects
+                .prompt_profiles
+                .last()
+                .copied()
+                .unwrap_or_default(),
+            allowed_tools: self.session_effects.allowed_tools_override.clone(),
+            model_profile: ModelProfile::Main,
+            inherit_session: true,
+            stream: true,
+            max_tokens: 4096,
+        }
+    }
+
     /// Build SubmitOptions incorporating active command effects.
+    ///
+    /// Routes through the Orchestrator so that prompt profiles, model selection,
+    /// and tool whitelists are applied consistently with side/forked queries.
     fn build_submit_options(&self) -> SubmitOptions {
-        let mut options = SubmitOptions::default();
+        let request = self.build_query_request_for_main_agent();
+        let mut options = if let Some(ref orchestrator) = self.orchestrator {
+            orchestrator.build_submit_options(&request)
+        } else {
+            // Fallback when no orchestrator is available
+            let mut opts = SubmitOptions::default();
+            if !self.session_effects.prompt_profiles.is_empty() {
+                opts.custom_system_prompt = Some(
+                    prompts::compose_system_prompt_for_profiles(
+                        &self.session_effects.prompt_profiles,
+                    ),
+                );
+            }
+            if let Some(ref prompt) = self.session_effects.append_system_prompt {
+                opts.append_system_prompt = Some(prompt.clone());
+            }
+            if let Some(ref tools) = self.session_effects.allowed_tools_override {
+                opts.allowed_tools_override = Some(tools.clone());
+            } else if let Some(default_tools) =
+                prompts::default_allowed_tools_for_profiles(&self.session_effects.prompt_profiles)
+            {
+                opts.allowed_tools_override = Some(default_tools);
+            }
+            opts
+        };
 
-        if !self.session_effects.prompt_profiles.is_empty() {
-            options.custom_system_prompt = Some(
-                prompts::compose_system_prompt_for_profiles(&self.session_effects.prompt_profiles),
-            );
-        }
-
-        if let Some(ref prompt) = self.session_effects.append_system_prompt {
-            options.append_system_prompt = Some(prompt.clone());
-        }
-
-        if let Some(ref tools) = self.session_effects.allowed_tools_override {
-            options.allowed_tools_override = Some(tools.clone());
-        } else if let Some(default_tools) =
-            prompts::default_allowed_tools_for_profiles(&self.session_effects.prompt_profiles)
-        {
-            options.allowed_tools_override = Some(default_tools);
-        }
-
+        // REPL-specific: extra context from commands is not part of QueryRequest
         if !self.session_effects.extra_context.is_empty() {
             options.replay_user_messages = Some(
                 self.session_effects
@@ -574,6 +617,48 @@ impl ReplLoop {
         }
 
         options
+    }
+
+    /// Trigger background features after a successful turn.
+    async fn trigger_background_features(&self, _user_prompt: &str) {
+        let Some(ref client) = self.api_client else {
+            return;
+        };
+
+        // Trigger prompt suggestions after the user has sent a few messages
+        if self.history.len() >= 3 && self.history.len() % 5 == 0 {
+            let conversation_summary = self
+                .history
+                .iter()
+                .rev()
+                .take(5)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join("\n");
+            let request = BackgroundFeatureRequest {
+                kind: BackgroundFeatureKind::PromptSuggestion,
+                system_prompt: "You are a prompt suggestion assistant.".into(),
+                user_prompt: format!(
+                    "Suggest 1-2 brief follow-up prompts based on this conversation context.\n\
+                     Recent messages:\n{conversation_summary}\n\
+                     Return only the suggestions, one per line."
+                ),
+                parent_context: None,
+                allowed_tools: None,
+                max_tokens: 128,
+            };
+            let client = client.clone_box();
+            tokio::spawn(async move {
+                match coderex_core::orchestrator::run_background_feature(client.as_ref(), request).await {
+                    Ok(result) => {
+                        tracing::info!("Background prompt suggestion: {}", result.content);
+                    }
+                    Err(e) => {
+                        tracing::warn!("Background feature failed: {e}");
+                    }
+                }
+            });
+        }
     }
 
     /// Apply effects from a CommandResult to session state.
@@ -612,6 +697,11 @@ impl ReplLoop {
         self.engine = Some(engine);
 
         self.drain_events(&mut output);
+
+        // Trigger background features on successful turn
+        if result.is_ok() {
+            self.trigger_background_features(prompt).await;
+        }
 
         if !self.session_effects.title_generated {
             if let Some(ref client) = self.api_client {

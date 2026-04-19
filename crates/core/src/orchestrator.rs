@@ -11,7 +11,7 @@
 //! - `run_forked_agent`: isolated sub-agent with its own context and tool set
 
 use crate::api_client::{ApiClient, ApiError};
-use crate::engine::{QueryEngine, SubmitOptions};
+use crate::engine::{QueryEngine, SubmitOptions, TerminalReason};
 use crate::permission_engine::{ExplainPermissionHook, PermissionEngine};
 use crate::permissions::{PermissionChecker, PermissionMode};
 use crate::query_profiles::{ModelProfile, PromptProfile, QueryKind, QueryRequest};
@@ -279,6 +279,58 @@ impl Orchestrator {
         let msg = Message::user(user_prompt);
         serde_json::to_value(&msg).map(|v| vec![v]).unwrap_or_default()
     }
+
+    /// Build SubmitOptions from a QueryRequest.
+    ///
+    /// Centralizes the translation from product-level intent to execution-level
+    /// parameters. This is the primary entry point for the REPL to route
+    /// main-agent calls through the orchestrator.
+    pub fn build_submit_options(&self, request: &QueryRequest) -> SubmitOptions {
+        build_options_from_request(request)
+    }
+
+    /// Run the main agent using an existing QueryEngine.
+    ///
+    /// Unlike the standalone `run_main_agent` path (which creates a fresh engine
+    /// for isolated tasks), this reuses the caller's long-lived Engine so that
+    /// session state — messages, turn count, cost tracker — is preserved across
+    /// turns. This is the correct entry point for the REPL's main conversation
+    /// loop.
+    pub async fn run_main_agent_with_engine(
+        &self,
+        engine: &mut QueryEngine,
+        request: &QueryRequest,
+    ) -> Result<TerminalReason, String> {
+        let options = self.build_submit_options(request);
+        engine.submit_streaming(request.user_prompt.clone(), options).await
+    }
+
+    /// Run a background feature through this orchestrator's API client.
+    pub async fn run_background_feature(
+        &self,
+        request: BackgroundFeatureRequest,
+    ) -> Result<QueryResult, OrchestratorError> {
+        run_background_feature(self.api_client.as_ref(), request).await
+    }
+}
+
+/// Build SubmitOptions from a QueryRequest.
+///
+/// Extracts the fields that affect prompt assembly and tool selection.
+fn build_options_from_request(request: &QueryRequest) -> SubmitOptions {
+    let mut options = SubmitOptions::default();
+    if let Some(ref prompt) = request.custom_system_prompt {
+        options.custom_system_prompt = Some(prompt.clone());
+    } else {
+        options.custom_system_prompt = Some(
+            crate::prompts::compose_system_prompt_for_profiles(&[request.prompt_profile]),
+        );
+    }
+    options.append_system_prompt = request.append_system_prompt.clone();
+    options.allowed_tools_override = request.allowed_tools.clone().or_else(|| {
+        crate::prompts::default_allowed_tools_for_profiles(&[request.prompt_profile])
+    });
+    options
 }
 
 /// Convenience function: run a side query without creating an orchestrator.
@@ -447,18 +499,7 @@ async fn run_engine_query(
         event_tx,
     );
 
-    let mut options = SubmitOptions::default();
-    if let Some(ref prompt) = request.custom_system_prompt {
-        options.custom_system_prompt = Some(prompt.clone());
-    } else {
-        options.custom_system_prompt = Some(
-            crate::prompts::compose_system_prompt_for_profiles(&[request.prompt_profile]),
-        );
-    }
-    options.append_system_prompt = request.append_system_prompt.clone();
-    options.allowed_tools_override = request.allowed_tools.clone().or_else(|| {
-        crate::prompts::default_allowed_tools_for_profiles(&[request.prompt_profile])
-    });
+    let options = build_options_from_request(request);
 
     if request.stream {
         engine
