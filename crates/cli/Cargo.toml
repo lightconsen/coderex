@@ -41,6 +41,7 @@ home.workspace = true
 serde_json.workspace = true
 crossterm.workspace = true
 compact_str.workspace = true
+uuid.workspace = true
 
 [dev-dependencies]
 assert_cmd.workspace = true

@@ -304,8 +304,15 @@ fn render_statusline(frame: &mut Frame, area: ratatui::layout::Rect, statusline:
 
 fn render_input(frame: &mut Frame, area: ratatui::layout::Rect, input: &crate::input::InputBuffer) {
     let cursor = input.cursor.min(input.text.len());
-    let text = format!("❯ {}", input.text);
-    let paragraph = Paragraph::new(text);
+    let mut spans: Vec<Span> = vec![Span::raw("❯ "), Span::raw(input.text.clone())];
+    if let Some(ref sug) = input.suggestion {
+        spans.push(Span::styled(
+            format!("  {sug}"),
+            Style::default().fg(Color::DarkGray),
+        ));
+    }
+    let line = Line::from(spans);
+    let paragraph = Paragraph::new(line);
     frame.render_widget(paragraph, area);
     // Position cursor
     frame.set_cursor_position((area.x + 2 + cursor as u16, area.y));

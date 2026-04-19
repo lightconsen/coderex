@@ -692,6 +692,17 @@ impl QueryEngine {
         self.transcript_path = Some(path);
     }
 
+    /// Compact session messages by keeping only the first user message
+    /// and the most recent `keep_recent_turns` turns.
+    ///
+    /// Returns the compact result including how many tokens were removed
+    /// and whether a boundary was inserted.
+    pub fn compact_session_messages(&mut self, keep_recent_turns: usize) -> CompactResult {
+        let result = compact::reactive_compact(&self.session.messages, keep_recent_turns);
+        self.session.messages.clone_from(&result.messages);
+        result
+    }
+
     /// Handle an elicitation request using the configured elicitation handler.
     ///
     /// Transitions the turn to `AwaitElicitation`, sends the elicitation via

@@ -12,6 +12,9 @@ use coderex_core::state::SessionState;
 use coderex_core::permissions::{PermissionChecker, PermissionMode};
 use coderex_core::api_client::ApiClient;
 use coderex_core::types::{EngineEvent, Message};
+use coderex_memory::{
+    ai_workflow, long_term::LongTermStore, session_memory::SessionMemoryStore,
+};
 use coderex_tools::{
     register_builtin_tools, ExecutionConfig, ExecutionContext, RegistryToolDispatcher,
     ToolExecutor as ToolsExecutor, ToolRegistry,
@@ -93,6 +96,12 @@ pub struct ReplLoop {
     background_results_tx: Option<mpsc::UnboundedSender<BackgroundTaskResult>>,
     /// Receiver for background task results.
     background_results_rx: Option<mpsc::UnboundedReceiver<BackgroundTaskResult>>,
+    /// Session memory store for persisting session facts.
+    session_memory_store: Option<Arc<SessionMemoryStore>>,
+    /// Long-term memory store for extracted memories.
+    long_term_store: Option<Arc<LongTermStore>>,
+    /// Session ID for memory operations.
+    session_id: Option<uuid::Uuid>,
 }
 
 impl ReplLoop {
@@ -116,6 +125,9 @@ impl ReplLoop {
             background_tasks: Vec::new(),
             background_results_tx: None,
             background_results_rx: None,
+            session_memory_store: None,
+            long_term_store: None,
+            session_id: None,
         }
     }
 
@@ -135,10 +147,15 @@ impl ReplLoop {
         coderex_commands::registry::register_all_commands(&mut commands);
 
         let session = SessionState::new(std::path::PathBuf::from(&cwd));
+        let session_id = session.session_id;
         let checker = PermissionChecker::new(PermissionMode::default());
         let mut permission_engine = PermissionEngine::new(checker);
         permission_engine.add_hook(Arc::new(ExplainPermissionHook::new(api_client.clone_box())));
         let (event_tx, event_rx) = mpsc::unbounded_channel::<EngineEvent>();
+
+        let memory_base = std::path::PathBuf::from(&cwd).join(".coderex").join("memory");
+        let session_memory_store = Arc::new(SessionMemoryStore::new(memory_base.join("session")));
+        let long_term_store = Arc::new(LongTermStore::new(memory_base.join("long_term")));
 
         let engine = QueryEngine::new(
             api_client.clone_box(),
@@ -178,6 +195,9 @@ impl ReplLoop {
             background_tasks: Vec::new(),
             background_results_tx: Some(bg_tx),
             background_results_rx: Some(bg_rx),
+            session_memory_store: Some(session_memory_store),
+            long_term_store: Some(long_term_store),
+            session_id: Some(session_id),
         }
     }
 
@@ -297,16 +317,51 @@ impl ReplLoop {
                 ui_state.statusline.spinner_frame = 0;
             }
 
-            // Poll for completed background tasks and inject into message list
+            // Poll for completed background tasks and route by kind
             for result in self.poll_background_results() {
-                let label = format!("[Background {:?}] {}", result.kind,
-                    if result.success { "Done" } else { "Failed" });
-                ui_state.messages.push(coderex_ui::message_list::Message {
-                    role: coderex_ui::message_list::MessageRole::System,
-                    content: format!("{label}\n{}", result.content).into(),
-                    tool_name: None,
-                    streaming: false,
-                });
+                match result.kind {
+                    BackgroundFeatureKind::PromptSuggestion => {
+                        if result.success {
+                            ui_state.input.suggestion = Some(result.content.trim().to_string());
+                        }
+                    }
+                    BackgroundFeatureKind::SessionMemoryUpdate => {
+                        self.handle_memory_update_result(&result).await;
+                        ui_state.messages.push(coderex_ui::message_list::Message {
+                            role: coderex_ui::message_list::MessageRole::System,
+                            content: if result.success {
+                                "Session memory updated.".into()
+                            } else {
+                                format!("Session memory update failed: {}", result.content).into()
+                            },
+                            tool_name: None,
+                            streaming: false,
+                        });
+                    }
+                    BackgroundFeatureKind::MemoryExtraction => {
+                        self.handle_memory_extraction_result(&result).await;
+                        ui_state.messages.push(coderex_ui::message_list::Message {
+                            role: coderex_ui::message_list::MessageRole::System,
+                            content: if result.success {
+                                "Long-term memories extracted.".into()
+                            } else {
+                                format!("Memory extraction failed: {}", result.content).into()
+                            },
+                            tool_name: None,
+                            streaming: false,
+                        });
+                    }
+                    _ => {
+                        let label = format!("[Background {:?}] {}", result.kind,
+                            if result.success { "Done" } else { "Failed" });
+                        ui_state.messages.push(coderex_ui::message_list::Message {
+                            role: coderex_ui::message_list::MessageRole::System,
+                            content: format!("{label}\n{}", result.content).into(),
+                            tool_name: None,
+                            streaming: false,
+                        });
+                    }
+                }
             }
 
             // Draw frame
@@ -813,6 +868,191 @@ impl ReplLoop {
         }
     }
 
+    /// Compact the session context by truncating older messages.
+    /// Keeps the first user message and the most recent 3 turns.
+    async fn compact_context(
+        &mut self,
+        ui_state: &mut coderex_ui::state::UiState,
+    ) -> String {
+        let Some(ref mut engine) = self.engine else {
+            return "No engine configured.".into();
+        };
+        let result = engine.compact_session_messages(3);
+        if result.tokens_removed == 0 {
+            return "Context is already compact.".into();
+        }
+        // Sync UI message list: rebuild from compacted messages
+        ui_state.messages.messages.clear();
+        ui_state.messages.start = 0;
+        for msg in &result.messages {
+            let (role, content, tool_name) = match (&msg.role, &msg.content) {
+                (coderex_core::types::Role::User, coderex_core::types::MessageContent::Text(t)) => {
+                    (coderex_ui::message_list::MessageRole::User, t.clone(), None)
+                }
+                (coderex_core::types::Role::Assistant, coderex_core::types::MessageContent::Text(t)) => {
+                    (coderex_ui::message_list::MessageRole::Assistant, t.clone(), None)
+                }
+                (coderex_core::types::Role::System, coderex_core::types::MessageContent::Text(t)) => {
+                    (coderex_ui::message_list::MessageRole::System, t.clone(), None)
+                }
+                (coderex_core::types::Role::Tool, coderex_core::types::MessageContent::ToolResult(tr)) => {
+                    (coderex_ui::message_list::MessageRole::ToolResult, tr.output.clone(), Some(tr.tool_call_id.clone().into()))
+                }
+                (_, c) => {
+                    (coderex_ui::message_list::MessageRole::System, format!("{c:?}"), None)
+                }
+            };
+            ui_state.messages.push(coderex_ui::message_list::Message {
+                role,
+                content: content.into(),
+                tool_name: tool_name.map(|t: String| t.into()),
+                streaming: false,
+            });
+        }
+        format!(
+            "Context compacted: {} tokens removed, {} messages remaining.",
+            result.tokens_removed,
+            result.messages.len()
+        )
+    }
+
+    /// Compact context in non-TUI mode.
+    async fn compact_context_non_tui(&mut self) -> String {
+        let Some(ref mut engine) = self.engine else {
+            return "No engine configured.".into();
+        };
+        let result = engine.compact_session_messages(3);
+        if result.tokens_removed == 0 {
+            return "Context is already compact.".into();
+        }
+        format!(
+            "Context compacted: {} tokens removed, {} messages remaining.",
+            result.tokens_removed,
+            result.messages.len()
+        )
+    }
+
+    /// Spawn a background task that updates session memory via ai_workflow.
+    async fn spawn_memory_update_task(&mut self) -> String {
+        let client = match &self.api_client {
+            Some(c) => c.clone_box(),
+            None => return "No API client configured.".into(),
+        };
+        let tx = match &self.background_results_tx {
+            Some(t) => t.clone(),
+            None => return "Background task channel not available.".into(),
+        };
+        let store = match &self.session_memory_store {
+            Some(s) => Arc::clone(s),
+            None => return "Session memory store not available.".into(),
+        };
+        let session_id = match self.session_id {
+            Some(s) => s,
+            None => return "Session ID not available.".into(),
+        };
+        let conversation = self.history.iter().rev().take(10).cloned().collect::<Vec<_>>().join("\n");
+        let current_memory = store.get_facts(session_id)
+            .into_iter()
+            .map(|f| f.fact)
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        self.cleanup_finished_background_tasks();
+        let task_id = format!("memory_update_{}", self.background_tasks.len());
+        let cancel_token = CancellationToken::new();
+        let task_cancel = cancel_token.clone();
+        self.background_tasks.push(BackgroundTask {
+            id: task_id.clone(),
+            kind: BackgroundFeatureKind::SessionMemoryUpdate,
+            cancel_token: cancel_token.clone(),
+        });
+
+        let task_id_clone = task_id.clone();
+        tokio::spawn(async move {
+            let result = tokio::select! {
+                biased;
+                _ = task_cancel.cancelled() => {
+                    Err(coderex_core::orchestrator::OrchestratorError::Config(
+                        "Cancelled by user".into()
+                    ))
+                }
+                res = ai_workflow::update_session_memory_ai(
+                    client.as_ref(), &store, session_id, &current_memory, &conversation
+                ) => res.map_err(|e| coderex_core::orchestrator::OrchestratorError::Config(e.to_string())),
+            };
+            let (success, content) = match result {
+                Ok(text) => (true, text),
+                Err(e) => (false, e.to_string()),
+            };
+            let _ = tx.send(BackgroundTaskResult {
+                id: task_id_clone,
+                kind: BackgroundFeatureKind::SessionMemoryUpdate,
+                success,
+                content,
+            });
+        });
+        format!("Background task started: {task_id}")
+    }
+
+    /// Spawn a background task that extracts long-term memories via ai_workflow.
+    async fn spawn_memory_extraction_task(&mut self) -> String {
+        let client = match &self.api_client {
+            Some(c) => c.clone_box(),
+            None => return "No API client configured.".into(),
+        };
+        let tx = match &self.background_results_tx {
+            Some(t) => t.clone(),
+            None => return "Background task channel not available.".into(),
+        };
+        let store = match &self.long_term_store {
+            Some(s) => Arc::clone(s),
+            None => return "Long-term memory store not available.".into(),
+        };
+        let conversation = self.history.iter().rev().take(10).cloned().collect::<Vec<_>>().join("\n");
+
+        self.cleanup_finished_background_tasks();
+        let task_id = format!("memory_extraction_{}", self.background_tasks.len());
+        let cancel_token = CancellationToken::new();
+        let task_cancel = cancel_token.clone();
+        self.background_tasks.push(BackgroundTask {
+            id: task_id.clone(),
+            kind: BackgroundFeatureKind::MemoryExtraction,
+            cancel_token: cancel_token.clone(),
+        });
+
+        let task_id_clone = task_id.clone();
+        tokio::spawn(async move {
+            let result = tokio::select! {
+                biased;
+                _ = task_cancel.cancelled() => {
+                    Err(coderex_core::orchestrator::OrchestratorError::Config(
+                        "Cancelled by user".into()
+                    ))
+                }
+                res = ai_workflow::extract_long_term_memories_ai(
+                    client.as_ref(), &store, &conversation
+                ) => res.map_err(|e| coderex_core::orchestrator::OrchestratorError::Config(e.to_string())),
+            };
+            let (success, content) = match result {
+                Ok(topics) => (true, topics.join(", ")),
+                Err(e) => (false, e.to_string()),
+            };
+            let _ = tx.send(BackgroundTaskResult {
+                id: task_id_clone,
+                kind: BackgroundFeatureKind::MemoryExtraction,
+                success,
+                content,
+            });
+        });
+        format!("Background task started: {task_id}")
+    }
+
+    /// Handle a completed session-memory-update result (no-op: already persisted in task).
+    async fn handle_memory_update_result(&mut self, _result: &BackgroundTaskResult) {}
+
+    /// Handle a completed memory-extraction result (no-op: already persisted in task).
+    async fn handle_memory_extraction_result(&mut self, _result: &BackgroundTaskResult) {}
+
     /// Spawn a background feature by kind with a sensible default request.
     fn spawn_background_feature_by_kind(&mut self, kind: BackgroundFeatureKind, user_prompt: String) -> String {
         let client = match &self.api_client {
@@ -1062,10 +1302,7 @@ impl ReplLoop {
                     return;
                 }
                 "compact" => {
-                    let msg = self.spawn_background_feature_by_kind(
-                        BackgroundFeatureKind::AwaySummary,
-                        "Summarize the recent conversation compactly.".into(),
-                    );
+                    let msg = self.compact_context(ui_state).await;
                     ui_state.messages.push(coderex_ui::message_list::Message {
                         role: coderex_ui::message_list::MessageRole::System,
                         content: msg.into(),
@@ -1114,10 +1351,7 @@ impl ReplLoop {
                     return;
                 }
                 "update-memory" => {
-                    let msg = self.spawn_background_feature_by_kind(
-                        BackgroundFeatureKind::SessionMemoryUpdate,
-                        "Update session memory with recent context.".into(),
-                    );
+                    let msg = self.spawn_memory_update_task().await;
                     ui_state.messages.push(coderex_ui::message_list::Message {
                         role: coderex_ui::message_list::MessageRole::System,
                         content: msg.into(),
@@ -1127,10 +1361,7 @@ impl ReplLoop {
                     return;
                 }
                 "extract-memories" => {
-                    let msg = self.spawn_background_feature_by_kind(
-                        BackgroundFeatureKind::MemoryExtraction,
-                        "Extract long-term memories from this session.".into(),
-                    );
+                    let msg = self.spawn_memory_extraction_task().await;
                     ui_state.messages.push(coderex_ui::message_list::Message {
                         role: coderex_ui::message_list::MessageRole::System,
                         content: msg.into(),
@@ -1242,10 +1473,7 @@ impl ReplLoop {
                 return Ok(());
             }
             "compact" => {
-                let msg = self.spawn_background_feature_by_kind(
-                    BackgroundFeatureKind::AwaySummary,
-                    "Summarize the recent conversation compactly.".into(),
-                );
+                let msg = self.compact_context_non_tui().await;
                 writeln!(stdout, "{msg}")?;
                 return Ok(());
             }
@@ -1274,18 +1502,12 @@ impl ReplLoop {
                 return Ok(());
             }
             "update-memory" => {
-                let msg = self.spawn_background_feature_by_kind(
-                    BackgroundFeatureKind::SessionMemoryUpdate,
-                    "Update session memory with recent context.".into(),
-                );
+                let msg = self.spawn_memory_update_task().await;
                 writeln!(stdout, "{msg}")?;
                 return Ok(());
             }
             "extract-memories" => {
-                let msg = self.spawn_background_feature_by_kind(
-                    BackgroundFeatureKind::MemoryExtraction,
-                    "Extract long-term memories from this session.".into(),
-                );
+                let msg = self.spawn_memory_extraction_task().await;
                 writeln!(stdout, "{msg}")?;
                 return Ok(());
             }

@@ -92,6 +92,8 @@ pub struct InputBuffer {
     pub history: Vec<String>,
     /// Position within history (0 = not in history, 1 = most recent).
     pub history_pos: usize,
+    /// Inline prompt suggestion displayed as ghost text.
+    pub suggestion: Option<String>,
 }
 
 impl Default for InputBuffer {
@@ -109,6 +111,7 @@ impl InputBuffer {
             cursor: 0,
             history: Vec::new(),
             history_pos: 0,
+            suggestion: None,
         }
     }
 
@@ -119,9 +122,11 @@ impl InputBuffer {
                 self.text.insert(self.cursor, *c);
                 self.cursor += c.len_utf8();
                 self.history_pos = 0;
+                self.suggestion = None;
                 None
             }
             InputAction::Backspace => {
+                self.suggestion = None;
                 if self.cursor > 0 {
                     let prev = self.text[..self.cursor]
                         .char_indices()
@@ -136,6 +141,7 @@ impl InputBuffer {
                 None
             }
             InputAction::Delete => {
+                self.suggestion = None;
                 if self.cursor < self.text.len() {
                     let ch = self.text[self.cursor..].chars().next();
                     if let Some(ch) = ch {
@@ -175,6 +181,7 @@ impl InputBuffer {
                 None
             }
             InputAction::Submit => {
+                self.suggestion = None;
                 if !self.text.is_empty() {
                     let submitted = self.text.clone();
                     self.history.push(self.text.clone());
@@ -187,6 +194,7 @@ impl InputBuffer {
                 }
             }
             InputAction::HistoryUp => {
+                self.suggestion = None;
                 if self.history_pos < self.history.len() {
                     self.history_pos += 1;
                     let idx = self.history.len() - self.history_pos;
@@ -196,6 +204,7 @@ impl InputBuffer {
                 None
             }
             InputAction::HistoryDown => {
+                self.suggestion = None;
                 if self.history_pos > 1 {
                     self.history_pos -= 1;
                     let idx = self.history.len() - self.history_pos;
@@ -209,15 +218,18 @@ impl InputBuffer {
                 None
             }
             InputAction::KillToEnd => {
+                self.suggestion = None;
                 self.text.truncate(self.cursor);
                 None
             }
             InputAction::KillToStart => {
+                self.suggestion = None;
                 self.text.drain(..self.cursor);
                 self.cursor = 0;
                 None
             }
             InputAction::DeleteWord => {
+                self.suggestion = None;
                 if self.cursor > 0 {
                     let before = &self.text[..self.cursor];
                     // Find word boundary: skip whitespace backward, then skip non-whitespace
