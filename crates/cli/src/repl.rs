@@ -241,7 +241,7 @@ impl ReplLoop {
             ui_state.statusline.thinking = thinking;
 
             // Draw frame
-            if let Err(e) = terminal_ui.draw(&ui_state) {
+            if let Err(e) = terminal_ui.draw(&mut ui_state) {
                 tracing::warn!("TUI draw error: {e}");
             }
 
@@ -380,6 +380,11 @@ impl ReplLoop {
                                 | VimAction::Append
                                 | VimAction::InsertAtEnd
                                 | VimAction::InsertAtStart => {}
+                            }
+
+                            // Sync slash-command suggestion overlay when typing in insert mode.
+                            if vim.is_insert() {
+                                self.update_slash_suggestions(&mut ui_state);
                             }
                         }
                         Event::Resize(_, _) => {}
@@ -609,6 +614,40 @@ impl ReplLoop {
         statusline.git_branch = current_git_branch(&self.cwd);
         statusline.total_tokens = self.history.len() * 100;
         statusline.cost_usd = 0.0;
+    }
+
+    /// Update slash-command suggestion overlay based on current input.
+    fn update_slash_suggestions(&self, ui_state: &mut coderex_ui::state::UiState) {
+        use coderex_ui::overlay::Overlay;
+
+        if ui_state.input.text.starts_with('/') {
+            let query = ui_state.input.text.trim_start_matches('/');
+            let cmds: Vec<String> = self
+                .commands
+                .list()
+                .iter()
+                .filter(|c| query.is_empty() || c.name.contains(query))
+                .map(|c| format!("/{} - {}", c.name, c.description))
+                .collect();
+            // Replace existing palette overlay so suggestions stay in sync.
+            if let Some(top) = ui_state.overlays.top() {
+                if matches!(top, Overlay::CommandPalette { .. }) {
+                    ui_state.overlays.pop();
+                }
+            }
+            ui_state.overlays.push(Overlay::CommandPalette {
+                query: ui_state.input.text.clone(),
+                commands: cmds,
+                selected: 0,
+            });
+        } else {
+            // Remove palette overlay when input no longer starts with '/'.
+            if let Some(top) = ui_state.overlays.top() {
+                if matches!(top, Overlay::CommandPalette { .. }) {
+                    ui_state.overlays.pop();
+                }
+            }
+        }
     }
 
     /// Process a line of input in the TUI context.

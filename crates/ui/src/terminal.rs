@@ -50,7 +50,7 @@ impl TerminalUi {
     }
 
     /// Draw a single frame.
-    pub fn draw(&mut self, state: &UiState) -> std::io::Result<()> {
+    pub fn draw(&mut self, state: &mut UiState) -> std::io::Result<()> {
         self.terminal.draw(|frame| {
             let area = frame.area();
             let chunks = Layout::default()
@@ -80,7 +80,9 @@ impl TerminalUi {
     }
 }
 
-fn render_messages(frame: &mut Frame, area: ratatui::layout::Rect, state: &UiState) {
+fn render_messages(frame: &mut Frame, area: ratatui::layout::Rect, state: &mut UiState) {
+    // Update visible count based on available terminal rows so messages actually appear.
+    state.messages.set_visible_count(area.height as usize);
     let visible = state.messages.visible();
     let mut lines: Vec<Line> = Vec::new();
 
