@@ -172,9 +172,50 @@ fn wrap_text(text: &str, width: usize) -> Vec<String> {
     result
 }
 
+/// Compute how many terminal rows a message occupies at the given width.
+fn message_display_height(msg: &crate::message_list::Message, width: usize) -> usize {
+    let prefix = match msg.role {
+        crate::message_list::MessageRole::User => "▸ ",
+        crate::message_list::MessageRole::Assistant => "◂ ",
+        crate::message_list::MessageRole::ToolResult => "✓ ",
+        crate::message_list::MessageRole::ToolCall => "⚙ ",
+        crate::message_list::MessageRole::System => "⋮ ",
+    };
+    let prefix_width = unicode_width::UnicodeWidthStr::width(prefix);
+    let wrap_width = width.saturating_sub(prefix_width);
+    let wrapped = wrap_text(&msg.content, wrap_width);
+    let mut height = wrapped.len().max(1);
+    if msg.tool_name.is_some()
+        && matches!(msg.role, crate::message_list::MessageRole::ToolCall | crate::message_list::MessageRole::ToolResult)
+    {
+        height += 1;
+    }
+    height
+}
+
 fn render_messages(frame: &mut Frame, area: ratatui::layout::Rect, state: &mut UiState) {
-    // Update visible count based on available terminal rows so messages actually appear.
-    state.messages.set_visible_count(area.height as usize);
+    let width = area.width as usize;
+    let viewport_height = area.height as usize;
+
+    // Compute each message's height so we can determine how many fit.
+    let mut heights: Vec<usize> = Vec::with_capacity(state.messages.messages.len());
+    for msg in &state.messages.messages {
+        heights.push(message_display_height(msg, width));
+    }
+
+    // Count how many messages fit from `start` downward.
+    let mut visible_count = 0;
+    let mut accumulated = 0;
+    for i in state.messages.start..state.messages.messages.len() {
+        accumulated += heights[i];
+        if accumulated > viewport_height {
+            break;
+        }
+        visible_count += 1;
+    }
+    visible_count = visible_count.max(1);
+
+    state.messages.set_visible_count(visible_count);
     let visible = state.messages.visible();
     let mut lines: Vec<Line> = Vec::new();
 
@@ -188,7 +229,7 @@ fn render_messages(frame: &mut Frame, area: ratatui::layout::Rect, state: &mut U
         };
 
         let prefix_width = unicode_width::UnicodeWidthStr::width(prefix);
-        let wrap_width = (area.width as usize).saturating_sub(prefix_width);
+        let wrap_width = width.saturating_sub(prefix_width);
         let wrapped = wrap_text(&msg.content, wrap_width);
 
         for (i, text) in wrapped.into_iter().enumerate() {
@@ -244,8 +285,7 @@ fn render_messages(frame: &mut Frame, area: ratatui::layout::Rect, state: &mut U
     }
 
     let paragraph = Paragraph::new(lines)
-        .block(Block::default().borders(Borders::NONE))
-        .scroll((state.messages.start as u16, 0));
+        .block(Block::default().borders(Borders::NONE));
     frame.render_widget(paragraph, area);
 }
 
