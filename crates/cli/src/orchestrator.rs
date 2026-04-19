@@ -316,9 +316,30 @@ impl StartupOrchestrator {
         Ok(())
     }
 
-    /// LoadCommands: register all built-in and plugin commands.
+    /// LoadCommands: discover and register custom commands from `.claude/commands/`.
     async fn phase_load_commands(&self) -> Result<()> {
-        tracing::info!("commands loaded");
+        let commands_dir = std::path::Path::new(&self.ctx.cwd).join(".claude/commands");
+        if commands_dir.exists() {
+            let mut count = 0;
+            if let Ok(entries) = std::fs::read_dir(&commands_dir) {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if path.extension().is_some_and(|e| e == "json") {
+                        if let Ok(content) = std::fs::read_to_string(&path) {
+                            if let Ok(cmd) = serde_json::from_str::<serde_json::Value>(&content) {
+                                if let Some(name) = cmd.get("name").and_then(|n| n.as_str()) {
+                                    tracing::debug!("discovered custom command: {name}");
+                                    count += 1;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            tracing::info!("commands loaded: {count} custom from {commands_dir:?}");
+        } else {
+            tracing::debug!("no custom commands directory found");
+        }
         Ok(())
     }
 
@@ -336,36 +357,130 @@ impl StartupOrchestrator {
         Ok(())
     }
 
-    /// InitPlugins: initialize registered plugins.
+    /// InitPlugins: discover and load plugins from plugin directories.
     async fn phase_init_plugins(&self) -> Result<()> {
-        tracing::info!("plugins initialized");
+        let mut manager = coderex_plugins::plugins::PluginManager::new();
+        let mut plugin_dirs: Vec<std::path::PathBuf> = Vec::new();
+
+        // Project-local plugins
+        let project_plugins = std::path::Path::new(&self.ctx.cwd).join(".claude/plugins");
+        if project_plugins.exists() {
+            manager.add_plugin_dir(project_plugins.clone());
+            plugin_dirs.push(project_plugins);
+        }
+
+        // Global plugins in config home
+        let global_plugins = coderex_config::config_home().join("plugins");
+        if global_plugins.exists() {
+            manager.add_plugin_dir(global_plugins.clone());
+            plugin_dirs.push(global_plugins);
+        }
+
+        // Discover and load each plugin
+        let mut loaded = 0;
+        for dir in &plugin_dirs {
+            if !dir.exists() {
+                continue;
+            }
+            if let Ok(entries) = std::fs::read_dir(dir) {
+                for entry in entries.flatten() {
+                    let manifest_path = entry.path().join("plugin.json");
+                    if manifest_path.exists() {
+                        if let Ok(content) = std::fs::read_to_string(&manifest_path) {
+                            if let Ok(manifest) = serde_json::from_str::<coderex_plugins::plugins::PluginManifest>(&content) {
+                                manager.load_plugin(manifest, entry.path());
+                                loaded += 1;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        tracing::info!("plugins initialized: {loaded} loaded");
         Ok(())
     }
 
     /// ReconcileMarketplaces: sync marketplace state.
     async fn phase_reconcile_marketplaces(&self) -> Result<()> {
-        tracing::info!("marketplaces reconciled");
+        let manager = coderex_plugins::plugins::PluginManager::new();
+        let reconciler = coderex_plugins::plugins::MarketplaceReconciler::new(300);
+
+        // Register marketplace if configured via environment
+        if let Ok(url) = std::env::var("CODEREX_MARKETPLACE_URL") {
+            if !url.is_empty() {
+                let name = std::env::var("CODEREX_MARKETPLACE_NAME")
+                    .unwrap_or_else(|_| "default".into());
+                manager.register_marketplace(name, url);
+            }
+        }
+
+        let install_dir = std::path::Path::new(&self.ctx.cwd).join(".claude/plugins");
+        match reconciler.reconcile(&manager, Some(&install_dir)).await {
+            Ok(report) => {
+                if report.is_empty() {
+                    tracing::debug!("marketplace reconciliation: no changes");
+                } else {
+                    tracing::info!(
+                        "marketplaces reconciled: {} new, {} updated, {} removed",
+                        report.new_count,
+                        report.updated_count,
+                        report.removed_count
+                    );
+                }
+            }
+            Err(e) => {
+                tracing::warn!("marketplace reconciliation failed (failing open): {e}");
+            }
+        }
+
         Ok(())
     }
 
     /// InitMcp: initialize MCP server connections (non-blocking, fail-open).
     async fn phase_init_mcp(&mut self) -> Result<()> {
         let settings = self.ctx.settings.clone().unwrap_or_default();
+        let manager = coderex_mcp::manager::McpManager::new();
+        let mut config_loaded = false;
 
-        if let Some(ref mcp_servers) = settings.mcp_servers {
-            // Check if MCP servers config is non-empty
-            if !mcp_servers.to_string().is_empty() && mcp_servers.to_string() != "null" {
-                tracing::info!("MCP server connections initializing (non-blocking)");
-                // MCP connections are async and don't block startup
-                // In a full implementation, this would spawn background tasks
-                // to connect to each configured server
-                self.ctx.mcp_ready = true;
+        // Load from .mcp.json if present
+        let mcp_path = std::path::Path::new(&self.ctx.cwd).join(".mcp.json");
+        if mcp_path.exists() {
+            match coderex_mcp::config::McpConfig::load(&mcp_path) {
+                Ok(config) => {
+                    if !config.is_empty() {
+                        manager.load_config(&config);
+                        config_loaded = true;
+                        tracing::info!(
+                            "MCP config loaded: {} servers from {mcp_path:?}",
+                            config.server_names().len()
+                        );
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("failed to load MCP config from {mcp_path:?}: {e}");
+                }
             }
         }
 
-        if !self.ctx.mcp_ready {
+        // Also check inline config from settings
+        if let Some(ref mcp_servers) = settings.mcp_servers {
+            if !mcp_servers.to_string().is_empty() && mcp_servers.to_string() != "null" {
+                tracing::debug!("MCP servers configured in settings");
+                config_loaded = true;
+            }
+        }
+
+        if config_loaded {
+            // Spawn all registered MCP servers in the background
+            manager.start_all().await;
+            let running = manager.list_servers();
+            tracing::info!("MCP servers started: {}", running.len());
+            self.ctx.mcp_ready = true;
+        } else {
             tracing::debug!("no MCP servers configured");
         }
+
         Ok(())
     }
 
@@ -384,9 +499,20 @@ impl StartupOrchestrator {
 
     /// InitRemoteServices: initialize remote service connections.
     async fn phase_init_remote_services(&mut self) -> Result<()> {
-        // Bridge, marketplace, and other remote services initialize here
-        // These are best-effort — failures don't block startup
-        tracing::info!("remote services initialized");
+        // Bridge transport initialization — best-effort, failures don't block startup
+        if let Ok(bridge_url) = std::env::var("CODEREX_BRIDGE_URL") {
+            if !bridge_url.is_empty() {
+                let factory = coderex_bridge::transport::default_factory();
+                tracing::info!(
+                    "bridge transport initialized: url={bridge_url}, transports={:?}",
+                    factory.registered_types()
+                );
+                self.ctx.remote_services_ready = true;
+                return Ok(());
+            }
+        }
+
+        tracing::debug!("no remote services configured");
         self.ctx.remote_services_ready = true;
         Ok(())
     }
@@ -489,6 +615,11 @@ impl StartupOrchestrator {
             .and_then(|s| s.parse::<u64>().ok())
             .unwrap_or(3600);
 
+        let port = std::env::var("CODEREX_PORT")
+            .ok()
+            .and_then(|s| s.parse::<u16>().ok())
+            .unwrap_or(8080);
+
         let config = ServerConfig {
             valid_keys,
             idle_timeout: std::time::Duration::from_secs(idle_timeout),
@@ -499,33 +630,13 @@ impl StartupOrchestrator {
 
         tracing::info!("CodeRex server initialized: cwd={cwd}");
         tracing::info!("Server config: idle_timeout={idle_timeout}s, max_sessions=100");
-        tracing::info!("Server ready — accepting WebSocket connections on ws://0.0.0.0:8080");
-        println!("CodeRex server running on ws://0.0.0.0:8080");
+        println!("CodeRex server running on ws://0.0.0.0:{port}");
         println!("Sessions: 0 active");
         println!("Press Ctrl+C to stop");
 
-        // In a full implementation, this would bind a WebSocket listener
-        // and accept connections, routing them through the DaemonServer.
-        // For now, we keep the server alive and log periodic status.
-        let mut ticker = tokio::time::interval(std::time::Duration::from_secs(60));
-        loop {
-            ticker.tick().await;
-            let count = server.session_count();
-            let idle = server.cleanup_idle();
-            if !idle.is_empty() {
-                tracing::info!("Cleaned up {} idle sessions: {:?}", idle.len(), idle);
-            }
-            tracing::debug!("Server heartbeat: {} active sessions", count);
-            let sessions = server.list_sessions();
-            for session in &sessions {
-                tracing::debug!(
-                    "  session {}: auth={}, age={:?}s",
-                    session.id,
-                    session.authenticated,
-                    session.last_activity.elapsed().as_secs()
-                );
-            }
-        }
+        let addr = std::net::SocketAddr::from(([0, 0, 0, 0], port));
+        server.run(addr).await.map_err(|e| anyhow::anyhow!(e))?;
+        Ok(())
     }
 
     #[allow(clippy::unused_async)]

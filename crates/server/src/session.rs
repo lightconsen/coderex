@@ -1,7 +1,12 @@
 //! Detached WebSocket session management with authentication and idle cleanup.
 
+use futures::{SinkExt, StreamExt};
 use std::collections::HashMap;
+use std::net::SocketAddr;
 use std::time::{Duration, Instant};
+use tokio::net::{TcpListener, TcpStream};
+use tokio_tungstenite::tungstenite::Message;
+use tracing::{debug, info, warn};
 
 /// A connected WebSocket session.
 #[derive(Debug)]
@@ -142,6 +147,172 @@ impl DaemonServer {
     #[must_use]
     pub fn session_count(&self) -> usize {
         self.sessions.len()
+    }
+
+    /// Start the WebSocket server and accept connections.
+    ///
+    /// Binds a TCP listener on the given address, upgrades connections to
+    /// WebSocket, authenticates clients, and routes messages.
+    pub async fn run(&mut self, addr: SocketAddr) -> Result<(), String> {
+        let listener = TcpListener::bind(addr)
+            .await
+            .map_err(|e| format!("failed to bind TCP listener: {e}"))?;
+
+        info!("WebSocket server listening on ws://{addr}");
+
+        let mut cleanup_interval = tokio::time::interval(Duration::from_secs(60));
+
+        loop {
+            tokio::select! {
+                accept_result = listener.accept() => {
+                    match accept_result {
+                        Ok((stream, peer)) => {
+                            debug!("new TCP connection from {peer}");
+                            self.handle_connection(stream).await;
+                        }
+                        Err(e) => {
+                            warn!("accept error: {e}");
+                        }
+                    }
+                }
+                _ = cleanup_interval.tick() => {
+                    let removed = self.cleanup_idle();
+                    if !removed.is_empty() {
+                        info!("cleaned up {} idle sessions: {:?}", removed.len(), removed);
+                    }
+                }
+            }
+        }
+    }
+
+    async fn handle_connection(&mut self, stream: TcpStream) {
+        let ws_result = tokio_tungstenite::accept_async(stream).await;
+        let mut ws = match ws_result {
+            Ok(ws) => ws,
+            Err(e) => {
+                warn!("WebSocket handshake failed: {e}");
+                return;
+            }
+        };
+
+        // First message must be auth token
+        let auth_msg = match tokio::time::timeout(
+            Duration::from_secs(10),
+            ws.next(),
+        )
+        .await
+        {
+            Ok(Some(Ok(Message::Text(t)))) => t,
+            Ok(Some(Ok(other))) => {
+                warn!("expected auth text, got: {other:?}");
+                let _ = ws
+                    .send(Message::Text(
+                        r#"{"error":"auth required"}"#.to_string().into(),
+                    ))
+                    .await;
+                return;
+            }
+            Ok(Some(Err(e))) => {
+                warn!("WebSocket error during auth: {e}");
+                return;
+            }
+            Ok(None) => {
+                debug!("client disconnected before auth");
+                return;
+            }
+            Err(_) => {
+                warn!("auth timeout");
+                let _ = ws
+                    .send(Message::Text(
+                        r#"{"error":"auth timeout"}"#.to_string().into(),
+                    ))
+                    .await;
+                return;
+            }
+        };
+
+        // Parse auth JSON: {"token":"..."}
+        let token = match serde_json::from_str::<serde_json::Value>(&auth_msg) {
+            Ok(v) => v
+                .get("token")
+                .and_then(|t| t.as_str())
+                .unwrap_or("")
+                .to_string(),
+            Err(_) => auth_msg.to_string(), // fallback: raw token
+        };
+
+        let session_id = match self.authenticate(&token) {
+            Ok(id) => id,
+            Err(e) => {
+                warn!("authentication failed: {e}");
+                let _ = ws
+                    .send(Message::Text(
+                        format!(r#"{{"error":"{e}"}}"#).into(),
+                    ))
+                    .await;
+                return;
+            }
+        };
+
+        let _ = ws
+            .send(Message::Text(
+                format!(r#"{{"session_id":"{session_id}"}}"#).into(),
+            ))
+            .await;
+
+        info!(
+            "session {session_id} authenticated, {} active",
+            self.session_count()
+        );
+
+        // Simple echo loop for the session
+        loop {
+            match tokio::time::timeout(Duration::from_secs(300), ws.next()).await {
+                Ok(Some(Ok(Message::Text(text)))) => {
+                    self.record_activity(&session_id);
+                    debug!("session {session_id} received: {text}");
+                    // Echo back with session info
+                    let response = format!(
+                        r#"{{"session_id":"{session_id}","echo":{text}}}"#
+                    );
+                    if let Err(e) = ws.send(Message::Text(response.into())).await {
+                        warn!("send error for session {session_id}: {e}");
+                        break;
+                    }
+                }
+                Ok(Some(Ok(Message::Close(_)))) => {
+                    debug!("session {session_id} closed connection");
+                    break;
+                }
+                Ok(Some(Ok(Message::Ping(data)))) => {
+                    if let Err(e) = ws.send(Message::Pong(data)).await {
+                        warn!("pong error for session {session_id}: {e}");
+                        break;
+                    }
+                }
+                Ok(Some(Err(e))) => {
+                    warn!("WebSocket error for session {session_id}: {e}");
+                    break;
+                }
+                Ok(None) => {
+                    debug!("session {session_id} stream ended");
+                    break;
+                }
+                Err(_) => {
+                    warn!("session {session_id} message timeout");
+                    break;
+                }
+                _ => {
+                    // Ignore Binary, Pong, Frame, and other message types
+                }
+            }
+        }
+
+        self.disconnect(&session_id);
+        info!(
+            "session {session_id} disconnected, {} active",
+            self.session_count()
+        );
     }
 }
 
