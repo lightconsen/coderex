@@ -158,7 +158,7 @@ mod tests {
         let mut state = SearchState::new();
         state.set_query("x");
         let lines = vec!["x", "x", "x"];
-        state.search_in(&lines);
+        let _ = state.search_in(&lines);
         assert_eq!(state.active_index, 0);
 
         state.next();
@@ -185,7 +185,7 @@ mod tests {
     fn clear_removes_matches() {
         let mut state = SearchState::new();
         state.set_query("hello");
-        state.search_in(&["hello"]);
+        let _ = state.search_in(&["hello"]);
         assert!(state.is_active());
         state.clear();
         assert!(!state.is_active());

@@ -1,4 +1,5 @@
 //! E2E test harness — mock server and test utilities.
+#![allow(dead_code)]
 
 use std::collections::{HashMap, VecDeque};
 
@@ -87,6 +88,7 @@ impl MockServer {
 }
 
 /// Test context for running e2e scenarios.
+#[derive(Debug)]
 pub struct E2EContext {
     /// The mock server.
     pub server: MockServer,

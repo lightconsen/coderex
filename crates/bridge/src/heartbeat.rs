@@ -53,8 +53,10 @@ pub struct Heartbeat {
     /// Last successful beat timestamp (epoch seconds).
     last_success: Option<i64>,
     /// Whether the heartbeat is actively running.
+    #[allow(dead_code)]
     running: AtomicBool,
     /// Beat counter (atomic for cross-thread access).
+    #[allow(dead_code)]
     beat_count: AtomicU64,
 }
 
@@ -421,8 +423,8 @@ mod tests {
     #[test]
     fn reconnector_reset() {
         let mut rc = WsReconnector::new(3);
-        rc.next_delay();
-        rc.next_delay();
+        let _ = rc.next_delay();
+        let _ = rc.next_delay();
         rc.reset();
         assert!(rc.can_reconnect());
         assert_eq!(rc.attempt_count(), 0);

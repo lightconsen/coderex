@@ -8,23 +8,35 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::RwLock;
 
+/// Key used to store the cron scheduler in `ToolContext.extra`.
 pub const CRON_SCHEDULER_KEY: &str = "cron_scheduler";
 
+#[allow(dead_code)]
 const JOB_FILE: &str = ".claude/scheduled_tasks.json";
 
+/// A scheduled cron job.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CronJob {
+    /// Unique job identifier.
     pub id: String,
+    /// Cron expression (5-field standard).
     pub cron: String,
+    /// Prompt to enqueue when the job fires.
     pub prompt: String,
+    /// Whether the job repeats.
     pub recurring: bool,
+    /// Whether the job survives process restart.
     pub durable: bool,
+    /// ISO-8601 timestamp of creation.
     pub created_at: String,
+    /// ISO-8601 timestamp of last execution (if any).
     pub last_fire: Option<String>,
+    /// ISO-8601 timestamp after which the job is ignored.
     pub expires_at: Option<String>,
 }
 
 impl CronJob {
+    /// Create a new cron job.
     pub fn new(cron: String, prompt: String, recurring: bool, durable: bool) -> Self {
         let id = format!("cron-{}", LOCAL_COUNTER.fetch_add(1, Ordering::SeqCst));
         let now = Local::now().format("%Y-%m-%dT%H:%M:%S").to_string();
@@ -43,18 +55,21 @@ impl CronJob {
 
 static LOCAL_COUNTER: AtomicU64 = AtomicU64::new(1);
 
-#[derive(Default)]
+/// In-memory cron job scheduler with optional file persistence.
+#[derive(Debug, Default)]
 pub struct CronScheduler {
     jobs: RwLock<HashMap<String, CronJob>>,
     storage_path: RwLock<Option<PathBuf>>,
 }
 
 impl CronScheduler {
+    /// Create a new scheduler with no storage path.
     pub fn new() -> Self {
         Self::default()
     }
 
-    pub fn with_storage(mut self, path: PathBuf) -> Self {
+    /// Set the filesystem path used for `load` / `save`.
+    pub fn with_storage(self, path: PathBuf) -> Self {
         *self.storage_path.write().unwrap() = Some(path);
         self
     }
@@ -93,6 +108,7 @@ impl CronScheduler {
         Ok(())
     }
 
+    /// Add a job to the scheduler.
     pub fn create(&self, job: CronJob) -> String {
         let id = job.id.clone();
         if job.durable {
@@ -104,6 +120,7 @@ impl CronScheduler {
         id
     }
 
+    /// Remove a job by ID.
     pub fn delete(&self, id: &str) -> bool {
         let removed = self.jobs.write().unwrap().remove(id).is_some();
         if removed {
@@ -112,6 +129,7 @@ impl CronScheduler {
         removed
     }
 
+    /// Return all jobs.
     pub fn list(&self) -> Vec<CronJob> {
         self.jobs.read().unwrap().values().cloned().collect()
     }
@@ -133,6 +151,7 @@ impl CronScheduler {
         match_cron_expr(&job.cron)
     }
 
+    /// Record that a job fired and update persistence.
     pub fn mark_fired(&self, id: &str) {
         let now = Local::now().format("%Y-%m-%dT%H:%M:%S").to_string();
         let mut map = self.jobs.write().unwrap();
@@ -147,6 +166,7 @@ impl CronScheduler {
         let _ = self.save();
     }
 
+    /// Get the prompt for a job by ID.
     pub fn get_prompt(&self, id: &str) -> Option<String> {
         self.jobs.read().unwrap().get(id).map(|j| j.prompt.clone())
     }
@@ -194,7 +214,7 @@ fn match_field(spec: &str, value: i64, min: i64, max: i64) -> bool {
     false
 }
 
-fn match_single(spec: &str, value: i64, min: i64, max: i64) -> bool {
+fn match_single(spec: &str, value: i64, min: i64, _max: i64) -> bool {
     // Handle step: */N or range/N
     if let Some((base, step_str)) = spec.split_once('/') {
         let step: i64 = match step_str.parse() {

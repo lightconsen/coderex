@@ -6,7 +6,6 @@
 use std::io::{BufRead, BufReader, Read, Write};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 
-use lsp_types::Position;
 use serde_json::Value;
 use url::Url;
 

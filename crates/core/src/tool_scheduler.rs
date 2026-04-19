@@ -13,7 +13,7 @@
 //! and maximum throughput for safe tools.
 
 use crate::engine::{DeniedToolCall, PendingToolCall, SubmitOptions};
-use crate::hook_executor::{HookExecutor, HookFireResult};
+use crate::hook_executor::HookExecutor;
 use crate::permission_engine::PermissionEngine;
 use crate::permissions::PermissionResult;
 use crate::tool_executor::{ToolDispatchOutcome, ToolExecutor};
@@ -44,6 +44,7 @@ struct ApprovedCall {
 /// 7. PostToolUse hook + ToolCallEnd event per completed call
 /// ```
 /// Outcome of running the tool scheduler.
+#[derive(Debug)]
 pub struct SchedulerOutcome {
     /// Results for all calls (approved, denied, blocked, etc.).
     pub results: Vec<ToolResult>,
@@ -51,6 +52,7 @@ pub struct SchedulerOutcome {
     pub pending_elevation: Option<crate::engine::PendingElevation>,
 }
 
+/// Execute pending tool calls with permission checks and hooks.
 pub async fn run_tool_calls(
     calls: &[PendingToolCall],
     tools: &dyn ToolExecutor,
@@ -246,7 +248,7 @@ pub async fn run_tool_calls(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{ModelId, ToolCall};
+    
     use tokio::sync::mpsc;
 
     struct MockToolExecutor;

@@ -128,7 +128,7 @@ pub fn register(registry: &mut CommandRegistry) {
             if ctx.is_feature_enabled("thinkback") {
                 let transcript_dir = std::path::Path::new(&ctx.cwd).join(".claude/transcripts");
                 let mut output = String::from("Thinkback\n────────\n");
-                let mut total_msgs = 0;
+                let total_msgs;
                 if transcript_dir.exists() {
                     // Look for transcript files for this session
                     let session_file = transcript_dir.join(format!("{}.jsonl", ctx.session_id));
@@ -136,6 +136,7 @@ pub fn register(registry: &mut CommandRegistry) {
                         if let Ok(content) = std::fs::read_to_string(&session_file) {
                             let lines: Vec<&str> = content.lines().collect();
                             total_msgs = lines.len();
+                            let _total = total_msgs;
                             output.push_str(&format!("Session {}: {} messages\n\n", ctx.session_id, total_msgs));
                             for line in lines.iter().take(10) {
                                 if let Ok(msg) = serde_json::from_str::<serde_json::Value>(line) {

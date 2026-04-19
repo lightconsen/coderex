@@ -107,6 +107,7 @@ fn extract_string(args: &serde_json::Value, key: &str) -> Result<String, ToolErr
 }
 
 #[cfg(test)]
+#[allow(dead_code)]
 mod tests {
     use super::*;
     use crate::task_store::{TaskRecord, TaskStore};

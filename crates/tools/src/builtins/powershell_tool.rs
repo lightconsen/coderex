@@ -122,6 +122,7 @@ fn extract_number(args: &serde_json::Value, key: &str) -> Option<i64> {
 }
 
 #[cfg(test)]
+#[allow(dead_code)]
 mod tests {
     use super::*;
     use crate::tool::ToolContext;

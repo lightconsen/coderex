@@ -176,7 +176,7 @@ fn stress_input_buffer_many_operations() {
 // Stress: Vim state with many operations
 #[test]
 fn stress_vim_many_operations() {
-    use coderex_ui::vim::{VimMode, VimState};
+    use coderex_ui::vim::VimState;
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
     let mut state = VimState::new();

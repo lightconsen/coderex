@@ -119,7 +119,7 @@ pub type CommandHandler =
 // ─── CommandContext ─────────────────────────────────────────────────────────
 
 /// Runtime context provided to command handlers.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct CommandContext {
     /// Current working directory.
     pub cwd: String,

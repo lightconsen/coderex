@@ -182,6 +182,7 @@ fn extract_string_array(args: &serde_json::Value, key: &str) -> Vec<String> {
 }
 
 #[cfg(test)]
+#[allow(dead_code)]
 mod tests {
     use super::*;
     use crate::tool::ToolContext;

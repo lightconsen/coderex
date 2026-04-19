@@ -78,7 +78,12 @@ pub enum TaskError {
     NotFound(String),
     /// Invalid state transition.
     #[error("invalid state transition: {from} -> {to}")]
-    InvalidTransition { from: TaskState, to: TaskState },
+    InvalidTransition {
+        /// Source state.
+        from: TaskState,
+        /// Target state.
+        to: TaskState,
+    },
     /// Task already cancelled/stopped.
     #[error("task already terminated: {0}")]
     AlreadyTerminated(String),

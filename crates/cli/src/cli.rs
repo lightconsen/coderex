@@ -2,7 +2,7 @@
 
 use clap::{Parser, Subcommand};
 
-#[derive(Parser)]
+#[derive(Parser, Debug)]
 #[command(
     name = "coderex",
     version,
@@ -32,7 +32,7 @@ pub struct Cli {
     pub command: Option<Command>,
 }
 
-#[derive(Subcommand)]
+#[derive(Subcommand, Debug)]
 pub enum Command {
     /// Start the interactive REPL (default when no command is given).
     Repl,

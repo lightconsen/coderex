@@ -498,7 +498,7 @@ impl AgentManager {
             pid: None,
         };
 
-        let mut task_manager = self.task_manager.lock().await;
+        let task_manager = self.task_manager.lock().await;
         // Use the specific ID for resumed agents
         let task_handle = TaskHandle::new(agent_id.to_string(), kind);
         drop(task_manager);
@@ -668,7 +668,7 @@ pub async fn spawn_dream_agent(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::PathBuf;
+    
 
     fn make_manager() -> AgentManager {
         AgentManager::standalone()

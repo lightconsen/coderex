@@ -22,8 +22,11 @@ pub struct TodoItem {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TodoStatus {
+    /// Not yet started.
     Pending,
+    /// Currently being worked on.
     InProgress,
+    /// Done.
     Completed,
 }
 
@@ -44,6 +47,7 @@ impl Default for TodoStatus {
 }
 
 impl TodoItem {
+    /// Create a new todo item with the given subject.
     pub fn new(subject: impl Into<String>) -> Self {
         Self {
             subject: subject.into(),
@@ -61,6 +65,7 @@ pub struct TodoStore {
 }
 
 impl TodoStore {
+    /// Create an empty todo store.
     pub fn new() -> Self {
         Self { items: Mutex::new(Vec::new()) }
     }

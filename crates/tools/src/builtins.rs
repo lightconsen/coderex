@@ -56,12 +56,11 @@ pub use exit_plan_mode_tool::ExitPlanModeTool;
 pub use feature_gated_tools::register_feature_gated_tools;
 pub use glob_tool::GlobTool;
 pub use mcp_resource_tools::{
-    ListMcpResourcesTool, McpResourceEntry, McpResourceHandle, ReadMcpResourceTool,
-    MCP_RESOURCE_HANDLE_KEY,
+    ListMcpResourcesTool, ReadMcpResourceTool,
 };
-pub use team_create_tool::{TeamCreateTool, TeamManagerHandle, TEAM_MANAGER_KEY};
+pub use team_create_tool::TeamCreateTool;
 pub use team_delete_tool::TeamDeleteTool;
-pub use worktree_tools::{EnterWorktreeTool, ExitWorktreeTool, WorktreeHandle, WORKTREE_HANDLE_KEY};
+pub use worktree_tools::{EnterWorktreeTool, ExitWorktreeTool};
 pub use grep_tool::GrepTool;
 pub use lsp_tool::LspTool;
 pub use mcp_auth_tool::McpAuthTool;

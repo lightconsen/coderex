@@ -88,6 +88,7 @@ pub struct InProcessTransport {
     /// Incoming message receiver.
     rx: Option<mpsc::UnboundedReceiver<TransportMessage>>,
     /// Shared message queue for bidirectional communication.
+    #[allow(dead_code)]
     message_queue: Arc<RwLock<Vec<TransportMessage>>>,
 }
 

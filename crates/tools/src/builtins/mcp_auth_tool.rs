@@ -3,8 +3,6 @@
 use crate::context::{ToolError, ToolOutput};
 use crate::tool::{Tool, ToolContext, ToolDescriptor, ToolInput, ToolTier};
 use async_trait::async_trait;
-use std::collections::HashMap;
-use std::sync::Arc;
 
 /// Trigger MCP OAuth authentication flow for a server.
 #[derive(Debug)]

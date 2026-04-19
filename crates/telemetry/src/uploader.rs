@@ -182,7 +182,7 @@ impl TelemetryUploader {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::store::TelemetryStore;
+    
 
     #[test]
     fn telemetry_config_defaults() {

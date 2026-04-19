@@ -43,9 +43,13 @@ pub struct TaskRecord {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TaskStatus {
+    /// Not yet started.
     Pending,
+    /// Currently being worked on.
     InProgress,
+    /// Done.
     Completed,
+    /// Removed from the store.
     Deleted,
 }
 
@@ -56,6 +60,7 @@ impl Default for TaskStatus {
 }
 
 impl TaskRecord {
+    /// Create a new task record.
     pub fn new(id: impl Into<String>, subject: impl Into<String>) -> Self {
         Self {
             id: id.into(),
@@ -81,6 +86,7 @@ pub struct TaskStore {
 }
 
 impl TaskStore {
+    /// Create an empty task store.
     pub fn new() -> Self {
         Self {
             tasks: DashMap::new(),
