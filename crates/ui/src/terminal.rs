@@ -13,6 +13,33 @@ use crate::message_list::MessageRole;
 use crate::state::UiState;
 use crate::statusline::Statusline;
 
+/// ASCII T-Rex welcome art (larger variant).
+const T_REX: &str = r#"
+                              .-.
+                    ,        ( {o\
+                    {\    /   ~o   }
+                     \`  '-'/    ~ |
+                    {.'   ~   ~  /}
+                     `.    ~  ~ /
+                    .'  ~  ~   `}.
+                   /    ~     ~  `}
+                  {      ~     ~  /)
+                  |`-._  ~    ~  /
+                  |    `-._     ~(
+                  |        `--.__/)
+                  {         `--._/
+                   |  |  |  |   |
+                   |  |  |  |   |
+                   |  |  |  |   |
+                   |  |  |  |   |
+                   |  |  |  |   |
+                   |__|__|__|___|
+                   |__|__|__|___|
+                   \____________/
+                    \__________/
+                     \________/
+"#;
+
 /// The main terminal UI.
 #[allow(missing_debug_implementations)]
 pub struct TerminalUi {
@@ -53,31 +80,96 @@ impl TerminalUi {
     pub fn draw(&mut self, state: &mut UiState) -> std::io::Result<()> {
         self.terminal.draw(|frame| {
             let area = frame.area();
+
+            // Determine if we need an inline palette above the input line.
+            let inline_palette_height = inline_palette_height(state);
+
             let chunks = Layout::default()
                 .direction(Direction::Vertical)
                 .constraints([
-                    Constraint::Min(1),       // message area
-                    Constraint::Length(1),    // statusline
-                    Constraint::Length(1),    // input line
+                    Constraint::Min(1),                    // message area
+                    Constraint::Length(inline_palette_height), // inline command hint
+                    Constraint::Length(1),                 // statusline
+                    Constraint::Length(1),                 // input line
                 ])
                 .split(area);
 
             // Message area
             render_messages(frame, chunks[0], state);
 
+            // Inline palette (when typing /commands)
+            if inline_palette_height > 0 {
+                render_inline_palette(frame, chunks[1], state);
+            }
+
             // Statusline
-            render_statusline(frame, chunks[1], &state.statusline);
+            render_statusline(frame, chunks[2], &state.statusline);
 
             // Input line
-            render_input(frame, chunks[2], &state.input);
+            render_input(frame, chunks[3], &state.input);
 
-            // Overlay (if any)
-            if state.overlays.is_active() {
+            // Overlay (only non-palette overlays; palette is rendered inline)
+            if state.overlays.is_active() && !is_inline_palette(state) {
                 render_overlay(frame, area, state);
             }
         })?;
         Ok(())
     }
+}
+
+/// Compute the height of the inline palette area (0 = hidden).
+fn inline_palette_height(state: &UiState) -> u16 {
+    use crate::overlay::Overlay;
+    let Some(overlay) = state.overlays.top() else { return 0 };
+    match overlay {
+        Overlay::CommandPalette { query, commands, .. } if query.starts_with('/') => {
+            // Header line + up to 5 visible commands, capped at remaining terminal space
+            let count = commands.len().min(5);
+            ((count + 1) as u16).min(6)
+        }
+        _ => 0,
+    }
+}
+
+/// Check whether the active overlay is an inline `/` palette.
+fn is_inline_palette(state: &UiState) -> bool {
+    use crate::overlay::Overlay;
+    state.overlays.top().map_or(false, |o| {
+        matches!(o, Overlay::CommandPalette { query, .. } if query.starts_with('/'))
+    })
+}
+
+/// Word-wrap text to the given display width.
+fn wrap_text(text: &str, width: usize) -> Vec<String> {
+    if width == 0 {
+        return vec![text.to_string()];
+    }
+    let mut result: Vec<String> = Vec::new();
+    for paragraph in text.split('\n') {
+        let mut current = String::new();
+        let mut current_width: usize = 0;
+        for word in paragraph.split_whitespace() {
+            let word_width = unicode_width::UnicodeWidthStr::width(word);
+            let space = if current.is_empty() { 0 } else { 1 };
+            if current_width + space + word_width > width {
+                result.push(std::mem::take(&mut current));
+                current_width = 0;
+            }
+            if !current.is_empty() {
+                current.push(' ');
+                current_width += 1;
+            }
+            current.push_str(word);
+            current_width += word_width;
+        }
+        if !current.is_empty() {
+            result.push(current);
+        }
+    }
+    if result.is_empty() {
+        result.push(String::new());
+    }
+    result
 }
 
 fn render_messages(frame: &mut Frame, area: ratatui::layout::Rect, state: &mut UiState) {
@@ -95,17 +187,37 @@ fn render_messages(frame: &mut Frame, area: ratatui::layout::Rect, state: &mut U
             MessageRole::System => ("⋮ ", Style::default().fg(Color::Gray)),
         };
 
-        lines.push(Line::from(vec![
-            Span::styled(prefix, style),
-            if msg.streaming {
-                Span::styled(&msg.content, style.add_modifier(Modifier::DIM))
+        let prefix_width = unicode_width::UnicodeWidthStr::width(prefix);
+        let wrap_width = (area.width as usize).saturating_sub(prefix_width);
+        let wrapped = wrap_text(&msg.content, wrap_width);
+
+        for (i, text) in wrapped.into_iter().enumerate() {
+            if i == 0 {
+                lines.push(Line::from(vec![
+                    Span::styled(prefix, style),
+                    if msg.streaming {
+                        Span::styled(text, style.add_modifier(Modifier::DIM))
+                    } else {
+                        Span::raw(text)
+                    },
+                ]));
             } else {
-                Span::raw(&msg.content)
-            },
-        ]));
+                let indent = " ".repeat(prefix_width);
+                lines.push(Line::from(vec![
+                    Span::styled(indent, style),
+                    if msg.streaming {
+                        Span::styled(text, style.add_modifier(Modifier::DIM))
+                    } else {
+                        Span::raw(text)
+                    },
+                ]));
+            }
+        }
 
         // Show tool name for tool messages
-        if let (Some(tool), MessageRole::ToolCall | MessageRole::ToolResult) = (&msg.tool_name, msg.role) {
+        if let (Some(tool), MessageRole::ToolCall | MessageRole::ToolResult) =
+            (&msg.tool_name, msg.role)
+        {
             lines.push(Line::from(Span::styled(
                 format!("  [{tool}]"),
                 Style::default().fg(Color::DarkGray),
@@ -113,10 +225,20 @@ fn render_messages(frame: &mut Frame, area: ratatui::layout::Rect, state: &mut U
         }
     }
 
-    // If no messages, show welcome
+    // If no messages, show T-Rex ASCII welcome art
     if lines.is_empty() {
+        for line in T_REX.lines() {
+            lines.push(Line::from(Span::styled(
+                line,
+                Style::default().fg(Color::Green),
+            )));
+        }
         lines.push(Line::from(Span::styled(
-            "Welcome to CodeRex. Type a message and press Enter.",
+            "",
+            Style::default(),
+        )));
+        lines.push(Line::from(Span::styled(
+            "  Welcome to CodeRex. Type a message and press Enter.",
             Style::default().fg(Color::DarkGray),
         )));
     }
@@ -129,7 +251,10 @@ fn render_messages(frame: &mut Frame, area: ratatui::layout::Rect, state: &mut U
 
 fn render_statusline(frame: &mut Frame, area: ratatui::layout::Rect, statusline: &Statusline) {
     let rendered = statusline.render(area.width as usize);
-    let spans = rendered.split(" | ").map(|s| Span::raw(s.to_string())).collect::<Vec<_>>();
+    let spans = rendered
+        .split(" | ")
+        .map(|s| Span::raw(s.to_string()))
+        .collect::<Vec<_>>();
     let line = Line::from(spans);
     let paragraph = Paragraph::new(line)
         .style(Style::default().fg(Color::White).bg(Color::DarkGray))
@@ -144,6 +269,38 @@ fn render_input(frame: &mut Frame, area: ratatui::layout::Rect, input: &crate::i
     frame.render_widget(paragraph, area);
     // Position cursor
     frame.set_cursor_position((area.x + 2 + cursor as u16, area.y));
+}
+
+/// Render the inline command palette just above the statusline / input line.
+fn render_inline_palette(frame: &mut Frame, area: ratatui::layout::Rect, state: &UiState) {
+    use crate::overlay::Overlay;
+    let Some(Overlay::CommandPalette { query, commands, selected }) = state.overlays.top() else {
+        return;
+    };
+
+    let mut lines: Vec<Line> = Vec::new();
+
+    // Header
+    lines.push(Line::from(vec![
+        Span::styled("Commands ", Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+        Span::styled(format!("[{query}]"), Style::default().fg(Color::Gray)),
+    ]));
+
+    let visible_count = commands.len().min(area.height as usize - 1);
+    let start = selected.saturating_sub(visible_count - 1).min(commands.len().saturating_sub(visible_count));
+
+    for i in start..(start + visible_count).min(commands.len()) {
+        let style = if i == *selected {
+            Style::default().fg(Color::Black).bg(Color::Cyan)
+        } else {
+            Style::default().fg(Color::White)
+        };
+        lines.push(Line::from(Span::styled(commands[i].clone(), style)));
+    }
+
+    let paragraph = Paragraph::new(lines)
+        .block(Block::default().borders(Borders::NONE).style(Style::default().bg(Color::DarkGray)));
+    frame.render_widget(paragraph, area);
 }
 
 fn render_overlay(frame: &mut Frame, area: ratatui::layout::Rect, state: &UiState) {
@@ -161,13 +318,9 @@ fn render_overlay(frame: &mut Frame, area: ratatui::layout::Rect, state: &UiStat
         Overlay::Notification { message, level } => {
             format!("Notification: {message} ({level:?})")
         }
-        Overlay::CommandPalette { query, commands, selected } => {
-            let mut s = format!("Command Palette [{query}]\n");
-            for (i, cmd) in commands.iter().enumerate() {
-                let prefix = if i == *selected { "> " } else { "  " };
-                s.push_str(&format!("{prefix}{cmd}\n"));
-            }
-            s
+        Overlay::CommandPalette { .. } => {
+            // Inline palette is handled separately; skip here.
+            return;
         }
         Overlay::Confirm { message } => {
             format!("{message}\n[y/n]")
@@ -212,11 +365,37 @@ mod tests {
             git_branch: "main".into(),
             session_title: "test".into(),
             thinking: false,
+            thinking_label: None,
+            spinner_frame: 0,
             show_tokens: true,
             show_cost: true,
             show_git_branch: true,
         };
         let rendered = sl.render(80);
         assert!(rendered.len() <= 80);
+    }
+
+    #[test]
+    fn wrap_text_basic() {
+        let lines = wrap_text("hello world foo", 10);
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0], "hello");
+        assert_eq!(lines[1], "world foo");
+    }
+
+    #[test]
+    fn wrap_text_preserves_newlines() {
+        let lines = wrap_text("a\nb\nc", 80);
+        assert_eq!(lines.len(), 3);
+        assert_eq!(lines[0], "a");
+        assert_eq!(lines[1], "b");
+        assert_eq!(lines[2], "c");
+    }
+
+    #[test]
+    fn wrap_text_zero_width() {
+        let lines = wrap_text("hello", 0);
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0], "hello");
     }
 }

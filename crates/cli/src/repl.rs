@@ -239,6 +239,15 @@ impl ReplLoop {
             // Sync statusline from REPL state
             self.sync_statusline(&mut ui_state.statusline);
             ui_state.statusline.thinking = thinking;
+            if thinking {
+                ui_state.statusline.spinner_frame = ui_state.statusline.spinner_frame.wrapping_add(1);
+                if ui_state.statusline.thinking_label.is_none() {
+                    ui_state.statusline.thinking_label = Some("Thinking (Esc to cancel)".into());
+                }
+            } else {
+                ui_state.statusline.thinking_label = None;
+                ui_state.statusline.spinner_frame = 0;
+            }
 
             // Draw frame
             if let Err(e) = terminal_ui.draw(&mut ui_state) {

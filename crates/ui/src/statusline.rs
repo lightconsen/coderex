@@ -1,5 +1,8 @@
 //! Statusline — renders model, tokens, cost, permissions, git branch.
 
+/// Spinner frames for the thinking indicator (rotating).
+const SPINNER: &[&str] = &["◐", "◓", "◑", "◒"];
+
 /// Statusline data to render.
 #[derive(Debug, Clone)]
 pub struct Statusline {
@@ -17,6 +20,10 @@ pub struct Statusline {
     pub session_title: String,
     /// Whether currently thinking/streaming.
     pub thinking: bool,
+    /// Detailed thinking label (e.g. "Thinking (Esc to cancel)").
+    pub thinking_label: Option<String>,
+    /// Spinner animation frame index (incremented each draw while thinking).
+    pub spinner_frame: u8,
     /// Show token count.
     pub show_tokens: bool,
     /// Show cost.
@@ -37,6 +44,8 @@ impl Statusline {
             git_branch: String::new(),
             session_title: String::new(),
             thinking: false,
+            thinking_label: None,
+            spinner_frame: 0,
             show_tokens: true,
             show_cost: true,
             show_git_branch: true,
@@ -46,12 +55,24 @@ impl Statusline {
     /// Render to a single-line string.
     #[must_use]
     pub fn render(&self, width: usize) -> String {
+        // If thinking with a label, show the spinner + label prominently.
+        if self.thinking {
+            let spinner = SPINNER[self.spinner_frame as usize % SPINNER.len()];
+            let label = self
+                .thinking_label
+                .as_ref()
+                .map_or("Thinking...".into(), |l| l.clone());
+            let text = format!("{spinner} {label}");
+            if text.len() <= width {
+                // Pad to width so the statusline background fills evenly.
+                let pad = width.saturating_sub(text.len());
+                return format!("{text}{}", " ".repeat(pad));
+            }
+            return text[..width].to_string();
+        }
+
         let mut segments: Vec<String> = vec![
-            if self.thinking {
-                "●".into()
-            } else {
-                "○".into()
-            },
+            "○".into(),
             self.model.clone(),
             self.session_title.clone(),
         ];
@@ -97,6 +118,8 @@ mod tests {
             git_branch: "main".into(),
             session_title: "Fix bug".into(),
             thinking: false,
+            thinking_label: None,
+            spinner_frame: 0,
             show_tokens: true,
             show_cost: true,
             show_git_branch: true,
@@ -118,6 +141,8 @@ mod tests {
             git_branch: "main".into(),
             session_title: "".into(),
             thinking: false,
+            thinking_label: None,
+            spinner_frame: 0,
             show_tokens: true,
             show_cost: true,
             show_git_branch: true,
@@ -127,16 +152,38 @@ mod tests {
     }
 
     #[test]
-    fn thinking_indicator() {
-        let sl_thinking = Statusline {
+    fn thinking_indicator_spins() {
+        let sl = Statusline {
             thinking: true,
+            thinking_label: Some("Thinking (Esc to cancel)".into()),
+            spinner_frame: 0,
             ..Statusline::new()
         };
-        let sl_idle = Statusline {
-            thinking: false,
+        let r0 = sl.render(200);
+        assert!(r0.contains("◐"));
+
+        let sl = Statusline {
+            thinking: true,
+            thinking_label: Some("Thinking (Esc to cancel)".into()),
+            spinner_frame: 1,
             ..Statusline::new()
         };
-        assert!(sl_thinking.render(200).contains("●"));
-        assert!(sl_idle.render(200).contains("○"));
+        let r1 = sl.render(200);
+        assert!(r1.contains("◓"));
+    }
+
+    #[test]
+    fn thinking_replaces_normal_segments() {
+        let sl = Statusline {
+            thinking: true,
+            thinking_label: Some("Running plan...".into()),
+            spinner_frame: 0,
+            model: "opus".into(),
+            ..Statusline::new()
+        };
+        let rendered = sl.render(200);
+        assert!(rendered.contains("Running plan..."));
+        // Normal segments should not appear while thinking
+        assert!(!rendered.contains("opus"));
     }
 }
