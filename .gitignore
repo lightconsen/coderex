@@ -10,3 +10,7 @@ kimi-cli/
 qwen-code/
 gemini-cli/
 start.kimi.sh
+
+# Local configuration and generated docs
+.claude/settings.json
+docs/compare10.md
