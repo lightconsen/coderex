@@ -203,7 +203,22 @@ pub fn register(registry: &mut CommandRegistry) {
         true,
         Arc::new(|ctx: &CommandContext, _args: &[String]| {
             if ctx.is_feature_enabled("ctx_viz") {
-                CommandResult::success("Context Visualization\n──────────────────\n(Context visualization would be rendered here)")
+                let mut output = String::from("Context Visualization\n──────────────────\n");
+                output.push_str(&format!("Working Directory: {}\n", ctx.cwd));
+                output.push_str(&format!("Model: {}\n", ctx.model.0));
+                output.push_str(&format!("Session: {}\n", ctx.session_id));
+                output.push_str(&format!("Messages: {}\n", ctx.message_count));
+                output.push_str(&format!("Input Tokens: {}\n", ctx.input_tokens));
+                output.push_str(&format!("Output Tokens: {}\n", ctx.output_tokens));
+                output.push_str(&format!("Cache Read: {}\n", ctx.cache_read_tokens));
+                output.push_str(&format!("Cache Creation: {}\n", ctx.cache_creation_tokens));
+                output.push_str(&format!("Cost: ${:.4}\n", ctx.cost_usd));
+                output.push_str(&format!("Permission Mode: {:?}\n", ctx.permission_mode));
+                output.push_str(&format!("Elapsed: {}s\n", ctx.elapsed_secs));
+                if !ctx.git_branch.is_empty() {
+                    output.push_str(&format!("Git Branch: {}\n", ctx.git_branch));
+                }
+                CommandResult::success(output)
             } else {
                 CommandResult::error("ctx_viz feature is not enabled. Set feature flag 'ctx_viz' to enable.")
             }

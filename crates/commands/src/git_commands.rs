@@ -175,10 +175,45 @@ pub fn register(registry: &mut CommandRegistry) {
         true,
         true,
         Arc::new(|ctx: &CommandContext, _args: &[String]| {
-            let branch = current_branch(std::path::Path::new(&ctx.cwd));
-            CommandResult::success(format!(
-                "Analyzing PR on branch '{branch}' for fixable issues...\n(Auto-fix suggestions would be generated here)"
-            ))
+            let dir = std::path::Path::new(&ctx.cwd);
+            let branch = current_branch(dir);
+            let mut output = format!("Analyzing PR on branch '{branch}' for fixable issues...\n");
+
+            // Check for PR checks status
+            match run_gh(dir, &["pr", "checks", "--json", "name,state"]) {
+                Ok(checks) => {
+                    let failing: Vec<&str> = checks
+                        .lines()
+                        .filter(|l| l.contains("failure") || l.contains("fail"))
+                        .collect();
+                    if failing.is_empty() {
+                        output.push_str("All PR checks passing.\n");
+                    } else {
+                        output.push_str(&format!("Found {} failing check(s):\n", failing.len()));
+                        for check in &failing {
+                            output.push_str(&format!("  - {check}\n"));
+                        }
+                    }
+                }
+                Err(_) => {
+                    output.push_str("Could not fetch PR checks (no PR or gh CLI unavailable).\n");
+                }
+            }
+
+            // Show current diff stats
+            match run_git(dir, &["diff", "--stat", "HEAD"]) {
+                Ok(diff) if !diff.is_empty() => {
+                    output.push_str("\nUncommitted changes:\n");
+                    for line in diff.lines().take(10) {
+                        output.push_str(&format!("  {line}\n"));
+                    }
+                }
+                _ => {
+                    output.push_str("\nNo uncommitted changes.\n");
+                }
+            }
+
+            CommandResult::success(output)
         }),
     ));
 

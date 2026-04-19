@@ -36,16 +36,61 @@ impl Tool for SkillTool {
         }
     }
 
-    async fn execute(&self, input: ToolInput, _ctx: ToolContext<'_>) -> Result<ToolOutput, ToolError> {
+    async fn execute(&self, input: ToolInput, ctx: ToolContext<'_>) -> Result<ToolOutput, ToolError> {
         let skill = extract_string(&input.arguments, "skill")?;
-        let _args = extract_string_opt(&input.arguments, "args");
+        let args = extract_string_opt(&input.arguments, "args");
 
-        // Skills are loaded from .claude/skills/{skill}.md
-        // For now, return a placeholder
-        Ok(ToolOutput {
-            output: format!("Skill '{skill}' loaded"),
-            is_display: true,
-        })
+        // Search for skill file in multiple locations
+        let skill_file = format!("{skill}.md");
+        let search_dirs = [
+            ctx.cwd.join(".claude/skills"),
+            coderex_config::settings::config_home().join("skills"),
+        ];
+
+        for dir in &search_dirs {
+            let path = dir.join(&skill_file);
+            if path.exists() {
+                match std::fs::read_to_string(&path) {
+                    Ok(content) => {
+                        let mut output = format!("Skill '{skill}' loaded from {path:?}\n\n");
+                        output.push_str(&content);
+                        if let Some(a) = args {
+                            output.push_str(&format!("\n\nArguments: {a}"));
+                        }
+                        return Ok(ToolOutput {
+                            output,
+                            is_display: true,
+                        });
+                    }
+                    Err(e) => {
+                        return Err(ToolError::InvalidInput {
+                            message: format!("failed to read skill file: {e}"),
+                        });
+                    }
+                }
+            }
+        }
+
+        // Skill not found — list available skills
+        let mut available = Vec::new();
+        for dir in &search_dirs {
+            if let Ok(entries) = std::fs::read_dir(dir) {
+                for entry in entries.flatten() {
+                    let name = entry.file_name().to_string_lossy().to_string();
+                    if name.ends_with(".md") {
+                        available.push(name.trim_end_matches(".md").to_string());
+                    }
+                }
+            }
+        }
+
+        let mut msg = format!("Skill '{skill}' not found.");
+        if !available.is_empty() {
+            msg.push_str(&format!("\nAvailable skills: {}", available.join(", ")));
+        } else {
+            msg.push_str("\nNo skills found in .claude/skills/ or ~/.claude/skills/");
+        }
+        Err(ToolError::InvalidInput { message: msg })
     }
 }
 
@@ -81,6 +126,17 @@ mod tests {
 
     #[tokio::test]
     async fn skill_loads() {
+        let tmp = tempfile::tempdir().unwrap();
+        let skills_dir = tmp.path().join(".claude/skills");
+        std::fs::create_dir_all(&skills_dir).unwrap();
+        std::fs::write(skills_dir.join("pdf.md"), "# PDF Skill\nExtract text from PDF files.").unwrap();
+
+        let ctx = ToolContext {
+            execution_context: ExecutionContext::Normal,
+            cwd: tmp.path(),
+            extra: Arc::new(HashMap::new()),
+        };
+
         let output = SkillTool
             .execute(
                 ToolInput {
@@ -88,11 +144,12 @@ mod tests {
                     name: "Skill".into(),
                     arguments: serde_json::json!({ "skill": "pdf" }),
                 },
-                test_ctx(),
+                ctx,
             )
             .await
             .unwrap();
         assert!(output.output.contains("pdf"));
+        assert!(output.output.contains("Extract text"));
     }
 
     #[tokio::test]

@@ -158,9 +158,48 @@ pub fn register(registry: &mut CommandRegistry) {
         false,
         false,
         false,
-        Arc::new(|_ctx: &CommandContext, _args: &[String]| {
-            CommandResult::success("Backfilling session index...\n(Scanning for historical transcripts)")
-                .with_state_change(true)
+        Arc::new(|ctx: &CommandContext, _args: &[String]| {
+            let mut found = 0;
+            let mut total_messages = 0;
+
+            // Scan project transcripts
+            let project_transcripts = std::path::Path::new(&ctx.cwd).join(".claude/transcripts");
+            if project_transcripts.exists() {
+                if let Ok(entries) = std::fs::read_dir(&project_transcripts) {
+                    for entry in entries.flatten() {
+                        let path = entry.path();
+                        if path.extension().is_some_and(|e| e == "jsonl") {
+                            if let Ok(content) = std::fs::read_to_string(&path) {
+                                let msgs = content.lines().count();
+                                total_messages += msgs;
+                                found += 1;
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Scan global transcripts
+            let global_transcripts = coderex_config::settings::config_home().join("transcripts");
+            if global_transcripts.exists() {
+                if let Ok(entries) = std::fs::read_dir(&global_transcripts) {
+                    for entry in entries.flatten() {
+                        let path = entry.path();
+                        if path.extension().is_some_and(|e| e == "jsonl") {
+                            if let Ok(content) = std::fs::read_to_string(&path) {
+                                let msgs = content.lines().count();
+                                total_messages += msgs;
+                                found += 1;
+                            }
+                        }
+                    }
+                }
+            }
+
+            CommandResult::success(format!(
+                "Backfilling session index...\nScanned {found} transcript file(s), {total_messages} total message(s)."
+            ))
+            .with_state_change(true)
         }),
     ));
 }
