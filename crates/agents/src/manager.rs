@@ -3,6 +3,11 @@
 //! Phase 10.3 + 10.5: Provides agent spawning with context inheritance,
 //! tool whitelisting, messaging, resume support, and teammate events.
 
+use coderex_core::api_client::ApiClient;
+use coderex_core::orchestrator::{
+    BackgroundFeatureRequest, QueryResult,
+    run_background_feature, run_forked_agent,
+};
 use coderex_core::task::{TaskHandle, TaskKind, TaskManager};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -50,6 +55,8 @@ pub struct SpawnOptions {
     pub cwd: Option<PathBuf>,
     /// Environment variables to inject.
     pub extra_env: HashMap<String, String>,
+    /// Whether the agent may write files (false = read-only tools).
+    pub writable: bool,
 }
 
 impl Default for SpawnOptions {
@@ -61,6 +68,7 @@ impl Default for SpawnOptions {
             isolation: None,
             cwd: None,
             extra_env: HashMap::new(),
+            writable: true,
         }
     }
 }
@@ -224,6 +232,7 @@ pub type TeammateEventCallback =
 /// - Tracking agent state and messaging
 /// - Resuming existing agents
 /// - Broadcasting teammate events
+/// - Running forked agents and background features via AI
 pub struct AgentManager {
     /// Shared task manager for lifecycle tracking.
     task_manager: Arc<Mutex<TaskManager>>,
@@ -234,6 +243,8 @@ pub struct AgentManager {
     event_callback: Option<TeammateEventCallback>,
     /// Resumed agents (from a previous session).
     resumed_agents: Vec<String>,
+    /// API client for forked/background AI execution.
+    api_client: Option<Box<dyn ApiClient>>,
 }
 
 impl std::fmt::Debug for AgentManager {
@@ -254,6 +265,7 @@ impl AgentManager {
             agents: HashMap::new(),
             event_callback: None,
             resumed_agents: Vec::new(),
+            api_client: None,
         }
     }
 
@@ -261,6 +273,11 @@ impl AgentManager {
     #[must_use]
     pub fn standalone() -> Self {
         Self::new(Arc::new(Mutex::new(TaskManager::new())))
+    }
+
+    /// Set the API client for forked/background AI execution.
+    pub fn set_api_client(&mut self, client: Box<dyn ApiClient>) {
+        self.api_client = Some(client);
     }
 
     /// Set the callback for teammate events.
@@ -524,6 +541,53 @@ impl AgentManager {
     #[must_use]
     pub fn is_resumed(&self, agent_id: &str) -> bool {
         self.resumed_agents.iter().any(|id| id == agent_id)
+    }
+
+    // ─── Forked / Background Agent Execution ─────────────────────────────────
+
+    /// Run a forked agent via this manager's API client.
+    ///
+    /// Requires `set_api_client` to have been called first.
+    pub async fn run_forked_agent(
+        &self,
+        system_prompt: &str,
+        user_prompt: &str,
+        parent_context: Option<&str>,
+        allowed_tools: Option<&[String]>,
+        model: &coderex_core::types::ModelId,
+        max_tokens: u32,
+        writable: bool,
+    ) -> Result<QueryResult, AgentError> {
+        let client = self.api_client.as_ref().ok_or_else(|| {
+            AgentError::SpawnFailed("API client not configured on AgentManager".into())
+        })?;
+        run_forked_agent(
+            client.as_ref(),
+            system_prompt,
+            user_prompt,
+            parent_context,
+            allowed_tools,
+            model,
+            max_tokens,
+            writable,
+        )
+        .await
+        .map_err(|e| AgentError::SpawnFailed(e.to_string()))
+    }
+
+    /// Run a background feature via this manager's API client.
+    ///
+    /// Requires `set_api_client` to have been called first.
+    pub async fn run_background_feature(
+        &self,
+        request: BackgroundFeatureRequest,
+    ) -> Result<QueryResult, AgentError> {
+        let client = self.api_client.as_ref().ok_or_else(|| {
+            AgentError::SpawnFailed("API client not configured on AgentManager".into())
+        })?;
+        run_background_feature(client.as_ref(), request)
+            .await
+            .map_err(|e| AgentError::SpawnFailed(e.to_string()))
     }
 }
 
@@ -926,6 +990,7 @@ mod tests {
         assert!(opts.isolation.is_none());
         assert!(opts.cwd.is_none());
         assert!(opts.extra_env.is_empty());
+        assert!(opts.writable);
     }
 
     #[test]

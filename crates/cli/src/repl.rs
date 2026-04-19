@@ -712,6 +712,7 @@ impl ReplLoop {
                 parent_context: None,
                 allowed_tools: None,
                 max_tokens: 128,
+                writable: false,
             };
             self.spawn_background_task(
                 "prompt_suggestion",
@@ -794,6 +795,24 @@ impl ReplLoop {
         results
     }
 
+    /// Run agent generation synchronously and return the result.
+    async fn run_agent_generation(&mut self, description: &str) -> String {
+        let Some(ref client) = self.api_client else {
+            return "No API client configured.".into();
+        };
+        match coderex_core::prompts::generate_agent(client.as_ref(), description).await {
+            Ok(spec) => format!(
+                "Agent Generated\n──────────────\nName: {}\nDescription: {}\nModel: {}\nAllowed Tools: {}\n\nSystem Prompt:\n{}",
+                spec.name,
+                spec.description,
+                spec.model_profile,
+                spec.allowed_tools.as_ref().map(|t| t.join(", ")).unwrap_or_else(|| "all".into()),
+                spec.system_prompt
+            ),
+            Err(e) => format!("Agent generation failed: {e}"),
+        }
+    }
+
     /// Spawn a background feature by kind with a sensible default request.
     fn spawn_background_feature_by_kind(&mut self, kind: BackgroundFeatureKind, user_prompt: String) -> String {
         let client = match &self.api_client {
@@ -863,6 +882,7 @@ impl ReplLoop {
             parent_context,
             allowed_tools: None,
             max_tokens,
+            writable: matches!(kind, BackgroundFeatureKind::SessionMemoryUpdate | BackgroundFeatureKind::MemoryExtraction),
         };
 
         let id = format!("{}_{}", background_feature_label(kind), self.background_tasks.len());
@@ -1119,6 +1139,26 @@ impl ReplLoop {
                     });
                     return;
                 }
+                "agent-generation" => {
+                    let description = args.join(" ");
+                    if description.is_empty() {
+                        ui_state.messages.push(coderex_ui::message_list::Message {
+                            role: coderex_ui::message_list::MessageRole::System,
+                            content: "Usage: /agent-generation <description>".into(),
+                            tool_name: None,
+                            streaming: false,
+                        });
+                    } else {
+                        let msg = self.run_agent_generation(&description).await;
+                        ui_state.messages.push(coderex_ui::message_list::Message {
+                            role: coderex_ui::message_list::MessageRole::System,
+                            content: msg.into(),
+                            tool_name: None,
+                            streaming: false,
+                        });
+                    }
+                    return;
+                }
                 _ => {}
             }
 
@@ -1247,6 +1287,16 @@ impl ReplLoop {
                     "Extract long-term memories from this session.".into(),
                 );
                 writeln!(stdout, "{msg}")?;
+                return Ok(());
+            }
+            "agent-generation" => {
+                let description = args.join(" ");
+                if description.is_empty() {
+                    writeln!(stdout, "Usage: /agent-generation <description>")?;
+                } else {
+                    let msg = self.run_agent_generation(&description).await;
+                    writeln!(stdout, "{msg}")?;
+                }
                 return Ok(());
             }
             _ => {}

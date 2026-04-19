@@ -42,6 +42,7 @@ pub async fn extract_memories(
             parent_context: Some(conversation.to_string()),
             allowed_tools: Some(vec!["Write".into()]),
             max_tokens: 1024,
+            writable: true,
         },
     )
     .await?;

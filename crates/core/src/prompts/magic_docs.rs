@@ -44,6 +44,7 @@ pub async fn generate_docs_for_code(
             parent_context: Some(code_content.to_string()),
             allowed_tools: Some(vec!["Read".into()]),
             max_tokens: 1024,
+            writable: false,
         },
     )
     .await?;
@@ -80,6 +81,7 @@ pub async fn generate_codebase_overview(
             parent_context: Some(file_listing.to_string()),
             allowed_tools: Some(vec!["Read".into()]),
             max_tokens: 1024,
+            writable: false,
         },
     )
     .await?;
@@ -122,6 +124,7 @@ pub async fn generate_readme(
             parent_context: Some(file_structure.to_string()),
             allowed_tools: Some(vec!["Read".into()]),
             max_tokens: 1024,
+            writable: false,
         },
     )
     .await?;

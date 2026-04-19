@@ -8,6 +8,7 @@ pub mod long_term;
 pub mod session_memory;
 pub mod team_memory;
 pub mod auto_dream;
+pub mod ai_workflow;
 
 pub use team_memory::{
     TeamMemoryEntry, TeamMemorySyncService, MemoryChecksum,

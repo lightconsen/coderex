@@ -35,6 +35,7 @@ pub async fn summarize_agent_activity(
             parent_context: Some(agent_activity.to_string()),
             allowed_tools: None,
             max_tokens: 64,
+            writable: false,
         },
     )
     .await?;
@@ -73,6 +74,7 @@ pub async fn generate_away_summary(
             parent_context: Some(events_text),
             allowed_tools: None,
             max_tokens: 256,
+            writable: false,
         },
     )
     .await?;
@@ -109,6 +111,7 @@ pub async fn generate_team_status(
             parent_context: Some(input),
             allowed_tools: None,
             max_tokens: 256,
+            writable: false,
         },
     )
     .await?;

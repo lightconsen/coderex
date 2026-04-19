@@ -39,6 +39,7 @@ pub async fn suggest_prompts(
             parent_context: Some(conversation_summary.to_string()),
             allowed_tools: None,
             max_tokens: 256,
+            writable: false,
         },
     )
     .await?;
@@ -81,6 +82,7 @@ pub async fn suggest_next_action(
             parent_context: Some(format!("Task: {current_task}")),
             allowed_tools: None,
             max_tokens: 128,
+            writable: false,
         },
     )
     .await?;

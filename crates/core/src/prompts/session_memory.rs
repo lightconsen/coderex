@@ -38,6 +38,7 @@ pub async fn update_session_memory(
             parent_context: Some(conversation_excerpt.to_string()),
             allowed_tools: Some(vec!["Edit".into()]),
             max_tokens: 1024,
+            writable: true,
         },
     )
     .await?;
@@ -68,6 +69,7 @@ pub async fn create_session_memory(
             parent_context: Some(conversation_excerpt.to_string()),
             allowed_tools: Some(vec!["Edit".into()]),
             max_tokens: 512,
+            writable: true,
         },
     )
     .await?;

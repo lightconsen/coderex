@@ -76,6 +76,8 @@ pub struct BackgroundFeatureRequest {
     pub allowed_tools: Option<Vec<String>>,
     /// Maximum output tokens.
     pub max_tokens: u32,
+    /// Whether the agent is allowed to write files.
+    pub writable: bool,
 }
 
 /// Errors from orchestrator operations.
@@ -248,6 +250,7 @@ impl Orchestrator {
             request.allowed_tools.as_deref(),
             &self.resolve_model(&request.model_profile),
             request.max_tokens,
+            true,
         )
         .await
     }
@@ -387,6 +390,7 @@ pub async fn run_lightweight_query(
 /// * `allowed_tools` — Optional tool whitelist (None = all tools).
 /// * `model` — Model profile to use.
 /// * `max_tokens` — Token budget for this sub-task.
+/// * `writable` — Whether the agent may write files (false = read-only).
 ///
 /// # Returns
 /// The sub-agent's response as a QueryResult.
@@ -398,6 +402,7 @@ pub async fn run_forked_agent(
     allowed_tools: Option<&[String]>,
     model: &ModelId,
     max_tokens: u32,
+    writable: bool,
 ) -> Result<QueryResult, OrchestratorError> {
     let mut full_system = match parent_context {
         Some(ctx) => format!(
@@ -413,10 +418,32 @@ pub async fn run_forked_agent(
         ),
     };
 
-    if let Some(tools) = allowed_tools {
+    let effective_tools: Option<Vec<String>> = if writable {
+        allowed_tools.map(|t| t.to_vec())
+    } else {
+        // Enforce read-only tool set when not writable
+        let read_only: Vec<String> = vec!["Read".into(), "Grep".into(), "Glob".into()];
+        match allowed_tools {
+            Some(tools) => {
+                let filtered: Vec<String> = tools
+                    .iter()
+                    .filter(|t| read_only.iter().any(|r: &String| r.eq_ignore_ascii_case(t)))
+                    .cloned()
+                    .collect();
+                Some(filtered)
+            }
+            None => Some(read_only),
+        }
+    };
+
+    if let Some(ref tools) = effective_tools {
         let tools_list = tools.join(", ");
         full_system.push_str("\n\nAvailable tools: ");
         full_system.push_str(&tools_list);
+    }
+
+    if !writable {
+        full_system.push_str("\n\nYou are running in READ-ONLY mode. You may NOT create, edit, delete, or write files. Use only read/search tools.");
     }
 
     let request = QueryRequest {
@@ -425,7 +452,7 @@ pub async fn run_forked_agent(
         custom_system_prompt: Some(full_system),
         append_system_prompt: None,
         prompt_profile: PromptProfile::DefaultAgent,
-        allowed_tools: allowed_tools.map(|tools| tools.to_vec()),
+        allowed_tools: effective_tools,
         model_profile: if model == &ModelProfile::Lightweight.resolve() {
             ModelProfile::Lightweight
         } else if model == &ModelProfile::Background.resolve() {
@@ -453,6 +480,7 @@ pub async fn run_background_feature(
         parent_context,
         allowed_tools,
         max_tokens,
+        writable,
     } = request;
 
     let decorated_system = format!(
@@ -468,6 +496,7 @@ pub async fn run_background_feature(
         allowed_tools.as_deref(),
         &ModelProfile::Background.resolve(),
         max_tokens,
+        writable,
     )
     .await
 }
@@ -712,6 +741,7 @@ mod tests {
             Some(&["Read".into(), "Grep".into()]),
             &ModelProfile::Main.resolve(),
             1024,
+            true,
         )
         .await;
         assert!(result.is_ok());
@@ -728,6 +758,7 @@ mod tests {
             None, // no tool whitelist
             &ModelProfile::Lightweight.resolve(),
             512,
+            false,
         )
         .await;
         assert!(result.is_ok());
@@ -745,6 +776,7 @@ mod tests {
             parent_context: Some("User is refactoring auth".into()),
             allowed_tools: None,
             max_tokens: 128,
+            writable: false,
         };
 
         let result = run_background_feature(&api, request).await;
