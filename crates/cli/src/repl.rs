@@ -288,9 +288,36 @@ impl ReplLoop {
                                     }
                                 }
                                 VimAction::Insert => {
-                                    if let KeyCode::Char(c) = key.code {
-                                        if vim.is_insert() {
-                                            ui_state.input.apply(&InputAction::InsertChar(c));
+                                    if vim.is_insert() {
+                                        match key.code {
+                                            KeyCode::Char(c) => {
+                                                ui_state.input.apply(&InputAction::InsertChar(c));
+                                            }
+                                            KeyCode::Backspace => {
+                                                ui_state.input.apply(&InputAction::Backspace);
+                                            }
+                                            KeyCode::Delete => {
+                                                ui_state.input.apply(&InputAction::Delete);
+                                            }
+                                            KeyCode::Left => {
+                                                ui_state.input.apply(&InputAction::CursorLeft);
+                                            }
+                                            KeyCode::Right => {
+                                                ui_state.input.apply(&InputAction::CursorRight);
+                                            }
+                                            KeyCode::Up => {
+                                                ui_state.input.apply(&InputAction::HistoryUp);
+                                            }
+                                            KeyCode::Down => {
+                                                ui_state.input.apply(&InputAction::HistoryDown);
+                                            }
+                                            KeyCode::Home => {
+                                                ui_state.input.apply(&InputAction::MoveToStart);
+                                            }
+                                            KeyCode::End => {
+                                                ui_state.input.apply(&InputAction::MoveToEnd);
+                                            }
+                                            _ => {}
                                         }
                                     }
                                 }
