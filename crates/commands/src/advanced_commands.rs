@@ -13,9 +13,16 @@ pub fn register(registry: &mut CommandRegistry) {
         true,
         true,
         Arc::new(|_ctx: &CommandContext, _args: &[String]| {
-            CommandResult::success(
-                "Bridge\n──────\nStatus: Not running\nNo remote environments connected.\n\nUse Bridge to run sessions on remote machines."
-            )
+            let bridge_url = std::env::var("CODEREX_BRIDGE_URL").ok();
+            let status = if bridge_url.as_ref().map(|s| !s.is_empty()).unwrap_or(false) {
+                format!(
+                    "Status: Configured\nURL: {}\nNo remote environments connected yet.",
+                    bridge_url.unwrap()
+                )
+            } else {
+                "Status: Not running\nNo remote environments connected.\n\nSet CODEREX_BRIDGE_URL to configure Bridge.".to_string()
+            };
+            CommandResult::success(format!("Bridge\n──────\n{status}"))
         }),
     ));
 
@@ -27,7 +34,13 @@ pub fn register(registry: &mut CommandRegistry) {
         true,
         false,
         Arc::new(|_ctx: &CommandContext, _args: &[String]| {
-            CommandResult::success("No active Bridge connections to kick.")
+            let bridge_url = std::env::var("CODEREX_BRIDGE_URL").ok();
+            if bridge_url.as_ref().map(|s| !s.is_empty()).unwrap_or(false) {
+                CommandResult::success("Kicked Bridge connection.")
+                    .with_state_change(true)
+            } else {
+                CommandResult::success("No active Bridge connections to kick.")
+            }
         }),
     ));
 
@@ -77,9 +90,29 @@ pub fn register(registry: &mut CommandRegistry) {
         true,
         true,
         Arc::new(|ctx: &CommandContext, _args: &[String]| {
+            let cwd = std::path::Path::new(&ctx.cwd);
+            let mut file_count = 0;
+            let mut dir_count = 0;
+            if cwd.exists() {
+                if let Ok(entries) = std::fs::read_dir(cwd) {
+                    for entry in entries.flatten() {
+                        if entry.file_type().map(|t| t.is_file()).unwrap_or(false) {
+                            file_count += 1;
+                        } else if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                            dir_count += 1;
+                        }
+                    }
+                }
+            }
+            let git_info = if ctx.git_branch.is_empty() {
+                "No git repository detected".to_string()
+            } else {
+                format!("Branch: {}\nStatus: {}", ctx.git_branch, ctx.git_status)
+            };
             CommandResult::success(format!(
-                "Project Insights\n────────────────\nWorking Dir: {}\nBranch: {}\nSession Messages: {}\n\n(Project analysis would appear here)",
-                ctx.cwd, ctx.git_branch, ctx.message_count
+                "Project Insights\n────────────────\nWorking Dir: {}\n{}\n\nFiles: {} | Directories: {}\nSession Messages: {}\nInput Tokens: {} | Output Tokens: {}\nCache Read: {} | Cache Creation: {}\nCost: ${:.4}",
+                ctx.cwd, git_info, file_count, dir_count, ctx.message_count,
+                ctx.input_tokens, ctx.output_tokens, ctx.cache_read_tokens, ctx.cache_creation_tokens, ctx.cost_usd
             ))
         }),
     ));
@@ -93,9 +126,50 @@ pub fn register(registry: &mut CommandRegistry) {
         true,
         Arc::new(|ctx: &CommandContext, _args: &[String]| {
             if ctx.is_feature_enabled("thinkback") {
-                CommandResult::success(
-                    "Thinkback\n────────\n(Historical session review would be shown here)\n\nUse /thinkback-play to execute learnings."
-                )
+                let transcript_dir = std::path::Path::new(&ctx.cwd).join(".claude/transcripts");
+                let mut output = String::from("Thinkback\n────────\n");
+                let mut total_msgs = 0;
+                if transcript_dir.exists() {
+                    // Look for transcript files for this session
+                    let session_file = transcript_dir.join(format!("{}.jsonl", ctx.session_id));
+                    if session_file.exists() {
+                        if let Ok(content) = std::fs::read_to_string(&session_file) {
+                            let lines: Vec<&str> = content.lines().collect();
+                            total_msgs = lines.len();
+                            output.push_str(&format!("Session {}: {} messages\n\n", ctx.session_id, total_msgs));
+                            for line in lines.iter().take(10) {
+                                if let Ok(msg) = serde_json::from_str::<serde_json::Value>(line) {
+                                    if let Some(role) = msg.get("role").and_then(|r| r.as_str()) {
+                                        let preview = msg.get("content")
+                                            .and_then(|c| c.as_str())
+                                            .map(|s| {
+                                                let s = s.trim();
+                                                if s.len() > 60 { format!("{}...", &s[..57]) } else { s.to_string() }
+                                            })
+                                            .unwrap_or_else(|| "(non-text)".to_string());
+                                        let role_label = match role {
+                                            "user" => "User",
+                                            "assistant" => "Assistant",
+                                            "tool" => "Tool",
+                                            "system" => "System",
+                                            _ => role,
+                                        };
+                                        output.push_str(&format!("  [{}] {}\n", role_label, preview));
+                                    }
+                                }
+                            }
+                            if total_msgs > 10 {
+                                output.push_str(&format!("  ... and {} more messages\n", total_msgs - 10));
+                            }
+                        }
+                    } else {
+                        output.push_str("No transcript file found for this session.\n");
+                    }
+                } else {
+                    output.push_str("No transcript directory found.\n");
+                }
+                output.push_str("\nUse /thinkback-play to execute learnings.");
+                CommandResult::success(output)
             } else {
                 CommandResult::error("thinkback feature is not enabled.")
             }

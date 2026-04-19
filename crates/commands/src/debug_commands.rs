@@ -12,10 +12,26 @@ pub fn register(registry: &mut CommandRegistry) {
         true,
         true,
         true,
-        Arc::new(|_ctx: &CommandContext, _args: &[String]| {
-            CommandResult::success(
-                "Recent Tool Calls\n─────────────────\n(No tool calls recorded in this session)\n\nTool calls appear here when the model invokes tools."
-            )
+        Arc::new(|ctx: &CommandContext, _args: &[String]| {
+            let mut lines = vec![
+                "Recent Tool Calls".to_string(),
+                "─────────────────".to_string(),
+                format!("Session: {}", ctx.session_id),
+                format!("Model: {}", ctx.model.0),
+                format!("Messages: {}", ctx.message_count),
+                String::new(),
+            ];
+            if ctx.message_count == 0 {
+                lines.push("(No tool calls recorded in this session)".to_string());
+                lines.push("Tool calls appear here when the model invokes tools.".to_string());
+            } else {
+                lines.push(format!("Input tokens: {}", ctx.input_tokens));
+                lines.push(format!("Output tokens: {}", ctx.output_tokens));
+                lines.push(format!("Cache read: {}", ctx.cache_read_tokens));
+                lines.push(format!("Cache creation: {}", ctx.cache_creation_tokens));
+                lines.push(format!("Cost: ${:.4}", ctx.cost_usd));
+            }
+            CommandResult::success(lines.join("\n"))
         }),
     ));
 
@@ -96,10 +112,24 @@ pub fn register(registry: &mut CommandRegistry) {
         true,
         true,
         true,
-        Arc::new(|_ctx: &CommandContext, _args: &[String]| {
-            CommandResult::success(
-                "API Call Trace\n──────────────\n(No API calls recorded in this trace session)\n\nAPI calls appear here when the model is invoked."
-            )
+        Arc::new(|ctx: &CommandContext, _args: &[String]| {
+            let mut lines = vec![
+                "API Call Trace".to_string(),
+                "──────────────".to_string(),
+                format!("Model: {}", ctx.model.0),
+                format!("Session: {}", ctx.session_id),
+                format!("Input tokens: {}", ctx.input_tokens),
+                format!("Output tokens: {}", ctx.output_tokens),
+                format!("Cache read: {}", ctx.cache_read_tokens),
+                format!("Cache creation: {}", ctx.cache_creation_tokens),
+                format!("Cost: ${:.4}", ctx.cost_usd),
+            ];
+            if ctx.input_tokens == 0 && ctx.output_tokens == 0 {
+                lines.push(String::new());
+                lines.push("(No API calls recorded in this trace session)".to_string());
+                lines.push("API calls appear here when the model is invoked.".to_string());
+            }
+            CommandResult::success(lines.join("\n"))
         }),
     ));
 
@@ -126,9 +156,29 @@ pub fn register(registry: &mut CommandRegistry) {
         true,
         true,
         true,
-        Arc::new(|_ctx: &CommandContext, _args: &[String]| {
-            CommandResult::success("Plugins reloaded successfully.")
-                .with_state_change(true)
+        Arc::new(|ctx: &CommandContext, _args: &[String]| {
+            let mut discovered = 0;
+            let plugin_dirs = [
+                std::path::Path::new(&ctx.cwd).join(".claude/plugins"),
+                coderex_config::settings::config_home().join("plugins"),
+            ];
+            for dir in &plugin_dirs {
+                if !dir.exists() {
+                    continue;
+                }
+                if let Ok(entries) = std::fs::read_dir(dir) {
+                    for entry in entries.flatten() {
+                        let manifest = entry.path().join("plugin.json");
+                        if manifest.exists() {
+                            discovered += 1;
+                        }
+                    }
+                }
+            }
+            CommandResult::success(format!(
+                "Plugins reloaded successfully.\nDiscovered: {discovered} plugin(s)"
+            ))
+            .with_state_change(true)
         }),
     ));
 }

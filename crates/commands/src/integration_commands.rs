@@ -33,7 +33,15 @@ pub fn register(registry: &mut CommandRegistry) {
         true,
         true,
         Arc::new(|_ctx: &CommandContext, _args: &[String]| {
-            CommandResult::success("Chrome DevTools: Not connected\nConfigure Chrome DevTools in settings.json.")
+            let connected = std::net::TcpStream::connect_timeout(
+                &std::net::SocketAddr::from(([127, 0, 0, 1], 9222)),
+                std::time::Duration::from_millis(50),
+            ).is_ok();
+            if connected {
+                CommandResult::success("Chrome DevTools: Connected\nDebugger listening on port 9222.")
+            } else {
+                CommandResult::success("Chrome DevTools: Not connected\nConfigure Chrome DevTools in settings.json or start Chrome with --remote-debugging-port=9222.")
+            }
         }),
     ));
 
@@ -45,7 +53,12 @@ pub fn register(registry: &mut CommandRegistry) {
         true,
         true,
         Arc::new(|_ctx: &CommandContext, _args: &[String]| {
-            CommandResult::success("Desktop App: Not detected\nRunning in terminal mode.")
+            let has_desktop = std::env::var("CODEREX_DESKTOP").ok().map(|s| !s.is_empty()).unwrap_or(false);
+            if has_desktop {
+                CommandResult::success("Desktop App: Connected\nRunning with desktop integration.")
+            } else {
+                CommandResult::success("Desktop App: Not detected\nRunning in terminal mode.")
+            }
         }),
     ));
 
@@ -57,7 +70,12 @@ pub fn register(registry: &mut CommandRegistry) {
         true,
         true,
         Arc::new(|_ctx: &CommandContext, _args: &[String]| {
-            CommandResult::success("Mobile: No active connections\nUse Bridge to connect mobile clients.")
+            let has_mobile = std::env::var("CODEREX_MOBILE").ok().map(|s| !s.is_empty()).unwrap_or(false);
+            if has_mobile {
+                CommandResult::success("Mobile: Active\nMobile client connected via Bridge.")
+            } else {
+                CommandResult::success("Mobile: No active connections\nUse Bridge to connect mobile clients.")
+            }
         }),
     ));
 
@@ -124,7 +142,30 @@ pub fn register(registry: &mut CommandRegistry) {
         true,
         true,
         Arc::new(|_ctx: &CommandContext, _args: &[String]| {
-            CommandResult::success("Remote Setup\n───────────\n1. Install coderex CLI\n2. Set API key: export ANTHROPIC_API_KEY=...\n3. Run: coderex daemon start\n\nUse Bridge for full remote session support.")
+            let bridge_url = std::env::var("CODEREX_BRIDGE_URL").ok();
+            let api_key_set = std::env::var("ANTHROPIC_API_KEY").ok().map(|s| !s.is_empty()).unwrap_or(false)
+                || std::env::var("CODEREX_API_KEY").ok().map(|s| !s.is_empty()).unwrap_or(false);
+            let mut lines = vec![
+                "Remote Setup".to_string(),
+                "───────────".to_string(),
+            ];
+            if api_key_set {
+                lines.push("API key: configured".to_string());
+            } else {
+                lines.push("API key: not set".to_string());
+                lines.push("  export ANTHROPIC_API_KEY=...".to_string());
+            }
+            if let Some(url) = bridge_url.filter(|s| !s.is_empty()) {
+                lines.push(format!("Bridge URL: {url}"));
+                lines.push("Bridge is configured. Use /bridge to check status.".to_string());
+            } else {
+                lines.push("Bridge: not configured".to_string());
+                lines.push("  export CODEREX_BRIDGE_URL=ws://host:port".to_string());
+            }
+            lines.push(String::new());
+            lines.push("Run: coderex serve".to_string());
+            lines.push("Use Bridge for full remote session support.".to_string());
+            CommandResult::success(lines.join("\n"))
         }),
     ));
 
@@ -135,9 +176,18 @@ pub fn register(registry: &mut CommandRegistry) {
         true,
         true,
         true,
-        Arc::new(|_ctx: &CommandContext, _args: &[String]| {
-            CommandResult::success("Opening statusline setup wizard...")
-                .with_state_change(true)
+        Arc::new(|ctx: &CommandContext, _args: &[String]| {
+            let format = if ctx.vim_mode {
+                "[model] [tokens] [cost] [permissions] [vim]"
+            } else {
+                "[model] [tokens] [cost] [permissions]"
+            };
+            CommandResult::success(format!(
+                "Statusline Setup\n────────────────\nFormat: {format}\nTheme: {}\n\nConfigure in ~/.claude/settings.json:\n  \"statusline\": {{\n    \"format\": \"{format}\",\n    \"theme\": \"{}\"\n  }}",
+                ctx.theme,
+                ctx.theme,
+            ))
+            .with_state_change(true)
         }),
     ));
 }
@@ -240,7 +290,7 @@ mod tests {
     fn statusline_setup_opens_wizard() {
         let reg = { let mut r = CommandRegistry::new(); register(&mut r); r };
         let result = reg.execute("statusline-setup", &ctx(), &[]);
-        assert!(result.output.contains("statusline setup"));
+        assert!(result.output.contains("Statusline Setup"));
         assert!(result.state_changed);
     }
 }
