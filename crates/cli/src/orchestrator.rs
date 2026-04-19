@@ -142,6 +142,9 @@ impl StartupOrchestrator {
             Ok(())
         } else if let Some(cmd) = args.command {
             match cmd {
+                crate::cli::Command::Repl => {
+                    self.run_repl(&self.ctx.cwd, model).await
+                }
                 crate::cli::Command::Serve => {
                     self.run_server(&self.ctx.cwd).await
                 }

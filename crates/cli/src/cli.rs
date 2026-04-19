@@ -3,7 +3,14 @@
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
-#[command(name = "coderex", version, about = "CodeRex — AI-powered coding assistant")]
+#[command(
+    name = "coderex",
+    version,
+    about = "CodeRex — AI-powered coding assistant",
+    long_about = "CodeRex — AI-powered coding assistant.\n\
+\n\
+Running without a subcommand starts the interactive REPL."
+)]
 pub struct Cli {
     /// Working directory (defaults to current directory).
     #[arg(short, long)]
@@ -27,6 +34,8 @@ pub struct Cli {
 
 #[derive(Subcommand)]
 pub enum Command {
+    /// Start the interactive REPL (default when no command is given).
+    Repl,
     /// Start in daemon/server mode.
     Serve,
     /// Resume a previous session.
