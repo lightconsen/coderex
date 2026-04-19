@@ -657,11 +657,11 @@ impl PromptCompiler {
 
 5.12.1 数据持久化与存储 Schema (Data Storage)
 
-coderex 完全依赖文件系统和特定组织架构来进行状态管理。为了保证与 coderex 生态的兼容性（包括允许未来两个版本共享配置或离线存储），CodeRex本的本地数据目录必须严格对齐 `getClaudeConfigHomeDir()`（默认 `~/.claude`）的路径范式：
+coderex 完全依赖文件系统和特定组织架构来进行状态管理。为了保证与 coderex 生态的兼容性（包括允许未来两个版本共享配置或离线存储），CodeRex本的本地数据目录必须严格对齐 `getClaudeConfigHomeDir()`（默认 `~/.coderex`）的路径范式：
 
 目录拓扑规范：
 ```text
-~/.claude/
+~/.coderex/
 ├── settings.json            # 用户全局配置
 ├── managed_settings.json    # 企业远程托管配置的缓存 (checksum 校验)
 ├── policy_limits.json       # API 速率、Budget 等服务端策略限额缓存
@@ -684,7 +684,7 @@ coderex **没有**使用关系型数据库保存对话流 (Transcript)，而是�
 - 第三方兼容：可以直接供外部编辑器或其他工具直接 `tail -f` 监控大模型输出。
 
 附属索引层 (SQLite Session Meta Index) 设计：
-虽然内容体使用 JSONL，但为了支持快速的 `/history` 搜索、`/cost` 聚合统计，CodeRex建议引入 SQLite 数据库（如 `~/.claude/sessions.db`）建立元数据索引层。仅依靠文件扫描会产生 OOM 与“I/O 读取刺客”问题：
+虽然内容体使用 JSONL，但为了支持快速的 `/history` 搜索、`/cost` 聚合统计，CodeRex建议引入 SQLite 数据库（如 `~/.coderex/sessions.db`）建立元数据索引层。仅依靠文件扫描会产生 OOM 与“I/O 读取刺客”问题：
 
 ```sql
 -- 推荐的 rusqlite Schema

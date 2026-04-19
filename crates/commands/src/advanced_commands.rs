@@ -126,7 +126,7 @@ pub fn register(registry: &mut CommandRegistry) {
         true,
         Arc::new(|ctx: &CommandContext, _args: &[String]| {
             if ctx.is_feature_enabled("thinkback") {
-                let transcript_dir = std::path::Path::new(&ctx.cwd).join(".claude/transcripts");
+                let transcript_dir = std::path::Path::new(&ctx.cwd).join(".coderex/transcripts");
                 let mut output = String::from("Thinkback\n────────\n");
                 let total_msgs;
                 if transcript_dir.exists() {

@@ -159,7 +159,7 @@ pub fn register(registry: &mut CommandRegistry) {
         Arc::new(|ctx: &CommandContext, _args: &[String]| {
             let mut discovered = 0;
             let plugin_dirs = [
-                std::path::Path::new(&ctx.cwd).join(".claude/plugins"),
+                std::path::Path::new(&ctx.cwd).join(".coderex/plugins"),
                 coderex_config::settings::config_home().join("plugins"),
             ];
             for dir in &plugin_dirs {

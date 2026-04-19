@@ -183,7 +183,7 @@ pub fn register(registry: &mut CommandRegistry) {
                 "[model] [tokens] [cost] [permissions]"
             };
             CommandResult::success(format!(
-                "Statusline Setup\n────────────────\nFormat: {format}\nTheme: {}\n\nConfigure in ~/.claude/settings.json:\n  \"statusline\": {{\n    \"format\": \"{format}\",\n    \"theme\": \"{}\"\n  }}",
+                "Statusline Setup\n────────────────\nFormat: {format}\nTheme: {}\n\nConfigure in ~/.coderex/settings.json:\n  \"statusline\": {{\n    \"format\": \"{format}\",\n    \"theme\": \"{}\"\n  }}",
                 ctx.theme,
                 ctx.theme,
             ))

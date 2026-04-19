@@ -112,14 +112,14 @@ impl ConfigService {
         }
     }
 
-    /// Load user config from `~/.claude/settings.json`.
+    /// Load user config from `~/.coderex/settings.json`.
     ///
     /// Returns `Ok(None)` if the file does not exist.
     pub fn load_user_config(&self) -> Result<Option<Settings>, ConfigError> {
         load_settings_file(&self.user_config_path)
     }
 
-    /// Load project config from `.claude/settings.json` in the current directory or nearest ancestor.
+    /// Load project config from `.coderex/settings.json` in the current directory or nearest ancestor.
     ///
     /// Returns `Ok(None)` if no project config is found.
     pub fn load_project_config(&self) -> Result<Option<Settings>, ConfigError> {
@@ -164,7 +164,7 @@ fn load_settings_file(path: &Path) -> Result<Option<Settings>, ConfigError> {
     Ok(Some(settings))
 }
 
-/// Get the Claude config home directory (~/.claude or CLAUDE_CONFIG_DIR override).
+/// Get the Claude config home directory (~/.coderex or CLAUDE_CONFIG_DIR override).
 #[must_use]
 pub fn config_home() -> PathBuf {
     std::env::var("CLAUDE_CONFIG_DIR")
@@ -173,7 +173,7 @@ pub fn config_home() -> PathBuf {
             || {
                 home::home_dir()
                     .unwrap_or_default()
-                    .join(".claude")
+                    .join(".coderex")
             },
             PathBuf::from,
         )

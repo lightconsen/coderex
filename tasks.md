@@ -51,7 +51,7 @@
 ## Phase 1: 配置系统
 
 ### 1.1 配置目录与文件加载 (crate: `config`)
-- [x] 实现 `~/.claude/` 目录路径解析（兼容 `CLAUDE_CONFIG_DIR` 环境变量覆盖）
+- [x] 实现 `~/.coderex/` 目录路径解析（兼容 `CLAUDE_CONFIG_DIR` 环境变量覆盖）
 - [x] 实现 `settings.json` 读取与解析为 `Settings` 结构体
 - [x] 实现三级配置合并：built-in defaults → user config → project config
 - [x] 定义 `RuntimeOverrides` 结构体
@@ -111,7 +111,7 @@
 ## Phase 2: 存储层
 
 ### 2.1 JSONL Transcript Store (crate: `memory`)
-- [x] 实现 `TranscriptStore`：按 `~/.claude/projects/<project_hash>/<session_id>.jsonl` 追加写入
+- [x] 实现 `TranscriptStore`：按 `~/.coderex/projects/<project_hash>/<session_id>.jsonl` 追加写入
 - [x] 实现 `append(message)` 方法
 - [x] 实现 `read_all(session_id)` 迭代器
 - [x] 实现 `SKIP_FIRST_PROMPT_PATTERN` 正则跳过机制
@@ -119,7 +119,7 @@
 - **依赖**：0.2
 
 ### 2.2 SQLite Session Meta Index (crate: `memory`)
-- [x] 创建 `~/.claude/sessions.db` 与 schema（sessions 表、索引）
+- [x] 创建 `~/.coderex/sessions.db` 与 schema（sessions 表、索引）
 - [x] 实现 `SessionIndex::create(session_id, project_path, ...)` 插入
 - [x] 实现 `SessionIndex::update_last_active(session_id, ...)` 更新
 - [x] 实现 `SessionIndex::list_by_project(project_path)` 查询
@@ -128,7 +128,7 @@
 - **依赖**：2.1
 
 ### 2.3 长期记忆存储 (crate: `memory`)
-- [x] 实现 `LongTermStore`：`~/.claude/memory/` 目录下的文件存储
+- [x] 实现 `LongTermStore`：`~/.coderex/memory/` 目录下的文件存储
 - [x] 实现 `read()` / `write(topic, content)` 接口
 - [x] 实现 `search(query)` 模糊匹配
 - **测试**：5 tests — 写入/读取、更新、缺失主题、搜索匹配、搜索排序

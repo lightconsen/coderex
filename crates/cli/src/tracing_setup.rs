@@ -40,7 +40,7 @@ pub fn init_tracing() {
 
 /// Install a panic hook using the telemetry crash reporter.
 ///
-/// Crash reports are written to `~/.claude/crashes/pending/` and ingested
+/// Crash reports are written to `~/.coderex/crashes/pending/` and ingested
 /// into the telemetry store on the next startup.
 pub fn install_panic_hook() {
     let pending_dir = coderex_config::config_home().join("crashes").join("pending");

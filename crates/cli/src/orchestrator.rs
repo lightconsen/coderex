@@ -316,9 +316,9 @@ impl StartupOrchestrator {
         Ok(())
     }
 
-    /// LoadCommands: discover and register custom commands from `.claude/commands/`.
+    /// LoadCommands: discover and register custom commands from `.coderex/commands/`.
     async fn phase_load_commands(&self) -> Result<()> {
-        let commands_dir = std::path::Path::new(&self.ctx.cwd).join(".claude/commands");
+        let commands_dir = std::path::Path::new(&self.ctx.cwd).join(".coderex/commands");
         if commands_dir.exists() {
             let mut count = 0;
             if let Ok(entries) = std::fs::read_dir(&commands_dir) {
@@ -343,9 +343,9 @@ impl StartupOrchestrator {
         Ok(())
     }
 
-    /// LoadSkills: discover and register skills from .claude/skills/.
+    /// LoadSkills: discover and register skills from .coderex/skills/.
     async fn phase_load_skills(&self) -> Result<()> {
-        let skills_dir = std::path::Path::new(&self.ctx.cwd).join(".claude/skills");
+        let skills_dir = std::path::Path::new(&self.ctx.cwd).join(".coderex/skills");
         if skills_dir.exists() {
             let count = std::fs::read_dir(&skills_dir)
                 .map(|d| d.count())
@@ -363,7 +363,7 @@ impl StartupOrchestrator {
         let mut plugin_dirs: Vec<std::path::PathBuf> = Vec::new();
 
         // Project-local plugins
-        let project_plugins = std::path::Path::new(&self.ctx.cwd).join(".claude/plugins");
+        let project_plugins = std::path::Path::new(&self.ctx.cwd).join(".coderex/plugins");
         if project_plugins.exists() {
             manager.add_plugin_dir(project_plugins.clone());
             plugin_dirs.push(project_plugins);
@@ -415,7 +415,7 @@ impl StartupOrchestrator {
             }
         }
 
-        let install_dir = std::path::Path::new(&self.ctx.cwd).join(".claude/plugins");
+        let install_dir = std::path::Path::new(&self.ctx.cwd).join(".coderex/plugins");
         match reconciler.reconcile(&manager, Some(&install_dir)).await {
             Ok(report) => {
                 if report.is_empty() {
@@ -486,7 +486,7 @@ impl StartupOrchestrator {
 
     /// InitMemory: initialize memory subsystem (auto dream, team memory).
     async fn phase_init_memory(&mut self) -> Result<()> {
-        let memory_dir = std::path::Path::new(&self.ctx.cwd).join(".claude");
+        let memory_dir = std::path::Path::new(&self.ctx.cwd).join(".coderex");
 
         if !memory_dir.exists() {
             std::fs::create_dir_all(&memory_dir)?;
@@ -534,7 +534,7 @@ impl StartupOrchestrator {
     fn find_project_config(cwd: &str) -> Option<std::path::PathBuf> {
         let mut current = std::path::Path::new(cwd);
         loop {
-            let candidate = current.join(".claude/settings.json");
+            let candidate = current.join(".coderex/settings.json");
             if candidate.exists() {
                 return Some(candidate);
             }
@@ -688,7 +688,7 @@ impl StartupOrchestrator {
     ) -> Result<Vec<coderex_core::types::Message>> {
         use coderex_memory::transcript::TranscriptStore;
 
-        let transcript_dir = std::path::Path::new(cwd).join(".claude/transcripts");
+        let transcript_dir = std::path::Path::new(cwd).join(".coderex/transcripts");
         let store = TranscriptStore::new(transcript_dir.clone());
         let messages = store.read_all_skip_first_prompt(session_id)?;
 
@@ -822,7 +822,7 @@ mod tests {
         let cwd = tmp.path().to_string_lossy().to_string();
 
         // Write a transcript
-        let transcript_dir = std::path::Path::new(&cwd).join(".claude/transcripts");
+        let transcript_dir = std::path::Path::new(&cwd).join(".coderex/transcripts");
         std::fs::create_dir_all(&transcript_dir).unwrap();
         let store = coderex_memory::transcript::TranscriptStore::new(transcript_dir);
         store

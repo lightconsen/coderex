@@ -70,7 +70,7 @@ pub fn register(registry: &mut CommandRegistry) {
                     let hint = if !available.is_empty() {
                         format!("\nAvailable themes:\n{}", available.iter().map(|t| format!("  {t}")).collect::<Vec<_>>().join("\n"))
                     } else {
-                        "\nNo custom themes installed in ~/.claude/themes/".to_string()
+                        "\nNo custom themes installed in ~/.coderex/themes/".to_string()
                     };
                     CommandResult::error(format!("Theme not found: {new_theme}{hint}"))
                 }
@@ -100,7 +100,7 @@ pub fn register(registry: &mut CommandRegistry) {
                 match args[0].as_str() {
                     "list" => {
                         if available.is_empty() {
-                            CommandResult::success("No hooks installed in ~/.claude/hooks/")
+                            CommandResult::success("No hooks installed in ~/.coderex/hooks/")
                         } else {
                             CommandResult::success(format!("Installed hooks:\n{}", available.join("\n")))
                         }
@@ -159,7 +159,7 @@ pub fn register(registry: &mut CommandRegistry) {
 
             if args.is_empty() {
                 if installed.is_empty() {
-                    CommandResult::success("No plugins installed.\nInstall plugins in ~/.claude/plugins/\nUse /plugin install <name> to install from marketplace.")
+                    CommandResult::success("No plugins installed.\nInstall plugins in ~/.coderex/plugins/\nUse /plugin install <name> to install from marketplace.")
                 } else {
                     CommandResult::success(format!("Installed plugins:\n{}", installed.iter().map(|p| format!("  {p}")).collect::<Vec<_>>().join("\n")))
                 }
@@ -199,7 +199,7 @@ pub fn register(registry: &mut CommandRegistry) {
                 let count = entries.len();
                 if count == 0 {
                     CommandResult::success(format!(
-                        "Memory: 0 entries\nMemory files found: {:?}\nUse /memory search <query> to search.\nMemory stored in ~/.claude/memory/",
+                        "Memory: 0 entries\nMemory files found: {:?}\nUse /memory search <query> to search.\nMemory stored in ~/.coderex/memory/",
                         memory_files
                     ))
                 } else {
@@ -240,7 +240,7 @@ pub fn register(registry: &mut CommandRegistry) {
 
             // Scan multiple skill directories
             let skill_dirs = [
-                home.join("skills"),          // ~/.claude/skills/
+                home.join("skills"),          // ~/.coderex/skills/
             ];
 
             let mut all_skills: Vec<String> = Vec::new();
@@ -251,7 +251,7 @@ pub fn register(registry: &mut CommandRegistry) {
 
             if args.is_empty() {
                 if all_skills.is_empty() {
-                    CommandResult::success("Skills:\n  No skills loaded.\nPlace skill scripts in ~/.claude/skills/")
+                    CommandResult::success("Skills:\n  No skills loaded.\nPlace skill scripts in ~/.coderex/skills/")
                 } else {
                     CommandResult::success(format!("Skills:\n{}", all_skills.iter().map(|s| format!("  {s}")).collect::<Vec<_>>().join("\n")))
                 }
@@ -278,16 +278,16 @@ pub fn register(registry: &mut CommandRegistry) {
         true,
         true,
         Arc::new(|_ctx: &CommandContext, args: &[String]| {
-            // Look for task files in .claude/tasks/ and cwd
+            // Look for task files in .coderex/tasks/ and cwd
             let home = config_home();
             let tasks_path = home.join("tasks");
             let task_files = list_dir_items(&tasks_path);
 
             if args.is_empty() {
                 if task_files.is_empty() {
-                    CommandResult::success("Tasks:\n  No tasks registered.\nUse TaskCreate to create tasks.\nTask files can be placed in ~/.claude/tasks/")
+                    CommandResult::success("Tasks:\n  No tasks registered.\nUse TaskCreate to create tasks.\nTask files can be placed in ~/.coderex/tasks/")
                 } else {
-                    CommandResult::success(format!("Task files in ~/.claude/tasks/:\n{}", task_files.iter().map(|t| format!("  {t}")).collect::<Vec<_>>().join("\n")))
+                    CommandResult::success(format!("Task files in ~/.coderex/tasks/:\n{}", task_files.iter().map(|t| format!("  {t}")).collect::<Vec<_>>().join("\n")))
                 }
             } else {
                 match args[0].as_str() {
@@ -330,7 +330,7 @@ pub fn register(registry: &mut CommandRegistry) {
                 let plan_files = list_dir_items(&plans_path);
                 if !plan_files.is_empty() {
                     CommandResult::success(format!(
-                        "Plan files found in ~/.claude/plans/:\n{}",
+                        "Plan files found in ~/.coderex/plans/:\n{}",
                         plan_files.join("\n")
                     ))
                 } else {

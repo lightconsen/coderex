@@ -12,7 +12,7 @@ use std::sync::RwLock;
 pub const CRON_SCHEDULER_KEY: &str = "cron_scheduler";
 
 #[allow(dead_code)]
-const JOB_FILE: &str = ".claude/scheduled_tasks.json";
+const JOB_FILE: &str = ".coderex/scheduled_tasks.json";
 
 /// A scheduled cron job.
 #[derive(Debug, Clone, Serialize, Deserialize)]

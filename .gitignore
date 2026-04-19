@@ -12,5 +12,5 @@ gemini-cli/
 start.kimi.sh
 
 # Local configuration and generated docs
-.claude/settings.json
+.coderex/settings.json
 docs/compare10.md

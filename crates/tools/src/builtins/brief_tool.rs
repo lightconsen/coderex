@@ -39,7 +39,7 @@ impl Tool for BriefTool {
         let session_id = extract_string_opt(&input.arguments, "session_id")
             .unwrap_or_else(|| "current".into());
 
-        let transcript_dir = ctx.cwd.join(".claude/transcripts");
+        let transcript_dir = ctx.cwd.join(".coderex/transcripts");
         let store = coderex_memory::transcript::TranscriptStore::new(transcript_dir);
 
         let messages = store
@@ -168,7 +168,7 @@ mod tests {
     #[tokio::test]
     async fn brief_reads_transcript() {
         let tmp = tempfile::tempdir().unwrap();
-        let transcript_dir = tmp.path().join(".claude/transcripts");
+        let transcript_dir = tmp.path().join(".coderex/transcripts");
         std::fs::create_dir_all(&transcript_dir).unwrap();
 
         let store = coderex_memory::transcript::TranscriptStore::new(transcript_dir);

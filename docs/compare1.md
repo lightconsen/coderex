@@ -85,7 +85,7 @@
 |---|---------|-------------|----------|-----------|------------|
 | **架构** | `coderex-memory` 独立 crate | 3 层内存 (`MEMORY.md` 指针索引) | 无独立内存模块 | 上下文管理 | `save_memory` 工具 |
 | **类型** | Transcript / SessionIndex / LongTerm / SessionMemory / TeamMemory | Pointer index + 主题文件 + 压缩上下文 | 层级管理 | 会话记忆 | 跨会话记忆 |
-| **持久化** | SQLite (rusqlite) | `.claude/` 目录文件 | 本地文件 | 本地文件 | 本地文件 |
+| **持久化** | SQLite (rusqlite) | `.coderex/` 目录文件 | 本地文件 | 本地文件 | 本地文件 |
 | **团队** | `TeamMemory` + `TeamMemorySyncService` | 无 | 无 | 无 | 无 |
 | **AutoDream** | CodeRex 独有 (梦境检查) | 无 | 无 | 无 | 无 |
 
@@ -258,7 +258,7 @@
 | **Claude Code** | Feature flags (44+) | 灰度发布控制 |
 | **Claude Code** | Lazy loading 工具 (~40/60+) | 减少内存/启动开销 |
 | **Claude Code** | React 组件 snapshot 测试 | TUI 渲染可测试性 |
-| **Claude Code** | `.claude/` 目录约定 | 用户习惯，降低学习成本 |
+| **Claude Code** | `.coderex/` 目录约定 | 用户习惯，降低学习成本 |
 | **Kimi CLI** | Scripted Echo Provider | 无 API 依赖的 E2E 测试 |
 | **Kimi CLI** | Wire 协议事件总线 | IDE 集成标准化 |
 | **Kimi CLI** | YAML Agent 声明 | 用户可自定义 Agent |
@@ -303,6 +303,6 @@
 CodeRex 在架构严谨性、权限控制、远程编排、记忆系统等方面 **已领先** 多数竞品。核心差距在于：
 - **测试工程化**（录制/回放、echo provider、snapshot）
 - **生态集成**（GitHub Action、Extension 市场、标准化 IDE 协议）
-- **用户心智模型**（`.claude/` 目录约定、YAML Agent 声明）
+- **用户心智模型**（`.coderex/` 目录约定、YAML Agent 声明）
 
 CodeRex 的 Rust + Cargo workspace 架构在类型安全、编译期检查、性能上具有天然优势，保持这一技术路线的同时吸收上述竞品的工程实践，可以快速缩小差距。

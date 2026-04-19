@@ -190,7 +190,7 @@ impl SkillLoader {
 
         // 3. Repo skills
         if let Some(repo) = repo_path {
-            let repo_skills = repo.join(".claude").join("skills");
+            let repo_skills = repo.join(".coderex").join("skills");
             if repo_skills.exists() {
                 self.load_from_dir(&repo_skills, SkillSource::RepoDir);
             }
@@ -393,7 +393,7 @@ This is the script content.
     #[test]
     fn repo_dir_skills_loaded() {
         let repo = tempfile::tempdir().unwrap();
-        let skills_dir = repo.path().join(".claude").join("skills");
+        let skills_dir = repo.path().join(".coderex").join("skills");
         std::fs::create_dir_all(&skills_dir).unwrap();
         std::fs::write(skills_dir.join("repo.md"), skill_content()).unwrap();
 

@@ -163,7 +163,7 @@ pub fn register(registry: &mut CommandRegistry) {
             let mut total_messages = 0;
 
             // Scan project transcripts
-            let project_transcripts = std::path::Path::new(&ctx.cwd).join(".claude/transcripts");
+            let project_transcripts = std::path::Path::new(&ctx.cwd).join(".coderex/transcripts");
             if project_transcripts.exists() {
                 if let Ok(entries) = std::fs::read_dir(&project_transcripts) {
                     for entry in entries.flatten() {

@@ -61,7 +61,7 @@ Commands (user-facing slash commands) are separate from Tools (LLM-facing functi
 
 ```
 Bootstrap -> LoadSettings -> BuildCapabilities -> LoadCommands
- |              |                                  (scan .claude/commands/)
+ |              |                                  (scan .coderex/commands/)
  |              +-- RuntimeOverrides (CLI flags, env vars)
  |
  +-- tracing init, signal handlers
@@ -71,12 +71,12 @@ LoadSkills -> InitPlugins -> ReconcileMarketplaces -> InitMcp
    |             |                |                      +-- .mcp.json -> McpManager.start_all()
    |             |                +-- MarketplaceReconciler.reconcile()
    |             +-- PluginManager.discover() + load()
-   +-- scan .claude/skills/
+   +-- scan .coderex/skills/
 
 InitMemory -> InitRemoteServices -> Ready
     |             |
     |             +-- Bridge transport (if CODEREX_BRIDGE_URL set)
-    +-- .claude/ directory setup
+    +-- .coderex/ directory setup
 ```
 
 ## 4. Key Abstractions
@@ -107,7 +107,7 @@ InitMemory -> InitRemoteServices -> Ready
 
 - TranscriptStore: JSONL append, read_all, skip-first-prompt
 - SessionIndex: SQLite (sessions.db), create/update/list/recent
-- LongTermStore: ~/.claude/memory/ file-based, fuzzy search
+- LongTermStore: ~/.coderex/memory/ file-based, fuzzy search
 
 ## 5. Notable Patterns
 

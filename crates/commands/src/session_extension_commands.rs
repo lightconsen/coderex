@@ -88,7 +88,7 @@ pub fn register(registry: &mut CommandRegistry) {
                         .with_state_change(true)
                     }
                     Ok(None) => {
-                        CommandResult::success("No previous sessions found. Sessions are stored in ~/.claude/sessions/")
+                        CommandResult::success("No previous sessions found. Sessions are stored in ~/.coderex/sessions/")
                     }
                     Err(e) => CommandResult::error(format!("Failed to search sessions: {e}")),
                 }
@@ -122,7 +122,7 @@ pub fn register(registry: &mut CommandRegistry) {
                                 ));
                             }
                         }
-                        CommandResult::error(format!("Session '{session_id}' not found. Sessions are stored in ~/.claude/sessions/"))
+                        CommandResult::error(format!("Session '{session_id}' not found. Sessions are stored in ~/.coderex/sessions/"))
                     }
                     Err(e) => CommandResult::error(format!("Failed to find session: {e}")),
                 }
@@ -258,7 +258,7 @@ mod tests {
             message_count: 5,
             ..CommandContext::new("/src".into(), "test-rename".into(), "Old Title".into(), ModelId::sonnet())
         };
-        // The command will try to write to ~/.claude/sessions/test-rename/meta.json
+        // The command will try to write to ~/.coderex/sessions/test-rename/meta.json
         let reg = { let mut r = CommandRegistry::new(); register(&mut r); r };
         let result = reg.execute("rename", &c, &["New Title".into()]);
         // Should either succeed or fail gracefully
