@@ -40,6 +40,8 @@ pub struct CommandResult {
     pub extra_context: Option<String>,
     /// System prompt to append for mode switching.
     pub append_system_prompt: Option<String>,
+    /// System prompt to fully override the default base prompt.
+    pub override_system_prompt: Option<String>,
     /// Prompt profile to switch the agent behavior.
     pub prompt_profile: Option<PromptProfile>,
     /// Override allowed tool names for this session.
@@ -55,6 +57,7 @@ impl CommandResult {
             suppress_output: false,
             extra_context: None,
             append_system_prompt: None,
+            override_system_prompt: None,
             prompt_profile: None,
             allowed_tools_override: None,
         }
@@ -68,6 +71,7 @@ impl CommandResult {
             suppress_output: false,
             extra_context: None,
             append_system_prompt: None,
+            override_system_prompt: None,
             prompt_profile: None,
             allowed_tools_override: None,
         }
@@ -94,6 +98,16 @@ impl CommandResult {
     /// Set a system prompt to append (for mode switching).
     pub fn with_append_system_prompt(mut self, prompt: impl Into<String>) -> Self {
         self.append_system_prompt = Some(prompt.into());
+        self
+    }
+
+    /// Override the base system prompt entirely.
+    ///
+    /// When set, this replaces the default base system prompt instead of
+    /// appending to it. This is useful for commands that want to switch
+    /// the agent into a completely different behavior mode.
+    pub fn with_override_system_prompt(mut self, prompt: impl Into<String>) -> Self {
+        self.override_system_prompt = Some(prompt.into());
         self
     }
 

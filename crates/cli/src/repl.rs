@@ -6,7 +6,7 @@ use coderex_core::types::ModelId;
 use coderex_core::engine::{QueryEngine, SubmitOptions, TerminalReason};
 use coderex_core::permission_engine::{ExplainPermissionHook, PermissionEngine};
 use coderex_core::prompts;
-use coderex_core::orchestrator::{BackgroundFeatureKind, BackgroundFeatureRequest};
+use coderex_core::orchestrator::{background_feature_label, BackgroundFeatureKind, BackgroundFeatureRequest};
 use coderex_core::query_profiles::{ModelProfile, PromptProfile, QueryKind, QueryRequest};
 use coderex_core::state::SessionState;
 use coderex_core::permissions::{PermissionChecker, PermissionMode};
@@ -20,6 +20,7 @@ use std::collections::HashMap;
 use std::io::{BufRead, Write};
 use std::sync::Arc;
 use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
 
 /// Session-level state that persists across turns.
 #[derive(Debug, Default)]
@@ -28,12 +29,39 @@ struct SessionEffects {
     prompt_profiles: Vec<PromptProfile>,
     /// Additional system prompt text appended by commands.
     append_system_prompt: Option<String>,
+    /// Full system prompt override (replaces base prompt).
+    override_system_prompt: Option<String>,
     /// Allowed tools override (None = use defaults).
     allowed_tools_override: Option<Vec<String>>,
     /// Additional user-context fragments accumulated from commands.
     extra_context: Vec<String>,
     /// Whether a title has been generated for this session.
     title_generated: bool,
+}
+
+/// Result from a completed background task, delivered to the UI.
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+struct BackgroundTaskResult {
+    /// The task ID.
+    id: String,
+    /// Which background feature ran.
+    kind: BackgroundFeatureKind,
+    /// Whether it succeeded.
+    success: bool,
+    /// Output content (result text or error message).
+    content: String,
+}
+
+/// Handle for an active background task.
+#[derive(Debug)]
+struct BackgroundTask {
+    /// Unique task ID.
+    id: String,
+    /// Feature kind.
+    kind: BackgroundFeatureKind,
+    /// Cancellation token — signal to abort the task.
+    cancel_token: CancellationToken,
 }
 
 /// The REPL event loop — reads user input, executes commands or queries.
@@ -59,6 +87,12 @@ pub struct ReplLoop {
     api_client: Option<Box<dyn ApiClient>>,
     /// Orchestrator for routing AI calls through product-level entry points.
     orchestrator: Option<coderex_core::orchestrator::Orchestrator>,
+    /// Active background tasks (observable + cancelable).
+    background_tasks: Vec<BackgroundTask>,
+    /// Sender for background task results back to the UI thread.
+    background_results_tx: Option<mpsc::UnboundedSender<BackgroundTaskResult>>,
+    /// Receiver for background task results.
+    background_results_rx: Option<mpsc::UnboundedReceiver<BackgroundTaskResult>>,
 }
 
 impl ReplLoop {
@@ -79,6 +113,9 @@ impl ReplLoop {
             session_effects: SessionEffects::default(),
             api_client: None,
             orchestrator: None,
+            background_tasks: Vec::new(),
+            background_results_tx: None,
+            background_results_rx: None,
         }
     }
 
@@ -125,6 +162,7 @@ impl ReplLoop {
         engine.set_tool_executor(Box::new(dispatcher));
 
         let orchestrator = coderex_core::orchestrator::Orchestrator::new(api_client.clone_box());
+        let (bg_tx, bg_rx) = mpsc::unbounded_channel::<BackgroundTaskResult>();
 
         Self {
             commands,
@@ -137,6 +175,9 @@ impl ReplLoop {
             session_effects: SessionEffects::default(),
             api_client: Some(api_client),
             orchestrator: Some(orchestrator),
+            background_tasks: Vec::new(),
+            background_results_tx: Some(bg_tx),
+            background_results_rx: Some(bg_rx),
         }
     }
 
@@ -254,6 +295,18 @@ impl ReplLoop {
             } else {
                 ui_state.statusline.thinking_label = None;
                 ui_state.statusline.spinner_frame = 0;
+            }
+
+            // Poll for completed background tasks and inject into message list
+            for result in self.poll_background_results() {
+                let label = format!("[Background {:?}] {}", result.kind,
+                    if result.success { "Done" } else { "Failed" });
+                ui_state.messages.push(coderex_ui::message_list::Message {
+                    role: coderex_ui::message_list::MessageRole::System,
+                    content: format!("{label}\n{}", result.content).into(),
+                    tool_name: None,
+                    streaming: false,
+                });
             }
 
             // Draw frame
@@ -495,9 +548,8 @@ impl ReplLoop {
                     match result {
                         Ok(_) => {
                             // Trigger background features after successful turn
-                            let prompt_text =
-                                self.history.last().map(|s| s.as_str()).unwrap_or("");
-                            self.trigger_background_features(prompt_text).await;
+                            let prompt_text = self.history.last().cloned().unwrap_or_default();
+                            self.trigger_background_features(&prompt_text).await;
                         }
                         Err(e) => {
                             ui_state.messages.push(Message {
@@ -557,7 +609,8 @@ impl ReplLoop {
         QueryRequest {
             kind: QueryKind::MainAgent,
             user_prompt: String::new(), // filled at submit time
-            custom_system_prompt: None,
+            // If override is set, it replaces the base prompt; otherwise None
+            custom_system_prompt: self.session_effects.override_system_prompt.clone(),
             append_system_prompt: self.session_effects.append_system_prompt.clone(),
             prompt_profile: self
                 .session_effects
@@ -584,7 +637,10 @@ impl ReplLoop {
         } else {
             // Fallback when no orchestrator is available
             let mut opts = SubmitOptions::default();
-            if !self.session_effects.prompt_profiles.is_empty() {
+            if let Some(ref override_prompt) = self.session_effects.override_system_prompt {
+                // Override takes precedence over profile-based composition
+                opts.custom_system_prompt = Some(override_prompt.clone());
+            } else if !self.session_effects.prompt_profiles.is_empty() {
                 opts.custom_system_prompt = Some(
                     prompts::compose_system_prompt_for_profiles(
                         &self.session_effects.prompt_profiles,
@@ -620,10 +676,20 @@ impl ReplLoop {
     }
 
     /// Trigger background features after a successful turn.
-    async fn trigger_background_features(&self, _user_prompt: &str) {
-        let Some(ref client) = self.api_client else {
-            return;
+    ///
+    /// Tasks are tracked in `self.background_tasks` with cancellation tokens.
+    /// Results are delivered asynchronously via `self.background_results_rx`.
+    async fn trigger_background_features(&mut self, _user_prompt: &str) {
+        let client = match &self.api_client {
+            Some(c) => c.clone_box(),
+            None => return,
         };
+        let tx = match &self.background_results_tx {
+            Some(t) => t.clone(),
+            None => return,
+        };
+
+        self.cleanup_finished_background_tasks();
 
         // Trigger prompt suggestions after the user has sent a few messages
         if self.history.len() >= 3 && self.history.len() % 5 == 0 {
@@ -647,18 +713,161 @@ impl ReplLoop {
                 allowed_tools: None,
                 max_tokens: 128,
             };
-            let client = client.clone_box();
-            tokio::spawn(async move {
-                match coderex_core::orchestrator::run_background_feature(client.as_ref(), request).await {
-                    Ok(result) => {
-                        tracing::info!("Background prompt suggestion: {}", result.content);
-                    }
-                    Err(e) => {
-                        tracing::warn!("Background feature failed: {e}");
-                    }
-                }
-            });
+            self.spawn_background_task(
+                "prompt_suggestion",
+                BackgroundFeatureKind::PromptSuggestion,
+                client,
+                request,
+                tx,
+            );
         }
+    }
+
+    /// Spawn a tracked background task with cancellation support.
+    fn spawn_background_task(
+        &mut self,
+        id: &str,
+        kind: BackgroundFeatureKind,
+        client: Box<dyn ApiClient>,
+        request: BackgroundFeatureRequest,
+        result_tx: mpsc::UnboundedSender<BackgroundTaskResult>,
+    ) {
+        let cancel_token = CancellationToken::new();
+        let task_id = id.to_string();
+        let task_cancel = cancel_token.clone();
+
+        self.background_tasks.push(BackgroundTask {
+            id: task_id.clone(),
+            kind,
+            cancel_token: cancel_token.clone(),
+        });
+
+        tokio::spawn(async move {
+            let result = tokio::select! {
+                biased;
+                _ = task_cancel.cancelled() => {
+                    Err(coderex_core::orchestrator::OrchestratorError::Config(
+                        "Cancelled by user".into()
+                    ))
+                }
+                res = coderex_core::orchestrator::run_background_feature(
+                    client.as_ref(), request
+                ) => res,
+            };
+
+            let (success, content) = match result {
+                Ok(r) => (true, r.content),
+                Err(e) => (false, e.to_string()),
+            };
+
+            let _ = result_tx.send(BackgroundTaskResult {
+                id: task_id,
+                kind,
+                success,
+                content,
+            });
+        });
+    }
+
+    /// Cancel all running background tasks.
+    fn cancel_background_tasks(&mut self) {
+        for task in &self.background_tasks {
+            task.cancel_token.cancel();
+            tracing::info!("Cancelled background task: {} ({:?})", task.id, task.kind);
+        }
+        self.background_tasks.clear();
+    }
+
+    /// Remove finished (cancelled or completed) background tasks from tracking.
+    fn cleanup_finished_background_tasks(&mut self) {
+        self.background_tasks.retain(|t| !t.cancel_token.is_cancelled());
+    }
+
+    /// Poll for completed background task results and return them.
+    fn poll_background_results(&mut self) -> Vec<BackgroundTaskResult> {
+        let mut results = Vec::new();
+        if let Some(ref mut rx) = self.background_results_rx {
+            while let Ok(result) = rx.try_recv() {
+                results.push(result);
+            }
+        }
+        results
+    }
+
+    /// Spawn a background feature by kind with a sensible default request.
+    fn spawn_background_feature_by_kind(&mut self, kind: BackgroundFeatureKind, user_prompt: String) -> String {
+        let client = match &self.api_client {
+            Some(c) => c.clone_box(),
+            None => return "No API client configured.".into(),
+        };
+        let tx = match &self.background_results_tx {
+            Some(t) => t.clone(),
+            None => return "Background task channel not available.".into(),
+        };
+
+        self.cleanup_finished_background_tasks();
+
+        let (system_prompt, max_tokens) = match kind {
+            BackgroundFeatureKind::AgentSummary => (
+                "You are a sub-agent summarizer. Produce a concise summary of recent activity.".into(),
+                256,
+            ),
+            BackgroundFeatureKind::AwaySummary => (
+                "You are a session summarizer. Summarize what happened while the user was away.".into(),
+                256,
+            ),
+            BackgroundFeatureKind::MagicDocs => (
+                "You are a documentation generator. Produce concise code documentation.".into(),
+                1024,
+            ),
+            BackgroundFeatureKind::CodebaseOverview => (
+                "You are a codebase analyst. Produce a high-level overview of the project.".into(),
+                1024,
+            ),
+            BackgroundFeatureKind::ReadmeGeneration => (
+                "You are a README generator. Produce a project README in Markdown.".into(),
+                2048,
+            ),
+            BackgroundFeatureKind::SessionMemoryUpdate => (
+                "You are a memory manager. Update session memory based on recent conversation.".into(),
+                512,
+            ),
+            BackgroundFeatureKind::MemoryExtraction => (
+                "You are a memory extractor. Identify long-term memories from this session.".into(),
+                512,
+            ),
+            BackgroundFeatureKind::PromptSuggestion => (
+                "You are a prompt suggestion assistant.".into(),
+                128,
+            ),
+            BackgroundFeatureKind::NextActionSuggestion => (
+                "You are a task planner. Suggest the next best action.".into(),
+                128,
+            ),
+            BackgroundFeatureKind::TeamStatus => (
+                "You are a team status aggregator.".into(),
+                256,
+            ),
+        };
+
+        let parent_context = if self.history.len() >= 3 {
+            Some(self.history.iter().rev().take(5).cloned().collect::<Vec<_>>().join("\n"))
+        } else {
+            None
+        };
+
+        let request = BackgroundFeatureRequest {
+            kind,
+            system_prompt,
+            user_prompt,
+            parent_context,
+            allowed_tools: None,
+            max_tokens,
+        };
+
+        let id = format!("{}_{}", background_feature_label(kind), self.background_tasks.len());
+        self.spawn_background_task(&id, kind, client, request, tx);
+        format!("Background task started: {id}")
     }
 
     /// Apply effects from a CommandResult to session state.
@@ -669,7 +878,10 @@ impl ReplLoop {
             }
         }
 
-        if let Some(ref prompt) = result.append_system_prompt {
+        if let Some(ref prompt) = result.override_system_prompt {
+            // Override takes precedence: replace the base prompt entirely
+            self.session_effects.override_system_prompt = Some(prompt.clone());
+        } else if let Some(ref prompt) = result.append_system_prompt {
             if let Some(ref existing) = self.session_effects.append_system_prompt {
                 self.session_effects.append_system_prompt =
                     Some(format!("{existing}\n{prompt}"));
@@ -819,6 +1031,94 @@ impl ReplLoop {
                     });
                     return;
                 }
+                "cancel" => {
+                    self.cancel_background_tasks();
+                    ui_state.messages.push(coderex_ui::message_list::Message {
+                        role: coderex_ui::message_list::MessageRole::System,
+                        content: "All background tasks cancelled.".into(),
+                        tool_name: None,
+                        streaming: false,
+                    });
+                    return;
+                }
+                "compact" => {
+                    let msg = self.spawn_background_feature_by_kind(
+                        BackgroundFeatureKind::AwaySummary,
+                        "Summarize the recent conversation compactly.".into(),
+                    );
+                    ui_state.messages.push(coderex_ui::message_list::Message {
+                        role: coderex_ui::message_list::MessageRole::System,
+                        content: msg.into(),
+                        tool_name: None,
+                        streaming: false,
+                    });
+                    return;
+                }
+                "agent-summary" => {
+                    let msg = self.spawn_background_feature_by_kind(
+                        BackgroundFeatureKind::AgentSummary,
+                        "Summarize what the agent has done recently.".into(),
+                    );
+                    ui_state.messages.push(coderex_ui::message_list::Message {
+                        role: coderex_ui::message_list::MessageRole::System,
+                        content: msg.into(),
+                        tool_name: None,
+                        streaming: false,
+                    });
+                    return;
+                }
+                "magic-docs" => {
+                    let msg = self.spawn_background_feature_by_kind(
+                        BackgroundFeatureKind::MagicDocs,
+                        "Generate documentation for the current codebase.".into(),
+                    );
+                    ui_state.messages.push(coderex_ui::message_list::Message {
+                        role: coderex_ui::message_list::MessageRole::System,
+                        content: msg.into(),
+                        tool_name: None,
+                        streaming: false,
+                    });
+                    return;
+                }
+                "generate-readme" => {
+                    let msg = self.spawn_background_feature_by_kind(
+                        BackgroundFeatureKind::ReadmeGeneration,
+                        "Generate a README for the current project.".into(),
+                    );
+                    ui_state.messages.push(coderex_ui::message_list::Message {
+                        role: coderex_ui::message_list::MessageRole::System,
+                        content: msg.into(),
+                        tool_name: None,
+                        streaming: false,
+                    });
+                    return;
+                }
+                "update-memory" => {
+                    let msg = self.spawn_background_feature_by_kind(
+                        BackgroundFeatureKind::SessionMemoryUpdate,
+                        "Update session memory with recent context.".into(),
+                    );
+                    ui_state.messages.push(coderex_ui::message_list::Message {
+                        role: coderex_ui::message_list::MessageRole::System,
+                        content: msg.into(),
+                        tool_name: None,
+                        streaming: false,
+                    });
+                    return;
+                }
+                "extract-memories" => {
+                    let msg = self.spawn_background_feature_by_kind(
+                        BackgroundFeatureKind::MemoryExtraction,
+                        "Extract long-term memories from this session.".into(),
+                    );
+                    ui_state.messages.push(coderex_ui::message_list::Message {
+                        role: coderex_ui::message_list::MessageRole::System,
+                        content: msg.into(),
+                        tool_name: None,
+                        streaming: false,
+                    });
+                    return;
+                }
                 _ => {}
             }
 
@@ -894,6 +1194,59 @@ impl ReplLoop {
             }
             "help" => {
                 self.show_help(stdout)?;
+                return Ok(());
+            }
+            "cancel" => {
+                self.cancel_background_tasks();
+                writeln!(stdout, "All background tasks cancelled.")?;
+                return Ok(());
+            }
+            "compact" => {
+                let msg = self.spawn_background_feature_by_kind(
+                    BackgroundFeatureKind::AwaySummary,
+                    "Summarize the recent conversation compactly.".into(),
+                );
+                writeln!(stdout, "{msg}")?;
+                return Ok(());
+            }
+            "agent-summary" => {
+                let msg = self.spawn_background_feature_by_kind(
+                    BackgroundFeatureKind::AgentSummary,
+                    "Summarize what the agent has done recently.".into(),
+                );
+                writeln!(stdout, "{msg}")?;
+                return Ok(());
+            }
+            "magic-docs" => {
+                let msg = self.spawn_background_feature_by_kind(
+                    BackgroundFeatureKind::MagicDocs,
+                    "Generate documentation for the current codebase.".into(),
+                );
+                writeln!(stdout, "{msg}")?;
+                return Ok(());
+            }
+            "generate-readme" => {
+                let msg = self.spawn_background_feature_by_kind(
+                    BackgroundFeatureKind::ReadmeGeneration,
+                    "Generate a README for the current project.".into(),
+                );
+                writeln!(stdout, "{msg}")?;
+                return Ok(());
+            }
+            "update-memory" => {
+                let msg = self.spawn_background_feature_by_kind(
+                    BackgroundFeatureKind::SessionMemoryUpdate,
+                    "Update session memory with recent context.".into(),
+                );
+                writeln!(stdout, "{msg}")?;
+                return Ok(());
+            }
+            "extract-memories" => {
+                let msg = self.spawn_background_feature_by_kind(
+                    BackgroundFeatureKind::MemoryExtraction,
+                    "Extract long-term memories from this session.".into(),
+                );
+                writeln!(stdout, "{msg}")?;
                 return Ok(());
             }
             _ => {}

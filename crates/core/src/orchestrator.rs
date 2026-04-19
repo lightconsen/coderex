@@ -549,7 +549,8 @@ async fn collect_text_output(event_rx: &mut mpsc::UnboundedReceiver<EngineEvent>
     content
 }
 
-fn background_feature_label(kind: BackgroundFeatureKind) -> &'static str {
+/// Return a snake_case label for a background feature kind.
+pub fn background_feature_label(kind: BackgroundFeatureKind) -> &'static str {
     match kind {
         BackgroundFeatureKind::AgentSummary => "agent_summary",
         BackgroundFeatureKind::AwaySummary => "away_summary",
