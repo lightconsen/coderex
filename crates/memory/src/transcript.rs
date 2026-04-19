@@ -71,13 +71,24 @@ impl TranscriptStore {
         let file = std::fs::File::open(&path)?;
         let reader = BufReader::new(file);
         let mut messages = Vec::new();
+        let mut line_no: usize = 0;
         for line in reader.lines() {
+            line_no += 1;
             let line = line?;
             if line.is_empty() {
                 continue;
             }
-            let msg: Message = serde_json::from_str(&line)?;
-            messages.push(msg);
+            match serde_json::from_str::<Message>(&line) {
+                Ok(msg) => messages.push(msg),
+                Err(e) => {
+                    tracing::warn!(
+                        "skipping corrupted transcript line {} in {:?}: {}",
+                        line_no,
+                        path,
+                        e
+                    );
+                }
+            }
         }
         Ok(messages)
     }
@@ -98,7 +109,9 @@ impl TranscriptStore {
         let reader = BufReader::new(file);
         let mut messages = Vec::new();
         let mut skipped = false;
+        let mut line_no: usize = 0;
         for line in reader.lines() {
+            line_no += 1;
             let line = line?;
             if line.is_empty() {
                 continue;
@@ -107,8 +120,17 @@ impl TranscriptStore {
                 skipped = true;
                 continue;
             }
-            let msg: Message = serde_json::from_str(&line)?;
-            messages.push(msg);
+            match serde_json::from_str::<Message>(&line) {
+                Ok(msg) => messages.push(msg),
+                Err(e) => {
+                    tracing::warn!(
+                        "skipping corrupted transcript line {} in {:?}: {}",
+                        line_no,
+                        path,
+                        e
+                    );
+                }
+            }
         }
         Ok(messages)
     }
@@ -325,6 +347,39 @@ mod tests {
         if let coderex_core::types::MessageContent::Text(s) = &messages[1].content {
             assert_eq!(s, "d");
         }
+    }
+
+    #[test]
+    fn read_all_skips_corrupted_lines() {
+        let (store, _tmp) = temp_store();
+        let path = store.session_path("session_corrupt");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let mut file = std::fs::File::create(&path).unwrap();
+        writeln!(file, "{}", serde_json::to_string(&Message::user("first")).unwrap()).unwrap();
+        writeln!(file, "this is not json").unwrap();
+        writeln!(file, "{}", serde_json::to_string(&Message::user("third")).unwrap()).unwrap();
+        drop(file);
+
+        let messages = store.read_all("session_corrupt").unwrap();
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].role, coderex_core::types::Role::User);
+        assert_eq!(messages[1].role, coderex_core::types::Role::User);
+    }
+
+    #[test]
+    fn truncate_before_skips_corrupted_lines() {
+        let (store, _tmp) = temp_store();
+        let path = store.session_path("session_truncate_corrupt");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let mut file = std::fs::File::create(&path).unwrap();
+        writeln!(file, "{}", serde_json::to_string(&Message::user("a")).unwrap()).unwrap();
+        writeln!(file, "bad json").unwrap();
+        writeln!(file, "{}", serde_json::to_string(&Message::user("c")).unwrap()).unwrap();
+        drop(file);
+
+        store.truncate_before("session_truncate_corrupt", 1).unwrap();
+        let messages = store.read_all("session_truncate_corrupt").unwrap();
+        assert_eq!(messages.len(), 1);
     }
 
     #[test]

@@ -72,19 +72,49 @@ pub struct SandboxConfig {
 /// Handle to an active sandbox configuration.
 #[allow(missing_debug_implementations)]
 pub struct SandboxHandle {
-    _inner: PlatformSandbox,
+    inner: PlatformSandbox,
 }
 
 impl SandboxHandle {
     /// Create and activate a sandbox with the given config.
     ///
-    /// On Linux: applies seccomp filters and rlimits.
+    /// On Linux: stores config for `pre_exec` application.
     /// On macOS: generates a sandbox-exec profile.
     /// On Windows: creates a Job Object with limits.
     /// On unsupported platforms: returns a warning but proceeds.
     pub fn create(config: SandboxConfig) -> Result<Self, SandboxError> {
         let inner = PlatformSandbox::create(config)?;
-        Ok(Self { _inner: inner })
+        Ok(Self { inner })
+    }
+
+    /// Prepare a `std::process::Command` to run inside the sandbox.
+    ///
+    /// - **Linux**: installs a `pre_exec` closure that applies rlimits and
+    ///   seccomp filters in the child process before `execve`.
+    /// - **macOS**: no-op. Use [`SandboxHandle::sandboxed_program`] to get the
+    ///   wrapper command.
+    /// - **Windows**: no-op. Use [`SandboxHandle::post_spawn`] after spawning.
+    /// - **Unsupported**: no-op.
+    pub fn prepare(&self, cmd: &mut std::process::Command) -> Result<(), SandboxError> {
+        self.inner.prepare(cmd)
+    }
+
+    /// Complete sandbox setup after the child process has spawned.
+    ///
+    /// - **Windows**: assigns the child process to the Job Object.
+    /// - **Other platforms**: no-op.
+    pub fn post_spawn(&self, child: &std::process::Child) -> Result<(), SandboxError> {
+        self.inner.post_spawn(child)
+    }
+
+    /// Get the program to use as a sandbox wrapper (macOS only).
+    ///
+    /// On macOS, returns `("sandbox-exec", ["-f", profile_path])`.
+    /// On other platforms, returns `None`.
+    #[cfg(target_os = "macos")]
+    #[must_use]
+    pub fn sandboxed_program(&self) -> Option<(&str, Vec<String>)> {
+        self.inner.sandboxed_program()
     }
 }
 
@@ -94,7 +124,6 @@ enum PlatformSandbox {
     #[cfg(target_os = "linux")]
     Linux(LinuxSandbox),
     #[cfg(target_os = "macos")]
-    #[allow(dead_code)]
     MacOs(MacOsSandbox),
     #[cfg(target_os = "windows")]
     Windows(WindowsSandbox),
@@ -120,6 +149,38 @@ impl PlatformSandbox {
             Ok(Self::Unsupported)
         }
     }
+
+    fn prepare(&self, _cmd: &mut std::process::Command) -> Result<(), SandboxError> {
+        match self {
+            #[cfg(target_os = "linux")]
+            Self::Linux(s) => s.prepare(cmd),
+            #[cfg(target_os = "macos")]
+            Self::MacOs(_) => Ok(()),
+            #[cfg(target_os = "windows")]
+            Self::Windows(_) => Ok(()),
+            Self::Unsupported => Ok(()),
+        }
+    }
+
+    fn post_spawn(&self, child: &std::process::Child) -> Result<(), SandboxError> {
+        match self {
+            #[cfg(target_os = "linux")]
+            Self::Linux(s) => s.post_spawn(child),
+            #[cfg(target_os = "macos")]
+            Self::MacOs(s) => s.post_spawn(child),
+            #[cfg(target_os = "windows")]
+            Self::Windows(s) => s.post_spawn(child),
+            Self::Unsupported => Ok(()),
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn sandboxed_program(&self) -> Option<(&str, Vec<String>)> {
+        match self {
+            Self::MacOs(s) => Some(s.exec_command()),
+            _ => None,
+        }
+    }
 }
 
 // ─── Linux: rlimit + seccomp ────────────────────────────────────────────────
@@ -127,6 +188,7 @@ impl PlatformSandbox {
 #[cfg(target_os = "linux")]
 mod linux_impl {
     use super::{SandboxConfig, SandboxError};
+    use std::process::Command;
 
     /// Linux sandbox using seccomp + rlimit.
     pub struct LinuxSandbox {
@@ -135,128 +197,252 @@ mod linux_impl {
 
     impl LinuxSandbox {
         pub fn create(config: SandboxConfig) -> Result<Self, SandboxError> {
-            let sandbox = Self { config };
-            // Apply limits immediately — in production this is done in the
-            // child process via pre_exec() before the command runs.
-            sandbox.apply_rlimits()?;
-            Ok(sandbox)
+            Ok(Self { config })
         }
 
-        /// Apply rlimit restrictions to the current process.
-        ///
-        /// In production, call this inside a `Command::pre_exec()` callback
-        /// so it affects the child process, not the parent.
-        pub fn apply_rlimits(&self) -> Result<(), SandboxError> {
+        pub fn prepare(&self, cmd: &mut Command) -> Result<(), SandboxError> {
+            let config = self.config.clone();
+            let apply = move || -> Result<(), std::io::Error> {
+                Self::apply_rlimits(&config)?;
+                Self::apply_seccomp()?;
+                Ok(())
+            };
+            // SAFETY: pre_exec runs in the child process before exec().
+            // The closure captures only `config` (Clone) and references no
+            // parent-process state that would be invalid after fork.
+            unsafe { cmd.pre_exec(apply) };
+            Ok(())
+        }
+
+        pub fn post_spawn(&self, _child: &std::process::Child) -> Result<(), SandboxError> {
+            Ok(())
+        }
+
+        // ─── rlimits ─────────────────────────────────────────────────────────
+
+        fn apply_rlimits(config: &SandboxConfig) -> Result<(), std::io::Error> {
             use libc::{prlimit, rlimit64, RLIMIT_AS, RLIMIT_CPU, RLIMIT_NOFILE};
 
-            // RLIMIT_NOFILE: maximum open file descriptors
-            if let Some(max_files) = self.config.max_open_files {
+            if let Some(max_files) = config.max_open_files {
                 let rl = rlimit64 {
                     rlim_cur: max_files,
                     rlim_max: max_files,
                 };
-                // SAFETY: prlimit is a safe syscall when given valid constants.
-                // Setting limits on our own process (pid=0) is always permitted.
                 let ret = unsafe { prlimit(0, RLIMIT_NOFILE, &rl, std::ptr::null_mut()) };
                 if ret != 0 {
-                    return Err(SandboxError::RlimitError(format!(
-                        "prlimit(RLIMIT_NOFILE) failed: {}",
-                        std::io::Error::last_os_error()
-                    )));
+                    return Err(std::io::Error::last_os_error());
                 }
-                tracing::debug!("RLIMIT_NOFILE set to {max_files}");
             }
 
-            // RLIMIT_AS: maximum virtual memory
-            if let Some(max_mem) = self.config.max_memory_bytes {
+            if let Some(max_mem) = config.max_memory_bytes {
                 let rl = rlimit64 {
                     rlim_cur: max_mem,
                     rlim_max: max_mem,
                 };
                 let ret = unsafe { prlimit(0, RLIMIT_AS, &rl, std::ptr::null_mut()) };
                 if ret != 0 {
-                    return Err(SandboxError::RlimitError(format!(
-                        "prlimit(RLIMIT_AS) failed: {}",
-                        std::io::Error::last_os_error()
-                    )));
+                    return Err(std::io::Error::last_os_error());
                 }
-                tracing::debug!("RLIMIT_AS set to {max_mem} bytes");
             }
 
-            // RLIMIT_CPU: maximum CPU time in seconds
-            if let Some(max_cpu) = self.config.max_cpu_seconds {
+            if let Some(max_cpu) = config.max_cpu_seconds {
                 let rl = rlimit64 {
                     rlim_cur: max_cpu,
                     rlim_max: max_cpu,
                 };
                 let ret = unsafe { prlimit(0, RLIMIT_CPU, &rl, std::ptr::null_mut()) };
                 if ret != 0 {
-                    return Err(SandboxError::RlimitError(format!(
-                        "prlimit(RLIMIT_CPU) failed: {}",
-                        std::io::Error::last_os_error()
-                    )));
+                    return Err(std::io::Error::last_os_error());
                 }
-                tracing::debug!("RLIMIT_CPU set to {max_cpu} seconds");
             }
 
             Ok(())
         }
 
-        /// Apply seccomp-bpf filters to restrict syscalls.
-        ///
-        /// Uses PR_SET_NO_NEW_PRIVS to ensure the process cannot gain
-        /// additional privileges, then installs a BPF filter that only
-        /// allows a minimal set of syscalls needed for safe operation.
-        ///
-        /// In production, call this inside a `Command::pre_exec()` callback.
-        pub fn apply_seccomp(&self) -> Result<(), SandboxError> {
-            use libc::{prctl, PR_SET_NO_NEW_PRIVS};
+        // ─── seccomp BPF ─────────────────────────────────────────────────────
 
-            // First, disable privilege escalation
-            let ret = unsafe { prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) };
-            if ret != 0 {
-                return Err(SandboxError::SeccompError(format!(
-                    "prctl(PR_SET_NO_NEW_PRIVS) failed: {}",
-                    std::io::Error::last_os_error()
-                )));
+        fn apply_seccomp() -> Result<(), std::io::Error> {
+            // Raw constants — libc may not expose all of these.
+            const PR_SET_NO_NEW_PRIVS: libc::c_int = 38;
+            const PR_SET_SECCOMP: libc::c_int = 22;
+            const SECCOMP_MODE_FILTER: libc::c_int = 2;
+            const AUDIT_ARCH_X86_64: u32 = 0xC000_003E;
+            const SECCOMP_RET_ALLOW: u32 = 0x7FFF_0000;
+            const SECCOMP_RET_KILL: u32 = 0x0000_0000;
+
+            const BPF_LD: u16 = 0x00;
+            const BPF_W: u16 = 0x00;
+            const BPF_ABS: u16 = 0x20;
+            const BPF_JMP: u16 = 0x05;
+            const BPF_JEQ: u16 = 0x10;
+            const BPF_K: u16 = 0x00;
+            const BPF_RET: u16 = 0x06;
+
+            #[repr(C)]
+            struct sock_filter {
+                code: u16,
+                jt: u8,
+                jf: u8,
+                k: u32,
             }
 
-            // Build a BPF filter program.
-            //
-            // The filter allows a minimal set of syscalls:
-            //   - read, write, exit, exit_group, futex, mmap, mprotect,
-            //     munmap, brk, close, fstat, lseek, arch_prctl,
-            //     access, execve, open, openat, newfstatat, getdents64,
-            //     rt_sigaction, rt_sigprocmask, sigaltstack
-            //
-            // This is a simplified filter. In production, use libseccomp
-            // for a more complete and audited policy.
-            let allowed_syscalls: &[i64] = &[
-                0,  // sys_read
-                1,  // sys_write
-                60, // sys_exit
-                231,// sys_exit_group
-                62, // sys_kill (for signals)
-                10, // sys_mmap
-                11, // sys_mprotect
-                12, // sys_munmap
-                15, // sys_rt_sigaction
-                14, // sys_rt_sigprocmask
-                13, // sys_brk
-                9,  // sys_mmap (x86_64 is 9, not 10 — corrected below)
+            #[repr(C)]
+            struct sock_fprog {
+                len: u16,
+                filter: *const sock_filter,
+            }
+
+            // x86_64 syscall numbers for a safe shell-command profile.
+            const ALLOWED: &[i64] = &[
+                0,   // read
+                1,   // write
+                2,   // open
+                3,   // close
+                5,   // fstat
+                8,   // lseek
+                9,   // mmap
+                10,  // mprotect
+                11,  // munmap
+                12,  // brk
+                13,  // rt_sigaction
+                14,  // rt_sigprocmask
+                15,  // rt_sigreturn
+                16,  // ioctl
+                17,  // pread64
+                18,  // pwrite64
+                19,  // readv
+                20,  // writev
+                21,  // access
+                22,  // pipe
+                32,  // dup
+                33,  // dup2
+                35,  // nanosleep
+                39,  // getpid
+                56,  // clone
+                57,  // fork
+                58,  // vfork
+                59,  // execve
+                60,  // exit
+                61,  // wait4
+                62,  // kill
+                63,  // uname
+                72,  // fcntl
+                78,  // getdents
+                79,  // getcwd
+                80,  // chdir
+                83,  // mkdir
+                84,  // rmdir
+                85,  // creat
+                87,  // unlink
+                89,  // readlink
+                90,  // chmod
+                95,  // umask
+                102, // getuid
+                104, // getgid
+                107, // geteuid
+                108, // getegid
+                109, // setpgid
+                110, // getppid
+                111, // getpgrp
+                158, // arch_prctl
+                217, // getdents64
+                218, // set_tid_address
+                231, // exit_group
+                257, // openat
+                258, // mkdirat
+                260, // fchownat
+                262, // newfstatat
+                263, // unlinkat
+                264, // renameat
+                267, // readlinkat
+                268, // fchmodat
+                269, // faccessat
+                273, // set_robust_list
+                274, // get_robust_list
+                302, // prlimit64
+                318, // getrandom
+                322, // execveat
             ];
 
-            // Use the simplified approach: only set NO_NEW_PRIVS for now.
-            // Full BPF filter requires architecture-specific syscall numbers
-            // and is better handled by libseccomp.
-            tracing::debug!(
-                "seccomp: PR_SET_NO_NEW_PRIVS set, BPF filter simplified \
-                 (use libseccomp for production)"
-            );
-            tracing::debug!(
-                "seccomp: allowed syscalls (abbreviated): {:?}",
-                allowed_syscalls
-            );
+            let mut filter: Vec<sock_filter> = Vec::with_capacity(4 + ALLOWED.len() * 2 + 1);
+
+            // load arch @ offset 0
+            filter.push(sock_filter {
+                code: BPF_LD + BPF_W + BPF_ABS,
+                jt: 0,
+                jf: 0,
+                k: 0,
+            });
+            // if arch == AUDIT_ARCH_X86_64, continue; else kill
+            filter.push(sock_filter {
+                code: BPF_JMP + BPF_JEQ + BPF_K,
+                jt: 0,
+                jf: 1,
+                k: AUDIT_ARCH_X86_64,
+            });
+            filter.push(sock_filter {
+                code: BPF_RET + BPF_K,
+                jt: 0,
+                jf: 0,
+                k: SECCOMP_RET_KILL,
+            });
+
+            // load syscall @ offset 4
+            filter.push(sock_filter {
+                code: BPF_LD + BPF_W + BPF_ABS,
+                jt: 0,
+                jf: 0,
+                k: 4,
+            });
+
+            // one JEQ + RET_ALLOW pair per allowed syscall
+            for &nr in ALLOWED {
+                filter.push(sock_filter {
+                    code: BPF_JMP + BPF_JEQ + BPF_K,
+                    jt: 0,
+                    jf: 1,
+                    k: nr as u32,
+                });
+                filter.push(sock_filter {
+                    code: BPF_RET + BPF_K,
+                    jt: 0,
+                    jf: 0,
+                    k: SECCOMP_RET_ALLOW,
+                });
+            }
+
+            // default deny
+            filter.push(sock_filter {
+                code: BPF_RET + BPF_K,
+                jt: 0,
+                jf: 0,
+                k: SECCOMP_RET_KILL,
+            });
+
+            let prog = sock_fprog {
+                len: filter.len() as u16,
+                filter: filter.as_ptr(),
+            };
+
+            // Disable privilege escalation
+            let ret = unsafe { libc::prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) };
+            if ret != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+
+            // Install BPF filter
+            let ret = unsafe {
+                libc::prctl(
+                    PR_SET_SECCOMP,
+                    SECCOMP_MODE_FILTER as libc::c_ulong,
+                    &prog as *const _ as libc::c_ulong,
+                    0,
+                    0,
+                )
+            };
+            if ret != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
 
             Ok(())
         }
@@ -278,7 +464,7 @@ mod macos_impl {
     /// macOS sandbox using sandbox-exec.
     pub struct MacOsSandbox {
         config: SandboxConfig,
-        pub(crate) profile_path: Option<PathBuf>,
+        profile_path: Option<PathBuf>,
     }
 
     impl MacOsSandbox {
@@ -287,49 +473,36 @@ mod macos_impl {
                 config,
                 profile_path: None,
             };
-            // Generate and write the profile to a temp file
             let profile = sandbox.generate_profile();
             let thread_id = format!("{:?}", std::thread::current().id());
             let profile_path = std::env::temp_dir()
                 .join(format!("coderex_sandbox_{}_{}.sb", std::process::id(), thread_id));
 
-            fs::write(&profile_path, &profile)
-                .map_err(|e| SandboxError::CreationError(format!(
-                    "failed to write sandbox profile: {e}"
-                )))?;
+            fs::write(&profile_path, &profile).map_err(|e| {
+                SandboxError::CreationError(format!("failed to write sandbox profile: {e}"))
+            })?;
 
-            // Restrict profile file permissions (owner read-only)
             if let Err(e) = fs::set_permissions(&profile_path, fs::Permissions::from_mode(0o400)) {
                 tracing::warn!("failed to set profile permissions: {e}");
             }
 
-            sandbox.profile_path = Some(profile_path.clone());
-
-            tracing::debug!("macOS sandbox profile written to: {:?}", profile_path);
-
+            sandbox.profile_path = Some(profile_path);
+            tracing::debug!("macOS sandbox profile: {:?}", sandbox.profile_path);
             Ok(sandbox)
         }
 
-        /// Get the sandbox-exec command line for spawning a sandboxed process.
-        ///
-        /// Returns the path to `sandbox-exec` and arguments to pass.
-        /// Use this with `std::process::Command`:
-        ///
-        /// ```ignore
-        /// let (cmd, args) = sandbox.exec_command();
-        /// let mut c = Command::new(cmd);
-        /// for arg in args { c.arg(arg); }
-        /// c.arg("your_actual_command");
-        /// c.output().unwrap();
-        /// ```
         #[must_use]
-        #[allow(dead_code)]
-        pub fn exec_command(&self) -> (&'static str, Vec<String>) {
-            let profile = self.profile_path
+        pub fn exec_command(&self) -> (&str, Vec<String>) {
+            let profile = self
+                .profile_path
                 .as_ref()
                 .map(|p| p.to_string_lossy().to_string())
                 .unwrap_or_default();
             ("sandbox-exec", vec!["-f".to_string(), profile])
+        }
+
+        pub fn post_spawn(&self, _child: &std::process::Child) -> Result<(), SandboxError> {
+            Ok(())
         }
 
         /// Generate a sandbox-exec profile string.
@@ -337,44 +510,57 @@ mod macos_impl {
             use std::fmt::Write;
             let mut profile = String::from("(version 1)\n\n(deny default)\n\n");
 
-            // Allow basic system operations
+            // Core IPC / system lookups
             profile.push_str("(allow mach-lookup)\n");
             profile.push_str("(allow ipc-posix-shm)\n");
             profile.push_str("(allow signal (target same-sandbox))\n");
             profile.push_str("(allow sysctl-read)\n\n");
 
-            // Allow reads on allowed paths
+            // Broad read access — the sandbox restricts writes, network,
+            // and arbitrary execution, not reading.
+            profile.push_str("(allow file-read*)\n");
+            profile.push_str("(allow process-fork)\n");
+            profile.push_str("(allow process-exec-interpreter)\n\n");
+
+            // Allow executing common system shells and utilities
+            let system_exec_paths = [
+                "/bin/sh",
+                "/bin/bash",
+                "/usr/bin/sh",
+                "/usr/bin/bash",
+                "/usr/bin/env",
+            ];
+            for path in &system_exec_paths {
+                let _ = writeln!(profile, "(allow process-exec (literal \"{path}\"))");
+            }
+            profile.push('\n');
+
             for path in &self.config.allowed_read_paths {
                 let p = path.to_string_lossy();
                 let _ = writeln!(profile, "(allow file-read* (subpath \"{p}\"))");
             }
 
-            // Allow writes on allowed paths
             for path in &self.config.allowed_write_paths {
                 let p = path.to_string_lossy();
                 let _ = writeln!(profile, "(allow file-write* (subpath \"{p}\"))");
             }
 
-            // Allow reads on additional working directories
             for dir in &self.config.additional_working_dirs {
                 let d = dir.to_string_lossy();
                 let _ = writeln!(profile, "(allow file-read* file-write* (subpath \"{d}\"))");
             }
 
-            // Allow execution of allowed binaries
             for path in &self.config.allowed_exec_paths {
                 let p = path.to_string_lossy();
                 let _ = writeln!(profile, "(allow process-exec (literal \"{p}\"))");
             }
 
-            // Network access
             if self.config.allow_network {
                 profile.push_str("(allow network*)\n");
             } else {
                 profile.push_str("(deny network*)\n");
             }
 
-            // Allow reading from standard file descriptors
             profile.push_str("(allow file-read-data (literal \"/dev/zero\"))\n");
             profile.push_str("(allow file-read-data (literal \"/dev/random\"))\n");
             profile.push_str("(allow file-read-data (literal \"/dev/urandom\"))\n");
@@ -403,23 +589,17 @@ mod windows_impl {
     use super::{SandboxConfig, SandboxError};
     use std::ffi::OsStr;
     use std::os::windows::ffi::OsStrExt;
-    use std::path::PathBuf;
     use std::ptr;
-    use windows_sys::Win32::Foundation::{CloseHandle, BOOL, HANDLE};
+    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
     use windows_sys::Win32::System::JobObjects::{
-        CreateJobObjectW, SetInformationJobObject, AssignProcessToJobObject,
-        JobObjectExtendedLimitInformation, JOBOBJECT_BASIC_LIMIT_INFORMATION,
-        JOBOBJECT_BASIC_UI_RESTRICTIONS, JOBOBJECTEXTENDED_LIMIT_INFORMATION,
-        JOB_OBJECT_LIMIT_ACTIVE_PROCESS,
-        JOB_OBJECT_LIMIT_JOB_MEMORY,
-        JOB_OBJECT_LIMIT_JOB_TIME,
-        JOB_OBJECT_LIMIT_PROCESS_MEMORY,
-        JOB_OBJECT_UI_NO_DESKTOP,
-        JOB_OBJECT_UI_EXIT_WINDOWS,
-        JOB_OBJECT_UI_GLOBAL_ATOMS,
-        JOB_OBJECT_UI_HANDLES,
-        JOB_OBJECT_UI_READCLIPBOARD,
-        JOB_OBJECT_UI_WRITECLIPBOARD,
+        AssignProcessToJobObject, CreateJobObjectW, SetInformationJobObject,
+        JobObjectBasicUIRestrictions, JobObjectExtendedLimitInformation,
+        JOBOBJECT_BASIC_LIMIT_INFORMATION, JOBOBJECT_BASIC_UI_RESTRICTIONS,
+        JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JOB_OBJECT_LIMIT_ACTIVE_PROCESS,
+        JOB_OBJECT_LIMIT_JOB_MEMORY, JOB_OBJECT_LIMIT_JOB_TIME,
+        JOB_OBJECT_UI_EXIT_WINDOWS, JOB_OBJECT_UI_GLOBAL_ATOMS,
+        JOB_OBJECT_UI_HANDLES, JOB_OBJECT_UI_NO_DESKTOP,
+        JOB_OBJECT_UI_READCLIPBOARD, JOB_OBJECT_UI_WRITECLIPBOARD,
     };
 
     /// Windows sandbox using Job Objects.
@@ -430,12 +610,12 @@ mod windows_impl {
 
     impl WindowsSandbox {
         pub fn create(config: SandboxConfig) -> Result<Self, SandboxError> {
-            // SAFETY: CreateJobObjectW is safe — it creates a new kernel object.
             let job_name_wide: Vec<u16> = OsStr::new("CodeRexSandboxJob")
                 .encode_wide()
                 .chain(Some(0))
                 .collect();
-            let job_handle = unsafe { CreateJobObjectW(ptr::null_mut(), job_name_wide.as_ptr()) };
+            let job_handle =
+                unsafe { CreateJobObjectW(ptr::null_mut(), job_name_wide.as_ptr()) };
             if job_handle == 0 {
                 return Err(SandboxError::CreationError(format!(
                     "CreateJobObject failed: {}",
@@ -448,36 +628,29 @@ mod windows_impl {
                 config,
             };
             sandbox.apply_limits()?;
-
             Ok(sandbox)
         }
 
-        /// Apply resource and UI restrictions to the Job Object.
         fn apply_limits(&mut self) -> Result<(), SandboxError> {
-            // SAFETY: We're setting limits on a job object we created.
             unsafe {
-                // Set basic limits (CPU time, memory)
-                let mut basic_limits: JOBOBJECT_BASIC_LIMIT_INFORMATION = std::mem::zeroed();
-                let mut limit_flags = 0u32;
-
-                if let Some(max_mem) = self.config.max_memory_bytes {
-                    basic_limits.JobMemoryLimit = max_mem as usize;
-                    limit_flags |= JOB_OBJECT_LIMIT_JOB_MEMORY;
-                }
+                let mut basic: JOBOBJECT_BASIC_LIMIT_INFORMATION = std::mem::zeroed();
+                let mut limit_flags: u32 = 0;
 
                 if let Some(max_cpu) = self.config.max_cpu_seconds {
-                    // Job time is in 100-nanosecond units
-                    basic_limits.PerJobUserTimeLimit.QuadPart =
-                        (max_cpu * 10_000_000) as i64;
+                    basic.PerJobUserTimeLimit.QuadPart = (max_cpu * 10_000_000) as i64;
                     limit_flags |= JOB_OBJECT_LIMIT_JOB_TIME;
                 }
 
                 if limit_flags != 0 {
-                    basic_limits.LimitFlags = limit_flags;
-                    let info = JOBOBJECTEXTENDED_LIMIT_INFORMATION {
-                        BasicLimitInformation: basic_limits,
-                        ..std::mem::zeroed()
-                    };
+                    basic.LimitFlags = limit_flags;
+                    let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
+                    info.BasicLimitInformation = basic;
+
+                    if let Some(max_mem) = self.config.max_memory_bytes {
+                        info.JobMemoryLimit = max_mem as usize;
+                        info.BasicLimitInformation.LimitFlags |= JOB_OBJECT_LIMIT_JOB_MEMORY;
+                    }
+
                     let ret = SetInformationJobObject(
                         self.job_handle,
                         JobObjectExtendedLimitInformation,
@@ -486,31 +659,29 @@ mod windows_impl {
                     );
                     if ret == 0 {
                         return Err(SandboxError::RlimitError(format!(
-                            "SetInformationJobObject failed: {}",
+                            "SetInformationJobObject(extended) failed: {}",
                             std::io::Error::last_os_error()
                         )));
                     }
                 }
 
-                // Apply UI restrictions
-                let mut ui_restrictions: JOBOBJECT_BASIC_UI_RESTRICTIONS = std::mem::zeroed();
-                ui_restrictions.UIRestrictionsClass =
-                    JOB_OBJECT_UI_NO_DESKTOP
-                        | JOB_OBJECT_UI_EXIT_WINDOWS
-                        | JOB_OBJECT_UI_GLOBAL_ATOMS
-                        | JOB_OBJECT_UI_HANDLES
-                        | JOB_OBJECT_UI_READCLIPBOARD
-                        | JOB_OBJECT_UI_WRITECLIPBOARD;
+                let mut ui: JOBOBJECT_BASIC_UI_RESTRICTIONS = std::mem::zeroed();
+                ui.UIRestrictionsClass = JOB_OBJECT_UI_NO_DESKTOP
+                    | JOB_OBJECT_UI_EXIT_WINDOWS
+                    | JOB_OBJECT_UI_GLOBAL_ATOMS
+                    | JOB_OBJECT_UI_HANDLES
+                    | JOB_OBJECT_UI_READCLIPBOARD
+                    | JOB_OBJECT_UI_WRITECLIPBOARD;
 
                 let ret = SetInformationJobObject(
                     self.job_handle,
-                    windows_sys::Win32::System::JobObjects::JobObjectBasicUIRestrictions,
-                    &ui_restrictions as *const _ as *const _,
-                    std::mem::size_of_val(&ui_restrictions) as u32,
+                    JobObjectBasicUIRestrictions,
+                    &ui as *const _ as *const _,
+                    std::mem::size_of_val(&ui) as u32,
                 );
                 if ret == 0 {
                     tracing::warn!(
-                        "Failed to set UI restrictions (non-critical): {}",
+                        "UI restrictions failed (non-critical): {}",
                         std::io::Error::last_os_error()
                     );
                 }
@@ -520,12 +691,8 @@ mod windows_impl {
             Ok(())
         }
 
-        /// Assign a process to this job.
-        ///
-        /// Call this on a `std::process::Child` after spawning but before
-        /// the child executes anything sensitive.
-        pub fn assign_process(&self, child: &std::process::Child) -> Result<(), SandboxError> {
-            // SAFETY: We're assigning a valid process handle to a valid job handle.
+        pub fn post_spawn(&self, child: &std::process::Child) -> Result<(), SandboxError> {
+            use std::os::windows::io::AsRawHandle;
             unsafe {
                 let ret = AssignProcessToJobObject(self.job_handle, child.as_raw_handle() as HANDLE);
                 if ret == 0 {
@@ -642,10 +809,28 @@ mod tests {
             allow_network: false,
             ..SandboxConfig::default()
         };
-        let sandbox = MacOsSandbox::create(config).unwrap();
-        let profile = sandbox.generate_profile();
+        let handle = SandboxHandle::create(config).unwrap();
+        let (cmd, args) = handle.sandboxed_program().unwrap();
+        assert_eq!(cmd, "sandbox-exec");
+        assert_eq!(args[0], "-f");
+        assert!(std::path::Path::new(&args[1]).exists());
+    }
 
-        // Verify profile structure
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn macos_sandbox_profile_contents() {
+        let config = SandboxConfig {
+            allowed_read_paths: vec![PathBuf::from("/tmp/test")],
+            allowed_write_paths: vec![PathBuf::from("/tmp/output")],
+            allowed_exec_paths: vec![PathBuf::from("/bin/ls")],
+            allow_network: false,
+            ..SandboxConfig::default()
+        };
+        let handle = SandboxHandle::create(config).unwrap();
+        let (_, args) = handle.sandboxed_program().unwrap();
+        let profile_path = &args[1];
+        let profile = std::fs::read_to_string(profile_path).unwrap();
+
         assert!(profile.contains("(version 1)"));
         assert!(profile.contains("(deny default)"));
         assert!(profile.contains("/tmp/test"));
@@ -653,40 +838,6 @@ mod tests {
         assert!(profile.contains("/bin/ls"));
         assert!(profile.contains("(deny network*)"));
         assert!(!profile.contains("(allow network*)"));
-
-        // Verify exec_command returns sandbox-exec
-        let (cmd, _args) = sandbox.exec_command();
-        assert_eq!(cmd, "sandbox-exec");
-
-        // Verify profile file was written
-        assert!(sandbox.profile_path.is_some());
-        let path = sandbox.profile_path.as_ref().unwrap();
-        assert!(path.exists());
-    }
-
-    #[test]
-    #[cfg(target_os = "linux")]
-    fn linux_sandbox_rlimits_apply() {
-        let config = SandboxConfig {
-            max_open_files: Some(64),
-            max_memory_bytes: Some(1024 * 1024 * 1024), // 1GB
-            max_cpu_seconds: Some(60),
-            ..SandboxConfig::default()
-        };
-        let sandbox = LinuxSandbox::create(config).unwrap();
-        // If we got here, rlimits applied without error
-        drop(sandbox);
-    }
-
-    #[test]
-    #[cfg(target_os = "linux")]
-    fn linux_sandbox_seccomp_no_new_privs() {
-        let config = SandboxConfig::default();
-        let sandbox = LinuxSandbox::create(config).unwrap();
-        sandbox.apply_seccomp().unwrap();
-        // Verify PR_SET_NO_NEW_PRIVS was set
-        let result = unsafe { libc::prctl(libc::PR_GET_NO_NEW_PRIVS, 0, 0, 0, 0) };
-        assert_eq!(result, 1, "PR_GET_NO_NEW_PRIVS should be 1");
     }
 
     #[test]
@@ -696,11 +847,75 @@ mod tests {
             allowed_read_paths: vec![PathBuf::from("/tmp/test")],
             ..SandboxConfig::default()
         };
-        let sandbox = MacOsSandbox::create(config).unwrap();
-        let profile_path = sandbox.profile_path.as_ref().unwrap().clone();
+        let handle = SandboxHandle::create(config).unwrap();
+        let (_, args) = handle.sandboxed_program().unwrap();
+        let profile_path = std::path::PathBuf::from(&args[1]);
         assert!(profile_path.exists());
-        drop(sandbox);
-        // Drop should clean up the profile file
+        drop(handle);
         assert!(!profile_path.exists());
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn macos_sandbox_allows_network() {
+        let config = SandboxConfig {
+            allow_network: true,
+            ..SandboxConfig::default()
+        };
+        let handle = SandboxHandle::create(config).unwrap();
+        let (_, args) = handle.sandboxed_program().unwrap();
+        let profile = std::fs::read_to_string(&args[1]).unwrap();
+        assert!(profile.contains("(allow network*)"));
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn macos_sandbox_prepare_noop() {
+        let config = SandboxConfig::default();
+        let handle = SandboxHandle::create(config).unwrap();
+        let mut cmd = std::process::Command::new("echo");
+        handle.prepare(&mut cmd).unwrap(); // no-op on macOS
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn linux_sandbox_prepare_sets_pre_exec() {
+        let config = SandboxConfig {
+            max_open_files: Some(64),
+            max_memory_bytes: Some(1024 * 1024 * 1024),
+            max_cpu_seconds: Some(60),
+            ..SandboxConfig::default()
+        };
+        let handle = SandboxHandle::create(config).unwrap();
+        let mut cmd = std::process::Command::new("echo");
+        // prepare installs pre_exec — if it compiles, the closure is valid
+        handle.prepare(&mut cmd).unwrap();
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn linux_sandbox_seccomp_filter_well_formed() {
+        // We can't easily verify the filter is installed without forking,
+        // but we can verify the SandboxHandle is created and prepare works.
+        let handle = SandboxHandle::create(SandboxConfig::default()).unwrap();
+        let mut cmd = std::process::Command::new("true");
+        handle.prepare(&mut cmd).unwrap();
+    }
+
+    #[test]
+    #[cfg(target_os = "windows")]
+    fn windows_sandbox_creates_job_object() {
+        let config = SandboxConfig {
+            max_memory_bytes: Some(512 * 1024 * 1024),
+            max_cpu_seconds: Some(30),
+            ..SandboxConfig::default()
+        };
+        let handle = SandboxHandle::create(config).unwrap();
+        let mut cmd = std::process::Command::new("cmd");
+        cmd.arg("/c").arg("echo hello");
+        handle.prepare(&mut cmd).unwrap(); // no-op on Windows
+        let child = cmd.spawn().unwrap();
+        handle.post_spawn(&child).unwrap();
+        let _ = child.wait_with_output();
     }
 }

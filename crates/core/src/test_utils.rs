@@ -120,7 +120,7 @@ impl ApiClient for MockApiClient {
         _messages: &[serde_json::Value],
         _model: &ModelId,
         _max_tokens: u32,
-    ) -> Pin<Box<dyn Stream<Item = StreamEvent> + Send + '_>> {
+    ) -> Pin<Box<dyn Stream<Item = StreamEvent> + Send + 'static>> {
         let events = self.stream_events.lock().unwrap().pop_front();
         match events {
             Some(evts) => Box::pin(futures::stream::iter(evts)),

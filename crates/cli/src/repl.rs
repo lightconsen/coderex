@@ -3,7 +3,7 @@
 use anyhow::Result;
 use coderex_commands::registry::{CommandContext, CommandRegistry, CommandResult};
 use coderex_core::types::ModelId;
-use coderex_core::engine::{QueryEngine, SubmitOptions};
+use coderex_core::engine::{QueryEngine, SubmitOptions, TerminalReason};
 use coderex_core::permission_engine::{ExplainPermissionHook, PermissionEngine};
 use coderex_core::prompts;
 use coderex_core::query_profiles::PromptProfile;
@@ -175,6 +175,300 @@ impl ReplLoop {
         Ok(())
     }
 
+    /// Run the interactive REPL with full ratatui TUI.
+    pub async fn run_tui(&mut self) -> Result<()> {
+        use crossterm::event::{Event, KeyCode, KeyModifiers};
+        use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
+        use coderex_ui::input::InputAction;
+        use coderex_ui::message_list::{Message, MessageRole};
+        use coderex_ui::overlay::Overlay;
+        use coderex_ui::state::{UiState, ViewMode};
+        use coderex_ui::terminal::TerminalUi;
+        use coderex_ui::vim::{VimAction, VimMode, VimState};
+        use std::time::Duration;
+
+        enable_raw_mode()?;
+        let mut terminal_ui = TerminalUi::new()?;
+        terminal_ui.enter()?;
+
+        let mut ui_state = UiState::new();
+
+        // Welcome message
+        ui_state.messages.push(Message {
+            role: MessageRole::System,
+            content: format!(
+                "CodeRex v{} | model: {} | cwd: {} | Type /help for commands, Ctrl+C to exit",
+                env!("CARGO_PKG_VERSION"),
+                self.model.0,
+                self.cwd
+            ).into(),
+            tool_name: None,
+            streaming: false,
+        });
+
+        // Crossterm event channel — read in a blocking thread
+        let (ct_tx, mut ct_rx) = tokio::sync::mpsc::unbounded_channel::<crossterm::event::Event>();
+        std::thread::spawn(move || {
+            loop {
+                match crossterm::event::poll(Duration::from_millis(50)) {
+                    Ok(true) => {
+                        if let Ok(event) = crossterm::event::read() {
+                            if ct_tx.send(event).is_err() {
+                                break;
+                            }
+                        }
+                    }
+                    Ok(false) => continue,
+                    Err(_) => break,
+                }
+            }
+        });
+
+        let mut event_rx = self.event_rx.take();
+        let mut vim = VimState::new_insert();
+        let mut thinking = false;
+        let mut query_done_rx: Option<
+            tokio::sync::oneshot::Receiver<(QueryEngine, Result<TerminalReason, String>)>,
+        > = None;
+
+        let result = loop {
+            if !self.running {
+                break Ok(());
+            }
+
+            // Sync statusline from REPL state
+            self.sync_statusline(&mut ui_state.statusline);
+            ui_state.statusline.thinking = thinking;
+
+            // Draw frame
+            if let Err(e) = terminal_ui.draw(&ui_state) {
+                tracing::warn!("TUI draw error: {e}");
+            }
+
+            tokio::select! {
+                Some(event) = ct_rx.recv() => {
+                    match event {
+                        Event::Key(key) => {
+                            if key.code == KeyCode::Char('c')
+                                && key.modifiers.contains(KeyModifiers::CONTROL)
+                            {
+                                if thinking {
+                                    thinking = false;
+                                    query_done_rx = None;
+                                    if let Some(last) = ui_state.messages.messages.last_mut() {
+                                        if last.role == MessageRole::Assistant {
+                                            last.streaming = false;
+                                            let mut msg = last.content.to_string();
+                                            msg.push_str(" (interrupted)");
+                                            last.content = msg.into();
+                                        }
+                                    }
+                                    continue;
+                                } else {
+                                    break Ok(());
+                                }
+                            }
+
+                            let action = vim.handle_key(key);
+                            match action {
+                                VimAction::Submit => {
+                                    if let Some(text) = ui_state.input.take() {
+                                        self.process_tui_input(
+                                            &text,
+                                            &mut ui_state,
+                                            &mut thinking,
+                                            &mut query_done_rx,
+                                        ).await;
+                                    }
+                                }
+                                VimAction::Escape => {
+                                    if vim.mode == VimMode::Normal {
+                                        ui_state.overlays.clear();
+                                        ui_state.active_view = ViewMode::MainRepl;
+                                    }
+                                }
+                                VimAction::Insert => {
+                                    if let KeyCode::Char(c) = key.code {
+                                        if vim.is_insert() {
+                                            ui_state.input.apply(&InputAction::InsertChar(c));
+                                        }
+                                    }
+                                }
+                                VimAction::Left => {
+                                    ui_state.input.apply(&InputAction::CursorLeft);
+                                }
+                                VimAction::Right => {
+                                    ui_state.input.apply(&InputAction::CursorRight);
+                                }
+                                VimAction::Up => {
+                                    ui_state.input.apply(&InputAction::HistoryUp);
+                                }
+                                VimAction::Down => {
+                                    ui_state.input.apply(&InputAction::HistoryDown);
+                                }
+                                VimAction::JumpToStart => {
+                                    ui_state.input.apply(&InputAction::MoveToStart);
+                                }
+                                VimAction::JumpToEnd => {
+                                    ui_state.input.apply(&InputAction::MoveToEnd);
+                                }
+                                VimAction::DeleteToEnd => {
+                                    ui_state.input.apply(&InputAction::KillToEnd);
+                                }
+                                VimAction::DeleteLine => {
+                                    ui_state.input.text.clear();
+                                    ui_state.input.cursor = 0;
+                                }
+                                VimAction::DeleteWord => {
+                                    ui_state.input.apply(&InputAction::DeleteWord);
+                                }
+                                VimAction::DeleteChar => {
+                                    ui_state.input.apply(&InputAction::Delete);
+                                }
+                                VimAction::YankLine => {
+                                    vim.yank(&ui_state.input.text);
+                                }
+                                VimAction::Paste => {
+                                    let yanked = vim.yanked().to_string();
+                                    for c in yanked.chars() {
+                                        ui_state.input.apply(&InputAction::InsertChar(c));
+                                    }
+                                }
+                                VimAction::Undo => {
+                                    if let Some(prev) = vim.pop_undo() {
+                                        vim.push_undo(&ui_state.input.text);
+                                        ui_state.input.text = prev;
+                                        ui_state.input.cursor = ui_state.input.text.len();
+                                    }
+                                }
+                                VimAction::PageUp => {
+                                    ui_state.messages.scroll_up(5);
+                                }
+                                VimAction::PageDown => {
+                                    ui_state.messages.scroll_down();
+                                }
+                                VimAction::HalfPageUp => {
+                                    ui_state.messages.scroll_up(10);
+                                }
+                                VimAction::HalfPageDown => {
+                                    ui_state.messages.scroll_down();
+                                }
+                                VimAction::JumpTop => {
+                                    ui_state.messages.start = 0;
+                                }
+                                VimAction::JumpBottom => {
+                                    ui_state.messages.scroll_to_bottom();
+                                }
+                                VimAction::Command => {
+                                    let cmds: Vec<String> = self
+                                        .commands
+                                        .list()
+                                        .iter()
+                                        .map(|c| format!("/{} - {}", c.name, c.description))
+                                        .collect();
+                                    ui_state.overlays.push(Overlay::CommandPalette {
+                                        query: ":".into(),
+                                        commands: cmds,
+                                        selected: 0,
+                                    });
+                                }
+                                VimAction::Search => {
+                                    ui_state.active_view = ViewMode::Search;
+                                }
+                                VimAction::Repeat
+                                | VimAction::Ignore
+                                | VimAction::Append
+                                | VimAction::InsertAtEnd
+                                | VimAction::InsertAtStart => {}
+                            }
+                        }
+                        Event::Resize(_, _) => {}
+                        _ => {}
+                    }
+                }
+
+                Some(engine_event) = async {
+                    event_rx.as_mut().unwrap().recv().await
+                }, if event_rx.is_some() => {
+                    match engine_event {
+                        EngineEvent::TextDelta(delta) => {
+                            if let Some(last) = ui_state.messages.messages.last_mut() {
+                                if last.role == MessageRole::Assistant && last.streaming {
+                                    let mut content = last.content.to_string();
+                                    content.push_str(&delta);
+                                    last.content = content.into();
+                                }
+                            }
+                        }
+                        EngineEvent::ToolCallStart { name, .. } => {
+                            ui_state.messages.push(Message {
+                                role: MessageRole::ToolCall,
+                                content: format!("Calling {name}...").into(),
+                                tool_name: Some(name.into()),
+                                streaming: false,
+                            });
+                        }
+                        EngineEvent::ToolCallEnd { result, .. } => {
+                            let content = if result.is_error {
+                                format!("Error: {}", result.output)
+                            } else {
+                                result.output
+                            };
+                            ui_state.messages.push(Message {
+                                role: MessageRole::ToolResult,
+                                content: content.into(),
+                                tool_name: None,
+                                streaming: false,
+                            });
+                        }
+                        EngineEvent::PermissionRequest { tool, .. } => {
+                            ui_state.overlays.push(Overlay::Notification {
+                                message: format!("Permission required: {tool}"),
+                                level: coderex_ui::overlay::NotificationLevel::Warning,
+                            });
+                        }
+                        _ => {}
+                    }
+                }
+
+                Some((engine, result)) = async {
+                    query_done_rx.as_mut().unwrap().await.ok()
+                }, if query_done_rx.is_some() => {
+                    self.engine = Some(engine);
+                    query_done_rx = None;
+                    thinking = false;
+
+                    if let Some(last) = ui_state.messages.messages.last_mut() {
+                        if last.role == MessageRole::Assistant {
+                            last.streaming = false;
+                        }
+                    }
+
+                    match result {
+                        Ok(_) => {}
+                        Err(e) => {
+                            ui_state.messages.push(Message {
+                                role: MessageRole::System,
+                                content: format!("Query failed: {e}").into(),
+                                tool_name: None,
+                                streaming: false,
+                            });
+                        }
+                    }
+                }
+
+                else => break Ok(()),
+            }
+        };
+
+        // Cleanup
+        let _ = terminal_ui.exit();
+        let _ = disable_raw_mode();
+        self.event_rx = event_rx;
+
+        result
+    }
+
     /// Run a single query in non-interactive (headless) mode.
     pub async fn run_headless(&mut self, prompt: &str) -> Result<String> {
         if prompt.starts_with('/') {
@@ -303,6 +597,105 @@ impl ReplLoop {
         }
     }
 
+    /// Sync REPL state into the TUI statusline.
+    fn sync_statusline(&self, statusline: &mut coderex_ui::statusline::Statusline) {
+        statusline.model = self.model.0.clone();
+        statusline.session_title = if self.session_effects.title_generated {
+            "Active".into()
+        } else {
+            "New Session".into()
+        };
+        statusline.permission_mode = "default".into();
+        statusline.git_branch = current_git_branch(&self.cwd);
+        statusline.total_tokens = self.history.len() * 100;
+        statusline.cost_usd = 0.0;
+    }
+
+    /// Process a line of input in the TUI context.
+    async fn process_tui_input(
+        &mut self,
+        text: &str,
+        ui_state: &mut coderex_ui::state::UiState,
+        thinking: &mut bool,
+        query_done_rx: &mut Option<
+            tokio::sync::oneshot::Receiver<(QueryEngine, Result<TerminalReason, String>)>,
+        >,
+    ) {
+        self.history.push(text.to_string());
+
+        // Add user message
+        ui_state.messages.push(coderex_ui::message_list::Message {
+            role: coderex_ui::message_list::MessageRole::User,
+            content: text.into(),
+            tool_name: None,
+            streaming: false,
+        });
+
+        if text.starts_with('/') {
+            let parts: Vec<&str> = text.split_whitespace().collect();
+            let cmd_name = parts[0].trim_start_matches('/');
+            let args: Vec<String> = parts[1..].iter().map(|s| s.to_string()).collect();
+
+            match cmd_name {
+                "exit" | "quit" => {
+                    self.running = false;
+                    return;
+                }
+                "help" => {
+                    let mut output = String::from("Available commands:\n");
+                    for cmd in self.commands.list() {
+                        output.push_str(&format!("  /{:<20} {}\n", cmd.name, cmd.description));
+                    }
+                    ui_state.messages.push(coderex_ui::message_list::Message {
+                        role: coderex_ui::message_list::MessageRole::Assistant,
+                        content: output.into(),
+                        tool_name: None,
+                        streaming: false,
+                    });
+                    return;
+                }
+                _ => {}
+            }
+
+            let ctx = self.build_context();
+            let result = self.commands.execute(cmd_name, &ctx, &args);
+            self.apply_command_effects(&result);
+
+            ui_state.messages.push(coderex_ui::message_list::Message {
+                role: coderex_ui::message_list::MessageRole::Assistant,
+                content: result.output.into(),
+                tool_name: None,
+                streaming: false,
+            });
+        } else if self.engine.is_some() {
+            // Start streaming assistant placeholder
+            ui_state.messages.push(coderex_ui::message_list::Message {
+                role: coderex_ui::message_list::MessageRole::Assistant,
+                content: "".into(),
+                tool_name: None,
+                streaming: true,
+            });
+
+            let options = self.build_submit_options();
+            let mut engine = self.engine.take().unwrap();
+            let prompt = text.to_string();
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            tokio::spawn(async move {
+                let result = engine.submit_streaming(prompt, options).await;
+                let _ = tx.send((engine, result));
+            });
+            *query_done_rx = Some(rx);
+            *thinking = true;
+        } else {
+            ui_state.messages.push(coderex_ui::message_list::Message {
+                role: coderex_ui::message_list::MessageRole::Assistant,
+                content: "[No engine configured]".into(),
+                tool_name: None,
+                streaming: false,
+            });
+        }
+    }
+
     async fn handle_input(&mut self, line: &str, stdout: &mut impl Write) -> std::io::Result<()> {
         if line.starts_with('/') {
             self.execute_command(line, stdout).await?;
@@ -368,6 +761,23 @@ impl ReplLoop {
         ctx.feature_flags = HashMap::new();
         ctx
     }
+}
+
+/// Get the current git branch for the statusline.
+fn current_git_branch(cwd: &str) -> String {
+    std::process::Command::new("git")
+        .args(["branch", "--show-current"])
+        .current_dir(cwd)
+        .output()
+        .ok()
+        .and_then(|o| {
+            if o.status.success() {
+                Some(String::from_utf8_lossy(&o.stdout).trim().to_string())
+            } else {
+                None
+            }
+        })
+        .unwrap_or_default()
 }
 
 /// Session state for the REPL.
@@ -520,5 +930,11 @@ mod tests {
         assert!(prompt.contains("senior technical advisor"));
         assert!(prompt.contains("code review specialist"));
         assert_eq!(options.allowed_tools_override.unwrap(), vec!["Read", "Grep"]);
+    }
+
+    #[test]
+    fn current_git_branch_falls_back() {
+        let branch = current_git_branch("/nonexistent");
+        assert!(branch.is_empty());
     }
 }

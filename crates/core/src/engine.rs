@@ -229,7 +229,12 @@ impl StreamingToolCallAssembler {
                 Vec::new()
             }
             StreamEvent::ToolCallBlockEnd { id, input } => {
-                let completed = if let Some((name, _)) = self.pending.remove(&id) {
+                let completed = if let Some((name, builder)) = self.pending.remove(&id) {
+                    let input = if input.is_null() {
+                        serde_json::from_str(&builder).unwrap_or(serde_json::json!({}))
+                    } else {
+                        input
+                    };
                     let call = ToolCall { id, name, input };
                     self.completed.push(call.clone());
                     vec![call]
@@ -1090,7 +1095,8 @@ impl QueryEngine {
         turn.transition_to(TurnState::StreamAssistant);
 
         // Streaming request
-        let (content, tool_calls, usage) = self.send_request_streaming(turn, options).await?;
+        let (content, tool_calls, early_results, usage) =
+            self.send_request_streaming(turn, options).await?;
 
         // Record budget and cost
         turn.budget.record_tokens(&usage);
@@ -1100,6 +1106,12 @@ impl QueryEngine {
         // Save assistant message
         let assistant_msg = Message::assistant(content.clone());
         turn.messages.push(assistant_msg);
+
+        // Apply early-executed tool results immediately so the model can see them
+        for result in &early_results {
+            let msg = Message::tool(result.clone());
+            self.session.messages.push(msg);
+        }
 
         if tool_calls.is_empty() {
             // No tool calls — turn complete
@@ -1112,7 +1124,7 @@ impl QueryEngine {
                         return Ok(TerminalReason::Error(e));
                     }
                     turn.transition_to(TurnState::StartRequest);
-                    let (content, _tool_calls, usage) =
+                    let (content, _tool_calls, _early_results, usage) =
                         self.send_request_streaming(turn, options).await?;
                     turn.budget.record_tokens(&usage);
                     self.cost_tracker.record_usage(&usage, &self.model);
@@ -1482,13 +1494,15 @@ impl QueryEngine {
 
     /// Send the request using streaming API.
     ///
-    /// Returns the assembled tool calls and accumulated text content.
+    /// Returns the accumulated text content, deferred tool calls (for batch
+    /// execution after the stream), early-executed tool results, and usage.
     async fn send_request_streaming(
-        &self,
+        &mut self,
         turn: &TurnRuntime,
-        _options: &SubmitOptions,
-    ) -> Result<(String, Vec<ToolCall>, UsageSummary), String> {
+        options: &SubmitOptions,
+    ) -> Result<(String, Vec<ToolCall>, Vec<ToolResult>, UsageSummary), String> {
         use futures::StreamExt;
+        use std::collections::HashSet;
 
         let system = turn
             .messages
@@ -1538,6 +1552,8 @@ impl QueryEngine {
             cache_creation_tokens: 0,
         };
         let mut text_so_far = String::new();
+        let mut early_results: Vec<ToolResult> = Vec::new();
+        let mut deferred_calls: Vec<ToolCall> = Vec::new();
 
         while let Some(event) = stream.next().await {
             match event.clone() {
@@ -1552,49 +1568,217 @@ impl QueryEngine {
                     });
                 }
                 StreamEvent::ToolCallBlockEnd { .. } => {
-                    // Tool call completed during streaming — emit event
-                    // (actual execution happens after stream ends or during)
-                    let _ = self.event_tx.send(EngineEvent::ToolCallEnd {
-                        id: String::new(),
-                        result: ToolResult {
-                            tool_call_id: String::new(),
-                            output: "tool call assembled from stream".to_string(),
-                            is_error: false,
-                        },
-                    });
+                    // Completion handled below via assembler.process_event
                 }
                 StreamEvent::ToolCallInputDelta { ref id, ref delta } => {
-                    // Incremental tool call input — assembler handles accumulation
                     tracing::trace!("tool call input delta for {id}: {} bytes", delta.len());
                 }
                 StreamEvent::UsageSummary(ref u) => {
                     usage = u.clone();
                 }
                 StreamEvent::StreamEnd => {
-                    // Finalize pending tool calls
+                    // Finalize pending tool calls — handled after loop
                 }
                 StreamEvent::Error(ref e) => {
-                    return Err(format!("streaming error: {e}"));
+                    tracing::warn!(
+                        "streaming network error ({} bytes received so far): {e}",
+                        text_so_far.len()
+                    );
+                    // Fail-open: stop consuming the stream but return whatever
+                    // partial text and tool calls we have gathered so far.
+                    break;
                 }
             }
 
-            // Process event through assembler
-            let newly_completed = assembler.process_event(event);
-            if !newly_completed.is_empty() {
-                // In a full implementation, these could be executed immediately
-                // while the stream is still running (early execution).
-                // For now, we collect them for execution after the stream ends.
+            // Process event through assembler and execute completed tool calls
+            // immediately while the stream is still running (early execution).
+            for call in assembler.process_event(event) {
+                match self.execute_early_tool_call(call, options).await {
+                    Ok(Some(result)) => early_results.push(result),
+                    Ok(None) => { /* deferred — call already tracked */ }
+                    Err(e) => {
+                        tracing::warn!("early tool execution failed: {e}");
+                    }
+                }
             }
         }
 
-        let tool_calls = {
-            let mut calls = assembler.take_completed();
-            // Also check for newly completed from stream end
-            calls.extend(assembler.process_event(StreamEvent::StreamEnd));
-            calls
-        };
+        // Finalize any remaining pending calls from stream end
+        for call in assembler.process_event(StreamEvent::StreamEnd) {
+            match self.execute_early_tool_call(call, options).await {
+                Ok(Some(result)) => early_results.push(result),
+                Ok(None) => { /* deferred */ }
+                Err(e) => {
+                    tracing::warn!("early tool execution failed: {e}");
+                }
+            }
+        }
 
-        Ok((text_so_far, tool_calls, usage))
+        // Partition completed calls: early-executed vs deferred.
+        let early_ids: HashSet<String> = early_results
+            .iter()
+            .map(|r| r.tool_call_id.clone())
+            .collect();
+        let all_completed = assembler.take_completed();
+        for call in all_completed {
+            if !early_ids.contains(&call.id) {
+                deferred_calls.push(call);
+            }
+        }
+
+        Ok((text_so_far, deferred_calls, early_results, usage))
+    }
+
+    /// Execute a single tool call immediately during streaming.
+    ///
+    /// Runs the full validation pipeline (allowed_tools_override, PreToolUse
+    /// hook, PermissionEngine) and executes the tool if allowed.
+    ///
+    /// - `Ok(Some(result))` — tool was executed or denied immediately.
+    /// - `Ok(None)` — tool requires user interaction (Ask/AskForSession/Elevated);
+    ///   the caller should defer it for batch execution after streaming.
+    async fn execute_early_tool_call(
+        &mut self,
+        call: ToolCall,
+        options: &SubmitOptions,
+    ) -> Result<Option<ToolResult>, String> {
+        // 1. allowed_tools_override
+        if let Some(ref allowed) = options.allowed_tools_override {
+            if !allowed.iter().any(|t| t.eq_ignore_ascii_case(&call.name)) {
+                self.denied_tools.push(DeniedToolCall {
+                    name: call.name.clone(),
+                    reason: "tool is not in the allowed tools override".to_string(),
+                });
+                let result = ToolResult {
+                    tool_call_id: call.id.clone(),
+                    output: format!(
+                        "tool '{}' blocked: not in allowed tools override",
+                        call.name
+                    ),
+                    is_error: true,
+                };
+                let _ = self.event_tx.send(EngineEvent::ToolCallEnd {
+                    id: call.id.clone(),
+                    result: result.clone(),
+                });
+                return Ok(Some(result));
+            }
+        }
+
+        // 2. PreToolUse hook
+        let mut ctx = std::collections::HashMap::new();
+        ctx.insert("tool_call_id".to_string(), call.id.clone());
+        ctx.insert("tool_input".to_string(), call.input.to_string());
+        let pre_hook = self.hooks.fire_hook("PreToolUse", &call.name, &ctx).await;
+        if pre_hook.stop {
+            self.denied_tools.push(DeniedToolCall {
+                name: call.name.clone(),
+                reason: "pre-use hook stopped execution".to_string(),
+            });
+            let result = ToolResult {
+                tool_call_id: call.id.clone(),
+                output: "tool execution stopped by hook".to_string(),
+                is_error: true,
+            };
+            let _ = self.event_tx.send(EngineEvent::ToolCallEnd {
+                id: call.id.clone(),
+                result: result.clone(),
+            });
+            return Ok(Some(result));
+        }
+
+        // 3. Permission check
+        let (_request, perm_result) = self
+            .permission_engine
+            .evaluate(
+                &call.name,
+                call.input.to_string(),
+                None,
+                std::collections::HashMap::new(),
+            )
+            .await
+            .map_err(|e| format!("permission check failed: {e}"))?;
+
+        match perm_result {
+            PermissionResult::Allow | PermissionResult::AllowForPath { .. } => {
+                let outcome = self.tools.execute(&call.id, &call.name, &call.input).await;
+                let result = outcome.result;
+
+                let mut ctx = std::collections::HashMap::new();
+                ctx.insert("tool_call_id".to_string(), call.id.clone());
+                ctx.insert("tool_output_len".to_string(), result.output.len().to_string());
+                let _ = self.hooks.fire_hook("PostToolUse", &call.name, &ctx).await;
+
+                let _ = self.event_tx.send(EngineEvent::ToolCallEnd {
+                    id: call.id.clone(),
+                    result: result.clone(),
+                });
+                Ok(Some(result))
+            }
+            PermissionResult::Ask { reason } | PermissionResult::AskForSession { reason } => {
+                let _ = self.event_tx.send(EngineEvent::PermissionRequest {
+                    id: call.id.clone(),
+                    tool: call.name.clone(),
+                    args: call.input.clone(),
+                });
+                self.denied_tools.push(DeniedToolCall {
+                    name: call.name.clone(),
+                    reason: reason.clone(),
+                });
+                let result = ToolResult {
+                    tool_call_id: call.id.clone(),
+                    output: format!("tool '{}' denied by user", call.name),
+                    is_error: true,
+                };
+                let mut ctx = std::collections::HashMap::new();
+                ctx.insert("tool_call_id".to_string(), call.id.clone());
+                ctx.insert("reason".to_string(), reason.clone());
+                let _ = self.hooks.fire_hook("PostToolUseFail", &call.name, &ctx).await;
+                let _ = self.event_tx.send(EngineEvent::ToolCallEnd {
+                    id: call.id.clone(),
+                    result: result.clone(),
+                });
+                Ok(Some(result))
+            }
+            PermissionResult::Deny { reason } => {
+                self.denied_tools.push(DeniedToolCall {
+                    name: call.name.clone(),
+                    reason: reason.clone(),
+                });
+                let result = ToolResult {
+                    tool_call_id: call.id.clone(),
+                    output: format!("tool '{}' denied", call.name),
+                    is_error: true,
+                };
+                let mut ctx = std::collections::HashMap::new();
+                ctx.insert("tool_call_id".to_string(), call.id.clone());
+                ctx.insert("reason".to_string(), reason.clone());
+                let _ = self.hooks.fire_hook("PostToolUseFail", &call.name, &ctx).await;
+                let _ = self.event_tx.send(EngineEvent::ToolCallEnd {
+                    id: call.id.clone(),
+                    result: result.clone(),
+                });
+                Ok(Some(result))
+            }
+            PermissionResult::Elevated { reason } => {
+                let elevation_id = format!("elev_{}", call.id);
+                let _ = self.event_tx.send(EngineEvent::ElevationRequest {
+                    id: elevation_id.clone(),
+                    tool: call.name.clone(),
+                    reason: reason.clone(),
+                });
+                let result = ToolResult {
+                    tool_call_id: call.id.clone(),
+                    output: format!("tool '{}' requires elevated permissions", call.name),
+                    is_error: true,
+                };
+                let _ = self.event_tx.send(EngineEvent::ToolCallEnd {
+                    id: call.id.clone(),
+                    result: result.clone(),
+                });
+                Ok(Some(result))
+            }
+        }
     }
 
     /// Extract tool calls from the assistant response text.
@@ -1859,7 +2043,7 @@ mod tests {
             _model: &ModelId,
             _max_tokens: u32,
         ) -> std::pin::Pin<
-            Box<dyn futures::Stream<Item = StreamEvent> + Send + '_>,
+            Box<dyn futures::Stream<Item = StreamEvent> + Send + 'static>,
         > {
             let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
             let _ = tx.send(StreamEvent::StreamEnd);

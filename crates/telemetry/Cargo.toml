@@ -1,0 +1,25 @@
+[package]
+name = "coderex-telemetry"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Telemetry, crash reporting, and usage analytics for CodeRex"
+
+[lints]
+workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+chrono.workspace = true
+uuid.workspace = true
+rusqlite.workspace = true
+reqwest.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

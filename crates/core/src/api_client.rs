@@ -169,7 +169,7 @@ pub trait ApiClient: Send + Sync {
         messages: &[serde_json::Value],
         model: &ModelId,
         max_tokens: u32,
-    ) -> Pin<Box<dyn Stream<Item = StreamEvent> + Send + '_>>;
+    ) -> Pin<Box<dyn Stream<Item = StreamEvent> + Send + 'static>>;
 }
 
 /// Anthropic API client implementation.
@@ -344,7 +344,7 @@ impl ApiClient for AnthropicApiClient {
         messages: &[serde_json::Value],
         model: &ModelId,
         max_tokens: u32,
-    ) -> Pin<Box<dyn Stream<Item = StreamEvent> + Send + '_>> {
+    ) -> Pin<Box<dyn Stream<Item = StreamEvent> + Send + 'static>> {
         if self.config.api_key.is_empty() {
             return Box::pin(futures::stream::once(async {
                 StreamEvent::Error(ApiError::Auth(
@@ -427,6 +427,13 @@ impl ApiClient for AnthropicApiClient {
 /// event: message_stop
 /// data: {"type":"message_stop"}
 /// ```
+/// State carried across SSE message parses to track content block indices.
+#[derive(Debug, Default)]
+struct SseParserState {
+    /// Maps content block index -> tool_call_id for tool_use blocks.
+    index_to_id: std::collections::HashMap<usize, String>,
+}
+
 fn parse_sse_stream(
     stream: impl futures::Stream<Item = Result<bytes::Bytes, reqwest::Error>> + Send + 'static,
 ) -> impl futures::Stream<Item = StreamEvent> + Send + 'static {
@@ -435,29 +442,30 @@ fn parse_sse_stream(
     let pinned = Box::pin(stream);
 
     futures::stream::unfold(
-        (pinned, String::new()),
-        |(mut inner, mut buffer)| async move {
+        (pinned, String::new(), SseParserState::default()),
+        |(mut inner, mut buffer, mut state)| async move {
             loop {
                 if let Some(pos) = find_sse_message_boundary(&buffer) {
                     let message = buffer[..pos].to_string();
                     buffer.drain(..=pos);
 
-                    if let Some(event) = parse_sse_message(&message) {
-                        return Some((event, (inner, buffer)));
+                    if let Some(event) = parse_sse_message(&message, &mut state) {
+                        return Some((event, (inner, buffer, state)));
                     }
                     continue;
                 }
 
                 match inner.next().await {
                     Some(Ok(chunk)) => {
-                        let chunk_str =
-                            std::str::from_utf8(&chunk).unwrap_or("");
-                        buffer.push_str(chunk_str);
+                        // Lossy decode: invalid UTF-8 sequences become U+FFFD
+                        // instead of silently dropping bytes.
+                        buffer.push_str(&String::from_utf8_lossy(&chunk));
                     }
                     Some(Err(e)) => {
+                        tracing::warn!("SSE stream network error: {e}");
                         return Some((
                             StreamEvent::Error(ApiError::from(e)),
-                            (inner, buffer),
+                            (inner, buffer, state),
                         ));
                     }
                     None => {
@@ -482,7 +490,7 @@ fn find_sse_message_boundary(buffer: &str) -> Option<usize> {
 }
 
 /// Parse a single SSE message block into a `StreamEvent`.
-fn parse_sse_message(message: &str) -> Option<StreamEvent> {
+fn parse_sse_message(message: &str, state: &mut SseParserState) -> Option<StreamEvent> {
     // Extract the `data:` line (accept both "data: " and "data:")
     let data_line = message
         .lines()
@@ -493,17 +501,51 @@ fn parse_sse_message(message: &str) -> Option<StreamEvent> {
     let event_type = value.get("type").and_then(|v| v.as_str())?;
 
     match event_type {
-        "content_block_delta" => {
-            let text = value
-                .get("delta")
-                .and_then(|d| d.get("text"))
-                .and_then(|t| t.as_str())
-                .unwrap_or("");
-            if text.is_empty() {
-                None
-            } else {
-                Some(StreamEvent::TextDelta(text.to_string()))
+        "content_block_start" => {
+            let index = value.get("index").and_then(serde_json::Value::as_u64)? as usize;
+            let block = value.get("content_block")?;
+            let block_type = block.get("type")?.as_str()?;
+            match block_type {
+                "tool_use" => {
+                    let id = block.get("id")?.as_str()?.to_string();
+                    let name = block.get("name")?.as_str()?.to_string();
+                    state.index_to_id.insert(index, id.clone());
+                    Some(StreamEvent::ToolCallBlockStart { id, name })
+                }
+                _ => None,
             }
+        }
+        "content_block_delta" => {
+            let index = value.get("index").and_then(serde_json::Value::as_u64)? as usize;
+            let delta = value.get("delta")?;
+            let delta_type = delta.get("type")?.as_str()?;
+            match delta_type {
+                "text_delta" => {
+                    let text = delta.get("text")?.as_str()?;
+                    if text.is_empty() {
+                        None
+                    } else {
+                        Some(StreamEvent::TextDelta(text.to_string()))
+                    }
+                }
+                "input_json_delta" => {
+                    let id = state.index_to_id.get(&index)?.clone();
+                    let partial_json = delta.get("partial_json")?.as_str()?;
+                    Some(StreamEvent::ToolCallInputDelta {
+                        id,
+                        delta: partial_json.to_string(),
+                    })
+                }
+                _ => None,
+            }
+        }
+        "content_block_stop" => {
+            let index = value.get("index").and_then(serde_json::Value::as_u64)? as usize;
+            let id = state.index_to_id.remove(&index)?.clone();
+            Some(StreamEvent::ToolCallBlockEnd {
+                id,
+                input: serde_json::Value::Null,
+            })
         }
         "message_delta" => {
             #[allow(clippy::cast_possible_truncation)]
@@ -589,5 +631,188 @@ mod tests {
         assert_eq!(AnthropicApiClient::resolve_model(&ModelId::sonnet()), "claude-sonnet-4-6");
         assert_eq!(AnthropicApiClient::resolve_model(&ModelId::opus()), "claude-opus-4-6");
         assert_eq!(AnthropicApiClient::resolve_model(&ModelId::haiku()), "claude-haiku-4-5-20251001");
+    }
+
+    // ─── SSE parser tests ───────────────────────────────────────────────
+
+    #[test]
+    fn parse_sse_message_text_delta() {
+        let msg = "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"Hello\"}}\n\n";
+        let mut state = SseParserState::default();
+        let event = parse_sse_message(msg, &mut state);
+        assert!(matches!(event, Some(StreamEvent::TextDelta(ref t)) if t == "Hello"));
+    }
+
+    #[test]
+    fn parse_sse_message_tool_use_start() {
+        let msg = "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_01ABC\",\"name\":\"read\",\"input\":{}}}\n\n";
+        let mut state = SseParserState::default();
+        let event = parse_sse_message(msg, &mut state);
+        assert!(
+            matches!(event, Some(StreamEvent::ToolCallBlockStart { ref id, ref name }) if id == "toolu_01ABC" && name == "read")
+        );
+        assert_eq!(state.index_to_id.get(&1), Some(&"toolu_01ABC".to_string()));
+    }
+
+    #[test]
+    fn parse_sse_message_input_json_delta() {
+        let mut state = SseParserState::default();
+        state.index_to_id.insert(1, "toolu_01ABC".to_string());
+
+        let msg = "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"file\\\":\\\"test.txt\\\"}\"}}\n\n";
+        let event = parse_sse_message(msg, &mut state);
+        assert!(
+            matches!(event, Some(StreamEvent::ToolCallInputDelta { ref id, ref delta }) if id == "toolu_01ABC" && delta == "{\"file\":\"test.txt\"}")
+        );
+    }
+
+    #[test]
+    fn parse_sse_message_content_block_stop() {
+        let mut state = SseParserState::default();
+        state.index_to_id.insert(1, "toolu_01ABC".to_string());
+
+        let msg = "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":1}\n\n";
+        let event = parse_sse_message(msg, &mut state);
+        assert!(
+            matches!(event, Some(StreamEvent::ToolCallBlockEnd { ref id, ref input }) if id == "toolu_01ABC" && input.is_null())
+        );
+        assert!(!state.index_to_id.contains_key(&1));
+    }
+
+    #[test]
+    fn parse_sse_message_usage_summary() {
+        let msg = "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"input_tokens\":100,\"output_tokens\":50}}\n\n";
+        let mut state = SseParserState::default();
+        let event = parse_sse_message(msg, &mut state);
+        assert!(
+            matches!(event, Some(StreamEvent::UsageSummary(ref u)) if u.input_tokens == 100 && u.output_tokens == 50)
+        );
+    }
+
+    #[test]
+    fn parse_sse_message_ignores_unknown_types() {
+        let msg = "event: ping\ndata: {\"type\":\"ping\"}\n\n";
+        let mut state = SseParserState::default();
+        let event = parse_sse_message(msg, &mut state);
+        assert!(event.is_none());
+    }
+
+    #[test]
+    fn parse_sse_message_ignores_text_block_start() {
+        let msg = "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n";
+        let mut state = SseParserState::default();
+        let event = parse_sse_message(msg, &mut state);
+        assert!(event.is_none());
+    }
+
+    #[tokio::test]
+    async fn parse_sse_stream_full_tool_call_sequence() {
+        let sse = r#"event: content_block_start
+data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"I'll read the file."}}
+
+event: content_block_start
+data: {"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"toolu_01XYZ","name":"read","input":{}}}
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{\"file\":\"hello.txt\"}"}}
+
+event: content_block_stop
+data: {"type":"content_block_stop","index":1}
+
+event: message_delta
+data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input_tokens":10,"output_tokens":20}}
+
+event: message_stop
+data: {"type":"message_stop"}
+
+"#;
+
+        let stream = futures::stream::iter(vec![Ok(bytes::Bytes::from(sse))]);
+        let events: Vec<StreamEvent> = parse_sse_stream(stream).collect().await;
+
+        assert_eq!(events.len(), 6); // text + tool_start + tool_delta + tool_end + usage + stream_end
+        assert!(matches!(&events[0], StreamEvent::TextDelta(t) if t == "I'll read the file."));
+        assert!(matches!(&events[1], StreamEvent::ToolCallBlockStart { id, name } if id == "toolu_01XYZ" && name == "read"));
+        assert!(matches!(&events[2], StreamEvent::ToolCallInputDelta { id, delta } if id == "toolu_01XYZ" && delta == "{\"file\":\"hello.txt\"}"));
+        assert!(matches!(&events[3], StreamEvent::ToolCallBlockEnd { id, .. } if id == "toolu_01XYZ"));
+        assert!(matches!(&events[4], StreamEvent::UsageSummary(u) if u.input_tokens == 10 && u.output_tokens == 20));
+    }
+
+    #[tokio::test]
+    async fn parse_sse_stream_stress_large_payload() {
+        let large_text = "x".repeat(100_000);
+        let sse = format!(
+            "event: content_block_delta\ndata: {{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{{\"type\":\"text_delta\",\"text\":\"{}\"}}}}\n\nevent: message_stop\ndata: {{\"type\":\"message_stop\"}}\n\n",
+            large_text
+        );
+
+        let stream = futures::stream::iter(vec![Ok(bytes::Bytes::from(sse))]);
+        let events: Vec<StreamEvent> = parse_sse_stream(stream).collect().await;
+
+        assert_eq!(events.len(), 2);
+        assert!(matches!(&events[0], StreamEvent::TextDelta(t) if t.len() == 100_000));
+    }
+
+    #[tokio::test]
+    async fn parse_sse_stream_stress_fragmented_chunks() {
+        // Send the SSE payload one byte at a time to stress the buffer accumulation
+        let sse = "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\" fragmented \"}}\n\nevent: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
+        let chunks: Vec<Result<bytes::Bytes, reqwest::Error>> =
+            sse.bytes().map(|b| Ok(bytes::Bytes::from(vec![b]))).collect();
+
+        let stream = futures::stream::iter(chunks);
+        let events: Vec<StreamEvent> = parse_sse_stream(stream).collect().await;
+
+        assert_eq!(events.len(), 2);
+        assert!(matches!(&events[0], StreamEvent::TextDelta(t) if t == " fragmented "));
+    }
+
+    #[tokio::test]
+    async fn parse_sse_stream_stress_multiple_tool_calls() {
+        let mut sse = String::new();
+        for i in 0..50 {
+            sse.push_str(&format!(
+                "event: content_block_start\ndata: {{\"type\":\"content_block_start\",\"index\":{i},\"content_block\":{{\"type\":\"tool_use\",\"id\":\"tool_{i}\",\"name\":\"read\",\"input\":{{}}}}}}\n\n"
+            ));
+            sse.push_str(&format!(
+                "event: content_block_delta\ndata: {{\"type\":\"content_block_delta\",\"index\":{i},\"delta\":{{\"type\":\"input_json_delta\",\"partial_json\":\"{{\\\"file\\\":\\\"f{i}.txt\\\"}}\"}}}}\n\n"
+            ));
+            sse.push_str(&format!(
+                "event: content_block_stop\ndata: {{\"type\":\"content_block_stop\",\"index\":{i}}}\n\n"
+            ));
+        }
+        sse.push_str("event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n");
+
+        let stream = futures::stream::iter(vec![Ok(bytes::Bytes::from(sse))]);
+        let events: Vec<StreamEvent> = parse_sse_stream(stream).collect().await;
+
+        let tool_starts = events.iter().filter(|e| matches!(e, StreamEvent::ToolCallBlockStart { .. })).count();
+        let tool_deltas = events.iter().filter(|e| matches!(e, StreamEvent::ToolCallInputDelta { .. })).count();
+        let tool_ends = events.iter().filter(|e| matches!(e, StreamEvent::ToolCallBlockEnd { .. })).count();
+
+        assert_eq!(tool_starts, 50);
+        assert_eq!(tool_deltas, 50);
+        assert_eq!(tool_ends, 50);
+    }
+
+    #[tokio::test]
+    async fn parse_sse_stream_handles_malformed_data_gracefully() {
+        let sse = "event: content_block_delta\ndata: not valid json\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"ok\"}}\n\n";
+        let stream = futures::stream::iter(vec![Ok(bytes::Bytes::from(sse))]);
+        let events: Vec<StreamEvent> = parse_sse_stream(stream).collect().await;
+
+        assert_eq!(events.len(), 2);
+        assert!(matches!(&events[0], StreamEvent::TextDelta(t) if t == "ok"));
+    }
+
+    #[tokio::test]
+    async fn parse_sse_stream_empty_body() {
+        let stream = futures::stream::iter(vec![Ok(bytes::Bytes::from(""))]);
+        let events: Vec<StreamEvent> = parse_sse_stream(stream).collect().await;
+        assert_eq!(events.len(), 1);
+        assert!(matches!(events[0], StreamEvent::StreamEnd));
     }
 }

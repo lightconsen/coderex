@@ -175,7 +175,7 @@ mod tests {
             _messages: &[serde_json::Value],
             _model: &ModelId,
             _max_tokens: u32,
-        ) -> Pin<Box<dyn Stream<Item = StreamEvent> + Send + '_>> {
+        ) -> Pin<Box<dyn Stream<Item = StreamEvent> + Send + 'static>> {
             Box::pin(futures::stream::empty())
         }
     }

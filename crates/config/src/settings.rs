@@ -29,6 +29,8 @@ pub struct Settings {
     pub permission_mode: Option<String>,
     /// Maximum budget in USD.
     pub max_budget_usd: Option<f64>,
+    /// Whether telemetry (crash reports, usage analytics) is enabled.
+    pub telemetry_enabled: Option<bool>,
     /// Hook configurations.
     pub hooks: Option<serde_json::Value>,
     /// MCP server configurations.
@@ -43,6 +45,7 @@ impl Settings {
             model: Some("claude-sonnet-4-6".into()),
             permission_mode: Some("default".into()),
             max_budget_usd: None,
+            telemetry_enabled: Some(true),
             hooks: None,
             mcp_servers: None,
         }
@@ -57,6 +60,7 @@ impl Settings {
             model: other.model.clone().or_else(|| self.model.clone()),
             permission_mode: other.permission_mode.clone().or_else(|| self.permission_mode.clone()),
             max_budget_usd: other.max_budget_usd.or(self.max_budget_usd),
+            telemetry_enabled: other.telemetry_enabled.or(self.telemetry_enabled),
             hooks: other.hooks.clone().or_else(|| self.hooks.clone()),
             mcp_servers: other.mcp_servers.clone().or_else(|| self.mcp_servers.clone()),
         }

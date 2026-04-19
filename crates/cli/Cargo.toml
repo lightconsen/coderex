@@ -28,6 +28,7 @@ coderex-server = { path = "../server" }
 coderex-ui = { path = "../ui" }
 coderex-sdk = { path = "../sdk" }
 coderex-config = { path = "../config" }
+coderex-telemetry = { path = "../telemetry" }
 
 clap.workspace = true
 tokio.workspace = true
@@ -37,6 +38,8 @@ thiserror.workspace = true
 anyhow.workspace = true
 home.workspace = true
 serde_json.workspace = true
+crossterm.workspace = true
+compact_str.workspace = true
 
 [dev-dependencies]
 assert_cmd.workspace = true
@@ -60,3 +63,11 @@ default = ["core"]
 core = []
 full = ["core"]
 enterprise = ["full", "coderex-config/enterprise"]
+
+[package.metadata.dist]
+# The name cargo-dist uses for this binary
+name = "coderex"
+# Whether to build this package in releases
+dist = true
+# The hosts to build for (inherits from workspace by default)
+targets = ["aarch64-apple-darwin", "x86_64-apple-darwin", "x86_64-unknown-linux-gnu", "x86_64-unknown-linux-musl", "x86_64-pc-windows-msvc"]

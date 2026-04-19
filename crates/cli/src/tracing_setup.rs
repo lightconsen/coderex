@@ -38,24 +38,12 @@ pub fn init_tracing() {
     }
 }
 
-/// Install a panic hook that writes crash information to `~/.claude/crash.log`.
+/// Install a panic hook using the telemetry crash reporter.
+///
+/// Crash reports are written to `~/.claude/crashes/pending/` and ingested
+/// into the telemetry store on the next startup.
 pub fn install_panic_hook() {
-    use std::backtrace::Backtrace;
-
-    let default_hook = std::panic::take_hook();
-    std::panic::set_hook(Box::new(move |info| {
-        if let Some(home) = home::home_dir() {
-            let crash_path = home.join(".claude").join("crash.log");
-            let backtrace = Backtrace::force_capture();
-            let log = format!(
-                "panic: {info}\nbacktrace:\n{backtrace}\n",
-            );
-            if let Some(parent) = crash_path.parent() {
-                let _ = std::fs::create_dir_all(parent);
-            }
-            let _ = std::fs::write(&crash_path, log);
-        }
-
-        default_hook(info);
-    }));
+    let pending_dir = coderex_config::config_home().join("crashes").join("pending");
+    let reporter = coderex_telemetry::CrashReporter::new(pending_dir);
+    reporter.install_hook();
 }

@@ -579,7 +579,7 @@ impl StartupOrchestrator {
         } else {
             crate::repl::ReplLoop::new(cwd.to_string(), model)
         };
-        repl.run_interactive().await
+        repl.run_tui().await
     }
 
     #[allow(clippy::unused_async)]
@@ -679,7 +679,7 @@ impl StartupOrchestrator {
         } else {
             crate::repl::ReplLoop::new(cwd.to_string(), model)
         };
-        repl.run_interactive().await
+        repl.run_tui().await
     }
 
     fn load_resume_messages(
@@ -754,6 +754,7 @@ mod tests {
             model: Some("claude-opus-4-6".into()),
             permission_mode: Some("default".into()),
             max_budget_usd: None,
+            telemetry_enabled: None,
             hooks: None,
             mcp_servers: None,
         });
@@ -769,6 +770,7 @@ mod tests {
             model: Some("claude-sonnet-4-6".into()),
             permission_mode: Some("default".into()),
             max_budget_usd: Some(10.0),
+            telemetry_enabled: None,
             hooks: None,
             mcp_servers: None,
         });

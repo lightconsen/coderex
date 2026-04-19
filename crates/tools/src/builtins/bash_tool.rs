@@ -1,4 +1,11 @@
 //! Bash tool — shell command execution with timeout.
+//!
+//! When a [`SandboxConfig`] is present in `ToolContext.extra` under the key
+//! `"sandbox_config"`, the command is executed inside the platform sandbox:
+//!
+//! - **Linux**: seccomp BPF + rlimits applied via `pre_exec`.
+//! - **macOS**: command rewritten to run through `sandbox-exec`.
+//! - **Windows**: Job Object (requires synchronous spawn).
 
 use std::time::Duration;
 
@@ -6,6 +13,73 @@ use crate::context::{ToolError, ToolOutput};
 use crate::tool::{Tool, ToolContext, ToolDescriptor, ToolInput, ToolTier};
 use async_trait::async_trait;
 use tokio::process::Command;
+
+/// Build a `tokio::process::Command` for the given shell command,
+/// applying sandbox wrapping if a [`SandboxConfig`] is present in
+/// `ctx.extra`.
+///
+/// Returns the command plus an optional `SandboxHandle` that must be
+/// kept alive until the command finishes (macOS profile cleanup).
+fn build_sandboxed_command(
+    ctx: &ToolContext<'_>,
+    command: &str,
+) -> Result<(Command, Option<coderex_core::sandbox::SandboxHandle>), ToolError> {
+    let sandbox_config = ctx
+        .extra
+        .get("sandbox_config")
+        .and_then(|v| v.downcast_ref::<coderex_core::sandbox::SandboxConfig>());
+
+    #[cfg(target_os = "macos")]
+    {
+        if let Some(config) = sandbox_config {
+            let handle = coderex_core::sandbox::SandboxHandle::create(config.clone())
+                .map_err(|e| ToolError::Io(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    format!("sandbox: {e}"),
+                )))?;
+            let (wrapper, prefix_args) = handle.sandboxed_program().ok_or_else(|| {
+                ToolError::Io(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    "sandbox: no wrapper program available",
+                ))
+            })?;
+            let mut cmd = Command::new(wrapper);
+            for arg in prefix_args {
+                cmd.arg(arg);
+            }
+            cmd.arg("sh").arg("-c").arg(command);
+            cmd.current_dir(ctx.cwd);
+            return Ok((cmd, Some(handle)));
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        if let Some(config) = sandbox_config {
+            let handle = coderex_core::sandbox::SandboxHandle::create(config.clone())
+                .map_err(|e| ToolError::Io(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    format!("sandbox: {e}"),
+                )))?;
+            let mut std_cmd = std::process::Command::new("sh");
+            std_cmd.arg("-c").arg(command);
+            std_cmd.current_dir(ctx.cwd);
+            handle
+                .prepare(&mut std_cmd)
+                .map_err(|e| ToolError::Io(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    format!("sandbox: {e}"),
+                )))?;
+            return Ok((Command::from(std_cmd), Some(handle)));
+        }
+    }
+
+    // No sandbox (or unsupported platform with sandbox config)
+    let mut cmd = Command::new("sh");
+    cmd.arg("-c").arg(command);
+    cmd.current_dir(ctx.cwd);
+    Ok((cmd, None))
+}
 
 /// Default timeout in seconds.
 const DEFAULT_TIMEOUT_SECS: u64 = 60;
@@ -57,13 +131,11 @@ impl Tool for BashTool {
             .unwrap_or(DEFAULT_TIMEOUT_SECS as i64)
             .clamp(1, MAX_TIMEOUT_SECS as i64) as u64;
 
+        let (mut cmd, _sandbox_handle) = build_sandboxed_command(&ctx, &command)?;
+
         let result = tokio::time::timeout(
             Duration::from_secs(timeout_secs),
-            Command::new("sh")
-                .arg("-c")
-                .arg(&command)
-                .current_dir(ctx.cwd)
-                .output(),
+            cmd.output(),
         )
         .await
         .map_err(|_| ToolError::Timeout {
@@ -194,5 +266,33 @@ mod tests {
             .await
             .unwrap();
         assert!(output.output.contains("Exit code: 42"));
+    }
+
+    #[tokio::test]
+    #[cfg(target_os = "macos")]
+    async fn sandboxed_echo_works() {
+        use std::collections::HashMap;
+        use std::path::PathBuf;
+
+        let mut extra = HashMap::new();
+        extra.insert(
+            "sandbox_config".to_string(),
+            Box::new(coderex_core::sandbox::SandboxConfig {
+                allowed_read_paths: vec![PathBuf::from("/tmp")],
+                allowed_write_paths: vec![PathBuf::from("/tmp")],
+                allow_network: false,
+                ..Default::default()
+            }) as crate::tool::SharedState,
+        );
+        let ctx = ToolContext::new(ExecutionContext::Normal, Path::new("/tmp"))
+            .with_extra(extra);
+
+        let output = BashTool
+            .execute(bash_input("echo sandboxed"), ctx)
+            .await
+            .unwrap();
+        eprintln!("SANDBOX OUTPUT: {:?}", output.output);
+        assert!(output.output.contains("sandboxed"), "output was: {}", output.output);
+        assert!(output.output.contains("Exit code: 0"), "output was: {}", output.output);
     }
 }
