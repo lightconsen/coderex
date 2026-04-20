@@ -9,7 +9,7 @@ The foundational engine of CodeRex. Manages LLM API communication, conversation 
 ### Key Types
 
 - **`QueryEngine`** (`engine.rs:592`) — The main conversation orchestrator. Manages turns through a 14-state state machine (`TurnState`).
-- **`TurnState`** (`engine.rs:289`) — State machine: Initialize → BuildContext → RunPreSubmitHooks → StartRequest → StreamAssistant → ExecuteTools → AwaitPermission → AwaitElicitation → ApplyToolResults → EvaluateContinuation → CompactRecovery → StopHooks → Finalize → Terminated.
+- **`TurnState`** (`engine.rs:289`) — State machine: Initialize -> BuildContext -> RunPreSubmitHooks -> StartRequest -> StreamAssistant -> ExecuteTools -> AwaitPermission -> AwaitElicitation -> ApplyToolResults -> EvaluateContinuation -> CompactRecovery -> StopHooks -> Finalize -> Terminated.
 - **`TurnRuntime`** (`engine.rs:475`) — Per-turn mutable state: messages, pending tool calls, budget, recovery count, terminal reason.
 - **`ApiClient` trait** (`api_client.rs:150`) — Abstraction over LLM providers. `AnthropicApiClient` is the primary impl.
 - **`StreamEvent`** (`api_client.rs:113`) — SSE parsing results: TextDelta, ToolCallBlockStart/End, ToolCallInputDelta, UsageSummary, StreamEnd, Error.
@@ -23,7 +23,7 @@ The foundational engine of CodeRex. Manages LLM API communication, conversation 
 ### Architecture Patterns
 
 - **State machine pattern** for turn lifecycle with explicit transitions.
-- **Producer-consumer** via `tokio::mpsc::unbounded_channel` for engine events → UI.
+- **Producer-consumer** via `tokio::mpsc::unbounded_channel` for engine events -> UI.
 - **Trait-based abstraction** for API client, tool executor, hook executor, elicitation handler.
 - **SSE streaming parser** with buffer accumulation and stateful `SseParserState` for tool call index mapping.
 - **Retry with exponential backoff** for API calls (3 retries, 1s base backoff).
@@ -51,23 +51,34 @@ Re-exports 30+ types from submodules: `types`, `state`, `runtime`, `engine`, `ap
 
 ### What Is Stubbed/Partial
 
-- ~~**`extract_tool_calls`** (`engine.rs:1788`) — Uses text-based JSON heuristic instead of native API tool blocks.~~ **FIXED**: Non-streaming path now parses native `tool_use` blocks from the API response `content` array into `ToolCall` structs. The text-based heuristic is retained as a fallback.
-- ~~**`Runtime::bootstrap()`** (`runtime.rs:337`) — Spawns a tokio task that just waits for shutdown; the actual event loop is in `Runtime::run()` but `bootstrap()` doesn't wire it up.~~ **FIXED**: `bootstrap()` now spawns `Runtime::run()` in a background tokio task, returning valid channel senders and a `RuntimeHandle`.
-- **Tool call execution in non-streaming path** — Delegates to `tool_scheduler::run_tool_calls` which has `#[allow(dead_code)]` on some fields.
-- **`handle_elicitation`** (`engine.rs:700`) — Marked `#[allow(dead_code)]`; default handler returns `Cancelled`.
-- **Cron scheduling** (`scheduler.rs`) — Wraps `cron` crate but no actual job execution is wired.
-- **Team/worktree/coordinator modules** — Exist as types but not integrated into main flow.
-- ~~**Syntax highlighting** — `SyntaxHighlighter` exists but not used in TUI.~~ **FIXED**: `SyntaxHighlighter` is now lazily initialized in `terminal.rs` and applied to assistant messages containing Markdown fenced code blocks (`\`\`\``). Syntect token colors are converted to ratatui `Color::Rgb` via `hex_to_color()`.
+*None remaining.*
 
-## Gaps for Production
+### Gaps for Production
 
-- ~~**Tool call extraction reliability**: The regex/JSON-heuristic approach will break with complex responses. Should use Anthropic's native `tool_use` blocks.~~ **FIXED**: The blocking path now parses `tool_use` blocks directly from the API response `content` array. `ApiResponse` carries a `tool_calls: Vec<ToolCall>` field populated by the provider. The streaming path already accumulated structured blocks via `StreamingToolCallAssembler`; the non-streaming path now matches it.
-- ~~**No connection pooling**: `reqwest::Client` is created fresh per `AnthropicApiClient`.~~ **FIXED**: Added `AnthropicApiClient::new_with_client()` which accepts an `Arc<reqwest::Client>`, enabling connection reuse across engine instances.
-- ~~**SSE parser edge cases**: `find_sse_message_boundary` only checks `\n\n`, not `\r\n\r\n`. No handling of SSE comments (`:` lines).~~ **FIXED**: `find_sse_message_boundary` now scans for both `\r\n\r\n` and `\n\n`. `parse_sse_message` filters out SSE comment lines (lines starting with `:`) before extracting the `data:` field.
-- **Budget/cost hardcoding**: Model pricing is likely hardcoded or estimated; no dynamic pricing updates.
-  → **Suggestion**: Fetch pricing from an API (e.g., Anthropic's pricing endpoint or a static JSON file on a CDN) at startup with a fallback to embedded defaults. Cache the result with a TTL.
-- ~~**No request timeout**: API requests have no explicit timeout beyond reqwest defaults.~~ **FIXED**: Added `request_timeout_secs` to `ApiConfig` (default 120s). The `AnthropicApiClient` applies this timeout to API requests.
-- ~~**Compact strategy selection is simplistic**: `select_compact_strategy` uses fixed thresholds.~~ **FIXED**: `select_compact_strategy` now accepts a `model: &ModelId` and computes thresholds as percentages of the model's context window (auto = 50%, reactive = 90%). `ModelId::context_window()` returns per-model window sizes.
-- **No graceful degradation**: If API is completely down, no fallback to cached/local mode.
-  → **Suggestion**: Implement a "local mode" that serves cached responses or runs a smaller local model (via `llama.cpp` or similar) when the primary API is unreachable. Cache the last N successful responses in SQLite.
-- ~~**`ToolCallBlockEnd` parses input as Null**: The SSE parser returns `serde_json::Value::Null` for tool call input on block end, relying on accumulated JSON deltas. This is fragile if deltas are malformed.~~ **FIXED**: `StreamingToolCallAssembler::process_event` now validates the accumulated JSON with `serde_json::from_str` on `ToolCallBlockEnd` and `StreamEnd`. Malformed JSON is no longer silently replaced with `Value::Null`.
+*None remaining.*
+
+## Recently Fixed
+
+| # | Item | Fix |
+|---|------|-----|
+| 1 | SSE parser edge cases | `find_sse_message_boundary` handles `\r\n\r\n` and `\n\n`; comment lines (`:`) filtered |
+| 2 | No API request timeout | `request_timeout_secs` added to `ApiConfig` (default 120s) |
+| 3 | Tool call extraction reliability | Non-streaming path parses native `tool_use` blocks; streaming path validates accumulated JSON |
+| 4 | `Runtime::bootstrap()` stub | Now spawns `Runtime::run()` in a background task |
+| 5 | No connection pooling | `AnthropicApiClient::new_with_client()` accepts `Arc<reqwest::Client>` |
+| 6 | `ToolCallBlockEnd` null JSON | `StreamingToolCallAssembler` validates accumulated JSON before emitting |
+| 7 | Compact strategy fixed thresholds | `select_compact_strategy` uses model-relative percentages (auto=50%, reactive=90%) |
+| 8 | Tool scheduler dead_code | `run_tool_calls` wired into `execute_tool_calls`; stale `#[allow(dead_code)]` removed |
+| 9 | `handle_elicitation` heuristic | Question-mark + short-message trigger wired into both blocking and streaming paths |
+| 10 | Cron scheduling | `CronRunner` with background tokio task, job add/remove/list/start/stop APIs added |
+| 11 | Syntax highlighting unused | `SyntaxHighlighter` integrated into TUI for assistant code blocks |
+| 12 | Team/worktree/coordinator orphan modules | Light integration: `team_context` + `coordinator` in `QueryEngine`, `worktree_manager` in `Runtime` |
+| 13 | Budget/cost hardcoding | `CostTracker` loads `~/.coderex/pricing.json` with fallback to built-in defaults; `reload_pricing()` for runtime updates |
+| 14 | No graceful degradation | `TerminalReason::ApiUnavailable` variant with friendly UI message; last successful response cached in `QueryEngine` |
+| 15 | `extract_tool_calls` dead code | Removed unused fallback function; native `ApiResponse.tool_calls` is the sole path |
+| 16 | `Runtime.task` dead code | Added `Runtime::shutdown()` that aborts the background task; removed `#[allow(dead_code)]` |
+| 17 | Elicitation handlers stubbed | `ReplElicitationHandler` now reads from stdin with numbered options; `SdkElicitationHandler` emits `EngineEvent::ElicitationRequest` |
+| 18 | ModelRouter not wired | CLI `try_create_api_client()` now uses `ProviderConfig::from_env().build_router()` with multi-provider fallback |
+| 19 | `CostTracker::format_summary()` unused | `/cost` command now uses `QueryEngine::cost_summary()` → `CostTracker::format_summary()` when available |
+| 20 | `ExplainPermissionHook` only traced | Now emits `EngineEvent::PermissionExplanation` via event channel; `TranscriptEntry::PermissionExplanation` added to `UiState` |
+| 21 | Orphaned permission recovery UI gap | `PermissionEngine::recover_orphaned()` now returns recovered requests; `QueryEngine::recover_orphaned_permissions()` emits them as `EngineEvent::PermissionRequest`; REPL sets persist path and auto-recovers on startup |

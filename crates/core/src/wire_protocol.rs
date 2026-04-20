@@ -109,6 +109,18 @@ pub enum WireEvent {
         /// The lifecycle event.
         event: crate::types::AgentLifecycleEvent,
     },
+    /// A notification message.
+    Notification {
+        /// Notification text.
+        message: String,
+    },
+    /// A permission explanation was generated for a tool request.
+    PermissionExplanation {
+        /// Tool name.
+        tool: String,
+        /// Generated explanation text.
+        explanation: String,
+    },
 }
 
 /// Requests sent by the client over the wire.

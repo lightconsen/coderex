@@ -1,10 +1,13 @@
 //! Cost tracking — model pricing, per-turn/per-session cost accumulation.
 
 use crate::types::{ModelId, UsageSummary};
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::path::Path;
+use std::sync::Arc;
 
 /// Per-model pricing configuration.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct ModelPricing {
     /// Price per 1M input tokens (USD).
     pub input_per_million: f64,
@@ -77,6 +80,52 @@ pub fn pricing_for_model(model: &ModelId) -> ModelPricing {
     }
 }
 
+/// Load custom pricing from a JSON file.
+///
+/// The JSON format is a map of model name to [`ModelPricing`]:
+/// ```json
+/// {
+///   "claude-sonnet-4-6": {
+///     "input_per_million": 3.0,
+///     "output_per_million": 15.0,
+///     "cache_read_per_million": 0.3,
+///     "cache_creation_per_million": 3.75
+///   }
+/// }
+/// ```
+///
+/// Returns an empty map if the file does not exist or cannot be parsed.
+#[must_use]
+pub fn load_pricing_from_path(path: &Path) -> HashMap<String, ModelPricing> {
+    if !path.exists() {
+        return HashMap::new();
+    }
+    let content = match std::fs::read_to_string(path) {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!("failed to read pricing file {}: {}", path.display(), e);
+            return HashMap::new();
+        }
+    };
+    match serde_json::from_str(&content) {
+        Ok(pricing) => pricing,
+        Err(e) => {
+            tracing::warn!("failed to parse pricing file {}: {}", path.display(), e);
+            HashMap::new()
+        }
+    }
+}
+
+/// Load pricing from the default user config path (`~/.coderex/pricing.json`).
+#[must_use]
+pub fn load_user_pricing() -> HashMap<String, ModelPricing> {
+    if let Ok(home) = std::env::var("HOME") {
+        let path = std::path::PathBuf::from(home).join(".coderex").join("pricing.json");
+        return load_pricing_from_path(&path);
+    }
+    HashMap::new()
+}
+
 /// Tracks costs per turn, session, and agent.
 #[derive(Debug, Clone)]
 pub struct CostTracker {
@@ -92,6 +141,8 @@ pub struct CostTracker {
     task_costs: HashMap<String, f64>,
     /// Cost history per turn (for reporting).
     turn_history: Vec<TurnCost>,
+    /// Optional team context to broadcast costs to.
+    team_context: Option<Arc<std::sync::Mutex<crate::team_context::TeamContext>>>,
 }
 
 /// Cost information for a single turn.
@@ -109,16 +160,33 @@ pub struct TurnCost {
 
 impl CostTracker {
     /// Create a new cost tracker.
+    ///
+    /// Attempts to load custom pricing from `~/.coderex/pricing.json`.
+    /// Falls back to built-in defaults if the file is missing or invalid.
     #[must_use]
     pub fn new() -> Self {
         Self {
-            pricing: HashMap::new(),
+            pricing: load_user_pricing(),
             turn_cost: 0.0,
             session_cost: 0.0,
             agent_costs: HashMap::new(),
             task_costs: HashMap::new(),
             turn_history: Vec::new(),
+            team_context: None,
         }
+    }
+
+    /// Reload pricing from `~/.coderex/pricing.json` at runtime.
+    pub fn reload_pricing(&mut self) {
+        self.pricing = load_user_pricing();
+    }
+
+    /// Set the team context for broadcasting turn costs.
+    pub fn set_team_context(
+        &mut self,
+        context: Arc<std::sync::Mutex<crate::team_context::TeamContext>>,
+    ) {
+        self.team_context = Some(context);
     }
 
     /// Register a custom pricing for a model name.
@@ -154,6 +222,16 @@ impl CostTracker {
             usage: *usage,
             model: model.0.clone(),
         });
+
+        // Broadcast to team context if present
+        if let Some(ref team_ctx) = self.team_context {
+            if let Ok(mut ctx) = team_ctx.lock() {
+                ctx.record_activity(
+                    "cost_tracker".into(),
+                    format!("Turn {turn_number} cost: ${cost:.4} ({})", model.0),
+                );
+            }
+        }
     }
 
     /// Start a new turn (reset turn-level cost).
@@ -411,5 +489,38 @@ mod tests {
         tracker.start_turn();
         let cost = tracker.record_usage(&usage, &ModelId::sonnet());
         assert!((cost - 2.0).abs() < 1e-9); // 1.0 + 1.0 with custom pricing
+    }
+
+    #[test]
+    fn load_pricing_from_valid_json() {
+        let json = r#"{
+            "custom-model": {
+                "input_per_million": 1.0,
+                "output_per_million": 2.0,
+                "cache_read_per_million": 0.1,
+                "cache_creation_per_million": 0.5
+            }
+        }"#;
+        let tmpfile = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(tmpfile.path(), json).unwrap();
+        let pricing = load_pricing_from_path(tmpfile.path());
+        assert!(pricing.contains_key("custom-model"));
+        let model = pricing.get("custom-model").unwrap();
+        assert!((model.input_per_million - 1.0).abs() < 1e-9);
+        assert!((model.output_per_million - 2.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn load_pricing_missing_file_returns_empty() {
+        let pricing = load_pricing_from_path(std::path::Path::new("/nonexistent/pricing.json"));
+        assert!(pricing.is_empty());
+    }
+
+    #[test]
+    fn load_pricing_invalid_json_returns_empty() {
+        let tmpfile = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(tmpfile.path(), "not json").unwrap();
+        let pricing = load_pricing_from_path(tmpfile.path());
+        assert!(pricing.is_empty());
     }
 }

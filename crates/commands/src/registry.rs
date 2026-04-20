@@ -181,6 +181,8 @@ pub struct CommandContext {
     pub env: HashMap<String, String>,
     /// Version string.
     pub version: String,
+    /// Pre-formatted cost summary from the cost tracker.
+    pub cost_summary: String,
 }
 
 impl CommandContext {
@@ -216,6 +218,7 @@ impl CommandContext {
             vim_mode: false,
             env: HashMap::new(),
             version: String::new(),
+            cost_summary: String::new(),
         }
     }
 

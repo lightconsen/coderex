@@ -44,6 +44,13 @@ pub fn engine_event_to_wire(event: &EngineEvent) -> Option<WireEvent> {
             agent_id: agent_id.clone(),
             event: event.clone(),
         },
+        EngineEvent::Notification { message } => WireEvent::Notification {
+            message: message.clone(),
+        },
+        EngineEvent::PermissionExplanation { tool, explanation } => WireEvent::PermissionExplanation {
+            tool: tool.clone(),
+            explanation: explanation.clone(),
+        },
     })
 }
 
@@ -82,6 +89,13 @@ pub fn wire_event_to_engine(event: &WireEvent) -> Option<EngineEvent> {
         WireEvent::AgentEvent { agent_id, event } => EngineEvent::AgentEvent {
             agent_id: agent_id.clone(),
             event: event.clone(),
+        },
+        WireEvent::Notification { message } => EngineEvent::Notification {
+            message: message.clone(),
+        },
+        WireEvent::PermissionExplanation { tool, explanation } => EngineEvent::PermissionExplanation {
+            tool: tool.clone(),
+            explanation: explanation.clone(),
         },
         WireEvent::UsageSummary { .. }
         | WireEvent::TurnStart { .. }

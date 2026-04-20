@@ -231,6 +231,18 @@ pub enum EngineEvent {
         /// The lifecycle event.
         event: AgentLifecycleEvent,
     },
+    /// A notification message (e.g., API degradation warning).
+    Notification {
+        /// Notification message.
+        message: String,
+    },
+    /// A permission explanation was generated for a tool request.
+    PermissionExplanation {
+        /// Tool name.
+        tool: String,
+        /// Generated explanation text.
+        explanation: String,
+    },
 }
 
 #[cfg(test)]

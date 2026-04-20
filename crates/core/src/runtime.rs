@@ -117,6 +117,13 @@ pub enum TranscriptEntry {
     CompactBoundary,
     /// Session-end marker.
     SessionEnd,
+    /// Permission explanation generated for a tool request.
+    PermissionExplanation {
+        /// Tool name.
+        tool: String,
+        /// Explanation text.
+        explanation: String,
+    },
 }
 
 /// Portable UI state driven by `handle_ui_event` / `handle_engine_event`.
@@ -228,6 +235,17 @@ impl UiState {
                 // Sub-agent events are handled by the parent engine / AgentManager.
                 // The REPL runtime does not need to render them directly.
             }
+            EngineEvent::Notification { message } => {
+                // Notifications are advisory; log them but don't change state.
+                tracing::info!("engine notification: {message}");
+            }
+            EngineEvent::PermissionExplanation { tool, explanation } => {
+                // Store explanation in transcript as an advisory note.
+                self.transcript.push(TranscriptEntry::PermissionExplanation {
+                    tool,
+                    explanation,
+                });
+            }
         }
     }
 
@@ -301,10 +319,13 @@ impl RuntimeHandle {
 /// consuming events from both the UI and engine channels.
 pub struct Runtime {
     /// Tokio handle for the runtime task.
-    #[allow(dead_code)]
     task: tokio::task::JoinHandle<()>,
     /// Shared UI state accumulated by the event loop.
     state: Arc<Mutex<UiState>>,
+    /// Optional cron job runner.
+    pub cron_runner: Option<crate::scheduler::CronRunner>,
+    /// Optional worktree manager for git worktree isolation.
+    pub worktree_manager: Option<crate::worktree::WorktreeManager>,
 }
 
 impl std::fmt::Debug for Runtime {
@@ -318,6 +339,11 @@ impl Runtime {
     #[must_use]
     pub fn state(&self) -> Arc<Mutex<UiState>> {
         Arc::clone(&self.state)
+    }
+
+    /// Shut down the runtime, aborting the background event-loop task.
+    pub fn shutdown(&self) {
+        self.task.abort();
     }
 
     /// Bootstrap the runtime, starting the event loop in a background task.
@@ -351,7 +377,12 @@ impl Runtime {
             Self::run(ui_tx_clone, ui_rx, engine_rx, shutdown_rx, state_for_run, intent_tx).await;
         });
 
-        let runtime = Runtime { task, state };
+        let runtime = Runtime {
+            task,
+            state,
+            cron_runner: None,
+            worktree_manager: None,
+        };
         (ui_tx, engine_tx, intent_rx, handle, runtime)
     }
 

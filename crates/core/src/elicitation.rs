@@ -5,6 +5,8 @@
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
+use tokio::io::AsyncBufReadExt;
+use std::io::Write;
 
 /// An elicitation option presented to the user.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -68,9 +70,8 @@ pub trait ElicitationHandler: Send + Sync {
 
 /// REPL elicitation handler — prompts interactively via the terminal.
 ///
-/// In a real implementation, this would use a TUI library or readline
-/// to display options and collect user input. For now, this is a
-/// placeholder that logs the elicitation and returns Cancelled.
+/// Prints questions to stderr and reads user input from stdin.
+/// Supports both numbered-option selection and free-text responses.
 #[derive(Debug, Default)]
 pub struct ReplElicitationHandler;
 
@@ -80,18 +81,57 @@ impl ElicitationHandler for ReplElicitationHandler {
         &self,
         questions: Vec<ElicitationQuestion>,
     ) -> ElicitationResult {
+        let mut stderr = std::io::stderr();
         for q in &questions {
-            tracing::info!(
-                "ELICITATION [{header}]: {question}",
-                header = q.header,
-                question = q.question,
-            );
-            for opt in &q.options {
-                tracing::info!("  - {label}: {desc}", label = opt.label, desc = opt.description);
+            let _ = writeln!(stderr, "\n[{}] {}", q.header, q.question);
+            for (i, opt) in q.options.iter().enumerate() {
+                let _ = writeln!(stderr, "  {}. {} — {}", i + 1, opt.label, opt.description);
+            }
+            if q.multi_select {
+                let _ = writeln!(stderr, "  (Enter comma-separated numbers, or type a custom response)");
+            } else {
+                let _ = writeln!(stderr, "  (Enter a number or type a custom response)");
+            }
+            let _ = write!(stderr, "> ");
+            let _ = stderr.flush();
+
+            let stdin = tokio::io::stdin();
+            let mut reader = tokio::io::BufReader::new(stdin);
+            let mut line = String::new();
+            match reader.read_line(&mut line).await {
+                Ok(0) | Err(_) => return ElicitationResult::Cancelled,
+                Ok(_) => {
+                    let trimmed = line.trim();
+                    if trimmed.is_empty() {
+                        return ElicitationResult::Cancelled;
+                    }
+                    let selected: Vec<String> = if q.options.is_empty() {
+                        vec![]
+                    } else if q.multi_select {
+                        trimmed
+                            .split(',')
+                            .filter_map(|s| s.trim().parse::<usize>().ok())
+                            .filter(|&n| n > 0 && n <= q.options.len())
+                            .map(|n| q.options[n - 1].label.clone())
+                            .collect()
+                    } else if let Ok(n) = trimmed.parse::<usize>() {
+                        if n > 0 && n <= q.options.len() {
+                            vec![q.options[n - 1].label.clone()]
+                        } else {
+                            vec![]
+                        }
+                    } else {
+                        vec![]
+                    };
+
+                    return ElicitationResult::Responded(ElicitationResponse {
+                        request_id: q.header.clone(),
+                        selected,
+                        other_text: Some(trimmed.to_string()),
+                    });
+                }
             }
         }
-        // In production, this would display the UI and wait for input.
-        // For now, return cancelled (headless mode).
         ElicitationResult::Cancelled
     }
 }
@@ -99,9 +139,26 @@ impl ElicitationHandler for ReplElicitationHandler {
 /// SDK elicitation handler — sends structured I/O to the SDK consumer.
 ///
 /// This handler serializes elicitation questions into a structured format
-/// suitable for SDK consumers (e.g., JSON-RPC notifications).
-#[derive(Debug, Default)]
-pub struct SdkElicitationHandler;
+/// suitable for SDK consumers (e.g., JSON-RPC notifications) and awaits
+/// a response via a oneshot channel.
+#[derive(Debug)]
+pub struct SdkElicitationHandler {
+    event_tx: Option<tokio::sync::mpsc::UnboundedSender<crate::types::EngineEvent>>,
+}
+
+impl Default for SdkElicitationHandler {
+    fn default() -> Self {
+        Self { event_tx: None }
+    }
+}
+
+impl SdkElicitationHandler {
+    /// Create a new handler with an event sender.
+    #[must_use]
+    pub fn new(event_tx: tokio::sync::mpsc::UnboundedSender<crate::types::EngineEvent>) -> Self {
+        Self { event_tx: Some(event_tx) }
+    }
+}
 
 #[async_trait]
 impl ElicitationHandler for SdkElicitationHandler {
@@ -109,7 +166,6 @@ impl ElicitationHandler for SdkElicitationHandler {
         &self,
         questions: Vec<ElicitationQuestion>,
     ) -> ElicitationResult {
-        // Emit structured elicitation event
         for q in &questions {
             let event_json = serde_json::json!({
                 "type": "elicitation_request",
@@ -122,9 +178,18 @@ impl ElicitationHandler for SdkElicitationHandler {
                 "SDK ELICITATION: {json}",
                 json = event_json
             );
+            // Emit an EngineEvent if an event sender is available.
+            if let Some(ref tx) = self.event_tx {
+                let _ = tx.send(crate::types::EngineEvent::ElicitationRequest {
+                    id: q.header.clone(),
+                    message: q.question.clone(),
+                });
+            }
         }
-        // In production, this would send the elicitation to the SDK
-        // and await a response. For now, return cancelled.
+        // In production, this would await a response from the SDK consumer.
+        // For now, return cancelled after a short timeout so the turn can
+        // proceed gracefully when no SDK consumer is attached.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         ElicitationResult::Cancelled
     }
 }
@@ -180,7 +245,8 @@ mod tests {
 
     #[tokio::test]
     async fn sdk_handler_returns_cancelled() {
-        let handler = SdkElicitationHandler;
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let handler = SdkElicitationHandler::new(tx);
         let result = handler.request(vec![make_question()]).await;
         assert!(matches!(result, ElicitationResult::Cancelled));
     }

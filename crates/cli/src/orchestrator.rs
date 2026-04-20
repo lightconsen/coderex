@@ -5,7 +5,7 @@ use coderex_config::{ConfigService, RuntimeOverrides, Settings};
 #[cfg(feature = "enterprise")]
 use coderex_config::{LoadingBarrier, RemoteManagedSettings, RemoteManagedSettingsClient, RemoteSettingsManager};
 use coderex_core::types::ModelId;
-use coderex_core::api_client::{AnthropicApiClient, ApiClient, ApiConfig};
+use coderex_core::api_client::ApiClient;
 use crate::cli::Cli;
 use std::io::IsTerminal;
 
@@ -546,26 +546,21 @@ impl StartupOrchestrator {
         None
     }
 
-    /// Create an API client if CODEREX_API_KEY or ANTHROPIC_API_KEY is set.
+    /// Create an API client from environment variables.
+    ///
+    /// Uses `ProviderConfig::from_env()` to build a [`ModelRouter`] that
+    /// supports multi-provider fallback (Anthropic → OpenAI → Groq → custom).
     fn try_create_api_client() -> Option<Box<dyn ApiClient>> {
-        let api_key = std::env::var("CODEREX_API_KEY")
-            .ok()
-            .filter(|k| !k.is_empty())
-            .or_else(|| {
-                std::env::var("ANTHROPIC_API_KEY")
-                    .ok()
-                    .filter(|k| !k.is_empty())
-            });
-
-        api_key.map(|key| {
-            let mut config = ApiConfig::new(key);
-            if let Ok(base_url) = std::env::var("CODEREX_BASE_URL") {
-                if !base_url.is_empty() {
-                    config.base_url = base_url;
-                }
-            }
-            Box::new(AnthropicApiClient::new(config)) as Box<dyn ApiClient>
-        })
+        let config = coderex_core::provider_config::ProviderConfig::from_env();
+        // Only build a router if at least one provider is configured.
+        if config.anthropic.is_none()
+            && config.openai.is_none()
+            && config.groq.is_none()
+            && config.custom.is_empty()
+        {
+            return None;
+        }
+        Some(Box::new(config.build_router()) as Box<dyn ApiClient>)
     }
 
     #[allow(clippy::unused_async)]

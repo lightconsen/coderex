@@ -39,15 +39,19 @@ pub fn register(registry: &mut CommandRegistry) {
         true,
         true,
         Arc::new(|ctx: &CommandContext, _args: &[String]| {
-            let output = format!(
-                "Session Cost: ${:.6}\nModel: {}\nInput Tokens: {}\nOutput Tokens: {}\nCache Read: {}\nCache Creation: {}",
-                ctx.cost_usd,
-                ctx.model.0,
-                ctx.input_tokens,
-                ctx.output_tokens,
-                ctx.cache_read_tokens,
-                ctx.cache_creation_tokens,
-            );
+            let output = if ctx.cost_summary.is_empty() {
+                format!(
+                    "Session Cost: ${:.6}\nModel: {}\nInput Tokens: {}\nOutput Tokens: {}\nCache Read: {}\nCache Creation: {}",
+                    ctx.cost_usd,
+                    ctx.model.0,
+                    ctx.input_tokens,
+                    ctx.output_tokens,
+                    ctx.cache_read_tokens,
+                    ctx.cache_creation_tokens,
+                )
+            } else {
+                ctx.cost_summary.clone()
+            };
             CommandResult::success(output)
         }),
     ));

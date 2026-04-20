@@ -308,8 +308,9 @@ impl PermissionEngine {
     }
 
     /// Recover orphaned permission requests from disk.
-    pub fn recover_orphaned(&mut self) -> Result<(), PermissionRequestError> {
-        self.pending.load()
+    pub fn recover_orphaned(&mut self) -> Result<Vec<PermissionRequest>, PermissionRequestError> {
+        self.pending.load()?;
+        Ok(self.pending.pending().into_iter().cloned().collect())
     }
 
     /// Get the current pending request count.
@@ -336,13 +337,29 @@ pub struct NoOpPermissionHook;
 #[allow(missing_debug_implementations)]
 pub struct ExplainPermissionHook {
     api_client: Box<dyn crate::api_client::ApiClient>,
+    event_tx: Option<tokio::sync::mpsc::UnboundedSender<crate::types::EngineEvent>>,
 }
 
 impl ExplainPermissionHook {
     /// Create a new hook with the given API client.
     #[must_use]
     pub fn new(api_client: Box<dyn crate::api_client::ApiClient>) -> Self {
-        Self { api_client }
+        Self {
+            api_client,
+            event_tx: None,
+        }
+    }
+
+    /// Create a new hook with an event sender for emitting `EngineEvent::PermissionExplanation`.
+    #[must_use]
+    pub fn new_with_event_tx(
+        api_client: Box<dyn crate::api_client::ApiClient>,
+        event_tx: tokio::sync::mpsc::UnboundedSender<crate::types::EngineEvent>,
+    ) -> Self {
+        Self {
+            api_client,
+            event_tx: Some(event_tx),
+        }
     }
 }
 
@@ -353,8 +370,6 @@ impl PermissionHook for ExplainPermissionHook {
         request: &PermissionRequest,
         _mode: crate::permissions::PermissionMode,
     ) -> Result<Option<PermissionResult>, PermissionRequestError> {
-        // Generate explanation — logged for downstream use.
-        // In a real implementation this would emit an event the UI subscribes to.
         let explanation = crate::prompts::explain_permission(
             self.api_client.as_ref(),
             &request.tool_name,
@@ -362,6 +377,14 @@ impl PermissionHook for ExplainPermissionHook {
         )
         .await
         .unwrap_or_else(|e| format!("[explanation unavailable: {e}]"));
+
+        // Emit an event so the UI can display the explanation.
+        if let Some(ref tx) = self.event_tx {
+            let _ = tx.send(crate::types::EngineEvent::PermissionExplanation {
+                tool: request.tool_name.clone(),
+                explanation: explanation.clone(),
+            });
+        }
 
         tracing::info!(
             tool = %request.tool_name,

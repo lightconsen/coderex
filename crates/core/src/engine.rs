@@ -11,6 +11,7 @@
 use tokio::sync::mpsc;
 use tokio::time::Instant;
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use crate::types::{EngineEvent, Message, ModelId, ToolCall, ToolResult, UsageSummary};
 use crate::budget::TokenBudget;
@@ -374,6 +375,11 @@ pub enum TerminalReason {
         /// How many times the pattern repeated.
         repetitions: usize,
     },
+    /// The API is unavailable after retry exhaustion.
+    ApiUnavailable {
+        /// Human-readable explanation.
+        message: String,
+    },
 }
 
 impl std::fmt::Display for TerminalReason {
@@ -388,6 +394,9 @@ impl std::fmt::Display for TerminalReason {
             Self::TokenLimitStop => write!(f, "token limit stop"),
             Self::LoopDetected { period, repetitions } => {
                 write!(f, "loop detected (period={period}, repetitions={repetitions})")
+            }
+            Self::ApiUnavailable { message } => {
+                write!(f, "api unavailable: {message}")
             }
         }
     }
@@ -652,6 +661,12 @@ pub struct QueryEngine {
     last_usage: Option<UsageSummary>,
     /// Loop detector for detecting repetitive tool call patterns.
     loop_detector: Option<LoopDetector>,
+    /// Last successful response content and usage (for graceful degradation).
+    last_successful_response: Option<(String, UsageSummary)>,
+    /// Optional team context for multi-agent collaboration.
+    team_context: Option<Arc<std::sync::Mutex<crate::team_context::TeamContext>>>,
+    /// Optional coordinator state for multi-phase workflows.
+    coordinator: Option<crate::coordinator::CoordinatorState>,
 }
 
 /// A denied tool call that should be summarized in the next turn.
@@ -692,6 +707,9 @@ impl QueryEngine {
             transcript_path: None,
             last_usage: None,
             loop_detector: Some(LoopDetector::new()),
+            last_successful_response: None,
+            team_context: None,
+            coordinator: None,
         }
     }
 
@@ -726,6 +744,40 @@ impl QueryEngine {
     /// by removing old messages and writing a compact boundary marker.
     pub fn set_transcript_path(&mut self, path: PathBuf) {
         self.transcript_path = Some(path);
+    }
+
+    /// Set the team context for multi-agent collaboration.
+    pub fn set_team_context(
+        &mut self,
+        context: Arc<std::sync::Mutex<crate::team_context::TeamContext>>,
+    ) {
+        self.team_context = Some(context);
+    }
+
+    /// Get a formatted cost summary from the cost tracker.
+    #[must_use]
+    pub fn cost_summary(&self) -> String {
+        self.cost_tracker.format_summary()
+    }
+
+    /// Set the coordinator state for multi-phase workflows.
+    pub fn set_coordinator(&mut self, coordinator: crate::coordinator::CoordinatorState) {
+        self.coordinator = Some(coordinator);
+    }
+
+    /// Recover orphaned permission requests from disk and emit them as
+    /// `EngineEvent::PermissionRequest` so the UI can surface them.
+    pub fn recover_orphaned_permissions(&mut self) {
+        let Ok(requests) = self.permission_engine.recover_orphaned() else {
+            return;
+        };
+        for req in requests {
+            let _ = self.event_tx.send(EngineEvent::PermissionRequest {
+                id: req.id,
+                tool: req.tool_name,
+                args: req.arguments.parse().unwrap_or_else(|_| serde_json::Value::Null),
+            });
+        }
     }
 
     /// Record tool calls from a turn and check for loops.
@@ -782,7 +834,6 @@ impl QueryEngine {
     ///
     /// Transitions the turn to `AwaitElicitation`, sends the elicitation via
     /// the handler, and stores the response.
-    #[allow(dead_code)]
     async fn handle_elicitation(
         &mut self,
         turn: &mut TurnRuntime,
@@ -930,16 +981,30 @@ impl QueryEngine {
             match self.execute_turn(&mut turn, &options, turn_number).await {
                 Ok(reason) => {
                     self.current_turn = turn_number;
+
+                    // Advance coordinator phase if present
+                    if let Some(ref mut coordinator) = self.coordinator {
+                        let summary = format!("Turn {turn_number}: {reason}");
+                        let _ = coordinator.advance(&summary);
+                    }
+
                     if matches!(
                         reason,
                         TerminalReason::Completed
                             | TerminalReason::TokenLimitStop
                             | TerminalReason::LoopDetected { .. }
+                            | TerminalReason::ApiUnavailable { .. }
                     ) {
                         // Check if we should continue (more turns needed for tool results)
                         break;
                     }
                     turn_number += 1;
+                }
+                Err(e) if e.starts_with("The AI service is temporarily unavailable") => {
+                    let reason = TerminalReason::ApiUnavailable { message: e };
+                    turn.terminate(reason.clone());
+                    self.current_turn = turn_number;
+                    return Ok(reason);
                 }
                 Err(e) => {
                     turn.terminate(TerminalReason::Error(e.clone()));
@@ -995,15 +1060,29 @@ impl QueryEngine {
             match self.execute_turn_streaming(&mut turn, &options, turn_number).await {
                 Ok(reason) => {
                     self.current_turn = turn_number;
+
+                    // Advance coordinator phase if present
+                    if let Some(ref mut coordinator) = self.coordinator {
+                        let summary = format!("Turn {turn_number}: {reason}");
+                        let _ = coordinator.advance(&summary);
+                    }
+
                     if matches!(
                         reason,
                         TerminalReason::Completed
                             | TerminalReason::TokenLimitStop
                             | TerminalReason::LoopDetected { .. }
+                            | TerminalReason::ApiUnavailable { .. }
                     ) {
                         break;
                     }
                     turn_number += 1;
+                }
+                Err(e) if e.starts_with("The AI service is temporarily unavailable") => {
+                    let reason = TerminalReason::ApiUnavailable { message: e };
+                    turn.terminate(reason.clone());
+                    self.current_turn = turn_number;
+                    return Ok(reason);
                 }
                 Err(e) => {
                     turn.terminate(TerminalReason::Error(e.clone()));
@@ -1066,6 +1145,26 @@ impl QueryEngine {
         let content = self.validate_structured_output(api_response.content.clone());
         let assistant_msg = Message::assistant(content.clone());
         turn.messages.push(assistant_msg);
+
+        // Elicitation heuristic: if the assistant asks a short question, prompt the user
+        let mut api_response = api_response;
+        if options.handle_elicitation && content.trim().ends_with('?') && content.len() < 200 {
+            let result = self.handle_elicitation(turn, format!("elic_{turn_number}"), content).await;
+            if let ElicitationResult::Responded(resp) = result {
+                if let Some(user_text) = resp.other_text.or_else(|| resp.selected.first().cloned()) {
+                    let user_msg = Message::user(user_text);
+                    turn.messages.push(user_msg.clone());
+                    self.session.messages.push(user_msg);
+                    // Re-send request with clarified context
+                    api_response = self.send_request(turn, options).await?;
+                    turn.budget.record_tokens(&api_response.usage);
+                    self.cost_tracker.record_usage(&api_response.usage, &self.model);
+                    self.last_usage = Some(api_response.usage);
+                    let new_content = self.validate_structured_output(api_response.content.clone());
+                    turn.messages.push(Message::assistant(new_content));
+                }
+            }
+        }
 
         // Use structured tool calls from the API response (blocking path).
         let tool_calls = api_response.tool_calls;
@@ -1225,7 +1324,7 @@ impl QueryEngine {
         turn.transition_to(TurnState::StreamAssistant);
 
         // Streaming request
-        let (content, tool_calls, early_results, usage) =
+        let (mut content, mut tool_calls, mut early_results, mut usage) =
             self.send_request_streaming(turn, options).await?;
 
         // Record budget and cost
@@ -1236,6 +1335,29 @@ impl QueryEngine {
         // Save assistant message
         let assistant_msg = Message::assistant(content.clone());
         turn.messages.push(assistant_msg);
+
+        // Elicitation heuristic: if the assistant asks a short question, prompt the user
+        if options.handle_elicitation && content.trim().ends_with('?') && content.len() < 200 {
+            let result = self.handle_elicitation(turn, format!("elic_{turn_number}"), content).await;
+            if let ElicitationResult::Responded(resp) = result {
+                if let Some(user_text) = resp.other_text.or_else(|| resp.selected.first().cloned()) {
+                    let user_msg = Message::user(user_text);
+                    turn.messages.push(user_msg.clone());
+                    self.session.messages.push(user_msg);
+                    // Re-send request with clarified context
+                    let (new_content, new_tool_calls, new_early_results, new_usage) =
+                        self.send_request_streaming(turn, options).await?;
+                    turn.budget.record_tokens(&new_usage);
+                    self.cost_tracker.record_usage(&new_usage, &self.model);
+                    self.last_usage = Some(new_usage);
+                    content = new_content;
+                    tool_calls = new_tool_calls;
+                    early_results = new_early_results;
+                    usage = new_usage;
+                    turn.messages.push(Message::assistant(content.clone()));
+                }
+            }
+        }
 
         // Apply early-executed tool results immediately so the model can see them
         for result in &early_results {
@@ -1578,7 +1700,7 @@ impl QueryEngine {
 
     /// Send the request to the API.
     async fn send_request(
-        &self,
+        &mut self,
         turn: &TurnRuntime,
         _options: &SubmitOptions,
     ) -> Result<ApiResponse, String> {
@@ -1617,11 +1739,24 @@ impl QueryEngine {
             })
             .collect();
 
-        let response = self
+        let response = match self
             .api_client
             .create_message(&system, &messages, &self.model, 4096)
             .await
-            .map_err(|e| e.to_string())?;
+        {
+            Ok(resp) => resp,
+            Err(crate::api_client::ApiError::RetryExhausted { attempts, last_error_message: _ }) => {
+                let msg = format!(
+                    "The AI service is temporarily unavailable after {attempts} attempts. Please try again later."
+                );
+                let _ = self.event_tx.send(EngineEvent::Notification { message: msg.clone() });
+                return Err(msg);
+            }
+            Err(e) => return Err(e.to_string()),
+        };
+
+        // Cache successful response for graceful degradation
+        self.last_successful_response = Some((response.content.clone(), response.usage));
 
         // Emit text delta event
         let _ = self
@@ -1918,38 +2053,6 @@ impl QueryEngine {
                 Ok(Some(result))
             }
         }
-    }
-
-    /// Extract tool calls from the assistant response text.
-    /// Fallback text-based tool call extraction.
-    ///
-    /// The blocking `submit()` path now uses `ApiResponse.tool_calls` directly.
-    /// This function remains as a fallback for edge cases where raw JSON text
-    /// needs to be parsed.
-    #[allow(dead_code)]
-    fn extract_tool_calls(content: &str) -> Vec<ToolCall> {
-        // Try to parse as JSON tool call array
-        if let Ok(calls) = serde_json::from_str::<Vec<ToolCall>>(content) {
-            return calls;
-        }
-
-        // Try to find a single tool call JSON object
-        if let Ok(call) = serde_json::from_str::<ToolCall>(content) {
-            return vec![call];
-        }
-
-        // Look for JSON array/object in the content
-        if let Some(start) = content.find('[') {
-            if let Some(end) = content.rfind(']') {
-                if let Ok(calls) =
-                    serde_json::from_str::<Vec<ToolCall>>(&content[start..=end])
-                {
-                    return calls;
-                }
-            }
-        }
-
-        Vec::new()
     }
 
     /// Execute pending tool calls with permission checks.
@@ -2290,28 +2393,6 @@ mod tests {
         assert!(opts.handle_elicitation);
     }
 
-    #[test]
-    fn extract_tool_calls_parses_json_array() {
-        let content = r#"[{"id":"tc_1","name":"read","input":{"path":"test.txt"}}]"#;
-        let calls = QueryEngine::extract_tool_calls(content);
-        assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].id, "tc_1");
-        assert_eq!(calls[0].name, "read");
-    }
-
-    #[test]
-    fn extract_tool_calls_parses_single_object() {
-        let content = r#"{"id":"tc_2","name":"bash","input":{"command":"ls"}}"#;
-        let calls = QueryEngine::extract_tool_calls(content);
-        assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].name, "bash");
-    }
-
-    #[test]
-    fn extract_tool_calls_returns_empty_for_plain_text() {
-        let calls = QueryEngine::extract_tool_calls("Just a regular text response");
-        assert!(calls.is_empty());
-    }
 
     #[test]
     fn build_context_loads_session_messages() {
@@ -2324,7 +2405,7 @@ mod tests {
 
     #[tokio::test]
     async fn send_request_returns_mock_response() {
-        let (engine, _rx, _session) = make_test_engine();
+        let (mut engine, _rx, _session) = make_test_engine();
         let budget = TokenBudget::with_defaults();
         let mut turn = TurnRuntime::new(budget);
         turn.messages.push(Message::user("hello"));
@@ -2354,6 +2435,78 @@ mod tests {
         let results = results.unwrap();
         assert_eq!(results.len(), 1);
         assert!(!results[0].is_error);
+    }
+
+    #[tokio::test]
+    async fn api_unavailable_returns_graceful_reason() {
+        struct FailingMock;
+
+        #[async_trait::async_trait]
+        impl ApiClient for FailingMock {
+            fn clone_box(&self) -> Box<dyn ApiClient> {
+                Box::new(FailingMock)
+            }
+
+            async fn create_message(
+                &self,
+                _system: &str,
+                _messages: &[serde_json::Value],
+                _model: &ModelId,
+                _max_tokens: u32,
+            ) -> Result<ApiResponse, crate::api_client::ApiError> {
+                Err(crate::api_client::ApiError::RetryExhausted {
+                    attempts: 3,
+                    last_error_message: "connection refused".into(),
+                })
+            }
+
+            async fn create_message_streaming(
+                &self,
+                _system: &str,
+                _messages: &[serde_json::Value],
+                _model: &ModelId,
+                _max_tokens: u32,
+            ) -> std::pin::Pin<Box<dyn futures::Stream<Item = StreamEvent> + Send + 'static>> {
+                let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+                let _ = tx.send(StreamEvent::StreamEnd);
+                Box::pin(futures::stream::unfold(rx, |mut rx| async move {
+                    rx.recv().await.map(|item| (item, rx))
+                }))
+            }
+        }
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let checker = PermissionChecker::new(PermissionMode::BypassPermissions);
+        let perm_engine = PermissionEngine::new(checker);
+        let session = SessionState::new(std::path::PathBuf::from("/tmp/test"));
+        let mut engine = QueryEngine::new(
+            Box::new(FailingMock),
+            ModelId::sonnet(),
+            session,
+            perm_engine,
+            tx,
+        );
+        engine.set_tool_executor(Box::new(StubOkToolExecutor));
+
+        let mut options = SubmitOptions::default();
+        options.handle_elicitation = false;
+
+        let result = engine.submit("hello".into(), options).await;
+
+        assert!(
+            matches!(result, Ok(TerminalReason::ApiUnavailable { .. })),
+            "expected ApiUnavailable, got {result:?}"
+        );
+
+        // Verify a Notification event was emitted
+        let mut found_notification = false;
+        while let Ok(event) = rx.try_recv() {
+            if matches!(event, EngineEvent::Notification { .. }) {
+                found_notification = true;
+                break;
+            }
+        }
+        assert!(found_notification, "expected Notification event to be emitted");
     }
 
     #[tokio::test]
@@ -2678,8 +2831,148 @@ mod tests {
     fn query_engine_has_default_elicitation_handler() {
         let (mut engine, _rx, _session) = make_test_engine();
         // Can set a custom handler
-        engine.set_elicitation_handler(Box::new(crate::elicitation::SdkElicitationHandler));
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        engine.set_elicitation_handler(Box::new(crate::elicitation::SdkElicitationHandler::new(tx)));
         // Handler was set without error
+    }
+
+    #[tokio::test]
+    async fn elicitation_heuristic_triggers_in_execute_turn() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct StatefulMock {
+            call_count: AtomicUsize,
+        }
+
+        #[async_trait::async_trait]
+        impl ApiClient for StatefulMock {
+            fn clone_box(&self) -> Box<dyn ApiClient> {
+                Box::new(StatefulMock {
+                    call_count: AtomicUsize::new(self.call_count.load(Ordering::SeqCst)),
+                })
+            }
+
+            async fn create_message(
+                &self,
+                _system: &str,
+                _messages: &[serde_json::Value],
+                _model: &ModelId,
+                _max_tokens: u32,
+            ) -> Result<ApiResponse, crate::api_client::ApiError> {
+                let count = self.call_count.fetch_add(1, Ordering::SeqCst);
+                if count == 0 {
+                    Ok(ApiResponse {
+                        content: "Which approach would you prefer?".into(),
+                        tool_calls: Vec::new(),
+                        usage: UsageSummary {
+                            input_tokens: 100,
+                            output_tokens: 50,
+                            cache_read_tokens: 0,
+                            cache_creation_tokens: 0,
+                        },
+                        stop_reason: "end_turn".into(),
+                    })
+                } else {
+                    Ok(ApiResponse {
+                        content: "Using approach A.".into(),
+                        tool_calls: Vec::new(),
+                        usage: UsageSummary {
+                            input_tokens: 100,
+                            output_tokens: 50,
+                            cache_read_tokens: 0,
+                            cache_creation_tokens: 0,
+                        },
+                        stop_reason: "end_turn".into(),
+                    })
+                }
+            }
+
+            async fn create_message_streaming(
+                &self,
+                _system: &str,
+                _messages: &[serde_json::Value],
+                _model: &ModelId,
+                _max_tokens: u32,
+            ) -> std::pin::Pin<Box<dyn futures::Stream<Item = StreamEvent> + Send + 'static>> {
+                let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+                let _ = tx.send(StreamEvent::StreamEnd);
+                Box::pin(futures::stream::unfold(rx, |mut rx| async move {
+                    rx.recv().await.map(|item| (item, rx))
+                }))
+            }
+        }
+
+        struct TestElicitationHandler;
+
+        #[async_trait::async_trait]
+        impl ElicitationHandler for TestElicitationHandler {
+            async fn request(
+                &self,
+                _questions: Vec<crate::elicitation::ElicitationQuestion>,
+            ) -> ElicitationResult {
+                ElicitationResult::Responded(crate::elicitation::ElicitationResponse {
+                    request_id: "elic_1".into(),
+                    selected: vec!["Approach A".into()],
+                    other_text: None,
+                })
+            }
+        }
+
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let checker = PermissionChecker::new(PermissionMode::BypassPermissions);
+        let perm_engine = PermissionEngine::new(checker);
+        let session = SessionState::new(std::path::PathBuf::from("/tmp/test"));
+        let api = StatefulMock {
+            call_count: AtomicUsize::new(0),
+        };
+        let mut engine = QueryEngine::new(
+            Box::new(api),
+            ModelId::sonnet(),
+            session,
+            perm_engine,
+            tx,
+        );
+        engine.set_tool_executor(Box::new(StubOkToolExecutor));
+        engine.set_elicitation_handler(Box::new(TestElicitationHandler));
+
+        let budget = TokenBudget::with_defaults();
+        let mut turn = TurnRuntime::new(budget);
+        let mut options = SubmitOptions::default();
+        options.handle_elicitation = true;
+
+        let reason = engine.execute_turn(&mut turn, &options, 1).await.unwrap();
+
+        assert_eq!(reason, TerminalReason::Completed);
+
+        // turn.messages should contain the user clarification and second assistant response
+        let user_texts: Vec<String> = turn
+            .messages
+            .iter()
+            .filter_map(|m| match (&m.role, &m.content) {
+                (crate::types::Role::User, crate::types::MessageContent::Text(t)) => Some(t.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(user_texts.iter().any(|t| t == "Approach A"), "expected user clarification in turn messages");
+
+        let assistant_texts: Vec<String> = turn
+            .messages
+            .iter()
+            .filter_map(|m| match (&m.role, &m.content) {
+                (crate::types::Role::Assistant, crate::types::MessageContent::Text(t)) => Some(t.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(assistant_texts.len(), 2, "expected two assistant messages: question and answer");
+        assert_eq!(assistant_texts[1], "Using approach A.");
+
+        // session.messages should contain the user clarification
+        assert!(
+            engine.session.messages.iter().any(|m| {
+                matches!(&m.content, crate::types::MessageContent::Text(t) if t == "Approach A")
+            }),
+            "expected user clarification in session messages"
+        );
     }
 
     // ─── Transcript Persistence ────────────────────────────────────────────

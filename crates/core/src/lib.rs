@@ -53,7 +53,7 @@ pub use file_traversal::{FileIterator, TraversalConfig, TraversalError, collect_
 pub use fuzzy_matcher::{FuzzyMatch, FuzzyMatcher, fuzzy_search};
 pub use markdown::{MarkdownConfig, MarkdownError, extract_frontmatter, markdown_to_commonmark, markdown_to_html, strip_markdown};
 pub use syntax::{SyntaxError, SyntaxHighlighter, Token};
-pub use scheduler::{CronError, CronSchedule, next_cron_time, validate_cron};
+pub use scheduler::{CronError, CronJob, CronRunner, CronSchedule, next_cron_time, validate_cron};
 pub use prompt::{AssembledContext, CompactConfig, PromptBlock, PromptCompiler, PromptContext};
 pub use compact::{
     CompactResult, CompactStrategy, auto_compact, compact_boundary_message, insert_compact_boundary,

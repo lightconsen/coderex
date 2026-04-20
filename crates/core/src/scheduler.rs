@@ -1,10 +1,173 @@
-//! Cron expression parsing and scheduling.
+//! Cron expression parsing, scheduling, and job execution.
 //!
 //! Wraps the `cron` crate for cron expression parsing and next-trigger calculation.
+//! Provides [`CronRunner`] for executing scheduled commands in a background task.
 
 use chrono::{DateTime, Utc};
+use std::collections::HashMap;
 use std::str::FromStr;
+use std::sync::Arc;
 use thiserror::Error;
+use tokio::process::Command;
+use tokio::sync::{mpsc, RwLock};
+
+/// A single cron job.
+#[derive(Debug, Clone)]
+pub struct CronJob {
+    /// Unique job identifier.
+    pub id: String,
+    /// Cron schedule.
+    pub schedule: CronSchedule,
+    /// Shell command to execute.
+    pub command: String,
+    /// Whether the job is enabled.
+    pub enabled: bool,
+}
+
+/// Runs cron jobs in a background task.
+#[derive(Debug)]
+pub struct CronRunner {
+    jobs: Arc<RwLock<Vec<CronJob>>>,
+    shutdown_tx: Option<mpsc::Sender<()>>,
+    handle: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl CronRunner {
+    /// Create a new cron runner with no jobs.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            jobs: Arc::new(RwLock::new(Vec::new())),
+            shutdown_tx: None,
+            handle: None,
+        }
+    }
+
+    /// Add a job to the runner.
+    pub async fn add_job(&self, job: CronJob) {
+        self.jobs.write().await.push(job);
+    }
+
+    /// Remove a job by id. Returns `true` if the job was found and removed.
+    pub async fn remove_job(&self, id: &str) -> bool {
+        let mut jobs = self.jobs.write().await;
+        if let Some(pos) = jobs.iter().position(|j| j.id == id) {
+            jobs.remove(pos);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// List all jobs.
+    #[must_use]
+    pub async fn list_jobs(&self) -> Vec<CronJob> {
+        self.jobs.read().await.clone()
+    }
+
+    /// Start the background execution loop.
+    ///
+    /// Does nothing if already started.
+    pub fn start(&mut self) {
+        if self.handle.is_some() {
+            return;
+        }
+        let (tx, mut rx) = mpsc::channel(1);
+        self.shutdown_tx = Some(tx);
+
+        let jobs = Arc::clone(&self.jobs);
+        let handle = tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
+            let mut last_run: HashMap<String, DateTime<Utc>> = HashMap::new();
+
+            loop {
+                tokio::select! {
+                    _ = interval.tick() => {
+                        let now = Utc::now();
+                        let jobs_guard = jobs.read().await;
+                        let mut ran_any = false;
+                        for job in jobs_guard.iter() {
+                            if !job.enabled {
+                                continue;
+                            }
+                            let should_run = match last_run.get(&job.id) {
+                                None => {
+                                    // First time seeing this job — seed last_run
+                                    // so it doesn't fire immediately on startup.
+                                    false
+                                }
+                                Some(last) => {
+                                    match job.schedule.next_after(last) {
+                                        Ok(next) => next <= now,
+                                        Err(_) => false,
+                                    }
+                                }
+                            };
+                            if should_run {
+                                let cmd = job.command.clone();
+                                let id = job.id.clone();
+                                let job_id_spawn = id.clone();
+                                tokio::spawn(async move {
+                                    tracing::info!(job_id = %job_id_spawn, command = %cmd, "executing cron job");
+                                    let parts: Vec<&str> = cmd.split_whitespace().collect();
+                                    if parts.is_empty() {
+                                        tracing::warn!(job_id = %job_id_spawn, "empty cron command");
+                                        return;
+                                    }
+                                    let mut command = Command::new(parts[0]);
+                                    command.args(&parts[1..]);
+                                    match command.output().await {
+                                        Ok(output) => {
+                                            if !output.status.success() {
+                                                let stderr = String::from_utf8_lossy(&output.stderr);
+                                                tracing::warn!(job_id = %job_id_spawn, stderr = %stderr, "cron job failed");
+                                            } else {
+                                                tracing::info!(job_id = %job_id_spawn, "cron job completed");
+                                            }
+                                        }
+                                        Err(e) => {
+                                            tracing::warn!(job_id = %job_id_spawn, error = %e, "cron job spawn failed");
+                                        }
+                                    }
+                                });
+                                last_run.insert(id, now);
+                                ran_any = true;
+                            } else if !last_run.contains_key(&job.id) {
+                                last_run.insert(job.id.clone(), now);
+                            }
+                        }
+                        drop(jobs_guard);
+                        if ran_any {
+                            // Small cooldown to avoid immediate re-fire
+                            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                        }
+                    }
+                    _ = rx.recv() => {
+                        tracing::info!("cron runner shutting down");
+                        break;
+                    }
+                }
+            }
+        });
+        self.handle = Some(handle);
+    }
+
+    /// Stop the background execution loop.
+    pub async fn stop(&mut self) {
+        if let Some(tx) = self.shutdown_tx.take() {
+            let _ = tx.send(()).await;
+        }
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.await;
+        }
+    }
+}
+
+impl Default for CronRunner {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 /// Errors from cron parsing and scheduling.
 #[derive(Debug, Error)]
@@ -243,5 +406,35 @@ mod tests {
     fn schedule_expression_returns_original() {
         let schedule = CronSchedule::new("30 14 * * *").unwrap();
         assert_eq!(schedule.expression(), "30 14 * * *");
+    }
+
+    #[tokio::test]
+    async fn cron_runner_lifecycle() {
+        let mut runner = CronRunner::new();
+
+        // Initially empty
+        assert!(runner.list_jobs().await.is_empty());
+
+        // Add a job
+        runner.add_job(CronJob {
+            id: "test_1".into(),
+            schedule: CronSchedule::new("0 * * * *").unwrap(),
+            command: "echo hello".into(),
+            enabled: true,
+        }).await;
+
+        let jobs = runner.list_jobs().await;
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].id, "test_1");
+
+        // Start and stop without panic
+        runner.start();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        runner.stop().await;
+
+        // Remove the job
+        assert!(runner.remove_job("test_1").await);
+        assert!(runner.list_jobs().await.is_empty());
+        assert!(!runner.remove_job("test_1").await);
     }
 }

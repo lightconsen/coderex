@@ -150,8 +150,15 @@ impl ReplLoop {
         let session_id = session.session_id;
         let checker = PermissionChecker::new(PermissionMode::default());
         let mut permission_engine = PermissionEngine::new(checker);
-        permission_engine.add_hook(Arc::new(ExplainPermissionHook::new(api_client.clone_box())));
+        let perm_path = std::path::PathBuf::from(&cwd)
+            .join(".coderex")
+            .join("permissions.json");
+        permission_engine.set_persist_path(perm_path);
         let (event_tx, event_rx) = mpsc::unbounded_channel::<EngineEvent>();
+        permission_engine.add_hook(Arc::new(ExplainPermissionHook::new_with_event_tx(
+            api_client.clone_box(),
+            event_tx.clone(),
+        )));
 
         let memory_base = std::path::PathBuf::from(&cwd).join(".coderex").join("memory");
         let session_memory_store = Arc::new(SessionMemoryStore::new(memory_base.join("session")));
@@ -177,6 +184,7 @@ impl ReplLoop {
             std::path::PathBuf::from(&cwd),
         );
         engine.set_tool_executor(Box::new(dispatcher));
+        engine.recover_orphaned_permissions();
 
         let orchestrator = coderex_core::orchestrator::Orchestrator::new(api_client.clone_box());
         let (bg_tx, bg_rx) = mpsc::unbounded_channel::<BackgroundTaskResult>();
@@ -601,6 +609,16 @@ impl ReplLoop {
                     }
 
                     match result {
+                        Ok(TerminalReason::ApiUnavailable { message }) => {
+                            ui_state.messages.push(Message {
+                                role: MessageRole::System,
+                                content: format!(
+                                    "The AI service is temporarily unavailable. Your conversation context is preserved. Please try again later.\n({message})"
+                                ).into(),
+                                tool_name: None,
+                                streaming: false,
+                            });
+                        }
                         Ok(_) => {
                             // Trigger background features after successful turn
                             let prompt_text = self.history.last().cloned().unwrap_or_default();
@@ -1189,6 +1207,11 @@ impl ReplLoop {
         }
 
         match result {
+            Ok(TerminalReason::ApiUnavailable { message }) => {
+                format!(
+                    "The AI service is temporarily unavailable. Your conversation context is preserved. Please try again later.\n({message})"
+                )
+            }
             Ok(reason) => {
                 if output.is_empty() {
                     format!("Query completed ({reason:?})")
@@ -1549,6 +1572,9 @@ impl ReplLoop {
         ctx.message_count = self.history.len();
         ctx.version = env!("CARGO_PKG_VERSION").to_string();
         ctx.feature_flags = HashMap::new();
+        if let Some(ref engine) = self.engine {
+            ctx.cost_summary = engine.cost_summary();
+        }
         ctx
     }
 }
