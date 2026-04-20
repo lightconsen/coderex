@@ -15,7 +15,11 @@ pub mod budget;
 pub mod cost;
 pub mod permissions;
 pub mod permission_engine;
+pub mod permission_manager;
+pub mod confirmation_bus;
 pub mod sandbox;
+pub mod loop_detector;
+pub mod shell_security;
 pub mod file_traversal;
 pub mod fuzzy_matcher;
 pub mod markdown;
@@ -25,6 +29,7 @@ pub mod prompt;
 pub mod compact;
 pub mod stop_hook;
 pub mod hook_executor;
+pub mod hook_security;
 pub mod tool_executor;
 pub mod tool_scheduler;
 pub mod elicitation;
@@ -36,6 +41,13 @@ pub mod team_context;
 pub mod orchestrator;
 pub mod query_profiles;
 pub mod prompts;
+pub mod wire_protocol;
+pub mod wire_transport;
+pub mod wire_adapter;
+pub mod provider;
+pub mod providers;
+pub mod model_router;
+pub mod provider_config;
 
 pub use file_traversal::{FileIterator, TraversalConfig, TraversalError, collect_files, count_files, traverse};
 pub use fuzzy_matcher::{FuzzyMatch, FuzzyMatcher, fuzzy_search};
@@ -89,5 +101,35 @@ pub use orchestrator::{
     BackgroundFeatureKind, BackgroundFeatureRequest, Orchestrator, OrchestratorError, QueryResult,
     run_background_feature, run_lightweight_query, run_side_query, run_forked_agent,
 };
+
+pub use confirmation_bus::{
+    ConfirmationBus, ConfirmationRequest, ConfirmationResponse, AutoApproveBus, AutoDenyBus,
+};
+
+pub use permission_manager::{
+    PermissionManager, PermissionManagerConfig, PermissionManagerError, RuleGroup,
+};
+
+pub use permission_engine::{
+    PermissionEngine, PermissionRequest, PermissionResponse, PermissionHook,
+    NoOpPermissionHook, ExplainPermissionHook, AutoApproveHook, BackgroundAgentDenyHook,
+    PendingPermissionStore, PermissionRequestError,
+};
+
+pub use hook_security::{
+    EnvInterpolator, InterpolationError, SsrfGuard, SsrfError, UrlValidator, UrlValidationError,
+};
+
+pub use shell_security::{
+    BashAst, BashCommand, DestructiveLevel, Redirect, RedirectKind,
+};
+
+pub use wire_protocol::{WireEvent, WireRequest, WireToolResult, encode_event, decode_event, encode_request, decode_request};
+pub use wire_transport::{WireTransport, InMemoryTransport, InMemoryTransportServer, StdioTransport, SinkTransport};
+pub use wire_adapter::{engine_event_to_wire, wire_event_to_engine, bridge_engine_to_wire, DualEventSink};
+
+pub use provider::{Provider, ProviderCapabilities, ProviderError, ProviderErrorKind, classify_api_error, provider_error_to_api};
+pub use model_router::{ModelRouter, RouteEntry};
+pub use provider_config::{ProviderConfig, ProviderEndpoint, NamedProviderEndpoint};
 
 pub mod test_utils;

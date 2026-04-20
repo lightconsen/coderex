@@ -47,6 +47,26 @@ impl Tool for EditTool {
         let path = resolve_path(&file_path, ctx.cwd);
         let path_buf = std::path::PathBuf::from(&path);
 
+        // Enforce sandbox path restrictions if a config is present
+        if let Some(config) = ctx
+            .extra
+            .get("sandbox_config")
+            .and_then(|v| v.downcast_ref::<coderex_core::sandbox::SandboxConfig>())
+        {
+            let allowed_read = &config.allowed_read_paths;
+            let allowed_write = &config.allowed_write_paths;
+            if !crate::sandbox_policy::is_path_allowed(&path_buf, allowed_read) {
+                return Err(ToolError::PermissionDenied {
+                    name: "Edit".into(),
+                });
+            }
+            if !crate::sandbox_policy::is_path_allowed(&path_buf, allowed_write) {
+                return Err(ToolError::PermissionDenied {
+                    name: "Edit".into(),
+                });
+            }
+        }
+
         let content = std::fs::read_to_string(&path_buf).map_err(|e| ToolError::InvalidInput {
             message: format!("failed to read file: {e}"),
         })?;

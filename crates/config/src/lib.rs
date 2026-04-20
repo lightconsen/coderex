@@ -20,6 +20,7 @@ pub use remote_settings::{
     RemoteSettingsError, RemoteSettingsManager, RemoteSettingsResponse,
 };
 pub use settings::{config_home, ConfigService, ConfigError, RuntimeOverrides, Settings};
+pub use flags::{CapabilitySet, FeatureFlags, FlagRegistry, percentage_rollout};
 #[cfg(feature = "enterprise")]
 pub use org_policy::{OrgPolicy, OrgPolicyError, OrgPolicyStore};
 #[cfg(feature = "enterprise")]

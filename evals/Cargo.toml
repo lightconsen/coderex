@@ -1,0 +1,27 @@
+[package]
+name = "coderex-evals"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "AI eval runner for CodeRex agent behavior regression tests"
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "eval-runner"
+path = "src/main.rs"
+
+[dependencies]
+coderex-core = { path = "../crates/core" }
+coderex-test-utils = { path = "../crates/test-utils" }
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+coderex-test-utils = { path = "../crates/test-utils" }

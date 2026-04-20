@@ -8,6 +8,7 @@ mod context;
 mod builtins;
 mod executor;
 mod dispatcher;
+mod sandbox_policy;
 mod todo_store;
 mod task_store;
 mod cron_scheduler;
@@ -26,6 +27,7 @@ pub use builtins::{
 };
 pub use executor::{ToolExecutor, ExecutionConfig};
 pub use dispatcher::RegistryToolDispatcher;
+pub use sandbox_policy::{default_sandbox_config, is_path_allowed};
 pub use todo_store::{TodoItem, TodoStatus, TodoStore, TODO_STORE_KEY};
 pub use task_store::{TaskRecord, TaskStatus, TaskStore, TASK_STORE_KEY};
 pub use cron_scheduler::{CronJob, CronScheduler, CRON_SCHEDULER_KEY};

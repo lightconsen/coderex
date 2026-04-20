@@ -196,6 +196,87 @@ macro_rules! feature_gate {
     };
 }
 
+/// Thread-safe registry for runtime feature flag queries.
+///
+/// Wraps [`FeatureFlags`] in a read-write lock so multiple components
+/// can query and update flags concurrently.
+#[derive(Debug, Clone, Default)]
+pub struct FlagRegistry {
+    flags: std::sync::Arc<std::sync::RwLock<FeatureFlags>>,
+}
+
+impl FlagRegistry {
+    /// Create a new registry with default flags.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Create a registry from parsed flags.
+    #[must_use]
+    pub fn from_flags(flags: FeatureFlags) -> Self {
+        Self {
+            flags: std::sync::Arc::new(std::sync::RwLock::new(flags)),
+        }
+    }
+
+    /// Load flags from environment and create a registry.
+    #[must_use]
+    pub fn from_env() -> Self {
+        Self::from_flags(FeatureFlags::from_env())
+    }
+
+    /// Get a snapshot of current flags.
+    #[must_use]
+    pub fn flags(&self) -> FeatureFlags {
+        self.flags.read().unwrap().clone()
+    }
+
+    /// Get current capabilities.
+    #[must_use]
+    pub fn capabilities(&self) -> CapabilitySet {
+        self.flags.read().unwrap().capabilities()
+    }
+
+    /// Check if a specific capability is enabled.
+    #[must_use]
+    pub fn has_capability(&self, cap: CapabilitySet) -> bool {
+        self.capabilities().contains(cap)
+    }
+
+    /// Update a flag by name.
+    pub fn set_flag(&self, name: &str, enable: bool) {
+        let mut flags = self.flags.write().unwrap();
+        flags.apply_flag(name, enable);
+    }
+
+    /// Apply experiment overrides.
+    pub fn apply_experiments(&self, experiments: &std::collections::HashMap<String, bool>) {
+        let mut flags = self.flags.write().unwrap();
+        for (name, &enabled) in experiments {
+            flags.apply_flag(name, enabled);
+        }
+    }
+}
+
+/// Determine if a feature should be enabled for this session based on
+/// a percentage rollout (0–100).
+///
+/// Uses a hash of the feature name + session identifier for stable
+/// assignment across restarts.
+#[must_use]
+pub fn percentage_rollout(feature_name: &str, session_id: &str, percentage: u8) -> bool {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+
+    let mut hasher = DefaultHasher::new();
+    feature_name.hash(&mut hasher);
+    session_id.hash(&mut hasher);
+    let hash = hasher.finish();
+
+    (hash % 100) < u64::from(percentage.clamp(0, 100))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -273,5 +354,56 @@ mod tests {
         assert!(flags.kairos);
         assert!(flags.team_collaboration);
         assert!(flags.auto_dream);
+    }
+
+    #[test]
+    fn flag_registry_read_write() {
+        let registry = FlagRegistry::new();
+        assert!(!registry.has_capability(CapabilitySet::DAEMON));
+
+        registry.set_flag("daemon", true);
+        assert!(registry.has_capability(CapabilitySet::DAEMON));
+
+        let flags = registry.flags();
+        assert!(flags.daemon);
+    }
+
+    #[test]
+    fn flag_registry_apply_experiments() {
+        let registry = FlagRegistry::new();
+        let mut experiments = HashMap::new();
+        experiments.insert("daemon".into(), true);
+        experiments.insert("buddy".into(), true);
+
+        registry.apply_experiments(&experiments);
+        assert!(registry.has_capability(CapabilitySet::DAEMON));
+        assert!(registry.has_capability(CapabilitySet::BUDDY));
+    }
+
+    #[test]
+    fn percentage_rollout_deterministic() {
+        // Same feature + session should always give the same result
+        let r1 = percentage_rollout("feature_a", "session_1", 50);
+        let r2 = percentage_rollout("feature_a", "session_1", 50);
+        assert_eq!(r1, r2);
+    }
+
+    #[test]
+    fn percentage_rollout_0_percent_always_false() {
+        assert!(!percentage_rollout("f", "s", 0));
+    }
+
+    #[test]
+    fn percentage_rollout_100_percent_always_true() {
+        assert!(percentage_rollout("f", "s", 100));
+    }
+
+    #[test]
+    fn percentage_rollout_different_sessions() {
+        // Different sessions may get different assignments
+        let _r1 = percentage_rollout("feature", "session_a", 50);
+        let _r2 = percentage_rollout("feature", "session_b", 50);
+        // We can't assert equality/inequality without knowing the hash,
+        // but the test ensures it doesn't panic.
     }
 }

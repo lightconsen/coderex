@@ -51,6 +51,7 @@ compact_str.workspace = true
 ratatui.workspace = true
 crossterm.workspace = true
 serde_json.workspace = true
+coderex-test-utils = { path = "../test-utils" }
 
 # ─── Release Tier Features ──────────────────────────────────────────────────
 # Each tier enables everything below it.

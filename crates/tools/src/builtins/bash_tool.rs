@@ -13,6 +13,7 @@ use crate::context::{ToolError, ToolOutput};
 use crate::tool::{Tool, ToolContext, ToolDescriptor, ToolInput, ToolTier};
 use async_trait::async_trait;
 use tokio::process::Command;
+use coderex_core::shell_security::BashAst;
 
 /// Build a `tokio::process::Command` for the given shell command,
 /// applying sandbox wrapping if a [`SandboxConfig`] is present in
@@ -131,6 +132,14 @@ impl Tool for BashTool {
             .unwrap_or(DEFAULT_TIMEOUT_SECS as i64)
             .clamp(1, MAX_TIMEOUT_SECS as i64) as u64;
 
+        // Shell security analysis
+        let ast = BashAst::parse(&command);
+        let security_warning = if ast.is_dangerous() {
+            Some(format!("[SECURITY WARNING: {}]\n", ast.summary()))
+        } else {
+            None
+        };
+
         let (mut cmd, _sandbox_handle) = build_sandboxed_command(&ctx, &command)?;
 
         let result = tokio::time::timeout(
@@ -149,6 +158,11 @@ impl Tool for BashTool {
 
         let mut output = String::new();
 
+        // Prepend security warning if dangerous
+        if let Some(warning) = security_warning {
+            output.push_str(&warning);
+        }
+
         // Truncate stdout if too large
         if stdout.len() > MAX_OUTPUT_BYTES {
             stdout.truncate(MAX_OUTPUT_BYTES);
@@ -165,8 +179,11 @@ impl Tool for BashTool {
             output.push_str(&stdout);
         }
         if !stderr.is_empty() {
-            if !output.is_empty() {
-                output.push_str("\n--- stderr ---\n");
+            if !output.is_empty() && !output.ends_with('\n') {
+                output.push('\n');
+            }
+            if !output.contains("--- stderr ---") {
+                output.push_str("--- stderr ---\n");
             }
             output.push_str(&stderr);
         }

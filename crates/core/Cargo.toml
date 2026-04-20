@@ -38,6 +38,9 @@ nucleo-matcher.workspace = true
 comrak.workspace = true
 syntect.workspace = true
 cron.workspace = true
+sha2.workspace = true
+async-stream.workspace = true
+toml.workspace = true
 
 # Optional
 wiremock = { workspace = true, optional = true }

@@ -15,6 +15,8 @@ pub struct ExecutionConfig {
     pub default_timeout: Duration,
     /// Maximum number of concurrent tool executions.
     pub max_concurrent: usize,
+    /// Whether to enforce sandbox restrictions for tool execution.
+    pub sandbox_enabled: bool,
 }
 
 impl Default for ExecutionConfig {
@@ -22,6 +24,7 @@ impl Default for ExecutionConfig {
         Self {
             default_timeout: Duration::from_secs(60),
             max_concurrent: 4,
+            sandbox_enabled: true,
         }
     }
 }
@@ -42,6 +45,12 @@ impl ToolExecutor {
             config,
             locks: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Return whether sandboxing is enabled.
+    #[must_use]
+    pub const fn sandbox_enabled(&self) -> bool {
+        self.config.sandbox_enabled
     }
 
     /// Get or create a lock for a specific tool name.

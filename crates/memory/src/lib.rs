@@ -13,6 +13,7 @@ pub mod session_memory_agent;
 pub mod extract_memories;
 pub mod prompts;
 
+pub use long_term::{LongTermStore, MemoryEntry, MemoryKey};
 pub use team_memory::{
     TeamMemoryEntry, TeamMemorySyncService, MemoryChecksum,
     SyncResult, RemoteState,

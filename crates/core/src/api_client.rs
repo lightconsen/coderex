@@ -179,7 +179,7 @@ pub trait ApiClient: Send + Sync {
 /// - Anthropic version header
 /// - Exponential backoff retry for transient failures
 /// - Model routing based on `ModelId`
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct AnthropicApiClient {
     config: ApiConfig,
     client: Client,

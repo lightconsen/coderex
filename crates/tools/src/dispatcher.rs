@@ -10,12 +10,14 @@
 use crate::context::{ExecutionContext, ToolError};
 use crate::executor::ToolExecutor as InnerExecutor;
 use crate::registry::ToolRegistry;
-use crate::tool::{ToolContext, ToolInput};
+use crate::sandbox_policy;
+use crate::tool::{ToolContext, ToolInput, SharedState};
 use coderex_core::tool_executor::{
     ToolDispatchOutcome, ToolExecutor as CoreToolExecutor,
 };
 use coderex_core::types::ToolResult;
 use serde_json::Value;
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -27,6 +29,7 @@ pub struct RegistryToolDispatcher {
     executor: Arc<InnerExecutor>,
     context: ExecutionContext,
     cwd: PathBuf,
+    sandbox_enabled: bool,
 }
 
 impl RegistryToolDispatcher {
@@ -39,12 +42,19 @@ impl RegistryToolDispatcher {
         context: ExecutionContext,
         cwd: PathBuf,
     ) -> Self {
+        let sandbox_enabled = executor.sandbox_enabled();
         Self {
             registry,
             executor,
             context,
             cwd,
+            sandbox_enabled,
         }
+    }
+
+    /// Enable or disable sandbox injection for dispatched tools.
+    pub fn set_sandbox_enabled(&mut self, enabled: bool) {
+        self.sandbox_enabled = enabled;
     }
 }
 
@@ -71,7 +81,20 @@ impl CoreToolExecutor for RegistryToolDispatcher {
             }
         };
 
-        let ctx = ToolContext::new(self.context, &self.cwd);
+        let mut ctx = ToolContext::new(self.context, &self.cwd);
+
+        // Inject sandbox config if enabled
+        if self.sandbox_enabled {
+            if let Some(config) = sandbox_policy::default_sandbox_config(tool_name, &self.cwd) {
+                let mut extra = HashMap::new();
+                extra.insert(
+                    "sandbox_config".to_string(),
+                    Box::new(config) as SharedState,
+                );
+                ctx = ctx.with_extra(extra);
+            }
+        }
+
         let call_input = ToolInput {
             call_id: tool_call_id.to_string(),
             name: tool_name.to_string(),

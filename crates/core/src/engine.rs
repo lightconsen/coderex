@@ -26,6 +26,7 @@ use crate::hook_executor::{HookExecutor, HookFireResult, NoOpHookExecutor};
 use crate::tool_executor::{NoOpToolExecutor, ToolExecutor};
 use crate::tool_scheduler;
 use crate::elicitation::{ElicitationHandler, ElicitationResult, ReplElicitationHandler};
+use crate::loop_detector::{LoopDetection, LoopDetector};
 use std::path::PathBuf;
 
 // ─── Structured Output Validation ───────────────────────────────────────────
@@ -351,6 +352,13 @@ pub enum TerminalReason {
     StopHook,
     /// The model's response was stopped due to token limit.
     TokenLimitStop,
+    /// A repetitive loop of tool calls was detected.
+    LoopDetected {
+        /// Period of the repeating pattern (1 = exact repeat, 2 = A-B, etc.).
+        period: usize,
+        /// How many times the pattern repeated.
+        repetitions: usize,
+    },
 }
 
 impl std::fmt::Display for TerminalReason {
@@ -363,6 +371,9 @@ impl std::fmt::Display for TerminalReason {
             Self::Error(msg) => write!(f, "error: {msg}"),
             Self::StopHook => write!(f, "stop hook"),
             Self::TokenLimitStop => write!(f, "token limit stop"),
+            Self::LoopDetected { period, repetitions } => {
+                write!(f, "loop detected (period={period}, repetitions={repetitions})")
+            }
         }
     }
 }
@@ -624,6 +635,8 @@ pub struct QueryEngine {
     transcript_path: Option<PathBuf>,
     /// Usage summary from the most recent model request.
     last_usage: Option<UsageSummary>,
+    /// Loop detector for detecting repetitive tool call patterns.
+    loop_detector: Option<LoopDetector>,
 }
 
 /// A denied tool call that should be summarized in the next turn.
@@ -663,6 +676,7 @@ impl QueryEngine {
             elicitation_handler: Box::new(ReplElicitationHandler),
             transcript_path: None,
             last_usage: None,
+            loop_detector: Some(LoopDetector::new()),
         }
     }
 
@@ -684,12 +698,58 @@ impl QueryEngine {
         self.tools = tools;
     }
 
+    /// Set the loop detector for detecting repetitive tool call patterns.
+    ///
+    /// Pass `None` to disable loop detection.
+    pub fn set_loop_detector(&mut self, detector: Option<LoopDetector>) {
+        self.loop_detector = detector;
+    }
+
     /// Set the transcript base path for persisting compact boundaries.
     ///
     /// When set, compact recovery will update the transcript file on disk
     /// by removing old messages and writing a compact boundary marker.
     pub fn set_transcript_path(&mut self, path: PathBuf) {
         self.transcript_path = Some(path);
+    }
+
+    /// Record tool calls from a turn and check for loops.
+    ///
+    /// Returns `Some(TerminalReason::LoopDetected)` if a loop is detected.
+    fn record_and_check_loop(&mut self, tool_calls: &[PendingToolCall]) -> Option<TerminalReason> {
+        let Some(ref mut detector) = self.loop_detector else {
+            return None;
+        };
+
+        let calls: Vec<ToolCall> = tool_calls
+            .iter()
+            .map(|c| ToolCall {
+                id: c.id.clone(),
+                name: c.name.clone(),
+                input: c.input.clone(),
+            })
+            .collect();
+
+        if calls.is_empty() {
+            detector.record_empty_turn();
+        } else {
+            detector.record_turn(&calls);
+        }
+
+        match detector.check() {
+            LoopDetection::Ok => None,
+            LoopDetection::LoopDetected {
+                period,
+                repetitions,
+                description,
+            } => {
+                tracing::warn!("Loop detected: {description}");
+                Some(TerminalReason::LoopDetected {
+                    period,
+                    repetitions,
+                })
+            }
+        }
     }
 
     /// Compact session messages by keeping only the first user message
@@ -837,7 +897,12 @@ impl QueryEngine {
             match self.execute_turn(&mut turn, &options, turn_number).await {
                 Ok(reason) => {
                     self.current_turn = turn_number;
-                    if matches!(reason, TerminalReason::Completed | TerminalReason::TokenLimitStop) {
+                    if matches!(
+                        reason,
+                        TerminalReason::Completed
+                            | TerminalReason::TokenLimitStop
+                            | TerminalReason::LoopDetected { .. }
+                    ) {
                         // Check if we should continue (more turns needed for tool results)
                         break;
                     }
@@ -897,7 +962,12 @@ impl QueryEngine {
             match self.execute_turn_streaming(&mut turn, &options, turn_number).await {
                 Ok(reason) => {
                     self.current_turn = turn_number;
-                    if matches!(reason, TerminalReason::Completed | TerminalReason::TokenLimitStop) {
+                    if matches!(
+                        reason,
+                        TerminalReason::Completed
+                            | TerminalReason::TokenLimitStop
+                            | TerminalReason::LoopDetected { .. }
+                    ) {
                         break;
                     }
                     turn_number += 1;
@@ -999,7 +1069,13 @@ impl QueryEngine {
                     let _ = self.fire_turn_end_hook(turn_number, &api_response.stop_reason).await;
 
                     if api_response.stop_reason == "max_tokens" {
+                        if let Some(reason) = self.record_and_check_loop(&[]) {
+                            return Ok(reason);
+                        }
                         return Ok(TerminalReason::TokenLimitStop);
+                    }
+                    if let Some(reason) = self.record_and_check_loop(&[]) {
+                        return Ok(reason);
                     }
                     return Ok(TerminalReason::Completed);
                 }
@@ -1013,7 +1089,13 @@ impl QueryEngine {
             let _ = self.fire_turn_end_hook(turn_number, &api_response.stop_reason).await;
 
             if api_response.stop_reason == "max_tokens" {
+                if let Some(reason) = self.record_and_check_loop(&[]) {
+                    return Ok(reason);
+                }
                 return Ok(TerminalReason::TokenLimitStop);
+            }
+            if let Some(reason) = self.record_and_check_loop(&[]) {
+                return Ok(reason);
             }
             return Ok(TerminalReason::Completed);
         }
@@ -1023,6 +1105,7 @@ impl QueryEngine {
             .iter()
             .map(PendingToolCall::from)
             .collect();
+        let pending_for_loop = turn.pending_tool_calls.clone();
 
         turn.transition_to(TurnState::ExecuteTools);
         let tool_results = self.execute_tool_calls(turn, options).await?;
@@ -1060,6 +1143,9 @@ impl QueryEngine {
 
         // If we have tool results, the model needs another turn
         // Return Completed here — the caller will start the next turn
+        if let Some(reason) = self.record_and_check_loop(&pending_for_loop) {
+            return Ok(reason);
+        }
         Ok(TerminalReason::Completed)
     }
 
@@ -1150,6 +1236,9 @@ impl QueryEngine {
                     turn.transition_to(TurnState::Finalize);
                     self.cost_tracker.end_turn(turn_number, &usage, &self.model);
                     let _ = self.fire_turn_end_hook(turn_number, "end_turn").await;
+                    if let Some(reason) = self.record_and_check_loop(&[]) {
+                        return Ok(reason);
+                    }
                     return Ok(TerminalReason::Completed);
                 }
                 turn.terminate(TerminalReason::BudgetExhausted);
@@ -1158,6 +1247,9 @@ impl QueryEngine {
             turn.transition_to(TurnState::Finalize);
             self.cost_tracker.end_turn(turn_number, &usage, &self.model);
             let _ = self.fire_turn_end_hook(turn_number, "end_turn").await;
+            if let Some(reason) = self.record_and_check_loop(&[]) {
+                return Ok(reason);
+            }
             return Ok(TerminalReason::Completed);
         }
 
@@ -1166,6 +1258,7 @@ impl QueryEngine {
             .iter()
             .map(PendingToolCall::from)
             .collect();
+        let pending_for_loop = turn.pending_tool_calls.clone();
 
         turn.transition_to(TurnState::ExecuteTools);
         let tool_results = self.execute_tool_calls(turn, options).await?;
@@ -1198,6 +1291,9 @@ impl QueryEngine {
         self.cost_tracker.end_turn(turn_number, &usage, &self.model);
         let _ = self.fire_turn_end_hook(turn_number, "end_turn").await;
 
+        if let Some(reason) = self.record_and_check_loop(&pending_for_loop) {
+            return Ok(reason);
+        }
         Ok(TerminalReason::Completed)
     }
 

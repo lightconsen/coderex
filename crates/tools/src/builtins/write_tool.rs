@@ -43,6 +43,27 @@ impl Tool for WriteTool {
         let path = resolve_path(&file_path, ctx.cwd);
         let path_buf = std::path::PathBuf::from(&path);
 
+        // Enforce sandbox path restrictions if a config is present
+        if let Some(config) = ctx
+            .extra
+            .get("sandbox_config")
+            .and_then(|v| v.downcast_ref::<coderex_core::sandbox::SandboxConfig>())
+        {
+            let allowed_write = &config.allowed_write_paths;
+            if !crate::sandbox_policy::is_path_allowed(&path_buf, allowed_write) {
+                return Err(ToolError::PermissionDenied {
+                    name: "Write".into(),
+                });
+            }
+            if let Some(parent) = path_buf.parent() {
+                if !crate::sandbox_policy::is_path_allowed(parent, allowed_write) {
+                    return Err(ToolError::PermissionDenied {
+                        name: "Write".into(),
+                    });
+                }
+            }
+        }
+
         if let Some(parent) = path_buf.parent() {
             std::fs::create_dir_all(parent).map_err(|e| ToolError::InvalidInput {
                 message: format!("failed to create directory: {e}"),
