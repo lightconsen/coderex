@@ -12,6 +12,7 @@ workspace = true
 
 [dependencies]
 coderex-core = { path = "../core" }
+coderex-agents = { path = "../agents" }
 coderex-config = { path = "../config" }
 coderex-memory = { path = "../memory" }
 

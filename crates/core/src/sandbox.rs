@@ -22,6 +22,7 @@
 
 #![allow(unsafe_code)]
 
+use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use thiserror::Error;
 
@@ -47,7 +48,7 @@ pub enum SandboxError {
 // ─── Configuration ──────────────────────────────────────────────────────────
 
 /// Configuration for a sandboxed process.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SandboxConfig {
     /// Paths the sandboxed process is allowed to read.
     pub allowed_read_paths: Vec<PathBuf>,

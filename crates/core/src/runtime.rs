@@ -224,6 +224,10 @@ impl UiState {
                 self.active_tool_calls.clear();
                 self.transcript.push(TranscriptEntry::SessionEnd);
             }
+            EngineEvent::AgentEvent { .. } => {
+                // Sub-agent events are handled by the parent engine / AgentManager.
+                // The REPL runtime does not need to render them directly.
+            }
         }
     }
 

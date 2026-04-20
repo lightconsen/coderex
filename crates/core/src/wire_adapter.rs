@@ -40,6 +40,10 @@ pub fn engine_event_to_wire(event: &EngineEvent) -> Option<WireEvent> {
             reason: reason.clone(),
         },
         EngineEvent::SessionEnd => WireEvent::SessionEnd,
+        EngineEvent::AgentEvent { agent_id, event } => WireEvent::AgentEvent {
+            agent_id: agent_id.clone(),
+            event: event.clone(),
+        },
     })
 }
 
@@ -75,6 +79,10 @@ pub fn wire_event_to_engine(event: &WireEvent) -> Option<EngineEvent> {
             reason: reason.clone(),
         },
         WireEvent::SessionEnd => EngineEvent::SessionEnd,
+        WireEvent::AgentEvent { agent_id, event } => EngineEvent::AgentEvent {
+            agent_id: agent_id.clone(),
+            event: event.clone(),
+        },
         WireEvent::UsageSummary { .. }
         | WireEvent::TurnStart { .. }
         | WireEvent::TurnEnd { .. }

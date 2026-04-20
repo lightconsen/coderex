@@ -102,6 +102,13 @@ pub enum WireEvent {
         /// Error message.
         message: String,
     },
+    /// An event from a sub-agent.
+    AgentEvent {
+        /// Agent identifier.
+        agent_id: String,
+        /// The lifecycle event.
+        event: crate::types::AgentLifecycleEvent,
+    },
 }
 
 /// Requests sent by the client over the wire.

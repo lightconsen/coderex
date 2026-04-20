@@ -855,6 +855,24 @@ impl QueryEngine {
         self.last_usage
     }
 
+    /// Get the total token usage accumulated across all completed turns.
+    #[must_use]
+    pub fn total_usage(&self) -> UsageSummary {
+        let mut total = UsageSummary {
+            input_tokens: 0,
+            output_tokens: 0,
+            cache_read_tokens: 0,
+            cache_creation_tokens: 0,
+        };
+        for turn in self.cost_tracker.get_turn_history() {
+            total.input_tokens += turn.usage.input_tokens;
+            total.output_tokens += turn.usage.output_tokens;
+            total.cache_read_tokens += turn.usage.cache_read_tokens;
+            total.cache_creation_tokens += turn.usage.cache_creation_tokens;
+        }
+        total
+    }
+
     /// Submit a user message and run the full turn loop.
     ///
     /// This is the main entry point for conversation turns. It will:

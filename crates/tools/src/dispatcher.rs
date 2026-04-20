@@ -30,6 +30,7 @@ pub struct RegistryToolDispatcher {
     context: ExecutionContext,
     cwd: PathBuf,
     sandbox_enabled: bool,
+    sandbox_override: Option<coderex_core::sandbox::SandboxConfig>,
 }
 
 impl RegistryToolDispatcher {
@@ -49,12 +50,18 @@ impl RegistryToolDispatcher {
             context,
             cwd,
             sandbox_enabled,
+            sandbox_override: None,
         }
     }
 
     /// Enable or disable sandbox injection for dispatched tools.
     pub fn set_sandbox_enabled(&mut self, enabled: bool) {
         self.sandbox_enabled = enabled;
+    }
+
+    /// Set a custom sandbox config that overrides the default per-tool policy.
+    pub fn set_sandbox_override(&mut self, config: Option<coderex_core::sandbox::SandboxConfig>) {
+        self.sandbox_override = config;
     }
 }
 
@@ -85,7 +92,11 @@ impl CoreToolExecutor for RegistryToolDispatcher {
 
         // Inject sandbox config if enabled
         if self.sandbox_enabled {
-            if let Some(config) = sandbox_policy::default_sandbox_config(tool_name, &self.cwd) {
+            let config = self
+                .sandbox_override
+                .clone()
+                .or_else(|| sandbox_policy::default_sandbox_config(tool_name, &self.cwd));
+            if let Some(config) = config {
                 let mut extra = HashMap::new();
                 extra.insert(
                     "sandbox_config".to_string(),

@@ -4,17 +4,25 @@
 //! tool whitelisting, messaging, resume support, and teammate events.
 
 use coderex_core::api_client::ApiClient;
+use coderex_core::engine::{QueryEngine, SubmitOptions, StructuredOutputValidator, ValidationResult};
 use coderex_core::orchestrator::{
     BackgroundFeatureRequest, QueryResult,
     run_background_feature, run_forked_agent,
 };
+use coderex_core::permission_engine::PermissionEngine;
+use coderex_core::permissions::{PermissionChecker, PermissionMode};
+use coderex_core::state::SessionState;
 use coderex_core::task::{TaskHandle, TaskKind, TaskManager};
+use coderex_core::tool_executor::ToolExecutor;
+use coderex_core::sandbox::SandboxConfig;
+use coderex_core::types::{AgentLifecycleEvent, EngineEvent, ModelId};
+use coderex_core::wire_adapter::engine_event_to_wire;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
-use tokio::sync::mpsc;
-use tokio::sync::Mutex;
+use std::time::Duration;
+use tokio::sync::{broadcast, mpsc, Mutex, Notify};
 use thiserror::Error;
 
 use crate::types::AgentType;
@@ -36,6 +44,58 @@ pub enum AgentError {
     /// Channel closed.
     #[error("agent channel closed: {0}")]
     ChannelClosed(String),
+    /// Validation failed after max retries.
+    #[error("agent output validation failed: {0}")]
+    ValidationFailed(String),
+    /// Agent timed out.
+    #[error("agent timed out after {0}s")]
+    Timeout(u64),
+}
+
+// ─── Retry Policy ───────────────────────────────────────────────────────────
+
+/// What to do when an agent fails.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FailureAction {
+    /// Retry the agent with the same or modified prompt.
+    Retry,
+    /// Escalate the failure to the parent session.
+    EscalateToParent,
+}
+
+/// Retry policy for agent execution.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RetryPolicy {
+    /// Maximum number of retries.
+    pub max_retries: u32,
+    /// Action to take when retries are exhausted.
+    pub on_failure: FailureAction,
+    /// Optional prompt to append on retry.
+    pub escalation_prompt: Option<String>,
+}
+
+impl Default for RetryPolicy {
+    fn default() -> Self {
+        Self {
+            max_retries: 2,
+            on_failure: FailureAction::EscalateToParent,
+            escalation_prompt: None,
+        }
+    }
+}
+
+// ─── Agent Result ───────────────────────────────────────────────────────────
+
+/// Result of a completed agent execution.
+#[derive(Debug, Clone)]
+pub struct AgentResult {
+    /// The agent's text output.
+    pub output: String,
+    /// Final status.
+    pub status: AgentStatus,
+    /// Token usage, if available.
+    pub token_usage: Option<u64>,
 }
 
 // ─── Spawn Options ──────────────────────────────────────────────────────────
@@ -57,6 +117,18 @@ pub struct SpawnOptions {
     pub extra_env: HashMap<String, String>,
     /// Whether the agent may write files (false = read-only tools).
     pub writable: bool,
+    /// Maximum tokens the agent may consume (0 = unlimited).
+    pub max_tokens: Option<u32>,
+    /// Maximum duration in seconds (0 = unlimited).
+    pub max_duration_seconds: Option<u64>,
+    /// Maximum number of turns (0 = unlimited).
+    pub max_turns: Option<u32>,
+    /// JSON schema for validating agent output.
+    pub output_schema: Option<serde_json::Value>,
+    /// Retry policy on failure.
+    pub retry_policy: Option<RetryPolicy>,
+    /// Sandbox configuration override (None = use default sandbox).
+    pub sandbox: Option<coderex_core::sandbox::SandboxConfig>,
 }
 
 impl Default for SpawnOptions {
@@ -69,6 +141,12 @@ impl Default for SpawnOptions {
             cwd: None,
             extra_env: HashMap::new(),
             writable: true,
+            max_tokens: None,
+            max_duration_seconds: None,
+            max_turns: None,
+            output_schema: None,
+            retry_policy: None,
+            sandbox: None,
         }
     }
 }
@@ -153,6 +231,15 @@ pub enum AgentStatus {
 
 // ─── Agent Instance ─────────────────────────────────────────────────────────
 
+/// Observable event from an agent for external subscribers.
+#[derive(Debug, Clone)]
+pub struct AgentObservableEvent {
+    /// The agent that emitted this event.
+    pub agent_id: String,
+    /// The engine event.
+    pub event: EngineEvent,
+}
+
 /// A running agent instance.
 #[derive(Debug)]
 pub struct AgentInstance {
@@ -172,6 +259,12 @@ pub struct AgentInstance {
     pub output_file: Option<PathBuf>,
     /// Agent's model override.
     pub model: Option<String>,
+    /// System prompt used for this agent.
+    pub prompt: String,
+    /// Background task handle for the running agent.
+    pub task_join_handle: Option<tokio::task::JoinHandle<()>>,
+    /// Notification for synchronous waiters.
+    pub completion_notify: Option<Arc<Notify>>,
 }
 
 impl AgentInstance {
@@ -192,6 +285,9 @@ impl AgentInstance {
             message_tx: None,
             output_file: None,
             model,
+            prompt: String::new(),
+            task_join_handle: None,
+            completion_notify: None,
         }
     }
 }
@@ -239,12 +335,20 @@ pub struct AgentManager {
     /// Active agent instances.
     agents: HashMap<String, AgentInstance>,
     /// Callback for teammate events.
-    #[allow(dead_code)]
     event_callback: Option<TeammateEventCallback>,
     /// Resumed agents (from a previous session).
     resumed_agents: Vec<String>,
     /// API client for forked/background AI execution.
     api_client: Option<Box<dyn ApiClient>>,
+    /// Event sender for forwarding agent events to the parent engine.
+    event_tx: Option<mpsc::UnboundedSender<EngineEvent>>,
+    /// Factory for creating tool executors for spawned agents.
+    /// The optional `SandboxConfig` allows per-agent sandbox overrides.
+    tool_executor_factory: Option<Arc<dyn Fn(Option<SandboxConfig>) -> Box<dyn ToolExecutor + Send + Sync> + Send + Sync>>,
+    /// Broadcast channel for agent observable events.
+    agent_event_broadcast: Option<broadcast::Sender<AgentObservableEvent>>,
+    /// Custom agent definitions loaded from config files.
+    custom_agents: HashMap<String, crate::custom_agents::CustomAgentDef>,
 }
 
 impl std::fmt::Debug for AgentManager {
@@ -266,6 +370,10 @@ impl AgentManager {
             event_callback: None,
             resumed_agents: Vec::new(),
             api_client: None,
+            event_tx: None,
+            tool_executor_factory: None,
+            agent_event_broadcast: None,
+            custom_agents: crate::custom_agents::load_custom_agents(),
         }
     }
 
@@ -288,10 +396,101 @@ impl AgentManager {
         self.event_callback = Some(Box::new(callback));
     }
 
+    /// Set the event sender for forwarding agent events to the parent engine.
+    pub fn set_event_sender(&mut self, tx: mpsc::UnboundedSender<EngineEvent>) {
+        self.event_tx = Some(tx);
+    }
+
+    /// Set the tool executor factory for spawned agents.
+    ///
+    /// Since `coderex-agents` cannot depend on `coderex-tools`, the caller
+    /// (e.g. the CLI or REPL) must provide a factory that creates a concrete
+    /// `ToolExecutor` implementation such as `RegistryToolDispatcher`.
+    pub fn set_tool_executor_factory<F>(&mut self, factory: F)
+    where
+        F: Fn(Option<SandboxConfig>) -> Box<dyn ToolExecutor + Send + Sync> + Send + Sync + 'static,
+    {
+        self.tool_executor_factory = Some(Arc::new(factory));
+    }
+
+    /// Subscribe to agent observable events.
+    #[must_use]
+    pub fn subscribe_to_agent(&self, _agent_id: &str) -> Option<broadcast::Receiver<AgentObservableEvent>> {
+        self.agent_event_broadcast.as_ref().map(|tx| tx.subscribe())
+    }
+
+    /// Wait for an agent to complete (synchronous execution).
+    pub async fn wait_for_completion(&self, agent_id: &str) -> Result<AgentResult, AgentError> {
+        let agent = self
+            .agents
+            .get(agent_id)
+            .ok_or_else(|| AgentError::NotFound(agent_id.to_string()))?;
+
+        // If already in a terminal state, return immediately.
+        // This avoids a race where notify_waiters() fires before notified().await.
+        match agent.status {
+            AgentStatus::Completed | AgentStatus::Failed | AgentStatus::Stopped => {
+                let output = if let Some(ref path) = agent.output_file {
+                    tokio::fs::read_to_string(path).await.unwrap_or_default()
+                } else {
+                    String::new()
+                };
+                let token_usage = Self::read_token_usage(agent.output_file.as_ref()).await;
+                return Ok(AgentResult {
+                    output,
+                    status: agent.status,
+                    token_usage,
+                });
+            }
+            _ => {}
+        }
+
+        if let Some(ref notify) = agent.completion_notify {
+            notify.notified().await;
+        }
+
+        let agent = self
+            .agents
+            .get(agent_id)
+            .ok_or_else(|| AgentError::NotFound(agent_id.to_string()))?;
+
+        let output = if let Some(ref path) = agent.output_file {
+            tokio::fs::read_to_string(path).await.unwrap_or_default()
+        } else {
+            String::new()
+        };
+
+        let token_usage = Self::read_token_usage(agent.output_file.as_ref()).await;
+
+        Ok(AgentResult {
+            output,
+            status: agent.status,
+            token_usage,
+        })
+    }
+
+    /// Read token usage from the companion `.meta.json` file for an agent.
+    async fn read_token_usage(output_file: Option<&PathBuf>) -> Option<u64> {
+        let meta_path = output_file?.with_extension("meta.json");
+        let content = tokio::fs::read_to_string(&meta_path).await.ok()?;
+        let meta: serde_json::Value = serde_json::from_str(&content).ok()?;
+        meta.get("token_usage")?.as_u64()
+    }
+
     /// Emit a teammate event (notifies callback if registered).
     fn emit_event(&self, event: TeammateEvent) {
         if let Some(ref cb) = self.event_callback {
             cb(event);
+        }
+    }
+
+    /// Emit an agent lifecycle event to the parent engine event stream.
+    fn emit_agent_lifecycle(&self, agent_id: &str, event: AgentLifecycleEvent) {
+        if let Some(ref tx) = self.event_tx {
+            let _ = tx.send(EngineEvent::AgentEvent {
+                agent_id: agent_id.to_string(),
+                event,
+            });
         }
     }
 
@@ -300,9 +499,14 @@ impl AgentManager {
     /// Creates a task handle, forks context from the parent session,
     /// applies tool whitelist, and starts the agent process.
     ///
+    /// If an API client is configured, the agent runs in a background
+    /// tokio task using a real [`QueryEngine`]. If no API client is
+    /// available, the agent is created but immediately marked as
+    /// complete with a placeholder output (useful for testing).
+    ///
     /// # Arguments
     /// * `agent_type` — Type of agent to spawn.
-    /// * `prompt` — System prompt for the agent.
+    /// * `prompt` — User prompt / task for the agent.
     /// * `options` — Spawn configuration.
     /// * `parent_session_id` — ID of the parent session for context fork.
     /// * `cwd` — Working directory.
@@ -334,13 +538,12 @@ impl AgentManager {
         let mut task_manager = self.task_manager.lock().await;
         let task = task_manager.create_task(kind);
         let task_id = task.id.clone();
-        // Mark as running
         let _ = task_manager.mark_running(&task_id);
         let task_handle = task_manager.get_task(&task_id).unwrap().clone();
         drop(task_manager);
 
         // Set up message channel
-        let (msg_tx, _msg_rx) = mpsc::unbounded_channel::<AgentMessage>();
+        let (msg_tx, mut msg_rx) = mpsc::unbounded_channel::<AgentMessage>();
 
         // Create output file path
         let output_file = options.cwd.as_ref().map_or_else(
@@ -349,8 +552,31 @@ impl AgentManager {
         );
 
         let agent_type_name_str = agent_type_name(&agent_type);
+        let system_prompt = system_prompt_for(&agent_type, prompt, &self.custom_agents);
 
-        // Clone task handle and create the agent
+        // Merge custom agent options if this is a named custom agent
+        let mut options = options;
+        if let AgentType::Custom { prompt: ref custom_name } = agent_type {
+            if let Some(def) = self.custom_agents.get(custom_name) {
+                if !def.allowed_tools.is_empty() && options.allowed_tools.is_none() {
+                    options.allowed_tools = Some(def.allowed_tools.clone());
+                }
+                if options.model_override.is_none() {
+                    options.model_override = def.model.clone();
+                }
+                if options.max_tokens.is_none() {
+                    options.max_tokens = def.max_tokens;
+                }
+                if options.output_schema.is_none() {
+                    options.output_schema = def.output_schema.clone();
+                }
+            }
+        }
+
+        // Completion notification for synchronous waits
+        let completion_notify = Arc::new(Notify::new());
+        let completion_notify_for_task = Arc::clone(&completion_notify);
+
         let mut instance = AgentInstance::new(
             agent_type,
             options.clone(),
@@ -360,18 +586,87 @@ impl AgentManager {
         instance.message_tx = Some(msg_tx);
         instance.output_file = Some(output_file.clone());
         instance.status = AgentStatus::Running;
+        instance.prompt = system_prompt.clone();
+        instance.completion_notify = Some(Arc::clone(&completion_notify));
 
-        // In a real implementation, this would spawn the actual process.
-        // For now, we log the spawn.
+        let agent_id = task_id.clone();
+
+        if let Some(ref api_client) = self.api_client {
+            let client = api_client.clone_box();
+            let model = options
+                .model_override
+                .as_ref()
+                .map(|m| ModelId(m.clone()))
+                .unwrap_or_else(ModelId::sonnet);
+            let max_tokens = options.max_tokens.unwrap_or(4096);
+            let max_duration = options.max_duration_seconds.unwrap_or(600);
+            let max_turns = options.max_turns.unwrap_or(50);
+            let allowed_tools = options.allowed_tools.clone();
+            let writable = options.writable;
+            let sandbox_config = options.sandbox.clone();
+            let retry_policy = options.retry_policy.clone();
+            let output_schema = options.output_schema.clone();
+            let user_prompt = prompt.to_string();
+            let output_file_path = output_file.clone();
+            let agent_id_for_task = agent_id.clone();
+            let event_tx = self.event_tx.clone();
+            let tool_factory = self.tool_executor_factory.clone();
+            let broadcast_tx = self.agent_event_broadcast.clone();
+
+            let handle = tokio::spawn(async move {
+                let result = run_agent_task(
+                    client,
+                    model,
+                    system_prompt,
+                    user_prompt,
+                    max_tokens,
+                    max_duration,
+                    max_turns,
+                    allowed_tools,
+                    writable,
+                    sandbox_config,
+                    output_file_path,
+                    agent_id_for_task,
+                    event_tx,
+                    tool_factory,
+                    broadcast_tx,
+                    retry_policy,
+                    output_schema,
+                    &mut msg_rx,
+                )
+                .await;
+
+                // Write result to output file
+                if let Ok(ref result) = result {
+                    let _ = tokio::fs::write(&output_file, &result.output).await;
+                }
+
+                completion_notify_for_task.notify_waiters();
+            });
+
+            instance.task_join_handle = Some(handle);
+        } else {
+            // No API client: write a placeholder and complete immediately.
+            // This preserves backward compatibility for tests.
+            let placeholder = format!(
+                "agent completed (no API client configured, no output file)\n\nAgent task: {prompt}"
+            );
+            let _ = tokio::fs::write(&output_file, &placeholder).await;
+            instance.status = AgentStatus::Completed;
+            completion_notify.notify_waiters();
+            tracing::warn!(
+                "agent spawned without API client: task_id={agent_id}, type={agent_type_name_str}"
+            );
+        }
+
+        self.agents.insert(agent_id.clone(), instance);
+
         tracing::info!(
-            "agent spawned: task_id={task_id}, type={agent_type_name_str}, prompt_len={}",
+            "agent spawned: task_id={agent_id}, type={agent_type_name_str}, prompt_len={}",
             prompt.len()
         );
 
-        let id = task_id.clone();
-        self.agents.insert(id, instance);
-
-        self.agents.get(&task_id).ok_or_else(|| {
+        self.agents.get(&agent_id).ok_or_else(|| {
             AgentError::SpawnFailed("agent not found after spawn".into())
         })
     }
@@ -591,6 +886,295 @@ impl AgentManager {
     }
 }
 
+/// Derive a system prompt from an agent type and user prompt.
+fn system_prompt_for(
+    agent_type: &AgentType,
+    user_prompt: &str,
+    custom_agents: &HashMap<String, crate::custom_agents::CustomAgentDef>,
+) -> String {
+    match agent_type {
+        AgentType::GeneralPurpose => format!(
+            "You are a general-purpose sub-agent. You help with a wide variety of tasks \
+             by reasoning step by step and using available tools when needed.\n\nTask: {user_prompt}"
+        ),
+        AgentType::Explore { thoroughness } => {
+            let depth = match thoroughness {
+                crate::types::Thoroughness::Quick => "quick scan",
+                crate::types::Thoroughness::Medium => "moderate depth",
+                crate::types::Thoroughness::VeryThorough => "full recursive analysis",
+            };
+            format!(
+                "You are an exploration agent specialized in analyzing codebases. \
+                 Thoroughness level: {depth}. Search thoroughly and report your findings.\n\nTask: {user_prompt}"
+            )
+        }
+        AgentType::Plan => format!(
+            "You are a planning agent. You analyze requirements and produce detailed, \
+             actionable implementation plans. Break down complex tasks into clear steps.\n\nTask: {user_prompt}"
+        ),
+        AgentType::Verification => format!(
+            "You are a verification agent. You review code, plans, or outputs for \
+             correctness, completeness, and adherence to requirements. Report issues clearly.\n\nTask: {user_prompt}"
+        ),
+        AgentType::ClaudeCodeGuide => format!(
+            "You are an expert on Claude Code. You answer questions about features, \
+             usage, configuration, and best practices for the Claude Code CLI tool.\n\nTask: {user_prompt}"
+        ),
+        AgentType::StatuslineSetup => format!(
+            "You help configure the Claude Code status line. You suggest settings, \
+             formatting, and customizations for the statusline display.\n\nTask: {user_prompt}"
+        ),
+        AgentType::Custom { prompt } => {
+            // If prompt matches a custom agent name, use its system prompt
+            if let Some(def) = custom_agents.get(prompt) {
+                return format!("{}\n\nTask: {user_prompt}", def.system_prompt);
+            }
+            if prompt.is_empty() {
+                user_prompt.to_string()
+            } else {
+                format!("{prompt}\n\nTask: {user_prompt}")
+            }
+        }
+    }
+}
+
+/// Run the actual agent task inside a spawned tokio task.
+///
+/// Creates a [`QueryEngine`], runs the submission, collects text output,
+/// and forwards lifecycle events to the parent.
+#[allow(clippy::too_many_arguments)]
+async fn run_agent_task(
+    api_client: Box<dyn ApiClient>,
+    model: ModelId,
+    system_prompt: String,
+    user_prompt: String,
+    max_tokens: u32,
+    max_duration: u64,
+    max_turns: u32,
+    allowed_tools: Option<Vec<String>>,
+    writable: bool,
+    sandbox_config: Option<SandboxConfig>,
+    output_file: PathBuf,
+    agent_id: String,
+    parent_event_tx: Option<mpsc::UnboundedSender<EngineEvent>>,
+    tool_factory: Option<Arc<dyn Fn(Option<SandboxConfig>) -> Box<dyn ToolExecutor + Send + Sync> + Send + Sync>>,
+    broadcast_tx: Option<broadcast::Sender<AgentObservableEvent>>,
+    retry_policy: Option<RetryPolicy>,
+    output_schema: Option<serde_json::Value>,
+    msg_rx: &mut mpsc::UnboundedReceiver<AgentMessage>,
+) -> Result<AgentResult, AgentError> {
+    // Notify parent that the agent started
+    if let Some(ref tx) = parent_event_tx {
+        let _ = tx.send(EngineEvent::AgentEvent {
+            agent_id: agent_id.clone(),
+            event: AgentLifecycleEvent::Started,
+        });
+    }
+
+    let max_retries = retry_policy.as_ref().map(|r| r.max_retries).unwrap_or(0);
+    let _on_failure = retry_policy.as_ref().map(|r| r.on_failure).unwrap_or(FailureAction::EscalateToParent);
+    let escalation_prompt = retry_policy.as_ref().and_then(|r| r.escalation_prompt.clone());
+
+    // Set up agent log file
+    let log_dir = home::home_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".coderex")
+        .join("agent_logs");
+    let log_path = log_dir.join(format!("{agent_id}.jsonl"));
+
+    let mut attempt_prompt = user_prompt;
+    let mut final_output = String::new();
+    let mut final_status = AgentStatus::Completed;
+    let mut final_error: Option<String> = None;
+    let mut total_token_usage: Option<u64> = None;
+
+    for attempt in 0..=max_retries {
+        // Drain any messages sent by the parent before this attempt
+        while let Ok(msg) = msg_rx.try_recv() {
+            attempt_prompt.push_str(&format!("\n\n[Message from parent]: {}", msg.content));
+        }
+
+        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        let session = SessionState::new(cwd);
+        let checker = PermissionChecker::new(PermissionMode::default());
+        let permission_engine = PermissionEngine::new(checker);
+
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel::<EngineEvent>();
+
+        let mut engine = QueryEngine::new(api_client.clone_box(), model.clone(), session, permission_engine, event_tx);
+
+        if let Some(ref factory) = tool_factory {
+            engine.set_tool_executor(factory(sandbox_config.clone()));
+        }
+
+        let mut options = SubmitOptions::default();
+        options.custom_system_prompt = Some(system_prompt.clone());
+        options.allowed_tools_override = if writable {
+            allowed_tools.clone()
+        } else {
+            let read_only = vec!["Read".into(), "Grep".into(), "Glob".into()];
+            match allowed_tools.clone() {
+                Some(tools) => Some(
+                    tools
+                        .into_iter()
+                        .filter(|t| read_only.iter().any(|r: &String| r.eq_ignore_ascii_case(t)))
+                        .collect(),
+                ),
+                None => Some(read_only),
+            }
+        };
+        options.max_turns = max_turns;
+        options.task_budget_tokens = u64::from(max_tokens);
+
+        let timeout = Duration::from_secs(max_duration);
+        let engine_result = tokio::time::timeout(timeout, engine.submit(attempt_prompt.clone(), options)).await;
+
+        // Capture total token usage before dropping the engine
+        let usage = engine.total_usage();
+        let attempt_tokens = usage.input_tokens + usage.output_tokens;
+        total_token_usage = Some(total_token_usage.unwrap_or(0) + attempt_tokens as u64);
+
+        // Drop engine to release event_tx so recv drains reliably
+        drop(engine);
+
+        // Collect text output from events and forward to observability channels
+        let mut attempt_output = String::new();
+        while let Ok(Some(event)) = tokio::time::timeout(Duration::from_secs(2), event_rx.recv()).await {
+            // Also drain any messages from parent while collecting events
+            while let Ok(msg) = msg_rx.try_recv() {
+                attempt_prompt.push_str(&format!("\n\n[Message from parent]: {}", msg.content));
+            }
+
+            if let EngineEvent::TextDelta(ref text) = event {
+                attempt_output.push_str(text);
+            }
+
+            // Forward to broadcast subscribers
+            if let Some(ref tx) = broadcast_tx {
+                let observable = AgentObservableEvent {
+                    agent_id: agent_id.clone(),
+                    event: event.clone(),
+                };
+                let _ = tx.send(observable);
+            }
+
+            // Append to NDJSON log file
+            if let Some(wire_event) = engine_event_to_wire(&event) {
+                if let Ok(json) = serde_json::to_string(&wire_event) {
+                    let _ = async {
+                        let _ = tokio::fs::create_dir_all(&log_dir).await;
+                        let mut file = tokio::fs::OpenOptions::new()
+                            .create(true)
+                            .append(true)
+                            .open(&log_path)
+                            .await?;
+                        use tokio::io::AsyncWriteExt;
+                        file.write_all(json.as_bytes()).await?;
+                        file.write_all(b"\n").await?;
+                        Ok::<(), std::io::Error>(())
+                    }
+                    .await;
+                }
+            }
+        }
+
+        match engine_result {
+            Ok(Ok(_)) => {
+                // Validate output against schema if provided
+                if let Some(ref schema) = output_schema {
+                    let validator = StructuredOutputValidator::new(schema.clone()).with_max_retries(2);
+                    match validator.validate(&attempt_output, 0) {
+                        ValidationResult::Valid(_) => {}
+                        ValidationResult::Invalid { error, .. } => {
+                            if attempt < max_retries {
+                                let retry_note = format!(
+                                    "\n\n{}",
+                                    validator.retry_instruction(&error)
+                                );
+                                attempt_prompt.push_str(&retry_note);
+                                continue;
+                            }
+                            final_output = attempt_output;
+                            final_status = AgentStatus::Failed;
+                            final_error = Some(format!("validation failed: {error}"));
+                            break;
+                        }
+                    }
+                }
+                final_output = attempt_output;
+                final_status = AgentStatus::Completed;
+                final_error = None;
+                break;
+            }
+            Ok(Err(e)) => {
+                let err_msg = format!("engine error: {e}");
+                if attempt < max_retries {
+                    // Build retry prompt with error context
+                    let mut retry_note = format!("\n\n[Previous attempt failed: {err_msg}. Retrying...]");
+                    if let Some(ref ep) = escalation_prompt {
+                        retry_note.push_str(&format!("\n{ep}"));
+                    }
+                    attempt_prompt.push_str(&retry_note);
+                    continue;
+                }
+                final_output = attempt_output;
+                final_status = AgentStatus::Failed;
+                final_error = Some(err_msg);
+            }
+            Err(_) => {
+                let err_msg = format!("agent timed out after {max_duration}s");
+                if attempt < max_retries {
+                    let mut retry_note = format!("\n\n[Previous attempt timed out after {max_duration}s. Retrying...]");
+                    if let Some(ref ep) = escalation_prompt {
+                        retry_note.push_str(&format!("\n{ep}"));
+                    }
+                    attempt_prompt.push_str(&retry_note);
+                    continue;
+                }
+                final_output = attempt_output;
+                final_status = AgentStatus::Failed;
+                final_error = Some(err_msg);
+            }
+        }
+    }
+
+    let (status, error) = (final_status, final_error);
+
+    // Notify parent of completion/failure
+    if let Some(ref tx) = parent_event_tx {
+        let lifecycle = if let Some(ref err) = error {
+            AgentLifecycleEvent::Failed {
+                error: err.clone(),
+            }
+        } else {
+            AgentLifecycleEvent::Completed {
+                summary: final_output.clone(),
+            }
+        };
+        let _ = tx.send(EngineEvent::AgentEvent {
+            agent_id: agent_id.clone(),
+            event: lifecycle,
+        });
+    }
+
+    // Write output to file
+    let _ = tokio::fs::write(&output_file, &final_output).await;
+
+    // Write companion meta file with token usage and final status
+    let meta_path = output_file.with_extension("meta.json");
+    let meta = serde_json::json!({
+        "status": status,
+        "token_usage": total_token_usage,
+    });
+    let _ = tokio::fs::write(&meta_path, meta.to_string()).await;
+
+    Ok(AgentResult {
+        output: final_output,
+        status,
+        token_usage: total_token_usage,
+    })
+}
+
 /// Get the string name of an agent type.
 fn agent_type_name(t: &AgentType) -> String {
     match t {
@@ -618,6 +1202,7 @@ pub async fn execute_via_agent(
 ) -> Result<String, AgentError> {
     let options = SpawnOptions {
         run_in_background: false,
+        cwd: Some(PathBuf::from(cwd)),
         ..Default::default()
     };
 
@@ -639,15 +1224,14 @@ pub async fn execute_via_agent(
     let task_id = instance.task_handle.id.clone();
     let output_file = instance.output_file.clone();
 
-    // Mark as completed (synchronous execution)
-    manager
-        .complete_agent(&task_id, command, "completed via agent")
-        .await?;
+    // Wait for the agent task to complete
+    manager.wait_for_completion(&task_id).await?;
 
     // Read output file if it exists
     if let Some(ref path) = output_file {
         if path.exists() {
-            return std::fs::read_to_string(path)
+            return tokio::fs::read_to_string(path)
+                .await
                 .map_err(|_| AgentError::SpawnFailed("could not read output".into()));
         }
     }
@@ -688,6 +1272,7 @@ pub async fn spawn_dream_agent(
     let options = SpawnOptions {
         run_in_background: true,
         allowed_tools: Some(allowed_tools),
+        cwd: Some(PathBuf::from(cwd)),
         ..Default::default()
     };
 
@@ -710,23 +1295,19 @@ pub async fn spawn_dream_agent(
         )
         .await?;
 
-    let task_id = instance.task_handle.id.clone();
     let output_file = instance.output_file.clone();
 
-    // Mark as completed
-    manager
-        .complete_agent(&task_id, "dream analysis", "dream completed")
-        .await?;
-
-    // Read output file if it exists
+    // Read output file if it exists (for no-API-client fallback it is written
+    // immediately; in production the background task writes it later).
     if let Some(ref path) = output_file {
         if path.exists() {
-            return std::fs::read_to_string(path)
+            return tokio::fs::read_to_string(path)
+                .await
                 .map_err(|_| AgentError::SpawnFailed("could not read dream output".into()));
         }
     }
 
-    Ok("dream agent completed (no output file written)".into())
+    Ok("dream agent spawned (background task running)".into())
 }
 
 #[cfg(test)]
@@ -767,7 +1348,8 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(instance.status, AgentStatus::Running);
+        // Without an API client the agent completes immediately.
+        assert_eq!(instance.status, AgentStatus::Completed);
         assert!(instance.context.is_some());
         let ctx = instance.context.as_ref().unwrap();
         assert_eq!(ctx.parent_session_id, "sess_1");
@@ -791,12 +1373,13 @@ mod tests {
             .unwrap();
         }
 
-        assert_eq!(mgr.running_count(), 3);
+        // Without an API client agents complete immediately.
+        assert_eq!(mgr.running_count(), 0);
         assert_eq!(mgr.list_agents().len(), 3);
     }
 
     #[tokio::test]
-    async fn send_message_to_running_agent() {
+    async fn send_message_to_completed_agent_errors() {
         let mut mgr = make_manager();
         mgr.spawn_agent(
             AgentType::GeneralPurpose,
@@ -811,8 +1394,10 @@ mod tests {
 
         let agent_id = mgr.list_agents()[0].task_handle.id.clone();
 
+        // Without an API client the agent completes immediately,
+        // so sending a message fails with NotRunning.
         let result = mgr.send_message(&agent_id, "follow up").await;
-        assert!(result.is_ok());
+        assert!(matches!(result, Err(AgentError::NotRunning(_))));
     }
 
     #[tokio::test]
@@ -950,10 +1535,16 @@ mod tests {
 
     #[tokio::test]
     async fn execute_via_agent_runs_command() {
+        let tmp = tempfile::tempdir().unwrap();
         let mut mgr = make_manager();
-        let output = super::execute_via_agent(&mut mgr, "explain this code", "sess_1", "/tmp")
-            .await
-            .unwrap();
+        let output = super::execute_via_agent(
+            &mut mgr,
+            "explain this code",
+            "sess_1",
+            tmp.path().to_str().unwrap(),
+        )
+        .await
+        .unwrap();
         assert!(output.contains("agent completed"));
     }
 
@@ -1018,6 +1609,7 @@ mod tests {
 
     #[tokio::test]
     async fn spawn_dream_agent_runs_with_readonly_tools() {
+        let tmp = tempfile::tempdir().unwrap();
         let mut mgr = make_manager();
         let dream_prompt = "Analyze recent sessions for patterns.";
         let summaries = vec!["Session 1: Fixed auth bug", "Session 2: Added tests"];
@@ -1026,7 +1618,7 @@ mod tests {
             &mut mgr,
             dream_prompt,
             "sess_parent",
-            "/tmp",
+            tmp.path().to_str().unwrap(),
             &summaries,
         )
         .await

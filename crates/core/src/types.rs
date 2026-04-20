@@ -135,6 +135,37 @@ impl ModelId {
     }
 }
 
+/// Lifecycle events for a sub-agent.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AgentLifecycleEvent {
+    /// Agent started execution.
+    Started,
+    /// Agent completed its task.
+    Completed {
+        /// Summary of work done.
+        summary: String,
+    },
+    /// Agent failed.
+    Failed {
+        /// Error message.
+        error: String,
+    },
+    /// Agent is idle.
+    Idle {
+        /// Reason for idleness.
+        reason: String,
+    },
+    /// Agent executed a tool call.
+    ToolCall {
+        /// Tool name.
+        name: String,
+        /// Tool arguments.
+        args: serde_json::Value,
+    },
+    /// Agent produced a text delta.
+    TextDelta(String),
+}
+
 /// Events emitted by the engine to the UI/SDK.
 #[derive(Debug, Clone)]
 #[non_exhaustive]
@@ -184,6 +215,13 @@ pub enum EngineEvent {
     },
     /// The session has ended.
     SessionEnd,
+    /// An event from a sub-agent.
+    AgentEvent {
+        /// Agent identifier.
+        agent_id: String,
+        /// The lifecycle event.
+        event: AgentLifecycleEvent,
+    },
 }
 
 #[cfg(test)]
