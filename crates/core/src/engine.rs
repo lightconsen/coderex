@@ -232,7 +232,15 @@ impl StreamingToolCallAssembler {
             StreamEvent::ToolCallBlockEnd { id, input } => {
                 let completed = if let Some((name, builder)) = self.pending.remove(&id) {
                     let input = if input.is_null() {
-                        serde_json::from_str(&builder).unwrap_or(serde_json::json!({}))
+                        match serde_json::from_str(&builder) {
+                            Ok(v) => v,
+                            Err(e) => {
+                                tracing::warn!(
+                                    "tool call {id} ({name}) has malformed JSON input: {e}\naccumulated: {builder}"
+                                );
+                                return Vec::new();
+                            }
+                        }
                     } else {
                         input
                     };
@@ -248,11 +256,18 @@ impl StreamingToolCallAssembler {
                 // Finalize any pending tool calls from accumulated JSON
                 let mut calls = Vec::new();
                 for (id, (name, builder)) in self.pending.drain() {
-                    let input: serde_json::Value =
-                        serde_json::from_str(&builder).unwrap_or(serde_json::json!({}));
-                    let call = ToolCall { id, name, input };
-                    self.completed.push(call.clone());
-                    calls.push(call);
+                    match serde_json::from_str(&builder) {
+                        Ok(input) => {
+                            let call = ToolCall { id, name, input };
+                            self.completed.push(call.clone());
+                            calls.push(call);
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                "tool call {id} ({name}) has malformed JSON input at stream end: {e}\naccumulated: {builder}"
+                            );
+                        }
+                    }
                 }
                 calls
             }
@@ -1052,8 +1067,8 @@ impl QueryEngine {
         let assistant_msg = Message::assistant(content.clone());
         turn.messages.push(assistant_msg);
 
-        // Check for tool calls in the response
-        let tool_calls = Self::extract_tool_calls(&content);
+        // Use structured tool calls from the API response (blocking path).
+        let tool_calls = api_response.tool_calls;
 
         if tool_calls.is_empty() {
             // No tool calls — turn is complete
@@ -1415,8 +1430,7 @@ impl QueryEngine {
         let strategy = compact::select_compact_strategy(
             stop_reason,
             estimated_tokens,
-            self.compact_config.auto_compact_threshold,
-            self.compact_config.reactive_compact_threshold,
+            &self.model,
             turn.budget.is_near_limit(),
         );
 
@@ -1907,9 +1921,12 @@ impl QueryEngine {
     }
 
     /// Extract tool calls from the assistant response text.
+    /// Fallback text-based tool call extraction.
     ///
-    /// In a production implementation, tool calls come as structured blocks
-    /// from the API response. Here we use a simple text-based heuristic.
+    /// The blocking `submit()` path now uses `ApiResponse.tool_calls` directly.
+    /// This function remains as a fallback for edge cases where raw JSON text
+    /// needs to be parsed.
+    #[allow(dead_code)]
     fn extract_tool_calls(content: &str) -> Vec<ToolCall> {
         // Try to parse as JSON tool call array
         if let Ok(calls) = serde_json::from_str::<Vec<ToolCall>>(content) {
@@ -2151,6 +2168,7 @@ mod tests {
         ) -> Result<ApiResponse, crate::api_client::ApiError> {
             Ok(ApiResponse {
                 content: "Hello from the mock assistant.".into(),
+                tool_calls: Vec::new(),
                 usage: UsageSummary {
                     input_tokens: 100,
                     output_tokens: 50,

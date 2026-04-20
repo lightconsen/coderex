@@ -190,6 +190,7 @@ impl Provider for OpenAiCompatibleProvider {
 
             Ok(ApiResponse {
                 content,
+                tool_calls: Vec::new(),
                 usage,
                 stop_reason,
             })

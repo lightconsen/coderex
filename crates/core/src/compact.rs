@@ -7,7 +7,7 @@
 //! - **Snip**: Truncate history at a boundary point, preserving essential context
 
 use crate::prompt::PromptCompiler;
-use crate::types::{Message, MessageContent, Role, ToolResult};
+use crate::types::{Message, MessageContent, ModelId, Role, ToolResult};
 
 // ─── Compact Strategy ───────────────────────────────────────────────────────
 
@@ -382,15 +382,22 @@ fn insert_compact_boundary_messages(messages: &mut Vec<Message>) {
 
 // ─── Compact Strategy Selection ─────────────────────────────────────────────
 
-/// Select the appropriate compact strategy based on current state.
+/// Select the appropriate compact strategy based on current state and model.
+///
+/// Thresholds are computed as percentages of the model's context window:
+/// - auto: 50% of context window
+/// - reactive: 90% of context window
 #[must_use]
 pub fn select_compact_strategy(
     stop_reason: &str,
     estimated_tokens: usize,
-    auto_threshold: usize,
-    reactive_threshold: usize,
+    model: &ModelId,
     budget_near_limit: bool,
 ) -> CompactStrategy {
+    let window = model.context_window();
+    let auto_threshold = window * 50 / 100;
+    let reactive_threshold = window * 90 / 100;
+
     if stop_reason == "max_tokens" {
         return CompactStrategy::Reactive;
     }
@@ -566,31 +573,41 @@ mod tests {
 
     #[test]
     fn select_strategy_max_tokens_is_reactive() {
-        let strategy = select_compact_strategy("max_tokens", 50000, 100000, 180000, false);
+        let strategy = select_compact_strategy("max_tokens", 50000, &ModelId::sonnet(), false);
         assert!(matches!(strategy, CompactStrategy::Reactive));
     }
 
     #[test]
     fn select_strategy_over_reactive_threshold_is_reactive() {
-        let strategy = select_compact_strategy("end_turn", 200000, 100000, 180000, false);
+        // Sonnet window = 200_000, reactive = 90% = 180_000
+        let strategy = select_compact_strategy("end_turn", 190_000, &ModelId::sonnet(), false);
         assert!(matches!(strategy, CompactStrategy::Reactive));
     }
 
     #[test]
     fn select_strategy_over_auto_threshold_is_auto() {
-        let strategy = select_compact_strategy("end_turn", 150000, 100000, 180000, false);
+        // Sonnet window = 200_000, auto = 50% = 100_000
+        let strategy = select_compact_strategy("end_turn", 110_000, &ModelId::sonnet(), false);
         assert!(matches!(strategy, CompactStrategy::Auto));
     }
 
     #[test]
     fn select_strategy_budget_near_limit_is_micro() {
-        let strategy = select_compact_strategy("end_turn", 50000, 100000, 180000, true);
+        let strategy = select_compact_strategy("end_turn", 50000, &ModelId::sonnet(), true);
         assert!(matches!(strategy, CompactStrategy::Micro));
     }
 
     #[test]
     fn select_strategy_default_is_snip() {
-        let strategy = select_compact_strategy("end_turn", 50000, 100000, 180000, false);
+        let strategy = select_compact_strategy("end_turn", 50000, &ModelId::sonnet(), false);
         assert!(matches!(strategy, CompactStrategy::Snip));
+    }
+
+    #[test]
+    fn select_strategy_over_auto_threshold_is_auto_for_default_window() {
+        // Default window is 200K: auto=100K, reactive=180K
+        let model = ModelId("custom-model".into());
+        let strategy = select_compact_strategy("end_turn", 110_000, &model, false);
+        assert!(matches!(strategy, CompactStrategy::Auto));
     }
 }

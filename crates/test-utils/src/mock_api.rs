@@ -103,6 +103,7 @@ impl ApiClient for MockApiClient {
             Some(MockResponse::Error(e)) => Err(e),
             _ => Ok(ApiResponse {
                 content: "mock fallback".into(),
+                tool_calls: Vec::new(),
                 usage: UsageSummary {
                     input_tokens: 0,
                     output_tokens: 0,
@@ -141,6 +142,26 @@ impl ApiClient for MockApiClient {
 pub fn mock_response(content: impl Into<String>) -> ApiResponse {
     ApiResponse {
         content: content.into(),
+        tool_calls: Vec::new(),
+        usage: UsageSummary {
+            input_tokens: 100,
+            output_tokens: 50,
+            cache_read_tokens: 0,
+            cache_creation_tokens: 0,
+        },
+        stop_reason: "end_turn".into(),
+    }
+}
+
+/// Build a static API response with tool calls for testing.
+#[must_use]
+pub fn mock_response_with_tool_calls(
+    content: impl Into<String>,
+    tool_calls: Vec<coderex_core::types::ToolCall>,
+) -> ApiResponse {
+    ApiResponse {
+        content: content.into(),
+        tool_calls,
         usage: UsageSummary {
             input_tokens: 100,
             output_tokens: 50,

@@ -22,9 +22,9 @@
 //! # }
 //! ```
 
-use crate::mock_api::{MockApiClient, MockResponseType, mock_response};
+use crate::mock_api::{MockApiClient, MockResponseType, mock_response, mock_response_with_tool_calls};
 use crate::rig::{StubOkToolExecutor, TestRigBuilder};
-use coderex_core::types::EngineEvent;
+use coderex_core::types::{EngineEvent, ToolCall};
 use std::future::Future;
 use std::pin::Pin;
 
@@ -105,7 +105,14 @@ pub async fn run_eval(scenario: EvalScenario) -> EvalResult {
     let api_responses: Vec<MockResponseType> = scenario
         .responses
         .into_iter()
-        .map(|r| MockResponseType::Static(mock_response(r)))
+        .map(|r| {
+            // Try to parse as a JSON array of ToolCall first
+            if let Ok(tool_calls) = serde_json::from_str::<Vec<ToolCall>>(&r) {
+                MockResponseType::Static(mock_response_with_tool_calls("", tool_calls))
+            } else {
+                MockResponseType::Static(mock_response(r))
+            }
+        })
         .collect();
 
     let api = MockApiClient::with_mixed(api_responses);

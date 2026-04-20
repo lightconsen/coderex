@@ -621,6 +621,7 @@ mod tests {
         ) -> Result<ApiResponse, ApiError> {
             Ok(ApiResponse {
                 content: r#"{"title": "Fix auth bug"}"#.into(),
+                tool_calls: Vec::new(),
                 usage: UsageSummary {
                     input_tokens: 100,
                     output_tokens: 20,

@@ -155,6 +155,7 @@ mod tests {
         ) -> Result<ApiResponse, crate::api_client::ApiError> {
             Ok(ApiResponse {
                 content: self.response_content.clone(),
+                tool_calls: Vec::new(),
                 usage: UsageSummary {
                     input_tokens: 200,
                     output_tokens: 100,

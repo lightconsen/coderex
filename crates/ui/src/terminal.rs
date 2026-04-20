@@ -9,9 +9,16 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 use std::io::Stdout;
+use std::sync::OnceLock;
 use crate::message_list::MessageRole;
 use crate::state::UiState;
 use crate::statusline::Statusline;
+
+/// Lazy-initialized syntax highlighter for the TUI.
+fn syntax_highlighter() -> &'static coderex_core::syntax::SyntaxHighlighter {
+    static HIGHLIGHTER: OnceLock<coderex_core::syntax::SyntaxHighlighter> = OnceLock::new();
+    HIGHLIGHTER.get_or_init(coderex_core::syntax::SyntaxHighlighter::new)
+}
 
 /// ASCII T-Rex welcome art (larger variant).
 const T_REX: &str = r#"
@@ -193,6 +200,84 @@ fn message_display_height(msg: &crate::message_list::Message, width: usize) -> u
     height
 }
 
+/// Convert a hex colour string (#RRGGBB) to a ratatui `Color`.
+fn hex_to_color(hex: &str) -> Color {
+    let hex = hex.trim_start_matches('#');
+    if hex.len() == 6 {
+        let r = u8::from_str_radix(&hex[0..2], 16).unwrap_or(255);
+        let g = u8::from_str_radix(&hex[2..4], 16).unwrap_or(255);
+        let b = u8::from_str_radix(&hex[4..6], 16).unwrap_or(255);
+        Color::Rgb(r, g, b)
+    } else {
+        Color::White
+    }
+}
+
+/// Build ratatui `Span`s from a piece of text, highlighting any Markdown
+/// fenced code blocks with `SyntaxHighlighter`.
+fn highlight_spans(text: &str, base_style: Style) -> Vec<Span<'_>> {
+    let mut spans = Vec::new();
+    let mut rest = text;
+
+    while let Some(start) = rest.find("```") {
+        // Text before the code block
+        if start > 0 {
+            spans.push(Span::styled(rest[..start].to_string(), base_style));
+        }
+
+        let after_open = &rest[start + 3..];
+        // Extract language (first line after ```)
+        let lang_end = after_open.find('\n').unwrap_or(after_open.len());
+        let lang = after_open[..lang_end].trim();
+        let after_lang = &after_open[lang_end..];
+
+        // Find closing ```
+        if let Some(close) = after_lang.find("```") {
+            let code = &after_lang[..close];
+            // Skip leading newline if present
+            let code = code.strip_prefix('\n').unwrap_or(code);
+
+            // Try syntax highlighting
+            match syntax_highlighter().highlight(code, lang) {
+                Ok(lines) => {
+                    for (i, line_tokens) in lines.iter().enumerate() {
+                        if i > 0 {
+                            spans.push(Span::styled("\n".to_string(), base_style));
+                        }
+                        for token in line_tokens {
+                            let mut style = base_style.fg(hex_to_color(&token.foreground));
+                            if token.is_bold {
+                                style = style.add_modifier(Modifier::BOLD);
+                            }
+                            if token.is_italic {
+                                style = style.add_modifier(Modifier::ITALIC);
+                            }
+                            spans.push(Span::styled(token.text.clone(), style));
+                        }
+                    }
+                }
+                Err(_) => {
+                    // Fallback: plain code block
+                    spans.push(Span::styled(code.to_string(), base_style));
+                }
+            }
+
+            rest = &after_lang[close + 3..];
+        } else {
+            // No closing fence — treat remainder as plain text
+            spans.push(Span::styled(rest[start..].to_string(), base_style));
+            rest = "";
+            break;
+        }
+    }
+
+    if !rest.is_empty() {
+        spans.push(Span::styled(rest.to_string(), base_style));
+    }
+
+    spans
+}
+
 fn render_messages(frame: &mut Frame, area: ratatui::layout::Rect, state: &mut UiState) {
     let width = area.width as usize;
     let viewport_height = area.height as usize;
@@ -230,28 +315,87 @@ fn render_messages(frame: &mut Frame, area: ratatui::layout::Rect, state: &mut U
 
         let prefix_width = unicode_width::UnicodeWidthStr::width(prefix);
         let wrap_width = width.saturating_sub(prefix_width);
-        let wrapped = wrap_text(&msg.content, wrap_width);
 
-        for (i, text) in wrapped.into_iter().enumerate() {
-            if i == 0 {
-                lines.push(Line::from(vec![
-                    Span::styled(prefix, style),
-                    if msg.streaming {
-                        Span::styled(text, style.add_modifier(Modifier::DIM))
+        // Use syntax highlighting for assistant messages that contain code blocks.
+        let use_highlight = msg.role == MessageRole::Assistant && msg.content.contains("```");
+
+        if use_highlight && !msg.streaming {
+            let spans = highlight_spans(&msg.content, style);
+            // Flatten spans into wrapped lines.
+            let mut line_spans: Vec<Span> = Vec::new();
+            let mut line_width = prefix_width;
+            let mut is_first_line = true;
+
+            for span in spans {
+                let span_text = span.content.to_string();
+                for word in span_text.split_whitespace() {
+                    let word_width = unicode_width::UnicodeWidthStr::width(word);
+                    let space = if line_spans.is_empty() { 0 } else { 1 };
+                    if line_width + space + word_width > width && !line_spans.is_empty() {
+                        // Flush current line
+                        let mut final_spans = if is_first_line {
+                            vec![Span::styled(prefix, style)]
+                        } else {
+                            vec![Span::styled(" ".repeat(prefix_width), style)]
+                        };
+                        final_spans.extend(std::mem::take(&mut line_spans));
+                        lines.push(Line::from(final_spans));
+                        line_width = prefix_width;
+                        is_first_line = false;
+                    }
+                    if !line_spans.is_empty() {
+                        line_spans.push(Span::styled(" ", style));
+                        line_width += 1;
+                    }
+                    line_spans.push(Span::styled(word.to_string(), span.style));
+                    line_width += word_width;
+                }
+                // Preserve newlines within the span text
+                if span_text.ends_with('\n') {
+                    let mut final_spans = if is_first_line {
+                        vec![Span::styled(prefix, style)]
                     } else {
-                        Span::raw(text)
-                    },
-                ]));
-            } else {
-                let indent = " ".repeat(prefix_width);
-                lines.push(Line::from(vec![
-                    Span::styled(indent, style),
-                    if msg.streaming {
-                        Span::styled(text, style.add_modifier(Modifier::DIM))
-                    } else {
-                        Span::raw(text)
-                    },
-                ]));
+                        vec![Span::styled(" ".repeat(prefix_width), style)]
+                    };
+                    final_spans.extend(std::mem::take(&mut line_spans));
+                    lines.push(Line::from(final_spans));
+                    line_width = prefix_width;
+                    is_first_line = false;
+                }
+            }
+
+            if !line_spans.is_empty() {
+                let mut final_spans = if is_first_line {
+                    vec![Span::styled(prefix, style)]
+                } else {
+                    vec![Span::styled(" ".repeat(prefix_width), style)]
+                };
+                final_spans.extend(line_spans);
+                lines.push(Line::from(final_spans));
+            }
+        } else {
+            let wrapped = wrap_text(&msg.content, wrap_width);
+            for (i, text) in wrapped.into_iter().enumerate() {
+                if i == 0 {
+                    lines.push(Line::from(vec![
+                        Span::styled(prefix, style),
+                        if msg.streaming {
+                            Span::styled(text, style.add_modifier(Modifier::DIM))
+                        } else {
+                            Span::raw(text)
+                        },
+                    ]));
+                } else {
+                    let indent = " ".repeat(prefix_width);
+                    lines.push(Line::from(vec![
+                        Span::styled(indent, style),
+                        if msg.streaming {
+                            Span::styled(text, style.add_modifier(Modifier::DIM))
+                        } else {
+                            Span::raw(text)
+                        },
+                    ]));
+                }
             }
         }
 

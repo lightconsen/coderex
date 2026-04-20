@@ -51,29 +51,23 @@ Re-exports 30+ types from submodules: `types`, `state`, `runtime`, `engine`, `ap
 
 ### What Is Stubbed/Partial
 
-- **`extract_tool_calls`** (`engine.rs:1788`) — Uses text-based JSON heuristic instead of native API tool blocks. Comment admits: "In a production implementation, tool calls come as structured blocks."
-- **`Runtime::bootstrap()`** (`runtime.rs:337`) — Spawns a tokio task that just waits for shutdown; the actual event loop is in `Runtime::run()` but `bootstrap()` doesn't wire it up.
+- ~~**`extract_tool_calls`** (`engine.rs:1788`) — Uses text-based JSON heuristic instead of native API tool blocks.~~ **FIXED**: Non-streaming path now parses native `tool_use` blocks from the API response `content` array into `ToolCall` structs. The text-based heuristic is retained as a fallback.
+- ~~**`Runtime::bootstrap()`** (`runtime.rs:337`) — Spawns a tokio task that just waits for shutdown; the actual event loop is in `Runtime::run()` but `bootstrap()` doesn't wire it up.~~ **FIXED**: `bootstrap()` now spawns `Runtime::run()` in a background tokio task, returning valid channel senders and a `RuntimeHandle`.
 - **Tool call execution in non-streaming path** — Delegates to `tool_scheduler::run_tool_calls` which has `#[allow(dead_code)]` on some fields.
 - **`handle_elicitation`** (`engine.rs:700`) — Marked `#[allow(dead_code)]`; default handler returns `Cancelled`.
 - **Cron scheduling** (`scheduler.rs`) — Wraps `cron` crate but no actual job execution is wired.
 - **Team/worktree/coordinator modules** — Exist as types but not integrated into main flow.
-- **Syntax highlighting** — `SyntaxHighlighter` exists but not used in TUI.
+- ~~**Syntax highlighting** — `SyntaxHighlighter` exists but not used in TUI.~~ **FIXED**: `SyntaxHighlighter` is now lazily initialized in `terminal.rs` and applied to assistant messages containing Markdown fenced code blocks (`\`\`\``). Syntect token colors are converted to ratatui `Color::Rgb` via `hex_to_color()`.
 
 ## Gaps for Production
 
-- **Tool call extraction reliability**: The regex/JSON-heuristic approach will break with complex responses. Should use Anthropic's native `tool_use` blocks.
-  → **Suggestion**: Replace `extract_tool_calls` with native `tool_use` block parsing from the SSE stream. The `StreamingToolCallAssembler` already accumulates structured blocks; wire it directly instead of falling back to regex on the raw response text.
-- **No connection pooling**: `reqwest::Client` is created fresh per `AnthropicApiClient`.
-  → **Suggestion**: Make `AnthropicApiClient` accept an `Arc<reqwest::Client>` or store the client in `Runtime` and clone `Arc` references per engine instance. This reduces TCP handshake overhead and enables connection reuse.
-- **SSE parser edge cases**: `find_sse_message_boundary` only checks `\n\n`, not `\r\n\r\n`. No handling of SSE comments (`:` lines).
-  → **Suggestion**: Update `find_sse_message_boundary` to scan for both `\n\n` and `\r\n\r\n`. Add a comment-stripping pass that discards lines starting with `:` before parsing field lines.
+- ~~**Tool call extraction reliability**: The regex/JSON-heuristic approach will break with complex responses. Should use Anthropic's native `tool_use` blocks.~~ **FIXED**: The blocking path now parses `tool_use` blocks directly from the API response `content` array. `ApiResponse` carries a `tool_calls: Vec<ToolCall>` field populated by the provider. The streaming path already accumulated structured blocks via `StreamingToolCallAssembler`; the non-streaming path now matches it.
+- ~~**No connection pooling**: `reqwest::Client` is created fresh per `AnthropicApiClient`.~~ **FIXED**: Added `AnthropicApiClient::new_with_client()` which accepts an `Arc<reqwest::Client>`, enabling connection reuse across engine instances.
+- ~~**SSE parser edge cases**: `find_sse_message_boundary` only checks `\n\n`, not `\r\n\r\n`. No handling of SSE comments (`:` lines).~~ **FIXED**: `find_sse_message_boundary` now scans for both `\r\n\r\n` and `\n\n`. `parse_sse_message` filters out SSE comment lines (lines starting with `:`) before extracting the `data:` field.
 - **Budget/cost hardcoding**: Model pricing is likely hardcoded or estimated; no dynamic pricing updates.
   → **Suggestion**: Fetch pricing from an API (e.g., Anthropic's pricing endpoint or a static JSON file on a CDN) at startup with a fallback to embedded defaults. Cache the result with a TTL.
-- **No request timeout**: API requests have no explicit timeout beyond reqwest defaults.
-  → **Suggestion**: Add a configurable `request_timeout` to `ApiClient` (default 120s). Use `reqwest::ClientBuilder::timeout()` or `tokio::time::timeout` around the request future.
-- **Compact strategy selection is simplistic**: `select_compact_strategy` uses fixed thresholds.
-  → **Suggestion**: Make thresholds configurable per model (different models have different context window sizes). Consider a hybrid strategy that analyzes message importance (e.g., recency + user vs assistant ratio) before choosing.
+- ~~**No request timeout**: API requests have no explicit timeout beyond reqwest defaults.~~ **FIXED**: Added `request_timeout_secs` to `ApiConfig` (default 120s). The `AnthropicApiClient` applies this timeout to API requests.
+- ~~**Compact strategy selection is simplistic**: `select_compact_strategy` uses fixed thresholds.~~ **FIXED**: `select_compact_strategy` now accepts a `model: &ModelId` and computes thresholds as percentages of the model's context window (auto = 50%, reactive = 90%). `ModelId::context_window()` returns per-model window sizes.
 - **No graceful degradation**: If API is completely down, no fallback to cached/local mode.
   → **Suggestion**: Implement a "local mode" that serves cached responses or runs a smaller local model (via `llama.cpp` or similar) when the primary API is unreachable. Cache the last N successful responses in SQLite.
-- **`ToolCallBlockEnd` parses input as Null**: The SSE parser returns `serde_json::Value::Null` for tool call input on block end, relying on accumulated JSON deltas. This is fragile if deltas are malformed.
-  → **Suggestion**: In `StreamingToolCallAssembler`, validate the accumulated JSON before emitting the final `ToolCall`. If malformed, emit an `Error` event instead of silently producing a null input.
+- ~~**`ToolCallBlockEnd` parses input as Null**: The SSE parser returns `serde_json::Value::Null` for tool call input on block end, relying on accumulated JSON deltas. This is fragile if deltas are malformed.~~ **FIXED**: `StreamingToolCallAssembler::process_event` now validates the accumulated JSON with `serde_json::from_str` on `ToolCallBlockEnd` and `StreamEnd`. Malformed JSON is no longer silently replaced with `Value::Null`.

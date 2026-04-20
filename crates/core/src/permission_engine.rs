@@ -631,6 +631,7 @@ mod tests {
             ) -> Result<ApiResponse, crate::api_client::ApiError> {
                 Ok(ApiResponse {
                     content: "This tool could modify system files.".into(),
+                    tool_calls: Vec::new(),
                     usage: UsageSummary {
                         input_tokens: 100,
                         output_tokens: 20,

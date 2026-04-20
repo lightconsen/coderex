@@ -14,5 +14,5 @@ pub mod eval;
 
 pub use rig::{TestRig, TestRigBuilder, StubOkToolExecutor};
 pub use wire_client::{WireTestClient, WireTestClientBuilder};
-pub use mock_api::{MockApiClient, MockResponseType, mock_response, mock_streaming_response};
+pub use mock_api::{MockApiClient, MockResponseType, mock_response, mock_response_with_tool_calls, mock_streaming_response};
 pub use eval::{EvalScenario, EvalAssertion, EvalResult, AssertionResult, EventType, run_eval};

@@ -1,6 +1,6 @@
 //! Anthropic API client with retry and model routing.
 
-use crate::types::{ModelId, UsageSummary};
+use crate::types::{ModelId, ToolCall, UsageSummary};
 use futures::Stream;
 use futures::StreamExt;
 use reqwest::Client;
@@ -74,6 +74,8 @@ pub struct ApiConfig {
     pub max_retries: u32,
     /// Initial backoff duration for retries.
     pub retry_backoff: Duration,
+    /// Request timeout in seconds (0 = use reqwest default).
+    pub request_timeout_secs: u64,
 }
 
 impl ApiConfig {
@@ -85,6 +87,7 @@ impl ApiConfig {
             base_url: "https://api.anthropic.com".into(),
             max_retries: 3,
             retry_backoff: Duration::from_secs(1),
+            request_timeout_secs: 120,
         }
     }
 
@@ -95,6 +98,13 @@ impl ApiConfig {
         self.retry_backoff = backoff;
         self
     }
+
+    /// Set the request timeout.
+    #[must_use]
+    pub const fn with_timeout(mut self, secs: u64) -> Self {
+        self.request_timeout_secs = secs;
+        self
+    }
 }
 
 /// Result from a non-streaming API call.
@@ -102,6 +112,8 @@ impl ApiConfig {
 pub struct ApiResponse {
     /// The text content from the assistant.
     pub content: String,
+    /// Tool calls extracted from structured API blocks.
+    pub tool_calls: Vec<ToolCall>,
     /// Token usage summary.
     pub usage: UsageSummary,
     /// Whether the response was stopped due to token limit.
@@ -186,13 +198,30 @@ pub struct AnthropicApiClient {
 }
 
 impl AnthropicApiClient {
-    /// Create a new Anthropic API client.
+    /// Create a new Anthropic API client with a dedicated `reqwest::Client`.
+    ///
+    /// Uses the timeout from `config.request_timeout_secs`. For connection
+    /// pooling across multiple engines, prefer [`Self::new_with_client`].
     #[must_use]
     pub fn new(config: ApiConfig) -> Self {
-        Self {
-            config,
-            client: Client::new(),
-        }
+        let client = if config.request_timeout_secs > 0 {
+            Client::builder()
+                .timeout(Duration::from_secs(config.request_timeout_secs))
+                .build()
+                .unwrap_or_else(|_| Client::new())
+        } else {
+            Client::new()
+        };
+        Self { config, client }
+    }
+
+    /// Create a client using an existing `reqwest::Client`.
+    ///
+    /// This enables connection pooling when multiple `AnthropicApiClient`
+    /// instances share the same underlying `reqwest::Client`.
+    #[must_use]
+    pub fn new_with_client(config: ApiConfig, client: Client) -> Self {
+        Self { config, client }
     }
 
     /// Resolve the model string from a ModelId.
@@ -307,12 +336,34 @@ impl ApiClient for AnthropicApiClient {
 
                 let json: serde_json::Value = resp.json().await.map_err(ApiError::from)?;
 
-                let content = json["content"]
-                    .as_array()
-                    .and_then(|arr| arr.first())
-                    .and_then(|block| block["text"].as_str())
-                    .unwrap_or("")
-                    .to_string();
+                let content_blocks = json["content"].as_array();
+                let mut text_parts = Vec::new();
+                let mut tool_calls = Vec::new();
+                if let Some(blocks) = content_blocks {
+                    for block in blocks {
+                        match block.get("type").and_then(|v| v.as_str()) {
+                            Some("text") => {
+                                if let Some(t) = block["text"].as_str() {
+                                    text_parts.push(t);
+                                }
+                            }
+                            Some("tool_use") => {
+                                if let (Some(id), Some(name)) = (
+                                    block["id"].as_str(),
+                                    block["name"].as_str(),
+                                ) {
+                                    tool_calls.push(ToolCall {
+                                        id: id.to_string(),
+                                        name: name.to_string(),
+                                        input: block["input"].clone(),
+                                    });
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                let content = text_parts.join("");
 
                 let stop_reason = json["stop_reason"]
                     .as_str()
@@ -329,6 +380,7 @@ impl ApiClient for AnthropicApiClient {
 
                 Ok(ApiResponse {
                     content,
+                    tool_calls,
                     usage,
                     stop_reason,
                 })
@@ -482,6 +534,11 @@ fn parse_sse_stream(
 
 /// Find the position of the next SSE message boundary (`\n\n` or `\r\n\r\n`).
 fn find_sse_message_boundary(buffer: &str) -> Option<usize> {
+    // Check for \r\n\r\n first (CRLF, used by some proxies/servers)
+    if let Some(pos) = buffer.find("\r\n\r\n") {
+        return Some(pos + 3); // include one CRLF
+    }
+    // Fall back to \n\n (LF, standard SSE)
     buffer
         .as_bytes()
         .windows(2)
@@ -491,9 +548,14 @@ fn find_sse_message_boundary(buffer: &str) -> Option<usize> {
 
 /// Parse a single SSE message block into a `StreamEvent`.
 fn parse_sse_message(message: &str, state: &mut SseParserState) -> Option<StreamEvent> {
-    // Extract the `data:` line (accept both "data: " and "data:")
+    // Filter out SSE comment lines (starting with ':') and blank lines,
+    // then extract the first `data:` line.
     let data_line = message
         .lines()
+        .filter(|line| {
+            let trimmed = line.trim();
+            !trimmed.is_empty() && !trimmed.starts_with(':')
+        })
         .find(|line| line.starts_with("data:"))?;
     let json_str = data_line.strip_prefix("data:").map(|s| s.trim_start())?;
 
@@ -600,6 +662,13 @@ mod tests {
         assert_eq!(config.base_url, "https://api.anthropic.com");
         assert_eq!(config.max_retries, 3);
         assert_eq!(config.retry_backoff, Duration::from_secs(1));
+        assert_eq!(config.request_timeout_secs, 120);
+    }
+
+    #[tokio::test]
+    async fn config_custom_timeout() {
+        let config = ApiConfig::new("test_key".into()).with_timeout(60);
+        assert_eq!(config.request_timeout_secs, 60);
     }
 
     #[test]

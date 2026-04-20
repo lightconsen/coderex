@@ -354,6 +354,7 @@ mod tests {
         ) -> Result<ApiResponse, ProviderError> {
             Ok(ApiResponse {
                 content: "success".into(),
+                tool_calls: Vec::new(),
                 usage: UsageSummary {
                     input_tokens: 0,
                     output_tokens: 0,

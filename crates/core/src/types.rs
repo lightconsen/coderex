@@ -133,6 +133,15 @@ impl ModelId {
     pub fn haiku() -> Self {
         Self("claude-haiku-4-5-20251001".into())
     }
+
+    /// Return the model's context window size in tokens.
+    #[must_use]
+    pub fn context_window(&self) -> usize {
+        match self.0.as_str() {
+            "claude-opus-4-6" | "claude-sonnet-4-6" | "claude-haiku-4-5-20251001" => 200_000,
+            _ => 200_000,
+        }
+    }
 }
 
 /// Lifecycle events for a sub-agent.

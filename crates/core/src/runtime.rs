@@ -303,6 +303,8 @@ pub struct Runtime {
     /// Tokio handle for the runtime task.
     #[allow(dead_code)]
     task: tokio::task::JoinHandle<()>,
+    /// Shared UI state accumulated by the event loop.
+    state: Arc<Mutex<UiState>>,
 }
 
 impl std::fmt::Debug for Runtime {
@@ -312,43 +314,45 @@ impl std::fmt::Debug for Runtime {
 }
 
 impl Runtime {
-    /// Bootstrap the runtime, returning communication channels and a handle.
+    /// Access the shared UI state.
+    #[must_use]
+    pub fn state(&self) -> Arc<Mutex<UiState>> {
+        Arc::clone(&self.state)
+    }
+
+    /// Bootstrap the runtime, starting the event loop in a background task.
     ///
     /// # Returns
     ///
     /// A tuple of:
     /// - `ui_tx`: sender for UI events
-    /// - `ui_rx`: receiver for UI events (for `Runtime::run`)
     /// - `engine_tx`: sender for engine events (from QueryEngine → UI)
-    /// - `engine_rx`: receiver for engine events (UI side)
+    /// - `intent_rx`: receiver for user intents (submit, interrupt, etc.)
     /// - `handle`: handle to shut down the runtime
+    /// - `runtime`: the runtime instance holding the task and shared state
     pub fn bootstrap() -> (
         mpsc::UnboundedSender<UiEvent>,
-        mpsc::UnboundedReceiver<UiEvent>,
         mpsc::UnboundedSender<EngineEvent>,
-        mpsc::UnboundedReceiver<EngineEvent>,
+        mpsc::UnboundedReceiver<UiIntent>,
         RuntimeHandle,
+        Runtime,
     ) {
-        let (ui_tx, ui_rx): (mpsc::UnboundedSender<UiEvent>, mpsc::UnboundedReceiver<UiEvent>) =
-            mpsc::unbounded_channel();
-        let (engine_tx, engine_rx): (
-            mpsc::UnboundedSender<EngineEvent>,
-            mpsc::UnboundedReceiver<EngineEvent>,
-        ) = mpsc::unbounded_channel();
-        let (shutdown_tx, mut shutdown_rx) = tokio::sync::oneshot::channel();
+        let (ui_tx, ui_rx) = mpsc::unbounded_channel();
+        let (engine_tx, engine_rx) = mpsc::unbounded_channel();
+        let (intent_tx, intent_rx) = mpsc::unbounded_channel();
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
         let handle = RuntimeHandle { shutdown_tx };
 
+        let state = Arc::new(Mutex::new(UiState::new()));
+        let state_for_run = Arc::clone(&state);
+        let ui_tx_clone = ui_tx.clone();
+
         let task = tokio::spawn(async move {
-            tokio::select! {
-                _ = &mut shutdown_rx => {
-                    tracing::info!("runtime: received shutdown signal");
-                }
-            }
-            tracing::info!("runtime: shutting down");
+            Self::run(ui_tx_clone, ui_rx, engine_rx, shutdown_rx, state_for_run, intent_tx).await;
         });
 
-        let _runtime = Self { task };
-        (ui_tx, ui_rx, engine_tx, engine_rx, handle)
+        let runtime = Runtime { task, state };
+        (ui_tx, engine_tx, intent_rx, handle, runtime)
     }
 
     /// Run the main event loop, accumulating state into the supplied
@@ -464,28 +468,33 @@ fn crossterm_key_to_portable(key: &crossterm::event::KeyEvent) -> (String, Vec<S
 mod tests {
     use super::*;
     use crate::types::ToolResult;
+    use std::time::Duration;
 
     #[tokio::test]
     async fn bootstrap_returns_valid_channels() {
-        let (ui_tx, _ui_rx, engine_tx, mut engine_rx, handle) = Runtime::bootstrap();
+        let (ui_tx, engine_tx, _intent_rx, handle, _runtime) = Runtime::bootstrap();
         assert!(ui_tx.send(UiEvent::Tick).is_ok());
         assert!(engine_tx.send(EngineEvent::SessionEnd).is_ok());
-        let event = engine_rx.try_recv().unwrap();
-        assert!(matches!(event, EngineEvent::SessionEnd));
         handle.shutdown();
     }
 
     #[tokio::test]
     async fn engine_event_received() {
-        let (_ui_tx, _ui_rx, engine_tx, mut engine_rx, handle) = Runtime::bootstrap();
+        let (_ui_tx, engine_tx, _intent_rx, handle, runtime) = Runtime::bootstrap();
         let event = EngineEvent::TextDelta("hello".into());
         engine_tx.send(event).unwrap();
-        let received = engine_rx.try_recv().unwrap();
-        if let EngineEvent::TextDelta(text) = received {
-            assert_eq!(text, "hello");
-        } else {
-            panic!("expected TextDelta");
-        }
+
+        // Allow the background event loop to process the event
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let state_arc = runtime.state();
+        let state = state_arc.lock().unwrap();
+        assert!(
+            state.transcript.iter().any(|e| matches!(e,
+                TranscriptEntry::AssistantText(t) if t == "hello"
+            )),
+            "expected TextDelta to be recorded in transcript"
+        );
         handle.shutdown();
     }
 

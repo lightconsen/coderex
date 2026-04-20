@@ -49,6 +49,7 @@ impl MockApiClient {
     pub fn enqueue_response(&self, content: &str, input_tokens: usize, output_tokens: usize) {
         self.responses.lock().unwrap().push_back(Ok(ApiResponse {
             content: content.into(),
+            tool_calls: Vec::new(),
             usage: crate::types::UsageSummary {
                 input_tokens,
                 output_tokens,

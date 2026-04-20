@@ -52,6 +52,7 @@ pub(crate) mod tests {
         ) -> Result<ApiResponse, coderex_core::api_client::ApiError> {
             Ok(ApiResponse {
                 content: self.response_content.clone(),
+                tool_calls: Vec::new(),
                 usage: UsageSummary {
                     input_tokens: 100,
                     output_tokens: 50,

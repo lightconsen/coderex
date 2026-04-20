@@ -5,8 +5,10 @@
 
 use coderex_core::engine::TerminalReason;
 use coderex_core::types::EngineEvent;
+use coderex_core::types::ToolCall;
 use coderex_test_utils::{
     MockApiClient, MockResponseType, StubOkToolExecutor, TestRig, TestRigBuilder, mock_response,
+    mock_response_with_tool_calls,
 };
 
 #[tokio::test]
@@ -26,8 +28,13 @@ async fn engine_completes_simple_prompt() {
 #[tokio::test]
 async fn engine_handles_tool_call() {
     let api = MockApiClient::with_mixed(vec![
-        MockResponseType::Static(mock_response(
-            r#"[{"id":"tc_1","name":"Read","input":{"path": "hello.txt"}}]"#,
+        MockResponseType::Static(mock_response_with_tool_calls(
+            "",
+            vec![ToolCall {
+                id: "tc_1".into(),
+                name: "Read".into(),
+                input: serde_json::json!({"path": "hello.txt"}),
+            }],
         )),
         MockResponseType::Static(mock_response(
             "Done reading the file.",
@@ -77,8 +84,13 @@ async fn engine_tracks_api_calls() {
 #[tokio::test]
 async fn tool_result_contains_stub_output() {
     let api = MockApiClient::with_mixed(vec![
-        MockResponseType::Static(mock_response(
-            r#"[{"id":"tc_1","name":"Read","input":{"path": "test.txt"}}]"#,
+        MockResponseType::Static(mock_response_with_tool_calls(
+            "",
+            vec![ToolCall {
+                id: "tc_1".into(),
+                name: "Read".into(),
+                input: serde_json::json!({"path": "test.txt"}),
+            }],
         )),
         MockResponseType::Static(mock_response(
             "All done.",
