@@ -751,20 +751,20 @@ user prompt 则来自用户配置的 `hook.prompt`，会把 `$ARGUMENTS` 替换�
 
 这里的 `cc-src` 和仓库中 `crates/` 下的 `coderex` 不是一回事：
 
-- `cc-src` 是一套独立、成熟、功能丰富的 code agent 产品实现。
-- `crates/` 下的 `coderex` 是参考 `cc-src` 重写/抽象出来的另一套实现，更偏内核与基础设施。
+- `cc-src` 是一套独立、成熟、功能丰富的 code agent 产品实现（TypeScript）。
+- `crates/` 下的 `coderex` 是参考 `cc-src` 用 Rust 重新实现的 agent 系统。
 
-因此，二者都在“使用 AI”，但使用方式和抽象层次明显不同。
+经过多轮演进，`coderex` 已经从“只有内核引擎”发展为具备完整 4 层 AI 架构的系统。二者在抽象分层上已高度对齐，差异主要体现在功能覆盖度与产品成熟度上。
 
 ### 1. 总体定位对比
 
 | 维度 | `cc-src` | `crates/` 中的 `coderex` |
 | --- | --- | --- |
-| 定位 | 产品层 agent 编排系统 | 内核化/重构中的 agent runtime |
-| 代码风格 | TS/JS，功能模块密集 | Rust，核心抽象更集中 |
-| AI 使用广度 | 很广，主会话外还有大量辅助 AI 功能 | 较收敛，围绕统一 engine 和 prompt compiler |
-| Prompt 风格 | 多层拼装 + 大量 feature-specific prompt | 统一 compiler + 少量专用 prompt |
-| 模型调用抽象 | `queryModelWithStreaming` / `queryHaiku` / `sideQuery` / `runForkedAgent` | `ApiClient::create_message` / `create_message_streaming` |
+| 定位 | 产品层 agent 编排系统 | 具备产品层编排的 Rust agent runtime |
+| 代码风格 | TS/JS，功能模块密集 | Rust，模块边界清晰 |
+| AI 使用广度 | 很广，主会话外还有大量辅助 AI 功能 | 主会话 + 9 个 feature prompt 模块 + 后台 agent |
+| Prompt 风格 | 多层拼装 + 大量 feature-specific prompt | `PromptCompiler` 骨架 + 9 个专用 feature prompt |
+| 模型调用抽象 | `queryModelWithStreaming` / `queryHaiku` / `sideQuery` / `runForkedAgent` | `run_main_agent` / `run_side_query` / `run_lightweight_query` / `run_forked_agent` / `run_background_feature` |
 
 ### 2. AI 使用位置对比
 
@@ -778,31 +778,43 @@ user prompt 则来自用户配置的 `hook.prompt`，会把 `$ARGUMENTS` 替换�
 - 小模型工具任务：title 生成、rename、date parser、web fetch apply、feedback title、shell prefix
 - 命令/skill prompt 生成：slash command、skills、agent 生成
 
-也就是说，`cc-src` 的 AI 是“平台化渗透”的：
+#### `coderex`：AI 使用已覆盖主链路与主要辅助能力
 
-- 主会话在用 AI
-- 辅助能力在用 AI
-- 审批与解释在用 AI
-- UI 附加体验也在用 AI
+`coderex` 的 AI 调用分布在 4 层：
 
-#### `coderex`：AI 使用主要集中在核心执行链
+**API 传输层**
+- `crates/core/src/api_client.rs` — `ApiClient::create_message` / `create_message_streaming`
 
-`crates/` 下的 `coderex` 目前更集中在这些位置：
+**核心执行层**
+- `crates/core/src/engine.rs` — `QueryEngine`，负责 turn state machine、tool loop、streaming、compact、permission、hooks
+- `crates/core/src/prompts/base.rs` — `PromptCompiler`，`static_blocks` / `dynamic_blocks` + `BOUNDARY_MARKER` cache 边界
 
-- prompt 组装：`crates/coderex-core/src/prompt.rs`
-- QueryEngine / turn state machine：`crates/coderex-core/src/engine.rs`
-- API 调用：`crates/coderex-core/src/api_client.rs`
-- CLI/REPL 接线：`crates/coderex-cli/src/repl.rs`
-- 少量专门 prompt：`crates/coderex-memory/src/auto_dream.rs`
-- 命令模式上下文注入：`crates/coderex-commands/src/misc_commands.rs`
+**AI 编排层**
+- `crates/core/src/orchestrator.rs` — `Orchestrator`，5 种调用原语：
+  - `run_main_agent` — 主会话流式调用
+  - `run_side_query` — 单次非流式判定/解释
+  - `run_lightweight_query` — 小模型轻任务
+  - `run_forked_agent` — 隔离子代理，支持工具白名单与 `writable: bool` 只读强制
+  - `run_background_feature` — 后台 feature 统一入口
+- `crates/core/src/query_profiles.rs` — `QueryKind` / `ModelProfile` / `PromptProfile` / `QueryRequest`
 
-换句话说，`coderex` 里的 AI 使用主要还是：
+**Feature 层**
+- `crates/core/src/prompts/features/` — 9 个专用 prompt 模块：
+  - `session_title` — 会话标题生成
+  - `permission_explainer` — 权限风险解释
+  - `compact_summary` — 对话压缩摘要
+  - `session_memory` — session memory AI 更新
+  - `memory_extraction` — 长期记忆提取
+  - `prompt_suggestion` — 下一句提示建议
+  - `agent_summary` — 子代理进度摘要
+  - `agent_generation` — agent 配置生成
+  - `magic_docs` — 文档自动生成
+- `crates/memory/src/session_memory_agent.rs` — AI 驱动的 session memory 更新与持久化
+- `crates/memory/src/extract_memories.rs` — AI 驱动的长期记忆提取与持久化
+- `crates/ui/src/input.rs` + `terminal.rs` — 内联 prompt suggestion ghost text 渲染
 
-- 如何拼上下文
-- 如何把消息发给模型
-- 如何处理 streaming / tool call / compact / permission / elicitation
-
-它还没有演化出 `cc-src` 那样密集的 feature-specific AI helper 生态。
+此外，命令系统已支持完整的 prompt 行为切换：
+- `crates/commands/src/registry.rs` — `CommandResult` 包含 `prompt_profile`、`override_system_prompt`、`append_system_prompt`、`allowed_tools_override`
 
 ### 3. Prompt 构建方式对比
 
@@ -813,91 +825,67 @@ user prompt 则来自用户配置的 `hook.prompt`，会把 `$ARGUMENTS` 替换�
 1. `getSystemPrompt(...)` 生成默认系统 prompt。
 2. `buildEffectiveSystemPrompt(...)` 决定 agent/custom/append 的优先级。
 3. `fetchSystemPromptParts(...)` 收集 `systemPrompt/userContext/systemContext`。
-4. 很多功能再单独定义专用 prompt：
-   - `buildSessionMemoryUpdatePrompt(...)`
-   - `buildExtractAutoOnlyPrompt(...)`
-   - `TOOL_USE_SUMMARY_SYSTEM_PROMPT`
-   - `SESSION_TITLE_PROMPT`
-   - `CRITIQUE_SYSTEM_PROMPT`
-   - `SELECT_MEMORIES_SYSTEM_PROMPT`
-   - 等等
+4. 很多功能再单独定义专用 prompt。
 
-因此 `cc-src` 的 prompt 体系是“通用系统 prompt + 大量专用任务 prompt”的组合。
+#### `coderex`：编译器骨架 + Feature 模块
 
-#### `coderex`：PromptCompiler 统一编译
+`coderex` 的 prompt 体系也是两层：
 
-`coderex` 的 prompt 构建更像“编译器”模型，集中在 `crates/coderex-core/src/prompt.rs`：
-
+**基础骨架层** — `crates/core/src/prompts/base.rs`：
 - `PromptCompiler` 维护 `static_blocks` 和 `dynamic_blocks`
-- 用 `BOUNDARY_MARKER` 切开静态/动态部分，服务 prompt cache
-- `CLAUDE.md` 被包成 context message，而不是零散拼接
-- `git branch` / `git status` 被统一收进 system context
-- 编译输出是 `AssembledContext { system_prompt, context_messages, estimated_tokens }`
+- `BOUNDARY_MARKER` 切开静态/动态部分，服务 prompt cache
+- `CLAUDE.md` 被包成 context message
+- 编译输出 `AssembledContext { system_prompt, context_messages, estimated_tokens }`
 
-然后在 `crates/coderex-core/src/engine.rs` 中：
+**Feature 专用层** — `crates/core/src/prompts/features/*.rs`：
+- 每个 feature 独立模块，定义自己的 system/user prompt
+- 通过 `query_profiles.rs` 的 `PromptProfile` 与 orchestrator 关联
+- 不复用主系统 prompt，避免行为边界耦合
 
-- 先把 `assembled.context_messages` 注入 turn messages
-- 再放 `assembled.system_prompt`
-- 再追加 session messages
-- 再追加 `custom_system_prompt` / `append_system_prompt`
-
-所以 `coderex` 的 prompt 方式更统一、更底层，强调：
-
-- 块级编译
-- cache 边界
-- 上下文标准化装配
-
-而不是像 `cc-src` 那样大量 feature-specific 入口各自定义 prompt。
+这种结构与 `cc-src` 的“通用系统 prompt + 大量专用任务 prompt”组合方式在本质上是同构的，只是 `coderex` 把专用 prompt 集中到了 `features/` 目录下。
 
 ### 4. 模型调用抽象对比
 
 #### `cc-src`
 
-`cc-src` 对模型调用做了很多按用途划分的抽象：
-
-- `queryModelWithStreaming(...)`
-- `queryModelWithoutStreaming(...)`
+- `queryModelWithStreaming(...)` / `queryModelWithoutStreaming(...)`
 - `queryHaiku(...)`
 - `sideQuery(...)`
-- `runForkedAgent(...)`
-- `runAgent(...)`
-
-这反映的是产品层需求：
-
-- 主会话要流式
-- 小任务要轻量
-- 判定类请求要旁路
-- 背景 agent 要共享 cache-safe 上下文
+- `runForkedAgent(...)` / `runAgent(...)`
 
 #### `coderex`
 
-`coderex` 的抽象更少、更接近协议层：
+`coderex` 现在也有按用途封装的调用原语：
 
-- `ApiClient::create_message(...)`
-- `ApiClient::create_message_streaming(...)`
+- `run_main_agent(...)` — 主会话流式，支持 `QueryEngine` 复用或新建
+- `run_side_query(...)` — 单次非流式，直接基于 `ApiClient::create_message`
+- `run_lightweight_query(...)` — 强制小模型，max_tokens 封顶
+- `run_forked_agent(...)` — 隔离子代理，支持 `inherit_session`、`allowed_tools`、`writable`
+- `run_background_feature(...)` — 后台 feature 统一封装，基于 `run_forked_agent`
 
-`engine.rs` 自己负责：
+同时还定义了：
+- `ModelProfile::Main` / `Lightweight` / `Background` — 解耦业务逻辑与具体模型型号
+- `QueryRequest` — 高层请求对象，表达“调用意图”而非原始参数
 
-- 从 turn messages 提取 system messages
-- 把非 system messages 序列化为 API messages
-- 发 streaming / non-streaming 请求
-- 装配 tool call delta
-
-这说明 `coderex` 还处在“把基础通路抽稳”的阶段，而不是把每种 AI 用法包装成独立产品 API。
+这与 `cc-src` 的调用形态抽象已高度对齐。
 
 ### 5. 命令与模式注入对比
 
-`cc-src` 中，slash command / skill 往往直接生成一段 prompt 文本给主代理执行，比如 `/review`、`/batch`、`skillify`、`simplify`。
+#### `cc-src`
 
-`coderex` 中，也有类似概念，但更简单：
+slash command / skill 往往直接生成一段完整 workflow prompt 给主代理执行，比如 `/review`、`/batch`。
 
-- `crates/coderex-commands/src/registry.rs` 里的 `CommandResult::with_context(...)` 可以把额外上下文注入会话
-- `crates/coderex-commands/src/misc_commands.rs` 里的 `/advisor`、`/bughunter` 本质上是给会话注入一段模式上下文
+#### `coderex`
 
-区别在于：
+命令系统已从早期的“仅注入额外 context”升级为支持完整 prompt 行为切换：
 
-- `cc-src` 的命令/skill prompt 已经高度产品化，往往是完整 workflow prompt
-- `coderex` 的命令 prompt 目前更像“切换模式”或“附加上下文”
+- `CommandResult::extra_context` — 附加用户上下文（保留）
+- `CommandResult::append_system_prompt` — 末尾追加系统 prompt
+- `CommandResult::override_system_prompt` — 完全覆盖默认系统 prompt
+- `CommandResult::prompt_profile` — 切换 `PromptProfile`（`Advisor` / `BugHunter` / `Reviewer` / `SecurityReviewer` 等）
+- `CommandResult::allowed_tools_override` — 限制可用工具集合
+
+`/advisor`、`/bughunter` 等模式命令现在能真正改变 agent 的行为边界，而不只是附加一句话。
 
 ### 6. Memory 相关 AI 使用对比
 
@@ -911,52 +899,43 @@ memory 是强 AI 驱动的：
 
 #### `coderex`
 
-memory 层更多是存储与抽象：
+memory 层也已具备 AI workflow 能力：
 
-- `crates/coderex-memory/src/session_memory.rs` 目前是事实存储层，不是 LLM 提取器
-- `crates/coderex-memory/src/auto_dream.rs` 有明确的 `generate_dream_prompt(...)`，说明这里保留了一小块 AI 驱动的 summarization 能力
+- `crates/memory/src/session_memory_agent.rs` — `update_session_memory_ai(...)` 调用 AI 生成 session memory 内容，并作为 `SessionFact` 持久化到 `SessionMemoryStore`
+- `crates/memory/src/extract_memories.rs` — `extract_long_term_memories_ai(...)` / `extract_single_memory_ai(...)` 调用 AI 提取长期记忆并写入 `LongTermStore`
+- `crates/memory/src/prompts/mod.rs` — memory 专用 prompt 组装 helper
+- `crates/cli/src/repl.rs` — REPL 中集成后台 memory 更新与提取任务，结果回写主会话
 
-也就是说：
-
-- `cc-src`：memory 是 AI workflow 的一部分
-- `coderex`：memory 目前更多是 data layer，只有少量 AI prompt 接口
+也就是说，`coderex` 的 memory 已不再是纯 data layer，而是具备完整“AI 提取 -> 结构化存储 -> 主会话消费”闭环的 workflow 层。
 
 ### 7. 一个更准确的总结
 
 如果把两者放在一起看：
 
-- `cc-src` 更像“完整的 AI 产品层”
-- `coderex` 更像“重写中的 AI 内核层”
+- `cc-src` 是“成熟的 AI 产品层”，功能覆盖广、产品细节丰富
+- `coderex` 是“架构对齐的 Rust 实现”，4 层抽象完整、调用形态与 `cc-src` 同构，部分 feature 的产品深度仍在持续完善
 
-二者关系不是简单的“功能多少”差异，而是抽象层不同：
-
-- `cc-src` 关注“AI 能为产品做什么”
-- `coderex` 关注“如何把 agent runtime、prompt compiler、API client、tool loop 抽成稳定内核”
-
-因此，比较二者使用 AI 的方式时，最关键的不是逐项功能一一对应，而是下面这组差异：
+二者关系已经从“抽象层不同”演变为“同构架构下的功能覆盖度差异”：
 
 | 对比点 | `cc-src` | `coderex` |
 | --- | --- | --- |
-| 主目标 | 完整产品能力 | 可复用核心引擎 |
-| AI 用途 | 主会话 + 辅助功能 + 分类 + UI 增强 | 主会话执行链 + 少量 memory/模式 prompt |
-| Prompt 组织 | 多模块拼装 + 大量专用 prompt | `PromptCompiler` 块式编译 + 少量专用 prompt |
-| 调用抽象 | 按用途细分 | 按协议/内核抽象 |
-| 命令系统 | 命令直接塑造 agent 行为 | 命令更多是注入额外 context |
+| 主目标 | 完整产品能力 | 可复用核心引擎 + 产品层编排 |
+| AI 用途 | 主会话 + 辅助功能 + 分类 + UI 增强 | 主会话 + 9 feature prompts + 后台 agent + UI suggestion |
+| Prompt 组织 | 多模块拼装 + 大量专用 prompt | `PromptCompiler` + `features/` 目录 9 个专用模块 |
+| 调用抽象 | 按用途细分 | `main` / `side` / `lightweight` / `forked` / `background` |
+| 命令系统 | 命令直接塑造 agent 行为 | 支持 profile / override / append / tool 限制 |
+| Memory | AI workflow 驱动文件更新 | AI workflow 驱动持久化存储 |
+
+主要差距：
+- `cc-src` 的某些产品级 feature（如 auto mode classifier、Chrome MCP、teleport、feedback 标题生成等）在 `coderex` 中尚未覆盖
+- `cc-src` 的 UI 集成更深（如 agent summary 进度条、away summary 卡片等），`coderex` 的 TUI 层还在逐步完善
 
 ### 8. 对当前文档的含义
 
-因此，当前这份文档更准确的标题应该理解为：
+当前这份文档主要研究 `cc-src` 的 AI 使用方式与 prompt 结构。由于 `coderex` 的架构已与 `cc-src` 高度对齐，后续阅读 `coderex` 代码时可以按同样的分层去理解：
 
-- `cc-src 中 AI 的应用与 Prompt 研究`
-
-而不是：
-
-- `整个 coderex 仓库中的 AI 研究`
-
-如果后续要扩成全仓版本，建议拆成两篇或两个大章节：
-
-1. `cc-src`：产品层 AI 编排
-2. `crates/coderex-*`：Rust 核心引擎中的 AI 执行链与 prompt compiler
+1. `cc-src`：产品层 AI 编排（研究对象）
+2. `crates/coderex-*`：Rust 实现，4 层架构与 `cc-src` 同构，可作为对照参考
 
 ## 十、结论
 
