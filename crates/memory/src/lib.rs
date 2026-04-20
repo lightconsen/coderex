@@ -9,6 +9,9 @@ pub mod session_memory;
 pub mod team_memory;
 pub mod auto_dream;
 pub mod ai_workflow;
+pub mod session_memory_agent;
+pub mod extract_memories;
+pub mod prompts;
 
 pub use team_memory::{
     TeamMemoryEntry, TeamMemorySyncService, MemoryChecksum,

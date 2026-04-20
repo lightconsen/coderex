@@ -1,30 +1,36 @@
-//! Feature-specific prompt templates.
+//! Prompt system — base compiler, feature prompts, and profile registry.
 //!
-//! This module contains dedicated prompt templates for single-purpose AI tasks
-//! like session title generation, permission explanation, compact summary, etc.
-//!
-//! These prompts are independent of the base system prompt and are used by
-//! the orchestrator for side queries and lightweight queries.
+//! Organized into three layers:
+//! - `base`: `PromptCompiler`, `AssembledContext`, `CompactConfig` — the core
+//!   prompt assembly machinery.
+//! - `features/`: dedicated prompt templates for single-purpose AI tasks
+//!   (session title, permission explanation, compact summary, etc.).
+//! - Profile registry: prompt profile specs for mode commands.
 
-pub mod session_title;
-pub mod permission_explainer;
-pub mod compact_summary;
-pub mod session_memory;
-pub mod memory_extraction;
-pub mod agent_summary;
-pub mod prompt_suggestion;
-pub mod agent_generation;
-pub mod magic_docs;
+pub mod base;
 
-pub use session_title::{generate_session_title, generate_session_title_from_messages, parse_title};
-pub use permission_explainer::{explain_permission, explain_permission_from_value};
-pub use compact_summary::{generate_compact_summary, generate_compact_summary_from_messages};
-pub use session_memory::{update_session_memory, create_session_memory};
-pub use memory_extraction::{extract_memories, extract_single_memory};
-pub use agent_summary::{summarize_agent_activity, generate_away_summary, generate_team_status};
-pub use prompt_suggestion::{suggest_prompts, suggest_next_action};
-pub use agent_generation::{generate_agent, generate_agent_prompt, AgentSpec};
-pub use magic_docs::{generate_docs_for_code, generate_codebase_overview, generate_readme};
+/// Feature-specific prompt templates — single-purpose AI tasks.
+pub mod features {
+    pub mod agent_generation;
+    pub mod agent_summary;
+    pub mod compact_summary;
+    pub mod magic_docs;
+    pub mod memory_extraction;
+    pub mod permission_explainer;
+    pub mod prompt_suggestion;
+    pub mod session_memory;
+    pub mod session_title;
+}
+
+pub use features::agent_generation::{generate_agent, generate_agent_prompt, AgentSpec};
+pub use features::agent_summary::{generate_away_summary, generate_team_status, summarize_agent_activity};
+pub use features::compact_summary::{generate_compact_summary, generate_compact_summary_from_messages};
+pub use features::magic_docs::{generate_codebase_overview, generate_docs_for_code, generate_readme};
+pub use features::memory_extraction::{extract_memories, extract_single_memory};
+pub use features::permission_explainer::{explain_permission, explain_permission_from_value};
+pub use features::prompt_suggestion::{suggest_next_action, suggest_prompts};
+pub use features::session_memory::{create_session_memory, update_session_memory};
+pub use features::session_title::{generate_session_title, generate_session_title_from_messages, parse_title};
 
 // ─── Session Title ──────────────────────────────────────────────────────────
 
