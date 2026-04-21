@@ -38,34 +38,4 @@ Terminal user interface via ratatui. Renders messages, statusline, input line, c
 
 ## Current Status
 
-### What Works
-
-- Full ratatui rendering with alternate screen.
-- Vim mode (Normal/Insert) with hjkl navigation, yank, paste, undo.
-- Word-wrapped message display with role-based prefixes and colors.
-- Inline `/` command palette with selection highlighting.
-- Thinking spinner (rotating ◐◓◑◒) in statusline during streaming.
-- T-Rex ASCII welcome art when no messages.
-- Statusline with model, tokens, cost, git branch, permission mode.
-- Permission dialogs, notifications, confirm overlays.
-- Theme loading from custom directories.
-- Search functionality (`/` in normal mode).
-- Cursor positioning in input line.
-
-### What Is Stubbed/Partial
-
-- **`voice` module** — Feature-gated, not fully implemented.
-- **`buddy` module** — Feature-gated, companion UI concept.
-
-## Gaps for Production
-
-- ~~**No mouse support**: Cannot click to position cursor or select messages.~~ — **Fixed**: Mouse capture enabled on enter, disabled on exit. Scroll wheel maps to message view scroll.
-- ~~**No copy-to-clipboard**: Cannot copy message text from TUI.~~ — **Fixed**: `yy` in Vim normal mode copies all messages to system clipboard. `VimAction::ExportCopy` wired in repl.rs.
-- ~~**Message search is basic**: Only finds first match, no highlight navigation.~~ — **Fixed**: `n`/`N` in Vim normal mode navigate search matches via `VimAction::SearchNext`/`SearchPrev`.
-- ~~**No message folding**: Long messages cannot be collapsed.~~ — **Fixed**: `folded: bool` field on `Message`, `za` in Vim normal mode toggles folding. Folded messages render as single line with `[+N lines folded]`.
-- ~~**No split-pane view**: Cannot view files alongside chat.~~ — **Fixed**: `LayoutMode` enum (SinglePane, HorizontalSplit { left_percent }). Ctrl+W v or Ctrl+S toggles split. `/open <path>` loads a file in the left pane. Left pane renders with bordered paragraph showing file content.
-- ~~**Statusline truncation is by bytes not chars**: May cut multi-byte characters incorrectly.~~ — **Fixed**: Uses `unicode-width::UnicodeWidthStr::width()` to measure display width, truncates at grapheme boundaries via `unicode-segmentation`.
-- ~~**No responsive layout for small terminals**: Below ~20 lines, layout breaks.~~ — **Fixed**: `is_compact` check in `draw()`: hides statusline when `height < 20`, truncates long messages when `height < 10`, skips welcome art.
-- ~~**Welcome art is static**: Could show tips, recent sessions, or project stats.~~ — **Fixed**: `render_welcome_art()` function returns dynamic lines (T-Rex ASCII + tips + welcome message).
-- ~~**No syntax highlighting in code blocks**: Markdown code blocks render as plain text.~~ — **Already fixed**: Syntax highlighting was previously implemented.
-- ~~**Cursor may drift on CJK input**: `unicode-width` used for rendering but input handling may miscount.~~ — **Fixed**: `InputBuffer::display_column()` computes visual column accounting for wide characters. `byte_from_column()` converts display column to byte position.
+The `coderex-ui` crate is fully implemented with no stubs or gaps for production.

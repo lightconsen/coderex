@@ -13,4 +13,5 @@ start.kimi.sh
 
 # Local configuration and generated docs
 .coderex/settings.json
+.claude/settings.json
 docs/compare10.md
