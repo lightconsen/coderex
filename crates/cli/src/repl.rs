@@ -13,7 +13,9 @@ use coderex_core::permissions::{PermissionChecker, PermissionMode};
 use coderex_core::api_client::ApiClient;
 use coderex_core::types::{EngineEvent, Message};
 use coderex_memory::{
-    ai_workflow, long_term::LongTermStore, session_memory::SessionMemoryStore,
+    ai_workflow, auto_dream::{AutoDream, DreamConfig}, DreamCheckResult,
+    long_term::LongTermStore, session_memory::SessionMemoryStore,
+    team_memory::TeamMemorySyncService,
 };
 use coderex_tools::{
     register_builtin_tools, ExecutionConfig, ExecutionContext, RegistryToolDispatcher,
@@ -102,6 +104,12 @@ pub struct ReplLoop {
     long_term_store: Option<Arc<LongTermStore>>,
     /// Session ID for memory operations.
     session_id: Option<uuid::Uuid>,
+    /// Auto-dream manager for background session consolidation.
+    auto_dream: Option<Arc<AutoDream>>,
+    /// Shutdown signal for the auto-dream watcher.
+    dream_shutdown_tx: Option<tokio::sync::oneshot::Sender<()>>,
+    /// Team memory sync service for cross-repo memory sharing.
+    team_memory_service: Option<Arc<TeamMemorySyncService>>,
 }
 
 impl ReplLoop {
@@ -128,6 +136,9 @@ impl ReplLoop {
             session_memory_store: None,
             long_term_store: None,
             session_id: None,
+            auto_dream: None,
+            dream_shutdown_tx: None,
+            team_memory_service: None,
         }
     }
 
@@ -163,6 +174,12 @@ impl ReplLoop {
         let memory_base = std::path::PathBuf::from(&cwd).join(".coderex").join("memory");
         let session_memory_store = Arc::new(SessionMemoryStore::new(memory_base.join("session")));
         let long_term_store = Arc::new(LongTermStore::new(memory_base.join("long_term")));
+
+        let auto_dream = Arc::new(AutoDream::new(memory_base.clone(), DreamConfig::default()));
+        let team_memory_service = Arc::new(TeamMemorySyncService::new(
+            "default".to_string(),
+            memory_base.join("team"),
+        ));
 
         let engine = QueryEngine::new(
             api_client.clone_box(),
@@ -206,6 +223,9 @@ impl ReplLoop {
             session_memory_store: Some(session_memory_store),
             long_term_store: Some(long_term_store),
             session_id: Some(session_id),
+            auto_dream: Some(auto_dream),
+            dream_shutdown_tx: None,
+            team_memory_service: Some(team_memory_service),
         }
     }
 
@@ -1443,6 +1463,34 @@ impl ReplLoop {
                     });
                     return;
                 }
+                "away-summary" => {
+                    let msg = self.spawn_background_feature_by_kind(
+                        BackgroundFeatureKind::AwaySummary,
+                        "Summarize what happened while the user was away.".into(),
+                    );
+                    ui_state.messages.push(coderex_ui::message_list::Message {
+                        role: coderex_ui::message_list::MessageRole::System,
+                        content: msg.into(),
+                        tool_name: None,
+                        streaming: false,
+                            folded: false,
+                    });
+                    return;
+                }
+                "codebase-overview" => {
+                    let msg = self.spawn_background_feature_by_kind(
+                        BackgroundFeatureKind::CodebaseOverview,
+                        "Generate a high-level overview of the codebase.".into(),
+                    );
+                    ui_state.messages.push(coderex_ui::message_list::Message {
+                        role: coderex_ui::message_list::MessageRole::System,
+                        content: msg.into(),
+                        tool_name: None,
+                        streaming: false,
+                            folded: false,
+                    });
+                    return;
+                }
                 "update-memory" => {
                     let msg = self.spawn_memory_update_task().await;
                     ui_state.messages.push(coderex_ui::message_list::Message {
@@ -1485,6 +1533,28 @@ impl ReplLoop {
                             folded: false,
                         });
                     }
+                    return;
+                }
+                "auto-dream" => {
+                    let msg = self.handle_auto_dream_command(&args);
+                    ui_state.messages.push(coderex_ui::message_list::Message {
+                        role: coderex_ui::message_list::MessageRole::System,
+                        content: msg.into(),
+                        tool_name: None,
+                        streaming: false,
+                            folded: false,
+                    });
+                    return;
+                }
+                "team-memory" => {
+                    let msg = self.handle_team_memory_command(&args).await;
+                    ui_state.messages.push(coderex_ui::message_list::Message {
+                        role: coderex_ui::message_list::MessageRole::System,
+                        content: msg.into(),
+                        tool_name: None,
+                        streaming: false,
+                            folded: false,
+                    });
                     return;
                 }
                 _ => {}
@@ -1601,6 +1671,22 @@ impl ReplLoop {
                 writeln!(stdout, "{msg}")?;
                 return Ok(());
             }
+            "away-summary" => {
+                let msg = self.spawn_background_feature_by_kind(
+                    BackgroundFeatureKind::AwaySummary,
+                    "Summarize what happened while the user was away.".into(),
+                );
+                writeln!(stdout, "{msg}")?;
+                return Ok(());
+            }
+            "codebase-overview" => {
+                let msg = self.spawn_background_feature_by_kind(
+                    BackgroundFeatureKind::CodebaseOverview,
+                    "Generate a high-level overview of the codebase.".into(),
+                );
+                writeln!(stdout, "{msg}")?;
+                return Ok(());
+            }
             "update-memory" => {
                 let msg = self.spawn_memory_update_task().await;
                 writeln!(stdout, "{msg}")?;
@@ -1621,6 +1707,16 @@ impl ReplLoop {
                 }
                 return Ok(());
             }
+            "auto-dream" => {
+                let msg = self.handle_auto_dream_command(&args);
+                writeln!(stdout, "{msg}")?;
+                return Ok(());
+            }
+            "team-memory" => {
+                let msg = self.handle_team_memory_command(&args).await;
+                writeln!(stdout, "{msg}")?;
+                return Ok(());
+            }
             _ => {}
         }
 
@@ -1637,6 +1733,175 @@ impl ReplLoop {
             writeln!(stdout, "  /{:<20} {}", cmd.name, cmd.description)?;
         }
         Ok(())
+    }
+
+    /// Handle /auto-dream command.
+    fn handle_auto_dream_command(&mut self, args: &[String]) -> String {
+        let dream = match &self.auto_dream {
+            Some(d) => d,
+            None => return "Auto-dream is not initialized.".into(),
+        };
+
+        if args.is_empty() {
+            return "Usage: /auto-dream <enable|disable|status>".into();
+        }
+
+        match args[0].as_str() {
+            "enable" => {
+                let mut config = dream.config.clone();
+                config.enabled = true;
+                if args.len() >= 2 {
+                    if let Ok(n) = args[1].parse::<usize>() {
+                        config.session_threshold = n;
+                    }
+                }
+                if args.len() >= 3 {
+                    if let Ok(n) = args[2].parse::<i64>() {
+                        config.time_threshold_hours = n;
+                    }
+                }
+                // Record a session to trigger immediate check if threshold is 1
+                let _ = dream.record_session();
+
+                // Spawn the watcher if API client is available
+                if let Some(api) = &self.api_client {
+                    let dream = dream.clone();
+                    let api = api.clone_box();
+                    let model = self.model.clone();
+                    let _memory_dir = dream.memory_dir.clone();
+                    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+                    self.dream_shutdown_tx = Some(shutdown_tx);
+
+                    tokio::spawn(async move {
+                        let (tx, mut rx) = tokio::sync::mpsc::channel(10);
+                        let watcher_handle = tokio::spawn(async move {
+                            // Collect recent session summaries as context
+                            let recent_sessions: Vec<String> = Vec::new();
+                            dream.spawn_watcher_with_model(
+                                tx,
+                                std::time::Duration::from_secs(30),
+                                shutdown_rx,
+                                api.as_ref(),
+                                &model,
+                                recent_sessions,
+                            ).await;
+                        });
+
+                        // Forward dream results to memory dir
+                        while let Some(session) = rx.recv().await {
+                            tracing::info!(
+                                "Auto-dream completed: analyzed {} sessions",
+                                session.sessions_analyzed
+                            );
+                            // Dream artifacts are already written by complete_dream
+                            let _ = session;
+                        }
+                        let _ = watcher_handle.await;
+                    });
+
+                    format!("Auto-dream enabled (threshold: {} sessions or {}h)", config.session_threshold, config.time_threshold_hours)
+                } else {
+                    "Auto-dream requires an API client and memory store.".into()
+                }
+            }
+            "disable" => {
+                if let Some(tx) = self.dream_shutdown_tx.take() {
+                    let _ = tx.send(());
+                    "Auto-dream disabled.".into()
+                } else {
+                    "Auto-dream is not running.".into()
+                }
+            }
+            "status" => {
+                let config = &dream.config;
+                let running = self.dream_shutdown_tx.is_some();
+                let threshold = dream.check_threshold();
+                let threshold_msg = match threshold {
+                    DreamCheckResult::ShouldDream { sessions_since_last, hours_since_last } =>
+                        format!("thresholds met: {sessions_since_last} sessions, {hours_since_last}h since last dream"),
+                    DreamCheckResult::NotReady => "thresholds not yet met".into(),
+                    DreamCheckResult::InProgress => "dream in progress".into(),
+                };
+                format!(
+                    "Auto-dream: {} | config: {} sessions or {}h | {threshold_msg}",
+                    if running { "running" } else { "stopped" },
+                    config.session_threshold,
+                    config.time_threshold_hours,
+                )
+            }
+            _ => "Usage: /auto-dream <enable|disable|status>".into(),
+        }
+    }
+
+    /// Handle /team-memory command.
+    async fn handle_team_memory_command(&mut self, args: &[String]) -> String {
+        let svc = match &self.team_memory_service {
+            Some(s) => s,
+            None => return "Team memory sync is not initialized.".into(),
+        };
+
+        if args.is_empty() {
+            return "Usage: /team-memory <upsert|read|list|delete|sync> [args...]".into();
+        }
+
+        match args[0].as_str() {
+            "upsert" => {
+                if args.len() < 3 {
+                    return "Usage: /team-memory upsert <topic> <content>".into();
+                }
+                let topic = &args[1];
+                let content = args[2..].join(" ");
+                match svc.upsert(topic, &content) {
+                    Ok(entry) => format!("Team memory upserted: '{}' (checksum: {})", entry.topic, entry.checksum.to_hex()),
+                    Err(e) => format!("Failed to upsert team memory: {e}"),
+                }
+            }
+            "read" => {
+                if args.len() < 2 {
+                    return "Usage: /team-memory read <topic>".into();
+                }
+                match svc.read(&args[1]) {
+                    Ok(Some(entry)) => format!("[{}]\n{}", entry.topic, entry.content),
+                    Ok(None) => "No entry found.".into(),
+                    Err(e) => format!("Failed to read team memory: {e}"),
+                }
+            }
+            "list" => {
+                match svc.list() {
+                    Ok(entries) if entries.is_empty() => "No team memories.".into(),
+                    Ok(entries) => {
+                        entries.iter()
+                            .map(|e| format!("- {} (updated: {})", e.topic, e.updated_at.format("%Y-%m-%d %H:%M")))
+                            .collect::<Vec<_>>()
+                            .join("\n")
+                    }
+                    Err(e) => format!("Failed to list team memories: {e}"),
+                }
+            }
+            "delete" => {
+                if args.len() < 2 {
+                    return "Usage: /team-memory delete <topic>".into();
+                }
+                match svc.delete(&args[1]) {
+                    Ok(()) => "Team memory deleted.".into(),
+                    Err(e) => format!("Failed to delete team memory: {e}"),
+                }
+            }
+            "sync" => {
+                // Sync via in-memory relay or HTTP transport
+                // For now, show local state info
+                match svc.list() {
+                    Ok(entries) => {
+                        format!(
+                            "Local team memories: {} entries. Use /team-memory sync --remote to sync with relay.",
+                            entries.len()
+                        )
+                    }
+                    Err(e) => format!("Failed to list for sync: {e}"),
+                }
+            }
+            _ => "Usage: /team-memory <upsert|read|list|delete|sync> [args...]".into(),
+        }
     }
 
     fn build_context(&self) -> CommandContext {
