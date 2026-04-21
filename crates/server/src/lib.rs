@@ -4,6 +4,8 @@
 
 pub mod session;
 pub mod filter;
+pub mod persistence;
 
-pub use session::{Session, ServerConfig, DaemonServer};
+pub use session::{Session, ServerConfig, DaemonServer, WsRequest, WsRequestKind, WsResponse, WsResponseKind, WsEvent};
 pub use filter::{CommandFilter, SafetyLevel};
+pub use persistence::{SessionStore, PersistedSession};

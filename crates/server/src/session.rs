@@ -1,12 +1,147 @@
-//! Detached WebSocket session management with authentication and idle cleanup.
+//! Detached WebSocket session management with authentication, rate limiting,
+//! and idle cleanup.
 
 use futures::{SinkExt, StreamExt};
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio::net::{TcpListener, TcpStream};
 use tokio_tungstenite::tungstenite::Message;
 use tracing::{debug, info, warn};
+
+/// ─── Structured JSON Protocol Types ──────────────────────────────────────
+
+/// Client → Server request message.
+#[derive(Debug, Serialize, Deserialize)]
+#[allow(missing_docs)]
+pub struct WsRequest {
+    /// Unique request ID for correlation.
+    pub id: String,
+    /// Request type.
+    #[serde(flatten)]
+    pub kind: WsRequestKind,
+}
+
+/// Type of client request.
+#[derive(Debug, Serialize, Deserialize)]
+#[allow(missing_docs)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum WsRequestKind {
+    /// Send a query/prompt to the assistant.
+    Query { content: String },
+    /// Interrupt the current query.
+    Interrupt,
+    /// Ping to keep the connection alive.
+    Ping,
+}
+
+/// Server → Client response message.
+#[derive(Debug, Serialize)]
+#[allow(missing_docs)]
+pub struct WsResponse {
+    /// Correlates to the request ID.
+    pub id: String,
+    /// Response payload.
+    #[serde(flatten)]
+    pub kind: WsResponseKind,
+}
+
+/// Type of server response.
+#[derive(Debug, Serialize)]
+#[allow(missing_docs)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum WsResponseKind {
+    /// Successful query response.
+    QueryOk { content: String },
+    /// Streaming chunk from a query in progress.
+    StreamChunk { chunk: String },
+    /// Query completed.
+    QueryDone,
+    /// Ping response.
+    Pong,
+    /// Error response.
+    Error { code: String, message: String },
+}
+
+/// Server → Client unsolicited event (not correlated to a request).
+#[derive(Debug, Serialize)]
+#[allow(missing_docs)]
+#[serde(tag = "event", rename_all = "snake_case")]
+pub enum WsEvent {
+    /// Session is ready to receive messages.
+    SessionReady { session_id: String },
+    /// Warning that the session is approaching idle timeout.
+    IdleWarning { message: String },
+    /// Session has been closed.
+    SessionClosed { reason: String },
+    /// Rate limit exceeded.
+    RateLimited,
+}
+
+impl WsResponse {
+    fn error(id: &str, code: &str, message: &str) -> Self {
+        Self {
+            id: id.to_string(),
+            kind: WsResponseKind::Error {
+                code: code.to_string(),
+                message: message.to_string(),
+            },
+        }
+    }
+
+    fn pong(id: &str) -> Self {
+        Self {
+            id: id.to_string(),
+            kind: WsResponseKind::Pong,
+        }
+    }
+}
+
+/// Token-bucket rate limiter per session.
+#[derive(Debug)]
+struct TokenBucket {
+    /// Maximum tokens.
+    capacity: u32,
+    /// Current tokens available.
+    tokens: f64,
+    /// Tokens added per second.
+    refill_rate: f64,
+    /// Last time tokens were refilled.
+    last_refill: Instant,
+}
+
+impl TokenBucket {
+    fn new(capacity: u32, refill_rate: f64) -> Self {
+        Self {
+            capacity,
+            tokens: capacity as f64,
+            refill_rate,
+            last_refill: Instant::now(),
+        }
+    }
+
+    /// Refill tokens based on elapsed time.
+    fn refill(&mut self) {
+        let now = Instant::now();
+        let elapsed = now.duration_since(self.last_refill).as_secs_f64();
+        self.tokens = (self.tokens + elapsed * self.refill_rate).min(self.capacity as f64);
+        self.last_refill = now;
+    }
+
+    /// Try to consume one token. Returns false if rate limit exceeded.
+    fn try_consume(&mut self) -> bool {
+        self.refill();
+        if self.tokens >= 1.0 {
+            self.tokens -= 1.0;
+            true
+        } else {
+            false
+        }
+    }
+}
 
 /// A connected WebSocket session.
 #[derive(Debug)]
@@ -32,6 +167,12 @@ pub struct ServerConfig {
     pub idle_timeout: Duration,
     /// Maximum number of concurrent sessions.
     pub max_sessions: usize,
+    /// Maximum messages per minute per session (rate limit).
+    pub rate_limit_per_minute: u32,
+    /// Optional port for the HTTP health endpoint (None = disabled).
+    pub health_port: Option<u16>,
+    /// Optional path to SQLite database for session persistence.
+    pub persist_path: Option<std::path::PathBuf>,
 }
 
 impl Default for ServerConfig {
@@ -40,6 +181,9 @@ impl Default for ServerConfig {
             valid_keys: Vec::new(),
             idle_timeout: Duration::from_secs(3600),
             max_sessions: 100,
+            rate_limit_per_minute: 100,
+            health_port: None,
+            persist_path: None,
         }
     }
 }
@@ -51,6 +195,10 @@ pub struct DaemonServer {
     sessions: HashMap<String, Session>,
     /// Server configuration.
     config: ServerConfig,
+    /// Thread-safe session count for the health endpoint.
+    session_count_atomic: Arc<AtomicUsize>,
+    /// Optional SQLite session store for persistence.
+    store: Option<crate::persistence::SessionStore>,
 }
 
 impl Default for DaemonServer {
@@ -66,16 +214,45 @@ impl DaemonServer {
         Self {
             sessions: HashMap::new(),
             config: ServerConfig::default(),
+            session_count_atomic: Arc::new(AtomicUsize::new(0)),
+            store: None,
         }
     }
 
     /// Create a new daemon server with the given config.
     #[must_use]
     pub fn with_config(config: ServerConfig) -> Self {
-        Self {
+        let mut server = Self {
             sessions: HashMap::new(),
-            config,
+            config: config.clone(),
+            session_count_atomic: Arc::new(AtomicUsize::new(0)),
+            store: None,
+        };
+
+        // Initialize persistence if configured
+        if let Some(ref path) = config.persist_path {
+            match crate::persistence::SessionStore::open(path) {
+                Ok(store) => {
+                    server.store = Some(store);
+                    // Restore previous sessions
+                    if let Ok(psessions) = server.store.as_ref().unwrap().load_all() {
+                        for ps in &psessions {
+                            let restored = crate::persistence::restore_session(ps);
+                            server.sessions.insert(restored.id.clone(), restored);
+                        }
+                        if !psessions.is_empty() {
+                            info!("Restored {} sessions from database", psessions.len());
+                        }
+                    }
+                }
+                Err(e) => {
+                    warn!("Failed to open session store at {:?}: {}", path, e);
+                }
+            }
         }
+
+        server.sync_session_count();
+        server
     }
 
     /// Authenticate a new session with the given token.
@@ -89,13 +266,25 @@ impl DaemonServer {
 
         let id = format!("sess_{}", self.sessions.len() + 1);
         let now = Instant::now();
-        self.sessions.insert(id.clone(), Session {
+        let session = Session {
             id: id.clone(),
             auth_token: token.to_string(),
             created_at: now,
             last_activity: now,
             authenticated: true,
-        });
+        };
+        self.sessions.insert(id.clone(), session);
+
+        // Persist to SQLite if configured
+        if let Some(ref mut store) = self.store {
+            let sess = self.sessions.get(&id).unwrap();
+            let ps = crate::persistence::persist_session(sess);
+            if let Err(e) = store.save(&ps) {
+                warn!("Failed to persist session {id}: {e}");
+            }
+        }
+
+        self.sync_session_count();
         Ok(id)
     }
 
@@ -123,6 +312,7 @@ impl DaemonServer {
                 true
             }
         });
+        self.sync_session_count();
         removed
     }
 
@@ -140,25 +330,50 @@ impl DaemonServer {
 
     /// Disconnect a session.
     pub fn disconnect(&mut self, session_id: &str) -> bool {
-        self.sessions.remove(session_id).is_some()
+        let removed = self.sessions.remove(session_id).is_some();
+        if removed {
+            // Remove from persistence layer
+            if let Some(ref mut store) = self.store {
+                if let Err(e) = store.remove(session_id) {
+                    warn!("Failed to remove session {session_id} from store: {e}");
+                }
+            }
+            self.sync_session_count();
+        }
+        removed
     }
 
     /// Number of active sessions.
     #[must_use]
     pub fn session_count(&self) -> usize {
-        self.sessions.len()
+        self.session_count_atomic.load(Ordering::Relaxed)
+    }
+
+    /// Update the atomic session counter (called after sessions change).
+    fn sync_session_count(&self) {
+        self.session_count_atomic.store(self.sessions.len(), Ordering::Relaxed);
     }
 
     /// Start the WebSocket server and accept connections.
     ///
     /// Binds a TCP listener on the given address, upgrades connections to
     /// WebSocket, authenticates clients, and routes messages.
+    /// If `config.health_port` is set, spawns a lightweight HTTP server
+    /// on that port serving a `/health` endpoint.
     pub async fn run(&mut self, addr: SocketAddr) -> Result<(), String> {
         let listener = TcpListener::bind(addr)
             .await
             .map_err(|e| format!("failed to bind TCP listener: {e}"))?;
 
         info!("WebSocket server listening on ws://{addr}");
+
+        // Spawn health endpoint if configured
+        if let Some(health_port) = self.config.health_port {
+            let counter = Arc::clone(&self.session_count_atomic);
+            tokio::spawn(async move {
+                run_health_server(health_port, counter).await;
+            });
+        }
 
         let mut cleanup_interval = tokio::time::interval(Duration::from_secs(60));
 
@@ -265,17 +480,34 @@ impl DaemonServer {
             self.session_count()
         );
 
-        // Simple echo loop for the session
+        // Per-connection rate limiter
+        let refill_rate = self.config.rate_limit_per_minute as f64 / 60.0;
+        let mut limiter = TokenBucket::new(self.config.rate_limit_per_minute, refill_rate);
+
+        // Send session-ready event
+        let ready = WsEvent::SessionReady { session_id: session_id.clone() };
+        let _ = ws
+            .send(Message::Text(serde_json::to_string(&ready).unwrap().into()))
+            .await;
+
+        // Message loop with structured JSON protocol
         loop {
             match tokio::time::timeout(Duration::from_secs(300), ws.next()).await {
                 Ok(Some(Ok(Message::Text(text)))) => {
+                    // Rate limit check
+                    if !limiter.try_consume() {
+                        let evt = WsEvent::RateLimited;
+                        let _ = ws
+                            .send(Message::Text(serde_json::to_string(&evt).unwrap().into()))
+                            .await;
+                        continue;
+                    }
                     self.record_activity(&session_id);
                     debug!("session {session_id} received: {text}");
-                    // Echo back with session info
-                    let response = format!(
-                        r#"{{"session_id":"{session_id}","echo":{text}}}"#
-                    );
-                    if let Err(e) = ws.send(Message::Text(response.into())).await {
+
+                    let response = self.handle_message(&session_id, &text);
+                    let json = serde_json::to_string(&response).unwrap();
+                    if let Err(e) = ws.send(Message::Text(json.into())).await {
                         warn!("send error for session {session_id}: {e}");
                         break;
                     }
@@ -314,6 +546,101 @@ impl DaemonServer {
             self.session_count()
         );
     }
+
+    /// Route a structured JSON message to the appropriate handler.
+    fn handle_message(&mut self, _session_id: &str, text: &str) -> WsResponse {
+        let req: WsRequest = match serde_json::from_str(text) {
+            Ok(r) => r,
+            Err(e) => {
+                return WsResponse::error(
+                    "unknown",
+                    "parse_error",
+                    &format!("invalid JSON request: {e}"),
+                );
+            }
+        };
+
+        match req.kind {
+            WsRequestKind::Query { content } => {
+                debug!("query from session {_session_id}: {}", content.chars().take(80).collect::<String>());
+                // In production, this routes to QueryEngine.
+                // For now, echo back as a query response to confirm the protocol works.
+                WsResponse {
+                    id: req.id,
+                    kind: WsResponseKind::QueryOk {
+                        content: format!("received query: {content}"),
+                    },
+                }
+            }
+            WsRequestKind::Interrupt => {
+                WsResponse {
+                    id: req.id,
+                    kind: WsResponseKind::QueryDone,
+                }
+            }
+            WsRequestKind::Ping => WsResponse::pong(&req.id),
+        }
+    }
+}
+
+/// Lightweight HTTP server serving a single `/health` endpoint.
+async fn run_health_server(port: u16, session_count: Arc<AtomicUsize>) {
+    let addr: SocketAddr = ([0, 0, 0, 0], port).into();
+    let listener = match TcpListener::bind(addr).await {
+        Ok(l) => l,
+        Err(e) => {
+            warn!("failed to bind health endpoint on port {port}: {e}");
+            return;
+        }
+    };
+    info!("Health endpoint listening on http://0.0.0.0:{port}/health");
+
+    loop {
+        let Ok((stream, _)) = listener.accept().await else {
+            continue;
+        };
+        let counter = Arc::clone(&session_count);
+        tokio::spawn(async move {
+            let _ = handle_health_request(stream, counter).await;
+        });
+    }
+}
+
+async fn handle_health_request(stream: TcpStream, session_count: Arc<AtomicUsize>) -> std::io::Result<()> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let (mut reader, mut writer) = stream.into_split();
+
+    // Read the HTTP request (just need the first line)
+    let mut buf = [0u8; 1024];
+    let n = reader.read(&mut buf).await?;
+    let request = String::from_utf8_lossy(&buf[..n]);
+    let first_line = request.lines().next().unwrap_or("");
+
+    let status: u16;
+    let body: serde_json::Value;
+
+    if first_line.starts_with("GET /health") {
+        status = 200;
+        body = serde_json::json!({
+            "status": "ok",
+            "version": env!("CARGO_PKG_VERSION"),
+            "sessions": session_count.load(Ordering::Relaxed),
+        });
+    } else {
+        status = 404;
+        body = serde_json::json!({ "error": "not found" });
+    }
+
+    let body_str = serde_json::to_string(&body).unwrap();
+    let response = format!(
+        "HTTP/1.1 {status} {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body_str}",
+        if status == 200 { "OK" } else { "Not Found" },
+        body_str.len(),
+    );
+
+    writer.write_all(response.as_bytes()).await?;
+    writer.shutdown().await
 }
 
 #[cfg(test)]
@@ -325,6 +652,9 @@ mod tests {
             valid_keys: vec!["key1".to_string(), "key2".to_string()],
             idle_timeout: Duration::from_secs(1),
             max_sessions: 10,
+            rate_limit_per_minute: 100,
+            health_port: None,
+            persist_path: None,
         })
     }
 
@@ -358,6 +688,9 @@ mod tests {
             valid_keys: Vec::new(),
             idle_timeout: Duration::from_millis(50),
             max_sessions: 10,
+            rate_limit_per_minute: 100,
+            health_port: None,
+            persist_path: None,
         });
         let id = server.authenticate("tok").unwrap();
         // Wait for timeout
@@ -373,6 +706,9 @@ mod tests {
             valid_keys: Vec::new(),
             idle_timeout: Duration::from_millis(50),
             max_sessions: 10,
+            rate_limit_per_minute: 100,
+            health_port: None,
+            persist_path: None,
         });
         let id = server.authenticate("tok").unwrap();
         // Activity right before timeout
@@ -390,6 +726,9 @@ mod tests {
             valid_keys: Vec::new(),
             idle_timeout: Duration::from_secs(3600),
             max_sessions: 2,
+            rate_limit_per_minute: 100,
+            health_port: None,
+            persist_path: None,
         });
         server.authenticate("a").unwrap();
         server.authenticate("b").unwrap();
@@ -413,5 +752,96 @@ mod tests {
         server.authenticate("key2").unwrap();
         let sessions = server.list_sessions();
         assert_eq!(sessions.len(), 2);
+    }
+
+    #[test]
+    fn token_bucket_allows_burst_then_limits() {
+        // 5 tokens, refill 1/sec
+        let mut bucket = TokenBucket::new(5, 1.0);
+        // Should allow 5 consumes
+        for _ in 0..5 {
+            assert!(bucket.try_consume());
+        }
+        // 6th should fail (no time elapsed)
+        assert!(!bucket.try_consume());
+    }
+
+    #[test]
+    fn token_bucket_refills_over_time() {
+        let mut bucket = TokenBucket::new(10, 100.0); // fast refill for test
+        // Drain all tokens
+        for _ in 0..10 {
+            assert!(bucket.try_consume());
+        }
+        assert!(!bucket.try_consume());
+        // Wait a bit for refill
+        std::thread::sleep(Duration::from_millis(50));
+        // Should have refilled enough tokens
+        assert!(bucket.try_consume());
+    }
+
+    #[test]
+    fn protocol_serialize_query_request() {
+        let req = WsRequest {
+            id: "req_1".to_string(),
+            kind: WsRequestKind::Query {
+                content: "hello".to_string(),
+            },
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(json.contains("req_1"));
+        assert!(json.contains("hello"));
+        assert!(json.contains("query"));
+    }
+
+    #[test]
+    fn protocol_serialize_query_response() {
+        let resp = WsResponse {
+            id: "req_1".to_string(),
+            kind: WsResponseKind::QueryOk {
+                content: "hi back".to_string(),
+            },
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        assert!(json.contains("query_ok"));
+        assert!(json.contains("hi back"));
+    }
+
+    #[test]
+    fn protocol_serialize_error_response() {
+        let resp = WsResponse::error("req_1", "bad_request", "invalid JSON");
+        let json = serde_json::to_string(&resp).unwrap();
+        assert!(json.contains("error"));
+        assert!(json.contains("bad_request"));
+        assert!(json.contains("invalid JSON"));
+    }
+
+    #[test]
+    fn protocol_serialize_event() {
+        let evt = WsEvent::SessionReady {
+            session_id: "sess_1".to_string(),
+        };
+        let json = serde_json::to_string(&evt).unwrap();
+        assert!(json.contains("session_ready"));
+        assert!(json.contains("sess_1"));
+    }
+
+    #[test]
+    fn protocol_deserialize_query_request() {
+        let json = r#"{"id":"r1","type":"query","content":"test"}"#;
+        let req: WsRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.id, "r1");
+        match req.kind {
+            WsRequestKind::Query { content } => assert_eq!(content, "test"),
+            _ => panic!("expected Query variant"),
+        }
+    }
+
+    #[test]
+    fn protocol_deserialize_ping_request() {
+        let json = r#"{"id":"r2","type":"ping"}"#;
+        let req: WsRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.id, "r2");
+        assert!(matches!(req.kind, WsRequestKind::Ping));
     }
 }
