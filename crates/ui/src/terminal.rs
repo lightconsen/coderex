@@ -115,8 +115,25 @@ impl TerminalUi {
                 .constraints(constraints)
                 .split(area);
 
-            // Message area (always index 0)
-            render_messages(frame, chunks[0], state);
+            // Message area (index 0) — may be split horizontally
+            let msg_area = chunks[0];
+            if let crate::state::LayoutMode::HorizontalSplit { left_percent } = state.layout_mode {
+                let pct = left_percent.clamp(10, 90) as u16;
+                let split_chunks = Layout::default()
+                    .direction(Direction::Horizontal)
+                    .constraints([
+                        Constraint::Percentage(pct),
+                        Constraint::Percentage(100 - pct),
+                    ])
+                    .split(msg_area);
+
+                // Left pane: file/content viewer
+                render_left_pane(frame, split_chunks[0], state);
+                // Right pane: messages
+                render_messages(frame, split_chunks[1], state);
+            } else {
+                render_messages(frame, msg_area, state);
+            }
 
             // Inline palette (index 1)
             if inline_palette_height > 0 {
@@ -538,6 +555,34 @@ fn render_notification_bar(frame: &mut Frame, area: ratatui::layout::Rect, cente
         // Mark as seen
         center.mark_seen();
     }
+}
+
+fn render_left_pane(frame: &mut Frame, area: ratatui::layout::Rect, state: &UiState) {
+    let content = if state.left_pane_content.is_empty() {
+        "No file open.\nUse /open <path> to view a file."
+    } else {
+        &state.left_pane_content
+    };
+
+    let wrapped = wrap_text(content, area.width.saturating_sub(2) as usize);
+    let lines: Vec<Line> = wrapped
+        .into_iter()
+        .map(|s| Line::from(Span::styled(s, Style::default().fg(Color::White))))
+        .collect();
+
+    let title = if state.left_pane_title.is_empty() {
+        "File Viewer"
+    } else {
+        &state.left_pane_title
+    };
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(title)
+        .style(Style::default().fg(Color::Gray));
+
+    let paragraph = Paragraph::new(lines).block(block);
+    frame.render_widget(paragraph, area);
 }
 
 fn render_statusline(frame: &mut Frame, area: ratatui::layout::Rect, statusline: &Statusline) {

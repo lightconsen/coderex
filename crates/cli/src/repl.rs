@@ -405,6 +405,18 @@ impl ReplLoop {
                                 }
                             }
 
+                            // Ctrl+Shift+S: toggle split-pane view
+                            if key.code == KeyCode::Char('S')
+                                && key.modifiers.contains(KeyModifiers::CONTROL)
+                            {
+                                use coderex_ui::state::LayoutMode;
+                                ui_state.layout_mode = match ui_state.layout_mode {
+                                    LayoutMode::SinglePane => LayoutMode::HorizontalSplit { left_percent: 50 },
+                                    LayoutMode::HorizontalSplit { .. } => LayoutMode::SinglePane,
+                                };
+                                continue;
+                            }
+
                             let action = vim.handle_key(key);
                             match action {
                                 VimAction::Submit => {
@@ -543,6 +555,13 @@ impl ReplLoop {
                                     if let Some(msg) = ui_state.messages.messages.last_mut() {
                                         msg.folded = !msg.folded;
                                     }
+                                }
+                                VimAction::ToggleSplit => {
+                                    use coderex_ui::state::LayoutMode;
+                                    ui_state.layout_mode = match ui_state.layout_mode {
+                                        LayoutMode::SinglePane => LayoutMode::HorizontalSplit { left_percent: 50 },
+                                        LayoutMode::HorizontalSplit { .. } => LayoutMode::SinglePane,
+                                    };
                                 }
                                 VimAction::SearchNext => {
                                     ui_state.search.next();

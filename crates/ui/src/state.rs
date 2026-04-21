@@ -34,6 +34,24 @@ pub enum ViewMode {
     StatuslineSetup,
 }
 
+/// Layout mode for the main content area.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LayoutMode {
+    /// Single pane: full width for messages.
+    SinglePane,
+    /// Horizontal split: left pane shows file/content, right pane shows chat.
+    HorizontalSplit {
+        /// Width percentage for the left pane (10-90).
+        left_percent: u16,
+    },
+}
+
+impl Default for LayoutMode {
+    fn default() -> Self {
+        Self::SinglePane
+    }
+}
+
 /// UI state, owned exclusively by the rendering thread.
 #[derive(Debug)]
 pub struct UiState {
@@ -55,6 +73,12 @@ pub struct UiState {
     pub statusline_setup: StatuslineSetup,
     /// Notification center.
     pub notifications: NotificationCenter,
+    /// Layout mode (single pane or split view).
+    pub layout_mode: LayoutMode,
+    /// Content shown in the left pane of split view.
+    pub left_pane_content: String,
+    /// Title shown on the left pane border (e.g., filename).
+    pub left_pane_title: String,
 }
 
 impl UiState {
@@ -71,6 +95,9 @@ impl UiState {
             statusline: Statusline::new(),
             statusline_setup: StatuslineSetup::new(),
             notifications: NotificationCenter::new(),
+            layout_mode: LayoutMode::SinglePane,
+            left_pane_content: String::new(),
+            left_pane_title: String::new(),
         }
     }
 }

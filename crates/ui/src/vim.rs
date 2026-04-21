@@ -82,6 +82,8 @@ pub enum VimAction {
     SearchPrev,
     /// Export/copy message to clipboard.
     ExportCopy,
+    /// Toggle split-pane view.
+    ToggleSplit,
     /// Ignore this key.
     Ignore,
 }
