@@ -41,18 +41,8 @@ Session transcript storage, indexing, and long-term memory. Persists conversatio
 - AutoDream configuration, threshold checking, session counting, and state persistence.
 - AutoDream background polling loop (`spawn_watcher`) with shutdown signal.
 - LongTermMemory topic-based storage with delete, delete_by_key, and list_all operations.
-- Thread-safe concurrent appends via `ConcurrentTranscriptStore` with per-session `DashMap` locking.
+- Thread-safe concurrent appends via `ConcurrentTranscriptStore` / `ConcurrentLongTermStore` with per-key locking.
 - TF-IDF semantic search on session content via `SessionIndex::index_content` / `search_semantic`.
-- Encrypted transcript append/decrypt with AES-256-GCM + HKDF key derivation (feature: `encryption`).
+- Encrypted transcript append/decrypt with AES-256-GCM + HKDF (feature: `encryption`).
 - HTTP team memory sync via `HttpTransport` (feature: `team-http`).
 - AutoDream LLM sub-agent via `spawn_watcher_with_model` accepting `dyn ApiClient`.
-
-### Closed Gaps
-
-All previously identified production gaps have been implemented:
-
-- **Thread-safety on shared stores**: `ConcurrentTranscriptStore` and `ConcurrentLongTermStore` wrap stores with per-key `DashMap<String, Arc<Mutex<()>>>` locking. `SharedSessionIndex` wraps `SessionIndex` in `Arc<parking_lot::Mutex<>>`. (module: `concurrent.rs`)
-- **Embeddings/semantic search**: TF-IDF cosine similarity search on `SessionIndex` via `index_content()` and `search_semantic()` methods. Stores term frequencies in `session_tfidf`/`session_idf` tables. (module: `session_index.rs`)
-- **Transcript encryption at rest**: `append_encrypted()` / `read_all_decrypted()` methods using AES-256-GCM with per-session keys derived via HKDF. Encrypted files use `.jsonl.enc` extension. (feature: `encryption`, module: `transcript_crypto.rs`)
-- **Team memory HTTP transport**: `HttpTransport` implements `TeamSyncTransport` over HTTP/JSON using `reqwest`. Endpoints: `GET /state`, `POST /delta`, `POST /entries`. (feature: `team-http`, module: `team_http.rs`)
-- **AutoDream LLM sub-agent**: `spawn_watcher_with_model()` accepts `&dyn ApiClient` to send dream prompts to an external LLM and parse the response. (module: `auto_dream.rs`)
