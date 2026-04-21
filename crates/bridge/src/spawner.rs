@@ -1,4 +1,4 @@
-//! Bridge session spawner — worktree creation and session directory preparation.
+//! Bridge session spawner — worktree creation, session directory preparation, and SSH remote spawning.
 
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -62,6 +62,12 @@ impl BridgeSessionSpawner {
             }
             SpawnMode::Worktree => {
                 self.spawn_worktree(config).await
+            }
+            SpawnMode::Ssh { ref host, ref remote_path, ref identity_file } => {
+                let host = host.clone();
+                let remote_path = remote_path.clone();
+                let identity_file = identity_file.clone();
+                self.spawn_ssh(config, &host, &remote_path, identity_file.as_deref()).await
             }
         }
     }
@@ -135,6 +141,64 @@ impl BridgeSessionSpawner {
                 .map_err(|e| format!("git worktree remove failed: {e}"))?;
         }
         Ok(())
+    }
+
+    /// Spawn a session on a remote host via SSH.
+    ///
+    /// Connects to the remote host using OpenSSH, creates the session
+    /// directory, and verifies that `coderex` is available on the remote.
+    async fn spawn_ssh(
+        &self,
+        config: SpawnConfig,
+        host: &str,
+        remote_path: &str,
+        _identity_file: Option<&str>,
+    ) -> Result<SpawnResult, String> {
+        let session_dir = format!("{remote_path}/{}", config.session_id);
+
+        // Build the SSH session using the system ssh command.
+        // Note: identity_file support requires MuxConfig; for now
+        // we rely on the user's ssh config (~/.ssh/config) for key selection.
+        let session = openssh::Session::connect(
+            host,
+            openssh::KnownHosts::Accept,
+        )
+        .await
+        .map_err(|e| format!("ssh connect failed: {e}"))?;
+
+        // Create session directory on remote: ssh host mkdir -p /path
+        let output = session
+            .command("mkdir")
+            .arg("-p")
+            .arg(&session_dir)
+            .output()
+            .await
+            .map_err(|e| format!("ssh mkdir failed: {e}"))?;
+
+        if !output.status.success() {
+            return Err(format!(
+                "remote mkdir failed: {}",
+                String::from_utf8_lossy(&output.stderr),
+            ));
+        }
+
+        // Verify coderex is available on remote
+        let output = session
+            .command("which")
+            .arg("coderex")
+            .output()
+            .await
+            .map_err(|e| format!("ssh which coderex failed: {e}"))?;
+
+        if !output.status.success() {
+            return Err("coderex not found on remote host".to_string());
+        }
+
+        Ok(SpawnResult {
+            session_id: config.session_id,
+            work_dir: PathBuf::from(&session_dir),
+            worktree_created: false,
+        })
     }
 }
 
@@ -240,5 +304,32 @@ mod tests {
         let (repo, wt, sess) = temp_dirs();
         let spawner = BridgeSessionSpawner::new(repo, wt, sess);
         spawner.cleanup_worktree("nonexistent").unwrap();
+    }
+
+    #[test]
+    fn spawn_mode_ssh_variant() {
+        let ssh_mode = SpawnMode::Ssh {
+            host: "user@remote".into(),
+            remote_path: "/tmp/work".into(),
+            identity_file: Some("~/.ssh/id_ed25519".into()),
+        };
+        match &ssh_mode {
+            SpawnMode::Ssh { host, remote_path, identity_file } => {
+                assert_eq!(host, "user@remote");
+                assert_eq!(remote_path, "/tmp/work");
+                assert_eq!(identity_file, &Some("~/.ssh/id_ed25519".into()));
+            }
+            _ => panic!("expected Ssh variant"),
+        }
+    }
+
+    #[test]
+    fn spawn_mode_ssh_no_identity() {
+        let ssh_mode = SpawnMode::Ssh {
+            host: "user@remote".into(),
+            remote_path: "/tmp/work".into(),
+            identity_file: None,
+        };
+        assert_eq!(ssh_mode.as_str(), "ssh");
     }
 }

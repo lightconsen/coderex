@@ -4,9 +4,17 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
 
+/// Current archive format version.
+///
+/// Increment this when the archive schema changes.
+/// Migrations should be added for each version bump.
+pub const CURRENT_ARCHIVE_VERSION: u32 = 1;
+
 /// Archived session metadata.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionArchive {
+    /// Archive format version.
+    pub version: u32,
     /// Session ID.
     pub session_id: String,
     /// Path to the archived transcript.
@@ -66,6 +74,7 @@ impl BridgeArchiveWriter {
             .map_err(|e| format!("failed to write transcript: {e}"))?;
 
         let archive = SessionArchive {
+            version: CURRENT_ARCHIVE_VERSION,
             session_id: session_id.to_string(),
             transcript_path: transcript_path.clone(),
             usage,
@@ -101,12 +110,19 @@ impl BridgeArchiveWriter {
     }
 
     /// Load archived metadata for a session.
+    ///
+    /// Returns `None` if the archive does not exist or uses an unsupported version.
     #[must_use]
     pub fn load_metadata(&self, session_id: &str) -> Option<SessionArchive> {
         let metadata_path = self.archive_dir.join(session_id).join("metadata.json");
         if metadata_path.exists() {
             let content = std::fs::read_to_string(&metadata_path).ok()?;
-            serde_json::from_str(&content).ok()
+            let archive: SessionArchive = serde_json::from_str(&content).ok()?;
+            if archive.version > CURRENT_ARCHIVE_VERSION {
+                // Future version — cannot parse safely
+                return None;
+            }
+            Some(archive)
         } else {
             None
         }
@@ -328,5 +344,42 @@ mod tests {
         assert_eq!(meta.status, "completed");
 
         assert!(writer.load_metadata("nonexistent").is_none());
+    }
+
+    #[test]
+    fn archive_version_is_set() {
+        let dir = tempfile::tempdir().unwrap();
+        let writer = BridgeArchiveWriter::new(dir.path().to_path_buf());
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let archive = rt
+            .block_on(writer.archive("s1", "line\n", sample_usage(), "completed"))
+            .unwrap();
+        assert_eq!(archive.version, CURRENT_ARCHIVE_VERSION);
+    }
+
+    #[test]
+    fn load_metadata_rejects_future_version() {
+        let dir = tempfile::tempdir().unwrap();
+        let session_dir = dir.path().join("s1");
+        std::fs::create_dir_all(&session_dir).unwrap();
+        // Write a future-version archive manually
+        let future_meta = serde_json::json!({
+            "version": 999,
+            "session_id": "s1",
+            "transcript_path": session_dir.join("transcript.jsonl"),
+            "usage": {
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "cache_read_tokens": 0,
+                "cache_creation_tokens": 0,
+                "cost_usd": 0.0
+            },
+            "status": "completed",
+            "archived_at": "2026-01-01T00:00:00Z"
+        });
+        std::fs::write(session_dir.join("metadata.json"), serde_json::to_string(&future_meta).unwrap()).unwrap();
+
+        let writer = BridgeArchiveWriter::new(dir.path().to_path_buf());
+        assert!(writer.load_metadata("s1").is_none());
     }
 }

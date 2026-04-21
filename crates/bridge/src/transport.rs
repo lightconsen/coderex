@@ -6,8 +6,9 @@
 //! - Mock transport for testing
 
 use std::collections::HashMap;
-use std::sync::Arc;
-use tokio::sync::{mpsc, RwLock};
+use serde::{Deserialize, Serialize};
+use tokio::sync::mpsc;
+use tokio::time::Duration;
 use thiserror::Error;
 
 /// Errors from transport operations.
@@ -35,7 +36,7 @@ pub enum TransportError {
 }
 
 /// A message sent over the transport layer.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TransportMessage {
     /// Message type identifier.
     pub r#type: String,
@@ -68,6 +69,19 @@ pub trait Transport: Send + Sync + 'static {
     /// Receive the next message from the remote endpoint.
     async fn receive(&mut self) -> Result<TransportMessage, TransportError>;
 
+    /// Receive the next message with a timeout.
+    ///
+    /// Default implementation wraps `receive()` with `tokio::time::timeout`.
+    /// Implementors may override this for more efficient native timeout support.
+    async fn receive_timeout(
+        &mut self,
+        timeout: Duration,
+    ) -> Result<TransportMessage, TransportError> {
+        tokio::time::timeout(timeout, self.receive())
+            .await
+            .map_err(|_| TransportError::ReceiveFailed("receive timed out".into()))?
+    }
+
     /// Get a unique identifier for this transport connection.
     fn connection_id(&self) -> &str;
 }
@@ -87,9 +101,6 @@ pub struct InProcessTransport {
     tx: Option<mpsc::UnboundedSender<TransportMessage>>,
     /// Incoming message receiver.
     rx: Option<mpsc::UnboundedReceiver<TransportMessage>>,
-    /// Shared message queue for bidirectional communication.
-    #[allow(dead_code)]
-    message_queue: Arc<RwLock<Vec<TransportMessage>>>,
 }
 
 impl InProcessTransport {
@@ -101,7 +112,6 @@ impl InProcessTransport {
             connection_id,
             tx: None,
             rx: None,
-            message_queue: Arc::new(RwLock::new(Vec::new())),
         }
     }
 
@@ -113,9 +123,6 @@ impl InProcessTransport {
         id_a: String,
         id_b: String,
     ) -> (Self, Self) {
-        let queue_a = Arc::new(RwLock::new(Vec::new()));
-        let queue_b = Arc::new(RwLock::new(Vec::new()));
-
         let (tx_a, rx_a) = mpsc::unbounded_channel::<TransportMessage>();
         let (tx_b, rx_b) = mpsc::unbounded_channel::<TransportMessage>();
 
@@ -124,7 +131,6 @@ impl InProcessTransport {
             connection_id: id_a,
             tx: Some(tx_a),
             rx: Some(rx_b), // a receives from b's sender
-            message_queue: queue_a,
         };
 
         let transport_b = Self {
@@ -132,7 +138,6 @@ impl InProcessTransport {
             connection_id: id_b,
             tx: Some(tx_b),
             rx: Some(rx_a), // b receives from a's sender
-            message_queue: queue_b,
         };
 
         (transport_a, transport_b)
@@ -365,6 +370,48 @@ mod tests {
         };
         let result = transport.send(msg).await;
         assert!(matches!(result, Err(TransportError::NotConnected)));
+    }
+
+    #[tokio::test]
+    async fn receive_timeout_returns_message_when_available() {
+        let (mut a, mut b) = InProcessTransport::create_pair(
+            "sender".into(),
+            "receiver".into(),
+        );
+        a.connect().await.unwrap();
+        b.connect().await.unwrap();
+
+        let msg = TransportMessage {
+            r#type: "ping".into(),
+            correlation_id: None,
+            payload: "{}".into(),
+            metadata: HashMap::new(),
+        };
+        a.send(msg).await.unwrap();
+
+        let received = b.receive_timeout(Duration::from_secs(1)).await.unwrap();
+        assert_eq!(received.r#type, "ping");
+    }
+
+    #[tokio::test]
+    async fn receive_timeout_returns_error_on_expiry() {
+        let (mut a, mut b) = InProcessTransport::create_pair(
+            "a".into(),
+            "b".into(),
+        );
+        a.connect().await.unwrap();
+        b.connect().await.unwrap();
+
+        // Keep b alive but don't send anything — a will timeout waiting
+        let handle = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            let _ = b;
+        });
+
+        let result = a.receive_timeout(Duration::from_millis(50)).await;
+        assert!(matches!(result, Err(TransportError::ReceiveFailed(msg)) if msg.contains("timed out")));
+
+        handle.abort();
     }
 
     #[test]

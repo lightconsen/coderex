@@ -20,10 +20,14 @@ async-trait.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tokio-tungstenite.workspace = true
+futures-util.workspace = true
 reqwest.workspace = true
 strum.workspace = true
 uuid.workspace = true
 chrono.workspace = true
+home.workspace = true
+sha2.workspace = true
+openssh.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

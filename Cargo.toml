@@ -26,8 +26,9 @@ resolver = "2"
 # Async runtime
 tokio = { version = "1", features = ["full"] }
 tokio-util = { version = "0.7", features = ["codec"] }
-tokio-tungstenite = "0.26"
+tokio-tungstenite = { version = "0.26", features = ["rustls-tls-webpki-roots"] }
 futures = "0.3"
+futures-util = "0.3"
 async-trait = "0.1"
 pin-project = "1"
 async-stream = "0.3"
@@ -110,6 +111,9 @@ bitflags = "2"
 
 # Cron
 cron = "0.15"
+
+# SSH
+openssh = { version = "0.11", features = ["process-mux"] }
 
 # LSP protocol types
 lsp-types = "0.97"
