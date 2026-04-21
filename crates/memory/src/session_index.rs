@@ -63,7 +63,11 @@ impl SessionIndex {
                 total_tokens INTEGER DEFAULT 0
             );
             CREATE INDEX IF NOT EXISTS idx_project_path ON sessions(project_path);
-            CREATE INDEX IF NOT EXISTS idx_last_active ON sessions(last_active_at DESC);",
+            CREATE INDEX IF NOT EXISTS idx_last_active ON sessions(last_active_at DESC);
+            CREATE VIRTUAL TABLE IF NOT EXISTS session_fts USING fts5(
+                session_id,
+                content
+            );",
         )?;
         Ok(Self { conn })
     }
@@ -87,6 +91,7 @@ impl SessionIndex {
                 meta.total_tokens,
             ],
         )?;
+        self.update_fts(meta)?;
         Ok(())
     }
 
@@ -146,6 +151,49 @@ impl SessionIndex {
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
             Err(e) => Err(e.into()),
         }
+    }
+
+    /// Search sessions by full-text query on title and tags.
+    ///
+    /// Returns matching sessions ordered by last_active_at.
+    pub fn search(
+        &self,
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<SessionMeta>, SessionIndexError> {
+        let search_term = format!("{}*", query);
+        let mut stmt = self.conn.prepare(
+            "SELECT s.* FROM sessions s
+             WHERE s.session_id IN (
+                 SELECT session_id FROM session_fts WHERE session_fts MATCH ?1
+             )
+             ORDER BY s.last_active_at DESC
+             LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![search_term, limit], row_to_meta)?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    /// Update the FTS index for a session.
+    fn update_fts(&self, meta: &SessionMeta) -> Result<(), SessionIndexError> {
+        let title = meta.ai_title.as_deref().unwrap_or("");
+        let tag = meta.tag.as_deref().unwrap_or("");
+        let combined = format!("{title} {tag}").trim().to_string();
+
+        // Delete old entry if exists
+        let _ = self.conn.execute(
+            "DELETE FROM session_fts WHERE session_id = ?1",
+            [meta.session_id.as_str()],
+        );
+
+        // Insert new entry (skip if no searchable content)
+        if !combined.is_empty() {
+            self.conn.execute(
+                "INSERT INTO session_fts (session_id, content) VALUES (?1, ?2)",
+                [meta.session_id.as_str(), combined.as_str()],
+            )?;
+        }
+        Ok(())
     }
 }
 
@@ -270,5 +318,36 @@ mod tests {
 
         let retrieved = index.get("replace_1").unwrap().unwrap();
         assert_eq!(retrieved.ai_title, Some("Second".into()));
+    }
+
+    #[test]
+    fn search_finds_matching_title() {
+        let (index, _tmp) = temp_index();
+
+        let mut meta1 = test_meta("s1");
+        meta1.ai_title = Some("Authentication fix".into());
+        index.create(&meta1).unwrap();
+
+        let mut meta2 = test_meta("s2");
+        meta2.ai_title = Some("UI redesign".into());
+        index.create(&meta2).unwrap();
+
+        let results = index.search("auth", 10).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].session_id, "s1");
+    }
+
+    #[test]
+    fn search_respects_limit() {
+        let (index, _tmp) = temp_index();
+
+        for i in 0..5 {
+            let mut meta = test_meta(&format!("search_{i}"));
+            meta.ai_title = Some(format!("Test session {i}"));
+            index.create(&meta).unwrap();
+        }
+
+        let results = index.search("test", 2).unwrap();
+        assert_eq!(results.len(), 2);
     }
 }

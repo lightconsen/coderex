@@ -75,8 +75,101 @@ impl RemoteState {
     }
 }
 
-/// Team memory sync service for a single repository.
+/// Abstract transport for team memory sync operations.
 ///
+/// Implement this trait to provide a custom network backend for
+/// syncing team memories between clients.
+#[async_trait::async_trait]
+pub trait TeamSyncTransport: Send + Sync {
+    /// Fetch the remote state (topics with checksums and timestamps).
+    async fn fetch_remote_state(&self) -> Result<RemoteState, String>;
+
+    /// Send local delta entries to the remote.
+    async fn send_delta(&self, entries: &[TeamMemoryEntry]) -> Result<(), String>;
+
+    /// Fetch full content for remote entries that need to be received.
+    async fn fetch_entries(&self, topics: &[String]) -> Result<Vec<TeamMemoryEntry>, String>;
+}
+
+/// In-memory relay for local team memory sync testing.
+///
+/// Acts as a simple central server that stores and serves team memories.
+#[derive(Debug, Default, Clone)]
+pub struct InMemoryRelay {
+    entries: std::sync::Arc<tokio::sync::RwLock<HashMap<String, TeamMemoryEntry>>>,
+}
+
+impl InMemoryRelay {
+    /// Create a new empty relay.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            entries: std::sync::Arc::new(tokio::sync::RwLock::new(HashMap::new())),
+        }
+    }
+
+    /// Upsert an entry on the relay.
+    pub async fn upsert(&self, entry: TeamMemoryEntry) {
+        self.entries.write().await.insert(entry.topic.clone(), entry);
+    }
+
+    /// Get all entry summaries for state comparison.
+    pub async fn get_state(&self) -> RemoteState {
+        let guard = self.entries.read().await;
+        let mut state = RemoteState::default();
+        for (topic, entry) in guard.iter() {
+            state.add(
+                topic.clone(),
+                entry.checksum,
+                entry.tombstoned,
+                entry.updated_at,
+            );
+        }
+        state
+    }
+
+    /// Get full entries by topic.
+    pub async fn get_entries(&self, topics: &[String]) -> Vec<TeamMemoryEntry> {
+        let guard = self.entries.read().await;
+        topics
+            .iter()
+            .filter_map(|t| guard.get(t).cloned())
+            .collect()
+    }
+}
+
+/// Transport adapter that wraps an [`InMemoryRelay`].
+#[derive(Debug, Clone)]
+pub struct RelayTransport {
+    relay: InMemoryRelay,
+}
+
+impl RelayTransport {
+    /// Create a new transport adapter for the given relay.
+    #[must_use]
+    pub fn new(relay: InMemoryRelay) -> Self {
+        Self { relay }
+    }
+}
+
+#[async_trait::async_trait]
+impl TeamSyncTransport for RelayTransport {
+    async fn fetch_remote_state(&self) -> Result<RemoteState, String> {
+        Ok(self.relay.get_state().await)
+    }
+
+    async fn send_delta(&self, entries: &[TeamMemoryEntry]) -> Result<(), String> {
+        for entry in entries {
+            self.relay.upsert(entry.clone()).await;
+        }
+        Ok(())
+    }
+
+    async fn fetch_entries(&self, topics: &[String]) -> Result<Vec<TeamMemoryEntry>, String> {
+        Ok(self.relay.get_entries(topics).await)
+    }
+}
+
 /// Memories are stored in `<repo_memory_dir>/<org_id>/<topic>.json`.
 /// Sync uses checksums to detect changes and only transfers deltas.
 #[derive(Debug)]
@@ -590,5 +683,76 @@ mod tests {
         assert_eq!(list1[0].topic, "a-only");
         assert_eq!(list2.len(), 1);
         assert_eq!(list2[0].topic, "b-only");
+    }
+
+    #[tokio::test]
+    async fn relay_transport_fetches_state() {
+        let relay = InMemoryRelay::new();
+        let transport = RelayTransport::new(relay.clone());
+
+        // Push an entry to the relay directly
+        relay.upsert(TeamMemoryEntry {
+            topic: "test-topic".into(),
+            content: "test content".into(),
+            checksum: MemoryChecksum::from_content("test content"),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            tombstoned: false,
+        }).await;
+
+        let state = transport.fetch_remote_state().await.unwrap();
+        assert!(state.entries.contains_key("test-topic"));
+    }
+
+    #[tokio::test]
+    async fn relay_transport_send_and_fetch() {
+        let relay = InMemoryRelay::new();
+        let transport = RelayTransport::new(relay.clone());
+
+        let entries = vec![
+            TeamMemoryEntry {
+                topic: "new-entry".into(),
+                content: "hello".into(),
+                checksum: MemoryChecksum::from_content("hello"),
+                created_at: Utc::now(),
+                updated_at: Utc::now(),
+                tombstoned: false,
+            },
+        ];
+
+        transport.send_delta(&entries).await.unwrap();
+        let fetched = transport.fetch_entries(&["new-entry".to_string()]).await.unwrap();
+        assert_eq!(fetched.len(), 1);
+        assert_eq!(fetched[0].content, "hello");
+    }
+
+    #[tokio::test]
+    async fn full_sync_via_relay() {
+        let tmp = tempfile::tempdir().unwrap();
+        let svc = TeamMemorySyncService::new("repo1".into(), tmp.path().to_path_buf());
+        svc.upsert("local-topic", "local content").unwrap();
+
+        let relay = InMemoryRelay::new();
+        let transport = RelayTransport::new(relay.clone());
+
+        // Send local delta to relay
+        let delta = svc.compute_sync_delta(&transport.fetch_remote_state().await.unwrap());
+        transport.send_delta(&delta.to_send).await.unwrap();
+
+        // Another client fetches from the relay
+        let tmp2 = tempfile::tempdir().unwrap();
+        let svc2 = TeamMemorySyncService::new("repo1".into(), tmp2.path().to_path_buf());
+        let transport2 = RelayTransport::new(relay.clone());
+        let remote_state = transport2.fetch_remote_state().await.unwrap();
+        let delta2 = svc2.compute_sync_delta(&remote_state);
+
+        // Fetch full content from relay and apply
+        let remote_entries = transport2.fetch_entries(
+            &delta2.to_receive.iter().map(|e| e.topic.clone()).collect::<Vec<_>>()
+        ).await.unwrap();
+        svc2.apply_remote(remote_entries).unwrap();
+
+        let local = svc2.read("local-topic").unwrap().unwrap();
+        assert_eq!(local.content, "local content");
     }
 }

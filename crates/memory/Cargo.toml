@@ -28,6 +28,7 @@ home.workspace = true
 sha2.workspace = true
 parking_lot.workspace = true
 once_cell.workspace = true
+flate2 = "1"
 
 [dev-dependencies]
 tempfile.workspace = true

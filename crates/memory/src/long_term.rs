@@ -232,6 +232,36 @@ impl LongTermStore {
         Ok(keys)
     }
 
+    /// List all memories in the store.
+    ///
+    /// Returns all entries sorted by access count (most accessed first).
+    pub fn list_all(&self) -> std::io::Result<Vec<MemoryEntry>> {
+        let mut results = Vec::new();
+        self.scan_dir(&self.base_path, &mut |entry| {
+            results.push(entry);
+        })?;
+        results.sort_by_key(|m| std::cmp::Reverse(m.access_count));
+        Ok(results)
+    }
+
+    /// Delete a memory by topic.
+    pub fn delete(&self, topic: &str) -> std::io::Result<()> {
+        let path = self.entry_path(topic);
+        if path.exists() {
+            std::fs::remove_file(&path)?;
+        }
+        Ok(())
+    }
+
+    /// Delete a memory by its hierarchical key.
+    pub fn delete_by_key(&self, key: &MemoryKey) -> std::io::Result<()> {
+        let path = self.key_path(key);
+        if path.exists() {
+            std::fs::remove_file(&path)?;
+        }
+        Ok(())
+    }
+
     // ─── Internal helpers ──────────────────────────────────────────────────
 
     fn read_at_path(&self, path: &Path) -> std::io::Result<Option<MemoryEntry>> {
@@ -573,5 +603,41 @@ mod tests {
 
         let all = store.search("content").unwrap();
         assert_eq!(all.len(), 2);
+    }
+
+    #[test]
+    fn delete_removes_topic() {
+        let (store, _tmp) = temp_store();
+        store.write("to-delete", "content").unwrap();
+        assert!(store.read("to-delete").unwrap().is_some());
+
+        store.delete("to-delete").unwrap();
+        assert!(store.read("to-delete").unwrap().is_none());
+    }
+
+    #[test]
+    fn delete_by_key_removes_entry() {
+        let (store, _tmp) = temp_store();
+        let key = MemoryKey::from_str("project/test");
+        store.write_with_key("Test", &key, "content").unwrap();
+        assert!(store.read_by_key(&key).unwrap().is_some());
+
+        store.delete_by_key(&key).unwrap();
+        assert!(store.read_by_key(&key).unwrap().is_none());
+    }
+
+    #[test]
+    fn list_all_returns_all_entries() {
+        let (store, _tmp) = temp_store();
+        store.write("alpha", "a").unwrap();
+        store.write("beta", "b").unwrap();
+        store.write("gamma", "c").unwrap();
+
+        let all = store.list_all().unwrap();
+        assert_eq!(all.len(), 3);
+        let topics: Vec<_> = all.iter().map(|e| e.topic.as_str()).collect();
+        assert!(topics.contains(&"alpha"));
+        assert!(topics.contains(&"beta"));
+        assert!(topics.contains(&"gamma"));
     }
 }

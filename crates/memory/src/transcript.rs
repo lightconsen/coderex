@@ -1,11 +1,14 @@
 //! JSONL transcript store — append-only session transcripts.
 
+use chrono::{DateTime, Utc};
 use coderex_core::types::Message;
-use std::sync::LazyLock;
-use regex::Regex;
-use std::fs::OpenOptions;
+use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::LazyLock;
+use flate2::write::GzEncoder;
+use flate2::Compression;
+use regex::Regex;
 use thiserror::Error;
 
 /// Errors from transcript operations.
@@ -206,6 +209,147 @@ impl TranscriptStore {
         std::fs::rename(&temp_path, &path)?;
         Ok(())
     }
+
+    /// List all session IDs found in the base directory.
+    pub fn list_sessions(&self) -> std::io::Result<Vec<String>> {
+        let mut sessions = Vec::new();
+        if !self.base_path.exists() {
+            return Ok(sessions);
+        }
+        for entry in std::fs::read_dir(&self.base_path)? {
+            let entry = entry?;
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) == Some("jsonl") {
+                if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
+                    sessions.push(stem.to_string());
+                }
+            }
+        }
+        sessions.sort();
+        Ok(sessions)
+    }
+
+    /// Get the file modification time for a session.
+    pub fn session_modified_at(&self, session_id: &str) -> std::io::Result<Option<DateTime<Utc>>> {
+        let path = self.session_path(session_id);
+        if !path.exists() {
+            return Ok(None);
+        }
+        let metadata = path.metadata()?;
+        metadata.modified()
+            .map(|t| Some(DateTime::<Utc>::from(t)))
+            .or(Ok(None))
+    }
+
+    /// Create a compressed archive of a session transcript.
+    ///
+    /// Writes `<archive_dir>/<session_id>.jsonl.gz`.
+    pub fn archive_session(&self, session_id: &str, archive_dir: &Path) -> std::io::Result<PathBuf> {
+        let source = self.session_path(session_id);
+        if !source.exists() {
+            return Err(std::io::Error::new(std::io::ErrorKind::NotFound, "session not found"));
+        }
+        std::fs::create_dir_all(archive_dir)?;
+        let dest = archive_dir.join(format!("{session_id}.jsonl.gz"));
+
+        let content = std::fs::read(&source)?;
+        let mut encoder = GzEncoder::new(File::create(&dest)?, Compression::default());
+        encoder.write_all(&content)?;
+        encoder.finish()?;
+
+        Ok(dest)
+    }
+
+    /// Prune old sessions: archive and delete sessions beyond the limits.
+    ///
+    /// Sessions are sorted by last-modified time (oldest first).
+    /// Archives sessions older than `max_sessions` to `<base_path>/archives/`
+    /// and deletes the originals.
+    pub fn prune(&self, max_sessions: usize) -> std::io::Result<PruneResult> {
+        let sessions = self.list_sessions()?;
+        if sessions.len() <= max_sessions {
+            return Ok(PruneResult {
+                archived: 0,
+                deleted: 0,
+                remaining: sessions.len(),
+            });
+        }
+
+        // Sort by modification time (oldest first)
+        let mut session_times: Vec<_> = sessions
+            .into_iter()
+            .filter_map(|id| {
+                self.session_modified_at(&id).ok().flatten().map(|t| (id, t))
+            })
+            .collect();
+        session_times.sort_by_key(|(_, t)| *t);
+
+        let to_prune_count = session_times.len() - max_sessions;
+        let to_prune = &session_times[..to_prune_count];
+
+        let archive_dir = self.base_path.join("archives");
+        std::fs::create_dir_all(&archive_dir)?;
+
+        let mut archived = 0;
+        let mut deleted = 0;
+
+        for (id, _) in to_prune {
+            // Archive
+            if self.archive_session(id, &archive_dir).is_ok() {
+                archived += 1;
+                // Delete original
+                let path = self.session_path(id);
+                if std::fs::remove_file(&path).is_ok() {
+                    deleted += 1;
+                }
+            }
+        }
+
+        let remaining = self.list_sessions()?.len();
+        Ok(PruneResult {
+            archived,
+            deleted,
+            remaining,
+        })
+    }
+
+    /// Create a backup copy of a session transcript.
+    ///
+    /// Writes `<session_path>.bak`.
+    pub fn backup(&self, session_id: &str) -> std::io::Result<PathBuf> {
+        let source = self.session_path(session_id);
+        if !source.exists() {
+            return Err(std::io::Error::new(std::io::ErrorKind::NotFound, "session not found"));
+        }
+        let backup_path = source.with_extension("jsonl.bak");
+        std::fs::copy(&source, &backup_path)?;
+        Ok(backup_path)
+    }
+
+    /// Restore a session from its backup.
+    ///
+    /// Reads `<session_path>.bak` and replaces the current transcript.
+    /// Returns `None` if no backup exists.
+    pub fn restore(&self, session_id: &str) -> std::io::Result<Option<PathBuf>> {
+        let source = self.session_path(session_id);
+        let backup_path = source.with_extension("jsonl.bak");
+        if !backup_path.exists() {
+            return Ok(None);
+        }
+        std::fs::copy(&backup_path, &source)?;
+        Ok(Some(source))
+    }
+}
+
+/// Result of a prune operation.
+#[derive(Debug, Clone)]
+pub struct PruneResult {
+    /// Number of sessions archived.
+    pub archived: usize,
+    /// Number of originals deleted.
+    pub deleted: usize,
+    /// Number of sessions remaining.
+    pub remaining: usize,
 }
 
 #[cfg(test)]
@@ -396,5 +540,80 @@ mod tests {
         if let coderex_core::types::MessageContent::Text(s) = &messages[0].content {
             assert_eq!(s, "rewritten");
         }
+    }
+
+    #[test]
+    fn list_sessions_returns_all_ids() {
+        let (store, _tmp) = temp_store();
+        store.append("alpha", &Message::user("a")).unwrap();
+        store.append("beta", &Message::user("b")).unwrap();
+        store.append("gamma", &Message::user("c")).unwrap();
+
+        let sessions = store.list_sessions().unwrap();
+        assert_eq!(sessions, vec!["alpha", "beta", "gamma"]);
+    }
+
+    #[test]
+    fn backup_and_restore_roundtrip() {
+        let (store, _tmp) = temp_store();
+        store.append("sess_bak", &Message::user("hello")).unwrap();
+        store.append("sess_bak", &Message::assistant("world")).unwrap();
+
+        let backup_path = store.backup("sess_bak").unwrap();
+        assert!(backup_path.exists());
+        assert!(backup_path.to_string_lossy().ends_with(".jsonl.bak"));
+
+        // Corrupt the original
+        let orig_path = store.session_path("sess_bak");
+        std::fs::write(&orig_path, "corrupted\n").unwrap();
+
+        let restored = store.restore("sess_bak").unwrap().unwrap();
+        assert_eq!(restored, orig_path);
+
+        let messages = store.read_all("sess_bak").unwrap();
+        assert_eq!(messages.len(), 2);
+    }
+
+    #[test]
+    fn restore_missing_backup_returns_none() {
+        let (store, _tmp) = temp_store();
+        let result = store.restore("no_backup").unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn prune_archives_oldest_sessions() {
+        let (store, tmp) = temp_store();
+        // Create 5 sessions
+        for i in 0..5 {
+            store.append(&format!("sess_{i}"), &Message::user(&format!("msg-{i}"))).unwrap();
+            // Space out modification times so ordering is deterministic
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+
+        // Prune to keep only 3
+        let result = store.prune(3).unwrap();
+        assert_eq!(result.remaining, 3);
+        assert_eq!(result.archived, 2);
+
+        // Check archive was created
+        let archive_dir = tmp.path().join("archives");
+        assert!(archive_dir.exists());
+
+        // Only 3 sessions should remain (not in archives dir)
+        let sessions = store.list_sessions().unwrap();
+        assert_eq!(sessions.len(), 3);
+    }
+
+    #[test]
+    fn prune_noop_when_under_limit() {
+        let (store, _tmp) = temp_store();
+        store.append("sess_1", &Message::user("a")).unwrap();
+        store.append("sess_2", &Message::user("b")).unwrap();
+
+        let result = store.prune(10).unwrap();
+        assert_eq!(result.remaining, 2);
+        assert_eq!(result.archived, 0);
+        assert_eq!(result.deleted, 0);
     }
 }

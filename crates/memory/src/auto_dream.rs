@@ -220,6 +220,69 @@ impl AutoDream {
         self.load_state().dream_history
     }
 
+    /// Spawn a background polling loop that checks dream thresholds
+    /// at the given interval and sends completed dream sessions to the channel.
+    ///
+    /// The loop runs until the shutdown signal is triggered.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let (tx, mut rx) = tokio::sync::mpsc::channel(10);
+    /// let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+    /// dream.spawn_watcher(tx, Duration::from_secs(60), shutdown_rx).await;
+    /// ```
+    pub async fn spawn_watcher(
+        &self,
+        tx: tokio::sync::mpsc::Sender<DreamSession>,
+        poll_interval: std::time::Duration,
+        mut shutdown: tokio::sync::oneshot::Receiver<()>,
+    ) {
+        let mut interval = tokio::time::interval(poll_interval);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+        loop {
+            tokio::select! {
+                _ = &mut shutdown => {
+                    tracing::debug!("auto dream watcher shutting down");
+                    break;
+                }
+                _ = interval.tick() => {
+                    if !self.config.enabled {
+                        continue;
+                    }
+                    match self.check_threshold() {
+                        DreamCheckResult::ShouldDream { sessions_since_last, .. } => {
+                            let dream = match self.start_dream() {
+                                Ok(d) => d,
+                                Err(e) => {
+                                    tracing::error!("failed to start dream: {e}");
+                                    continue;
+                                }
+                            };
+                            let completed = match self.complete_dream(
+                                dream,
+                                &format!("Auto-dream: analyzed {sessions_since_last} sessions"),
+                                sessions_since_last,
+                            ) {
+                                Ok(c) => c,
+                                Err(e) => {
+                                    tracing::error!("failed to complete dream: {e}");
+                                    continue;
+                                }
+                            };
+                            if tx.send(completed).await.is_err() {
+                                tracing::debug!("dream watcher receiver dropped, stopping");
+                                break;
+                            }
+                        }
+                        DreamCheckResult::NotReady | DreamCheckResult::InProgress => {}
+                    }
+                }
+            }
+        }
+    }
+
     /// Generate dream prompt content for the sub-agent.
     ///
     /// This produces the instructions that would be given to a read-only
@@ -401,5 +464,40 @@ mod tests {
         let result = dream.check_threshold();
         // With no previous dream, hours_since_last = MAX which exceeds any threshold
         assert!(matches!(result, DreamCheckResult::ShouldDream { .. }));
+    }
+
+    #[tokio::test]
+    async fn spawn_watcher_triggers_on_threshold() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = DreamConfig {
+            session_threshold: 1, // Trigger immediately
+            time_threshold_hours: 0,
+            enabled: true,
+        };
+        let dream = AutoDream::new(tmp.path().to_path_buf(), config);
+
+        // Record enough sessions to trigger
+        dream.record_session().unwrap();
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(10);
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+
+        // Run the watcher with a very short poll interval
+        let poll_interval = std::time::Duration::from_millis(50);
+        let handle = tokio::spawn(async move {
+            dream.spawn_watcher(tx, poll_interval, shutdown_rx).await;
+        });
+
+        // Should receive a dream session within a second
+        let received = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+            .await
+            .expect("timed out waiting for dream")
+            .expect("channel closed");
+        assert!(received.success);
+        assert_eq!(received.sessions_analyzed, 1);
+
+        // Signal shutdown and wait
+        let _ = shutdown_tx.send(());
+        let _ = handle.await;
     }
 }

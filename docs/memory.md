@@ -9,48 +9,44 @@ Session transcript storage, indexing, and long-term memory. Persists conversatio
 ### Key Types
 
 - **`TranscriptStore`** (`transcript.rs`) — File-based JSONL store. Append-only writes, full-read for sessions.
-- **`SessionIndex`** (`session_index.rs`) — Indexes sessions by metadata for fast listing.
-- **`LongTermMemory`** (`long_term.rs`) — Placeholder for vector-based semantic search.
+- **`SessionIndex`** (`session_index.rs`) — SQLite metadata index with FTS5 full-text search.
+- **`LongTermStore`** (`long_term.rs`) — Topic-based structured memory with file-backed JSON persistence.
 - **`SessionMemory`** (`session_memory.rs`) — In-memory session cache with compaction awareness.
-- **`TeamMemory`** (`team_memory.rs`) — Collaborative memory with sync service and checksums.
-- **`AutoDream`** (`auto_dream.rs`) — Background summarization agent for long sessions.
+- **`TeamMemorySyncService`** (`team_memory.rs`) — Collaborative memory with file-based sync, checksums, and org-scoped isolation.
+- **`AutoDream`** (`auto_dream.rs`) — Background session consolidation triggered by configurable thresholds.
 
 ### Architecture Patterns
 
 - **JSONL append-only** — Each message is a JSON line; atomic append for durability.
 - **Session-scoped files** — `~/.coderex/transcripts/{session_id}.jsonl`.
 - **Compact boundary markers** — Special `<coderex_compact_boundary>` messages indicate context windows that were compressed.
+- **SQLite FTS5** — Full-text search over session metadata (titles, tags) via a virtual table.
+- **CRDT-style sync** — Team memory uses checksums and tombstones for conflict-free synchronization.
 
 ## Current Status
 
 ### What Works
 
-- TranscriptStore append and read_all operations.
-- JSONL persistence with directory creation.
-- Session index for listing available transcripts.
-- Compact boundary detection and counting.
-- Team memory sync types and checksum validation.
-- AutoDream configuration and session types.
+- TranscriptStore append, read_all, and message filtering (skip_first_prompt).
+- JSONL persistence with directory creation and corrupted line skipping.
+- Session index for listing, filtering by project, and FTS5 full-text search.
+- Compact boundary detection, counting, and truncation.
+- Transcript pruning with automatic archival to gzip-compressed files.
+- Transcript backup (`.jsonl.bak`) and restore roundtrip.
+- Team memory sync service with upsert, delete (tombstone), list, and org-scoped isolation.
+- Team memory sync delta computation and remote entry application.
+- Team memory transport abstraction (`TeamSyncTransport` trait) with `InMemoryRelay` for testing.
+- AutoDream configuration, threshold checking, session counting, and state persistence.
+- AutoDream background polling loop (`spawn_watcher`) with shutdown signal.
+- LongTermMemory topic-based storage with delete, delete_by_key, and list_all operations.
 
-### What Is Stubbed/Partial
+### Remaining Gaps for Production
 
-- **LongTermMemory** — Types exist but no vector DB integration (no embeddings, no similarity search).
-- **AutoDream** — Configuration types only; no actual background summarization running.
-- **TeamMemory sync** — Network sync service is typed but not wired to actual sync protocol.
-
-## Gaps for Production
-
-- **No embeddings/semantic search**: Cannot find "that message about authentication from last week".
-  → **Suggestion**: Integrate `fastembed-rs` or `ort` for local embeddings. Store vectors in an SQLite extension (`sqlite-vec`) or `lance` dataset. Index on session boundaries and query with cosine similarity.
-- **No transcript encryption**: Session files are plaintext JSONL.
-  → **Suggestion**: Encrypt transcripts at rest using `aes-gcm` with a key derived from the user's OS login (via `keyring`). Store the nonce per file header. Decrypt transparently on read.
-- **No transcript pruning policy**: Files grow unbounded; no automatic archival.
-  → **Suggestion**: Add a retention policy config (e.g., `keep_last: 30_sessions`). On startup, archive sessions older than the threshold to a compressed `.tar.gz` in `~/.coderex/archives/`. Delete originals after successful archive.
-- **No cross-session search**: Can only read one session at a time.
-  → **Suggestion**: Maintain an inverted index (word → [(session_id, line_number)]) in SQLite. Update it incrementally on each transcript append. Provide a `/search` command that queries the index.
-- **Team memory sync unimplemented**: Types defined but no actual network sync.
-  → **Suggestion**: Implement a simple CRDT-based sync over WebSocket. Each team member's session appends to a shared Merkle tree. Resolve conflicts by timestamp. Start with a central relay server.
-- **Session indexing is basic**: No full-text index, just file listing.
-  → **Suggestion**: Build an FTS5 virtual table in SQLite over transcript content. Index each message as a row with `session_id`, `timestamp`, `role`, `content`. Query with MATCH syntax.
-- **No backup/restore**: Single file per session; corruption loses entire session.
-  → **Suggestion**: After every N appends (e.g., 10), create a `.jsonl.bak` copy. On read failure, attempt to restore from the backup. Also support manual `/backup` and `/restore` commands.
+- **No embeddings/semantic search**: Cannot find "that message about authentication from last week" across transcript content.
+  → **Suggestion**: Integrate `fastembed-rs` or `ort` for local embeddings. Store vectors in `sqlite-vec` or `lance` dataset. Index on session boundaries and query with cosine similarity.
+- **No transcript encryption at rest**: Session files are plaintext JSONL.
+  → **Suggestion**: Encrypt transcripts using `aes-gcm` with a key derived from the user's OS login (via `keyring`). Store the nonce per file header. Decrypt transparently on read.
+- **Team memory uses file-based sync only**: Types for network transport (`TeamSyncTransport` trait) exist but no HTTP/WebSocket implementation is wired up.
+  → **Suggestion**: Implement `TeamSyncTransport` over HTTP with the existing relay pattern. Each team member's session sends deltas to a central relay. Resolve conflicts by timestamp with last-write-wins semantics.
+- **AutoDream spawns locally**: The dream agent runs synchronously on the same process; no external LLM sub-agent is actually invoked.
+  → **Suggestion**: Wire `spawn_watcher` to spawn a read-only sub-agent that receives session summaries via the channel and produces structured analysis output. The `generate_dream_prompt()` method already provides the prompt template.
