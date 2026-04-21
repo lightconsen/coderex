@@ -1,6 +1,7 @@
 //! Feature flags and capability sets.
 
 use bitflags::bitflags;
+use std::collections::HashMap;
 
 /// All feature flags supported by CodeRex.
 #[derive(Debug, Clone, Default)]
@@ -152,12 +153,36 @@ impl FeatureFlags {
 
     /// Apply remote experiment overrides on top of base flags.
     #[must_use]
-    pub fn with_experiments(&self, experiments: &std::collections::HashMap<String, bool>) -> Self {
+    pub fn with_experiments(&self, experiments: &HashMap<String, bool>) -> Self {
         let mut flags = self.clone();
         for (name, &enabled) in experiments {
             flags.apply_flag(name, enabled);
         }
         flags
+    }
+
+    /// Apply per-project flag overrides on top of base flags.
+    ///
+    /// Project-level flags take precedence over global flags for the current
+    /// project context (based on `.coderex/flags.json` in the project root).
+    #[must_use]
+    pub fn with_project_overrides(&self, project_overrides: &HashMap<String, bool>) -> Self {
+        let mut flags = self.clone();
+        for (name, &enabled) in project_overrides {
+            flags.apply_flag(name, enabled);
+        }
+        flags
+    }
+
+    /// Load per-project feature flags from a JSON file at the given path.
+    ///
+    /// Returns an empty map if the file doesn't exist or can't be parsed.
+    /// The file format is `{"daemon": true, "bridge_mode": false, ...}`.
+    pub fn load_project_flags(path: &std::path::Path) -> HashMap<String, bool> {
+        std::fs::read_to_string(path)
+            .ok()
+            .and_then(|content| serde_json::from_str::<HashMap<String, bool>>(&content).ok())
+            .unwrap_or_default()
     }
 
     fn apply_flag(&mut self, name: &str, enable: bool) {
@@ -251,10 +276,28 @@ impl FlagRegistry {
     }
 
     /// Apply experiment overrides.
-    pub fn apply_experiments(&self, experiments: &std::collections::HashMap<String, bool>) {
+    pub fn apply_experiments(&self, experiments: &HashMap<String, bool>) {
         let mut flags = self.flags.write().unwrap();
         for (name, &enabled) in experiments {
             flags.apply_flag(name, enabled);
+        }
+    }
+
+    /// Apply a per-project feature flag override.
+    pub fn set_project_override(&self, name: &str, enable: bool) {
+        let mut flags = self.flags.write().unwrap();
+        flags.apply_flag(name, enable);
+    }
+
+    /// Load and apply per-project flags from a JSON file.
+    ///
+    /// This is the primary way to apply project-specific feature flags
+    /// that override global settings for the current project context.
+    pub fn load_project_flags(&self, path: &std::path::Path) {
+        let project_flags = FeatureFlags::load_project_flags(path);
+        let mut flags = self.flags.write().unwrap();
+        for (name, enabled) in project_flags {
+            flags.apply_flag(&name, enabled);
         }
     }
 }
@@ -405,5 +448,52 @@ mod tests {
         let _r2 = percentage_rollout("feature", "session_b", 50);
         // We can't assert equality/inequality without knowing the hash,
         // but the test ensures it doesn't panic.
+    }
+
+    #[test]
+    fn feature_flags_with_project_overrides() {
+        let flags = FeatureFlags::default();
+        let mut overrides = HashMap::new();
+        overrides.insert("daemon".into(), true);
+        overrides.insert("coordinator_mode".into(), true);
+
+        let result = flags.with_project_overrides(&overrides);
+        assert!(result.daemon);
+        assert!(result.coordinator_mode);
+        assert!(!result.buddy);
+    }
+
+    #[test]
+    fn load_project_flags_from_file() {
+        let tmp = std::env::temp_dir();
+        let path = tmp.join("coderex_test_project_flags.json");
+        std::fs::write(&path, r#"{"daemon":true,"buddy":true}"#).unwrap();
+
+        let flags = FeatureFlags::load_project_flags(&path);
+        assert_eq!(flags.get("daemon"), Some(&true));
+        assert_eq!(flags.get("buddy"), Some(&true));
+        assert!(!flags.contains_key("coordinator_mode"));
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn load_project_flags_missing_file_returns_empty() {
+        let flags = FeatureFlags::load_project_flags(std::path::Path::new("/nonexistent/path"));
+        assert!(flags.is_empty());
+    }
+
+    #[test]
+    fn flag_registry_load_project_flags() {
+        let tmp = std::env::temp_dir();
+        let path = tmp.join("coderex_test_registry_flags.json");
+        std::fs::write(&path, r#"{"daemon":true,"voice_mode":true}"#).unwrap();
+
+        let registry = FlagRegistry::new();
+        registry.load_project_flags(&path);
+        assert!(registry.has_capability(CapabilitySet::DAEMON));
+        assert!(registry.has_capability(CapabilitySet::VOICE));
+
+        let _ = std::fs::remove_file(&path);
     }
 }

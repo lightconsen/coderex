@@ -1,7 +1,7 @@
 //! Startup orchestrator — four-phase initialization.
 
 use anyhow::{Result, bail};
-use coderex_config::{ConfigService, RuntimeOverrides, Settings};
+use coderex_config::{config_home, ConfigService, RuntimeOverrides, Settings};
 #[cfg(feature = "enterprise")]
 use coderex_config::{LoadingBarrier, RemoteManagedSettings, RemoteManagedSettingsClient, RemoteSettingsManager};
 use coderex_core::types::ModelId;
@@ -221,6 +221,7 @@ impl StartupOrchestrator {
             model: args.model.clone(),
             permission_mode: args.permissions.clone(),
             max_budget_usd: None,
+            api_key: None,
         };
         settings = overrides.apply(settings);
 
@@ -239,13 +240,17 @@ impl StartupOrchestrator {
     /// without blocking the full startup. On timeout or error, fails open.
     #[cfg(feature = "enterprise")]
     async fn phase_merge_remote_settings(&mut self) -> Result<()> {
-        let settings = self.ctx.settings.clone().unwrap_or_default();
+        let _settings = self.ctx.settings.clone().unwrap_or_default();
 
         // Build remote settings client from environment / config
         let base_url = std::env::var("CODEREX_REMOTE_SETTINGS_URL").unwrap_or_default();
         let api_key = std::env::var("CODEREX_REMOTE_API_KEY").unwrap_or_default();
 
-        let mgr = RemoteSettingsManager::new(base_url, api_key.clone());
+        let mgr = RemoteSettingsManager::new(
+            base_url,
+            api_key.clone(),
+            Some(config_home().join("remote_settings_cache.json")),
+        );
 
         if mgr.client.is_some() {
             tracing::info!("remote settings client configured, fetching asynchronously");
@@ -619,6 +624,9 @@ impl StartupOrchestrator {
             valid_keys,
             idle_timeout: std::time::Duration::from_secs(idle_timeout),
             max_sessions: 100,
+            rate_limit_per_minute: 60,
+            health_port: None,
+            persist_path: None,
         };
 
         let mut server = DaemonServer::with_config(config);
@@ -748,10 +756,7 @@ mod tests {
         orch.ctx.settings = Some(Settings {
             model: Some("claude-opus-4-6".into()),
             permission_mode: Some("default".into()),
-            max_budget_usd: None,
-            telemetry_enabled: None,
-            hooks: None,
-            mcp_servers: None,
+            ..Settings::defaults()
         });
         orch.phase_build_capabilities().await.unwrap();
         assert!(orch.ctx.model.is_some());
@@ -765,9 +770,7 @@ mod tests {
             model: Some("claude-sonnet-4-6".into()),
             permission_mode: Some("default".into()),
             max_budget_usd: Some(10.0),
-            telemetry_enabled: None,
-            hooks: None,
-            mcp_servers: None,
+            ..Settings::defaults()
         });
         orch.phase_merge_remote_settings().await.unwrap();
         // Should succeed even without remote client

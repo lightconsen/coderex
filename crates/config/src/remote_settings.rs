@@ -9,8 +9,10 @@ use chrono::{DateTime, Utc};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::path::Path;
 use std::sync::Arc;
 use tokio::sync::{watch, RwLock};
+use tracing::{debug, warn};
 
 use crate::settings::Settings;
 
@@ -165,6 +167,17 @@ impl Default for LoadingBarrier {
     }
 }
 
+/// Disk-persisted cache entry for offline resilience.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CachedSettings {
+    /// The cached settings payload.
+    settings: RemoteManagedSettings,
+    /// SHA-256 checksum for integrity and change detection.
+    checksum: String,
+    /// When these settings were last fetched from the server.
+    fetched_at: DateTime<Utc>,
+}
+
 /// Remote managed settings client.
 #[derive(Debug)]
 pub struct RemoteManagedSettingsClient {
@@ -176,18 +189,58 @@ pub struct RemoteManagedSettingsClient {
     api_key: String,
     /// Cached checksum to skip unchanged fetches.
     last_checksum: RwLock<Option<String>>,
+    /// Optional path for disk-based offline cache.
+    cache_path: Option<std::path::PathBuf>,
 }
 
 impl RemoteManagedSettingsClient {
     /// Create a new remote settings client.
+    ///
+    /// If `cache_path` is provided, settings are persisted to disk for offline access.
     #[must_use]
-    pub fn new(base_url: String, api_key: String) -> Self {
+    pub fn new(base_url: String, api_key: String, cache_path: Option<std::path::PathBuf>) -> Self {
+        let last_checksum = if let Some(ref path) = cache_path {
+            // Load cached checksum from disk on initialization
+            load_cached_checksum(path)
+        } else {
+            None
+        };
         Self {
             base_url,
             http: Client::new(),
             api_key,
-            last_checksum: RwLock::new(None),
+            last_checksum: RwLock::new(last_checksum),
+            cache_path,
         }
+    }
+
+    /// Save settings to the disk cache if configured.
+    async fn save_to_cache(&self, settings: &RemoteManagedSettings, checksum: &str) {
+        if let Some(ref path) = self.cache_path {
+            let cached = CachedSettings {
+                settings: settings.clone(),
+                checksum: checksum.to_string(),
+                fetched_at: Utc::now(),
+            };
+            if let Err(e) = save_cached_settings(path, &cached) {
+                warn!("failed to save settings to disk cache: {e}");
+            } else {
+                debug!("saved settings to disk cache at {:?}", path);
+            }
+        }
+    }
+
+    /// Load the last cached checksum from disk.
+    fn load_cached_checksum(&self) -> Option<String> {
+        self.cache_path.as_ref().and_then(|p| load_cached_checksum(p.as_path()))
+    }
+
+    /// Load full cached settings from disk (for offline fallback).
+    fn load_cached_settings(&self) -> Option<RemoteManagedSettings> {
+        self.cache_path
+            .as_ref()
+            .and_then(|p| load_cached_settings(p.as_path()))
+            .map(|c| c.settings)
     }
 
     /// Check if the current user/org is eligible for enterprise managed settings.
@@ -252,7 +305,7 @@ impl RemoteManagedSettingsClient {
             });
         }
 
-        // Check if settings have changed since last fetch
+        // Check if settings have changed since last fetch (from memory or disk cache)
         let last = self.last_checksum.read().await;
         if let Some(ref prev) = *last {
             if *prev == body.checksum {
@@ -261,13 +314,19 @@ impl RemoteManagedSettingsClient {
         }
         drop(last);
 
-        *self.last_checksum.write().await = Some(body.checksum);
-        Ok(Some(body.settings))
+        let checksum = body.checksum.clone();
+        let settings = body.settings.clone();
+
+        // Persist to disk cache
+        self.save_to_cache(&settings, &checksum).await;
+
+        *self.last_checksum.write().await = Some(checksum);
+        Ok(Some(settings))
     }
 
     /// Fetch remote settings with fail-open semantics.
     ///
-    /// On any error, logs a warning and returns `None` rather than propagating the error.
+    /// On any error, logs a warning and falls back to the last cached copy from disk.
     /// The loading barrier is used to signal completion to waiting subsystems.
     pub async fn fetch_with_barrier(
         &self,
@@ -283,11 +342,20 @@ impl RemoteManagedSettingsClient {
             }
             Ok(None) => {
                 // No change — resolve with current cached state
-                barrier.resolve_success(RemoteManagedSettings::default(), String::new()).await;
+                let checksum = self.last_checksum.read().await.clone().unwrap_or_default();
+                let settings = self.load_cached_settings().unwrap_or_default();
+                barrier.resolve_success(settings, checksum).await;
                 None
             }
             Err(e) => {
+                // Fail open: try to use the last cached settings from disk
                 tracing::warn!("remote settings fetch failed (failing open): {e}");
+                if let Some(cached) = self.load_cached_settings() {
+                    tracing::info!("using last cached settings from disk (offline fallback)");
+                    let checksum = self.last_checksum.read().await.clone().unwrap_or_default();
+                    barrier.resolve_success(cached.clone(), checksum).await;
+                    return Some(cached);
+                }
                 barrier.resolve_failed(e.to_string()).await;
                 None
             }
@@ -341,10 +409,16 @@ pub struct RemoteSettingsManager {
 impl RemoteSettingsManager {
     /// Create a new manager. If base_url or api_key is empty, no remote client is created
     /// and the system will use local settings only.
+    ///
+    /// If `cache_path` is provided, settings are persisted to disk for offline access.
     #[must_use]
-    pub fn new(base_url: String, api_key: String) -> Self {
+    pub fn new(
+        base_url: String,
+        api_key: String,
+        cache_path: Option<std::path::PathBuf>,
+    ) -> Self {
         let client = if !base_url.is_empty() && !api_key.is_empty() {
-            Some(RemoteManagedSettingsClient::new(base_url, api_key))
+            Some(RemoteManagedSettingsClient::new(base_url, api_key, cache_path))
         } else {
             None
         };
@@ -383,6 +457,29 @@ impl RemoteSettingsManager {
             local
         }
     }
+}
+
+// Disk cache helpers
+
+fn load_cached_checksum(path: &Path) -> Option<String> {
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|content| serde_json::from_str::<CachedSettings>(&content).ok())
+        .map(|c| c.checksum)
+}
+
+fn load_cached_settings(path: &Path) -> Option<CachedSettings> {
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|content| serde_json::from_str::<CachedSettings>(&content).ok())
+}
+
+fn save_cached_settings(path: &Path, cached: &CachedSettings) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let content = serde_json::to_string_pretty(cached)?;
+    std::fs::write(path, content)
 }
 
 #[cfg(test)]
@@ -511,7 +608,7 @@ mod tests {
 
     #[tokio::test]
     async fn remote_manager_without_client_resolves_immediately() {
-        let mgr = RemoteSettingsManager::new(String::new(), String::new());
+        let mgr = RemoteSettingsManager::new(String::new(), String::new(), None);
         mgr.start_fetch().await;
         let state = mgr.barrier.current_state().await;
         assert!(matches!(state, FetchState::Ready { .. }));
@@ -519,7 +616,7 @@ mod tests {
 
     #[tokio::test]
     async fn remote_manager_resolve_applies_overrides() {
-        let mgr = RemoteSettingsManager::new(String::new(), String::new());
+        let mgr = RemoteSettingsManager::new(String::new(), String::new(), None);
         // Simulate having fetched settings
         *mgr.settings.write().await = Some(RemoteManagedSettings {
             enforced_model: Some("enforced-model".into()),
@@ -539,15 +636,43 @@ mod tests {
 
     #[tokio::test]
     async fn eligibility_empty_api_key_fails() {
-        let client = RemoteManagedSettingsClient::new("https://example.com".into(), String::new());
+        let client = RemoteManagedSettingsClient::new("https://example.com".into(), String::new(), None);
         let result = client.check_eligibility().await;
         assert!(matches!(result, Err(RemoteSettingsError::NotEligible)));
     }
 
     #[tokio::test]
     async fn eligibility_invalid_url_fails() {
-        let client = RemoteManagedSettingsClient::new("not-a-url".into(), "some-key".into());
+        let client = RemoteManagedSettingsClient::new("not-a-url".into(), "some-key".into(), None);
         let result = client.check_eligibility().await;
         assert!(matches!(result, Err(RemoteSettingsError::NotEligible)));
+    }
+
+    #[test]
+    fn disk_cache_roundtrip() {
+        let tmp = std::env::temp_dir();
+        let cache_path = tmp.join("coderex_test_remote_cache.json");
+
+        let cached = CachedSettings {
+            settings: RemoteManagedSettings {
+                enforced_model: Some("cached-model".into()),
+                budget_cap_usd: Some(50.0),
+                ..Default::default()
+            },
+            checksum: "abc123".to_string(),
+            fetched_at: Utc::now(),
+        };
+
+        save_cached_settings(&cache_path, &cached).unwrap();
+        let loaded = load_cached_settings(&cache_path).unwrap();
+        assert_eq!(loaded.settings.enforced_model, Some("cached-model".into()));
+        assert_eq!(loaded.checksum, "abc123");
+        assert_eq!(loaded.settings.budget_cap_usd, Some(50.0));
+
+        // Checksum from disk matches what the client would load
+        let cksum = load_cached_checksum(&cache_path).unwrap();
+        assert_eq!(cksum, "abc123");
+
+        let _ = std::fs::remove_file(&cache_path);
     }
 }

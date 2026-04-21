@@ -354,9 +354,7 @@ mod tests {
         let settings = Settings {
             model: Some("claude-haiku-4-5-20251001".into()),
             permission_mode: Some("default".into()),
-            max_budget_usd: None,
-            hooks: None,
-            mcp_servers: None,
+            ..Settings::defaults()
         };
         let merged = policy.apply_to_settings(settings);
         // haiku is denied, should fall back to an allowed model
@@ -371,8 +369,7 @@ mod tests {
             model: Some("claude-sonnet-4-6".into()),
             permission_mode: Some("default".into()),
             max_budget_usd: Some(100.0),
-            hooks: None,
-            mcp_servers: None,
+            ..Settings::defaults()
         };
         let merged = policy.apply_to_settings(settings);
         assert_eq!(merged.max_budget_usd, Some(50.0)); // org cap is lower
