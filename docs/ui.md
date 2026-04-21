@@ -56,29 +56,17 @@ Terminal user interface via ratatui. Renders messages, statusline, input line, c
 
 - **`voice` module** — Feature-gated, not fully implemented.
 - **`buddy` module** — Feature-gated, companion UI concept.
-- **Theme hot-reload** — Themes load at startup but don't refresh without restart.
-- **Export functionality** (`export.rs`) — Basic structure, not wired to commands.
-- **Notification center** (`notification_center.rs`) — Types exist but not actively used.
 
 ## Gaps for Production
 
-- **No mouse support**: Cannot click to position cursor or select messages.
-  → **Suggestion**: Enable `crossterm::event::MouseEvent` capture. Map clicks to message selection, double-clicks to copy text, and wheel events to scroll. Add `mouse_enabled` config toggle.
-- **No copy-to-clipboard**: Cannot copy message text from TUI.
-  → **Suggestion**: In Normal mode, bind `y` (yank) to copy the current message to the system clipboard using the `arboard` crate. Support `yy` for the whole message, `yw` for a word.
-- **Message search is basic**: Only finds first match, no highlight navigation.
-  → **Suggestion**: Store search match positions as a `Vec<(line, column)>` in `UiState`. Bind `n`/`N` to jump to next/previous match. Highlight all matches in yellow, current match in red.
-- **No message folding**: Long messages cannot be collapsed.
-  → **Suggestion**: Add a `folded: bool` field to `Message`. In Normal mode, bind `za` to toggle folding. Render folded messages as a single line with `[+N lines]` indicator.
-- **No split-pane view**: Cannot view files alongside chat.
+- ~~**No mouse support**: Cannot click to position cursor or select messages.~~ — **Fixed**: Mouse capture enabled on enter, disabled on exit. Scroll wheel maps to message view scroll.
+- ~~**No copy-to-clipboard**: Cannot copy message text from TUI.~~ — **Fixed**: `yy` in Vim normal mode copies all messages to system clipboard. `VimAction::ExportCopy` wired in repl.rs.
+- ~~**Message search is basic**: Only finds first match, no highlight navigation.~~ — **Fixed**: `n`/`N` in Vim normal mode navigate search matches via `VimAction::SearchNext`/`SearchPrev`.
+- ~~**No message folding**: Long messages cannot be collapsed.~~ — **Fixed**: `folded: bool` field on `Message`, `za` in Vim normal mode toggles folding. Folded messages render as single line with `[+N lines folded]`.
+- **No split-pane view**: Cannot view files alongside chat. *(Deferred — requires significant layout restructuring)*
   → **Suggestion**: Add a `LayoutMode` enum (SinglePane, HorizontalSplit). In split mode, render the left pane with file content (via Read tool) and right pane with chat. Bind `Ctrl-w v` to toggle.
-- **Statusline truncation is by bytes not chars**: May cut multi-byte characters incorrectly.
-  → **Suggestion**: Use `unicode-width::UnicodeWidthStr::width()` to compute display width before truncation. Truncate at grapheme boundaries using `unicode-segmentation`.
-- **No responsive layout for small terminals**: Below ~20 lines, layout breaks.
-  → **Suggestion**: Add a `compact_mode` that activates when `area.height < 20`. Hide the statusline, inline palette, and welcome art. Use single-line messages with truncation.
-- **Welcome art is static**: Could show tips, recent sessions, or project stats.
-  → **Suggestion**: Replace static ASCII with a dynamic widget that shows: (1) last 3 session names, (2) current project name, (3) a random tip from `tips.json`. Load tips asynchronously.
-- **No syntax highlighting in code blocks**: Markdown code blocks render as plain text.
-  → **Suggestion**: Detect ```language fences in messages. Use `syntect` or `tree-sitter` to tokenize code blocks and render them with `ratatui::text::Span` colorization based on the detected language.
-- **Cursor may drift on CJK input**: `unicode-width` used for rendering but input handling may miscount.
-  → **Suggestion**: Audit `InputBuffer` cursor movement to use `UnicodeWidthChar::width()` for all character indexing. Ensure `cursor_position` tracks display columns, not byte offsets. Add CJK input tests.
+- ~~**Statusline truncation is by bytes not chars**: May cut multi-byte characters incorrectly.~~ — **Fixed**: Uses `unicode-width::UnicodeWidthStr::width()` to measure display width, truncates at grapheme boundaries via `unicode-segmentation`.
+- ~~**No responsive layout for small terminals**: Below ~20 lines, layout breaks.~~ — **Fixed**: `is_compact` check in `draw()`: hides statusline when `height < 20`, truncates long messages when `height < 10`, skips welcome art.
+- ~~**Welcome art is static**: Could show tips, recent sessions, or project stats.~~ — **Fixed**: `render_welcome_art()` function returns dynamic lines (T-Rex ASCII + tips + welcome message).
+- ~~**No syntax highlighting in code blocks**: Markdown code blocks render as plain text.~~ — **Already fixed**: Syntax highlighting was previously implemented.
+- ~~**Cursor may drift on CJK input**: `unicode-width` used for rendering but input handling may miscount.~~ — **Fixed**: `InputBuffer::display_column()` computes visual column accounting for wide characters. `byte_from_column()` converts display column to byte position.

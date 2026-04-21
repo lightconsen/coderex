@@ -1,5 +1,7 @@
 //! Statusline — renders model, tokens, cost, permissions, git branch.
 
+use unicode_width::UnicodeWidthStr;
+
 /// Spinner frames for the thinking indicator (rotating).
 const SPINNER: &[&str] = &["◐", "◓", "◑", "◒"];
 
@@ -63,12 +65,12 @@ impl Statusline {
                 .as_ref()
                 .map_or("Thinking...".into(), |l| l.clone());
             let text = format!("{spinner} {label}");
-            if text.len() <= width {
-                // Pad to width so the statusline background fills evenly.
-                let pad = width.saturating_sub(text.len());
+            let display_width = UnicodeWidthStr::width(text.as_str());
+            if display_width <= width {
+                let pad = width.saturating_sub(display_width);
                 return format!("{text}{}", " ".repeat(pad));
             }
-            return text[..width].to_string();
+            return truncate_to_width(&text, width);
         }
 
         let mut segments: Vec<String> = vec![
@@ -89,11 +91,10 @@ impl Statusline {
         segments.push(self.permission_mode.clone());
 
         let full = segments.join(" | ");
-        if full.len() <= width {
+        if UnicodeWidthStr::width(full.as_str()) <= width {
             full
         } else {
-            // Truncate by bytes, not chars, to ensure width constraint
-            full[..width].to_string()
+            truncate_to_width(&full, width)
         }
     }
 }
@@ -102,6 +103,25 @@ impl Default for Statusline {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Truncate a string to fit within `max_width` display columns,
+/// respecting grapheme boundaries.
+fn truncate_to_width(s: &str, max_width: usize) -> String {
+    let mut width = 0;
+    let mut result = String::new();
+    use unicode_segmentation::UnicodeSegmentation;
+    for grapheme in s.graphemes(true) {
+        let gw = UnicodeWidthStr::width(grapheme);
+        if width + gw > max_width {
+            break;
+        }
+        width += gw;
+        result.push_str(grapheme);
+    }
+    // Pad to exact width
+    result.push_str(&" ".repeat(max_width.saturating_sub(width)));
+    result
 }
 
 #[cfg(test)]
@@ -148,7 +168,7 @@ mod tests {
             show_git_branch: true,
         };
         let rendered = sl.render(20);
-        assert!(rendered.len() <= 20);
+        assert!(UnicodeWidthStr::width(rendered.as_str()) <= 20);
     }
 
     #[test]
@@ -185,5 +205,26 @@ mod tests {
         assert!(rendered.contains("Running plan..."));
         // Normal segments should not appear while thinking
         assert!(!rendered.contains("opus"));
+    }
+
+    #[test]
+    fn truncation_respects_unicode_width() {
+        let sl = Statusline {
+            model: "日本語モデル".into(),
+            total_tokens: 0,
+            cost_usd: 0.0,
+            permission_mode: "default".into(),
+            git_branch: "main".into(),
+            session_title: "".into(),
+            thinking: false,
+            thinking_label: None,
+            spinner_frame: 0,
+            show_tokens: true,
+            show_cost: true,
+            show_git_branch: true,
+        };
+        let rendered = sl.render(20);
+        // Each CJK char is 2 columns wide, so truncation should handle correctly
+        assert!(UnicodeWidthStr::width(rendered.as_str()) <= 20);
     }
 }

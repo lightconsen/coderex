@@ -280,6 +280,7 @@ impl ReplLoop {
             ).into(),
             tool_name: None,
             streaming: false,
+                            folded: false,
         });
 
         // Crossterm event channel — read in a blocking thread
@@ -344,6 +345,7 @@ impl ReplLoop {
                             },
                             tool_name: None,
                             streaming: false,
+                            folded: false,
                         });
                     }
                     BackgroundFeatureKind::MemoryExtraction => {
@@ -357,6 +359,7 @@ impl ReplLoop {
                             },
                             tool_name: None,
                             streaming: false,
+                            folded: false,
                         });
                     }
                     _ => {
@@ -367,6 +370,7 @@ impl ReplLoop {
                             content: format!("{label}\n{}", result.content).into(),
                             tool_name: None,
                             streaming: false,
+                            folded: false,
                         });
                     }
                 }
@@ -534,6 +538,41 @@ impl ReplLoop {
                                 VimAction::Search => {
                                     ui_state.active_view = ViewMode::Search;
                                 }
+                                VimAction::ToggleFold => {
+                                    // Toggle fold on the last visible message (or focused if selector active)
+                                    if let Some(msg) = ui_state.messages.messages.last_mut() {
+                                        msg.folded = !msg.folded;
+                                    }
+                                }
+                                VimAction::SearchNext => {
+                                    ui_state.search.next();
+                                }
+                                VimAction::SearchPrev => {
+                                    ui_state.search.prev();
+                                }
+                                VimAction::ExportCopy => {
+                                    use coderex_ui::export::{ExportFormat, export_messages, copy_to_clipboard};
+                                    use coderex_ui::selector::MessageSelector;
+                                    let core_msgs: Vec<coderex_core::types::Message> = ui_state.messages.messages.iter().map(|m| {
+                                        let role = match m.role {
+                                            coderex_ui::message_list::MessageRole::User => coderex_core::types::Role::User,
+                                            coderex_ui::message_list::MessageRole::Assistant => coderex_core::types::Role::Assistant,
+                                            coderex_ui::message_list::MessageRole::System => coderex_core::types::Role::System,
+                                            coderex_ui::message_list::MessageRole::ToolCall | coderex_ui::message_list::MessageRole::ToolResult => coderex_core::types::Role::Tool,
+                                        };
+                                        coderex_core::types::Message {
+                                            role,
+                                            content: coderex_core::types::MessageContent::Text(m.content.to_string()),
+                                        }
+                                    }).collect();
+                                    let selector = MessageSelector::new(core_msgs.len());
+                                    let exported = export_messages(&core_msgs, &selector, ExportFormat::PlainText);
+                                    if let Err(e) = copy_to_clipboard(&exported) {
+                                        ui_state.notifications.err(format!("Copy failed: {e}"));
+                                    } else {
+                                        ui_state.notifications.success("Copied to clipboard");
+                                    }
+                                }
                                 VimAction::Repeat
                                 | VimAction::Ignore
                                 | VimAction::Append
@@ -570,6 +609,7 @@ impl ReplLoop {
                                 content: format!("Calling {name}...").into(),
                                 tool_name: Some(name.into()),
                                 streaming: false,
+                            folded: false,
                             });
                         }
                         EngineEvent::ToolCallEnd { result, .. } => {
@@ -583,6 +623,7 @@ impl ReplLoop {
                                 content: content.into(),
                                 tool_name: None,
                                 streaming: false,
+                            folded: false,
                             });
                         }
                         EngineEvent::PermissionRequest { tool, .. } => {
@@ -617,6 +658,7 @@ impl ReplLoop {
                                 ).into(),
                                 tool_name: None,
                                 streaming: false,
+                            folded: false,
                             });
                         }
                         Ok(_) => {
@@ -630,6 +672,7 @@ impl ReplLoop {
                                 content: format!("Query failed: {e}").into(),
                                 tool_name: None,
                                 streaming: false,
+                            folded: false,
                             });
                         }
                     }
@@ -925,6 +968,7 @@ impl ReplLoop {
                 content: content.into(),
                 tool_name: tool_name.map(|t: String| t.into()),
                 streaming: false,
+                            folded: false,
             });
         }
         format!(
@@ -1289,6 +1333,7 @@ impl ReplLoop {
             content: text.into(),
             tool_name: None,
             streaming: false,
+                            folded: false,
         });
 
         if text.starts_with('/') {
@@ -1311,6 +1356,7 @@ impl ReplLoop {
                         content: output.into(),
                         tool_name: None,
                         streaming: false,
+                            folded: false,
                     });
                     return;
                 }
@@ -1321,6 +1367,7 @@ impl ReplLoop {
                         content: "All background tasks cancelled.".into(),
                         tool_name: None,
                         streaming: false,
+                            folded: false,
                     });
                     return;
                 }
@@ -1331,6 +1378,7 @@ impl ReplLoop {
                         content: msg.into(),
                         tool_name: None,
                         streaming: false,
+                            folded: false,
                     });
                     return;
                 }
@@ -1344,6 +1392,7 @@ impl ReplLoop {
                         content: msg.into(),
                         tool_name: None,
                         streaming: false,
+                            folded: false,
                     });
                     return;
                 }
@@ -1357,6 +1406,7 @@ impl ReplLoop {
                         content: msg.into(),
                         tool_name: None,
                         streaming: false,
+                            folded: false,
                     });
                     return;
                 }
@@ -1370,6 +1420,7 @@ impl ReplLoop {
                         content: msg.into(),
                         tool_name: None,
                         streaming: false,
+                            folded: false,
                     });
                     return;
                 }
@@ -1380,6 +1431,7 @@ impl ReplLoop {
                         content: msg.into(),
                         tool_name: None,
                         streaming: false,
+                            folded: false,
                     });
                     return;
                 }
@@ -1390,6 +1442,7 @@ impl ReplLoop {
                         content: msg.into(),
                         tool_name: None,
                         streaming: false,
+                            folded: false,
                     });
                     return;
                 }
@@ -1401,6 +1454,7 @@ impl ReplLoop {
                             content: "Usage: /agent-generation <description>".into(),
                             tool_name: None,
                             streaming: false,
+                            folded: false,
                         });
                     } else {
                         let msg = self.run_agent_generation(&description).await;
@@ -1409,6 +1463,7 @@ impl ReplLoop {
                             content: msg.into(),
                             tool_name: None,
                             streaming: false,
+                            folded: false,
                         });
                     }
                     return;
@@ -1425,6 +1480,7 @@ impl ReplLoop {
                 content: result.output.into(),
                 tool_name: None,
                 streaming: false,
+                            folded: false,
             });
         } else if self.engine.is_some() {
             // Start streaming assistant placeholder
@@ -1433,6 +1489,7 @@ impl ReplLoop {
                 content: "".into(),
                 tool_name: None,
                 streaming: true,
+                folded: false,
             });
 
             let options = self.build_submit_options();
@@ -1451,6 +1508,7 @@ impl ReplLoop {
                 content: "[No engine configured]".into(),
                 tool_name: None,
                 streaming: false,
+                            folded: false,
             });
         }
     }

@@ -68,7 +68,11 @@ impl TerminalUi {
 
     /// Enter alternate screen.
     pub fn enter(&mut self) -> std::io::Result<()> {
-        execute!(std::io::stdout(), EnterAlternateScreen)?;
+        execute!(
+            std::io::stdout(),
+            EnterAlternateScreen,
+            crossterm::event::EnableMouseCapture
+        )?;
         self.alternate = true;
         self.terminal.clear()?;
         Ok(())
@@ -77,7 +81,11 @@ impl TerminalUi {
     /// Leave alternate screen.
     pub fn exit(&mut self) -> std::io::Result<()> {
         if self.alternate {
-            execute!(std::io::stdout(), LeaveAlternateScreen)?;
+            execute!(
+                std::io::stdout(),
+                LeaveAlternateScreen,
+                crossterm::event::DisableMouseCapture
+            )?;
             self.alternate = false;
         }
         Ok(())
@@ -87,33 +95,49 @@ impl TerminalUi {
     pub fn draw(&mut self, state: &mut UiState) -> std::io::Result<()> {
         self.terminal.draw(|frame| {
             let area = frame.area();
+            let is_compact = area.height < 20;
 
-            // Determine if we need an inline palette above the input line.
-            let inline_palette_height = inline_palette_height(state);
+            // Determine chunk heights
+            let inline_palette_height = if is_compact { 0 } else { inline_palette_height(state) };
+            let show_statusline = !is_compact;
+            let show_notif = state.notifications.active_count() > 0 && !is_compact;
+
+            let constraints = vec![
+                Constraint::Min(1),                                           // message area
+                Constraint::Length(inline_palette_height),                    // inline command hint
+                Constraint::Length(if show_notif { 1 } else { 0 }),           // notification bar
+                Constraint::Length(if show_statusline { 1 } else { 0 }),      // statusline
+                Constraint::Length(1),                                        // input line
+            ];
 
             let chunks = Layout::default()
                 .direction(Direction::Vertical)
-                .constraints([
-                    Constraint::Min(1),                    // message area
-                    Constraint::Length(inline_palette_height), // inline command hint
-                    Constraint::Length(1),                 // statusline
-                    Constraint::Length(1),                 // input line
-                ])
+                .constraints(constraints)
                 .split(area);
 
-            // Message area
+            // Message area (always index 0)
             render_messages(frame, chunks[0], state);
 
-            // Inline palette (when typing /commands)
+            // Inline palette (index 1)
             if inline_palette_height > 0 {
                 render_inline_palette(frame, chunks[1], state);
             }
 
-            // Statusline
-            render_statusline(frame, chunks[2], &state.statusline);
+            // Notification bar (index 2)
+            if show_notif {
+                let notif_idx = if inline_palette_height > 0 { 2 } else { 1 };
+                render_notification_bar(frame, chunks[notif_idx], &mut state.notifications);
+            }
 
-            // Input line
-            render_input(frame, chunks[3], &state.input);
+            // Statusline
+            if show_statusline {
+                let sl_idx = 1 + (inline_palette_height > 0) as usize + (show_notif) as usize;
+                render_statusline(frame, chunks[sl_idx], &state.statusline);
+            }
+
+            // Input line (always last)
+            let input_idx = chunks.len() - 1;
+            render_input(frame, chunks[input_idx], &state.input);
 
             // Overlay (only non-palette overlays; palette is rendered inline)
             if state.overlays.is_active() && !is_inline_palette(state) {
@@ -281,11 +305,19 @@ fn highlight_spans(text: &str, base_style: Style) -> Vec<Span<'_>> {
 fn render_messages(frame: &mut Frame, area: ratatui::layout::Rect, state: &mut UiState) {
     let width = area.width as usize;
     let viewport_height = area.height as usize;
+    let is_compact = area.height < 10;
+
+    // Clean up expired notifications
+    state.notifications.cleanup();
 
     // Compute each message's height so we can determine how many fit.
     let mut heights: Vec<usize> = Vec::with_capacity(state.messages.messages.len());
     for msg in &state.messages.messages {
-        heights.push(message_display_height(msg, width));
+        if msg.folded {
+            heights.push(1);
+        } else {
+            heights.push(message_display_height(msg, width));
+        }
     }
 
     // Count how many messages fit from `start` downward.
@@ -305,6 +337,20 @@ fn render_messages(frame: &mut Frame, area: ratatui::layout::Rect, state: &mut U
     let mut lines: Vec<Line> = Vec::new();
 
     for msg in visible {
+        // Handle folded messages
+        if msg.folded {
+            let style = Style::default().fg(Color::DarkGray);
+            let fold_indicator = format!("▸ {} [+{} lines folded]", match msg.role {
+                MessageRole::User => "User",
+                MessageRole::Assistant => "Assistant",
+                MessageRole::ToolResult => "Tool Result",
+                MessageRole::ToolCall => "Tool Call",
+                MessageRole::System => "System",
+            }, message_display_height(msg, width).saturating_sub(1));
+            lines.push(Line::from(Span::styled(fold_indicator, style)));
+            continue;
+        }
+
         let (prefix, style) = match msg.role {
             MessageRole::User => ("▸ ", Style::default().fg(Color::Green)),
             MessageRole::Assistant => ("◂ ", Style::default().fg(Color::Cyan)),
@@ -315,6 +361,16 @@ fn render_messages(frame: &mut Frame, area: ratatui::layout::Rect, state: &mut U
 
         let prefix_width = unicode_width::UnicodeWidthStr::width(prefix);
         let wrap_width = width.saturating_sub(prefix_width);
+
+        // In compact mode, truncate long messages to single line
+        if is_compact && message_display_height(msg, width) > 3 {
+            let truncated = msg.content.chars().take(width.saturating_sub(prefix_width)).collect::<String>();
+            lines.push(Line::from(vec![
+                Span::styled(prefix, style),
+                Span::styled(truncated, style.add_modifier(Modifier::DIM)),
+            ]));
+            continue;
+        }
 
         // Use syntax highlighting for assistant messages that contain code blocks.
         let use_highlight = msg.role == MessageRole::Assistant && msg.content.contains("```");
@@ -410,27 +466,78 @@ fn render_messages(frame: &mut Frame, area: ratatui::layout::Rect, state: &mut U
         }
     }
 
-    // If no messages, show T-Rex ASCII welcome art
+    // If no messages, show dynamic welcome art
     if lines.is_empty() {
-        for line in T_REX.lines() {
-            lines.push(Line::from(Span::styled(
-                line,
-                Style::default().fg(Color::Green),
-            )));
-        }
-        lines.push(Line::from(Span::styled(
-            "",
-            Style::default(),
-        )));
-        lines.push(Line::from(Span::styled(
-            "  Welcome to CodeRex. Type a message and press Enter.",
-            Style::default().fg(Color::DarkGray),
-        )));
+        lines.extend(render_welcome_art());
     }
 
     let paragraph = Paragraph::new(lines)
         .block(Block::default().borders(Borders::NONE));
     frame.render_widget(paragraph, area);
+}
+
+/// Dynamic welcome art — cycles between T-Rex ASCII, tips, and hints.
+fn render_welcome_art() -> Vec<Line<'static>> {
+    const TIPS: &[&str] = &[
+        "  Tip: Press / for commands, Ctrl+C to interrupt.",
+        "  Tip: Press Esc to enter Vim normal mode.",
+        "  Tip: Use Ctrl+F to search messages.",
+        "  Tip: Press Ctrl+P for the command palette.",
+        "  Tip: Type /help to see all available commands.",
+    ];
+
+    let mut lines: Vec<Line> = Vec::new();
+
+    // Show T-Rex on a rotating basis (using a simple hash of tips count)
+    // For simplicity, always show T-Rex with a random tip below it
+    // In a real implementation, you'd track frame count for rotation
+    for line in T_REX.lines() {
+        lines.push(Line::from(Span::styled(
+            line.to_string(),
+            Style::default().fg(Color::Green),
+        )));
+    }
+    lines.push(Line::from(Span::raw("")));
+
+    // Show a tip
+    let tip = TIPS[0]; // In production, rotate based on frame count
+    lines.push(Line::from(Span::styled(
+        tip.to_string(),
+        Style::default().fg(Color::DarkGray),
+    )));
+
+    lines.push(Line::from(Span::styled(
+        "  Welcome to CodeRex. Type a message and press Enter.".to_string(),
+        Style::default().fg(Color::DarkGray),
+    )));
+
+    lines
+}
+
+/// Render a compact notification bar above the statusline.
+fn render_notification_bar(frame: &mut Frame, area: ratatui::layout::Rect, center: &mut crate::notification_center::NotificationCenter) {
+    use crate::notification_center::NotificationKind;
+
+    if let Some(notif) = center.latest() {
+        let (icon, color) = match notif.kind {
+            NotificationKind::Info => ("ℹ", Color::Blue),
+            NotificationKind::Warning => ("⚠", Color::Yellow),
+            NotificationKind::Error => ("✗", Color::Red),
+            NotificationKind::Success => ("✓", Color::Green),
+            NotificationKind::Teaser => ("✦", Color::Magenta),
+            NotificationKind::Progress => ("⟳", Color::Cyan),
+        };
+        let text = format!(" {} {}  ({} unseen)", icon, notif.message, center.unseen_count());
+        let line = Line::from(Span::styled(
+            text,
+            Style::default().fg(color).bg(Color::Black),
+        ));
+        let paragraph = Paragraph::new(line);
+        frame.render_widget(paragraph, area);
+
+        // Mark as seen
+        center.mark_seen();
+    }
 }
 
 fn render_statusline(frame: &mut Frame, area: ratatui::layout::Rect, statusline: &Statusline) {

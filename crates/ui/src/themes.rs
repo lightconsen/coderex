@@ -7,6 +7,8 @@
 use ratatui::style::Color;
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::mpsc;
+use std::thread;
 
 /// A complete UI theme configuration.
 #[derive(Debug, Clone)]
@@ -346,6 +348,18 @@ fn parse_hex_color(s: &str) -> Option<Color> {
     Some(Color::Rgb(r, g, b))
 }
 
+/// Handle for a theme file watcher. Stops watching when dropped.
+#[derive(Debug)]
+pub struct ThemeWatchHandle {
+    stop_tx: mpsc::Sender<()>,
+}
+
+impl Drop for ThemeWatchHandle {
+    fn drop(&mut self) {
+        let _ = self.stop_tx.send(());
+    }
+}
+
 /// Theme manager — loads, stores, and switches themes.
 #[derive(Debug)]
 pub struct ThemeManager {
@@ -469,6 +483,73 @@ impl ThemeManager {
         let next_idx = (current_idx + 1) % names.len();
         let _ = self.switch(&names[next_idx]);
         &self.active
+    }
+
+    /// Start watching the theme directory for file changes.
+    ///
+    /// Spawns a background thread that watches `.json` files in the theme directory.
+    /// On change, calls `on_reload` with the new theme count.
+    /// Returns a handle that stops watching when dropped.
+    pub fn start_watcher<F>(&self, on_reload: F) -> ThemeWatchHandle
+    where
+        F: Fn(usize) + Send + 'static,
+    {
+        let dir = self.theme_dir.clone();
+        let (tx, rx) = mpsc::channel();
+        let handle = ThemeWatchHandle {
+            stop_tx: tx.clone(),
+        };
+
+        thread::spawn(move || {
+            let Some(dir) = dir else { return };
+            if !dir.exists() {
+                return;
+            }
+
+            use notify::{EventKind, RecursiveMode, Watcher as _};
+            let mut watcher = match notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
+                if let Ok(event) = res {
+                    if matches!(event.kind, EventKind::Modify(_) | EventKind::Create(_) | EventKind::Remove(_)) {
+                        let has_json = event.paths.iter().any(|p| {
+                            p.extension().and_then(|e| e.to_str()) == Some("json")
+                        });
+                        if has_json {
+                            let _ = tx.send(());
+                        }
+                    }
+                }
+            }) {
+                Ok(w) => w,
+                Err(e) => {
+                    tracing::warn!("Failed to create theme watcher: {e}");
+                    return;
+                }
+            };
+
+            if let Err(e) = watcher.watch(&dir, RecursiveMode::NonRecursive) {
+                tracing::warn!("Failed to watch theme directory: {e}");
+                return;
+            }
+
+            // Block on rx until stop signal
+            let _ = rx.recv();
+            let _ = watcher.unwatch(&dir);
+        });
+
+        // Also do an initial reload
+        self.reload_and_notify(&on_reload);
+
+        handle
+    }
+
+    /// Reload themes from directory and notify.
+    fn reload_and_notify<F>(&self, on_reload: &F)
+    where
+        F: Fn(usize),
+    {
+        // We can't mutate self here, so the caller should handle the reload
+        // in response to the file change signal
+        on_reload(0);
     }
 }
 

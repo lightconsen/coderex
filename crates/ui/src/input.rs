@@ -1,6 +1,7 @@
 //! Input handling — keyboard event processing and input buffer editing.
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use unicode_width::UnicodeWidthChar;
 
 /// A user input action derived from a key event.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -263,6 +264,38 @@ impl InputBuffer {
     pub fn display(&self) -> &str {
         &self.text
     }
+
+    /// Compute the display column (visual width) of the cursor position,
+    /// accounting for CJK and other wide characters.
+    #[must_use]
+    pub fn display_column(&self) -> usize {
+        let byte_pos = self.cursor;
+        let mut width = 0;
+        for c in self.text[..byte_pos.min(self.text.len())].chars() {
+            width += UnicodeWidthChar::width(c).unwrap_or(1);
+        }
+        width
+    }
+
+    /// Compute the byte position from a display column, accounting for wide chars.
+    #[must_use]
+    pub fn byte_from_column(&self, column: usize) -> usize {
+        let mut width = 0;
+        for (byte_idx, c) in self.text.char_indices() {
+            let cw = UnicodeWidthChar::width(c).unwrap_or(1);
+            if width + cw > column {
+                return byte_idx;
+            }
+            width += cw;
+        }
+        self.text.len()
+    }
+
+    /// Convert cursor byte offset to display column.
+    #[must_use]
+    pub fn cursor_display_column(&self) -> usize {
+        self.display_column()
+    }
 }
 
 #[cfg(test)]
@@ -446,5 +479,31 @@ mod tests {
     fn empty_submit_returns_none() {
         let mut buf = InputBuffer::new();
         assert!(buf.take().is_none());
+    }
+
+    #[test]
+    fn display_column_handles_cjk() {
+        let mut buf = InputBuffer::new();
+        buf.apply(&InputAction::InsertChar('中'));
+        buf.apply(&InputAction::InsertChar('文'));
+        // "中文" has display width 4 (each char is 2 columns)
+        assert_eq!(buf.display_column(), 4);
+        buf.apply(&InputAction::CursorLeft);
+        // After moving left, cursor is at byte position for '中', display column 2
+        assert_eq!(buf.display_column(), 2);
+    }
+
+    #[test]
+    fn byte_from_column_handles_cjk() {
+        let mut buf = InputBuffer::new();
+        buf.apply(&InputAction::InsertChar('a'));
+        buf.apply(&InputAction::InsertChar('中'));
+        buf.apply(&InputAction::InsertChar('b'));
+        // "a中b" — byte positions: a=0, 中=1, b=4; display columns: a=1, 中=3, b=4
+        assert_eq!(buf.byte_from_column(0), 0);  // before 'a'
+        assert_eq!(buf.byte_from_column(1), 1);  // before '中'
+        assert_eq!(buf.byte_from_column(2), 1);  // middle of '中', rounds down
+        assert_eq!(buf.byte_from_column(3), 4);  // before 'b'
+        assert_eq!(buf.byte_from_column(4), 5);  // after 'b' (text.len())
     }
 }

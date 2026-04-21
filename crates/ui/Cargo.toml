@@ -30,6 +30,7 @@ compact_str.workspace = true
 strum.workspace = true
 regex.workspace = true
 chrono = { workspace = true, features = ["serde"] }
+notify = { version = "7", default-features = false, features = ["macos_fsevent"] }
 
 [dev-dependencies]
 tempfile.workspace = true

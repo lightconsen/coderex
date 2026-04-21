@@ -2,6 +2,7 @@
 
 use crate::input::InputBuffer;
 use crate::message_list::MessageView;
+use crate::notification_center::NotificationCenter;
 use crate::overlay::OverlayStack;
 use crate::search::SearchState;
 use crate::selector::MessageSelector;
@@ -52,6 +53,8 @@ pub struct UiState {
     pub statusline: Statusline,
     /// Statusline setup wizard state.
     pub statusline_setup: StatuslineSetup,
+    /// Notification center.
+    pub notifications: NotificationCenter,
 }
 
 impl UiState {
@@ -67,6 +70,7 @@ impl UiState {
             selector: None,
             statusline: Statusline::new(),
             statusline_setup: StatuslineSetup::new(),
+            notifications: NotificationCenter::new(),
         }
     }
 }

@@ -28,6 +28,8 @@ pub struct Message {
     pub tool_name: Option<CompactString>,
     /// Whether the message is currently streaming.
     pub streaming: bool,
+    /// Whether the message is folded (collapsed).
+    pub folded: bool,
 }
 
 /// Virtualized viewport into a message list.
@@ -148,6 +150,7 @@ mod tests {
             content: CompactString::from(text),
             tool_name: None,
             streaming: false,
+            folded: false,
         }
     }
 

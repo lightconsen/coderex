@@ -21,6 +21,7 @@ fn stress_large_message_list() {
             content: CompactString::new(format!("Message {i}")),
             tool_name: None,
             streaming: false,
+            folded: false,
         });
     }
 
@@ -44,6 +45,7 @@ fn stress_virtualization_scroll() {
             content: CompactString::new(format!("A very long message number {i} with extra content to make it more realistic")),
             tool_name: None,
             streaming: false,
+            folded: false,
         });
     }
 

@@ -74,6 +74,14 @@ pub enum VimAction {
     Escape,
     /// Repeat last change.
     Repeat,
+    /// Toggle fold on focused message.
+    ToggleFold,
+    /// Next search match.
+    SearchNext,
+    /// Previous search match.
+    SearchPrev,
+    /// Export/copy message to clipboard.
+    ExportCopy,
     /// Ignore this key.
     Ignore,
 }
@@ -264,6 +272,13 @@ impl VimState {
 
             // Repeat
             KeyCode::Char('.') => VimAction::Repeat,
+
+            // Fold toggle
+            KeyCode::Char('z') => VimAction::ToggleFold,
+
+            // Search navigation
+            KeyCode::Char('n') => VimAction::SearchNext,
+            KeyCode::Char('N') => VimAction::SearchPrev,
 
             // Escape (already in normal mode, acts like clear pending)
             KeyCode::Esc => {
