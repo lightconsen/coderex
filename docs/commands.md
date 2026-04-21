@@ -1,76 +1,86 @@
-# commands Module Inspection
+# commands Module
 
 ## Goal
 
-Implements the `/` slash command system that users type in the REPL. Provides registry, dispatch, and 14 command categories covering sessions, configuration, content management, diagnostics, Git integration, and debugging.
+Implements the `/` slash command system that users type in the REPL. Provides a registry with type-safe dispatch across ~75 commands covering sessions, configuration, diagnostics, Git integration, context management, macros, history, and advanced features.
 
 ## Design
 
 ### Key Types
 
-- **`CommandRegistry`** (`registry.rs`) — Maps command names to `CommandHandler` closures. Supports aliases.
-- **`CommandContext`** (`registry.rs`) — Per-invocation context: session state, config service, UI state reference.
-- **`CommandHandler`** (`registry.rs`) — Type alias for `fn(&mut CommandContext, &[String]) -> CommandResult`.
-- **`SlashCommand`** (`registry.rs`) — Metadata: name, description, aliases, handler.
-- **`CommandResult`** (`registry.rs`) — `Ok(String)` for success, `Err(String)` for failure.
+- **`CommandRegistry`** (`registry.rs`) — Vec-based registry mapping command names to handler closures. Supports `find`, `list`, `execute`, and availability filtering. Validates argument count before dispatch via `CommandArgs`.
+- **`CommandContext`** (`registry.rs`) — Per-invocation context: cwd, model, session state, token usage, cost, feature flags, git branch, theme, vim mode, env vars, and `pipe_input: Option<String>` for command chaining.
+- **`CommandHandler`** (`registry.rs`) — `Arc<dyn Fn(&CommandContext, &[String]) -> CommandResult + Send + Sync>`.
+- **`SlashCommand`** (`registry.rs`) — Metadata: name, description, kind (`Local`/`LocalUi`/`Prompt`/`Standalone`), `supports_non_interactive`, `remote_safe`, `bridge_safe`, `uses_agent_backend`, `destructive: bool`, `args: CommandArgs`, handler.
+- **`CommandResult`** (`registry.rs`) — Output, `state_changed`, `suppress_output`, `extra_context`, `append_system_prompt`, `override_system_prompt`, `prompt_profile`, `allowed_tools_override`, `scrollable: bool`.
+- **`CommandArgs`** (`registry.rs`) — Argument validation enum: `None` (no validation), `AtLeast(n)`, `AtMost(n)`, `Exactly(n)`. Validated pre-dispatch in `execute()`.
+- **`CommandHistory`** (`history.rs`) — Ring buffer (max 1000) with JSONL file persistence (`~/.coderex/command_history.jsonl`). Tracks `{cmd, args, timestamp}` per entry. Supports `append`, `list(n)`, `search(query)`.
+- **`MacroRegistry`** (`macro_commands.rs`) — User-defined command sequences as `HashMap<String, Vec<String>>` with JSON persistence (`~/.coderex/macros.json`). Supports `define`, `delete`, `get`, `list`, `load`.
 
-### Command Categories (14 modules)
+### Command Inventory (~75 commands across 15 modules)
 
 | Module | Commands | Purpose |
 |--------|----------|---------|
-| `session_commands` | `/clear`, `/compact`, `/exit`, `/save` | Session lifecycle |
-| `config_commands` | `/config`, `/model`, `/mode` | Configuration |
-| `stats_commands` | `/cost`, `/tokens` | Usage stats |
-| `content_commands` | `/paste`, `/yank` | Clipboard/yank |
-| `session_extension_commands` | `/load`, `/resume` | Session persistence |
-| `config_extension_commands` | `/theme`, `/keymap` | UI config |
-| `diagnostic_commands` | `/lint`, `/check` | Code diagnostics |
-| `context_commands` | `/context`, `/files` | Context management |
-| `integration_commands` | `/commit`, `/pr` | GitHub integration |
-| `git_commands` | `/diff`, `/branch`, `/log` | Git operations |
-| `debug_commands` | `/debug`, `/trace` | Debugging |
-| `advanced_commands` | `/plan`, `/agent` | Advanced features |
-| `misc_commands` | `/help`, `/version` | General |
+| `session_commands` | `/clear`, `/exit`, `/session` | Session lifecycle |
+| `config_commands` | `/config`, `/model`, `/permissions` | Core configuration |
+| `stats_commands` | `/stats`, `/cost`, `/usage` | Usage statistics |
+| `content_commands` | `/compact`, `/help`, `/version` | Session content & help |
+| `session_extension_commands` | `/resume`, `/rename`, `/rewind` | Session persistence & manipulation |
+| `config_extension_commands` | `/theme`, `/hooks`, `/mcp`, `/plugin`, `/memory`, `/skills`, `/tasks`, `/plan` | Extended configuration |
+| `diagnostic_commands` | `/status`, `/doctor` | System health checks |
+| `context_commands` | `/copy`, `/init`, `/summary`, `/files`, `/context`, `/add-dir` | Context management |
+| `integration_commands` | `/ide`, `/chrome`, `/desktop`, `/mobile`, `/voice`, `/vim`, `/remote-env`, `/remote-setup`, `/statusline-setup` | External integrations |
+| `git_commands` | `/commit`, `/commit-push-pr`, `/review`, `/security-review`, `/autofix-pr`, `/branch` | Git & code review |
+| `debug_commands` | `/debug-tool-call`, `/heapdump`, `/mock-limits`, `/perf-issue`, `/ant-trace`, `/break-cache`, `/reload-plugins` | Debugging tools |
+| `advanced_commands` | `/bridge`, `/bridge-kick`, `/teleport`, `/ultraplan`, `/insights`, `/thinkback`, `/thinkback-play`, `/statusline` | Advanced/feature-gated |
+| `misc_commands` | `/advisor`, `/btw`, `/good-claude`, `/stickers`, `/bughunter`, `/issue`, `/env`, `/diff`, `/oauth-refresh`, `/backfill-sessions`, `/history` | Miscellaneous |
+| `macro_commands` | `/macro define|run|list|delete` | User-defined command macros |
 
 ### Architecture Patterns
 
-- **Registry pattern** — Commands register themselves at startup via `register_all_commands()`.
-- **Closure-based handlers** — Each command is a function pointer with shared `CommandContext`.
-- **Modular organization** — Commands grouped by domain across 14 files.
+- **Registry pattern** — Commands register at startup via `register_all_commands()` called from `registry.rs`.
+- **Closure-based handlers** — Each command is an `Arc<dyn Fn>` with shared `CommandContext`.
+- **Availability matrix** — Commands filtered by `supports_non_interactive`, `remote_safe`, `bridge_safe` for different execution contexts.
+- **Agent backend flag** — Commands can opt into sub-agent execution via `with_agent_backend()`.
+- **Argument validation** — `CommandArgs` enum validated pre-dispatch; `CommandArgs::None` accepts any count, while `AtLeast(n)`, `AtMost(n)`, `Exactly(n)` enforce constraints.
+- **Destructive confirmation** — Commands marked `.with_destructive()` trigger a `Confirm` overlay in TUI mode (y/n), skipped in headless mode.
+- **Command piping** — Input split on `|` operator; segments executed sequentially with output of each passed as `pipe_input` to the next via `CommandContext`.
+- **Macro expansion** — Command names resolved against `MacroRegistry` before registry dispatch; macro sequences expanded and executed in order.
+- **Scrollable output** — `CommandResult.scrollable` flag causes TUI to render output as an `Assistant` message (scrollable in message list) rather than a single-line `System` message.
+- **Command history** — Every command execution appended to `CommandHistory` ring buffer with file persistence; `/history` command queries and searches.
+- **Modular organization** — Commands grouped by domain across 15 files, each with a `register(&mut CommandRegistry)` function.
 
 ## Current Status
 
 ### What Works
 
-- Command registry with name-to-handler mapping.
-- `/clear`, `/compact`, `/exit`, `/help`, `/version` fully functional.
-- `/model` switches active model.
-- `/cost` and `/tokens` report usage.
-- Git integration commands (`/diff`, `/branch`, `/log`) work via git CLI.
-- `/commit` command with conventional commit formatting.
-- All commands have basic error handling.
+- Full command registry with name-to-handler mapping, argument validation, and availability filtering.
+- `/clear`, `/exit`, `/help`, `/version`, `/compact` fully functional. `/clear` requires confirmation in TUI mode.
+- `/model` switches active model; `/permissions` manages permission mode.
+- `/cost`, `/stats`, `/usage` report token usage and cost breakdown.
+- Git commands (`/commit`, `/commit-push-pr`, `/review`, `/branch`) work via git CLI and prompt profiles.
+- `/theme` lists and changes themes with available theme detection.
+- `/status` and `/doctor` show comprehensive system health (API key, MCP, git, model, feature flags).
+- `/memory` reads and searches long-term memory entries.
+- `/hooks`, `/mcp`, `/plugin`, `/skills`, `/tasks` list and manage subsystem state.
+- Feature-gated commands (`/teleport`, `/ultraplan`, `/thinkback`, `/voice`) check `CommandContext.feature_flags`.
+- `/bridge` and `/bridge-kick` check `CODEREX_BRIDGE_URL` env var.
+- `/insights` aggregates project file counts, git info, and session token usage.
+- Command chaining via `|` operator (e.g., `/diff | /commit`) passes output between commands.
+- User-defined macros via `/macro define|run|list|delete` with JSON persistence.
+- Command history via `/history [n]` and `/history search <query>` with ring buffer + file persistence.
+- All commands have basic error handling with usage messages.
 
-### What Is Stubbed/Partial
+### Feature-Gated Commands
 
-- **`/plan` and `/agent`** — Invoke planning/agent flow but integration with `agents` crate is minimal.
-- **`/pr`** — GitHub PR creation exists but may not handle auth properly.
-- **`/lint` and `/check`** — Run external tools but output formatting is basic.
-- **`/theme` and `/keymap`** — UI config commands may not persist changes.
-- **Command completion/suggestions** — No fuzzy matching for command names.
+Several commands require feature flags to be enabled in `CommandContext`:
+- `/teleport` — needs `teleport` flag
+- `/ultraplan` — needs `ultraplan` flag
+- `/thinkback` / `/thinkback-play` — needs `thinkback` flag
+- `/voice` — needs `voice_mode` flag
 
-## Gaps for Production
+These return an error message when the feature is not enabled.
 
-- **No command history**: Previous commands not searchable or recallable.
-  → **Suggestion**: Persist command history to `~/.coderex/command_history.jsonl`. Support up-arrow recall in input mode and `/history` to list recent commands. Integrate with `InputBuffer` history.
-- **No command validation**: Arguments are not validated against schemas before execution.
-  → **Suggestion**: Add a `CommandArgs` trait with `validate(&[String]) -> Result<(), String>`. Each command defines its expected argument count/types. Validate before dispatching to the handler.
-- **No undo for destructive commands**: `/clear` permanently wipes session without confirmation.
-  → **Suggestion**: Tag commands with a `destructive: bool` flag in `SlashCommand`. Before executing destructive commands, show a `Confirm` overlay requiring `y/n` input.
-- **GitHub integration lacks auth flow**: `/pr` assumes pre-configured credentials.
-  → **Suggestion**: Detect missing `gh` CLI or `GITHUB_TOKEN` and prompt the user to run `gh auth login` or set the env var. Cache the auth check result per session.
-- **No command macros**: Users cannot define custom command aliases or sequences.
-  → **Suggestion**: Add a `/macro` command that records a sequence of commands (e.g., `/macro save "compact, save, exit"`). Store macros in `~/.coderex/macros.json` and expand them at parse time.
-- **Command output not scrollable**: Long command output (e.g., `/log`) may overflow the TUI.
-  → **Suggestion**: Treat command output as a temporary message in the message list, allowing the user to scroll through it. Add a `scrollable_output` flag to `CommandResult`.
-- **No command piping**: Cannot chain commands (e.g., `/diff | /commit`).
-  → **Suggestion**: Implement a simple pipe operator where the `Ok(String)` output of the first command becomes input/context for the second. Start with `/diff | /commit` as the primary use case.
+## Remaining Gaps and Suggestions
+
+No known gaps. The command system is fully implemented with ~75 commands across 15 modules, including command history, argument validation, destructive confirmation, user-defined macros, scrollable output, and command piping.

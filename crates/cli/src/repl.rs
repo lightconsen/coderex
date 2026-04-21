@@ -2,6 +2,7 @@
 
 use anyhow::Result;
 use coderex_commands::registry::{CommandContext, CommandRegistry, CommandResult};
+use coderex_commands::{CommandHistory, MacroRegistry};
 use coderex_core::types::ModelId;
 use coderex_core::engine::{QueryEngine, SubmitOptions, TerminalReason};
 use coderex_core::permission_engine::{ExplainPermissionHook, PermissionEngine};
@@ -113,6 +114,12 @@ pub struct ReplLoop {
     /// Config watcher for hot-reloading settings.
     #[cfg(feature = "hot-reload")]
     config_changed_rx: Option<tokio::sync::watch::Receiver<()>>,
+    /// Command history with persistence.
+    command_history: CommandHistory,
+    /// Macro registry for user-defined command sequences.
+    macro_registry: MacroRegistry,
+    /// Pending destructive command awaiting confirmation.
+    pending_destructive_cmd: Option<(String, Vec<String>)>,
 }
 
 impl ReplLoop {
@@ -122,7 +129,7 @@ impl ReplLoop {
     pub fn new(cwd: String, model: ModelId) -> Self {
         let mut commands = CommandRegistry::new();
         coderex_commands::registry::register_all_commands(&mut commands);
-        Self {
+        let mut this = Self {
             commands,
             model,
             cwd,
@@ -142,9 +149,14 @@ impl ReplLoop {
             auto_dream: None,
             dream_shutdown_tx: None,
             team_memory_service: None,
+            command_history: CommandHistory::new(1000),
+            macro_registry: MacroRegistry::new(),
+            pending_destructive_cmd: None,
             #[cfg(feature = "hot-reload")]
             config_changed_rx: None,
-        }
+        };
+        this.init_command_persistence();
+        this
     }
 
     /// Create a new REPL loop wired to a QueryEngine (14.1).
@@ -214,7 +226,7 @@ impl ReplLoop {
         #[cfg(feature = "hot-reload")]
         let config_changed_rx = Self::init_config_watcher(&cwd);
 
-        Self {
+        let mut this = Self {
             commands,
             model,
             cwd,
@@ -234,8 +246,29 @@ impl ReplLoop {
             auto_dream: Some(auto_dream),
             dream_shutdown_tx: None,
             team_memory_service: Some(team_memory_service),
+            command_history: CommandHistory::new(1000),
+            macro_registry: MacroRegistry::new(),
+            pending_destructive_cmd: None,
             #[cfg(feature = "hot-reload")]
             config_changed_rx,
+        };
+        this.init_command_persistence();
+        this
+    }
+
+    /// Initialize command history and macro registry from disk.
+    fn init_command_persistence(&mut self) {
+        let config_dir = coderex_config::settings::config_home();
+        let history_path = config_dir.join("command_history.jsonl");
+        self.command_history.set_file_path(history_path.clone());
+        if let Err(e) = self.command_history.load() {
+            tracing::warn!("Failed to load command history: {e}");
+        }
+
+        let macros_path = config_dir.join("macros.json");
+        self.macro_registry.set_file_path(macros_path);
+        if let Err(e) = self.macro_registry.load() {
+            tracing::warn!("Failed to load macros: {e}");
         }
     }
 
@@ -469,6 +502,31 @@ impl ReplLoop {
                                     LayoutMode::SinglePane => LayoutMode::HorizontalSplit { left_percent: 50 },
                                     LayoutMode::HorizontalSplit { .. } => LayoutMode::SinglePane,
                                 };
+                                continue;
+                            }
+
+                            // Handle Confirm overlay for destructive commands
+                            if matches!(ui_state.overlays.top(), Some(coderex_ui::overlay::Overlay::Confirm { .. })) {
+                                match key.code {
+                                    KeyCode::Char('y') | KeyCode::Char('Y') => {
+                                        ui_state.overlays.pop();
+                                        if let Some((cmd, args)) = self.pending_destructive_cmd.take() {
+                                            self.execute_and_display_command(&cmd, &args, &mut ui_state).await;
+                                        }
+                                    }
+                                    KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                                        ui_state.overlays.pop();
+                                        self.pending_destructive_cmd = None;
+                                        ui_state.messages.push(coderex_ui::message_list::Message {
+                                            role: coderex_ui::message_list::MessageRole::System,
+                                            content: "Command cancelled.".into(),
+                                            tool_name: None,
+                                            streaming: false,
+                                            folded: false,
+                                        });
+                                    }
+                                    _ => {}
+                                }
                                 continue;
                             }
 
@@ -767,9 +825,47 @@ impl ReplLoop {
     /// Run a single query in non-interactive (headless) mode.
     pub async fn run_headless(&mut self, prompt: &str) -> Result<String> {
         if prompt.starts_with('/') {
+            // Check for macro expansion
             let parts: Vec<&str> = prompt.split_whitespace().collect();
             let cmd_name = parts[0].trim_start_matches('/');
+            if self.macro_registry.has(cmd_name) {
+                if let Some(commands) = self.macro_registry.get(cmd_name) {
+                    let cmds: Vec<String> = commands.to_vec();
+                    let mut outputs = Vec::new();
+                    for macro_cmd in cmds {
+                        let out = Box::pin(self.run_headless(&macro_cmd)).await?;
+                        outputs.push(out);
+                    }
+                    return Ok(outputs.join("\n"));
+                }
+            }
+
+            // Check for pipe operator
+            if prompt.contains('|') {
+                let segments: Vec<&str> = prompt.trim_start_matches('/').split('|').collect();
+                let mut pipe_input: Option<String> = None;
+                let mut outputs = Vec::new();
+                for segment in &segments {
+                    let segment = segment.trim();
+                    if segment.is_empty() {
+                        continue;
+                    }
+                    let p: Vec<&str> = segment.split_whitespace().collect();
+                    let name = p[0];
+                    let args: Vec<String> = p[1..].iter().map(|s| s.to_string()).collect();
+                    self.command_history.append(name, &args);
+                    let mut ctx = self.build_context();
+                    ctx.pipe_input = pipe_input;
+                    let result = self.commands.execute(name, &ctx, &args);
+                    self.apply_command_effects(&result);
+                    outputs.push(result.output.clone());
+                    pipe_input = Some(result.output);
+                }
+                return Ok(outputs.join("\n---\n"));
+            }
+
             let args: Vec<String> = parts[1..].iter().map(|s| s.to_string()).collect();
+            self.command_history.append(cmd_name, &args);
             let ctx = self.build_context();
             let result = self.commands.execute(cmd_name, &ctx, &args);
             self.apply_command_effects(&result);
@@ -1415,230 +1511,37 @@ impl ReplLoop {
             let cmd_name = parts[0].trim_start_matches('/');
             let args: Vec<String> = parts[1..].iter().map(|s| s.to_string()).collect();
 
-            match cmd_name {
-                "exit" | "quit" => {
-                    self.running = false;
-                    return;
-                }
-                "help" => {
-                    let mut output = String::from("Available commands:\n");
-                    for cmd in self.commands.list() {
-                        output.push_str(&format!("  /{:<20} {}\n", cmd.name, cmd.description));
-                    }
-                    ui_state.messages.push(coderex_ui::message_list::Message {
-                        role: coderex_ui::message_list::MessageRole::Assistant,
-                        content: output.into(),
-                        tool_name: None,
-                        streaming: false,
-                            folded: false,
-                    });
-                    return;
-                }
-                "cancel" => {
-                    self.cancel_background_tasks();
-                    ui_state.messages.push(coderex_ui::message_list::Message {
-                        role: coderex_ui::message_list::MessageRole::System,
-                        content: "All background tasks cancelled.".into(),
-                        tool_name: None,
-                        streaming: false,
-                            folded: false,
-                    });
-                    return;
-                }
-                "compact" => {
-                    let msg = self.compact_context(ui_state).await;
-                    ui_state.messages.push(coderex_ui::message_list::Message {
-                        role: coderex_ui::message_list::MessageRole::System,
-                        content: msg.into(),
-                        tool_name: None,
-                        streaming: false,
-                            folded: false,
-                    });
-                    return;
-                }
-                "agent-summary" => {
-                    let msg = self.spawn_background_feature_by_kind(
-                        BackgroundFeatureKind::AgentSummary,
-                        "Summarize what the agent has done recently.".into(),
-                    );
-                    ui_state.messages.push(coderex_ui::message_list::Message {
-                        role: coderex_ui::message_list::MessageRole::System,
-                        content: msg.into(),
-                        tool_name: None,
-                        streaming: false,
-                            folded: false,
-                    });
-                    return;
-                }
-                "magic-docs" => {
-                    let msg = self.spawn_background_feature_by_kind(
-                        BackgroundFeatureKind::MagicDocs,
-                        "Generate documentation for the current codebase.".into(),
-                    );
-                    ui_state.messages.push(coderex_ui::message_list::Message {
-                        role: coderex_ui::message_list::MessageRole::System,
-                        content: msg.into(),
-                        tool_name: None,
-                        streaming: false,
-                            folded: false,
-                    });
-                    return;
-                }
-                "generate-readme" => {
-                    let msg = self.spawn_background_feature_by_kind(
-                        BackgroundFeatureKind::ReadmeGeneration,
-                        "Generate a README for the current project.".into(),
-                    );
-                    ui_state.messages.push(coderex_ui::message_list::Message {
-                        role: coderex_ui::message_list::MessageRole::System,
-                        content: msg.into(),
-                        tool_name: None,
-                        streaming: false,
-                            folded: false,
-                    });
-                    return;
-                }
-                "away-summary" => {
-                    let msg = self.spawn_background_feature_by_kind(
-                        BackgroundFeatureKind::AwaySummary,
-                        "Summarize what happened while the user was away.".into(),
-                    );
-                    ui_state.messages.push(coderex_ui::message_list::Message {
-                        role: coderex_ui::message_list::MessageRole::System,
-                        content: msg.into(),
-                        tool_name: None,
-                        streaming: false,
-                            folded: false,
-                    });
-                    return;
-                }
-                "codebase-overview" => {
-                    let msg = self.spawn_background_feature_by_kind(
-                        BackgroundFeatureKind::CodebaseOverview,
-                        "Generate a high-level overview of the codebase.".into(),
-                    );
-                    ui_state.messages.push(coderex_ui::message_list::Message {
-                        role: coderex_ui::message_list::MessageRole::System,
-                        content: msg.into(),
-                        tool_name: None,
-                        streaming: false,
-                            folded: false,
-                    });
-                    return;
-                }
-                "update-memory" => {
-                    let msg = self.spawn_memory_update_task().await;
-                    ui_state.messages.push(coderex_ui::message_list::Message {
-                        role: coderex_ui::message_list::MessageRole::System,
-                        content: msg.into(),
-                        tool_name: None,
-                        streaming: false,
-                            folded: false,
-                    });
-                    return;
-                }
-                "extract-memories" => {
-                    let msg = self.spawn_memory_extraction_task().await;
-                    ui_state.messages.push(coderex_ui::message_list::Message {
-                        role: coderex_ui::message_list::MessageRole::System,
-                        content: msg.into(),
-                        tool_name: None,
-                        streaming: false,
-                            folded: false,
-                    });
-                    return;
-                }
-                "agent-generation" => {
-                    let description = args.join(" ");
-                    if description.is_empty() {
-                        ui_state.messages.push(coderex_ui::message_list::Message {
-                            role: coderex_ui::message_list::MessageRole::System,
-                            content: "Usage: /agent-generation <description>".into(),
-                            tool_name: None,
-                            streaming: false,
-                            folded: false,
-                        });
-                    } else {
-                        let msg = self.run_agent_generation(&description).await;
-                        ui_state.messages.push(coderex_ui::message_list::Message {
-                            role: coderex_ui::message_list::MessageRole::System,
-                            content: msg.into(),
-                            tool_name: None,
-                            streaming: false,
-                            folded: false,
-                        });
+            // Check for macro expansion first
+            if self.macro_registry.has(cmd_name) {
+                if let Some(commands) = self.macro_registry.get(cmd_name) {
+                    let cmds: Vec<String> = commands.to_vec();
+                    for macro_cmd in cmds {
+                        self.execute_single_command(&macro_cmd, ui_state).await;
                     }
                     return;
                 }
-                "auto-dream" => {
-                    let msg = self.handle_auto_dream_command(&args);
-                    ui_state.messages.push(coderex_ui::message_list::Message {
-                        role: coderex_ui::message_list::MessageRole::System,
-                        content: msg.into(),
-                        tool_name: None,
-                        streaming: false,
-                            folded: false,
-                    });
-                    return;
-                }
-                "team-memory" => {
-                    let msg = self.handle_team_memory_command(&args).await;
-                    ui_state.messages.push(coderex_ui::message_list::Message {
-                        role: coderex_ui::message_list::MessageRole::System,
-                        content: msg.into(),
-                        tool_name: None,
-                        streaming: false,
-                            folded: false,
-                    });
-                    return;
-                }
-                "workspace" => {
-                    let msg = self.handle_workspace_command(&args);
-                    ui_state.messages.push(coderex_ui::message_list::Message {
-                        role: coderex_ui::message_list::MessageRole::System,
-                        content: msg.into(),
-                        tool_name: None,
-                        streaming: false,
-                        folded: false,
-                    });
-                    return;
-                }
-                "recover" => {
-                    let msg = self.handle_recover_command();
-                    ui_state.messages.push(coderex_ui::message_list::Message {
-                        role: coderex_ui::message_list::MessageRole::System,
-                        content: msg.into(),
-                        tool_name: None,
-                        streaming: false,
-                        folded: false,
-                    });
-                    return;
-                }
-                "update-check" => {
-                    let msg = self.handle_update_check_command().await;
-                    ui_state.messages.push(coderex_ui::message_list::Message {
-                        role: coderex_ui::message_list::MessageRole::System,
-                        content: msg.into(),
-                        tool_name: None,
-                        streaming: false,
-                        folded: false,
-                    });
-                    return;
-                }
-                _ => {}
             }
 
-            let ctx = self.build_context();
-            let result = self.commands.execute(cmd_name, &ctx, &args);
-            self.apply_command_effects(&result);
+            // Check for pipe operator
+            if text.contains('|') {
+                self.execute_piped_commands(text, ui_state).await;
+                return;
+            }
 
-            ui_state.messages.push(coderex_ui::message_list::Message {
-                role: coderex_ui::message_list::MessageRole::Assistant,
-                content: result.output.into(),
-                tool_name: None,
-                streaming: false,
-                            folded: false,
-            });
+            // Check for destructive command confirmation
+            if let Some(cmd) = self.commands.find(cmd_name) {
+                if cmd.destructive {
+                    self.pending_destructive_cmd = Some((cmd_name.to_string(), args));
+                    ui_state.overlays.push(coderex_ui::overlay::Overlay::Confirm {
+                        message: format!("Are you sure you want to run /{}? This action may be destructive.", cmd.name),
+                    });
+                    return;
+                }
+            }
+
+            // Execute the command directly
+            self.execute_and_display_command(cmd_name, &args, ui_state).await;
+            return;
         } else if self.engine.is_some() {
             // Start streaming assistant placeholder
             ui_state.messages.push(coderex_ui::message_list::Message {
@@ -1670,6 +1573,109 @@ impl ReplLoop {
         }
     }
 
+    /// Execute a single command through the registry and display the result in the TUI.
+    async fn execute_and_display_command(
+        &mut self,
+        cmd_name: &str,
+        args: &[String],
+        ui_state: &mut coderex_ui::state::UiState,
+    ) {
+        self.command_history.append(cmd_name, args);
+        let ctx = self.build_context();
+        let result = self.commands.execute(cmd_name, &ctx, args);
+        self.apply_command_effects(&result);
+
+        ui_state.messages.push(coderex_ui::message_list::Message {
+            role: if result.scrollable {
+                coderex_ui::message_list::MessageRole::Assistant
+            } else {
+                coderex_ui::message_list::MessageRole::System
+            },
+            content: result.output.into(),
+            tool_name: None,
+            streaming: false,
+            folded: false,
+        });
+    }
+
+    /// Execute piped commands: split on `|`, run sequentially, pass output as pipe_input.
+    async fn execute_piped_commands(
+        &mut self,
+        text: &str,
+        ui_state: &mut coderex_ui::state::UiState,
+    ) {
+        let segments: Vec<&str> = text.trim_start_matches('/').split('|').collect();
+        let mut pipe_input: Option<String> = None;
+        let mut outputs = Vec::new();
+
+        for segment in &segments {
+            let segment = segment.trim();
+            if segment.is_empty() {
+                continue;
+            }
+            let parts: Vec<&str> = segment.split_whitespace().collect();
+            let cmd_name = parts[0];
+            let args: Vec<String> = parts[1..].iter().map(|s| s.to_string()).collect();
+
+            self.command_history.append(cmd_name, &args);
+
+            let mut ctx = self.build_context();
+            ctx.pipe_input = pipe_input;
+
+            let result = self.commands.execute(cmd_name, &ctx, &args);
+            self.apply_command_effects(&result);
+            outputs.push(result.output.clone());
+            pipe_input = Some(result.output);
+        }
+
+        let combined = outputs.join("\n---\n");
+        ui_state.messages.push(coderex_ui::message_list::Message {
+            role: coderex_ui::message_list::MessageRole::Assistant,
+            content: combined.into(),
+            tool_name: None,
+            streaming: false,
+            folded: false,
+        });
+    }
+
+    /// Execute a single command string (from macro expansion) in the TUI.
+    async fn execute_single_command(
+        &mut self,
+        cmd_str: &str,
+        ui_state: &mut coderex_ui::state::UiState,
+    ) {
+        let trimmed = cmd_str.trim();
+        if trimmed.starts_with('/') {
+            let parts: Vec<&str> = trimmed.split_whitespace().collect();
+            let cmd_name = parts[0].trim_start_matches('/');
+            let args: Vec<String> = parts[1..].iter().map(|s| s.to_string()).collect();
+            self.command_history.append(cmd_name, &args);
+            let ctx = self.build_context();
+            let result = self.commands.execute(cmd_name, &ctx, &args);
+            self.apply_command_effects(&result);
+            ui_state.messages.push(coderex_ui::message_list::Message {
+                role: if result.scrollable {
+                    coderex_ui::message_list::MessageRole::Assistant
+                } else {
+                    coderex_ui::message_list::MessageRole::System
+                },
+                content: result.output.into(),
+                tool_name: None,
+                streaming: false,
+                folded: false,
+            });
+        } else {
+            // Non-command string: treat as a user message
+            ui_state.messages.push(coderex_ui::message_list::Message {
+                role: coderex_ui::message_list::MessageRole::System,
+                content: format!("[Macro] {trimmed}").into(),
+                tool_name: None,
+                streaming: false,
+                folded: false,
+            });
+        }
+    }
+
     async fn handle_input(&mut self, line: &str, stdout: &mut impl Write) -> std::io::Result<()> {
         if line.starts_with('/') {
             self.execute_command(line, stdout).await?;
@@ -1690,9 +1696,25 @@ impl ReplLoop {
     }
 
     async fn execute_command(&mut self, line: &str, stdout: &mut impl Write) -> std::io::Result<()> {
+        // Check for pipe operator
+        if line.contains('|') {
+            return self.execute_piped_commands_non_tui(line, stdout);
+        }
+
         let parts: Vec<&str> = line.split_whitespace().collect();
         let cmd_name = parts[0].trim_start_matches('/');
         let args: Vec<String> = parts[1..].iter().map(|s| s.to_string()).collect();
+
+        // Check for macro expansion
+        if self.macro_registry.has(cmd_name) {
+            if let Some(commands) = self.macro_registry.get(cmd_name) {
+                let cmds: Vec<String> = commands.to_vec();
+                for macro_cmd in cmds {
+                    self.execute_single_command_non_tui(&macro_cmd, stdout)?;
+                }
+                return Ok(());
+            }
+        }
 
         // Built-in REPL commands that don't go through registry
         match cmd_name {
@@ -1803,6 +1825,7 @@ impl ReplLoop {
             _ => {}
         }
 
+        self.command_history.append(cmd_name, &args);
         let ctx = self.build_context();
         let result = self.commands.execute(cmd_name, &ctx, &args);
         self.apply_command_effects(&result);
@@ -1814,6 +1837,59 @@ impl ReplLoop {
         writeln!(stdout, "Available commands:")?;
         for cmd in self.commands.list() {
             writeln!(stdout, "  /{:<20} {}", cmd.name, cmd.description)?;
+        }
+        Ok(())
+    }
+
+    /// Execute piped commands in non-TUI mode.
+    fn execute_piped_commands_non_tui(
+        &mut self,
+        line: &str,
+        stdout: &mut impl Write,
+    ) -> std::io::Result<()> {
+        let segments: Vec<&str> = line.trim_start_matches('/').split('|').collect();
+        let mut pipe_input: Option<String> = None;
+
+        for segment in &segments {
+            let segment = segment.trim();
+            if segment.is_empty() {
+                continue;
+            }
+            let parts: Vec<&str> = segment.split_whitespace().collect();
+            let cmd_name = parts[0];
+            let args: Vec<String> = parts[1..].iter().map(|s| s.to_string()).collect();
+
+            self.command_history.append(cmd_name, &args);
+
+            let mut ctx = self.build_context();
+            ctx.pipe_input = pipe_input;
+
+            let result = self.commands.execute(cmd_name, &ctx, &args);
+            self.apply_command_effects(&result);
+            writeln!(stdout, "{}", result.output)?;
+            pipe_input = Some(result.output);
+        }
+        Ok(())
+    }
+
+    /// Execute a single command string in non-TUI mode (from macro expansion).
+    fn execute_single_command_non_tui(
+        &mut self,
+        cmd_str: &str,
+        stdout: &mut impl Write,
+    ) -> std::io::Result<()> {
+        let trimmed = cmd_str.trim();
+        if trimmed.starts_with('/') {
+            let parts: Vec<&str> = trimmed.split_whitespace().collect();
+            let cmd_name = parts[0].trim_start_matches('/');
+            let args: Vec<String> = parts[1..].iter().map(|s| s.to_string()).collect();
+            self.command_history.append(cmd_name, &args);
+            let ctx = self.build_context();
+            let result = self.commands.execute(cmd_name, &ctx, &args);
+            self.apply_command_effects(&result);
+            writeln!(stdout, "{}", result.output)?;
+        } else {
+            writeln!(stdout, "[Macro] {trimmed}")?;
         }
         Ok(())
     }

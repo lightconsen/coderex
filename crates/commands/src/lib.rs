@@ -18,9 +18,13 @@ mod git_commands;
 mod debug_commands;
 mod advanced_commands;
 mod misc_commands;
+mod history;
+mod macro_commands;
 
 // Re-export key types
 pub use registry::{
-    CommandContext, CommandHandler, CommandRegistry, CommandResult, CommandType,
+    CommandArgs, CommandContext, CommandHandler, CommandRegistry, CommandResult, CommandType,
     SlashCommand, register_all_commands,
 };
+pub use history::CommandHistory;
+pub use macro_commands::MacroRegistry;

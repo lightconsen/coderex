@@ -1,6 +1,6 @@
 //! Session management commands: /clear, /exit, /session.
 
-use crate::registry::{CommandContext, CommandRegistry, CommandResult, SlashCommand};
+use crate::registry::{CommandArgs, CommandContext, CommandRegistry, CommandResult, SlashCommand};
 use std::sync::Arc;
 
 /// Register session management commands.
@@ -16,7 +16,8 @@ pub fn register(registry: &mut CommandRegistry) {
             CommandResult::success(format!("Session '{}' cleared", ctx.session_id))
                 .with_state_change(true)
         }),
-    ));
+    )
+    .with_destructive());
 
     // /exit — graceful exit
     registry.register(SlashCommand::local(

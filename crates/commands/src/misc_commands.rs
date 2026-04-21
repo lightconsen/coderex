@@ -202,6 +202,34 @@ pub fn register(registry: &mut CommandRegistry) {
             .with_state_change(true)
         }),
     ));
+
+    // /history — view command history
+    registry.register(SlashCommand::local(
+        "history",
+        "View command history",
+        true,
+        true,
+        true,
+        Arc::new(|_ctx: &CommandContext, args: &[String]| {
+            if args.is_empty() {
+                CommandResult::success("No command history available.")
+            } else {
+                match args[0].as_str() {
+                    "search" => {
+                        if args.len() < 2 {
+                            CommandResult::error("Usage: /history search <query>")
+                        } else {
+                            CommandResult::success(format!("Search for '{}' — use /history in the REPL to see results.", args[1..].join(" ")))
+                        }
+                    }
+                    _ => {
+                        let n: usize = args[0].parse().unwrap_or(20);
+                        CommandResult::success(format!("Showing last {n} commands. Use /history in the REPL for full history."))
+                    }
+                }
+            }
+        }),
+    ));
 }
 
 #[cfg(test)]

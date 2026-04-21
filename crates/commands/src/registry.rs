@@ -46,6 +46,8 @@ pub struct CommandResult {
     pub prompt_profile: Option<PromptProfile>,
     /// Override allowed tool names for this session.
     pub allowed_tools_override: Option<Vec<String>>,
+    /// Whether the output should be rendered as a scrollable message.
+    pub scrollable: bool,
 }
 
 impl CommandResult {
@@ -60,6 +62,7 @@ impl CommandResult {
             override_system_prompt: None,
             prompt_profile: None,
             allowed_tools_override: None,
+            scrollable: false,
         }
     }
 
@@ -74,6 +77,7 @@ impl CommandResult {
             override_system_prompt: None,
             prompt_profile: None,
             allowed_tools_override: None,
+            scrollable: false,
         }
     }
 
@@ -121,6 +125,31 @@ impl CommandResult {
     pub fn with_allowed_tools_override(mut self, tools: Vec<String>) -> Self {
         self.allowed_tools_override = Some(tools);
         self
+    }
+
+    /// Mark the output as scrollable (rendered as a full message).
+    pub fn with_scrollable(mut self) -> Self {
+        self.scrollable = true;
+        self
+    }
+}
+
+/// Command argument specification for validation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommandArgs {
+    /// No specific argument validation — any number of arguments accepted.
+    None,
+    /// At least N arguments required.
+    AtLeast(usize),
+    /// At most N arguments allowed.
+    AtMost(usize),
+    /// Exactly N arguments required.
+    Exactly(usize),
+}
+
+impl Default for CommandArgs {
+    fn default() -> Self {
+        CommandArgs::None
     }
 }
 
@@ -183,6 +212,8 @@ pub struct CommandContext {
     pub version: String,
     /// Pre-formatted cost summary from the cost tracker.
     pub cost_summary: String,
+    /// Pipe input from a previous command in a chain (e.g., `/diff | /commit`).
+    pub pipe_input: Option<String>,
 }
 
 impl CommandContext {
@@ -219,6 +250,7 @@ impl CommandContext {
             env: HashMap::new(),
             version: String::new(),
             cost_summary: String::new(),
+            pipe_input: None,
         }
     }
 
@@ -249,6 +281,10 @@ pub struct SlashCommand {
     pub allowed_tools_override: Option<Vec<String>>,
     /// Whether this command should be executed via a sub-agent backend (10.5).
     pub uses_agent_backend: bool,
+    /// Whether this command is destructive and requires confirmation.
+    pub destructive: bool,
+    /// Argument specification for validation.
+    pub args: CommandArgs,
     /// The handler function.
     pub handler: CommandHandler,
 }
@@ -264,6 +300,8 @@ impl std::fmt::Debug for SlashCommand {
             .field("bridge_safe", &self.bridge_safe)
             .field("allowed_tools_override", &self.allowed_tools_override)
             .field("uses_agent_backend", &self.uses_agent_backend)
+            .field("destructive", &self.destructive)
+            .field("args", &self.args)
             .finish_non_exhaustive()
     }
 }
@@ -287,6 +325,8 @@ impl SlashCommand {
             bridge_safe,
             allowed_tools_override: None,
             uses_agent_backend: false,
+            destructive: false,
+            args: CommandArgs::None,
             handler,
         }
     }
@@ -307,6 +347,8 @@ impl SlashCommand {
             bridge_safe: true,
             allowed_tools_override: None,
             uses_agent_backend: false,
+            destructive: false,
+            args: CommandArgs::None,
             handler,
         }
     }
@@ -327,6 +369,8 @@ impl SlashCommand {
             bridge_safe: true,
             allowed_tools_override: None,
             uses_agent_backend: false,
+            destructive: false,
+            args: CommandArgs::None,
             handler,
         }
     }
@@ -346,6 +390,8 @@ impl SlashCommand {
             bridge_safe: false,
             allowed_tools_override: None,
             uses_agent_backend: false,
+            destructive: false,
+            args: CommandArgs::None,
             handler,
         }
     }
@@ -353,6 +399,18 @@ impl SlashCommand {
     /// Mark this command to be executed via a sub-agent backend.
     pub const fn with_agent_backend(mut self) -> Self {
         self.uses_agent_backend = true;
+        self
+    }
+
+    /// Mark this command as destructive, requiring confirmation in TUI mode.
+    pub const fn with_destructive(mut self) -> Self {
+        self.destructive = true;
+        self
+    }
+
+    /// Set the argument validation spec for this command.
+    pub const fn with_args(mut self, args: CommandArgs) -> Self {
+        self.args = args;
         self
     }
 }
@@ -368,6 +426,42 @@ pub struct CommandRegistry {
 impl Default for CommandRegistry {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Validate command arguments against the spec.
+/// Returns an error result if validation fails, or None if valid.
+fn validate_args(
+    spec: &CommandArgs,
+    args: &[String],
+    name: &str,
+) -> Option<CommandResult> {
+    match spec {
+        CommandArgs::None => {
+            // No validation — accept any number of arguments
+            None
+        }
+        CommandArgs::AtLeast(n) => {
+            if args.len() < *n {
+                Some(CommandResult::error(format!("Command /{name} requires at least {n} argument(s). Got {}.", args.len())))
+            } else {
+                None
+            }
+        }
+        CommandArgs::AtMost(n) => {
+            if args.len() > *n {
+                Some(CommandResult::error(format!("Command /{name} takes at most {n} argument(s). Got {}.", args.len())))
+            } else {
+                None
+            }
+        }
+        CommandArgs::Exactly(n) => {
+            if args.len() != *n {
+                Some(CommandResult::error(format!("Command /{name} requires exactly {n} argument(s). Got {}.", args.len())))
+            } else {
+                None
+            }
+        }
     }
 }
 
@@ -399,6 +493,7 @@ impl CommandRegistry {
 
     /// Execute a command by name with the given arguments.
     ///
+    /// Validates argument count before dispatching to the handler.
     /// Returns a `CommandResult` or an error message if the command is not found.
     pub fn execute(
         &self,
@@ -407,7 +502,13 @@ impl CommandRegistry {
         args: &[String],
     ) -> CommandResult {
         match self.find(name) {
-            Some(cmd) => (cmd.handler)(ctx, args),
+            Some(cmd) => {
+                // Validate arguments
+                if let Some(err) = validate_args(&cmd.args, args, name) {
+                    return err;
+                }
+                (cmd.handler)(ctx, args)
+            }
             None => CommandResult::error(format!("Unknown command: /{name}")),
         }
     }
