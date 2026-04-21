@@ -283,6 +283,92 @@ impl AutoDream {
         }
     }
 
+    /// Spawn a background watcher that calls an LLM to produce dream summaries.
+    ///
+    /// Similar to [`spawn_watcher`](Self::spawn_watcher) but instead of
+    /// generating a placeholder summary, it sends the dream prompt to an
+    /// [`ApiClient`](coderex_core::api_client::ApiClient) and uses the
+    /// LLM response as the dream summary.
+    ///
+    /// # Arguments
+    /// * `tx` — Channel to send completed dream sessions.
+    /// * `poll_interval` — How often to check thresholds.
+    /// * `shutdown` — Signal to stop the watcher.
+    /// * `api_client` — LLM API client for generating the summary.
+    /// * `model` — Model to use for dream analysis.
+    /// * `recent_sessions` — Session summaries to include in the prompt.
+    pub async fn spawn_watcher_with_model(
+        &self,
+        tx: tokio::sync::mpsc::Sender<DreamSession>,
+        poll_interval: std::time::Duration,
+        mut shutdown: tokio::sync::oneshot::Receiver<()>,
+        api_client: &dyn coderex_core::api_client::ApiClient,
+        model: &coderex_core::types::ModelId,
+        recent_sessions: Vec<String>,
+    ) {
+        let mut interval = tokio::time::interval(poll_interval);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+        loop {
+            tokio::select! {
+                _ = &mut shutdown => {
+                    tracing::debug!("auto dream watcher (model) shutting down");
+                    break;
+                }
+                _ = interval.tick() => {
+                    if !self.config.enabled {
+                        continue;
+                    }
+                    match self.check_threshold() {
+                        DreamCheckResult::ShouldDream { sessions_since_last, .. } => {
+                            let dream = match self.start_dream() {
+                                Ok(d) => d,
+                                Err(e) => {
+                                    tracing::error!("failed to start dream: {e}");
+                                    continue;
+                                }
+                            };
+
+                            let summaries: Vec<&str> = recent_sessions.iter().map(|s| s.as_str()).collect();
+                            let prompt = self.generate_dream_prompt(&summaries);
+
+                            // Call LLM
+                            let messages = vec![serde_json::json!({
+                                "role": "user",
+                                "content": prompt,
+                            })];
+
+                            match api_client.create_message("", &messages, model, 4096).await {
+                                Ok(response) => {
+                                    let completed = match self.complete_dream(
+                                        dream,
+                                        &response.content,
+                                        sessions_since_last,
+                                    ) {
+                                        Ok(c) => c,
+                                        Err(e) => {
+                                            tracing::error!("failed to complete dream: {e}");
+                                            continue;
+                                        }
+                                    };
+                                    if tx.send(completed).await.is_err() {
+                                        tracing::debug!("dream watcher receiver dropped, stopping");
+                                        break;
+                                    }
+                                }
+                                Err(e) => {
+                                    tracing::error!("dream LLM call failed: {e}");
+                                    continue;
+                                }
+                            }
+                        }
+                        DreamCheckResult::NotReady | DreamCheckResult::InProgress => {}
+                    }
+                }
+            }
+        }
+    }
+
     /// Generate dream prompt content for the sub-agent.
     ///
     /// This produces the instructions that would be given to a read-only
@@ -497,6 +583,44 @@ mod tests {
         assert_eq!(received.sessions_analyzed, 1);
 
         // Signal shutdown and wait
+        let _ = shutdown_tx.send(());
+        let _ = handle.await;
+    }
+
+    #[tokio::test]
+    async fn spawn_watcher_with_model_calls_llm() {
+        use crate::ai_workflow::tests::MockApi;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let config = DreamConfig {
+            session_threshold: 1,
+            time_threshold_hours: 0,
+            enabled: true,
+        };
+        let dream = AutoDream::new(tmp.path().to_path_buf(), config);
+        dream.record_session().unwrap();
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(10);
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+
+        let api = MockApi::new("AI dream summary: found 3 patterns");
+        let model = coderex_core::types::ModelId::sonnet();
+        let sessions = vec!["Session 1: fixed auth".to_string()];
+
+        let poll_interval = std::time::Duration::from_millis(50);
+        let handle = tokio::spawn(async move {
+            dream
+                .spawn_watcher_with_model(tx, poll_interval, shutdown_rx, &api, &model, sessions)
+                .await;
+        });
+
+        let received = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+            .await
+            .expect("timed out waiting for dream")
+            .expect("channel closed");
+        assert!(received.success);
+        assert!(received.summary.contains("AI dream summary"));
+
         let _ = shutdown_tx.send(());
         let _ = handle.await;
     }

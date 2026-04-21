@@ -3,6 +3,7 @@
 use chrono::{DateTime, Utc};
 use rusqlite::params;
 use rusqlite::Connection;
+use std::collections::HashMap;
 use std::path::Path;
 use thiserror::Error;
 
@@ -67,6 +68,16 @@ impl SessionIndex {
             CREATE VIRTUAL TABLE IF NOT EXISTS session_fts USING fts5(
                 session_id,
                 content
+            );
+            CREATE TABLE IF NOT EXISTS session_tfidf (
+                session_id TEXT NOT NULL,
+                term TEXT NOT NULL,
+                tf REAL NOT NULL,
+                PRIMARY KEY (session_id, term)
+            );
+            CREATE TABLE IF NOT EXISTS session_idf (
+                term TEXT PRIMARY KEY,
+                df INTEGER NOT NULL DEFAULT 0
             );",
         )?;
         Ok(Self { conn })
@@ -195,6 +206,174 @@ impl SessionIndex {
         }
         Ok(())
     }
+
+    // ─── TF-IDF semantic search ─────────────────────────────────────────────
+
+    /// Index the content of a session for semantic (TF-IDF cosine similarity) search.
+    ///
+    /// Tokenizes the content, stores term frequencies in the `tfidf` table.
+    /// On subsequent `search_semantic` calls, query tokens are compared
+    /// against stored term frequencies using cosine similarity.
+    pub fn index_content(
+        &self,
+        session_id: &str,
+        content: &str,
+    ) -> Result<(), SessionIndexError> {
+        self.conn.execute(
+            "DELETE FROM session_tfidf WHERE session_id = ?1",
+            [session_id],
+        )?;
+
+        let terms = tokenize(content);
+        if terms.is_empty() {
+            return Ok(());
+        }
+
+        let total: f64 = terms.values().sum::<usize>() as f64;
+        for (term, count) in &terms {
+            let tf = *count as f64 / total;
+            self.conn.execute(
+                "INSERT OR REPLACE INTO session_tfidf (session_id, term, tf) VALUES (?1, ?2, ?3)",
+                params![session_id, term, tf],
+            )?;
+        }
+
+        // Update document frequency count
+        for term in terms.keys() {
+            self.conn.execute(
+                "UPDATE session_idf SET df = df + 1 WHERE term = ?1",
+                [term],
+            )?;
+            if self.conn.execute(
+                "INSERT OR IGNORE INTO session_idf (term, df) VALUES (?1, 1)",
+                [term],
+            )? == 0 {
+                // Already existed, df was updated above
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Search sessions by semantic similarity to the query.
+    ///
+    /// Computes TF-IDF cosine similarity between query tokens and stored
+    /// session term frequencies. Returns the top `limit` sessions ordered
+    /// by similarity score.
+    pub fn search_semantic(
+        &self,
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<(String, f64)>, SessionIndexError> {
+        let query_terms = tokenize(query);
+        if query_terms.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let total_query: f64 = query_terms.values().sum::<usize>() as f64;
+
+        // Get total document count for IDF
+        let doc_count: i64 = self.conn.query_row(
+            "SELECT COUNT(DISTINCT session_id) FROM session_tfidf",
+            [],
+            |row| row.get(0),
+        )?;
+        let doc_count = doc_count.max(1);
+
+        // Load all stored TF values into memory
+        let mut stmt = self.conn.prepare(
+            "SELECT session_id, term, tf FROM session_tfidf",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            let sid: String = row.get(0)?;
+            let term: String = row.get(1)?;
+            let tf: f64 = row.get(2)?;
+            Ok((sid, term, tf))
+        })?;
+
+        // Group by session: session_id -> { term -> tf }
+        let mut session_tfs: HashMap<String, HashMap<String, f64>> = HashMap::new();
+        for row in rows {
+            let (sid, term, tf) = row?;
+            session_tfs.entry(sid).or_default().insert(term, tf);
+        }
+
+        // Build IDF lookup
+        let mut idf_stmt = self.conn.prepare("SELECT term, df FROM session_idf")?;
+        let idf_rows = idf_stmt.query_map([], |row| {
+            let term: String = row.get(0)?;
+            let df: i64 = row.get(1)?;
+            Ok((term, df))
+        })?;
+        let idf_map: HashMap<String, i64> = idf_rows.filter_map(|r| r.ok()).collect();
+
+        // Compute IDF for query terms
+        let query_idf: HashMap<String, f64> = query_terms
+            .keys()
+            .map(|term| {
+                let df = idf_map.get(term).copied().unwrap_or(0);
+                (term.clone(), (doc_count as f64) / (1.0 + df as f64))
+            })
+            .collect();
+
+        // Compute query vector norm
+        let query_norm: f64 = query_terms
+            .iter()
+            .map(|(term, count)| {
+                let qtf = *count as f64 / total_query;
+                let idf = query_idf.get(term).copied().unwrap_or(1.0);
+                (qtf * idf).powi(2)
+            })
+            .sum::<f64>()
+            .sqrt();
+
+        if query_norm == 0.0 {
+            return Ok(Vec::new());
+        }
+
+        // Compute cosine similarity for each session
+        let mut results: Vec<(String, f64)> = session_tfs
+            .into_iter()
+            .filter_map(|(sid, terms)| {
+                let mut dot = 0.0f64;
+                let mut s_norm_sq = 0.0f64;
+
+                for (term, tf) in &terms {
+                    let df = idf_map.get(term).copied().unwrap_or(0);
+                    let idf = (doc_count as f64) / (1.0 + df as f64);
+                    s_norm_sq += (tf * idf).powi(2);
+
+                    if let Some(&qtf_count) = query_terms.get(term) {
+                        let qtf = qtf_count as f64 / total_query;
+                        dot += (*tf * idf) * (qtf * idf);
+                    }
+                }
+
+                let s_norm = s_norm_sq.sqrt();
+                if s_norm == 0.0 || dot == 0.0 {
+                    return None;
+                }
+                Some((sid, dot / (s_norm * query_norm)))
+            })
+            .collect();
+
+        results.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        results.truncate(limit);
+        Ok(results)
+    }
+}
+
+/// Tokenize text into lowercase alphanumeric tokens.
+fn tokenize(text: &str) -> HashMap<String, usize> {
+    let mut counts = HashMap::new();
+    for token in text
+        .to_lowercase()
+        .split(|c: char| !c.is_alphanumeric() && c != '\'')
+        .filter(|s| s.len() > 1)
+    {
+        *counts.entry(token.to_string()).or_default() += 1;
+    }
+    counts
 }
 
 /// Convert a database row to `SessionMeta`.
@@ -349,5 +528,54 @@ mod tests {
 
         let results = index.search("test", 2).unwrap();
         assert_eq!(results.len(), 2);
+    }
+
+    #[test]
+    fn semantic_search_finds_indexed_content() {
+        let (index, _tmp) = temp_index();
+
+        index.index_content("sess_auth", "authentication login oauth2 token session").unwrap();
+        index.index_content("sess_ui", "react component button styling css").unwrap();
+        index.index_content("sess_db", "database migration postgresql schema").unwrap();
+
+        let results = index.search_semantic("authentication token", 3).unwrap();
+        assert!(!results.is_empty());
+        assert_eq!(results[0].0, "sess_auth");
+        assert!(results[0].1 > 0.0);
+    }
+
+    #[test]
+    fn semantic_search_returns_empty_for_no_matches() {
+        let (index, _tmp) = temp_index();
+
+        index.index_content("sess_a", "hello world").unwrap();
+
+        // Query has completely different terms than indexed content
+        let results = index.search_semantic("quantum physics", 5).unwrap();
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn semantic_search_respects_limit() {
+        let (index, _tmp) = temp_index();
+
+        for i in 0..5 {
+            index.index_content(
+                &format!("sem_{i}"),
+                &format!("test session number {i}"),
+            ).unwrap();
+        }
+
+        let results = index.search_semantic("test session", 2).unwrap();
+        assert_eq!(results.len(), 2);
+    }
+
+    #[test]
+    fn semantic_search_empty_query_returns_empty() {
+        let (index, _tmp) = temp_index();
+        index.index_content("sess_x", "some content").unwrap();
+
+        let results = index.search_semantic("", 5).unwrap();
+        assert!(results.is_empty());
     }
 }

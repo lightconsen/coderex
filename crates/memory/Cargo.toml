@@ -27,10 +27,25 @@ pathdiff.workspace = true
 home.workspace = true
 sha2.workspace = true
 parking_lot.workspace = true
+dashmap.workspace = true
 once_cell.workspace = true
 flate2 = "1"
+
+# Optional: transcript encryption
+aes-gcm = { workspace = true, optional = true }
+hkdf = { workspace = true, optional = true }
+hex = { workspace = true, optional = true }
+rand_core = { workspace = true, optional = true }
+
+# Optional: team HTTP transport
+reqwest = { workspace = true, optional = true }
 
 [dev-dependencies]
 tempfile.workspace = true
 proptest.workspace = true
 futures.workspace = true
+wiremock.workspace = true
+
+[features]
+encryption = ["dep:aes-gcm", "dep:hkdf", "dep:hex", "dep:rand_core"]
+team-http = ["dep:reqwest"]

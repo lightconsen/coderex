@@ -62,7 +62,7 @@ pub struct SyncResult {
 }
 
 /// In-memory representation of remote state for sync comparison.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct RemoteState {
     /// Map of topic -> (checksum, tombstoned) from the server.
     pub entries: HashMap<String, (MemoryChecksum, bool, DateTime<Utc>)>,

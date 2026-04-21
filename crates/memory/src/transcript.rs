@@ -60,6 +60,7 @@ impl TranscriptStore {
             .open(&path)?;
         let line = serde_json::to_string(message)?;
         writeln!(file, "{line}")?;
+        file.sync_all()?;
         Ok(())
     }
 
@@ -339,6 +340,92 @@ impl TranscriptStore {
         std::fs::copy(&backup_path, &source)?;
         Ok(Some(source))
     }
+
+    // ─── Encryption (feature-gated) ────────────────────────────────────────
+
+    /// Append an encrypted message to a session's transcript.
+    ///
+    /// The file is stored at `<base_path>/<session_id>.jsonl.enc`.
+    /// Each line is `nonce_hex:ciphertext_hex`.
+    #[cfg(feature = "encryption")]
+    pub fn append_encrypted(
+        &self,
+        session_id: &str,
+        message: &Message,
+        cipher: &aes_gcm::Aes256Gcm,
+    ) -> Result<(), TranscriptError> {
+        use aes_gcm::aead::{Aead, AeadCore};
+        use rand_core::OsRng;
+        let path = self.encrypted_session_path(session_id);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let mut file = OpenOptions::new().create(true).append(true).open(&path)?;
+        let line = serde_json::to_string(message)?;
+        let nonce_bytes = <aes_gcm::Aes256Gcm as AeadCore>::generate_nonce(&mut OsRng);
+        let ciphertext = cipher
+            .encrypt(&nonce_bytes, line.as_bytes())
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("{e}")))?;
+        writeln!(
+            file,
+            "{}:{}",
+            hex::encode(nonce_bytes.as_slice()),
+            hex::encode(&ciphertext)
+        )?;
+        Ok(())
+    }
+
+    /// Read all messages from an encrypted session transcript.
+    ///
+    /// Reads from `<base_path>/<session_id>.jsonl.enc`.
+    /// Returns an empty vec if the file does not exist.
+    #[cfg(feature = "encryption")]
+    pub fn read_all_decrypted(
+        &self,
+        session_id: &str,
+        cipher: &aes_gcm::Aes256Gcm,
+    ) -> Result<Vec<Message>, TranscriptError> {
+        use aes_gcm::aead::Aead;
+        let path = self.encrypted_session_path(session_id);
+        if !path.exists() {
+            return Ok(Vec::new());
+        }
+        let file = std::fs::File::open(&path)?;
+        let reader = BufReader::new(file);
+        let mut messages = Vec::new();
+        for line in reader.lines() {
+            let line = line?;
+            if line.is_empty() {
+                continue;
+            }
+            let Some((nonce_hex, ct_hex)) = line.split_once(':') else {
+                tracing::warn!("skipping malformed encrypted line in {:?}", path);
+                continue;
+            };
+            let nonce = hex::decode(nonce_hex)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+            let ct = hex::decode(ct_hex)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+
+            let plaintext = cipher
+                .decrypt(nonce.as_slice().into(), ct.as_ref())
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("{e}")))?;
+
+            match serde_json::from_slice::<Message>(&plaintext) {
+                Ok(msg) => messages.push(msg),
+                Err(e) => {
+                    tracing::warn!("skipping corrupted decrypted line in {:?}: {}", path, e);
+                }
+            }
+        }
+        Ok(messages)
+    }
+
+    /// Get the file path for an encrypted session.
+    #[cfg(feature = "encryption")]
+    fn encrypted_session_path(&self, session_id: &str) -> PathBuf {
+        self.base_path.join(format!("{session_id}.jsonl.enc"))
+    }
 }
 
 /// Result of a prune operation.
@@ -615,5 +702,59 @@ mod tests {
         assert_eq!(result.remaining, 2);
         assert_eq!(result.archived, 0);
         assert_eq!(result.deleted, 0);
+    }
+
+    #[cfg(feature = "encryption")]
+    #[test]
+    fn encrypted_append_and_decrypt_roundtrip() {
+        use crate::transcript_crypto::derive_cipher;
+
+        let (store, _tmp) = temp_store();
+        let key = crate::transcript_crypto::generate_master_key();
+        let cipher = derive_cipher(&key, "enc_sess_1").unwrap();
+
+        store.append_encrypted("enc_sess_1", &Message::user("secret hello"), &cipher).unwrap();
+        store.append_encrypted("enc_sess_1", &Message::assistant("secret response"), &cipher).unwrap();
+
+        let messages = store.read_all_decrypted("enc_sess_1", &cipher).unwrap();
+        assert_eq!(messages.len(), 2);
+        if let coderex_core::types::MessageContent::Text(s) = &messages[0].content {
+            assert_eq!(s, "secret hello");
+        } else {
+            panic!("expected text");
+        }
+    }
+
+    #[cfg(feature = "encryption")]
+    #[test]
+    fn wrong_key_cannot_decrypt() {
+        use crate::transcript_crypto::derive_cipher;
+
+        let (store, _tmp) = temp_store();
+        let key1 = crate::transcript_crypto::generate_master_key();
+        let key2 = crate::transcript_crypto::generate_master_key();
+        let cipher1 = derive_cipher(&key1, "enc_sess_2").unwrap();
+        let cipher2 = derive_cipher(&key2, "enc_sess_2").unwrap();
+
+        store.append_encrypted("enc_sess_2", &Message::user("secret"), &cipher1).unwrap();
+
+        // Wrong key → decryption error
+        let result = store.read_all_decrypted("enc_sess_2", &cipher2);
+        assert!(result.is_err());
+    }
+
+    #[cfg(feature = "encryption")]
+    #[test]
+    fn encrypted_file_uses_enc_extension() {
+        use crate::transcript_crypto::derive_cipher;
+
+        let (store, tmp) = temp_store();
+        let key = crate::transcript_crypto::generate_master_key();
+        let cipher = derive_cipher(&key, "ext_check").unwrap();
+
+        store.append_encrypted("ext_check", &Message::user("test"), &cipher).unwrap();
+
+        let enc_path = tmp.path().join("ext_check.jsonl.enc");
+        assert!(enc_path.exists());
     }
 }
