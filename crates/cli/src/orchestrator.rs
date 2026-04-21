@@ -1,12 +1,15 @@
 //! Startup orchestrator — four-phase initialization.
 
 use anyhow::{Result, bail};
-use coderex_config::{config_home, ConfigService, RuntimeOverrides, Settings};
+#[cfg(feature = "enterprise")]
+use coderex_config::config_home;
+use coderex_config::{ConfigService, RuntimeOverrides, Settings};
 #[cfg(feature = "enterprise")]
 use coderex_config::{LoadingBarrier, RemoteManagedSettings, RemoteManagedSettingsClient, RemoteSettingsManager};
 use coderex_core::types::ModelId;
 use coderex_core::api_client::ApiClient;
 use crate::cli::Cli;
+use crate::daemon;
 use std::io::IsTerminal;
 
 /// Duration (ms) to wait for remote settings before timing out and failing open.
@@ -126,6 +129,46 @@ impl StartupOrchestrator {
             .await?;
         self.run_phase(StartupPhase::Ready, &args).await?;
 
+        // Non-blocking update check (once per 24h)
+        {
+            let cwd = self.ctx.cwd.clone();
+            tokio::spawn(async move {
+                use crate::version;
+                let cwd_path = std::path::Path::new(&cwd);
+                if version::should_check(cwd_path) {
+                    if let Some(msg) = version::check_for_updates().await {
+                        tracing::info!("{msg}");
+                    }
+                    version::record_check_time(cwd_path);
+                }
+            });
+        }
+
+        #[cfg(unix)]
+        {
+            use tokio::signal::unix::{SignalKind, signal};
+            let cwd = self.ctx.cwd.clone();
+            tokio::spawn(async move {
+                let Ok(mut sigterm) = signal(SignalKind::terminate()) else { return };
+                let Ok(mut sighup) = signal(SignalKind::hangup()) else { return };
+                loop {
+                    tokio::select! {
+                        _ = sigterm.recv() => {
+                            tracing::info!("Received SIGTERM — shutting down gracefully");
+                            let _ = crate::daemon::remove_pid_file();
+                            // Save recovery snapshot before exit
+                            let _ = crate::recovery::remove(&cwd);
+                            std::process::exit(0);
+                        }
+                        _ = sighup.recv() => {
+                            tracing::info!("Received SIGHUP — config reload requested");
+                            // Config reload is handled by ConfigWatcher in the REPL loop
+                        }
+                    }
+                }
+            });
+        }
+
         tracing::info!("CodeRex ready");
 
         // Determine model: CODEREX_MODEL env → settings → default
@@ -147,6 +190,12 @@ impl StartupOrchestrator {
                 }
                 crate::cli::Command::Serve => {
                     self.run_server(&self.ctx.cwd).await
+                }
+                crate::cli::Command::ServeStop => {
+                    self.run_serve_stop().await
+                }
+                crate::cli::Command::ServeStatus => {
+                    self.run_serve_status().await
                 }
                 crate::cli::Command::Resume { session_id } => {
                     self.run_resume(&self.ctx.cwd, &session_id, model).await
@@ -604,6 +653,9 @@ impl StartupOrchestrator {
     async fn run_server(&self, cwd: &str) -> Result<()> {
         use coderex_server::{DaemonServer, ServerConfig};
 
+        // Write PID file before starting
+        daemon::write_pid_file().map_err(|e| anyhow::anyhow!("Failed to write PID file: {e}"))?;
+
         // Build server config from environment
         let valid_keys: Vec<String> = std::env::var("CODEREX_API_KEYS")
             .ok()
@@ -638,7 +690,28 @@ impl StartupOrchestrator {
         println!("Press Ctrl+C to stop");
 
         let addr = std::net::SocketAddr::from(([0, 0, 0, 0], port));
-        server.run(addr).await.map_err(|e| anyhow::anyhow!(e))?;
+        let result = server.run(addr).await.map_err(|e| anyhow::anyhow!(e));
+
+        // Clean up PID file on shutdown
+        let _ = daemon::remove_pid_file();
+
+        result
+    }
+
+    #[allow(clippy::unused_async)]
+    async fn run_serve_stop(&self) -> Result<()> {
+        match daemon::stop_daemon() {
+            Ok(msg) => {
+                println!("{msg}");
+                Ok(())
+            }
+            Err(e) => bail!("{e}"),
+        }
+    }
+
+    #[allow(clippy::unused_async)]
+    async fn run_serve_status(&self) -> Result<()> {
+        println!("{}", daemon::serve_status());
         Ok(())
     }
 

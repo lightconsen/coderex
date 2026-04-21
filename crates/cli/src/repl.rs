@@ -110,6 +110,9 @@ pub struct ReplLoop {
     dream_shutdown_tx: Option<tokio::sync::oneshot::Sender<()>>,
     /// Team memory sync service for cross-repo memory sharing.
     team_memory_service: Option<Arc<TeamMemorySyncService>>,
+    /// Config watcher for hot-reloading settings.
+    #[cfg(feature = "hot-reload")]
+    config_changed_rx: Option<tokio::sync::watch::Receiver<()>>,
 }
 
 impl ReplLoop {
@@ -139,6 +142,8 @@ impl ReplLoop {
             auto_dream: None,
             dream_shutdown_tx: None,
             team_memory_service: None,
+            #[cfg(feature = "hot-reload")]
+            config_changed_rx: None,
         }
     }
 
@@ -206,6 +211,9 @@ impl ReplLoop {
         let orchestrator = coderex_core::orchestrator::Orchestrator::new(api_client.clone_box());
         let (bg_tx, bg_rx) = mpsc::unbounded_channel::<BackgroundTaskResult>();
 
+        #[cfg(feature = "hot-reload")]
+        let config_changed_rx = Self::init_config_watcher(&cwd);
+
         Self {
             commands,
             model,
@@ -226,6 +234,33 @@ impl ReplLoop {
             auto_dream: Some(auto_dream),
             dream_shutdown_tx: None,
             team_memory_service: Some(team_memory_service),
+            #[cfg(feature = "hot-reload")]
+            config_changed_rx,
+        }
+    }
+
+    /// Initialize the ConfigWatcher if the hot-reload feature is enabled.
+    #[cfg(feature = "hot-reload")]
+    fn init_config_watcher(cwd: &str) -> Option<tokio::sync::watch::Receiver<()>> {
+        use coderex_config::ConfigWatcher;
+        let user_path = coderex_config::config_home().join("settings.json");
+        let project_path = std::path::Path::new(cwd).join(".coderex/settings.json");
+        let mut paths = Vec::new();
+        if user_path.exists() {
+            paths.push(user_path);
+        }
+        if project_path.exists() {
+            paths.push(project_path);
+        }
+        if paths.is_empty() {
+            return None;
+        }
+        match ConfigWatcher::new(&paths) {
+            Ok(watcher) => Some(watcher.subscribe()),
+            Err(e) => {
+                tracing::warn!("Failed to initialize config watcher: {e}");
+                None
+            }
         }
     }
 
@@ -1557,6 +1592,39 @@ impl ReplLoop {
                     });
                     return;
                 }
+                "workspace" => {
+                    let msg = self.handle_workspace_command(&args);
+                    ui_state.messages.push(coderex_ui::message_list::Message {
+                        role: coderex_ui::message_list::MessageRole::System,
+                        content: msg.into(),
+                        tool_name: None,
+                        streaming: false,
+                        folded: false,
+                    });
+                    return;
+                }
+                "recover" => {
+                    let msg = self.handle_recover_command();
+                    ui_state.messages.push(coderex_ui::message_list::Message {
+                        role: coderex_ui::message_list::MessageRole::System,
+                        content: msg.into(),
+                        tool_name: None,
+                        streaming: false,
+                        folded: false,
+                    });
+                    return;
+                }
+                "update-check" => {
+                    let msg = self.handle_update_check_command().await;
+                    ui_state.messages.push(coderex_ui::message_list::Message {
+                        role: coderex_ui::message_list::MessageRole::System,
+                        content: msg.into(),
+                        tool_name: None,
+                        streaming: false,
+                        folded: false,
+                    });
+                    return;
+                }
                 _ => {}
             }
 
@@ -1714,6 +1782,21 @@ impl ReplLoop {
             }
             "team-memory" => {
                 let msg = self.handle_team_memory_command(&args).await;
+                writeln!(stdout, "{msg}")?;
+                return Ok(());
+            }
+            "workspace" => {
+                let msg = self.handle_workspace_command(&args);
+                writeln!(stdout, "{msg}")?;
+                return Ok(());
+            }
+            "recover" => {
+                let msg = self.handle_recover_command();
+                writeln!(stdout, "{msg}")?;
+                return Ok(());
+            }
+            "update-check" => {
+                let msg = self.handle_update_check_command().await;
                 writeln!(stdout, "{msg}")?;
                 return Ok(());
             }
@@ -1901,6 +1984,52 @@ impl ReplLoop {
                 }
             }
             _ => "Usage: /team-memory <upsert|read|list|delete|sync> [args...]".into(),
+        }
+    }
+
+    /// Handle /workspace command — switch or show current workspace directory.
+    fn handle_workspace_command(&mut self, args: &[String]) -> String {
+        if args.is_empty() {
+            return format!("Current workspace: {}", self.cwd);
+        }
+        let path = &args[0];
+        let expanded = if path.starts_with('~') {
+            if let Some(home) = home::home_dir() {
+                home.join(&path[1..]).to_string_lossy().to_string()
+            } else {
+                return "Could not expand ~ path.".into();
+            }
+        } else {
+            path.to_string()
+        };
+        let target = std::path::Path::new(&expanded);
+        if !target.exists() {
+            return format!("Workspace path does not exist: {expanded}");
+        }
+        if !target.is_dir() {
+            return format!("Path is not a directory: {expanded}");
+        }
+        let abs = target.canonicalize().unwrap_or(target.to_path_buf());
+        let old = std::mem::replace(&mut self.cwd, abs.to_string_lossy().to_string());
+        format!("Workspace switched: {old} → {}", self.cwd)
+    }
+
+    /// Handle /recover command — restore session from crash recovery snapshot.
+    fn handle_recover_command(&self) -> String {
+        let Some(state) = crate::recovery::load(&self.cwd) else {
+            return "No recovery snapshot found.".into();
+        };
+        format!(
+            "Recovery snapshot found: session={}, messages={}, last_input='{}', saved_at={}",
+            state.session_id, state.message_count, state.last_input, state.saved_at
+        )
+    }
+
+    /// Handle /update-check command — check for new versions.
+    async fn handle_update_check_command(&self) -> String {
+        match crate::version::check_for_updates().await {
+            Some(msg) => msg,
+            None => format!("You are running the latest version ({})", crate::version::CURRENT_VERSION),
         }
     }
 

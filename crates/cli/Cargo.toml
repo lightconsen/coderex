@@ -28,6 +28,7 @@ coderex-server = { path = "../server" }
 coderex-ui = { path = "../ui" }
 coderex-sdk = { path = "../sdk" }
 coderex-config = { path = "../config" }
+notify = { version = "7", optional = true }
 coderex-telemetry = { path = "../telemetry" }
 
 clap.workspace = true
@@ -38,7 +39,10 @@ tracing-subscriber.workspace = true
 thiserror.workspace = true
 anyhow.workspace = true
 home.workspace = true
+libc.workspace = true
+serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
+reqwest.workspace = true
 crossterm.workspace = true
 compact_str.workspace = true
 uuid.workspace = true
@@ -65,6 +69,7 @@ coderex-test-utils = { path = "../test-utils" }
 default = ["core"]
 core = []
 full = ["core"]
+hot-reload = ["coderex-config/hot-reload", "dep:notify"]
 enterprise = ["full", "coderex-config/enterprise"]
 
 [package.metadata.dist]

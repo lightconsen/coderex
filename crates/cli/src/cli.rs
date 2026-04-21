@@ -38,6 +38,10 @@ pub enum Command {
     Repl,
     /// Start in daemon/server mode.
     Serve,
+    /// Stop a running daemon server.
+    ServeStop,
+    /// Show status of a running daemon server.
+    ServeStatus,
     /// Resume a previous session.
     Resume { session_id: String },
 }
