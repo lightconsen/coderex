@@ -116,6 +116,7 @@ mod tests {
         let mut extra = HashMap::<String, crate::tool::SharedState>::new();
         extra.insert("tool_registry".to_string(), Box::new(Arc::new(reg)));
         ToolContext {
+            elicit_tx: None,
             execution_context: ExecutionContext::Normal,
             cwd: Path::new("/tmp"),
             extra: Arc::new(extra),

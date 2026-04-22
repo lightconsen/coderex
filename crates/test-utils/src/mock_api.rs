@@ -3,7 +3,6 @@
 //! Provides [`MockApiClient`] — a test-double for [`ApiClient`] that
 //! returns pre-programmed responses instead of hitting a real API.
 
-use async_trait::async_trait;
 use coderex_core::api_client::{ApiClient, ApiError, ApiResponse, StreamEvent};
 use coderex_core::types::{ModelId, UsageSummary};
 use futures::Stream;

@@ -36,6 +36,14 @@ pub struct TestRig {
     pub temp_dir: tempfile::TempDir,
 }
 
+impl std::fmt::Debug for TestRig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TestRig")
+            .field("temp_dir", &self.temp_dir.path())
+            .finish_non_exhaustive()
+    }
+}
+
 impl TestRig {
     /// Create a new TestRig with sensible defaults.
     ///

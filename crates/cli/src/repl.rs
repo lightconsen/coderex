@@ -124,7 +124,7 @@ pub struct ReplLoop {
     /// Plugin manager for dynamic plugin commands and tools.
     plugin_manager: Option<Arc<coderex_plugins::plugins::PluginManager>>,
     /// Primary tool executor (stored so plugin fallback can be layered on top).
-    primary_tool_executor: Option<Arc<dyn coderex_core::tool_executor::ToolExecutor + Send + Sync>>,
+    _primary_tool_executor: Option<Arc<dyn coderex_core::tool_executor::ToolExecutor + Send + Sync>>,
     /// Dispatcher reference for setting per-turn state (e.g., elicitation channel).
     dispatcher: Option<Arc<RegistryToolDispatcher>>,
     /// Pending elicitation response sender — when set, user input is treated as an answer.
@@ -134,7 +134,7 @@ pub struct ReplLoop {
     /// SDK session for headless/structured event consumers.
     sdk_session: Option<Arc<SdkSession>>,
     /// Background timeout checker for the SDK session.
-    sdk_timeout_handle: Option<tokio::task::JoinHandle<()>>,
+    _sdk_timeout_handle: Option<tokio::task::JoinHandle<()>>,
     /// Teleport manager for session sharing and directory switching.
     teleport_manager: Option<coderex_bridge::teleport::TeleportManager>,
 }
@@ -217,12 +217,12 @@ impl ReplLoop {
             macro_registry: MacroRegistry::new(),
             pending_destructive_cmd: None,
             plugin_manager: None,
-            primary_tool_executor: None,
+            _primary_tool_executor: None,
             dispatcher: None,
             pending_elicitation: None,
             cron_rx: None,
             sdk_session: None,
-            sdk_timeout_handle: None,
+            _sdk_timeout_handle: None,
             teleport_manager: Some(coderex_bridge::teleport::TeleportManager::new()),
             #[cfg(feature = "hot-reload")]
             config_changed_rx: None,
@@ -358,12 +358,12 @@ impl ReplLoop {
             macro_registry: MacroRegistry::new(),
             pending_destructive_cmd: None,
             plugin_manager: None,
-            primary_tool_executor: Some(primary_executor),
+            _primary_tool_executor: Some(primary_executor),
             dispatcher: Some(dispatcher),
             pending_elicitation: None,
             cron_rx: Some(cron_rx),
             sdk_session: Some(sdk_session),
-            sdk_timeout_handle,
+            _sdk_timeout_handle: sdk_timeout_handle,
             teleport_manager: Some(coderex_bridge::teleport::TeleportManager::new()),
             #[cfg(feature = "hot-reload")]
             config_changed_rx,
@@ -1323,6 +1323,7 @@ impl ReplLoop {
 
     /// Compact the session context by truncating older messages.
     /// Keeps the first user message and the most recent 3 turns.
+    #[allow(dead_code)]
     async fn compact_context(
         &mut self,
         ui_state: &mut coderex_ui::state::UiState,

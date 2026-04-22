@@ -9,7 +9,7 @@
 //! unified access with fallback chains.
 
 use crate::api_client::{ApiError, ApiResponse};
-use crate::types::{ModelId, UsageSummary};
+use crate::types::ModelId;
 use async_trait::async_trait;
 use futures::Stream;
 use std::pin::Pin;

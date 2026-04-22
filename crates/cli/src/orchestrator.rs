@@ -600,7 +600,7 @@ impl StartupOrchestrator {
             if !url.is_empty() {
                 let name = std::env::var("CODEREX_MARKETPLACE_NAME")
                     .unwrap_or_else(|_| "default".into());
-                manager.register_marketplace(name, url);
+                let _ = manager.register_marketplace(name, url);
             }
         }
 

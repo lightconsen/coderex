@@ -42,6 +42,7 @@ pub fn redact_events(events: &[EngineEvent]) -> Vec<RedactedEvent> {
 
 /// A redacted version of [`EngineEvent`] for snapshotting.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(missing_docs)]
 pub enum RedactedEvent {
     /// Text delta.
     TextDelta(String),

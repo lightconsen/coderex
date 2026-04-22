@@ -124,6 +124,7 @@ mod tests {
         extra.insert(WORKTREE_HANDLE_KEY.into(), Box::new(typed));
         (
             ToolContext {
+            elicit_tx: None,
                 execution_context: ExecutionContext::Normal,
                 cwd: Path::new("/tmp"),
                 extra: Arc::new(extra),

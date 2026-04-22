@@ -84,6 +84,7 @@ mod tests {
         let mut extra = HashMap::<String, crate::tool::SharedState>::new();
         extra.insert(CRON_SCHEDULER_KEY.to_string(), Box::new(scheduler));
         ToolContext {
+            elicit_tx: None,
             execution_context: ExecutionContext::Normal,
             cwd: Path::new("/tmp"),
             extra: Arc::new(extra),

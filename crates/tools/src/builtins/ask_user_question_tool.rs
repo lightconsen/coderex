@@ -97,10 +97,10 @@ mod tests {
 
     fn test_ctx() -> ToolContext<'static> {
         ToolContext {
+            elicit_tx: None,
             execution_context: ExecutionContext::Normal,
             cwd: Path::new("/tmp"),
             extra: Arc::new(HashMap::new()),
-            elicit_tx: None,
         }
     }
 
@@ -132,10 +132,10 @@ mod tests {
     async fn ask_user_question_with_channel_receives_answers() {
         let (tx, mut rx) = tokio::sync::mpsc::channel(1);
         let ctx = ToolContext {
+            elicit_tx: Some(tx),
             execution_context: ExecutionContext::Normal,
             cwd: Path::new("/tmp"),
             extra: Arc::new(HashMap::new()),
-            elicit_tx: Some(tx),
         };
 
         let handle = tokio::spawn(async move {

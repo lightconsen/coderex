@@ -9,9 +9,8 @@
 //! Built on top of the existing [`PermissionChecker`](crate::permissions::PermissionChecker)
 //! and [`PermissionEngine`](crate::permission_engine::PermissionEngine) foundations.
 
-use crate::permissions::{PermissionAction, PermissionChecker, PermissionMode, PermissionResult, PermissionRule};
+use crate::permissions::{PermissionAction, PermissionChecker, PermissionMode, PermissionRule};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 use std::path::Path;
 use thiserror::Error;
 

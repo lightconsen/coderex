@@ -25,8 +25,6 @@
 use crate::mock_api::{MockApiClient, MockResponseType, mock_response, mock_response_with_tool_calls};
 use crate::rig::{StubOkToolExecutor, TestRigBuilder};
 use coderex_core::types::{EngineEvent, ToolCall};
-use std::future::Future;
-use std::pin::Pin;
 
 /// A single eval scenario.
 pub struct EvalScenario {
@@ -40,8 +38,19 @@ pub struct EvalScenario {
     pub tool_executor: Option<Box<dyn coderex_core::tool_executor::ToolExecutor + Send + Sync>>,
 }
 
+impl std::fmt::Debug for EvalScenario {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EvalScenario")
+            .field("name", &self.name)
+            .field("responses", &self.responses)
+            .field("assertions", &self.assertions)
+            .finish_non_exhaustive()
+    }
+}
+
 /// An assertion about engine behavior.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(missing_docs)]
 pub enum EvalAssertion {
     /// Assert a specific tool was called.
     ToolCalled { name: String },

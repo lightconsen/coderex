@@ -1,6 +1,6 @@
 //! Crash recovery — session state snapshot/restore via `.coderex/recovery.json`.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// Recovery snapshot written periodically during REPL sessions.

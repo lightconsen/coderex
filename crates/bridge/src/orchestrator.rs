@@ -34,6 +34,7 @@ pub struct BridgeConfig {
 
 /// A running session tracked by the bridge.
 #[derive(Debug)]
+#[allow(dead_code)]
 struct ManagedSession {
     /// Session state machine.
     state_machine: BridgeSessionStateMachine,
@@ -45,6 +46,7 @@ struct ManagedSession {
 
 /// Bridge events emitted during operation.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[allow(missing_docs)]
 pub enum BridgeEvent {
     /// A session was spawned.
     SessionSpawned { session_id: String, work_dir: String },
@@ -78,7 +80,7 @@ pub enum BridgeEvent {
 /// - BridgeArchiveWriter + BridgeCleanupManager for session archival
 pub struct Bridge {
     /// Bridge configuration.
-    config: BridgeConfig,
+    _config: BridgeConfig,
     /// Transport layer.
     transport: Option<Box<dyn Transport>>,
     /// Heartbeat loop for connection monitoring.
@@ -101,6 +103,15 @@ pub struct Bridge {
     event_tx: tokio::sync::broadcast::Sender<BridgeEvent>,
     /// Whether the bridge is currently running.
     running: bool,
+}
+
+impl std::fmt::Debug for Bridge {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Bridge")
+            .field("sessions", &self.sessions.len())
+            .field("running", &self.running)
+            .finish_non_exhaustive()
+    }
 }
 
 impl Bridge {
@@ -126,7 +137,7 @@ impl Bridge {
         let (event_tx, _) = tokio::sync::broadcast::channel(256);
 
         Self {
-            config: config.clone(),
+            _config: config.clone(),
             transport: Some(transport),
             heartbeat_loop: Some(heartbeat_loop),
             reconnector,
@@ -258,7 +269,7 @@ impl Bridge {
     }
 
     /// ─── Internal: Spawn a session from a work assignment ───
-
+    #[allow(dead_code)]
     async fn spawn_session(&mut self, assignment: &WorkAssignment) -> Result<SpawnResult, String> {
         let session_id = &assignment.session_id;
 
@@ -290,7 +301,7 @@ impl Bridge {
     }
 
     /// ─── Internal: Complete a session (archive + cleanup) ───
-
+    #[allow(dead_code)]
     async fn complete_session(&mut self, session_id: &str, usage: UsageStats) -> Result<(), String> {
         // Drive session through required states: assigned → preparing → spawning → running → archiving
         if let Some(session) = self.sessions.get_mut(session_id) {
@@ -350,7 +361,7 @@ impl Bridge {
     }
 
     /// ─── Internal: Fail a session ───
-
+    #[allow(dead_code)]
     fn fail_session(&mut self, session_id: &str, reason: String) {
         if let Some(session) = self.sessions.get_mut(session_id) {
             session.state_machine.fail(reason.clone());
@@ -363,7 +374,7 @@ impl Bridge {
     }
 
     /// ─── Internal: Handle transport disconnect with reconnection ───
-
+    #[allow(dead_code)]
     async fn handle_transport_disconnect(&mut self) {
         let attempt = self.reconnector.attempt_count() + 1;
         self.emit(BridgeEvent::TransportReconnecting { attempt });

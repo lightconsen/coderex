@@ -1,6 +1,6 @@
 //! Session management commands: /clear, /exit, /session.
 
-use crate::registry::{CommandArgs, CommandContext, CommandRegistry, CommandResult, SlashCommand};
+use crate::registry::{CommandContext, CommandRegistry, CommandResult, SlashCommand};
 use std::sync::Arc;
 
 /// Register session management commands.

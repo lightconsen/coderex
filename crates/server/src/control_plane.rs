@@ -71,13 +71,13 @@ pub struct CapacityReport {
 
 /// A registered bridge environment.
 #[derive(Debug, Clone)]
-struct Environment {
+pub struct Environment {
     /// Registration info.
-    pub register: RegisterRequest,
+    pub _register: RegisterRequest,
     /// Current capacity report.
     pub capacity: Option<CapacityReport>,
     /// Registered at (Unix timestamp seconds).
-    pub registered_at: u64,
+    pub _registered_at: u64,
 }
 
 /// Shared state for the control plane server.
@@ -99,9 +99,9 @@ impl ControlPlaneState {
         self.environments.insert(
             req.env_id.clone(),
             Environment {
-                register: req,
+                _register: req,
                 capacity: None,
-                registered_at: now,
+                _registered_at: now,
             },
         );
     }
@@ -210,12 +210,11 @@ async fn handle_request(
     stream: tokio::net::TcpStream,
     state: Arc<Mutex<ControlPlaneState>>,
 ) -> std::io::Result<()> {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::io::AsyncReadExt;
 
     let (mut reader, mut writer) = stream.into_split();
 
     // Read HTTP request
-    let mut buf: Vec<u8> = Vec::new();
     let mut header_buf = [0u8; 4096];
     let n = reader.read(&mut header_buf).await?;
     let request = String::from_utf8_lossy(&header_buf[..n]);

@@ -488,6 +488,7 @@ impl AgentManager {
     }
 
     /// Emit an agent lifecycle event to the parent engine event stream.
+    #[allow(dead_code)]
     fn emit_agent_lifecycle(&self, agent_id: &str, event: AgentLifecycleEvent) {
         if let Some(ref tx) = self.event_tx {
             let _ = tx.send(EngineEvent::AgentEvent {

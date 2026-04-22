@@ -67,6 +67,15 @@ pub struct CompositeToolExecutor {
     mcp: Arc<McpToolExecutor>,
 }
 
+impl std::fmt::Debug for CompositeToolExecutor {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CompositeToolExecutor")
+            .field("has_primary", &true)
+            .field("has_mcp", &true)
+            .finish()
+    }
+}
+
 impl CompositeToolExecutor {
     /// Create a composite that tries `primary` first, then `mcp`.
     #[must_use]

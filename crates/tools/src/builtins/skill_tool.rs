@@ -118,6 +118,7 @@ mod tests {
 
     fn test_ctx() -> ToolContext<'static> {
         ToolContext {
+            elicit_tx: None,
             execution_context: ExecutionContext::Normal,
             cwd: Path::new("/tmp"),
             extra: Arc::new(HashMap::new()),
@@ -132,6 +133,7 @@ mod tests {
         std::fs::write(skills_dir.join("pdf.md"), "# PDF Skill\nExtract text from PDF files.").unwrap();
 
         let ctx = ToolContext {
+            elicit_tx: None,
             execution_context: ExecutionContext::Normal,
             cwd: tmp.path(),
             extra: Arc::new(HashMap::new()),

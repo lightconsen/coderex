@@ -384,6 +384,7 @@ impl LongTermStore {
     }
 
     /// Recursively collect all hierarchical keys.
+    #[allow(dead_code)]
     fn collect_keys(
         &self,
         dir: &Path,
