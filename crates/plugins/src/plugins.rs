@@ -4,6 +4,8 @@ use dashmap::DashMap;
 use ed25519_dalek::Verifier;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -47,8 +49,33 @@ pub struct PluginHandle {
     pub max_retries: u32,
 }
 
+/// Plugin runtime type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RuntimeType {
+    /// External process (JSON-RPC over stdio).
+    Process,
+    /// WASM module (not yet implemented).
+    Wasm,
+}
+
+impl Default for RuntimeType {
+    fn default() -> Self {
+        Self::Process
+    }
+}
+
+impl std::fmt::Display for RuntimeType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RuntimeType::Process => write!(f, "process"),
+            RuntimeType::Wasm => write!(f, "wasm"),
+        }
+    }
+}
+
 /// A plugin manifest — parsed from plugin.json.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct PluginManifest {
     /// Plugin name.
     pub name: String,
@@ -72,6 +99,15 @@ pub struct PluginManifest {
     /// Ed25519 signature of the plugin archive (hex-encoded).
     #[serde(default)]
     pub signature: Option<String>,
+    /// Runtime type: "process" (default) or "wasm".
+    #[serde(default)]
+    pub runtime: RuntimeType,
+    /// Entrypoint command for process plugins (e.g., "bin/plugin", "node index.js").
+    #[serde(default)]
+    pub entrypoint: Option<String>,
+    /// Environment variables for the plugin process.
+    #[serde(default)]
+    pub env: HashMap<String, String>,
 }
 
 /// Marketplace plugin listing.
@@ -116,11 +152,15 @@ pub struct MarketplaceConnection {
     pub download_endpoint: String,
 }
 
+use crate::runtime::PluginProcess;
+
 /// Manages all loaded plugins and marketplace state.
 #[derive(Debug)]
 pub struct PluginManager {
     /// Loaded plugins.
     plugins: DashMap<String, PluginHandle>,
+    /// Active plugin processes (for process-runtime plugins).
+    pub(crate) active_processes: DashMap<String, PluginProcess>,
     /// Marketplace connections.
     marketplaces: DashMap<String, MarketplaceConnection>,
     /// Whether a refresh is needed (new plugins installed).
@@ -149,6 +189,7 @@ impl PluginManager {
     pub fn new() -> Self {
         Self {
             plugins: DashMap::new(),
+            active_processes: DashMap::new(),
             marketplaces: DashMap::new(),
             needs_refresh: AtomicBool::new(false),
             plugin_dirs: Vec::new(),
@@ -200,6 +241,7 @@ impl PluginManager {
     /// Load a discovered plugin.
     ///
     /// Skips loading if the plugin's `min_version` is incompatible.
+    /// For process-runtime plugins, spawns the subprocess asynchronously.
     pub fn load_plugin(&self, manifest: PluginManifest, path: PathBuf) {
         if !self.is_version_compatible(manifest.min_version.as_deref()) {
             tracing::warn!(
@@ -228,19 +270,41 @@ impl PluginManager {
 
         let handle = PluginHandle {
             name: manifest.name.clone(),
-            version: manifest.version,
+            version: manifest.version.clone(),
             state: PluginState::Active,
-            path,
-            commands: manifest.commands,
-            skills: manifest.skills,
+            path: path.clone(),
+            commands: manifest.commands.clone(),
+            skills: manifest.skills.clone(),
             retry_count: 0,
             max_retries: 3,
         };
-        self.plugins.insert(handle.name.clone(), handle);
+        self.plugins.insert(manifest.name.clone(), handle);
+
+        // Spawn process plugins asynchronously (only if a tokio runtime is available)
+        if manifest.runtime == RuntimeType::Process {
+            let name = manifest.name.clone();
+            if tokio::runtime::Handle::try_current().is_ok() {
+                tokio::spawn(async move {
+                    tracing::debug!(
+                        plugin = %name,
+                        "process plugin loaded; spawn via PluginManager::spawn_plugin()"
+                    );
+                });
+            }
+        }
     }
 
-    /// Unload a plugin and clean up its directory.
+    /// Unload a plugin, stop its process, and clean up its directory.
     pub fn unload_plugin(&self, name: &str) -> bool {
+        // Stop the process first (only if a tokio runtime is available)
+        if let Some((_, mut process)) = self.active_processes.remove(name) {
+            if tokio::runtime::Handle::try_current().is_ok() {
+                let _ = tokio::spawn(async move {
+                    let _ = process.terminate().await;
+                });
+            }
+        }
+
         if let Some((_, handle)) = self.plugins.remove(name) {
             // Clean up plugin directory if it exists
             if handle.path.exists() {
@@ -255,6 +319,141 @@ impl PluginManager {
             true
         } else {
             false
+        }
+    }
+
+    /// Spawn a process plugin's subprocess and perform initialize handshake.
+    ///
+    /// Discovers commands and skills dynamically from the plugin process.
+    pub async fn spawn_plugin(&self, name: &str) -> Result<(), String> {
+        let handle = self.plugins.get(name)
+            .ok_or_else(|| format!("plugin '{}' not found", name))?;
+
+        let manifest_path = handle.path.join("plugin.json");
+        let manifest: PluginManifest = if manifest_path.exists() {
+            let content = std::fs::read_to_string(&manifest_path)
+                .map_err(|e| format!("failed to read plugin.json: {e}"))?;
+            serde_json::from_str(&content)
+                .map_err(|e| format!("failed to parse plugin.json: {e}"))?
+        } else {
+            return Err(format!("plugin '{}' missing plugin.json", name));
+        };
+
+        if manifest.runtime == RuntimeType::Wasm {
+            tracing::warn!(plugin = %name, "WASM runtime not yet implemented; skipping plugin spawn");
+            return Ok(());
+        }
+
+        if manifest.runtime != RuntimeType::Process {
+            return Err(format!("plugin '{}' has unsupported runtime '{}'", name, manifest.runtime));
+        }
+
+        // Determine entrypoint
+        let entrypoint = manifest.entrypoint.as_deref()
+            .unwrap_or("bin/plugin");
+
+        // Split entrypoint into command and args (supports "node index.js")
+        let parts: Vec<&str> = entrypoint.split_whitespace().collect();
+        if parts.is_empty() {
+            return Err(format!("plugin '{}' has empty entrypoint", name));
+        }
+
+        let cmd = parts[0].to_string();
+        let args: Vec<String> = parts[1..].iter().map(|s| s.to_string()).collect();
+
+        let mut process = PluginProcess::new(
+            cmd,
+            args,
+            manifest.env,
+            handle.path.clone(),
+        );
+
+        process.spawn().await?;
+        process.initialize().await?;
+
+        // Discover commands and skills dynamically
+        let discovered_commands: Vec<String> = match process.list_commands().await {
+            Ok(cmds) => cmds.into_iter().map(|c| c.name).collect(),
+            Err(e) => {
+                tracing::warn!(plugin = %name, "failed to list commands: {e}");
+                manifest.commands.clone()
+            }
+        };
+
+        let discovered_skills: Vec<String> = match process.list_skills().await {
+            Ok(skills) => skills.into_iter().map(|s| s.name).collect(),
+            Err(e) => {
+                tracing::warn!(plugin = %name, "failed to list skills: {e}");
+                manifest.skills.clone()
+            }
+        };
+
+        // Update handle with discovered commands/skills
+        drop(handle);
+        if let Some(mut entry) = self.plugins.get_mut(name) {
+            entry.commands = discovered_commands;
+            entry.skills = discovered_skills;
+        }
+
+        self.active_processes.insert(name.to_string(), process);
+        tracing::info!(plugin = %name, "process plugin spawned successfully");
+        Ok(())
+    }
+
+    /// Stop a process plugin's subprocess.
+    pub async fn stop_plugin(&self, name: &str) -> bool {
+        if let Some((_, mut process)) = self.active_processes.remove(name) {
+            if let Err(e) = process.terminate().await {
+                tracing::warn!(plugin = %name, "failed to terminate process: {e}");
+            }
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Find the first active plugin that provides the given command.
+    #[must_use]
+    pub fn find_plugin_for_command(&self, command_name: &str) -> Option<String> {
+        for entry in self.plugins.iter() {
+            if entry.commands.iter().any(|c| c == command_name) {
+                return Some(entry.key().clone());
+            }
+        }
+        None
+    }
+
+    /// Execute a command on a process plugin.
+    pub async fn execute_command(
+        &self,
+        plugin_name: &str,
+        command_name: &str,
+        args: &[String],
+    ) -> Result<String, String> {
+        if let Some(mut entry) = self.active_processes.get_mut(plugin_name) {
+            entry.execute_command(command_name, args).await
+        } else {
+            Err(format!(
+                "plugin '{}' is not running (no active process)",
+                plugin_name
+            ))
+        }
+    }
+
+    /// Execute a skill on a process plugin.
+    pub async fn execute_skill(
+        &self,
+        plugin_name: &str,
+        skill_name: &str,
+        context: &Value,
+    ) -> Result<String, String> {
+        if let Some(mut entry) = self.active_processes.get_mut(plugin_name) {
+            entry.execute_skill(skill_name, context).await
+        } else {
+            Err(format!(
+                "plugin '{}' is not running (no active process)",
+                plugin_name
+            ))
         }
     }
 
@@ -1024,6 +1223,9 @@ mod tests {
             skills: vec!["skill1".into()],
             dependencies: Vec::new(),
             signature: None,
+            runtime: RuntimeType::Process,
+            entrypoint: None,
+            env: HashMap::new(),
         };
         mgr.load_plugin(manifest, PathBuf::from("/plugins/test"));
         assert_eq!(mgr.len(), 1);
@@ -1047,6 +1249,9 @@ mod tests {
             skills: vec![],
             dependencies: Vec::new(),
             signature: None,
+            runtime: RuntimeType::Process,
+            entrypoint: None,
+            env: HashMap::new(),
         };
         mgr.load_plugin(manifest, PathBuf::from("/tmp"));
         assert!(mgr.unload_plugin("temp"));
@@ -1079,6 +1284,9 @@ mod tests {
             skills: vec!["sk1".into()],
             dependencies: Vec::new(),
             signature: None,
+            runtime: RuntimeType::Process,
+            entrypoint: None,
+            env: HashMap::new(),
         };
         let m2 = PluginManifest {
             name: "b".into(), version: "1".into(),
@@ -1087,6 +1295,9 @@ mod tests {
             skills: vec!["sk2".into()],
             dependencies: Vec::new(),
             signature: None,
+            runtime: RuntimeType::Process,
+            entrypoint: None,
+            env: HashMap::new(),
         };
         mgr.load_plugin(m1, PathBuf::new());
         mgr.load_plugin(m2, PathBuf::new());
@@ -1116,6 +1327,9 @@ mod tests {
             skills: vec![],
             dependencies: Vec::new(),
             signature: None,
+            runtime: RuntimeType::Process,
+            entrypoint: None,
+            env: HashMap::new(),
         };
         std::fs::write(
             plugin_dir.join("plugin.json"),
@@ -1265,6 +1479,9 @@ mod tests {
             skills: vec![],
             dependencies: Vec::new(),
             signature: None,
+            runtime: RuntimeType::Process,
+            entrypoint: None,
+            env: HashMap::new(),
         };
         mgr.load_plugin(manifest, PathBuf::from("/tmp/old"));
         let plugin = mgr.get_plugin("old-plugin").unwrap();
@@ -1302,12 +1519,14 @@ mod tests {
             description: String::new(), author: String::new(),
             min_version: None, commands: vec![], skills: vec![],
             dependencies: Vec::new(), signature: None,
+            ..Default::default()
         };
         let m2 = PluginManifest {
             name: "derived".into(), version: "1".into(),
             description: String::new(), author: String::new(),
             min_version: None, commands: vec![], skills: vec![],
             dependencies: vec!["base".into()], signature: None,
+            ..Default::default()
         };
         std::fs::write(base_dir.join("plugin.json"), serde_json::to_string(&m1).unwrap()).unwrap();
         std::fs::write(derived_dir.join("plugin.json"), serde_json::to_string(&m2).unwrap()).unwrap();
@@ -1334,12 +1553,14 @@ mod tests {
             description: String::new(), author: String::new(),
             min_version: None, commands: vec![], skills: vec![],
             dependencies: vec!["b".into()], signature: None,
+            ..Default::default()
         };
         let m2 = PluginManifest {
             name: "b".into(), version: "1".into(),
             description: String::new(), author: String::new(),
             min_version: None, commands: vec![], skills: vec![],
             dependencies: vec!["a".into()], signature: None,
+            ..Default::default()
         };
         std::fs::write(a_dir.join("plugin.json"), serde_json::to_string(&m1).unwrap()).unwrap();
         std::fs::write(b_dir.join("plugin.json"), serde_json::to_string(&m2).unwrap()).unwrap();
@@ -1360,6 +1581,7 @@ mod tests {
             description: String::new(), author: String::new(),
             min_version: None, commands: vec![], skills: vec![],
             dependencies: Vec::new(), signature: None,
+            ..Default::default()
         };
         mgr.load_plugin(manifest.clone(), PathBuf::from("/tmp"));
         // Force into error state

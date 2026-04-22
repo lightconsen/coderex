@@ -28,6 +28,8 @@ pub struct Skill {
     pub source: SkillSource,
     /// The path to the skill file.
     pub path: PathBuf,
+    /// For plugin skills, the name of the owning plugin.
+    pub plugin_name: Option<String>,
 }
 
 /// Where a skill was loaded from.
@@ -289,6 +291,7 @@ impl SkillLoader {
                                 metadata: skill_file.metadata,
                                 source,
                                 path,
+                                plugin_name: None,
                             });
                         }
                     }
@@ -298,11 +301,17 @@ impl SkillLoader {
     }
 
     /// Add a skill from a plugin.
-    pub fn add_plugin_skill(&mut self, metadata: SkillMetadata, path: PathBuf) {
+    pub fn add_plugin_skill(
+        &mut self,
+        metadata: SkillMetadata,
+        path: PathBuf,
+        plugin_name: impl Into<String>,
+    ) {
         self.skills.push(Skill {
             metadata,
             source: SkillSource::Plugin,
             path,
+            plugin_name: Some(plugin_name.into()),
         });
     }
 
@@ -312,7 +321,39 @@ impl SkillLoader {
             metadata,
             source: SkillSource::Mcp,
             path: PathBuf::new(),
+            plugin_name: None,
         });
+    }
+
+    /// Execute a skill by name.
+    ///
+    /// Plugin skills are forwarded to their owning plugin process.
+    /// Non-plugin skills return their script path as a prompt template reference.
+    pub async fn execute_skill(
+        &self,
+        name: &str,
+        context: &serde_json::Value,
+        plugin_manager: &crate::plugins::PluginManager,
+    ) -> Result<String, String> {
+        let skill = self
+            .get(name)
+            .ok_or_else(|| format!("skill '{}' not found", name))?;
+
+        match skill.source {
+            SkillSource::Plugin => {
+                let plugin_name = skill
+                    .plugin_name
+                    .as_deref()
+                    .ok_or_else(|| format!("skill '{}' has no associated plugin", name))?;
+                plugin_manager
+                    .execute_skill(plugin_name, name, context)
+                    .await
+            }
+            _ => {
+                // Non-plugin skills are prompt templates — return their script path
+                Ok(skill.path.to_string_lossy().to_string())
+            }
+        }
     }
 
     /// Get a skill by name.
@@ -422,14 +463,18 @@ This is the script content.
     #[test]
     fn loader_add_plugin_skill() {
         let mut loader = SkillLoader::new(PathBuf::new(), PathBuf::new());
-        loader.add_plugin_skill(SkillMetadata {
-            name: "plugin-skill".into(),
-            hooks: vec!["pre-query".into()],
-            agent: None,
-            allowed_tools: vec![],
-            description: "From plugin".into(),
-            enabled: true,
-        }, PathBuf::from("/plugin/test.md"));
+        loader.add_plugin_skill(
+            SkillMetadata {
+                name: "plugin-skill".into(),
+                hooks: vec!["pre-query".into()],
+                agent: None,
+                allowed_tools: vec![],
+                description: "From plugin".into(),
+                enabled: true,
+            },
+            PathBuf::from("/plugin/test.md"),
+            "test-plugin",
+        );
 
         let skill = loader.get("plugin-skill").unwrap();
         assert_eq!(skill.source, SkillSource::Plugin);

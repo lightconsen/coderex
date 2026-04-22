@@ -29,6 +29,16 @@ flate2.workspace = true
 serde_yaml.workspace = true
 semver.workspace = true
 ed25519-dalek.workspace = true
+async-trait.workspace = true
+
+[features]
+default = ["process-runtime"]
+process-runtime = []
+wasm-runtime = ["dep:wasmtime"]
+
+[dependencies.wasmtime]
+version = "20"
+optional = true
 
 [dev-dependencies]
 tempfile.workspace = true

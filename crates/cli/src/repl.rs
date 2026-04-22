@@ -120,6 +120,57 @@ pub struct ReplLoop {
     macro_registry: MacroRegistry,
     /// Pending destructive command awaiting confirmation.
     pending_destructive_cmd: Option<(String, Vec<String>)>,
+    /// Plugin manager for dynamic plugin commands and tools.
+    plugin_manager: Option<Arc<coderex_plugins::plugins::PluginManager>>,
+    /// Primary tool executor (stored so plugin fallback can be layered on top).
+    primary_tool_executor: Option<Arc<dyn coderex_core::tool_executor::ToolExecutor + Send + Sync>>,
+}
+
+/// Wrapper that implements `ToolExecutor` for `Arc<dyn ToolExecutor>`.
+///
+/// Needed because `Arc<dyn Trait>` does not automatically implement `Trait`.
+#[derive(Clone)]
+struct ArcToolExecutor(Arc<dyn coderex_core::tool_executor::ToolExecutor + Send + Sync>);
+
+#[async_trait::async_trait]
+impl coderex_core::tool_executor::ToolExecutor for ArcToolExecutor {
+    async fn execute(
+        &self,
+        tool_call_id: &str,
+        tool_name: &str,
+        input: &serde_json::Value,
+    ) -> coderex_core::tool_executor::ToolDispatchOutcome {
+        self.0.execute(tool_call_id, tool_name, input).await
+    }
+}
+
+/// Tool executor that falls back to plugin tools when the primary reports "not found".
+#[derive(Clone)]
+struct PluginToolFallbackExecutor {
+    primary: ArcToolExecutor,
+    plugin: Arc<coderex_plugins::tool_executor::PluginToolExecutor>,
+}
+
+#[async_trait::async_trait]
+impl coderex_core::tool_executor::ToolExecutor for PluginToolFallbackExecutor {
+    async fn execute(
+        &self,
+        tool_call_id: &str,
+        tool_name: &str,
+        input: &serde_json::Value,
+    ) -> coderex_core::tool_executor::ToolDispatchOutcome {
+        let primary = self.primary.execute(tool_call_id, tool_name, input).await;
+
+        let is_not_found = primary.result.is_error
+            && (primary.result.output.contains("not found")
+                || primary.result.output.contains("not registered"));
+
+        if is_not_found {
+            self.plugin.execute(tool_call_id, tool_name, input).await
+        } else {
+            primary
+        }
+    }
 }
 
 impl ReplLoop {
@@ -152,6 +203,8 @@ impl ReplLoop {
             command_history: CommandHistory::new(1000),
             macro_registry: MacroRegistry::new(),
             pending_destructive_cmd: None,
+            plugin_manager: None,
+            primary_tool_executor: None,
             #[cfg(feature = "hot-reload")]
             config_changed_rx: None,
         };
@@ -217,7 +270,9 @@ impl ReplLoop {
             ExecutionContext::Normal,
             std::path::PathBuf::from(&cwd),
         );
-        engine.set_tool_executor(Box::new(dispatcher));
+        let primary_executor: Arc<dyn coderex_core::tool_executor::ToolExecutor + Send + Sync> = Arc::new(dispatcher);
+        let arc_exec = ArcToolExecutor(Arc::clone(&primary_executor));
+        engine.set_tool_executor(Box::new(arc_exec.clone()));
         engine.recover_orphaned_permissions();
 
         let orchestrator = coderex_core::orchestrator::Orchestrator::new(api_client.clone_box());
@@ -249,11 +304,41 @@ impl ReplLoop {
             command_history: CommandHistory::new(1000),
             macro_registry: MacroRegistry::new(),
             pending_destructive_cmd: None,
+            plugin_manager: None,
+            primary_tool_executor: Some(primary_executor),
             #[cfg(feature = "hot-reload")]
             config_changed_rx,
         };
         this.init_command_persistence();
         this
+    }
+
+    /// Wire a plugin manager into this REPL loop.
+    ///
+    /// Registers plugin-discovered slash commands and layers the plugin
+    /// tool executor as a fallback behind the primary tool registry.
+    pub fn with_plugin_manager(&mut self, plugin_manager: Arc<coderex_plugins::plugins::PluginManager>) {
+        // Register plugin commands as /{plugin}/{command} slash commands
+        coderex_plugins::command_bridge::PluginCommandBridge::register_commands(
+            &plugin_manager,
+            &mut self.commands,
+        );
+
+        // If we have a primary tool executor and an engine, layer plugin fallback
+        if let Some(primary) = self.primary_tool_executor.clone() {
+            if let Some(ref mut engine) = self.engine {
+                let plugin_exec = Arc::new(coderex_plugins::tool_executor::PluginToolExecutor::new(
+                    Arc::clone(&plugin_manager),
+                ));
+                let fallback = PluginToolFallbackExecutor {
+                    primary: ArcToolExecutor(primary),
+                    plugin: plugin_exec,
+                };
+                engine.set_tool_executor(Box::new(fallback));
+            }
+        }
+
+        self.plugin_manager = Some(plugin_manager);
     }
 
     /// Initialize command history and macro registry from disk.

@@ -11,6 +11,7 @@ use coderex_core::api_client::ApiClient;
 use crate::cli::Cli;
 use crate::daemon;
 use std::io::IsTerminal;
+use std::sync::Arc;
 
 /// Duration (ms) to wait for remote settings before timing out and failing open.
 #[cfg(feature = "enterprise")]
@@ -39,6 +40,8 @@ pub struct SessionContext {
     pub remote_services_ready: bool,
     /// Working directory for the session.
     pub cwd: String,
+    /// Plugin manager (initialized during InitPlugins).
+    pub plugin_manager: Option<Arc<coderex_plugins::plugins::PluginManager>>,
 }
 
 /// Phases of startup.
@@ -100,6 +103,7 @@ impl StartupOrchestrator {
                 memory_ready: false,
                 remote_services_ready: false,
                 cwd: String::new(),
+                plugin_manager: None,
             },
         }
     }
@@ -414,8 +418,8 @@ impl StartupOrchestrator {
         Ok(())
     }
 
-    /// InitPlugins: discover and load plugins from plugin directories.
-    async fn phase_init_plugins(&self) -> Result<()> {
+    /// InitPlugins: discover, load, and spawn plugins from plugin directories.
+    async fn phase_init_plugins(&mut self) -> Result<()> {
         let mut manager = coderex_plugins::plugins::PluginManager::new();
         let mut plugin_dirs: Vec<std::path::PathBuf> = Vec::new();
 
@@ -454,7 +458,25 @@ impl StartupOrchestrator {
             }
         }
 
-        tracing::info!("plugins initialized: {loaded} loaded");
+        // Spawn process plugins and discover commands/skills dynamically
+        let mut spawned = 0;
+        for name in manager.list_plugins() {
+            match manager.spawn_plugin(&name).await {
+                Ok(()) => {
+                    spawned += 1;
+                    tracing::info!(plugin = %name, "spawned process plugin");
+                }
+                Err(e) => {
+                    tracing::warn!(plugin = %name, "failed to spawn plugin: {e}");
+                }
+            }
+        }
+
+        tracing::info!(
+            "plugins initialized: {loaded} loaded, {spawned} spawned"
+        );
+
+        self.ctx.plugin_manager = Some(Arc::new(manager));
         Ok(())
     }
 
@@ -650,6 +672,9 @@ impl StartupOrchestrator {
         } else {
             crate::repl::ReplLoop::new(cwd.to_string(), model)
         };
+        if let Some(ref pm) = self.ctx.plugin_manager {
+            repl.with_plugin_manager(Arc::clone(pm));
+        }
         repl.run_tui().await
     }
 
@@ -666,6 +691,9 @@ impl StartupOrchestrator {
         } else {
             crate::repl::ReplLoop::new(cwd.to_string(), model)
         };
+        if let Some(ref pm) = self.ctx.plugin_manager {
+            repl.with_plugin_manager(Arc::clone(pm));
+        }
         let result = repl.run_headless(&stdin).await?;
         println!("{result}");
         Ok(())
@@ -777,6 +805,9 @@ impl StartupOrchestrator {
         } else {
             crate::repl::ReplLoop::new(cwd.to_string(), model)
         };
+        if let Some(ref pm) = self.ctx.plugin_manager {
+            repl.with_plugin_manager(Arc::clone(pm));
+        }
         repl.run_tui().await
     }
 
