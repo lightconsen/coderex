@@ -4,6 +4,7 @@ use crate::input::InputBuffer;
 use crate::message_list::MessageView;
 use crate::notification_center::NotificationCenter;
 use crate::overlay::OverlayStack;
+use crate::permission_bar::PermissionBar;
 use crate::search::SearchState;
 use crate::selector::MessageSelector;
 use crate::statusline::Statusline;
@@ -69,6 +70,8 @@ pub struct UiState {
     pub selector: Option<MessageSelector>,
     /// Statusline data.
     pub statusline: Statusline,
+    /// Permission bar (below input line).
+    pub permission_bar: PermissionBar,
     /// Statusline setup wizard state.
     pub statusline_setup: StatuslineSetup,
     /// Notification center.
@@ -93,6 +96,7 @@ impl UiState {
             search: SearchState::new(),
             selector: None,
             statusline: Statusline::new(),
+            permission_bar: PermissionBar::new(),
             statusline_setup: StatuslineSetup::new(),
             notifications: NotificationCenter::new(),
             layout_mode: LayoutMode::SinglePane,

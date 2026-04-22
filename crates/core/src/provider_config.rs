@@ -82,6 +82,23 @@ impl ProviderConfig {
         config
     }
 
+    /// Override the Anthropic provider API key (e.g. from CLI --api-key).
+    ///
+    /// If no Anthropic provider is configured yet, creates one with the given
+    /// key and no base URL override.
+    pub fn set_anthropic_api_key(&mut self, key: String) {
+        if let Some(ref mut ep) = self.anthropic {
+            ep.api_key = key;
+        } else {
+            self.anthropic = Some(ProviderEndpoint {
+                api_key: key,
+                base_url: std::env::var("CODEREX_BASE_URL")
+                    .or_else(|_| std::env::var("ANTHROPIC_BASE_URL"))
+                    .ok(),
+            });
+        }
+    }
+
     /// Build a [`ModelRouter`] from this configuration.
     ///
     /// Providers are added in priority order: Anthropic > OpenAI > Groq > custom.

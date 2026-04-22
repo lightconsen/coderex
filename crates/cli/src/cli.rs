@@ -133,7 +133,7 @@ pub struct Cli {
     #[arg(long, value_name = "DIR")]
     pub plugin_dir: Option<PathBuf>,
 
-    /// Settings file path (overrides default).
+    /// Settings file path (overrides default ~/.coderex/settings.json).
     #[arg(long, value_name = "PATH")]
     pub settings: Option<PathBuf>,
 

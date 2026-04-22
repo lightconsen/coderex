@@ -49,11 +49,13 @@ pub struct SessionContext {
     /// Whether to skip permission prompts.
     pub skip_permissions: bool,
     /// Additional directories in context.
-    pub extra_dirs: Vec<String>,
+    pub add_dir: Vec<String>,
     /// Files included in context.
-    pub context_files: Vec<std::path::PathBuf>,
+    pub file: Vec<std::path::PathBuf>,
     /// Custom system prompt.
     pub system_prompt: Option<String>,
+    /// Append to default system prompt.
+    pub append_system_prompt: bool,
     /// Whether session persistence is disabled.
     pub no_persistence: bool,
     /// Whether slash commands are disabled.
@@ -66,6 +68,54 @@ pub struct SessionContext {
     pub fallback_model: Option<ModelId>,
     /// Allowed tools.
     pub allowed_tools: Vec<String>,
+    /// Custom settings path.
+    pub settings_path: Option<std::path::PathBuf>,
+    /// MCP config path.
+    pub mcp_config_path: Option<std::path::PathBuf>,
+    /// MCP debug mode.
+    pub mcp_debug: bool,
+    /// Strict MCP config.
+    pub strict_mcp_config: bool,
+    /// Additional plugin directory.
+    pub plugin_dir: Option<std::path::PathBuf>,
+    /// Input format.
+    pub input_format: String,
+    /// JSON schema for structured output.
+    pub json_schema: Option<String>,
+    /// Replay user messages.
+    pub replay_user_messages: bool,
+    /// Include partial messages.
+    pub include_partial_messages: bool,
+    /// Reasoning effort.
+    pub effort: Option<String>,
+    /// Beta features.
+    pub betas: Vec<String>,
+    /// Chrome integration.
+    pub chrome: bool,
+    /// No chrome.
+    pub no_chrome: bool,
+    /// Tmux integration.
+    pub tmux: bool,
+    /// Agent to use.
+    pub agent: Option<String>,
+    /// IDE mode.
+    pub ide: Option<String>,
+    /// Worktree mode.
+    pub worktree: bool,
+    /// Fork from session.
+    pub fork_session: Option<String>,
+    /// Load from PR.
+    pub from_pr: Option<String>,
+    /// Show setting sources.
+    pub setting_sources: bool,
+    /// Verbose mode.
+    pub verbose: bool,
+    /// Debug mode.
+    pub debug: bool,
+    /// Bare output (no decorations).
+    pub bare: bool,
+    /// Brief output (concise).
+    pub brief: bool,
 }
 
 /// Phases of startup.
@@ -131,15 +181,40 @@ impl StartupOrchestrator {
                 telemetry_handle: None,
                 session_name: None,
                 skip_permissions: false,
-                extra_dirs: Vec::new(),
-                context_files: Vec::new(),
+                add_dir: Vec::new(),
+                file: Vec::new(),
                 system_prompt: None,
+                append_system_prompt: false,
                 no_persistence: false,
                 no_slash_commands: false,
                 output_format: "text".into(),
                 debug_file: None,
                 fallback_model: None,
                 allowed_tools: Vec::new(),
+                settings_path: None,
+                mcp_config_path: None,
+                mcp_debug: false,
+                strict_mcp_config: false,
+                plugin_dir: None,
+                input_format: "text".into(),
+                json_schema: None,
+                replay_user_messages: false,
+                include_partial_messages: false,
+                effort: None,
+                betas: Vec::new(),
+                chrome: false,
+                no_chrome: false,
+                tmux: false,
+                agent: None,
+                ide: None,
+                worktree: false,
+                fork_session: None,
+                from_pr: None,
+                setting_sources: false,
+                verbose: false,
+                debug: false,
+                bare: false,
+                brief: false,
             },
         }
     }
@@ -157,13 +232,38 @@ impl StartupOrchestrator {
         // Store CLI-derived context
         self.ctx.session_name = args.name.clone();
         self.ctx.skip_permissions = args.dangerously_skip_permissions;
-        self.ctx.extra_dirs = args.add_dir.clone();
-        self.ctx.context_files = args.file.clone();
+        self.ctx.add_dir = args.add_dir.clone();
+        self.ctx.file = args.file.clone();
         self.ctx.system_prompt = args.system_prompt.clone();
+        self.ctx.append_system_prompt = args.append_system_prompt;
         self.ctx.no_persistence = args.no_session_persistence;
         self.ctx.no_slash_commands = args.disable_slash_commands;
         self.ctx.output_format = args.output_format.clone();
         self.ctx.debug_file = args.debug_file.clone();
+        self.ctx.settings_path = args.settings.clone();
+        self.ctx.mcp_config_path = args.mcp_config.clone();
+        self.ctx.mcp_debug = args.mcp_debug;
+        self.ctx.strict_mcp_config = args.strict_mcp_config;
+        self.ctx.plugin_dir = args.plugin_dir.clone();
+        self.ctx.input_format = args.input_format.clone();
+        self.ctx.json_schema = args.json_schema.clone();
+        self.ctx.replay_user_messages = args.replay_user_messages;
+        self.ctx.include_partial_messages = args.include_partial_messages;
+        self.ctx.effort = args.effort.clone();
+        self.ctx.betas = args.betas.clone();
+        self.ctx.chrome = args.chrome;
+        self.ctx.no_chrome = args.no_chrome;
+        self.ctx.tmux = args.tmux;
+        self.ctx.agent = args.agent.clone();
+        self.ctx.ide = args.ide.clone();
+        self.ctx.worktree = args.worktree;
+        self.ctx.fork_session = args.fork_session.clone();
+        self.ctx.from_pr = args.from_pr.clone();
+        self.ctx.setting_sources = args.setting_sources;
+        self.ctx.verbose = args.verbose;
+        self.ctx.debug = args.debug;
+        self.ctx.bare = args.bare;
+        self.ctx.brief = args.brief;
         if let Some(ref tools) = args.allowed_tools {
             self.ctx.allowed_tools = tools.split(',').map(|s| s.trim().to_string()).collect();
         }
@@ -337,15 +437,39 @@ impl StartupOrchestrator {
 
     /// Bootstrap: initialize tracing, signal handlers, and core subsystems.
     async fn phase_bootstrap(&self) -> Result<()> {
-        tracing::info!("initializing tracing subscriber");
+        // Build log level from CLI flags: --debug → debug, --verbose → debug, default → info
+        let log_level = if self.ctx.debug || self.ctx.verbose {
+            "debug"
+        } else {
+            "info"
+        };
+        let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+            .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(log_level));
 
         // Initialize tracing if not already done
-        let subscriber = tracing_subscriber::fmt()
-            .with_env_filter(
-                tracing_subscriber::EnvFilter::try_from_default_env()
-                    .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-            )
-            .finish();
+        let subscriber: Box<dyn tracing::Subscriber + Send + Sync> =
+            if let Some(ref debug_path) = self.ctx.debug_file {
+                if let Some(parent) = debug_path.parent() {
+                    let _ = std::fs::create_dir_all(parent);
+                }
+                let file = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(debug_path)
+                    .unwrap_or_else(|_| std::fs::File::open("/dev/null").unwrap());
+                Box::new(
+                    tracing_subscriber::fmt()
+                        .with_env_filter(filter)
+                        .with_writer(move || {
+                            file.try_clone().unwrap_or_else(|_| {
+                                std::fs::File::open("/dev/null").unwrap()
+                            })
+                        })
+                        .finish(),
+                )
+            } else {
+                Box::new(tracing_subscriber::fmt().with_env_filter(filter).finish())
+            };
 
         // Only init once — ignore if already initialized
         let _ = tracing::subscriber::set_global_default(subscriber);
@@ -358,12 +482,15 @@ impl StartupOrchestrator {
     /// and initialize telemetry with settings.json integration.
     async fn phase_load_settings(&mut self, args: &Cli) -> Result<()> {
         let config_dir = coderex_config::config_home();
-        let user_path = config_dir.join("settings.json");
+
+        // Use custom settings path if --settings is provided
+        let user_path = args.settings.clone()
+            .unwrap_or_else(|| config_dir.join("settings.json"));
 
         // Find project config in CWD or ancestors
         let project_path = Self::find_project_config(&self.ctx.cwd);
 
-        let config_service = ConfigService::new(user_path.clone(), project_path);
+        let config_service = ConfigService::new(user_path.clone(), project_path.clone());
         let mut settings = config_service.resolve()?;
 
         // First-run consent gate: if no user config exists and telemetry_enabled
@@ -395,6 +522,12 @@ impl StartupOrchestrator {
             "settings loaded: model={}",
             settings.model.as_deref().unwrap_or("default")
         );
+
+        // --setting-sources: print where each value came from
+        if args.setting_sources {
+            let diff = settings.diff_from_defaults("resolved");
+            println!("{}", diff.render());
+        }
 
         // Initialize telemetry subsystem with resolved settings
         let telemetry_enabled = settings.telemetry_enabled.unwrap_or(true);
@@ -642,6 +775,16 @@ impl StartupOrchestrator {
             plugin_dirs.push(global_plugins);
         }
 
+        // Additional plugin directory from --plugin-dir
+        if let Some(ref extra_dir) = self.ctx.plugin_dir {
+            if extra_dir.exists() {
+                manager.add_plugin_dir(extra_dir.clone());
+                plugin_dirs.push(extra_dir.clone());
+            } else {
+                tracing::warn!("plugin directory does not exist: {extra_dir:?}");
+            }
+        }
+
         // Discover and load each plugin
         let mut loaded = 0;
         for dir in &plugin_dirs {
@@ -727,8 +870,9 @@ impl StartupOrchestrator {
         let manager = coderex_mcp::manager::McpManager::new();
         let mut config_loaded = false;
 
-        // Load from .mcp.json if present
-        let mcp_path = std::path::Path::new(&self.ctx.cwd).join(".mcp.json");
+        // Load from custom --mcp-config or default .mcp.json
+        let mcp_path = self.ctx.mcp_config_path.clone()
+            .unwrap_or_else(|| std::path::Path::new(&self.ctx.cwd).join(".mcp.json"));
         if mcp_path.exists() {
             match coderex_mcp::config::McpConfig::load(&mcp_path) {
                 Ok(config) => {
@@ -742,9 +886,14 @@ impl StartupOrchestrator {
                     }
                 }
                 Err(e) => {
+                    if self.ctx.strict_mcp_config {
+                        return Err(anyhow::anyhow!("strict MCP config validation failed: {e}"));
+                    }
                     tracing::warn!("failed to load MCP config from {mcp_path:?}: {e}");
                 }
             }
+        } else if self.ctx.mcp_config_path.is_some() {
+            tracing::warn!("custom MCP config not found: {mcp_path:?}");
         }
 
         // Also check inline config from settings
@@ -756,6 +905,9 @@ impl StartupOrchestrator {
         }
 
         if config_loaded {
+            if self.ctx.mcp_debug {
+                tracing::info!("MCP debug mode enabled");
+            }
             // Spawn all registered MCP servers in the background
             manager.start_all().await;
             let running = manager.list_servers();
@@ -853,8 +1005,11 @@ impl StartupOrchestrator {
     ///
     /// Uses `ProviderConfig::from_env()` to build a [`ModelRouter`] that
     /// supports multi-provider fallback (Anthropic → OpenAI → Groq → custom).
-    fn try_create_api_client() -> Option<Box<dyn ApiClient>> {
-        let config = coderex_core::provider_config::ProviderConfig::from_env();
+    fn try_create_api_client(api_key_override: Option<&str>) -> Option<Box<dyn ApiClient>> {
+        let mut config = coderex_core::provider_config::ProviderConfig::from_env();
+        if let Some(key) = api_key_override {
+            config.set_anthropic_api_key(key.into());
+        }
         // Only build a router if at least one provider is configured.
         if config.anthropic.is_none()
             && config.openai.is_none()
@@ -866,13 +1021,46 @@ impl StartupOrchestrator {
         Some(Box::new(config.build_router()) as Box<dyn ApiClient>)
     }
 
+    /// Get the API key override from settings if set.
+    fn api_key_from_settings(&self) -> Option<&str> {
+        self.ctx.settings.as_ref()
+            .and_then(|s| s.api_key.as_deref())
+    }
+
+    /// Configure a ReplLoop with all CLI-derived settings.
+    fn configure_repl(&self, repl: &mut crate::repl::ReplLoop) {
+        repl.with_skip_permissions(self.ctx.skip_permissions);
+        repl.with_no_persistence(self.ctx.no_persistence);
+        repl.with_no_slash_commands(self.ctx.no_slash_commands);
+        repl.with_json_schema(self.ctx.json_schema.clone());
+        repl.with_replay_user_messages(self.ctx.replay_user_messages);
+        repl.with_include_partial_messages(self.ctx.include_partial_messages);
+        repl.with_betas(self.ctx.betas.clone());
+        repl.with_chrome_enabled(self.ctx.chrome && !self.ctx.no_chrome);
+        repl.with_agent(self.ctx.agent.clone());
+        repl.with_ide(self.ctx.ide.clone());
+        repl.with_worktree(self.ctx.worktree);
+        repl.with_fork_session(self.ctx.fork_session.clone());
+        repl.with_from_pr(self.ctx.from_pr.clone());
+        repl.with_session_name(self.ctx.session_name.clone());
+        repl.with_add_dir(self.ctx.add_dir.clone());
+        repl.with_input_format(self.ctx.input_format.clone());
+        repl.with_tmux_enabled(self.ctx.tmux);
+        repl.with_debug_file(self.ctx.debug_file.clone());
+        if !self.ctx.allowed_tools.is_empty() {
+            repl.with_allowed_tools(self.ctx.allowed_tools.clone());
+        }
+        repl.apply_cli_config();
+    }
+
     #[allow(clippy::unused_async)]
     async fn run_repl(&self, cwd: &str, model: ModelId) -> Result<()> {
         if !std::io::stdin().is_terminal() {
             bail!("interactive REPL requires a terminal on stdin");
         }
 
-        let mut repl = if let Some(api_client) = Self::try_create_api_client() {
+        let api_key = self.api_key_from_settings();
+        let mut repl = if let Some(api_client) = Self::try_create_api_client(api_key) {
             crate::repl::ReplLoop::with_engine(api_client, cwd.to_string(), model)
         } else {
             crate::repl::ReplLoop::new(cwd.to_string(), model)
@@ -880,12 +1068,14 @@ impl StartupOrchestrator {
         if let Some(ref pm) = self.ctx.plugin_manager {
             repl.with_plugin_manager(Arc::clone(pm));
         }
+        self.configure_repl(&mut repl);
         repl.run_tui().await
     }
 
     #[allow(clippy::unused_async)]
     async fn run_headless_with_prompt(&self, cwd: &str, model: ModelId, prompt: &str) -> Result<()> {
-        let mut repl = if let Some(api_client) = Self::try_create_api_client() {
+        let api_key = self.api_key_from_settings();
+        let mut repl = if let Some(api_client) = Self::try_create_api_client(api_key) {
             crate::repl::ReplLoop::with_engine(api_client, cwd.to_string(), model)
         } else {
             crate::repl::ReplLoop::new(cwd.to_string(), model)
@@ -893,9 +1083,74 @@ impl StartupOrchestrator {
         if let Some(ref pm) = self.ctx.plugin_manager {
             repl.with_plugin_manager(Arc::clone(pm));
         }
-        let result = repl.run_headless(prompt).await?;
-        println!("{result}");
+        self.configure_repl(&mut repl);
+
+        // Parse input based on --input-format
+        let user_prompt = if self.ctx.input_format == "json" {
+            match serde_json::from_str::<serde_json::Value>(prompt) {
+                Ok(val) => {
+                    val.get("prompt")
+                        .and_then(|p| p.as_str())
+                        .unwrap_or(prompt)
+                        .to_string()
+                }
+                Err(_) => prompt.to_string(),
+            }
+        } else {
+            prompt.to_string()
+        };
+
+        // Build final prompt: include --file contents, system prompt, user prompt
+        let mut final_prompt = String::new();
+
+        // Add system prompt if provided
+        if let Some(ref sp) = self.ctx.system_prompt {
+            final_prompt.push_str("System: ");
+            final_prompt.push_str(sp);
+            final_prompt.push('\n');
+            final_prompt.push('\n');
+        }
+
+        // Add file contents
+        for file_path in &self.ctx.file {
+            match std::fs::read_to_string(file_path) {
+                Ok(content) => {
+                    final_prompt.push_str(&format!("--- {} ---\n{}\n\n", file_path.display(), content));
+                }
+                Err(e) => {
+                    tracing::warn!("failed to read file {}: {e}", file_path.display());
+                }
+            }
+        }
+
+        final_prompt.push_str(&user_prompt);
+
+        let result = repl.run_headless(&final_prompt).await?;
+
+        // Apply output formatting
+        let formatted = self.format_headless_output(&result);
+        println!("{formatted}");
         Ok(())
+    }
+
+    /// Format headless output based on --output-format, --brief, --bare flags.
+    fn format_headless_output(&self, raw: &str) -> String {
+        let mut output = raw.to_string();
+
+        if self.ctx.bare || self.ctx.brief {
+            // Strip markdown decorations and extra whitespace
+            output = output.trim().to_string();
+        }
+
+        if self.ctx.output_format == "json" {
+            let json_obj = serde_json::json!({
+                "response": output,
+                "model": self.ctx.model.as_ref().map(|m| m.0.clone()),
+            });
+            return json_obj.to_string();
+        }
+
+        output
     }
 
     #[allow(clippy::unused_async)]
@@ -974,7 +1229,11 @@ impl StartupOrchestrator {
 
     #[allow(clippy::unused_async)]
     async fn run_auth(&self) -> Result<()> {
-        let config = coderex_core::provider_config::ProviderConfig::from_env();
+        let mut config = coderex_core::provider_config::ProviderConfig::from_env();
+        // Apply CLI --api-key override if present
+        if let Some(key) = self.api_key_from_settings() {
+            config.set_anthropic_api_key(key.into());
+        }
         let mut providers = Vec::new();
         if config.anthropic.is_some() {
             providers.push("Anthropic");
@@ -1002,7 +1261,7 @@ impl StartupOrchestrator {
         println!("CodeRex Doctor");
         println!("==============");
         let checks = [
-            ("API key configured", Self::try_create_api_client().is_some()),
+            ("API key configured", Self::try_create_api_client(self.api_key_from_settings()).is_some()),
             ("Settings file exists", coderex_config::config_home().join("settings.json").exists()),
             ("Working directory accessible", std::env::current_dir().is_ok()),
         ];
@@ -1036,34 +1295,80 @@ impl StartupOrchestrator {
 
     #[allow(clippy::unused_async)]
     async fn run_mcp(&self, action: Option<crate::cli::McpAction>) -> Result<()> {
+        let mcp_path = self.ctx.mcp_config_path.clone()
+            .unwrap_or_else(|| std::path::Path::new(&self.ctx.cwd).join(".mcp.json"));
         match action {
             Some(crate::cli::McpAction::List) => {
                 println!("Configured MCP servers:");
-                let mcp_path = std::path::Path::new(&self.ctx.cwd).join(".mcp.json");
                 if mcp_path.exists() {
                     match coderex_mcp::config::McpConfig::load(&mcp_path) {
                         Ok(config) => {
-                            for name in config.server_names() {
-                                println!("  {name}");
+                            if config.mcp_servers.is_empty() {
+                                println!("  (none)");
+                            } else {
+                                for (name, srv) in &config.mcp_servers {
+                                    println!("  {name}: {} {}", srv.command, srv.args.join(" "));
+                                }
                             }
                         }
                         Err(e) => println!("  Error loading config: {e}"),
                     }
                 } else {
-                    println!("  No .mcp.json found in current directory.");
+                    println!("  No MCP config found at {mcp_path:?}");
                 }
             }
             Some(crate::cli::McpAction::Add { name, command }) => {
-                println!("Adding MCP server '{name}' with command: {command}");
-                println!("(Edit .mcp.json manually for now — interactive add coming soon)");
+                let mut config = if mcp_path.exists() {
+                    coderex_mcp::config::McpConfig::load(&mcp_path)
+                        .unwrap_or_else(|_| coderex_mcp::config::McpConfig::new())
+                } else {
+                    coderex_mcp::config::McpConfig::new()
+                };
+                let parts: Vec<&str> = command.split_whitespace().collect();
+                let cmd = parts.first().map_or(command.clone(), |s| s.to_string());
+                let args: Vec<String> = parts.iter().skip(1).map(|s| s.to_string()).collect();
+                config.add_server(name.clone(), coderex_mcp::config::McpServerConfig {
+                    command: cmd,
+                    args,
+                    env: std::collections::HashMap::new(),
+                });
+                match config.save(&mcp_path) {
+                    Ok(()) => println!("Added MCP server '{name}' to {mcp_path:?}"),
+                    Err(e) => println!("Error saving config: {e}"),
+                }
             }
             Some(crate::cli::McpAction::Remove { name }) => {
-                println!("Removing MCP server '{name}'...");
-                println!("(Edit .mcp.json manually for now — interactive remove coming soon)");
+                let mut config = if mcp_path.exists() {
+                    coderex_mcp::config::McpConfig::load(&mcp_path)
+                        .unwrap_or_else(|_| coderex_mcp::config::McpConfig::new())
+                } else {
+                    coderex_mcp::config::McpConfig::new()
+                };
+                if config.remove_server(&name).is_some() {
+                    match config.save(&mcp_path) {
+                        Ok(()) => println!("Removed MCP server '{name}' from {mcp_path:?}"),
+                        Err(e) => println!("Error saving config: {e}"),
+                    }
+                } else {
+                    println!("MCP server '{name}' not found in config.");
+                }
             }
             Some(crate::cli::McpAction::Test { name }) => {
-                println!("Testing MCP server '{name}'...");
-                println!("(MCP test command coming soon)");
+                if !mcp_path.exists() {
+                    println!("No MCP config found at {mcp_path:?}");
+                    return Ok(());
+                }
+                match coderex_mcp::config::McpConfig::load(&mcp_path) {
+                    Ok(config) => {
+                        if config.mcp_servers.contains_key(&name) {
+                            println!("MCP server '{name}' is configured.");
+                            println!("(Live connection test requires server spawn — not yet implemented)");
+                        } else {
+                            println!("MCP server '{name}' not found in config.");
+                        }
+                    }
+                    Err(e) => println!("Error loading config: {e}"),
+                }
             }
             None => {
                 println!("Usage: coderex mcp <list|add|remove|test>");
@@ -1074,6 +1379,7 @@ impl StartupOrchestrator {
 
     #[allow(clippy::unused_async)]
     async fn run_plugin(&self, action: Option<crate::cli::PluginAction>) -> Result<()> {
+        let install_dir = std::path::Path::new(&self.ctx.cwd).join(".coderex/plugins");
         match action {
             Some(crate::cli::PluginAction::List) => {
                 if let Some(ref pm) = self.ctx.plugin_manager {
@@ -1092,15 +1398,51 @@ impl StartupOrchestrator {
             }
             Some(crate::cli::PluginAction::Install { source }) => {
                 println!("Installing plugin from '{source}'...");
-                println!("(Plugin marketplace installation coming soon)");
+                let manager = coderex_plugins::plugins::PluginManager::new();
+                let plugin = coderex_plugins::plugins::MarketplacePlugin {
+                    name: source.clone(),
+                    version: "latest".into(),
+                    url: source.clone(),
+                    description: String::new(),
+                };
+                let result = manager.install_plugin(&plugin, &install_dir).await;
+                match result {
+                    Ok(path) => println!("Plugin installed to: {path:?}"),
+                    Err(e) => println!("Installation failed: {e}"),
+                }
             }
             Some(crate::cli::PluginAction::Uninstall { name }) => {
                 println!("Uninstalling plugin '{name}'...");
-                println!("(Plugin uninstallation coming soon)");
+                if let Some(ref pm) = self.ctx.plugin_manager {
+                    if pm.unload_plugin(&name) {
+                        // Remove plugin directory
+                        let plugin_dir = install_dir.join(&name);
+                        if plugin_dir.exists() {
+                            match std::fs::remove_dir_all(&plugin_dir) {
+                                Ok(()) => println!("Plugin '{name}' uninstalled."),
+                                Err(e) => println!("Failed to remove plugin directory: {e}"),
+                            }
+                        } else {
+                            println!("Plugin '{name}' removed from registry.");
+                        }
+                    } else {
+                        println!("Plugin '{name}' not found.");
+                    }
+                } else {
+                    println!("No plugin manager available.");
+                }
             }
             Some(crate::cli::PluginAction::Update) => {
-                println!("Updating all plugins...");
-                println!("(Plugin update coming soon)");
+                println!("Updating plugins...");
+                let manager = coderex_plugins::plugins::PluginManager::new();
+                let reconciler = coderex_plugins::plugins::MarketplaceReconciler::new(300);
+                match reconciler.reconcile(&manager, Some(&install_dir)).await {
+                    Ok(report) => {
+                        println!("Update complete: {} new, {} updated, {} removed",
+                            report.new_count, report.updated_count, report.removed_count);
+                    }
+                    Err(e) => println!("Update failed: {e}"),
+                }
             }
             None => {
                 println!("Usage: coderex plugin <list|install|uninstall|update>");
@@ -1112,8 +1454,20 @@ impl StartupOrchestrator {
     #[allow(clippy::unused_async)]
     async fn run_auto_mode(&self) -> Result<()> {
         println!("Auto-mode settings:");
-        println!("  Status: not yet implemented");
-        println!("  Use /auto-dream inside the REPL to configure auto-mode.");
+        let memory_dir = std::path::Path::new(&self.ctx.cwd).join(".coderex/memory");
+        let dream_config_path = memory_dir.join("dream_config.json");
+        if dream_config_path.exists() {
+            match std::fs::read_to_string(&dream_config_path) {
+                Ok(content) => {
+                    println!("  Config file: {dream_config_path:?}");
+                    println!("  {content}");
+                }
+                Err(e) => println!("  Config exists but unreadable: {e}"),
+            }
+        } else {
+            println!("  Auto-dream: disabled (no config found)");
+            println!("  Use /auto-dream enable inside the REPL to enable.");
+        }
         Ok(())
     }
 
@@ -1152,7 +1506,8 @@ impl StartupOrchestrator {
         }
 
         // Enter REPL with the resumed context
-        let mut repl = if let Some(api_client) = Self::try_create_api_client() {
+        let api_key = self.api_key_from_settings();
+        let mut repl = if let Some(api_client) = Self::try_create_api_client(api_key) {
             crate::repl::ReplLoop::with_engine(api_client, cwd.to_string(), model)
         } else {
             crate::repl::ReplLoop::new(cwd.to_string(), model)
@@ -1160,6 +1515,7 @@ impl StartupOrchestrator {
         if let Some(ref pm) = self.ctx.plugin_manager {
             repl.with_plugin_manager(Arc::clone(pm));
         }
+        self.configure_repl(&mut repl);
         repl.run_tui().await
     }
 
@@ -1394,7 +1750,7 @@ mod tests {
         // In CI/tests the env var is typically unset, so we verify
         // the function returns None when no key is configured.
         // Direct env manipulation is blocked by -D unsafe-code.
-        let result = StartupOrchestrator::try_create_api_client();
+        let result = StartupOrchestrator::try_create_api_client(None);
         // We can't guarantee env state, but verify the function compiles and runs
         // In practice: None when ANTHROPIC_API_KEY is unset, Some when set
         let _ = result;

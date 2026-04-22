@@ -61,7 +61,8 @@ impl MessageView {
     pub fn push(&mut self, msg: Message) {
         self.messages.push(msg);
         // Auto-scroll to bottom if near bottom
-        let at_bottom = self.start + self.visible_count >= self.messages.len().saturating_sub(1);
+        let vc = self.visible_count.max(1);
+        let at_bottom = self.start + vc >= self.messages.len().saturating_sub(1);
         if at_bottom {
             self.scroll_to_bottom();
         }
@@ -70,7 +71,7 @@ impl MessageView {
     /// Scroll to the last message.
     pub fn scroll_to_bottom(&mut self) {
         let total = self.messages.len();
-        self.start = total.saturating_sub(self.visible_count);
+        self.start = total.saturating_sub(self.visible_count.max(1));
     }
 
     /// Scroll up by n messages.

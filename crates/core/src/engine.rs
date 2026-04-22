@@ -17,7 +17,7 @@ use crate::types::{EngineEvent, Message, ModelId, ToolCall, ToolResult, UsageSum
 use crate::budget::TokenBudget;
 use crate::cost::CostTracker;
 use crate::permission_engine::{PermissionEngine, PermissionResponse};
-use crate::permissions::{PermissionMode, PermissionResult};
+use crate::permissions::{PermissionChecker, PermissionMode, PermissionResult};
 use crate::api_client::{ApiClient, ApiResponse, StreamEvent};
 use crate::state::SessionState;
 use crate::prompt::{AssembledContext, CompactConfig, PromptCompiler, PromptContext};
@@ -769,6 +769,12 @@ impl QueryEngine {
     /// Replace the current session state.
     pub fn set_session(&mut self, session: SessionState) {
         self.session = session;
+    }
+
+    /// Get the permission checker (shared, for mode changes).
+    #[must_use]
+    pub fn permission_checker(&self) -> Arc<std::sync::Mutex<PermissionChecker>> {
+        self.permission_engine.checker()
     }
 
     /// Set the coordinator state for multi-phase workflows.

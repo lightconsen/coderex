@@ -7,6 +7,7 @@ pub mod keybindings;
 pub mod message_list;
 pub mod notification_center;
 pub mod overlay;
+pub mod permission_bar;
 pub mod search;
 pub mod selector;
 pub mod state;

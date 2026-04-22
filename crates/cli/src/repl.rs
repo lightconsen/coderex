@@ -137,6 +137,44 @@ pub struct ReplLoop {
     _sdk_timeout_handle: Option<tokio::task::JoinHandle<()>>,
     /// Teleport manager for session sharing and directory switching.
     teleport_manager: Option<coderex_bridge::teleport::TeleportManager>,
+    /// Skip permission prompts (--dangerously-skip-permissions).
+    skip_permissions: bool,
+    /// Disable session persistence (--no-session-persistence).
+    no_persistence: bool,
+    /// Disable slash commands (--disable-slash-commands).
+    no_slash_commands: bool,
+    /// JSON schema for structured output (--json-schema).
+    json_schema: Option<String>,
+    /// Replay user messages from previous session (--replay-user-messages).
+    replay_user_messages: bool,
+    /// Include partial messages in context (--include-partial-messages).
+    include_partial_messages: bool,
+    /// Beta features enabled (--betas).
+    betas: Vec<String>,
+    /// Chrome integration enabled (--chrome / --no-chrome).
+    chrome_enabled: bool,
+    /// Agent to use (--agent).
+    agent: Option<String>,
+    /// IDE mode (--ide).
+    ide: Option<String>,
+    /// Worktree mode (--worktree).
+    worktree: bool,
+    /// Fork from session ID (--fork-session).
+    fork_session: Option<String>,
+    /// Load context from PR URL (--from-pr).
+    from_pr: Option<String>,
+    /// Session name for transcript naming (--name).
+    session_name: Option<String>,
+    /// Additional directories to include in context (--add-dir).
+    add_dir: Vec<String>,
+    /// Input format for non-interactive mode (--input-format).
+    input_format: String,
+    /// Tmux integration (--tmux).
+    tmux_enabled: bool,
+    /// Debug file path (--debug-file).
+    debug_file: Option<std::path::PathBuf>,
+    /// When the current query started (for elapsed-time display).
+    query_start_time: Option<std::time::Instant>,
 }
 
 /// Wrapper that implements `ToolExecutor` for `Arc<dyn ToolExecutor>`.
@@ -226,6 +264,25 @@ impl ReplLoop {
             teleport_manager: Some(coderex_bridge::teleport::TeleportManager::new()),
             #[cfg(feature = "hot-reload")]
             config_changed_rx: None,
+            skip_permissions: false,
+            no_persistence: false,
+            no_slash_commands: false,
+            json_schema: None,
+            replay_user_messages: false,
+            include_partial_messages: false,
+            betas: Vec::new(),
+            chrome_enabled: true,
+            agent: None,
+            ide: None,
+            worktree: false,
+            fork_session: None,
+            from_pr: None,
+            session_name: None,
+            add_dir: Vec::new(),
+            input_format: "text".into(),
+            tmux_enabled: false,
+            debug_file: None,
+            query_start_time: None,
         };
         this.init_command_persistence();
         this
@@ -367,6 +424,25 @@ impl ReplLoop {
             teleport_manager: Some(coderex_bridge::teleport::TeleportManager::new()),
             #[cfg(feature = "hot-reload")]
             config_changed_rx,
+            skip_permissions: false,
+            no_persistence: false,
+            no_slash_commands: false,
+            json_schema: None,
+            replay_user_messages: false,
+            include_partial_messages: false,
+            betas: Vec::new(),
+            chrome_enabled: true,
+            agent: None,
+            ide: None,
+            worktree: false,
+            fork_session: None,
+            from_pr: None,
+            session_name: None,
+            add_dir: Vec::new(),
+            input_format: "text".into(),
+            tmux_enabled: false,
+            debug_file: None,
+            query_start_time: None,
         };
         this.init_command_persistence();
         this
@@ -399,6 +475,272 @@ impl ReplLoop {
         }
 
         self.plugin_manager = Some(plugin_manager);
+    }
+
+    // ─── CLI Configuration Builder Methods ──────────────────────────────────
+
+    pub fn with_skip_permissions(&mut self, skip: bool) {
+        self.skip_permissions = skip;
+    }
+
+    pub fn with_no_persistence(&mut self, no_persist: bool) {
+        self.no_persistence = no_persist;
+    }
+
+    pub fn with_no_slash_commands(&mut self, no_slash: bool) {
+        self.no_slash_commands = no_slash;
+    }
+
+    pub fn with_json_schema(&mut self, schema: Option<String>) {
+        self.json_schema = schema;
+    }
+
+    pub fn with_replay_user_messages(&mut self, replay: bool) {
+        self.replay_user_messages = replay;
+    }
+
+    pub fn with_include_partial_messages(&mut self, include: bool) {
+        self.include_partial_messages = include;
+    }
+
+    pub fn with_betas(&mut self, betas: Vec<String>) {
+        self.betas = betas;
+    }
+
+    pub fn with_chrome_enabled(&mut self, enabled: bool) {
+        self.chrome_enabled = enabled;
+    }
+
+    pub fn with_agent(&mut self, agent: Option<String>) {
+        self.agent = agent;
+    }
+
+    pub fn with_ide(&mut self, ide: Option<String>) {
+        self.ide = ide;
+    }
+
+    pub fn with_worktree(&mut self, worktree: bool) {
+        self.worktree = worktree;
+    }
+
+    pub fn with_fork_session(&mut self, fork: Option<String>) {
+        self.fork_session = fork;
+    }
+
+    pub fn with_from_pr(&mut self, from_pr: Option<String>) {
+        self.from_pr = from_pr;
+    }
+
+    pub fn with_session_name(&mut self, name: Option<String>) {
+        self.session_name = name;
+    }
+
+    pub fn with_add_dir(&mut self, dirs: Vec<String>) {
+        self.add_dir = dirs;
+    }
+
+    pub fn with_input_format(&mut self, format: String) {
+        self.input_format = format;
+    }
+
+    pub fn with_tmux_enabled(&mut self, tmux: bool) {
+        self.tmux_enabled = tmux;
+    }
+
+    pub fn with_debug_file(&mut self, path: Option<std::path::PathBuf>) {
+        self.debug_file = path;
+    }
+
+    pub fn with_allowed_tools(&mut self, tools: Vec<String>) {
+        self.session_effects.allowed_tools_override = Some(tools);
+    }
+
+    /// Apply all CLI configuration settings to the engine, dispatcher, and session.
+    /// Must be called after `with_engine` (or `new`) and before `run_tui`/`run_headless`.
+    pub fn apply_cli_config(&mut self) {
+        // 1. Permission mode
+        if self.skip_permissions {
+            if let Some(ref mut engine) = self.engine {
+                let checker = engine.permission_checker();
+                let mut c = checker.lock().unwrap();
+                c.set_mode(PermissionMode::BypassPermissions);
+            }
+        }
+
+        // 2. Disable slash commands
+        if self.no_slash_commands {
+            self.commands.clear();
+        }
+
+        // 2b. Disable session persistence — clear memory stores so nothing writes to disk
+        if self.no_persistence {
+            self.session_memory_store = None;
+            self.long_term_store = None;
+            self.auto_dream = None;
+            self.team_memory_service = None;
+            tracing::info!("Session persistence disabled — memory stores cleared");
+        }
+
+        // 3. Chrome integration
+        if !self.chrome_enabled {
+            if let Some(arc_dispatcher) = self.dispatcher.as_mut() {
+                if let Some(dispatcher) = Arc::get_mut(arc_dispatcher) {
+                    dispatcher.clear_chrome_client();
+                }
+            }
+        }
+
+        // 4. Session name / title
+        if let Some(ref name) = self.session_name {
+            if let Some(ref mut engine) = self.engine {
+                let mut session = engine.session().clone();
+                session.title = Some(name.clone());
+                engine.set_session(session);
+            }
+        }
+
+        // 5. Worktree mode
+        if self.worktree {
+            if let Some(ref mut engine) = self.engine {
+                let mut session = engine.session().clone();
+                if let Ok(base) = std::env::current_dir() {
+                    let branch = std::process::Command::new("git")
+                        .args(["rev-parse", "--abbrev-ref", "HEAD"])
+                        .current_dir(&base)
+                        .output();
+                    let branch_str = branch.ok()
+                        .and_then(|o| String::from_utf8(o.stdout).ok())
+                        .map(|s| s.trim().to_string())
+                        .unwrap_or_else(|| "unknown".into());
+                    session.active_worktree = Some(coderex_core::state::WorktreeState {
+                        path: base.clone(),
+                        base: branch_str,
+                        has_changes: false,
+                    });
+                    engine.set_session(session);
+                }
+            }
+        }
+
+        // 6. Fork session — load existing messages
+        if let Some(ref fork_id) = self.fork_session {
+            if let Some(ref mut engine) = self.engine {
+                let transcript_dir = std::path::Path::new(&self.cwd).join(".coderex/transcripts");
+                if transcript_dir.exists() {
+                    let store = coderex_memory::transcript::TranscriptStore::new(transcript_dir);
+                    if let Ok(msgs) = store.read_all_skip_first_prompt(fork_id) {
+                        let mut session = engine.session().clone();
+                        session.messages = msgs;
+                        engine.set_session(session);
+                    }
+                }
+            }
+        }
+
+        // 7. Replay user messages from most recent session
+        if self.replay_user_messages {
+            if let Some(ref mut engine) = self.engine {
+                let transcript_dir = std::path::Path::new(&self.cwd).join(".coderex/transcripts");
+                if transcript_dir.exists() {
+                    if let Ok(entries) = std::fs::read_dir(&transcript_dir) {
+                        let mut latest: Option<(std::time::SystemTime, String)> = None;
+                        for entry in entries.flatten() {
+                            let path = entry.path();
+                            if path.is_dir() {
+                                if let Ok(meta) = entry.metadata() {
+                                    if let Ok(modified) = meta.modified() {
+                                        let name = path.file_name()
+                                            .map(|n| n.to_string_lossy().to_string())
+                                            .unwrap_or_default();
+                                        if latest.as_ref().map_or(true, |(t, _)| modified > *t) {
+                                            latest = Some((modified, name));
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        if let Some((_, session_id)) = latest {
+                            let store = coderex_memory::transcript::TranscriptStore::new(transcript_dir);
+                            if let Ok(msgs) = store.read_all_skip_first_prompt(&session_id) {
+                                let user_msgs: Vec<_> = msgs.into_iter()
+                                    .filter(|m| matches!(m.role, coderex_core::types::Role::User))
+                                    .collect();
+                                let mut session = engine.session().clone();
+                                session.messages.extend(user_msgs);
+                                engine.set_session(session);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // 8. Add directory contents to extra context
+        for dir in &self.add_dir {
+            let path = std::path::Path::new(dir);
+            if path.exists() && path.is_dir() {
+                let listing = Self::list_directory_contents(path);
+                self.session_effects.extra_context.push(format!(
+                    "Directory listing for {}:\n{}", dir, listing
+                ));
+            }
+        }
+
+        // 9. PR context
+        if let Some(ref pr_url) = self.from_pr {
+            self.session_effects.extra_context.push(format!(
+                "Loading context from PR: {pr_url}"
+            ));
+        }
+
+        // 10. Agent context
+        if let Some(ref agent) = self.agent {
+            self.session_effects.extra_context.push(format!(
+                "Active agent: {agent}"
+            ));
+        }
+
+        // 11. IDE context
+        if let Some(ref ide) = self.ide {
+            self.session_effects.extra_context.push(format!(
+                "IDE mode: {ide}"
+            ));
+        }
+
+        // 12. Beta features
+        if !self.betas.is_empty() {
+            self.session_effects.extra_context.push(format!(
+                "Enabled beta features: {}", self.betas.join(", ")
+            ));
+        }
+
+        // 13. Tmux context
+        if self.tmux_enabled {
+            self.session_effects.extra_context.push(
+                "Tmux integration enabled".into()
+            );
+        }
+
+        // 14. Debug file — log that it would be configured
+        if let Some(ref debug_path) = self.debug_file {
+            tracing::info!("Debug output file configured: {debug_path:?}");
+        }
+    }
+
+    /// List directory contents as a simple string.
+    fn list_directory_contents(path: &std::path::Path) -> String {
+        let mut entries = Vec::new();
+        if let Ok(dir) = std::fs::read_dir(path) {
+            for entry in dir.flatten() {
+                let name = entry.file_name().to_string_lossy().to_string();
+                let meta = entry.metadata();
+                let kind = meta.as_ref().map_or("?", |m| {
+                    if m.is_dir() { "d" } else { "f" }
+                });
+                entries.push(format!("  [{kind}] {name}"));
+            }
+        }
+        entries.join("\n")
     }
 
     /// Forward an engine event into the SDK session's broadcast stream.
@@ -569,12 +911,23 @@ impl ReplLoop {
             if thinking {
                 ui_state.statusline.spinner_frame = ui_state.statusline.spinner_frame.wrapping_add(1);
                 if ui_state.statusline.thinking_label.is_none() {
-                    ui_state.statusline.thinking_label = Some("Thinking (Esc to cancel)".into());
+                    ui_state.statusline.thinking_label = Some("Thinking".into());
+                }
+                if ui_state.statusline.thinking_started.is_none() {
+                    ui_state.statusline.thinking_started = Some(std::time::Instant::now());
                 }
             } else {
                 ui_state.statusline.thinking_label = None;
                 ui_state.statusline.spinner_frame = 0;
+                if ui_state.statusline.thinking_started.is_some() {
+                    if let Some(start) = self.query_start_time {
+                        ui_state.statusline.last_duration = Some(start.elapsed());
+                    }
+                    ui_state.statusline.thinking_started = None;
+                }
             }
+            // Sync permission bar
+            self.sync_permission_bar(&mut ui_state.permission_bar);
 
             // Poll for completed background tasks and route by kind
             for result in self.poll_background_results() {
@@ -655,6 +1008,18 @@ impl ReplLoop {
                                 }
                             }
 
+                            // Shift+Tab: cycle permission mode
+                            if key.code == KeyCode::BackTab {
+                                ui_state.permission_bar.cycle_mode();
+                                if let Some(ref mut engine) = self.engine {
+                                    let checker = engine.permission_checker();
+                                    if let Ok(mut c) = checker.lock() {
+                                        c.set_mode(ui_state.permission_bar.mode);
+                                    }
+                                }
+                                continue;
+                            }
+
                             // Ctrl+Shift+S: toggle split-pane view
                             if key.code == KeyCode::Char('S')
                                 && key.modifiers.contains(KeyModifiers::CONTROL)
@@ -706,7 +1071,22 @@ impl ReplLoop {
                                     }
                                 }
                                 VimAction::Escape => {
-                                    if vim.mode == VimMode::Normal {
+                                    if thinking {
+                                        thinking = false;
+                                        query_done_rx = None;
+                                        elicit_rx = None;
+                                        if let Some(last) = ui_state.messages.messages.last_mut() {
+                                            if last.role == MessageRole::Assistant {
+                                                last.streaming = false;
+                                                let mut msg = last.content.to_string();
+                                                msg.push_str(" (cancelled)");
+                                                last.content = msg.into();
+                                            }
+                                        }
+                                        if let Some(ref dispatcher) = self.dispatcher {
+                                            dispatcher.set_elicit_tx(None);
+                                        }
+                                    } else if vim.mode == VimMode::Normal {
                                         ui_state.overlays.clear();
                                         ui_state.active_view = ViewMode::MainRepl;
                                     }
@@ -1179,6 +1559,14 @@ impl ReplLoop {
                     .collect(),
             );
         }
+
+        // Apply CLI flag overrides
+        if let Some(ref schema) = self.json_schema {
+            if let Ok(val) = serde_json::from_str::<serde_json::Value>(schema) {
+                options.json_schema = Some(val);
+            }
+        }
+        options.include_partial_messages = self.include_partial_messages;
 
         options
     }
@@ -1713,10 +2101,19 @@ impl ReplLoop {
         } else {
             "New Session".into()
         };
-        statusline.permission_mode = "default".into();
         statusline.git_branch = current_git_branch(&self.cwd);
         statusline.total_tokens = self.history.len() * 100;
         statusline.cost_usd = 0.0;
+    }
+
+    /// Sync current permission mode into the TUI permission bar.
+    fn sync_permission_bar(&self, bar: &mut coderex_ui::permission_bar::PermissionBar) {
+        if let Some(ref engine) = self.engine {
+            let checker = engine.permission_checker();
+            if let Ok(c) = checker.lock() {
+                bar.mode = c.mode();
+            }
+        }
     }
 
     /// Update slash-command suggestion overlay based on current input.
@@ -1764,6 +2161,9 @@ impl ReplLoop {
         >,
         elicit_rx: &mut Option<tokio::sync::mpsc::Receiver<coderex_tools::ElicitRequest>>,
     ) {
+        // Clear previous turn's duration display so it doesn't linger.
+        ui_state.statusline.last_duration = None;
+
         // If there's a pending elicitation, treat this input as the answer.
         if let Some(tx) = self.pending_elicitation.take() {
             let answer = serde_json::json!({ "answer": text });
@@ -1845,6 +2245,7 @@ impl ReplLoop {
             if let Some(ref dispatcher) = self.dispatcher {
                 dispatcher.set_elicit_tx(Some(elicit_tx));
             }
+            self.query_start_time = Some(std::time::Instant::now());
             tokio::spawn(async move {
                 let result = engine.submit_streaming(prompt, options).await;
                 let _ = tx.send((engine, result));

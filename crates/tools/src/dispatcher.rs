@@ -99,6 +99,11 @@ impl RegistryToolDispatcher {
         self.chrome_client = Some(client);
     }
 
+    /// Remove the Chrome CDP client (used when --no-chrome is set).
+    pub fn clear_chrome_client(&mut self) {
+        self.chrome_client = None;
+    }
+
     /// Attach an elicitation channel for mid-execution user questions.
     pub fn set_elicit_tx(&self, tx: Option<tokio::sync::mpsc::Sender<crate::tool::ElicitRequest>>) {
         if let Ok(mut guard) = self.elicit_tx.lock() {

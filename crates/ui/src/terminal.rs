@@ -102,12 +102,14 @@ impl TerminalUi {
             let show_statusline = !is_compact;
             let show_notif = state.notifications.active_count() > 0 && !is_compact;
 
+            let show_perm_bar = !is_compact;
             let constraints = vec![
                 Constraint::Min(1),                                           // message area
                 Constraint::Length(inline_palette_height),                    // inline command hint
                 Constraint::Length(if show_notif { 1 } else { 0 }),           // notification bar
-                Constraint::Length(if show_statusline { 1 } else { 0 }),      // statusline
+                Constraint::Length(if show_statusline { 1 } else { 0 }),      // statusline (thinking)
                 Constraint::Length(1),                                        // input line
+                Constraint::Length(if show_perm_bar { 1 } else { 0 }),        // permission bar
             ];
 
             let chunks = Layout::default()
@@ -146,15 +148,21 @@ impl TerminalUi {
                 render_notification_bar(frame, chunks[notif_idx], &mut state.notifications);
             }
 
-            // Statusline
+            // Statusline (above input)
             if show_statusline {
                 let sl_idx = 1 + (inline_palette_height > 0) as usize + (show_notif) as usize;
                 render_statusline(frame, chunks[sl_idx], &state.statusline);
             }
 
-            // Input line (always last)
-            let input_idx = chunks.len() - 1;
+            // Input line
+            let input_idx = if show_perm_bar { chunks.len() - 2 } else { chunks.len() - 1 };
             render_input(frame, chunks[input_idx], &state.input);
+
+            // Permission bar (below input)
+            if show_perm_bar {
+                let perm_idx = chunks.len() - 1;
+                render_permission_bar(frame, chunks[perm_idx], &state.permission_bar);
+            }
 
             // Overlay (only non-palette overlays; palette is rendered inline)
             if state.overlays.is_active() && !is_inline_palette(state) {
@@ -341,13 +349,25 @@ fn render_messages(frame: &mut Frame, area: ratatui::layout::Rect, state: &mut U
     let mut visible_count = 0;
     let mut accumulated = 0;
     for i in state.messages.start..state.messages.messages.len() {
-        accumulated += heights[i];
-        if accumulated > viewport_height {
+        let h = heights[i];
+        if accumulated + h > viewport_height {
             break;
         }
+        accumulated += h;
         visible_count += 1;
     }
     visible_count = visible_count.max(1);
+
+    // Fill remaining viewport space with older messages so history stays visible.
+    while state.messages.start > 0 {
+        let h = heights[state.messages.start - 1];
+        if accumulated + h > viewport_height {
+            break;
+        }
+        accumulated += h;
+        state.messages.start -= 1;
+        visible_count += 1;
+    }
 
     state.messages.set_visible_count(visible_count);
     let visible = state.messages.visible();
@@ -598,6 +618,21 @@ fn render_statusline(frame: &mut Frame, area: ratatui::layout::Rect, statusline:
     frame.render_widget(paragraph, area);
 }
 
+fn render_permission_bar(
+    frame: &mut Frame,
+    area: ratatui::layout::Rect,
+    bar: &crate::permission_bar::PermissionBar,
+) {
+    let color = bar.color();
+    let rendered = bar.render(area.width as usize);
+    let line = Line::from(Span::styled(
+        rendered,
+        Style::default().fg(color).bg(Color::Black),
+    ));
+    let paragraph = Paragraph::new(line).alignment(Alignment::Left);
+    frame.render_widget(paragraph, area);
+}
+
 fn render_input(frame: &mut Frame, area: ratatui::layout::Rect, input: &crate::input::InputBuffer) {
     let cursor = input.cursor.min(input.text.len());
     let mut spans: Vec<Span> = vec![Span::raw("❯ "), Span::raw(input.text.clone())];
@@ -704,10 +739,12 @@ mod tests {
             model: "sonnet".into(),
             total_tokens: 100,
             cost_usd: 0.01,
-            permission_mode: "default".into(),
             git_branch: "main".into(),
             session_title: "test".into(),
             thinking: false,
+            thinking_started: None,
+            last_duration: None,
+            plan_status: None,
             thinking_label: None,
             spinner_frame: 0,
             show_tokens: true,

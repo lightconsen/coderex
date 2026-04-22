@@ -551,6 +551,11 @@ impl CommandRegistry {
     pub fn is_empty(&self) -> bool {
         self.commands.is_empty()
     }
+
+    /// Remove all registered commands.
+    pub fn clear(&mut self) {
+        self.commands.clear();
+    }
 }
 
 // ─── Register All Commands ──────────────────────────────────────────────────

@@ -1,5 +1,6 @@
-//! Statusline — renders model, tokens, cost, permissions, git branch.
+//! Statusline — renders system status (thinking / elapsed time) above the input line.
 
+use std::time::{Duration, Instant};
 use unicode_width::UnicodeWidthStr;
 
 /// Spinner frames for the thinking indicator (rotating).
@@ -14,14 +15,18 @@ pub struct Statusline {
     pub total_tokens: usize,
     /// Cost in USD.
     pub cost_usd: f64,
-    /// Permission mode label.
-    pub permission_mode: String,
     /// Git branch name.
     pub git_branch: String,
     /// Session title.
     pub session_title: String,
     /// Whether currently thinking/streaming.
     pub thinking: bool,
+    /// When the current thinking session started.
+    pub thinking_started: Option<Instant>,
+    /// Duration of the last completed turn.
+    pub last_duration: Option<Duration>,
+    /// Current plan execution status (e.g. "Step 2/5: Running tests").
+    pub plan_status: Option<String>,
     /// Detailed thinking label (e.g. "Thinking (Esc to cancel)").
     pub thinking_label: Option<String>,
     /// Spinner animation frame index (incremented each draw while thinking).
@@ -42,10 +47,12 @@ impl Statusline {
             model: String::new(),
             total_tokens: 0,
             cost_usd: 0.0,
-            permission_mode: "default".into(),
             git_branch: String::new(),
             session_title: String::new(),
             thinking: false,
+            thinking_started: None,
+            last_duration: None,
+            plan_status: None,
             thinking_label: None,
             spinner_frame: 0,
             show_tokens: true,
@@ -54,17 +61,59 @@ impl Statusline {
         }
     }
 
+    /// Format a duration as "Xm Ys" or "Xs".
+    #[must_use]
+    fn fmt_duration(d: Duration) -> String {
+        let secs = d.as_secs();
+        let mins = secs / 60;
+        let rem = secs % 60;
+        if mins > 0 {
+            format!("{mins}m {rem}s")
+        } else {
+            format!("{secs}s")
+        }
+    }
+
     /// Render to a single-line string.
     #[must_use]
     pub fn render(&self, width: usize) -> String {
-        // If thinking with a label, show the spinner + label prominently.
         if self.thinking {
             let spinner = SPINNER[self.spinner_frame as usize % SPINNER.len()];
-            let label = self
-                .thinking_label
-                .as_ref()
-                .map_or("Thinking...".into(), |l| l.clone());
+            let elapsed = self
+                .thinking_started
+                .map(|s| Self::fmt_duration(s.elapsed()))
+                .unwrap_or_default();
+
+            let label = if let Some(ref plan) = self.plan_status {
+                if elapsed.is_empty() {
+                    format!("{plan}")
+                } else {
+                    format!("{plan}  ({elapsed})")
+                }
+            } else {
+                let base = self
+                    .thinking_label
+                    .as_ref()
+                    .map_or("Thinking...".into(), |l| l.clone());
+                if elapsed.is_empty() {
+                    base
+                } else {
+                    format!("{base}  ({elapsed})")
+                }
+            };
+
             let text = format!("{spinner} {label}");
+            let display_width = UnicodeWidthStr::width(text.as_str());
+            if display_width <= width {
+                let pad = width.saturating_sub(display_width);
+                return format!("{text}{}", " ".repeat(pad));
+            }
+            return truncate_to_width(&text, width);
+        }
+
+        // After a turn completes, show elapsed time for a short while.
+        if let Some(dur) = self.last_duration {
+            let text = format!("Churned for {}", Self::fmt_duration(dur));
             let display_width = UnicodeWidthStr::width(text.as_str());
             if display_width <= width {
                 let pad = width.saturating_sub(display_width);
@@ -88,7 +137,6 @@ impl Statusline {
         if self.show_git_branch {
             segments.push(self.git_branch.clone());
         }
-        segments.push(self.permission_mode.clone());
 
         let full = segments.join(" | ");
         if UnicodeWidthStr::width(full.as_str()) <= width {
@@ -134,10 +182,12 @@ mod tests {
             model: "sonnet".into(),
             total_tokens: 1234,
             cost_usd: 0.42,
-            permission_mode: "approve".into(),
             git_branch: "main".into(),
             session_title: "Fix bug".into(),
             thinking: false,
+            thinking_started: None,
+            last_duration: None,
+            plan_status: None,
             thinking_label: None,
             spinner_frame: 0,
             show_tokens: true,
@@ -157,10 +207,12 @@ mod tests {
             model: "a very long model name here".into(),
             total_tokens: 0,
             cost_usd: 0.0,
-            permission_mode: "default".into(),
             git_branch: "main".into(),
             session_title: "".into(),
             thinking: false,
+            thinking_started: None,
+            last_duration: None,
+            plan_status: None,
             thinking_label: None,
             spinner_frame: 0,
             show_tokens: true,
@@ -213,10 +265,12 @@ mod tests {
             model: "日本語モデル".into(),
             total_tokens: 0,
             cost_usd: 0.0,
-            permission_mode: "default".into(),
             git_branch: "main".into(),
             session_title: "".into(),
             thinking: false,
+            thinking_started: None,
+            last_duration: None,
+            plan_status: None,
             thinking_label: None,
             spinner_frame: 0,
             show_tokens: true,
@@ -226,5 +280,30 @@ mod tests {
         let rendered = sl.render(20);
         // Each CJK char is 2 columns wide, so truncation should handle correctly
         assert!(UnicodeWidthStr::width(rendered.as_str()) <= 20);
+    }
+
+    #[test]
+    fn churned_for_shows_after_completion() {
+        let sl = Statusline {
+            thinking: false,
+            last_duration: Some(Duration::from_secs(7 * 60 + 27)),
+            ..Statusline::new()
+        };
+        let rendered = sl.render(200);
+        assert!(rendered.contains("Churned for"));
+        assert!(rendered.contains("7m 27s"));
+    }
+
+    #[test]
+    fn plan_status_shows_during_thinking() {
+        let sl = Statusline {
+            thinking: true,
+            plan_status: Some("Step 2/5: Running tests".into()),
+            spinner_frame: 0,
+            ..Statusline::new()
+        };
+        let rendered = sl.render(200);
+        assert!(rendered.contains("Step 2/5"));
+        assert!(rendered.contains("Running tests"));
     }
 }
