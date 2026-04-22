@@ -294,6 +294,16 @@ pub struct RuntimeOverrides {
     pub telemetry_enabled: Option<bool>,
     /// API key, overriding config.
     pub api_key: Option<String>,
+    /// Custom system prompt override.
+    pub system_prompt: Option<String>,
+    /// Append to system prompt instead of replacing.
+    pub append_system_prompt: bool,
+    /// Allowed tools list.
+    pub allowed_tools: Option<Vec<String>>,
+    /// Fallback model.
+    pub fallback_model: Option<String>,
+    /// Reasoning effort level.
+    pub effort: Option<String>,
 }
 
 impl RuntimeOverrides {

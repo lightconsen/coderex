@@ -44,6 +44,28 @@ pub struct SessionContext {
     pub plugin_manager: Option<Arc<coderex_plugins::plugins::PluginManager>>,
     /// Telemetry handle (initialized during LoadSettings).
     pub telemetry_handle: Option<coderex_telemetry::TelemetryHandle>,
+    /// Session name for transcript naming.
+    pub session_name: Option<String>,
+    /// Whether to skip permission prompts.
+    pub skip_permissions: bool,
+    /// Additional directories in context.
+    pub extra_dirs: Vec<String>,
+    /// Files included in context.
+    pub context_files: Vec<std::path::PathBuf>,
+    /// Custom system prompt.
+    pub system_prompt: Option<String>,
+    /// Whether session persistence is disabled.
+    pub no_persistence: bool,
+    /// Whether slash commands are disabled.
+    pub no_slash_commands: bool,
+    /// Output format preference.
+    pub output_format: String,
+    /// Debug file path.
+    pub debug_file: Option<std::path::PathBuf>,
+    /// Fallback model.
+    pub fallback_model: Option<ModelId>,
+    /// Allowed tools.
+    pub allowed_tools: Vec<String>,
 }
 
 /// Phases of startup.
@@ -91,7 +113,7 @@ impl Default for StartupOrchestrator {
 impl StartupOrchestrator {
     /// Create a new orchestrator.
     #[must_use]
-    pub const fn new() -> Self {
+    pub fn new() -> Self {
         Self {
             ctx: SessionContext {
                 settings: None,
@@ -107,6 +129,17 @@ impl StartupOrchestrator {
                 cwd: String::new(),
                 plugin_manager: None,
                 telemetry_handle: None,
+                session_name: None,
+                skip_permissions: false,
+                extra_dirs: Vec::new(),
+                context_files: Vec::new(),
+                system_prompt: None,
+                no_persistence: false,
+                no_slash_commands: false,
+                output_format: "text".into(),
+                debug_file: None,
+                fallback_model: None,
+                allowed_tools: Vec::new(),
             },
         }
     }
@@ -120,6 +153,23 @@ impl StartupOrchestrator {
                 .to_string_lossy()
                 .to_string()
         });
+
+        // Store CLI-derived context
+        self.ctx.session_name = args.name.clone();
+        self.ctx.skip_permissions = args.dangerously_skip_permissions;
+        self.ctx.extra_dirs = args.add_dir.clone();
+        self.ctx.context_files = args.file.clone();
+        self.ctx.system_prompt = args.system_prompt.clone();
+        self.ctx.no_persistence = args.no_session_persistence;
+        self.ctx.no_slash_commands = args.disable_slash_commands;
+        self.ctx.output_format = args.output_format.clone();
+        self.ctx.debug_file = args.debug_file.clone();
+        if let Some(ref tools) = args.allowed_tools {
+            self.ctx.allowed_tools = tools.split(',').map(|s| s.trim().to_string()).collect();
+        }
+        if let Some(ref fb) = args.fallback_model {
+            self.ctx.fallback_model = Some(ModelId(fb.clone()));
+        }
 
         self.run_phase(StartupPhase::Bootstrap, &args).await?;
         self.run_phase(StartupPhase::LoadSettings, &args).await?;
@@ -188,18 +238,40 @@ impl StartupOrchestrator {
             .or_else(|| self.ctx.model.clone())
             .unwrap_or_else(ModelId::sonnet);
 
+        // Handle --resume flag (resume last or specific session)
+        if let Some(ref session_id) = args.resume {
+            return self.run_resume(&self.ctx.cwd, session_id, model).await;
+        }
+        if args.r#continue {
+            // Continue most recent session — find latest transcript
+            if let Some(latest) = self.find_latest_session() {
+                return self.run_resume(&self.ctx.cwd, &latest, model).await;
+            }
+            bail!("No previous session found to continue");
+        }
+
         // Route based on CLI args
-        if args.print {
-            // Non-interactive: read from stdin
-            self.run_headless(&self.ctx.cwd, model).await?;
-            Ok(())
+        if args.print || !args.prompt.is_empty() {
+            // Non-interactive: read from stdin or use positional prompt
+            let prompt = if !args.prompt.is_empty() {
+                args.prompt.join(" ")
+            } else {
+                let mut stdin = String::new();
+                std::io::stdin().read_line(&mut stdin)?;
+                stdin.trim().to_string()
+            };
+            if prompt.is_empty() {
+                bail!("No input provided");
+            }
+            self.run_headless_with_prompt(&self.ctx.cwd, model, &prompt).await?;
+            return Ok(());
         } else if let Some(cmd) = args.command {
             match cmd {
                 crate::cli::Command::Repl => {
                     self.run_repl(&self.ctx.cwd, model).await
                 }
-                crate::cli::Command::Serve => {
-                    self.run_server(&self.ctx.cwd).await
+                crate::cli::Command::Serve { port } => {
+                    self.run_server(&self.ctx.cwd, port).await
                 }
                 crate::cli::Command::ServeStop => {
                     self.run_serve_stop().await
@@ -207,8 +279,26 @@ impl StartupOrchestrator {
                 crate::cli::Command::ServeStatus => {
                     self.run_serve_status().await
                 }
-                crate::cli::Command::Resume { session_id } => {
-                    self.run_resume(&self.ctx.cwd, &session_id, model).await
+                crate::cli::Command::Agents { detailed } => {
+                    self.run_agents(detailed).await
+                }
+                crate::cli::Command::Auth => {
+                    self.run_auth().await
+                }
+                crate::cli::Command::Doctor => {
+                    self.run_doctor().await
+                }
+                crate::cli::Command::Update => {
+                    self.run_update().await
+                }
+                crate::cli::Command::Mcp { action } => {
+                    self.run_mcp(action).await
+                }
+                crate::cli::Command::Plugin { action } => {
+                    self.run_plugin(action).await
+                }
+                crate::cli::Command::AutoMode => {
+                    self.run_auto_mode().await
                 }
             }
         } else {
@@ -290,9 +380,14 @@ impl StartupOrchestrator {
         let overrides = RuntimeOverrides {
             model: args.model.clone(),
             permission_mode: args.permissions.clone(),
-            max_budget_usd: None,
-            telemetry_enabled: None,
-            api_key: None,
+            max_budget_usd: args.max_budget_usd,
+            telemetry_enabled: if args.no_telemetry { Some(false) } else { None },
+            api_key: args.api_key.clone(),
+            system_prompt: args.system_prompt.clone(),
+            append_system_prompt: args.append_system_prompt,
+            allowed_tools: args.allowed_tools.as_ref().map(|s| s.split(',').map(|t| t.trim().to_string()).collect()),
+            fallback_model: args.fallback_model.clone(),
+            effort: args.effort.clone(),
         };
         settings = overrides.apply(settings);
 
@@ -789,13 +884,7 @@ impl StartupOrchestrator {
     }
 
     #[allow(clippy::unused_async)]
-    async fn run_headless(&self, cwd: &str, model: ModelId) -> Result<()> {
-        let mut stdin = String::new();
-        std::io::stdin().read_line(&mut stdin)?;
-        let stdin = stdin.trim().to_string();
-        if stdin.is_empty() {
-            bail!("No input provided");
-        }
+    async fn run_headless_with_prompt(&self, cwd: &str, model: ModelId, prompt: &str) -> Result<()> {
         let mut repl = if let Some(api_client) = Self::try_create_api_client() {
             crate::repl::ReplLoop::with_engine(api_client, cwd.to_string(), model)
         } else {
@@ -804,13 +893,13 @@ impl StartupOrchestrator {
         if let Some(ref pm) = self.ctx.plugin_manager {
             repl.with_plugin_manager(Arc::clone(pm));
         }
-        let result = repl.run_headless(&stdin).await?;
+        let result = repl.run_headless(prompt).await?;
         println!("{result}");
         Ok(())
     }
 
     #[allow(clippy::unused_async)]
-    async fn run_server(&self, cwd: &str) -> Result<()> {
+    async fn run_server(&self, cwd: &str, port: u16) -> Result<()> {
         use coderex_server::{DaemonServer, ServerConfig};
 
         // Write PID file before starting
@@ -827,11 +916,6 @@ impl StartupOrchestrator {
             .and_then(|s| s.parse::<u64>().ok())
             .unwrap_or(3600);
 
-        let port = std::env::var("CODEREX_PORT")
-            .ok()
-            .and_then(|s| s.parse::<u16>().ok())
-            .unwrap_or(8080);
-
         let config = ServerConfig {
             valid_keys,
             idle_timeout: std::time::Duration::from_secs(idle_timeout),
@@ -844,7 +928,7 @@ impl StartupOrchestrator {
         let mut server = DaemonServer::with_config(config);
 
         tracing::info!("CodeRex server initialized: cwd={cwd}");
-        tracing::info!("Server config: idle_timeout={idle_timeout}s, max_sessions=100");
+        tracing::info!("Server config: idle_timeout={idle_timeout}s, max_sessions=100, port={port}");
         println!("CodeRex server running on ws://0.0.0.0:{port}");
         println!("Sessions: 0 active");
         println!("Press Ctrl+C to stop");
@@ -872,6 +956,164 @@ impl StartupOrchestrator {
     #[allow(clippy::unused_async)]
     async fn run_serve_status(&self) -> Result<()> {
         println!("{}", daemon::serve_status());
+        Ok(())
+    }
+
+    #[allow(clippy::unused_async)]
+    async fn run_agents(&self, detailed: bool) -> Result<()> {
+        println!("Available agents:");
+        if detailed {
+            println!("  advisor    - Code review and architectural guidance");
+            println!("  bughunter  - Bug detection and root cause analysis");
+            println!("  reviewer   - PR-style code review");
+        } else {
+            println!("  advisor  bughunter  reviewer");
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::unused_async)]
+    async fn run_auth(&self) -> Result<()> {
+        let config = coderex_core::provider_config::ProviderConfig::from_env();
+        let mut providers = Vec::new();
+        if config.anthropic.is_some() {
+            providers.push("Anthropic");
+        }
+        if config.openai.is_some() {
+            providers.push("OpenAI");
+        }
+        if config.groq.is_some() {
+            providers.push("Groq");
+        }
+        if !config.custom.is_empty() {
+            providers.push("Custom");
+        }
+        if providers.is_empty() {
+            println!("No API providers configured.");
+            println!("Set ANTHROPIC_API_KEY, OPENAI_API_KEY, GROQ_API_KEY, or CODEREX_API_KEY.");
+        } else {
+            println!("Authenticated providers: {}", providers.join(", "));
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::unused_async)]
+    async fn run_doctor(&self) -> Result<()> {
+        println!("CodeRex Doctor");
+        println!("==============");
+        let checks = [
+            ("API key configured", Self::try_create_api_client().is_some()),
+            ("Settings file exists", coderex_config::config_home().join("settings.json").exists()),
+            ("Working directory accessible", std::env::current_dir().is_ok()),
+        ];
+        let mut issues = 0;
+        for (name, ok) in &checks {
+            let status = if *ok { "OK" } else { "FAIL" };
+            println!("  [{status}] {name}");
+            if !ok {
+                issues += 1;
+            }
+        }
+        if issues == 0 {
+            println!("\nAll checks passed.");
+        } else {
+            println!("\n{issues} check(s) failed.");
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::unused_async)]
+    async fn run_update(&self) -> Result<()> {
+        use crate::version;
+        let cwd = std::env::current_dir().unwrap_or_default();
+        match version::check_for_updates().await {
+            Some(msg) => println!("{msg}"),
+            None => println!("CodeRex is up to date."),
+        }
+        version::record_check_time(&cwd);
+        Ok(())
+    }
+
+    #[allow(clippy::unused_async)]
+    async fn run_mcp(&self, action: Option<crate::cli::McpAction>) -> Result<()> {
+        match action {
+            Some(crate::cli::McpAction::List) => {
+                println!("Configured MCP servers:");
+                let mcp_path = std::path::Path::new(&self.ctx.cwd).join(".mcp.json");
+                if mcp_path.exists() {
+                    match coderex_mcp::config::McpConfig::load(&mcp_path) {
+                        Ok(config) => {
+                            for name in config.server_names() {
+                                println!("  {name}");
+                            }
+                        }
+                        Err(e) => println!("  Error loading config: {e}"),
+                    }
+                } else {
+                    println!("  No .mcp.json found in current directory.");
+                }
+            }
+            Some(crate::cli::McpAction::Add { name, command }) => {
+                println!("Adding MCP server '{name}' with command: {command}");
+                println!("(Edit .mcp.json manually for now — interactive add coming soon)");
+            }
+            Some(crate::cli::McpAction::Remove { name }) => {
+                println!("Removing MCP server '{name}'...");
+                println!("(Edit .mcp.json manually for now — interactive remove coming soon)");
+            }
+            Some(crate::cli::McpAction::Test { name }) => {
+                println!("Testing MCP server '{name}'...");
+                println!("(MCP test command coming soon)");
+            }
+            None => {
+                println!("Usage: coderex mcp <list|add|remove|test>");
+            }
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::unused_async)]
+    async fn run_plugin(&self, action: Option<crate::cli::PluginAction>) -> Result<()> {
+        match action {
+            Some(crate::cli::PluginAction::List) => {
+                if let Some(ref pm) = self.ctx.plugin_manager {
+                    let plugins = pm.list_plugins();
+                    if plugins.is_empty() {
+                        println!("No plugins installed.");
+                    } else {
+                        println!("Installed plugins:");
+                        for name in plugins {
+                            println!("  {name}");
+                        }
+                    }
+                } else {
+                    println!("No plugins installed.");
+                }
+            }
+            Some(crate::cli::PluginAction::Install { source }) => {
+                println!("Installing plugin from '{source}'...");
+                println!("(Plugin marketplace installation coming soon)");
+            }
+            Some(crate::cli::PluginAction::Uninstall { name }) => {
+                println!("Uninstalling plugin '{name}'...");
+                println!("(Plugin uninstallation coming soon)");
+            }
+            Some(crate::cli::PluginAction::Update) => {
+                println!("Updating all plugins...");
+                println!("(Plugin update coming soon)");
+            }
+            None => {
+                println!("Usage: coderex plugin <list|install|uninstall|update>");
+            }
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::unused_async)]
+    async fn run_auto_mode(&self) -> Result<()> {
+        println!("Auto-mode settings:");
+        println!("  Status: not yet implemented");
+        println!("  Use /auto-dream inside the REPL to configure auto-mode.");
         Ok(())
     }
 
@@ -937,6 +1179,31 @@ impl StartupOrchestrator {
 
         Ok(messages)
     }
+
+    /// Find the most recent session ID from the transcripts directory.
+    fn find_latest_session(&self) -> Option<String> {
+        let transcript_dir = std::path::Path::new(&self.ctx.cwd).join(".coderex/transcripts");
+        if !transcript_dir.exists() {
+            return None;
+        }
+        let mut latest: Option<(std::time::SystemTime, String)> = None;
+        if let Ok(entries) = std::fs::read_dir(&transcript_dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    if let Ok(meta) = entry.metadata() {
+                        if let Ok(modified) = meta.modified() {
+                            let name = path.file_name()?.to_string_lossy().to_string();
+                            if latest.as_ref().map_or(true, |(t, _)| modified > *t) {
+                                latest = Some((modified, name));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        latest.map(|(_, name)| name)
+    }
 }
 
 #[cfg(test)]
@@ -968,9 +1235,51 @@ mod tests {
     fn test_cli_args() -> Cli {
         Cli {
             directory: None,
+            add_dir: Vec::new(),
             permissions: None,
+            dangerously_skip_permissions: false,
+            allowed_tools: None,
             model: None,
+            fallback_model: None,
+            system_prompt: None,
+            append_system_prompt: false,
+            file: Vec::new(),
             print: false,
+            brief: false,
+            bare: false,
+            verbose: false,
+            debug: false,
+            debug_file: None,
+            r#continue: false,
+            resume: None,
+            name: None,
+            fork_session: None,
+            from_pr: None,
+            no_session_persistence: false,
+            disable_slash_commands: false,
+            max_budget_usd: None,
+            api_key: None,
+            no_telemetry: false,
+            mcp_config: None,
+            mcp_debug: false,
+            strict_mcp_config: false,
+            plugin_dir: None,
+            settings: None,
+            setting_sources: false,
+            input_format: "text".into(),
+            output_format: "text".into(),
+            json_schema: None,
+            replay_user_messages: false,
+            include_partial_messages: false,
+            effort: None,
+            betas: Vec::new(),
+            chrome: false,
+            no_chrome: false,
+            tmux: false,
+            agent: None,
+            ide: None,
+            worktree: false,
+            prompt: Vec::new(),
             command: None,
         }
     }

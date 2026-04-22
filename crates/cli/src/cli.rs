@@ -1,6 +1,7 @@
 //! CLI argument parsing with clap.
 
 use clap::{Parser, Subcommand};
+use std::path::PathBuf;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -13,20 +14,188 @@ Running without a subcommand starts the interactive REPL."
 )]
 pub struct Cli {
     /// Working directory (defaults to current directory).
-    #[arg(short, long)]
+    #[arg(long, value_name = "DIR")]
     pub directory: Option<String>,
 
-    /// Permission mode.
-    #[arg(long)]
+    /// Additional directories to include in context.
+    #[arg(short = 'a', long, value_name = "DIR")]
+    pub add_dir: Vec<String>,
+
+    /// Permission mode (default, accept-edits, plan, dont-ask).
+    #[arg(long, value_name = "MODE")]
     pub permissions: Option<String>,
 
-    /// Model to use.
-    #[arg(long)]
+    /// Skip permission prompts (dangerous — use with caution).
+    #[arg(long, alias = "allow-dangerously-skip-permissions")]
+    pub dangerously_skip_permissions: bool,
+
+    /// Comma-separated list of allowed tools.
+    #[arg(long, value_name = "TOOLS")]
+    pub allowed_tools: Option<String>,
+
+    /// Model to use (e.g., claude-sonnet-4-6, claude-opus-4-6).
+    #[arg(short = 'm', long, value_name = "MODEL")]
     pub model: Option<String>,
 
-    /// Non-interactive mode: read prompt from stdin.
+    /// Fallback model if primary is unavailable.
+    #[arg(long, value_name = "MODEL")]
+    pub fallback_model: Option<String>,
+
+    /// Custom system prompt.
+    #[arg(long, value_name = "PROMPT")]
+    pub system_prompt: Option<String>,
+
+    /// Append to the default system prompt instead of replacing it.
     #[arg(long)]
+    pub append_system_prompt: bool,
+
+    /// Include a file in context.
+    #[arg(short = 'f', long, value_name = "FILE")]
+    pub file: Vec<PathBuf>,
+
+    /// Non-interactive mode: read prompt from stdin, print response, exit.
+    #[arg(short = 'p', long)]
     pub print: bool,
+
+    /// Concise output (minimal formatting).
+    #[arg(long)]
+    pub brief: bool,
+
+    /// Minimal output (no decorations, aliases --brief).
+    #[arg(long)]
+    pub bare: bool,
+
+    /// Verbose output (more detail).
+    #[arg(long)]
+    pub verbose: bool,
+
+    /// Enable debug logging.
+    #[arg(short = 'd', long)]
+    pub debug: bool,
+
+    /// Write debug output to a file.
+    #[arg(long, value_name = "PATH")]
+    pub debug_file: Option<PathBuf>,
+
+    /// Continue the most recent session.
+    #[arg(short = 'c', long)]
+    pub r#continue: bool,
+
+    /// Resume a specific session by ID.
+    #[arg(short = 'r', long, value_name = "ID")]
+    pub resume: Option<String>,
+
+    /// Session name (used for transcript naming).
+    #[arg(short = 'n', long, value_name = "NAME")]
+    pub name: Option<String>,
+
+    /// Fork a session from an existing session ID.
+    #[arg(long, value_name = "ID")]
+    pub fork_session: Option<String>,
+
+    /// Load context from a PR URL.
+    #[arg(long, value_name = "URL")]
+    pub from_pr: Option<String>,
+
+    /// Disable session persistence (do not save transcripts).
+    #[arg(long)]
+    pub no_session_persistence: bool,
+
+    /// Disable slash commands in the REPL.
+    #[arg(long)]
+    pub disable_slash_commands: bool,
+
+    /// Maximum budget in USD for this session.
+    #[arg(long, value_name = "USD")]
+    pub max_budget_usd: Option<f64>,
+
+    /// API key (overrides environment and config).
+    #[arg(long, value_name = "KEY")]
+    pub api_key: Option<String>,
+
+    /// Disable telemetry for this session.
+    #[arg(long)]
+    pub no_telemetry: bool,
+
+    /// MCP config file path.
+    #[arg(long, value_name = "PATH")]
+    pub mcp_config: Option<PathBuf>,
+
+    /// Enable MCP debug mode.
+    #[arg(long)]
+    pub mcp_debug: bool,
+
+    /// Strict MCP config validation (fail on unknown fields).
+    #[arg(long)]
+    pub strict_mcp_config: bool,
+
+    /// Additional plugin directory to search.
+    #[arg(long, value_name = "DIR")]
+    pub plugin_dir: Option<PathBuf>,
+
+    /// Settings file path (overrides default).
+    #[arg(long, value_name = "PATH")]
+    pub settings: Option<PathBuf>,
+
+    /// Show where each setting value comes from.
+    #[arg(long)]
+    pub setting_sources: bool,
+
+    /// Input format for non-interactive mode (text, json).
+    #[arg(long, value_name = "FORMAT", default_value = "text")]
+    pub input_format: String,
+
+    /// Output format for non-interactive mode (text, json, markdown).
+    #[arg(long, value_name = "FORMAT", default_value = "text")]
+    pub output_format: String,
+
+    /// JSON schema for structured output (enables JSON mode).
+    #[arg(long, value_name = "SCHEMA")]
+    pub json_schema: Option<String>,
+
+    /// Replay user messages from a previous session.
+    #[arg(long)]
+    pub replay_user_messages: bool,
+
+    /// Include partial/incomplete assistant messages in context.
+    #[arg(long)]
+    pub include_partial_messages: bool,
+
+    /// Set reasoning effort (low, medium, high).
+    #[arg(long, value_name = "LEVEL")]
+    pub effort: Option<String>,
+
+    /// Enable beta features.
+    #[arg(long)]
+    pub betas: Vec<String>,
+
+    /// Enable browser / web integration.
+    #[arg(long)]
+    pub chrome: bool,
+
+    /// Disable browser / web integration.
+    #[arg(long)]
+    pub no_chrome: bool,
+
+    /// Enable tmux integration.
+    #[arg(long)]
+    pub tmux: bool,
+
+    /// Use a specific agent.
+    #[arg(long, value_name = "AGENT")]
+    pub agent: Option<String>,
+
+    /// IDE integration mode (vscode, jetbrains, etc).
+    #[arg(long, value_name = "IDE")]
+    pub ide: Option<String>,
+
+    /// Worktree mode (isolated git worktree).
+    #[arg(short = 'w', long)]
+    pub worktree: bool,
+
+    /// Remaining positional arguments: optional initial prompt.
+    #[arg(value_name = "PROMPT")]
+    pub prompt: Vec<String>,
 
     #[command(subcommand)]
     pub command: Option<Command>,
@@ -37,13 +206,65 @@ pub enum Command {
     /// Start the interactive REPL (default when no command is given).
     Repl,
     /// Start in daemon/server mode.
-    Serve,
+    Serve {
+        /// Port to listen on.
+        #[arg(short, long, default_value = "8080")]
+        port: u16,
+    },
     /// Stop a running daemon server.
     ServeStop,
     /// Show status of a running daemon server.
     ServeStatus,
-    /// Resume a previous session.
-    Resume { session_id: String },
+    /// List available agents.
+    Agents {
+        /// Show detailed agent information.
+        #[arg(long)]
+        detailed: bool,
+    },
+    /// Check authentication status.
+    Auth,
+    /// Run diagnostics and report issues.
+    Doctor,
+    /// Check for updates.
+    Update,
+    /// Manage MCP servers.
+    Mcp {
+        #[command(subcommand)]
+        action: Option<McpAction>,
+    },
+    /// Manage plugins.
+    Plugin {
+        #[command(subcommand)]
+        action: Option<PluginAction>,
+    },
+    /// Configure auto-mode settings.
+    AutoMode,
+}
+
+/// MCP management subcommands.
+#[derive(Subcommand, Debug)]
+pub enum McpAction {
+    /// List configured MCP servers.
+    List,
+    /// Add an MCP server.
+    Add { name: String, command: String },
+    /// Remove an MCP server.
+    Remove { name: String },
+    /// Test connection to an MCP server.
+    Test { name: String },
+}
+
+/// Plugin management subcommands.
+#[derive(Subcommand, Debug)]
+pub enum PluginAction {
+    /// List installed plugins.
+    List,
+    /// Install a plugin from a marketplace or path.
+    Install { source: String },
+    /// Uninstall a plugin.
+    Uninstall { name: String },
+    /// Update all plugins.
+    Update,
 }
 
 /// Parse CLI arguments from std::env::args.
