@@ -18,16 +18,29 @@ pub struct CrashReport {
     pub timestamp: chrono::DateTime<chrono::Utc>,
 }
 
+/// Default maximum size for the pending crash directory (50 MB).
+const DEFAULT_MAX_PENDING_BYTES: u64 = 50 * 1024 * 1024;
+
 /// Crash reporter that hooks into the panic handler.
 #[derive(Debug, Clone)]
 pub struct CrashReporter {
     pending_dir: PathBuf,
+    max_pending_bytes: u64,
 }
 
 impl CrashReporter {
     /// Create a new crash reporter.
     pub fn new(pending_dir: PathBuf) -> Self {
-        Self { pending_dir }
+        Self {
+            pending_dir,
+            max_pending_bytes: DEFAULT_MAX_PENDING_BYTES,
+        }
+    }
+
+    /// Set the maximum allowed size of the pending crash directory.
+    pub fn with_max_pending_bytes(mut self, bytes: u64) -> Self {
+        self.max_pending_bytes = bytes;
+        self
     }
 
     /// Install a panic hook that records crashes to the pending directory.
@@ -60,10 +73,16 @@ impl CrashReporter {
 
     /// Scan the pending directory and ingest crash files.
     ///
+    /// Before ingestion, if the total size of the pending directory exceeds
+    /// `max_pending_bytes`, oldest files are deleted until under the limit.
+    ///
     /// Returns the number of crashes ingested.
-    pub fn ingest_pending(&self,
+    pub fn ingest_pending(
+        &self,
         store: &crate::TelemetryStore,
     ) -> Result<usize, crate::TelemetryError> {
+        self.enforce_size_limit();
+
         let mut count = 0;
         let entries = match std::fs::read_dir(&self.pending_dir) {
             Ok(entries) => entries,
@@ -91,6 +110,61 @@ impl CrashReporter {
         }
 
         Ok(count)
+    }
+
+    /// Delete oldest crash files until the pending directory is under the size limit.
+    fn enforce_size_limit(&self) {
+        let total_size = self.pending_dir_size();
+        if total_size <= self.max_pending_bytes {
+            return;
+        }
+
+        let mut files: Vec<(std::path::PathBuf, u64, std::time::SystemTime)> =
+            match std::fs::read_dir(&self.pending_dir) {
+                Ok(entries) => entries
+                    .flatten()
+                    .filter_map(|e| {
+                        let path = e.path();
+                        if path.extension().and_then(|s| s.to_str()) != Some("json") {
+                            return None;
+                        }
+                        let meta = e.metadata().ok()?;
+                        let size = meta.len();
+                        let mtime = meta.modified().ok()?;
+                        Some((path, size, mtime))
+                    })
+                    .collect(),
+                Err(_) => return,
+            };
+
+        // Sort by mtime ascending (oldest first)
+        files.sort_by(|a, b| a.2.cmp(&b.2));
+
+        let mut to_free = total_size - self.max_pending_bytes;
+        for (path, size, _) in files {
+            if to_free == 0 {
+                break;
+            }
+            let _ = std::fs::remove_file(&path);
+            to_free = to_free.saturating_sub(size);
+        }
+    }
+
+    /// Compute total size of all `.json` files in the pending directory.
+    fn pending_dir_size(&self) -> u64 {
+        match std::fs::read_dir(&self.pending_dir) {
+            Ok(entries) => entries
+                .flatten()
+                .filter_map(|e| {
+                    let path = e.path();
+                    if path.extension().and_then(|s| s.to_str()) != Some("json") {
+                        return None;
+                    }
+                    e.metadata().ok().map(|m| m.len())
+                })
+                .sum(),
+            Err(_) => 0,
+        }
     }
 }
 

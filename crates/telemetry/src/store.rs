@@ -8,9 +8,15 @@ use std::path::Path;
 #[derive(Debug)]
 pub struct TelemetryStore {
     conn: Connection,
+    db_path: std::path::PathBuf,
 }
 
 impl TelemetryStore {
+    /// Return the filesystem path of this store.
+    pub fn path(&self) -> &std::path::Path {
+        &self.db_path
+    }
+
     /// Open (or create) the telemetry database at the given path.
     ///
     /// Creates parent directories and initializes the schema if needed.
@@ -47,8 +53,14 @@ impl TelemetryStore {
             CREATE INDEX IF NOT EXISTS idx_events_created
                 ON telemetry_events(created_at);
 
-            -- Retention: delete events older than 7 days
-            CREATE TRIGGER IF NOT EXISTS telemetry_retention
+            CREATE INDEX IF NOT EXISTS idx_crash_uploaded
+                ON crash_reports(uploaded_at);
+
+            CREATE INDEX IF NOT EXISTS idx_crash_created
+                ON crash_reports(created_at);
+
+            -- Retention: delete oldest 100 events when table exceeds 10000 rows
+            CREATE TRIGGER IF NOT EXISTS telemetry_retention_count
             AFTER INSERT ON telemetry_events
             WHEN (SELECT COUNT(*) FROM telemetry_events) > 10000
             BEGIN
@@ -59,10 +71,10 @@ impl TelemetryStore {
                     LIMIT 100
                 );
             END;
-            "
+"
         )?;
 
-        Ok(Self { conn })
+        Ok(Self { conn, db_path: path.to_path_buf() })
     }
 
     /// Insert a single event.
@@ -209,6 +221,42 @@ impl TelemetryStore {
         )?;
         Ok(count)
     }
+
+    /// Check whether the database file exceeds the given size limit (bytes).
+    ///
+    /// Uses `PRAGMA page_count * page_size`.
+    pub fn db_size_bytes(&self) -> Result<i64, TelemetryError> {
+        let page_count: i64 = self.conn.query_row("PRAGMA page_count", [], |row| row.get(0))?;
+        let page_size: i64 = self.conn.query_row("PRAGMA page_size", [], |row| row.get(0))?;
+        Ok(page_count * page_size)
+    }
+
+    /// Prune oldest events until the database is under `max_bytes`.
+    ///
+    /// Deletes in chunks of 100 until under limit or no more events.
+    pub fn prune_to_size(&self, max_bytes: i64) -> Result<usize, TelemetryError> {
+        let mut deleted = 0;
+        loop {
+            let size = self.db_size_bytes()?;
+            if size <= max_bytes {
+                break;
+            }
+            let n = self.conn.execute(
+                "DELETE FROM telemetry_events
+                 WHERE id IN (
+                     SELECT id FROM telemetry_events
+                     ORDER BY created_at ASC
+                     LIMIT 100
+                 )",
+                [],
+            )?;
+            if n == 0 {
+                break;
+            }
+            deleted += n;
+        }
+        Ok(deleted)
+    }
 }
 
 /// A telemetry event pending upload.
@@ -289,14 +337,14 @@ pub enum TelemetryEvent {
 
 impl TelemetryEvent {
     fn to_db(&self) -> (String, String, String) {
-        let event_type = match self {
-            TelemetryEvent::SessionStart { .. } => "session_start",
-            TelemetryEvent::ToolUsed { .. } => "tool_used",
-            TelemetryEvent::ApiCall { .. } => "api_call",
-            TelemetryEvent::Error { .. } => "error",
+        let (event_type, timestamp) = match self {
+            TelemetryEvent::SessionStart { timestamp, .. } => ("session_start", *timestamp),
+            TelemetryEvent::ToolUsed { timestamp, .. } => ("tool_used", *timestamp),
+            TelemetryEvent::ApiCall { timestamp, .. } => ("api_call", *timestamp),
+            TelemetryEvent::Error { timestamp, .. } => ("error", *timestamp),
         };
         let payload = serde_json::to_string(self).unwrap_or_default();
-        let created_at = chrono::Utc::now().to_rfc3339();
+        let created_at = timestamp.to_rfc3339();
         (event_type.to_string(), payload, created_at)
     }
 }

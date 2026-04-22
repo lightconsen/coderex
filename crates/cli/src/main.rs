@@ -47,6 +47,6 @@ fn init_telemetry() -> Option<coderex_telemetry::TelemetryHandle> {
         Err(e) => tracing::warn!("failed to ingest pending crashes: {e}"),
     }
 
-    let (handle, _uploader) = coderex_telemetry::TelemetryHandle::new(store);
+    let (handle, _uploader) = coderex_telemetry::TelemetryHandle::new(store, None);
     Some(handle)
 }
