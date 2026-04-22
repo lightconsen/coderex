@@ -1787,6 +1787,15 @@ impl ReplLoop {
             let cmd_name = parts[0].trim_start_matches('/');
             let args: Vec<String> = parts[1..].iter().map(|s| s.to_string()).collect();
 
+            // Built-in REPL commands that bypass the registry
+            match cmd_name {
+                "exit" | "quit" => {
+                    self.running = false;
+                    return;
+                }
+                _ => {}
+            }
+
             // Check for macro expansion first
             if self.macro_registry.has(cmd_name) {
                 if let Some(commands) = self.macro_registry.get(cmd_name) {
