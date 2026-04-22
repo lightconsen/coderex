@@ -13,6 +13,7 @@ use coderex_core::state::SessionState;
 use coderex_core::permissions::{PermissionChecker, PermissionMode};
 use coderex_core::api_client::ApiClient;
 use coderex_core::types::{EngineEvent, Message};
+use coderex_sdk::{SdkEvent, SdkSession};
 use coderex_memory::{
     ai_workflow, auto_dream::{AutoDream, DreamConfig}, DreamCheckResult,
     long_term::LongTermStore, session_memory::SessionMemoryStore,
@@ -126,6 +127,10 @@ pub struct ReplLoop {
     primary_tool_executor: Option<Arc<dyn coderex_core::tool_executor::ToolExecutor + Send + Sync>>,
     /// Receiver for cron job fire events.
     cron_rx: Option<tokio::sync::mpsc::UnboundedReceiver<(String, String)>>,
+    /// SDK session for headless/structured event consumers.
+    sdk_session: Option<Arc<SdkSession>>,
+    /// Background timeout checker for the SDK session.
+    sdk_timeout_handle: Option<tokio::task::JoinHandle<()>>,
 }
 
 /// Wrapper that implements `ToolExecutor` for `Arc<dyn ToolExecutor>`.
@@ -208,6 +213,8 @@ impl ReplLoop {
             plugin_manager: None,
             primary_tool_executor: None,
             cron_rx: None,
+            sdk_session: None,
+            sdk_timeout_handle: None,
             #[cfg(feature = "hot-reload")]
             config_changed_rx: None,
         };
@@ -301,6 +308,10 @@ impl ReplLoop {
         // Start cron background runner
         let cron_rx = cron_scheduler.spawn_runner();
 
+        // Create SDK session and start its timeout checker
+        let sdk_session = Arc::new(SdkSession::new(session_id.to_string()));
+        let sdk_timeout_handle = sdk_session.spawn_timeout_checker();
+
         let orchestrator = coderex_core::orchestrator::Orchestrator::new(api_client.clone_box());
         let (bg_tx, bg_rx) = mpsc::unbounded_channel::<BackgroundTaskResult>();
 
@@ -333,6 +344,8 @@ impl ReplLoop {
             plugin_manager: None,
             primary_tool_executor: Some(primary_executor),
             cron_rx: Some(cron_rx),
+            sdk_session: Some(sdk_session),
+            sdk_timeout_handle,
             #[cfg(feature = "hot-reload")]
             config_changed_rx,
         };
@@ -366,6 +379,13 @@ impl ReplLoop {
         }
 
         self.plugin_manager = Some(plugin_manager);
+    }
+
+    /// Forward an engine event into the SDK session's broadcast stream.
+    fn forward_engine_event(&self, event: &EngineEvent) {
+        if let Some(ref session) = self.sdk_session {
+            session.emit(SdkEvent::Engine(event.clone()));
+        }
     }
 
     /// Initialize command history and macro registry from disk.
@@ -844,6 +864,7 @@ impl ReplLoop {
                 Some(engine_event) = async {
                     event_rx.as_mut().unwrap().recv().await
                 }, if event_rx.is_some() => {
+                    self.forward_engine_event(&engine_event);
                     match engine_event {
                         EngineEvent::TextDelta(delta) => {
                             if let Some(last) = ui_state.messages.messages.last_mut() {
@@ -1010,10 +1031,15 @@ impl ReplLoop {
         }
     }
 
-    /// Drain pending events from the event channel and append text deltas to output.
+    /// Drain pending events from the event channel, append text deltas to output,
+    /// and forward all events into the SDK session.
     fn drain_events(&mut self, output: &mut String) {
+        let sdk = self.sdk_session.clone();
         if let Some(ref mut rx) = self.event_rx {
             while let Ok(event) = rx.try_recv() {
+                if let Some(ref session) = sdk {
+                    session.emit(SdkEvent::Engine(event.clone()));
+                }
                 if let EngineEvent::TextDelta(delta) = event {
                     output.push_str(&delta);
                 }

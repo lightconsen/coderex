@@ -55,11 +55,13 @@ Provides a structured event-driven API for headless and embedded usage of CodeRe
 - **Backpressure handling** — `SdkSubscriber` tracks lag via `try_recv()`; capacity increased to 4096; warnings logged.
 - **Schema validation** — `PermissionSchema` with `ArgType` (String, Number, Boolean, Array, Object); validated in `PermissionTracker::create()`.
 - **Comprehensive documentation** — Module-level examples, per-variant rustdoc on `SdkEvent`, inline docs on all public items.
+- **Engine event bridge** — `ReplLoop::with_engine()` creates an `SdkSession` and forwards every `EngineEvent` from `QueryEngine` into the SDK session as `SdkEvent::Engine(...)`. TUI and headless modes both forward events.
+- **Tool execution bridge** — The `QueryEngine` already emits `ToolCallStart`/`ToolCallEnd` as `EngineEvent`s during tool dispatch. These are bridged into the SDK session, so external subscribers see tool lifecycle events.
+- **SDK timeout checker** — `SdkSession::spawn_timeout_checker()` runs a background task that auto-resolves expired permissions and elicitations every 5 seconds.
 
 ### What Is Stubbed/Partial
 
-- **No integration with actual tool execution**: `ToolCallStart`/`ToolCallEnd` are emitted but no caller actually emits them in this crate.
-- **`Engine` variant**: Wraps `coderex_core::types::EngineEvent` but the core integration is not visible here.
+None — all identified stubs are bridged.
 
 ### Tests
 
