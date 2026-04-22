@@ -31,13 +31,15 @@ Implements the tool trait system, registers built-in tools, and provides executi
 | AskUserQuestion | Interactive | Functional |
 | SendMessage, EnterPlanMode, ExitPlanMode | Agent flow | Functional |
 | NotebookEdit | Jupyter | Functional |
-| LspTool | LSP integration | Stub |
-| McpAuthTool | MCP auth | Stub |
+| LspTool | LSP integration | Functional (spawns language server, JSON-RPC stdio) |
+| McpAuthTool | MCP auth | Stub (returns auth URL, no OAuth exchange) |
 | ConfigTool | Settings read | Functional |
 | Echo, NoOp, Sleep | Utilities | Functional |
-| RemoteTriggerTool | Remote execution | Stub |
-| ReplTool, AgentTool | REPL/Agent | Partial |
-| StructuredOutputTool, SyntheticOutputTool | Output formatting | Partial |
+| RemoteTriggerTool | Remote execution | Functional (HTTP POST to bridge server) |
+| ReplTool | REPL command | Functional (intentional no-op — handled by session UI) |
+| AgentTool | Agent spawning | Functional (integrates with AgentManager) |
+| StructuredOutputTool | Output validation | Functional (custom JSON schema validator) |
+| SyntheticOutputTool | Output formatting | Functional (plain/json/display modes) |
 
 ### Architecture Patterns
 
@@ -59,21 +61,17 @@ Implements the tool trait system, registers built-in tools, and provides executi
 
 ### What Is Stubbed/Partial
 
-- **LspTool** — Exists but minimal implementation.
-- **McpAuthTool** — Auth flow not fully implemented.
-- **RemoteTriggerTool** — No actual remote execution.
-- **Cron jobs never execute** — `CronScheduler` parses but no runner triggers jobs.
-- **Task store is in-memory only** — No persistence across restarts.
+- **McpAuthTool** — Returns an auth URL but does not perform the actual MCP OAuth flow (no browser open, no token exchange).
+- **Cron jobs never execute** — `CronScheduler` parses expressions and persists jobs, but there is no background tokio task that polls and fires them.
+- **Task store is in-memory only** — `TaskStore` uses a `DashMap` with no load/save; all tasks are lost on restart.
 
 ## Gaps for Production
 
 - **SECURITY — Shell sandbox is basic**: `SandboxConfig` exists but sandboxing relies on OS-level features; command injection still possible via crafted arguments.
   → **Suggestion**: Implement a proper sandbox using `seccomp-bpf` (Linux) or `sandbox-exec` (macOS) for BashTool. Parse and validate command arguments against an allowlist before execution.
-- **No tool output size limits**: Large file reads or command outputs could OOM the process.
-  → **Suggestion**: Add a `max_output_bytes` field to `ToolContext` (default 1MB). Truncate outputs with a "... [truncated]" suffix and emit a warning event.
-- **No tool timeout enforcement**: `BashTool` can hang indefinitely.
-  → **Suggestion**: Wrap all tool `execute()` calls in `tokio::time::timeout` with a configurable duration (default 60s for shell, 10s for file ops). Return a timeout-specific error variant.
-- **No tool result caching**: Repeated identical tool calls hit the filesystem every time.
+- **No global tool output size limit**: The `Read` tool caps at 2000 lines with truncation, but other tools (e.g., `Bash`, `WebFetch`) have no output bound.
+  → **Suggestion**: Add a `max_output_bytes` field to `ToolContext` (default 1MB) enforced by `ToolExecutor`. Truncate outputs with a "... [truncated]" suffix and emit a warning event.
+- **No global tool result caching**: `WebFetch` has a simple URL cache, but repeated identical calls to file, shell, or search tools hit the underlying system every time.
   → **Suggestion**: Add an LRU cache keyed by `(tool_name, arguments_hash)` in `ToolRegistry`. Invalidate on file modification time for file-read tools. Use `moka` crate for concurrent caching.
 - **WebFetch may follow redirects to arbitrary domains**: No domain whitelist.
   → **Suggestion**: Add `allowed_domains` to `WebFetch` tool config. Use `reqwest` redirect policy to intercept and validate the final URL against the whitelist before following.
