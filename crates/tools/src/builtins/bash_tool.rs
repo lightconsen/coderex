@@ -92,8 +92,47 @@ const MAX_TIMEOUT_SECS: u64 = 600;
 const MAX_OUTPUT_BYTES: usize = 50000;
 
 /// Execute shell commands with timeout control.
-#[derive(Debug)]
-pub struct BashTool;
+#[derive(Debug, Default)]
+pub struct BashTool {
+    /// Optional allowlist of permitted commands.
+    /// When `Some`, only commands whose first token is in the list are allowed.
+    allowed_commands: Option<Vec<String>>,
+}
+
+impl BashTool {
+    /// Create a new Bash tool.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Restrict execution to a list of permitted command names.
+    pub fn with_allowed_commands(mut self, commands: Vec<String>) -> Self {
+        self.allowed_commands = Some(commands);
+        self
+    }
+
+    /// Validate that `command` does not contain shell metacharacters
+    /// and that its first token is in the allowlist (if configured).
+    fn validate_command(&self, command: &str) -> Result<(), ToolError> {
+        if let Some(ref allowed) = self.allowed_commands {
+            // Reject common shell metacharacters that enable command injection
+            let forbidden = [';', '|', '&', '`', '$', '(', ')', '<', '>'];
+            if command.chars().any(|c| forbidden.contains(&c)) {
+                return Err(ToolError::InvalidInput {
+                    message: "shell metacharacters are not permitted when an allowlist is active".into(),
+                });
+            }
+
+            let first_token = command.split_whitespace().next().unwrap_or("");
+            if !allowed.iter().any(|a| a == first_token) {
+                return Err(ToolError::PermissionDenied {
+                    name: first_token.into(),
+                });
+            }
+        }
+        Ok(())
+    }
+}
 
 #[async_trait]
 impl Tool for BashTool {
@@ -131,6 +170,9 @@ impl Tool for BashTool {
         let timeout_secs = extract_number(&input.arguments, "timeout")
             .unwrap_or(DEFAULT_TIMEOUT_SECS as i64)
             .clamp(1, MAX_TIMEOUT_SECS as i64) as u64;
+
+        // Validate against allowlist and metacharacters
+        self.validate_command(&command)?;
 
         // Shell security analysis
         let ast = BashAst::parse(&command);
@@ -231,7 +273,7 @@ mod tests {
 
     #[tokio::test]
     async fn simple_command() {
-        let output = BashTool
+        let output = BashTool::new()
             .execute(bash_input("echo hello"), test_ctx(Path::new("/tmp")))
             .await
             .unwrap();
@@ -241,7 +283,7 @@ mod tests {
 
     #[tokio::test]
     async fn command_with_stderr() {
-        let output = BashTool
+        let output = BashTool::new()
             .execute(
                 bash_input("echo stderr_out >&2"),
                 test_ctx(Path::new("/tmp")),
@@ -258,13 +300,13 @@ mod tests {
             name: "Bash".into(),
             arguments: serde_json::json!({ "command": "sleep 10", "timeout": 1 }),
         };
-        let result = BashTool.execute(input, test_ctx(Path::new("/tmp"))).await;
+        let result = BashTool::new().execute(input, test_ctx(Path::new("/tmp"))).await;
         assert!(matches!(result, Err(ToolError::Timeout { .. })));
     }
 
     #[tokio::test]
     async fn nonexistent_command_errors() {
-        let output = BashTool
+        let output = BashTool::new()
             .execute(
                 bash_input("nonexistent_command_xyz_123"),
                 test_ctx(Path::new("/tmp")),
@@ -278,7 +320,7 @@ mod tests {
 
     #[tokio::test]
     async fn exit_code_captured() {
-        let output = BashTool
+        let output = BashTool::new()
             .execute(bash_input("exit 42"), test_ctx(Path::new("/tmp")))
             .await
             .unwrap();
@@ -304,7 +346,7 @@ mod tests {
         let ctx = ToolContext::new(ExecutionContext::Normal, Path::new("/tmp"))
             .with_extra(extra);
 
-        let output = BashTool
+        let output = BashTool::new()
             .execute(bash_input("echo sandboxed"), ctx)
             .await
             .unwrap();

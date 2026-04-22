@@ -8,9 +8,12 @@
 //! graph.
 
 use crate::context::{ExecutionContext, ToolError};
+use crate::cron_scheduler::{CronScheduler, CRON_SCHEDULER_KEY};
 use crate::executor::ToolExecutor as InnerExecutor;
+use crate::rate_limiter::{RateLimiter, RATE_LIMITER_KEY};
 use crate::registry::ToolRegistry;
 use crate::sandbox_policy;
+use crate::task_store::{TaskStore, TASK_STORE_KEY};
 use crate::tool::{ToolContext, ToolInput, SharedState};
 use coderex_core::tool_executor::{
     ToolDispatchOutcome, ToolExecutor as CoreToolExecutor,
@@ -31,6 +34,9 @@ pub struct RegistryToolDispatcher {
     cwd: PathBuf,
     sandbox_enabled: bool,
     sandbox_override: Option<coderex_core::sandbox::SandboxConfig>,
+    task_store: Option<Arc<TaskStore>>,
+    cron_scheduler: Option<Arc<CronScheduler>>,
+    rate_limiter: Option<Arc<RateLimiter>>,
 }
 
 impl RegistryToolDispatcher {
@@ -51,6 +57,9 @@ impl RegistryToolDispatcher {
             cwd,
             sandbox_enabled,
             sandbox_override: None,
+            task_store: None,
+            cron_scheduler: None,
+            rate_limiter: None,
         }
     }
 
@@ -62,6 +71,21 @@ impl RegistryToolDispatcher {
     /// Set a custom sandbox config that overrides the default per-tool policy.
     pub fn set_sandbox_override(&mut self, config: Option<coderex_core::sandbox::SandboxConfig>) {
         self.sandbox_override = config;
+    }
+
+    /// Attach a shared task store for task tools.
+    pub fn set_task_store(&mut self, store: Arc<TaskStore>) {
+        self.task_store = Some(store);
+    }
+
+    /// Attach a shared cron scheduler for cron tools.
+    pub fn set_cron_scheduler(&mut self, scheduler: Arc<CronScheduler>) {
+        self.cron_scheduler = Some(scheduler);
+    }
+
+    /// Attach a shared rate limiter for web tools.
+    pub fn set_rate_limiter(&mut self, limiter: Arc<RateLimiter>) {
+        self.rate_limiter = Some(limiter);
     }
 }
 
@@ -90,6 +114,9 @@ impl CoreToolExecutor for RegistryToolDispatcher {
 
         let mut ctx = ToolContext::new(self.context, &self.cwd);
 
+        // Build shared state map
+        let mut extra = HashMap::new();
+
         // Inject sandbox config if enabled
         if self.sandbox_enabled {
             let config = self
@@ -97,13 +124,39 @@ impl CoreToolExecutor for RegistryToolDispatcher {
                 .clone()
                 .or_else(|| sandbox_policy::default_sandbox_config(tool_name, &self.cwd));
             if let Some(config) = config {
-                let mut extra = HashMap::new();
                 extra.insert(
                     "sandbox_config".to_string(),
                     Box::new(config) as SharedState,
                 );
-                ctx = ctx.with_extra(extra);
             }
+        }
+
+        // Inject task store
+        if let Some(ref store) = self.task_store {
+            extra.insert(
+                TASK_STORE_KEY.to_string(),
+                Box::new(Arc::clone(store)) as SharedState,
+            );
+        }
+
+        // Inject cron scheduler
+        if let Some(ref scheduler) = self.cron_scheduler {
+            extra.insert(
+                CRON_SCHEDULER_KEY.to_string(),
+                Box::new(Arc::clone(scheduler)) as SharedState,
+            );
+        }
+
+        // Inject rate limiter
+        if let Some(ref limiter) = self.rate_limiter {
+            extra.insert(
+                RATE_LIMITER_KEY.to_string(),
+                Box::new(Arc::clone(limiter)) as SharedState,
+            );
+        }
+
+        if !extra.is_empty() {
+            ctx = ctx.with_extra(extra);
         }
 
         let call_input = ToolInput {
@@ -136,6 +189,9 @@ impl CoreToolExecutor for RegistryToolDispatcher {
                     }
                     ToolError::PermissionDenied { name } => {
                         format!("tool '{name}' permission denied")
+                    }
+                    ToolError::RateLimited { name } => {
+                        format!("tool '{name}' rate limit exceeded")
                     }
                 };
                 ToolDispatchOutcome {

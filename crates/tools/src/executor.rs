@@ -17,6 +17,8 @@ pub struct ExecutionConfig {
     pub max_concurrent: usize,
     /// Whether to enforce sandbox restrictions for tool execution.
     pub sandbox_enabled: bool,
+    /// Maximum output size in bytes before truncation.
+    pub max_output_bytes: usize,
 }
 
 impl Default for ExecutionConfig {
@@ -25,6 +27,7 @@ impl Default for ExecutionConfig {
             default_timeout: Duration::from_secs(60),
             max_concurrent: 4,
             sandbox_enabled: true,
+            max_output_bytes: 1_048_576, // 1 MB
         }
     }
 }
@@ -53,6 +56,18 @@ impl ToolExecutor {
         self.config.sandbox_enabled
     }
 
+    /// Truncate tool output if it exceeds `max_output_bytes`.
+    fn truncate_output(&self, mut output: ToolOutput) -> ToolOutput {
+        let max = self.config.max_output_bytes;
+        if output.output.len() > max {
+            let mut truncated = output.output;
+            truncated.truncate(max);
+            truncated.push_str("\n... [truncated]");
+            output.output = truncated;
+        }
+        output
+    }
+
     /// Get or create a lock for a specific tool name.
     async fn get_lock(&self, tool_name: &str) -> Arc<Mutex<()>> {
         let mut locks = self.locks.lock().await;
@@ -76,23 +91,25 @@ impl ToolExecutor {
         let desc = tool.descriptor();
 
         // For non-concurrency-safe tools, serialize execution
-        if !desc.is_concurrency_safe {
+        let result = if !desc.is_concurrency_safe {
             let tool_name = desc.name.clone();
             let lock = self.get_lock(&tool_name).await;
             let _guard = lock.lock().await;
-            return timeout(self.config.default_timeout, tool.execute(input, ctx))
+            timeout(self.config.default_timeout, tool.execute(input, ctx))
                 .await
                 .map_err(|_| ToolError::Timeout {
                     timeout: self.config.default_timeout,
-                })?;
-        }
+                })?
+        } else {
+            // Concurrency-safe tools run without serialization
+            timeout(self.config.default_timeout, tool.execute(input, ctx))
+                .await
+                .map_err(|_| ToolError::Timeout {
+                    timeout: self.config.default_timeout,
+                })?
+        };
 
-        // Concurrency-safe tools run without serialization
-        timeout(self.config.default_timeout, tool.execute(input, ctx))
-            .await
-            .map_err(|_| ToolError::Timeout {
-                timeout: self.config.default_timeout,
-            })?
+        result.map(|output| self.truncate_output(output))
     }
 
     /// Execute multiple tool calls in concurrent batches.
@@ -113,15 +130,24 @@ impl ToolExecutor {
                 let input = input.clone();
                 let ctx = ctx.clone();
                 let exec_timeout = self.config.default_timeout;
+                let max_output_bytes = self.config.max_output_bytes;
 
                 let handle = tokio::spawn(async move {
                     let desc = tool.descriptor();
 
                     drop(desc);
 
-                    tokio::time::timeout(exec_timeout, tool.execute(input, ctx))
+                    let result = tokio::time::timeout(exec_timeout, tool.execute(input, ctx))
                         .await
-                        .map_err(|_| ToolError::Timeout { timeout: exec_timeout })?
+                        .map_err(|_| ToolError::Timeout { timeout: exec_timeout })?;
+
+                    result.map(|mut output| {
+                        if output.output.len() > max_output_bytes {
+                            output.output.truncate(max_output_bytes);
+                            output.output.push_str("\n... [truncated]");
+                        }
+                        output
+                    })
                 });
 
                 handles.push(handle);

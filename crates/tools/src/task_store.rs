@@ -4,6 +4,9 @@ use chrono::{DateTime, Utc};
 use dashmap::DashMap;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
+use std::fs;
+use std::io::{BufRead, Write};
+use std::path::PathBuf;
 
 /// A task record stored in the TaskStore.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -83,6 +86,7 @@ impl TaskRecord {
 pub struct TaskStore {
     tasks: DashMap<String, TaskRecord>,
     counter: Mutex<u64>,
+    storage_path: Mutex<Option<PathBuf>>,
 }
 
 impl TaskStore {
@@ -91,7 +95,54 @@ impl TaskStore {
         Self {
             tasks: DashMap::new(),
             counter: Mutex::new(0),
+            storage_path: Mutex::new(None),
         }
+    }
+
+    /// Set the filesystem path used for `load` / `save`.
+    pub fn with_storage(self, path: PathBuf) -> Self {
+        *self.storage_path.lock() = Some(path);
+        self
+    }
+
+    /// Load tasks from a JSONL file if the storage path is set and the file exists.
+    pub fn load(&self) -> Result<(), String> {
+        let guard = self.storage_path.lock();
+        let path = guard.as_ref().ok_or_else(|| "no storage path set".to_string())?;
+        if !path.exists() {
+            return Ok(());
+        }
+        let file = fs::File::open(path).map_err(|e| format!("failed to open: {e}"))?;
+        let reader = std::io::BufReader::new(file);
+        for line in reader.lines() {
+            let line = line.map_err(|e| format!("failed to read line: {e}"))?;
+            if line.trim().is_empty() {
+                continue;
+            }
+            let record: TaskRecord =
+                serde_json::from_str(&line).map_err(|e| format!("failed to parse: {e}"))?;
+            self.tasks.insert(record.id.clone(), record);
+        }
+        Ok(())
+    }
+
+    /// Persist all non-deleted tasks to the JSONL file.
+    pub fn save(&self) -> Result<(), String> {
+        let guard = self.storage_path.lock();
+        let path = guard.as_ref().ok_or_else(|| "no storage path set".to_string())?;
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).map_err(|e| format!("failed to create dir: {e}"))?;
+        }
+        let mut file = fs::File::create(path).map_err(|e| format!("failed to create file: {e}"))?;
+        for record in self.tasks.iter() {
+            if record.value().status == TaskStatus::Deleted {
+                continue;
+            }
+            let line = serde_json::to_string(record.value())
+                .map_err(|e| format!("failed to serialize: {e}"))?;
+            writeln!(file, "{line}").map_err(|e| format!("failed to write: {e}"))?;
+        }
+        Ok(())
     }
 
     /// Generate a unique task ID.
@@ -104,6 +155,7 @@ impl TaskStore {
     /// Create a new task.
     pub fn create(&self, record: TaskRecord) {
         self.tasks.insert(record.id.clone(), record);
+        let _ = self.save();
     }
 
     /// Get a task by ID.
@@ -131,7 +183,7 @@ impl TaskStore {
         description: Option<String>,
         active_form: Option<String>,
     ) -> bool {
-        if let Some(mut r) = self.tasks.get_mut(id) {
+        let ok = if let Some(mut r) = self.tasks.get_mut(id) {
             if let Some(s) = status {
                 r.status = s;
             }
@@ -147,7 +199,25 @@ impl TaskStore {
             true
         } else {
             false
+        };
+        if ok {
+            let _ = self.save();
         }
+        ok
+    }
+
+    /// Delete a task by marking it as deleted.
+    pub fn delete(&self, id: &str) -> bool {
+        let ok = if let Some(mut r) = self.tasks.get_mut(id) {
+            r.status = TaskStatus::Deleted;
+            true
+        } else {
+            false
+        };
+        if ok {
+            let _ = self.save();
+        }
+        ok
     }
 
     /// Set the output file path for a task.
@@ -155,6 +225,7 @@ impl TaskStore {
         if let Some(mut r) = self.tasks.get_mut(id) {
             r.output_file_path = Some(path.to_string());
         }
+        let _ = self.save();
     }
 
     /// Set the owner for a task.
@@ -162,6 +233,7 @@ impl TaskStore {
         if let Some(mut r) = self.tasks.get_mut(id) {
             r.owner = Some(owner.to_string());
         }
+        let _ = self.save();
     }
 }
 

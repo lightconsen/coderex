@@ -37,6 +37,7 @@ async-trait.workspace = true
 regex.workspace = true
 base64.workspace = true
 chrono.workspace = true
+uuid.workspace = true
 cron = "0.15"
 html2text = "0.13"
 lsp-types.workspace = true

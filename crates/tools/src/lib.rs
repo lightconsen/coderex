@@ -12,6 +12,7 @@ mod sandbox_policy;
 mod todo_store;
 mod task_store;
 mod cron_scheduler;
+mod rate_limiter;
 
 pub use tool::{Tool, ToolInput, InterruptBehavior, ToolTier};
 pub use registry::{ToolRegistry, ToolDenyRule, ToolNotFoundError};
@@ -31,3 +32,4 @@ pub use sandbox_policy::{default_sandbox_config, is_path_allowed};
 pub use todo_store::{TodoItem, TodoStatus, TodoStore, TODO_STORE_KEY};
 pub use task_store::{TaskRecord, TaskStatus, TaskStore, TASK_STORE_KEY};
 pub use cron_scheduler::{CronJob, CronScheduler, CRON_SCHEDULER_KEY};
+pub use rate_limiter::{RateLimiter, RateLimitConfig, RATE_LIMITER_KEY};

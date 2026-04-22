@@ -19,8 +19,8 @@ use coderex_memory::{
     team_memory::TeamMemorySyncService,
 };
 use coderex_tools::{
-    register_builtin_tools, ExecutionConfig, ExecutionContext, RegistryToolDispatcher,
-    ToolExecutor as ToolsExecutor, ToolRegistry,
+    register_builtin_tools, CronScheduler, ExecutionConfig, ExecutionContext,
+    RateLimiter, RegistryToolDispatcher, TaskStore, ToolExecutor as ToolsExecutor, ToolRegistry,
 };
 use std::collections::HashMap;
 use std::io::{BufRead, Write};
@@ -124,6 +124,8 @@ pub struct ReplLoop {
     plugin_manager: Option<Arc<coderex_plugins::plugins::PluginManager>>,
     /// Primary tool executor (stored so plugin fallback can be layered on top).
     primary_tool_executor: Option<Arc<dyn coderex_core::tool_executor::ToolExecutor + Send + Sync>>,
+    /// Receiver for cron job fire events.
+    cron_rx: Option<tokio::sync::mpsc::UnboundedReceiver<(String, String)>>,
 }
 
 /// Wrapper that implements `ToolExecutor` for `Arc<dyn ToolExecutor>`.
@@ -205,6 +207,7 @@ impl ReplLoop {
             pending_destructive_cmd: None,
             plugin_manager: None,
             primary_tool_executor: None,
+            cron_rx: None,
             #[cfg(feature = "hot-reload")]
             config_changed_rx: None,
         };
@@ -264,16 +267,39 @@ impl ReplLoop {
         register_builtin_tools(&mut registry);
         let registry = Arc::new(registry);
         let inner_executor = Arc::new(ToolsExecutor::new(ExecutionConfig::default()));
-        let dispatcher = RegistryToolDispatcher::new(
+        let mut dispatcher = RegistryToolDispatcher::new(
             registry,
             inner_executor,
             ExecutionContext::Normal,
             std::path::PathBuf::from(&cwd),
         );
+
+        // Shared task store with persistence
+        let config_home = coderex_config::config_home();
+        let task_store = Arc::new(
+            TaskStore::new().with_storage(config_home.join("tasks.jsonl")),
+        );
+        let _ = task_store.load();
+        dispatcher.set_task_store(Arc::clone(&task_store));
+
+        // Shared cron scheduler with persistence
+        let cron_scheduler = Arc::new(
+            CronScheduler::new().with_storage(config_home.join("scheduled_tasks.json")),
+        );
+        let _ = cron_scheduler.load();
+        dispatcher.set_cron_scheduler(Arc::clone(&cron_scheduler));
+
+        // Shared rate limiter for web tools
+        let rate_limiter = Arc::new(RateLimiter::new());
+        dispatcher.set_rate_limiter(Arc::clone(&rate_limiter));
+
         let primary_executor: Arc<dyn coderex_core::tool_executor::ToolExecutor + Send + Sync> = Arc::new(dispatcher);
         let arc_exec = ArcToolExecutor(Arc::clone(&primary_executor));
         engine.set_tool_executor(Box::new(arc_exec.clone()));
         engine.recover_orphaned_permissions();
+
+        // Start cron background runner
+        let cron_rx = cron_scheduler.spawn_runner();
 
         let orchestrator = coderex_core::orchestrator::Orchestrator::new(api_client.clone_box());
         let (bg_tx, bg_rx) = mpsc::unbounded_channel::<BackgroundTaskResult>();
@@ -306,6 +332,7 @@ impl ReplLoop {
             pending_destructive_cmd: None,
             plugin_manager: None,
             primary_tool_executor: Some(primary_executor),
+            cron_rx: Some(cron_rx),
             #[cfg(feature = "hot-reload")]
             config_changed_rx,
         };
@@ -400,6 +427,13 @@ impl ReplLoop {
         loop {
             if !self.running {
                 break;
+            }
+
+            // Drain any cron fire events
+            if let Some(ref mut rx) = self.cron_rx {
+                while let Ok((job_id, prompt)) = rx.try_recv() {
+                    writeln!(stdout, "[Cron {job_id}] {prompt}")?;
+                }
             }
 
             write!(stdout, "❯ ")?;
@@ -893,6 +927,18 @@ impl ReplLoop {
                             });
                         }
                     }
+                }
+
+                Some((job_id, prompt)) = async {
+                    self.cron_rx.as_mut().unwrap().recv().await
+                }, if self.cron_rx.is_some() => {
+                    ui_state.messages.push(Message {
+                        role: MessageRole::System,
+                        content: format!("[Cron {job_id}] {prompt}").into(),
+                        tool_name: None,
+                        streaming: false,
+                        folded: false,
+                    });
                 }
 
                 else => break Ok(()),

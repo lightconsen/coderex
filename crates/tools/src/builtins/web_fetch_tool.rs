@@ -46,8 +46,24 @@ impl WebFetchCache {
 pub const WEB_FETCH_CACHE_KEY: &str = "web_fetch_cache";
 
 /// Fetch web pages and convert HTML to markdown.
-#[derive(Debug)]
-pub struct WebFetchTool;
+#[derive(Debug, Default)]
+pub struct WebFetchTool {
+    allowed_domains: Vec<String>,
+}
+
+impl WebFetchTool {
+    /// Create a new WebFetch tool.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Restrict redirects to the given list of domains.
+    /// An empty list means no restriction (allow all).
+    pub fn with_allowed_domains(mut self, domains: Vec<String>) -> Self {
+        self.allowed_domains = domains;
+        self
+    }
+}
 
 #[async_trait]
 impl Tool for WebFetchTool {
@@ -95,11 +111,35 @@ impl Tool for WebFetchTool {
             None
         };
 
+        // Rate limit check (skip if cached)
         let content = if let Some(cached) = cached {
             cached
         } else {
+            if let Some(limiter) = crate::rate_limiter::get_rate_limiter(&_ctx) {
+                if !limiter.check("WebFetch", 30) {
+                    return Err(crate::context::ToolError::RateLimited {
+                        name: "WebFetch".into(),
+                    });
+                }
+            }
+
+            let allowed = self.allowed_domains.clone();
+            let redirect_policy = if allowed.is_empty() {
+                reqwest::redirect::Policy::default()
+            } else {
+                reqwest::redirect::Policy::custom(move |attempt| {
+                    if let Some(host) = attempt.url().host_str() {
+                        if allowed.iter().any(|d| host == d.as_str() || host.ends_with(&format!(".{d}"))) {
+                            return attempt.follow();
+                        }
+                    }
+                    attempt.stop()
+                })
+            };
+
             let client = reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(30))
+                .redirect(redirect_policy)
                 .build()
                 .map_err(|e| ToolError::InvalidInput {
                     message: format!("failed to create HTTP client: {e}"),
@@ -206,7 +246,7 @@ mod tests {
 
     #[tokio::test]
     async fn webfetch_invalid_url() {
-        let result = WebFetchTool
+        let result = WebFetchTool::new()
             .execute(webfetch_input("not-a-url", "test"), test_ctx())
             .await;
         assert!(result.is_err());
@@ -219,7 +259,7 @@ mod tests {
             name: "WebFetch".into(),
             arguments: serde_json::json!({ "url": "http://example.com" }),
         };
-        let result = WebFetchTool.execute(input, test_ctx()).await;
+        let result = WebFetchTool::new().execute(input, test_ctx()).await;
         assert!(result.is_err());
     }
 

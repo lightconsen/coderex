@@ -185,13 +185,13 @@ pub fn register_builtin_tools(reg: &mut crate::registry::ToolRegistry) {
     reg.register(Arc::new(WriteTool));
     reg.register(Arc::new(EditTool));
     reg.register(Arc::new(NotebookEditTool));
-    reg.register(Arc::new(BashTool));
+    reg.register(Arc::new(BashTool::new()));
     reg.register(Arc::new(PowerShellTool));
     reg.register(Arc::new(SleepTool));
     reg.register(Arc::new(GlobTool));
     reg.register(Arc::new(GrepTool));
     reg.register(Arc::new(LspTool));
-    reg.register(Arc::new(WebFetchTool));
+    reg.register(Arc::new(WebFetchTool::new()));
     reg.register(Arc::new(WebSearchTool));
     reg.register(Arc::new(TodoWriteTool));
     reg.register(Arc::new(AskUserQuestionTool));

@@ -53,6 +53,12 @@ pub enum ToolError {
         /// The name of the tool that was denied.
         name: String,
     },
+    /// Rate limit exceeded for tool execution.
+    #[error("rate limit exceeded for tool '{name}'")]
+    RateLimited {
+        /// The name of the tool that was rate limited.
+        name: String,
+    },
 }
 
 /// Output from a successful tool execution.

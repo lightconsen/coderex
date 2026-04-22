@@ -6,7 +6,9 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::sync::RwLock;
+use tokio::sync::mpsc;
 
 /// Key used to store the cron scheduler in `ToolContext.extra`.
 pub const CRON_SCHEDULER_KEY: &str = "cron_scheduler";
@@ -169,6 +171,37 @@ impl CronScheduler {
     /// Get the prompt for a job by ID.
     pub fn get_prompt(&self, id: &str) -> Option<String> {
         self.jobs.read().unwrap().get(id).map(|j| j.prompt.clone())
+    }
+
+    /// Spawn a background tokio task that polls jobs every 60 seconds.
+    ///
+    /// Returns an unbounded receiver that yields `(job_id, prompt)` for each
+    /// job that fires. The consumer should call `mark_fired(job_id)` after
+    /// handling the prompt.
+    pub fn spawn_runner(
+        self: Arc<Self>,
+    ) -> mpsc::UnboundedReceiver<(String, String)> {
+        let (tx, rx) = mpsc::unbounded_channel::<(String, String)>();
+
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+            loop {
+                interval.tick().await;
+
+                let jobs = self.list();
+                for job in jobs {
+                    if self.should_fire(&job.id) {
+                        if let Some(prompt) = self.get_prompt(&job.id) {
+                            let _ = tx.send((job.id.clone(), prompt));
+                        }
+                    }
+                }
+            }
+        });
+
+        rx
     }
 }
 

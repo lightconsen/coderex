@@ -45,6 +45,15 @@ impl Tool for WebSearchTool {
         let allowed_domains = extract_string_array(&input.arguments, "allowed_domains");
         let blocked_domains = extract_string_array(&input.arguments, "blocked_domains");
 
+        // Rate limit check
+        if let Some(limiter) = crate::rate_limiter::get_rate_limiter(&_ctx) {
+            if !limiter.check("WebSearch", 10) {
+                return Err(ToolError::RateLimited {
+                    name: "WebSearch".into(),
+                });
+            }
+        }
+
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(30))
             .build()
