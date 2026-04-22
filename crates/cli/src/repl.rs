@@ -125,6 +125,10 @@ pub struct ReplLoop {
     plugin_manager: Option<Arc<coderex_plugins::plugins::PluginManager>>,
     /// Primary tool executor (stored so plugin fallback can be layered on top).
     primary_tool_executor: Option<Arc<dyn coderex_core::tool_executor::ToolExecutor + Send + Sync>>,
+    /// Dispatcher reference for setting per-turn state (e.g., elicitation channel).
+    dispatcher: Option<Arc<RegistryToolDispatcher>>,
+    /// Pending elicitation response sender — when set, user input is treated as an answer.
+    pending_elicitation: Option<tokio::sync::oneshot::Sender<serde_json::Value>>,
     /// Receiver for cron job fire events.
     cron_rx: Option<tokio::sync::mpsc::UnboundedReceiver<(String, String)>>,
     /// SDK session for headless/structured event consumers.
@@ -214,6 +218,8 @@ impl ReplLoop {
             pending_destructive_cmd: None,
             plugin_manager: None,
             primary_tool_executor: None,
+            dispatcher: None,
+            pending_elicitation: None,
             cron_rx: None,
             sdk_session: None,
             sdk_timeout_handle: None,
@@ -309,7 +315,8 @@ impl ReplLoop {
         // Chrome DevTools client for browser automation tools
         dispatcher.set_chrome_client(ChromeClient::new());
 
-        let primary_executor: Arc<dyn coderex_core::tool_executor::ToolExecutor + Send + Sync> = Arc::new(dispatcher);
+        let dispatcher = Arc::new(dispatcher);
+        let primary_executor: Arc<dyn coderex_core::tool_executor::ToolExecutor + Send + Sync> = dispatcher.clone();
         let arc_exec = ArcToolExecutor(Arc::clone(&primary_executor));
         engine.set_tool_executor(Box::new(arc_exec.clone()));
         engine.recover_orphaned_permissions();
@@ -352,6 +359,8 @@ impl ReplLoop {
             pending_destructive_cmd: None,
             plugin_manager: None,
             primary_tool_executor: Some(primary_executor),
+            dispatcher: Some(dispatcher),
+            pending_elicitation: None,
             cron_rx: Some(cron_rx),
             sdk_session: Some(sdk_session),
             sdk_timeout_handle,
@@ -375,8 +384,9 @@ impl ReplLoop {
         );
 
         // If we have a primary tool executor and an engine, layer plugin fallback
-        if let Some(primary) = self.primary_tool_executor.clone() {
+        if let Some(ref dispatcher) = self.dispatcher {
             if let Some(ref mut engine) = self.engine {
+                let primary: Arc<dyn coderex_core::tool_executor::ToolExecutor + Send + Sync> = dispatcher.clone();
                 let plugin_exec = Arc::new(coderex_plugins::tool_executor::PluginToolExecutor::new(
                     Arc::clone(&plugin_manager),
                 ));
@@ -544,6 +554,9 @@ impl ReplLoop {
         let mut query_done_rx: Option<
             tokio::sync::oneshot::Receiver<(QueryEngine, Result<TerminalReason, String>)>,
         > = None;
+        let mut elicit_rx: Option<
+            tokio::sync::mpsc::Receiver<coderex_tools::ElicitRequest>,
+        > = None;
 
         let result = loop {
             if !self.running {
@@ -688,6 +701,7 @@ impl ReplLoop {
                                             &mut ui_state,
                                             &mut thinking,
                                             &mut query_done_rx,
+                                            &mut elicit_rx,
                                         ).await;
                                     }
                                 }
@@ -923,6 +937,7 @@ impl ReplLoop {
                 }, if query_done_rx.is_some() => {
                     self.engine = Some(engine);
                     query_done_rx = None;
+                    elicit_rx = None;
                     thinking = false;
 
                     if let Some(last) = ui_state.messages.messages.last_mut() {
@@ -970,6 +985,45 @@ impl ReplLoop {
                         streaming: false,
                         folded: false,
                     });
+                }
+
+                Some(request) = async {
+                    elicit_rx.as_mut().unwrap().recv().await
+                }, if elicit_rx.is_some() => {
+                    for (i, q) in request.questions.iter().enumerate() {
+                        let text = q.get("question").and_then(|v| v.as_str()).unwrap_or("?");
+                        ui_state.messages.push(Message {
+                            role: MessageRole::System,
+                            content: format!("[Question {}] {}", i + 1, text).into(),
+                            tool_name: None,
+                            streaming: false,
+                            folded: false,
+                        });
+                        if let Some(options) = q.get("options").and_then(|v| v.as_array()) {
+                            for opt in options {
+                                if let (Some(label), Some(desc)) = (
+                                    opt.get("label").and_then(|v| v.as_str()),
+                                    opt.get("description").and_then(|v| v.as_str()),
+                                ) {
+                                    ui_state.messages.push(Message {
+                                        role: MessageRole::System,
+                                        content: format!("  {} — {}", label, desc).into(),
+                                        tool_name: None,
+                                        streaming: false,
+                                        folded: false,
+                                    });
+                                }
+                            }
+                        }
+                    }
+                    ui_state.messages.push(Message {
+                        role: MessageRole::System,
+                        content: "Type your answer and press Enter.".into(),
+                        tool_name: None,
+                        streaming: false,
+                        folded: false,
+                    });
+                    self.pending_elicitation = Some(request.response_tx);
                 }
 
                 else => break Ok(()),
@@ -1036,8 +1090,9 @@ impl ReplLoop {
             // 14.1: Route to QueryEngine instead of placeholder
             Ok(self.submit_prompt(prompt).await)
         } else {
-            // No engine configured — fall back to placeholder
-            Ok(format!("[QueryEngine would process: {prompt}]"))
+            return Err(anyhow::anyhow!(
+                "No QueryEngine configured. Set ANTHROPIC_API_KEY or run `coderex --api-key <key>`"
+            ));
         }
     }
 
@@ -1559,12 +1614,57 @@ impl ReplLoop {
     }
 
     async fn submit_prompt(&mut self, prompt: &str) -> String {
+        let (elicit_tx, mut elicit_rx) = tokio::sync::mpsc::channel::<coderex_tools::ElicitRequest>(4);
+
+        if let Some(ref dispatcher) = self.dispatcher {
+            dispatcher.set_elicit_tx(Some(elicit_tx));
+        }
+
         let mut output = String::new();
         self.drain_events(&mut output);
 
         let options = self.build_submit_options();
         let mut engine = self.engine.take().unwrap();
-        let result = engine.submit_streaming(prompt.to_string(), options).await;
+        let prompt_owned = prompt.to_string();
+        let (engine_tx, engine_rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let result = engine.submit_streaming(prompt_owned, options).await;
+            let _ = engine_tx.send((engine, result));
+        });
+
+        let mut engine_rx = Some(engine_rx);
+        let (engine, result) = loop {
+            tokio::select! {
+                Some(request) = elicit_rx.recv() => {
+                    for (i, q) in request.questions.iter().enumerate() {
+                        if let Some(text) = q.get("question").and_then(|v| v.as_str()) {
+                            println!("  [{}] {}", i + 1, text);
+                        }
+                        if let Some(options) = q.get("options").and_then(|v| v.as_array()) {
+                            for opt in options {
+                                if let (Some(label), Some(desc)) = (
+                                    opt.get("label").and_then(|v| v.as_str()),
+                                    opt.get("description").and_then(|v| v.as_str()),
+                                ) {
+                                    println!("     {} — {}", label, desc);
+                                }
+                            }
+                        }
+                    }
+                    print!("Your answer: ");
+                    let _ = std::io::Write::flush(&mut std::io::stdout());
+                    let mut line = String::new();
+                    let _ = std::io::stdin().read_line(&mut line);
+                    let answer = line.trim();
+                    let answers = serde_json::json!({ "answer": answer });
+                    let _ = request.response_tx.send(answers);
+                }
+                Ok((engine, result)) = async { engine_rx.take().unwrap().await }, if engine_rx.is_some() => {
+                    break (engine, result);
+                }
+            }
+        };
+
         self.engine = Some(engine);
 
         self.drain_events(&mut output);
@@ -1661,7 +1761,15 @@ impl ReplLoop {
         query_done_rx: &mut Option<
             tokio::sync::oneshot::Receiver<(QueryEngine, Result<TerminalReason, String>)>,
         >,
+        elicit_rx: &mut Option<tokio::sync::mpsc::Receiver<coderex_tools::ElicitRequest>>,
     ) {
+        // If there's a pending elicitation, treat this input as the answer.
+        if let Some(tx) = self.pending_elicitation.take() {
+            let answer = serde_json::json!({ "answer": text });
+            let _ = tx.send(answer);
+            return;
+        }
+
         self.history.push(text.to_string());
 
         // Add user message
@@ -1723,11 +1831,16 @@ impl ReplLoop {
             let mut engine = self.engine.take().unwrap();
             let prompt = text.to_string();
             let (tx, rx) = tokio::sync::oneshot::channel();
+            let (elicit_tx, erx) = tokio::sync::mpsc::channel(4);
+            if let Some(ref dispatcher) = self.dispatcher {
+                dispatcher.set_elicit_tx(Some(elicit_tx));
+            }
             tokio::spawn(async move {
                 let result = engine.submit_streaming(prompt, options).await;
                 let _ = tx.send((engine, result));
             });
             *query_done_rx = Some(rx);
+            *elicit_rx = Some(erx);
             *thinking = true;
         } else {
             ui_state.messages.push(coderex_ui::message_list::Message {
@@ -1855,8 +1968,10 @@ impl ReplLoop {
                 let output = self.submit_prompt(line).await;
                 writeln!(stdout, "{output}")?;
             } else {
-                self.history.push(line.to_string());
-                writeln!(stdout, "[Processing: {line}]")?;
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::NotConnected,
+                    "No QueryEngine configured. Set ANTHROPIC_API_KEY or run `coderex --api-key <key>`",
+                ));
             }
         }
         Ok(())
@@ -2542,9 +2657,10 @@ mod tests {
     #[tokio::test]
     async fn headless_message_without_engine() {
         let mut loop_obj = ReplLoop::new("/src".into(), ModelId::sonnet());
-        let result = loop_obj.run_headless("Hello").await.unwrap();
-        assert!(result.contains("Hello"));
-        assert!(result.contains("QueryEngine"));
+        let result = loop_obj.run_headless("Hello").await;
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("QueryEngine"), "expected QueryEngine in error: {err}");
     }
 
     #[tokio::test]

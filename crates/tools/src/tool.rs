@@ -79,6 +79,15 @@ pub trait Tool: Send + Sync {
     async fn execute(&self, input: ToolInput, ctx: ToolContext<'_>) -> Result<ToolOutput, ToolError>;
 }
 
+/// Request to elicit answers from the user mid-execution.
+#[derive(Debug)]
+pub struct ElicitRequest {
+    /// Questions to present to the user.
+    pub questions: Vec<serde_json::Value>,
+    /// Channel to receive answers back.
+    pub response_tx: tokio::sync::oneshot::Sender<serde_json::Value>,
+}
+
 /// Runtime context provided to tool execution.
 #[derive(Clone)]
 pub struct ToolContext<'a> {
@@ -88,6 +97,8 @@ pub struct ToolContext<'a> {
     pub cwd: &'a std::path::Path,
     /// Additional shared state (e.g., task stores, registries).
     pub extra: Arc<HashMap<String, SharedState>>,
+    /// Optional channel for asking the user questions mid-execution.
+    pub elicit_tx: Option<tokio::sync::mpsc::Sender<ElicitRequest>>,
 }
 
 impl fmt::Debug for ToolContext<'_> {
@@ -95,6 +106,7 @@ impl fmt::Debug for ToolContext<'_> {
         f.debug_struct("ToolContext")
             .field("execution_context", &self.execution_context)
             .field("cwd", &self.cwd)
+            .field("has_elicit_tx", &self.elicit_tx.is_some())
             .finish()
     }
 }
@@ -110,6 +122,7 @@ impl<'a> ToolContext<'a> {
             execution_context,
             cwd,
             extra: Arc::new(HashMap::new()),
+            elicit_tx: None,
         }
     }
 
@@ -117,6 +130,13 @@ impl<'a> ToolContext<'a> {
     #[must_use]
     pub fn with_extra(mut self, extra: HashMap<String, SharedState>) -> Self {
         self.extra = Arc::new(extra);
+        self
+    }
+
+    /// Attach an elicitation channel.
+    #[must_use]
+    pub fn with_elicit_tx(mut self, tx: tokio::sync::mpsc::Sender<ElicitRequest>) -> Self {
+        self.elicit_tx = Some(tx);
         self
     }
 }

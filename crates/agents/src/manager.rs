@@ -50,6 +50,9 @@ pub enum AgentError {
     /// Agent timed out.
     #[error("agent timed out after {0}s")]
     Timeout(u64),
+    /// Missing required configuration.
+    #[error("configuration error: {0}")]
+    Configuration(String),
 }
 
 // ─── Retry Policy ───────────────────────────────────────────────────────────
@@ -501,8 +504,8 @@ impl AgentManager {
     ///
     /// If an API client is configured, the agent runs in a background
     /// tokio task using a real [`QueryEngine`]. If no API client is
-    /// available, the agent is created but immediately marked as
-    /// complete with a placeholder output (useful for testing).
+    /// available, returns [`AgentError::Configuration`] in production.
+    /// In tests, a placeholder output is written for convenience.
     ///
     /// # Arguments
     /// * `agent_type` — Type of agent to spawn.
@@ -646,17 +649,24 @@ impl AgentManager {
 
             instance.task_join_handle = Some(handle);
         } else {
-            // No API client: write a placeholder and complete immediately.
-            // This preserves backward compatibility for tests.
-            let placeholder = format!(
-                "agent completed (no API client configured, no output file)\n\nAgent task: {prompt}"
-            );
-            let _ = tokio::fs::write(&output_file, &placeholder).await;
-            instance.status = AgentStatus::Completed;
-            completion_notify.notify_waiters();
-            tracing::warn!(
-                "agent spawned without API client: task_id={agent_id}, type={agent_type_name_str}"
-            );
+            #[cfg(test)]
+            {
+                // Test convenience: write placeholder and complete immediately
+                let placeholder = format!(
+                    "agent completed (no API client configured, no output file)\n\nAgent task: {prompt}"
+                );
+                let _ = tokio::fs::write(&output_file, &placeholder).await;
+                instance.status = AgentStatus::Completed;
+                completion_notify.notify_waiters();
+            }
+            #[cfg(not(test))]
+            {
+                return Err(AgentError::Configuration(
+                    "AgentManager requires an API client to spawn agents. \
+                     Configure one via set_api_client() before calling spawn_agent()."
+                        .into(),
+                ));
+            }
         }
 
         self.agents.insert(agent_id.clone(), instance);

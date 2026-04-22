@@ -57,21 +57,30 @@ impl Tool for AskUserQuestionTool {
         }
     }
 
-    async fn execute(&self, input: ToolInput, _ctx: ToolContext<'_>) -> Result<ToolOutput, ToolError> {
+    async fn execute(&self, input: ToolInput, ctx: ToolContext<'_>) -> Result<ToolOutput, ToolError> {
         let questions = input.arguments.get("questions").ok_or_else(|| ToolError::InvalidInput {
             message: "missing required field: questions".into(),
         })?;
 
-        // In a real implementation, this would use an elicitation channel
-        // to present questions to the user and wait for their response.
-        // For now, return a placeholder indicating the question was received.
-        let count = questions.as_array().map(|a| a.len()).unwrap_or(0);
+        let question_values: Vec<serde_json::Value> = questions.as_array()
+            .ok_or_else(|| ToolError::InvalidInput {
+                message: "questions must be an array".into(),
+            })?
+            .clone();
+
+        let tx = ctx.elicit_tx.ok_or(ToolError::ElicitationUnavailable)?;
+        let (response_tx, response_rx) = tokio::sync::oneshot::channel();
+
+        tx.send(crate::tool::ElicitRequest {
+            questions: question_values,
+            response_tx,
+        }).await.map_err(|_| ToolError::ElicitationUnavailable)?;
+
+        let answers = response_rx.await
+            .map_err(|_| ToolError::ElicitationUnavailable)?;
 
         Ok(ToolOutput {
-            output: serde_json::json!({
-                "answers": {},
-                "_note": format!("{count} question(s) received — user interaction not available in this context")
-            }).to_string(),
+            output: serde_json::json!({ "answers": answers }).to_string(),
             is_display: true,
         })
     }
@@ -91,12 +100,13 @@ mod tests {
             execution_context: ExecutionContext::Normal,
             cwd: Path::new("/tmp"),
             extra: Arc::new(HashMap::new()),
+            elicit_tx: None,
         }
     }
 
     #[tokio::test]
-    async fn ask_user_question_returns_placeholder() {
-        let output = AskUserQuestionTool
+    async fn ask_user_question_without_channel_errors() {
+        let result = AskUserQuestionTool
             .execute(
                 ToolInput {
                     call_id: "1".into(),
@@ -114,9 +124,47 @@ mod tests {
                 },
                 test_ctx(),
             )
-            .await
-            .unwrap();
-        assert!(output.output.contains("question"));
+            .await;
+        assert!(matches!(result, Err(ToolError::ElicitationUnavailable)));
+    }
+
+    #[tokio::test]
+    async fn ask_user_question_with_channel_receives_answers() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        let ctx = ToolContext {
+            execution_context: ExecutionContext::Normal,
+            cwd: Path::new("/tmp"),
+            extra: Arc::new(HashMap::new()),
+            elicit_tx: Some(tx),
+        };
+
+        let handle = tokio::spawn(async move {
+            AskUserQuestionTool
+                .execute(
+                    ToolInput {
+                        call_id: "1".into(),
+                        name: "AskUserQuestion".into(),
+                        arguments: serde_json::json!({
+                            "questions": [{
+                                "question": "Which library?",
+                                "header": "Library",
+                                "options": [
+                                    { "label": "A", "description": "Option A" }
+                                ]
+                            }]
+                        }),
+                    },
+                    ctx,
+                )
+                .await
+        });
+
+        let request = rx.recv().await.expect("should receive elicit request");
+        assert_eq!(request.questions.len(), 1);
+        let _ = request.response_tx.send(serde_json::json!({ "answer": "A" }));
+
+        let output = handle.await.unwrap().unwrap();
+        assert!(output.output.contains("A"));
     }
 
     #[tokio::test]

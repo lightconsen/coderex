@@ -15,7 +15,7 @@ mod cron_scheduler;
 mod rate_limiter;
 mod tool_cache;
 
-pub use tool::{Tool, ToolInput, InterruptBehavior, ToolTier};
+pub use tool::{Tool, ToolInput, InterruptBehavior, ToolTier, ElicitRequest};
 pub use registry::{ToolRegistry, ToolDenyRule, ToolNotFoundError};
 pub use context::{ExecutionContext, ToolError, ToolOutput};
 pub use builtins::{

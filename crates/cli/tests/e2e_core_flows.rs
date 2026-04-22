@@ -9,19 +9,20 @@ fn test_ctx(cwd: &str) -> CommandContext {
     CommandContext::new(cwd.into(), "e2e_test".into(), "E2E Test".into(), ModelId::sonnet())
 }
 
-// E2E: User asks question → assistant streams answer → correct content
+// E2E: User asks question → fails fast without QueryEngine
 #[tokio::test]
 async fn e2e_user_query_gets_response() {
     let mut repl = coderex_cli::ReplLoop::new("/src".into(), ModelId::sonnet());
-    let result = repl.run_headless("What is Rust?").await.unwrap();
-    assert!(result.contains("What is Rust?"));
+    let result = repl.run_headless("What is Rust?").await;
+    assert!(result.is_err());
+    assert!(result.unwrap_err().to_string().contains("QueryEngine"));
 }
 
 // E2E: Slash command /clear → session cleared
 #[tokio::test]
 async fn e2e_slash_clear_resets_session() {
     let mut repl = coderex_cli::ReplLoop::new("/src".into(), ModelId::sonnet());
-    repl.run_headless("Hello").await.unwrap();
+    repl.run_headless("Hello").await.expect_err("should fail without engine");
     let result = repl.run_headless("/clear").await.unwrap();
     assert!(!result.is_empty());
 }
@@ -100,32 +101,32 @@ fn e2e_vim_toggle() {
     assert!(result.output.contains("disabled"));
 }
 
-// E2E: /clear after multiple messages
+// E2E: /clear after multiple messages — fails fast without engine
 #[tokio::test]
 async fn e2e_clear_after_messages() {
     let mut repl = coderex_cli::ReplLoop::new("/src".into(), ModelId::sonnet());
 
-    repl.run_headless("Message 1").await.unwrap();
-    repl.run_headless("Message 2").await.unwrap();
-    repl.run_headless("Message 3").await.unwrap();
+    repl.run_headless("Message 1").await.expect_err("should fail without engine");
+    repl.run_headless("Message 2").await.expect_err("should fail without engine");
+    repl.run_headless("Message 3").await.expect_err("should fail without engine");
 
     let result = repl.run_headless("/clear").await.unwrap();
     assert!(!result.is_empty());
 }
 
-// E2E: Multi-turn conversation history
+// E2E: Multi-turn conversation history — fails fast without engine
 #[tokio::test]
 async fn e2e_multi_turn_conversation() {
     let mut repl = coderex_cli::ReplLoop::new("/src".into(), ModelId::sonnet());
 
-    let r1 = repl.run_headless("Hello").await.unwrap();
-    assert!(r1.contains("Hello"));
+    let r1 = repl.run_headless("Hello").await;
+    assert!(r1.is_err());
 
-    let r2 = repl.run_headless("How are you?").await.unwrap();
-    assert!(r2.contains("How are you?"));
+    let r2 = repl.run_headless("How are you?").await;
+    assert!(r2.is_err());
 
-    let r3 = repl.run_headless("Tell me about Rust").await.unwrap();
-    assert!(r3.contains("Rust"));
+    let r3 = repl.run_headless("Tell me about Rust").await;
+    assert!(r3.is_err());
 }
 
 // E2E: Command registry has all expected commands
@@ -145,12 +146,13 @@ fn e2e_all_commands_registered() {
     assert!(names.contains(&"voice"));
 }
 
-// E2E: REPL headless with empty input — echoes back (no QueryEngine integration)
+// E2E: REPL headless with empty input — fails fast without QueryEngine
 #[tokio::test]
 async fn e2e_empty_headless_input() {
     let mut repl = coderex_cli::ReplLoop::new("/src".into(), ModelId::sonnet());
-    let result = repl.run_headless("").await.unwrap();
-    assert!(result.contains("QueryEngine"));
+    let result = repl.run_headless("").await;
+    assert!(result.is_err());
+    assert!(result.unwrap_err().to_string().contains("QueryEngine"));
 }
 
 // E2E: CLI binary argument parsing — version

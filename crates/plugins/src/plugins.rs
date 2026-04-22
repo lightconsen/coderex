@@ -153,6 +153,7 @@ pub struct MarketplaceConnection {
 }
 
 use crate::runtime::PluginProcess;
+use crate::wasm_runtime::PluginWasmInstance;
 
 /// Manages all loaded plugins and marketplace state.
 #[derive(Debug)]
@@ -161,6 +162,8 @@ pub struct PluginManager {
     plugins: DashMap<String, PluginHandle>,
     /// Active plugin processes (for process-runtime plugins).
     pub(crate) active_processes: DashMap<String, PluginProcess>,
+    /// Active WASM plugin instances (for wasm-runtime plugins).
+    pub(crate) active_wasm_instances: DashMap<String, PluginWasmInstance>,
     /// Marketplace connections.
     marketplaces: DashMap<String, MarketplaceConnection>,
     /// Whether a refresh is needed (new plugins installed).
@@ -190,6 +193,7 @@ impl PluginManager {
         Self {
             plugins: DashMap::new(),
             active_processes: DashMap::new(),
+            active_wasm_instances: DashMap::new(),
             marketplaces: DashMap::new(),
             needs_refresh: AtomicBool::new(false),
             plugin_dirs: Vec::new(),
@@ -294,7 +298,7 @@ impl PluginManager {
         }
     }
 
-    /// Unload a plugin, stop its process, and clean up its directory.
+    /// Unload a plugin, stop its runtime, and clean up its directory.
     pub fn unload_plugin(&self, name: &str) -> bool {
         // Stop the process first (only if a tokio runtime is available)
         if let Some((_, mut process)) = self.active_processes.remove(name) {
@@ -304,6 +308,9 @@ impl PluginManager {
                 });
             }
         }
+
+        // Remove WASM instance if present
+        let _ = self.active_wasm_instances.remove(name);
 
         if let Some((_, handle)) = self.plugins.remove(name) {
             // Clean up plugin directory if it exists
@@ -340,7 +347,40 @@ impl PluginManager {
         };
 
         if manifest.runtime == RuntimeType::Wasm {
-            tracing::warn!(plugin = %name, "WASM runtime not yet implemented; skipping plugin spawn");
+            let wasm_file = manifest.entrypoint.as_deref().unwrap_or("plugin.wasm");
+            let wasm_path = handle.path.join(wasm_file);
+
+            let mut instance = PluginWasmInstance::new(&wasm_path)
+                .map_err(|e| format!("failed to load WASM plugin '{name}': {e}"))?;
+
+            instance.initialize().await.map_err(|e| {
+                format!("WASM plugin '{name}' initialize failed: {e}")
+            })?;
+
+            let discovered_commands: Vec<String> = match instance.list_commands().await {
+                Ok(cmds) => cmds.into_iter().map(|c| c.name).collect(),
+                Err(e) => {
+                    tracing::warn!(plugin = %name, "failed to list commands: {e}");
+                    manifest.commands.clone()
+                }
+            };
+
+            let discovered_skills: Vec<String> = match instance.list_skills().await {
+                Ok(skills) => skills.into_iter().map(|s| s.name).collect(),
+                Err(e) => {
+                    tracing::warn!(plugin = %name, "failed to list skills: {e}");
+                    manifest.skills.clone()
+                }
+            };
+
+            drop(handle);
+            if let Some(mut entry) = self.plugins.get_mut(name) {
+                entry.commands = discovered_commands;
+                entry.skills = discovered_skills;
+            }
+
+            self.active_wasm_instances.insert(name.to_string(), instance);
+            tracing::info!(plugin = %name, "WASM plugin loaded successfully");
             return Ok(());
         }
 
@@ -400,16 +440,22 @@ impl PluginManager {
         Ok(())
     }
 
-    /// Stop a process plugin's subprocess.
+    /// Stop a plugin's runtime (process or wasm).
     pub async fn stop_plugin(&self, name: &str) -> bool {
+        let mut stopped = false;
+
         if let Some((_, mut process)) = self.active_processes.remove(name) {
             if let Err(e) = process.terminate().await {
                 tracing::warn!(plugin = %name, "failed to terminate process: {e}");
             }
-            true
-        } else {
-            false
+            stopped = true;
         }
+
+        if self.active_wasm_instances.remove(name).is_some() {
+            stopped = true;
+        }
+
+        stopped
     }
 
     /// Find the first active plugin that provides the given command.
@@ -423,7 +469,7 @@ impl PluginManager {
         None
     }
 
-    /// Execute a command on a process plugin.
+    /// Execute a command on an active plugin (process or wasm).
     pub async fn execute_command(
         &self,
         plugin_name: &str,
@@ -431,16 +477,18 @@ impl PluginManager {
         args: &[String],
     ) -> Result<String, String> {
         if let Some(mut entry) = self.active_processes.get_mut(plugin_name) {
-            entry.execute_command(command_name, args).await
-        } else {
-            Err(format!(
-                "plugin '{}' is not running (no active process)",
-                plugin_name
-            ))
+            return entry.execute_command(command_name, args).await;
         }
+        if let Some(mut entry) = self.active_wasm_instances.get_mut(plugin_name) {
+            return entry.execute_command(command_name, args).await;
+        }
+        Err(format!(
+            "plugin '{}' is not running (no active process or wasm instance)",
+            plugin_name
+        ))
     }
 
-    /// Execute a skill on a process plugin.
+    /// Execute a skill on an active plugin (process or wasm).
     pub async fn execute_skill(
         &self,
         plugin_name: &str,
@@ -448,13 +496,15 @@ impl PluginManager {
         context: &Value,
     ) -> Result<String, String> {
         if let Some(mut entry) = self.active_processes.get_mut(plugin_name) {
-            entry.execute_skill(skill_name, context).await
-        } else {
-            Err(format!(
-                "plugin '{}' is not running (no active process)",
-                plugin_name
-            ))
+            return entry.execute_skill(skill_name, context).await;
         }
+        if let Some(mut entry) = self.active_wasm_instances.get_mut(plugin_name) {
+            return entry.execute_skill(skill_name, context).await;
+        }
+        Err(format!(
+            "plugin '{}' is not running (no active process or wasm instance)",
+            plugin_name
+        ))
     }
 
     /// Mark that a refresh is needed.

@@ -7,3 +7,4 @@ pub mod plugins;
 pub mod runtime;
 pub mod command_bridge;
 pub mod tool_executor;
+pub mod wasm_runtime;

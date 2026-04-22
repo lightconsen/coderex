@@ -59,6 +59,9 @@ pub enum ToolError {
         /// The name of the tool that was rate limited.
         name: String,
     },
+    /// User input required but elicitation channel unavailable.
+    #[error("user input required but elicitation channel unavailable")]
+    ElicitationUnavailable,
 }
 
 /// Output from a successful tool execution.

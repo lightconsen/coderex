@@ -27,6 +27,7 @@ use std::sync::Arc;
 
 /// A `ToolExecutor` (core trait) implementation backed by the in-crate
 /// `ToolRegistry` + `ToolExecutor` pipeline.
+#[derive(Clone)]
 #[allow(missing_debug_implementations)]
 pub struct RegistryToolDispatcher {
     registry: Arc<ToolRegistry>,
@@ -39,6 +40,7 @@ pub struct RegistryToolDispatcher {
     cron_scheduler: Option<Arc<CronScheduler>>,
     rate_limiter: Option<Arc<RateLimiter>>,
     chrome_client: Option<ChromeClient>,
+    elicit_tx: Arc<std::sync::Mutex<Option<tokio::sync::mpsc::Sender<crate::tool::ElicitRequest>>>>,
 }
 
 impl RegistryToolDispatcher {
@@ -63,6 +65,7 @@ impl RegistryToolDispatcher {
             cron_scheduler: None,
             rate_limiter: None,
             chrome_client: None,
+            elicit_tx: Arc::new(std::sync::Mutex::new(None)),
         }
     }
 
@@ -95,6 +98,13 @@ impl RegistryToolDispatcher {
     pub fn set_chrome_client(&mut self, client: ChromeClient) {
         self.chrome_client = Some(client);
     }
+
+    /// Attach an elicitation channel for mid-execution user questions.
+    pub fn set_elicit_tx(&self, tx: Option<tokio::sync::mpsc::Sender<crate::tool::ElicitRequest>>) {
+        if let Ok(mut guard) = self.elicit_tx.lock() {
+            *guard = tx;
+        }
+    }
 }
 
 #[async_trait::async_trait]
@@ -121,6 +131,13 @@ impl CoreToolExecutor for RegistryToolDispatcher {
         };
 
         let mut ctx = ToolContext::new(self.context, &self.cwd);
+
+        // Inject elicitation channel if available
+        if let Ok(guard) = self.elicit_tx.lock() {
+            if let Some(ref tx) = *guard {
+                ctx = ctx.with_elicit_tx(tx.clone());
+            }
+        }
 
         // Build shared state map
         let mut extra = HashMap::new();
@@ -208,6 +225,9 @@ impl CoreToolExecutor for RegistryToolDispatcher {
                     }
                     ToolError::RateLimited { name } => {
                         format!("tool '{name}' rate limit exceeded")
+                    }
+                    ToolError::ElicitationUnavailable => {
+                        format!("tool '{tool_name}' requires user input but no elicitation channel is available")
                     }
                 };
                 ToolDispatchOutcome {
