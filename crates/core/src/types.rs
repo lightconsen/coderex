@@ -176,7 +176,7 @@ pub enum AgentLifecycleEvent {
 }
 
 /// Events emitted by the engine to the UI/SDK.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[non_exhaustive]
 pub enum EngineEvent {
     /// A text delta from the assistant.
