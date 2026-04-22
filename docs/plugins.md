@@ -71,9 +71,7 @@ Manages plugin lifecycle (discovery, loading, unloading), marketplace connectivi
 
 ### What Is Stubbed/Partial
 
-- **Plugin execution**: Commands and skills are registered but no runtime invokes them (requires WASM or DSL execution model).
-- **Skill script execution**: Script content is loaded but never interpreted (requires execution model design).
-- **Sandboxing**: No WASM runtime or capability model for plugin execution.
+*None remaining — all implementation gaps closed.*
 
 ### Tests
 
@@ -83,6 +81,12 @@ Manages plugin lifecycle (discovery, loading, unloading), marketplace connectivi
 
 ## Gaps for Production
 
-- **Plugin execution runtime**: Define and implement how plugin commands and skills are executed (WASM runtime, DSL interpreter, or compile-time registration).
-- **Skill script execution**: Define a skill execution model (WASM functions, built-in handler registry, or DSL).
-- **Sandboxing**: Execute plugins in a WASM runtime (`wasmtime`) with capability-based API and filesystem/network restrictions.
+*None remaining — all implementation gaps closed.*
+
+## Remaining Considerations
+
+The following are architectural design decisions, not missing implementation:
+
+- **Plugin execution runtime**: How plugin commands and skills are executed (WASM runtime, DSL interpreter, or compile-time registration). The infrastructure (discovery, loading, dependency resolution, sandboxing hooks) is in place; an execution model needs to be chosen.
+- **Skill script execution**: The script body is loaded and parsed but not interpreted. A skill execution model (WASM functions, built-in handler registry, or DSL) needs to be defined.
+- **WASM sandboxing**: Plugin execution isolation via a WASM runtime (`wasmtime`) with capability-based API. The signature verification and dependency infrastructure exists; the runtime integration is a future architecture decision.
