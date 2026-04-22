@@ -94,29 +94,4 @@ None — all previously stubbed items are now implemented.
 
 ## Gaps for Production
 
-### Implemented
-
-| Gap | Implementation |
-|-----|----------------|
-| Uploader not wired up | `TelemetryHandle::new(store, config)` accepts `Option<TelemetryConfig>`. If present and `enabled`, constructs `TelemetryUploader` with the store's DB path. |
-| No graceful shutdown | `TelemetryHandle::shutdown()` sends `WorkerCommand::FlushAndExit(ack_tx)`. Worker flushes batch, sends ack, exits. 5-second timeout on caller side. |
-| No upload retry backoff | `CircuitBreaker` in `uploader.rs` tracks consecutive failures. Opens after 5 failures → skips uploads for 60s → transitions to HalfOpen → tries one upload → Closed on success, Open on failure. |
-| Crash endpoint hardcoded | `TelemetryConfig` has `crash_endpoint: Option<String>`. `resolve_crash_endpoint()` uses explicit value or derives from events endpoint. |
-| Timestamp inconsistency | `TelemetryEvent::to_db()` extracts the original `timestamp` field from each variant instead of generating `Utc::now()`. |
-| Missing crash_report indices | Schema creates `idx_crash_uploaded ON crash_reports(uploaded_at)` and `idx_crash_created ON crash_reports(created_at)`. |
-| No disk space protection | `CrashReporter::enforce_size_limit()` computes total `.json` size, deletes oldest by mtime until under `max_pending_bytes` (default 50MB). Called in `ingest_pending()`. |
-| No upload compression | `compress_json()` uses `flate2::GzEncoder`. Payloads <1KB skip compression. `Content-Encoding: gzip` header added. |
-| No circuit breaker | `CircuitBreaker` with `AtomicUsize` state, `AtomicUsize` failure count, `AtomicU64` last failure timestamp. |
-| No event sampling | `TelemetryHandle::record()` hashes serialized JSON with `DefaultHasher`. Skips if `hash / u64::MAX >= sample_rate`. |
-| Retention trigger is coarse | Added `TelemetryStore::prune_to_size(max_bytes)` using `PRAGMA page_count * page_size`. Deletes oldest 100 events iteratively until under limit. |
-
-### Remaining
-
-| Gap | Implementation |
-|-----|----------------|
-| **SECURITY — API key in plain text** | `coderex_config::resolve_api_key()` handles `keyring://` prefixes via the OS keychain (gated by `keyring` feature). The raw key is never logged or serialized. `TelemetryConfig.api_key` is resolved before use. |
-| **SECURITY — No certificate pinning** | `TelemetryConfig.pinned_cert_pem: Option<String>` added. When set, `TelemetryUploader::new()` calls `reqwest::ClientBuilder::add_root_certificate()` with the PEM, adding it as a trusted root for TLS verification. |
-| **PRIVACY — No user consent gate** | `StartupOrchestrator::prompt_telemetry_consent()` shows a one-time interactive prompt on first run (when no `settings.json` exists). The choice is persisted to `~/.coderex/settings.json` under `telemetry_enabled` and respected immediately. |
-| **PRIVACY — No PII scrubbing** | `Scrubber` in `scrubber.rs` regex-replaces email addresses, IP addresses (v4/v6), home-directory paths, and API-key patterns. `TelemetryHandle::record()` scrubs `Error` and `ApiCall` events before insertion. |
-| **Worker thread panic handling** | `spawn_worker_with_recovery()` wraps `run_store_worker()` in `std::panic::catch_unwind`. On panic, a fresh SQLite connection is opened and the worker respawns after a 10s cooldown. Max 3 respawns before giving up. |
-| **Hardcoded defaults / no settings.json integration** | `Settings` schema bumped to v3 with `telemetry: Option<TelemetrySubConfig>` (endpoint, crash_endpoint, batch_size, upload_interval_secs, sample_rate, pinned_cert_pem). `StartupOrchestrator::init_telemetry()` reads these overrides and builds `TelemetryConfig` from merged settings. |
+None — all identified production gaps are implemented.
