@@ -158,7 +158,10 @@ pub async fn run_tool_calls(
                 let mut ctx = HashMap::new();
                 ctx.insert("tool_call_id".to_string(), call.id.clone());
                 ctx.insert("reason".to_string(), reason.clone());
-                let _ = hooks.fire_hook("PostToolUseFail", &call.name, &ctx).await;
+                let fail_result = hooks.fire_hook("PostToolUseFail", &call.name, &ctx).await;
+                if !fail_result.errors.is_empty() {
+                    tracing::warn!("PostToolUseFail hook errors for {}: {:?}", call.name, fail_result.errors);
+                }
                 let _ = event_tx.send(EngineEvent::ToolCallEnd {
                     id: call.id.clone(),
                     result: result.clone(),
@@ -178,7 +181,10 @@ pub async fn run_tool_calls(
                 let mut ctx = HashMap::new();
                 ctx.insert("tool_call_id".to_string(), call.id.clone());
                 ctx.insert("reason".to_string(), reason.clone());
-                let _ = hooks.fire_hook("PostToolUseFail", &call.name, &ctx).await;
+                let fail_result = hooks.fire_hook("PostToolUseFail", &call.name, &ctx).await;
+                if !fail_result.errors.is_empty() {
+                    tracing::warn!("PostToolUseFail hook errors for {}: {:?}", call.name, fail_result.errors);
+                }
                 let _ = event_tx.send(EngineEvent::ToolCallEnd {
                     id: call.id.clone(),
                     result: result.clone(),
@@ -227,7 +233,10 @@ pub async fn run_tool_calls(
         let mut ctx = HashMap::new();
         ctx.insert("tool_call_id".to_string(), call.id.clone());
         ctx.insert("tool_output_len".to_string(), result.output.len().to_string());
-        let _ = hooks.fire_hook("PostToolUse", &call.name, &ctx).await;
+        let post_result = hooks.fire_hook("PostToolUse", &call.name, &ctx).await;
+        if !post_result.errors.is_empty() {
+            tracing::warn!("PostToolUse hook errors for {}: {:?}", call.name, post_result.errors);
+        }
 
         let _ = event_tx.send(EngineEvent::ToolCallEnd {
             id: call.id.clone(),

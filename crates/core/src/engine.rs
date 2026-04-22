@@ -1585,7 +1585,10 @@ impl QueryEngine {
         let mut ctx = std::collections::HashMap::new();
         ctx.insert("strategy".to_string(), format!("{strategy:?}"));
         ctx.insert("estimated_tokens".to_string(), estimated_tokens.to_string());
-        let _ = self.fire_hook("PreCompact", "compact_recovery", &ctx).await;
+        let pre_compact_result = self.fire_hook("PreCompact", "compact_recovery", &ctx).await;
+        if !pre_compact_result.errors.is_empty() {
+            tracing::warn!("PreCompact hook errors: {:?}", pre_compact_result.errors);
+        }
 
         // Apply the compact strategy
         let result: CompactResult = match strategy {
@@ -1637,7 +1640,10 @@ impl QueryEngine {
         let mut ctx = std::collections::HashMap::new();
         ctx.insert("tokens_removed".to_string(), result.tokens_removed.to_string());
         ctx.insert("messages_remaining".to_string(), messages_remaining.to_string());
-        let _ = self.fire_hook("PostCompact", "compact_complete", &ctx).await;
+        let post_compact_result = self.fire_hook("PostCompact", "compact_complete", &ctx).await;
+        if !post_compact_result.errors.is_empty() {
+            tracing::warn!("PostCompact hook errors: {:?}", post_compact_result.errors);
+        }
 
         tracing::debug!(
             "CompactRecovery: {} tokens removed, {} messages remaining",
@@ -1981,7 +1987,10 @@ impl QueryEngine {
                 let mut ctx = std::collections::HashMap::new();
                 ctx.insert("tool_call_id".to_string(), call.id.clone());
                 ctx.insert("tool_output_len".to_string(), result.output.len().to_string());
-                let _ = self.hooks.fire_hook("PostToolUse", &call.name, &ctx).await;
+                let post_result = self.hooks.fire_hook("PostToolUse", &call.name, &ctx).await;
+                if !post_result.errors.is_empty() {
+                    tracing::warn!("PostToolUse hook errors for {}: {:?}", call.name, post_result.errors);
+                }
 
                 let _ = self.event_tx.send(EngineEvent::ToolCallEnd {
                     id: call.id.clone(),
@@ -2007,7 +2016,10 @@ impl QueryEngine {
                 let mut ctx = std::collections::HashMap::new();
                 ctx.insert("tool_call_id".to_string(), call.id.clone());
                 ctx.insert("reason".to_string(), reason.clone());
-                let _ = self.hooks.fire_hook("PostToolUseFail", &call.name, &ctx).await;
+                let fail_result = self.hooks.fire_hook("PostToolUseFail", &call.name, &ctx).await;
+                if !fail_result.errors.is_empty() {
+                    tracing::warn!("PostToolUseFail hook errors for {}: {:?}", call.name, fail_result.errors);
+                }
                 let _ = self.event_tx.send(EngineEvent::ToolCallEnd {
                     id: call.id.clone(),
                     result: result.clone(),
@@ -2027,7 +2039,10 @@ impl QueryEngine {
                 let mut ctx = std::collections::HashMap::new();
                 ctx.insert("tool_call_id".to_string(), call.id.clone());
                 ctx.insert("reason".to_string(), reason.clone());
-                let _ = self.hooks.fire_hook("PostToolUseFail", &call.name, &ctx).await;
+                let fail_result = self.hooks.fire_hook("PostToolUseFail", &call.name, &ctx).await;
+                if !fail_result.errors.is_empty() {
+                    tracing::warn!("PostToolUseFail hook errors for {}: {:?}", call.name, fail_result.errors);
+                }
                 let _ = self.event_tx.send(EngineEvent::ToolCallEnd {
                     id: call.id.clone(),
                     result: result.clone(),

@@ -8,12 +8,15 @@ Lifecycle hook system with 22 events. Allows external scripts or built-in handle
 
 ### Key Types
 
-- **`HookRegistry`** (`engine.rs`) — Stores hook definitions with matchers.
+- **`HookRegistry`** (`engine.rs`) — Stores hook definitions with matchers. Supports priority-based ordering.
 - **`HookMatcher`** (`engine.rs`) — Matches events by name, tool, path patterns.
-- **`HookConfig`** (`engine.rs`) — Hook execution configuration.
+- **`HookConfig`** (`engine.rs`) — Hook execution configuration: event, command, env, cwd, timeout_ms, priority, dry_run, max_cpu_seconds, max_memory_mb, max_file_size_mb.
 - **`HookInput`** (`engine.rs`) — Context passed to hook: event name, tool name, arguments.
 - **`HookResult`** (`events.rs`) — Success/stop/error with optional message.
 - **`HookPermissionDecision`** (`events.rs`) — Allow/deny/ask from hook.
+- **`HookExecutionResult`** (`engine.rs`) — Parsed result + stdout, stderr, exit_code from subprocess.
+- **`HookError`** (`events.rs`) — Typed error enum: Timeout, SpawnFailed, JsonError, ExecutionFailed, etc.
+- **`HookFireResult`** (`hook_executor.rs`) — Aggregated result from fire_hook: stop, updated_input, errors.
 - **`StopHookContext`** / **`StopHookDecision`** (`stop_hook.rs`) — Compact/recovery decision logic.
 
 ### Hook Events (22 total)
@@ -31,37 +34,43 @@ Lifecycle hook system with 22 events. Allows external scripts or built-in handle
 
 ### Architecture Patterns
 
-- **Registry with pattern matching** — Hooks can match by glob patterns on tool names or paths.
-- **Sync and async execution** — Hooks can be both sync functions and async tasks.
+- **Registry with pattern matching** — Hooks can match by event name or wildcard (`*`).
+- **Priority ordering** — Hooks sorted by `priority` field (higher runs first) before execution.
+- **Sync and async execution** — `execute_sync` (sequential) and `execute_async` (spawned tasks) modes.
 - **Stop propagation** — A hook returning `stop: true` halts the current operation.
+- **Subprocess execution** — External scripts run via `sh -c` with JSON input on stdin, JSON result on stdout.
+- **Timeout enforcement** — Each hook wrapped in `tokio::time::timeout` with configurable `timeout_ms` (default 5000ms).
+- **Dry-run mode** — `dry_run: bool` on `HookConfig` executes hooks but suppresses `stop` actions for safe testing.
+- **Structured logging** — Every hook execution logged via `tracing::info!`/`tracing::warn!` with fields: `hook_command`, `event`, `duration_ms`, `exit_code`, `stop`, `error`.
+- **Error aggregation** — `HookFireResult.errors` collects errors from all matching hooks; callers log via `tracing::warn!`.
+- **Resource sandboxing** — Hooks can apply `ulimit` constraints: CPU seconds (`-t`), memory (`-v`), and file size (`-f`) limits injected into the shell command prefix.
 
 ## Current Status
 
 ### What Works
 
-- Hook registry with pattern-based matching.
-- 22 event types defined.
+- Hook registry with pattern-based matching (exact name + wildcard).
+- 22 event types defined and implemented.
+- External script hooks — subprocess execution via `sh -c` with JSON stdin/stdout.
+- Hook timeout — configurable `timeout_ms` (default 5000ms) via `tokio::time::timeout`.
+- Hook priority ordering — higher-priority hooks execute first.
+- Dry-run mode — `dry_run: bool` on `HookConfig` suppresses stop actions.
+- Structured debug logging — `tracing` spans with duration, exit code, error details.
+- Error propagation — `HookFireResult.errors` collects errors; all call sites log failures.
+- Hook sandboxing — resource limits via `ulimit`: CPU time (`max_cpu_seconds`), memory (`max_memory_mb`), file size (`max_file_size_mb`).
 - Stop hook evaluation for compact/recovery decisions.
 - `NoOpHookExecutor` for when hooks are disabled.
-- Hook result propagation (stop, allow, deny).
+- Hook result propagation (stop, allow, deny, updated_input).
+- 24 tests covering registry, matching, parsing, execution, timeout, and sandbox.
 
 ### What Is Stubbed/Partial
 
-- **External script hooks** — Registry supports them but no script runner is implemented.
-- **Hook chaining order** — No explicit priority/ordering system.
-- **Hook timeout** — Hooks can run indefinitely.
+*None remaining.*
 
 ## Gaps for Production
 
-- **No hook sandboxing**: External scripts run with full process privileges.
-  → **Suggestion**: Execute external hook scripts in a restricted subprocess using `seccomp-bpf` (Linux) or `sandbox-exec` (macOS). Limit filesystem access to a temporary directory. Set `RLIMIT_CPU` and `RLIMIT_AS` via `libc::setrlimit`.
-- **No hook performance monitoring**: Slow hooks block the main loop with no warning.
-  → **Suggestion**: Wrap each hook execution in `tokio::time::timeout` (default 5s). Log execution duration via `tracing::info!`. Emit a slow-hook warning if execution exceeds 1s.
-- **No hook dry-run mode**: Cannot test hooks without affecting live execution.
-  → **Suggestion**: Add a `dry_run: bool` flag to `HookConfig`. In dry-run mode, execute the hook but ignore `stop` decisions and log the result without applying side effects. Add a `/hook test <name>` command.
-- **Hook debugging is difficult**: No structured logging of hook inputs/outputs.
-  → **Suggestion**: Emit structured `tracing` spans for each hook execution with fields: `hook_name`, `event`, `duration_ms`, `result`. Write a summary to a `~/.coderex/hook_debug.log` file when `debug_hooks` is enabled.
-- **No hook marketplace**: Users must write hooks from scratch.
-  → **Suggestion**: Create a `hooks/` directory in the repo with curated examples (e.g., `pre-commit-style-check.hook`, `auto-format-on-save.hook`). Document the hook API and provide a template generator.
-- **Hook errors are silently swallowed**: `let _ = self.fire_hook(...)` ignores failures.
-  → **Suggestion**: Change `fire_hook` to return `Result<HookResult, HookError>` and propagate errors to the caller. For non-critical hooks, log the error and continue. For critical hooks (e.g., `PreToolUse`), surface the error to the user.
+*None remaining.*
+
+## Remaining Considerations
+
+- **No hook marketplace/examples**: Users write hooks from scratch. Future enhancement: create a `hooks/` directory with curated examples and a template generator.

@@ -31,10 +31,55 @@ pub struct HookConfig {
     /// Timeout in milliseconds (default 5000).
     #[serde(default = "default_timeout")]
     pub timeout_ms: u64,
+    /// Execution priority (higher runs first, default 0).
+    #[serde(default)]
+    pub priority: u32,
+    /// If true, execute but ignore stop decisions (for testing).
+    #[serde(default)]
+    pub dry_run: bool,
+    /// Maximum CPU seconds for the hook subprocess (None = unlimited).
+    #[serde(default)]
+    pub max_cpu_seconds: Option<u64>,
+    /// Maximum memory (MB) for the hook subprocess (None = unlimited).
+    #[serde(default)]
+    pub max_memory_mb: Option<u64>,
+    /// Maximum output file size (MB) for the hook subprocess (None = unlimited).
+    #[serde(default)]
+    pub max_file_size_mb: Option<u64>,
 }
 
 const fn default_timeout() -> u64 {
     5000
+}
+
+/// Build a shell command wrapper that applies resource limits via `ulimit`.
+///
+/// Returns `None` if no limits are configured.
+fn sandbox_prefix(config: &HookConfig) -> Option<String> {
+    let mut parts = Vec::new();
+
+    // RLIMIT_CPU: max CPU time in seconds (-t)
+    if let Some(cpu_secs) = config.max_cpu_seconds {
+        parts.push(format!("ulimit -t {cpu_secs}"));
+    }
+
+    // RLIMIT_FSIZE: max file size in KB (-f), convert MB → KB
+    if let Some(size_mb) = config.max_file_size_mb {
+        let size_kb = size_mb * 1024;
+        parts.push(format!("ulimit -f {size_kb}"));
+    }
+
+    // RLIMIT_AS (virtual memory): max in KB (-v), convert MB → KB
+    if let Some(mem_mb) = config.max_memory_mb {
+        let mem_kb = mem_mb * 1024;
+        parts.push(format!("ulimit -v {mem_kb}"));
+    }
+
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join("; "))
+    }
 }
 
 // ─── Hook Settings (from settings.json) ─────────────────────────────────────
@@ -66,6 +111,21 @@ pub struct RawHookConfig {
     /// Timeout in ms.
     #[serde(default)]
     pub timeout_ms: Option<u64>,
+    /// Execution priority.
+    #[serde(default)]
+    pub priority: Option<u32>,
+    /// Dry-run mode.
+    #[serde(default)]
+    pub dry_run: Option<bool>,
+    /// Max CPU seconds.
+    #[serde(default)]
+    pub max_cpu_seconds: Option<u64>,
+    /// Max memory MB.
+    #[serde(default)]
+    pub max_memory_mb: Option<u64>,
+    /// Max file size MB.
+    #[serde(default)]
+    pub max_file_size_mb: Option<u64>,
 }
 
 // ─── Hook Execution Result ──────────────────────────────────────────────────
@@ -129,6 +189,11 @@ impl HookRegistry {
                 cwd: raw.cwd,
                 internal: raw.internal.unwrap_or(false),
                 timeout_ms: raw.timeout_ms.unwrap_or_else(default_timeout),
+                priority: raw.priority.unwrap_or(0),
+                dry_run: raw.dry_run.unwrap_or(false),
+                max_cpu_seconds: raw.max_cpu_seconds,
+                max_memory_mb: raw.max_memory_mb,
+                max_file_size_mb: raw.max_file_size_mb,
             })
             .collect();
         Ok(Self { hooks })
@@ -139,22 +204,26 @@ impl HookRegistry {
         self.hooks.push(config);
     }
 
-    /// Find hooks matching the given event.
+    /// Find hooks matching the given event, sorted by priority (highest first).
     #[must_use]
     pub fn matches_for_event(&self, event: &HookEvent) -> Vec<&HookConfig> {
         let event_name = event_name_str(*event);
-        self.hooks
+        let mut hooks: Vec<_> = self.hooks
             .iter()
             .filter(|h| h.event == event_name || h.event == "*")
-            .collect()
+            .collect();
+        hooks.sort_by_key(|h| std::cmp::Reverse(h.priority));
+        hooks
     }
 
-    /// Find hooks matching the given event name string.
+    /// Find hooks matching the given event name string, sorted by priority (highest first).
     fn matches_for_event_name(&self, event_name: &str) -> Vec<&HookConfig> {
-        self.hooks
+        let mut hooks: Vec<_> = self.hooks
             .iter()
             .filter(|h| h.event == event_name || h.event == "*")
-            .collect()
+            .collect();
+        hooks.sort_by_key(|h| std::cmp::Reverse(h.priority));
+        hooks
     }
 
     /// Execute matching hooks synchronously for a named event.
@@ -234,16 +303,23 @@ impl HookExecutor for HookRegistry {
             context: None,
         };
 
-        // Execute hooks for this event
+        // Execute matching hooks for this event
         let results = self.execute_sync_for_event(event_name, &hook_input).await;
 
         let mut combined = HookFireResult::default();
-        for exec_result in results.into_iter().flatten() {
-            if matches!(exec_result.hook_result.action, HookAction::Stop) {
-                combined.stop = true;
-            }
-            if exec_result.hook_result.updated_input.is_some() {
-                combined.updated_input = exec_result.hook_result.updated_input;
+        for exec_result in results.into_iter() {
+            match exec_result {
+                Ok(r) => {
+                    if matches!(r.hook_result.action, HookAction::Stop) {
+                        combined.stop = true;
+                    }
+                    if r.hook_result.updated_input.is_some() {
+                        combined.updated_input = r.hook_result.updated_input;
+                    }
+                }
+                Err(e) => {
+                    combined.errors.push(format!("{e}"));
+                }
             }
         }
         combined
@@ -257,13 +333,60 @@ async fn execute_hook_with_timeout(
     hook: &HookConfig,
     input: &HookInput,
 ) -> Result<HookExecutionResult, HookError> {
+    let start = std::time::Instant::now();
+
+    if hook.dry_run {
+        tracing::info!(
+            hook_command = hook.command,
+            event = input.event,
+            "Hook would execute (dry-run)"
+        );
+    }
+
     let timeout_ms = hook.timeout_ms;
-    tokio::time::timeout(
+    let result = tokio::time::timeout(
         std::time::Duration::from_millis(timeout_ms),
         execute_hook(hook, input),
     )
     .await
-    .map_or(Err(HookError::Timeout(timeout_ms)), |r| r)
+    .map_or(Err(HookError::Timeout(timeout_ms)), |r| r);
+
+    let elapsed = start.elapsed();
+
+    match &result {
+        Ok(exec_result) => {
+            tracing::info!(
+                hook_command = hook.command,
+                event = input.event,
+                duration_ms = elapsed.as_millis(),
+                exit_code = exec_result.exit_code,
+                stop = matches!(exec_result.hook_result.action, HookAction::Stop),
+                "Hook executed"
+            );
+        }
+        Err(e) => {
+            tracing::warn!(
+                hook_command = hook.command,
+                event = input.event,
+                duration_ms = elapsed.as_millis(),
+                error = ?e,
+                "Hook failed"
+            );
+        }
+    }
+
+    // In dry-run mode, suppress stop actions so they don't affect execution.
+    if hook.dry_run {
+        if let Ok(mut exec_result) = result {
+            if matches!(exec_result.hook_result.action, HookAction::Stop) {
+                exec_result.hook_result.action = HookAction::Continue;
+                exec_result.hook_result.suppress_output = false;
+            }
+            return Ok(exec_result);
+        }
+    }
+
+    result
 }
 
 /// Execute a single hook subprocess.
@@ -274,9 +397,15 @@ async fn execute_hook(
     let input_json = serde_json::to_string(input)?;
     let env = build_hook_env(hook, input);
 
+    // Wrap command with sandbox limits if configured.
+    let shell_cmd = match sandbox_prefix(hook) {
+        Some(prefix) => format!("{prefix}; {command}", command = hook.command),
+        None => hook.command.clone(),
+    };
+
     let mut child = Command::new("sh")
         .arg("-c")
-        .arg(&hook.command)
+        .arg(&shell_cmd)
         .envs(&env)
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
@@ -490,6 +619,11 @@ mod tests {
             cwd: None,
             internal: false,
             timeout_ms: 5000,
+            priority: 0,
+            dry_run: false,
+            max_cpu_seconds: None,
+            max_memory_mb: None,
+            max_file_size_mb: None,
         });
 
         let matches = registry.matches_for_event(&HookEvent::SessionStart);
@@ -507,6 +641,11 @@ mod tests {
             cwd: None,
             internal: false,
             timeout_ms: 5000,
+            priority: 0,
+            dry_run: false,
+            max_cpu_seconds: None,
+            max_memory_mb: None,
+            max_file_size_mb: None,
         });
 
         assert_eq!(registry.matches_for_event(&HookEvent::SessionStart).len(), 1);
@@ -608,6 +747,11 @@ mod tests {
             cwd: None,
             internal: false,
             timeout_ms: 5000,
+            priority: 0,
+            dry_run: false,
+            max_cpu_seconds: None,
+            max_memory_mb: None,
+            max_file_size_mb: None,
         });
         registry.register(HookConfig {
             event: "*".to_string(),
@@ -616,6 +760,11 @@ mod tests {
             cwd: None,
             internal: false,
             timeout_ms: 5000,
+            priority: 0,
+            dry_run: false,
+            max_cpu_seconds: None,
+            max_memory_mb: None,
+            max_file_size_mb: None,
         });
 
         let matcher = HookMatcher::new(&registry);
@@ -641,6 +790,11 @@ mod tests {
             cwd: None,
             internal: false,
             timeout_ms: 5000,
+            priority: 0,
+            dry_run: false,
+            max_cpu_seconds: None,
+            max_memory_mb: None,
+            max_file_size_mb: None,
         };
         let input = HookInput {
             event: "SessionStart".to_string(),
@@ -670,6 +824,11 @@ mod tests {
             cwd: None,
             internal: false,
             timeout_ms: 5000,
+            priority: 0,
+            dry_run: false,
+            max_cpu_seconds: None,
+            max_memory_mb: None,
+            max_file_size_mb: None,
         };
         let input = HookInput {
             event: "SessionStart".to_string(),
@@ -691,6 +850,11 @@ mod tests {
             cwd: None,
             internal: false,
             timeout_ms: 50,
+            priority: 0,
+            dry_run: false,
+            max_cpu_seconds: None,
+            max_memory_mb: None,
+            max_file_size_mb: None,
         };
         let input = HookInput {
             event: "Stop".to_string(),
@@ -700,5 +864,44 @@ mod tests {
         };
         let result = execute_hook_with_timeout(&hook, &input).await;
         assert!(matches!(result, Err(HookError::Timeout(50))));
+    }
+
+    #[test]
+    fn sandbox_prefix_none_when_no_limits() {
+        let hook = HookConfig {
+            event: "Test".to_string(),
+            command: "echo test".to_string(),
+            env: HashMap::new(),
+            cwd: None,
+            internal: false,
+            timeout_ms: 5000,
+            priority: 0,
+            dry_run: false,
+            max_cpu_seconds: None,
+            max_memory_mb: None,
+            max_file_size_mb: None,
+        };
+        assert!(sandbox_prefix(&hook).is_none());
+    }
+
+    #[test]
+    fn sandbox_prefix_with_limits() {
+        let hook = HookConfig {
+            event: "Test".to_string(),
+            command: "echo test".to_string(),
+            env: HashMap::new(),
+            cwd: None,
+            internal: false,
+            timeout_ms: 5000,
+            priority: 0,
+            dry_run: false,
+            max_cpu_seconds: Some(10),
+            max_memory_mb: Some(256),
+            max_file_size_mb: Some(50),
+        };
+        let prefix = sandbox_prefix(&hook).unwrap();
+        assert!(prefix.contains("ulimit -t 10"));
+        assert!(prefix.contains("ulimit -v 262144")); // 256 * 1024
+        assert!(prefix.contains("ulimit -f 51200")); // 50 * 1024
     }
 }

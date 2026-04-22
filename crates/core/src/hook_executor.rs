@@ -13,6 +13,8 @@ pub struct HookFireResult {
     pub stop: bool,
     /// Optional replacement for the user input.
     pub updated_input: Option<String>,
+    /// Errors encountered during hook execution (empty on success).
+    pub errors: Vec<String>,
 }
 
 /// Abstract hook executor — implemented by `coderex-hooks::HookRegistry`.
