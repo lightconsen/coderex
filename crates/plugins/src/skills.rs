@@ -45,6 +45,21 @@ pub enum SkillSource {
     Mcp,
 }
 
+impl SkillSource {
+    /// Precedence for conflict resolution.
+    /// Higher value = higher priority.
+    #[must_use]
+    pub fn precedence(self) -> u8 {
+        match self {
+            SkillSource::UserDir => 5,
+            SkillSource::RepoDir => 4,
+            SkillSource::Bundled => 3,
+            SkillSource::Plugin => 2,
+            SkillSource::Mcp => 1,
+        }
+    }
+}
+
 impl std::fmt::Display for SkillSource {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -66,7 +81,58 @@ pub struct SkillFile {
     pub script: String,
 }
 
-/// Parse skill frontmatter from markdown file content.
+/// Deserialize a field that may be a single string or a list of strings.
+fn deserialize_string_or_list<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    struct StringOrList;
+
+    impl<'de> serde::de::Visitor<'de> for StringOrList {
+        type Value = Vec<String>;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+            formatter.write_str("a string or a list of strings")
+        }
+
+        fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            Ok(vec![value.to_string()])
+        }
+
+        fn visit_seq<S>(self, visitor: S) -> Result<Self::Value, S::Error>
+        where
+            S: serde::de::SeqAccess<'de>,
+        {
+            serde::Deserialize::deserialize(serde::de::value::SeqAccessDeserializer::new(visitor))
+        }
+    }
+
+    deserializer.deserialize_any(StringOrList)
+}
+
+/// Intermediate representation for YAML frontmatter parsing.
+#[derive(Debug, serde::Deserialize)]
+struct SkillFrontmatter {
+    name: String,
+    #[serde(default, deserialize_with = "deserialize_string_or_list")]
+    hooks: Vec<String>,
+    agent: Option<String>,
+    #[serde(default, alias = "allowed_tools", deserialize_with = "deserialize_string_or_list")]
+    allowed_tools: Vec<String>,
+    #[serde(default)]
+    description: String,
+    #[serde(default = "default_true")]
+    enabled: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+/// Parse skill frontmatter from markdown file content using serde_yaml.
 /// Expected format:
 /// ```markdown
 /// ---
@@ -90,38 +156,9 @@ pub fn parse_skill_file(content: &str) -> Option<SkillFile> {
     let frontmatter_end = 3 + closing + 5; // "---\n" is 4 chars + newline
     let frontmatter = &content[3..3 + closing];
 
-    let mut name = String::new();
-    let mut hooks = Vec::new();
-    let mut agent = None;
-    let mut allowed_tools = Vec::new();
-    let mut description = String::new();
-    let mut enabled = true;
+    let parsed: SkillFrontmatter = serde_yaml::from_str(frontmatter).ok()?;
 
-    for line in frontmatter.lines() {
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-        if let Some((key, value)) = line.split_once(':') {
-            let key = key.trim();
-            let value = value.trim();
-            match key {
-                "name" => name = value.trim_matches('"').to_string(),
-                "description" => description = value.trim_matches('"').to_string(),
-                "agent" => agent = Some(value.trim_matches('"').to_string()),
-                "enabled" => enabled = value.parse().unwrap_or(true),
-                "hooks" => {
-                    hooks = parse_string_list(value);
-                }
-                "allowed_tools" => {
-                    allowed_tools = parse_string_list(value);
-                }
-                _ => {}
-            }
-        }
-    }
-
-    if name.is_empty() {
+    if parsed.name.is_empty() {
         return None;
     }
 
@@ -129,29 +166,15 @@ pub fn parse_skill_file(content: &str) -> Option<SkillFile> {
 
     Some(SkillFile {
         metadata: SkillMetadata {
-            name,
-            hooks,
-            agent,
-            allowed_tools,
-            description,
-            enabled,
+            name: parsed.name,
+            hooks: parsed.hooks,
+            agent: parsed.agent,
+            allowed_tools: parsed.allowed_tools,
+            description: parsed.description,
+            enabled: parsed.enabled,
         },
         script,
     })
-}
-
-fn parse_string_list(value: &str) -> Vec<String> {
-    let value = value.trim();
-    if value.starts_with('[') && value.ends_with(']') {
-        let inner = &value[1..value.len() - 1];
-        inner
-            .split(',')
-            .map(|s| s.trim().trim_matches('"').to_string())
-            .filter(|s| !s.is_empty())
-            .collect()
-    } else {
-        vec![value.trim_matches('"').to_string()]
-    }
 }
 
 /// Loads skills from all configured sources.
@@ -177,6 +200,9 @@ impl SkillLoader {
     }
 
     /// Discover and load skills from all sources.
+    ///
+    /// After loading, conflicts are resolved by precedence:
+    /// `UserDir > RepoDir > Bundled > Plugin > Mcp`.
     pub fn load_all(&mut self, repo_path: Option<&Path>) {
         self.skills.clear();
 
@@ -195,6 +221,57 @@ impl SkillLoader {
                 self.load_from_dir(&repo_skills, SkillSource::RepoDir);
             }
         }
+
+        // 4. Resolve conflicts by precedence
+        self.resolve_conflicts();
+    }
+
+    /// Resolve duplicate skill names by source precedence.
+    ///
+    /// Logs a warning for each overridden skill.
+    fn resolve_conflicts(&mut self) {
+        use std::collections::HashMap;
+
+        let mut by_name: HashMap<&str, Vec<usize>> = HashMap::new();
+        for (idx, skill) in self.skills.iter().enumerate() {
+            by_name.entry(&skill.metadata.name).or_default().push(idx);
+        }
+
+        let mut keep: Vec<bool> = vec![true; self.skills.len()];
+        for (_name, indices) in by_name {
+            if indices.len() <= 1 {
+                continue;
+            }
+            // Find the highest-precedence skill
+            let best_idx = *indices
+                .iter()
+                .max_by_key(|&&idx| self.skills[idx].source.precedence())
+                .unwrap_or(&indices[0]);
+
+            for &idx in &indices {
+                if idx != best_idx {
+                    let overridden = &self.skills[idx];
+                    let winner = &self.skills[best_idx];
+                    tracing::warn!(
+                        skill = %overridden.metadata.name,
+                        overridden_source = %overridden.source,
+                        winner_source = %winner.source,
+                        "skill conflict resolved: {} overridden by {}",
+                        overridden.source,
+                        winner.source
+                    );
+                    keep[idx] = false;
+                }
+            }
+        }
+
+        let mut retained = Vec::with_capacity(self.skills.len());
+        for (idx, skill) in self.skills.drain(..).enumerate() {
+            if keep[idx] {
+                retained.push(skill);
+            }
+        }
+        self.skills = retained;
     }
 
     /// Load skills from a directory.
@@ -402,5 +479,45 @@ This is the script content.
 
         assert_eq!(loader.enabled().len(), 1);
         assert_eq!(loader.enabled()[0].source, SkillSource::RepoDir);
+    }
+
+    #[test]
+    fn conflict_resolution_prefers_user_over_bundled() {
+        let dir = tempfile::tempdir().unwrap();
+        // Write a bundled skill
+        std::fs::write(dir.path().join("bundled.md"), skill_content()).unwrap();
+
+        // Write a user skill with same name
+        let user_dir = tempfile::tempdir().unwrap();
+        std::fs::write(user_dir.path().join("user.md"), skill_content()).unwrap();
+
+        let mut loader = SkillLoader::new(dir.path().to_path_buf(), user_dir.path().to_path_buf());
+        loader.load_all(None);
+
+        // Should only have 1 skill (duplicate resolved)
+        assert_eq!(loader.list().len(), 1);
+        // UserDir takes precedence over Bundled
+        assert_eq!(loader.list()[0].source, SkillSource::UserDir);
+    }
+
+    #[test]
+    fn source_precedence_order() {
+        assert!(SkillSource::UserDir.precedence() > SkillSource::RepoDir.precedence());
+        assert!(SkillSource::RepoDir.precedence() > SkillSource::Bundled.precedence());
+        assert!(SkillSource::Bundled.precedence() > SkillSource::Plugin.precedence());
+        assert!(SkillSource::Plugin.precedence() > SkillSource::Mcp.precedence());
+    }
+
+    #[test]
+    fn frontmatter_parses_quoted_colons() {
+        let content = r#"---
+name: quoted-skill
+description: "This: has a colon"
+hooks: [pre-query]
+enabled: true
+---
+script"#;
+        let parsed = parse_skill_file(content).unwrap();
+        assert_eq!(parsed.metadata.description, "This: has a colon");
     }
 }

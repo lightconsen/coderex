@@ -316,6 +316,18 @@ impl McpManager {
             .collect()
     }
 
+    /// List all registered tools with full metadata.
+    #[must_use]
+    pub fn list_tool_info(&self) -> Vec<McpToolInfo> {
+        self.tools
+            .lock()
+            .unwrap()
+            .list()
+            .iter()
+            .map(|t| (*t).clone())
+            .collect()
+    }
+
     /// List all registered resource URIs.
     #[must_use]
     pub fn list_resources(&self) -> Vec<String> {

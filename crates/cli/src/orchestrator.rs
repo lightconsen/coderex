@@ -31,6 +31,8 @@ pub struct SessionContext {
     pub remote_barrier: Option<LoadingBarrier>,
     /// MCP server connections initialized.
     pub mcp_ready: bool,
+    /// MCP-discovered skills registered during InitMcp.
+    pub mcp_skills: Vec<coderex_plugins::skills::SkillMetadata>,
     /// Memory subsystem initialized.
     pub memory_ready: bool,
     /// Remote services initialized.
@@ -94,6 +96,7 @@ impl StartupOrchestrator {
                 #[cfg(feature = "enterprise")]
                 remote_barrier: None,
                 mcp_ready: false,
+                mcp_skills: Vec::new(),
                 memory_ready: false,
                 remote_services_ready: false,
                 cwd: String::new(),
@@ -530,6 +533,25 @@ impl StartupOrchestrator {
             manager.start_all().await;
             let running = manager.list_servers();
             tracing::info!("MCP servers started: {}", running.len());
+
+            // Bridge MCP-discovered tools to skills
+            for tool in manager.list_tool_info() {
+                self.ctx.mcp_skills.push(coderex_plugins::skills::SkillMetadata {
+                    name: tool.name.clone(),
+                    hooks: vec!["post-query".into()],
+                    agent: Some(tool.server.clone()),
+                    allowed_tools: vec![tool.name],
+                    description: tool.description,
+                    enabled: true,
+                });
+            }
+            if !self.ctx.mcp_skills.is_empty() {
+                tracing::info!(
+                    "MCP skills bridged: {} tools registered as skills",
+                    self.ctx.mcp_skills.len()
+                );
+            }
+
             self.ctx.mcp_ready = true;
         } else {
             tracing::debug!("no MCP servers configured");
