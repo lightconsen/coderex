@@ -25,6 +25,7 @@ oauth2.workspace = true
 reqwest.workspace = true
 url.workspace = true
 chrono.workspace = true
+async-trait.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

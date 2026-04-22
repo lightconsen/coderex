@@ -150,6 +150,16 @@ impl JsonRpcChannel {
         Ok(result)
     }
 
+    /// Discover tools from the MCP server.
+    pub async fn list_tools(&mut self) -> Result<Value, String> {
+        self.send_request("tools/list", None).await
+    }
+
+    /// Discover resources from the MCP server.
+    pub async fn list_resources(&mut self) -> Result<Value, String> {
+        self.send_request("resources/list", None).await
+    }
+
     /// Send a JSON-RPC request and wait for the response.
     pub async fn send_request(
         &mut self,

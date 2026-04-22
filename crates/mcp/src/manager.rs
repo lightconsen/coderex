@@ -4,27 +4,42 @@ use crate::config::McpConfig;
 use crate::elicitation::ElicitationManager;
 use crate::oauth::OAuthManager;
 use crate::proxy::{McpToolInfo, McpToolProxy, McpToolRegistry};
-use crate::resources::{McpResource, McpResourceRegistry};
+use crate::resources::{McpResource, McpResourceContent, McpResourceRegistry};
 use crate::server::{McpServer, ServerStatus};
 use dashmap::DashMap;
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+/// Cached resource entry with TTL.
+#[derive(Debug, Clone)]
+struct CachedResource {
+    content: McpResourceContent,
+    cached_at: Instant,
+}
 
 /// Manager for all MCP servers, tools, and resources.
 #[derive(Debug)]
 pub struct McpManager {
-    /// Server instances.
-    servers: DashMap<String, McpServer>,
+    /// Server instances (shared for health monitor access).
+    servers: Arc<DashMap<String, McpServer>>,
     /// Discovered tools.
     tools: Mutex<McpToolRegistry>,
     /// Discovered resources.
     resources: Mutex<McpResourceRegistry>,
+    /// Resource read cache: (server_id, uri) -> content.
+    resource_cache: Mutex<HashMap<(String, String), CachedResource>>,
+    /// Default cache TTL.
+    cache_ttl: Duration,
     /// OAuth state.
     oauth: OAuthManager,
     /// Elicitation state.
     elicitation: ElicitationManager,
     /// Whether a refresh (re-discovery) is needed.
     needs_refresh: AtomicBool,
+    /// Health monitor cancellation sender.
+    health_cancel: Mutex<Option<tokio::sync::watch::Sender<bool>>>,
 }
 
 impl Default for McpManager {
@@ -38,12 +53,15 @@ impl McpManager {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            servers: DashMap::new(),
+            servers: Arc::new(DashMap::new()),
             tools: Mutex::new(McpToolRegistry::new()),
             resources: Mutex::new(McpResourceRegistry::new()),
+            resource_cache: Mutex::new(HashMap::new()),
+            cache_ttl: Duration::from_secs(60),
             oauth: OAuthManager::new(),
             elicitation: ElicitationManager::new(),
             needs_refresh: AtomicBool::new(false),
+            health_cancel: Mutex::new(None),
         }
     }
 
@@ -61,19 +79,171 @@ impl McpManager {
         self.needs_refresh.store(true, Ordering::SeqCst);
     }
 
-    /// Spawn all registered servers.
+    /// Spawn all registered servers and discover tools/resources.
     pub async fn start_all(&self) {
         for mut entry in self.servers.iter_mut() {
             let server = entry.value_mut();
             let _ = server.spawn().await;
         }
+        self.discover_all().await;
     }
 
-    /// Stop all servers.
+    /// Discover tools and resources from all running servers.
+    pub async fn discover_all(&self) {
+        self.discover_all_tools().await;
+        self.discover_all_resources().await;
+    }
+
+    /// Discover tools from all running servers.
+    pub async fn discover_all_tools(&self) {
+        for mut entry in self.servers.iter_mut() {
+            let server = entry.value_mut();
+            if server.status != crate::server::ServerStatus::Running {
+                continue;
+            }
+            match server.discover_tools().await {
+                Ok(value) => {
+                    if let Some(tools) = value.get("tools").and_then(|t| t.as_array()) {
+                        for tool in tools {
+                            let name = tool
+                                .get("name")
+                                .and_then(|n| n.as_str())
+                                .unwrap_or("unknown")
+                                .to_string();
+                            let description = tool
+                                .get("description")
+                                .and_then(|d| d.as_str())
+                                .unwrap_or("")
+                                .to_string();
+                            let input_schema = tool
+                                .get("inputSchema")
+                                .cloned()
+                                .unwrap_or_else(|| serde_json::json!({}));
+
+                            self.register_tool(McpToolInfo {
+                                server: server.name.clone(),
+                                name,
+                                description,
+                                input_schema,
+                            });
+                        }
+                        tracing::info!(
+                            server = %server.name,
+                            count = tools.len(),
+                            "Discovered MCP tools"
+                        );
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(server = %server.name, "Tool discovery failed: {e}");
+                }
+            }
+        }
+    }
+
+    /// Discover resources from all running servers.
+    pub async fn discover_all_resources(&self) {
+        for mut entry in self.servers.iter_mut() {
+            let server = entry.value_mut();
+            if server.status != crate::server::ServerStatus::Running {
+                continue;
+            }
+            match server.discover_resources().await {
+                Ok(value) => {
+                    if let Some(resources) = value.get("resources").and_then(|r| r.as_array()) {
+                        for res in resources {
+                            let uri = res
+                                .get("uri")
+                                .and_then(|u| u.as_str())
+                                .unwrap_or("")
+                                .to_string();
+                            let name = res
+                                .get("name")
+                                .and_then(|n| n.as_str())
+                                .unwrap_or("")
+                                .to_string();
+                            let mime_type = res
+                                .get("mimeType")
+                                .and_then(|m| m.as_str())
+                                .unwrap_or("application/octet-stream")
+                                .to_string();
+                            let description = res
+                                .get("description")
+                                .and_then(|d| d.as_str())
+                                .map(String::from);
+
+                            self.register_resource(crate::resources::McpResource {
+                                uri,
+                                name,
+                                mime_type,
+                                description,
+                            });
+                        }
+                        tracing::info!(
+                            server = %server.name,
+                            count = resources.len(),
+                            "Discovered MCP resources"
+                        );
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(server = %server.name, "Resource discovery failed: {e}");
+                }
+            }
+        }
+    }
+
+    /// Stop all servers and cancel health monitor.
     pub async fn stop_all(&self) {
+        self.cancel_health_monitor();
         for mut entry in self.servers.iter_mut() {
             let server = entry.value_mut();
             server.stop().await;
+        }
+    }
+
+    /// Spawn a background health monitor that checks all servers every 30s.
+    pub fn spawn_health_monitor(&self) {
+        self.cancel_health_monitor();
+
+        let (tx, mut rx) = tokio::sync::watch::channel(false);
+        *self.health_cancel.lock().unwrap() = Some(tx);
+
+        let servers = Arc::clone(&self.servers);
+
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
+
+            loop {
+                tokio::select! {
+                    _ = interval.tick() => {}
+                    _ = rx.changed() => {
+                        if *rx.borrow() {
+                            break;
+                        }
+                    }
+                }
+
+                for entry in servers.iter() {
+                    let name = entry.key().clone();
+                    let server = entry.value();
+                    if server.status != ServerStatus::Running {
+                        continue;
+                    }
+                    if let Err(e) = server.health_check().await {
+                        tracing::warn!(server = %name, "MCP health check failed: {e}");
+                    }
+                }
+            }
+
+            tracing::debug!("MCP health monitor stopped");
+        });
+    }
+
+    /// Cancel the health monitor background task.
+    fn cancel_health_monitor(&self) {
+        if let Some(tx) = self.health_cancel.lock().unwrap().take() {
+            let _ = tx.send(true);
         }
     }
 
@@ -168,6 +338,44 @@ impl McpManager {
     #[must_use]
     pub fn resource_count(&self) -> usize {
         self.resources.lock().unwrap().len()
+    }
+
+    /// Get a cached resource if present and not expired.
+    #[must_use]
+    pub fn get_cached_resource(&self, server_id: &str, uri: &str) -> Option<McpResourceContent> {
+        let cache = self.resource_cache.lock().unwrap();
+        let key = (server_id.to_string(), uri.to_string());
+        cache.get(&key).and_then(|entry| {
+            if entry.cached_at.elapsed() < self.cache_ttl {
+                Some(entry.content.clone())
+            } else {
+                None
+            }
+        })
+    }
+
+    /// Store a resource in the cache.
+    pub fn cache_resource(&self, server_id: &str, uri: &str, content: McpResourceContent) {
+        let mut cache = self.resource_cache.lock().unwrap();
+        cache.insert(
+            (server_id.to_string(), uri.to_string()),
+            CachedResource {
+                content,
+                cached_at: Instant::now(),
+            },
+        );
+    }
+
+    /// Invalidate a specific cached resource.
+    pub fn invalidate_resource_cache(&self, server_id: &str, uri: &str) {
+        let mut cache = self.resource_cache.lock().unwrap();
+        cache.remove(&(server_id.to_string(), uri.to_string()));
+    }
+
+    /// Clear the entire resource cache.
+    pub fn clear_resource_cache(&self) {
+        let mut cache = self.resource_cache.lock().unwrap();
+        cache.clear();
     }
 
     /// Mark as needing refresh.

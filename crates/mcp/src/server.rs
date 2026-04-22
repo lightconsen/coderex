@@ -134,8 +134,42 @@ impl McpServer {
         Ok(())
     }
 
-    /// Run a health check via process liveness.
-    pub async fn health_check(&mut self) -> Result<(), McpServerError> {
+    /// Run a health check via process liveness (immutable).
+    pub async fn health_check(&self) -> Result<(), McpServerError> {
+        if self.status != ServerStatus::Running {
+            return Err(McpServerError::HealthCheckFailed {
+                name: self.name.clone(),
+                reason: "server not running".to_string(),
+            });
+        }
+
+        if let Some(ref channel) = self.channel {
+            let mut ch = channel.lock().await;
+            ch.ping().await.map_err(|e| McpServerError::HealthCheckFailed {
+                name: self.name.clone(),
+                reason: e,
+            })?;
+        } else {
+            return Err(McpServerError::HealthCheckFailed {
+                name: self.name.clone(),
+                reason: "no channel".to_string(),
+            });
+        }
+
+        Ok(())
+    }
+
+    /// Update server status (for health monitor).
+    pub fn set_status(&mut self, status: ServerStatus) {
+        self.status = status;
+    }
+
+    /// Discover tools from the MCP server.
+    ///
+    /// Returns the raw `tools/list` JSON response.
+    pub async fn discover_tools(
+        &mut self,
+    ) -> Result<serde_json::Value, McpServerError> {
         if self.status != ServerStatus::Running {
             return Err(McpServerError::HealthCheckFailed {
                 name: self.name.clone(),
@@ -144,18 +178,56 @@ impl McpServer {
         }
 
         let channel_opt = self.channel.take();
-        if let Some(ref channel) = channel_opt {
+        let result = if let Some(ref channel) = channel_opt {
             let mut ch = channel.lock().await;
-            ch.ping().await.map_err(|e| McpServerError::HealthCheckFailed {
+            ch.list_tools().await.map_err(|e| McpServerError::HealthCheckFailed {
                 name: self.name.clone(),
                 reason: e,
-            })?;
-        }
+            })
+        } else {
+            Err(McpServerError::HealthCheckFailed {
+                name: self.name.clone(),
+                reason: "no channel".to_string(),
+            })
+        };
+
         if let Some(channel) = channel_opt {
             self.channel = Some(channel);
         }
+        result
+    }
 
-        Ok(())
+    /// Discover resources from the MCP server.
+    ///
+    /// Returns the raw `resources/list` JSON response.
+    pub async fn discover_resources(
+        &mut self,
+    ) -> Result<serde_json::Value, McpServerError> {
+        if self.status != ServerStatus::Running {
+            return Err(McpServerError::HealthCheckFailed {
+                name: self.name.clone(),
+                reason: "server not running".to_string(),
+            });
+        }
+
+        let channel_opt = self.channel.take();
+        let result = if let Some(ref channel) = channel_opt {
+            let mut ch = channel.lock().await;
+            ch.list_resources().await.map_err(|e| McpServerError::HealthCheckFailed {
+                name: self.name.clone(),
+                reason: e,
+            })
+        } else {
+            Err(McpServerError::HealthCheckFailed {
+                name: self.name.clone(),
+                reason: "no channel".to_string(),
+            })
+        };
+
+        if let Some(channel) = channel_opt {
+            self.channel = Some(channel);
+        }
+        result
     }
 
     /// Attempt reconnection — terminate old channel and spawn new one.

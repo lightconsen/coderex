@@ -49,6 +49,18 @@ impl McpOAuthState {
         }
     }
 
+    /// Check if the token is near expiry (within 5 minutes).
+    #[must_use]
+    pub fn is_near_expiry(&self) -> bool {
+        match self.expires_at {
+            Some(exp) => {
+                let now = chrono::Utc::now().timestamp();
+                now >= exp - 300
+            }
+            None => true,
+        }
+    }
+
     /// Check if authenticated.
     #[must_use]
     pub fn is_authenticated(&self) -> bool {
@@ -63,6 +75,12 @@ impl McpOAuthState {
     }
 }
 
+/// Token store for persistence.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct TokenStore {
+    states: Vec<McpOAuthState>,
+}
+
 /// OAuth flow manager.
 #[derive(Debug, Default)]
 pub struct OAuthManager {
@@ -74,6 +92,41 @@ impl OAuthManager {
     #[must_use]
     pub fn new() -> Self {
         Self { states: Vec::new() }
+    }
+
+    /// Load tokens from the default persistence file.
+    pub fn load_tokens() -> Result<Self, std::io::Error> {
+        let path = Self::token_path();
+        if !path.exists() {
+            return Ok(Self::new());
+        }
+        let content = std::fs::read_to_string(&path)?;
+        let store: TokenStore = serde_json::from_str(&content)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        Ok(Self { states: store.states })
+    }
+
+    /// Save tokens to the default persistence file.
+    pub fn save_tokens(&self) -> Result<(), std::io::Error> {
+        let path = Self::token_path();
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let store = TokenStore {
+            states: self.states.clone(),
+        };
+        let content = serde_json::to_string_pretty(&store)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        std::fs::write(&path, content)
+    }
+
+    /// Default token file path: ~/.coderex/mcp_tokens.json
+    #[must_use]
+    pub fn token_path() -> std::path::PathBuf {
+        std::env::var("HOME")
+            .or_else(|_| std::env::var("USERPROFILE"))
+            .map(|h| std::path::PathBuf::from(h).join(".coderex").join("mcp_tokens.json"))
+            .unwrap_or_else(|_| std::path::PathBuf::from(".coderex/mcp_tokens.json"))
     }
 
     /// Register a server for OAuth.
@@ -153,5 +206,31 @@ mod tests {
             s.update_tokens("tok".into(), None, 3600);
         }
         assert!(mgr.is_authenticated("http://server1"));
+    }
+
+    #[test]
+    fn near_expiry_detects_within_5_minutes() {
+        let mut state = McpOAuthState::new("http://localhost", "client1");
+        state.update_tokens("tok".into(), None, 300); // expires in 5 min exactly
+        assert!(state.is_near_expiry());
+        assert!(!state.is_expired());
+    }
+
+    #[test]
+    fn save_and_load_tokens_roundtrip() {
+        let mut mgr = OAuthManager::new();
+        let mut state = McpOAuthState::new("http://server1", "client1");
+        state.update_tokens("access".into(), Some("refresh".into()), 3600);
+        mgr.register(state);
+
+        mgr.save_tokens().unwrap();
+        let loaded = OAuthManager::load_tokens().unwrap();
+        assert!(loaded.is_authenticated("http://server1"));
+        let s = loaded.get("http://server1").unwrap();
+        assert_eq!(s.access_token.as_ref().unwrap(), "access");
+        assert_eq!(s.refresh_token.as_ref().unwrap(), "refresh");
+
+        // Clean up
+        let _ = std::fs::remove_file(OAuthManager::token_path());
     }
 }
