@@ -22,6 +22,8 @@ pub struct TelemetryConfig {
     pub enabled: bool,
     /// Fraction of events to record (0.0–1.0).
     pub sample_rate: f64,
+    /// Optional pinned root certificate PEM for additional TLS trust.
+    pub pinned_cert_pem: Option<String>,
 }
 
 impl Default for TelemetryConfig {
@@ -34,6 +36,7 @@ impl Default for TelemetryConfig {
             upload_interval_secs: 300,
             enabled: true,
             sample_rate: 1.0,
+            pinned_cert_pem: None,
         }
     }
 }
@@ -139,10 +142,22 @@ impl Clone for TelemetryUploader {
 impl TelemetryUploader {
     /// Create a new uploader.
     pub fn new(db_path: PathBuf, config: TelemetryConfig) -> Self {
-        let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(30))
-            .build()
-            .unwrap_or_default();
+        let mut builder = reqwest::Client::builder()
+            .timeout(Duration::from_secs(30));
+
+        if let Some(ref pem) = config.pinned_cert_pem {
+            match reqwest::Certificate::from_pem(pem.as_bytes()) {
+                Ok(cert) => {
+                    builder = builder.add_root_certificate(cert);
+                    tracing::debug!("telemetry uploader: added pinned root certificate");
+                }
+                Err(e) => {
+                    tracing::warn!("telemetry uploader: failed to parse pinned cert PEM: {e}");
+                }
+            }
+        }
+
+        let client = builder.build().unwrap_or_default();
 
         Self {
             db_path,

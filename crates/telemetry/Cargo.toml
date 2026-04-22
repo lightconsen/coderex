@@ -21,6 +21,7 @@ uuid.workspace = true
 rusqlite.workspace = true
 reqwest.workspace = true
 flate2.workspace = true
+regex.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

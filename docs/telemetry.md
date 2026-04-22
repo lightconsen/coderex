@@ -20,9 +20,13 @@ Privacy-first telemetry collection, local storage, and batch upload. Stores even
 
 ### Key Types (uploader.rs)
 
-- **`TelemetryConfig`** — Endpoint, optional explicit crash endpoint, API key, batch size (default 100), interval (default 300s), enabled flag, sample rate (default 1.0).
+- **`TelemetryConfig`** — Endpoint, optional explicit crash endpoint, API key, batch size (default 100), interval (default 300s), enabled flag, sample rate (default 1.0), optional pinned root certificate PEM for TLS pinning.
 - **`TelemetryUploader`** — reqwest client + own DB connection + config + circuit breaker. Opens a fresh SQLite connection per upload batch for safe concurrent access.
 - **`CircuitBreaker`** — Three-state breaker (Closed/Open/HalfOpen). Opens after 5 consecutive failures, cools down for 60s, then transitions to HalfOpen.
+
+### Key Types (scrubber.rs)
+
+- **`Scrubber`** — Regex-based PII sanitizer. Replaces emails, IPs, home paths, and API keys with `<EMAIL>`, `<IP>`, `<USER>`, `<API_KEY>` tokens. Applied to `Error` and `ApiCall` events before insertion.
 
 ### Key Types (crash.rs)
 
@@ -40,10 +44,14 @@ Privacy-first telemetry collection, local storage, and batch upload. Stores even
 - **Circuit breaker**: Prevents hammering a failing endpoint with exponential backoff via Open/HalfOpen states.
 - **Event sampling**: Deterministic hash-based sampling on the serialized event JSON. Same event always yields the same decision.
 - **Own-connection uploader**: `TelemetryUploader` opens a fresh `TelemetryStore` connection per batch instead of sharing the worker's connection, avoiding Sync issues.
+- **PII scrubbing**: `Scrubber` regex-sanitizes `Error` and `ApiCall` events before insertion.
+- **Worker panic recovery**: `spawn_worker_with_recovery()` uses `catch_unwind` + fresh connection respawn (max 3 attempts, 10s cooldown).
+- **Certificate pinning**: Optional `pinned_cert_pem` in `TelemetryConfig` adds a custom root certificate to the reqwest client.
+- **Settings.json integration**: `TelemetrySubConfig` nested struct (schema v3) loads user overrides from `~/.coderex/settings.json`.
 
 ### Public API Surface
 
-- `TelemetryHandle`, `TelemetryEvent`, `TelemetryStore`, `TelemetryUploader`, `TelemetryConfig`, `CrashReporter`, `CrashReport`, `PendingEvent`, `PendingCrash`.
+- `TelemetryHandle`, `TelemetryEvent`, `TelemetryStore`, `TelemetryUploader`, `TelemetryConfig`, `CrashReporter`, `CrashReport`, `PendingEvent`, `PendingCrash`, `Scrubber`.
 
 ## Current Status
 
@@ -66,6 +74,11 @@ Privacy-first telemetry collection, local storage, and batch upload. Stores even
 - **Size-based retention** via `TelemetryStore::prune_to_size()`.
 - **Explicit crash endpoint** override (`TelemetryConfig.crash_endpoint`) or derived from events endpoint.
 - **DB size queries** via `PRAGMA page_count * page_size`.
+- **PII scrubbing** via `Scrubber` (emails, IPs, paths, API keys) applied to `Error` and `ApiCall` events.
+- **Worker panic recovery** with `catch_unwind`, fresh DB connection per respawn, 3-attempt limit, 10s cooldown.
+- **Certificate pinning** via `TelemetryConfig.pinned_cert_pem` + `add_root_certificate()`.
+- **User consent gate** on first run, persisted to `settings.json`.
+- **Settings.json integration** via `TelemetrySubConfig` nested struct (schema v3).
 
 ### What Is Stubbed/Partial
 
@@ -76,6 +89,7 @@ None — all previously stubbed items are now implemented.
 - 4 tests in `store.rs` (insert, batch, mark uploaded, crash roundtrip).
 - 6 tests in `uploader.rs` (config defaults, crash endpoint explicit/derived, circuit breaker, compression).
 - 1 test in `crash.rs` (serialization).
+- 5 tests in `scrubber.rs` (email, IPv4, home path, API key, event scrubbing).
 - Tests use tempfile/NamedTempFile for SQLite.
 
 ## Gaps for Production
@@ -98,15 +112,11 @@ None — all previously stubbed items are now implemented.
 
 ### Remaining
 
-- **SECURITY — API key in plain text**: `TelemetryConfig.api_key` is `Option<String>` with no encryption or keychain integration.
-  - **Suggestion**: Store the API key in the OS keychain via `keyring` crate. In config, use `"api_key": "keyring://coderex-telemetry"` as a reference. Never log or serialize the raw key.
-- **SECURITY — No certificate pinning**: reqwest client uses default TLS config; no validation of telemetry endpoint identity.
-  - **Suggestion**: Pin the telemetry server's certificate or public key hash in the binary. Use `reqwest::ClientBuilder::add_root_certificate()` with a custom CA or implement HPKP-style pinning. Fail closed on mismatch.
-- **PRIVACY — No user consent gate**: Claims "privacy-first and opt-out" but no actual UI or API for users to opt out.
-  - **Suggestion**: On first run, show a one-time consent dialog: "Help improve CodeRex by sending anonymous usage data? [Yes/No]". Store the choice in `~/.coderex/settings.json` under `telemetry.enabled`. Respect the choice immediately; default to disabled in GDPR jurisdictions.
-- **PRIVACY — No PII scrubbing**: Comments claim "sanitized, no PII" but `Error` event takes raw message string with no scrubbing logic.
-  - **Suggestion**: Implement a `Scrubber` that regex-replaces: email addresses, IP addresses, file paths containing the username, and API keys. Run it on all `Error` and `ApiCall` events before insertion. Audit the regex list quarterly.
-- **Worker thread panic handling**: If `flush_batch` panics, the worker thread dies silently; no recovery.
-  - **Suggestion**: Wrap the worker loop body in `std::panic::catch_unwind` (if Send). On panic, log the backtrace, mark the store as unhealthy, and respawn the worker thread after a 10s cooldown. Limit respawns to 3 before giving up.
-- **Hardcoded defaults partially addressed**: Endpoint, batch size, and interval are configurable via `TelemetryConfig`, but there is no `settings.json` integration to load user overrides at startup.
-  - **Suggestion**: Add a `TelemetryDefaults` struct and load overrides from `~/.coderex/settings.json` under a `telemetry` key.
+| Gap | Implementation |
+|-----|----------------|
+| **SECURITY — API key in plain text** | `coderex_config::resolve_api_key()` handles `keyring://` prefixes via the OS keychain (gated by `keyring` feature). The raw key is never logged or serialized. `TelemetryConfig.api_key` is resolved before use. |
+| **SECURITY — No certificate pinning** | `TelemetryConfig.pinned_cert_pem: Option<String>` added. When set, `TelemetryUploader::new()` calls `reqwest::ClientBuilder::add_root_certificate()` with the PEM, adding it as a trusted root for TLS verification. |
+| **PRIVACY — No user consent gate** | `StartupOrchestrator::prompt_telemetry_consent()` shows a one-time interactive prompt on first run (when no `settings.json` exists). The choice is persisted to `~/.coderex/settings.json` under `telemetry_enabled` and respected immediately. |
+| **PRIVACY — No PII scrubbing** | `Scrubber` in `scrubber.rs` regex-replaces email addresses, IP addresses (v4/v6), home-directory paths, and API-key patterns. `TelemetryHandle::record()` scrubs `Error` and `ApiCall` events before insertion. |
+| **Worker thread panic handling** | `spawn_worker_with_recovery()` wraps `run_store_worker()` in `std::panic::catch_unwind`. On panic, a fresh SQLite connection is opened and the worker respawns after a 10s cooldown. Max 3 respawns before giving up. |
+| **Hardcoded defaults / no settings.json integration** | `Settings` schema bumped to v3 with `telemetry: Option<TelemetrySubConfig>` (endpoint, crash_endpoint, batch_size, upload_interval_secs, sample_rate, pinned_cert_pem). `StartupOrchestrator::init_telemetry()` reads these overrides and builds `TelemetryConfig` from merged settings. |

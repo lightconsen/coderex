@@ -16,10 +16,12 @@
 #![warn(missing_docs)]
 
 mod crash;
+mod scrubber;
 mod store;
 mod uploader;
 
 pub use crash::{CrashReport, CrashReporter};
+pub use scrubber::Scrubber;
 pub use store::{PendingCrash, PendingEvent, TelemetryEvent, TelemetryStore};
 pub use uploader::{TelemetryConfig, TelemetryUploader};
 
@@ -44,6 +46,7 @@ enum WorkerCommand {
 pub struct TelemetryHandle {
     sender: mpsc::Sender<WorkerCommand>,
     sample_rate: f64,
+    scrubber: Option<Scrubber>,
 }
 
 impl TelemetryHandle {
@@ -58,13 +61,15 @@ impl TelemetryHandle {
         let (sender, receiver) = mpsc::channel::<WorkerCommand>();
         let db_path = store.path().to_path_buf();
 
-        // Spawn the SQLite worker thread
-        std::thread::spawn(move || {
-            run_store_worker(receiver, store);
-        });
+        // Spawn the SQLite worker thread with panic recovery
+        spawn_worker_with_recovery(receiver, db_path.clone());
 
         let sample_rate = config.as_ref().map(|c| c.sample_rate).unwrap_or(1.0);
-        let handle = Self { sender, sample_rate };
+        let handle = Self {
+            sender,
+            sample_rate,
+            scrubber: Some(Scrubber::new()),
+        };
 
         let uploader = config.and_then(|cfg| {
             if cfg.enabled {
@@ -83,9 +88,13 @@ impl TelemetryHandle {
     /// asynchronously by the worker thread.
     ///
     /// If sampling is configured and the event is skipped, this is a no-op.
-    pub fn record(&self, event: TelemetryEvent) {
+    /// PII is scrubbed from `Error` and `ApiCall` events before storage.
+    pub fn record(&self, mut event: TelemetryEvent) {
         if !should_sample(self.sample_rate, &event) {
             return;
+        }
+        if let Some(ref scrubber) = self.scrubber {
+            scrubber.scrub_event(&mut event);
         }
         let _ = self.sender.send(WorkerCommand::Event(event));
     }
@@ -139,8 +148,46 @@ impl TelemetryHandle {
     }
 }
 
+/// Spawn the worker thread with panic recovery.
+///
+/// If the worker panics, it is respawned (up to 3 times) after a 10s cooldown.
+/// A fresh SQLite connection is opened on each respawn to avoid poisoning.
+fn spawn_worker_with_recovery(receiver: mpsc::Receiver<WorkerCommand>, db_path: std::path::PathBuf) {
+    std::thread::spawn(move || {
+        let mut respawn_count = 0;
+        const MAX_RESPAWNS: usize = 3;
+        const COOLDOWN: std::time::Duration = std::time::Duration::from_secs(10);
+
+        loop {
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let store = TelemetryStore::open(&db_path)
+                    .expect("telemetry worker failed to open store");
+                run_store_worker(&receiver, &store);
+            }));
+
+            match result {
+                Ok(()) => break, // Clean exit (FlushAndExit or Disconnected)
+                Err(_) => {
+                    respawn_count += 1;
+                    if respawn_count > MAX_RESPAWNS {
+                        tracing::error!(
+                            "telemetry worker panicked {respawn_count} times — giving up"
+                        );
+                        break;
+                    }
+                    tracing::warn!(
+                        "telemetry worker panicked; respawning in {}s (attempt {respawn_count}/{MAX_RESPAWNS})",
+                        COOLDOWN.as_secs()
+                    );
+                    std::thread::sleep(COOLDOWN);
+                }
+            }
+        }
+    });
+}
+
 /// Run the SQLite worker loop.
-fn run_store_worker(receiver: mpsc::Receiver<WorkerCommand>, store: TelemetryStore) {
+fn run_store_worker(receiver: &mpsc::Receiver<WorkerCommand>, store: &TelemetryStore) {
     let mut batch = Vec::with_capacity(32);
     let mut last_flush = std::time::Instant::now();
     const FLUSH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
@@ -151,27 +198,27 @@ fn run_store_worker(receiver: mpsc::Receiver<WorkerCommand>, store: TelemetrySto
             Ok(WorkerCommand::Event(event)) => {
                 batch.push(event);
                 if batch.len() >= BATCH_SIZE {
-                    flush_batch(&store, &mut batch);
+                    flush_batch(store, &mut batch);
                     last_flush = std::time::Instant::now();
                 }
             }
             Ok(WorkerCommand::FlushAndExit(ack)) => {
                 if !batch.is_empty() {
-                    flush_batch(&store, &mut batch);
+                    flush_batch(store, &mut batch);
                 }
                 let _ = ack.send(());
                 break;
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {
                 if !batch.is_empty() && last_flush.elapsed() >= FLUSH_INTERVAL {
-                    flush_batch(&store, &mut batch);
+                    flush_batch(store, &mut batch);
                     last_flush = std::time::Instant::now();
                 }
             }
             Err(mpsc::RecvTimeoutError::Disconnected) => {
                 // Channel closed — flush remaining and exit
                 if !batch.is_empty() {
-                    flush_batch(&store, &mut batch);
+                    flush_batch(store, &mut batch);
                 }
                 break;
             }

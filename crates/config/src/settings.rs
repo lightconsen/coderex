@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use thiserror::Error;
 
 /// The current config schema version. Increment when the format changes.
-pub const CURRENT_SCHEMA_VERSION: u32 = 2;
+pub const CURRENT_SCHEMA_VERSION: u32 = 3;
 
 /// Errors from config loading and validation.
 #[derive(Debug, Error)]
@@ -83,6 +83,23 @@ impl ConfigDiff {
     }
 }
 
+/// Telemetry-specific sub-configuration.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct TelemetrySubConfig {
+    /// Endpoint URL for telemetry event uploads.
+    pub endpoint: Option<String>,
+    /// Explicit crash endpoint override.
+    pub crash_endpoint: Option<String>,
+    /// Maximum events per batch.
+    pub batch_size: Option<usize>,
+    /// Upload interval in seconds.
+    pub upload_interval_secs: Option<u64>,
+    /// Fraction of events to record (0.0–1.0).
+    pub sample_rate: Option<f64>,
+    /// Optional pinned root certificate PEM for TLS pinning.
+    pub pinned_cert_pem: Option<String>,
+}
+
 /// Resolved settings after merging all sources.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Settings {
@@ -97,6 +114,8 @@ pub struct Settings {
     pub max_budget_usd: Option<f64>,
     /// Whether telemetry (crash reports, usage analytics) is enabled.
     pub telemetry_enabled: Option<bool>,
+    /// Telemetry sub-configuration (endpoint, batch size, etc.).
+    pub telemetry: Option<TelemetrySubConfig>,
     /// Hook configurations.
     pub hooks: Option<serde_json::Value>,
     /// MCP server configurations.
@@ -115,6 +134,7 @@ impl Settings {
             permission_mode: Some("default".into()),
             max_budget_usd: None,
             telemetry_enabled: Some(true),
+            telemetry: None,
             hooks: None,
             mcp_servers: None,
             api_key: None,
@@ -167,6 +187,24 @@ impl Settings {
                 });
             }
         }
+        if let Some(ref telemetry) = self.telemetry {
+            if let Some(sample_rate) = telemetry.sample_rate {
+                if !(0.0..=1.0).contains(&sample_rate) {
+                    return Err(ConfigError::Validation {
+                        field: "telemetry.sample_rate".to_string(),
+                        message: "sample_rate must be between 0.0 and 1.0".to_string(),
+                    });
+                }
+            }
+            if let Some(batch_size) = telemetry.batch_size {
+                if batch_size == 0 {
+                    return Err(ConfigError::Validation {
+                        field: "telemetry.batch_size".to_string(),
+                        message: "batch_size must be > 0".to_string(),
+                    });
+                }
+            }
+        }
         Ok(())
     }
 
@@ -181,6 +219,7 @@ impl Settings {
             permission_mode: other.permission_mode.clone().or_else(|| self.permission_mode.clone()),
             max_budget_usd: other.max_budget_usd.or(self.max_budget_usd),
             telemetry_enabled: other.telemetry_enabled.or(self.telemetry_enabled),
+            telemetry: other.telemetry.clone().or_else(|| self.telemetry.clone()),
             hooks: other.hooks.clone().or_else(|| self.hooks.clone()),
             mcp_servers: other.mcp_servers.clone().or_else(|| self.mcp_servers.clone()),
             api_key: other.api_key.clone().or_else(|| self.api_key.clone()),
@@ -198,7 +237,7 @@ impl Settings {
 
         let keys = [
             "model", "permission_mode", "max_budget_usd",
-            "telemetry_enabled", "hooks", "mcp_servers", "api_key",
+            "telemetry_enabled", "telemetry", "hooks", "mcp_servers", "api_key",
         ];
         let mut changes = Vec::new();
 
@@ -230,6 +269,10 @@ pub fn migrate_settings(settings: &mut Settings, source: &str) {
         // v1 → v2: add api_key field (already present via Default)
         settings.config_version = 2;
     }
+    if from < 3 {
+        // v2 → v3: add telemetry sub-config field (already present via Default)
+        settings.config_version = 3;
+    }
     if settings.config_version != from {
         tracing::info!(
             "migrated settings from v{from} to v{} (source: {source})",
@@ -247,6 +290,8 @@ pub struct RuntimeOverrides {
     pub permission_mode: Option<String>,
     /// Maximum budget in USD, overriding config.
     pub max_budget_usd: Option<f64>,
+    /// Telemetry enabled override.
+    pub telemetry_enabled: Option<bool>,
     /// API key, overriding config.
     pub api_key: Option<String>,
 }
@@ -263,6 +308,9 @@ impl RuntimeOverrides {
         }
         if let Some(max_budget_usd) = self.max_budget_usd {
             settings.max_budget_usd = Some(max_budget_usd);
+        }
+        if let Some(telemetry_enabled) = self.telemetry_enabled {
+            settings.telemetry_enabled = Some(telemetry_enabled);
         }
         if let Some(api_key) = self.api_key {
             settings.api_key = Some(api_key);
@@ -352,7 +400,7 @@ fn load_settings_file(path: &Path, source: &str) -> Result<Option<Settings>, Con
         if let Some(obj) = value.as_object() {
             let known_fields = [
                 "config_version", "model", "permission_mode", "max_budget_usd",
-                "telemetry_enabled", "hooks", "mcp_servers", "api_key",
+                "telemetry_enabled", "telemetry", "hooks", "mcp_servers", "api_key",
             ];
             for key in obj.keys() {
                 if !known_fields.contains(&key.as_str()) {
@@ -659,6 +707,7 @@ mod tests {
             permission_mode: Some("default".into()),
             max_budget_usd: None,
             telemetry_enabled: Some(true),
+            telemetry: None,
             hooks: None,
             mcp_servers: None,
             api_key: None,

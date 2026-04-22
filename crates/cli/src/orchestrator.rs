@@ -42,6 +42,8 @@ pub struct SessionContext {
     pub cwd: String,
     /// Plugin manager (initialized during InitPlugins).
     pub plugin_manager: Option<Arc<coderex_plugins::plugins::PluginManager>>,
+    /// Telemetry handle (initialized during LoadSettings).
+    pub telemetry_handle: Option<coderex_telemetry::TelemetryHandle>,
 }
 
 /// Phases of startup.
@@ -104,6 +106,7 @@ impl StartupOrchestrator {
                 remote_services_ready: false,
                 cwd: String::new(),
                 plugin_manager: None,
+                telemetry_handle: None,
             },
         }
     }
@@ -261,7 +264,8 @@ impl StartupOrchestrator {
         Ok(())
     }
 
-    /// LoadSettings: load user + project config, resolve with overrides.
+    /// LoadSettings: load user + project config, resolve with overrides,
+    /// and initialize telemetry with settings.json integration.
     async fn phase_load_settings(&mut self, args: &Cli) -> Result<()> {
         let config_dir = coderex_config::config_home();
         let user_path = config_dir.join("settings.json");
@@ -269,14 +273,25 @@ impl StartupOrchestrator {
         // Find project config in CWD or ancestors
         let project_path = Self::find_project_config(&self.ctx.cwd);
 
-        let config_service = ConfigService::new(user_path, project_path);
+        let config_service = ConfigService::new(user_path.clone(), project_path);
         let mut settings = config_service.resolve()?;
+
+        // First-run consent gate: if no user config exists and telemetry_enabled
+        // is not explicitly set, prompt the user interactively.
+        if !user_path.exists() && settings.telemetry_enabled.is_none() {
+            if let Some(choice) = Self::prompt_telemetry_consent() {
+                settings.telemetry_enabled = Some(choice);
+                // Persist the choice to settings.json
+                let _ = Self::write_user_settings(&user_path, &settings);
+            }
+        }
 
         // Apply CLI runtime overrides
         let overrides = RuntimeOverrides {
             model: args.model.clone(),
             permission_mode: args.permissions.clone(),
             max_budget_usd: None,
+            telemetry_enabled: None,
             api_key: None,
         };
         settings = overrides.apply(settings);
@@ -286,8 +301,103 @@ impl StartupOrchestrator {
             settings.model.as_deref().unwrap_or("default")
         );
 
+        // Initialize telemetry subsystem with resolved settings
+        let telemetry_enabled = settings.telemetry_enabled.unwrap_or(true);
+        if telemetry_enabled {
+            if let Some((handle, _uploader)) = Self::init_telemetry(&settings) {
+                self.ctx.telemetry_handle = Some(handle);
+            }
+        } else {
+            tracing::info!("telemetry disabled by user preference");
+        }
+
         self.ctx.settings = Some(settings);
         Ok(())
+    }
+
+    /// Initialize the telemetry subsystem using resolved settings.
+    fn init_telemetry(
+        settings: &Settings,
+    ) -> Option<(coderex_telemetry::TelemetryHandle, Option<coderex_telemetry::TelemetryUploader>)> {
+        let config_home = coderex_config::config_home();
+        let db_path = config_home.join("telemetry.db");
+        let pending_dir = config_home.join("crashes").join("pending");
+
+        let store = match coderex_telemetry::TelemetryStore::open(&db_path) {
+            Ok(store) => store,
+            Err(e) => {
+                tracing::warn!("failed to open telemetry store: {e}");
+                return None;
+            }
+        };
+
+        // Ingest crash reports from previous panics
+        let crash_reporter = coderex_telemetry::CrashReporter::new(pending_dir);
+        match crash_reporter.ingest_pending(&store) {
+            Ok(count) => {
+                if count > 0 {
+                    tracing::info!("ingested {count} pending crash reports");
+                }
+            }
+            Err(e) => tracing::warn!("failed to ingest pending crashes: {e}"),
+        }
+
+        // Build TelemetryConfig from settings sub-config
+        let telemetry_config = settings.telemetry.as_ref().map(|t| {
+            let api_key = settings.api_key.as_ref().map(|k| coderex_config::resolve_api_key(k));
+            coderex_telemetry::TelemetryConfig {
+                endpoint: t.endpoint.clone().unwrap_or_else(|| {
+                    "https://telemetry.coderex.dev/v1/events".into()
+                }),
+                crash_endpoint: t.crash_endpoint.clone(),
+                api_key,
+                batch_size: t.batch_size.unwrap_or(100),
+                upload_interval_secs: t.upload_interval_secs.unwrap_or(300),
+                enabled: true,
+                sample_rate: t.sample_rate.unwrap_or(1.0),
+                pinned_cert_pem: t.pinned_cert_pem.clone(),
+            }
+        });
+
+        let (handle, uploader) =
+            coderex_telemetry::TelemetryHandle::new(store, telemetry_config);
+        Some((handle, uploader))
+    }
+
+    /// Prompt the user for telemetry consent on first run.
+    ///
+    /// Returns `Some(true/false)` if the user answered, or `None` if
+    /// stdin is not interactive or the prompt failed.
+    fn prompt_telemetry_consent() -> Option<bool> {
+        if !std::io::stdin().is_terminal() {
+            return None;
+        }
+        eprintln!();
+        eprintln!("Help improve CodeRex by sending anonymous usage data?");
+        eprintln!("  - No PII is collected");
+        eprintln!("  - Events are stored locally and batch-uploaded");
+        eprintln!("  - You can change this anytime in ~/.coderex/settings.json");
+        eprint!("Enable telemetry? [Y/n]: ");
+
+        let mut input = String::new();
+        if std::io::stdin().read_line(&mut input).is_err() {
+            return None;
+        }
+        let trimmed = input.trim().to_lowercase();
+        let choice = trimmed.is_empty() || trimmed.starts_with('y');
+        Some(choice)
+    }
+
+    /// Write user settings to disk, preserving other fields.
+    fn write_user_settings(
+        path: &std::path::Path,
+        settings: &Settings,
+    ) -> Result<(), std::io::Error> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let json = serde_json::to_string_pretty(settings).unwrap_or_default();
+        std::fs::write(path, json)
     }
 
     /// MergeRemoteManagedSettings: fetch remote settings with fail-open semantics.
