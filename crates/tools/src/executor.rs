@@ -2,6 +2,7 @@
 
 use crate::context::{ToolError, ToolOutput};
 use crate::tool::{Tool, ToolContext, ToolInput};
+use crate::tool_cache::{ToolCache, ToolCacheConfig};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
@@ -19,6 +20,8 @@ pub struct ExecutionConfig {
     pub sandbox_enabled: bool,
     /// Maximum output size in bytes before truncation.
     pub max_output_bytes: usize,
+    /// Cache configuration for tool results.
+    pub cache_config: ToolCacheConfig,
 }
 
 impl Default for ExecutionConfig {
@@ -28,25 +31,34 @@ impl Default for ExecutionConfig {
             max_concurrent: 4,
             sandbox_enabled: true,
             max_output_bytes: 1_048_576, // 1 MB
+            cache_config: ToolCacheConfig::default(),
         }
     }
 }
 
-/// Executes tools with concurrency control and timeout.
+/// Executes tools with concurrency control, timeout, and result caching.
 #[derive(Debug)]
 pub struct ToolExecutor {
     config: ExecutionConfig,
     /// Per-tool-name locks for non-concurrency-safe tools.
     locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
+    /// Optional global result cache for read-only tools.
+    cache: Option<ToolCache>,
 }
 
 impl ToolExecutor {
     /// Create a new executor with the given config.
     #[must_use]
     pub fn new(config: ExecutionConfig) -> Self {
+        let cache = if config.cache_config.enabled {
+            Some(ToolCache::new(config.cache_config.clone()))
+        } else {
+            None
+        };
         Self {
             config,
             locks: Mutex::new(HashMap::new()),
+            cache,
         }
     }
 
@@ -82,6 +94,8 @@ impl ToolExecutor {
     /// Respects the tool's concurrency safety flag:
     /// - Concurrency-safe tools may run in parallel
     /// - Non-safe tools are serialized per-tool-name
+    ///
+    /// Read-only results are cached and served from cache when possible.
     pub async fn execute_single(
         &self,
         tool: &dyn Tool,
@@ -90,64 +104,114 @@ impl ToolExecutor {
     ) -> Result<ToolOutput, ToolError> {
         let desc = tool.descriptor();
 
+        // Try cache for read-only tools
+        if desc.is_read_only {
+            if let Some(ref cache) = self.cache {
+                if let Some(cached) = cache.get(&desc.name, &input.arguments).await {
+                    return Ok(self.truncate_output(cached));
+                }
+            }
+        }
+
         // For non-concurrency-safe tools, serialize execution
         let result = if !desc.is_concurrency_safe {
             let tool_name = desc.name.clone();
             let lock = self.get_lock(&tool_name).await;
             let _guard = lock.lock().await;
-            timeout(self.config.default_timeout, tool.execute(input, ctx))
+            timeout(self.config.default_timeout, tool.execute(input.clone(), ctx))
                 .await
                 .map_err(|_| ToolError::Timeout {
                     timeout: self.config.default_timeout,
                 })?
         } else {
             // Concurrency-safe tools run without serialization
-            timeout(self.config.default_timeout, tool.execute(input, ctx))
+            timeout(self.config.default_timeout, tool.execute(input.clone(), ctx))
                 .await
                 .map_err(|_| ToolError::Timeout {
                     timeout: self.config.default_timeout,
                 })?
         };
 
-        result.map(|output| self.truncate_output(output))
+        let result = result.map(|output| self.truncate_output(output));
+
+        // Cache successful read-only results
+        if desc.is_read_only {
+            if let (Some(cache), Ok(output)) = (&self.cache, &result) {
+                cache.insert(&desc.name, &input.arguments, output.clone()).await;
+            }
+        }
+
+        result
     }
 
     /// Execute multiple tool calls in concurrent batches.
     ///
     /// Tools are batched according to `max_concurrent`. Each tool in the
     /// batch runs concurrently unless it is marked non-concurrency-safe.
+    ///
+    /// Read-only results are cached and may be served from cache without
+    /// spawning a task.
     pub async fn execute_many(
         &self,
         calls: Vec<(Arc<dyn Tool>, ToolInput, ToolContext<'static>)>,
     ) -> Vec<Result<ToolOutput, ToolError>> {
-        let mut all_results = Vec::with_capacity(calls.len());
+        let mut all_results: Vec<Option<Result<ToolOutput, ToolError>>> =
+            std::iter::repeat_with(|| None).take(calls.len()).collect();
+        let mut to_spawn: Vec<(usize, Arc<dyn Tool>, ToolInput, ToolContext<'static>)> =
+            Vec::new();
 
-        for batch in calls.chunks(self.config.max_concurrent) {
+        // Phase 1: check cache
+        for (idx, (tool, input, ctx)) in calls.into_iter().enumerate() {
+            let desc = tool.descriptor();
+            if desc.is_read_only {
+                if let Some(ref cache) = self.cache {
+                    if let Some(cached) = cache.get(&desc.name, &input.arguments).await {
+                        all_results[idx] = Some(Ok(self.truncate_output(cached)));
+                        continue;
+                    }
+                }
+            }
+            to_spawn.push((idx, tool, input, ctx));
+        }
+
+        // Phase 2: execute remaining calls in batches
+        for batch in to_spawn.chunks(self.config.max_concurrent) {
             let mut handles = Vec::new();
 
-            for (tool, input, ctx) in batch {
+            for (idx, tool, input, ctx) in batch {
+                let idx = *idx;
                 let tool = Arc::clone(tool);
                 let input = input.clone();
                 let ctx = ctx.clone();
                 let exec_timeout = self.config.default_timeout;
                 let max_output_bytes = self.config.max_output_bytes;
+                let cache = self.cache.clone();
 
                 let handle = tokio::spawn(async move {
                     let desc = tool.descriptor();
+                    let is_read_only = desc.is_read_only;
+                    let tool_name = desc.name.clone();
 
-                    drop(desc);
-
-                    let result = tokio::time::timeout(exec_timeout, tool.execute(input, ctx))
-                        .await
-                        .map_err(|_| ToolError::Timeout { timeout: exec_timeout })?;
-
-                    result.map(|mut output| {
-                        if output.output.len() > max_output_bytes {
-                            output.output.truncate(max_output_bytes);
-                            output.output.push_str("\n... [truncated]");
+                    let result = match tokio::time::timeout(exec_timeout, tool.execute(input.clone(), ctx)).await {
+                        Ok(Ok(mut output)) => {
+                            if output.output.len() > max_output_bytes {
+                                output.output.truncate(max_output_bytes);
+                                output.output.push_str("\n... [truncated]");
+                            }
+                            Ok(output)
                         }
-                        output
-                    })
+                        Ok(Err(e)) => Err(e),
+                        Err(_) => Err(ToolError::Timeout { timeout: exec_timeout }),
+                    };
+
+                    // Cache successful read-only results
+                    if is_read_only {
+                        if let (Some(cache), Ok(output)) = (&cache, &result) {
+                            cache.insert(&tool_name, &input.arguments, output.clone()).await;
+                        }
+                    }
+
+                    (idx, result)
                 });
 
                 handles.push(handle);
@@ -155,15 +219,21 @@ impl ToolExecutor {
 
             for handle in handles {
                 match handle.await {
-                    Ok(result) => all_results.push(result),
-                    Err(_) => all_results.push(Err(ToolError::InvalidInput {
-                        message: "task panicked".into(),
-                    })),
+                    Ok((idx, result)) => {
+                        all_results[idx] = Some(result);
+                    }
+                    Err(_) => {
+                        // Task panicked
+                    }
                 }
             }
         }
 
-        all_results
+        all_results.into_iter().map(|r| {
+            r.unwrap_or(Err(ToolError::InvalidInput {
+                message: "internal batch error".into(),
+            }))
+        }).collect()
     }
 }
 

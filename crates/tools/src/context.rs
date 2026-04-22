@@ -62,7 +62,7 @@ pub enum ToolError {
 }
 
 /// Output from a successful tool execution.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ToolOutput {
     /// Text output from the tool.
     pub output: String,

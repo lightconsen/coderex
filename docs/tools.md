@@ -21,6 +21,7 @@ Implements the tool trait system, registers built-in tools, and provides executi
 - **`TaskStore`** (`task_store.rs`) — `DashMap`-backed task registry with JSONL persistence (`~/.coderex/tasks.jsonl`). Supports create, update, delete, list, filter by status.
 - **`CronScheduler`** (`cron_scheduler.rs`) — In-memory cron job scheduler with optional file persistence for durable jobs. Includes `spawn_runner()` which returns an `mpsc::UnboundedReceiver<(job_id, prompt)>` fired by a background tokio task polling every 60s.
 - **`SandboxConfig`** (`sandbox_policy.rs`) — Default per-tool sandbox policies injected by `RegistryToolDispatcher` when sandboxing is enabled.
+- **`ToolCache`** (`tool_cache.rs`) — Global LRU cache for read-only tool results using `moka`. Keys are `(tool_name, arguments_hash)`. `Read` tool entries are invalidated when the file's mtime changes.
 
 ### Built-in Tools (44 baseline + 13 feature-gated)
 
@@ -87,6 +88,7 @@ Registered with `ToolTier::FeatureGated` and `is_enabled: false`. Return a "feat
 - **Output truncation** — `ExecutionConfig.max_output_bytes` (default 1MB) enforced by `ToolExecutor`. Outputs beyond the limit are truncated with `"\n... [truncated]"`.
 - **Timeout enforcement** — All tool executions wrapped in `tokio::time::timeout` using `ExecutionConfig.default_timeout` (default 60s).
 - **Batch execution** — `execute_many()` chunks calls into batches of `max_concurrent` and runs each batch concurrently.
+- **Result caching** — `ToolExecutor` caches successful results from read-only tools in an LRU cache (`moka`, default 1000 entries, 5-minute TTL). `Read` tool cache entries are invalidated when the underlying file's mtime changes.
 
 ## Current Status
 
@@ -103,7 +105,8 @@ Registered with `ToolTier::FeatureGated` and `is_enabled: false`. Return a "feat
 - `WebFetchTool` redirect validation via `reqwest::redirect::Policy::custom` against `allowed_domains` whitelist. Simple in-memory URL cache with 15-minute TTL.
 - `BashTool` command allowlist + shell metacharacter rejection (`;`, `|`, `&`, `` ` ``, `$`, `(`, `)`, `<`, `>`) + OS-level sandbox integration (macOS `sandbox-exec`, Linux `seccomp-bpf`).
 - `McpAuthTool` full OAuth flow: `open_browser()` → `wait_for_callback()` on `localhost:8765` → code exchange POST → `persist_token()` to `~/.coderex/mcp_tokens.json`.
-- All major tools have unit tests (167+ tests in `coderex-tools`).
+- `ToolCache` global LRU cache for read-only tool results. Keys are `(tool_name, arguments_hash)` with 5-minute TTL and 1000-entry capacity. `Read` tool entries invalidated on file mtime change.
+- All major tools have unit tests (170+ tests in `coderex-tools`).
 
 ### What Is Stubbed/Partial
 
@@ -111,5 +114,4 @@ None — all previously stubbed items are now implemented.
 
 ## Gaps for Production
 
-- **No global tool result caching** — `WebFetchTool` has a simple per-URL cache (15-min TTL), but repeated identical calls to file, shell, or search tools hit the underlying system every time.
-  - **Suggestion**: Add an LRU cache keyed by `(tool_name, arguments_hash)` in `ToolRegistry`. Invalidate on file modification time for file-read tools. Use `moka` crate for concurrent caching.
+None — all previously identified gaps are now implemented.

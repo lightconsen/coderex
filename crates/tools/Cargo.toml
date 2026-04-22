@@ -40,6 +40,7 @@ chrono.workspace = true
 uuid.workspace = true
 cron = "0.15"
 html2text = "0.13"
+moka.workspace = true
 lsp-types.workspace = true
 
 [dev-dependencies]
