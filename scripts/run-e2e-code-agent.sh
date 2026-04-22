@@ -3,7 +3,7 @@ set -euo pipefail
 
 # Load API credentials
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-source "${SCRIPT_DIR}/start.kimi.sh"
+source "${SCRIPT_DIR}/export_local_env.sh"
 
 # Run E2E code-agent tests against real LLM
 cd "${SCRIPT_DIR}/.."
