@@ -2,11 +2,12 @@
 
 use crate::types::{Message, ModelId, UsageSummary};
 use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use uuid::Uuid;
 
 /// State of a single conversation session.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionState {
     /// Unique session identifier.
     pub session_id: Uuid,
@@ -54,7 +55,7 @@ impl SessionState {
 }
 
 /// State of a git worktree.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorktreeState {
     /// Path to the worktree directory.
     pub path: PathBuf,

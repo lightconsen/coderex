@@ -13,6 +13,7 @@ use crate::executor::ToolExecutor as InnerExecutor;
 use crate::rate_limiter::{RateLimiter, RATE_LIMITER_KEY};
 use crate::registry::ToolRegistry;
 use crate::sandbox_policy;
+use crate::builtins::chrome::{ChromeClient, CHROME_CLIENT_KEY};
 use crate::task_store::{TaskStore, TASK_STORE_KEY};
 use crate::tool::{ToolContext, ToolInput, SharedState};
 use coderex_core::tool_executor::{
@@ -37,6 +38,7 @@ pub struct RegistryToolDispatcher {
     task_store: Option<Arc<TaskStore>>,
     cron_scheduler: Option<Arc<CronScheduler>>,
     rate_limiter: Option<Arc<RateLimiter>>,
+    chrome_client: Option<ChromeClient>,
 }
 
 impl RegistryToolDispatcher {
@@ -60,6 +62,7 @@ impl RegistryToolDispatcher {
             task_store: None,
             cron_scheduler: None,
             rate_limiter: None,
+            chrome_client: None,
         }
     }
 
@@ -86,6 +89,11 @@ impl RegistryToolDispatcher {
     /// Attach a shared rate limiter for web tools.
     pub fn set_rate_limiter(&mut self, limiter: Arc<RateLimiter>) {
         self.rate_limiter = Some(limiter);
+    }
+
+    /// Attach a Chrome CDP client for browser automation tools.
+    pub fn set_chrome_client(&mut self, client: ChromeClient) {
+        self.chrome_client = Some(client);
     }
 }
 
@@ -152,6 +160,14 @@ impl CoreToolExecutor for RegistryToolDispatcher {
             extra.insert(
                 RATE_LIMITER_KEY.to_string(),
                 Box::new(Arc::clone(limiter)) as SharedState,
+            );
+        }
+
+        // Inject Chrome CDP client
+        if let Some(ref client) = self.chrome_client {
+            extra.insert(
+                CHROME_CLIENT_KEY.to_string(),
+                Box::new(client.clone()) as SharedState,
             );
         }
 

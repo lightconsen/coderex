@@ -19,7 +19,7 @@ pub use tool::{Tool, ToolInput, InterruptBehavior, ToolTier};
 pub use registry::{ToolRegistry, ToolDenyRule, ToolNotFoundError};
 pub use context::{ExecutionContext, ToolError, ToolOutput};
 pub use builtins::{
-    AgentTool, AskUserQuestionTool, BashTool, BriefTool, ConfigTool, CronCreateTool, CronDeleteTool,
+    AgentTool, AskUserQuestionTool, BashTool, BriefTool, ChromeClient, ConfigTool, CronCreateTool, CronDeleteTool,
     CronListTool, EchoTool, EditTool, EnterPlanModeTool, ExitPlanModeTool, GlobTool, GrepTool,
     LspTool, McpAuthTool, NoOpTool, NotebookEditTool, PowerShellTool, ReadTool, RemoteTriggerTool, ReplTool, SendMessageTool,
     SkillTool, SleepTool, StructuredOutputTool, SyntheticOutputTool, TaskCreateTool, TaskGetTool,

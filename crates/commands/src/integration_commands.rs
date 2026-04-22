@@ -32,16 +32,33 @@ pub fn register(registry: &mut CommandRegistry) {
         true,
         true,
         true,
-        Arc::new(|_ctx: &CommandContext, _args: &[String]| {
+        Arc::new(|_ctx: &CommandContext, args: &[String]| {
             let connected = std::net::TcpStream::connect_timeout(
                 &std::net::SocketAddr::from(([127, 0, 0, 1], 9222)),
                 std::time::Duration::from_millis(50),
             ).is_ok();
-            if connected {
-                CommandResult::success("Chrome DevTools: Connected\nDebugger listening on port 9222.")
-            } else {
-                CommandResult::success("Chrome DevTools: Not connected\nConfigure Chrome DevTools in settings.json or start Chrome with --remote-debugging-port=9222.")
+
+            if let Some(arg) = args.first() {
+                if arg == "--tools" {
+                    return CommandResult::success(
+                        "Chrome Tools\n───────────\n\
+chrome_list_tabs      — List open Chrome tabs\n\
+chrome_navigate       — Open a URL in a new tab\n\
+chrome_execute_js     — Execute JavaScript in a tab\n\
+chrome_screenshot     — Capture a screenshot (base64 PNG)\n\
+chrome_get_content    — Extract page HTML as markdown"
+                    );
+                }
             }
+
+            let status = if connected {
+                "Connected\nDebugger listening on port 9222."
+            } else {
+                "Not connected\n\nStart Chrome with:\n  google-chrome --remote-debugging-port=9222\n  # or\n  /Applications/Google\\ Chrome.app/Contents/MacOS/Google\\ Chrome --remote-debugging-port=9222"
+            };
+            CommandResult::success(format!(
+                "Chrome DevTools\n───────────────\nStatus: {status}\n\nUse /chrome --tools to see available tools."
+            ))
         }),
     ));
 

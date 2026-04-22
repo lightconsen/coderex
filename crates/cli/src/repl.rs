@@ -5,7 +5,7 @@ use coderex_commands::registry::{CommandContext, CommandRegistry, CommandResult}
 use coderex_commands::{CommandHistory, MacroRegistry};
 use coderex_core::types::ModelId;
 use coderex_core::engine::{QueryEngine, SubmitOptions, TerminalReason};
-use coderex_core::permission_engine::{ExplainPermissionHook, PermissionEngine};
+use coderex_core::permission_engine::{AutoClassifierHook, ExplainPermissionHook, PermissionEngine};
 use coderex_core::prompts;
 use coderex_core::orchestrator::{background_feature_label, BackgroundFeatureKind, BackgroundFeatureRequest};
 use coderex_core::query_profiles::{ModelProfile, PromptProfile, QueryKind, QueryRequest};
@@ -20,7 +20,7 @@ use coderex_memory::{
     team_memory::TeamMemorySyncService,
 };
 use coderex_tools::{
-    register_builtin_tools, CronScheduler, ExecutionConfig, ExecutionContext,
+    register_builtin_tools, ChromeClient, CronScheduler, ExecutionConfig, ExecutionContext,
     RateLimiter, RegistryToolDispatcher, TaskStore, ToolExecutor as ToolsExecutor, ToolRegistry,
 };
 use std::collections::HashMap;
@@ -131,6 +131,8 @@ pub struct ReplLoop {
     sdk_session: Option<Arc<SdkSession>>,
     /// Background timeout checker for the SDK session.
     sdk_timeout_handle: Option<tokio::task::JoinHandle<()>>,
+    /// Teleport manager for session sharing and directory switching.
+    teleport_manager: Option<coderex_bridge::teleport::TeleportManager>,
 }
 
 /// Wrapper that implements `ToolExecutor` for `Arc<dyn ToolExecutor>`.
@@ -215,6 +217,7 @@ impl ReplLoop {
             cron_rx: None,
             sdk_session: None,
             sdk_timeout_handle: None,
+            teleport_manager: Some(coderex_bridge::teleport::TeleportManager::new()),
             #[cfg(feature = "hot-reload")]
             config_changed_rx: None,
         };
@@ -249,6 +252,9 @@ impl ReplLoop {
         permission_engine.add_hook(Arc::new(ExplainPermissionHook::new_with_event_tx(
             api_client.clone_box(),
             event_tx.clone(),
+        )));
+        permission_engine.add_hook(Arc::new(AutoClassifierHook::new(
+            api_client.clone_box(),
         )));
 
         let memory_base = std::path::PathBuf::from(&cwd).join(".coderex").join("memory");
@@ -300,6 +306,9 @@ impl ReplLoop {
         let rate_limiter = Arc::new(RateLimiter::new());
         dispatcher.set_rate_limiter(Arc::clone(&rate_limiter));
 
+        // Chrome DevTools client for browser automation tools
+        dispatcher.set_chrome_client(ChromeClient::new());
+
         let primary_executor: Arc<dyn coderex_core::tool_executor::ToolExecutor + Send + Sync> = Arc::new(dispatcher);
         let arc_exec = ArcToolExecutor(Arc::clone(&primary_executor));
         engine.set_tool_executor(Box::new(arc_exec.clone()));
@@ -346,6 +355,7 @@ impl ReplLoop {
             cron_rx: Some(cron_rx),
             sdk_session: Some(sdk_session),
             sdk_timeout_handle,
+            teleport_manager: Some(coderex_bridge::teleport::TeleportManager::new()),
             #[cfg(feature = "hot-reload")]
             config_changed_rx,
         };
@@ -1979,6 +1989,16 @@ impl ReplLoop {
                 writeln!(stdout, "{msg}")?;
                 return Ok(());
             }
+            "feedback" => {
+                let msg = self.handle_feedback_command(&args).await;
+                writeln!(stdout, "{msg}")?;
+                return Ok(());
+            }
+            "teleport" => {
+                let msg = self.handle_teleport_command(&args).await;
+                writeln!(stdout, "{msg}")?;
+                return Ok(());
+            }
             _ => {}
         }
 
@@ -2263,6 +2283,123 @@ impl ReplLoop {
         match crate::version::check_for_updates().await {
             Some(msg) => msg,
             None => format!("You are running the latest version ({})", crate::version::CURRENT_VERSION),
+        }
+    }
+
+    /// Handle /feedback command — generate a title for user feedback.
+    async fn handle_feedback_command(&self, args: &[String]) -> String {
+        let text = args.join(" ");
+        if text.is_empty() {
+            return "Usage: /feedback <message> — generates a title for your feedback.".into();
+        }
+        let Some(ref client) = self.api_client else {
+            return "No API client available.".into();
+        };
+        match coderex_core::prompts::generate_session_title(client.as_ref(), &text).await {
+            Ok(title) => format!("Feedback title: \"{title}\"\n\nFeedback: {text}"),
+            Err(e) => format!("Failed to generate title: {e}"),
+        }
+    }
+
+    /// Handle the /teleport command: directory switching, share, join, list, revoke.
+    async fn handle_teleport_command(&mut self, args: &[String]) -> String {
+        let mgr = match self.teleport_manager {
+            Some(ref mgr) => mgr.clone(),
+            None => return "Teleport manager not initialized.".into(),
+        };
+
+        if args.is_empty() {
+            return "Usage: /teleport <directory> | --share | --join <token> | --list | --revoke <token>".into();
+        }
+
+        match args[0].as_str() {
+            "--share" => {
+                let session = self.engine.as_ref().map(|e| e.session().clone());
+                match session {
+                    Some(session) => match mgr.share_session(&session) {
+                        Ok(token) => format!("Share token: {token}"),
+                        Err(e) => format!("Failed to share session: {e}"),
+                    },
+                    None => "No active session to share.".into(),
+                }
+            }
+            "--join" => {
+                if args.len() < 2 {
+                    return "Usage: /teleport --join <token>".into();
+                }
+                let token = &args[1];
+                match mgr.join_session(token) {
+                    Ok(state) => {
+                        let new_cwd = state.cwd.to_string_lossy().to_string();
+                        self.cwd = new_cwd.clone();
+                        let _ = std::env::set_current_dir(&new_cwd);
+                        if let Some(ref mut engine) = self.engine {
+                            engine.set_session(state);
+                        }
+                        format!("Joined shared session. CWD: {new_cwd}")
+                    }
+                    Err(e) => format!("Failed to join session: {e}"),
+                }
+            }
+            "--list" => {
+                let shares = mgr.list_shares();
+                if shares.is_empty() {
+                    "No active shares.".into()
+                } else {
+                    format!("Active shares: {}", shares.join(", "))
+                }
+            }
+            "--revoke" => {
+                if args.len() < 2 {
+                    return "Usage: /teleport --revoke <token>".into();
+                }
+                let token = &args[1];
+                match mgr.revoke_share(token) {
+                    Ok(true) => format!("Revoked share: {token}"),
+                    Ok(false) => format!("Share not found: {token}"),
+                    Err(e) => format!("Failed to revoke share: {e}"),
+                }
+            }
+            dir => {
+                let target_dir = std::path::PathBuf::from(dir);
+                if !target_dir.exists() {
+                    return format!("Directory does not exist: {dir}");
+                }
+                if !target_dir.is_dir() {
+                    return format!("Not a directory: {dir}");
+                }
+
+                // Save current session to current directory
+                if let Some(ref engine) = self.engine {
+                    let session = engine.session().clone();
+                    if let Err(e) = mgr.save_to_directory(&session, std::path::Path::new(&self.cwd)) {
+                        return format!("Failed to save session: {e}");
+                    }
+                }
+
+                // Try to load session from target directory
+                let loaded = match mgr.load_from_directory(&target_dir) {
+                    Ok(state) => state,
+                    Err(e) => return format!("Failed to load session: {e}"),
+                };
+
+                // Update CWD and process working directory
+                let new_cwd = target_dir.canonicalize().unwrap_or(target_dir).to_string_lossy().to_string();
+                self.cwd = new_cwd.clone();
+                let _ = std::env::set_current_dir(&new_cwd);
+
+                if let Some(ref mut engine) = self.engine {
+                    if let Some(state) = loaded {
+                        engine.set_session(state);
+                    } else {
+                        let mut fresh = SessionState::new(std::path::PathBuf::from(&new_cwd));
+                        fresh.session_id = engine.session().session_id;
+                        engine.set_session(fresh);
+                    }
+                }
+
+                format!("Teleported to: {new_cwd}")
+            }
         }
     }
 

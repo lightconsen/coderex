@@ -28,6 +28,7 @@ chrono.workspace = true
 home.workspace = true
 sha2.workspace = true
 openssh.workspace = true
+rand = "0.8"
 
 [dev-dependencies]
 tempfile.workspace = true

@@ -3,6 +3,7 @@
 mod ask_user_question_tool;
 mod bash_tool;
 mod brief_tool;
+pub mod chrome;
 mod config_tool;
 mod cron_create_tool;
 mod cron_delete_tool;
@@ -46,6 +47,10 @@ pub use ask_user_question_tool::AskUserQuestionTool;
 pub use agent_tool::AgentTool;
 pub use bash_tool::BashTool;
 pub use brief_tool::BriefTool;
+pub use chrome::{
+    ChromeClient, ChromeExecuteJsTool, ChromeGetContentTool, ChromeListTabsTool,
+    ChromeNavigateTool, ChromeScreenshotTool,
+};
 pub use config_tool::ConfigTool;
 pub use cron_create_tool::CronCreateTool;
 pub use cron_delete_tool::CronDeleteTool;
@@ -227,6 +232,13 @@ pub fn register_builtin_tools(reg: &mut crate::registry::ToolRegistry) {
     reg.register(Arc::new(ReadMcpResourceTool));
     reg.register(Arc::new(EchoTool));
     reg.register(Arc::new(NoOpTool));
+
+    // Chrome DevTools tools (feature-gated)
+    reg.register(Arc::new(ChromeListTabsTool));
+    reg.register(Arc::new(ChromeNavigateTool));
+    reg.register(Arc::new(ChromeExecuteJsTool));
+    reg.register(Arc::new(ChromeScreenshotTool));
+    reg.register(Arc::new(ChromeGetContentTool));
 
     // Feature-gated tools
     register_feature_gated_tools(reg);

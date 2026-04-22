@@ -112,7 +112,7 @@ pub use permission_manager::{
 
 pub use permission_engine::{
     PermissionEngine, PermissionRequest, PermissionResponse, PermissionHook,
-    NoOpPermissionHook, ExplainPermissionHook, AutoApproveHook, BackgroundAgentDenyHook,
+    NoOpPermissionHook, ExplainPermissionHook, AutoApproveHook, BackgroundAgentDenyHook, AutoClassifierHook,
     PendingPermissionStore, PermissionRequestError,
 };
 

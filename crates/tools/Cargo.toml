@@ -42,6 +42,8 @@ cron = "0.15"
 html2text = "0.13"
 moka.workspace = true
 lsp-types.workspace = true
+tokio-tungstenite.workspace = true
+futures-util.workspace = true
 
 [dev-dependencies]
 mockall.workspace = true

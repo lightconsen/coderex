@@ -462,6 +462,84 @@ impl PermissionHook for BackgroundAgentDenyHook {
     }
 }
 
+/// A hook that uses a lightweight AI query to classify permission risk in Auto mode.
+///
+/// Only activates when the permission mode is [`PermissionMode::Auto`].
+/// Sends the tool name and arguments to a lightweight model and classifies
+/// the operation as "safe", "caution", or "dangerous".
+///
+/// - **safe** → returns `Allow` (short-circuit)
+/// - **caution** or **dangerous** → returns `None` (fall through to checker)
+#[allow(missing_debug_implementations)]
+pub struct AutoClassifierHook {
+    api_client: Box<dyn crate::api_client::ApiClient>,
+}
+
+impl AutoClassifierHook {
+    /// Create a new auto-classifier hook with the given API client.
+    #[must_use]
+    pub fn new(api_client: Box<dyn crate::api_client::ApiClient>) -> Self {
+        Self { api_client }
+    }
+}
+
+/// System prompt for the auto-classifier.
+const AUTO_CLASSIFIER_SYSTEM: &str =
+    "You are a security classifier. Given a tool name and its arguments, \
+     classify the risk level as exactly one word: safe, caution, or dangerous. \
+     Respond with ONLY the classification word.\n\n\
+     safe = read-only or harmless operations (read, grep, ls, web_search, etc.)\n\
+     caution = mutations to non-sensitive files (edit src files, write tests, etc.)\n\
+     dangerous = destructive or sensitive operations (rm, sudo, system paths, secrets)";
+
+#[async_trait]
+impl PermissionHook for AutoClassifierHook {
+    async fn evaluate(
+        &self,
+        request: &PermissionRequest,
+        mode: crate::permissions::PermissionMode,
+    ) -> Result<Option<PermissionResult>, PermissionRequestError> {
+        if mode != crate::permissions::PermissionMode::Auto {
+            return Ok(None);
+        }
+
+        let user_prompt = format!(
+            "Tool: {}\nArguments: {}\n\nClassify the risk level:",
+            request.tool_name, request.arguments
+        );
+
+        let result = crate::orchestrator::run_lightweight_query(
+            self.api_client.as_ref(),
+            AUTO_CLASSIFIER_SYSTEM,
+            &user_prompt,
+            32,
+        )
+        .await;
+
+        match result {
+            Ok(query_result) => {
+                let classification = query_result.content.trim().to_lowercase();
+                tracing::debug!(
+                    tool = %request.tool_name,
+                    classification = %classification,
+                    "auto-classifier result"
+                );
+                if classification.contains("safe") {
+                    Ok(Some(PermissionResult::Allow))
+                } else {
+                    // caution or dangerous → fall through to checker
+                    Ok(None)
+                }
+            }
+            Err(e) => {
+                tracing::warn!("auto-classifier query failed: {e}");
+                // On failure, fall through to checker
+                Ok(None)
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -680,6 +758,155 @@ mod tests {
         let request = make_request("Write");
         let result = hook.evaluate(&request, PermissionMode::Default).await.unwrap();
         // Should always pass through (not short-circuit)
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn auto_classifier_allows_safe_in_auto_mode() {
+        use crate::api_client::{ApiClient, ApiResponse, StreamEvent};
+        use crate::types::UsageSummary;
+        use futures::Stream;
+        use std::pin::Pin;
+
+        #[derive(Clone)]
+        struct SafeClassifier;
+
+        #[async_trait::async_trait]
+        impl ApiClient for SafeClassifier {
+            fn clone_box(&self) -> Box<dyn ApiClient> {
+                Box::new(self.clone())
+            }
+
+            async fn create_message(
+                &self,
+                _system: &str,
+                _messages: &[serde_json::Value],
+                _model: &ModelId,
+                _max_tokens: u32,
+            ) -> Result<ApiResponse, crate::api_client::ApiError> {
+                Ok(ApiResponse {
+                    content: "safe".into(),
+                    tool_calls: Vec::new(),
+                    usage: UsageSummary {
+                        input_tokens: 50,
+                        output_tokens: 1,
+                        cache_read_tokens: 0,
+                        cache_creation_tokens: 0,
+                    },
+                    stop_reason: "end_turn".into(),
+                })
+            }
+
+            async fn create_message_streaming(
+                &self,
+                _system: &str,
+                _messages: &[serde_json::Value],
+                _model: &ModelId,
+                _max_tokens: u32,
+            ) -> Pin<Box<dyn Stream<Item = StreamEvent> + Send + 'static>> {
+                Box::pin(futures::stream::empty())
+            }
+        }
+
+        let hook = AutoClassifierHook::new(Box::new(SafeClassifier));
+        let request = make_request("read");
+        let result = hook.evaluate(&request, PermissionMode::Auto).await.unwrap();
+        assert!(matches!(result, Some(PermissionResult::Allow)));
+    }
+
+    #[tokio::test]
+    async fn auto_classifier_falls_through_for_caution() {
+        use crate::api_client::{ApiClient, ApiResponse, StreamEvent};
+        use crate::types::UsageSummary;
+        use futures::Stream;
+        use std::pin::Pin;
+
+        #[derive(Clone)]
+        struct CautionClassifier;
+
+        #[async_trait::async_trait]
+        impl ApiClient for CautionClassifier {
+            fn clone_box(&self) -> Box<dyn ApiClient> {
+                Box::new(self.clone())
+            }
+
+            async fn create_message(
+                &self,
+                _system: &str,
+                _messages: &[serde_json::Value],
+                _model: &ModelId,
+                _max_tokens: u32,
+            ) -> Result<ApiResponse, crate::api_client::ApiError> {
+                Ok(ApiResponse {
+                    content: "caution".into(),
+                    tool_calls: Vec::new(),
+                    usage: UsageSummary {
+                        input_tokens: 50,
+                        output_tokens: 1,
+                        cache_read_tokens: 0,
+                        cache_creation_tokens: 0,
+                    },
+                    stop_reason: "end_turn".into(),
+                })
+            }
+
+            async fn create_message_streaming(
+                &self,
+                _system: &str,
+                _messages: &[serde_json::Value],
+                _model: &ModelId,
+                _max_tokens: u32,
+            ) -> Pin<Box<dyn Stream<Item = StreamEvent> + Send + 'static>> {
+                Box::pin(futures::stream::empty())
+            }
+        }
+
+        let hook = AutoClassifierHook::new(Box::new(CautionClassifier));
+        let request = make_request("edit");
+        let result = hook.evaluate(&request, PermissionMode::Auto).await.unwrap();
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn auto_classifier_passes_through_in_non_auto_mode() {
+        use crate::api_client::{ApiClient, ApiResponse, StreamEvent};
+        use crate::types::UsageSummary;
+        use futures::Stream;
+        use std::pin::Pin;
+
+        #[derive(Clone)]
+        struct NeverCalled;
+
+        #[async_trait::async_trait]
+        impl ApiClient for NeverCalled {
+            fn clone_box(&self) -> Box<dyn ApiClient> {
+                Box::new(self.clone())
+            }
+
+            async fn create_message(
+                &self,
+                _system: &str,
+                _messages: &[serde_json::Value],
+                _model: &ModelId,
+                _max_tokens: u32,
+            ) -> Result<ApiResponse, crate::api_client::ApiError> {
+                panic!("API should not be called in non-auto mode")
+            }
+
+            async fn create_message_streaming(
+                &self,
+                _system: &str,
+                _messages: &[serde_json::Value],
+                _model: &ModelId,
+                _max_tokens: u32,
+            ) -> Pin<Box<dyn Stream<Item = StreamEvent> + Send + 'static>> {
+                Box::pin(futures::stream::empty())
+            }
+        }
+
+        let hook = AutoClassifierHook::new(Box::new(NeverCalled));
+        let request = make_request("read");
+        let result = hook.evaluate(&request, PermissionMode::Default).await.unwrap();
         assert!(result.is_none());
     }
 

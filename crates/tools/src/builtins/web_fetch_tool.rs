@@ -192,7 +192,7 @@ fn get_cache(ctx: &ToolContext<'_>) -> Option<Arc<WebFetchCache>> {
 }
 
 /// Convert HTML to plain text/markdown.
-fn html_to_markdown(html: &str) -> String {
+pub fn html_to_markdown(html: &str) -> String {
     html2text::from_read(html.as_bytes(), 80)
         .unwrap_or_else(|_| strip_tags_fallback(html))
 }

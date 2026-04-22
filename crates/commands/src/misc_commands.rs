@@ -203,6 +203,18 @@ pub fn register(registry: &mut CommandRegistry) {
         }),
     ));
 
+    // /feedback — generate a title for user feedback (REPL built-in)
+    registry.register(SlashCommand::local(
+        "feedback",
+        "Generate an AI title for your feedback",
+        true,
+        true,
+        true,
+        Arc::new(|_ctx: &CommandContext, _args: &[String]| {
+            CommandResult::success("Use /feedback <message> in the REPL to generate a title.")
+        }),
+    ));
+
     // /history — view command history
     registry.register(SlashCommand::local(
         "history",
@@ -364,5 +376,12 @@ mod tests {
         let result = reg.execute("backfill-sessions", &ctx(), &[]);
         assert!(result.output.contains("Backfilling"));
         assert!(result.state_changed);
+    }
+
+    #[test]
+    fn feedback_help() {
+        let reg = { let mut r = CommandRegistry::new(); register(&mut r); r };
+        let result = reg.execute("feedback", &ctx(), &[]);
+        assert!(result.output.contains("Use /feedback"));
     }
 }

@@ -760,6 +760,17 @@ impl QueryEngine {
         self.cost_tracker.format_summary()
     }
 
+    /// Get a reference to the current session state.
+    #[must_use]
+    pub fn session(&self) -> &SessionState {
+        &self.session
+    }
+
+    /// Replace the current session state.
+    pub fn set_session(&mut self, session: SessionState) {
+        self.session = session;
+    }
+
     /// Set the coordinator state for multi-phase workflows.
     pub fn set_coordinator(&mut self, coordinator: crate::coordinator::CoordinatorState) {
         self.coordinator = Some(coordinator);
@@ -2208,11 +2219,6 @@ impl QueryEngine {
     #[must_use]
     pub const fn current_turn(&self) -> u32 {
         self.current_turn
-    }
-
-    /// Get the session state (read-only).
-    pub const fn session(&self) -> &SessionState {
-        &self.session
     }
 
     /// Interrupt the current turn (e.g., from Ctrl+C).

@@ -44,24 +44,16 @@ pub fn register(registry: &mut CommandRegistry) {
         }),
     ));
 
-    // /teleport — switch CWD and session (feature-gated)
+    // /teleport — handled directly by the REPL (built-in command).
+    // This registry stub exists for non-REPL consumers.
     registry.register(SlashCommand::local(
         "teleport",
-        "Teleport to another working directory and session (feature-gated)",
+        "Teleport to another working directory and session (REPL built-in)",
         true,
         true,
         true,
-        Arc::new(|ctx: &CommandContext, args: &[String]| {
-            if ctx.is_feature_enabled("teleport") {
-                if args.is_empty() {
-                    CommandResult::error("Usage: /teleport <directory>")
-                } else {
-                    CommandResult::success(format!("Teleporting to: {}", args[0]))
-                        .with_state_change(true)
-                }
-            } else {
-                CommandResult::error("teleport feature is not enabled.")
-            }
+        Arc::new(|_ctx: &CommandContext, _args: &[String]| {
+            CommandResult::success("Teleport is handled by the REPL. Use /teleport <directory> | --share | --join <token> | --list | --revoke <token>.")
         }),
     ));
 
@@ -234,31 +226,10 @@ mod tests {
     }
 
     #[test]
-    fn teleport_feature_gated() {
+    fn teleport_registry_stub() {
         let reg = { let mut r = CommandRegistry::new(); register(&mut r); r };
         let result = reg.execute("teleport", &ctx(), &[]);
-        assert!(result.output.contains("not enabled"));
-    }
-
-    #[test]
-    fn teleport_when_enabled() {
-        let mut flags = std::collections::HashMap::new();
-        flags.insert("teleport".into(), true);
-        let c = CommandContext { feature_flags: flags, ..ctx() };
-        let reg = { let mut r = CommandRegistry::new(); register(&mut r); r };
-        let result = reg.execute("teleport", &c, &["/other".into()]);
-        assert!(result.output.contains("/other"));
-        assert!(result.state_changed);
-    }
-
-    #[test]
-    fn teleport_requires_arg() {
-        let mut flags = std::collections::HashMap::new();
-        flags.insert("teleport".into(), true);
-        let c = CommandContext { feature_flags: flags, ..ctx() };
-        let reg = { let mut r = CommandRegistry::new(); register(&mut r); r };
-        let result = reg.execute("teleport", &c, &[]);
-        assert!(result.output.contains("Usage"));
+        assert!(result.output.contains("handled by the REPL"));
     }
 
     #[test]
