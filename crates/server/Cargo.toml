@@ -24,3 +24,7 @@ futures.workspace = true
 rusqlite.workspace = true
 chrono.workspace = true
 uuid.workspace = true
+
+[dev-dependencies]
+tokio-tungstenite.workspace = true
+futures.workspace = true
