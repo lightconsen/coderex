@@ -985,6 +985,7 @@ impl QueryEngine {
 
         let mut turn = TurnRuntime::new(budget);
         let mut turn_number = self.current_turn + 1;
+        let mut last_reason = TerminalReason::Completed;
 
         // Add user message
         self.session.messages.push(Message::user(prompt.clone()));
@@ -1003,6 +1004,7 @@ impl QueryEngine {
             match self.execute_turn(&mut turn, &options, turn_number).await {
                 Ok(reason) => {
                     self.current_turn = turn_number;
+                    last_reason = reason.clone();
 
                     // Advance coordinator phase if present
                     if let Some(ref mut coordinator) = self.coordinator {
@@ -1049,7 +1051,7 @@ impl QueryEngine {
             }
         }
 
-        Ok(turn.terminal_reason.unwrap_or(TerminalReason::Completed))
+        Ok(turn.terminal_reason.unwrap_or(last_reason))
     }
 
     /// Submit a user message and run the full turn loop using streaming API.
@@ -1071,6 +1073,7 @@ impl QueryEngine {
 
         let mut turn = TurnRuntime::new(budget);
         let mut turn_number = self.current_turn + 1;
+        let mut last_reason = TerminalReason::Completed;
 
         // Add user message
         self.session.messages.push(Message::user(prompt.clone()));
@@ -1089,6 +1092,7 @@ impl QueryEngine {
             match self.execute_turn_streaming(&mut turn, &options, turn_number).await {
                 Ok(reason) => {
                     self.current_turn = turn_number;
+                    last_reason = reason.clone();
 
                     // Advance coordinator phase if present
                     if let Some(ref mut coordinator) = self.coordinator {
@@ -1135,7 +1139,7 @@ impl QueryEngine {
             }
         }
 
-        Ok(turn.terminal_reason.unwrap_or(TerminalReason::Completed))
+        Ok(turn.terminal_reason.unwrap_or(last_reason))
     }
 
     /// Execute a single turn through the state machine.
