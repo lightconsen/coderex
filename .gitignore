@@ -9,7 +9,8 @@ claurst/
 kimi-cli/
 qwen-code/
 gemini-cli/
-export_env.kimi.sh
+export_env.*.sh
+!export_env.local.sh
 
 # Local configuration and generated docs
 .coderex/
