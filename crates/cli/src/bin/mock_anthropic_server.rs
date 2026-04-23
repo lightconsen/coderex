@@ -71,6 +71,14 @@ fn handle_connection(mut stream: TcpStream) {
     let has_tool_result = body_str.contains("\"type\":\"tool_result\"");
     let is_streaming = body_str.contains("\"stream\":true");
 
+    // Simulate API errors for retry testing
+    let p_lower = prompt.to_lowercase();
+    if p_lower.contains("simulate error") || p_lower.contains("force error") || p_lower.contains("trigger error") {
+        let _ = stream.write_all(b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+        let _ = stream.flush();
+        return;
+    }
+
     if is_streaming {
         let sse = if has_tool_result {
             build_text_response(&prompt)
@@ -167,6 +175,15 @@ fn resolve_text_response(prompt: &str) -> &str {
         p if p.contains("api_key") || p.contains("secret") => {
             "I don't have access to the CODEREX_API_KEY value."
         }
+        p if p.contains("web fetch") || p.contains("fetch url") => {
+            "Fetched content: This is a mock web page with sample text for testing purposes."
+        }
+        p if p.contains("web search") || p.contains("search web") => {
+            "Search results:\n1. Mock result A\n2. Mock result B\n3. Mock result C"
+        }
+        p if p.contains("hello") || p.contains("hi") => {
+            "Hello! I'm ready to help you with your coding tasks."
+        }
         _ => "Done!",
     }
 }
@@ -251,6 +268,7 @@ fn tool_to_json(tool: &Tool) -> (String, String) {
             ("Bash".into(), format!(r#"{{"command":"{command}"}}"#))
         }
         Tool::Read { file } => {
+            let _content = std::fs::read_to_string(file).unwrap_or_else(|_| format!("// File not found: {file}"));
             ("Read".into(), format!(r#"{{"file_path":"{file}"}}"#))
         }
     }
@@ -503,6 +521,18 @@ async fn main() {
     } else if p.contains("bash") || p.contains("list") {
         vec![Tool::Bash {
             command: "find . -name '*.rs' -type f".into(),
+        }]
+    } else if p.contains("glob") || p.contains("find all") || p.contains("list all files") {
+        vec![Tool::Bash {
+            command: "find . -name '*.rs' -type f | sort".into(),
+        }]
+    } else if p.contains("grep") || p.contains("search pattern") || p.contains("search for") {
+        vec![Tool::Bash {
+            command: "grep -rn 'fn ' src/".into(),
+        }]
+    } else if p.contains("read file") || p.contains("show content") || p.contains("file content") {
+        vec![Tool::Read {
+            file: "src/lib.rs".into(),
         }]
     } else if p.contains("image.bin") || p.contains("binary") {
         vec![Tool::Bash {
