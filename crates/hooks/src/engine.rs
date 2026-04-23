@@ -413,12 +413,13 @@ async fn execute_hook(
         .spawn()
         .map_err(|e| HookError::SpawnFailed(e.to_string()))?;
 
-    // Write input to stdin
+    // Write input to stdin (ignore broken pipe — hook may not read stdin)
     if let Some(mut stdin) = child.stdin.take() {
-        stdin
-            .write_all(input_json.as_bytes())
-            .await
-            .map_err(|e| HookError::SpawnFailed(e.to_string()))?;
+        if let Err(e) = stdin.write_all(input_json.as_bytes()).await {
+            if e.kind() != std::io::ErrorKind::BrokenPipe {
+                return Err(HookError::SpawnFailed(e.to_string()));
+            }
+        }
     }
 
     // Collect stdout and stderr
