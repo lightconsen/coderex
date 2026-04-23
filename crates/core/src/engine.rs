@@ -782,6 +782,11 @@ impl QueryEngine {
         self.coordinator = Some(coordinator);
     }
 
+    /// Set the structured output validator from a JSON schema.
+    pub fn set_structured_output(&mut self, schema: serde_json::Value) {
+        self.structured_output = Some(StructuredOutputValidator::new(schema));
+    }
+
     /// Recover orphaned permission requests from disk and emit them as
     /// `EngineEvent::PermissionRequest` so the UI can surface them.
     pub fn recover_orphaned_permissions(&mut self) {
@@ -1368,6 +1373,9 @@ impl QueryEngine {
         self.cost_tracker.record_usage(&usage, &self.model);
         self.last_usage = Some(usage);
 
+        // Validate structured output if a schema is configured
+        content = self.validate_structured_output(content);
+
         // Save assistant message
         let assistant_msg = Message::assistant(content.clone());
         turn.messages.push(assistant_msg.clone());
@@ -1399,10 +1407,12 @@ impl QueryEngine {
         }
 
         // Apply early-executed tool results immediately so the model can see them
+        tracing::info!("early_results count: {}", early_results.len());
         for result in &early_results {
             let msg = Message::tool(result.clone());
             self.session.messages.push(msg);
         }
+        tracing::info!("session.messages after early_results: {:?}", self.session.messages.len());
 
         if tool_calls.is_empty() {
             // No tool calls — turn complete
@@ -1560,6 +1570,15 @@ impl QueryEngine {
         // Append turn-specific system prompt
         if let Some(ref prompt) = options.append_system_prompt {
             turn.messages.push(Message::system(prompt.clone()));
+        }
+
+        // Inject JSON schema instructions for structured output
+        if let Some(ref schema) = options.json_schema {
+            let instruction = format!(
+                "You must respond with ONLY valid JSON that matches this schema:\n{}",
+                serde_json::to_string_pretty(schema).unwrap_or_default()
+            );
+            turn.messages.push(Message::system(instruction));
         }
 
         // Replay user messages if provided (for session resume)

@@ -145,6 +145,10 @@ pub struct ReplLoop {
     no_slash_commands: bool,
     /// JSON schema for structured output (--json-schema).
     json_schema: Option<String>,
+    /// Maximum budget in USD for this session (--max-budget-usd).
+    max_budget_usd: Option<f64>,
+    /// Maximum number of turns (--max-turns).
+    max_turns: Option<u32>,
     /// Replay user messages from previous session (--replay-user-messages).
     replay_user_messages: bool,
     /// Include partial messages in context (--include-partial-messages).
@@ -268,6 +272,8 @@ impl ReplLoop {
             no_persistence: false,
             no_slash_commands: false,
             json_schema: None,
+            max_budget_usd: None,
+            max_turns: None,
             replay_user_messages: false,
             include_partial_messages: false,
             betas: Vec::new(),
@@ -428,6 +434,8 @@ impl ReplLoop {
             no_persistence: false,
             no_slash_commands: false,
             json_schema: None,
+            max_budget_usd: None,
+            max_turns: None,
             replay_user_messages: false,
             include_partial_messages: false,
             betas: Vec::new(),
@@ -493,6 +501,14 @@ impl ReplLoop {
 
     pub fn with_json_schema(&mut self, schema: Option<String>) {
         self.json_schema = schema;
+    }
+
+    pub fn with_max_budget_usd(&mut self, budget: Option<f64>) {
+        self.max_budget_usd = budget;
+    }
+
+    pub fn with_max_turns(&mut self, turns: Option<u32>) {
+        self.max_turns = turns;
     }
 
     pub fn with_replay_user_messages(&mut self, replay: bool) {
@@ -1518,7 +1534,7 @@ impl ReplLoop {
     ///
     /// Routes through the Orchestrator so that prompt profiles, model selection,
     /// and tool whitelists are applied consistently with side/forked queries.
-    fn build_submit_options(&self) -> SubmitOptions {
+    fn build_submit_options(&mut self) -> SubmitOptions {
         let request = self.build_query_request_for_main_agent();
         let mut options = if let Some(ref orchestrator) = self.orchestrator {
             orchestrator.build_submit_options(&request)
@@ -1562,9 +1578,31 @@ impl ReplLoop {
 
         // Apply CLI flag overrides
         if let Some(ref schema) = self.json_schema {
-            if let Ok(val) = serde_json::from_str::<serde_json::Value>(schema) {
-                options.json_schema = Some(val);
+            let schema_val: Result<serde_json::Value, _> =
+                if let Ok(val) = serde_json::from_str::<serde_json::Value>(schema) {
+                    Ok(val)
+                } else if let Ok(contents) = std::fs::read_to_string(schema) {
+                    serde_json::from_str(&contents)
+                } else {
+                    Err(serde_json::from_str::<serde_json::Value>("").unwrap_err())
+                };
+            if let Ok(val) = schema_val {
+                options.json_schema = Some(val.clone());
+                // Configure the engine's structured output validator
+                if let Some(ref mut engine) = self.engine {
+                    engine.set_structured_output(val);
+                }
             }
+        }
+        if let Some(budget_usd) = self.max_budget_usd {
+            if budget_usd > 0.0 {
+                // Convert USD to tokens using a conservative rate ($3 per 1M tokens)
+                let tokens = ((budget_usd / 3.0) * 1_000_000.0).max(1.0) as u64;
+                options.task_budget_tokens = tokens;
+            }
+        }
+        if let Some(turns) = self.max_turns {
+            options.max_turns = turns;
         }
         options.include_partial_messages = self.include_partial_messages;
 
@@ -2085,6 +2123,8 @@ impl ReplLoop {
             Ok(reason) => {
                 if output.is_empty() {
                     format!("Query completed ({reason:?})")
+                } else if !matches!(reason, TerminalReason::Completed) {
+                    format!("{output}\nQuery completed ({reason:?})")
                 } else {
                     output
                 }

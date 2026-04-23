@@ -82,6 +82,8 @@ pub struct SessionContext {
     pub input_format: String,
     /// JSON schema for structured output.
     pub json_schema: Option<String>,
+    /// Maximum number of turns.
+    pub max_turns: Option<u32>,
     /// Replay user messages.
     pub replay_user_messages: bool,
     /// Include partial messages.
@@ -198,6 +200,7 @@ impl StartupOrchestrator {
                 plugin_dir: None,
                 input_format: "text".into(),
                 json_schema: None,
+                max_turns: None,
                 replay_user_messages: false,
                 include_partial_messages: false,
                 effort: None,
@@ -247,6 +250,7 @@ impl StartupOrchestrator {
         self.ctx.plugin_dir = args.plugin_dir.clone();
         self.ctx.input_format = args.input_format.clone();
         self.ctx.json_schema = args.json_schema.clone();
+        self.ctx.max_turns = args.max_turns;
         self.ctx.replay_user_messages = args.replay_user_messages;
         self.ctx.include_partial_messages = args.include_partial_messages;
         self.ctx.effort = args.effort.clone();
@@ -1033,6 +1037,9 @@ impl StartupOrchestrator {
         repl.with_no_persistence(self.ctx.no_persistence);
         repl.with_no_slash_commands(self.ctx.no_slash_commands);
         repl.with_json_schema(self.ctx.json_schema.clone());
+        let budget = self.ctx.settings.as_ref().and_then(|s| s.max_budget_usd);
+        repl.with_max_budget_usd(budget);
+        repl.with_max_turns(self.ctx.max_turns);
         repl.with_replay_user_messages(self.ctx.replay_user_messages);
         repl.with_include_partial_messages(self.ctx.include_partial_messages);
         repl.with_betas(self.ctx.betas.clone());
@@ -1614,6 +1621,7 @@ mod tests {
             no_session_persistence: false,
             disable_slash_commands: false,
             max_budget_usd: None,
+            max_turns: None,
             api_key: None,
             no_telemetry: false,
             mcp_config: None,

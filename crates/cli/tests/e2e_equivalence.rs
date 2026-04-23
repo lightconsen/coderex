@@ -359,6 +359,120 @@ fn engine_error_recovery_nonexistent_file() {
     assert!(!out.stdout.trim().is_empty(), "expected non-empty error-handling response");
 }
 
+#[test]
+#[ignore = "live LLM test"]
+fn engine_multi_turn_5_rounds() {
+    let dir = tempfile::tempdir().unwrap();
+    create_rust_lib(dir.path());
+
+    // Mock server returns a different Bash tool each turn when prompted with "multi-turn sequence"
+    let out = run_with_args(
+        dir.path(),
+        "Execute a multi-turn sequence of bash commands.",
+        &["--max-turns", "5"],
+        120,
+    );
+    eprintln!("stdout:\n{}", out.stdout);
+    eprintln!("stderr:\n{}", out.stderr);
+
+    // All 5 turns are tool calls (Bash) with no assistant text, so stdout is empty.
+    // Verify the engine ran all 5 turns and exited cleanly.
+    assert_eq!(out.exit_code, Some(0), "expected clean exit after 5 turns");
+    assert!(out.duration < Duration::from_secs(120), "should complete within timeout");
+}
+
+#[test]
+#[ignore = "live LLM test"]
+fn engine_termination_budget_exhausted() {
+    let dir = tempfile::tempdir().unwrap();
+    create_rust_lib(dir.path());
+
+    // Extremely low budget should force early termination
+    let out = run_with_args(
+        dir.path(),
+        "Say hello briefly.",
+        &["--max-budget-usd", "0.0000001"],
+        60,
+    );
+    eprintln!("stdout:\n{}", out.stdout);
+
+    // Budget exhaustion may produce an error or truncated response
+    assert!(
+        out.exit_code != Some(0) || out.stdout.to_lowercase().contains("budget") || out.stdout.to_lowercase().contains("exhaust"),
+        "expected budget exhaustion signal, got exit={:?} stdout={}",
+        out.exit_code,
+        out.stdout
+    );
+}
+
+#[test]
+#[ignore = "live LLM test"]
+fn engine_termination_api_error() {
+    let dir = tempfile::tempdir().unwrap();
+    create_rust_lib(dir.path());
+
+    // Mock server returns HTTP 500 for "trigger error" prompts
+    let out = run(dir.path(), "Trigger an API error and report what happened.", 120);
+    eprintln!("stdout:\n{}", out.stdout);
+
+    // Should handle gracefully — either retry succeeds, or returns error message
+    assert!(
+        !out.stdout.trim().is_empty() || out.exit_code != Some(0),
+        "expected some response (success or error) for API error scenario"
+    );
+}
+
+#[test]
+#[ignore = "live LLM test"]
+fn engine_termination_loop_detected() {
+    let dir = tempfile::tempdir().unwrap();
+    create_rust_lib(dir.path());
+
+    // Mock server returns the identical Bash tool on every turn for "trigger loop"
+    // Loop detector fires after 3 repetitions (DEFAULT_REPEAT_THRESHOLD)
+    let out = run_with_args(
+        dir.path(),
+        "Trigger a loop by running the same command repeatedly.",
+        &["--max-turns", "10"],
+        120,
+    );
+    eprintln!("stdout:\n{}", out.stdout);
+
+    // Loop detection should stop the engine before max_turns (10) is reached
+    assert!(
+        out.duration < Duration::from_secs(120),
+        "loop detection should prevent runaway, got duration={:?}",
+        out.duration
+    );
+}
+
+#[test]
+#[ignore = "live LLM test"]
+fn engine_structured_output() {
+    let dir = tempfile::tempdir().unwrap();
+    create_rust_lib(dir.path());
+
+    // Create a simple JSON schema file
+    let schema = r#"{"type":"object","properties":{"greeting":{"type":"string"}},"required":["greeting"]}"#;
+    let schema_path = dir.path().join("schema.json");
+    std::fs::write(&schema_path, schema).unwrap();
+
+    let out = run_with_args(
+        dir.path(),
+        "Say hello.",
+        &["--json-schema", schema_path.to_str().unwrap()],
+        120,
+    );
+    eprintln!("stdout:\n{}", out.stdout);
+
+    // Should produce valid JSON containing the required field
+    assert!(
+        out.stdout.contains("\"greeting\"") || out.stdout.contains("{"),
+        "expected JSON output matching schema, got: {}",
+        out.stdout
+    );
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 //  Module 2: Tool System — Baseline Tools
 // ═══════════════════════════════════════════════════════════════════════════

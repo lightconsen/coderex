@@ -70,6 +70,16 @@ fn handle_connection(mut stream: TcpStream) {
     let prompt = extract_last_user_prompt(&body_str);
     let has_tool_result = body_str.contains("\"type\":\"tool_result\"");
     let is_streaming = body_str.contains("\"stream\":true");
+    let turn_number = count_tool_results(&body_str) + 1;
+    // Schema may be embedded in the system prompt string (escaped quotes) or as raw JSON.
+    let has_json_schema = body_str.contains("\"type\":\"object\"")
+        || body_str.contains("\\\"type\\\": \\\"object\\\"")
+        || body_str.contains("\\\"type\\\":\\\"object\\\"")
+        || body_str.contains("json_schema");
+    eprintln!("[mock] prompt='{prompt}' has_tool_result={has_tool_result} is_streaming={is_streaming} turn={turn_number} json_schema={has_json_schema}");
+    if !has_tool_result {
+        eprintln!("[mock] body snippet: {}", &body_str.chars().take(500).collect::<String>());
+    }
 
     // Simulate API errors for retry testing
     let p_lower = prompt.to_lowercase();
@@ -80,7 +90,16 @@ fn handle_connection(mut stream: TcpStream) {
     }
 
     if is_streaming {
-        let sse = if has_tool_result {
+        let sse = if p_lower.contains("trigger loop") {
+            // Always return the same tool call to trigger loop detection
+            build_loop_tool_response()
+        } else if p_lower.contains("multi-turn sequence") || p_lower.contains("do 5 things") {
+            // Return a different tool each turn (up to 5)
+            build_sequence_tool_response(turn_number)
+        } else if has_json_schema {
+            // Structured output mode — return JSON matching the schema
+            build_json_sse_response(r#"{"greeting": "Hello!"}"#)
+        } else if has_tool_result {
             build_text_response(&prompt)
         } else {
             build_tool_response(&prompt)
@@ -119,6 +138,24 @@ fn extract_last_user_prompt(body: &str) -> String {
         }
     }
     String::new()
+}
+
+fn count_tool_results(body: &str) -> usize {
+    let value: serde_json::Value = serde_json::from_str(body).unwrap_or_default();
+    if let Some(messages) = value.get("messages").and_then(|m| m.as_array()) {
+        messages
+            .iter()
+            .filter(|msg| {
+                if let Some(content) = msg.get("content") {
+                    content.to_string().contains("\"type\":\"tool_result\"")
+                } else {
+                    false
+                }
+            })
+            .count()
+    } else {
+        0
+    }
 }
 
 fn resolve_text_response(prompt: &str) -> &str {
@@ -202,11 +239,12 @@ fn build_text_response(prompt: &str) -> String {
 }
 
 fn sse_text_block(text: &str) -> String {
+    let escaped = json_escape_string(text);
     format!(
         "event: content_block_start\n\
          data: {{\"type\":\"content_block_start\",\"index\":0,\"content_block\":{{\"type\":\"text\",\"text\":\"\"}}}}\n\n\
          event: content_block_delta\n\
-         data: {{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{{\"type\":\"text_delta\",\"text\":\"{text}\"}}}}\n\n\
+         data: {{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{{\"type\":\"text_delta\",\"text\":\"{escaped}\"}}}}\n\n\
          event: content_block_stop\n\
          data: {{\"type\":\"content_block_stop\",\"index\":0}}\n\n\
          event: message_delta\n\
@@ -214,6 +252,10 @@ fn sse_text_block(text: &str) -> String {
          event: message_stop\n\
          data: {{\"type\":\"message_stop\"}}\n\n"
     )
+}
+
+fn build_json_sse_response(json: &str) -> String {
+    sse_text_block(json)
 }
 
 fn build_json_response(prompt: &str, has_tool_result: bool) -> String {
@@ -260,6 +302,49 @@ fn build_tool_response(prompt: &str) -> String {
     );
 
     sse
+}
+
+/// Build a response that always returns the same tool call — used to trigger loop detection.
+fn build_loop_tool_response() -> String {
+    let tool = Tool::Bash {
+        command: "echo 'loop_iteration'".into(),
+    };
+    let (tool_name, input_json) = tool_to_json(&tool);
+    let input_json_escaped = json_escape_string(&input_json);
+    let id = "tool_loop";
+    format!(
+        "event: content_block_start\n\
+         data: {{\"type\":\"content_block_start\",\"index\":0,\"content_block\":{{\"type\":\"tool_use\",\"id\":\"{id}\",\"name\":\"{tool_name}\",\"input\":{{}}}}}}\n\n\
+         event: content_block_delta\n\
+         data: {{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{{\"type\":\"input_json_delta\",\"partial_json\":\"{input_json_escaped}\"}}}}\n\n\
+         event: content_block_stop\n\
+         data: {{\"type\":\"content_block_stop\",\"index\":0}}\n\n\
+         event: message_delta\n\
+         data: {{\"type\":\"message_delta\",\"delta\":{{\"stop_reason\":\"end_turn\"}},\"usage\":{{\"input_tokens\":10,\"output_tokens\":20}}}}\n\n\
+         event: message_stop\n\
+         data: {{\"type\":\"message_stop\"}}\n\n"
+    )
+}
+
+/// Build a response with a different tool each turn — used for multi-turn sequence testing.
+fn build_sequence_tool_response(turn_number: usize) -> String {
+    let command = format!("echo 'turn_{turn_number}'");
+    let tool = Tool::Bash { command };
+    let (tool_name, input_json) = tool_to_json(&tool);
+    let input_json_escaped = json_escape_string(&input_json);
+    let id = format!("tool_seq_{turn_number:02}");
+    format!(
+        "event: content_block_start\n\
+         data: {{\"type\":\"content_block_start\",\"index\":0,\"content_block\":{{\"type\":\"tool_use\",\"id\":\"{id}\",\"name\":\"{tool_name}\",\"input\":{{}}}}}}\n\n\
+         event: content_block_delta\n\
+         data: {{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{{\"type\":\"input_json_delta\",\"partial_json\":\"{input_json_escaped}\"}}}}\n\n\
+         event: content_block_stop\n\
+         data: {{\"type\":\"content_block_stop\",\"index\":0}}\n\n\
+         event: message_delta\n\
+         data: {{\"type\":\"message_delta\",\"delta\":{{\"stop_reason\":\"end_turn\"}},\"usage\":{{\"input_tokens\":10,\"output_tokens\":20}}}}\n\n\
+         event: message_stop\n\
+         data: {{\"type\":\"message_stop\"}}\n\n"
+    )
 }
 
 fn tool_to_json(tool: &Tool) -> (String, String) {

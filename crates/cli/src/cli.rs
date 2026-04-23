@@ -109,6 +109,10 @@ pub struct Cli {
     #[arg(long, value_name = "USD")]
     pub max_budget_usd: Option<f64>,
 
+    /// Maximum number of turns for this session.
+    #[arg(long, value_name = "TURNS")]
+    pub max_turns: Option<u32>,
+
     /// API key (overrides environment and config).
     #[arg(long, value_name = "KEY")]
     pub api_key: Option<String>,
