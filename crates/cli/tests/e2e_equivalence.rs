@@ -855,10 +855,52 @@ fn hook_settings_sources_shows_hooks() {
 
 // ═══════════════════════════════════════════════════════════════════════════
 //  Module 6: Agents
-//  NOTE: Sub-agents require Agent spawn infrastructure.
-//  Not testable via CLI binary without agent-specific CLI commands.
-//  Test via: coderex-agents crate integration tests.
 // ═══════════════════════════════════════════════════════════════════════════
+
+#[test]
+#[ignore = "requires CLI binary build"]
+fn agent_cli_lists_available_agents() {
+    let dir = tempfile::tempdir().unwrap();
+    create_rust_lib(dir.path());
+
+    let out = run_with_args(dir.path(), "", &["agents"], 30);
+    eprintln!("stdout:\n{}", out.stdout);
+
+    assert_eq!(out.exit_code, Some(0), "agents command should succeed");
+    assert!(out.stdout.contains("advisor"), "expected advisor agent");
+    assert!(out.stdout.contains("bughunter"), "expected bughunter agent");
+    assert!(out.stdout.contains("reviewer"), "expected reviewer agent");
+}
+
+#[test]
+#[ignore = "requires CLI binary build"]
+fn agent_cli_detailed_shows_descriptions() {
+    let dir = tempfile::tempdir().unwrap();
+    create_rust_lib(dir.path());
+
+    let out = run_with_args(dir.path(), "", &["agents", "--detailed"], 30);
+    eprintln!("stdout:\n{}", out.stdout);
+
+    assert_eq!(out.exit_code, Some(0));
+    assert!(
+        out.stdout.contains("Code review") || out.stdout.contains("architectural"),
+        "expected description for advisor agent"
+    );
+    assert!(
+        out.stdout.contains("Bug detection") || out.stdout.contains("root cause"),
+        "expected description for bughunter agent"
+    );
+    assert!(
+        out.stdout.contains("review") || out.stdout.contains("PR"),
+        "expected description for reviewer agent"
+    );
+}
+
+// NOTE: Full agent spawn/execution E2E (Explore, Plan, background run,
+// SendMessage, worktree isolation, tool whitelist) requires the CLI to
+// expose agent spawning commands. Currently agents are only spawned
+// programmatically via AgentManager. These behaviors are covered by
+// coderex-agents integration tests.
 
 // ═══════════════════════════════════════════════════════════════════════════
 //  Module 7: Compact

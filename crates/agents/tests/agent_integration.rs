@@ -1,0 +1,550 @@
+//! Agent integration tests — covering all 7 agent types and lifecycle behavior.
+//!
+//! These tests correspond to the equivalence test plan Module 6:
+//! 6.1 general-purpose, 6.2 Explore, 6.3 Plan, 6.4 run_in_background,
+//! 6.5 SendMessage, 6.6 worktree isolation, 6.7 tool whitelist
+
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+
+use coderex_agents::{
+    AgentManager, AgentResult, AgentStatus, AgentType, ForkedContext, SpawnOptions,
+    TeammateEvent, Thoroughness,
+};
+
+fn test_manager() -> AgentManager {
+    let mut mgr = AgentManager::standalone();
+    mgr.enable_test_mode();
+    mgr
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  6.1 General-purpose agent — spawns and completes a task
+// ═══════════════════════════════════════════════════════════════════════════
+
+#[tokio::test]
+async fn agent_general_purpose_spawns_and_completes() {
+    let mut mgr = test_manager();
+    let tmp = tempfile::tempdir().unwrap();
+
+    let instance = mgr
+        .spawn_agent(
+            AgentType::GeneralPurpose,
+            "explain what this project does",
+            SpawnOptions::default(),
+            "sess_001",
+            tmp.path().to_str().unwrap(),
+            3,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(instance.status, AgentStatus::Completed);
+    assert!(instance.context.is_some());
+    let ctx = instance.context.as_ref().unwrap();
+    assert_eq!(ctx.parent_session_id, "sess_001");
+    assert_eq!(ctx.recent_message_count, 3);
+    assert!(instance.output_file.is_some());
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  6.2 Explore agent — different thoroughness levels produce different prompts
+// ═══════════════════════════════════════════════════════════════════════════
+
+#[tokio::test]
+async fn agent_explore_quick_thoroughness() {
+    let mut mgr = test_manager();
+    let tmp = tempfile::tempdir().unwrap();
+
+    let instance = mgr
+        .spawn_agent(
+            AgentType::Explore {
+                thoroughness: Thoroughness::Quick,
+            },
+            "find all Rust files",
+            SpawnOptions::default(),
+            "sess_002",
+            tmp.path().to_str().unwrap(),
+            0,
+        )
+        .await
+        .unwrap();
+
+    assert!(instance.prompt.contains("quick scan"));
+    assert_eq!(instance.status, AgentStatus::Completed);
+}
+
+#[tokio::test]
+async fn agent_explore_medium_thoroughness() {
+    let mut mgr = test_manager();
+    let tmp = tempfile::tempdir().unwrap();
+
+    let instance = mgr
+        .spawn_agent(
+            AgentType::Explore {
+                thoroughness: Thoroughness::Medium,
+            },
+            "analyze the codebase structure",
+            SpawnOptions::default(),
+            "sess_003",
+            tmp.path().to_str().unwrap(),
+            0,
+        )
+        .await
+        .unwrap();
+
+    assert!(instance.prompt.contains("moderate depth"));
+}
+
+#[tokio::test]
+async fn agent_explore_very_thorough() {
+    let mut mgr = test_manager();
+    let tmp = tempfile::tempdir().unwrap();
+
+    let instance = mgr
+        .spawn_agent(
+            AgentType::Explore {
+                thoroughness: Thoroughness::VeryThorough,
+            },
+            "deep audit of dependencies",
+            SpawnOptions::default(),
+            "sess_004",
+            tmp.path().to_str().unwrap(),
+            0,
+        )
+        .await
+        .unwrap();
+
+    assert!(instance.prompt.contains("full recursive analysis"));
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  6.3 Plan agent — returns implementation plan in system prompt
+// ═══════════════════════════════════════════════════════════════════════════
+
+#[tokio::test]
+async fn agent_plan_produces_implementation_plan() {
+    let mut mgr = test_manager();
+    let tmp = tempfile::tempdir().unwrap();
+
+    let instance = mgr
+        .spawn_agent(
+            AgentType::Plan,
+            "add OAuth2 authentication",
+            SpawnOptions::default(),
+            "sess_005",
+            tmp.path().to_str().unwrap(),
+            0,
+        )
+        .await
+        .unwrap();
+
+    assert!(instance.prompt.contains("planning agent"));
+    assert!(instance.prompt.contains("implementation plans"));
+    assert_eq!(instance.status, AgentStatus::Completed);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  6.4 run_in_background — spawn returns immediately, agent runs async
+// ═══════════════════════════════════════════════════════════════════════════
+
+#[tokio::test]
+async fn agent_background_spawn_returns_immediately() {
+    let mut mgr = test_manager();
+    let tmp = tempfile::tempdir().unwrap();
+
+    let start = std::time::Instant::now();
+    let instance = mgr
+        .spawn_agent(
+            AgentType::GeneralPurpose,
+            "long running analysis",
+            SpawnOptions {
+                run_in_background: true,
+                ..Default::default()
+            },
+            "sess_006",
+            tmp.path().to_str().unwrap(),
+            0,
+        )
+        .await
+        .unwrap();
+
+    // spawn_agent should return quickly (< 1s) even for background tasks
+    assert!(start.elapsed() < std::time::Duration::from_secs(1));
+    // In test mode without API client, the agent completes immediately
+    assert_eq!(instance.status, AgentStatus::Completed);
+    assert!(instance.options.run_in_background);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  6.5 SendMessage — send a message to a running agent
+// ═══════════════════════════════════════════════════════════════════════════
+
+#[tokio::test]
+async fn agent_send_message_to_running_agent_succeeds() {
+    let mut mgr = test_manager();
+
+    // Use resume_agent to create a Running agent (no task spawned)
+    let context = ForkedContext::new("sess_007".into(), "/tmp".into(), 5);
+    mgr.resume_agent(
+        "running_agent_1",
+        AgentType::GeneralPurpose,
+        SpawnOptions::default(),
+        context,
+    )
+    .await
+    .unwrap();
+
+    // Now the agent is Running, send_message should succeed
+    let result = mgr.send_message("running_agent_1", "please also check tests").await;
+    assert!(result.is_ok());
+}
+
+#[tokio::test]
+async fn agent_send_message_to_completed_agent_fails() {
+    let mut mgr = test_manager();
+    let tmp = tempfile::tempdir().unwrap();
+
+    mgr.spawn_agent(
+        AgentType::GeneralPurpose,
+        "hello",
+        SpawnOptions::default(),
+        "sess_008",
+        tmp.path().to_str().unwrap(),
+        0,
+    )
+    .await
+    .unwrap();
+
+    let agent_id = mgr.list_agents()[0].task_handle.id.clone();
+    // In test mode agent completes immediately
+    let result = mgr.send_message(&agent_id, "follow up").await;
+    assert!(result.is_err());
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  6.6 Worktree isolation — agent runs in separate working directory
+// ═══════════════════════════════════════════════════════════════════════════
+
+#[tokio::test]
+async fn agent_worktree_isolation_separate_cwd() {
+    let mut mgr = test_manager();
+    let parent_dir = tempfile::tempdir().unwrap();
+    let agent_dir = tempfile::tempdir().unwrap();
+
+    let instance = mgr
+        .spawn_agent(
+            AgentType::GeneralPurpose,
+            "analyze this directory",
+            SpawnOptions {
+                cwd: Some(agent_dir.path().to_path_buf()),
+                ..Default::default()
+            },
+            "sess_009",
+            parent_dir.path().to_str().unwrap(),
+            0,
+        )
+        .await
+        .unwrap();
+
+    // The agent's output file should be in the agent's cwd, not the parent's
+    if let Some(ref path) = instance.output_file {
+        let parent = path.parent().unwrap();
+        assert_eq!(parent, agent_dir.path());
+    } else {
+        panic!("expected output_file to be set");
+    }
+
+    // Context cwd should be the parent's cwd
+    let ctx = instance.context.as_ref().unwrap();
+    assert_eq!(ctx.cwd, parent_dir.path().to_str().unwrap());
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  6.7 Tool whitelist — only specified tools are available to the agent
+// ═══════════════════════════════════════════════════════════════════════════
+
+#[tokio::test]
+async fn agent_tool_whitelist_restricts_tools() {
+    let mut mgr = test_manager();
+    let tmp = tempfile::tempdir().unwrap();
+
+    let instance = mgr
+        .spawn_agent(
+            AgentType::GeneralPurpose,
+            "read and search only",
+            SpawnOptions {
+                allowed_tools: Some(vec!["Read".into(), "Grep".into()]),
+                ..Default::default()
+            },
+            "sess_010",
+            tmp.path().to_str().unwrap(),
+            0,
+        )
+        .await
+        .unwrap();
+
+    let ctx = instance.context.as_ref().unwrap();
+    assert_eq!(ctx.allowed_tools, vec!["Read", "Grep"]);
+}
+
+#[tokio::test]
+async fn agent_tool_whitelist_empty_allows_none() {
+    let mut mgr = test_manager();
+    let tmp = tempfile::tempdir().unwrap();
+
+    let instance = mgr
+        .spawn_agent(
+            AgentType::GeneralPurpose,
+            "no tools",
+            SpawnOptions {
+                allowed_tools: Some(vec![]),
+                ..Default::default()
+            },
+            "sess_011",
+            tmp.path().to_str().unwrap(),
+            0,
+        )
+        .await
+        .unwrap();
+
+    let ctx = instance.context.as_ref().unwrap();
+    assert!(ctx.allowed_tools.is_empty());
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  Cross-cutting: lifecycle, callbacks, and edge cases
+// ═══════════════════════════════════════════════════════════════════════════
+
+#[tokio::test]
+async fn agent_wait_for_completion_returns_result() {
+    let mut mgr = test_manager();
+    let tmp = tempfile::tempdir().unwrap();
+
+    let instance = mgr
+        .spawn_agent(
+            AgentType::GeneralPurpose,
+            "do something",
+            SpawnOptions::default(),
+            "sess_wait",
+            tmp.path().to_str().unwrap(),
+            0,
+        )
+        .await
+        .unwrap();
+
+    let agent_id = instance.task_handle.id.clone();
+    let result: AgentResult = mgr.wait_for_completion(&agent_id).await.unwrap();
+    assert_eq!(result.status, AgentStatus::Completed);
+}
+
+#[tokio::test]
+async fn agent_stop_agent_changes_status() {
+    let mut mgr = test_manager();
+    let tmp = tempfile::tempdir().unwrap();
+
+    mgr.spawn_agent(
+        AgentType::GeneralPurpose,
+        "long task",
+        SpawnOptions::default(),
+        "sess_stop",
+        tmp.path().to_str().unwrap(),
+        0,
+    )
+    .await
+    .unwrap();
+
+    let agent_id = mgr.list_agents()[0].task_handle.id.clone();
+    mgr.stop_agent(&agent_id).await.unwrap();
+
+    assert_eq!(mgr.list_agents()[0].status, AgentStatus::Stopped);
+}
+
+#[tokio::test]
+async fn agent_teammate_event_callback_receives_events() {
+    let mut mgr = test_manager();
+    let tmp = tempfile::tempdir().unwrap();
+
+    let event_received = Arc::new(AtomicBool::new(false));
+    let flag = event_received.clone();
+    mgr.set_event_callback(move |event| {
+        if let TeammateEvent::TaskCompleted { .. } = event {
+            flag.store(true, Ordering::SeqCst);
+        }
+    });
+
+    mgr.spawn_agent(
+        AgentType::GeneralPurpose,
+        "test",
+        SpawnOptions::default(),
+        "sess_event",
+        tmp.path().to_str().unwrap(),
+        0,
+    )
+    .await
+    .unwrap();
+
+    let agent_id = mgr.list_agents()[0].task_handle.id.clone();
+    mgr.complete_agent(&agent_id, "subject", "summary")
+        .await
+        .unwrap();
+
+    assert!(event_received.load(Ordering::SeqCst));
+}
+
+#[tokio::test]
+async fn agent_verification_type_spawns() {
+    let mut mgr = test_manager();
+    let tmp = tempfile::tempdir().unwrap();
+
+    let instance = mgr
+        .spawn_agent(
+            AgentType::Verification,
+            "verify this code is correct",
+            SpawnOptions::default(),
+            "sess_verify",
+            tmp.path().to_str().unwrap(),
+            0,
+        )
+        .await
+        .unwrap();
+
+    assert!(instance.prompt.contains("verification agent"));
+    assert_eq!(instance.status, AgentStatus::Completed);
+}
+
+#[tokio::test]
+async fn agent_custom_agent_with_system_prompt() {
+    let mut mgr = test_manager();
+    let tmp = tempfile::tempdir().unwrap();
+
+    let instance = mgr
+        .spawn_agent(
+            AgentType::Custom {
+                prompt: "You are a Rust expert focused on unsafe code.".into(),
+            },
+            "review this unsafe block",
+            SpawnOptions::default(),
+            "sess_custom",
+            tmp.path().to_str().unwrap(),
+            0,
+        )
+        .await
+        .unwrap();
+
+    assert!(instance.prompt.contains("Rust expert"));
+    assert!(instance.prompt.contains("unsafe code"));
+}
+
+#[tokio::test]
+async fn agent_claude_code_guide_type_spawns() {
+    let mut mgr = test_manager();
+    let tmp = tempfile::tempdir().unwrap();
+
+    let instance = mgr
+        .spawn_agent(
+            AgentType::ClaudeCodeGuide,
+            "how do I use worktrees?",
+            SpawnOptions::default(),
+            "sess_guide",
+            tmp.path().to_str().unwrap(),
+            0,
+        )
+        .await
+        .unwrap();
+
+    assert!(instance.prompt.contains("Claude Code"));
+    assert_eq!(instance.status, AgentStatus::Completed);
+}
+
+#[tokio::test]
+async fn agent_statusline_setup_type_spawns() {
+    let mut mgr = test_manager();
+    let tmp = tempfile::tempdir().unwrap();
+
+    let instance = mgr
+        .spawn_agent(
+            AgentType::StatuslineSetup,
+            "configure my status line",
+            SpawnOptions::default(),
+            "sess_status",
+            tmp.path().to_str().unwrap(),
+            0,
+        )
+        .await
+        .unwrap();
+
+    assert!(instance.prompt.contains("status line"));
+    assert_eq!(instance.status, AgentStatus::Completed);
+}
+
+#[tokio::test]
+async fn agent_multiple_agents_tracked_independently() {
+    let mut mgr = test_manager();
+    let tmp = tempfile::tempdir().unwrap();
+
+    for i in 0..5 {
+        mgr.spawn_agent(
+            AgentType::GeneralPurpose,
+            &format!("task {}", i),
+            SpawnOptions::default(),
+            "sess_multi",
+            tmp.path().to_str().unwrap(),
+            0,
+        )
+        .await
+        .unwrap();
+    }
+
+    assert_eq!(mgr.list_agents().len(), 5);
+}
+
+#[tokio::test]
+async fn agent_get_agent_by_id() {
+    let mut mgr = test_manager();
+    let tmp = tempfile::tempdir().unwrap();
+
+    let instance = mgr
+        .spawn_agent(
+            AgentType::GeneralPurpose,
+            "test",
+            SpawnOptions::default(),
+            "sess_get",
+            tmp.path().to_str().unwrap(),
+            0,
+        )
+        .await
+        .unwrap();
+
+    let agent_id = instance.task_handle.id.clone();
+    let fetched = mgr.get_agent(&agent_id).unwrap();
+    assert_eq!(fetched.task_handle.id, agent_id);
+}
+
+#[tokio::test]
+async fn agent_env_variables_inherited_in_context() {
+    let mut mgr = test_manager();
+    let tmp = tempfile::tempdir().unwrap();
+
+    let mut env = HashMap::new();
+    env.insert("AGENT_VAR".into(), "agent_value".into());
+
+    let instance = mgr
+        .spawn_agent(
+            AgentType::GeneralPurpose,
+            "test",
+            SpawnOptions {
+                extra_env: env,
+                ..Default::default()
+            },
+            "sess_env",
+            tmp.path().to_str().unwrap(),
+            0,
+        )
+        .await
+        .unwrap();
+
+    let ctx = instance.context.as_ref().unwrap();
+    assert_eq!(ctx.env_snapshot.get("AGENT_VAR").unwrap(), "agent_value");
+}

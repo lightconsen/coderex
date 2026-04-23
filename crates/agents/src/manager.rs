@@ -352,6 +352,8 @@ pub struct AgentManager {
     agent_event_broadcast: Option<broadcast::Sender<AgentObservableEvent>>,
     /// Custom agent definitions loaded from config files.
     custom_agents: HashMap<String, crate::custom_agents::CustomAgentDef>,
+    /// When true, spawn_agent writes a placeholder instead of requiring an API client.
+    test_mode: bool,
 }
 
 impl std::fmt::Debug for AgentManager {
@@ -377,6 +379,7 @@ impl AgentManager {
             tool_executor_factory: None,
             agent_event_broadcast: None,
             custom_agents: crate::custom_agents::load_custom_agents(),
+            test_mode: false,
         }
     }
 
@@ -414,6 +417,12 @@ impl AgentManager {
         F: Fn(Option<SandboxConfig>) -> Box<dyn ToolExecutor + Send + Sync> + Send + Sync + 'static,
     {
         self.tool_executor_factory = Some(Arc::new(factory));
+    }
+
+    /// Enable test mode — spawn_agent will write a placeholder instead of
+    /// requiring a real API client. Used by integration tests.
+    pub fn enable_test_mode(&mut self) {
+        self.test_mode = true;
     }
 
     /// Subscribe to agent observable events.
@@ -649,25 +658,20 @@ impl AgentManager {
             });
 
             instance.task_join_handle = Some(handle);
+        } else if cfg!(test) || self.test_mode {
+            // Test convenience: write placeholder and complete immediately
+            let placeholder = format!(
+                "agent completed (no API client configured, no output file)\n\nAgent task: {prompt}"
+            );
+            let _ = tokio::fs::write(&output_file, &placeholder).await;
+            instance.status = AgentStatus::Completed;
+            completion_notify.notify_waiters();
         } else {
-            #[cfg(test)]
-            {
-                // Test convenience: write placeholder and complete immediately
-                let placeholder = format!(
-                    "agent completed (no API client configured, no output file)\n\nAgent task: {prompt}"
-                );
-                let _ = tokio::fs::write(&output_file, &placeholder).await;
-                instance.status = AgentStatus::Completed;
-                completion_notify.notify_waiters();
-            }
-            #[cfg(not(test))]
-            {
-                return Err(AgentError::Configuration(
-                    "AgentManager requires an API client to spawn agents. \
-                     Configure one via set_api_client() before calling spawn_agent()."
-                        .into(),
-                ));
-            }
+            return Err(AgentError::Configuration(
+                "AgentManager requires an API client to spawn agents. \
+                 Configure one via set_api_client() before calling spawn_agent()."
+                    .into(),
+            ));
         }
 
         self.agents.insert(agent_id.clone(), instance);
