@@ -34,14 +34,13 @@ pub struct BridgeConfig {
 
 /// A running session tracked by the bridge.
 #[derive(Debug)]
-#[allow(dead_code)]
-struct ManagedSession {
+pub struct ManagedSession {
     /// Session state machine.
-    state_machine: BridgeSessionStateMachine,
+    pub state_machine: BridgeSessionStateMachine,
     /// Working directory for the session.
-    work_dir: PathBuf,
+    pub work_dir: PathBuf,
     /// Whether a worktree was created.
-    worktree_created: bool,
+    pub worktree_created: bool,
 }
 
 /// Bridge events emitted during operation.
@@ -98,7 +97,7 @@ pub struct Bridge {
     /// Cleanup manager for resource teardown.
     cleanup_manager: BridgeCleanupManager,
     /// Active sessions tracked by state machine.
-    sessions: std::collections::HashMap<String, ManagedSession>,
+    pub sessions: std::collections::HashMap<String, ManagedSession>,
     /// Event broadcast channel for observers.
     event_tx: tokio::sync::broadcast::Sender<BridgeEvent>,
     /// Whether the bridge is currently running.
@@ -161,7 +160,7 @@ impl Bridge {
     }
 
     /// Broadcast an event to all subscribers.
-    fn emit(&self, event: BridgeEvent) {
+    pub fn emit(&self, event: BridgeEvent) {
         let _ = self.event_tx.send(event);
     }
 
@@ -230,6 +229,12 @@ impl Bridge {
             .collect()
     }
 
+    /// Check if a session is tracked by the bridge.
+    #[must_use]
+    pub fn has_session(&self, session_id: &str) -> bool {
+        self.sessions.contains_key(session_id)
+    }
+
     /// Get the state of a specific session.
     pub fn session_state(&self, session_id: &str) -> Option<&BridgeSessionState> {
         self.sessions.get(session_id).map(|s| &s.state_machine.current)
@@ -268,9 +273,8 @@ impl Bridge {
         self.transport.as_ref().map(|t| t.connection_id())
     }
 
-    /// ─── Internal: Spawn a session from a work assignment ───
-    #[allow(dead_code)]
-    async fn spawn_session(&mut self, assignment: &WorkAssignment) -> Result<SpawnResult, String> {
+    /// Spawn a session from a work assignment.
+    pub async fn spawn_session(&mut self, assignment: &WorkAssignment) -> Result<SpawnResult, String> {
         let session_id = &assignment.session_id;
 
         let config = SpawnConfig {
@@ -278,7 +282,7 @@ impl Bridge {
             work_dir: PathBuf::from(&assignment.working_directory),
             mode: assignment.spawn_mode.clone(),
             branch: match assignment.spawn_mode {
-                SpawnMode::Worktree => Some("main".into()),
+                SpawnMode::Worktree => Some("HEAD".into()),
                 SpawnMode::Ssh { .. } => None,
                 _ => None,
             },
@@ -300,9 +304,8 @@ impl Bridge {
         Ok(result)
     }
 
-    /// ─── Internal: Complete a session (archive + cleanup) ───
-    #[allow(dead_code)]
-    async fn complete_session(&mut self, session_id: &str, usage: UsageStats) -> Result<(), String> {
+    /// Complete a session (archive + cleanup).
+    pub async fn complete_session(&mut self, session_id: &str, usage: UsageStats) -> Result<(), String> {
         // Drive session through required states: assigned → preparing → spawning → running → archiving
         if let Some(session) = self.sessions.get_mut(session_id) {
             if matches!(session.state_machine.current, BridgeSessionState::Assigned) {
@@ -360,9 +363,8 @@ impl Bridge {
         Ok(())
     }
 
-    /// ─── Internal: Fail a session ───
-    #[allow(dead_code)]
-    fn fail_session(&mut self, session_id: &str, reason: String) {
+    /// Fail a session.
+    pub fn fail_session(&mut self, session_id: &str, reason: String) {
         if let Some(session) = self.sessions.get_mut(session_id) {
             session.state_machine.fail(reason.clone());
         }

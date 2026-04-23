@@ -97,7 +97,7 @@ impl BridgeSessionSpawner {
         let worktree_path = self.worktree_base.join(&config.session_id);
 
         if !worktree_path.exists() {
-            std::process::Command::new("git")
+            let output = std::process::Command::new("git")
                 .args([
                     "worktree",
                     "add",
@@ -107,6 +107,12 @@ impl BridgeSessionSpawner {
                 .current_dir(&self.repo_root)
                 .output()
                 .map_err(|e| format!("git worktree add failed: {e}"))?;
+            if !output.status.success() {
+                return Err(format!(
+                    "git worktree add failed: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                ));
+            }
         }
 
         self.prepare_session_dir(&config.session_id).await?;
