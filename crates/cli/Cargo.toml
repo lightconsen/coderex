@@ -18,6 +18,14 @@ path = "src/main.rs"
 name = "mock-anthropic-server"
 path = "src/bin/mock_anthropic_server.rs"
 
+[[bin]]
+name = "record-anthropic-responses"
+path = "src/bin/record_anthropic_responses.rs"
+
+[[bin]]
+name = "static-anthropic-server"
+path = "src/bin/static_anthropic_server.rs"
+
 [dependencies]
 coderex-core = { path = "../core" }
 coderex-tools = { path = "../tools" }
