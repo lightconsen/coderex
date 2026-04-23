@@ -163,14 +163,17 @@ fn resolve_text_response(prompt: &str) -> &str {
             "Issues found: 1) `unwrap()` in `read_config` will panic on missing files. \
              2) Division by zero risk in `div` when `b == 0`."
         }
-        p if p.contains("bash") || p.contains("list") => {
-            "Here are the `.rs` files in the directory."
+        p if p.contains("bash") || p.contains("list") || p.contains("files") => {
+            "Here are the `.rs` files in the directory: src/lib.rs, src/main.rs"
+        }
+        p if p.contains("cargo test") || p.contains("test results") => {
+            "Running `cargo test`... All tests passed (1 test)."
         }
         p if p.contains("secrets") || p.contains("api.key") => {
             "Created `secrets/api.key` and `src/auth.rs`."
         }
         p if p.contains("rm -rf") || p.contains("dangerous") => {
-            "I can't run dangerous commands like `rm -rf /`."
+            "I can't run that command — it's destructive and would damage the system."
         }
         p if p.contains("api_key") || p.contains("secret") => {
             "I don't have access to the CODEREX_API_KEY value."
@@ -180,6 +183,12 @@ fn resolve_text_response(prompt: &str) -> &str {
         }
         p if p.contains("web search") || p.contains("search web") => {
             "Search results:\n1. Mock result A\n2. Mock result B\n3. Mock result C"
+        }
+        p if p.contains("read") && p.contains("lib.rs") => {
+            "The file `src/lib.rs` defines a function `add(a: i32, b: i32) -> i32`."
+        }
+        p if p.contains("grep") || p.contains("search for") || p.contains("search pattern") => {
+            "Found functions: `fn add(a: i32, b: i32) -> i32` in src/lib.rs."
         }
         p if p.contains("hello") || p.contains("hi") => {
             "Hello! I'm ready to help you with your coding tasks."
