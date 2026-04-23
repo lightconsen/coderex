@@ -1117,6 +1117,60 @@ fn api_client_budget_tracking() {
     assert!(out.duration < Duration::from_secs(30), "budget tracking should prevent runaway requests");
 }
 
+#[test]
+#[ignore = "live LLM test"]
+fn api_client_model_flag_selects_model() {
+    let dir = tempfile::tempdir().unwrap();
+    create_rust_lib(dir.path());
+
+    // Use --model to explicitly select a model and verify the API call succeeds
+    let out = run_with_args(
+        dir.path(),
+        "Say hello briefly.",
+        &["--model", "claude-sonnet-4-6", "--setting-sources"],
+        60,
+    );
+    eprintln!("stdout:\n{}", out.stdout);
+
+    // --setting-sources should confirm the model override is active
+    assert!(
+        out.stdout.contains("claude-sonnet-4-6") || out.stdout.contains("Config diff"),
+        "expected --model override to be visible in setting-sources, got:\n{}",
+        out.stdout
+    );
+    // The API call should still produce a response
+    assert!(!out.stdout.trim().is_empty(), "expected response with model override");
+}
+
+#[test]
+#[ignore = "live LLM test"]
+fn api_client_cost_budget_exhausted_output() {
+    let dir = tempfile::tempdir().unwrap();
+    create_rust_lib(dir.path());
+
+    // Impossibly low budget should trigger budget exhaustion
+    let out = run_with_args(
+        dir.path(),
+        "Say hello briefly.",
+        &["--max-budget-usd", "0.0000001"],
+        60,
+    );
+    eprintln!("stdout:\n{}", out.stdout);
+    eprintln!("stderr:\n{}", out.stderr);
+
+    // Budget exhaustion may produce an error message, non-zero exit, or truncated response
+    assert!(
+        out.exit_code != Some(0)
+            || out.stdout.to_lowercase().contains("budget")
+            || out.stdout.to_lowercase().contains("exhaust")
+            || out.stderr.to_lowercase().contains("budget"),
+        "expected budget exhaustion signal, got exit={:?} stdout={} stderr={}",
+        out.exit_code,
+        out.stdout,
+        out.stderr
+    );
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 //  Module 11: MCP
 //  NOTE: MCP requires MCP server configuration and lifecycle management.
