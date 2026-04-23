@@ -1034,6 +1034,10 @@ impl StartupOrchestrator {
     /// Configure a ReplLoop with all CLI-derived settings.
     fn configure_repl(&self, repl: &mut crate::repl::ReplLoop) {
         repl.with_skip_permissions(self.ctx.skip_permissions);
+        let perm_mode = self.ctx.settings.as_ref()
+            .and_then(|s| s.permission_mode.as_deref())
+            .and_then(|m| m.parse::<coderex_core::permissions::PermissionMode>().ok());
+        repl.with_permission_mode(perm_mode);
         repl.with_no_persistence(self.ctx.no_persistence);
         repl.with_no_slash_commands(self.ctx.no_slash_commands);
         repl.with_json_schema(self.ctx.json_schema.clone());

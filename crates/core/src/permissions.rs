@@ -46,6 +46,36 @@ impl PermissionMode {
     }
 }
 
+impl std::fmt::Display for PermissionMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let s = match self {
+            Self::Default => "default",
+            Self::AcceptEdits => "accept-edits",
+            Self::BypassPermissions => "bypass-permissions",
+            Self::DontAsk => "dont-ask",
+            Self::Plan => "plan",
+            Self::Auto => "auto",
+        };
+        f.write_str(s)
+    }
+}
+
+impl std::str::FromStr for PermissionMode {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "default" => Ok(Self::Default),
+            "accept-edits" => Ok(Self::AcceptEdits),
+            "bypass-permissions" => Ok(Self::BypassPermissions),
+            "dont-ask" => Ok(Self::DontAsk),
+            "plan" => Ok(Self::Plan),
+            "auto" => Ok(Self::Auto),
+            _ => Err(format!("unknown permission mode: {s}")),
+        }
+    }
+}
+
 /// The result of a permission check.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PermissionResult {
@@ -355,14 +385,15 @@ impl PermissionChecker {
     /// Check if a tool is known to be dangerous.
     #[must_use]
     pub fn is_dangerous_tool(&self, tool_name: &str) -> bool {
-        self.dangerous_tools.iter().any(|t| t == tool_name)
+        let lower = tool_name.to_lowercase();
+        self.dangerous_tools.iter().any(|t| t.eq_ignore_ascii_case(&lower))
     }
 
     /// Check if a tool is read-only (safe for plan mode).
     #[must_use]
     pub fn is_tool_read_only(&self, tool_name: &str) -> bool {
         matches!(
-            tool_name,
+            tool_name.to_lowercase().as_str(),
             "read" | "ls" | "grep" | "glob"
                 | "web_search" | "web_fetch" | "grep_code"
                 | "file_search" | "notebook_read"
@@ -371,7 +402,7 @@ impl PermissionChecker {
 
     /// Check if a rule matches the given tool and path.
     fn rule_matches(rule: &CompiledRule, tool_name: &str, path: Option<&str>) -> bool {
-        let name_matches = rule.tool_name.is_empty() || rule.tool_name == tool_name;
+        let name_matches = rule.tool_name.is_empty() || rule.tool_name.eq_ignore_ascii_case(tool_name);
         if !name_matches {
             return false;
         }
@@ -614,5 +645,60 @@ mod tests {
         assert!(matches!(checker.mode(), PermissionMode::Plan));
         checker.exit_plan_mode();
         assert!(matches!(checker.mode(), PermissionMode::Auto));
+    }
+
+    #[test]
+    fn permission_mode_from_str() {
+        assert!(matches!(
+            "default".parse::<PermissionMode>().unwrap(),
+            PermissionMode::Default
+        ));
+        assert!(matches!(
+            "accept-edits".parse::<PermissionMode>().unwrap(),
+            PermissionMode::AcceptEdits
+        ));
+        assert!(matches!(
+            "bypass-permissions".parse::<PermissionMode>().unwrap(),
+            PermissionMode::BypassPermissions
+        ));
+        assert!(matches!(
+            "dont-ask".parse::<PermissionMode>().unwrap(),
+            PermissionMode::DontAsk
+        ));
+        assert!(matches!(
+            "plan".parse::<PermissionMode>().unwrap(),
+            PermissionMode::Plan
+        ));
+        assert!(matches!(
+            "auto".parse::<PermissionMode>().unwrap(),
+            PermissionMode::Auto
+        ));
+        assert!("invalid".parse::<PermissionMode>().is_err());
+    }
+
+    #[test]
+    fn permission_mode_display() {
+        assert_eq!(PermissionMode::Default.to_string(), "default");
+        assert_eq!(PermissionMode::AcceptEdits.to_string(), "accept-edits");
+        assert_eq!(PermissionMode::BypassPermissions.to_string(), "bypass-permissions");
+        assert_eq!(PermissionMode::DontAsk.to_string(), "dont-ask");
+        assert_eq!(PermissionMode::Plan.to_string(), "plan");
+        assert_eq!(PermissionMode::Auto.to_string(), "auto");
+    }
+
+    #[test]
+    fn permission_mode_roundtrip() {
+        for mode in [
+            PermissionMode::Default,
+            PermissionMode::AcceptEdits,
+            PermissionMode::BypassPermissions,
+            PermissionMode::DontAsk,
+            PermissionMode::Plan,
+            PermissionMode::Auto,
+        ] {
+            let s = mode.to_string();
+            let parsed: PermissionMode = s.parse().unwrap();
+            assert_eq!(parsed, mode);
+        }
     }
 }

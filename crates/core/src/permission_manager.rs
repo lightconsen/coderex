@@ -179,7 +179,7 @@ impl PermissionManager {
     /// Remove a rule by matching its tool name and paths.
     pub fn remove_rule(&mut self, tool_name: &str, path_pattern: Option<&str>) {
         self.config.rules.retain(|r| {
-            if r.tool_name != tool_name {
+            if !r.tool_name.eq_ignore_ascii_case(tool_name) {
                 return true;
             }
             if let Some(pattern) = path_pattern {
@@ -274,7 +274,7 @@ impl PermissionManager {
 
         for (i, r1) in all_rules.iter().enumerate() {
             for r2 in all_rules.iter().skip(i + 1) {
-                if r1.tool_name == r2.tool_name && r1.action != r2.action {
+                if r1.tool_name.eq_ignore_ascii_case(&r2.tool_name) && r1.action != r2.action {
                     // Check for path overlap
                     let paths_overlap = if r1.paths.is_empty() || r2.paths.is_empty() {
                         true // Empty paths = applies everywhere

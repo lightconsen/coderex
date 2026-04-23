@@ -139,6 +139,8 @@ pub struct ReplLoop {
     teleport_manager: Option<coderex_bridge::teleport::TeleportManager>,
     /// Skip permission prompts (--dangerously-skip-permissions).
     skip_permissions: bool,
+    /// Permission mode override (--permissions).
+    permission_mode: Option<PermissionMode>,
     /// Disable session persistence (--no-session-persistence).
     no_persistence: bool,
     /// Disable slash commands (--disable-slash-commands).
@@ -269,6 +271,7 @@ impl ReplLoop {
             #[cfg(feature = "hot-reload")]
             config_changed_rx: None,
             skip_permissions: false,
+            permission_mode: None,
             no_persistence: false,
             no_slash_commands: false,
             json_schema: None,
@@ -431,6 +434,7 @@ impl ReplLoop {
             #[cfg(feature = "hot-reload")]
             config_changed_rx,
             skip_permissions: false,
+            permission_mode: None,
             no_persistence: false,
             no_slash_commands: false,
             json_schema: None,
@@ -489,6 +493,10 @@ impl ReplLoop {
 
     pub fn with_skip_permissions(&mut self, skip: bool) {
         self.skip_permissions = skip;
+    }
+
+    pub fn with_permission_mode(&mut self, mode: Option<PermissionMode>) {
+        self.permission_mode = mode;
     }
 
     pub fn with_no_persistence(&mut self, no_persist: bool) {
@@ -580,6 +588,12 @@ impl ReplLoop {
                 let checker = engine.permission_checker();
                 let mut c = checker.lock().unwrap();
                 c.set_mode(PermissionMode::BypassPermissions);
+            }
+        } else if let Some(mode) = self.permission_mode {
+            if let Some(ref mut engine) = self.engine {
+                let checker = engine.permission_checker();
+                let mut c = checker.lock().unwrap();
+                c.set_mode(mode);
             }
         }
 

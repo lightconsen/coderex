@@ -429,7 +429,7 @@ impl PermissionHook for AutoApproveHook {
         request: &PermissionRequest,
         _mode: crate::permissions::PermissionMode,
     ) -> Result<Option<PermissionResult>, PermissionRequestError> {
-        if self.tool_names.contains(&request.tool_name) {
+        if self.tool_names.iter().any(|t| t.eq_ignore_ascii_case(&request.tool_name)) {
             Ok(Some(PermissionResult::Allow))
         } else {
             Ok(None)
