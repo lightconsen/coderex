@@ -193,6 +193,58 @@ fn run_with_args(cwd: &Path, prompt: &str, extra_args: &[&str], timeout_secs: u6
     }
 }
 
+/// Run the coderex binary with arbitrary arguments (non-interactive mode).
+fn run_command(cwd: &Path, args: &[&str], timeout_secs: u64) -> CoderexOutput {
+    let mut cmd = Command::new(binary_path());
+    cmd.args(args)
+        .current_dir(cwd)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    let start = Instant::now();
+    let mut child = cmd.spawn().expect("spawn coderex");
+
+    let stdout_handle = child.stdout.take().unwrap();
+    let stderr_handle = child.stderr.take().unwrap();
+
+    let stdout_thread = thread::spawn(move || {
+        let mut buf = String::new();
+        BufReader::new(stdout_handle).read_to_string(&mut buf).unwrap_or(0);
+        buf
+    });
+
+    let stderr_thread = thread::spawn(move || {
+        let mut buf = String::new();
+        BufReader::new(stderr_handle).read_to_string(&mut buf).unwrap_or(0);
+        buf
+    });
+
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(s)) => break s,
+            Ok(None) => {
+                if start.elapsed() > Duration::from_secs(timeout_secs) {
+                    let _ = child.kill();
+                    panic!("coderex timed out after {timeout_secs}s");
+                }
+                thread::sleep(Duration::from_millis(200));
+            }
+            Err(e) => panic!("wait error: {e}"),
+        }
+    };
+
+    let stdout = stdout_thread.join().unwrap();
+    let stderr = stderr_thread.join().unwrap();
+
+    CoderexOutput {
+        stdout,
+        stderr,
+        exit_code: status.code(),
+        duration: start.elapsed(),
+    }
+}
+
 fn assert_response_contains(stdout: &str, keywords: &[&str], label: &str) {
     let lower = stdout.to_lowercase();
     let mut found = 0;
@@ -1173,10 +1225,125 @@ fn api_client_cost_budget_exhausted_output() {
 
 // ═══════════════════════════════════════════════════════════════════════════
 //  Module 11: MCP
-//  NOTE: MCP requires MCP server configuration and lifecycle management.
-//  Not testable via CLI E2E without pre-configured MCP servers.
-//  Test via: coderex-mcp crate integration tests.
 // ═══════════════════════════════════════════════════════════════════════════
+
+#[test]
+fn mcp_cli_list_empty() {
+    let dir = tempfile::tempdir().unwrap();
+    let out = run_command(dir.path(), &["mcp", "list"], 60);
+    assert!(
+        out.stdout.contains("Configured MCP servers:") || out.stdout.contains("No MCP config found"),
+        "expected empty MCP list header, got: {}",
+        out.stdout
+    );
+    assert!(out.stdout.contains("(none)") || out.stdout.contains("No MCP config found"));
+}
+
+#[test]
+fn mcp_cli_list_with_config() {
+    let dir = tempfile::tempdir().unwrap();
+    let config_path = dir.path().join(".mcp.json");
+    std::fs::write(
+        &config_path,
+        r#"{"mcp_servers":{"filesystem":{"command":"npx","args":["@modelcontextprotocol/server-filesystem","/tmp"],"env":{}}}}"#,
+    )
+    .unwrap();
+
+    let out = run_command(dir.path(), &["mcp", "list"], 60);
+    assert!(
+        out.stdout.contains("filesystem"),
+        "expected filesystem server in output, got: {}",
+        out.stdout
+    );
+    assert!(out.stdout.contains("npx"));
+}
+
+#[test]
+fn mcp_cli_add_server() {
+    let dir = tempfile::tempdir().unwrap();
+
+    let out = run_command(
+        dir.path(),
+        &["mcp", "add", "test-server", "echo hello"],
+        60,
+    );
+    assert!(
+        out.stdout.contains("Added MCP server 'test-server'"),
+        "expected add confirmation, got: {}",
+        out.stdout
+    );
+
+    let config_path = dir.path().join(".mcp.json");
+    assert!(config_path.exists());
+    let content = std::fs::read_to_string(&config_path).unwrap();
+    assert!(content.contains("test-server"));
+    assert!(content.contains("echo"));
+    assert!(content.contains("hello"));
+}
+
+#[test]
+fn mcp_cli_remove_server() {
+    let dir = tempfile::tempdir().unwrap();
+    let config_path = dir.path().join(".mcp.json");
+    std::fs::write(
+        &config_path,
+        r#"{"mcp_servers":{"srv1":{"command":"echo","args":[],"env":{}},"srv2":{"command":"cat","args":[],"env":{}}}}"#,
+    )
+    .unwrap();
+
+    let out = run_command(dir.path(), &["mcp", "remove", "srv1"], 60);
+    assert!(
+        out.stdout.contains("Removed MCP server 'srv1'"),
+        "expected remove confirmation, got: {}",
+        out.stdout
+    );
+
+    let content = std::fs::read_to_string(&config_path).unwrap();
+    assert!(!content.contains("srv1"));
+    assert!(content.contains("srv2"));
+}
+
+#[test]
+fn mcp_cli_remove_nonexistent_server() {
+    let dir = tempfile::tempdir().unwrap();
+
+    let out = run_command(dir.path(), &["mcp", "remove", "missing"], 60);
+    assert!(
+        out.stdout.contains("not found"),
+        "expected not-found message, got: {}",
+        out.stdout
+    );
+}
+
+#[test]
+fn mcp_cli_test_server_found() {
+    let dir = tempfile::tempdir().unwrap();
+    let config_path = dir.path().join(".mcp.json");
+    std::fs::write(
+        &config_path,
+        r#"{"mcp_servers":{"mock":{"command":"echo","args":[],"env":{}}}}"#,
+    )
+    .unwrap();
+
+    let out = run_command(dir.path(), &["mcp", "test", "mock"], 60);
+    assert!(
+        out.stdout.contains("is configured"),
+        "expected configured message, got: {}",
+        out.stdout
+    );
+}
+
+#[test]
+fn mcp_cli_test_server_not_found() {
+    let dir = tempfile::tempdir().unwrap();
+
+    let out = run_command(dir.path(), &["mcp", "test", "missing"], 60);
+    assert!(
+        out.stdout.contains("not found") || out.stdout.contains("No MCP config found"),
+        "expected not-found message, got: {}",
+        out.stdout
+    );
+}
 
 // ═══════════════════════════════════════════════════════════════════════════
 //  Module 12: Bridge / Remote
