@@ -2,11 +2,11 @@
 # Run the static-anthropic-server binary with a responses file.
 #
 # Usage:
-#   ./run-static-anthropic-server.sh --response crates/cli/tests/data/static_responses.json
+#   ./run-static-anthropic-server.sh --response tests/responses.json
 #   ./run-static-anthropic-server.sh --response /path/to/custom_responses.json --port 8888
 #
 # Defaults:
-#   --response → crates/cli/tests/data/static_responses.json (relative to repo root)
+#   --response → tests/responses.json (relative to repo root)
 #   --port     → 9876
 
 set -euo pipefail
@@ -14,7 +14,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
 
-DEFAULT_RESPONSES="${REPO_ROOT}/crates/cli/tests/data/static_responses.json"
+DEFAULT_RESPONSES="${REPO_ROOT}/tests/responses.json"
 PORT="9876"
 RESPONSES=""
 
