@@ -3,7 +3,7 @@ set -euo pipefail
 
 # Start the mock Anthropic API server for E2E testing.
 # Usage:
-#   ./scripts/run_mock_anthropic_server.sh [PORT]
+#   ./tests/run-mock-anthropic-server.sh [PORT]
 # Default port is 9876.
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"

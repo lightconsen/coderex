@@ -5,11 +5,11 @@ set -euo pipefail
 #
 # Mock server (fast, deterministic):
 #   source export_env.local.sh
-#   ./scripts/run-e2e-equivalence.sh
+#   ./tests/run-e2e-equivalence.sh
 #
 # Live Kimi API (slow, non-deterministic):
 #   source export_env.kimi.sh
-#   ./scripts/run-e2e-equivalence.sh
+#   ./tests/run-e2e-equivalence.sh
 
 # Check required environment variables
 if [ -z "${CODEREX_API_KEY:-}" ] || [ -z "${CODEREX_BASE_URL:-}" ]; then
@@ -28,7 +28,7 @@ echo ""
 if [ "${CODEREX_API_KEY}" = "mock" ]; then
     if ! curl -sf http://127.0.0.1:9876/v1/messages -X POST -d '{}' >/dev/null 2>&1; then
         echo "Mock server not running, starting it..."
-        ./scripts/run-mock-anthropic-server.sh &
+        ./tests/run-mock-anthropic-server.sh &
         MOCK_PID=$!
         sleep 2
         trap 'kill $MOCK_PID 2>/dev/null' EXIT

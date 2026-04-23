@@ -12,7 +12,7 @@
 //!
 //! ## Running
 //! Mock server (fast, deterministic):
-//!   ./scripts/run-mock-anthropic-server.sh
+//!   ./tests/run-mock-anthropic-server.sh
 //!   source export_env.local.sh
 //!   cargo test -p coderex-cli --test e2e_equivalence -- --ignored
 //!

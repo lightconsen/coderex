@@ -7,7 +7,7 @@
 //! verify response text and opportunistically check filesystem.
 //!
 //! Run:
-//!   ./scripts/run-e2e-code-agent.sh
+//!   ./tests/run-e2e-code-agent.sh
 
 use std::io::{BufReader, Read, Write};
 use std::path::{Path, PathBuf};

@@ -64,8 +64,10 @@ without calling a real LLM.
 source export_env.local.sh
 cargo test -p coderex-cli --test e2e_code_agent -- --ignored
 
-# Or use the helper script
-./scripts/run-e2e-code-agent-mock.sh
+# Or use the helper scripts
+./tests/run-mock-anthropic-server.sh --port 9876
+./tests/run-e2e-code-agent.sh
+./tests/run-e2e-equivalence.sh
 ```
 
 **What it tests:**
@@ -88,7 +90,7 @@ source export_env.kimi.sh
 cargo test -p coderex-cli --test e2e_code_agent -- --ignored --test-threads=1
 
 # Or use the helper script
-./scripts/run-e2e-code-agent.sh
+./tests/run-e2e-code-agent.sh
 ```
 
 **Requirements:**
