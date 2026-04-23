@@ -965,6 +965,96 @@ fn config_cli_allowed_tools() {
     assert!(!out.stdout.trim().is_empty(), "expected response with allowed-tools restriction");
 }
 
+#[test]
+#[ignore = "live LLM test"]
+fn config_cli_settings_override() {
+    let dir = tempfile::tempdir().unwrap();
+    create_rust_lib(dir.path());
+
+    // Create a custom settings file with a specific model
+    let custom_settings = dir.path().join("custom_settings.json");
+    std::fs::write(
+        &custom_settings,
+        r#"{"model":"claude-sonnet-4-6","permission_mode":"default"}"#,
+    )
+    .unwrap();
+
+    let out = run_with_args(
+        dir.path(),
+        "Say hello briefly.",
+        &["--settings", custom_settings.to_str().unwrap()],
+        60,
+    );
+    eprintln!("stdout:\n{}", out.stdout);
+
+    assert!(!out.stdout.trim().is_empty(), "expected response with --settings override");
+}
+
+#[test]
+#[ignore = "live LLM test"]
+fn config_cli_setting_sources_shows_origins() {
+    let dir = tempfile::tempdir().unwrap();
+    create_rust_lib(dir.path());
+
+    // Create a custom settings file so there's something to diff
+    let custom_settings = dir.path().join("custom_settings.json");
+    std::fs::write(
+        &custom_settings,
+        r#"{"model":"claude-sonnet-4-6","max_budget_usd":10.0}"#,
+    )
+    .unwrap();
+
+    let out = run_with_args(
+        dir.path(),
+        "Say hello briefly.",
+        &[
+            "--settings",
+            custom_settings.to_str().unwrap(),
+            "--setting-sources",
+        ],
+        60,
+    );
+    eprintln!("stdout:\n{}", out.stdout);
+
+    // --setting-sources prints diff output before the LLM response
+    assert!(
+        out.stdout.contains("Config diff") || out.stdout.contains("change(s)"),
+        "expected --setting-sources to print config diff, got:\n{}",
+        out.stdout
+    );
+}
+
+#[test]
+#[ignore = "live LLM test"]
+fn config_cli_project_settings_loaded() {
+    let dir = tempfile::tempdir().unwrap();
+    create_rust_lib(dir.path());
+
+    // Create .coderex/settings.json in the project directory
+    let coderex_dir = dir.path().join(".coderex");
+    std::fs::create_dir_all(&coderex_dir).unwrap();
+    std::fs::write(
+        coderex_dir.join("settings.json"),
+        r#"{"model":"claude-sonnet-4-6","permission_mode":"accept-edits"}"#,
+    )
+    .unwrap();
+
+    let out = run_with_args(
+        dir.path(),
+        "Say hello briefly.",
+        &["--setting-sources"],
+        60,
+    );
+    eprintln!("stdout:\n{}", out.stdout);
+
+    // The project config should be loaded and visible in setting-sources output
+    assert!(
+        out.stdout.contains("accept-edits") || out.stdout.contains("Config diff"),
+        "expected project .coderex/settings.json to be loaded, got:\n{}",
+        out.stdout
+    );
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 //  Module 9: Slash Commands
 //  NOTE: Slash commands require interactive REPL mode.
