@@ -774,10 +774,84 @@ fn memory_session_messages_accumulate() {
 
 // ═══════════════════════════════════════════════════════════════════════════
 //  Module 5: Hooks
-//  NOTE: Hooks require hook infrastructure loaded at startup.
-//  Not testable via CLI binary in headless mode without pre-configured hooks.
-//  Test via: coderex-test-utils crate integration tests.
 // ═══════════════════════════════════════════════════════════════════════════
+
+#[test]
+#[ignore = "requires CLI binary build"]
+fn hook_settings_load_without_crash() {
+    let dir = tempfile::tempdir().unwrap();
+    create_rust_lib(dir.path());
+
+    // Write a settings.json with hooks configured
+    let coderex_dir = dir.path().join(".coderex");
+    std::fs::create_dir_all(&coderex_dir).unwrap();
+    let settings = serde_json::json!({
+        "hooks": [
+            {
+                "event": "SessionStart",
+                "command": "echo 'session started'",
+                "priority": 1
+            },
+            {
+                "event": "PreToolUse",
+                "command": "echo 'pre tool'",
+                "timeout_ms": 3000
+            },
+            {
+                "event": "PostToolUse",
+                "command": "echo 'post tool'"
+            },
+            {
+                "event": "UserPromptSubmit",
+                "command": "echo 'user prompt'",
+                "env": {"HOOK_VAR": "value"}
+            }
+        ]
+    });
+    std::fs::write(coderex_dir.join("settings.json"), settings.to_string()).unwrap();
+
+    // Run coderex with the hooked settings — should not crash during startup
+    let out = run_with_args(dir.path(), "Say hi briefly.", &[], 60);
+    eprintln!("stdout:\n{}", out.stdout);
+    eprintln!("stderr:\n{}", out.stderr);
+
+    // Should complete without error (hooks are loaded but not wired to engine in headless mode)
+    assert_eq!(out.exit_code, Some(0), "CLI should not crash with hook settings loaded");
+    assert!(!out.stdout.is_empty(), "expected some output");
+}
+
+#[test]
+#[ignore = "requires CLI binary build"]
+fn hook_settings_sources_shows_hooks() {
+    let dir = tempfile::tempdir().unwrap();
+    create_rust_lib(dir.path());
+
+    let coderex_dir = dir.path().join(".coderex");
+    std::fs::create_dir_all(&coderex_dir).unwrap();
+    let settings = serde_json::json!({
+        "hooks": [
+            {
+                "event": "SessionStart",
+                "command": "echo start"
+            }
+        ]
+    });
+    std::fs::write(coderex_dir.join("settings.json"), settings.to_string()).unwrap();
+
+    let out = run_with_args(dir.path(), "", &["--setting-sources"], 30);
+    eprintln!("stdout:\n{}", out.stdout);
+
+    // --setting-sources should show hooks as a configured setting
+    assert!(
+        out.stdout.contains("hooks") || out.stderr.contains("hooks"),
+        "expected hooks to appear in settings sources output"
+    );
+}
+
+// NOTE: Full hook firing E2E (PreToolUse stopping a tool, UserPromptSubmit
+// modifying input, etc.) requires the REPL to wire HookRegistry into the
+// QueryEngine via set_hooks(). This is tested in coderex-hooks integration
+// tests and coderex-core engine tests.
 
 // ═══════════════════════════════════════════════════════════════════════════
 //  Module 6: Agents
