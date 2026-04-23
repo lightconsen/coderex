@@ -1012,10 +1012,17 @@ impl QueryEngine {
                             | TerminalReason::LoopDetected { .. }
                             | TerminalReason::ApiUnavailable { .. }
                     ) {
-                        // Check if we should continue (more turns needed for tool results)
-                        break;
+                        // If the last message is a tool result, the model needs another turn
+                        if matches!(reason, TerminalReason::Completed)
+                            && self.session.messages.last().map(|m| matches!(m.role, crate::types::Role::Tool)).unwrap_or(false)
+                        {
+                            turn_number += 1;
+                        } else {
+                            break;
+                        }
+                    } else {
+                        turn_number += 1;
                     }
-                    turn_number += 1;
                 }
                 Err(e) if e.starts_with("The AI service is temporarily unavailable") => {
                     let reason = TerminalReason::ApiUnavailable { message: e };
@@ -1091,9 +1098,17 @@ impl QueryEngine {
                             | TerminalReason::LoopDetected { .. }
                             | TerminalReason::ApiUnavailable { .. }
                     ) {
-                        break;
+                        // If the last message is a tool result, the model needs another turn
+                        if matches!(reason, TerminalReason::Completed)
+                            && self.session.messages.last().map(|m| matches!(m.role, crate::types::Role::Tool)).unwrap_or(false)
+                        {
+                            turn_number += 1;
+                        } else {
+                            break;
+                        }
+                    } else {
+                        turn_number += 1;
                     }
-                    turn_number += 1;
                 }
                 Err(e) if e.starts_with("The AI service is temporarily unavailable") => {
                     let reason = TerminalReason::ApiUnavailable { message: e };
@@ -1161,7 +1176,8 @@ impl QueryEngine {
         // Parse the response
         let content = self.validate_structured_output(api_response.content.clone());
         let assistant_msg = Message::assistant(content.clone());
-        turn.messages.push(assistant_msg);
+        turn.messages.push(assistant_msg.clone());
+        self.session.messages.push(assistant_msg);
 
         // Elicitation heuristic: if the assistant asks a short question, prompt the user
         let mut api_response = api_response;
@@ -1178,7 +1194,9 @@ impl QueryEngine {
                     self.cost_tracker.record_usage(&api_response.usage, &self.model);
                     self.last_usage = Some(api_response.usage);
                     let new_content = self.validate_structured_output(api_response.content.clone());
-                    turn.messages.push(Message::assistant(new_content));
+                    let elic_assistant = Message::assistant(new_content);
+                    turn.messages.push(elic_assistant.clone());
+                    self.session.messages.push(elic_assistant);
                 }
             }
         }
@@ -1205,7 +1223,8 @@ impl QueryEngine {
                     self.last_usage = Some(api_response.usage);
                     let content = self.validate_structured_output(api_response.content.clone());
                     let assistant_msg = Message::assistant(content);
-                    turn.messages.push(assistant_msg);
+                    turn.messages.push(assistant_msg.clone());
+                    self.session.messages.push(assistant_msg);
 
                     // After recovery retry, check if we still need to compact
                     if !turn.budget.should_continue() {
@@ -1351,7 +1370,8 @@ impl QueryEngine {
 
         // Save assistant message
         let assistant_msg = Message::assistant(content.clone());
-        turn.messages.push(assistant_msg);
+        turn.messages.push(assistant_msg.clone());
+        self.session.messages.push(assistant_msg);
 
         // Elicitation heuristic: if the assistant asks a short question, prompt the user
         if options.handle_elicitation && content.trim().ends_with('?') && content.len() < 200 {
@@ -1371,7 +1391,9 @@ impl QueryEngine {
                     tool_calls = new_tool_calls;
                     early_results = new_early_results;
                     usage = new_usage;
-                    turn.messages.push(Message::assistant(content.clone()));
+                    let elic_assistant = Message::assistant(content.clone());
+                    turn.messages.push(elic_assistant.clone());
+                    self.session.messages.push(elic_assistant);
                 }
             }
         }
@@ -1398,7 +1420,9 @@ impl QueryEngine {
                     turn.budget.record_tokens(&usage);
                     self.cost_tracker.record_usage(&usage, &self.model);
                     self.last_usage = Some(usage);
-                    turn.messages.push(Message::assistant(content));
+                    let assistant_msg = Message::assistant(content);
+                    turn.messages.push(assistant_msg.clone());
+                    self.session.messages.push(assistant_msg);
 
                     if !turn.budget.should_continue() {
                         turn.terminate(TerminalReason::BudgetExhausted);
