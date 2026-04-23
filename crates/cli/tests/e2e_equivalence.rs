@@ -31,6 +31,7 @@ use std::time::{Duration, Instant};
 //  Harness (shared pattern with e2e_code_agent.rs)
 // ═══════════════════════════════════════════════════════════════════════════
 
+#[allow(dead_code)]
 fn have_live_env() -> bool {
     std::env::var("CODEREX_API_KEY").is_ok() && std::env::var("CODEREX_BASE_URL").is_ok()
 }
@@ -248,6 +249,7 @@ mod tests {
     std::fs::write(dir.join("src/lib.rs"), lib_rs).unwrap();
 }
 
+#[allow(dead_code)]
 fn create_review_project(dir: &Path) {
     let cargo_toml = r#"[package]
 name = "review_target"
@@ -269,6 +271,7 @@ pub fn div(a: i32, b: i32) -> i32 {
     std::fs::write(dir.join("src/lib.rs"), lib_rs).unwrap();
 }
 
+#[allow(dead_code)]
 fn create_multi_file_project(dir: &Path) {
     let cargo_toml = r#"[package]
 name = "multi_file"
