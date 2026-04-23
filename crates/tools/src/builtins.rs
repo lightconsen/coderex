@@ -324,4 +324,203 @@ mod tests {
         assert!(desc.is_read_only);
         assert!(desc.is_concurrency_safe);
     }
+
+    // ─── Tool Property Validation (Equivalence Test Plan §2) ───────────────
+
+    #[test]
+    fn read_tool_is_read_only() {
+        let desc = ReadTool.descriptor();
+        assert!(desc.is_read_only);
+        assert!(!desc.requires_approval);
+        assert!(desc.is_concurrency_safe);
+    }
+
+    #[test]
+    fn write_tool_is_not_read_only() {
+        let desc = WriteTool.descriptor();
+        assert!(!desc.is_read_only);
+        assert!(desc.is_enabled);
+    }
+
+    #[test]
+    fn edit_tool_is_not_read_only() {
+        let desc = EditTool.descriptor();
+        assert!(!desc.is_read_only);
+        assert!(desc.is_enabled);
+    }
+
+    #[test]
+    fn notebook_edit_tool_is_not_read_only() {
+        let desc = NotebookEditTool.descriptor();
+        assert!(!desc.is_read_only);
+        assert!(!desc.is_concurrency_safe);
+        assert!(desc.is_enabled);
+    }
+
+    #[test]
+    fn bash_tool_is_not_read_only() {
+        let desc = BashTool::new().descriptor();
+        assert!(!desc.is_read_only);
+        assert!(desc.is_concurrency_safe);
+    }
+
+    #[test]
+    fn glob_tool_is_read_only() {
+        let desc = GlobTool.descriptor();
+        assert!(desc.is_read_only);
+        assert!(!desc.requires_approval);
+        assert!(desc.is_concurrency_safe);
+    }
+
+    #[test]
+    fn grep_tool_is_read_only() {
+        let desc = GrepTool.descriptor();
+        assert!(desc.is_read_only);
+        assert!(!desc.requires_approval);
+        assert!(desc.is_concurrency_safe);
+    }
+
+    #[test]
+    fn web_fetch_tool_is_read_only() {
+        let desc = WebFetchTool::new().descriptor();
+        assert!(desc.is_read_only);
+        assert!(!desc.requires_approval);
+        assert!(desc.is_concurrency_safe);
+    }
+
+    #[test]
+    fn web_search_tool_is_read_only() {
+        let desc = WebSearchTool.descriptor();
+        assert!(desc.is_read_only);
+        assert!(!desc.requires_approval);
+        assert!(desc.is_concurrency_safe);
+    }
+
+    #[test]
+    fn agent_tool_is_not_read_only() {
+        let desc = AgentTool::new().descriptor();
+        assert!(!desc.is_read_only);
+        assert!(!desc.requires_approval);
+        assert!(!desc.is_concurrency_safe);
+    }
+
+    #[test]
+    fn ask_user_question_is_read_only() {
+        let desc = AskUserQuestionTool.descriptor();
+        assert!(desc.is_read_only);
+        assert!(!desc.requires_approval);
+        assert!(!desc.is_concurrency_safe);
+    }
+
+    #[test]
+    fn todo_write_tool_is_not_read_only() {
+        let desc = TodoWriteTool.descriptor();
+        assert!(!desc.is_read_only);
+        assert!(!desc.requires_approval);
+        assert!(!desc.is_concurrency_safe);
+    }
+
+    #[test]
+    fn enter_plan_mode_is_read_only() {
+        let desc = EnterPlanModeTool.descriptor();
+        assert!(desc.is_read_only);
+        assert!(!desc.requires_approval);
+        assert!(desc.is_concurrency_safe);
+    }
+
+    #[test]
+    fn enter_worktree_requires_approval() {
+        let desc = EnterWorktreeTool.descriptor();
+        assert!(!desc.is_read_only);
+        assert!(desc.requires_approval);
+        assert!(!desc.is_concurrency_safe);
+    }
+
+    #[test]
+    fn cron_create_is_not_read_only() {
+        let desc = CronCreateTool.descriptor();
+        assert!(!desc.is_read_only);
+        assert!(!desc.requires_approval);
+        assert!(!desc.is_concurrency_safe);
+    }
+
+    #[test]
+    fn all_tool_schemas_are_valid_json() {
+        let tools: Vec<Box<dyn Tool>> = vec![
+            Box::new(ReadTool),
+            Box::new(WriteTool),
+            Box::new(EditTool),
+            Box::new(NotebookEditTool),
+            Box::new(BashTool::new()),
+            Box::new(GlobTool),
+            Box::new(GrepTool),
+            Box::new(WebFetchTool::new()),
+            Box::new(WebSearchTool),
+            Box::new(AgentTool::new()),
+            Box::new(AskUserQuestionTool),
+            Box::new(TodoWriteTool),
+            Box::new(EnterPlanModeTool),
+            Box::new(EnterWorktreeTool),
+            Box::new(CronCreateTool),
+        ];
+        for tool in &tools {
+            let desc = tool.descriptor();
+            assert!(
+                desc.input_schema.get("type").is_some(),
+                "{}: input_schema missing type field",
+                desc.name
+            );
+            assert!(
+                desc.output_schema.get("type").is_some(),
+                "{}: output_schema missing type field",
+                desc.name
+            );
+        }
+    }
+
+    #[test]
+    fn all_tool_names_are_unique() {
+        use std::collections::HashSet;
+        let tools: Vec<Box<dyn Tool>> = vec![
+            Box::new(ReadTool),
+            Box::new(WriteTool),
+            Box::new(EditTool),
+            Box::new(NotebookEditTool),
+            Box::new(BashTool::new()),
+            Box::new(GlobTool),
+            Box::new(GrepTool),
+            Box::new(WebFetchTool::new()),
+            Box::new(WebSearchTool),
+            Box::new(AgentTool::new()),
+            Box::new(AskUserQuestionTool),
+            Box::new(TodoWriteTool),
+            Box::new(EnterPlanModeTool),
+            Box::new(EnterWorktreeTool),
+            Box::new(CronCreateTool),
+        ];
+        let mut names = HashSet::new();
+        for tool in &tools {
+            let name = tool.descriptor().name;
+            assert!(
+                names.insert(name.clone()),
+                "duplicate tool name: {name}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn tool_error_on_invalid_input() {
+        // ReadTool with nonexistent file returns ToolError
+        let result = ReadTool
+            .execute(
+                ToolInput {
+                    call_id: "1".into(),
+                    name: "Read".into(),
+                    arguments: serde_json::json!({"file": "/tmp/nonexistent_file_12345.txt"}),
+                },
+                test_ctx(),
+            )
+            .await;
+        assert!(result.is_err(), "ReadTool should error on missing file");
+    }
 }
