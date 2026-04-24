@@ -1,6 +1,7 @@
 //! Mock API client for testing — simulates API responses without network calls.
 
 use crate::api_client::{ApiClient, ApiError, ApiResponse, StreamEvent};
+use crate::tool_executor::ToolInfo;
 use crate::types::ModelId;
 use futures::Stream;
 use std::collections::VecDeque;
@@ -95,6 +96,7 @@ impl ApiClient for MockApiClient {
         messages: &[serde_json::Value],
         model: &ModelId,
         max_tokens: u32,
+        _tools: &[ToolInfo],
     ) -> Result<ApiResponse, ApiError> {
         self.call_log.lock().unwrap().push((
             system.to_string(),
@@ -121,6 +123,7 @@ impl ApiClient for MockApiClient {
         _messages: &[serde_json::Value],
         _model: &ModelId,
         _max_tokens: u32,
+        _tools: &[ToolInfo],
     ) -> Pin<Box<dyn Stream<Item = StreamEvent> + Send + 'static>> {
         let events = self.stream_events.lock().unwrap().pop_front();
         match events {

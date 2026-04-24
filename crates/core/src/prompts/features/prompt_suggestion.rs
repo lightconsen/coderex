@@ -7,6 +7,7 @@ use crate::api_client::ApiClient;
 use crate::orchestrator::{
     BackgroundFeatureKind, BackgroundFeatureRequest, OrchestratorError, run_background_feature,
 };
+use crate::tool_executor::ToolInfo;
 
 /// Suggests follow-up prompts based on the conversation state.
 ///
@@ -138,6 +139,7 @@ mod tests {
             _messages: &[serde_json::Value],
             _model: &ModelId,
             _max_tokens: u32,
+            _tools: &[ToolInfo],
         ) -> Result<ApiResponse, crate::api_client::ApiError> {
             Ok(ApiResponse {
                 content: self.response_content.clone(),
@@ -158,6 +160,7 @@ mod tests {
             _messages: &[serde_json::Value],
             _model: &ModelId,
             _max_tokens: u32,
+            _tools: &[ToolInfo],
         ) -> Pin<Box<dyn Stream<Item = StreamEvent> + Send + 'static>> {
             Box::pin(futures::stream::empty())
         }

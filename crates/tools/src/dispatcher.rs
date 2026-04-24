@@ -114,6 +114,23 @@ impl RegistryToolDispatcher {
 
 #[async_trait::async_trait]
 impl CoreToolExecutor for RegistryToolDispatcher {
+    fn list_tools(&self) -> Vec<coderex_core::tool_executor::ToolInfo> {
+        self.registry
+            .all_descriptors()
+            .into_iter()
+            .map(|d| coderex_core::tool_executor::ToolInfo {
+                name: d.name.clone(),
+                description: d
+                    .input_schema
+                    .get("description")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or(&d.name)
+                    .to_string(),
+                input_schema: d.input_schema,
+            })
+            .collect()
+    }
+
     async fn execute(
         &self,
         tool_call_id: &str,

@@ -20,6 +20,7 @@ use crate::types::{EngineEvent, Message, ModelId, UsageSummary};
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::mpsc;
+use crate::tool_executor::ToolInfo;
 
 /// Result from a query execution.
 #[derive(Debug, Clone)]
@@ -180,7 +181,7 @@ impl Orchestrator {
         };
 
         let response = self.api_client
-            .create_message(&system, &messages, &model, max_tokens)
+            .create_message(&system, &messages, &model, max_tokens, &[])
             .await?;
 
         Ok(QueryResult {
@@ -211,7 +212,7 @@ impl Orchestrator {
         };
 
         let response = self.api_client
-            .create_message(&system, &messages, &model, max_tokens)
+            .create_message(&system, &messages, &model, max_tokens, &[])
             .await?;
 
         Ok(QueryResult {
@@ -348,7 +349,7 @@ pub async fn run_side_query(
 ) -> Result<QueryResult, OrchestratorError> {
     let messages = Orchestrator::build_messages(user_prompt);
     let response = api_client
-        .create_message(system_prompt, &messages, model, max_tokens)
+        .create_message(system_prompt, &messages, model, max_tokens, &[])
         .await?;
 
     Ok(QueryResult {
@@ -618,6 +619,7 @@ mod tests {
             _messages: &[serde_json::Value],
             _model: &ModelId,
             _max_tokens: u32,
+            _tools: &[ToolInfo],
         ) -> Result<ApiResponse, ApiError> {
             Ok(ApiResponse {
                 content: r#"{"title": "Fix auth bug"}"#.into(),
@@ -638,6 +640,7 @@ mod tests {
             _messages: &[serde_json::Value],
             _model: &ModelId,
             _max_tokens: u32,
+            _tools: &[ToolInfo],
         ) -> Pin<Box<dyn Stream<Item = StreamEvent> + Send + 'static>> {
             Box::pin(futures::stream::empty())
         }

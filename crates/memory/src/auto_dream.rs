@@ -338,7 +338,7 @@ impl AutoDream {
                                 "content": prompt,
                             })];
 
-                            match api_client.create_message("", &messages, model, 4096).await {
+                            match api_client.create_message("", &messages, model, 4096, &[]).await {
                                 Ok(response) => {
                                     let completed = match self.complete_dream(
                                         dream,

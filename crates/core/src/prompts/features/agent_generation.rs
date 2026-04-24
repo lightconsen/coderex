@@ -6,6 +6,7 @@
 use crate::api_client::ApiClient;
 use crate::orchestrator::{OrchestratorError, run_side_query};
 use crate::query_profiles::ModelProfile;
+use crate::tool_executor::ToolInfo;
 
 /// Represents a generated agent specification.
 #[derive(Debug, Clone)]
@@ -152,6 +153,7 @@ mod tests {
             _messages: &[serde_json::Value],
             _model: &ModelId,
             _max_tokens: u32,
+            _tools: &[ToolInfo],
         ) -> Result<ApiResponse, crate::api_client::ApiError> {
             Ok(ApiResponse {
                 content: self.response_content.clone(),
@@ -172,6 +174,7 @@ mod tests {
             _messages: &[serde_json::Value],
             _model: &ModelId,
             _max_tokens: u32,
+            _tools: &[ToolInfo],
         ) -> Pin<Box<dyn Stream<Item = StreamEvent> + Send + 'static>> {
             Box::pin(futures::stream::empty())
         }

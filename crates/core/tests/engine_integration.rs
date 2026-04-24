@@ -17,6 +17,7 @@ use coderex_core::tool_executor::{ToolDispatchOutcome, ToolExecutor};
 use coderex_core::types::{EngineEvent, MessageContent, ModelId, ToolCall, ToolResult, UsageSummary};
 use futures::Stream;
 use tokio::sync::mpsc;
+use coderex_core::tool_executor::ToolInfo;
 
 // ═══════════════════════════════════════════════════════════════════════════
 //  Helpers
@@ -122,6 +123,7 @@ impl ApiClient for TextMock {
         _messages: &[serde_json::Value],
         _model: &ModelId,
         _max_tokens: u32,
+        _tools: &[ToolInfo],
     ) -> Result<ApiResponse, ApiError> {
         Ok(self.response.clone())
     }
@@ -132,6 +134,7 @@ impl ApiClient for TextMock {
         _messages: &[serde_json::Value],
         _model: &ModelId,
         _max_tokens: u32,
+        _tools: &[ToolInfo],
     ) -> Pin<Box<dyn Stream<Item = StreamEvent> + Send + 'static>> {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let _ = tx.send(StreamEvent::StreamEnd);
@@ -171,6 +174,7 @@ impl ApiClient for SequenceMock {
         _messages: &[serde_json::Value],
         _model: &ModelId,
         _max_tokens: u32,
+        _tools: &[ToolInfo],
     ) -> Result<ApiResponse, ApiError> {
         let idx = self.call_count.fetch_add(1, Ordering::SeqCst);
         let resp = if idx < self.responses.len() {
@@ -187,6 +191,7 @@ impl ApiClient for SequenceMock {
         _messages: &[serde_json::Value],
         _model: &ModelId,
         _max_tokens: u32,
+        _tools: &[ToolInfo],
     ) -> Pin<Box<dyn Stream<Item = StreamEvent> + Send + 'static>> {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let _ = tx.send(StreamEvent::StreamEnd);
@@ -215,6 +220,7 @@ impl ApiClient for StreamingMock {
         _messages: &[serde_json::Value],
         _model: &ModelId,
         _max_tokens: u32,
+        _tools: &[ToolInfo],
     ) -> Result<ApiResponse, ApiError> {
         let content = self.deltas.join("");
         Ok(text_response(&content))
@@ -226,6 +232,7 @@ impl ApiClient for StreamingMock {
         _messages: &[serde_json::Value],
         _model: &ModelId,
         _max_tokens: u32,
+        _tools: &[ToolInfo],
     ) -> Pin<Box<dyn Stream<Item = StreamEvent> + Send + 'static>> {
         let deltas = self.deltas.clone();
         let stream = async_stream::stream! {
@@ -604,6 +611,7 @@ async fn termination_budget_exhausted() {
             _messages: &[serde_json::Value],
             _model: &ModelId,
             _max_tokens: u32,
+            _tools: &[ToolInfo],
         ) -> Result<ApiResponse, ApiError> {
             Ok(ApiResponse {
                 content: "response".into(),
@@ -623,6 +631,7 @@ async fn termination_budget_exhausted() {
             _messages: &[serde_json::Value],
             _model: &ModelId,
             _max_tokens: u32,
+            _tools: &[ToolInfo],
         ) -> Pin<Box<dyn Stream<Item = StreamEvent> + Send + 'static>> {
             let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
             let _ = tx.send(StreamEvent::StreamEnd);
@@ -661,6 +670,7 @@ impl ApiClient for CountingMock {
         _messages: &[serde_json::Value],
         _model: &ModelId,
         _max_tokens: u32,
+        _tools: &[ToolInfo],
     ) -> Result<ApiResponse, ApiError> {
         let c = self.count.fetch_add(1, Ordering::SeqCst);
         Ok(ApiResponse {
@@ -685,6 +695,7 @@ impl ApiClient for CountingMock {
         _messages: &[serde_json::Value],
         _model: &ModelId,
         _max_tokens: u32,
+        _tools: &[ToolInfo],
     ) -> Pin<Box<dyn Stream<Item = StreamEvent> + Send + 'static>> {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let _ = tx.send(StreamEvent::StreamEnd);

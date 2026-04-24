@@ -1,5 +1,6 @@
 //! Anthropic API client with retry and model routing.
 
+use crate::tool_executor::ToolInfo;
 use crate::types::{ModelId, ToolCall, UsageSummary};
 use futures::Stream;
 use futures::StreamExt;
@@ -170,6 +171,7 @@ pub trait ApiClient: Send + Sync {
         messages: &[serde_json::Value],
         model: &ModelId,
         max_tokens: u32,
+        tools: &[ToolInfo],
     ) -> Result<ApiResponse, ApiError>;
 
     /// Send a streaming message to the API.
@@ -181,6 +183,7 @@ pub trait ApiClient: Send + Sync {
         messages: &[serde_json::Value],
         model: &ModelId,
         max_tokens: u32,
+        tools: &[ToolInfo],
     ) -> Pin<Box<dyn Stream<Item = StreamEvent> + Send + 'static>>;
 }
 
@@ -283,6 +286,7 @@ impl ApiClient for AnthropicApiClient {
         messages: &[serde_json::Value],
         model: &ModelId,
         max_tokens: u32,
+        tools: &[ToolInfo],
     ) -> Result<ApiResponse, ApiError> {
         if self.config.api_key.is_empty() {
             return Err(ApiError::Auth(
@@ -297,12 +301,28 @@ impl ApiClient for AnthropicApiClient {
 
         let model_name = Self::resolve_model(model);
 
-        let body = serde_json::json!({
+        let mut body = serde_json::json!({
             "model": model_name,
             "system": system,
             "messages": messages,
             "max_tokens": max_tokens,
         });
+
+        if !tools.is_empty() {
+            let tools_json: Vec<serde_json::Value> = tools
+                .iter()
+                .map(|t| {
+                    serde_json::json!({
+                        "name": t.name,
+                        "description": t.description,
+                        "input_schema": t.input_schema,
+                    })
+                })
+                .collect();
+            body.as_object_mut()
+                .unwrap()
+                .insert("tools".to_string(), serde_json::Value::Array(tools_json));
+        }
 
         let response = self
             .with_retry(|| async {
@@ -396,6 +416,7 @@ impl ApiClient for AnthropicApiClient {
         messages: &[serde_json::Value],
         model: &ModelId,
         max_tokens: u32,
+        tools: &[ToolInfo],
     ) -> Pin<Box<dyn Stream<Item = StreamEvent> + Send + 'static>> {
         if self.config.api_key.is_empty() {
             return Box::pin(futures::stream::once(async {
@@ -413,13 +434,30 @@ impl ApiClient for AnthropicApiClient {
         let model_name = Self::resolve_model(model).to_string();
         let api_key = self.config.api_key.clone();
         let is_anthropic = self.is_anthropic_api();
-        let body = serde_json::json!({
+        let mut body = serde_json::json!({
             "model": model_name.clone(),
             "system": system,
             "messages": messages,
             "max_tokens": max_tokens,
             "stream": true,
         });
+
+        if !tools.is_empty() {
+            let tools_json: Vec<serde_json::Value> = tools
+                .iter()
+                .map(|t| {
+                    serde_json::json!({
+                        "name": t.name,
+                        "description": t.description,
+                        "input_schema": t.input_schema,
+                    })
+                })
+                .collect();
+            body.as_object_mut()
+                .unwrap()
+                .insert("tools".to_string(), serde_json::Value::Array(tools_json));
+        }
+
         let client = self.client.clone();
 
         Box::pin(futures::stream::once(async move {
@@ -650,7 +688,7 @@ mod tests {
         let client = AnthropicApiClient::new(config);
 
         let result = client
-            .create_message("system", &[], &ModelId::sonnet(), 1024)
+            .create_message("system", &[], &ModelId::sonnet(), 1024, &[])
             .await;
 
         assert!(matches!(result, Err(ApiError::Auth(_))));

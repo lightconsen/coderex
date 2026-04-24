@@ -9,6 +9,7 @@
 //! unified access with fallback chains.
 
 use crate::api_client::{ApiError, ApiResponse};
+use crate::tool_executor::ToolInfo;
 use crate::types::ModelId;
 use async_trait::async_trait;
 use futures::Stream;
@@ -109,6 +110,7 @@ pub trait Provider: Send + Sync {
         messages: &[serde_json::Value],
         model: &ModelId,
         max_tokens: u32,
+        tools: &[ToolInfo],
     ) -> Result<ApiResponse, ProviderError>;
 
     /// Send a streaming message.
@@ -122,6 +124,7 @@ pub trait Provider: Send + Sync {
         messages: &[serde_json::Value],
         model: &ModelId,
         max_tokens: u32,
+        tools: &[ToolInfo],
     ) -> Pin<Box<dyn Stream<Item = crate::api_client::StreamEvent> + Send + 'static>>;
 
     /// Map a generic ModelId to this provider's model string.

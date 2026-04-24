@@ -127,6 +127,7 @@ impl Provider for OpenAiCompatibleProvider {
         messages: &[serde_json::Value],
         model: &ModelId,
         max_tokens: u32,
+        tools: &[crate::tool_executor::ToolInfo],
     ) -> Result<ApiResponse, ProviderError> {
         let url = format!(
             "{}/v1/chat/completions",
@@ -140,11 +141,30 @@ impl Provider for OpenAiCompatibleProvider {
         })];
         body_messages.extend(messages.iter().cloned());
 
-        let body = serde_json::json!({
+        let mut body = serde_json::json!({
             "model": model_name,
             "messages": body_messages,
             "max_tokens": max_tokens,
         });
+
+        if !tools.is_empty() {
+            let tools_json: Vec<serde_json::Value> = tools
+                .iter()
+                .map(|t| {
+                    serde_json::json!({
+                        "type": "function",
+                        "function": {
+                            "name": t.name,
+                            "description": t.description,
+                            "parameters": t.input_schema,
+                        }
+                    })
+                })
+                .collect();
+            body.as_object_mut()
+                .unwrap()
+                .insert("tools".to_string(), serde_json::Value::Array(tools_json));
+        }
 
         self.with_retry(|| async {
             let req = self
@@ -205,10 +225,11 @@ impl Provider for OpenAiCompatibleProvider {
         messages: &[serde_json::Value],
         model: &ModelId,
         max_tokens: u32,
+        tools: &[crate::tool_executor::ToolInfo],
     ) -> Pin<Box<dyn Stream<Item = StreamEvent> + Send + 'static>> {
         // For now, delegate to non-streaming and emit as a single chunk
         // A full implementation would use SSE streaming
-        let result = self.create_message(system, messages, model, max_tokens).await;
+        let result = self.create_message(system, messages, model, max_tokens, tools).await;
         match result {
             Ok(resp) => {
                 let events = vec![

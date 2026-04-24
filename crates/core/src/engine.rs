@@ -1537,9 +1537,10 @@ impl QueryEngine {
         options: &SubmitOptions,
     ) {
         // Assemble context using PromptCompiler
+        let available_tools = self.tools.list_tools();
         let ctx = PromptContext {
             cwd: self.session.cwd.as_path(),
-            available_tools: &[],
+            available_tools,
             denied_tools: &self.denied_tools,
             model: &self.model,
             budget: &turn.budget,
@@ -1809,9 +1810,10 @@ impl QueryEngine {
             })
             .collect();
 
+        let tools = self.tools.list_tools();
         let response = match self
             .api_client
-            .create_message(&system, &messages, &self.model, 4096)
+            .create_message(&system, &messages, &self.model, 4096, &tools)
             .await
         {
             Ok(resp) => resp,
@@ -1883,9 +1885,10 @@ impl QueryEngine {
             })
             .collect();
 
+        let tools = self.tools.list_tools();
         let mut stream = self
             .api_client
-            .create_message_streaming(&system, &messages, &self.model, 4096)
+            .create_message_streaming(&system, &messages, &self.model, 4096, &tools)
             .await;
 
         let mut assembler = StreamingToolCallAssembler::new();
@@ -2342,6 +2345,7 @@ mod tests {
             _messages: &[serde_json::Value],
             _model: &ModelId,
             _max_tokens: u32,
+            _tools: &[crate::tool_executor::ToolInfo],
         ) -> Result<ApiResponse, crate::api_client::ApiError> {
             Ok(ApiResponse {
                 content: "Hello from the mock assistant.".into(),
@@ -2362,6 +2366,7 @@ mod tests {
             _messages: &[serde_json::Value],
             _model: &ModelId,
             _max_tokens: u32,
+            _tools: &[crate::tool_executor::ToolInfo],
         ) -> std::pin::Pin<
             Box<dyn futures::Stream<Item = StreamEvent> + Send + 'static>,
         > {
@@ -2527,6 +2532,7 @@ mod tests {
                 _messages: &[serde_json::Value],
                 _model: &ModelId,
                 _max_tokens: u32,
+                _tools: &[crate::tool_executor::ToolInfo],
             ) -> Result<ApiResponse, crate::api_client::ApiError> {
                 Err(crate::api_client::ApiError::RetryExhausted {
                     attempts: 3,
@@ -2540,6 +2546,7 @@ mod tests {
                 _messages: &[serde_json::Value],
                 _model: &ModelId,
                 _max_tokens: u32,
+                _tools: &[crate::tool_executor::ToolInfo],
             ) -> std::pin::Pin<Box<dyn futures::Stream<Item = StreamEvent> + Send + 'static>> {
                 let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
                 let _ = tx.send(StreamEvent::StreamEnd);
@@ -2932,6 +2939,7 @@ mod tests {
                 _messages: &[serde_json::Value],
                 _model: &ModelId,
                 _max_tokens: u32,
+                _tools: &[crate::tool_executor::ToolInfo],
             ) -> Result<ApiResponse, crate::api_client::ApiError> {
                 let count = self.call_count.fetch_add(1, Ordering::SeqCst);
                 if count == 0 {
@@ -2967,6 +2975,7 @@ mod tests {
                 _messages: &[serde_json::Value],
                 _model: &ModelId,
                 _max_tokens: u32,
+                _tools: &[crate::tool_executor::ToolInfo],
             ) -> std::pin::Pin<Box<dyn futures::Stream<Item = StreamEvent> + Send + 'static>> {
                 let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
                 let _ = tx.send(StreamEvent::StreamEnd);

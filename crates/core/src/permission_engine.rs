@@ -10,6 +10,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use thiserror::Error;
+use crate::tool_executor::ToolInfo;
 
 /// Errors from the permission request system.
 #[derive(Debug, Error)]
@@ -729,6 +730,7 @@ mod tests {
                 _messages: &[serde_json::Value],
                 _model: &ModelId,
                 _max_tokens: u32,
+                _tools: &[ToolInfo],
             ) -> Result<ApiResponse, crate::api_client::ApiError> {
                 Ok(ApiResponse {
                     content: "This tool could modify system files.".into(),
@@ -749,6 +751,7 @@ mod tests {
                 _messages: &[serde_json::Value],
                 _model: &ModelId,
                 _max_tokens: u32,
+                _tools: &[ToolInfo],
             ) -> Pin<Box<dyn Stream<Item = StreamEvent> + Send + 'static>> {
                 Box::pin(futures::stream::empty())
             }
@@ -783,6 +786,7 @@ mod tests {
                 _messages: &[serde_json::Value],
                 _model: &ModelId,
                 _max_tokens: u32,
+                _tools: &[ToolInfo],
             ) -> Result<ApiResponse, crate::api_client::ApiError> {
                 Ok(ApiResponse {
                     content: "safe".into(),
@@ -803,6 +807,7 @@ mod tests {
                 _messages: &[serde_json::Value],
                 _model: &ModelId,
                 _max_tokens: u32,
+                _tools: &[ToolInfo],
             ) -> Pin<Box<dyn Stream<Item = StreamEvent> + Send + 'static>> {
                 Box::pin(futures::stream::empty())
             }
@@ -836,6 +841,7 @@ mod tests {
                 _messages: &[serde_json::Value],
                 _model: &ModelId,
                 _max_tokens: u32,
+                _tools: &[ToolInfo],
             ) -> Result<ApiResponse, crate::api_client::ApiError> {
                 Ok(ApiResponse {
                     content: "caution".into(),
@@ -856,6 +862,7 @@ mod tests {
                 _messages: &[serde_json::Value],
                 _model: &ModelId,
                 _max_tokens: u32,
+                _tools: &[ToolInfo],
             ) -> Pin<Box<dyn Stream<Item = StreamEvent> + Send + 'static>> {
                 Box::pin(futures::stream::empty())
             }
@@ -889,6 +896,7 @@ mod tests {
                 _messages: &[serde_json::Value],
                 _model: &ModelId,
                 _max_tokens: u32,
+                _tools: &[ToolInfo],
             ) -> Result<ApiResponse, crate::api_client::ApiError> {
                 panic!("API should not be called in non-auto mode")
             }
@@ -899,6 +907,7 @@ mod tests {
                 _messages: &[serde_json::Value],
                 _model: &ModelId,
                 _max_tokens: u32,
+                _tools: &[ToolInfo],
             ) -> Pin<Box<dyn Stream<Item = StreamEvent> + Send + 'static>> {
                 Box::pin(futures::stream::empty())
             }

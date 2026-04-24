@@ -19,9 +19,25 @@ pub struct ToolDispatchOutcome {
     pub result: ToolResult,
 }
 
+/// Metadata for a tool that can be advertised to the LLM.
+#[derive(Debug, Clone)]
+pub struct ToolInfo {
+    /// Unique tool name.
+    pub name: String,
+    /// Human-readable description of what the tool does.
+    pub description: String,
+    /// JSON schema describing the tool's input parameters.
+    pub input_schema: Value,
+}
+
 /// Abstract tool dispatcher — implemented by `coderex-tools::RegistryToolExecutor`.
 #[async_trait::async_trait]
 pub trait ToolExecutor: Send + Sync {
+    /// List available tools with metadata for LLM advertisement.
+    fn list_tools(&self) -> Vec<ToolInfo> {
+        Vec::new()
+    }
+
     /// Execute a tool by name with the given input and return its result.
     ///
     /// Implementations should return a `ToolResult` with `is_error = true`

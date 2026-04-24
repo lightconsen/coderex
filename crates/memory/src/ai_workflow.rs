@@ -4,6 +4,8 @@
 //! The concrete implementations live in `session_memory_agent` and
 //! `extract_memories`.
 
+use coderex_core::tool_executor::ToolInfo;
+
 pub use crate::extract_memories::{
     extract_long_term_memories_ai, extract_single_memory_ai,
 };
@@ -26,6 +28,7 @@ pub enum MemoryWorkflowError {
 #[cfg(test)]
 pub(crate) mod tests {
     use coderex_core::api_client::{ApiClient, ApiResponse, StreamEvent};
+    use coderex_core::tool_executor::ToolInfo;
     use coderex_core::types::{ModelId, UsageSummary};
     use std::pin::Pin;
     use futures::Stream;
@@ -49,6 +52,7 @@ pub(crate) mod tests {
             _messages: &[serde_json::Value],
             _model: &ModelId,
             _max_tokens: u32,
+            _tools: &[ToolInfo],
         ) -> Result<ApiResponse, coderex_core::api_client::ApiError> {
             Ok(ApiResponse {
                 content: self.response_content.clone(),
@@ -69,6 +73,7 @@ pub(crate) mod tests {
             _messages: &[serde_json::Value],
             _model: &ModelId,
             _max_tokens: u32,
+            _tools: &[ToolInfo],
         ) -> Pin<Box<dyn Stream<Item = StreamEvent> + Send + 'static>> {
             Box::pin(futures::stream::empty())
         }

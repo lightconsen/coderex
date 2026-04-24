@@ -4,6 +4,7 @@
 //! returns pre-programmed responses instead of hitting a real API.
 
 use coderex_core::api_client::{ApiClient, ApiError, ApiResponse, StreamEvent};
+use coderex_core::tool_executor::ToolInfo;
 use coderex_core::types::{ModelId, UsageSummary};
 use futures::Stream;
 use std::pin::Pin;
@@ -96,6 +97,7 @@ impl ApiClient for MockApiClient {
         _messages: &[serde_json::Value],
         _model: &ModelId,
         _max_tokens: u32,
+        _tools: &[ToolInfo],
     ) -> Result<ApiResponse, ApiError> {
         match self.next_response() {
             Some(MockResponse::Static(r)) => Ok(r),
@@ -120,6 +122,7 @@ impl ApiClient for MockApiClient {
         _messages: &[serde_json::Value],
         _model: &ModelId,
         _max_tokens: u32,
+        _tools: &[ToolInfo],
     ) -> Pin<Box<dyn Stream<Item = StreamEvent> + Send + 'static>> {
         let events = match self.next_response() {
             Some(MockResponse::Streaming(e)) => e,

@@ -13,6 +13,7 @@ use coderex_core::provider::{Provider, ProviderCapabilities, ProviderError, Prov
 use coderex_core::types::{ModelId, UsageSummary};
 use async_trait::async_trait;
 use futures::Stream;
+use coderex_core::tool_executor::ToolInfo;
 
 // ═══════════════════════════════════════════════════════════════════════════
 //  Mock Providers
@@ -76,6 +77,7 @@ impl Provider for MockProvider {
         _messages: &[serde_json::Value],
         _model: &ModelId,
         _max_tokens: u32,
+        _tools: &[ToolInfo],
     ) -> Result<ApiResponse, ProviderError> {
         if let Some(ref kind) = self.error_kind {
             return Err(ProviderError {
@@ -103,6 +105,7 @@ impl Provider for MockProvider {
         _messages: &[serde_json::Value],
         _model: &ModelId,
         _max_tokens: u32,
+        _tools: &[ToolInfo],
     ) -> Pin<Box<dyn Stream<Item = StreamEvent> + Send + 'static>> {
         if self.error_kind.is_some() {
             return Box::pin(futures::stream::once(async {
@@ -445,7 +448,7 @@ async fn model_router_falls_back_on_failure() {
     router.add_provider(Box::new(MockProvider::new("success1")));
 
     let result = router
-        .create_message("", &[], &ModelId::sonnet(), 1024)
+        .create_message("", &[], &ModelId::sonnet(), 1024, &[])
         .await;
 
     assert!(result.is_ok());
@@ -459,7 +462,7 @@ async fn model_router_non_fallback_error_stops() {
     router.add_provider(Box::new(MockProvider::new("success1")));
 
     let result = router
-        .create_message("", &[], &ModelId::sonnet(), 1024)
+        .create_message("", &[], &ModelId::sonnet(), 1024, &[])
         .await;
 
     assert!(result.is_err());
@@ -470,7 +473,7 @@ async fn model_router_no_providers_fails() {
     let router = ModelRouter::new("empty");
 
     let result = router
-        .create_message("", &[], &ModelId::sonnet(), 1024)
+        .create_message("", &[], &ModelId::sonnet(), 1024, &[])
         .await;
 
     assert!(result.is_err());
@@ -487,7 +490,7 @@ async fn model_router_model_filtered_providers() {
 
     // Model that doesn't match the filter should still hit fallback
     let result = router
-        .create_message("", &[], &ModelId("claude-opus-4-6".into()), 1024)
+        .create_message("", &[], &ModelId("claude-opus-4-6".into()), 1024, &[])
         .await;
 
     assert!(result.is_ok());
@@ -502,7 +505,7 @@ async fn model_router_max_fallbacks_respected() {
     router.add_provider(Box::new(MockProvider::new("success1")));
 
     let result = router
-        .create_message("", &[], &ModelId::sonnet(), 1024)
+        .create_message("", &[], &ModelId::sonnet(), 1024, &[])
         .await;
 
     // Only 1 fallback attempt, so we exhaust after fail1 -> fail2
@@ -517,7 +520,7 @@ async fn model_router_max_fallbacks_respected() {
 async fn streaming_delivers_events() {
     let provider = MockProvider::new("streamer");
     let stream = provider
-        .create_message_streaming("", &[], &ModelId::sonnet(), 1024)
+        .create_message_streaming("", &[], &ModelId::sonnet(), 1024, &[])
         .await;
 
     let events: Vec<StreamEvent> = futures::StreamExt::collect(stream).await;
@@ -530,7 +533,7 @@ async fn streaming_delivers_events() {
 async fn streaming_error_event() {
     let provider = MockProvider::failing("fail", ProviderErrorKind::Unavailable);
     let stream = provider
-        .create_message_streaming("", &[], &ModelId::sonnet(), 1024)
+        .create_message_streaming("", &[], &ModelId::sonnet(), 1024, &[])
         .await;
 
     let events: Vec<StreamEvent> = futures::StreamExt::collect(stream).await;
@@ -545,7 +548,7 @@ async fn model_router_streaming_fallback() {
     router.add_provider(Box::new(MockProvider::new("success1")));
 
     let stream = router
-        .create_message_streaming("", &[], &ModelId::sonnet(), 1024)
+        .create_message_streaming("", &[], &ModelId::sonnet(), 1024, &[])
         .await;
 
     let events: Vec<StreamEvent> = futures::StreamExt::collect(stream).await;

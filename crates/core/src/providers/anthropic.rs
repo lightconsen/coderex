@@ -53,9 +53,10 @@ impl Provider for AnthropicProvider {
         messages: &[serde_json::Value],
         model: &ModelId,
         max_tokens: u32,
+        tools: &[crate::tool_executor::ToolInfo],
     ) -> Result<ApiResponse, ProviderError> {
         self.client
-            .create_message(system, messages, model, max_tokens)
+            .create_message(system, messages, model, max_tokens, tools)
             .await
             .map_err(|e| classify_api_error(self.name(), e))
     }
@@ -66,9 +67,10 @@ impl Provider for AnthropicProvider {
         messages: &[serde_json::Value],
         model: &ModelId,
         max_tokens: u32,
+        tools: &[crate::tool_executor::ToolInfo],
     ) -> Pin<Box<dyn Stream<Item = StreamEvent> + Send + 'static>> {
         self.client
-            .create_message_streaming(system, messages, model, max_tokens)
+            .create_message_streaming(system, messages, model, max_tokens, tools)
             .await
     }
 

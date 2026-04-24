@@ -7,6 +7,7 @@
 use std::fmt::Write;
 use std::path::Path;
 
+use crate::tool_executor::ToolInfo;
 use crate::types::{Message, ModelId};
 use crate::budget::TokenBudget;
 use crate::engine::DeniedToolCall;
@@ -79,8 +80,8 @@ impl Default for CompactConfig {
 pub struct PromptContext<'a> {
     /// Current working directory.
     pub cwd: &'a Path,
-    /// Available tool names.
-    pub available_tools: &'a [String],
+    /// Available tools with metadata for LLM advertisement.
+    pub available_tools: Vec<ToolInfo>,
     /// Denied tool calls from previous turns.
     pub denied_tools: &'a [DeniedToolCall],
     /// Model being used.
@@ -318,12 +319,23 @@ mod tests {
         compiler.register_static_block("base", "You are a helpful assistant.");
         compiler.register_dynamic_fn("session", Box::new(|_| "Current session guidance.".into()));
 
-        let tools = vec!["Read".into(), "Write".into()];
+        let tools = vec![
+            ToolInfo {
+                name: "Read".into(),
+                description: "Read file contents".into(),
+                input_schema: serde_json::json!({"type": "object"}),
+            },
+            ToolInfo {
+                name: "Write".into(),
+                description: "Write file contents".into(),
+                input_schema: serde_json::json!({"type": "object"}),
+            },
+        ];
         let model = ModelId::sonnet();
         let budget = TokenBudget::with_defaults();
         let ctx = PromptContext {
             cwd: Path::new("/tmp"),
-            available_tools: &tools,
+            available_tools: tools,
             denied_tools: &[],
             model: &model,
             budget: &budget,
@@ -346,12 +358,16 @@ mod tests {
     #[test]
     fn boundary_marker_present() {
         let compiler = PromptCompiler::new(CompactConfig::default());
-        let tools = vec!["Read".into()];
+        let tools = vec![ToolInfo {
+            name: "Read".into(),
+            description: "Read file contents".into(),
+            input_schema: serde_json::json!({"type": "object"}),
+        }];
         let model = ModelId::sonnet();
         let budget = TokenBudget::with_defaults();
         let ctx = PromptContext {
             cwd: Path::new("/tmp"),
-            available_tools: &tools,
+            available_tools: tools,
             denied_tools: &[],
             model: &model,
             budget: &budget,
@@ -405,12 +421,16 @@ mod tests {
         let mut compiler = PromptCompiler::new(CompactConfig::default());
         compiler.register_static_block("base", "Hello world static.");
 
-        let tools = vec!["Read".into()];
+        let tools = vec![ToolInfo {
+            name: "Read".into(),
+            description: "Read file contents".into(),
+            input_schema: serde_json::json!({"type": "object"}),
+        }];
         let model = ModelId::sonnet();
         let budget = TokenBudget::with_defaults();
         let ctx = PromptContext {
             cwd: Path::new("/tmp"),
-            available_tools: &tools,
+            available_tools: tools,
             denied_tools: &[],
             model: &model,
             budget: &budget,

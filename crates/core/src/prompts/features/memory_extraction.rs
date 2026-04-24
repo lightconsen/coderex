@@ -8,6 +8,7 @@ use crate::orchestrator::{
     BackgroundFeatureKind, BackgroundFeatureRequest, OrchestratorError, run_background_feature,
     run_side_query,
 };
+use crate::tool_executor::ToolInfo;
 use crate::query_profiles::ModelProfile;
 
 /// Extracts long-term memories from recent conversation.
@@ -127,6 +128,7 @@ mod tests {
             _messages: &[serde_json::Value],
             _model: &ModelId,
             _max_tokens: u32,
+            _tools: &[ToolInfo],
         ) -> Result<ApiResponse, crate::api_client::ApiError> {
             Ok(ApiResponse {
                 content: self.response_content.clone(),
@@ -147,6 +149,7 @@ mod tests {
             _messages: &[serde_json::Value],
             _model: &ModelId,
             _max_tokens: u32,
+            _tools: &[ToolInfo],
         ) -> Pin<Box<dyn Stream<Item = StreamEvent> + Send + 'static>> {
             Box::pin(futures::stream::empty())
         }

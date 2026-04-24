@@ -17,6 +17,7 @@
 
 use crate::api_client::{ApiClient, ApiError, ApiResponse, StreamEvent};
 use crate::provider::{Provider, ProviderError, provider_error_to_api};
+use crate::tool_executor::ToolInfo;
 use crate::types::ModelId;
 use async_trait::async_trait;
 use futures::Stream;
@@ -149,6 +150,7 @@ impl ModelRouter {
         messages: &[serde_json::Value],
         model: &ModelId,
         max_tokens: u32,
+        tools: &[ToolInfo],
     ) -> Result<ApiResponse, ProviderError> {
         let providers = self.eligible_providers(model);
         if providers.is_empty() {
@@ -175,7 +177,7 @@ impl ModelRouter {
                 model.0
             );
 
-            match provider.create_message(system, messages, model, max_tokens).await {
+            match provider.create_message(system, messages, model, max_tokens, tools).await {
                 Ok(result) => return Ok(result),
                 Err(err) => {
                     tracing::warn!(
@@ -219,8 +221,9 @@ impl ApiClient for ModelRouter {
         messages: &[serde_json::Value],
         model: &ModelId,
         max_tokens: u32,
+        tools: &[ToolInfo],
     ) -> Result<ApiResponse, ApiError> {
-        self.route_create_message(system, messages, model, max_tokens)
+        self.route_create_message(system, messages, model, max_tokens, tools)
             .await
             .map_err(provider_error_to_api)
     }
@@ -231,6 +234,7 @@ impl ApiClient for ModelRouter {
         messages: &[serde_json::Value],
         model: &ModelId,
         max_tokens: u32,
+        tools: &[ToolInfo],
     ) -> Pin<Box<dyn Stream<Item = StreamEvent> + Send + 'static>> {
         // For streaming, we try the first provider that succeeds in starting the stream
         let providers: Vec<_> = self.routes.iter()
@@ -247,6 +251,7 @@ impl ApiClient for ModelRouter {
         let system = system.to_string();
         let messages: Vec<serde_json::Value> = messages.to_vec();
         let model = model.clone();
+        let tools: Vec<ToolInfo> = tools.to_vec();
 
         Box::pin(async_stream::stream! {
             for provider in providers {
@@ -255,6 +260,7 @@ impl ApiClient for ModelRouter {
                     &messages,
                     &model,
                     max_tokens,
+                    &tools,
                 ).await;
 
                 use futures::StreamExt;
@@ -301,6 +307,7 @@ mod tests {
             _messages: &[serde_json::Value],
             _model: &ModelId,
             _max_tokens: u32,
+            _tools: &[ToolInfo],
         ) -> Result<ApiResponse, ProviderError> {
             Err(ProviderError {
                 message: "test failure".into(),
@@ -318,6 +325,7 @@ mod tests {
             _messages: &[serde_json::Value],
             _model: &ModelId,
             _max_tokens: u32,
+            _tools: &[ToolInfo],
         ) -> Pin<Box<dyn Stream<Item = StreamEvent> + Send + 'static>> {
             Box::pin(futures::stream::empty())
         }
@@ -351,6 +359,7 @@ mod tests {
             _messages: &[serde_json::Value],
             _model: &ModelId,
             _max_tokens: u32,
+            _tools: &[ToolInfo],
         ) -> Result<ApiResponse, ProviderError> {
             Ok(ApiResponse {
                 content: "success".into(),
@@ -370,6 +379,7 @@ mod tests {
             _messages: &[serde_json::Value],
             _model: &ModelId,
             _max_tokens: u32,
+            _tools: &[ToolInfo],
         ) -> Pin<Box<dyn Stream<Item = StreamEvent> + Send + 'static>> {
             Box::pin(futures::stream::empty())
         }
@@ -394,7 +404,7 @@ mod tests {
         router.add_provider(Box::new(SuccessProvider));
 
         let result = router
-            .create_message("", &[], &ModelId::sonnet(), 1024)
+            .create_message("", &[], &ModelId::sonnet(), 1024, &[])
             .await;
 
         assert!(result.is_ok());
@@ -411,7 +421,7 @@ mod tests {
         router.add_provider(Box::new(SuccessProvider));
 
         let result = router
-            .create_message("", &[], &ModelId::sonnet(), 1024)
+            .create_message("", &[], &ModelId::sonnet(), 1024, &[])
             .await;
 
         assert!(result.is_err());
