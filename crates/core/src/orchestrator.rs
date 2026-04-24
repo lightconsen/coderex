@@ -20,7 +20,6 @@ use crate::types::{EngineEvent, Message, ModelId, UsageSummary};
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::mpsc;
-use crate::tool_executor::ToolInfo;
 
 /// Result from a query execution.
 #[derive(Debug, Clone)]

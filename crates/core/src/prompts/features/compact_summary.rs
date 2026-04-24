@@ -6,7 +6,6 @@
 use crate::api_client::ApiClient;
 use crate::orchestrator::{OrchestratorError, run_side_query};
 use crate::query_profiles::ModelProfile;
-use crate::tool_executor::ToolInfo;
 
 /// Generates a compact summary of recent conversation.
 ///

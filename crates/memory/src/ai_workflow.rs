@@ -4,7 +4,6 @@
 //! The concrete implementations live in `session_memory_agent` and
 //! `extract_memories`.
 
-use coderex_core::tool_executor::ToolInfo;
 
 pub use crate::extract_memories::{
     extract_long_term_memories_ai, extract_single_memory_ai,

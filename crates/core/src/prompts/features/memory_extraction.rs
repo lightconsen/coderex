@@ -8,7 +8,6 @@ use crate::orchestrator::{
     BackgroundFeatureKind, BackgroundFeatureRequest, OrchestratorError, run_background_feature,
     run_side_query,
 };
-use crate::tool_executor::ToolInfo;
 use crate::query_profiles::ModelProfile;
 
 /// Extracts long-term memories from recent conversation.

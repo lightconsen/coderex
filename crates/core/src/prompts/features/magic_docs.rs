@@ -7,7 +7,6 @@ use crate::api_client::ApiClient;
 use crate::orchestrator::{
     BackgroundFeatureKind, BackgroundFeatureRequest, OrchestratorError, run_background_feature,
 };
-use crate::tool_executor::ToolInfo;
 
 /// Generates documentation for a specific file or code snippet.
 ///

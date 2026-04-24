@@ -10,7 +10,6 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use thiserror::Error;
-use crate::tool_executor::ToolInfo;
 
 /// Errors from the permission request system.
 #[derive(Debug, Error)]

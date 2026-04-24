@@ -5,7 +5,6 @@
 
 use crate::api_client::ApiClient;
 use crate::orchestrator::{QueryResult, OrchestratorError, run_lightweight_query};
-use crate::tool_executor::ToolInfo;
 
 /// Generates a session title from the first user message.
 ///
