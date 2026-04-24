@@ -18,20 +18,25 @@ use std::sync::Arc;
 /// Check if live API credentials are available.
 #[must_use]
 pub fn have_live_env() -> bool {
-    std::env::var("CODEREX_API_KEY").is_ok() && std::env::var("CODEREX_BASE_URL").is_ok()
+    (std::env::var("ANTHROPIC_API_KEY").is_ok() && std::env::var("ANTHROPIC_BASE_URL").is_ok())
+        || (std::env::var("OPENAI_API_KEY").is_ok() && std::env::var("OPENAI_BASE_URL").is_ok())
 }
 
 /// Skip message when env is missing.
 #[must_use]
 pub fn skip_msg() -> &'static str {
-    "CODEREX_API_KEY and CODEREX_BASE_URL not set — run `source start.kimi.sh`"
+    "ANTHROPIC_API_KEY+ANTHROPIC_BASE_URL or OPENAI_API_KEY+OPENAI_BASE_URL not set"
 }
 
 /// Build a real API client from environment.
 #[must_use]
 pub fn live_api_client() -> AnthropicApiClient {
-    let key = std::env::var("CODEREX_API_KEY").expect("CODEREX_API_KEY not set");
-    let base = std::env::var("CODEREX_BASE_URL").expect("CODEREX_BASE_URL not set");
+    let key = std::env::var("ANTHROPIC_API_KEY")
+        .or_else(|_| std::env::var("OPENAI_API_KEY"))
+        .expect("ANTHROPIC_API_KEY or OPENAI_API_KEY not set");
+    let base = std::env::var("ANTHROPIC_BASE_URL")
+        .or_else(|_| std::env::var("OPENAI_BASE_URL"))
+        .expect("ANTHROPIC_BASE_URL or OPENAI_BASE_URL not set");
     let mut config = ApiConfig::new(key);
     config.base_url = base;
     config.request_timeout_secs = 180; // longer timeout for live tests
@@ -41,7 +46,9 @@ pub fn live_api_client() -> AnthropicApiClient {
 /// Build a model ID from environment or default.
 #[must_use]
 pub fn live_model() -> ModelId {
-    let model = std::env::var("CODEREX_MODEL").unwrap_or_else(|_| "K2.6".into());
+    let model = std::env::var("ANTHROPIC_MODEL")
+        .or_else(|_| std::env::var("OPENAI_MODEL"))
+        .unwrap_or_else(|_| "claude-sonnet-4-6".into());
     ModelId(model)
 }
 

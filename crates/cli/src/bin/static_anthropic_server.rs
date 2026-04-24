@@ -9,7 +9,7 @@
 //!   cargo run --bin record-anthropic-responses -- responses.json
 //!   cargo run --bin static-anthropic-server -- --port 9876 --responses responses.json
 //!
-//!   CODEREX_API_KEY=mock CODEREX_BASE_URL=http://127.0.0.1:9876 \
+//!   ANTHROPIC_API_KEY=mock ANTHROPIC_BASE_URL=http://127.0.0.1:9876 \
 //!       cargo test -p coderex-cli --test e2e_code_agent -- --ignored
 
 use std::collections::HashMap;

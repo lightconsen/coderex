@@ -161,7 +161,7 @@ chrome_get_content    — Extract page HTML as markdown"
         Arc::new(|_ctx: &CommandContext, _args: &[String]| {
             let bridge_url = std::env::var("CODEREX_BRIDGE_URL").ok();
             let api_key_set = std::env::var("ANTHROPIC_API_KEY").ok().map(|s| !s.is_empty()).unwrap_or(false)
-                || std::env::var("CODEREX_API_KEY").ok().map(|s| !s.is_empty()).unwrap_or(false);
+                || std::env::var("OPENAI_API_KEY").ok().map(|s| !s.is_empty()).unwrap_or(false);
             let mut lines = vec![
                 "Remote Setup".to_string(),
                 "───────────".to_string(),
@@ -170,7 +170,7 @@ chrome_get_content    — Extract page HTML as markdown"
                 lines.push("API key: configured".to_string());
             } else {
                 lines.push("API key: not set".to_string());
-                lines.push("  export ANTHROPIC_API_KEY=...".to_string());
+                lines.push("  export ANTHROPIC_API_KEY=...  # or OPENAI_API_KEY".to_string());
             }
             if let Some(url) = bridge_url.filter(|s| !s.is_empty()) {
                 lines.push(format!("Bridge URL: {url}"));

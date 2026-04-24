@@ -335,8 +335,10 @@ impl StartupOrchestrator {
 
         tracing::info!("CodeRex ready");
 
-        // Determine model: CODEREX_MODEL env → settings → default
-        let model = std::env::var("CODEREX_MODEL").ok()
+        // Determine model: ANTHROPIC_MODEL / OPENAI_MODEL env → settings → default
+        let model = std::env::var("ANTHROPIC_MODEL")
+            .or_else(|_| std::env::var("OPENAI_MODEL"))
+            .ok()
             .filter(|m| !m.is_empty())
             .map(ModelId)
             .or_else(|| self.ctx.model.clone())
@@ -1260,7 +1262,7 @@ impl StartupOrchestrator {
         }
         if providers.is_empty() {
             println!("No API providers configured.");
-            println!("Set ANTHROPIC_API_KEY, OPENAI_API_KEY, GROQ_API_KEY, or CODEREX_API_KEY.");
+            println!("Set ANTHROPIC_API_KEY, OPENAI_API_KEY, or GROQ_API_KEY.");
         } else {
             println!("Authenticated providers: {}", providers.join(", "));
         }

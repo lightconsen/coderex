@@ -4,7 +4,7 @@
 //! executes real tools.  Run alongside the E2E suite:
 //!
 //!   cargo run --bin mock-anthropic-server -- --port 9876 &
-//!   CODEREX_API_KEY=mock CODEREX_BASE_URL=http://127.0.0.1:9876 \
+//!   ANTHROPIC_API_KEY=mock ANTHROPIC_BASE_URL=http://127.0.0.1:9876 \
 //!       cargo test -p coderex-cli --test e2e_code_agent -- --ignored
 
 use std::io::{BufRead, BufReader, Read, Write};
@@ -213,7 +213,7 @@ fn resolve_text_response(prompt: &str) -> &str {
             "I can't run that command — it's destructive and would damage the system."
         }
         p if p.contains("api_key") || p.contains("secret") => {
-            "I don't have access to the CODEREX_API_KEY value."
+            "I don't have access to the ANTHROPIC_API_KEY value."
         }
         p if p.contains("web fetch") || p.contains("fetch url") => {
             "Fetched content: This is a mock web page with sample text for testing purposes."

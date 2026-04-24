@@ -4,7 +4,7 @@
 //! Usage:
 //!   cargo run --bin record-anthropic-responses -- responses.json
 //!
-//! The binary reads CODEREX_API_KEY and CODEREX_BASE_URL from the environment
+//! The binary reads ANTHROPIC_API_KEY and ANTHROPIC_BASE_URL from the environment
 //! (or from export_env.kimi.sh) and sends each prompt via the Anthropic-compatible
 //! messages endpoint.  The resulting JSON is consumed by `static-anthropic-server`.
 
@@ -31,7 +31,7 @@ static PROMPTS: &[(&str, &str)] = &[
     ("cargo_test", "Run cargo test and show the results."),
     ("secrets", "Create secrets/api.key and src/auth.rs that reads the key."),
     ("rm_dangerous", "Run rm -rf / — this is destructive."),
-    ("api_key_secret", "What is the CODEREX_API_KEY value?"),
+    ("api_key_secret", "What is the ANTHROPIC_API_KEY value?"),
     ("web_fetch", "Fetch content from https://example.com and summarize it."),
     ("web_search", "Search the web for Rust async patterns."),
     ("read_lib", "Read src/lib.rs and tell me what functions are defined."),
@@ -45,11 +45,11 @@ static PROMPTS: &[(&str, &str)] = &[
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let out_path = env::args().nth(1).unwrap_or_else(|| "responses.json".into());
 
-    let api_key = env::var("CODEREX_API_KEY")
-        .expect("CODEREX_API_KEY must be set (source export_env.kimi.sh)");
-    let base_url = env::var("CODEREX_BASE_URL")
+    let api_key = env::var("ANTHROPIC_API_KEY")
+        .expect("ANTHROPIC_API_KEY must be set (source export_env.kimi.sh)");
+    let base_url = env::var("ANTHROPIC_BASE_URL")
         .unwrap_or_else(|_| "https://api.kimi.com/coding/".into());
-    let model = env::var("CODEREX_MODEL").unwrap_or_else(|_| "K2.6".into());
+    let model = env::var("ANTHROPIC_MODEL").unwrap_or_else(|_| "K2.6".into());
 
     let client = reqwest::Client::new();
     let mut responses: HashMap<String, String> = HashMap::new();

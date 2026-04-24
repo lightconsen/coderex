@@ -94,7 +94,7 @@ cargo test -p coderex-cli --test e2e_code_agent -- --ignored --test-threads=1
 ```
 
 **Requirements:**
-- `CODEREX_API_KEY` and `CODEREX_BASE_URL` must be set
+- `ANTHROPIC_API_KEY` + `ANTHROPIC_BASE_URL` or `OPENAI_API_KEY` + `OPENAI_BASE_URL` must be set
 - Tests are marked `#[ignore = "live LLM test"]` and require `--ignored`
 - Single-threaded execution (`--test-threads=1`) to avoid rate limits
 
@@ -156,7 +156,7 @@ fn my_new_scenario() {
 ```
 
 For mock-server-only tests (no `#[ignore]` needed), add a separate test file
-in `crates/cli/tests/` that uses `CODEREX_API_KEY=mock`.
+in `crates/cli/tests/` that uses `ANTHROPIC_API_KEY=mock`.
 
 ---
 

@@ -2,7 +2,6 @@
 //!
 //! Supports:
 //! - `ANTHROPIC_API_KEY` / `ANTHROPIC_BASE_URL`
-//! - `CODEREX_API_KEY` / `CODEREX_BASE_URL` (Anthropic-compatible fallback)
 //! - `OPENAI_API_KEY` / `OPENAI_BASE_URL`
 //! - `GROQ_API_KEY` / `GROQ_BASE_URL`
 //! - Config file at `~/.coderex/providers.toml`
@@ -58,11 +57,6 @@ impl ProviderConfig {
                 api_key: key,
                 base_url: std::env::var("ANTHROPIC_BASE_URL").ok(),
             });
-        } else if let Ok(key) = std::env::var("CODEREX_API_KEY") {
-            config.anthropic = Some(ProviderEndpoint {
-                api_key: key,
-                base_url: std::env::var("CODEREX_BASE_URL").ok(),
-            });
         }
 
         if let Ok(key) = std::env::var("OPENAI_API_KEY") {
@@ -92,9 +86,7 @@ impl ProviderConfig {
         } else {
             self.anthropic = Some(ProviderEndpoint {
                 api_key: key,
-                base_url: std::env::var("CODEREX_BASE_URL")
-                    .or_else(|_| std::env::var("ANTHROPIC_BASE_URL"))
-                    .ok(),
+                base_url: std::env::var("ANTHROPIC_BASE_URL").ok(),
             });
         }
     }

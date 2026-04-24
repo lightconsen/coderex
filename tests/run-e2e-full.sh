@@ -12,8 +12,8 @@ set -euo pipefail
 #   ./tests/run-e2e-full.sh
 
 # Check required environment variables
-if [ -z "${CODEREX_API_KEY:-}" ] || [ -z "${CODEREX_BASE_URL:-}" ]; then
-    echo "Error: CODEREX_API_KEY and CODEREX_BASE_URL must be set."
+if { [ -z "${ANTHROPIC_API_KEY:-}" ] || [ -z "${ANTHROPIC_BASE_URL:-}" ]; } && { [ -z "${OPENAI_API_KEY:-}" ] || [ -z "${OPENAI_BASE_URL:-}" ]; }; then
+    echo "Error: ANTHROPIC_API_KEY+ANTHROPIC_BASE_URL or OPENAI_API_KEY+OPENAI_BASE_URL must be set."
     echo "  For mock server tests: source export_env.local.sh"
     echo "  For live Kimi tests:   source export_env.kimi.sh"
     exit 1
@@ -22,16 +22,18 @@ fi
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "${SCRIPT_DIR}/.."
 
+MODEL="${ANTHROPIC_MODEL:-${OPENAI_MODEL:-default}}"
+API_KEY_PREFIX="${ANTHROPIC_API_KEY:-${OPENAI_API_KEY:-}}"
 echo "========================================"
 echo "Running all E2E tests"
-echo "Model: ${CODEREX_MODEL:-default}"
-echo "API key: ${CODEREX_API_KEY:0:4}..."
+echo "Model: ${MODEL}"
+echo "API key: ${API_KEY_PREFIX:0:4}..."
 echo "========================================"
 echo ""
 
 # If using mock server, start it automatically
 MOCK_PID=""
-if [ "${CODEREX_API_KEY}" = "mock" ]; then
+if [ "${ANTHROPIC_API_KEY:-}" = "mock" ] || [ "${OPENAI_API_KEY:-}" = "mock" ]; then
     if ! curl -sf http://127.0.0.1:9876/v1/messages -X POST -d '{}' >/dev/null 2>&1; then
         echo "Mock server not running, starting it..."
         ./tests/run-mock-anthropic-server.sh &

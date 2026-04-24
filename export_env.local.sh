@@ -7,5 +7,5 @@
 # Note: Do NOT use "set -euo pipefail" here — this file is sourced into
 # the current shell and strict mode would break prompt hooks.
 
-export CODEREX_API_KEY="mock"
-export CODEREX_BASE_URL="http://127.0.0.1:9876"
+export ANTHROPIC_API_KEY="mock"
+export ANTHROPIC_BASE_URL="http://127.0.0.1:9876"

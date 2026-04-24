@@ -33,7 +33,8 @@ use std::time::{Duration, Instant};
 
 #[allow(dead_code)]
 fn have_live_env() -> bool {
-    std::env::var("CODEREX_API_KEY").is_ok() && std::env::var("CODEREX_BASE_URL").is_ok()
+    (std::env::var("ANTHROPIC_API_KEY").is_ok() && std::env::var("ANTHROPIC_BASE_URL").is_ok())
+        || (std::env::var("OPENAI_API_KEY").is_ok() && std::env::var("OPENAI_BASE_URL").is_ok())
 }
 
 fn binary_path() -> &'static Path {
@@ -66,16 +67,9 @@ struct CoderexOutput {
 }
 
 fn run(cwd: &Path, prompt: &str, timeout_secs: u64) -> CoderexOutput {
-    let api_key = std::env::var("CODEREX_API_KEY").unwrap_or_default();
-    let base_url = std::env::var("CODEREX_BASE_URL").unwrap_or_default();
-    let model = std::env::var("CODEREX_MODEL").unwrap_or_else(|_| "K2.6".into());
-
     let mut cmd = Command::new(binary_path());
     cmd.arg("-p")
         .arg("--dangerously-skip-permissions")
-        .env("CODEREX_API_KEY", api_key)
-        .env("CODEREX_BASE_URL", base_url)
-        .env("CODEREX_MODEL", model)
         .current_dir(cwd)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -130,16 +124,9 @@ fn run(cwd: &Path, prompt: &str, timeout_secs: u64) -> CoderexOutput {
 }
 
 fn run_with_args(cwd: &Path, prompt: &str, extra_args: &[&str], timeout_secs: u64) -> CoderexOutput {
-    let api_key = std::env::var("CODEREX_API_KEY").unwrap_or_default();
-    let base_url = std::env::var("CODEREX_BASE_URL").unwrap_or_default();
-    let model = std::env::var("CODEREX_MODEL").unwrap_or_else(|_| "K2.6".into());
-
     let mut cmd = Command::new(binary_path());
     cmd.arg("-p")
         .args(extra_args)
-        .env("CODEREX_API_KEY", api_key)
-        .env("CODEREX_BASE_URL", base_url)
-        .env("CODEREX_MODEL", model)
         .current_dir(cwd)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
