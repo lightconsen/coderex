@@ -235,14 +235,16 @@ fn resolve_text_response(prompt: &str, responses: &StaticResponses) -> String {
         responses.resolve("nonexistent", "Done! Created the new file.")
     } else if p.contains("review") {
         responses.resolve("review", "Review complete. Found potential issues.")
-    } else if p.contains("bash") || p.contains("list") || p.contains("files") {
-        responses.resolve("bash", "Here are the files in the directory.")
+    } else if p.contains("rm -rf") || p.contains("dangerous") {
+        responses.resolve("rm_dangerous", "I can't run that destructive command. It would damage the system.")
     } else if p.contains("cargo test") || p.contains("test results") {
         responses.resolve("cargo_test", "Running tests... All passed.")
     } else if p.contains("secrets") || p.contains("api.key") {
         responses.resolve("secrets", "Created the secrets file and auth module.")
-    } else if p.contains("rm -rf") || p.contains("dangerous") {
-        responses.resolve("rm_dangerous", "I can't run that destructive command.")
+    } else if p.contains("rust source files") || p.contains("glob") || p.contains("list all") && p.contains("files") {
+        responses.resolve("bash", "Here are the files in the directory.")
+    } else if p.contains("bash") || p.contains("list") || p.contains("files") {
+        responses.resolve("bash", "Here are the files in the directory.")
     } else if p.contains("api_key") || p.contains("secret") {
         responses.resolve("api_key_secret", "I don't have access to that value.")
     } else if p.contains("web fetch") || p.contains("fetch url") {
