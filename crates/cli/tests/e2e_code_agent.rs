@@ -58,13 +58,17 @@ struct CoderexOutput {
 }
 
 fn run(cwd: &Path, prompt: &str, timeout_secs: u64) -> CoderexOutput {
+    run_with_args(cwd, prompt, &["--dangerously-skip-permissions"], timeout_secs)
+}
+
+fn run_with_args(cwd: &Path, prompt: &str, extra_args: &[&str], timeout_secs: u64) -> CoderexOutput {
     let api_key = std::env::var("CODEREX_API_KEY").unwrap_or_default();
     let base_url = std::env::var("CODEREX_BASE_URL").unwrap_or_default();
     let model = std::env::var("CODEREX_MODEL").unwrap_or_else(|_| "K2.6".into());
 
     let mut cmd = Command::new(binary_path());
     cmd.arg("-p")
-        .arg("--dangerously-skip-permissions")
+        .args(extra_args)
         .env("CODEREX_API_KEY", api_key)
         .env("CODEREX_BASE_URL", base_url)
         .env("CODEREX_MODEL", model)
@@ -484,7 +488,12 @@ fn refactor_extract_helper() {
     let dir = tempfile::tempdir().unwrap();
     create_legacy_project(dir.path());
 
-    let out = run(dir.path(), "Refactor src/lib.rs: extract the duplicated age-prefix logic into a shared helper function called `format_user_label`. Keep both public functions working.", 120);
+    let out = run_with_args(
+        dir.path(),
+        "Refactor src/lib.rs: extract the duplicated age-prefix logic into a shared helper function called `format_user_label`. Keep both public functions working.",
+        &["--dangerously-skip-permissions", "--max-turns", "3"],
+        120,
+    );
     eprintln!("stdout:\n{}", out.stdout);
 
     assert_response_contains(&out.stdout, &["format_user_label", "helper", "extract", "refactor"], "expected refactoring discussion");
