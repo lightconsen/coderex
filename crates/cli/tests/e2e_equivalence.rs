@@ -524,17 +524,17 @@ fn tool_read_file() {
     let out = run_with_args(
         dir.path(),
         "Read src/lib.rs and tell me what functions are defined.",
-        &["--dangerously-skip-permissions", "--max-turns", "3"],
+        &["--dangerously-skip-permissions", "--max-turns", "5"],
         180,
     );
     eprintln!("stdout:\n{}", out.stdout);
 
-    // Live LLM may emit a tool_use with no follow-up text when max_turns is tight.
-    // Accept any non-empty response (text or completion marker).
-    assert!(
-        !out.stdout.trim().is_empty(),
-        "expected non-empty response for read-file prompt, got: {}",
-        out.stdout
+    // Verify the read tool actually executed by checking the LLM mentions
+    // content from the file (an `add` function is defined in the stub lib).
+    assert_response_contains(
+        &out.stdout,
+        &["add", "pub fn"],
+        "expected read tool to execute and mention file content",
     );
 }
 
