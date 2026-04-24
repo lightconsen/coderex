@@ -5,7 +5,7 @@
 
 use crate::api_client::{ApiError, ApiResponse, StreamEvent};
 use crate::provider::{Provider, ProviderCapabilities, ProviderError, classify_api_error};
-use crate::types::ModelId;
+use crate::types::{ModelId, ToolCall};
 use async_trait::async_trait;
 use futures::Stream;
 use reqwest::Client;
@@ -164,6 +164,9 @@ impl Provider for OpenAiCompatibleProvider {
             body.as_object_mut()
                 .unwrap()
                 .insert("tools".to_string(), serde_json::Value::Array(tools_json));
+            body.as_object_mut()
+                .unwrap()
+                .insert("tool_choice".to_string(), "auto".into());
         }
 
         self.with_retry(|| async {
@@ -186,19 +189,43 @@ impl Provider for OpenAiCompatibleProvider {
 
             let json: serde_json::Value = resp.json().await.map_err(ApiError::from)?;
 
-            let content = json["choices"]
-                .as_array()
-                .and_then(|arr| arr.first())
-                .and_then(|c| c["message"]["content"].as_str())
+            let choice = json["choices"].as_array().and_then(|arr| arr.first());
+            let message = choice.and_then(|c| c["message"].as_object());
+
+            let content = message
+                .and_then(|m| m.get("content"))
+                .and_then(|c| c.as_str())
                 .unwrap_or("")
                 .to_string();
 
-            let stop_reason = json["choices"]
-                .as_array()
-                .and_then(|arr| arr.first())
+            let stop_reason = choice
                 .and_then(|c| c["finish_reason"].as_str())
                 .unwrap_or("unknown")
                 .to_string();
+
+            // Extract tool_calls from OpenAI format
+            let mut tool_calls = Vec::new();
+            if let Some(tool_calls_arr) = message
+                .and_then(|m| m.get("tool_calls"))
+                .and_then(|t| t.as_array())
+            {
+                for tc in tool_calls_arr {
+                    let id = tc["id"].as_str().unwrap_or("").to_string();
+                    let name = tc["function"]["name"]
+                        .as_str()
+                        .unwrap_or("")
+                        .to_string();
+                    let args_str = tc["function"]["arguments"]
+                        .as_str()
+                        .unwrap_or("{}");
+                    let input = serde_json::from_str(args_str).unwrap_or_else(|_| {
+                        serde_json::json!({"raw": args_str})
+                    });
+                    if !id.is_empty() && !name.is_empty() {
+                        tool_calls.push(ToolCall { id, name, input });
+                    }
+                }
+            }
 
             #[allow(clippy::cast_possible_truncation)]
             let usage = crate::types::UsageSummary {
@@ -210,7 +237,7 @@ impl Provider for OpenAiCompatibleProvider {
 
             Ok(ApiResponse {
                 content,
-                tool_calls: Vec::new(),
+                tool_calls,
                 usage,
                 stop_reason,
             })
@@ -232,11 +259,22 @@ impl Provider for OpenAiCompatibleProvider {
         let result = self.create_message(system, messages, model, max_tokens, tools).await;
         match result {
             Ok(resp) => {
-                let events = vec![
-                    StreamEvent::TextDelta(resp.content),
-                    StreamEvent::UsageSummary(resp.usage),
-                    StreamEvent::StreamEnd,
-                ];
+                let mut events: Vec<StreamEvent> = Vec::new();
+                if !resp.content.is_empty() {
+                    events.push(StreamEvent::TextDelta(resp.content));
+                }
+                for tc in resp.tool_calls {
+                    events.push(StreamEvent::ToolCallBlockStart {
+                        id: tc.id.clone(),
+                        name: tc.name.clone(),
+                    });
+                    events.push(StreamEvent::ToolCallBlockEnd {
+                        id: tc.id,
+                        input: tc.input,
+                    });
+                }
+                events.push(StreamEvent::UsageSummary(resp.usage));
+                events.push(StreamEvent::StreamEnd);
                 Box::pin(futures::stream::iter(events))
             }
             Err(e) => {
