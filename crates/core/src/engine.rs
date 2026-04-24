@@ -679,6 +679,112 @@ pub struct DeniedToolCall {
 }
 
 impl QueryEngine {
+    fn extract_inline_tool_calls_from_text(&self, text: &str) -> Vec<ToolCall> {
+        fn parse_balanced_json_object(input: &str, start: usize) -> Option<usize> {
+            let bytes = input.as_bytes();
+            if bytes.get(start).copied() != Some(b'{') {
+                return None;
+            }
+            let mut i = start;
+            let mut depth = 0usize;
+            let mut in_string = false;
+            let mut escaped = false;
+            while i < bytes.len() {
+                let b = bytes[i];
+                if in_string {
+                    if escaped {
+                        escaped = false;
+                    } else if b == b'\\' {
+                        escaped = true;
+                    } else if b == b'"' {
+                        in_string = false;
+                    }
+                } else if b == b'"' {
+                    in_string = true;
+                } else if b == b'{' {
+                    depth += 1;
+                } else if b == b'}' {
+                    depth = depth.saturating_sub(1);
+                    if depth == 0 {
+                        return Some(i + 1);
+                    }
+                }
+                i += 1;
+            }
+            None
+        }
+
+        fn is_ident_char(b: u8) -> bool {
+            b.is_ascii_alphanumeric() || b == b'_'
+        }
+
+        let mut known_tools: HashMap<String, String> = HashMap::new();
+        for info in self.tools.list_tools() {
+            known_tools.insert(info.name.to_lowercase(), info.name);
+        }
+
+        let mut calls = Vec::new();
+        let bytes = text.as_bytes();
+        let mut i = 0usize;
+
+        while i < bytes.len() {
+            if bytes[i] != b'(' {
+                i += 1;
+                continue;
+            }
+
+            // Parse function/tool name before '('
+            let mut j = i;
+            while j > 0 && bytes[j - 1].is_ascii_whitespace() {
+                j -= 1;
+            }
+            let end = j;
+            while j > 0 && is_ident_char(bytes[j - 1]) {
+                j -= 1;
+            }
+            if j == end {
+                i += 1;
+                continue;
+            }
+            let raw_name = &text[j..end];
+            let Some(canonical_name) = known_tools.get(&raw_name.to_lowercase()) else {
+                i += 1;
+                continue;
+            };
+
+            // Parse JSON object inside parentheses
+            let mut k = i + 1;
+            while k < bytes.len() && bytes[k].is_ascii_whitespace() {
+                k += 1;
+            }
+            let Some(obj_end) = parse_balanced_json_object(text, k) else {
+                i += 1;
+                continue;
+            };
+            let mut after = obj_end;
+            while after < bytes.len() && bytes[after].is_ascii_whitespace() {
+                after += 1;
+            }
+            if bytes.get(after).copied() != Some(b')') {
+                i += 1;
+                continue;
+            }
+
+            let json_slice = &text[k..obj_end];
+            if let Ok(input) = serde_json::from_str::<serde_json::Value>(json_slice) {
+                calls.push(ToolCall {
+                    id: format!("inline_{}_{}", canonical_name.to_lowercase(), calls.len() + 1),
+                    name: canonical_name.clone(),
+                    input,
+                });
+            }
+
+            i = after + 1;
+        }
+
+        calls
+    }
+
     /// Create a new QueryEngine.
     #[must_use]
     pub fn new(
@@ -1191,7 +1297,7 @@ impl QueryEngine {
         // Elicitation heuristic: if the assistant asks a short question, prompt the user
         let mut api_response = api_response;
         if options.handle_elicitation && content.trim().ends_with('?') && content.len() < 200 {
-            let result = self.handle_elicitation(turn, format!("elic_{turn_number}"), content).await;
+            let result = self.handle_elicitation(turn, format!("elic_{turn_number}"), content.clone()).await;
             if let ElicitationResult::Responded(resp) = result {
                 if let Some(user_text) = resp.other_text.or_else(|| resp.selected.first().cloned()) {
                     let user_msg = Message::user(user_text);
@@ -1211,7 +1317,10 @@ impl QueryEngine {
         }
 
         // Use structured tool calls from the API response (blocking path).
-        let tool_calls = api_response.tool_calls;
+        let mut tool_calls = api_response.tool_calls;
+        if tool_calls.is_empty() {
+            tool_calls = self.extract_inline_tool_calls_from_text(&content);
+        }
 
         if tool_calls.is_empty() {
             // No tool calls — turn is complete
@@ -1387,7 +1496,7 @@ impl QueryEngine {
 
         // Elicitation heuristic: if the assistant asks a short question, prompt the user
         if options.handle_elicitation && content.trim().ends_with('?') && content.len() < 200 {
-            let result = self.handle_elicitation(turn, format!("elic_{turn_number}"), content).await;
+            let result = self.handle_elicitation(turn, format!("elic_{turn_number}"), content.clone()).await;
             if let ElicitationResult::Responded(resp) = result {
                 if let Some(user_text) = resp.other_text.or_else(|| resp.selected.first().cloned()) {
                     let user_msg = Message::user(user_text);
@@ -1417,6 +1526,10 @@ impl QueryEngine {
             self.session.messages.push(msg);
         }
         tracing::info!("session.messages after early_results: {:?}", self.session.messages.len());
+
+        if tool_calls.is_empty() {
+            tool_calls = self.extract_inline_tool_calls_from_text(&content);
+        }
 
         if tool_calls.is_empty() {
             // No tool calls — turn complete
@@ -2887,6 +3000,61 @@ mod tests {
         assert_eq!(taken.len(), 1);
         // Second take is empty
         assert!(assembler.take_completed().is_empty());
+    }
+
+    struct CatalogOnlyExecutor;
+
+    #[async_trait::async_trait]
+    impl crate::tool_executor::ToolExecutor for CatalogOnlyExecutor {
+        fn list_tools(&self) -> Vec<crate::tool_executor::ToolInfo> {
+            vec![crate::tool_executor::ToolInfo {
+                name: "Read".into(),
+                description: "read a file".into(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "file_path": { "type": "string" }
+                    }
+                }),
+            }]
+        }
+
+        async fn execute(
+            &self,
+            tool_call_id: &str,
+            tool_name: &str,
+            _input: &serde_json::Value,
+        ) -> crate::tool_executor::ToolDispatchOutcome {
+            crate::tool_executor::ToolDispatchOutcome {
+                result: ToolResult {
+                    tool_call_id: tool_call_id.to_string(),
+                    output: format!("stub ok: {tool_name}"),
+                    is_error: false,
+                },
+            }
+        }
+    }
+
+    #[test]
+    fn extract_inline_tool_calls_parses_known_tool_call() {
+        let (mut engine, _rx, _session) = make_test_engine();
+        engine.set_tool_executor(Box::new(CatalogOnlyExecutor));
+        let text = r#"I'll inspect it now. read({"file_path":"src/lib.rs"})"#;
+
+        let calls = engine.extract_inline_tool_calls_from_text(text);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "Read");
+        assert_eq!(calls[0].input["file_path"], "src/lib.rs");
+    }
+
+    #[test]
+    fn extract_inline_tool_calls_ignores_unknown_function_calls() {
+        let (mut engine, _rx, _session) = make_test_engine();
+        engine.set_tool_executor(Box::new(CatalogOnlyExecutor));
+        let text = r#"something_else({"file_path":"src/lib.rs"})"#;
+
+        let calls = engine.extract_inline_tool_calls_from_text(text);
+        assert!(calls.is_empty());
     }
 
     // ─── Elicitation Integration ───────────────────────────────────────────

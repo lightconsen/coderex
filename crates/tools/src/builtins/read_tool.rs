@@ -114,6 +114,17 @@ fn extract_number(args: &Value, key: &str) -> Option<i64> {
 fn resolve_path(file_path: &str, cwd: &std::path::Path) -> String {
     let path = PathBuf::from(file_path);
     if path.is_absolute() {
+        // Some providers occasionally emit repo-relative paths with a leading
+        // slash (e.g. "/src/lib.rs"). If that absolute path does not exist but
+        // `<cwd>/<trimmed>` does, prefer the workspace-local file.
+        if !path.exists() {
+            if let Ok(trimmed) = path.strip_prefix("/") {
+                let candidate = cwd.join(trimmed);
+                if candidate.exists() {
+                    return candidate.to_string_lossy().to_string();
+                }
+            }
+        }
         file_path.to_string()
     } else {
         cwd.join(&path).to_string_lossy().to_string()
@@ -184,6 +195,16 @@ mod tests {
             .execute(test_input("no_such_file.txt"), test_ctx(tmp.path()))
             .await;
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn resolve_path_maps_leading_slash_repo_relative() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("src")).unwrap();
+        std::fs::write(tmp.path().join("src/lib.rs"), "pub fn add() {}").unwrap();
+
+        let resolved = resolve_path("/src/lib.rs", tmp.path());
+        assert_eq!(resolved, tmp.path().join("src/lib.rs").to_string_lossy());
     }
 
     #[tokio::test]
