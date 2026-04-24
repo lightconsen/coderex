@@ -49,10 +49,15 @@ impl Tool for ReadTool {
         }
     }
 
-    async fn execute(&self, input: ToolInput, ctx: ToolContext<'_>) -> Result<ToolOutput, ToolError> {
+    async fn execute(
+        &self,
+        input: ToolInput,
+        ctx: ToolContext<'_>,
+    ) -> Result<ToolOutput, ToolError> {
         let file_path = extract_file_path(&input.arguments)?;
         let offset = extract_number(&input.arguments, "offset").unwrap_or(0) as usize;
-        let limit = extract_number(&input.arguments, "limit").unwrap_or(DEFAULT_LINE_LIMIT as i64) as usize;
+        let limit =
+            extract_number(&input.arguments, "limit").unwrap_or(DEFAULT_LINE_LIMIT as i64) as usize;
 
         let path = resolve_path(&file_path, ctx.cwd);
         let path_buf = PathBuf::from(&path);
@@ -86,7 +91,11 @@ impl Tool for ReadTool {
 
         if excerpt.len() > MAX_DISPLAY_CHARS {
             Ok(ToolOutput {
-                output: format!("{}\n\n... (truncated, {} chars omitted)", &excerpt[..MAX_DISPLAY_CHARS], excerpt.len() - MAX_DISPLAY_CHARS),
+                output: format!(
+                    "{}\n\n... (truncated, {} chars omitted)",
+                    &excerpt[..MAX_DISPLAY_CHARS],
+                    excerpt.len() - MAX_DISPLAY_CHARS
+                ),
                 is_display: true,
             })
         } else {
@@ -210,7 +219,10 @@ mod tests {
     #[tokio::test]
     async fn read_with_offset_and_limit() {
         let tmp = tempfile::tempdir().unwrap();
-        let content = (0..10).map(|i| format!("line-{i}")).collect::<Vec<_>>().join("\n");
+        let content = (0..10)
+            .map(|i| format!("line-{i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
         std::fs::write(tmp.path().join("lines.txt"), &content).unwrap();
 
         let output = ReadTool

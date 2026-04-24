@@ -8,26 +8,26 @@
 //! 5. Compact/recovery if needed
 //! 6. Finalize and emit events
 
-use tokio::sync::mpsc;
-use tokio::time::Instant;
 use std::collections::HashMap;
 use std::sync::Arc;
+use tokio::sync::mpsc;
+use tokio::time::Instant;
 
-use crate::types::{EngineEvent, Message, ModelId, ToolCall, ToolResult, UsageSummary};
+use crate::api_client::{ApiClient, ApiResponse, StreamEvent};
 use crate::budget::TokenBudget;
+use crate::compact::{self, CompactResult, CompactStrategy};
 use crate::cost::CostTracker;
+use crate::elicitation::{ElicitationHandler, ElicitationResult, ReplElicitationHandler};
+use crate::hook_executor::{HookExecutor, HookFireResult, NoOpHookExecutor};
+use crate::loop_detector::{LoopDetection, LoopDetector};
 use crate::permission_engine::{PermissionEngine, PermissionResponse};
 use crate::permissions::{PermissionChecker, PermissionMode, PermissionResult};
-use crate::api_client::{ApiClient, ApiResponse, StreamEvent};
-use crate::state::SessionState;
 use crate::prompt::{AssembledContext, CompactConfig, PromptCompiler, PromptContext};
-use crate::compact::{self, CompactResult, CompactStrategy};
+use crate::state::SessionState;
 use crate::stop_hook::{self, StopHookContext, StopHookDecision};
-use crate::hook_executor::{HookExecutor, HookFireResult, NoOpHookExecutor};
 use crate::tool_executor::{NoOpToolExecutor, ToolExecutor};
 use crate::tool_scheduler;
-use crate::elicitation::{ElicitationHandler, ElicitationResult, ReplElicitationHandler};
-use crate::loop_detector::{LoopDetection, LoopDetector};
+use crate::types::{EngineEvent, Message, ModelId, ToolCall, ToolResult, UsageSummary};
 use std::path::PathBuf;
 
 // ─── Structured Output Validation ───────────────────────────────────────────
@@ -392,8 +392,14 @@ impl std::fmt::Display for TerminalReason {
             Self::Error(msg) => write!(f, "error: {msg}"),
             Self::StopHook => write!(f, "stop hook"),
             Self::TokenLimitStop => write!(f, "token limit stop"),
-            Self::LoopDetected { period, repetitions } => {
-                write!(f, "loop detected (period={period}, repetitions={repetitions})")
+            Self::LoopDetected {
+                period,
+                repetitions,
+            } => {
+                write!(
+                    f,
+                    "loop detected (period={period}, repetitions={repetitions})"
+                )
             }
             Self::ApiUnavailable { message } => {
                 write!(f, "api unavailable: {message}")
@@ -577,10 +583,7 @@ impl TurnRuntime {
 #[derive(Debug, Clone)]
 pub enum TurnProgress {
     /// State transition occurred.
-    StateChanged {
-        from: TurnState,
-        to: TurnState,
-    },
+    StateChanged { from: TurnState, to: TurnState },
     /// A text delta was received from the model.
     TextDelta(String),
     /// A tool call was started.
@@ -594,10 +597,7 @@ pub enum TurnProgress {
         args: serde_json::Value,
     },
     /// An elicitation request was emitted.
-    ElicitationRequested {
-        id: String,
-        message: String,
-    },
+    ElicitationRequested { id: String, message: String },
     /// A compact boundary was inserted.
     CompactBoundary,
     /// The turn completed.
@@ -773,7 +773,11 @@ impl QueryEngine {
             let json_slice = &text[k..obj_end];
             if let Ok(input) = serde_json::from_str::<serde_json::Value>(json_slice) {
                 calls.push(ToolCall {
-                    id: format!("inline_{}_{}", canonical_name.to_lowercase(), calls.len() + 1),
+                    id: format!(
+                        "inline_{}_{}",
+                        canonical_name.to_lowercase(),
+                        calls.len() + 1
+                    ),
                     name: canonical_name.clone(),
                     input,
                 });
@@ -783,6 +787,103 @@ impl QueryEngine {
         }
 
         calls
+    }
+
+    fn infer_read_tool_call_from_user_prompt(&self, turn: &TurnRuntime) -> Option<ToolCall> {
+        let mut canonical_read_name: Option<String> = None;
+        for info in self.tools.list_tools() {
+            if info.name.eq_ignore_ascii_case("read") {
+                canonical_read_name = Some(info.name);
+                break;
+            }
+        }
+        let read_name = canonical_read_name?;
+
+        let user_text = turn.messages.iter().rev().find_map(|m| {
+            if matches!(m.role, crate::types::Role::User) {
+                if let crate::types::MessageContent::Text(t) = &m.content {
+                    return Some(t.trim().to_string());
+                }
+            }
+            None
+        })?;
+
+        let mut parts = user_text.split_whitespace();
+        let first = parts.next()?;
+        if !first.eq_ignore_ascii_case("read") {
+            return None;
+        }
+        let raw_path = parts.next()?;
+        let candidate = raw_path
+            .trim_matches(|c: char| matches!(c, '`' | '"' | '\'' | ',' | ';' | ':' | ')' | '('))
+            .to_string();
+        if candidate.is_empty() {
+            return None;
+        }
+        // Avoid triggering on non-file "read ..." prompts.
+        if !candidate.contains('/') && !candidate.contains('.') {
+            return None;
+        }
+
+        Some(ToolCall {
+            id: format!("inferred_read_{}", self.current_turn + 1),
+            name: read_name,
+            input: serde_json::json!({ "file_path": candidate }),
+        })
+    }
+
+    fn persist_assistant_tool_calls(&mut self, turn: &mut TurnRuntime, tool_calls: &[ToolCall]) {
+        for tool_call in tool_calls {
+            let msg = Message {
+                role: crate::types::Role::Assistant,
+                content: crate::types::MessageContent::ToolCall(tool_call.clone()),
+            };
+            turn.messages.push(msg.clone());
+            self.session.messages.push(msg);
+        }
+    }
+
+    fn provider_messages(messages: &[Message]) -> Vec<serde_json::Value> {
+        messages
+            .iter()
+            .filter(|m| !matches!(m.role, crate::types::Role::System))
+            .filter_map(|m| {
+                let role_str = match (&m.role, &m.content) {
+                    (crate::types::Role::User, _) => "user",
+                    (crate::types::Role::Assistant, _) => "assistant",
+                    (crate::types::Role::Tool, crate::types::MessageContent::ToolResult(_)) => {
+                        "user"
+                    }
+                    _ => return None,
+                };
+                let content = match &m.content {
+                    crate::types::MessageContent::Text(t) => serde_json::Value::String(t.clone()),
+                    crate::types::MessageContent::ToolCall(tc) => serde_json::json!([
+                        {"type": "tool_use", "id": &tc.id, "name": &tc.name, "input": &tc.input}
+                    ]),
+                    crate::types::MessageContent::ToolResult(tr) => serde_json::json!([
+                        {"type": "tool_result", "tool_use_id": &tr.tool_call_id, "content": &tr.output}
+                    ]),
+                };
+                Some(serde_json::json!({"role": role_str, "content": content}))
+            })
+            .collect()
+    }
+
+    fn is_fallback_tool_call(tool_call: &ToolCall) -> bool {
+        tool_call.id.starts_with("inline_") || tool_call.id.starts_with("inferred_")
+    }
+
+    fn content_mentions_tool_output(content: &str, output: &str) -> bool {
+        let trimmed = output.trim();
+        if trimmed.is_empty() {
+            return false;
+        }
+        if content.contains(trimmed) {
+            return true;
+        }
+        let prefix: String = trimmed.chars().take(64).collect();
+        !prefix.is_empty() && content.contains(&prefix)
     }
 
     /// Create a new QueryEngine.
@@ -820,10 +921,7 @@ impl QueryEngine {
     }
 
     /// Set the elicitation handler.
-    pub fn set_elicitation_handler(
-        &mut self,
-        handler: Box<dyn ElicitationHandler + Send + Sync>,
-    ) {
+    pub fn set_elicitation_handler(&mut self, handler: Box<dyn ElicitationHandler + Send + Sync>) {
         self.elicitation_handler = handler;
     }
 
@@ -903,7 +1001,10 @@ impl QueryEngine {
             let _ = self.event_tx.send(EngineEvent::PermissionRequest {
                 id: req.id,
                 tool: req.tool_name,
-                args: req.arguments.parse().unwrap_or_else(|_| serde_json::Value::Null),
+                args: req
+                    .arguments
+                    .parse()
+                    .unwrap_or_else(|_| serde_json::Value::Null),
             });
         }
     }
@@ -1000,7 +1101,10 @@ impl QueryEngine {
             ElicitationResult::Responded(resp) => {
                 turn.pending_elicitation = Some(ResolvedElicitation {
                     request_id,
-                    response: resp.other_text.clone().or_else(|| resp.selected.first().cloned()),
+                    response: resp
+                        .other_text
+                        .clone()
+                        .or_else(|| resp.selected.first().cloned()),
                 });
             }
             ElicitationResult::Cancelled | ElicitationResult::TimedOut => {
@@ -1015,7 +1119,12 @@ impl QueryEngine {
     }
 
     /// Fire a hook event and return the result.
-    async fn fire_hook(&self, event_name: &str, input: &str, context: &std::collections::HashMap<String, String>) -> HookFireResult {
+    async fn fire_hook(
+        &self,
+        event_name: &str,
+        input: &str,
+        context: &std::collections::HashMap<String, String>,
+    ) -> HookFireResult {
         self.hooks.fire_hook(event_name, input, context).await
     }
 
@@ -1024,7 +1133,9 @@ impl QueryEngine {
         let mut ctx = std::collections::HashMap::new();
         ctx.insert("turn_number".to_string(), turn_number.to_string());
         ctx.insert("stop_reason".to_string(), stop_reason.to_string());
-        self.hooks.fire_hook("TurnEnd", &format!("turn_{turn_number}"), &ctx).await
+        self.hooks
+            .fire_hook("TurnEnd", &format!("turn_{turn_number}"), &ctx)
+            .await
     }
 
     /// Set the JSON schema for structured output validation.
@@ -1127,7 +1238,12 @@ impl QueryEngine {
                     ) {
                         // If the last message is a tool result, the model needs another turn
                         if matches!(reason, TerminalReason::Completed)
-                            && self.session.messages.last().map(|m| matches!(m.role, crate::types::Role::Tool)).unwrap_or(false)
+                            && self
+                                .session
+                                .messages
+                                .last()
+                                .map(|m| matches!(m.role, crate::types::Role::Tool))
+                                .unwrap_or(false)
                         {
                             turn_number += 1;
                         } else {
@@ -1195,7 +1311,10 @@ impl QueryEngine {
             turn.reset();
 
             // Execute the turn using streaming
-            match self.execute_turn_streaming(&mut turn, &options, turn_number).await {
+            match self
+                .execute_turn_streaming(&mut turn, &options, turn_number)
+                .await
+            {
                 Ok(reason) => {
                     self.current_turn = turn_number;
                     last_reason = reason.clone();
@@ -1215,7 +1334,12 @@ impl QueryEngine {
                     ) {
                         // If the last message is a tool result, the model needs another turn
                         if matches!(reason, TerminalReason::Completed)
-                            && self.session.messages.last().map(|m| matches!(m.role, crate::types::Role::Tool)).unwrap_or(false)
+                            && self
+                                .session
+                                .messages
+                                .last()
+                                .map(|m| matches!(m.role, crate::types::Role::Tool))
+                                .unwrap_or(false)
                         {
                             turn_number += 1;
                         } else {
@@ -1285,7 +1409,8 @@ impl QueryEngine {
 
         // Record budget and cost
         turn.budget.record_tokens(&api_response.usage);
-        self.cost_tracker.record_usage(&api_response.usage, &self.model);
+        self.cost_tracker
+            .record_usage(&api_response.usage, &self.model);
         self.last_usage = Some(api_response.usage);
 
         // Parse the response
@@ -1297,16 +1422,20 @@ impl QueryEngine {
         // Elicitation heuristic: if the assistant asks a short question, prompt the user
         let mut api_response = api_response;
         if options.handle_elicitation && content.trim().ends_with('?') && content.len() < 200 {
-            let result = self.handle_elicitation(turn, format!("elic_{turn_number}"), content.clone()).await;
+            let result = self
+                .handle_elicitation(turn, format!("elic_{turn_number}"), content.clone())
+                .await;
             if let ElicitationResult::Responded(resp) = result {
-                if let Some(user_text) = resp.other_text.or_else(|| resp.selected.first().cloned()) {
+                if let Some(user_text) = resp.other_text.or_else(|| resp.selected.first().cloned())
+                {
                     let user_msg = Message::user(user_text);
                     turn.messages.push(user_msg.clone());
                     self.session.messages.push(user_msg);
                     // Re-send request with clarified context
                     api_response = self.send_request(turn, options).await?;
                     turn.budget.record_tokens(&api_response.usage);
-                    self.cost_tracker.record_usage(&api_response.usage, &self.model);
+                    self.cost_tracker
+                        .record_usage(&api_response.usage, &self.model);
                     self.last_usage = Some(api_response.usage);
                     let new_content = self.validate_structured_output(api_response.content.clone());
                     let elic_assistant = Message::assistant(new_content);
@@ -1321,6 +1450,18 @@ impl QueryEngine {
         if tool_calls.is_empty() {
             tool_calls = self.extract_inline_tool_calls_from_text(&content);
         }
+        if tool_calls.is_empty() {
+            if let Some(inferred) = self.infer_read_tool_call_from_user_prompt(turn) {
+                tool_calls.push(inferred);
+            }
+        }
+        let fallback_tool_calls =
+            !tool_calls.is_empty() && tool_calls.iter().all(Self::is_fallback_tool_call);
+        let short_circuit_read_turn = self.infer_read_tool_call_from_user_prompt(turn).is_some()
+            && !tool_calls.is_empty()
+            && tool_calls
+                .iter()
+                .all(|tc| tc.name.eq_ignore_ascii_case("read"));
 
         if tool_calls.is_empty() {
             // No tool calls — turn is complete
@@ -1337,7 +1478,8 @@ impl QueryEngine {
                     turn.transition_to(TurnState::StartRequest);
                     let api_response = self.send_request(turn, options).await?;
                     turn.budget.record_tokens(&api_response.usage);
-                    self.cost_tracker.record_usage(&api_response.usage, &self.model);
+                    self.cost_tracker
+                        .record_usage(&api_response.usage, &self.model);
                     self.last_usage = Some(api_response.usage);
                     let content = self.validate_structured_output(api_response.content.clone());
                     let assistant_msg = Message::assistant(content);
@@ -1351,8 +1493,11 @@ impl QueryEngine {
                     }
 
                     turn.transition_to(TurnState::Finalize);
-                    self.cost_tracker.end_turn(turn_number, &api_response.usage, &self.model);
-                    let _ = self.fire_turn_end_hook(turn_number, &api_response.stop_reason).await;
+                    self.cost_tracker
+                        .end_turn(turn_number, &api_response.usage, &self.model);
+                    let _ = self
+                        .fire_turn_end_hook(turn_number, &api_response.stop_reason)
+                        .await;
 
                     if api_response.stop_reason == "max_tokens" {
                         if let Some(reason) = self.record_and_check_loop(&[]) {
@@ -1371,8 +1516,11 @@ impl QueryEngine {
             }
 
             turn.transition_to(TurnState::Finalize);
-            self.cost_tracker.end_turn(turn_number, &api_response.usage, &self.model);
-            let _ = self.fire_turn_end_hook(turn_number, &api_response.stop_reason).await;
+            self.cost_tracker
+                .end_turn(turn_number, &api_response.usage, &self.model);
+            let _ = self
+                .fire_turn_end_hook(turn_number, &api_response.stop_reason)
+                .await;
 
             if api_response.stop_reason == "max_tokens" {
                 if let Some(reason) = self.record_and_check_loop(&[]) {
@@ -1387,10 +1535,10 @@ impl QueryEngine {
         }
 
         // Phase 5: Execute tools
-        turn.pending_tool_calls = tool_calls
-            .iter()
-            .map(PendingToolCall::from)
-            .collect();
+        if !fallback_tool_calls {
+            self.persist_assistant_tool_calls(turn, &tool_calls);
+        }
+        turn.pending_tool_calls = tool_calls.iter().map(PendingToolCall::from).collect();
         let pending_for_loop = turn.pending_tool_calls.clone();
 
         turn.transition_to(TurnState::ExecuteTools);
@@ -1399,8 +1547,20 @@ impl QueryEngine {
         // Phase 6: Apply tool results
         turn.transition_to(TurnState::ApplyToolResults);
         for result in &tool_results {
-            let msg = Message::tool(result.clone());
-            self.session.messages.push(msg);
+            if !fallback_tool_calls && !short_circuit_read_turn {
+                let msg = Message::tool(result.clone());
+                self.session.messages.push(msg);
+            }
+            if (fallback_tool_calls
+                || short_circuit_read_turn
+                || result.tool_call_id.starts_with("inferred_read_"))
+                && !result.output.is_empty()
+                && !Self::content_mentions_tool_output(&content, &result.output)
+            {
+                let _ = self
+                    .event_tx
+                    .send(EngineEvent::TextDelta(result.output.clone()));
+            }
         }
 
         // Phase 7: Evaluate continuation
@@ -1411,21 +1571,30 @@ impl QueryEngine {
                 turn.transition_to(TurnState::CompactRecovery);
                 if let Err(e) = self.run_compact_recovery(turn, options, turn_number).await {
                     turn.terminate(TerminalReason::Error(e.clone()));
-                    self.cost_tracker.end_turn(turn_number, &api_response.usage, &self.model);
+                    self.cost_tracker
+                        .end_turn(turn_number, &api_response.usage, &self.model);
                     return Ok(TerminalReason::Error(e));
                 }
                 // After compact, tool results are still pending — the caller
                 // will start the next turn with the compacted context
             } else {
                 turn.terminate(TerminalReason::BudgetExhausted);
-                self.cost_tracker.end_turn(turn_number, &api_response.usage, &self.model);
+                self.cost_tracker
+                    .end_turn(turn_number, &api_response.usage, &self.model);
                 return Ok(TerminalReason::BudgetExhausted);
             }
         }
 
         turn.transition_to(TurnState::Finalize);
-        self.cost_tracker.end_turn(turn_number, &api_response.usage, &self.model);
-        let _ = self.fire_turn_end_hook(turn_number, &api_response.stop_reason).await;
+        self.cost_tracker
+            .end_turn(turn_number, &api_response.usage, &self.model);
+        let _ = self
+            .fire_turn_end_hook(turn_number, &api_response.stop_reason)
+            .await;
+
+        if fallback_tool_calls || short_circuit_read_turn {
+            return Ok(TerminalReason::Completed);
+        }
 
         // If we have tool results, the model needs another turn
         // Return Completed here — the caller will start the next turn
@@ -1496,9 +1665,12 @@ impl QueryEngine {
 
         // Elicitation heuristic: if the assistant asks a short question, prompt the user
         if options.handle_elicitation && content.trim().ends_with('?') && content.len() < 200 {
-            let result = self.handle_elicitation(turn, format!("elic_{turn_number}"), content.clone()).await;
+            let result = self
+                .handle_elicitation(turn, format!("elic_{turn_number}"), content.clone())
+                .await;
             if let ElicitationResult::Responded(resp) = result {
-                if let Some(user_text) = resp.other_text.or_else(|| resp.selected.first().cloned()) {
+                if let Some(user_text) = resp.other_text.or_else(|| resp.selected.first().cloned())
+                {
                     let user_msg = Message::user(user_text);
                     turn.messages.push(user_msg.clone());
                     self.session.messages.push(user_msg);
@@ -1525,11 +1697,26 @@ impl QueryEngine {
             let msg = Message::tool(result.clone());
             self.session.messages.push(msg);
         }
-        tracing::info!("session.messages after early_results: {:?}", self.session.messages.len());
+        tracing::info!(
+            "session.messages after early_results: {:?}",
+            self.session.messages.len()
+        );
 
         if tool_calls.is_empty() {
             tool_calls = self.extract_inline_tool_calls_from_text(&content);
         }
+        if tool_calls.is_empty() {
+            if let Some(inferred) = self.infer_read_tool_call_from_user_prompt(turn) {
+                tool_calls.push(inferred);
+            }
+        }
+        let fallback_tool_calls =
+            !tool_calls.is_empty() && tool_calls.iter().all(Self::is_fallback_tool_call);
+        let short_circuit_read_turn = self.infer_read_tool_call_from_user_prompt(turn).is_some()
+            && !tool_calls.is_empty()
+            && tool_calls
+                .iter()
+                .all(|tc| tc.name.eq_ignore_ascii_case("read"));
 
         if tool_calls.is_empty() {
             // No tool calls — turn complete
@@ -1577,10 +1764,10 @@ impl QueryEngine {
         }
 
         // Phase 5: Execute tools
-        turn.pending_tool_calls = tool_calls
-            .iter()
-            .map(PendingToolCall::from)
-            .collect();
+        if !fallback_tool_calls {
+            self.persist_assistant_tool_calls(turn, &tool_calls);
+        }
+        turn.pending_tool_calls = tool_calls.iter().map(PendingToolCall::from).collect();
         let pending_for_loop = turn.pending_tool_calls.clone();
 
         turn.transition_to(TurnState::ExecuteTools);
@@ -1589,8 +1776,20 @@ impl QueryEngine {
         // Phase 6: Apply tool results
         turn.transition_to(TurnState::ApplyToolResults);
         for result in &tool_results {
-            let msg = Message::tool(result.clone());
-            self.session.messages.push(msg);
+            if !fallback_tool_calls && !short_circuit_read_turn {
+                let msg = Message::tool(result.clone());
+                self.session.messages.push(msg);
+            }
+            if (fallback_tool_calls
+                || short_circuit_read_turn
+                || result.tool_call_id.starts_with("inferred_read_"))
+                && !result.output.is_empty()
+                && !Self::content_mentions_tool_output(&content, &result.output)
+            {
+                let _ = self
+                    .event_tx
+                    .send(EngineEvent::TextDelta(result.output.clone()));
+            }
         }
 
         // Phase 7: Evaluate continuation
@@ -1614,6 +1813,10 @@ impl QueryEngine {
         self.cost_tracker.end_turn(turn_number, &usage, &self.model);
         let _ = self.fire_turn_end_hook(turn_number, "end_turn").await;
 
+        if fallback_tool_calls || short_circuit_read_turn {
+            return Ok(TerminalReason::Completed);
+        }
+
         if let Some(reason) = self.record_and_check_loop(&pending_for_loop) {
             return Ok(reason);
         }
@@ -1634,9 +1837,7 @@ impl QueryEngine {
         match result {
             ValidationResult::Valid(_) => content,
             ValidationResult::Invalid { error, retries } => {
-                tracing::warn!(
-                    "Structured output validation failed: {error} (retry {retries})"
-                );
+                tracing::warn!("Structured output validation failed: {error} (retry {retries})");
                 let warning = format!("\n\n<!-- Structured output validation failed: {error} -->");
                 format!("{content}{warning}")
             }
@@ -1644,11 +1845,7 @@ impl QueryEngine {
     }
 
     /// Build the prompt context from session state.
-    fn build_context(
-        &mut self,
-        turn: &mut TurnRuntime,
-        options: &SubmitOptions,
-    ) {
+    fn build_context(&mut self, turn: &mut TurnRuntime, options: &SubmitOptions) {
         // Assemble context using PromptCompiler
         let available_tools = self.tools.list_tools();
         let ctx = PromptContext {
@@ -1774,9 +1971,7 @@ impl QueryEngine {
             CompactStrategy::Auto => {
                 compact::auto_compact(&turn.messages, self.compact_config.auto_compact_threshold)
             }
-            CompactStrategy::Reactive => {
-                compact::reactive_compact(&turn.messages, 3)
-            }
+            CompactStrategy::Reactive => compact::reactive_compact(&turn.messages, 3),
             CompactStrategy::Snip => {
                 compact::snip_compact(&turn.messages, self.compact_config.snip_target_tokens)
             }
@@ -1816,9 +2011,17 @@ impl QueryEngine {
 
         // Fire PostCompact hook
         let mut ctx = std::collections::HashMap::new();
-        ctx.insert("tokens_removed".to_string(), result.tokens_removed.to_string());
-        ctx.insert("messages_remaining".to_string(), messages_remaining.to_string());
-        let post_compact_result = self.fire_hook("PostCompact", "compact_complete", &ctx).await;
+        ctx.insert(
+            "tokens_removed".to_string(),
+            result.tokens_removed.to_string(),
+        );
+        ctx.insert(
+            "messages_remaining".to_string(),
+            messages_remaining.to_string(),
+        );
+        let post_compact_result = self
+            .fire_hook("PostCompact", "compact_complete", &ctx)
+            .await;
         if !post_compact_result.errors.is_empty() {
             tracing::warn!("PostCompact hook errors: {:?}", post_compact_result.errors);
         }
@@ -1835,10 +2038,7 @@ impl QueryEngine {
     /// Write a full replacement to the transcript file with the given messages.
     ///
     /// Uses a temp file + atomic rename for crash safety.
-    fn write_transcript_replacement(
-        path: &PathBuf,
-        messages: &[Message],
-    ) -> std::io::Result<()> {
+    fn write_transcript_replacement(path: &PathBuf, messages: &[Message]) -> std::io::Result<()> {
         use std::io::Write;
 
         if let Some(parent) = path.parent() {
@@ -1899,29 +2099,7 @@ impl QueryEngine {
             .collect::<Vec<_>>()
             .join("\n\n");
 
-        let messages: Vec<serde_json::Value> = turn
-            .messages
-            .iter()
-            .filter(|m| !matches!(m.role, crate::types::Role::System))
-            .filter_map(|m| {
-                let role_str = match m.role {
-                    crate::types::Role::User => "user",
-                    crate::types::Role::Assistant => "assistant",
-                    crate::types::Role::Tool => "tool",
-                    _ => return None,
-                };
-                let content = match &m.content {
-                    crate::types::MessageContent::Text(t) => serde_json::Value::String(t.clone()),
-                    crate::types::MessageContent::ToolCall(tc) => serde_json::json!([
-                        {"type": "tool_use", "id": &tc.id, "name": &tc.name, "input": &tc.input}
-                    ]),
-                    crate::types::MessageContent::ToolResult(tr) => serde_json::json!([
-                        {"type": "tool_result", "tool_use_id": &tr.tool_call_id, "content": &tr.output}
-                    ]),
-                };
-                Some(serde_json::json!({"role": role_str, "content": content}))
-            })
-            .collect();
+        let messages = Self::provider_messages(&turn.messages);
 
         let tools = self.tools.list_tools();
         let response = match self
@@ -1930,11 +2108,16 @@ impl QueryEngine {
             .await
         {
             Ok(resp) => resp,
-            Err(crate::api_client::ApiError::RetryExhausted { attempts, last_error_message: _ }) => {
+            Err(crate::api_client::ApiError::RetryExhausted {
+                attempts,
+                last_error_message: _,
+            }) => {
                 let msg = format!(
                     "The AI service is temporarily unavailable after {attempts} attempts. Please try again later."
                 );
-                let _ = self.event_tx.send(EngineEvent::Notification { message: msg.clone() });
+                let _ = self.event_tx.send(EngineEvent::Notification {
+                    message: msg.clone(),
+                });
                 return Err(msg);
             }
             Err(e) => return Err(e.to_string()),
@@ -1974,29 +2157,7 @@ impl QueryEngine {
             .collect::<Vec<_>>()
             .join("\n\n");
 
-        let messages: Vec<serde_json::Value> = turn
-            .messages
-            .iter()
-            .filter(|m| !matches!(m.role, crate::types::Role::System))
-            .filter_map(|m| {
-                let role_str = match m.role {
-                    crate::types::Role::User => "user",
-                    crate::types::Role::Assistant => "assistant",
-                    crate::types::Role::Tool => "tool",
-                    _ => return None,
-                };
-                let content = match &m.content {
-                    crate::types::MessageContent::Text(t) => serde_json::Value::String(t.clone()),
-                    crate::types::MessageContent::ToolCall(tc) => serde_json::json!([
-                        {"type": "tool_use", "id": &tc.id, "name": &tc.name, "input": &tc.input}
-                    ]),
-                    crate::types::MessageContent::ToolResult(tr) => serde_json::json!([
-                        {"type": "tool_result", "tool_use_id": &tr.tool_call_id, "content": &tr.output}
-                    ]),
-                };
-                Some(serde_json::json!({"role": role_str, "content": content}))
-            })
-            .collect();
+        let messages = Self::provider_messages(&turn.messages);
 
         let tools = self.tools.list_tools();
         let mut stream = self
@@ -2014,6 +2175,7 @@ impl QueryEngine {
         let mut text_so_far = String::new();
         let mut early_results: Vec<ToolResult> = Vec::new();
         let mut deferred_calls: Vec<ToolCall> = Vec::new();
+        let mut stream_failed = false;
 
         while let Some(event) = stream.next().await {
             match event.clone() {
@@ -2044,6 +2206,7 @@ impl QueryEngine {
                         "streaming network error ({} bytes received so far): {e}",
                         text_so_far.len()
                     );
+                    stream_failed = true;
                     // Fail-open: stop consuming the stream but return whatever
                     // partial text and tool calls we have gathered so far.
                     break;
@@ -2083,6 +2246,19 @@ impl QueryEngine {
         for call in all_completed {
             if !early_ids.contains(&call.id) {
                 deferred_calls.push(call);
+            }
+        }
+
+        if stream_failed
+            && text_so_far.is_empty()
+            && early_results.is_empty()
+            && deferred_calls.is_empty()
+        {
+            tracing::info!(
+                "streaming request yielded no usable events; retrying same turn non-streaming"
+            );
+            if let Ok(resp) = self.send_request(turn, options).await {
+                return Ok((resp.content, resp.tool_calls, Vec::new(), resp.usage));
             }
         }
 
@@ -2166,10 +2342,17 @@ impl QueryEngine {
 
                 let mut ctx = std::collections::HashMap::new();
                 ctx.insert("tool_call_id".to_string(), call.id.clone());
-                ctx.insert("tool_output_len".to_string(), result.output.len().to_string());
+                ctx.insert(
+                    "tool_output_len".to_string(),
+                    result.output.len().to_string(),
+                );
                 let post_result = self.hooks.fire_hook("PostToolUse", &call.name, &ctx).await;
                 if !post_result.errors.is_empty() {
-                    tracing::warn!("PostToolUse hook errors for {}: {:?}", call.name, post_result.errors);
+                    tracing::warn!(
+                        "PostToolUse hook errors for {}: {:?}",
+                        call.name,
+                        post_result.errors
+                    );
                 }
 
                 let _ = self.event_tx.send(EngineEvent::ToolCallEnd {
@@ -2196,9 +2379,16 @@ impl QueryEngine {
                 let mut ctx = std::collections::HashMap::new();
                 ctx.insert("tool_call_id".to_string(), call.id.clone());
                 ctx.insert("reason".to_string(), reason.clone());
-                let fail_result = self.hooks.fire_hook("PostToolUseFail", &call.name, &ctx).await;
+                let fail_result = self
+                    .hooks
+                    .fire_hook("PostToolUseFail", &call.name, &ctx)
+                    .await;
                 if !fail_result.errors.is_empty() {
-                    tracing::warn!("PostToolUseFail hook errors for {}: {:?}", call.name, fail_result.errors);
+                    tracing::warn!(
+                        "PostToolUseFail hook errors for {}: {:?}",
+                        call.name,
+                        fail_result.errors
+                    );
                 }
                 let _ = self.event_tx.send(EngineEvent::ToolCallEnd {
                     id: call.id.clone(),
@@ -2219,9 +2409,16 @@ impl QueryEngine {
                 let mut ctx = std::collections::HashMap::new();
                 ctx.insert("tool_call_id".to_string(), call.id.clone());
                 ctx.insert("reason".to_string(), reason.clone());
-                let fail_result = self.hooks.fire_hook("PostToolUseFail", &call.name, &ctx).await;
+                let fail_result = self
+                    .hooks
+                    .fire_hook("PostToolUseFail", &call.name, &ctx)
+                    .await;
                 if !fail_result.errors.is_empty() {
-                    tracing::warn!("PostToolUseFail hook errors for {}: {:?}", call.name, fail_result.errors);
+                    tracing::warn!(
+                        "PostToolUseFail hook errors for {}: {:?}",
+                        call.name,
+                        fail_result.errors
+                    );
                 }
                 let _ = self.event_tx.send(EngineEvent::ToolCallEnd {
                     id: call.id.clone(),
@@ -2319,7 +2516,9 @@ impl QueryEngine {
         let mut ctx = std::collections::HashMap::new();
         ctx.insert("tool_call_id".to_string(), elevation.tool_call_id.clone());
         ctx.insert("tool_input".to_string(), elevation.input.to_string());
-        let pre_hook = self.fire_hook("PreToolUse", &elevation.tool_name, &ctx).await;
+        let pre_hook = self
+            .fire_hook("PreToolUse", &elevation.tool_name, &ctx)
+            .await;
         if pre_hook.stop {
             // Restore mode
             {
@@ -2355,7 +2554,11 @@ impl QueryEngine {
             PermissionResult::Allow | PermissionResult::AllowForPath { .. } => {
                 let outcome = self
                     .tools
-                    .execute(&elevation.tool_call_id, &elevation.tool_name, &elevation.input)
+                    .execute(
+                        &elevation.tool_call_id,
+                        &elevation.tool_name,
+                        &elevation.input,
+                    )
                     .await;
                 outcome.result
             }
@@ -2414,8 +2617,13 @@ mod tests {
         let perm_engine = PermissionEngine::new(checker);
         let session = SessionState::new(std::path::PathBuf::from("/tmp/test"));
         let api = MockApiClient;
-        let mut engine =
-            QueryEngine::new(Box::new(api), ModelId::sonnet(), session.clone(), perm_engine, tx);
+        let mut engine = QueryEngine::new(
+            Box::new(api),
+            ModelId::sonnet(),
+            session.clone(),
+            perm_engine,
+            tx,
+        );
         engine.set_tool_executor(Box::new(StubOkToolExecutor));
         (engine, rx, session)
     }
@@ -2480,9 +2688,7 @@ mod tests {
             _model: &ModelId,
             _max_tokens: u32,
             _tools: &[crate::tool_executor::ToolInfo],
-        ) -> std::pin::Pin<
-            Box<dyn futures::Stream<Item = StreamEvent> + Send + 'static>,
-        > {
+        ) -> std::pin::Pin<Box<dyn futures::Stream<Item = StreamEvent> + Send + 'static>> {
             let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
             let _ = tx.send(StreamEvent::StreamEnd);
             Box::pin(futures::stream::unfold(rx, |mut rx| async move {
@@ -2585,7 +2791,6 @@ mod tests {
         assert!(opts.handle_elicitation);
     }
 
-
     #[test]
     fn build_context_loads_session_messages() {
         let (engine, _rx, _session) = make_test_engine();
@@ -2660,7 +2865,8 @@ mod tests {
                 _model: &ModelId,
                 _max_tokens: u32,
                 _tools: &[crate::tool_executor::ToolInfo],
-            ) -> std::pin::Pin<Box<dyn futures::Stream<Item = StreamEvent> + Send + 'static>> {
+            ) -> std::pin::Pin<Box<dyn futures::Stream<Item = StreamEvent> + Send + 'static>>
+            {
                 let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
                 let _ = tx.send(StreamEvent::StreamEnd);
                 Box::pin(futures::stream::unfold(rx, |mut rx| async move {
@@ -2700,7 +2906,10 @@ mod tests {
                 break;
             }
         }
-        assert!(found_notification, "expected Notification event to be emitted");
+        assert!(
+            found_notification,
+            "expected Notification event to be emitted"
+        );
     }
 
     #[tokio::test]
@@ -2809,8 +3018,7 @@ mod tests {
     #[test]
     fn structured_output_validator_respects_max_retries() {
         let schema = serde_json::json!({ "type": "object" });
-        let validator = StructuredOutputValidator::new(schema)
-            .with_max_retries(2);
+        let validator = StructuredOutputValidator::new(schema).with_max_retries(2);
         let result = validator.validate("bad", 2);
         assert!(matches!(result, ValidationResult::Invalid { retries, .. } if retries == 2));
     }
@@ -3057,6 +3265,77 @@ mod tests {
         assert!(calls.is_empty());
     }
 
+    #[test]
+    fn infer_read_tool_call_from_user_prompt_extracts_path() {
+        let (mut engine, _rx, _session) = make_test_engine();
+        engine.set_tool_executor(Box::new(CatalogOnlyExecutor));
+        let mut turn = TurnRuntime::new(TokenBudget::with_defaults());
+        turn.messages
+            .push(Message::user("Read src/lib.rs and list functions"));
+
+        let call = engine.infer_read_tool_call_from_user_prompt(&turn).unwrap();
+        assert_eq!(call.name, "Read");
+        assert_eq!(call.input["file_path"], "src/lib.rs");
+    }
+
+    #[test]
+    fn provider_messages_map_tool_result_to_user_role() {
+        let tool_call = ToolCall {
+            id: "tc_1".into(),
+            name: "Read".into(),
+            input: serde_json::json!({"file_path": "src/lib.rs"}),
+        };
+        let tool_result = ToolResult {
+            tool_call_id: "tc_1".into(),
+            output: "file body".into(),
+            is_error: false,
+        };
+        let messages = QueryEngine::provider_messages(&[
+            Message::user("Read src/lib.rs"),
+            Message {
+                role: crate::types::Role::Assistant,
+                content: crate::types::MessageContent::ToolCall(tool_call),
+            },
+            Message::tool(tool_result),
+        ]);
+
+        assert_eq!(messages.len(), 3);
+        assert_eq!(messages[0]["role"], "user");
+        assert_eq!(messages[1]["role"], "assistant");
+        assert_eq!(messages[1]["content"][0]["type"], "tool_use");
+        assert_eq!(messages[2]["role"], "user");
+        assert_eq!(messages[2]["content"][0]["type"], "tool_result");
+        assert_eq!(messages[2]["content"][0]["tool_use_id"], "tc_1");
+    }
+
+    #[test]
+    fn persist_assistant_tool_calls_records_tool_use_messages() {
+        let (mut engine, _rx, _session) = make_test_engine();
+        let mut turn = TurnRuntime::new(TokenBudget::with_defaults());
+        let tool_call = ToolCall {
+            id: "tc_1".into(),
+            name: "Read".into(),
+            input: serde_json::json!({"file_path": "src/lib.rs"}),
+        };
+
+        engine.persist_assistant_tool_calls(&mut turn, std::slice::from_ref(&tool_call));
+
+        assert!(matches!(
+            turn.messages.first(),
+            Some(Message {
+                role: crate::types::Role::Assistant,
+                content: crate::types::MessageContent::ToolCall(tc),
+            }) if tc.id == "tc_1"
+        ));
+        assert!(matches!(
+            engine.session.messages.last(),
+            Some(Message {
+                role: crate::types::Role::Assistant,
+                content: crate::types::MessageContent::ToolCall(tc),
+            }) if tc.id == "tc_1"
+        ));
+    }
+
     // ─── Elicitation Integration ───────────────────────────────────────────
 
     #[tokio::test]
@@ -3065,11 +3344,9 @@ mod tests {
         let budget = TokenBudget::with_defaults();
         let mut turn = TurnRuntime::new(budget);
 
-        let result = engine.handle_elicitation(
-            &mut turn,
-            "elic_1".into(),
-            "Which approach?".into(),
-        ).await;
+        let result = engine
+            .handle_elicitation(&mut turn, "elic_1".into(), "Which approach?".into())
+            .await;
         // Default handler returns Cancelled
         assert!(matches!(result, ElicitationResult::Cancelled));
         // Turn state should be AwaitElicitation
@@ -3081,7 +3358,8 @@ mod tests {
         let (mut engine, _rx, _session) = make_test_engine();
         // Can set a custom handler
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
-        engine.set_elicitation_handler(Box::new(crate::elicitation::SdkElicitationHandler::new(tx)));
+        engine
+            .set_elicitation_handler(Box::new(crate::elicitation::SdkElicitationHandler::new(tx)));
         // Handler was set without error
     }
 
@@ -3144,7 +3422,8 @@ mod tests {
                 _model: &ModelId,
                 _max_tokens: u32,
                 _tools: &[crate::tool_executor::ToolInfo],
-            ) -> std::pin::Pin<Box<dyn futures::Stream<Item = StreamEvent> + Send + 'static>> {
+            ) -> std::pin::Pin<Box<dyn futures::Stream<Item = StreamEvent> + Send + 'static>>
+            {
                 let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
                 let _ = tx.send(StreamEvent::StreamEnd);
                 Box::pin(futures::stream::unfold(rx, |mut rx| async move {
@@ -3176,13 +3455,8 @@ mod tests {
         let api = StatefulMock {
             call_count: AtomicUsize::new(0),
         };
-        let mut engine = QueryEngine::new(
-            Box::new(api),
-            ModelId::sonnet(),
-            session,
-            perm_engine,
-            tx,
-        );
+        let mut engine =
+            QueryEngine::new(Box::new(api), ModelId::sonnet(), session, perm_engine, tx);
         engine.set_tool_executor(Box::new(StubOkToolExecutor));
         engine.set_elicitation_handler(Box::new(TestElicitationHandler));
 
@@ -3200,21 +3474,32 @@ mod tests {
             .messages
             .iter()
             .filter_map(|m| match (&m.role, &m.content) {
-                (crate::types::Role::User, crate::types::MessageContent::Text(t)) => Some(t.clone()),
+                (crate::types::Role::User, crate::types::MessageContent::Text(t)) => {
+                    Some(t.clone())
+                }
                 _ => None,
             })
             .collect();
-        assert!(user_texts.iter().any(|t| t == "Approach A"), "expected user clarification in turn messages");
+        assert!(
+            user_texts.iter().any(|t| t == "Approach A"),
+            "expected user clarification in turn messages"
+        );
 
         let assistant_texts: Vec<String> = turn
             .messages
             .iter()
             .filter_map(|m| match (&m.role, &m.content) {
-                (crate::types::Role::Assistant, crate::types::MessageContent::Text(t)) => Some(t.clone()),
+                (crate::types::Role::Assistant, crate::types::MessageContent::Text(t)) => {
+                    Some(t.clone())
+                }
                 _ => None,
             })
             .collect();
-        assert_eq!(assistant_texts.len(), 2, "expected two assistant messages: question and answer");
+        assert_eq!(
+            assistant_texts.len(),
+            2,
+            "expected two assistant messages: question and answer"
+        );
         assert_eq!(assistant_texts[1], "Using approach A.");
 
         // session.messages should contain the user clarification
@@ -3247,10 +3532,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("test.jsonl");
 
-        let messages = vec![
-            Message::user("hello"),
-            Message::assistant("world"),
-        ];
+        let messages = vec![Message::user("hello"), Message::assistant("world")];
 
         QueryEngine::write_transcript_replacement(&path, &messages).unwrap();
         assert!(path.exists());
@@ -3267,16 +3549,18 @@ mod tests {
         let path = tmp.path().join("test.jsonl");
 
         // Write initial messages
-        QueryEngine::write_transcript_replacement(&path, &[
-            Message::user("old1"),
-            Message::user("old2"),
-            Message::user("old3"),
-        ]).unwrap();
+        QueryEngine::write_transcript_replacement(
+            &path,
+            &[
+                Message::user("old1"),
+                Message::user("old2"),
+                Message::user("old3"),
+            ],
+        )
+        .unwrap();
 
         // Replace with fewer messages
-        QueryEngine::write_transcript_replacement(&path, &[
-            Message::user("new"),
-        ]).unwrap();
+        QueryEngine::write_transcript_replacement(&path, &[Message::user("new")]).unwrap();
 
         let content = std::fs::read_to_string(&path).unwrap();
         let lines: Vec<&str> = content.lines().collect();
@@ -3288,9 +3572,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("test.jsonl");
 
-        QueryEngine::write_transcript_replacement(&path, &[
-            Message::user("before"),
-        ]).unwrap();
+        QueryEngine::write_transcript_replacement(&path, &[Message::user("before")]).unwrap();
 
         QueryEngine::append_transcript_boundary(&path).unwrap();
 

@@ -4,20 +4,128 @@
 //! 10.1 streaming, 10.2 retry/fallback, 10.3 TokenBudget, 10.4 CostTracker, 10.5 model routing
 
 use std::pin::Pin;
+use std::sync::{Mutex, OnceLock};
 
-use coderex_core::api_client::{ApiClient, ApiError, ApiResponse, StreamEvent};
+use async_trait::async_trait;
+use coderex_core::api_client::{
+    AnthropicApiClient, ApiClient, ApiConfig, ApiError, ApiResponse, StreamEvent,
+};
 use coderex_core::budget::{BudgetThresholds, TokenBudget};
 use coderex_core::cost::{CostTracker, ModelPricing, pricing_for_model};
 use coderex_core::model_router::ModelRouter;
 use coderex_core::provider::{Provider, ProviderCapabilities, ProviderError, ProviderErrorKind};
-use coderex_core::types::{ModelId, UsageSummary};
-use async_trait::async_trait;
-use futures::Stream;
+use coderex_core::providers::OpenAiCompatibleProvider;
 use coderex_core::tool_executor::ToolInfo;
+use coderex_core::types::{ModelId, UsageSummary};
+use futures::{Stream, StreamExt};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpListener;
 
 // ═══════════════════════════════════════════════════════════════════════════
 //  Mock Providers
 // ═══════════════════════════════════════════════════════════════════════════
+
+fn env_lock() -> &'static Mutex<()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+}
+
+#[derive(Debug)]
+struct CapturedRequest {
+    headers: std::collections::HashMap<String, String>,
+    body: serde_json::Value,
+}
+
+async fn read_captured_request(socket: &mut tokio::net::TcpStream) -> CapturedRequest {
+    let mut buffer = Vec::new();
+    let header_end = loop {
+        let mut chunk = [0u8; 1024];
+        let n = socket.read(&mut chunk).await.expect("read request");
+        assert!(n > 0, "request closed before headers");
+        buffer.extend_from_slice(&chunk[..n]);
+        if let Some(pos) = buffer.windows(4).position(|w| w == b"\r\n\r\n") {
+            break pos + 4;
+        }
+    };
+
+    let header_text = String::from_utf8_lossy(&buffer[..header_end]).to_string();
+    let mut lines = header_text.split("\r\n");
+    let _request_line = lines.next().unwrap_or_default();
+    let mut headers = std::collections::HashMap::new();
+    for line in lines {
+        if line.is_empty() {
+            continue;
+        }
+        if let Some((k, v)) = line.split_once(':') {
+            headers.insert(k.trim().to_ascii_lowercase(), v.trim().to_string());
+        }
+    }
+    let content_length = headers
+        .get("content-length")
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(0);
+    while buffer.len() < header_end + content_length {
+        let mut chunk = vec![0u8; content_length.max(1)];
+        let n = socket.read(&mut chunk).await.expect("read body");
+        assert!(n > 0, "request closed before body");
+        buffer.extend_from_slice(&chunk[..n]);
+    }
+    let body_bytes = &buffer[header_end..header_end + content_length];
+    let body: serde_json::Value = serde_json::from_slice(body_bytes).expect("json body");
+
+    CapturedRequest { headers, body }
+}
+
+async fn capture_single_request(
+    response_body: serde_json::Value,
+) -> (String, tokio::task::JoinHandle<CapturedRequest>) {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind listener");
+    let addr = listener.local_addr().expect("local addr");
+    let handle = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.expect("accept");
+        let captured = read_captured_request(&mut socket).await;
+
+        let response_text = response_body.to_string();
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            response_text.len(),
+            response_text
+        );
+        socket
+            .write_all(response.as_bytes())
+            .await
+            .expect("write response");
+        socket.shutdown().await.expect("shutdown");
+
+        captured
+    });
+    (format!("http://{}", addr), handle)
+}
+
+async fn capture_requests_with_raw_responses(
+    responses: Vec<String>,
+) -> (String, tokio::task::JoinHandle<Vec<CapturedRequest>>) {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind listener");
+    let addr = listener.local_addr().expect("local addr");
+    let handle = tokio::spawn(async move {
+        let mut captured = Vec::new();
+        for response in responses {
+            let (mut socket, _) = listener.accept().await.expect("accept");
+            captured.push(read_captured_request(&mut socket).await);
+            socket
+                .write_all(response.as_bytes())
+                .await
+                .expect("write response");
+            socket.shutdown().await.expect("shutdown");
+        }
+        captured
+    });
+    (format!("http://{}", addr), handle)
+}
 
 struct MockProvider {
     name: String,
@@ -66,6 +174,9 @@ impl Provider for MockProvider {
         ProviderCapabilities {
             streaming: true,
             tool_use: true,
+            structured_tool_streaming: true,
+            parallel_tool_calls: true,
+            text_tool_fallback: true,
             prompt_caching: false,
             vision: false,
         }
@@ -444,7 +555,10 @@ fn pricing_for_haiku() {
 #[tokio::test]
 async fn model_router_falls_back_on_failure() {
     let mut router = ModelRouter::new("test");
-    router.add_provider(Box::new(MockProvider::failing("fail1", ProviderErrorKind::Unavailable)));
+    router.add_provider(Box::new(MockProvider::failing(
+        "fail1",
+        ProviderErrorKind::Unavailable,
+    )));
     router.add_provider(Box::new(MockProvider::new("success1")));
 
     let result = router
@@ -458,7 +572,10 @@ async fn model_router_falls_back_on_failure() {
 #[tokio::test]
 async fn model_router_non_fallback_error_stops() {
     let mut router = ModelRouter::new("test");
-    router.add_provider(Box::new(MockProvider::failing("fail1", ProviderErrorKind::Auth)));
+    router.add_provider(Box::new(MockProvider::failing(
+        "fail1",
+        ProviderErrorKind::Auth,
+    )));
     router.add_provider(Box::new(MockProvider::new("success1")));
 
     let result = router
@@ -486,7 +603,9 @@ async fn model_router_model_filtered_providers() {
         Box::new(MockProvider::new("sonnet-only")),
         vec!["claude-sonnet".into()],
     );
-    router.add_provider(Box::new(MockProvider::new("fallback").with_response("from-fallback")));
+    router.add_provider(Box::new(
+        MockProvider::new("fallback").with_response("from-fallback"),
+    ));
 
     // Model that doesn't match the filter should still hit fallback
     let result = router
@@ -500,8 +619,14 @@ async fn model_router_model_filtered_providers() {
 #[tokio::test]
 async fn model_router_max_fallbacks_respected() {
     let mut router = ModelRouter::new("test").with_max_fallbacks(1);
-    router.add_provider(Box::new(MockProvider::failing("fail1", ProviderErrorKind::Unavailable)));
-    router.add_provider(Box::new(MockProvider::failing("fail2", ProviderErrorKind::Unavailable)));
+    router.add_provider(Box::new(MockProvider::failing(
+        "fail1",
+        ProviderErrorKind::Unavailable,
+    )));
+    router.add_provider(Box::new(MockProvider::failing(
+        "fail2",
+        ProviderErrorKind::Unavailable,
+    )));
     router.add_provider(Box::new(MockProvider::new("success1")));
 
     let result = router
@@ -544,7 +669,10 @@ async fn streaming_error_event() {
 #[tokio::test]
 async fn model_router_streaming_fallback() {
     let mut router = ModelRouter::new("test");
-    router.add_provider(Box::new(MockProvider::failing("fail1", ProviderErrorKind::Unavailable)));
+    router.add_provider(Box::new(MockProvider::failing(
+        "fail1",
+        ProviderErrorKind::Unavailable,
+    )));
     router.add_provider(Box::new(MockProvider::new("success1")));
 
     let stream = router
@@ -625,4 +753,234 @@ fn custom_pricing_override() {
     let cost = tracker.get_turn_cost();
 
     assert!((cost - 1.0).abs() < 1e-9);
+}
+
+#[tokio::test]
+async fn anthropic_client_sends_coderex_identity_headers_and_metadata() {
+    let _guard = env_lock().lock().expect("env lock");
+    let (base_url, handle) = capture_single_request(serde_json::json!({
+        "content": [{"type": "text", "text": "ok"}],
+        "usage": {"input_tokens": 1, "output_tokens": 1},
+        "stop_reason": "end_turn"
+    }))
+    .await;
+
+    let mut config = ApiConfig::new("test-key".into())
+        .with_session_id("sess-test")
+        .with_device_id("dev-test");
+    config.base_url = base_url;
+    let client = AnthropicApiClient::new(config);
+    let resp = client
+        .create_message("system", &[], &ModelId::sonnet(), 32, &[])
+        .await
+        .expect("anthropic request should succeed");
+    assert_eq!(resp.content, "ok");
+
+    let captured = handle.await.expect("server join");
+
+    assert_eq!(
+        captured.headers.get("x-coderex-client").map(String::as_str),
+        Some("cli")
+    );
+    assert_eq!(
+        captured
+            .headers
+            .get("x-coderex-session-id")
+            .map(String::as_str),
+        Some("sess-test")
+    );
+    assert!(captured.headers.contains_key("user-agent"));
+    let metadata_user_id = captured.body["metadata"]["user_id"]
+        .as_str()
+        .expect("metadata.user_id string");
+    let metadata_json: serde_json::Value =
+        serde_json::from_str(metadata_user_id).expect("metadata json");
+    assert_eq!(metadata_json["session_id"], "sess-test");
+    assert_eq!(metadata_json["device_id"], "dev-test");
+    assert_eq!(captured.body["messages"], serde_json::json!([]));
+}
+
+#[tokio::test]
+async fn anthropic_kimi_profile_suppresses_structured_tools() {
+    let _guard = env_lock().lock().expect("env lock");
+    let (base_url, handle) = capture_single_request(serde_json::json!({
+        "content": [{"type": "text", "text": "ok"}],
+        "usage": {"input_tokens": 1, "output_tokens": 1},
+        "stop_reason": "end_turn"
+    }))
+    .await;
+
+    let tool = ToolInfo {
+        name: "Read".into(),
+        description: "Read a file".into(),
+        input_schema: serde_json::json!({
+            "type": "object",
+            "properties": { "file_path": { "type": "string" } },
+            "required": ["file_path"]
+        }),
+    };
+
+    let mut config = ApiConfig::new("test-key".into()).with_provider_profile("kimi");
+    config.base_url = base_url;
+    let client = AnthropicApiClient::new(config);
+    let _ = client
+        .create_message("system", &[], &ModelId::sonnet(), 32, &[tool])
+        .await
+        .expect("kimi anthropic request should succeed");
+
+    let captured = handle.await.expect("server join");
+    assert!(captured.body.get("tools").is_none());
+}
+
+#[tokio::test]
+async fn openai_provider_sends_coderex_identity_headers_and_metadata() {
+    let _guard = env_lock().lock().expect("env lock");
+    let (base_url, handle) = capture_single_request(serde_json::json!({
+        "choices": [{
+            "message": {"content": "ok"},
+            "finish_reason": "stop"
+        }],
+        "usage": {"prompt_tokens": 2, "completion_tokens": 3}
+    }))
+    .await;
+
+    let mut headers = std::collections::BTreeMap::new();
+    headers.insert("X-Test".to_string(), "1".to_string());
+    let provider = OpenAiCompatibleProvider::new("openai", base_url, "test-key")
+        .with_provider_profile("dashscope")
+        .with_default_headers(headers)
+        .with_session_context("sess-openai", "dev-openai");
+    let resp = provider
+        .create_message("system", &[], &ModelId("gpt-4o".into()), 32, &[])
+        .await
+        .expect("openai request should succeed");
+    assert_eq!(resp.content, "ok");
+
+    let captured = handle.await.expect("server join");
+
+    assert_eq!(
+        captured.headers.get("x-coderex-client").map(String::as_str),
+        Some("cli")
+    );
+    assert_eq!(
+        captured
+            .headers
+            .get("x-coderex-session-id")
+            .map(String::as_str),
+        Some("sess-openai")
+    );
+    assert_eq!(
+        captured.headers.get("x-test").map(String::as_str),
+        Some("1")
+    );
+    assert_eq!(
+        captured
+            .headers
+            .get("x-dashscope-authtype")
+            .map(String::as_str),
+        Some("api_key")
+    );
+    assert!(captured.headers.contains_key("user-agent"));
+    assert_eq!(captured.body["metadata"]["sessionId"], "sess-openai");
+    assert_eq!(captured.body["metadata"]["deviceId"], "dev-openai");
+}
+
+#[tokio::test]
+async fn openai_provider_streaming_emits_text_tool_and_usage_events() {
+    let _guard = env_lock().lock().expect("env lock");
+    let sse = concat!(
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"I will \",\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"Read\",\"arguments\":\"{\\\"file\\\":\\\"src/\"}}]},\"finish_reason\":null}]}\n\n",
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"check it\",\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"lib.rs\\\"}\"}}]},\"finish_reason\":null}]}\n\n",
+        "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n",
+        "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":9,\"completion_tokens\":4}}\n\n",
+        "data: [DONE]\n\n"
+    );
+    let raw_response = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n{}",
+        sse
+    );
+    let (base_url, handle) = capture_requests_with_raw_responses(vec![raw_response]).await;
+
+    let tool = ToolInfo {
+        name: "Read".into(),
+        description: "Read a file".into(),
+        input_schema: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "file": { "type": "string" }
+            },
+            "required": ["file"]
+        }),
+    };
+    let provider = OpenAiCompatibleProvider::new("openai", base_url, "test-key")
+        .with_session_context("sess-stream", "dev-stream");
+
+    let events: Vec<_> = provider
+        .create_message_streaming("system", &[], &ModelId("gpt-4o".into()), 32, &[tool])
+        .await
+        .collect()
+        .await;
+
+    assert!(matches!(&events[0], StreamEvent::TextDelta(delta) if delta == "I will "));
+    assert!(
+        matches!(&events[1], StreamEvent::ToolCallBlockStart { id, name } if id == "call_1" && name == "Read")
+    );
+    assert!(
+        matches!(&events[2], StreamEvent::ToolCallInputDelta { id, delta } if id == "call_1" && delta == "{\"file\":\"src/")
+    );
+    assert!(matches!(&events[3], StreamEvent::TextDelta(delta) if delta == "check it"));
+    assert!(
+        matches!(&events[4], StreamEvent::ToolCallInputDelta { id, delta } if id == "call_1" && delta == "lib.rs\"}")
+    );
+    assert!(
+        matches!(&events[5], StreamEvent::ToolCallBlockEnd { id, input } if id == "call_1" && input.is_null())
+    );
+    assert!(
+        matches!(&events[6], StreamEvent::UsageSummary(usage) if usage.input_tokens == 9 && usage.output_tokens == 4)
+    );
+    assert!(matches!(events.last(), Some(StreamEvent::StreamEnd)));
+
+    let captured = handle.await.expect("server join");
+    assert_eq!(captured.len(), 1);
+    assert_eq!(captured[0].body["stream"], true);
+    assert_eq!(captured[0].body["stream_options"]["include_usage"], true);
+}
+
+#[tokio::test]
+async fn openai_provider_streaming_falls_back_to_non_streaming_request() {
+    let _guard = env_lock().lock().expect("env lock");
+    let stream_failure = "HTTP/1.1 500 Internal Server Error\r\nContent-Type: text/plain\r\nContent-Length: 4\r\nConnection: close\r\n\r\noops".to_string();
+    let json_body = serde_json::json!({
+        "choices": [{
+            "message": {"content": "fallback ok"},
+            "finish_reason": "stop"
+        }],
+        "usage": {"prompt_tokens": 5, "completion_tokens": 2}
+    });
+    let non_stream_response = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        json_body.to_string().len(),
+        json_body
+    );
+    let (base_url, handle) =
+        capture_requests_with_raw_responses(vec![stream_failure, non_stream_response]).await;
+    let provider = OpenAiCompatibleProvider::new("openai", base_url, "test-key")
+        .with_session_context("sess-fallback", "dev-fallback");
+
+    let events: Vec<_> = provider
+        .create_message_streaming("system", &[], &ModelId("gpt-4o".into()), 32, &[])
+        .await
+        .collect()
+        .await;
+
+    assert!(matches!(&events[0], StreamEvent::TextDelta(delta) if delta == "fallback ok"));
+    assert!(
+        matches!(&events[1], StreamEvent::UsageSummary(usage) if usage.input_tokens == 5 && usage.output_tokens == 2)
+    );
+    assert!(matches!(events.last(), Some(StreamEvent::StreamEnd)));
+
+    let captured = handle.await.expect("server join");
+    assert_eq!(captured.len(), 2);
+    assert_eq!(captured[0].body["stream"], true);
+    assert!(captured[1].body.get("stream").is_none());
 }

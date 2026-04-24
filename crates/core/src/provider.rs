@@ -15,6 +15,17 @@ use async_trait::async_trait;
 use futures::Stream;
 use std::pin::Pin;
 
+/// Provider API style.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProviderApiStyle {
+    /// Anthropic messages API style.
+    AnthropicMessages,
+    /// OpenAI chat completions API style.
+    OpenAiChat,
+    /// OpenAI responses API style.
+    OpenAiResponses,
+}
+
 /// Error classification for provider-level errors.
 ///
 /// Determines whether an error is retryable and whether fallback to
@@ -25,6 +36,8 @@ pub enum ProviderErrorKind {
     Retryable,
     /// Authentication error — retry won't help without config change.
     Auth,
+    /// Request is blocked by provider access policy.
+    AccessPolicy,
     /// Rate limit — retry after backoff.
     RateLimit,
     /// Invalid model or request — retry won't help.
@@ -85,10 +98,137 @@ pub struct ProviderCapabilities {
     pub streaming: bool,
     /// Supports tool use / function calling.
     pub tool_use: bool,
+    /// Supports streaming tool deltas / partial tool assembly.
+    pub structured_tool_streaming: bool,
+    /// Supports issuing multiple tool calls safely in one response.
+    pub parallel_tool_calls: bool,
+    /// Whether textual tool-call fallback is expected to be useful.
+    pub text_tool_fallback: bool,
     /// Supports prompt caching.
     pub prompt_caching: bool,
     /// Supports vision / image input.
     pub vision: bool,
+}
+
+/// Resolved provider interaction profile.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResolvedProviderProfile {
+    /// Canonical profile name.
+    pub name: &'static str,
+    /// Provider API style.
+    pub api_style: ProviderApiStyle,
+    /// Provider capability matrix.
+    pub capabilities: ProviderCapabilities,
+}
+
+impl ResolvedProviderProfile {
+    /// Resolve a provider profile from explicit hint and base URL.
+    #[must_use]
+    pub fn resolve(
+        profile_hint: Option<&str>,
+        base_url: &str,
+        default_style: ProviderApiStyle,
+    ) -> Self {
+        let explicit = profile_hint.unwrap_or_default().to_ascii_lowercase();
+        let host = base_url.to_ascii_lowercase();
+        let name = if explicit.contains("dashscope") || host.contains("dashscope") {
+            "dashscope"
+        } else if explicit.contains("kimi")
+            || host.contains("kimi.com")
+            || host.contains("moonshot")
+        {
+            "kimi"
+        } else if explicit.contains("groq") || host.contains("groq") {
+            "groq"
+        } else if explicit.contains("openai") || host.contains("openai.com") {
+            "openai"
+        } else if explicit.contains("anthropic") || host.contains("anthropic.com") {
+            "anthropic"
+        } else {
+            "custom"
+        };
+
+        match (name, default_style) {
+            ("anthropic", ProviderApiStyle::AnthropicMessages) => Self {
+                name,
+                api_style: ProviderApiStyle::AnthropicMessages,
+                capabilities: ProviderCapabilities {
+                    streaming: true,
+                    tool_use: true,
+                    structured_tool_streaming: true,
+                    parallel_tool_calls: true,
+                    text_tool_fallback: true,
+                    prompt_caching: true,
+                    vision: true,
+                },
+            },
+            ("dashscope", ProviderApiStyle::AnthropicMessages) => Self {
+                name,
+                api_style: ProviderApiStyle::AnthropicMessages,
+                capabilities: ProviderCapabilities {
+                    streaming: true,
+                    tool_use: true,
+                    structured_tool_streaming: true,
+                    parallel_tool_calls: true,
+                    text_tool_fallback: true,
+                    prompt_caching: true,
+                    vision: true,
+                },
+            },
+            ("dashscope", ProviderApiStyle::OpenAiChat) => Self {
+                name,
+                api_style: ProviderApiStyle::OpenAiChat,
+                capabilities: ProviderCapabilities {
+                    streaming: true,
+                    tool_use: true,
+                    structured_tool_streaming: true,
+                    parallel_tool_calls: true,
+                    text_tool_fallback: true,
+                    prompt_caching: false,
+                    vision: false,
+                },
+            },
+            ("kimi", _) => Self {
+                name,
+                api_style: default_style,
+                capabilities: ProviderCapabilities {
+                    streaming: true,
+                    tool_use: false,
+                    structured_tool_streaming: false,
+                    parallel_tool_calls: false,
+                    text_tool_fallback: true,
+                    prompt_caching: false,
+                    vision: false,
+                },
+            },
+            ("groq", _) | ("openai", _) | ("custom", _) => Self {
+                name,
+                api_style: default_style,
+                capabilities: ProviderCapabilities {
+                    streaming: true,
+                    tool_use: true,
+                    structured_tool_streaming: true,
+                    parallel_tool_calls: true,
+                    text_tool_fallback: true,
+                    prompt_caching: false,
+                    vision: name == "openai",
+                },
+            },
+            _ => Self {
+                name,
+                api_style: default_style,
+                capabilities: ProviderCapabilities {
+                    streaming: true,
+                    tool_use: true,
+                    structured_tool_streaming: true,
+                    parallel_tool_calls: true,
+                    text_tool_fallback: true,
+                    prompt_caching: matches!(default_style, ProviderApiStyle::AnthropicMessages),
+                    vision: matches!(default_style, ProviderApiStyle::AnthropicMessages),
+                },
+            },
+        }
+    }
 }
 
 /// Abstract provider for a specific LLM API.
@@ -142,10 +282,15 @@ pub trait Provider: Send + Sync {
 pub fn classify_api_error(provider: &str, err: ApiError) -> ProviderError {
     let kind = match &err {
         ApiError::Auth(_) => ProviderErrorKind::Auth,
+        ApiError::AccessPolicy(_) => ProviderErrorKind::AccessPolicy,
         ApiError::Response { status, .. } => match status {
+            401 => ProviderErrorKind::Auth,
+            403 if matches_access_policy_message(&err.to_string()) => {
+                ProviderErrorKind::AccessPolicy
+            }
             429 => ProviderErrorKind::RateLimit,
             500 | 502 | 503 | 504 => ProviderErrorKind::Unavailable,
-            400 | 401 | 403 | 404 => ProviderErrorKind::InvalidRequest,
+            400 | 403 | 404 => ProviderErrorKind::InvalidRequest,
             _ => ProviderErrorKind::Unknown,
         },
         ApiError::RetryExhausted { .. } => ProviderErrorKind::Unavailable,
@@ -165,10 +310,53 @@ pub fn classify_api_error(provider: &str, err: ApiError) -> ProviderError {
 pub fn provider_error_to_api(err: ProviderError) -> ApiError {
     match err.kind {
         ProviderErrorKind::Auth => ApiError::Auth(err.message),
+        ProviderErrorKind::AccessPolicy => ApiError::AccessPolicy(err.message),
         ProviderErrorKind::RateLimit | ProviderErrorKind::Unavailable => {
             ApiError::Http(err.message)
         }
         ProviderErrorKind::InvalidRequest => ApiError::InvalidModel(err.message),
         _ => ApiError::Http(err.message),
+    }
+}
+
+fn matches_access_policy_message(message: &str) -> bool {
+    let lowered = message.to_ascii_lowercase();
+    lowered.contains("coding agent")
+        || lowered.contains("coding agents")
+        || lowered.contains("access policy")
+        || lowered.contains("policy denied")
+        || lowered.contains("not allowed for this api key")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resolve_kimi_profile_disables_structured_tools() {
+        let profile = ResolvedProviderProfile::resolve(
+            Some("kimi"),
+            "https://api.kimi.com/coding/",
+            ProviderApiStyle::AnthropicMessages,
+        );
+
+        assert_eq!(profile.name, "kimi");
+        assert!(!profile.capabilities.tool_use);
+        assert!(!profile.capabilities.structured_tool_streaming);
+        assert!(profile.capabilities.text_tool_fallback);
+    }
+
+    #[test]
+    fn classify_access_policy_errors() {
+        let err = classify_api_error(
+            "anthropic",
+            ApiError::Response {
+                status: 403,
+                message: "This API is only available for Coding Agents".into(),
+            },
+        );
+
+        assert_eq!(err.kind, ProviderErrorKind::AccessPolicy);
+        assert!(!err.is_fallback_eligible());
     }
 }

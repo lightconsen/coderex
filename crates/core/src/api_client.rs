@@ -1,14 +1,17 @@
 //! Anthropic API client with retry and model routing.
 
+use crate::provider::{ProviderApiStyle, ResolvedProviderProfile};
 use crate::tool_executor::ToolInfo;
 use crate::types::{ModelId, ToolCall, UsageSummary};
 use futures::Stream;
 use futures::StreamExt;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::pin::Pin;
 use thiserror::Error;
-use tokio::time::{sleep, Duration};
+use tokio::time::{Duration, sleep};
+use uuid::Uuid;
 
 /// Errors from API operations.
 #[derive(Debug, Error)]
@@ -27,6 +30,9 @@ pub enum ApiError {
         /// Error message from API.
         message: String,
     },
+    /// Provider rejected the request because of access policy.
+    #[error("access policy error: {0}")]
+    AccessPolicy(String),
     /// Retry attempts exhausted.
     #[error("retry exhausted after {attempts} attempts")]
     RetryExhausted {
@@ -49,7 +55,11 @@ impl Clone for ApiError {
                 status: *status,
                 message: message.clone(),
             },
-            Self::RetryExhausted { attempts, last_error_message } => Self::RetryExhausted {
+            Self::AccessPolicy(msg) => Self::AccessPolicy(msg.clone()),
+            Self::RetryExhausted {
+                attempts,
+                last_error_message,
+            } => Self::RetryExhausted {
                 attempts: *attempts,
                 last_error_message: last_error_message.clone(),
             },
@@ -77,6 +87,27 @@ pub struct ApiConfig {
     pub retry_backoff: Duration,
     /// Request timeout in seconds (0 = use reqwest default).
     pub request_timeout_secs: u64,
+    /// Provider interaction profile hint (e.g. "dashscope", "kimi", "anthropic").
+    pub provider_profile: Option<String>,
+    /// Extra request headers appended to provider requests.
+    pub custom_headers: BTreeMap<String, String>,
+    /// Metadata policy for outgoing requests.
+    pub metadata_policy: MetadataPolicy,
+    /// Optional explicit session id for request headers and metadata.
+    pub session_id: Option<String>,
+    /// Optional explicit device id for request metadata.
+    pub device_id: Option<String>,
+    /// Client name used in identity headers.
+    pub client_name: String,
+}
+
+/// Controls how request metadata is attached to provider requests.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MetadataPolicy {
+    /// Do not attach metadata.
+    None,
+    /// Attach session-level metadata.
+    Session,
 }
 
 impl ApiConfig {
@@ -89,6 +120,12 @@ impl ApiConfig {
             max_retries: 3,
             retry_backoff: Duration::from_secs(1),
             request_timeout_secs: 120,
+            provider_profile: std::env::var("CODEREX_PROVIDER_PROFILE").ok(),
+            custom_headers: parse_custom_headers_env(),
+            metadata_policy: MetadataPolicy::Session,
+            session_id: std::env::var("CODEREX_SESSION_ID").ok(),
+            device_id: std::env::var("CODEREX_DEVICE_ID").ok(),
+            client_name: "cli".into(),
         }
     }
 
@@ -104,6 +141,41 @@ impl ApiConfig {
     #[must_use]
     pub const fn with_timeout(mut self, secs: u64) -> Self {
         self.request_timeout_secs = secs;
+        self
+    }
+
+    /// Set the provider profile hint.
+    #[must_use]
+    pub fn with_provider_profile(mut self, profile: impl Into<String>) -> Self {
+        self.provider_profile = Some(profile.into());
+        self
+    }
+
+    /// Add a custom header.
+    #[must_use]
+    pub fn with_custom_header(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
+        self.custom_headers.insert(key.into(), value.into());
+        self
+    }
+
+    /// Set metadata policy.
+    #[must_use]
+    pub const fn with_metadata_policy(mut self, policy: MetadataPolicy) -> Self {
+        self.metadata_policy = policy;
+        self
+    }
+
+    /// Set an explicit session id.
+    #[must_use]
+    pub fn with_session_id(mut self, session_id: impl Into<String>) -> Self {
+        self.session_id = Some(session_id.into());
+        self
+    }
+
+    /// Set an explicit device id.
+    #[must_use]
+    pub fn with_device_id(mut self, device_id: impl Into<String>) -> Self {
+        self.device_id = Some(device_id.into());
         self
     }
 }
@@ -234,8 +306,151 @@ impl AnthropicApiClient {
 
     /// Returns true if this is the official Anthropic API.
     fn is_anthropic_api(&self) -> bool {
-        let url = self.config.base_url.strip_suffix('/').unwrap_or(&self.config.base_url);
+        let url = self
+            .config
+            .base_url
+            .strip_suffix('/')
+            .unwrap_or(&self.config.base_url);
         url == "https://api.anthropic.com"
+    }
+
+    fn user_agent() -> String {
+        format!(
+            "CodeRex/{} ({}; {})",
+            env!("CARGO_PKG_VERSION"),
+            std::env::consts::OS,
+            std::env::consts::ARCH
+        )
+    }
+
+    pub(crate) fn resolved_profile(&self) -> ResolvedProviderProfile {
+        ResolvedProviderProfile::resolve(
+            self.config.provider_profile.as_deref(),
+            &self.config.base_url,
+            ProviderApiStyle::AnthropicMessages,
+        )
+    }
+
+    fn profile_name(&self) -> &'static str {
+        self.resolved_profile().name
+    }
+
+    fn log_request_start(
+        &self,
+        request_id: &str,
+        model_name: &str,
+        streaming: bool,
+        tool_count: usize,
+        tool_fallback: bool,
+    ) {
+        tracing::info!(
+            provider = "anthropic",
+            profile = self.profile_name(),
+            request_id = %request_id,
+            model = model_name,
+            base_url = %self.config.base_url,
+            streaming,
+            tool_count,
+            tool_fallback,
+            metadata_policy = ?self.config.metadata_policy,
+            "provider request started"
+        );
+    }
+
+    fn log_response(
+        &self,
+        request_id: &str,
+        status: u16,
+        server_request_id: Option<&str>,
+        tool_fallback: bool,
+    ) {
+        tracing::info!(
+            provider = "anthropic",
+            profile = self.profile_name(),
+            request_id = %request_id,
+            status,
+            server_request_id = server_request_id.unwrap_or(""),
+            tool_fallback,
+            "provider response received"
+        );
+    }
+
+    fn build_metadata_user_id(&self, request_id: &str) -> String {
+        let session_id = self
+            .config
+            .session_id
+            .clone()
+            .or_else(|| std::env::var("CODEREX_SESSION_ID").ok())
+            .unwrap_or_else(|| "unknown".into());
+        let device_id = self
+            .config
+            .device_id
+            .clone()
+            .or_else(|| std::env::var("CODEREX_DEVICE_ID").ok())
+            .unwrap_or_else(|| "unknown".into());
+        serde_json::json!({
+            "device_id": device_id,
+            "session_id": session_id,
+            "client": self.config.client_name,
+            "request_id": request_id,
+        })
+        .to_string()
+    }
+
+    fn apply_standard_headers(
+        &self,
+        mut req: reqwest::RequestBuilder,
+        request_id: &str,
+    ) -> reqwest::RequestBuilder {
+        let user_agent = Self::user_agent();
+        req = req
+            .header("User-Agent", user_agent.clone())
+            .header("X-CodeRex-Client", &self.config.client_name)
+            .header("X-CodeRex-Request-Id", request_id);
+
+        if let Some(session_id) = self
+            .config
+            .session_id
+            .clone()
+            .or_else(|| std::env::var("CODEREX_SESSION_ID").ok())
+        {
+            if !session_id.trim().is_empty() {
+                req = req.header("X-CodeRex-Session-Id", session_id);
+            }
+        }
+
+        if self.profile_name() == "dashscope" {
+            req = req
+                .header("X-DashScope-UserAgent", user_agent)
+                .header("X-DashScope-CacheControl", "enable")
+                .header(
+                    "X-DashScope-AuthType",
+                    std::env::var("CODEREX_AUTHTYPE").unwrap_or_else(|_| "api_key".into()),
+                );
+        }
+
+        for (k, v) in &self.config.custom_headers {
+            req = req.header(k, v);
+        }
+
+        req
+    }
+
+    fn attach_metadata(&self, body: &mut serde_json::Value, request_id: &str) {
+        if self.config.metadata_policy == MetadataPolicy::None {
+            return;
+        }
+        if let Some(obj) = body.as_object_mut() {
+            if obj.contains_key("metadata") {
+                return;
+            }
+            obj.insert(
+                "metadata".to_string(),
+                serde_json::json!({
+                    "user_id": self.build_metadata_user_id(request_id),
+                }),
+            );
+        }
     }
 
     /// Execute a request with retry logic.
@@ -248,7 +463,10 @@ impl AnthropicApiClient {
         for attempt in 0..=self.config.max_retries {
             if attempt > 0 {
                 let backoff = self.config.retry_backoff * 2_u32.pow(attempt - 1);
-                tracing::debug!("API retry {attempt}/{}, backing off {backoff:?}", self.config.max_retries);
+                tracing::debug!(
+                    "API retry {attempt}/{}, backing off {backoff:?}",
+                    self.config.max_retries
+                );
                 sleep(backoff).await;
             }
 
@@ -296,10 +514,14 @@ impl ApiClient for AnthropicApiClient {
 
         let url = format!(
             "{}/v1/messages",
-            self.config.base_url.strip_suffix('/').unwrap_or(&self.config.base_url)
+            self.config
+                .base_url
+                .strip_suffix('/')
+                .unwrap_or(&self.config.base_url)
         );
 
         let model_name = Self::resolve_model(model);
+        let request_id = Uuid::new_v4().to_string();
 
         let mut body = serde_json::json!({
             "model": model_name,
@@ -307,8 +529,23 @@ impl ApiClient for AnthropicApiClient {
             "messages": messages,
             "max_tokens": max_tokens,
         });
+        self.attach_metadata(&mut body, &request_id);
 
-        if !tools.is_empty() {
+        let capabilities = self.resolved_profile().capabilities;
+        let tool_fallback = !tools.is_empty() && !capabilities.tool_use;
+        self.log_request_start(
+            &request_id,
+            &model_name,
+            false,
+            if capabilities.tool_use {
+                tools.len()
+            } else {
+                0
+            },
+            tool_fallback,
+        );
+
+        if !tools.is_empty() && capabilities.tool_use {
             let tools_json: Vec<serde_json::Value> = tools
                 .iter()
                 .map(|t| {
@@ -329,7 +566,11 @@ impl ApiClient for AnthropicApiClient {
                 let mut req = self
                     .client
                     .post(&url)
-                    .header("content-type", "application/json");
+                    .header("content-type", "application/json")
+                    // Anthropic-compatible gateways (Qwen/Kimi/etc.) may expect this
+                    // version header even when the host is not api.anthropic.com.
+                    .header("anthropic-version", "2023-06-01");
+                req = self.apply_standard_headers(req, &request_id);
 
                 if self.is_anthropic_api() {
                     req = req
@@ -339,15 +580,22 @@ impl ApiClient for AnthropicApiClient {
                     req = req.header("Authorization", format!("Bearer {}", &self.config.api_key));
                 }
 
-                let resp = req
-                    .json(&body)
-                    .send()
-                    .await
-                    .map_err(ApiError::from)?;
+                let resp = req.json(&body).send().await.map_err(ApiError::from)?;
 
                 let status = resp.status().as_u16();
+                let server_request_id = resp
+                    .headers()
+                    .get("x-request-id")
+                    .or_else(|| resp.headers().get("request-id"))
+                    .and_then(|v| v.to_str().ok())
+                    .map(str::to_string);
                 if status >= 400 {
                     let err_text = resp.text().await.unwrap_or_default();
+                    if err_text.to_ascii_lowercase().contains("coding agent")
+                        || err_text.to_ascii_lowercase().contains("access policy")
+                    {
+                        return Err(ApiError::AccessPolicy(err_text));
+                    }
                     return Err(ApiError::Response {
                         status,
                         message: err_text,
@@ -368,10 +616,9 @@ impl ApiClient for AnthropicApiClient {
                                 }
                             }
                             Some("tool_use") => {
-                                if let (Some(id), Some(name)) = (
-                                    block["id"].as_str(),
-                                    block["name"].as_str(),
-                                ) {
+                                if let (Some(id), Some(name)) =
+                                    (block["id"].as_str(), block["name"].as_str())
+                                {
                                     tool_calls.push(ToolCall {
                                         id: id.to_string(),
                                         name: name.to_string(),
@@ -394,9 +641,23 @@ impl ApiClient for AnthropicApiClient {
                 let usage = UsageSummary {
                     input_tokens: json["usage"]["input_tokens"].as_u64().unwrap_or(0) as usize,
                     output_tokens: json["usage"]["output_tokens"].as_u64().unwrap_or(0) as usize,
-                    cache_read_tokens: json["usage"]["cache_read_input_tokens"].as_u64().unwrap_or(0) as usize,
-                    cache_creation_tokens: json["usage"]["cache_creation_input_tokens"].as_u64().unwrap_or(0) as usize,
+                    cache_read_tokens: json["usage"]["cache_read_input_tokens"]
+                        .as_u64()
+                        .unwrap_or(0) as usize,
+                    cache_creation_tokens: json["usage"]["cache_creation_input_tokens"]
+                        .as_u64()
+                        .unwrap_or(0) as usize,
                 };
+
+                tracing::info!(
+                    provider = "anthropic",
+                    profile = self.profile_name(),
+                    request_id = %request_id,
+                    status,
+                    server_request_id = server_request_id.as_deref().unwrap_or(""),
+                    tool_fallback,
+                    "provider response received"
+                );
 
                 Ok(ApiResponse {
                     content,
@@ -406,6 +667,8 @@ impl ApiClient for AnthropicApiClient {
                 })
             })
             .await?;
+
+        self.log_response(&request_id, 200, None, tool_fallback);
 
         Ok(response)
     }
@@ -428,12 +691,16 @@ impl ApiClient for AnthropicApiClient {
 
         let url = format!(
             "{}/v1/messages",
-            self.config.base_url.strip_suffix('/').unwrap_or(&self.config.base_url)
+            self.config
+                .base_url
+                .strip_suffix('/')
+                .unwrap_or(&self.config.base_url)
         );
 
         let model_name = Self::resolve_model(model).to_string();
         let api_key = self.config.api_key.clone();
         let is_anthropic = self.is_anthropic_api();
+        let request_id = Uuid::new_v4().to_string();
         let mut body = serde_json::json!({
             "model": model_name.clone(),
             "system": system,
@@ -441,8 +708,23 @@ impl ApiClient for AnthropicApiClient {
             "max_tokens": max_tokens,
             "stream": true,
         });
+        self.attach_metadata(&mut body, &request_id);
 
-        if !tools.is_empty() {
+        let capabilities = self.resolved_profile().capabilities;
+        let tool_fallback = !tools.is_empty() && !capabilities.tool_use;
+        self.log_request_start(
+            &request_id,
+            &model_name,
+            true,
+            if capabilities.tool_use {
+                tools.len()
+            } else {
+                0
+            },
+            tool_fallback,
+        );
+
+        if !tools.is_empty() && capabilities.tool_use {
             let tools_json: Vec<serde_json::Value> = tools
                 .iter()
                 .map(|t| {
@@ -459,45 +741,90 @@ impl ApiClient for AnthropicApiClient {
         }
 
         let client = self.client.clone();
+        let config = self.config.clone();
 
-        Box::pin(futures::stream::once(async move {
-            let mut req = client
-                .post(&url)
-                .header("content-type", "application/json");
-
-            if is_anthropic {
-                req = req
-                    .header("x-api-key", &api_key)
+        Box::pin(
+            futures::stream::once(async move {
+                let temp_client = AnthropicApiClient {
+                    config,
+                    client: client.clone(),
+                };
+                tracing::debug!(
+                    provider = "anthropic",
+                    profile = temp_client.profile_name(),
+                    request_id = %request_id,
+                    body = %serde_json::to_string(&body).unwrap_or_default(),
+                    "starting streaming provider request"
+                );
+                let mut req = client
+                    .post(&url)
+                    .header("content-type", "application/json")
+                    // Anthropic-compatible gateways (Qwen/Kimi/etc.) may expect this
+                    // version header even when the host is not api.anthropic.com.
                     .header("anthropic-version", "2023-06-01");
-            } else {
-                req = req.header("Authorization", format!("Bearer {}", &api_key));
-            }
+                req = temp_client.apply_standard_headers(req, &request_id);
 
-            let response = req.json(&body).send().await;
-
-            match response {
-                Ok(resp) => {
-                    let status = resp.status().as_u16();
-                    if status >= 400 {
-                        let err_text = resp.text().await.unwrap_or_default();
-                        return futures::stream::once(async move {
-                            StreamEvent::Error(ApiError::Response {
-                                status,
-                                message: err_text,
-                            })
-                        })
-                        .chain(futures::stream::once(async move { StreamEvent::StreamEnd }))
-                        .boxed();
-                    }
-
-                    parse_sse_stream(resp.bytes_stream()).boxed()
+                if is_anthropic {
+                    req = req
+                        .header("x-api-key", &api_key)
+                        .header("anthropic-version", "2023-06-01");
+                } else {
+                    req = req.header("Authorization", format!("Bearer {}", &api_key));
                 }
-                Err(e) => futures::stream::once(async move { StreamEvent::Error(ApiError::from(e)) })
-                    .chain(futures::stream::once(async move { StreamEvent::StreamEnd }))
-                    .boxed(),
-            }
-        })
-        .flatten())
+
+                let response = req.json(&body).send().await;
+
+                match response {
+                    Ok(resp) => {
+                        let status = resp.status().as_u16();
+                        let server_request_id = resp
+                            .headers()
+                            .get("x-request-id")
+                            .or_else(|| resp.headers().get("request-id"))
+                            .and_then(|v| v.to_str().ok())
+                            .map(str::to_string);
+                        if status >= 400 {
+                            let err_text = resp.text().await.unwrap_or_default();
+                            if err_text.to_ascii_lowercase().contains("coding agent")
+                                || err_text.to_ascii_lowercase().contains("access policy")
+                            {
+                                return futures::stream::once(async move {
+                                    StreamEvent::Error(ApiError::AccessPolicy(err_text))
+                                })
+                                .chain(futures::stream::once(async move { StreamEvent::StreamEnd }))
+                                .boxed();
+                            }
+                            return futures::stream::once(async move {
+                                StreamEvent::Error(ApiError::Response {
+                                    status,
+                                    message: err_text,
+                                })
+                            })
+                            .chain(futures::stream::once(async move { StreamEvent::StreamEnd }))
+                            .boxed();
+                        }
+
+                        tracing::info!(
+                            provider = "anthropic",
+                            profile = temp_client.profile_name(),
+                            request_id = %request_id,
+                            status,
+                            server_request_id = server_request_id.as_deref().unwrap_or(""),
+                            tool_fallback,
+                            "streaming provider response started"
+                        );
+
+                        parse_sse_stream(resp.bytes_stream()).boxed()
+                    }
+                    Err(e) => {
+                        futures::stream::once(async move { StreamEvent::Error(ApiError::from(e)) })
+                            .chain(futures::stream::once(async move { StreamEvent::StreamEnd }))
+                            .boxed()
+                    }
+                }
+            })
+            .flatten(),
+        )
     }
 }
 
@@ -565,9 +892,7 @@ fn parse_sse_stream(
             }
         },
     )
-    .chain(futures::stream::once(async move {
-        StreamEvent::StreamEnd
-    }))
+    .chain(futures::stream::once(async move { StreamEvent::StreamEnd }))
 }
 
 /// Find the position of the next SSE message boundary (`\n\n` or `\r\n\r\n`).
@@ -650,8 +975,14 @@ fn parse_sse_message(message: &str, state: &mut SseParserState) -> Option<Stream
         "message_delta" => {
             #[allow(clippy::cast_possible_truncation)]
             let usage = value.get("usage").map(|u| UsageSummary {
-                input_tokens: u.get("input_tokens").and_then(serde_json::Value::as_u64).unwrap_or(0) as usize,
-                output_tokens: u.get("output_tokens").and_then(serde_json::Value::as_u64).unwrap_or(0) as usize,
+                input_tokens: u
+                    .get("input_tokens")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0) as usize,
+                output_tokens: u
+                    .get("output_tokens")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0) as usize,
                 cache_read_tokens: u
                     .get("cache_read_input_tokens")
                     .and_then(serde_json::Value::as_u64)
@@ -668,13 +999,35 @@ fn parse_sse_message(message: &str, state: &mut SseParserState) -> Option<Stream
 }
 fn is_retryable(error: &ApiError) -> bool {
     match error {
-        ApiError::Http(msg) => {
-            msg.contains("timeout") || msg.contains("connect")
-        }
-        ApiError::Response { status, .. } => {
-            *status >= 500 || *status == 429
-        }
+        ApiError::Http(msg) => msg.contains("timeout") || msg.contains("connect"),
+        ApiError::Response { status, .. } => *status >= 500 || *status == 429,
+        ApiError::AccessPolicy(_) => false,
         _ => false,
+    }
+}
+
+fn parse_custom_headers(raw: &str) -> BTreeMap<String, String> {
+    let mut out = BTreeMap::new();
+    for line in raw.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if let Some((k, v)) = trimmed.split_once(':') {
+            let key = k.trim();
+            let val = v.trim();
+            if !key.is_empty() {
+                out.insert(key.to_string(), val.to_string());
+            }
+        }
+    }
+    out
+}
+
+fn parse_custom_headers_env() -> BTreeMap<String, String> {
+    match std::env::var("CODEREX_CUSTOM_HEADERS") {
+        Ok(v) => parse_custom_headers(&v),
+        Err(_) => BTreeMap::new(),
     }
 }
 
@@ -701,6 +1054,8 @@ mod tests {
         assert_eq!(config.max_retries, 3);
         assert_eq!(config.retry_backoff, Duration::from_secs(1));
         assert_eq!(config.request_timeout_secs, 120);
+        assert_eq!(config.metadata_policy, MetadataPolicy::Session);
+        assert_eq!(config.client_name, "cli");
     }
 
     #[tokio::test]
@@ -735,9 +1090,62 @@ mod tests {
 
     #[test]
     fn model_routing_resolves_correctly() {
-        assert_eq!(AnthropicApiClient::resolve_model(&ModelId::sonnet()), "claude-sonnet-4-6");
-        assert_eq!(AnthropicApiClient::resolve_model(&ModelId::opus()), "claude-opus-4-6");
-        assert_eq!(AnthropicApiClient::resolve_model(&ModelId::haiku()), "claude-haiku-4-5-20251001");
+        assert_eq!(
+            AnthropicApiClient::resolve_model(&ModelId::sonnet()),
+            "claude-sonnet-4-6"
+        );
+        assert_eq!(
+            AnthropicApiClient::resolve_model(&ModelId::opus()),
+            "claude-opus-4-6"
+        );
+        assert_eq!(
+            AnthropicApiClient::resolve_model(&ModelId::haiku()),
+            "claude-haiku-4-5-20251001"
+        );
+    }
+
+    #[test]
+    fn parse_custom_headers_from_env() {
+        let headers = parse_custom_headers("X-Test-Header: foo\nX-Trace: bar\ninvalid-line");
+        assert_eq!(headers.get("X-Test-Header"), Some(&"foo".to_string()));
+        assert_eq!(headers.get("X-Trace"), Some(&"bar".to_string()));
+    }
+
+    #[test]
+    fn apply_standard_headers_sets_agent_identity_headers() {
+        let mut config = ApiConfig::new("key".into());
+        config.provider_profile = Some("dashscope".into());
+        config.custom_headers.insert("X-Custom".into(), "1".into());
+        let client = AnthropicApiClient::new(config);
+        let req = client.client.post("https://example.com");
+        let req = client.apply_standard_headers(req, "req-123");
+        let built = req.build().expect("request should build");
+        let headers = built.headers();
+        assert!(headers.get("User-Agent").is_some());
+        assert_eq!(headers.get("X-CodeRex-Client").unwrap(), "cli");
+        assert_eq!(headers.get("X-CodeRex-Request-Id").unwrap(), "req-123");
+        assert_eq!(headers.get("X-Custom").unwrap(), "1");
+        assert_eq!(headers.get("X-DashScope-CacheControl").unwrap(), "enable");
+    }
+
+    #[test]
+    fn attach_metadata_respects_policy() {
+        let mut body = serde_json::json!({
+            "model": "x",
+            "messages": []
+        });
+        let client = AnthropicApiClient::new(ApiConfig::new("key".into()));
+        client.attach_metadata(&mut body, "req-1");
+        assert!(body.get("metadata").is_some());
+
+        let mut body_no_meta = serde_json::json!({
+            "model": "x",
+            "messages": []
+        });
+        let cfg = ApiConfig::new("key".into()).with_metadata_policy(MetadataPolicy::None);
+        let client = AnthropicApiClient::new(cfg);
+        client.attach_metadata(&mut body_no_meta, "req-2");
+        assert!(body_no_meta.get("metadata").is_none());
     }
 
     // ─── SSE parser tests ───────────────────────────────────────────────
@@ -778,7 +1186,8 @@ mod tests {
         let mut state = SseParserState::default();
         state.index_to_id.insert(1, "toolu_01ABC".to_string());
 
-        let msg = "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":1}\n\n";
+        let msg =
+            "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":1}\n\n";
         let event = parse_sse_message(msg, &mut state);
         assert!(
             matches!(event, Some(StreamEvent::ToolCallBlockEnd { ref id, ref input }) if id == "toolu_01ABC" && input.is_null())
@@ -842,10 +1251,18 @@ data: {"type":"message_stop"}
 
         assert_eq!(events.len(), 6); // text + tool_start + tool_delta + tool_end + usage + stream_end
         assert!(matches!(&events[0], StreamEvent::TextDelta(t) if t == "I'll read the file."));
-        assert!(matches!(&events[1], StreamEvent::ToolCallBlockStart { id, name } if id == "toolu_01XYZ" && name == "read"));
-        assert!(matches!(&events[2], StreamEvent::ToolCallInputDelta { id, delta } if id == "toolu_01XYZ" && delta == "{\"file\":\"hello.txt\"}"));
-        assert!(matches!(&events[3], StreamEvent::ToolCallBlockEnd { id, .. } if id == "toolu_01XYZ"));
-        assert!(matches!(&events[4], StreamEvent::UsageSummary(u) if u.input_tokens == 10 && u.output_tokens == 20));
+        assert!(
+            matches!(&events[1], StreamEvent::ToolCallBlockStart { id, name } if id == "toolu_01XYZ" && name == "read")
+        );
+        assert!(
+            matches!(&events[2], StreamEvent::ToolCallInputDelta { id, delta } if id == "toolu_01XYZ" && delta == "{\"file\":\"hello.txt\"}")
+        );
+        assert!(
+            matches!(&events[3], StreamEvent::ToolCallBlockEnd { id, .. } if id == "toolu_01XYZ")
+        );
+        assert!(
+            matches!(&events[4], StreamEvent::UsageSummary(u) if u.input_tokens == 10 && u.output_tokens == 20)
+        );
     }
 
     #[tokio::test]
@@ -867,8 +1284,10 @@ data: {"type":"message_stop"}
     async fn parse_sse_stream_stress_fragmented_chunks() {
         // Send the SSE payload one byte at a time to stress the buffer accumulation
         let sse = "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\" fragmented \"}}\n\nevent: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
-        let chunks: Vec<Result<bytes::Bytes, reqwest::Error>> =
-            sse.bytes().map(|b| Ok(bytes::Bytes::from(vec![b]))).collect();
+        let chunks: Vec<Result<bytes::Bytes, reqwest::Error>> = sse
+            .bytes()
+            .map(|b| Ok(bytes::Bytes::from(vec![b])))
+            .collect();
 
         let stream = futures::stream::iter(chunks);
         let events: Vec<StreamEvent> = parse_sse_stream(stream).collect().await;
@@ -896,9 +1315,18 @@ data: {"type":"message_stop"}
         let stream = futures::stream::iter(vec![Ok(bytes::Bytes::from(sse))]);
         let events: Vec<StreamEvent> = parse_sse_stream(stream).collect().await;
 
-        let tool_starts = events.iter().filter(|e| matches!(e, StreamEvent::ToolCallBlockStart { .. })).count();
-        let tool_deltas = events.iter().filter(|e| matches!(e, StreamEvent::ToolCallInputDelta { .. })).count();
-        let tool_ends = events.iter().filter(|e| matches!(e, StreamEvent::ToolCallBlockEnd { .. })).count();
+        let tool_starts = events
+            .iter()
+            .filter(|e| matches!(e, StreamEvent::ToolCallBlockStart { .. }))
+            .count();
+        let tool_deltas = events
+            .iter()
+            .filter(|e| matches!(e, StreamEvent::ToolCallInputDelta { .. }))
+            .count();
+        let tool_ends = events
+            .iter()
+            .filter(|e| matches!(e, StreamEvent::ToolCallBlockEnd { .. }))
+            .count();
 
         assert_eq!(tool_starts, 50);
         assert_eq!(tool_deltas, 50);

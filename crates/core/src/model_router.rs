@@ -54,6 +54,8 @@ pub struct ModelRouter {
     routes: Vec<RouteEntry>,
     /// Maximum number of fallback attempts.
     max_fallbacks: u32,
+    /// Optional explicit fallback provider allowlist.
+    fallback_providers: Vec<String>,
 }
 
 impl std::fmt::Debug for ModelRouter {
@@ -62,6 +64,7 @@ impl std::fmt::Debug for ModelRouter {
             .field("name", &self.name)
             .field("routes", &self.routes)
             .field("max_fallbacks", &self.max_fallbacks)
+            .field("fallback_providers", &self.fallback_providers)
             .finish()
     }
 }
@@ -74,6 +77,7 @@ impl ModelRouter {
             name: name.into(),
             routes: Vec::new(),
             max_fallbacks: 2,
+            fallback_providers: Vec::new(),
         }
     }
 
@@ -84,11 +88,18 @@ impl ModelRouter {
         self
     }
 
+    /// Restrict fallbacks to an explicit provider allowlist.
+    #[must_use]
+    pub fn with_fallback_providers(mut self, providers: Vec<String>) -> Self {
+        self.fallback_providers = providers
+            .into_iter()
+            .map(|provider| provider.to_ascii_lowercase())
+            .collect();
+        self
+    }
+
     /// Add a provider to the routing chain.
-    pub fn add_provider(
-        &mut self,
-        provider: Box<dyn Provider>,
-    ) {
+    pub fn add_provider(&mut self, provider: Box<dyn Provider>) {
         self.routes.push(RouteEntry {
             provider,
             priority: self.routes.len() as u32,
@@ -98,11 +109,7 @@ impl ModelRouter {
     }
 
     /// Add a provider with a specific priority.
-    pub fn add_provider_with_priority(
-        &mut self,
-        provider: Box<dyn Provider>,
-        priority: u32,
-    ) {
+    pub fn add_provider_with_priority(&mut self, provider: Box<dyn Provider>, priority: u32) {
         self.routes.push(RouteEntry {
             provider,
             priority,
@@ -112,11 +119,7 @@ impl ModelRouter {
     }
 
     /// Add a provider restricted to specific models.
-    pub fn add_provider_for_models(
-        &mut self,
-        provider: Box<dyn Provider>,
-        models: Vec<String>,
-    ) {
+    pub fn add_provider_for_models(&mut self, provider: Box<dyn Provider>, models: Vec<String>) {
         self.routes.push(RouteEntry {
             provider,
             priority: self.routes.len() as u32,
@@ -126,10 +129,7 @@ impl ModelRouter {
     }
 
     /// Get eligible providers for a model.
-    fn eligible_providers(
-        &self,
-        model: &ModelId,
-    ) -> Vec<Box<dyn Provider>> {
+    fn eligible_providers(&self, model: &ModelId) -> Vec<Box<dyn Provider>> {
         self.routes
             .iter()
             .filter(|entry| {
@@ -143,6 +143,46 @@ impl ModelRouter {
             .collect()
     }
 
+    fn providers_for_request(&self, model: &ModelId) -> Vec<Box<dyn Provider>> {
+        let eligible = self.eligible_providers(model);
+        if self.fallback_providers.is_empty() || eligible.len() <= 1 {
+            return eligible;
+        }
+
+        let mut filtered = Vec::new();
+        for (idx, provider) in eligible.into_iter().enumerate() {
+            if idx == 0
+                || self
+                    .fallback_providers
+                    .iter()
+                    .any(|name| name.eq_ignore_ascii_case(provider.name()))
+            {
+                filtered.push(provider);
+            }
+        }
+        filtered
+    }
+
+    fn response_to_stream_events(resp: ApiResponse) -> Vec<StreamEvent> {
+        let mut events = Vec::new();
+        if !resp.content.is_empty() {
+            events.push(StreamEvent::TextDelta(resp.content));
+        }
+        for tc in resp.tool_calls {
+            events.push(StreamEvent::ToolCallBlockStart {
+                id: tc.id.clone(),
+                name: tc.name.clone(),
+            });
+            events.push(StreamEvent::ToolCallBlockEnd {
+                id: tc.id,
+                input: tc.input,
+            });
+        }
+        events.push(StreamEvent::UsageSummary(resp.usage));
+        events.push(StreamEvent::StreamEnd);
+        events
+    }
+
     /// Try each eligible provider in order, falling back on eligible errors.
     async fn route_create_message(
         &self,
@@ -152,7 +192,7 @@ impl ModelRouter {
         max_tokens: u32,
         tools: &[ToolInfo],
     ) -> Result<ApiResponse, ProviderError> {
-        let providers = self.eligible_providers(model);
+        let providers = self.providers_for_request(model);
         if providers.is_empty() {
             return Err(ProviderError {
                 message: format!("no provider available for model '{}'", model.0),
@@ -177,7 +217,20 @@ impl ModelRouter {
                 model.0
             );
 
-            match provider.create_message(system, messages, model, max_tokens, tools).await {
+            match provider
+                .create_message(
+                    system,
+                    messages,
+                    model,
+                    max_tokens,
+                    if provider.capabilities().tool_use {
+                        tools
+                    } else {
+                        &[]
+                    },
+                )
+                .await
+            {
                 Ok(result) => return Ok(result),
                 Err(err) => {
                     tracing::warn!(
@@ -207,8 +260,8 @@ impl ModelRouter {
 #[async_trait]
 impl ApiClient for ModelRouter {
     fn clone_box(&self) -> Box<dyn ApiClient> {
-        let mut router = ModelRouter::new(self.name.clone())
-            .with_max_fallbacks(self.max_fallbacks);
+        let mut router = ModelRouter::new(self.name.clone()).with_max_fallbacks(self.max_fallbacks);
+        router = router.with_fallback_providers(self.fallback_providers.clone());
         for entry in &self.routes {
             router.add_provider_with_priority(entry.provider.clone_box(), entry.priority);
         }
@@ -237,16 +290,7 @@ impl ApiClient for ModelRouter {
         tools: &[ToolInfo],
     ) -> Pin<Box<dyn Stream<Item = StreamEvent> + Send + 'static>> {
         // For streaming, we try the first provider that succeeds in starting the stream
-        let providers: Vec<_> = self.routes.iter()
-            .filter(|entry| {
-                if let Some(ref allowed) = entry.models {
-                    allowed.contains(&model.0)
-                } else {
-                    entry.provider.supports_model(model)
-                }
-            })
-            .map(|entry| entry.provider.clone_box())
-            .collect();
+        let providers = self.providers_for_request(model);
 
         let system = system.to_string();
         let messages: Vec<serde_json::Value> = messages.to_vec();
@@ -255,12 +299,48 @@ impl ApiClient for ModelRouter {
 
         Box::pin(async_stream::stream! {
             for provider in providers {
+                if !provider.capabilities().streaming {
+                    match provider
+                        .create_message(
+                            &system,
+                            &messages,
+                            &model,
+                            max_tokens,
+                            if provider.capabilities().tool_use {
+                                &tools
+                            } else {
+                                &[]
+                            },
+                        )
+                        .await
+                    {
+                        Ok(response) => {
+                            for event in Self::response_to_stream_events(response) {
+                                yield event;
+                            }
+                            break;
+                        }
+                        Err(err) => {
+                            yield StreamEvent::Error(provider_error_to_api(err.clone()));
+                            if err.is_fallback_eligible() {
+                                continue;
+                            }
+                            yield StreamEvent::StreamEnd;
+                            break;
+                        }
+                    }
+                }
+
                 let stream = provider.create_message_streaming(
                     &system,
                     &messages,
                     &model,
                     max_tokens,
-                    &tools,
+                    if provider.capabilities().tool_use {
+                        &tools
+                    } else {
+                        &[]
+                    },
                 ).await;
 
                 use futures::StreamExt;
@@ -425,5 +505,27 @@ mod tests {
             .await;
 
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn fallback_allowlist_restricts_router_chain() {
+        let mut router =
+            ModelRouter::new("test").with_fallback_providers(vec!["success".to_string()]);
+        router.add_provider(Box::new(FailingProvider {
+            name: "fail1".into(),
+            fallback_eligible: true,
+        }));
+        router.add_provider(Box::new(FailingProvider {
+            name: "skip-me".into(),
+            fallback_eligible: true,
+        }));
+        router.add_provider(Box::new(SuccessProvider));
+
+        let result = router
+            .create_message("", &[], &ModelId::sonnet(), 1024, &[])
+            .await;
+
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().content, "success");
     }
 }

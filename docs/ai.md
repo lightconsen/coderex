@@ -25,7 +25,7 @@ CodeRex is a Rust-native AI coding agent system built around a 4-layer architect
 ├─────────────────────────────────────────────────────────────┤
 │  API Transport Layer                                        │
 │  - ApiClient trait: streaming + non-streaming               │
-│  - Anthropic SDK integration                                │
+│  - Multi-provider adapter/profile integration               │
 │  - Token budget + cost tracking                             │
 └─────────────────────────────────────────────────────────────┘
 ```
@@ -483,3 +483,145 @@ Session sharing and directory switching:
 5. **ToolExecutor trait** — Decouples the engine from tool implementations, enabling test doubles, MCP fallback, and plugin tools.
 
 6. **CommandResult prompt injection** — Commands shape agent behavior through structured effects rather than string manipulation, making behavior changes predictable and reversible.
+
+---
+
+## 14. Provider Interaction Design
+
+This section consolidates the provider interaction contract for CodeRex (Anthropic-compatible / OpenAI-compatible / platform gateways).
+
+### 14.1 Goals
+
+- Stable tool invocation (prefer structured tool-use events over text pseudo-calls)
+- Cross-provider compatibility with a single engine path
+- Strong Code Agent identity signals (headers + metadata + session context)
+- Observable and recoverable request lifecycle
+
+### 14.2 Layering
+
+```text
+QueryEngine
+  -> ProviderRouter
+      -> ProviderAdapter (Anthropic/OpenAI/Kimi/DashScope...)
+          -> HTTP Transport
+```
+
+- `QueryEngine`: turn state machine, tool loop, permissions, budgets
+- `ProviderRouter`: selects provider profile by model/config
+- `ProviderAdapter`: request shaping, stream parsing, error normalization
+- `HTTP Transport`: timeout, retry, proxy, request-id injection
+
+### 14.3 Unified Internal Request Model
+
+Core fields used regardless of provider API style:
+
+- `system_prompt`
+- `messages`
+- `tools`
+- `tool_choice`
+- `thinking` / `effort`
+- `output_config` (structured output / budget)
+- `session_context` (`session_id`, `turn_id`, `agent_id`)
+- `provider_hints` (profile-specific hints)
+
+### 14.4 Provider Profile Contract
+
+Each provider profile should define:
+
+- `api_style`: `anthropic_messages` | `openai_chat` | `openai_responses`
+- base URL + path behavior
+- default headers (version/beta/platform headers)
+- metadata mapping rules
+- tool-call capability flags (structured stream, parallel tools, etc.)
+- error mapping policy
+
+### 14.5 Identity and Session Signals
+
+For each main-thread request, include at least:
+
+- `User-Agent: CodeRex/<version> (<os>; <arch>)`
+- `X-CodeRex-Session-Id: <session_id>`
+- `X-CodeRex-Client: cli`
+- `metadata.user_id` (JSON string containing `device_id` + `session_id`)
+
+Optional signals:
+
+- `X-CodeRex-Agent-Id`
+- `X-CodeRex-Request-Id` (local request correlation id)
+- provider-specific headers from the selected profile
+
+### 14.6 Tool Calling Path
+
+Primary path (structured):
+
+1. Parse stream events (`text/tool_start/tool_delta/tool_end/usage/stop`)
+2. Incrementally assemble tool input (`partial_json`/delta)
+3. Execute tools via normal tool scheduler
+4. Inject `tool_result` back into conversation and continue
+
+Fallback path (compatibility only):
+
+1. Parse inline text call (e.g. `Read({...})`)
+2. Re-validate tool name + schema
+3. Execute and inject canonical `tool_result`
+4. Record `fallback_reason` for diagnostics/governance
+
+### 14.7 Tool Execution Orchestration
+
+- Concurrency-safe (read-only) tools may run in parallel
+- Side-effecting tools should run serially
+- Critical tool errors should support coordinated cancellation
+- Streaming fallback must discard mismatched/orphan tool results
+
+### 14.8 Error Model and Recovery
+
+Normalized error classes:
+
+- `AuthError`
+- `AccessPolicyError` (e.g. “only available for Coding Agents”)
+- `RateLimitError`
+- `TransientError`
+- `InvalidRequestError`
+
+Recovery order:
+
+1. Retry same provider (backoff)
+2. Streaming -> non-streaming fallback (same semantic request)
+3. Optional fallback provider (if policy allows)
+4. User-facing actionable error with request id
+
+### 14.9 Observability
+
+Per request, track:
+
+- local `request_id` + provider `server_request_id` (if available)
+- provider/profile/model/base_url
+- header policy version (without sensitive values)
+- fallback flags (`tool_fallback`, `streaming_fallback`)
+- tool execution stats (concurrency, failures, cancellations)
+- token/latency/cost metrics
+
+### 14.10 Configuration Surface
+
+Recommended config extensions:
+
+- `provider_profile`
+- `custom_headers`
+- `metadata_policy`
+- `fallback_providers`
+
+Policy: safe defaults, explicit overrides, auditable behavior.
+
+### 14.11 Alignment with Current CodeRex
+
+1. Move header/metadata injection to profile-driven rules
+2. Keep text pseudo-call parsing as secondary path
+3. Standardize `X-CodeRex-Session-Id` and `metadata.user_id`
+4. Add provider capability matrix for tool-stream support
+5. Surface fallback reasons + request ids in debug output
+
+### 14.12 Non-Goals
+
+- No bypass/impersonation logic against provider policy
+- No provider-specific hardcoded business logic in engine core
+- No secret leakage in logs or transcripts
