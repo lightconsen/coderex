@@ -36,7 +36,11 @@ impl Tool for WriteTool {
         }
     }
 
-    async fn execute(&self, input: ToolInput, ctx: ToolContext<'_>) -> Result<ToolOutput, ToolError> {
+    async fn execute(
+        &self,
+        input: ToolInput,
+        ctx: ToolContext<'_>,
+    ) -> Result<ToolOutput, ToolError> {
         let file_path = extract_string(&input.arguments, "file_path")?;
         let content = extract_string(&input.arguments, "content")?;
 
@@ -103,8 +107,8 @@ fn resolve_path(file_path: &str, cwd: &std::path::Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tool::ToolContext;
     use crate::context::ExecutionContext;
+    use crate::tool::ToolContext;
     use std::path::Path;
 
     fn test_ctx(cwd: &Path) -> ToolContext<'_> {
@@ -129,7 +133,10 @@ mod tests {
         assert!(output.output.contains("Wrote"));
         assert!(output.output.contains("bytes"));
         assert!(tmp.path().join("new.txt").exists());
-        assert_eq!(std::fs::read_to_string(tmp.path().join("new.txt")).unwrap(), "hello");
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join("new.txt")).unwrap(),
+            "hello"
+        );
     }
 
     #[tokio::test]
@@ -168,6 +175,9 @@ mod tests {
             .unwrap();
         assert!(output.output.contains("Wrote 0 bytes"));
         assert!(tmp.path().join("empty.txt").exists());
-        assert_eq!(std::fs::read_to_string(tmp.path().join("empty.txt")).unwrap(), "");
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join("empty.txt")).unwrap(),
+            ""
+        );
     }
 }

@@ -114,7 +114,11 @@ mod tests {
 
     #[test]
     fn stats_shows_all_data() {
-        let reg = { let mut r = CommandRegistry::new(); register(&mut r); r };
+        let reg = {
+            let mut r = CommandRegistry::new();
+            register(&mut r);
+            r
+        };
         let result = reg.execute("stats", &ctx(), &[]);
         assert!(result.output.contains("5000"));
         assert!(result.output.contains("3000"));
@@ -125,7 +129,11 @@ mod tests {
 
     #[test]
     fn cost_shows_monetary_value() {
-        let reg = { let mut r = CommandRegistry::new(); register(&mut r); r };
+        let reg = {
+            let mut r = CommandRegistry::new();
+            register(&mut r);
+            r
+        };
         let result = reg.execute("cost", &ctx(), &[]);
         assert!(result.output.contains("$0.04"));
         assert!(result.output.contains("Input Tokens"));
@@ -133,7 +141,11 @@ mod tests {
 
     #[test]
     fn usage_shows_token_breakdown() {
-        let reg = { let mut r = CommandRegistry::new(); register(&mut r); r };
+        let reg = {
+            let mut r = CommandRegistry::new();
+            register(&mut r);
+            r
+        };
         let result = reg.execute("usage", &ctx(), &[]);
         assert!(result.output.contains("5000"));
         assert!(result.output.contains("3000"));

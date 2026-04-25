@@ -1,5 +1,6 @@
 //! Built-in tools: EchoTool, NoOpTool, and all baseline tool implementations.
 
+mod agent_tool;
 mod ask_user_question_tool;
 mod bash_tool;
 mod brief_tool;
@@ -13,19 +14,15 @@ mod enter_plan_mode_tool;
 mod exit_plan_mode_tool;
 mod feature_gated_tools;
 mod glob_tool;
-mod mcp_resource_tools;
-pub mod team_create_tool;
-mod team_delete_tool;
-mod worktree_tools;
 mod grep_tool;
 mod lsp_tool;
 mod mcp_auth_tool;
+mod mcp_resource_tools;
 mod notebook_edit_tool;
 mod powershell_tool;
 mod read_tool;
 mod remote_trigger_tool;
 mod repl_tool;
-mod agent_tool;
 mod send_message_tool;
 mod skill_tool;
 mod sleep_tool;
@@ -37,14 +34,17 @@ mod task_list_tool;
 mod task_output_tool;
 mod task_stop_tool;
 mod task_update_tool;
-mod tool_search_tool;
+pub mod team_create_tool;
+mod team_delete_tool;
 mod todo_write_tool;
+mod tool_search_tool;
 mod web_fetch_tool;
 mod web_search_tool;
+mod worktree_tools;
 mod write_tool;
 
-pub use ask_user_question_tool::AskUserQuestionTool;
 pub use agent_tool::AgentTool;
+pub use ask_user_question_tool::AskUserQuestionTool;
 pub use bash_tool::BashTool;
 pub use brief_tool::BriefTool;
 pub use chrome::{
@@ -60,15 +60,10 @@ pub use enter_plan_mode_tool::EnterPlanModeTool;
 pub use exit_plan_mode_tool::ExitPlanModeTool;
 pub use feature_gated_tools::register_feature_gated_tools;
 pub use glob_tool::GlobTool;
-pub use mcp_resource_tools::{
-    ListMcpResourcesTool, ReadMcpResourceTool,
-};
-pub use team_create_tool::TeamCreateTool;
-pub use team_delete_tool::TeamDeleteTool;
-pub use worktree_tools::{EnterWorktreeTool, ExitWorktreeTool};
 pub use grep_tool::GrepTool;
 pub use lsp_tool::LspTool;
 pub use mcp_auth_tool::McpAuthTool;
+pub use mcp_resource_tools::{ListMcpResourcesTool, ReadMcpResourceTool};
 pub use notebook_edit_tool::NotebookEditTool;
 pub use powershell_tool::PowerShellTool;
 pub use read_tool::ReadTool;
@@ -85,10 +80,13 @@ pub use task_list_tool::TaskListTool;
 pub use task_output_tool::TaskOutputTool;
 pub use task_stop_tool::TaskStopTool;
 pub use task_update_tool::TaskUpdateTool;
-pub use tool_search_tool::ToolSearchTool;
+pub use team_create_tool::TeamCreateTool;
+pub use team_delete_tool::TeamDeleteTool;
 pub use todo_write_tool::TodoWriteTool;
+pub use tool_search_tool::ToolSearchTool;
 pub use web_fetch_tool::WebFetchTool;
 pub use web_search_tool::WebSearchTool;
+pub use worktree_tools::{EnterWorktreeTool, ExitWorktreeTool};
 pub use write_tool::WriteTool;
 
 use crate::context::{ToolError, ToolOutput};
@@ -128,14 +126,17 @@ impl Tool for EchoTool {
         }
     }
 
-    async fn execute(&self, input: ToolInput, _ctx: ToolContext<'_>) -> Result<ToolOutput, ToolError> {
+    async fn execute(
+        &self,
+        input: ToolInput,
+        _ctx: ToolContext<'_>,
+    ) -> Result<ToolOutput, ToolError> {
         let echoed = match &input.arguments {
             Value::Object(map) => {
                 if let Some(msg) = map.get("message").and_then(Value::as_str) {
                     msg.to_string()
                 } else {
-                    serde_json::to_string_pretty(&input.arguments)
-                        .unwrap_or_else(|_| String::new())
+                    serde_json::to_string_pretty(&input.arguments).unwrap_or_else(|_| String::new())
                 }
             }
             other => other.to_string(),
@@ -175,7 +176,11 @@ impl Tool for NoOpTool {
         }
     }
 
-    async fn execute(&self, _input: ToolInput, _ctx: ToolContext<'_>) -> Result<ToolOutput, ToolError> {
+    async fn execute(
+        &self,
+        _input: ToolInput,
+        _ctx: ToolContext<'_>,
+    ) -> Result<ToolOutput, ToolError> {
         Ok(ToolOutput {
             output: String::new(),
             is_display: false,
@@ -251,10 +256,7 @@ mod tests {
     use std::path::Path;
 
     fn test_ctx() -> ToolContext<'static> {
-        ToolContext::new(
-            crate::context::ExecutionContext::Normal,
-            Path::new("/tmp"),
-        )
+        ToolContext::new(crate::context::ExecutionContext::Normal, Path::new("/tmp"))
     }
 
     #[tokio::test]
@@ -501,10 +503,7 @@ mod tests {
         let mut names = HashSet::new();
         for tool in &tools {
             let name = tool.descriptor().name;
-            assert!(
-                names.insert(name.clone()),
-                "duplicate tool name: {name}"
-            );
+            assert!(names.insert(name.clone()), "duplicate tool name: {name}");
         }
     }
 

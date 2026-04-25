@@ -19,7 +19,11 @@ pub fn print_welcome_screen<W: Write>(
     cwd: &str,
     api_connected: bool,
 ) -> std::io::Result<()> {
-    let api_status = if api_connected { "connected" } else { "offline" };
+    let api_status = if api_connected {
+        "connected"
+    } else {
+        "offline"
+    };
 
     writeln!(out, "{T_REX}")?;
     writeln!(out)?;
@@ -39,14 +43,7 @@ mod tests {
     #[test]
     fn welcome_screen_renders() {
         let mut buf = Vec::new();
-        print_welcome_screen(
-            &mut buf,
-            "0.1.0",
-            "claude-sonnet-4-6",
-            "/tmp/test",
-            true,
-        )
-        .unwrap();
+        print_welcome_screen(&mut buf, "0.1.0", "claude-sonnet-4-6", "/tmp/test", true).unwrap();
         let output = String::from_utf8(buf).unwrap();
         assert!(output.contains("CodeRex"));
         assert!(output.contains("0.1.0"));

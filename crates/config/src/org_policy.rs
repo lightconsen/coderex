@@ -114,7 +114,10 @@ impl OrgPolicy {
 
     /// Merge this org policy into settings, applying org-level restrictions.
     #[must_use]
-    pub fn apply_to_settings(&self, settings: crate::settings::Settings) -> crate::settings::Settings {
+    pub fn apply_to_settings(
+        &self,
+        settings: crate::settings::Settings,
+    ) -> crate::settings::Settings {
         let mut merged = settings;
 
         // Restrict model if not allowed
@@ -147,7 +150,12 @@ impl OrgPolicy {
     }
 
     /// Validate that a requested action is allowed under this policy.
-    pub fn validate(&self, model: Option<&str>, mode: Option<&str>, tool: Option<&str>) -> Result<(), OrgPolicyError> {
+    pub fn validate(
+        &self,
+        model: Option<&str>,
+        mode: Option<&str>,
+        tool: Option<&str>,
+    ) -> Result<(), OrgPolicyError> {
         if let Some(m) = model {
             if !self.is_model_allowed(m) {
                 return Err(OrgPolicyError::Violation {
@@ -158,7 +166,10 @@ impl OrgPolicy {
         if let Some(m) = mode {
             if !self.is_permission_mode_allowed(m) {
                 return Err(OrgPolicyError::Violation {
-                    reason: format!("permission mode '{m}' is not allowed for org '{}'", self.org_id),
+                    reason: format!(
+                        "permission mode '{m}' is not allowed for org '{}'",
+                        self.org_id
+                    ),
                 });
             }
         }
@@ -225,7 +236,9 @@ impl OrgPolicyStore {
 
     /// Get the active org's policy.
     pub fn active_policy(&self) -> Option<&OrgPolicy> {
-        self.active_org_id.as_ref().and_then(|id| self.policies.get(id))
+        self.active_org_id
+            .as_ref()
+            .and_then(|id| self.policies.get(id))
     }
 
     /// Validate a request against the active org policy.
@@ -242,7 +255,10 @@ impl OrgPolicyStore {
     }
 
     /// Apply the active org policy to settings.
-    pub fn apply_active_to_settings(&self, settings: crate::settings::Settings) -> crate::settings::Settings {
+    pub fn apply_active_to_settings(
+        &self,
+        settings: crate::settings::Settings,
+    ) -> crate::settings::Settings {
         match self.active_policy() {
             Some(policy) => policy.apply_to_settings(settings),
             None => settings,
@@ -393,12 +409,16 @@ mod tests {
         store.upsert_policy(test_policy());
         store.set_active_org("acme-corp".to_string());
 
-        assert!(store
-            .validate_active(Some("claude-sonnet-4-6"), None, None)
-            .is_ok());
-        assert!(store
-            .validate_active(Some("claude-haiku-4-5-20251001"), None, None)
-            .is_err());
+        assert!(
+            store
+                .validate_active(Some("claude-sonnet-4-6"), None, None)
+                .is_ok()
+        );
+        assert!(
+            store
+                .validate_active(Some("claude-haiku-4-5-20251001"), None, None)
+                .is_err()
+        );
     }
 
     #[test]

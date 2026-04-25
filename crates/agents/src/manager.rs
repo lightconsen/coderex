@@ -4,17 +4,18 @@
 //! tool whitelisting, messaging, resume support, and teammate events.
 
 use coderex_core::api_client::ApiClient;
-use coderex_core::engine::{QueryEngine, SubmitOptions, StructuredOutputValidator, ValidationResult};
+use coderex_core::engine::{
+    QueryEngine, StructuredOutputValidator, SubmitOptions, ValidationResult,
+};
 use coderex_core::orchestrator::{
-    BackgroundFeatureRequest, QueryResult,
-    run_background_feature, run_forked_agent,
+    BackgroundFeatureRequest, QueryResult, run_background_feature, run_forked_agent,
 };
 use coderex_core::permission_engine::PermissionEngine;
 use coderex_core::permissions::{PermissionChecker, PermissionMode};
+use coderex_core::sandbox::SandboxConfig;
 use coderex_core::state::SessionState;
 use coderex_core::task::{TaskHandle, TaskKind, TaskManager};
 use coderex_core::tool_executor::ToolExecutor;
-use coderex_core::sandbox::SandboxConfig;
 use coderex_core::types::{AgentLifecycleEvent, EngineEvent, ModelId};
 use coderex_core::wire_adapter::engine_event_to_wire;
 use serde::{Deserialize, Serialize};
@@ -22,8 +23,8 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::{broadcast, mpsc, Mutex, Notify};
 use thiserror::Error;
+use tokio::sync::{Mutex, Notify, broadcast, mpsc};
 
 use crate::types::AgentType;
 
@@ -174,11 +175,7 @@ pub struct ForkedContext {
 impl ForkedContext {
     /// Create a forked context from the parent session.
     #[must_use]
-    pub fn new(
-        parent_session_id: String,
-        cwd: String,
-        message_count: usize,
-    ) -> Self {
+    pub fn new(parent_session_id: String, cwd: String, message_count: usize) -> Self {
         Self {
             parent_session_id,
             cwd,
@@ -273,11 +270,7 @@ pub struct AgentInstance {
 impl AgentInstance {
     /// Create a new agent instance.
     #[must_use]
-    pub fn new(
-        agent_type: AgentType,
-        options: SpawnOptions,
-        task_handle: TaskHandle,
-    ) -> Self {
+    pub fn new(agent_type: AgentType, options: SpawnOptions, task_handle: TaskHandle) -> Self {
         let model = options.model_override.clone();
         Self {
             agent_type,
@@ -319,8 +312,7 @@ pub enum TeammateEvent {
 }
 
 /// Callback for receiving teammate events.
-pub type TeammateEventCallback =
-    Box<dyn Fn(TeammateEvent) + Send + Sync + 'static>;
+pub type TeammateEventCallback = Box<dyn Fn(TeammateEvent) + Send + Sync + 'static>;
 
 // ─── AgentManager ───────────────────────────────────────────────────────────
 
@@ -347,7 +339,9 @@ pub struct AgentManager {
     event_tx: Option<mpsc::UnboundedSender<EngineEvent>>,
     /// Factory for creating tool executors for spawned agents.
     /// The optional `SandboxConfig` allows per-agent sandbox overrides.
-    tool_executor_factory: Option<Arc<dyn Fn(Option<SandboxConfig>) -> Box<dyn ToolExecutor + Send + Sync> + Send + Sync>>,
+    tool_executor_factory: Option<
+        Arc<dyn Fn(Option<SandboxConfig>) -> Box<dyn ToolExecutor + Send + Sync> + Send + Sync>,
+    >,
     /// Broadcast channel for agent observable events.
     agent_event_broadcast: Option<broadcast::Sender<AgentObservableEvent>>,
     /// Custom agent definitions loaded from config files.
@@ -427,7 +421,10 @@ impl AgentManager {
 
     /// Subscribe to agent observable events.
     #[must_use]
-    pub fn subscribe_to_agent(&self, _agent_id: &str) -> Option<broadcast::Receiver<AgentObservableEvent>> {
+    pub fn subscribe_to_agent(
+        &self,
+        _agent_id: &str,
+    ) -> Option<broadcast::Receiver<AgentObservableEvent>> {
         self.agent_event_broadcast.as_ref().map(|tx| tx.subscribe())
     }
 
@@ -569,7 +566,10 @@ impl AgentManager {
 
         // Merge custom agent options if this is a named custom agent
         let mut options = options;
-        if let AgentType::Custom { prompt: ref custom_name } = agent_type {
+        if let AgentType::Custom {
+            prompt: ref custom_name,
+        } = agent_type
+        {
             if let Some(def) = self.custom_agents.get(custom_name) {
                 if !def.allowed_tools.is_empty() && options.allowed_tools.is_none() {
                     options.allowed_tools = Some(def.allowed_tools.clone());
@@ -590,11 +590,7 @@ impl AgentManager {
         let completion_notify = Arc::new(Notify::new());
         let completion_notify_for_task = Arc::clone(&completion_notify);
 
-        let mut instance = AgentInstance::new(
-            agent_type,
-            options.clone(),
-            task_handle,
-        );
+        let mut instance = AgentInstance::new(agent_type, options.clone(), task_handle);
         instance.context = Some(context);
         instance.message_tx = Some(msg_tx);
         instance.output_file = Some(output_file.clone());
@@ -681,9 +677,9 @@ impl AgentManager {
             prompt.len()
         );
 
-        self.agents.get(&agent_id).ok_or_else(|| {
-            AgentError::SpawnFailed("agent not found after spawn".into())
-        })
+        self.agents
+            .get(&agent_id)
+            .ok_or_else(|| AgentError::SpawnFailed("agent not found after spawn".into()))
     }
 
     /// Get an agent by task ID.
@@ -693,11 +689,7 @@ impl AgentManager {
     }
 
     /// Send a message to a running agent.
-    pub async fn send_message(
-        &self,
-        agent_id: &str,
-        content: &str,
-    ) -> Result<(), AgentError> {
+    pub async fn send_message(&self, agent_id: &str, content: &str) -> Result<(), AgentError> {
         let agent = self
             .agents
             .get(agent_id)
@@ -752,11 +744,7 @@ impl AgentManager {
     }
 
     /// Mark an agent as idle and emit an Idle event.
-    pub async fn mark_idle(
-        &self,
-        agent_id: &str,
-        reason: &str,
-    ) -> Result<(), AgentError> {
+    pub async fn mark_idle(&self, agent_id: &str, reason: &str) -> Result<(), AgentError> {
         if !self.agents.contains_key(agent_id) {
             return Err(AgentError::NotFound(agent_id.to_string()));
         }
@@ -972,7 +960,9 @@ async fn run_agent_task(
     output_file: PathBuf,
     agent_id: String,
     parent_event_tx: Option<mpsc::UnboundedSender<EngineEvent>>,
-    tool_factory: Option<Arc<dyn Fn(Option<SandboxConfig>) -> Box<dyn ToolExecutor + Send + Sync> + Send + Sync>>,
+    tool_factory: Option<
+        Arc<dyn Fn(Option<SandboxConfig>) -> Box<dyn ToolExecutor + Send + Sync> + Send + Sync>,
+    >,
     broadcast_tx: Option<broadcast::Sender<AgentObservableEvent>>,
     retry_policy: Option<RetryPolicy>,
     output_schema: Option<serde_json::Value>,
@@ -987,8 +977,13 @@ async fn run_agent_task(
     }
 
     let max_retries = retry_policy.as_ref().map(|r| r.max_retries).unwrap_or(0);
-    let _on_failure = retry_policy.as_ref().map(|r| r.on_failure).unwrap_or(FailureAction::EscalateToParent);
-    let escalation_prompt = retry_policy.as_ref().and_then(|r| r.escalation_prompt.clone());
+    let _on_failure = retry_policy
+        .as_ref()
+        .map(|r| r.on_failure)
+        .unwrap_or(FailureAction::EscalateToParent);
+    let escalation_prompt = retry_policy
+        .as_ref()
+        .and_then(|r| r.escalation_prompt.clone());
 
     // Set up agent log file
     let log_dir = home::home_dir()
@@ -1016,7 +1011,13 @@ async fn run_agent_task(
 
         let (event_tx, mut event_rx) = mpsc::unbounded_channel::<EngineEvent>();
 
-        let mut engine = QueryEngine::new(api_client.clone_box(), model.clone(), session, permission_engine, event_tx);
+        let mut engine = QueryEngine::new(
+            api_client.clone_box(),
+            model.clone(),
+            session,
+            permission_engine,
+            event_tx,
+        );
 
         if let Some(ref factory) = tool_factory {
             engine.set_tool_executor(factory(sandbox_config.clone()));
@@ -1042,7 +1043,8 @@ async fn run_agent_task(
         options.task_budget_tokens = u64::from(max_tokens);
 
         let timeout = Duration::from_secs(max_duration);
-        let engine_result = tokio::time::timeout(timeout, engine.submit(attempt_prompt.clone(), options)).await;
+        let engine_result =
+            tokio::time::timeout(timeout, engine.submit(attempt_prompt.clone(), options)).await;
 
         // Capture total token usage before dropping the engine
         let usage = engine.total_usage();
@@ -1054,7 +1056,9 @@ async fn run_agent_task(
 
         // Collect text output from events and forward to observability channels
         let mut attempt_output = String::new();
-        while let Ok(Some(event)) = tokio::time::timeout(Duration::from_secs(2), event_rx.recv()).await {
+        while let Ok(Some(event)) =
+            tokio::time::timeout(Duration::from_secs(2), event_rx.recv()).await
+        {
             // Also drain any messages from parent while collecting events
             while let Ok(msg) = msg_rx.try_recv() {
                 attempt_prompt.push_str(&format!("\n\n[Message from parent]: {}", msg.content));
@@ -1097,15 +1101,14 @@ async fn run_agent_task(
             Ok(Ok(_)) => {
                 // Validate output against schema if provided
                 if let Some(ref schema) = output_schema {
-                    let validator = StructuredOutputValidator::new(schema.clone()).with_max_retries(2);
+                    let validator =
+                        StructuredOutputValidator::new(schema.clone()).with_max_retries(2);
                     match validator.validate(&attempt_output, 0) {
                         ValidationResult::Valid(_) => {}
                         ValidationResult::Invalid { error, .. } => {
                             if attempt < max_retries {
-                                let retry_note = format!(
-                                    "\n\n{}",
-                                    validator.retry_instruction(&error)
-                                );
+                                let retry_note =
+                                    format!("\n\n{}", validator.retry_instruction(&error));
                                 attempt_prompt.push_str(&retry_note);
                                 continue;
                             }
@@ -1125,7 +1128,8 @@ async fn run_agent_task(
                 let err_msg = format!("engine error: {e}");
                 if attempt < max_retries {
                     // Build retry prompt with error context
-                    let mut retry_note = format!("\n\n[Previous attempt failed: {err_msg}. Retrying...]");
+                    let mut retry_note =
+                        format!("\n\n[Previous attempt failed: {err_msg}. Retrying...]");
                     if let Some(ref ep) = escalation_prompt {
                         retry_note.push_str(&format!("\n{ep}"));
                     }
@@ -1139,7 +1143,9 @@ async fn run_agent_task(
             Err(_) => {
                 let err_msg = format!("agent timed out after {max_duration}s");
                 if attempt < max_retries {
-                    let mut retry_note = format!("\n\n[Previous attempt timed out after {max_duration}s. Retrying...]");
+                    let mut retry_note = format!(
+                        "\n\n[Previous attempt timed out after {max_duration}s. Retrying...]"
+                    );
                     if let Some(ref ep) = escalation_prompt {
                         retry_note.push_str(&format!("\n{ep}"));
                     }
@@ -1158,9 +1164,7 @@ async fn run_agent_task(
     // Notify parent of completion/failure
     if let Some(ref tx) = parent_event_tx {
         let lifecycle = if let Some(ref err) = error {
-            AgentLifecycleEvent::Failed {
-                error: err.clone(),
-            }
+            AgentLifecycleEvent::Failed { error: err.clone() }
         } else {
             AgentLifecycleEvent::Completed {
                 summary: final_output.clone(),
@@ -1226,14 +1230,7 @@ pub async fn execute_via_agent(
     };
 
     let instance = manager
-        .spawn_agent(
-            agent_type,
-            command,
-            options,
-            parent_session_id,
-            cwd,
-            0,
-        )
+        .spawn_agent(agent_type, command, options, parent_session_id, cwd, 0)
         .await?;
 
     let task_id = instance.task_handle.id.clone();
@@ -1278,11 +1275,7 @@ pub async fn spawn_dream_agent(
     session_summaries: &[&str],
 ) -> Result<String, AgentError> {
     // Read-only tool whitelist for dream agents
-    let allowed_tools = vec![
-        "Read".into(),
-        "Glob".into(),
-        "Grep".into(),
-    ];
+    let allowed_tools = vec!["Read".into(), "Glob".into(), "Grep".into()];
 
     let options = SpawnOptions {
         run_in_background: true,
@@ -1295,7 +1288,12 @@ pub async fn spawn_dream_agent(
         prompt: format!(
             "Dream agent: Analyze recent sessions and produce a structured summary.\n\n{}\n\nSession summaries:\n{}",
             dream_prompt,
-            session_summaries.iter().enumerate().map(|(i, s)| format!("## Session {}\n{}", i + 1, s)).collect::<Vec<_>>().join("\n")
+            session_summaries
+                .iter()
+                .enumerate()
+                .map(|(i, s)| format!("## Session {}\n{}", i + 1, s))
+                .collect::<Vec<_>>()
+                .join("\n")
         ),
     };
 
@@ -1328,7 +1326,6 @@ pub async fn spawn_dream_agent(
 #[cfg(test)]
 mod tests {
     use super::*;
-    
 
     fn make_manager() -> AgentManager {
         AgentManager::standalone()
@@ -1507,11 +1504,7 @@ mod tests {
     #[tokio::test]
     async fn resume_agent() {
         let mut mgr = make_manager();
-        let context = ForkedContext::new(
-            "sess_parent".into(),
-            "/tmp".into(),
-            10,
-        );
+        let context = ForkedContext::new("sess_parent".into(), "/tmp".into(), 10);
 
         mgr.resume_agent(
             "resumed_1",
@@ -1529,11 +1522,7 @@ mod tests {
     #[tokio::test]
     async fn resume_existing_agent_errors() {
         let mut mgr = make_manager();
-        let context = ForkedContext::new(
-            "sess_parent".into(),
-            "/tmp".into(),
-            10,
-        );
+        let context = ForkedContext::new("sess_parent".into(), "/tmp".into(), 10);
 
         mgr.resume_agent(
             "dup_1",
@@ -1544,7 +1533,9 @@ mod tests {
         .await
         .unwrap();
 
-        let result = mgr.resume_agent("dup_1", AgentType::Plan, SpawnOptions::default(), context).await;
+        let result = mgr
+            .resume_agent("dup_1", AgentType::Plan, SpawnOptions::default(), context)
+            .await;
         assert!(matches!(result, Err(AgentError::SpawnFailed(_))));
     }
 
@@ -1565,14 +1556,20 @@ mod tests {
 
     #[test]
     fn agent_type_name_maps() {
-        assert_eq!(agent_type_name(&AgentType::GeneralPurpose), "general_purpose");
+        assert_eq!(
+            agent_type_name(&AgentType::GeneralPurpose),
+            "general_purpose"
+        );
         assert_eq!(agent_type_name(&AgentType::Plan), "plan");
         assert_eq!(agent_type_name(&AgentType::Verification), "verification");
         assert_eq!(
             agent_type_name(&AgentType::ClaudeCodeGuide),
             "claude_code_guide"
         );
-        assert_eq!(agent_type_name(&AgentType::StatuslineSetup), "statusline_setup");
+        assert_eq!(
+            agent_type_name(&AgentType::StatuslineSetup),
+            "statusline_setup"
+        );
         assert_eq!(
             agent_type_name(&AgentType::Explore {
                 thoroughness: crate::types::Thoroughness::Medium

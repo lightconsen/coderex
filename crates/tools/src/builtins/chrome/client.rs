@@ -104,7 +104,8 @@ impl ChromeClient {
             "returnByValue": true,
             "awaitPromise": true,
         });
-        self.send_cdp_command(ws_url, "Runtime.evaluate", params).await
+        self.send_cdp_command(ws_url, "Runtime.evaluate", params)
+            .await
     }
 
     /// Capture a screenshot of the given tab as a base64-encoded PNG.
@@ -162,9 +163,9 @@ impl ChromeClient {
         });
 
         let msg = WsMessage::Text(request.to_string().into());
-        futures_util::SinkExt::send(&mut write, msg)
-            .await
-            .map_err(|e: tokio_tungstenite::tungstenite::Error| ChromeError::WebSocket(e.to_string()))?;
+        futures_util::SinkExt::send(&mut write, msg).await.map_err(
+            |e: tokio_tungstenite::tungstenite::Error| ChromeError::WebSocket(e.to_string()),
+        )?;
 
         let response = tokio::time::timeout(WS_TIMEOUT, async {
             while let Some(Ok(msg)) = futures_util::StreamExt::next(&mut read).await {
@@ -198,10 +199,7 @@ impl ChromeClient {
             });
         }
 
-        Ok(response
-            .get("result")
-            .cloned()
-            .unwrap_or(Value::Null))
+        Ok(response.get("result").cloned().unwrap_or(Value::Null))
     }
 }
 

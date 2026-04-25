@@ -5,8 +5,8 @@
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
-use tokio::io::AsyncBufReadExt;
 use std::io::Write;
+use tokio::io::AsyncBufReadExt;
 
 /// An elicitation option presented to the user.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -62,10 +62,7 @@ pub trait ElicitationHandler: Send + Sync {
     /// Request an elicitation from the user.
     ///
     /// Returns the user's response, cancellation, or timeout.
-    async fn request(
-        &self,
-        questions: Vec<ElicitationQuestion>,
-    ) -> ElicitationResult;
+    async fn request(&self, questions: Vec<ElicitationQuestion>) -> ElicitationResult;
 }
 
 /// REPL elicitation handler — prompts interactively via the terminal.
@@ -77,10 +74,7 @@ pub struct ReplElicitationHandler;
 
 #[async_trait]
 impl ElicitationHandler for ReplElicitationHandler {
-    async fn request(
-        &self,
-        questions: Vec<ElicitationQuestion>,
-    ) -> ElicitationResult {
+    async fn request(&self, questions: Vec<ElicitationQuestion>) -> ElicitationResult {
         let mut stderr = std::io::stderr();
         for q in &questions {
             let _ = writeln!(stderr, "\n[{}] {}", q.header, q.question);
@@ -88,7 +82,10 @@ impl ElicitationHandler for ReplElicitationHandler {
                 let _ = writeln!(stderr, "  {}. {} — {}", i + 1, opt.label, opt.description);
             }
             if q.multi_select {
-                let _ = writeln!(stderr, "  (Enter comma-separated numbers, or type a custom response)");
+                let _ = writeln!(
+                    stderr,
+                    "  (Enter comma-separated numbers, or type a custom response)"
+                );
             } else {
                 let _ = writeln!(stderr, "  (Enter a number or type a custom response)");
             }
@@ -156,16 +153,15 @@ impl SdkElicitationHandler {
     /// Create a new handler with an event sender.
     #[must_use]
     pub fn new(event_tx: tokio::sync::mpsc::UnboundedSender<crate::types::EngineEvent>) -> Self {
-        Self { event_tx: Some(event_tx) }
+        Self {
+            event_tx: Some(event_tx),
+        }
     }
 }
 
 #[async_trait]
 impl ElicitationHandler for SdkElicitationHandler {
-    async fn request(
-        &self,
-        questions: Vec<ElicitationQuestion>,
-    ) -> ElicitationResult {
+    async fn request(&self, questions: Vec<ElicitationQuestion>) -> ElicitationResult {
         for q in &questions {
             let event_json = serde_json::json!({
                 "type": "elicitation_request",
@@ -174,10 +170,7 @@ impl ElicitationHandler for SdkElicitationHandler {
                 "options": q.options,
                 "multi_select": q.multi_select,
             });
-            tracing::info!(
-                "SDK ELICITATION: {json}",
-                json = event_json
-            );
+            tracing::info!("SDK ELICITATION: {json}", json = event_json);
             // Emit an EngineEvent if an event sender is available.
             if let Some(ref tx) = self.event_tx {
                 let _ = tx.send(crate::types::EngineEvent::ElicitationRequest {

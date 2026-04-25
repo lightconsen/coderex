@@ -15,9 +15,7 @@ const REPO_NAME: &str = "coderex";
 ///
 /// Returns a message if a newer version is available, `None` otherwise.
 pub async fn check_for_updates() -> Option<String> {
-    let url = format!(
-        "https://api.github.com/repos/{REPO_OWNER}/{REPO_NAME}/releases/latest"
-    );
+    let url = format!("https://api.github.com/repos/{REPO_OWNER}/{REPO_NAME}/releases/latest");
 
     let client = match reqwest::Client::builder()
         .timeout(Duration::from_secs(5))
@@ -64,14 +62,8 @@ pub async fn check_for_updates() -> Option<String> {
 /// Returns `true` if `latest` is newer than `current`.
 #[must_use]
 pub fn is_newer(latest: &str, current: &str) -> bool {
-    let latest_parts: Vec<u32> = latest
-        .split('.')
-        .filter_map(|s| s.parse().ok())
-        .collect();
-    let current_parts: Vec<u32> = current
-        .split('.')
-        .filter_map(|s| s.parse().ok())
-        .collect();
+    let latest_parts: Vec<u32> = latest.split('.').filter_map(|s| s.parse().ok()).collect();
+    let current_parts: Vec<u32> = current.split('.').filter_map(|s| s.parse().ok()).collect();
 
     for (l, c) in latest_parts.iter().zip(current_parts.iter()) {
         if l > c {
@@ -180,8 +172,11 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_secs();
-        std::fs::write(tmp.path().join(".coderex/.last_version_check"), old.to_string())
-            .unwrap();
+        std::fs::write(
+            tmp.path().join(".coderex/.last_version_check"),
+            old.to_string(),
+        )
+        .unwrap();
         assert!(should_check(tmp.path()));
     }
 

@@ -38,11 +38,19 @@ impl Tool for EditTool {
         }
     }
 
-    async fn execute(&self, input: ToolInput, ctx: ToolContext<'_>) -> Result<ToolOutput, ToolError> {
+    async fn execute(
+        &self,
+        input: ToolInput,
+        ctx: ToolContext<'_>,
+    ) -> Result<ToolOutput, ToolError> {
         let file_path = extract_string(&input.arguments, "file_path")?;
         let old_string = extract_string(&input.arguments, "old_string")?;
         let new_string = extract_string(&input.arguments, "new_string")?;
-        let replace_all = input.arguments.get("replace_all").and_then(serde_json::Value::as_bool).unwrap_or(false);
+        let replace_all = input
+            .arguments
+            .get("replace_all")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
 
         let path = resolve_path(&file_path, ctx.cwd);
         let path_buf = std::path::PathBuf::from(&path);
@@ -79,7 +87,9 @@ impl Tool for EditTool {
         }
         if count > 1 && !replace_all {
             return Err(ToolError::InvalidInput {
-                message: format!("old_string appears {count} times, use replace_all to replace all occurrences"),
+                message: format!(
+                    "old_string appears {count} times, use replace_all to replace all occurrences"
+                ),
             });
         }
 
@@ -121,8 +131,8 @@ fn resolve_path(file_path: &str, cwd: &std::path::Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tool::ToolContext;
     use crate::context::ExecutionContext;
+    use crate::tool::ToolContext;
     use std::path::Path;
 
     fn test_ctx(cwd: &Path) -> ToolContext<'_> {
@@ -148,7 +158,10 @@ mod tests {
         std::fs::write(tmp.path().join("test.txt"), "hello world foo").unwrap();
 
         let output = EditTool
-            .execute(edit_input("test.txt", "hello", "hi", false), test_ctx(tmp.path()))
+            .execute(
+                edit_input("test.txt", "hello", "hi", false),
+                test_ctx(tmp.path()),
+            )
             .await
             .unwrap();
         assert!(output.output.contains("Replaced 1 occurrence"));
@@ -164,7 +177,10 @@ mod tests {
         std::fs::write(tmp.path().join("test.txt"), "foo bar foo").unwrap();
 
         let _ = EditTool
-            .execute(edit_input("test.txt", "foo", "baz", true), test_ctx(tmp.path()))
+            .execute(
+                edit_input("test.txt", "foo", "baz", true),
+                test_ctx(tmp.path()),
+            )
             .await
             .unwrap();
         assert_eq!(
@@ -179,7 +195,10 @@ mod tests {
         std::fs::write(tmp.path().join("test.txt"), "dup dup dup").unwrap();
 
         let result = EditTool
-            .execute(edit_input("test.txt", "dup", "new", false), test_ctx(tmp.path()))
+            .execute(
+                edit_input("test.txt", "dup", "new", false),
+                test_ctx(tmp.path()),
+            )
             .await;
         assert!(result.is_err());
         let err = result.unwrap_err();
@@ -192,7 +211,10 @@ mod tests {
     async fn file_not_found() {
         let tmp = tempfile::tempdir().unwrap();
         let result = EditTool
-            .execute(edit_input("nope.txt", "old", "new", false), test_ctx(tmp.path()))
+            .execute(
+                edit_input("nope.txt", "old", "new", false),
+                test_ctx(tmp.path()),
+            )
             .await;
         assert!(result.is_err());
     }
@@ -203,7 +225,10 @@ mod tests {
         std::fs::write(tmp.path().join("test.txt"), "hello").unwrap();
 
         let result = EditTool
-            .execute(edit_input("test.txt", "world", "new", false), test_ctx(tmp.path()))
+            .execute(
+                edit_input("test.txt", "world", "new", false),
+                test_ctx(tmp.path()),
+            )
             .await;
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("not found"));
@@ -216,7 +241,10 @@ mod tests {
         std::fs::write(tmp.path().join("test.txt"), original).unwrap();
 
         let output = EditTool
-            .execute(edit_input("test.txt", "same", "same", false), test_ctx(tmp.path()))
+            .execute(
+                edit_input("test.txt", "same", "same", false),
+                test_ctx(tmp.path()),
+            )
             .await
             .unwrap();
         assert!(output.output.contains("Replaced 1"));

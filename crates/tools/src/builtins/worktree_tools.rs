@@ -56,13 +56,23 @@ impl Tool for EnterWorktreeTool {
         }
     }
 
-    async fn execute(&self, input: ToolInput, ctx: ToolContext<'_>) -> Result<ToolOutput, ToolError> {
-        let branch = input.arguments.get("branch").and_then(serde_json::Value::as_str);
+    async fn execute(
+        &self,
+        input: ToolInput,
+        ctx: ToolContext<'_>,
+    ) -> Result<ToolOutput, ToolError> {
+        let branch = input
+            .arguments
+            .get("branch")
+            .and_then(serde_json::Value::as_str);
         let handle = get_handle(&ctx)?;
         let path = handle
             .enter(branch)
             .map_err(|e| ToolError::InvalidInput { message: e })?;
-        Ok(ToolOutput { output: path, is_display: true })
+        Ok(ToolOutput {
+            output: path,
+            is_display: true,
+        })
     }
 }
 
@@ -89,10 +99,19 @@ impl Tool for ExitWorktreeTool {
         }
     }
 
-    async fn execute(&self, _input: ToolInput, ctx: ToolContext<'_>) -> Result<ToolOutput, ToolError> {
+    async fn execute(
+        &self,
+        _input: ToolInput,
+        ctx: ToolContext<'_>,
+    ) -> Result<ToolOutput, ToolError> {
         let handle = get_handle(&ctx)?;
-        handle.exit().map_err(|e| ToolError::InvalidInput { message: e })?;
-        Ok(ToolOutput { output: "exited".into(), is_display: true })
+        handle
+            .exit()
+            .map_err(|e| ToolError::InvalidInput { message: e })?;
+        Ok(ToolOutput {
+            output: "exited".into(),
+            is_display: true,
+        })
     }
 }
 
@@ -124,7 +143,7 @@ mod tests {
         extra.insert(WORKTREE_HANDLE_KEY.into(), Box::new(typed));
         (
             ToolContext {
-            elicit_tx: None,
+                elicit_tx: None,
                 execution_context: ExecutionContext::Normal,
                 cwd: Path::new("/tmp"),
                 extra: Arc::new(extra),
@@ -138,7 +157,11 @@ mod tests {
         let (ctx, _h) = ctx_with_handle();
         let out = EnterWorktreeTool
             .execute(
-                ToolInput { call_id: "1".into(), name: "EnterWorktree".into(), arguments: serde_json::json!({"branch": "dev"}) },
+                ToolInput {
+                    call_id: "1".into(),
+                    name: "EnterWorktree".into(),
+                    arguments: serde_json::json!({"branch": "dev"}),
+                },
                 ctx,
             )
             .await
@@ -151,7 +174,11 @@ mod tests {
         let (ctx, _h) = ctx_with_handle();
         let out = ExitWorktreeTool
             .execute(
-                ToolInput { call_id: "1".into(), name: "ExitWorktree".into(), arguments: serde_json::json!({}) },
+                ToolInput {
+                    call_id: "1".into(),
+                    name: "ExitWorktree".into(),
+                    arguments: serde_json::json!({}),
+                },
                 ctx,
             )
             .await
@@ -164,7 +191,11 @@ mod tests {
         let ctx = ToolContext::new(ExecutionContext::Normal, Path::new("/tmp"));
         let err = EnterWorktreeTool
             .execute(
-                ToolInput { call_id: "1".into(), name: "EnterWorktree".into(), arguments: serde_json::json!({}) },
+                ToolInput {
+                    call_id: "1".into(),
+                    name: "EnterWorktree".into(),
+                    arguments: serde_json::json!({}),
+                },
                 ctx,
             )
             .await

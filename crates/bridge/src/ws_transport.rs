@@ -8,10 +8,10 @@ use futures_util::{SinkExt, StreamExt};
 use std::collections::HashMap;
 use std::marker::PhantomPinned;
 use tokio::time::Duration;
-use tokio_tungstenite::connect_async_tls_with_config;
-use tokio_tungstenite::tungstenite::client::IntoClientRequest;
-use tokio_tungstenite::tungstenite::Message as WsMessage;
 use tokio_tungstenite::Connector;
+use tokio_tungstenite::connect_async_tls_with_config;
+use tokio_tungstenite::tungstenite::Message as WsMessage;
+use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tracing::{debug, info, warn};
 
 use crate::transport::{Transport, TransportError, TransportMessage};
@@ -342,8 +342,7 @@ mod tests {
 
     #[test]
     fn ws_transport_config_builder() {
-        let config = WsTransportConfig::new("wss://example.com/ws")
-            .with_auth("secret-token");
+        let config = WsTransportConfig::new("wss://example.com/ws").with_auth("secret-token");
         assert_eq!(config.url, "wss://example.com/ws");
         assert_eq!(config.auth_token, Some("secret-token".into()));
     }

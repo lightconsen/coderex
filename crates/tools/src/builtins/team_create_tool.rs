@@ -47,7 +47,11 @@ impl Tool for TeamCreateTool {
         }
     }
 
-    async fn execute(&self, input: ToolInput, ctx: ToolContext<'_>) -> Result<ToolOutput, ToolError> {
+    async fn execute(
+        &self,
+        input: ToolInput,
+        ctx: ToolContext<'_>,
+    ) -> Result<ToolOutput, ToolError> {
         let name = input
             .arguments
             .get("name")
@@ -91,7 +95,9 @@ mod tests {
             *n += 1;
             Ok(format!("team_{}", *n))
         }
-        fn delete_team(&self, _team_id: &str) -> Result<(), String> { Ok(()) }
+        fn delete_team(&self, _team_id: &str) -> Result<(), String> {
+            Ok(())
+        }
     }
 
     #[tokio::test]
@@ -105,20 +111,34 @@ mod tests {
             cwd: Path::new("/tmp"),
             extra: Arc::new(extra),
         };
-        let out = TeamCreateTool.execute(
-            ToolInput { call_id: "1".into(), name: "TeamCreate".into(), arguments: serde_json::json!({"name": "alpha"}) },
-            ctx,
-        ).await.unwrap();
+        let out = TeamCreateTool
+            .execute(
+                ToolInput {
+                    call_id: "1".into(),
+                    name: "TeamCreate".into(),
+                    arguments: serde_json::json!({"name": "alpha"}),
+                },
+                ctx,
+            )
+            .await
+            .unwrap();
         assert_eq!(out.output, "team_1");
     }
 
     #[tokio::test]
     async fn team_create_missing_manager() {
         let ctx = ToolContext::new(ExecutionContext::Normal, Path::new("/tmp"));
-        let err = TeamCreateTool.execute(
-            ToolInput { call_id: "1".into(), name: "TeamCreate".into(), arguments: serde_json::json!({"name": "a"}) },
-            ctx,
-        ).await.unwrap_err();
+        let err = TeamCreateTool
+            .execute(
+                ToolInput {
+                    call_id: "1".into(),
+                    name: "TeamCreate".into(),
+                    arguments: serde_json::json!({"name": "a"}),
+                },
+                ctx,
+            )
+            .await
+            .unwrap_err();
         assert!(matches!(err, ToolError::InvalidInput { .. }));
     }
 }

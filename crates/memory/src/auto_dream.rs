@@ -119,8 +119,7 @@ impl AutoDream {
     /// Persist dream state to disk.
     fn save_state(&self, state: &DreamState) -> std::io::Result<()> {
         std::fs::create_dir_all(&self.memory_dir)?;
-        let serialized = serde_json::to_string_pretty(state)
-            .map_err(std::io::Error::other)?;
+        let serialized = serde_json::to_string_pretty(state).map_err(std::io::Error::other)?;
         std::fs::write(&self.state_path, serialized)
     }
 
@@ -382,7 +381,7 @@ impl AutoDream {
             1. **Key Decisions** — important architectural or design decisions made\n\
             2. **Code Patterns** — recurring patterns, conventions, or idioms observed\n\
             3. **Unresolved Items** — TODOs, open questions, or incomplete work\n\
-            4. **Suggestions** — improvements or refactorings to consider\n\n"
+            4. **Suggestions** — improvements or refactorings to consider\n\n",
         );
 
         prompt.push_str("Here are the recent session summaries:\n\n");
@@ -441,7 +440,13 @@ mod tests {
         dream.record_session().unwrap();
 
         let result = dream.check_threshold();
-        assert!(matches!(result, DreamCheckResult::ShouldDream { sessions_since_last: 3, .. }));
+        assert!(matches!(
+            result,
+            DreamCheckResult::ShouldDream {
+                sessions_since_last: 3,
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -449,14 +454,20 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let config = DreamConfig::default();
         let _dream = AutoDream::new(tmp.path().to_path_buf(), config.clone());
-        let disabled_config = DreamConfig { enabled: false, ..config };
+        let disabled_config = DreamConfig {
+            enabled: false,
+            ..config
+        };
         let dream2 = AutoDream::new(tmp.path().join("2"), disabled_config);
 
         // Even with many sessions, disabled means not ready
         for _ in 0..100 {
             dream2.record_session().unwrap();
         }
-        assert!(matches!(dream2.check_threshold(), DreamCheckResult::NotReady));
+        assert!(matches!(
+            dream2.check_threshold(),
+            DreamCheckResult::NotReady
+        ));
     }
 
     #[test]
@@ -478,7 +489,9 @@ mod tests {
     fn dream_artifact_written() {
         let (dream, tmp) = temp_dream();
         let dream_session = dream.start_dream().unwrap();
-        dream.complete_dream(dream_session, "# Dream Summary\nKey finding: Rust", 3).unwrap();
+        dream
+            .complete_dream(dream_session, "# Dream Summary\nKey finding: Rust", 3)
+            .unwrap();
 
         let dreams_dir = tmp.path().join("dreams");
         assert!(dreams_dir.exists());
@@ -500,7 +513,9 @@ mod tests {
             dream.record_session().unwrap();
             dream.record_session().unwrap();
             let ds = dream.start_dream().unwrap();
-            dream.complete_dream(ds, &format!("Dream {}", i), 3).unwrap();
+            dream
+                .complete_dream(ds, &format!("Dream {}", i), 3)
+                .unwrap();
         }
 
         let history = dream.dream_history();
@@ -510,7 +525,8 @@ mod tests {
     #[test]
     fn generate_dream_prompt_contains_sessions() {
         let (dream, _tmp) = temp_dream();
-        let prompt = dream.generate_dream_prompt(&["Session A: fixed auth bug", "Session B: added tests"]);
+        let prompt =
+            dream.generate_dream_prompt(&["Session A: fixed auth bug", "Session B: added tests"]);
         assert!(prompt.contains("Session A: fixed auth bug"));
         assert!(prompt.contains("Session B: added tests"));
         assert!(prompt.contains("Key Decisions"));
@@ -541,7 +557,7 @@ mod tests {
     fn check_threshold_time_based() {
         let tmp = tempfile::tempdir().unwrap();
         let config = DreamConfig {
-            session_threshold: 100, // High session threshold so time triggers first
+            session_threshold: 100,  // High session threshold so time triggers first
             time_threshold_hours: 0, // Trigger immediately if no previous dream
             enabled: true,
         };

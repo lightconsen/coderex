@@ -185,7 +185,9 @@ impl TrustedDeviceRegistry {
         // Check token expiry
         let expires_at = device.registered_at + chrono::Duration::hours(self.token_expiry_hours);
         if now > expires_at {
-            return Err(TrustedDeviceError::TokenExpired { expired_at: expires_at });
+            return Err(TrustedDeviceError::TokenExpired {
+                expired_at: expires_at,
+            });
         }
 
         device.trust_status = TrustStatus::Trusted;
@@ -339,7 +341,8 @@ mod tests {
     #[test]
     fn register_device_with_org_id() {
         let (mut reg, _tmp) = temp_registry();
-        reg.register_device("work-laptop", Some("acme-corp")).unwrap();
+        reg.register_device("work-laptop", Some("acme-corp"))
+            .unwrap();
         let device = reg.list_devices()[0];
         assert_eq!(device.org_id.as_deref(), Some("acme-corp"));
     }
@@ -350,7 +353,10 @@ mod tests {
         // Same machine gets same device_id, so second registration fails
         reg.register_device("my-laptop", None).unwrap();
         let result = reg.register_device("my-laptop", None);
-        assert!(matches!(result, Err(TrustedDeviceError::DeviceAlreadyRegistered { .. })));
+        assert!(matches!(
+            result,
+            Err(TrustedDeviceError::DeviceAlreadyRegistered { .. })
+        ));
     }
 
     #[test]
@@ -377,7 +383,10 @@ mod tests {
         let (mut reg, _tmp) = temp_registry();
         reg.register_device("my-laptop", None).unwrap();
         let result = reg.check_trust();
-        assert!(matches!(result, Err(TrustedDeviceError::DeviceNotTrusted { .. })));
+        assert!(matches!(
+            result,
+            Err(TrustedDeviceError::DeviceNotTrusted { .. })
+        ));
     }
 
     #[test]
@@ -395,7 +404,10 @@ mod tests {
         reg.verify_device(&token).unwrap();
         let device_id = reg.list_devices()[0].device_id.clone();
         reg.revoke_device(&device_id).unwrap();
-        assert!(matches!(reg.check_trust(), Err(TrustedDeviceError::DeviceNotTrusted { .. })));
+        assert!(matches!(
+            reg.check_trust(),
+            Err(TrustedDeviceError::DeviceNotTrusted { .. })
+        ));
         let device = reg.get_device(&device_id).unwrap();
         assert_eq!(device.trust_status, TrustStatus::Revoked);
     }
@@ -466,6 +478,9 @@ mod tests {
         reg.devices.insert(device_id.clone(), record);
 
         let result = reg.verify_device(&token);
-        assert!(matches!(result, Err(TrustedDeviceError::TokenExpired { .. })));
+        assert!(matches!(
+            result,
+            Err(TrustedDeviceError::TokenExpired { .. })
+        ));
     }
 }

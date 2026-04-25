@@ -99,11 +99,17 @@ mod tests {
 
     fn sample_config() -> McpConfig {
         let mut config = McpConfig::new();
-        config.add_server("filesystem", McpServerConfig {
-            command: "npx".into(),
-            args: vec!["@modelcontextprotocol/server-filesystem".into(), "/tmp".into()],
-            env: HashMap::new(),
-        });
+        config.add_server(
+            "filesystem",
+            McpServerConfig {
+                command: "npx".into(),
+                args: vec![
+                    "@modelcontextprotocol/server-filesystem".into(),
+                    "/tmp".into(),
+                ],
+                env: HashMap::new(),
+            },
+        );
         config
     }
 
@@ -133,12 +139,22 @@ mod tests {
     #[test]
     fn server_names() {
         let mut config = McpConfig::new();
-        config.add_server("a", McpServerConfig {
-            command: "echo".into(), args: vec![], env: HashMap::new(),
-        });
-        config.add_server("b", McpServerConfig {
-            command: "echo".into(), args: vec![], env: HashMap::new(),
-        });
+        config.add_server(
+            "a",
+            McpServerConfig {
+                command: "echo".into(),
+                args: vec![],
+                env: HashMap::new(),
+            },
+        );
+        config.add_server(
+            "b",
+            McpServerConfig {
+                command: "echo".into(),
+                args: vec![],
+                env: HashMap::new(),
+            },
+        );
         let names = config.server_names();
         assert_eq!(names.len(), 2);
         assert!(names.contains(&"a"));

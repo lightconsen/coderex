@@ -9,9 +9,9 @@ use parking_lot::Mutex;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use crate::long_term::LongTermStore;
 use crate::session_index::SessionIndex;
 use crate::transcript::{TranscriptError, TranscriptStore};
-use crate::long_term::LongTermStore;
 use coderex_core::types::Message;
 
 /// Type alias for a thread-safe [`SessionIndex`].
@@ -74,11 +74,7 @@ impl ConcurrentTranscriptStore {
     }
 
     /// Rewrite the transcript with new messages (thread-safe).
-    pub fn rewrite(
-        &self,
-        session_id: &str,
-        messages: &[Message],
-    ) -> Result<(), TranscriptError> {
+    pub fn rewrite(&self, session_id: &str, messages: &[Message]) -> Result<(), TranscriptError> {
         let lock = self.get_lock(session_id);
         let _guard = lock.lock();
         let store = TranscriptStore::new(self.base_path.clone());
@@ -196,7 +192,12 @@ mod tests {
         }
 
         let messages = store.read_all("shared_session").unwrap();
-        assert_eq!(messages.len(), 20, "expected 20 messages but got {}", messages.len());
+        assert_eq!(
+            messages.len(),
+            20,
+            "expected 20 messages but got {}",
+            messages.len()
+        );
     }
 
     #[test]
@@ -229,9 +230,8 @@ mod tests {
         let mut handles = Vec::new();
         for i in 0..10 {
             let s = store.clone();
-            let h = std::thread::spawn(move || {
-                s.write(&format!("topic_{i}"), &format!("content {i}"))
-            });
+            let h =
+                std::thread::spawn(move || s.write(&format!("topic_{i}"), &format!("content {i}")));
             handles.push(h);
         }
 
@@ -252,9 +252,7 @@ mod tests {
         let mut handles = Vec::new();
         for i in 0..10 {
             let s = store.clone();
-            let h = std::thread::spawn(move || {
-                s.write("shared", &format!("update-{i}"))
-            });
+            let h = std::thread::spawn(move || s.write("shared", &format!("update-{i}")));
             handles.push(h);
         }
 

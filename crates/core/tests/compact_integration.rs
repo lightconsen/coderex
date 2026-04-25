@@ -6,11 +6,13 @@
 //! 7.4 snip compact, 7.5 compact boundary, 7.6 dead loop protection
 
 use coderex_core::compact::{
-    auto_compact, compact_boundary_message, insert_compact_boundary, micro_compact,
-    reactive_compact, select_compact_strategy, should_auto_compact,
-    should_reactive_compact, snip_compact, CompactResult, CompactStrategy,
+    CompactResult, CompactStrategy, auto_compact, compact_boundary_message,
+    insert_compact_boundary, micro_compact, reactive_compact, select_compact_strategy,
+    should_auto_compact, should_reactive_compact, snip_compact,
 };
-use coderex_core::stop_hook::{StopHookContext, StopHookDecision, evaluate_stop_hook, should_proceed_with_compact};
+use coderex_core::stop_hook::{
+    StopHookContext, StopHookDecision, evaluate_stop_hook, should_proceed_with_compact,
+};
 use coderex_core::types::{Message, MessageContent, ModelId, Role, ToolResult};
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -70,14 +72,14 @@ fn micro_compact_summarizes_early_tool_results() {
 
 #[test]
 fn micro_compact_no_op_when_few_tool_results() {
-    let messages = vec![
-        make_user("hello"),
-        make_tool_result("only result"),
-    ];
+    let messages = vec![make_user("hello"), make_tool_result("only result")];
 
     let result = micro_compact(&messages, 5);
     assert_eq!(result.tokens_removed, 0);
-    assert!(matches!(result.messages[1].content, MessageContent::ToolResult(_)));
+    assert!(matches!(
+        result.messages[1].content,
+        MessageContent::ToolResult(_)
+    ));
 }
 
 #[test]
@@ -107,15 +109,15 @@ fn auto_compact_triggers_above_threshold() {
         .iter()
         .filter(|m| matches!(m.role, Role::Assistant))
         .count();
-    assert!(assistant_count <= 1, "expected at most 1 assistant message after auto compact");
+    assert!(
+        assistant_count <= 1,
+        "expected at most 1 assistant message after auto compact"
+    );
 }
 
 #[test]
 fn auto_compact_does_not_trigger_below_threshold() {
-    let messages = vec![
-        make_user("hello"),
-        make_assistant("world"),
-    ];
+    let messages = vec![make_user("hello"), make_assistant("world")];
 
     // Use a very high threshold so auto compact should not trigger
     let result = auto_compact(&messages, 100_000);
@@ -125,12 +127,20 @@ fn auto_compact_does_not_trigger_below_threshold() {
 
 #[test]
 fn should_auto_compact_returns_true_above_threshold() {
-    assert!(should_auto_compact(1000, 500, &coderex_core::budget::TokenBudget::with_defaults()));
+    assert!(should_auto_compact(
+        1000,
+        500,
+        &coderex_core::budget::TokenBudget::with_defaults()
+    ));
 }
 
 #[test]
 fn should_auto_compact_returns_false_below_threshold() {
-    assert!(!should_auto_compact(100, 500, &coderex_core::budget::TokenBudget::with_defaults()));
+    assert!(!should_auto_compact(
+        100,
+        500,
+        &coderex_core::budget::TokenBudget::with_defaults()
+    ));
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -171,7 +181,10 @@ fn reactive_compact_boundary_inserted_when_gap_exists() {
 
     let result = reactive_compact(&messages, 1);
 
-    assert!(result.boundary_inserted, "boundary should be inserted when gap exists");
+    assert!(
+        result.boundary_inserted,
+        "boundary should be inserted when gap exists"
+    );
     assert!(result.boundary_index.is_some());
     // The boundary message should be a system message
     let boundary_idx = result.boundary_index.unwrap();
@@ -181,11 +194,7 @@ fn reactive_compact_boundary_inserted_when_gap_exists() {
 
 #[test]
 fn reactive_compact_no_boundary_when_no_gap() {
-    let messages = vec![
-        make_user("first"),
-        make_assistant("a"),
-        make_user("second"),
-    ];
+    let messages = vec![make_user("first"), make_assistant("a"), make_user("second")];
 
     // keep_recent_turns=1 with only 2 turns -> no truncation -> no boundary
     let result = reactive_compact(&messages, 1);
@@ -258,7 +267,10 @@ fn snip_compact_boundary_inserted_when_gap_exists() {
 
     let result = snip_compact(&messages, 200);
 
-    assert!(result.boundary_inserted, "snip should insert boundary when truncating");
+    assert!(
+        result.boundary_inserted,
+        "snip should insert boundary when truncating"
+    );
     assert!(result.boundary_index.is_some());
     // Verify boundary message exists
     let boundary_idx = result.boundary_index.unwrap();
@@ -272,10 +284,7 @@ fn snip_compact_boundary_inserted_when_gap_exists() {
 
 #[test]
 fn snip_compact_no_op_when_under_target() {
-    let messages = vec![
-        make_user("hello"),
-        make_assistant("world"),
-    ];
+    let messages = vec![make_user("hello"), make_assistant("world")];
 
     let result = snip_compact(&messages, 100_000);
     assert_eq!(result.tokens_removed, 0);
@@ -325,10 +334,7 @@ fn insert_compact_boundary_at_index() {
 
 #[test]
 fn insert_compact_boundary_at_end_when_index_out_of_range() {
-    let mut messages = vec![
-        make_user("first"),
-        make_assistant("second"),
-    ];
+    let mut messages = vec![make_user("first"), make_assistant("second")];
 
     insert_compact_boundary(&mut messages, 100);
 

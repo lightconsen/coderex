@@ -149,7 +149,12 @@ impl BridgeWorkPoller {
         let body = RegisterRequest {
             env_id: self.env_id.clone(),
             max_concurrent: self.max_concurrent,
-            capabilities: vec!["worktree".into(), "single_session".into(), "same_dir".into(), "ssh".into()],
+            capabilities: vec![
+                "worktree".into(),
+                "single_session".into(),
+                "same_dir".into(),
+                "ssh".into(),
+            ],
         };
         let response = client
             .post(&url)
@@ -220,7 +225,10 @@ impl BridgeWorkPoller {
     /// enqueues any returned assignments.
     pub async fn fetch_assignments(&mut self) -> Result<usize, String> {
         let client = reqwest::Client::new();
-        let url = format!("{}/api/environments/{}/assignments", self.control_plane_url, self.env_id);
+        let url = format!(
+            "{}/api/environments/{}/assignments",
+            self.control_plane_url, self.env_id
+        );
         let response = client
             .get(&url)
             .send()
@@ -256,7 +264,10 @@ impl BridgeWorkPoller {
     /// Calls `POST /api/environments/{env_id}/capacity`.
     pub async fn report_capacity_to_server(&self) -> Result<(), String> {
         let client = reqwest::Client::new();
-        let url = format!("{}/api/environments/{}/capacity", self.control_plane_url, self.env_id);
+        let url = format!(
+            "{}/api/environments/{}/capacity",
+            self.control_plane_url, self.env_id
+        );
         let report = self.report_capacity();
 
         // Build JSON body matching the server's CapacityReport
@@ -357,11 +368,8 @@ mod tests {
 
     #[test]
     fn with_url_constructor() {
-        let poller = BridgeWorkPoller::with_url(
-            "env2".into(),
-            10,
-            "https://control.example:8443".into(),
-        );
+        let poller =
+            BridgeWorkPoller::with_url("env2".into(), 10, "https://control.example:8443".into());
         assert_eq!(poller.control_plane_url, "https://control.example:8443");
         assert_eq!(poller.max_concurrent, 10);
     }

@@ -45,10 +45,7 @@ pub enum StopHookDecision {
 ///
 /// Also implements dead loop protection: if `recovery_count >= max_recovery_retries`,
 /// forces a `Terminate` decision regardless of hook output.
-pub async fn execute_stop_hook(
-    registry: &HookRegistry,
-    ctx: &StopHookContext,
-) -> StopHookDecision {
+pub async fn execute_stop_hook(registry: &HookRegistry, ctx: &StopHookContext) -> StopHookDecision {
     // Dead loop protection: hard limit on recovery retries
     if ctx.recovery_count >= ctx.max_recovery_retries {
         return StopHookDecision::Terminate {

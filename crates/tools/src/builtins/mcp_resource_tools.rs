@@ -68,7 +68,11 @@ impl Tool for ListMcpResourcesTool {
         }
     }
 
-    async fn execute(&self, _input: ToolInput, ctx: ToolContext<'_>) -> Result<ToolOutput, ToolError> {
+    async fn execute(
+        &self,
+        _input: ToolInput,
+        ctx: ToolContext<'_>,
+    ) -> Result<ToolOutput, ToolError> {
         let handle = get_handle(&ctx)?;
         let entries = handle.list();
         let json: Vec<_> = entries
@@ -109,7 +113,11 @@ impl Tool for ReadMcpResourceTool {
         }
     }
 
-    async fn execute(&self, input: ToolInput, ctx: ToolContext<'_>) -> Result<ToolOutput, ToolError> {
+    async fn execute(
+        &self,
+        input: ToolInput,
+        ctx: ToolContext<'_>,
+    ) -> Result<ToolOutput, ToolError> {
         let uri = input
             .arguments
             .get("uri")
@@ -121,7 +129,10 @@ impl Tool for ReadMcpResourceTool {
         let content = handle
             .read(uri)
             .map_err(|e| ToolError::InvalidInput { message: e })?;
-        Ok(ToolOutput { output: content, is_display: true })
+        Ok(ToolOutput {
+            output: content,
+            is_display: true,
+        })
     }
 }
 
@@ -143,7 +154,11 @@ mod tests {
             }]
         }
         fn read(&self, uri: &str) -> Result<String, String> {
-            if uri == "file:///x" { Ok("hello".into()) } else { Err("not found".into()) }
+            if uri == "file:///x" {
+                Ok("hello".into())
+            } else {
+                Err("not found".into())
+            }
         }
     }
 
@@ -163,7 +178,11 @@ mod tests {
     async fn list_resources_returns_entries() {
         let out = ListMcpResourcesTool
             .execute(
-                ToolInput { call_id: "1".into(), name: "ListMcpResources".into(), arguments: serde_json::json!({}) },
+                ToolInput {
+                    call_id: "1".into(),
+                    name: "ListMcpResources".into(),
+                    arguments: serde_json::json!({}),
+                },
                 ctx_with_handle(),
             )
             .await
@@ -175,7 +194,11 @@ mod tests {
     async fn read_resource_returns_content() {
         let out = ReadMcpResourceTool
             .execute(
-                ToolInput { call_id: "1".into(), name: "ReadMcpResource".into(), arguments: serde_json::json!({"uri": "file:///x"}) },
+                ToolInput {
+                    call_id: "1".into(),
+                    name: "ReadMcpResource".into(),
+                    arguments: serde_json::json!({"uri": "file:///x"}),
+                },
                 ctx_with_handle(),
             )
             .await
@@ -187,7 +210,11 @@ mod tests {
     async fn read_missing_uri_errors() {
         let err = ReadMcpResourceTool
             .execute(
-                ToolInput { call_id: "1".into(), name: "ReadMcpResource".into(), arguments: serde_json::json!({}) },
+                ToolInput {
+                    call_id: "1".into(),
+                    name: "ReadMcpResource".into(),
+                    arguments: serde_json::json!({}),
+                },
                 ctx_with_handle(),
             )
             .await

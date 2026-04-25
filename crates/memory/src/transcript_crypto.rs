@@ -20,16 +20,14 @@ pub enum CryptoError {
 ///
 /// The master key should be a hex-encoded 32-byte (64 hex char) key.
 /// Each session gets a unique key via HKDF(master_key, session_id).
-pub fn derive_cipher(
-    master_key_hex: &str,
-    session_id: &str,
-) -> Result<Aes256Gcm, CryptoError> {
-    let master_key = hex::decode(master_key_hex)
-        .map_err(|e| CryptoError::InvalidKey(e.to_string()))?;
+pub fn derive_cipher(master_key_hex: &str, session_id: &str) -> Result<Aes256Gcm, CryptoError> {
+    let master_key =
+        hex::decode(master_key_hex).map_err(|e| CryptoError::InvalidKey(e.to_string()))?;
     if master_key.len() != 32 {
-        return Err(CryptoError::InvalidKey(
-            format!("expected 32-byte key, got {} bytes", master_key.len()),
-        ));
+        return Err(CryptoError::InvalidKey(format!(
+            "expected 32-byte key, got {} bytes",
+            master_key.len()
+        )));
     }
 
     let hkdf = Hkdf::<Sha256>::new(None, &master_key);

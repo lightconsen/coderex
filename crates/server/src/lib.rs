@@ -2,12 +2,18 @@
 
 #![warn(missing_docs)]
 
-pub mod session;
+pub mod control_plane;
 pub mod filter;
 pub mod persistence;
-pub mod control_plane;
+pub mod session;
 
-pub use session::{Session, ServerConfig, DaemonServer, WsRequest, WsRequestKind, WsResponse, WsResponseKind, WsEvent};
+pub use control_plane::{
+    AssignmentEntry, CapacityReport, ControlPlaneServer, ControlPlaneState, RegisterRequest,
+    RegisterResponse,
+};
 pub use filter::{CommandFilter, SafetyLevel};
-pub use persistence::{SessionStore, PersistedSession};
-pub use control_plane::{ControlPlaneServer, ControlPlaneState, RegisterRequest, RegisterResponse, AssignmentEntry, CapacityReport};
+pub use persistence::{PersistedSession, SessionStore};
+pub use session::{
+    DaemonServer, ServerConfig, Session, WsEvent, WsRequest, WsRequestKind, WsResponse,
+    WsResponseKind,
+};

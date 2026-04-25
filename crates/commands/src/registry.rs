@@ -156,8 +156,7 @@ impl Default for CommandArgs {
 // ─── CommandHandler ─────────────────────────────────────────────────────────
 
 /// A command handler function.
-pub type CommandHandler =
-    Arc<dyn Fn(&CommandContext, &[String]) -> CommandResult + Send + Sync>;
+pub type CommandHandler = Arc<dyn Fn(&CommandContext, &[String]) -> CommandResult + Send + Sync>;
 
 // ─── CommandContext ─────────────────────────────────────────────────────────
 
@@ -219,12 +218,7 @@ pub struct CommandContext {
 impl CommandContext {
     /// Create a new command context.
     #[must_use]
-    pub fn new(
-        cwd: String,
-        session_id: String,
-        session_title: String,
-        model: ModelId,
-    ) -> Self {
+    pub fn new(cwd: String, session_id: String, session_title: String, model: ModelId) -> Self {
         Self {
             cwd,
             model,
@@ -431,11 +425,7 @@ impl Default for CommandRegistry {
 
 /// Validate command arguments against the spec.
 /// Returns an error result if validation fails, or None if valid.
-fn validate_args(
-    spec: &CommandArgs,
-    args: &[String],
-    name: &str,
-) -> Option<CommandResult> {
+fn validate_args(spec: &CommandArgs, args: &[String], name: &str) -> Option<CommandResult> {
     match spec {
         CommandArgs::None => {
             // No validation — accept any number of arguments
@@ -443,21 +433,30 @@ fn validate_args(
         }
         CommandArgs::AtLeast(n) => {
             if args.len() < *n {
-                Some(CommandResult::error(format!("Command /{name} requires at least {n} argument(s). Got {}.", args.len())))
+                Some(CommandResult::error(format!(
+                    "Command /{name} requires at least {n} argument(s). Got {}.",
+                    args.len()
+                )))
             } else {
                 None
             }
         }
         CommandArgs::AtMost(n) => {
             if args.len() > *n {
-                Some(CommandResult::error(format!("Command /{name} takes at most {n} argument(s). Got {}.", args.len())))
+                Some(CommandResult::error(format!(
+                    "Command /{name} takes at most {n} argument(s). Got {}.",
+                    args.len()
+                )))
             } else {
                 None
             }
         }
         CommandArgs::Exactly(n) => {
             if args.len() != *n {
-                Some(CommandResult::error(format!("Command /{name} requires exactly {n} argument(s). Got {}.", args.len())))
+                Some(CommandResult::error(format!(
+                    "Command /{name} requires exactly {n} argument(s). Got {}.",
+                    args.len()
+                )))
             } else {
                 None
             }
@@ -495,12 +494,7 @@ impl CommandRegistry {
     ///
     /// Validates argument count before dispatching to the handler.
     /// Returns a `CommandResult` or an error message if the command is not found.
-    pub fn execute(
-        &self,
-        name: &str,
-        ctx: &CommandContext,
-        args: &[String],
-    ) -> CommandResult {
+    pub fn execute(&self, name: &str, ctx: &CommandContext, args: &[String]) -> CommandResult {
         match self.find(name) {
             Some(cmd) => {
                 // Validate arguments
@@ -680,12 +674,30 @@ mod tests {
     #[test]
     fn availability_matrix_filters() {
         let mut reg = CommandRegistry::new();
-        reg.register(SlashCommand::local("safe", "safe", true, true, true,
-            Arc::new(|_, _| CommandResult::success("ok"))));
-        reg.register(SlashCommand::local("unsafe", "unsafe", true, false, false,
-            Arc::new(|_, _| CommandResult::success("ok"))));
-        reg.register(SlashCommand::local("interactive", "interactive", false, true, true,
-            Arc::new(|_, _| CommandResult::success("ok"))));
+        reg.register(SlashCommand::local(
+            "safe",
+            "safe",
+            true,
+            true,
+            true,
+            Arc::new(|_, _| CommandResult::success("ok")),
+        ));
+        reg.register(SlashCommand::local(
+            "unsafe",
+            "unsafe",
+            true,
+            false,
+            false,
+            Arc::new(|_, _| CommandResult::success("ok")),
+        ));
+        reg.register(SlashCommand::local(
+            "interactive",
+            "interactive",
+            false,
+            true,
+            true,
+            Arc::new(|_, _| CommandResult::success("ok")),
+        ));
 
         // Remote-safe only
         let remote = reg.available_commands(false, true, false);
@@ -709,10 +721,22 @@ mod tests {
     #[test]
     fn list_returns_all() {
         let mut reg = CommandRegistry::new();
-        reg.register(SlashCommand::local("a", "a", true, true, true,
-            Arc::new(|_, _| CommandResult::success("ok"))));
-        reg.register(SlashCommand::local("b", "b", true, true, true,
-            Arc::new(|_, _| CommandResult::success("ok"))));
+        reg.register(SlashCommand::local(
+            "a",
+            "a",
+            true,
+            true,
+            true,
+            Arc::new(|_, _| CommandResult::success("ok")),
+        ));
+        reg.register(SlashCommand::local(
+            "b",
+            "b",
+            true,
+            true,
+            true,
+            Arc::new(|_, _| CommandResult::success("ok")),
+        ));
         assert_eq!(reg.list().len(), 2);
     }
 
@@ -726,8 +750,14 @@ mod tests {
 
     #[test]
     fn with_agent_backend() {
-        let cmd = SlashCommand::local("test", "test", true, true, true,
-            Arc::new(|_, _| CommandResult::success("ok")));
+        let cmd = SlashCommand::local(
+            "test",
+            "test",
+            true,
+            true,
+            true,
+            Arc::new(|_, _| CommandResult::success("ok")),
+        );
         assert!(!cmd.uses_agent_backend);
 
         let cmd = cmd.with_agent_backend();

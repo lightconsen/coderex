@@ -12,8 +12,8 @@ use std::time::Duration;
 use crate::context::{ToolError, ToolOutput};
 use crate::tool::{Tool, ToolContext, ToolDescriptor, ToolInput, ToolTier};
 use async_trait::async_trait;
-use tokio::process::Command;
 use coderex_core::shell_security::BashAst;
+use tokio::process::Command;
 
 /// Build a `tokio::process::Command` for the given shell command,
 /// applying sandbox wrapping if a [`SandboxConfig`] is present in
@@ -33,11 +33,13 @@ fn build_sandboxed_command(
     #[cfg(target_os = "macos")]
     {
         if let Some(config) = sandbox_config {
-            let handle = coderex_core::sandbox::SandboxHandle::create(config.clone())
-                .map_err(|e| ToolError::Io(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    format!("sandbox: {e}"),
-                )))?;
+            let handle =
+                coderex_core::sandbox::SandboxHandle::create(config.clone()).map_err(|e| {
+                    ToolError::Io(std::io::Error::new(
+                        std::io::ErrorKind::Other,
+                        format!("sandbox: {e}"),
+                    ))
+                })?;
             let (wrapper, prefix_args) = handle.sandboxed_program().ok_or_else(|| {
                 ToolError::Io(std::io::Error::new(
                     std::io::ErrorKind::Other,
@@ -57,20 +59,22 @@ fn build_sandboxed_command(
     #[cfg(target_os = "linux")]
     {
         if let Some(config) = sandbox_config {
-            let handle = coderex_core::sandbox::SandboxHandle::create(config.clone())
-                .map_err(|e| ToolError::Io(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    format!("sandbox: {e}"),
-                )))?;
+            let handle =
+                coderex_core::sandbox::SandboxHandle::create(config.clone()).map_err(|e| {
+                    ToolError::Io(std::io::Error::new(
+                        std::io::ErrorKind::Other,
+                        format!("sandbox: {e}"),
+                    ))
+                })?;
             let mut std_cmd = std::process::Command::new("sh");
             std_cmd.arg("-c").arg(command);
             std_cmd.current_dir(ctx.cwd);
-            handle
-                .prepare(&mut std_cmd)
-                .map_err(|e| ToolError::Io(std::io::Error::new(
+            handle.prepare(&mut std_cmd).map_err(|e| {
+                ToolError::Io(std::io::Error::new(
                     std::io::ErrorKind::Other,
                     format!("sandbox: {e}"),
-                )))?;
+                ))
+            })?;
             return Ok((Command::from(std_cmd), Some(handle)));
         }
     }
@@ -119,7 +123,8 @@ impl BashTool {
             let forbidden = [';', '|', '&', '`', '$', '(', ')', '<', '>'];
             if command.chars().any(|c| forbidden.contains(&c)) {
                 return Err(ToolError::InvalidInput {
-                    message: "shell metacharacters are not permitted when an allowlist is active".into(),
+                    message: "shell metacharacters are not permitted when an allowlist is active"
+                        .into(),
                 });
             }
 
@@ -165,7 +170,11 @@ impl Tool for BashTool {
         }
     }
 
-    async fn execute(&self, input: ToolInput, ctx: ToolContext<'_>) -> Result<ToolOutput, ToolError> {
+    async fn execute(
+        &self,
+        input: ToolInput,
+        ctx: ToolContext<'_>,
+    ) -> Result<ToolOutput, ToolError> {
         let command = extract_string(&input.arguments, "command")?;
         let timeout_secs = extract_number(&input.arguments, "timeout")
             .unwrap_or(DEFAULT_TIMEOUT_SECS as i64)
@@ -184,15 +193,12 @@ impl Tool for BashTool {
 
         let (mut cmd, _sandbox_handle) = build_sandboxed_command(&ctx, &command)?;
 
-        let result = tokio::time::timeout(
-            Duration::from_secs(timeout_secs),
-            cmd.output(),
-        )
-        .await
-        .map_err(|_| ToolError::Timeout {
-            timeout: Duration::from_secs(timeout_secs),
-        })?
-        .map_err(ToolError::Io)?;
+        let result = tokio::time::timeout(Duration::from_secs(timeout_secs), cmd.output())
+            .await
+            .map_err(|_| ToolError::Timeout {
+                timeout: Duration::from_secs(timeout_secs),
+            })?
+            .map_err(ToolError::Io)?;
 
         let exit_code = result.status.code().unwrap_or(-1);
         let mut stdout = String::from_utf8_lossy(&result.stdout).to_string();
@@ -255,8 +261,8 @@ fn extract_number(args: &serde_json::Value, key: &str) -> Option<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tool::ToolContext;
     use crate::context::ExecutionContext;
+    use crate::tool::ToolContext;
     use std::path::Path;
 
     fn test_ctx(cwd: &Path) -> ToolContext<'_> {
@@ -300,7 +306,9 @@ mod tests {
             name: "Bash".into(),
             arguments: serde_json::json!({ "command": "sleep 10", "timeout": 1 }),
         };
-        let result = BashTool::new().execute(input, test_ctx(Path::new("/tmp"))).await;
+        let result = BashTool::new()
+            .execute(input, test_ctx(Path::new("/tmp")))
+            .await;
         assert!(matches!(result, Err(ToolError::Timeout { .. })));
     }
 
@@ -343,15 +351,22 @@ mod tests {
                 ..Default::default()
             }) as crate::tool::SharedState,
         );
-        let ctx = ToolContext::new(ExecutionContext::Normal, Path::new("/tmp"))
-            .with_extra(extra);
+        let ctx = ToolContext::new(ExecutionContext::Normal, Path::new("/tmp")).with_extra(extra);
 
         let output = BashTool::new()
             .execute(bash_input("echo sandboxed"), ctx)
             .await
             .unwrap();
         eprintln!("SANDBOX OUTPUT: {:?}", output.output);
-        assert!(output.output.contains("sandboxed"), "output was: {}", output.output);
-        assert!(output.output.contains("Exit code: 0"), "output was: {}", output.output);
+        assert!(
+            output.output.contains("sandboxed"),
+            "output was: {}",
+            output.output
+        );
+        assert!(
+            output.output.contains("Exit code: 0"),
+            "output was: {}",
+            output.output
+        );
     }
 }

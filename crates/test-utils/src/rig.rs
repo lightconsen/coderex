@@ -59,10 +59,7 @@ impl TestRig {
     ///
     /// # Errors
     /// Returns an error if the engine encounters an error.
-    pub async fn submit(
-        &mut self,
-        prompt: impl Into<String>,
-    ) -> Result<TerminalReason, String> {
+    pub async fn submit(&mut self, prompt: impl Into<String>) -> Result<TerminalReason, String> {
         self.engine
             .submit(prompt.into(), SubmitOptions::default())
             .await

@@ -442,11 +442,14 @@ mod tests {
     fn load_config_adds_servers() {
         let mgr = McpManager::new();
         let mut config = McpConfig::new();
-        config.add_server("fs", McpServerConfig {
-            command: "echo".into(),
-            args: vec![],
-            env: HashMap::new(),
-        });
+        config.add_server(
+            "fs",
+            McpServerConfig {
+                command: "echo".into(),
+                args: vec![],
+                env: HashMap::new(),
+            },
+        );
         mgr.load_config(&config);
         assert_eq!(mgr.list_servers().len(), 1);
         assert!(mgr.needs_refresh());
@@ -456,11 +459,14 @@ mod tests {
     async fn start_and_stop() {
         let mgr = McpManager::new();
         let mut config = McpConfig::new();
-        config.add_server("test", McpServerConfig {
-            command: "cat".into(),
-            args: vec![],
-            env: HashMap::new(),
-        });
+        config.add_server(
+            "test",
+            McpServerConfig {
+                command: "cat".into(),
+                args: vec![],
+                env: HashMap::new(),
+            },
+        );
         mgr.load_config(&config);
 
         mgr.start_all().await;
@@ -474,11 +480,14 @@ mod tests {
     fn get_server() {
         let mgr = McpManager::new();
         let mut config = McpConfig::new();
-        config.add_server("fs", McpServerConfig {
-            command: "npx".into(),
-            args: vec![],
-            env: HashMap::new(),
-        });
+        config.add_server(
+            "fs",
+            McpServerConfig {
+                command: "npx".into(),
+                args: vec![],
+                env: HashMap::new(),
+            },
+        );
         mgr.load_config(&config);
 
         let srv = mgr.get_server("fs").unwrap();
@@ -517,7 +526,10 @@ mod tests {
         assert_eq!(mgr.tool_count(), 1);
         assert_eq!(mgr.resource_count(), 1);
         assert!(mgr.list_tools().contains(&"read_file".to_string()));
-        assert!(mgr.list_resources().contains(&"file:///tmp/test.txt".to_string()));
+        assert!(
+            mgr.list_resources()
+                .contains(&"file:///tmp/test.txt".to_string())
+        );
     }
 
     #[test]

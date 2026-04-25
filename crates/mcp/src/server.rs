@@ -3,8 +3,8 @@
 use crate::channel::JsonRpcChannel;
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::Mutex;
 use thiserror::Error;
+use tokio::sync::Mutex;
 
 /// Errors from MCP server operations.
 #[derive(Debug, Error)]
@@ -100,15 +100,14 @@ impl McpServer {
     /// Spawn the server process and initialize JSON-RPC channel.
     pub async fn spawn(&mut self) -> Result<(), McpServerError> {
         if self.status == ServerStatus::Running {
-            return Err(McpServerError::AlreadyRunning { name: self.name.clone() });
+            return Err(McpServerError::AlreadyRunning {
+                name: self.name.clone(),
+            });
         }
         self.status = ServerStatus::Starting;
 
-        let mut channel = JsonRpcChannel::new(
-            self.command.clone(),
-            self.args.clone(),
-            self.env.clone(),
-        );
+        let mut channel =
+            JsonRpcChannel::new(self.command.clone(), self.args.clone(), self.env.clone());
 
         channel.spawn().await.map_err(|e| {
             self.status = ServerStatus::Errored;
@@ -145,10 +144,12 @@ impl McpServer {
 
         if let Some(ref channel) = self.channel {
             let mut ch = channel.lock().await;
-            ch.ping().await.map_err(|e| McpServerError::HealthCheckFailed {
-                name: self.name.clone(),
-                reason: e,
-            })?;
+            ch.ping()
+                .await
+                .map_err(|e| McpServerError::HealthCheckFailed {
+                    name: self.name.clone(),
+                    reason: e,
+                })?;
         } else {
             return Err(McpServerError::HealthCheckFailed {
                 name: self.name.clone(),
@@ -167,9 +168,7 @@ impl McpServer {
     /// Discover tools from the MCP server.
     ///
     /// Returns the raw `tools/list` JSON response.
-    pub async fn discover_tools(
-        &mut self,
-    ) -> Result<serde_json::Value, McpServerError> {
+    pub async fn discover_tools(&mut self) -> Result<serde_json::Value, McpServerError> {
         if self.status != ServerStatus::Running {
             return Err(McpServerError::HealthCheckFailed {
                 name: self.name.clone(),
@@ -180,10 +179,12 @@ impl McpServer {
         let channel_opt = self.channel.take();
         let result = if let Some(ref channel) = channel_opt {
             let mut ch = channel.lock().await;
-            ch.list_tools().await.map_err(|e| McpServerError::HealthCheckFailed {
-                name: self.name.clone(),
-                reason: e,
-            })
+            ch.list_tools()
+                .await
+                .map_err(|e| McpServerError::HealthCheckFailed {
+                    name: self.name.clone(),
+                    reason: e,
+                })
         } else {
             Err(McpServerError::HealthCheckFailed {
                 name: self.name.clone(),
@@ -200,9 +201,7 @@ impl McpServer {
     /// Discover resources from the MCP server.
     ///
     /// Returns the raw `resources/list` JSON response.
-    pub async fn discover_resources(
-        &mut self,
-    ) -> Result<serde_json::Value, McpServerError> {
+    pub async fn discover_resources(&mut self) -> Result<serde_json::Value, McpServerError> {
         if self.status != ServerStatus::Running {
             return Err(McpServerError::HealthCheckFailed {
                 name: self.name.clone(),
@@ -213,10 +212,12 @@ impl McpServer {
         let channel_opt = self.channel.take();
         let result = if let Some(ref channel) = channel_opt {
             let mut ch = channel.lock().await;
-            ch.list_resources().await.map_err(|e| McpServerError::HealthCheckFailed {
-                name: self.name.clone(),
-                reason: e,
-            })
+            ch.list_resources()
+                .await
+                .map_err(|e| McpServerError::HealthCheckFailed {
+                    name: self.name.clone(),
+                    reason: e,
+                })
         } else {
             Err(McpServerError::HealthCheckFailed {
                 name: self.name.clone(),
@@ -250,11 +251,8 @@ impl McpServer {
         self.channel = None;
 
         // Spawn fresh channel
-        let mut channel = JsonRpcChannel::new(
-            self.command.clone(),
-            self.args.clone(),
-            self.env.clone(),
-        );
+        let mut channel =
+            JsonRpcChannel::new(self.command.clone(), self.args.clone(), self.env.clone());
 
         channel.spawn().await.map_err(|e| {
             self.status = ServerStatus::Errored;

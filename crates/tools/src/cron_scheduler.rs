@@ -5,9 +5,9 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::sync::RwLock;
+use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::mpsc;
 
 /// Key used to store the cron scheduler in `ToolContext.extra`.
@@ -51,7 +51,16 @@ impl CronJob {
         } else {
             None
         };
-        Self { id, cron, prompt, recurring, durable, created_at: now, last_fire: None, expires_at }
+        Self {
+            id,
+            cron,
+            prompt,
+            recurring,
+            durable,
+            created_at: now,
+            last_fire: None,
+            expires_at,
+        }
     }
 }
 
@@ -79,7 +88,9 @@ impl CronScheduler {
     /// Load durable jobs from disk if the storage file exists.
     pub fn load(&self) -> Result<(), String> {
         let guard = self.storage_path.read().unwrap();
-        let path = guard.as_ref().ok_or_else(|| "no storage path set".to_string())?;
+        let path = guard
+            .as_ref()
+            .ok_or_else(|| "no storage path set".to_string())?;
         if !path.exists() {
             return Ok(());
         }
@@ -98,7 +109,9 @@ impl CronScheduler {
     /// Persist durable jobs to disk.
     pub fn save(&self) -> Result<(), String> {
         let guard = self.storage_path.read().unwrap();
-        let path = guard.as_ref().ok_or_else(|| "no storage path set".to_string())?;
+        let path = guard
+            .as_ref()
+            .ok_or_else(|| "no storage path set".to_string())?;
         let map = self.jobs.read().unwrap();
         let durable: Vec<&CronJob> = map.values().filter(|j| j.durable).collect();
         let content = serde_json::to_string_pretty(&durable)
@@ -178,9 +191,7 @@ impl CronScheduler {
     /// Returns an unbounded receiver that yields `(job_id, prompt)` for each
     /// job that fires. The consumer should call `mark_fired(job_id)` after
     /// handling the prompt.
-    pub fn spawn_runner(
-        self: Arc<Self>,
-    ) -> mpsc::UnboundedReceiver<(String, String)> {
+    pub fn spawn_runner(self: Arc<Self>) -> mpsc::UnboundedReceiver<(String, String)> {
         let (tx, rx) = mpsc::unbounded_channel::<(String, String)>();
 
         tokio::spawn(async move {
@@ -257,8 +268,14 @@ fn match_single(spec: &str, value: i64, min: i64, _max: i64) -> bool {
         let range_start = if base == "*" {
             min
         } else if let Some((s, e)) = base.split_once('-') {
-            let s: i64 = match s.parse() { Ok(n) => n, _ => return false };
-            let e: i64 = match e.parse() { Ok(n) => n, _ => return false };
+            let s: i64 = match s.parse() {
+                Ok(n) => n,
+                _ => return false,
+            };
+            let e: i64 = match e.parse() {
+                Ok(n) => n,
+                _ => return false,
+            };
             // value must be in range AND match step from start
             if value < s || value > e {
                 return false;
@@ -276,8 +293,14 @@ fn match_single(spec: &str, value: i64, min: i64, _max: i64) -> bool {
 
     // Range: N-M
     if let Some((s, e)) = spec.split_once('-') {
-        let s: i64 = match s.parse() { Ok(n) => n, _ => return false };
-        let e: i64 = match e.parse() { Ok(n) => n, _ => return false };
+        let s: i64 = match s.parse() {
+            Ok(n) => n,
+            _ => return false,
+        };
+        let e: i64 = match e.parse() {
+            Ok(n) => n,
+            _ => return false,
+        };
         return (s..=e).contains(&value);
     }
 

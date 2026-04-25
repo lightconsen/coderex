@@ -59,10 +59,7 @@ impl McpResultAdapter {
                         .get("mimeType")
                         .and_then(|m| m.as_str())
                         .unwrap_or("image/png");
-                    let data = item
-                        .get("data")
-                        .and_then(|d| d.as_str())
-                        .unwrap_or("");
+                    let data = item.get("data").and_then(|d| d.as_str()).unwrap_or("");
                     let truncated = if data.len() > 64 {
                         format!("{}...[truncated]", &data[..64])
                     } else {
@@ -72,18 +69,9 @@ impl McpResultAdapter {
                 }
                 Some("resource") => {
                     if let Some(resource) = item.get("resource") {
-                        let uri = resource
-                            .get("uri")
-                            .and_then(|u| u.as_str())
-                            .unwrap_or("");
-                        let text = resource
-                            .get("text")
-                            .and_then(|t| t.as_str())
-                            .unwrap_or("");
-                        let blob = resource
-                            .get("blob")
-                            .and_then(|b| b.as_str())
-                            .unwrap_or("");
+                        let uri = resource.get("uri").and_then(|u| u.as_str()).unwrap_or("");
+                        let text = resource.get("text").and_then(|t| t.as_str()).unwrap_or("");
+                        let blob = resource.get("blob").and_then(|b| b.as_str()).unwrap_or("");
                         if !text.is_empty() {
                             format!("[Resource: {uri}]\n{text}")
                         } else if !blob.is_empty() {

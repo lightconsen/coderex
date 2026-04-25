@@ -5,19 +5,21 @@
 //! 1.1 single-turn, 1.2 multi-turn, 1.3 streaming, 1.4 tool call loop,
 //! 1.5 structured output, 1.6 termination conditions, 1.7 state machine
 
-use std::pin::Pin;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use async_trait::async_trait;
 use coderex_core::api_client::{ApiClient, ApiError, ApiResponse, StreamEvent};
 use coderex_core::engine::{QueryEngine, SubmitOptions, TerminalReason};
 use coderex_core::permission_engine::PermissionEngine;
 use coderex_core::permissions::{PermissionChecker, PermissionMode};
 use coderex_core::state::SessionState;
-use coderex_core::tool_executor::{ToolDispatchOutcome, ToolExecutor};
-use coderex_core::types::{EngineEvent, MessageContent, ModelId, ToolCall, ToolResult, UsageSummary};
-use futures::Stream;
-use tokio::sync::mpsc;
 use coderex_core::tool_executor::ToolInfo;
+use coderex_core::tool_executor::{ToolDispatchOutcome, ToolExecutor};
+use coderex_core::types::{
+    EngineEvent, MessageContent, ModelId, ToolCall, ToolResult, UsageSummary,
+};
+use futures::Stream;
+use std::pin::Pin;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use tokio::sync::mpsc;
 
 // ═══════════════════════════════════════════════════════════════════════════
 //  Helpers
@@ -319,7 +321,10 @@ async fn multi_turn_tool_call_then_text() {
     let mut options = SubmitOptions::default();
     options.handle_elicitation = false;
 
-    let result = engine.submit("read test.txt".into(), options).await.unwrap();
+    let result = engine
+        .submit("read test.txt".into(), options)
+        .await
+        .unwrap();
     assert_eq!(result, TerminalReason::Completed);
 
     // Should have 4 messages: user, assistant(1), tool_result, assistant(2)
@@ -371,12 +376,7 @@ async fn multi_turn_context_accumulated() {
 #[tokio::test]
 async fn streaming_text_deltas_emitted() {
     let api = Box::new(StreamingMock {
-        deltas: vec![
-            "Hello".into(),
-            " ".into(),
-            "stream".into(),
-            "!".into(),
-        ],
+        deltas: vec!["Hello".into(), " ".into(), "stream".into(), "!".into()],
     });
     let tools = Box::new(EchoToolExecutor);
     let (mut engine, mut rx) = make_engine(api, tools);
@@ -415,7 +415,10 @@ async fn streaming_no_tool_calls_completes_cleanly() {
     let mut options = SubmitOptions::default();
     options.handle_elicitation = false;
 
-    let result = engine.submit_streaming("hello".into(), options).await.unwrap();
+    let result = engine
+        .submit_streaming("hello".into(), options)
+        .await
+        .unwrap();
     assert_eq!(result, TerminalReason::Completed);
 
     let events = drain_events(&mut rx).await;
@@ -449,7 +452,10 @@ async fn tool_call_loop_executes_and_continues() {
     let mut options = SubmitOptions::default();
     options.handle_elicitation = false;
 
-    let result = engine.submit("find rust files".into(), options).await.unwrap();
+    let result = engine
+        .submit("find rust files".into(), options)
+        .await
+        .unwrap();
     assert_eq!(result, TerminalReason::Completed);
 
     // Verify tool result was appended to session
@@ -539,7 +545,9 @@ async fn structured_output_valid_json_passes() {
 
     // The assistant message should contain the JSON (no validation warning appended)
     let msgs = &engine.session().messages;
-    let assistant_msg = msgs.iter().find(|m| matches!(m.role, coderex_core::types::Role::Assistant));
+    let assistant_msg = msgs
+        .iter()
+        .find(|m| matches!(m.role, coderex_core::types::Role::Assistant));
     assert!(assistant_msg.is_some());
     let content = match &assistant_msg.unwrap().content {
         MessageContent::Text(t) => t.as_str(),
@@ -565,7 +573,9 @@ async fn structured_output_invalid_json_gets_warning() {
 
     // The assistant message should have a validation warning appended
     let msgs = &engine.session().messages;
-    let assistant_msg = msgs.iter().find(|m| matches!(m.role, coderex_core::types::Role::Assistant));
+    let assistant_msg = msgs
+        .iter()
+        .find(|m| matches!(m.role, coderex_core::types::Role::Assistant));
     let content = match &assistant_msg.unwrap().content {
         MessageContent::Text(t) => t.as_str(),
         _ => panic!("expected text content"),
@@ -592,7 +602,10 @@ async fn termination_max_turns_reached() {
     options.max_turns = 1;
     options.handle_elicitation = false;
 
-    let result = engine.submit("read something".into(), options).await.unwrap();
+    let result = engine
+        .submit("read something".into(), options)
+        .await
+        .unwrap();
     assert_eq!(result, TerminalReason::MaxTurnsReached);
 }
 
@@ -708,7 +721,12 @@ impl ApiClient for CountingMock {
 #[tokio::test]
 async fn termination_loop_detected() {
     let tools = Box::new(EchoToolExecutor);
-    let (mut engine, _rx) = make_engine(Box::new(CountingMock { count: AtomicUsize::new(0) }), tools);
+    let (mut engine, _rx) = make_engine(
+        Box::new(CountingMock {
+            count: AtomicUsize::new(0),
+        }),
+        tools,
+    );
 
     let mut options = SubmitOptions::default();
     options.handle_elicitation = false;
@@ -717,7 +735,10 @@ async fn termination_loop_detected() {
     assert!(
         matches!(
             result,
-            TerminalReason::LoopDetected { period: 1, repetitions: 3 }
+            TerminalReason::LoopDetected {
+                period: 1,
+                repetitions: 3
+            }
         ),
         "expected LoopDetected, got {result:?}"
     );
@@ -772,10 +793,7 @@ async fn state_machine_turn_counter_increments() {
 
 #[tokio::test]
 async fn engine_tracks_cost_across_turns() {
-    let responses = vec![
-        text_response("Turn 1"),
-        text_response("Turn 2"),
-    ];
+    let responses = vec![text_response("Turn 1"), text_response("Turn 2")];
     let api = Box::new(SequenceMock::new(responses));
     let tools = Box::new(EchoToolExecutor);
     let (mut engine, _rx) = make_engine(api, tools);
@@ -784,7 +802,10 @@ async fn engine_tracks_cost_across_turns() {
     options.handle_elicitation = false;
 
     // Two separate submit calls
-    engine.submit("first".into(), options.clone()).await.unwrap();
+    engine
+        .submit("first".into(), options.clone())
+        .await
+        .unwrap();
     engine.submit("second".into(), options).await.unwrap();
 
     // Cost tracker should have recorded both turns
@@ -826,7 +847,10 @@ async fn engine_allowed_tools_override_blocks_unlisted() {
     options.allowed_tools_override = Some(vec!["read".into()]);
     options.handle_elicitation = false;
 
-    let result = engine.submit("write something".into(), options).await.unwrap();
+    let result = engine
+        .submit("write something".into(), options)
+        .await
+        .unwrap();
     assert_eq!(result, TerminalReason::Completed);
 
     // The write tool should have been blocked
@@ -837,5 +861,9 @@ async fn engine_allowed_tools_override_blocks_unlisted() {
             matches!(e, EngineEvent::ToolCallEnd { result, .. } if result.is_error && result.output.contains("blocked"))
         })
         .collect();
-    assert_eq!(blocked.len(), 1, "write tool should be blocked by allowed_tools_override");
+    assert_eq!(
+        blocked.len(),
+        1,
+        "write tool should be blocked by allowed_tools_override"
+    );
 }

@@ -1,7 +1,7 @@
 //! TaskCreate tool — create a structured task.
 
 use crate::context::{ToolError, ToolOutput};
-use crate::task_store::{TaskRecord, TASK_STORE_KEY};
+use crate::task_store::{TASK_STORE_KEY, TaskRecord};
 use crate::tool::{Tool, ToolContext, ToolDescriptor, ToolInput, ToolTier};
 use async_trait::async_trait;
 use std::sync::Arc;
@@ -42,7 +42,11 @@ impl Tool for TaskCreateTool {
         }
     }
 
-    async fn execute(&self, input: ToolInput, ctx: ToolContext<'_>) -> Result<ToolOutput, ToolError> {
+    async fn execute(
+        &self,
+        input: ToolInput,
+        ctx: ToolContext<'_>,
+    ) -> Result<ToolOutput, ToolError> {
         let subject = extract_string(&input.arguments, "subject")?;
         let description = extract_string(&input.arguments, "description")?;
         let active_form = extract_string_opt(&input.arguments, "activeForm");
@@ -72,9 +76,10 @@ impl Tool for TaskCreateTool {
 }
 
 fn get_store(ctx: &ToolContext<'_>) -> Option<Arc<crate::task_store::TaskStore>> {
-    ctx.extra
-        .get(TASK_STORE_KEY)
-        .and_then(|v| v.downcast_ref::<Arc<crate::task_store::TaskStore>>().map(Arc::clone))
+    ctx.extra.get(TASK_STORE_KEY).and_then(|v| {
+        v.downcast_ref::<Arc<crate::task_store::TaskStore>>()
+            .map(Arc::clone)
+    })
 }
 
 fn extract_string(args: &serde_json::Value, key: &str) -> Result<String, ToolError> {
@@ -93,16 +98,20 @@ fn extract_string_opt(args: &serde_json::Value, key: &str) -> Option<String> {
 fn extract_string_array(args: &serde_json::Value, key: &str) -> Vec<String> {
     args.get(key)
         .and_then(|v| v.as_array())
-        .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
         .unwrap_or_default()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::context::ExecutionContext;
     use crate::task_store::TaskStore;
     use crate::tool::ToolContext;
-    use crate::context::ExecutionContext;
     use std::collections::HashMap;
     use std::path::Path;
 

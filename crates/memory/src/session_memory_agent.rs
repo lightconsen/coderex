@@ -59,7 +59,8 @@ mod tests {
         let api = MockApi::new("Current State: testing AI workflow.");
         let sid = Uuid::new_v4();
 
-        let result = update_session_memory_ai(&api, &store, sid, "", "user: test conversation").await;
+        let result =
+            update_session_memory_ai(&api, &store, sid, "", "user: test conversation").await;
         assert!(result.is_ok());
 
         let facts = store.get_facts(sid);

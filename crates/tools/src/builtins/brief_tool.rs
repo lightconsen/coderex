@@ -35,9 +35,13 @@ impl Tool for BriefTool {
         }
     }
 
-    async fn execute(&self, input: ToolInput, ctx: ToolContext<'_>) -> Result<ToolOutput, ToolError> {
-        let session_id = extract_string_opt(&input.arguments, "session_id")
-            .unwrap_or_else(|| "current".into());
+    async fn execute(
+        &self,
+        input: ToolInput,
+        ctx: ToolContext<'_>,
+    ) -> Result<ToolOutput, ToolError> {
+        let session_id =
+            extract_string_opt(&input.arguments, "session_id").unwrap_or_else(|| "current".into());
 
         let transcript_dir = ctx.cwd.join(".coderex/transcripts");
         let store = coderex_memory::transcript::TranscriptStore::new(transcript_dir);
@@ -79,10 +83,7 @@ fn generate_summary(session_id: &str, messages: &[coderex_core::types::Message])
         .iter()
         .filter(|m| matches!(m.role, coderex_core::types::Role::Tool))
         .count();
-    let compact_count = messages
-        .iter()
-        .filter(|m| is_compact_boundary(m))
-        .count();
+    let compact_count = messages.iter().filter(|m| is_compact_boundary(m)).count();
 
     let preview = messages
         .iter()
@@ -119,8 +120,8 @@ fn is_compact_boundary(msg: &coderex_core::types::Message) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tool::ToolContext;
     use crate::context::ExecutionContext;
+    use crate::tool::ToolContext;
     use std::collections::HashMap;
     use std::path::Path;
     use std::sync::Arc;
@@ -177,7 +178,10 @@ mod tests {
             .append("sess_1", &coderex_core::types::Message::user("hello world"))
             .unwrap();
         store
-            .append("sess_1", &coderex_core::types::Message::assistant("hi there"))
+            .append(
+                "sess_1",
+                &coderex_core::types::Message::assistant("hi there"),
+            )
             .unwrap();
 
         let ctx = ToolContext {

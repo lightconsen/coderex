@@ -50,7 +50,12 @@ fn most_recent_session(base: &Path) -> std::io::Result<Option<(String, String)>>
 }
 
 /// Save session metadata to disk.
-fn save_session_meta(base: &Path, session_id: &str, title: &str, message_count: usize) -> Result<(), String> {
+fn save_session_meta(
+    base: &Path,
+    session_id: &str,
+    title: &str,
+    message_count: usize,
+) -> Result<(), String> {
     let dir = base.join(session_id);
     std::fs::create_dir_all(&dir).map_err(|e| format!("failed to create session dir: {e}"))?;
     let meta = SessionMeta {
@@ -58,8 +63,10 @@ fn save_session_meta(base: &Path, session_id: &str, title: &str, message_count: 
         title: title.to_string(),
         message_count,
     };
-    let content = serde_json::to_string_pretty(&meta).map_err(|e| format!("failed to serialize: {e}"))?;
-    std::fs::write(dir.join("meta.json"), content).map_err(|e| format!("failed to write metadata: {e}"))
+    let content =
+        serde_json::to_string_pretty(&meta).map_err(|e| format!("failed to serialize: {e}"))?;
+    std::fs::write(dir.join("meta.json"), content)
+        .map_err(|e| format!("failed to write metadata: {e}"))
 }
 
 /// Get the default session base path.
@@ -221,30 +228,53 @@ mod tests {
     #[test]
     fn resume_no_sessions() {
         // With a nonexistent session base, should return "no sessions found" or an error
-        let reg = { let mut r = CommandRegistry::new(); register(&mut r); r };
+        let reg = {
+            let mut r = CommandRegistry::new();
+            register(&mut r);
+            r
+        };
         let result = reg.execute("resume", &ctx(), &[]);
         // Either "no previous sessions" or an error about the path
-        assert!(result.output.to_lowercase().contains("session") || result.output.to_lowercase().contains("no previous"));
+        assert!(
+            result.output.to_lowercase().contains("session")
+                || result.output.to_lowercase().contains("no previous")
+        );
     }
 
     #[test]
     fn resume_specific_session() {
-        let reg = { let mut r = CommandRegistry::new(); register(&mut r); r };
+        let reg = {
+            let mut r = CommandRegistry::new();
+            register(&mut r);
+            r
+        };
         let result = reg.execute("resume", &ctx(), &["s_abc".into()]);
         // Session doesn't exist, so either "not found" or an error
-        assert!(result.output.contains("s_abc") || result.output.contains("not found") || result.output.contains("No previous"));
+        assert!(
+            result.output.contains("s_abc")
+                || result.output.contains("not found")
+                || result.output.contains("No previous")
+        );
     }
 
     #[test]
     fn rename_requires_arg() {
-        let reg = { let mut r = CommandRegistry::new(); register(&mut r); r };
+        let reg = {
+            let mut r = CommandRegistry::new();
+            register(&mut r);
+            r
+        };
         let result = reg.execute("rename", &ctx(), &[]);
         assert!(result.output.contains("Usage"));
     }
 
     #[test]
     fn rename_success() {
-        let reg = { let mut r = CommandRegistry::new(); register(&mut r); r };
+        let reg = {
+            let mut r = CommandRegistry::new();
+            register(&mut r);
+            r
+        };
         let result = reg.execute("rename", &ctx(), &["New".into(), "Title".into()]);
         assert!(result.output.contains("New Title"));
         assert!(result.state_changed);
@@ -256,10 +286,19 @@ mod tests {
         // Create a fake home dir by setting up session dir
         let c = CommandContext {
             message_count: 5,
-            ..CommandContext::new("/src".into(), "test-rename".into(), "Old Title".into(), ModelId::sonnet())
+            ..CommandContext::new(
+                "/src".into(),
+                "test-rename".into(),
+                "Old Title".into(),
+                ModelId::sonnet(),
+            )
         };
         // The command will try to write to ~/.coderex/sessions/test-rename/meta.json
-        let reg = { let mut r = CommandRegistry::new(); register(&mut r); r };
+        let reg = {
+            let mut r = CommandRegistry::new();
+            register(&mut r);
+            r
+        };
         let result = reg.execute("rename", &c, &["New Title".into()]);
         // Should either succeed or fail gracefully
         assert!(result.output.contains("New Title"));
@@ -268,14 +307,22 @@ mod tests {
 
     #[test]
     fn rewind_requires_arg() {
-        let reg = { let mut r = CommandRegistry::new(); register(&mut r); r };
+        let reg = {
+            let mut r = CommandRegistry::new();
+            register(&mut r);
+            r
+        };
         let result = reg.execute("rewind", &ctx(), &[]);
         assert!(result.output.contains("Usage"));
     }
 
     #[test]
     fn rewind_valid_number() {
-        let reg = { let mut r = CommandRegistry::new(); register(&mut r); r };
+        let reg = {
+            let mut r = CommandRegistry::new();
+            register(&mut r);
+            r
+        };
         let result = reg.execute("rewind", &ctx(), &["5".into()]);
         assert!(result.output.contains("message 5"));
         assert!(result.state_changed);
@@ -283,14 +330,22 @@ mod tests {
 
     #[test]
     fn rewind_out_of_range() {
-        let reg = { let mut r = CommandRegistry::new(); register(&mut r); r };
+        let reg = {
+            let mut r = CommandRegistry::new();
+            register(&mut r);
+            r
+        };
         let result = reg.execute("rewind", &ctx(), &["999".into()]);
         assert!(result.output.contains("not found"));
     }
 
     #[test]
     fn rewind_invalid_number() {
-        let reg = { let mut r = CommandRegistry::new(); register(&mut r); r };
+        let reg = {
+            let mut r = CommandRegistry::new();
+            register(&mut r);
+            r
+        };
         let result = reg.execute("rewind", &ctx(), &["abc".into()]);
         assert!(result.output.contains("Invalid"));
     }

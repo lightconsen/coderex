@@ -34,7 +34,11 @@ impl Tool for ReplTool {
         }
     }
 
-    async fn execute(&self, _input: ToolInput, _ctx: ToolContext<'_>) -> Result<ToolOutput, ToolError> {
+    async fn execute(
+        &self,
+        _input: ToolInput,
+        _ctx: ToolContext<'_>,
+    ) -> Result<ToolOutput, ToolError> {
         // REPL commands are handled at the session level, not as tools.
         Ok(ToolOutput {
             output: "REPL commands are handled by the session interface".to_string(),
@@ -46,8 +50,8 @@ impl Tool for ReplTool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tool::ToolContext;
     use crate::context::ExecutionContext;
+    use crate::tool::ToolContext;
     use std::collections::HashMap;
     use std::path::Path;
     use std::sync::Arc;

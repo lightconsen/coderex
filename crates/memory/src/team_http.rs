@@ -57,15 +57,10 @@ impl TeamSyncTransport for HttpTransport {
             .map_err(|e| e.to_string())?;
 
         if !resp.status().is_success() {
-            return Err(format!(
-                "fetch state failed with status: {}",
-                resp.status()
-            ));
+            return Err(format!("fetch state failed with status: {}", resp.status()));
         }
 
-        resp.json::<RemoteState>()
-            .await
-            .map_err(|e| e.to_string())
+        resp.json::<RemoteState>().await.map_err(|e| e.to_string())
     }
 
     async fn send_delta(&self, entries: &[TeamMemoryEntry]) -> Result<(), String> {
@@ -175,7 +170,10 @@ mod tests {
             .await;
 
         let transport = HttpTransport::new(mock.uri());
-        let entries = transport.fetch_entries(&["fetched".to_string()]).await.unwrap();
+        let entries = transport
+            .fetch_entries(&["fetched".to_string()])
+            .await
+            .unwrap();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].topic, "fetched");
     }

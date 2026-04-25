@@ -7,18 +7,16 @@
 //! real tools without pulling `coderex-tools` into its dependency
 //! graph.
 
+use crate::builtins::chrome::{CHROME_CLIENT_KEY, ChromeClient};
 use crate::context::{ExecutionContext, ToolError};
-use crate::cron_scheduler::{CronScheduler, CRON_SCHEDULER_KEY};
+use crate::cron_scheduler::{CRON_SCHEDULER_KEY, CronScheduler};
 use crate::executor::ToolExecutor as InnerExecutor;
-use crate::rate_limiter::{RateLimiter, RATE_LIMITER_KEY};
+use crate::rate_limiter::{RATE_LIMITER_KEY, RateLimiter};
 use crate::registry::ToolRegistry;
 use crate::sandbox_policy;
-use crate::builtins::chrome::{ChromeClient, CHROME_CLIENT_KEY};
-use crate::task_store::{TaskStore, TASK_STORE_KEY};
-use crate::tool::{ToolContext, ToolInput, SharedState};
-use coderex_core::tool_executor::{
-    ToolDispatchOutcome, ToolExecutor as CoreToolExecutor,
-};
+use crate::task_store::{TASK_STORE_KEY, TaskStore};
+use crate::tool::{SharedState, ToolContext, ToolInput};
+use coderex_core::tool_executor::{ToolDispatchOutcome, ToolExecutor as CoreToolExecutor};
 use coderex_core::types::ToolResult;
 use serde_json::Value;
 use std::collections::HashMap;
@@ -143,9 +141,7 @@ impl CoreToolExecutor for RegistryToolDispatcher {
                 return ToolDispatchOutcome {
                     result: ToolResult {
                         tool_call_id: tool_call_id.to_string(),
-                        output: format!(
-                            "tool '{tool_name}' not found in registry"
-                        ),
+                        output: format!("tool '{tool_name}' not found in registry"),
                         is_error: true,
                     },
                 };
@@ -249,7 +245,9 @@ impl CoreToolExecutor for RegistryToolDispatcher {
                         format!("tool '{name}' rate limit exceeded")
                     }
                     ToolError::ElicitationUnavailable => {
-                        format!("tool '{tool_name}' requires user input but no elicitation channel is available")
+                        format!(
+                            "tool '{tool_name}' requires user input but no elicitation channel is available"
+                        )
                     }
                 };
                 ToolDispatchOutcome {

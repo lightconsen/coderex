@@ -36,7 +36,11 @@ impl Tool for SkillTool {
         }
     }
 
-    async fn execute(&self, input: ToolInput, ctx: ToolContext<'_>) -> Result<ToolOutput, ToolError> {
+    async fn execute(
+        &self,
+        input: ToolInput,
+        ctx: ToolContext<'_>,
+    ) -> Result<ToolOutput, ToolError> {
         let skill = extract_string(&input.arguments, "skill")?;
         let args = extract_string_opt(&input.arguments, "args");
 
@@ -110,8 +114,8 @@ fn extract_string_opt(args: &serde_json::Value, key: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tool::ToolContext;
     use crate::context::ExecutionContext;
+    use crate::tool::ToolContext;
     use std::collections::HashMap;
     use std::path::Path;
     use std::sync::Arc;
@@ -130,7 +134,11 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let skills_dir = tmp.path().join(".coderex/skills");
         std::fs::create_dir_all(&skills_dir).unwrap();
-        std::fs::write(skills_dir.join("pdf.md"), "# PDF Skill\nExtract text from PDF files.").unwrap();
+        std::fs::write(
+            skills_dir.join("pdf.md"),
+            "# PDF Skill\nExtract text from PDF files.",
+        )
+        .unwrap();
 
         let ctx = ToolContext {
             elicit_tx: None,

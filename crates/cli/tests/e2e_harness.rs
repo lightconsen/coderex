@@ -83,7 +83,10 @@ impl MockServer {
     /// Get all prompts sent to the server.
     #[must_use]
     pub fn prompts(&self) -> Vec<&str> {
-        self.call_history.iter().map(|c| c.prompt.as_str()).collect()
+        self.call_history
+            .iter()
+            .map(|c| c.prompt.as_str())
+            .collect()
     }
 }
 

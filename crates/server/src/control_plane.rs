@@ -187,7 +187,10 @@ impl ControlPlaneServer {
             .await
             .map_err(|e| format!("failed to bind control plane on port {}: {e}", self.port))?;
 
-        info!("Control plane server listening on http://0.0.0.0:{}/api/environments", self.port);
+        info!(
+            "Control plane server listening on http://0.0.0.0:{}/api/environments",
+            self.port
+        );
 
         loop {
             let (stream, _) = match listener.accept().await {
@@ -223,16 +226,27 @@ async fn handle_request(
     // Parse method and path
     let parts: Vec<&str> = first_line.split_whitespace().collect();
     if parts.len() < 2 {
-        return write_response(&mut writer, 400, &serde_json::json!({"error": "bad request"})).await;
+        return write_response(
+            &mut writer,
+            400,
+            &serde_json::json!({"error": "bad request"}),
+        )
+        .await;
     }
     let method = parts[0];
     let path = parts[1];
 
     // Read body if Content-Length present
-    let body: String = if let Some(content_len_line) = request.lines().find(|l| l.to_lowercase().starts_with("content-length:")) {
+    let body: String = if let Some(content_len_line) = request
+        .lines()
+        .find(|l| l.to_lowercase().starts_with("content-length:"))
+    {
         if let Some(len_str) = content_len_line.split(':').nth(1) {
             if let Ok(len) = len_str.trim().parse::<usize>() {
-                let header_end = request.find("\r\n\r\n").or_else(|| request.find("\n\n")).unwrap_or(n);
+                let header_end = request
+                    .find("\r\n\r\n")
+                    .or_else(|| request.find("\n\n"))
+                    .unwrap_or(n);
                 let remaining = n.saturating_sub(header_end);
                 let body_len = len.saturating_sub(remaining);
                 let mut body_bytes = if remaining > 0 {
@@ -275,7 +289,10 @@ async fn route(
 
     // GET /api/environments/{env_id}/assignments
     if method == "GET" {
-        if let Some(env_id) = path.strip_prefix("/api/environments/").and_then(|p| p.strip_suffix("/assignments")) {
+        if let Some(env_id) = path
+            .strip_prefix("/api/environments/")
+            .and_then(|p| p.strip_suffix("/assignments"))
+        {
             return handle_get_assignments(env_id, state).await;
         }
     }
@@ -294,7 +311,10 @@ async fn route(
 
     // POST /api/environments/{env_id}/capacity
     if method == "POST" {
-        if let Some(env_id) = path.strip_prefix("/api/environments/").and_then(|p| p.strip_suffix("/capacity")) {
+        if let Some(env_id) = path
+            .strip_prefix("/api/environments/")
+            .and_then(|p| p.strip_suffix("/capacity"))
+        {
             return handle_capacity(env_id, body, state).await;
         }
     }
@@ -314,16 +334,24 @@ async fn handle_register(
 ) -> (u16, serde_json::Value) {
     let req: RegisterRequest = match serde_json::from_str(body) {
         Ok(r) => r,
-        Err(e) => return (400, serde_json::json!({"error": format!("invalid JSON: {e}")})),
+        Err(e) => {
+            return (
+                400,
+                serde_json::json!({"error": format!("invalid JSON: {e}")}),
+            );
+        }
     };
 
     let env_id = req.env_id.clone();
     state.lock().await.register_env(req);
 
-    (200, serde_json::json!({
-        "ok": true,
-        "env_id": env_id,
-    }))
+    (
+        200,
+        serde_json::json!({
+            "ok": true,
+            "env_id": env_id,
+        }),
+    )
 }
 
 /// GET /api/environments/{env_id}/assignments
@@ -336,11 +364,14 @@ async fn handle_get_assignments(
     let entries: Vec<_> = assignments.into_iter().cloned().collect();
     drop(guard);
 
-    (200, serde_json::json!({
-        "env_id": env_id,
-        "assignments": entries,
-        "count": entries.len(),
-    }))
+    (
+        200,
+        serde_json::json!({
+            "env_id": env_id,
+            "assignments": entries,
+            "count": entries.len(),
+        }),
+    )
 }
 
 /// POST /api/environments/{env_id}/assignments/{id}/claim
@@ -351,16 +382,22 @@ async fn handle_claim(
 ) -> (u16, serde_json::Value) {
     let claimed = state.lock().await.claim_assignment(assignment_id, env_id);
     if claimed {
-        (200, serde_json::json!({
-            "ok": true,
-            "assignment_id": assignment_id,
-            "claimed_by": env_id,
-        }))
+        (
+            200,
+            serde_json::json!({
+                "ok": true,
+                "assignment_id": assignment_id,
+                "claimed_by": env_id,
+            }),
+        )
     } else {
-        (409, serde_json::json!({
-            "error": "assignment already claimed or not found",
-            "assignment_id": assignment_id,
-        }))
+        (
+            409,
+            serde_json::json!({
+                "error": "assignment already claimed or not found",
+                "assignment_id": assignment_id,
+            }),
+        )
     }
 }
 
@@ -372,14 +409,22 @@ async fn handle_capacity(
 ) -> (u16, serde_json::Value) {
     let report: CapacityReport = match serde_json::from_str(body) {
         Ok(r) => r,
-        Err(e) => return (400, serde_json::json!({"error": format!("invalid JSON: {e}")})),
+        Err(e) => {
+            return (
+                400,
+                serde_json::json!({"error": format!("invalid JSON: {e}")}),
+            );
+        }
     };
 
     let updated = state.lock().await.update_capacity(env_id, report);
     if updated {
         (200, serde_json::json!({"ok": true}))
     } else {
-        (404, serde_json::json!({"error": "environment not registered", "env_id": env_id}))
+        (
+            404,
+            serde_json::json!({"error": "environment not registered", "env_id": env_id}),
+        )
     }
 }
 
@@ -391,10 +436,13 @@ async fn handle_list_environments(
     let envs = guard.list_environments();
     let count = envs.len();
     let envs_vec: Vec<&str> = envs.into_iter().collect();
-    (200, serde_json::json!({
-        "environments": envs_vec,
-        "count": count,
-    }))
+    (
+        200,
+        serde_json::json!({
+            "environments": envs_vec,
+            "count": count,
+        }),
+    )
 }
 
 /// Write an HTTP response.
@@ -442,23 +490,36 @@ mod tests {
             max_concurrent: 5,
             capabilities: vec![],
         });
-        let ok = state.update_capacity("env1", CapacityReport {
-            active_sessions: 2,
-            max_concurrent: 5,
-            available_slots: 3,
-        });
+        let ok = state.update_capacity(
+            "env1",
+            CapacityReport {
+                active_sessions: 2,
+                max_concurrent: 5,
+                available_slots: 3,
+            },
+        );
         assert!(ok);
-        assert_eq!(state.environments["env1"].capacity.as_ref().unwrap().active_sessions, 2);
+        assert_eq!(
+            state.environments["env1"]
+                .capacity
+                .as_ref()
+                .unwrap()
+                .active_sessions,
+            2
+        );
     }
 
     #[test]
     fn state_update_capacity_unknown_env() {
         let mut state = ControlPlaneState::default();
-        assert!(!state.update_capacity("nope", CapacityReport {
-            active_sessions: 0,
-            max_concurrent: 1,
-            available_slots: 1,
-        }));
+        assert!(!state.update_capacity(
+            "nope",
+            CapacityReport {
+                active_sessions: 0,
+                max_concurrent: 1,
+                available_slots: 1,
+            }
+        ));
     }
 
     #[test]
@@ -529,7 +590,8 @@ mod tests {
             env_id: "test-env".into(),
             max_concurrent: 10,
             capabilities: vec!["worktree".into(), "ssh".into()],
-        }).unwrap();
+        })
+        .unwrap();
         let (status, resp) = handle_register(&body, &state).await;
         assert_eq!(status, 200);
         assert_eq!(resp["env_id"], "test-env");
@@ -596,7 +658,8 @@ mod tests {
             active_sessions: 2,
             max_concurrent: 5,
             available_slots: 3,
-        }).unwrap();
+        })
+        .unwrap();
         let (status, _) = handle_capacity("env1", &body, &state).await;
         assert_eq!(status, 200);
     }
@@ -608,7 +671,8 @@ mod tests {
             active_sessions: 0,
             max_concurrent: 1,
             available_slots: 1,
-        }).unwrap();
+        })
+        .unwrap();
         let (status, _) = handle_capacity("nope", &body, &state).await;
         assert_eq!(status, 404);
     }

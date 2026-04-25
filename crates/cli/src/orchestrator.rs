@@ -1,15 +1,17 @@
 //! Startup orchestrator — four-phase initialization.
 
+use crate::cli::Cli;
+use crate::daemon;
 use anyhow::{Result, bail};
 #[cfg(feature = "enterprise")]
 use coderex_config::config_home;
 use coderex_config::{ConfigService, RuntimeOverrides, Settings};
 #[cfg(feature = "enterprise")]
-use coderex_config::{LoadingBarrier, RemoteManagedSettings, RemoteManagedSettingsClient, RemoteSettingsManager};
-use coderex_core::types::ModelId;
+use coderex_config::{
+    LoadingBarrier, RemoteManagedSettings, RemoteManagedSettingsClient, RemoteSettingsManager,
+};
 use coderex_core::api_client::ApiClient;
-use crate::cli::Cli;
-use crate::daemon;
+use coderex_core::types::ModelId;
 use std::io::IsTerminal;
 use std::sync::Arc;
 
@@ -313,8 +315,12 @@ impl StartupOrchestrator {
             use tokio::signal::unix::{SignalKind, signal};
             let cwd = self.ctx.cwd.clone();
             tokio::spawn(async move {
-                let Ok(mut sigterm) = signal(SignalKind::terminate()) else { return };
-                let Ok(mut sighup) = signal(SignalKind::hangup()) else { return };
+                let Ok(mut sigterm) = signal(SignalKind::terminate()) else {
+                    return;
+                };
+                let Ok(mut sighup) = signal(SignalKind::hangup()) else {
+                    return;
+                };
                 loop {
                     tokio::select! {
                         _ = sigterm.recv() => {
@@ -334,6 +340,10 @@ impl StartupOrchestrator {
         }
 
         tracing::info!("CodeRex ready");
+        eprintln!(
+            "[DEBUG] args.print = {}, args.prompt = {:?}",
+            args.print, args.prompt
+        );
 
         // Determine model: ANTHROPIC_MODEL / OPENAI_MODEL env → settings → default
         let model = std::env::var("ANTHROPIC_MODEL")
@@ -369,43 +379,22 @@ impl StartupOrchestrator {
             if prompt.is_empty() {
                 bail!("No input provided");
             }
-            self.run_headless_with_prompt(&self.ctx.cwd, model, &prompt).await?;
+            self.run_headless_with_prompt(&self.ctx.cwd, model, &prompt)
+                .await?;
             return Ok(());
         } else if let Some(cmd) = args.command {
             match cmd {
-                crate::cli::Command::Repl => {
-                    self.run_repl(&self.ctx.cwd, model).await
-                }
-                crate::cli::Command::Serve { port } => {
-                    self.run_server(&self.ctx.cwd, port).await
-                }
-                crate::cli::Command::ServeStop => {
-                    self.run_serve_stop().await
-                }
-                crate::cli::Command::ServeStatus => {
-                    self.run_serve_status().await
-                }
-                crate::cli::Command::Agents { detailed } => {
-                    self.run_agents(detailed).await
-                }
-                crate::cli::Command::Auth => {
-                    self.run_auth().await
-                }
-                crate::cli::Command::Doctor => {
-                    self.run_doctor().await
-                }
-                crate::cli::Command::Update => {
-                    self.run_update().await
-                }
-                crate::cli::Command::Mcp { action } => {
-                    self.run_mcp(action).await
-                }
-                crate::cli::Command::Plugin { action } => {
-                    self.run_plugin(action).await
-                }
-                crate::cli::Command::AutoMode => {
-                    self.run_auto_mode().await
-                }
+                crate::cli::Command::Repl => self.run_repl(&self.ctx.cwd, model).await,
+                crate::cli::Command::Serve { port } => self.run_server(&self.ctx.cwd, port).await,
+                crate::cli::Command::ServeStop => self.run_serve_stop().await,
+                crate::cli::Command::ServeStatus => self.run_serve_status().await,
+                crate::cli::Command::Agents { detailed } => self.run_agents(detailed).await,
+                crate::cli::Command::Auth => self.run_auth().await,
+                crate::cli::Command::Doctor => self.run_doctor().await,
+                crate::cli::Command::Update => self.run_update().await,
+                crate::cli::Command::Mcp { action } => self.run_mcp(action).await,
+                crate::cli::Command::Plugin { action } => self.run_plugin(action).await,
+                crate::cli::Command::AutoMode => self.run_auto_mode().await,
             }
         } else {
             // Interactive REPL
@@ -419,9 +408,7 @@ impl StartupOrchestrator {
             StartupPhase::Bootstrap => self.phase_bootstrap().await,
             StartupPhase::LoadSettings => self.phase_load_settings(args).await,
             #[cfg(feature = "enterprise")]
-            StartupPhase::MergeRemoteManagedSettings => {
-                self.phase_merge_remote_settings().await
-            }
+            StartupPhase::MergeRemoteManagedSettings => self.phase_merge_remote_settings().await,
             #[cfg(not(feature = "enterprise"))]
             StartupPhase::MergeRemoteManagedSettings => {
                 tracing::debug!("remote settings phase skipped (enterprise feature not enabled)");
@@ -431,9 +418,7 @@ impl StartupOrchestrator {
             StartupPhase::LoadCommands => self.phase_load_commands().await,
             StartupPhase::LoadSkills => self.phase_load_skills().await,
             StartupPhase::InitPlugins => self.phase_init_plugins().await,
-            StartupPhase::ReconcileMarketplaces => {
-                self.phase_reconcile_marketplaces().await
-            }
+            StartupPhase::ReconcileMarketplaces => self.phase_reconcile_marketplaces().await,
             StartupPhase::InitMcp => self.phase_init_mcp().await,
             StartupPhase::InitMemory => self.phase_init_memory().await,
             StartupPhase::InitRemoteServices => self.phase_init_remote_services().await,
@@ -467,9 +452,8 @@ impl StartupOrchestrator {
                     tracing_subscriber::fmt()
                         .with_env_filter(filter)
                         .with_writer(move || {
-                            file.try_clone().unwrap_or_else(|_| {
-                                std::fs::File::open("/dev/null").unwrap()
-                            })
+                            file.try_clone()
+                                .unwrap_or_else(|_| std::fs::File::open("/dev/null").unwrap())
                         })
                         .finish(),
                 )
@@ -490,7 +474,9 @@ impl StartupOrchestrator {
         let config_dir = coderex_config::config_home();
 
         // Use custom settings path if --settings is provided
-        let user_path = args.settings.clone()
+        let user_path = args
+            .settings
+            .clone()
             .unwrap_or_else(|| config_dir.join("settings.json"));
 
         // Find project config in CWD or ancestors
@@ -518,7 +504,10 @@ impl StartupOrchestrator {
             api_key: args.api_key.clone(),
             system_prompt: args.system_prompt.clone(),
             append_system_prompt: args.append_system_prompt,
-            allowed_tools: args.allowed_tools.as_ref().map(|s| s.split(',').map(|t| t.trim().to_string()).collect()),
+            allowed_tools: args
+                .allowed_tools
+                .as_ref()
+                .map(|s| s.split(',').map(|t| t.trim().to_string()).collect()),
             fallback_model: args.fallback_model.clone(),
             effort: args.effort.clone(),
         };
@@ -552,7 +541,10 @@ impl StartupOrchestrator {
     /// Initialize the telemetry subsystem using resolved settings.
     fn init_telemetry(
         settings: &Settings,
-    ) -> Option<(coderex_telemetry::TelemetryHandle, Option<coderex_telemetry::TelemetryUploader>)> {
+    ) -> Option<(
+        coderex_telemetry::TelemetryHandle,
+        Option<coderex_telemetry::TelemetryUploader>,
+    )> {
         let config_home = coderex_config::config_home();
         let db_path = config_home.join("telemetry.db");
         let pending_dir = config_home.join("crashes").join("pending");
@@ -578,11 +570,15 @@ impl StartupOrchestrator {
 
         // Build TelemetryConfig from settings sub-config
         let telemetry_config = settings.telemetry.as_ref().map(|t| {
-            let api_key = settings.api_key.as_ref().map(|k| coderex_config::resolve_api_key(k));
+            let api_key = settings
+                .api_key
+                .as_ref()
+                .map(|k| coderex_config::resolve_api_key(k));
             coderex_telemetry::TelemetryConfig {
-                endpoint: t.endpoint.clone().unwrap_or_else(|| {
-                    "https://telemetry.coderex.dev/v1/events".into()
-                }),
+                endpoint: t
+                    .endpoint
+                    .clone()
+                    .unwrap_or_else(|| "https://telemetry.coderex.dev/v1/events".into()),
                 crash_endpoint: t.crash_endpoint.clone(),
                 api_key,
                 batch_size: t.batch_size.unwrap_or(100),
@@ -593,8 +589,7 @@ impl StartupOrchestrator {
             }
         });
 
-        let (handle, uploader) =
-            coderex_telemetry::TelemetryHandle::new(store, telemetry_config);
+        let (handle, uploader) = coderex_telemetry::TelemetryHandle::new(store, telemetry_config);
         Some((handle, uploader))
     }
 
@@ -668,7 +663,9 @@ impl StartupOrchestrator {
             match barrier_result {
                 Ok(state) => {
                     match state {
-                        coderex_config::FetchState::Ready { settings: remote, .. } => {
+                        coderex_config::FetchState::Ready {
+                            settings: remote, ..
+                        } => {
                             tracing::info!("remote settings applied");
                             self.ctx.remote_settings = Some(remote);
                         }
@@ -677,7 +674,9 @@ impl StartupOrchestrator {
                         }
                         _ => {
                             // Still fetching — we'll merge later when ready
-                            tracing::debug!("remote settings still fetching, will merge asynchronously");
+                            tracing::debug!(
+                                "remote settings still fetching, will merge asynchronously"
+                            );
                         }
                     }
                 }
@@ -802,7 +801,10 @@ impl StartupOrchestrator {
                     let manifest_path = entry.path().join("plugin.json");
                     if manifest_path.exists() {
                         if let Ok(content) = std::fs::read_to_string(&manifest_path) {
-                            if let Ok(manifest) = serde_json::from_str::<coderex_plugins::plugins::PluginManifest>(&content) {
+                            if let Ok(manifest) = serde_json::from_str::<
+                                coderex_plugins::plugins::PluginManifest,
+                            >(&content)
+                            {
                                 manager.load_plugin(manifest, entry.path());
                                 loaded += 1;
                             }
@@ -826,9 +828,7 @@ impl StartupOrchestrator {
             }
         }
 
-        tracing::info!(
-            "plugins initialized: {loaded} loaded, {spawned} spawned"
-        );
+        tracing::info!("plugins initialized: {loaded} loaded, {spawned} spawned");
 
         self.ctx.plugin_manager = Some(Arc::new(manager));
         Ok(())
@@ -842,8 +842,8 @@ impl StartupOrchestrator {
         // Register marketplace if configured via environment
         if let Ok(url) = std::env::var("CODEREX_MARKETPLACE_URL") {
             if !url.is_empty() {
-                let name = std::env::var("CODEREX_MARKETPLACE_NAME")
-                    .unwrap_or_else(|_| "default".into());
+                let name =
+                    std::env::var("CODEREX_MARKETPLACE_NAME").unwrap_or_else(|_| "default".into());
                 let _ = manager.register_marketplace(name, url);
             }
         }
@@ -877,7 +877,10 @@ impl StartupOrchestrator {
         let mut config_loaded = false;
 
         // Load from custom --mcp-config or default .mcp.json
-        let mcp_path = self.ctx.mcp_config_path.clone()
+        let mcp_path = self
+            .ctx
+            .mcp_config_path
+            .clone()
             .unwrap_or_else(|| std::path::Path::new(&self.ctx.cwd).join(".mcp.json"));
         if mcp_path.exists() {
             match coderex_mcp::config::McpConfig::load(&mcp_path) {
@@ -921,14 +924,16 @@ impl StartupOrchestrator {
 
             // Bridge MCP-discovered tools to skills
             for tool in manager.list_tool_info() {
-                self.ctx.mcp_skills.push(coderex_plugins::skills::SkillMetadata {
-                    name: tool.name.clone(),
-                    hooks: vec!["post-query".into()],
-                    agent: Some(tool.server.clone()),
-                    allowed_tools: vec![tool.name],
-                    description: tool.description,
-                    enabled: true,
-                });
+                self.ctx
+                    .mcp_skills
+                    .push(coderex_plugins::skills::SkillMetadata {
+                        name: tool.name.clone(),
+                        hooks: vec!["post-query".into()],
+                        agent: Some(tool.server.clone()),
+                        allowed_tools: vec![tool.name],
+                        description: tool.description,
+                        enabled: true,
+                    });
             }
             if !self.ctx.mcp_skills.is_empty() {
                 tracing::info!(
@@ -983,7 +988,11 @@ impl StartupOrchestrator {
         tracing::info!(
             "startup complete: cwd={}, model={}, mcp={}, memory={}, remote={}",
             self.ctx.cwd,
-            self.ctx.model.as_ref().map(|m| m.0.as_str()).unwrap_or("default"),
+            self.ctx
+                .model
+                .as_ref()
+                .map(|m| m.0.as_str())
+                .unwrap_or("default"),
             self.ctx.mcp_ready,
             self.ctx.memory_ready,
             self.ctx.remote_services_ready,
@@ -1029,14 +1038,19 @@ impl StartupOrchestrator {
 
     /// Get the API key override from settings if set.
     fn api_key_from_settings(&self) -> Option<&str> {
-        self.ctx.settings.as_ref()
+        self.ctx
+            .settings
+            .as_ref()
             .and_then(|s| s.api_key.as_deref())
     }
 
     /// Configure a ReplLoop with all CLI-derived settings.
     fn configure_repl(&self, repl: &mut crate::repl::ReplLoop) {
         repl.with_skip_permissions(self.ctx.skip_permissions);
-        let perm_mode = self.ctx.settings.as_ref()
+        let perm_mode = self
+            .ctx
+            .settings
+            .as_ref()
             .and_then(|s| s.permission_mode.as_deref())
             .and_then(|m| m.parse::<coderex_core::permissions::PermissionMode>().ok());
         repl.with_permission_mode(perm_mode);
@@ -1086,7 +1100,12 @@ impl StartupOrchestrator {
     }
 
     #[allow(clippy::unused_async)]
-    async fn run_headless_with_prompt(&self, cwd: &str, model: ModelId, prompt: &str) -> Result<()> {
+    async fn run_headless_with_prompt(
+        &self,
+        cwd: &str,
+        model: ModelId,
+        prompt: &str,
+    ) -> Result<()> {
         let api_key = self.api_key_from_settings();
         let mut repl = if let Some(api_client) = Self::try_create_api_client(api_key) {
             crate::repl::ReplLoop::with_engine(api_client, cwd.to_string(), model)
@@ -1101,12 +1120,11 @@ impl StartupOrchestrator {
         // Parse input based on --input-format
         let user_prompt = if self.ctx.input_format == "json" {
             match serde_json::from_str::<serde_json::Value>(prompt) {
-                Ok(val) => {
-                    val.get("prompt")
-                        .and_then(|p| p.as_str())
-                        .unwrap_or(prompt)
-                        .to_string()
-                }
+                Ok(val) => val
+                    .get("prompt")
+                    .and_then(|p| p.as_str())
+                    .unwrap_or(prompt)
+                    .to_string(),
                 Err(_) => prompt.to_string(),
             }
         } else {
@@ -1128,7 +1146,11 @@ impl StartupOrchestrator {
         for file_path in &self.ctx.file {
             match std::fs::read_to_string(file_path) {
                 Ok(content) => {
-                    final_prompt.push_str(&format!("--- {} ---\n{}\n\n", file_path.display(), content));
+                    final_prompt.push_str(&format!(
+                        "--- {} ---\n{}\n\n",
+                        file_path.display(),
+                        content
+                    ));
                 }
                 Err(e) => {
                     tracing::warn!("failed to read file {}: {e}", file_path.display());
@@ -1196,7 +1218,9 @@ impl StartupOrchestrator {
         let mut server = DaemonServer::with_config(config);
 
         tracing::info!("CodeRex server initialized: cwd={cwd}");
-        tracing::info!("Server config: idle_timeout={idle_timeout}s, max_sessions=100, port={port}");
+        tracing::info!(
+            "Server config: idle_timeout={idle_timeout}s, max_sessions=100, port={port}"
+        );
         println!("CodeRex server running on ws://0.0.0.0:{port}");
         println!("Sessions: 0 active");
         println!("Press Ctrl+C to stop");
@@ -1274,9 +1298,18 @@ impl StartupOrchestrator {
         println!("CodeRex Doctor");
         println!("==============");
         let checks = [
-            ("API key configured", Self::try_create_api_client(self.api_key_from_settings()).is_some()),
-            ("Settings file exists", coderex_config::config_home().join("settings.json").exists()),
-            ("Working directory accessible", std::env::current_dir().is_ok()),
+            (
+                "API key configured",
+                Self::try_create_api_client(self.api_key_from_settings()).is_some(),
+            ),
+            (
+                "Settings file exists",
+                coderex_config::config_home().join("settings.json").exists(),
+            ),
+            (
+                "Working directory accessible",
+                std::env::current_dir().is_ok(),
+            ),
         ];
         let mut issues = 0;
         for (name, ok) in &checks {
@@ -1308,7 +1341,10 @@ impl StartupOrchestrator {
 
     #[allow(clippy::unused_async)]
     async fn run_mcp(&self, action: Option<crate::cli::McpAction>) -> Result<()> {
-        let mcp_path = self.ctx.mcp_config_path.clone()
+        let mcp_path = self
+            .ctx
+            .mcp_config_path
+            .clone()
             .unwrap_or_else(|| std::path::Path::new(&self.ctx.cwd).join(".mcp.json"));
         match action {
             Some(crate::cli::McpAction::List) => {
@@ -1340,11 +1376,14 @@ impl StartupOrchestrator {
                 let parts: Vec<&str> = command.split_whitespace().collect();
                 let cmd = parts.first().map_or(command.clone(), |s| s.to_string());
                 let args: Vec<String> = parts.iter().skip(1).map(|s| s.to_string()).collect();
-                config.add_server(name.clone(), coderex_mcp::config::McpServerConfig {
-                    command: cmd,
-                    args,
-                    env: std::collections::HashMap::new(),
-                });
+                config.add_server(
+                    name.clone(),
+                    coderex_mcp::config::McpServerConfig {
+                        command: cmd,
+                        args,
+                        env: std::collections::HashMap::new(),
+                    },
+                );
                 match config.save(&mcp_path) {
                     Ok(()) => println!("Added MCP server '{name}' to {mcp_path:?}"),
                     Err(e) => println!("Error saving config: {e}"),
@@ -1375,7 +1414,9 @@ impl StartupOrchestrator {
                     Ok(config) => {
                         if config.mcp_servers.contains_key(&name) {
                             println!("MCP server '{name}' is configured.");
-                            println!("(Live connection test requires server spawn — not yet implemented)");
+                            println!(
+                                "(Live connection test requires server spawn — not yet implemented)"
+                            );
                         } else {
                             println!("MCP server '{name}' not found in config.");
                         }
@@ -1451,8 +1492,10 @@ impl StartupOrchestrator {
                 let reconciler = coderex_plugins::plugins::MarketplaceReconciler::new(300);
                 match reconciler.reconcile(&manager, Some(&install_dir)).await {
                     Ok(report) => {
-                        println!("Update complete: {} new, {} updated, {} removed",
-                            report.new_count, report.updated_count, report.removed_count);
+                        println!(
+                            "Update complete: {} new, {} updated, {} removed",
+                            report.new_count, report.updated_count, report.removed_count
+                        );
                     }
                     Err(e) => println!("Update failed: {e}"),
                 }
@@ -1498,9 +1541,7 @@ impl StartupOrchestrator {
         // Show a summary of the conversation history
         let user_msgs: Vec<_> = messages
             .iter()
-            .filter(|m| {
-                matches!(m.role, coderex_core::types::Role::User)
-            })
+            .filter(|m| matches!(m.role, coderex_core::types::Role::User))
             .collect();
         println!("User messages in session: {}", user_msgs.len());
         for (i, msg) in user_msgs.iter().enumerate() {
@@ -1720,10 +1761,8 @@ mod tests {
 
     #[test]
     fn resume_fails_for_missing_transcript() {
-        let result = StartupOrchestrator::load_resume_messages(
-            "/nonexistent",
-            "nonexistent_session",
-        );
+        let result =
+            StartupOrchestrator::load_resume_messages("/nonexistent", "nonexistent_session");
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(err.to_string().contains("No transcript found"));
@@ -1739,7 +1778,10 @@ mod tests {
         std::fs::create_dir_all(&transcript_dir).unwrap();
         let store = coderex_memory::transcript::TranscriptStore::new(transcript_dir);
         store
-            .append("sess_1", &coderex_core::types::Message::system("you are helpful"))
+            .append(
+                "sess_1",
+                &coderex_core::types::Message::system("you are helpful"),
+            )
             .unwrap();
         store
             .append("sess_1", &coderex_core::types::Message::user("hello"))
@@ -1755,7 +1797,10 @@ mod tests {
             .expect("resume should load transcript messages");
         assert_eq!(messages.len(), 2);
         assert!(matches!(messages[0].role, coderex_core::types::Role::User));
-        assert!(matches!(messages[1].role, coderex_core::types::Role::Assistant));
+        assert!(matches!(
+            messages[1].role,
+            coderex_core::types::Role::Assistant
+        ));
     }
 
     #[test]

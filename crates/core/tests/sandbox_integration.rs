@@ -50,7 +50,10 @@ fn sandbox_handle_create_with_limits() {
 #[test]
 fn sandbox_handle_create_no_limits() {
     let handle = SandboxHandle::create(SandboxConfig::default());
-    assert!(handle.is_ok(), "sandbox creation with defaults should succeed");
+    assert!(
+        handle.is_ok(),
+        "sandbox creation with defaults should succeed"
+    );
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -89,7 +92,10 @@ fn linux_rlimit_cpu_kills_busy_process() {
         }
     };
 
-    assert!(!result.success(), "busy-loop should have been killed by CPU limit");
+    assert!(
+        !result.success(),
+        "busy-loop should have been killed by CPU limit"
+    );
     assert!(
         start.elapsed() < Duration::from_secs(4),
         "CPU limit should have killed process quickly, took {:?}",
@@ -148,7 +154,10 @@ fn linux_rlimit_nofile_enforced() {
 #[test]
 fn macos_sandbox_allows_write_in_allowed_path() {
     // Use /private/tmp (canonical temp on macOS) to avoid sandbox-exec subpath issues
-    let allowed = PathBuf::from(format!("/private/tmp/coderex_sandbox_test_{}", std::process::id()));
+    let allowed = PathBuf::from(format!(
+        "/private/tmp/coderex_sandbox_test_{}",
+        std::process::id()
+    ));
     let _ = std::fs::remove_dir_all(&allowed);
     std::fs::create_dir(&allowed).unwrap();
 
@@ -183,8 +192,14 @@ fn macos_sandbox_allows_write_in_allowed_path() {
 #[cfg(target_os = "macos")]
 #[test]
 fn macos_sandbox_denies_write_outside_allowed_path() {
-    let allowed = PathBuf::from(format!("/private/tmp/coderex_sandbox_allowed_{}", std::process::id()));
-    let restricted = PathBuf::from(format!("/private/tmp/coderex_sandbox_restricted_{}", std::process::id()));
+    let allowed = PathBuf::from(format!(
+        "/private/tmp/coderex_sandbox_allowed_{}",
+        std::process::id()
+    ));
+    let restricted = PathBuf::from(format!(
+        "/private/tmp/coderex_sandbox_restricted_{}",
+        std::process::id()
+    ));
     let _ = std::fs::remove_dir_all(&allowed);
     let _ = std::fs::remove_dir_all(&restricted);
     std::fs::create_dir(&allowed).unwrap();
@@ -201,10 +216,10 @@ fn macos_sandbox_denies_write_outside_allowed_path() {
 
     let test_file = restricted.join("test.txt");
     let mut cmd = std::process::Command::new(wrapper);
-    cmd.args(&args)
-        .arg("sh")
-        .arg("-c")
-        .arg(format!("echo bad > {} 2>/dev/null || echo denied", test_file.display()));
+    cmd.args(&args).arg("sh").arg("-c").arg(format!(
+        "echo bad > {} 2>/dev/null || echo denied",
+        test_file.display()
+    ));
 
     let output = cmd.output().unwrap();
     let stdout = String::from_utf8_lossy(&output.stdout);

@@ -26,9 +26,8 @@ pub mod events;
 pub mod store;
 
 pub use events::{
-    ArgType, ElicitationResponse, ElicitationTracker, PermissionSchema,
-    PermissionStatus, PermissionTracker, PermissionValidationError,
-    SdkEvent, SdkEventStream, SdkSession, SdkSubscriber,
-    TrackedElicitation, TrackedPermission,
+    ArgType, ElicitationResponse, ElicitationTracker, PermissionSchema, PermissionStatus,
+    PermissionTracker, PermissionValidationError, SdkEvent, SdkEventStream, SdkSession,
+    SdkSubscriber, TrackedElicitation, TrackedPermission,
 };
 pub use store::{SessionStore, StoreError};

@@ -1,7 +1,7 @@
 //! Message export — export selected messages in various formats.
 
-use coderex_core::types::Message;
 use crate::selector::MessageSelector;
+use coderex_core::types::Message;
 
 /// Export format for messages.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -28,10 +28,7 @@ pub fn export_messages(
         format_messages(&refs, format)
     } else {
         // Export only selected messages
-        let selected: Vec<&Message> = indices
-            .iter()
-            .filter_map(|&i| messages.get(i))
-            .collect();
+        let selected: Vec<&Message> = indices.iter().filter_map(|&i| messages.get(i)).collect();
         format_messages(&selected, format)
     }
 }
@@ -96,10 +93,16 @@ fn format_markdown(messages: &[&Message]) -> String {
                 out.push('\n');
             }
             coderex_core::types::MessageContent::ToolCall(tc) => {
-                out.push_str(&format!("```json\n{{\"tool\": \"{}\", \"id\": \"{}\"}}\n```\n", tc.name, tc.id));
+                out.push_str(&format!(
+                    "```json\n{{\"tool\": \"{}\", \"id\": \"{}\"}}\n```\n",
+                    tc.name, tc.id
+                ));
             }
             coderex_core::types::MessageContent::ToolResult(tr) => {
-                out.push_str(&format!("```json\n{{\"result\": \"{}\", \"id\": \"{}\"}}\n```\n", tr.output, tr.tool_call_id));
+                out.push_str(&format!(
+                    "```json\n{{\"result\": \"{}\", \"id\": \"{}\"}}\n```\n",
+                    tr.output, tr.tool_call_id
+                ));
             }
             _ => out.push_str("[unknown]\n"),
         }
@@ -137,7 +140,9 @@ pub fn copy_to_clipboard(text: &str) -> Result<(), String> {
         .map_err(|e| e.to_string())?;
 
     if let Some(mut stdin) = child.stdin.take() {
-        stdin.write_all(text.as_bytes()).map_err(|e| e.to_string())?;
+        stdin
+            .write_all(text.as_bytes())
+            .map_err(|e| e.to_string())?;
     }
 
     child.wait().map_err(|e| e.to_string())?;
@@ -158,7 +163,9 @@ pub fn copy_to_clipboard(text: &str) -> Result<(), String> {
         .map_err(|e| e.to_string())?;
 
     if let Some(mut stdin) = child.stdin.take() {
-        stdin.write_all(text.as_bytes()).map_err(|e| e.to_string())?;
+        stdin
+            .write_all(text.as_bytes())
+            .map_err(|e| e.to_string())?;
     }
 
     child.wait().map_err(|e| e.to_string())?;
@@ -177,10 +184,7 @@ mod tests {
     use crate::selector::MessageSelector;
 
     fn test_messages() -> Vec<Message> {
-        vec![
-            Message::user("Hello"),
-            Message::assistant("Hi there!"),
-        ]
+        vec![Message::user("Hello"), Message::assistant("Hi there!")]
     }
 
     #[test]

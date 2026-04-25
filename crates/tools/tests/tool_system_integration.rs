@@ -9,8 +9,8 @@ use std::sync::Arc;
 
 use coderex_core::tool_executor::ToolExecutor;
 use coderex_tools::{
-    register_builtin_tools, ExecutionConfig, ExecutionContext, RegistryToolDispatcher,
-    ToolCacheConfig, ToolExecutor as ToolsExecutor, ToolRegistry,
+    ExecutionConfig, ExecutionContext, RegistryToolDispatcher, ToolCacheConfig,
+    ToolExecutor as ToolsExecutor, ToolRegistry, register_builtin_tools,
 };
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -28,7 +28,8 @@ fn test_dispatcher(cwd: PathBuf) -> RegistryToolDispatcher {
     let mut config = ExecutionConfig::default();
     config.sandbox_enabled = false;
     let executor = Arc::new(ToolsExecutor::new(config));
-    let mut dispatcher = RegistryToolDispatcher::new(registry, executor, ExecutionContext::Normal, cwd);
+    let mut dispatcher =
+        RegistryToolDispatcher::new(registry, executor, ExecutionContext::Normal, cwd);
     dispatcher.set_sandbox_enabled(false);
     dispatcher
 }
@@ -49,7 +50,11 @@ async fn read_tool_via_dispatcher_reads_file() {
 
     let dispatcher = test_dispatcher(tmp.path().to_path_buf());
     let outcome = dispatcher
-        .execute("tc-1", "Read", &tool_args(serde_json::json!({"file_path": "test.txt"})))
+        .execute(
+            "tc-1",
+            "Read",
+            &tool_args(serde_json::json!({"file_path": "test.txt"})),
+        )
         .await;
 
     assert!(!outcome.result.is_error);
@@ -69,7 +74,9 @@ async fn read_tool_missing_file_returns_error() {
         .await;
 
     assert!(outcome.result.is_error);
-    assert!(outcome.result.output.contains("not found") || outcome.result.output.contains("failed"));
+    assert!(
+        outcome.result.output.contains("not found") || outcome.result.output.contains("failed")
+    );
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -170,7 +177,9 @@ async fn edit_tool_non_unique_string_errors() {
         .await;
 
     assert!(outcome.result.is_error);
-    assert!(outcome.result.output.contains("replace_all") || outcome.result.output.contains("3 times"));
+    assert!(
+        outcome.result.output.contains("replace_all") || outcome.result.output.contains("3 times")
+    );
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -265,7 +274,11 @@ async fn glob_tool_via_dispatcher_matches_files() {
 #[tokio::test]
 async fn grep_tool_via_dispatcher_finds_pattern() {
     let tmp = tempfile::tempdir().unwrap();
-    std::fs::write(tmp.path().join("src.txt"), "hello world\nfoo bar\nhello again").unwrap();
+    std::fs::write(
+        tmp.path().join("src.txt"),
+        "hello world\nfoo bar\nhello again",
+    )
+    .unwrap();
 
     let dispatcher = test_dispatcher(tmp.path().to_path_buf());
     let outcome = dispatcher
@@ -388,7 +401,9 @@ fn read_only_tools_marked_correctly() {
     let read_only_tools = ["Read", "Glob", "Grep", "WebFetch", "WebSearch"];
 
     for name in &read_only_tools {
-        let tool = registry.get_tool_arc(name).unwrap_or_else(|| panic!("{name} not found"));
+        let tool = registry
+            .get_tool_arc(name)
+            .unwrap_or_else(|| panic!("{name} not found"));
         let desc = tool.descriptor();
         assert!(desc.is_read_only, "{name} should be read-only");
     }
@@ -400,7 +415,9 @@ fn dangerous_tools_not_read_only() {
     let dangerous = ["Write", "Edit", "Bash"];
 
     for name in &dangerous {
-        let tool = registry.get_tool_arc(name).unwrap_or_else(|| panic!("{name} not found"));
+        let tool = registry
+            .get_tool_arc(name)
+            .unwrap_or_else(|| panic!("{name} not found"));
         let desc = tool.descriptor();
         assert!(!desc.is_read_only, "{name} should not be read-only");
     }
@@ -512,7 +529,11 @@ fn all_registered_tools_have_input_output_schemas() {
 fn all_tool_names_are_unique_in_registry() {
     let registry = test_registry();
     let names: Vec<String> = registry.list_tools().into_iter().map(|(n, _)| n).collect();
-    let unique_count = names.iter().cloned().collect::<std::collections::HashSet<_>>().len();
+    let unique_count = names
+        .iter()
+        .cloned()
+        .collect::<std::collections::HashSet<_>>()
+        .len();
     assert_eq!(
         unique_count,
         names.len(),
@@ -559,7 +580,10 @@ async fn sandbox_denies_write_outside_allowed_paths() {
         .await;
 
     assert!(outcome.result.is_error);
-    assert!(outcome.result.output.contains("permission denied") || outcome.result.output.contains("PermissionDenied"));
+    assert!(
+        outcome.result.output.contains("permission denied")
+            || outcome.result.output.contains("PermissionDenied")
+    );
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

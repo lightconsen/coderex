@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::path::Path;
 use std::sync::Arc;
-use tokio::sync::{watch, RwLock};
+use tokio::sync::{RwLock, watch};
 use tracing::{debug, warn};
 
 use crate::settings::Settings;
@@ -232,7 +232,9 @@ impl RemoteManagedSettingsClient {
 
     /// Load the last cached checksum from disk.
     fn load_cached_checksum(&self) -> Option<String> {
-        self.cache_path.as_ref().and_then(|p| load_cached_checksum(p.as_path()))
+        self.cache_path
+            .as_ref()
+            .and_then(|p| load_cached_checksum(p.as_path()))
     }
 
     /// Load full cached settings from disk (for offline fallback).
@@ -257,8 +259,13 @@ impl RemoteManagedSettingsClient {
         }
 
         // Probe the eligibility endpoint
-        let url = format!("{}/api/v1/enterprise/eligible", self.base_url.trim_end_matches('/'));
-        let resp = self.http.get(&url)
+        let url = format!(
+            "{}/api/v1/enterprise/eligible",
+            self.base_url.trim_end_matches('/')
+        );
+        let resp = self
+            .http
+            .get(&url)
             .header("Authorization", format!("Bearer {}", self.api_key))
             .send()
             .await;
@@ -270,13 +277,17 @@ impl RemoteManagedSettingsClient {
                 } else if r.status() == 403 {
                     Err(RemoteSettingsError::NotEligible)
                 } else {
-                    Err(RemoteSettingsError::Network(r.error_for_status().unwrap_err()))
+                    Err(RemoteSettingsError::Network(
+                        r.error_for_status().unwrap_err(),
+                    ))
                 }
             }
             Err(e) => {
                 // Network errors don't mean ineligible — could be offline
                 // Treat as eligible but with local settings
-                tracing::warn!("eligibility check failed (network error): {e}, treating as eligible with local settings");
+                tracing::warn!(
+                    "eligibility check failed (network error): {e}, treating as eligible with local settings"
+                );
                 Ok(true)
             }
         }
@@ -286,8 +297,13 @@ impl RemoteManagedSettingsClient {
     ///
     /// Returns `None` if the checksum hasn't changed (cached copy is current).
     pub async fn fetch(&self) -> Result<Option<RemoteManagedSettings>, RemoteSettingsError> {
-        let url = format!("{}/api/v1/enterprise/settings", self.base_url.trim_end_matches('/'));
-        let resp = self.http.get(&url)
+        let url = format!(
+            "{}/api/v1/enterprise/settings",
+            self.base_url.trim_end_matches('/')
+        );
+        let resp = self
+            .http
+            .get(&url)
             .header("Authorization", format!("Bearer {}", self.api_key))
             .header("Accept", "application/json")
             .send()
@@ -301,7 +317,10 @@ impl RemoteManagedSettingsClient {
         let computed = Self::compute_checksum(&body.settings)?;
         if computed != body.checksum {
             return Err(RemoteSettingsError::SecurityViolation {
-                reason: format!("checksum mismatch: expected {}, computed {}", body.checksum, computed),
+                reason: format!(
+                    "checksum mismatch: expected {}, computed {}",
+                    body.checksum, computed
+                ),
             });
         }
 
@@ -366,10 +385,7 @@ impl RemoteManagedSettingsClient {
     ///
     /// Remote settings take precedence over local settings for enforced values.
     #[must_use]
-    pub fn merge_into_local(
-        remote: &RemoteManagedSettings,
-        local: Settings,
-    ) -> Settings {
+    pub fn merge_into_local(remote: &RemoteManagedSettings, local: Settings) -> Settings {
         let mut merged = local;
 
         if let Some(ref model) = remote.enforced_model {
@@ -412,13 +428,11 @@ impl RemoteSettingsManager {
     ///
     /// If `cache_path` is provided, settings are persisted to disk for offline access.
     #[must_use]
-    pub fn new(
-        base_url: String,
-        api_key: String,
-        cache_path: Option<std::path::PathBuf>,
-    ) -> Self {
+    pub fn new(base_url: String, api_key: String, cache_path: Option<std::path::PathBuf>) -> Self {
         let client = if !base_url.is_empty() && !api_key.is_empty() {
-            Some(RemoteManagedSettingsClient::new(base_url, api_key, cache_path))
+            Some(RemoteManagedSettingsClient::new(
+                base_url, api_key, cache_path,
+            ))
         } else {
             None
         };
@@ -440,7 +454,9 @@ impl RemoteSettingsManager {
             }
         } else {
             // No remote client configured — resolve immediately with empty settings
-            self.barrier.resolve_success(RemoteManagedSettings::default(), String::new()).await;
+            self.barrier
+                .resolve_success(RemoteManagedSettings::default(), String::new())
+                .await;
         }
     }
 
@@ -574,7 +590,9 @@ mod tests {
         rt.block_on(async {
             let barrier = LoadingBarrier::new();
             barrier.mark_fetching().await;
-            barrier.resolve_success(RemoteManagedSettings::default(), "abc123".into()).await;
+            barrier
+                .resolve_success(RemoteManagedSettings::default(), "abc123".into())
+                .await;
 
             let state = barrier.wait().await;
             assert!(matches!(state, FetchState::Ready { .. }));
@@ -599,7 +617,9 @@ mod tests {
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
             let barrier = LoadingBarrier::new();
-            barrier.resolve_success(RemoteManagedSettings::default(), "abc".into()).await;
+            barrier
+                .resolve_success(RemoteManagedSettings::default(), "abc".into())
+                .await;
 
             let state = barrier.wait().await;
             assert!(matches!(state, FetchState::Ready { .. }));
@@ -636,7 +656,8 @@ mod tests {
 
     #[tokio::test]
     async fn eligibility_empty_api_key_fails() {
-        let client = RemoteManagedSettingsClient::new("https://example.com".into(), String::new(), None);
+        let client =
+            RemoteManagedSettingsClient::new("https://example.com".into(), String::new(), None);
         let result = client.check_eligibility().await;
         assert!(matches!(result, Err(RemoteSettingsError::NotEligible)));
     }

@@ -219,7 +219,10 @@ impl NotificationCenter {
     /// Get all active (non-dismissed, non-expired) notifications.
     #[must_use]
     pub fn active(&self) -> Vec<&Notification> {
-        self.notifications.iter().filter(|n| n.is_active()).collect()
+        self.notifications
+            .iter()
+            .filter(|n| n.is_active())
+            .collect()
     }
 
     /// Get the most recent active notification.

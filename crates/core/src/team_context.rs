@@ -63,15 +63,18 @@ impl TeamContext {
     ///
     /// If the activity log exceeds the limit, the oldest entries are dropped.
     pub fn record_activity(&mut self, member_id: String, description: String) {
-        self.recent_activity.insert(0, ActivityEntry {
-            id: format!("act_{}", self.recent_activity.len() + 1),
-            member_id,
-            description,
-            timestamp: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_secs())
-                .unwrap_or(0),
-        });
+        self.recent_activity.insert(
+            0,
+            ActivityEntry {
+                id: format!("act_{}", self.recent_activity.len() + 1),
+                member_id,
+                description,
+                timestamp: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0),
+            },
+        );
 
         // Trim to limit
         if self.recent_activity.len() > self.activity_limit {
@@ -209,7 +212,10 @@ impl SessionPointerStore {
         let entries = self.sessions.entry(project_hash).or_default();
 
         // Update existing if same session_id
-        if let Some(existing) = entries.iter_mut().find(|e| e.session_id == pointer.session_id) {
+        if let Some(existing) = entries
+            .iter_mut()
+            .find(|e| e.session_id == pointer.session_id)
+        {
             existing.last_active_at = pointer.last_active_at;
             existing.message_count = pointer.message_count;
             existing.cwd = pointer.cwd;
@@ -239,9 +245,7 @@ impl SessionPointerStore {
             .get(project_hash)
             .into_iter()
             .flat_map(|v| v.iter())
-            .find(|s| {
-                worktree_filter.map_or(true, |wp| s.worktree_path.as_ref() == Some(wp))
-            })
+            .find(|s| worktree_filter.map_or(true, |wp| s.worktree_path.as_ref() == Some(wp)))
     }
 
     /// Get all recent sessions for a project.

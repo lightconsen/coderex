@@ -85,9 +85,7 @@ mod tests {
     #[tokio::test]
     async fn noop_returns_error_result() {
         let exec = NoOpToolExecutor;
-        let outcome = exec
-            .execute("id-1", "read_file", &Value::Null)
-            .await;
+        let outcome = exec.execute("id-1", "read_file", &Value::Null).await;
         assert!(outcome.result.is_error);
         assert_eq!(outcome.result.tool_call_id, "id-1");
         assert!(outcome.result.output.contains("not registered"));

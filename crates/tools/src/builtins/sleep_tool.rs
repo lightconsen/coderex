@@ -38,7 +38,11 @@ impl Tool for SleepTool {
         }
     }
 
-    async fn execute(&self, input: ToolInput, _ctx: ToolContext<'_>) -> Result<ToolOutput, ToolError> {
+    async fn execute(
+        &self,
+        input: ToolInput,
+        _ctx: ToolContext<'_>,
+    ) -> Result<ToolOutput, ToolError> {
         let duration_secs = input
             .arguments
             .get("duration")
@@ -71,8 +75,8 @@ impl Tool for SleepTool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tool::ToolContext;
     use crate::context::ExecutionContext;
+    use crate::tool::ToolContext;
     use std::path::Path;
     use std::time::Instant;
 

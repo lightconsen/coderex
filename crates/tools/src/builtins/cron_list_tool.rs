@@ -34,7 +34,11 @@ impl Tool for CronListTool {
         }
     }
 
-    async fn execute(&self, _input: ToolInput, ctx: ToolContext<'_>) -> Result<ToolOutput, ToolError> {
+    async fn execute(
+        &self,
+        _input: ToolInput,
+        ctx: ToolContext<'_>,
+    ) -> Result<ToolOutput, ToolError> {
         let scheduler = get_scheduler(&ctx).ok_or_else(|| ToolError::InvalidInput {
             message: "cron scheduler not available".into(),
         })?;
@@ -50,17 +54,18 @@ impl Tool for CronListTool {
 }
 
 fn get_scheduler(ctx: &ToolContext<'_>) -> Option<Arc<crate::cron_scheduler::CronScheduler>> {
-    ctx.extra
-        .get(CRON_SCHEDULER_KEY)
-        .and_then(|v| v.downcast_ref::<Arc<crate::cron_scheduler::CronScheduler>>().map(Arc::clone))
+    ctx.extra.get(CRON_SCHEDULER_KEY).and_then(|v| {
+        v.downcast_ref::<Arc<crate::cron_scheduler::CronScheduler>>()
+            .map(Arc::clone)
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::context::ExecutionContext;
     use crate::cron_scheduler::{CronJob, CronScheduler};
     use crate::tool::ToolContext;
-    use crate::context::ExecutionContext;
     use std::collections::HashMap;
     use std::path::Path;
 
@@ -81,7 +86,11 @@ mod tests {
     async fn cron_list_returns_jobs() {
         let output = CronListTool
             .execute(
-                ToolInput { call_id: "1".into(), name: "CronList".into(), arguments: serde_json::json!({}) },
+                ToolInput {
+                    call_id: "1".into(),
+                    name: "CronList".into(),
+                    arguments: serde_json::json!({}),
+                },
                 test_ctx(),
             )
             .await
@@ -102,7 +111,11 @@ mod tests {
         };
         let output = CronListTool
             .execute(
-                ToolInput { call_id: "1".into(), name: "CronList".into(), arguments: serde_json::json!({}) },
+                ToolInput {
+                    call_id: "1".into(),
+                    name: "CronList".into(),
+                    arguments: serde_json::json!({}),
+                },
                 ctx,
             )
             .await

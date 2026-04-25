@@ -7,8 +7,7 @@
 use std::collections::HashMap;
 
 use coderex_commands::{
-    CommandContext, CommandRegistry, CommandResult, CommandType,
-    register_all_commands,
+    CommandContext, CommandRegistry, CommandResult, CommandType, register_all_commands,
 };
 use coderex_core::types::ModelId;
 
@@ -262,7 +261,11 @@ fn issue_usage_without_args() {
 #[test]
 fn issue_create_with_title() {
     let reg = full_registry();
-    let result = reg.execute("issue", &test_ctx(), &["create".into(), "fix".into(), "bug".into()]);
+    let result = reg.execute(
+        "issue",
+        &test_ctx(),
+        &["create".into(), "fix".into(), "bug".into()],
+    );
     assert!(result.output.contains("fix bug"));
     assert!(result.state_changed);
 }

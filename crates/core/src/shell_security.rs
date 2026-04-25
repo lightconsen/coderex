@@ -268,7 +268,13 @@ fn try_parse_redirect(tokens: &[String], idx: usize) -> Option<ParsedRedirect> {
     let token = tokens.get(idx)?;
 
     // > file, >> file, < file
-    if token == ">" || token == ">>" || token == "<" || token.starts_with(">>") || token.starts_with(">") || token.starts_with("<") {
+    if token == ">"
+        || token == ">>"
+        || token == "<"
+        || token.starts_with(">>")
+        || token.starts_with(">")
+        || token.starts_with("<")
+    {
         let (kind, prefix_len) = if token.starts_with(">>") {
             (RedirectKind::Append, 2)
         } else if token.starts_with('>') {
@@ -337,7 +343,11 @@ fn classify_command(cmd: &mut BashCommand) {
     match prog.as_str() {
         "rm" => {
             if args_set.iter().any(|a| a.starts_with("-")) {
-                let flags: String = args_set.iter().filter(|a| a.starts_with("-")).cloned().collect();
+                let flags: String = args_set
+                    .iter()
+                    .filter(|a| a.starts_with("-"))
+                    .cloned()
+                    .collect();
                 if flags.contains('r') && flags.contains('f') {
                     cmd.level = DestructiveLevel::Dangerous;
                     cmd.reasons.push("rm -rf (recursive force delete)".into());
@@ -362,7 +372,8 @@ fn classify_command(cmd: &mut BashCommand) {
         }
         "mkfs" | "mke2fs" | "mkfs.ext4" | "mkfs.ext3" | "mkfs.ntfs" | "mkfs.vfat" => {
             cmd.level = DestructiveLevel::Dangerous;
-            cmd.reasons.push("mkfs (filesystem creation / disk erase)".into());
+            cmd.reasons
+                .push("mkfs (filesystem creation / disk erase)".into());
         }
         "fdisk" | "parted" | "gparted" => {
             cmd.level = DestructiveLevel::Dangerous;
@@ -406,12 +417,14 @@ fn classify_command(cmd: &mut BashCommand) {
         }
         "truncate" | "shred" => {
             cmd.level = DestructiveLevel::Dangerous;
-            cmd.reasons.push(format!("{} (destructive file operation)", prog));
+            cmd.reasons
+                .push(format!("{} (destructive file operation)", prog));
         }
         "wget" | "curl" => {
             if args_set.contains("-o") || args_set.contains("--output") || args_set.contains("-O") {
                 cmd.level = DestructiveLevel::Caution;
-                cmd.reasons.push(format!("{} with output file (overwrite risk)", prog));
+                cmd.reasons
+                    .push(format!("{} with output file (overwrite risk)", prog));
             }
         }
         "sudo" | "su" => {
@@ -424,7 +437,8 @@ fn classify_command(cmd: &mut BashCommand) {
         }
         "source" | "." => {
             cmd.level = DestructiveLevel::Caution;
-            cmd.reasons.push("source (executes arbitrary script)".into());
+            cmd.reasons
+                .push("source (executes arbitrary script)".into());
         }
         _ => {}
     }
@@ -436,13 +450,15 @@ fn classify_command(cmd: &mut BashCommand) {
                 if cmd.level < DestructiveLevel::Dangerous {
                     cmd.level = DestructiveLevel::Dangerous;
                 }
-                cmd.reasons.push(format!("> {} (overwrites file)", redirect.target));
+                cmd.reasons
+                    .push(format!("> {} (overwrites file)", redirect.target));
             }
             RedirectKind::Append => {
                 if cmd.level < DestructiveLevel::Caution {
                     cmd.level = DestructiveLevel::Caution;
                 }
-                cmd.reasons.push(format!(">> {} (appends to file)", redirect.target));
+                cmd.reasons
+                    .push(format!(">> {} (appends to file)", redirect.target));
             }
             _ => {}
         }

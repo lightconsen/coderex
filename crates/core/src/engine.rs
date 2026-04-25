@@ -13,7 +13,7 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio::time::Instant;
 
-use crate::api_client::{ApiClient, ApiResponse, StreamEvent};
+use crate::api_client::{ApiClient, ApiResponse, RequestContext, StreamEvent};
 use crate::budget::TokenBudget;
 use crate::compact::{self, CompactResult, CompactStrategy};
 use crate::cost::CostTracker;
@@ -489,6 +489,10 @@ pub struct SubmitOptions {
     pub orphaned_permission: bool,
     /// Restrict tool execution to the given tool names for this submission.
     pub allowed_tools_override: Option<Vec<String>>,
+    /// Optional agent id for forked/background flows.
+    pub agent_id: Option<String>,
+    /// Provider-specific request hints.
+    pub provider_hints: HashMap<String, String>,
 }
 
 impl Default for SubmitOptions {
@@ -505,6 +509,8 @@ impl Default for SubmitOptions {
             handle_elicitation: true,
             orphaned_permission: false,
             allowed_tools_override: None,
+            agent_id: None,
+            provider_hints: HashMap::new(),
         }
     }
 }
@@ -884,6 +890,17 @@ impl QueryEngine {
         }
         let prefix: String = trimmed.chars().take(64).collect();
         !prefix.is_empty() && content.contains(&prefix)
+    }
+
+    fn build_request_context(&self, turn_number: u32, options: &SubmitOptions) -> RequestContext {
+        RequestContext {
+            session_id: Some(self.session.session_id.to_string()),
+            device_id: std::env::var("CODEREX_DEVICE_ID").ok(),
+            turn_id: Some(turn_number.to_string()),
+            agent_id: options.agent_id.clone(),
+            request_id: None,
+            provider_hints: options.provider_hints.clone().into_iter().collect(),
+        }
     }
 
     /// Create a new QueryEngine.
@@ -2086,7 +2103,7 @@ impl QueryEngine {
     async fn send_request(
         &mut self,
         turn: &TurnRuntime,
-        _options: &SubmitOptions,
+        options: &SubmitOptions,
     ) -> Result<ApiResponse, String> {
         let system = turn
             .messages
@@ -2102,8 +2119,10 @@ impl QueryEngine {
         let messages = Self::provider_messages(&turn.messages);
 
         let tools = self.tools.list_tools();
-        let response = match self
+        let request_client = self
             .api_client
+            .with_request_context(self.build_request_context(self.current_turn, options));
+        let response = match request_client
             .create_message(&system, &messages, &self.model, 4096, &tools)
             .await
         {
@@ -2160,8 +2179,10 @@ impl QueryEngine {
         let messages = Self::provider_messages(&turn.messages);
 
         let tools = self.tools.list_tools();
-        let mut stream = self
+        let request_client = self
             .api_client
+            .with_request_context(self.build_request_context(self.current_turn, options));
+        let mut stream = request_client
             .create_message_streaming(&system, &messages, &self.model, 4096, &tools)
             .await;
 

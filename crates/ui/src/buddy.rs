@@ -92,8 +92,7 @@ impl BuddySoul {
             BuddyPersonality::Encouraging,
         ];
         let names = [
-            "Rex", "Pixel", "Nova", "Byte", "Echo",
-            "Luna", "Cosmo", "Dash", "Spark", "Glitch",
+            "Rex", "Pixel", "Nova", "Byte", "Echo", "Luna", "Cosmo", "Dash", "Spark", "Glitch",
         ];
 
         Self {
@@ -119,7 +118,10 @@ impl BuddySoul {
 fn simple_hash(s: &str) -> usize {
     let mut h: usize = 5381;
     for b in s.bytes() {
-        h = h.wrapping_mul(33).wrapping_add(b as usize).wrapping_add(h >> 5);
+        h = h
+            .wrapping_mul(33)
+            .wrapping_add(b as usize)
+            .wrapping_add(h >> 5);
     }
     h
 }

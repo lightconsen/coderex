@@ -1,7 +1,7 @@
 //! CronCreate tool — schedule a cron job.
 
 use crate::context::{ToolError, ToolOutput};
-use crate::cron_scheduler::{CronJob, CronScheduler, CRON_SCHEDULER_KEY};
+use crate::cron_scheduler::{CRON_SCHEDULER_KEY, CronJob, CronScheduler};
 use crate::tool::{Tool, ToolContext, ToolDescriptor, ToolInput, ToolTier};
 use async_trait::async_trait;
 use std::sync::Arc;
@@ -40,11 +40,23 @@ impl Tool for CronCreateTool {
         }
     }
 
-    async fn execute(&self, input: ToolInput, ctx: ToolContext<'_>) -> Result<ToolOutput, ToolError> {
+    async fn execute(
+        &self,
+        input: ToolInput,
+        ctx: ToolContext<'_>,
+    ) -> Result<ToolOutput, ToolError> {
         let cron = extract_string(&input.arguments, "cron")?;
         let prompt = extract_string(&input.arguments, "prompt")?;
-        let recurring = input.arguments.get("recurring").and_then(|v| v.as_bool()).unwrap_or(true);
-        let durable = input.arguments.get("durable").and_then(|v| v.as_bool()).unwrap_or(false);
+        let recurring = input
+            .arguments
+            .get("recurring")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true);
+        let durable = input
+            .arguments
+            .get("durable")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
 
         let scheduler = get_scheduler(&ctx).ok_or_else(|| ToolError::InvalidInput {
             message: "cron scheduler not available".into(),
@@ -78,9 +90,9 @@ fn extract_string(args: &serde_json::Value, key: &str) -> Result<String, ToolErr
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::context::ExecutionContext;
     use crate::cron_scheduler::CronScheduler;
     use crate::tool::ToolContext;
-    use crate::context::ExecutionContext;
     use std::collections::HashMap;
     use std::path::Path;
 

@@ -36,7 +36,11 @@ impl Tool for ToolSearchTool {
         }
     }
 
-    async fn execute(&self, input: ToolInput, ctx: ToolContext<'_>) -> Result<ToolOutput, ToolError> {
+    async fn execute(
+        &self,
+        input: ToolInput,
+        ctx: ToolContext<'_>,
+    ) -> Result<ToolOutput, ToolError> {
         let query = extract_string(&input.arguments, "query")?;
         let limit = extract_number(&input.arguments, "limit").unwrap_or(10) as usize;
 
@@ -74,7 +78,11 @@ impl Tool for ToolSearchTool {
         let output = if results.is_empty() {
             format!("No tools found matching \"{query}\"")
         } else {
-            format!("Found {} tool(s) matching \"{query}\":\n\n{}", results.len(), results.join("\n\n"))
+            format!(
+                "Found {} tool(s) matching \"{query}\":\n\n{}",
+                results.len(),
+                results.join("\n\n")
+            )
         };
 
         Ok(ToolOutput {
@@ -103,9 +111,9 @@ fn extract_number(args: &serde_json::Value, key: &str) -> Option<i64> {
 mod tests {
     use super::*;
     use crate::builtins::{EchoTool, ReadTool};
+    use crate::context::ExecutionContext;
     use crate::registry::ToolRegistry;
     use crate::tool::ToolContext;
-    use crate::context::ExecutionContext;
     use std::collections::HashMap;
     use std::path::Path;
 

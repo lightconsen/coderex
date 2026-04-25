@@ -53,7 +53,15 @@ pub fn register(registry: &mut CommandRegistry) {
                 let available = list_dir_items(&themes_path);
                 let mut output = format!("Current theme: {}", ctx.theme);
                 if !available.is_empty() {
-                    output.push_str(&format!("\nAvailable themes:\n{}", available.iter().take(10).map(|t| format!("  {t}")).collect::<Vec<_>>().join("\n")));
+                    output.push_str(&format!(
+                        "\nAvailable themes:\n{}",
+                        available
+                            .iter()
+                            .take(10)
+                            .map(|t| format!("  {t}"))
+                            .collect::<Vec<_>>()
+                            .join("\n")
+                    ));
                 }
                 CommandResult::success(output)
             } else {
@@ -62,13 +70,24 @@ pub fn register(registry: &mut CommandRegistry) {
                 let themes_path = home.join("themes");
                 let theme_file = themes_path.join(format!("{new_theme}.toml"));
                 let theme_dir = themes_path.join(new_theme);
-                if theme_file.exists() || theme_dir.is_dir() || new_theme == "light" || new_theme == "dark" {
+                if theme_file.exists()
+                    || theme_dir.is_dir()
+                    || new_theme == "light"
+                    || new_theme == "dark"
+                {
                     CommandResult::success(format!("Theme changed to: {}", args[0]))
                         .with_state_change(true)
                 } else {
                     let available = list_dir_items(&themes_path);
                     let hint = if !available.is_empty() {
-                        format!("\nAvailable themes:\n{}", available.iter().map(|t| format!("  {t}")).collect::<Vec<_>>().join("\n"))
+                        format!(
+                            "\nAvailable themes:\n{}",
+                            available
+                                .iter()
+                                .map(|t| format!("  {t}"))
+                                .collect::<Vec<_>>()
+                                .join("\n")
+                        )
                     } else {
                         "\nNo custom themes installed in ~/.coderex/themes/".to_string()
                     };
@@ -93,7 +112,14 @@ pub fn register(registry: &mut CommandRegistry) {
             if args.is_empty() {
                 let mut output = format!("Active hooks: {}", ctx.active_hooks);
                 if !available.is_empty() {
-                    output.push_str(&format!("\nInstalled hooks:\n{}", available.iter().map(|h| format!("  {h}")).collect::<Vec<_>>().join("\n")));
+                    output.push_str(&format!(
+                        "\nInstalled hooks:\n{}",
+                        available
+                            .iter()
+                            .map(|h| format!("  {h}"))
+                            .collect::<Vec<_>>()
+                            .join("\n")
+                    ));
                 }
                 CommandResult::success(output)
             } else {
@@ -102,7 +128,10 @@ pub fn register(registry: &mut CommandRegistry) {
                         if available.is_empty() {
                             CommandResult::success("No hooks installed in ~/.coderex/hooks/")
                         } else {
-                            CommandResult::success(format!("Installed hooks:\n{}", available.join("\n")))
+                            CommandResult::success(format!(
+                                "Installed hooks:\n{}",
+                                available.join("\n")
+                            ))
                         }
                     }
                     _ => CommandResult::error("Usage: /hooks [list]"),
@@ -240,7 +269,7 @@ pub fn register(registry: &mut CommandRegistry) {
 
             // Scan multiple skill directories
             let skill_dirs = [
-                home.join("skills"),          // ~/.coderex/skills/
+                home.join("skills"), // ~/.coderex/skills/
             ];
 
             let mut all_skills: Vec<String> = Vec::new();
@@ -251,9 +280,18 @@ pub fn register(registry: &mut CommandRegistry) {
 
             if args.is_empty() {
                 if all_skills.is_empty() {
-                    CommandResult::success("Skills:\n  No skills loaded.\nPlace skill scripts in ~/.coderex/skills/")
+                    CommandResult::success(
+                        "Skills:\n  No skills loaded.\nPlace skill scripts in ~/.coderex/skills/",
+                    )
                 } else {
-                    CommandResult::success(format!("Skills:\n{}", all_skills.iter().map(|s| format!("  {s}")).collect::<Vec<_>>().join("\n")))
+                    CommandResult::success(format!(
+                        "Skills:\n{}",
+                        all_skills
+                            .iter()
+                            .map(|s| format!("  {s}"))
+                            .collect::<Vec<_>>()
+                            .join("\n")
+                    ))
                 }
             } else {
                 match args[0].as_str() {
@@ -261,7 +299,10 @@ pub fn register(registry: &mut CommandRegistry) {
                         if all_skills.is_empty() {
                             CommandResult::success("No skills loaded.")
                         } else {
-                            CommandResult::success(format!("Loaded skills:\n{}", all_skills.join("\n")))
+                            CommandResult::success(format!(
+                                "Loaded skills:\n{}",
+                                all_skills.join("\n")
+                            ))
                         }
                     }
                     _ => CommandResult::error("Usage: /skills [list]"),
@@ -319,7 +360,14 @@ pub fn register(registry: &mut CommandRegistry) {
                 let plan_files = list_dir_items(&plans_path);
                 let mut output = "Plan loaded.\n\n".to_string();
                 if !plan_files.is_empty() {
-                    output.push_str(&format!("Available plans:\n{}\n", plan_files.iter().map(|p| format!("  {p}")).collect::<Vec<_>>().join("\n")));
+                    output.push_str(&format!(
+                        "Available plans:\n{}\n",
+                        plan_files
+                            .iter()
+                            .map(|p| format!("  {p}"))
+                            .collect::<Vec<_>>()
+                            .join("\n")
+                    ));
                 }
                 output.push_str("(Use the Read tool to view plan details)");
                 CommandResult::success(output)
@@ -352,14 +400,22 @@ mod tests {
 
     #[test]
     fn theme_shows_current() {
-        let reg = { let mut r = CommandRegistry::new(); register(&mut r); r };
+        let reg = {
+            let mut r = CommandRegistry::new();
+            register(&mut r);
+            r
+        };
         let result = reg.execute("theme", &ctx(), &[]);
         assert!(result.output.contains("Current theme"));
     }
 
     #[test]
     fn theme_changes() {
-        let reg = { let mut r = CommandRegistry::new(); register(&mut r); r };
+        let reg = {
+            let mut r = CommandRegistry::new();
+            register(&mut r);
+            r
+        };
         let result = reg.execute("theme", &ctx(), &["dark".into()]);
         assert!(result.output.contains("dark"));
         assert!(result.state_changed);
@@ -367,7 +423,11 @@ mod tests {
 
     #[test]
     fn theme_unknown_not_found() {
-        let reg = { let mut r = CommandRegistry::new(); register(&mut r); r };
+        let reg = {
+            let mut r = CommandRegistry::new();
+            register(&mut r);
+            r
+        };
         let result = reg.execute("theme", &ctx(), &["nonexistent-theme-xyz".into()]);
         // Will show error since theme doesn't exist
         assert!(result.output.contains("nonexistent-theme-xyz"));
@@ -375,100 +435,170 @@ mod tests {
 
     #[test]
     fn hooks_shows_count() {
-        let reg = { let mut r = CommandRegistry::new(); register(&mut r); r };
+        let reg = {
+            let mut r = CommandRegistry::new();
+            register(&mut r);
+            r
+        };
         let result = reg.execute("hooks", &ctx(), &[]);
         assert!(result.output.contains("Active hooks"));
     }
 
     #[test]
     fn hooks_list() {
-        let reg = { let mut r = CommandRegistry::new(); register(&mut r); r };
+        let reg = {
+            let mut r = CommandRegistry::new();
+            register(&mut r);
+            r
+        };
         let result = reg.execute("hooks", &ctx(), &["list".into()]);
         assert!(result.output.contains("hooks") || result.output.contains("Installed"));
     }
 
     #[test]
     fn mcp_status_not_connected() {
-        let reg = { let mut r = CommandRegistry::new(); register(&mut r); r };
+        let reg = {
+            let mut r = CommandRegistry::new();
+            register(&mut r);
+            r
+        };
         let result = reg.execute("mcp", &ctx(), &[]);
         assert!(result.output.contains("Not connected"));
     }
 
     #[test]
     fn mcp_status_connected() {
-        let c = CommandContext { mcp_connected: true, ..ctx() };
-        let reg = { let mut r = CommandRegistry::new(); register(&mut r); r };
+        let c = CommandContext {
+            mcp_connected: true,
+            ..ctx()
+        };
+        let reg = {
+            let mut r = CommandRegistry::new();
+            register(&mut r);
+            r
+        };
         let result = reg.execute("mcp", &c, &[]);
         assert!(result.output.contains("Connected"));
     }
 
     #[test]
     fn plugin_shows_none() {
-        let reg = { let mut r = CommandRegistry::new(); register(&mut r); r };
+        let reg = {
+            let mut r = CommandRegistry::new();
+            register(&mut r);
+            r
+        };
         let result = reg.execute("plugin", &ctx(), &[]);
         assert!(result.output.contains("No plugins") || result.output.contains("Installed"));
     }
 
     #[test]
     fn plugin_list() {
-        let reg = { let mut r = CommandRegistry::new(); register(&mut r); r };
+        let reg = {
+            let mut r = CommandRegistry::new();
+            register(&mut r);
+            r
+        };
         let result = reg.execute("plugin", &ctx(), &["list".into()]);
         assert!(result.output.contains("plugin") || result.output.contains("No plugins"));
     }
 
     #[test]
     fn memory_search() {
-        let reg = { let mut r = CommandRegistry::new(); register(&mut r); r };
-        let result = reg.execute("memory", &ctx(), &["search".into(), "user".into(), "preferences".into()]);
-        assert!(result.output.contains("user") || result.output.contains("No memory") || result.output.contains("Memory"));
+        let reg = {
+            let mut r = CommandRegistry::new();
+            register(&mut r);
+            r
+        };
+        let result = reg.execute(
+            "memory",
+            &ctx(),
+            &["search".into(), "user".into(), "preferences".into()],
+        );
+        assert!(
+            result.output.contains("user")
+                || result.output.contains("No memory")
+                || result.output.contains("Memory")
+        );
     }
 
     #[test]
     fn memory_empty_by_default() {
-        let reg = { let mut r = CommandRegistry::new(); register(&mut r); r };
+        let reg = {
+            let mut r = CommandRegistry::new();
+            register(&mut r);
+            r
+        };
         let result = reg.execute("memory", &ctx(), &[]);
         assert!(result.output.contains("Memory"));
     }
 
     #[test]
     fn skills_shows_none() {
-        let reg = { let mut r = CommandRegistry::new(); register(&mut r); r };
+        let reg = {
+            let mut r = CommandRegistry::new();
+            register(&mut r);
+            r
+        };
         let result = reg.execute("skills", &ctx(), &[]);
         assert!(result.output.contains("No skills") || result.output.contains("Skills"));
     }
 
     #[test]
     fn skills_list() {
-        let reg = { let mut r = CommandRegistry::new(); register(&mut r); r };
+        let reg = {
+            let mut r = CommandRegistry::new();
+            register(&mut r);
+            r
+        };
         let result = reg.execute("skills", &ctx(), &["list".into()]);
         assert!(result.output.contains("skills") || result.output.contains("No skills"));
     }
 
     #[test]
     fn tasks_shows_none() {
-        let reg = { let mut r = CommandRegistry::new(); register(&mut r); r };
+        let reg = {
+            let mut r = CommandRegistry::new();
+            register(&mut r);
+            r
+        };
         let result = reg.execute("tasks", &ctx(), &[]);
         assert!(result.output.contains("No tasks") || result.output.contains("tasks"));
     }
 
     #[test]
     fn tasks_list() {
-        let reg = { let mut r = CommandRegistry::new(); register(&mut r); r };
+        let reg = {
+            let mut r = CommandRegistry::new();
+            register(&mut r);
+            r
+        };
         let result = reg.execute("tasks", &ctx(), &["list".into()]);
         assert!(result.output.to_lowercase().contains("task"));
     }
 
     #[test]
     fn plan_no_plan() {
-        let reg = { let mut r = CommandRegistry::new(); register(&mut r); r };
+        let reg = {
+            let mut r = CommandRegistry::new();
+            register(&mut r);
+            r
+        };
         let result = reg.execute("plan", &ctx(), &[]);
         assert!(result.output.contains("No active plan") || result.output.contains("Plan"));
     }
 
     #[test]
     fn plan_loaded() {
-        let c = CommandContext { has_plan: true, ..ctx() };
-        let reg = { let mut r = CommandRegistry::new(); register(&mut r); r };
+        let c = CommandContext {
+            has_plan: true,
+            ..ctx()
+        };
+        let reg = {
+            let mut r = CommandRegistry::new();
+            register(&mut r);
+            r
+        };
         let result = reg.execute("plan", &c, &[]);
         assert!(result.output.contains("Plan"));
     }

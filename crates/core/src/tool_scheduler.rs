@@ -123,22 +123,20 @@ pub async fn run_tool_calls(
 
         // 4. Permission check
         let (_request, perm_result) = permission_engine
-            .evaluate(
-                &call.name,
-                call.input.to_string(),
-                None,
-                HashMap::new(),
-            )
+            .evaluate(&call.name, call.input.to_string(), None, HashMap::new())
             .await
             .map_err(|e| format!("permission check failed: {e}"))?;
 
         match perm_result {
             PermissionResult::Allow | PermissionResult::AllowForPath { .. } => {
-                approved.push((idx, ApprovedCall {
-                    id: call.id.clone(),
-                    name: call.name.clone(),
-                    input: call.input.clone(),
-                }));
+                approved.push((
+                    idx,
+                    ApprovedCall {
+                        id: call.id.clone(),
+                        name: call.name.clone(),
+                        input: call.input.clone(),
+                    },
+                ));
             }
             PermissionResult::Ask { reason } | PermissionResult::AskForSession { reason } => {
                 let _ = event_tx.send(EngineEvent::PermissionRequest {
@@ -160,7 +158,11 @@ pub async fn run_tool_calls(
                 ctx.insert("reason".to_string(), reason.clone());
                 let fail_result = hooks.fire_hook("PostToolUseFail", &call.name, &ctx).await;
                 if !fail_result.errors.is_empty() {
-                    tracing::warn!("PostToolUseFail hook errors for {}: {:?}", call.name, fail_result.errors);
+                    tracing::warn!(
+                        "PostToolUseFail hook errors for {}: {:?}",
+                        call.name,
+                        fail_result.errors
+                    );
                 }
                 let _ = event_tx.send(EngineEvent::ToolCallEnd {
                     id: call.id.clone(),
@@ -183,7 +185,11 @@ pub async fn run_tool_calls(
                 ctx.insert("reason".to_string(), reason.clone());
                 let fail_result = hooks.fire_hook("PostToolUseFail", &call.name, &ctx).await;
                 if !fail_result.errors.is_empty() {
-                    tracing::warn!("PostToolUseFail hook errors for {}: {:?}", call.name, fail_result.errors);
+                    tracing::warn!(
+                        "PostToolUseFail hook errors for {}: {:?}",
+                        call.name,
+                        fail_result.errors
+                    );
                 }
                 let _ = event_tx.send(EngineEvent::ToolCallEnd {
                     id: call.id.clone(),
@@ -232,10 +238,17 @@ pub async fn run_tool_calls(
 
         let mut ctx = HashMap::new();
         ctx.insert("tool_call_id".to_string(), call.id.clone());
-        ctx.insert("tool_output_len".to_string(), result.output.len().to_string());
+        ctx.insert(
+            "tool_output_len".to_string(),
+            result.output.len().to_string(),
+        );
         let post_result = hooks.fire_hook("PostToolUse", &call.name, &ctx).await;
         if !post_result.errors.is_empty() {
-            tracing::warn!("PostToolUse hook errors for {}: {:?}", call.name, post_result.errors);
+            tracing::warn!(
+                "PostToolUse hook errors for {}: {:?}",
+                call.name,
+                post_result.errors
+            );
         }
 
         let _ = event_tx.send(EngineEvent::ToolCallEnd {
@@ -257,7 +270,7 @@ pub async fn run_tool_calls(
 #[cfg(test)]
 mod tests {
     use super::*;
-    
+
     use tokio::sync::mpsc;
 
     struct MockToolExecutor;
@@ -285,9 +298,9 @@ mod tests {
         let (tx, mut rx) = mpsc::unbounded_channel();
         let tools = MockToolExecutor;
         let hooks = crate::hook_executor::NoOpHookExecutor;
-        let mut perm_engine = PermissionEngine::new(
-            crate::permissions::PermissionChecker::new(crate::permissions::PermissionMode::BypassPermissions),
-        );
+        let mut perm_engine = PermissionEngine::new(crate::permissions::PermissionChecker::new(
+            crate::permissions::PermissionMode::BypassPermissions,
+        ));
         let mut denied = Vec::new();
         let options = SubmitOptions::default();
 
@@ -334,9 +347,9 @@ mod tests {
         let (tx, _rx) = mpsc::unbounded_channel();
         let tools = MockToolExecutor;
         let hooks = crate::hook_executor::NoOpHookExecutor;
-        let mut perm_engine = PermissionEngine::new(
-            crate::permissions::PermissionChecker::new(crate::permissions::PermissionMode::BypassPermissions),
-        );
+        let mut perm_engine = PermissionEngine::new(crate::permissions::PermissionChecker::new(
+            crate::permissions::PermissionMode::BypassPermissions,
+        ));
         let mut denied = Vec::new();
         let mut options = SubmitOptions::default();
         options.allowed_tools_override = Some(vec!["read".into()]);
@@ -355,14 +368,28 @@ mod tests {
         ];
 
         let outcome = run_tool_calls(
-            &calls, &tools, &mut perm_engine, &hooks, &options, &tx, &mut denied,
+            &calls,
+            &tools,
+            &mut perm_engine,
+            &hooks,
+            &options,
+            &tx,
+            &mut denied,
         )
         .await
         .unwrap();
 
         assert_eq!(outcome.results.len(), 2, "expected 2 results");
-        assert!(!outcome.results[0].is_error, "read should be allowed, got: {}", outcome.results[0].output); // read allowed
-        assert!(outcome.results[1].is_error, "write should be blocked, got: {}", outcome.results[1].output);  // write blocked
+        assert!(
+            !outcome.results[0].is_error,
+            "read should be allowed, got: {}",
+            outcome.results[0].output
+        ); // read allowed
+        assert!(
+            outcome.results[1].is_error,
+            "write should be blocked, got: {}",
+            outcome.results[1].output
+        ); // write blocked
         assert_eq!(denied.len(), 1);
     }
 }

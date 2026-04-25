@@ -77,23 +77,34 @@ pub fn register(registry: &mut CommandRegistry) {
             let mut findings = Vec::new();
 
             // Check context size
-            let total_tokens = ctx.input_tokens + ctx.output_tokens + ctx.cache_read_tokens + ctx.cache_creation_tokens;
+            let total_tokens = ctx.input_tokens
+                + ctx.output_tokens
+                + ctx.cache_read_tokens
+                + ctx.cache_creation_tokens;
             if total_tokens > 100_000 {
-                findings.push(format!("[!] High context usage: {total_tokens} tokens — consider /compact"));
+                findings.push(format!(
+                    "[!] High context usage: {total_tokens} tokens — consider /compact"
+                ));
             } else {
                 findings.push(format!("[✓] Context usage: {total_tokens} tokens"));
             }
 
             // Check message count
             if ctx.message_count > 100 {
-                findings.push(format!("[!] High message count: {} — compact recommended", ctx.message_count));
+                findings.push(format!(
+                    "[!] High message count: {} — compact recommended",
+                    ctx.message_count
+                ));
             } else {
                 findings.push(format!("[✓] Message count: {}", ctx.message_count));
             }
 
             // Check elapsed time
             if ctx.elapsed_secs > 3600 {
-                findings.push(format!("[!] Long session: {:.1} hours", ctx.elapsed_secs as f64 / 3600.0));
+                findings.push(format!(
+                    "[!] Long session: {:.1} hours",
+                    ctx.elapsed_secs as f64 / 3600.0
+                ));
             } else {
                 findings.push(format!("[✓] Session duration: {}s", ctx.elapsed_secs));
             }
@@ -194,14 +205,22 @@ mod tests {
 
     #[test]
     fn debug_tool_call() {
-        let reg = { let mut r = CommandRegistry::new(); register(&mut r); r };
+        let reg = {
+            let mut r = CommandRegistry::new();
+            register(&mut r);
+            r
+        };
         let result = reg.execute("debug-tool-call", &ctx(), &[]);
         assert!(result.output.contains("Tool Calls"));
     }
 
     #[test]
     fn heapdump_feature_gated() {
-        let reg = { let mut r = CommandRegistry::new(); register(&mut r); r };
+        let reg = {
+            let mut r = CommandRegistry::new();
+            register(&mut r);
+            r
+        };
         let result = reg.execute("heapdump", &ctx(), &[]);
         assert!(result.output.contains("Error"));
         assert!(result.output.contains("not enabled"));
@@ -211,15 +230,26 @@ mod tests {
     fn heapdump_enabled() {
         let mut flags = std::collections::HashMap::new();
         flags.insert("heapdump".into(), true);
-        let c = CommandContext { feature_flags: flags, ..ctx() };
-        let reg = { let mut r = CommandRegistry::new(); register(&mut r); r };
+        let c = CommandContext {
+            feature_flags: flags,
+            ..ctx()
+        };
+        let reg = {
+            let mut r = CommandRegistry::new();
+            register(&mut r);
+            r
+        };
         let result = reg.execute("heapdump", &c, &[]);
         assert!(result.output.contains("heap.prof"));
     }
 
     #[test]
     fn mock_limits_simulation() {
-        let reg = { let mut r = CommandRegistry::new(); register(&mut r); r };
+        let reg = {
+            let mut r = CommandRegistry::new();
+            register(&mut r);
+            r
+        };
         let result = reg.execute("mock-limits", &ctx(), &[]);
         assert!(result.output.contains("429"));
         assert!(result.state_changed);
@@ -227,7 +257,11 @@ mod tests {
 
     #[test]
     fn perf_issue_low_usage() {
-        let reg = { let mut r = CommandRegistry::new(); register(&mut r); r };
+        let reg = {
+            let mut r = CommandRegistry::new();
+            register(&mut r);
+            r
+        };
         let result = reg.execute("perf-issue", &ctx(), &[]);
         assert!(result.output.contains("Performance Diagnostics"));
     }
@@ -241,7 +275,11 @@ mod tests {
             elapsed_secs: 7200,
             ..ctx()
         };
-        let reg = { let mut r = CommandRegistry::new(); register(&mut r); r };
+        let reg = {
+            let mut r = CommandRegistry::new();
+            register(&mut r);
+            r
+        };
         let result = reg.execute("perf-issue", &c, &[]);
         assert!(result.output.contains("High context"));
         assert!(result.output.contains("compact recommended"));
@@ -250,15 +288,26 @@ mod tests {
 
     #[test]
     fn ant_trace() {
-        let reg = { let mut r = CommandRegistry::new(); register(&mut r); r };
+        let reg = {
+            let mut r = CommandRegistry::new();
+            register(&mut r);
+            r
+        };
         let result = reg.execute("ant-trace", &ctx(), &[]);
         assert!(result.output.contains("API Call Trace"));
     }
 
     #[test]
     fn break_cache() {
-        let c = CommandContext { cache_read_tokens: 5000, ..ctx() };
-        let reg = { let mut r = CommandRegistry::new(); register(&mut r); r };
+        let c = CommandContext {
+            cache_read_tokens: 5000,
+            ..ctx()
+        };
+        let reg = {
+            let mut r = CommandRegistry::new();
+            register(&mut r);
+            r
+        };
         let result = reg.execute("break-cache", &c, &[]);
         assert!(result.output.contains("cleared"));
         assert!(result.output.contains("5000"));
@@ -267,7 +316,11 @@ mod tests {
 
     #[test]
     fn reload_plugins() {
-        let reg = { let mut r = CommandRegistry::new(); register(&mut r); r };
+        let reg = {
+            let mut r = CommandRegistry::new();
+            register(&mut r);
+            r
+        };
         let result = reg.execute("reload-plugins", &ctx(), &[]);
         assert!(result.output.contains("Plugins reloaded"));
         assert!(result.state_changed);

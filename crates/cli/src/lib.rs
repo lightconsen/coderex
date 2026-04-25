@@ -9,5 +9,5 @@ pub mod tracing_setup;
 pub mod version;
 pub mod welcome;
 
-pub use cli::{parse_args, Cli, Command};
+pub use cli::{Cli, Command, parse_args};
 pub use repl::ReplLoop;

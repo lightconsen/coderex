@@ -126,7 +126,11 @@ pub fn traverse(config: &TraversalConfig) -> Result<FileIterator, TraversalError
                 .add(&format!("!{pattern}"))
                 .map_err(|e| TraversalError::Io(std::io::Error::other(e)))?;
         }
-        builder.overrides(override_builder.build().map_err(|e| TraversalError::Io(std::io::Error::other(e)))?);
+        builder.overrides(
+            override_builder
+                .build()
+                .map_err(|e| TraversalError::Io(std::io::Error::other(e)))?,
+        );
     }
 
     let iter = builder.build().filter_map(|entry| match entry {
@@ -193,10 +197,7 @@ mod tests {
         setup_tree(&base);
 
         let config = TraversalConfig::new(&base);
-        let files: Vec<_> = traverse(&config)
-            .unwrap()
-            .map(|r| r.unwrap())
-            .collect();
+        let files: Vec<_> = traverse(&config).unwrap().map(|r| r.unwrap()).collect();
 
         let names: Vec<_> = files
             .iter()
@@ -219,10 +220,7 @@ mod tests {
         setup_tree(&base);
 
         let config = TraversalConfig::new(&base).max_depth(1);
-        let files: Vec<_> = traverse(&config)
-            .unwrap()
-            .map(|r| r.unwrap())
-            .collect();
+        let files: Vec<_> = traverse(&config).unwrap().map(|r| r.unwrap()).collect();
 
         let names: Vec<_> = files
             .iter()
@@ -241,10 +239,7 @@ mod tests {
         setup_tree(&base);
 
         let config = TraversalConfig::new(&base).include_hidden();
-        let files: Vec<_> = traverse(&config)
-            .unwrap()
-            .map(|r| r.unwrap())
-            .collect();
+        let files: Vec<_> = traverse(&config).unwrap().map(|r| r.unwrap()).collect();
 
         let names: Vec<_> = files
             .iter()
@@ -259,11 +254,10 @@ mod tests {
         let (base, _tmp) = temp_dir();
         setup_tree(&base);
 
-        let config = TraversalConfig::new(&base).ignore_gitignore().include_hidden();
-        let files: Vec<_> = traverse(&config)
-            .unwrap()
-            .map(|r| r.unwrap())
-            .collect();
+        let config = TraversalConfig::new(&base)
+            .ignore_gitignore()
+            .include_hidden();
+        let files: Vec<_> = traverse(&config).unwrap().map(|r| r.unwrap()).collect();
 
         let names: Vec<_> = files
             .iter()
@@ -283,7 +277,10 @@ mod tests {
         let config = TraversalConfig::new(&base)
             .include_hidden()
             .ignore_gitignore();
-        let files = traverse(&config).unwrap().collect::<Result<Vec<_>, _>>().unwrap();
+        let files = traverse(&config)
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
 
         // main.rs, lib.rs, Cargo.toml, README.md, .hidden, .gitignore, debug.log, output.bin
         assert_eq!(files.len(), 8);

@@ -15,10 +15,7 @@ impl PluginCommandBridge {
     /// Register all commands from active process and wasm plugins into the registry.
     ///
     /// Command names are namespaced as `{plugin_name}/{command_name}`.
-    pub fn register_commands(
-        plugin_manager: &Arc<PluginManager>,
-        registry: &mut CommandRegistry,
-    ) {
+    pub fn register_commands(plugin_manager: &Arc<PluginManager>, registry: &mut CommandRegistry) {
         // Process plugins
         for entry in plugin_manager.active_processes.iter() {
             let plugin_name = entry.key().clone();
@@ -35,26 +32,27 @@ impl PluginCommandBridge {
                 let p_name = plugin_name.clone();
                 let c_name = cmd_info.name.clone();
 
-                let handler = Arc::new(move |_ctx: &coderex_commands::registry::CommandContext,
-                                             args: &[String]| {
-                    let result = tokio::task::block_in_place(|| {
-                        tokio::runtime::Handle::current().block_on(async {
-                            pm.execute_command(&p_name, &c_name, args).await
-                        })
-                    });
+                let handler = Arc::new(
+                    move |_ctx: &coderex_commands::registry::CommandContext, args: &[String]| {
+                        let result = tokio::task::block_in_place(|| {
+                            tokio::runtime::Handle::current().block_on(async {
+                                pm.execute_command(&p_name, &c_name, args).await
+                            })
+                        });
 
-                    match result {
-                        Ok(output) => CommandResult::success(output),
-                        Err(e) => CommandResult::error(e),
-                    }
-                });
+                        match result {
+                            Ok(output) => CommandResult::success(output),
+                            Err(e) => CommandResult::error(e),
+                        }
+                    },
+                );
 
                 registry.register(SlashCommand::local(
                     name_static,
                     desc_static,
-                    true,  // supports_non_interactive
-                    true,  // remote_safe
-                    true,  // bridge_safe
+                    true, // supports_non_interactive
+                    true, // remote_safe
+                    true, // bridge_safe
                     handler,
                 ));
             }
@@ -76,26 +74,27 @@ impl PluginCommandBridge {
                 let p_name = plugin_name.clone();
                 let c_name = cmd_info.name.clone();
 
-                let handler = Arc::new(move |_ctx: &coderex_commands::registry::CommandContext,
-                                             args: &[String]| {
-                    let result = tokio::task::block_in_place(|| {
-                        tokio::runtime::Handle::current().block_on(async {
-                            pm.execute_command(&p_name, &c_name, args).await
-                        })
-                    });
+                let handler = Arc::new(
+                    move |_ctx: &coderex_commands::registry::CommandContext, args: &[String]| {
+                        let result = tokio::task::block_in_place(|| {
+                            tokio::runtime::Handle::current().block_on(async {
+                                pm.execute_command(&p_name, &c_name, args).await
+                            })
+                        });
 
-                    match result {
-                        Ok(output) => CommandResult::success(output),
-                        Err(e) => CommandResult::error(e),
-                    }
-                });
+                        match result {
+                            Ok(output) => CommandResult::success(output),
+                            Err(e) => CommandResult::error(e),
+                        }
+                    },
+                );
 
                 registry.register(SlashCommand::local(
                     name_static,
                     desc_static,
-                    true,  // supports_non_interactive
-                    true,  // remote_safe
-                    true,  // bridge_safe
+                    true, // supports_non_interactive
+                    true, // remote_safe
+                    true, // bridge_safe
                     handler,
                 ));
             }

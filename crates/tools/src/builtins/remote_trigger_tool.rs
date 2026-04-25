@@ -40,7 +40,11 @@ impl Tool for RemoteTriggerTool {
         }
     }
 
-    async fn execute(&self, input: ToolInput, _ctx: ToolContext<'_>) -> Result<ToolOutput, ToolError> {
+    async fn execute(
+        &self,
+        input: ToolInput,
+        _ctx: ToolContext<'_>,
+    ) -> Result<ToolOutput, ToolError> {
         let assignment_id = extract_string(&input.arguments, "assignment_id")?;
         let bridge_url = extract_string(&input.arguments, "bridge_url")
             .unwrap_or_else(|_| self.bridge_url.clone());
@@ -53,16 +57,20 @@ impl Tool for RemoteTriggerTool {
             .body(serde_json::json!({ "assignment_id": assignment_id }).to_string())
             .send()
             .await
-            .map_err(|e| ToolError::Io(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                format!("HTTP request failed: {e}"),
-            )))?;
+            .map_err(|e| {
+                ToolError::Io(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    format!("HTTP request failed: {e}"),
+                ))
+            })?;
 
         let status = response.status();
-        let body = response.text().await.map_err(|e| ToolError::Io(std::io::Error::new(
-            std::io::ErrorKind::Other,
-            format!("failed to read response: {e}"),
-        )))?;
+        let body = response.text().await.map_err(|e| {
+            ToolError::Io(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                format!("failed to read response: {e}"),
+            ))
+        })?;
 
         if status.is_success() {
             Ok(ToolOutput {
@@ -70,7 +78,8 @@ impl Tool for RemoteTriggerTool {
                     "triggered": true,
                     "status": format!("assignment {assignment_id} triggered"),
                     "response": body
-                }).to_string(),
+                })
+                .to_string(),
                 is_display: true,
             })
         } else {
@@ -93,8 +102,8 @@ fn extract_string(args: &serde_json::Value, key: &str) -> Result<String, ToolErr
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tool::ToolContext;
     use crate::context::ExecutionContext;
+    use crate::tool::ToolContext;
     use std::path::Path;
 
     fn test_ctx() -> ToolContext<'static> {

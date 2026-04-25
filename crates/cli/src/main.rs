@@ -3,7 +3,7 @@
 #![warn(missing_docs)]
 
 use anyhow::Result;
-use coderex_cli::{parse_args, orchestrator};
+use coderex_cli::{orchestrator, parse_args};
 
 #[tokio::main]
 async fn main() -> Result<()> {

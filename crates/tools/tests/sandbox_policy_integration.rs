@@ -7,8 +7,14 @@ fn sandbox_policy_bash_has_restrictive_defaults() {
     assert!(config.is_some(), "Bash should have a sandbox policy");
     let config = config.unwrap();
     assert!(!config.allow_network, "Bash should not have network access");
-    assert!(config.max_cpu_seconds.is_some(), "Bash should have CPU limit");
-    assert!(config.max_memory_bytes.is_some(), "Bash should have memory limit");
+    assert!(
+        config.max_cpu_seconds.is_some(),
+        "Bash should have CPU limit"
+    );
+    assert!(
+        config.max_memory_bytes.is_some(),
+        "Bash should have memory limit"
+    );
     assert!(config.max_open_files.is_some(), "Bash should have fd limit");
 }
 
@@ -18,9 +24,18 @@ fn sandbox_policy_write_has_restrictive_defaults() {
     let config = coderex_tools::default_sandbox_config("Write", tmp.path());
     assert!(config.is_some(), "Write should have a sandbox policy");
     let config = config.unwrap();
-    assert!(!config.allow_network, "Write should not have network access");
-    assert!(config.max_cpu_seconds.is_some(), "Write should have CPU limit");
-    assert!(config.max_memory_bytes.is_some(), "Write should have memory limit");
+    assert!(
+        !config.allow_network,
+        "Write should not have network access"
+    );
+    assert!(
+        config.max_cpu_seconds.is_some(),
+        "Write should have CPU limit"
+    );
+    assert!(
+        config.max_memory_bytes.is_some(),
+        "Write should have memory limit"
+    );
 }
 
 #[test]
@@ -74,7 +89,10 @@ fn sandbox_policy_bash_has_system_exec_paths() {
     let tmp = tempfile::tempdir().unwrap();
     let config = coderex_tools::default_sandbox_config("Bash", tmp.path()).unwrap();
 
-    assert!(!config.allowed_exec_paths.is_empty(), "Bash needs system exec paths");
+    assert!(
+        !config.allowed_exec_paths.is_empty(),
+        "Bash needs system exec paths"
+    );
 }
 
 #[test]
@@ -82,14 +100,20 @@ fn sandbox_policy_write_has_no_exec_paths() {
     let tmp = tempfile::tempdir().unwrap();
     let config = coderex_tools::default_sandbox_config("Write", tmp.path()).unwrap();
 
-    assert!(config.allowed_exec_paths.is_empty(), "Write should not execute anything");
+    assert!(
+        config.allowed_exec_paths.is_empty(),
+        "Write should not execute anything"
+    );
 }
 
 #[test]
 fn sandbox_policy_unknown_tool_gets_default() {
     let tmp = tempfile::tempdir().unwrap();
     let config = coderex_tools::default_sandbox_config("SomeUnknownTool", tmp.path());
-    assert!(config.is_some(), "unknown tools should get a default policy");
+    assert!(
+        config.is_some(),
+        "unknown tools should get a default policy"
+    );
 }
 
 #[test]

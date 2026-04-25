@@ -2,13 +2,13 @@
 
 use chrono::{DateTime, Utc};
 use coderex_core::types::Message;
+use flate2::Compression;
+use flate2::write::GzEncoder;
+use regex::Regex;
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
-use flate2::write::GzEncoder;
-use flate2::Compression;
-use regex::Regex;
 use thiserror::Error;
 
 /// Errors from transcript operations.
@@ -23,9 +23,8 @@ pub enum TranscriptError {
 }
 
 /// Regex pattern to skip the first system prompt during replay.
-static SKIP_FIRST_PROMPT_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r#""role"\s*:\s*"System""#).expect("invalid skip regex")
-});
+static SKIP_FIRST_PROMPT_PATTERN: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r#""role"\s*:\s*"System""#).expect("invalid skip regex"));
 
 /// Append-only JSONL transcript store.
 ///
@@ -54,10 +53,7 @@ impl TranscriptStore {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let mut file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)?;
+        let mut file = OpenOptions::new().create(true).append(true).open(&path)?;
         let line = serde_json::to_string(message)?;
         writeln!(file, "{line}")?;
         file.sync_all()?;
@@ -188,11 +184,7 @@ impl TranscriptStore {
     /// Rewrite the transcript with a new set of messages (full replace).
     ///
     /// Uses a temp file + atomic rename for crash safety.
-    pub fn rewrite(
-        &self,
-        session_id: &str,
-        messages: &[Message],
-    ) -> Result<(), TranscriptError> {
+    pub fn rewrite(&self, session_id: &str, messages: &[Message]) -> Result<(), TranscriptError> {
         let path = self.session_path(session_id);
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
@@ -237,7 +229,8 @@ impl TranscriptStore {
             return Ok(None);
         }
         let metadata = path.metadata()?;
-        metadata.modified()
+        metadata
+            .modified()
             .map(|t| Some(DateTime::<Utc>::from(t)))
             .or(Ok(None))
     }
@@ -245,10 +238,17 @@ impl TranscriptStore {
     /// Create a compressed archive of a session transcript.
     ///
     /// Writes `<archive_dir>/<session_id>.jsonl.gz`.
-    pub fn archive_session(&self, session_id: &str, archive_dir: &Path) -> std::io::Result<PathBuf> {
+    pub fn archive_session(
+        &self,
+        session_id: &str,
+        archive_dir: &Path,
+    ) -> std::io::Result<PathBuf> {
         let source = self.session_path(session_id);
         if !source.exists() {
-            return Err(std::io::Error::new(std::io::ErrorKind::NotFound, "session not found"));
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "session not found",
+            ));
         }
         std::fs::create_dir_all(archive_dir)?;
         let dest = archive_dir.join(format!("{session_id}.jsonl.gz"));
@@ -280,7 +280,10 @@ impl TranscriptStore {
         let mut session_times: Vec<_> = sessions
             .into_iter()
             .filter_map(|id| {
-                self.session_modified_at(&id).ok().flatten().map(|t| (id, t))
+                self.session_modified_at(&id)
+                    .ok()
+                    .flatten()
+                    .map(|t| (id, t))
             })
             .collect();
         session_times.sort_by_key(|(_, t)| *t);
@@ -320,7 +323,10 @@ impl TranscriptStore {
     pub fn backup(&self, session_id: &str) -> std::io::Result<PathBuf> {
         let source = self.session_path(session_id);
         if !source.exists() {
-            return Err(std::io::Error::new(std::io::ErrorKind::NotFound, "session not found"));
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "session not found",
+            ));
         }
         let backup_path = source.with_extension("jsonl.bak");
         std::fs::copy(&source, &backup_path)?;
@@ -409,7 +415,9 @@ impl TranscriptStore {
 
             let plaintext = cipher
                 .decrypt(nonce.as_slice().into(), ct.as_ref())
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("{e}")))?;
+                .map_err(|e| {
+                    std::io::Error::new(std::io::ErrorKind::InvalidData, format!("{e}"))
+                })?;
 
             match serde_json::from_slice::<Message>(&plaintext) {
                 Ok(msg) => messages.push(msg),
@@ -470,7 +478,9 @@ mod tests {
     fn append_and_read_multiple_messages_in_order() {
         let (store, _tmp) = temp_store();
         store.append("session_2", &Message::user("first")).unwrap();
-        store.append("session_2", &Message::assistant("second")).unwrap();
+        store
+            .append("session_2", &Message::assistant("second"))
+            .unwrap();
         store.append("session_2", &Message::user("third")).unwrap();
 
         let messages = store.read_all("session_2").unwrap();
@@ -490,9 +500,13 @@ mod tests {
     #[test]
     fn skip_first_prompt_skips_system_message() {
         let (store, _tmp) = temp_store();
-        store.append("session_3", &Message::system("you are a helper")).unwrap();
+        store
+            .append("session_3", &Message::system("you are a helper"))
+            .unwrap();
         store.append("session_3", &Message::user("hi")).unwrap();
-        store.append("session_3", &Message::assistant("hello")).unwrap();
+        store
+            .append("session_3", &Message::assistant("hello"))
+            .unwrap();
 
         let messages = store.read_all_skip_first_prompt("session_3").unwrap();
         assert_eq!(messages.len(), 2);
@@ -548,7 +562,9 @@ mod tests {
     fn truncate_before_removes_messages_before_index() {
         let (store, _tmp) = temp_store();
         store.append("session_t", &Message::user("first")).unwrap();
-        store.append("session_t", &Message::assistant("second")).unwrap();
+        store
+            .append("session_t", &Message::assistant("second"))
+            .unwrap();
         store.append("session_t", &Message::user("third")).unwrap();
 
         store.truncate_before("session_t", 1).unwrap();
@@ -586,9 +602,19 @@ mod tests {
         let path = store.session_path("session_corrupt");
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         let mut file = std::fs::File::create(&path).unwrap();
-        writeln!(file, "{}", serde_json::to_string(&Message::user("first")).unwrap()).unwrap();
+        writeln!(
+            file,
+            "{}",
+            serde_json::to_string(&Message::user("first")).unwrap()
+        )
+        .unwrap();
         writeln!(file, "this is not json").unwrap();
-        writeln!(file, "{}", serde_json::to_string(&Message::user("third")).unwrap()).unwrap();
+        writeln!(
+            file,
+            "{}",
+            serde_json::to_string(&Message::user("third")).unwrap()
+        )
+        .unwrap();
         drop(file);
 
         let messages = store.read_all("session_corrupt").unwrap();
@@ -603,12 +629,24 @@ mod tests {
         let path = store.session_path("session_truncate_corrupt");
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         let mut file = std::fs::File::create(&path).unwrap();
-        writeln!(file, "{}", serde_json::to_string(&Message::user("a")).unwrap()).unwrap();
+        writeln!(
+            file,
+            "{}",
+            serde_json::to_string(&Message::user("a")).unwrap()
+        )
+        .unwrap();
         writeln!(file, "bad json").unwrap();
-        writeln!(file, "{}", serde_json::to_string(&Message::user("c")).unwrap()).unwrap();
+        writeln!(
+            file,
+            "{}",
+            serde_json::to_string(&Message::user("c")).unwrap()
+        )
+        .unwrap();
         drop(file);
 
-        store.truncate_before("session_truncate_corrupt", 1).unwrap();
+        store
+            .truncate_before("session_truncate_corrupt", 1)
+            .unwrap();
         let messages = store.read_all("session_truncate_corrupt").unwrap();
         assert_eq!(messages.len(), 1);
     }
@@ -616,10 +654,7 @@ mod tests {
     #[test]
     fn rewrite_produces_correct_transcript() {
         let (store, _tmp) = temp_store();
-        let new_messages = vec![
-            Message::user("rewritten"),
-            Message::assistant("ok"),
-        ];
+        let new_messages = vec![Message::user("rewritten"), Message::assistant("ok")];
         store.rewrite("session_r", &new_messages).unwrap();
 
         let messages = store.read_all("session_r").unwrap();
@@ -644,7 +679,9 @@ mod tests {
     fn backup_and_restore_roundtrip() {
         let (store, _tmp) = temp_store();
         store.append("sess_bak", &Message::user("hello")).unwrap();
-        store.append("sess_bak", &Message::assistant("world")).unwrap();
+        store
+            .append("sess_bak", &Message::assistant("world"))
+            .unwrap();
 
         let backup_path = store.backup("sess_bak").unwrap();
         assert!(backup_path.exists());
@@ -673,7 +710,9 @@ mod tests {
         let (store, tmp) = temp_store();
         // Create 5 sessions
         for i in 0..5 {
-            store.append(&format!("sess_{i}"), &Message::user(&format!("msg-{i}"))).unwrap();
+            store
+                .append(&format!("sess_{i}"), &Message::user(&format!("msg-{i}")))
+                .unwrap();
             // Space out modification times so ordering is deterministic
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
@@ -713,8 +752,16 @@ mod tests {
         let key = crate::transcript_crypto::generate_master_key();
         let cipher = derive_cipher(&key, "enc_sess_1").unwrap();
 
-        store.append_encrypted("enc_sess_1", &Message::user("secret hello"), &cipher).unwrap();
-        store.append_encrypted("enc_sess_1", &Message::assistant("secret response"), &cipher).unwrap();
+        store
+            .append_encrypted("enc_sess_1", &Message::user("secret hello"), &cipher)
+            .unwrap();
+        store
+            .append_encrypted(
+                "enc_sess_1",
+                &Message::assistant("secret response"),
+                &cipher,
+            )
+            .unwrap();
 
         let messages = store.read_all_decrypted("enc_sess_1", &cipher).unwrap();
         assert_eq!(messages.len(), 2);
@@ -736,7 +783,9 @@ mod tests {
         let cipher1 = derive_cipher(&key1, "enc_sess_2").unwrap();
         let cipher2 = derive_cipher(&key2, "enc_sess_2").unwrap();
 
-        store.append_encrypted("enc_sess_2", &Message::user("secret"), &cipher1).unwrap();
+        store
+            .append_encrypted("enc_sess_2", &Message::user("secret"), &cipher1)
+            .unwrap();
 
         // Wrong key → decryption error
         let result = store.read_all_decrypted("enc_sess_2", &cipher2);
@@ -752,7 +801,9 @@ mod tests {
         let key = crate::transcript_crypto::generate_master_key();
         let cipher = derive_cipher(&key, "ext_check").unwrap();
 
-        store.append_encrypted("ext_check", &Message::user("test"), &cipher).unwrap();
+        store
+            .append_encrypted("ext_check", &Message::user("test"), &cipher)
+            .unwrap();
 
         let enc_path = tmp.path().join("ext_check.jsonl.enc");
         assert!(enc_path.exists());

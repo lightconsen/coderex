@@ -83,9 +83,7 @@ impl ToolCache {
         // TTL is handled by moka, but we still need mtime checks
         if tool_name == "Read" {
             if let Some(ref path_str) = entry.file_path {
-                let current_mtime = std::fs::metadata(path_str)
-                    .and_then(|m| m.modified())
-                    .ok();
+                let current_mtime = std::fs::metadata(path_str).and_then(|m| m.modified()).ok();
                 if current_mtime != entry.file_mtime {
                     // File changed — invalidate
                     self.inner.invalidate(&key).await;
@@ -108,9 +106,7 @@ impl ToolCache {
 
         let (file_path, file_mtime) = if tool_name == "Read" {
             if let Some(path) = arguments.get("file_path").and_then(Value::as_str) {
-                let mtime = std::fs::metadata(path)
-                    .and_then(|m| m.modified())
-                    .ok();
+                let mtime = std::fs::metadata(path).and_then(|m| m.modified()).ok();
                 (Some(path.to_string()), mtime)
             } else {
                 (None, None)
@@ -168,7 +164,9 @@ mod tests {
         assert!(cache.get("WebSearch", &args).await.is_none());
 
         // Insert
-        cache.insert("WebSearch", &args, test_output("results")).await;
+        cache
+            .insert("WebSearch", &args, test_output("results"))
+            .await;
 
         // Hit
         let hit = cache.get("WebSearch", &args).await.unwrap();
@@ -194,7 +192,9 @@ mod tests {
         });
         let args = serde_json::json!({"query": "rust"});
 
-        cache.insert("WebSearch", &args, test_output("results")).await;
+        cache
+            .insert("WebSearch", &args, test_output("results"))
+            .await;
         assert!(cache.get("WebSearch", &args).await.is_none());
     }
 }

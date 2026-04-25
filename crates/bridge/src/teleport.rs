@@ -76,18 +76,12 @@ impl TeleportSnapshot {
     fn to_state_map(state: &SessionState) -> HashMap<String, String> {
         let mut map = HashMap::new();
         map.insert("session_id".into(), state.session_id.to_string());
-        map.insert(
-            "title".into(),
-            state.title.clone().unwrap_or_default(),
-        );
+        map.insert("title".into(), state.title.clone().unwrap_or_default());
         map.insert("cost_usd".into(), state.cost_usd.to_string());
         map.insert("created_at".into(), state.created_at.to_rfc3339());
         map.insert("cwd".into(), state.cwd.to_string_lossy().to_string());
         map.insert("usage_input".into(), state.usage.input_tokens.to_string());
-        map.insert(
-            "usage_output".into(),
-            state.usage.output_tokens.to_string(),
-        );
+        map.insert("usage_output".into(), state.usage.output_tokens.to_string());
         map.insert(
             "usage_cache_read".into(),
             state.usage.cache_read_tokens.to_string(),
@@ -174,8 +168,8 @@ impl TeleportManager {
         std::fs::create_dir_all(&coderex_dir)?;
         let path = coderex_dir.join("teleport_state.json");
         let snapshot = TeleportSnapshot::from_session(state);
-        let json =
-            serde_json::to_string_pretty(&snapshot).map_err(|e| TeleportError::Serialize(e.to_string()))?;
+        let json = serde_json::to_string_pretty(&snapshot)
+            .map_err(|e| TeleportError::Serialize(e.to_string()))?;
         std::fs::write(&path, json)?;
         Ok(path)
     }
@@ -189,8 +183,8 @@ impl TeleportManager {
             return Ok(None);
         }
         let content = std::fs::read_to_string(&path)?;
-        let snapshot: TeleportSnapshot =
-            serde_json::from_str(&content).map_err(|e| TeleportError::Deserialize(e.to_string()))?;
+        let snapshot: TeleportSnapshot = serde_json::from_str(&content)
+            .map_err(|e| TeleportError::Deserialize(e.to_string()))?;
         Ok(Some(snapshot.to_session_state()))
     }
 
@@ -202,8 +196,8 @@ impl TeleportManager {
         std::fs::create_dir_all(&self.share_base)?;
         let path = self.share_base.join(format!("{token}.json"));
         let snapshot = TeleportSnapshot::from_session(state);
-        let json =
-            serde_json::to_string_pretty(&snapshot).map_err(|e| TeleportError::Serialize(e.to_string()))?;
+        let json = serde_json::to_string_pretty(&snapshot)
+            .map_err(|e| TeleportError::Serialize(e.to_string()))?;
         std::fs::write(&path, json)?;
         Ok(token)
     }
@@ -220,8 +214,8 @@ impl TeleportManager {
             return Err(TeleportError::SessionNotFound(token.into()));
         }
         let content = std::fs::read_to_string(&path)?;
-        let snapshot: TeleportSnapshot =
-            serde_json::from_str(&content).map_err(|e| TeleportError::Deserialize(e.to_string()))?;
+        let snapshot: TeleportSnapshot = serde_json::from_str(&content)
+            .map_err(|e| TeleportError::Deserialize(e.to_string()))?;
         Ok(snapshot.to_session_state())
     }
 
@@ -239,8 +233,7 @@ impl TeleportManager {
                     .filter_map(|e| {
                         let path = e.path();
                         if path.extension().is_some_and(|ext| ext == "json") {
-                            path.file_stem()
-                                .map(|s| s.to_string_lossy().to_string())
+                            path.file_stem().map(|s| s.to_string_lossy().to_string())
                         } else {
                             None
                         }

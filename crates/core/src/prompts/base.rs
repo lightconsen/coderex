@@ -7,10 +7,10 @@
 use std::fmt::Write;
 use std::path::Path;
 
-use crate::tool_executor::ToolInfo;
-use crate::types::{Message, ModelId};
 use crate::budget::TokenBudget;
 use crate::engine::DeniedToolCall;
+use crate::tool_executor::ToolInfo;
+use crate::types::{Message, ModelId};
 
 // ─── Block Types ────────────────────────────────────────────────────────────
 
@@ -134,8 +134,7 @@ impl PromptCompiler {
         id: &str,
         f: Box<dyn Fn(&PromptContext) -> String + Send + Sync>,
     ) {
-        self.dynamic_blocks
-            .push((id.to_string(), f));
+        self.dynamic_blocks.push((id.to_string(), f));
     }
 
     /// Assemble the full system prompt and context messages.

@@ -1,7 +1,7 @@
 //! Local SQLite storage for telemetry events.
 
 use crate::TelemetryError;
-use rusqlite::{params, Connection};
+use rusqlite::{Connection, params};
 use std::path::Path;
 
 /// SQLite-backed store for telemetry events.
@@ -71,10 +71,13 @@ impl TelemetryStore {
                     LIMIT 100
                 );
             END;
-"
+",
         )?;
 
-        Ok(Self { conn, db_path: path.to_path_buf() })
+        Ok(Self {
+            conn,
+            db_path: path.to_path_buf(),
+        })
     }
 
     /// Insert a single event.
@@ -110,7 +113,7 @@ impl TelemetryStore {
              FROM telemetry_events
              WHERE uploaded_at IS NULL
              ORDER BY created_at ASC
-             LIMIT ?1"
+             LIMIT ?1",
         )?;
 
         let rows = stmt.query_map([limit], |row| {
@@ -148,7 +151,11 @@ impl TelemetryStore {
     }
 
     /// Insert a crash report.
-    pub fn insert_crash(&self, panic_info: &str, backtrace: Option<&str>) -> Result<i64, TelemetryError> {
+    pub fn insert_crash(
+        &self,
+        panic_info: &str,
+        backtrace: Option<&str>,
+    ) -> Result<i64, TelemetryError> {
         let now = chrono::Utc::now().to_rfc3339();
         self.conn.execute(
             "INSERT INTO crash_reports (panic_info, backtrace, created_at)
@@ -165,7 +172,7 @@ impl TelemetryStore {
              FROM crash_reports
              WHERE uploaded_at IS NULL
              ORDER BY created_at ASC
-             LIMIT ?1"
+             LIMIT ?1",
         )?;
 
         let rows = stmt.query_map([limit], |row| {
@@ -204,11 +211,11 @@ impl TelemetryStore {
 
     /// Count total events.
     pub fn event_count(&self) -> Result<i64, TelemetryError> {
-        let count: i64 = self.conn.query_row(
-            "SELECT COUNT(*) FROM telemetry_events",
-            [],
-            |row| row.get(0),
-        )?;
+        let count: i64 =
+            self.conn
+                .query_row("SELECT COUNT(*) FROM telemetry_events", [], |row| {
+                    row.get(0)
+                })?;
         Ok(count)
     }
 
@@ -226,8 +233,12 @@ impl TelemetryStore {
     ///
     /// Uses `PRAGMA page_count * page_size`.
     pub fn db_size_bytes(&self) -> Result<i64, TelemetryError> {
-        let page_count: i64 = self.conn.query_row("PRAGMA page_count", [], |row| row.get(0))?;
-        let page_size: i64 = self.conn.query_row("PRAGMA page_size", [], |row| row.get(0))?;
+        let page_count: i64 = self
+            .conn
+            .query_row("PRAGMA page_count", [], |row| row.get(0))?;
+        let page_size: i64 = self
+            .conn
+            .query_row("PRAGMA page_size", [], |row| row.get(0))?;
         Ok(page_count * page_size)
     }
 
@@ -407,7 +418,9 @@ mod tests {
     #[test]
     fn crash_report_roundtrip() {
         let store = temp_store();
-        let id = store.insert_crash("panic at foo.rs:42", Some("backtrace...")).unwrap();
+        let id = store
+            .insert_crash("panic at foo.rs:42", Some("backtrace..."))
+            .unwrap();
         let pending = store.pending_crashes(10).unwrap();
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0].id, id);

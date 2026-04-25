@@ -412,14 +412,20 @@ mod tests {
             checker.check("bash", None),
             PermissionResult::Ask { .. }
         ));
-        assert!(matches!(checker.check("read", None), PermissionResult::Allow));
+        assert!(matches!(
+            checker.check("read", None),
+            PermissionResult::Allow
+        ));
     }
 
     #[test]
     fn strict_preset_only_allows_readonly() {
         let mgr = PermissionManager::strict_preset();
         let checker = mgr.checker();
-        assert!(matches!(checker.check("read", None), PermissionResult::Allow));
+        assert!(matches!(
+            checker.check("read", None),
+            PermissionResult::Allow
+        ));
         assert!(matches!(
             checker.check("bash", None),
             PermissionResult::Deny { .. }
@@ -434,7 +440,10 @@ mod tests {
             checker.check("bash", None),
             PermissionResult::Ask { .. }
         ));
-        assert!(matches!(checker.check("write", None), PermissionResult::Allow));
+        assert!(matches!(
+            checker.check("write", None),
+            PermissionResult::Allow
+        ));
     }
 
     #[test]

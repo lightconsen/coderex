@@ -32,7 +32,11 @@ impl Tool for EnterPlanModeTool {
         }
     }
 
-    async fn execute(&self, _input: ToolInput, _ctx: ToolContext<'_>) -> Result<ToolOutput, ToolError> {
+    async fn execute(
+        &self,
+        _input: ToolInput,
+        _ctx: ToolContext<'_>,
+    ) -> Result<ToolOutput, ToolError> {
         // Actual mode change is session-level; this is a no-op compatibility layer.
         Ok(ToolOutput {
             output: "true".to_string(),
@@ -44,8 +48,8 @@ impl Tool for EnterPlanModeTool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tool::ToolContext;
     use crate::context::ExecutionContext;
+    use crate::tool::ToolContext;
     use std::collections::HashMap;
     use std::path::Path;
     use std::sync::Arc;
@@ -63,7 +67,11 @@ mod tests {
     async fn enter_plan_mode_returns_success() {
         let output = EnterPlanModeTool
             .execute(
-                ToolInput { call_id: "1".into(), name: "EnterPlanMode".into(), arguments: serde_json::json!({}) },
+                ToolInput {
+                    call_id: "1".into(),
+                    name: "EnterPlanMode".into(),
+                    arguments: serde_json::json!({}),
+                },
                 test_ctx(),
             )
             .await

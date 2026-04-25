@@ -37,7 +37,11 @@ impl Tool for CronDeleteTool {
         }
     }
 
-    async fn execute(&self, input: ToolInput, ctx: ToolContext<'_>) -> Result<ToolOutput, ToolError> {
+    async fn execute(
+        &self,
+        input: ToolInput,
+        ctx: ToolContext<'_>,
+    ) -> Result<ToolOutput, ToolError> {
         let id = extract_string(&input.arguments, "id")?;
 
         let scheduler = get_scheduler(&ctx).ok_or_else(|| ToolError::InvalidInput {
@@ -54,9 +58,10 @@ impl Tool for CronDeleteTool {
 }
 
 fn get_scheduler(ctx: &ToolContext<'_>) -> Option<Arc<crate::cron_scheduler::CronScheduler>> {
-    ctx.extra
-        .get(CRON_SCHEDULER_KEY)
-        .and_then(|v| v.downcast_ref::<Arc<crate::cron_scheduler::CronScheduler>>().map(Arc::clone))
+    ctx.extra.get(CRON_SCHEDULER_KEY).and_then(|v| {
+        v.downcast_ref::<Arc<crate::cron_scheduler::CronScheduler>>()
+            .map(Arc::clone)
+    })
 }
 
 fn extract_string(args: &serde_json::Value, key: &str) -> Result<String, ToolError> {
@@ -71,9 +76,9 @@ fn extract_string(args: &serde_json::Value, key: &str) -> Result<String, ToolErr
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::context::ExecutionContext;
     use crate::cron_scheduler::{CronJob, CronScheduler};
     use crate::tool::ToolContext;
-    use crate::context::ExecutionContext;
     use std::collections::HashMap;
     use std::path::Path;
 
@@ -95,7 +100,8 @@ mod tests {
     async fn cron_delete_existing() {
         let ctx = test_ctx();
         let ids = {
-            let sched = ctx.extra
+            let sched = ctx
+                .extra
                 .get(CRON_SCHEDULER_KEY)
                 .and_then(|v| v.downcast_ref::<Arc<CronScheduler>>())
                 .unwrap();

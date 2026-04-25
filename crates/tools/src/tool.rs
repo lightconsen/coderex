@@ -76,7 +76,11 @@ pub trait Tool: Send + Sync {
     fn descriptor(&self) -> ToolDescriptor;
 
     /// Execute the tool with the given input and execution context.
-    async fn execute(&self, input: ToolInput, ctx: ToolContext<'_>) -> Result<ToolOutput, ToolError>;
+    async fn execute(
+        &self,
+        input: ToolInput,
+        ctx: ToolContext<'_>,
+    ) -> Result<ToolOutput, ToolError>;
 }
 
 /// Request to elicit answers from the user mid-execution.
@@ -114,10 +118,7 @@ impl fmt::Debug for ToolContext<'_> {
 impl<'a> ToolContext<'a> {
     /// Create a new tool context.
     #[must_use]
-    pub fn new(
-        execution_context: ExecutionContext,
-        cwd: &'a std::path::Path,
-    ) -> Self {
+    pub fn new(execution_context: ExecutionContext, cwd: &'a std::path::Path) -> Self {
         Self {
             execution_context,
             cwd,

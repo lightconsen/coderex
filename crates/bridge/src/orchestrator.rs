@@ -4,7 +4,9 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
 use crate::archive::{BridgeArchiveWriter, BridgeCleanupManager, UsageStats};
-use crate::heartbeat::{HeartbeatConfig, HeartbeatLoop, HeartbeatStatus, WsReconnector, SessionRecoveryState};
+use crate::heartbeat::{
+    HeartbeatConfig, HeartbeatLoop, HeartbeatStatus, SessionRecoveryState, WsReconnector,
+};
 use crate::permission::{BridgePermissionRouter, PermissionResponse};
 use crate::poller::{BridgeWorkPoller, SpawnMode, WorkAssignment};
 use crate::spawner::{BridgeSessionSpawner, SpawnConfig, SpawnResult};
@@ -48,13 +50,20 @@ pub struct ManagedSession {
 #[allow(missing_docs)]
 pub enum BridgeEvent {
     /// A session was spawned.
-    SessionSpawned { session_id: String, work_dir: String },
+    SessionSpawned {
+        session_id: String,
+        work_dir: String,
+    },
     /// A session completed successfully.
     SessionCompleted { session_id: String },
     /// A session failed.
     SessionFailed { session_id: String, reason: String },
     /// A permission request was routed.
-    PermissionRequested { request_id: String, session_id: String, tool: String },
+    PermissionRequested {
+        request_id: String,
+        session_id: String,
+        tool: String,
+    },
     /// Permission was granted/denied.
     PermissionResolved { request_id: String, allowed: bool },
     /// Transport disconnected and is reconnecting.
@@ -196,12 +205,19 @@ impl Bridge {
     }
 
     /// Submit a permission response for a pending request.
-    pub fn respond_to_permission(&mut self, request_id: &str, response: PermissionResponse) -> bool {
+    pub fn respond_to_permission(
+        &mut self,
+        request_id: &str,
+        response: PermissionResponse,
+    ) -> bool {
         let resolved = self.permission_router.respond(request_id, response);
         if resolved {
             if let Some(resp) = self.permission_router.get_response(request_id) {
                 let allowed = matches!(resp, PermissionResponse::Allow { .. });
-                self.emit(BridgeEvent::PermissionResolved { request_id: request_id.to_string(), allowed });
+                self.emit(BridgeEvent::PermissionResolved {
+                    request_id: request_id.to_string(),
+                    allowed,
+                });
             }
         }
         resolved
@@ -237,7 +253,9 @@ impl Bridge {
 
     /// Get the state of a specific session.
     pub fn session_state(&self, session_id: &str) -> Option<&BridgeSessionState> {
-        self.sessions.get(session_id).map(|s| &s.state_machine.current)
+        self.sessions
+            .get(session_id)
+            .map(|s| &s.state_machine.current)
     }
 
     /// Get the number of active sessions.
@@ -274,7 +292,10 @@ impl Bridge {
     }
 
     /// Spawn a session from a work assignment.
-    pub async fn spawn_session(&mut self, assignment: &WorkAssignment) -> Result<SpawnResult, String> {
+    pub async fn spawn_session(
+        &mut self,
+        assignment: &WorkAssignment,
+    ) -> Result<SpawnResult, String> {
         let session_id = &assignment.session_id;
 
         let config = SpawnConfig {
@@ -290,11 +311,14 @@ impl Bridge {
 
         let result = self.spawner.spawn(config).await?;
 
-        self.sessions.insert(session_id.clone(), ManagedSession {
-            state_machine: BridgeSessionStateMachine::new(session_id.clone()),
-            work_dir: result.work_dir.clone(),
-            worktree_created: result.worktree_created,
-        });
+        self.sessions.insert(
+            session_id.clone(),
+            ManagedSession {
+                state_machine: BridgeSessionStateMachine::new(session_id.clone()),
+                work_dir: result.work_dir.clone(),
+                worktree_created: result.worktree_created,
+            },
+        );
 
         self.emit(BridgeEvent::SessionSpawned {
             session_id: session_id.clone(),
@@ -305,28 +329,43 @@ impl Bridge {
     }
 
     /// Complete a session (archive + cleanup).
-    pub async fn complete_session(&mut self, session_id: &str, usage: UsageStats) -> Result<(), String> {
+    pub async fn complete_session(
+        &mut self,
+        session_id: &str,
+        usage: UsageStats,
+    ) -> Result<(), String> {
         // Drive session through required states: assigned → preparing → spawning → running → archiving
         if let Some(session) = self.sessions.get_mut(session_id) {
             if matches!(session.state_machine.current, BridgeSessionState::Assigned) {
-                session.state_machine.transition(BridgeSessionState::Preparing)
+                session
+                    .state_machine
+                    .transition(BridgeSessionState::Preparing)
                     .map_err(|e| format!("state transition failed: {e}"))?;
-                session.state_machine.transition(BridgeSessionState::Spawning)
+                session
+                    .state_machine
+                    .transition(BridgeSessionState::Spawning)
                     .map_err(|e| format!("state transition failed: {e}"))?;
-                session.state_machine.transition(BridgeSessionState::Running)
+                session
+                    .state_machine
+                    .transition(BridgeSessionState::Running)
                     .map_err(|e| format!("state transition failed: {e}"))?;
             }
-            session.state_machine.transition(BridgeSessionState::Archiving)
+            session
+                .state_machine
+                .transition(BridgeSessionState::Archiving)
                 .map_err(|e| format!("state transition failed: {e}"))?;
         }
 
         // Archive the session
-        let archive = self.archive_writer.archive(
-            session_id,
-            "", // transcript content — would come from transport
-            usage,
-            "completed",
-        ).await?;
+        let archive = self
+            .archive_writer
+            .archive(
+                session_id,
+                "", // transcript content — would come from transport
+                usage,
+                "completed",
+            )
+            .await?;
 
         self.emit(BridgeEvent::SessionArchived {
             session_id: session_id.to_string(),
@@ -334,7 +373,9 @@ impl Bridge {
 
         // Transition to cleaning up
         if let Some(session) = self.sessions.get_mut(session_id) {
-            session.state_machine.transition(BridgeSessionState::CleaningUp)
+            session
+                .state_machine
+                .transition(BridgeSessionState::CleaningUp)
                 .map_err(|e| format!("state transition failed: {e}"))?;
         }
 
@@ -687,11 +728,14 @@ mod tests {
         let mut bridge = test_bridge(tmp.path());
 
         // Manually insert a session
-        bridge.sessions.insert("s1".into(), ManagedSession {
-            state_machine: BridgeSessionStateMachine::new("s1".into()),
-            work_dir: PathBuf::from("/tmp/s1"),
-            worktree_created: false,
-        });
+        bridge.sessions.insert(
+            "s1".into(),
+            ManagedSession {
+                state_machine: BridgeSessionStateMachine::new("s1".into()),
+                work_dir: PathBuf::from("/tmp/s1"),
+                worktree_created: false,
+            },
+        );
 
         let states = bridge.all_recovery_states();
         assert_eq!(states.len(), 1);

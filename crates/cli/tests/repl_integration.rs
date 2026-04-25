@@ -5,10 +5,10 @@
 //! 14.1 ReplLoop construction, 14.2 Headless execution, 14.3 Slash commands,
 //! 14.4 Command parsing, 14.5 CLI config effects, 14.6 Session state
 
-use coderex_cli::repl::{parse_input, ReplLoop, ReplSession};
+use coderex_cli::repl::{ReplLoop, ReplSession, parse_input};
 use coderex_core::permissions::PermissionMode;
 use coderex_core::types::ModelId;
-use coderex_test_utils::{mock_response, MockApiClient};
+use coderex_test_utils::{MockApiClient, mock_response};
 
 // ═══════════════════════════════════════════════════════════════════════════
 //  14.1 ReplLoop Construction
@@ -53,7 +53,10 @@ fn run_headless_clear_command() {
     let mut repl = ReplLoop::new("/tmp".into(), ModelId::sonnet());
     let rt = tokio::runtime::Runtime::new().unwrap();
     let result = rt.block_on(repl.run_headless("/clear")).unwrap();
-    assert!(result.contains("cleared"), "expected 'cleared', got: {result}");
+    assert!(
+        result.contains("cleared"),
+        "expected 'cleared', got: {result}"
+    );
 }
 
 #[test]
@@ -76,7 +79,10 @@ fn run_headless_session_command() {
         result.contains("Session:"),
         "expected session info, got: {result}"
     );
-    assert!(result.contains("claude-sonnet-4-6"), "expected model name in output");
+    assert!(
+        result.contains("claude-sonnet-4-6"),
+        "expected model name in output"
+    );
 }
 
 #[test]
@@ -94,7 +100,9 @@ fn run_headless_advisor_mode_command() {
 fn run_headless_btw_command_with_args() {
     let mut repl = ReplLoop::new("/tmp".into(), ModelId::sonnet());
     let rt = tokio::runtime::Runtime::new().unwrap();
-    let result = rt.block_on(repl.run_headless("/btw this is important")).unwrap();
+    let result = rt
+        .block_on(repl.run_headless("/btw this is important"))
+        .unwrap();
     assert!(
         result.contains("Added context"),
         "expected context addition, got: {result}"
@@ -161,7 +169,9 @@ fn run_headless_diff_command() {
 fn run_headless_issue_create_command() {
     let mut repl = ReplLoop::new("/tmp".into(), ModelId::sonnet());
     let rt = tokio::runtime::Runtime::new().unwrap();
-    let result = rt.block_on(repl.run_headless("/issue create fix bug")).unwrap();
+    let result = rt
+        .block_on(repl.run_headless("/issue create fix bug"))
+        .unwrap();
     assert!(
         result.contains("fix bug"),
         "expected issue creation, got: {result}"

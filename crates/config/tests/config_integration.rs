@@ -9,11 +9,11 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use coderex_config::{
-    CapabilitySet, ConfigService, FeatureFlags, FlagRegistry, RuntimeOverrides, Settings,
-    config_home, percentage_rollout, CURRENT_SCHEMA_VERSION,
-};
 use coderex_config::dirs::{DataDirectories, ManagedSettings};
+use coderex_config::{
+    CURRENT_SCHEMA_VERSION, CapabilitySet, ConfigService, FeatureFlags, FlagRegistry,
+    RuntimeOverrides, Settings, config_home, percentage_rollout,
+};
 
 // ═══════════════════════════════════════════════════════════════════════════
 //  Helpers
@@ -40,10 +40,7 @@ fn temp_settings_file(settings: &Settings) -> PathBuf {
 
 #[test]
 fn config_priority_defaults_when_no_files() {
-    let service = ConfigService::new(
-        PathBuf::from("/nonexistent/user.json"),
-        None,
-    );
+    let service = ConfigService::new(PathBuf::from("/nonexistent/user.json"), None);
     let resolved = service.resolve().unwrap();
 
     assert_eq!(resolved.model, Some("claude-sonnet-4-6".into()));
@@ -187,7 +184,9 @@ fn settings_validate_rejects_empty_model() {
         ..Default::default()
     };
     let err = settings.validate().unwrap_err();
-    assert!(matches!(err, coderex_config::ConfigError::Validation { ref field, .. } if field == "model"));
+    assert!(
+        matches!(err, coderex_config::ConfigError::Validation { ref field, .. } if field == "model")
+    );
 }
 
 #[test]
@@ -197,7 +196,9 @@ fn settings_validate_rejects_negative_budget() {
         ..Default::default()
     };
     let err = settings.validate().unwrap_err();
-    assert!(matches!(err, coderex_config::ConfigError::Validation { ref field, .. } if field == "max_budget_usd"));
+    assert!(
+        matches!(err, coderex_config::ConfigError::Validation { ref field, .. } if field == "max_budget_usd")
+    );
 }
 
 #[test]
@@ -207,7 +208,9 @@ fn settings_validate_rejects_invalid_permission_mode() {
         ..Default::default()
     };
     let err = settings.validate().unwrap_err();
-    assert!(matches!(err, coderex_config::ConfigError::Validation { ref field, .. } if field == "permission_mode"));
+    assert!(
+        matches!(err, coderex_config::ConfigError::Validation { ref field, .. } if field == "permission_mode")
+    );
 }
 
 #[test]
@@ -428,9 +431,9 @@ fn experiments_merged_with_existing_flags() {
     experiments.insert("buddy".into(), true);
 
     let result = flags.with_experiments(&experiments);
-    assert!(result.daemon);           // preserved
+    assert!(result.daemon); // preserved
     assert!(!result.coordinator_mode); // overridden by experiment
-    assert!(result.buddy);            // added by experiment
+    assert!(result.buddy); // added by experiment
 }
 
 #[test]

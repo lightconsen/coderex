@@ -144,9 +144,7 @@ impl PlatformSandbox {
 
         #[allow(unreachable_code)]
         {
-            tracing::warn!(
-                "Sandbox not supported on this platform; proceeding without isolation"
-            );
+            tracing::warn!("Sandbox not supported on this platform; proceeding without isolation");
             Ok(Self::Unsupported)
         }
     }
@@ -222,7 +220,7 @@ mod linux_impl {
         // ─── rlimits ─────────────────────────────────────────────────────────
 
         fn apply_rlimits(config: &SandboxConfig) -> Result<(), std::io::Error> {
-            use libc::{prlimit, rlimit64, RLIMIT_AS, RLIMIT_CPU, RLIMIT_NOFILE};
+            use libc::{RLIMIT_AS, RLIMIT_CPU, RLIMIT_NOFILE, prlimit, rlimit64};
 
             if let Some(max_files) = config.max_open_files {
                 let rl = rlimit64 {
@@ -476,8 +474,11 @@ mod macos_impl {
             };
             let profile = sandbox.generate_profile();
             let thread_id = format!("{:?}", std::thread::current().id());
-            let profile_path = std::env::temp_dir()
-                .join(format!("coderex_sandbox_{}_{}.sb", std::process::id(), thread_id));
+            let profile_path = std::env::temp_dir().join(format!(
+                "coderex_sandbox_{}_{}.sb",
+                std::process::id(),
+                thread_id
+            ));
 
             fs::write(&profile_path, &profile).map_err(|e| {
                 SandboxError::CreationError(format!("failed to write sandbox profile: {e}"))
@@ -593,14 +594,13 @@ mod windows_impl {
     use std::ptr;
     use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
     use windows_sys::Win32::System::JobObjects::{
-        AssignProcessToJobObject, CreateJobObjectW, SetInformationJobObject,
-        JobObjectBasicUIRestrictions, JobObjectExtendedLimitInformation,
-        JOBOBJECT_BASIC_LIMIT_INFORMATION, JOBOBJECT_BASIC_UI_RESTRICTIONS,
-        JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JOB_OBJECT_LIMIT_ACTIVE_PROCESS,
-        JOB_OBJECT_LIMIT_JOB_MEMORY, JOB_OBJECT_LIMIT_JOB_TIME,
-        JOB_OBJECT_UI_EXIT_WINDOWS, JOB_OBJECT_UI_GLOBAL_ATOMS,
-        JOB_OBJECT_UI_HANDLES, JOB_OBJECT_UI_NO_DESKTOP,
+        AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_ACTIVE_PROCESS,
+        JOB_OBJECT_LIMIT_JOB_MEMORY, JOB_OBJECT_LIMIT_JOB_TIME, JOB_OBJECT_UI_EXIT_WINDOWS,
+        JOB_OBJECT_UI_GLOBAL_ATOMS, JOB_OBJECT_UI_HANDLES, JOB_OBJECT_UI_NO_DESKTOP,
         JOB_OBJECT_UI_READCLIPBOARD, JOB_OBJECT_UI_WRITECLIPBOARD,
+        JOBOBJECT_BASIC_LIMIT_INFORMATION, JOBOBJECT_BASIC_UI_RESTRICTIONS,
+        JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectBasicUIRestrictions,
+        JobObjectExtendedLimitInformation, SetInformationJobObject,
     };
 
     /// Windows sandbox using Job Objects.
@@ -615,8 +615,7 @@ mod windows_impl {
                 .encode_wide()
                 .chain(Some(0))
                 .collect();
-            let job_handle =
-                unsafe { CreateJobObjectW(ptr::null_mut(), job_name_wide.as_ptr()) };
+            let job_handle = unsafe { CreateJobObjectW(ptr::null_mut(), job_name_wide.as_ptr()) };
             if job_handle == 0 {
                 return Err(SandboxError::CreationError(format!(
                     "CreateJobObject failed: {}",
@@ -624,10 +623,7 @@ mod windows_impl {
                 )));
             }
 
-            let mut sandbox = Self {
-                job_handle,
-                config,
-            };
+            let mut sandbox = Self { job_handle, config };
             sandbox.apply_limits()?;
             Ok(sandbox)
         }
@@ -695,7 +691,8 @@ mod windows_impl {
         pub fn post_spawn(&self, child: &std::process::Child) -> Result<(), SandboxError> {
             use std::os::windows::io::AsRawHandle;
             unsafe {
-                let ret = AssignProcessToJobObject(self.job_handle, child.as_raw_handle() as HANDLE);
+                let ret =
+                    AssignProcessToJobObject(self.job_handle, child.as_raw_handle() as HANDLE);
                 if ret == 0 {
                     return Err(SandboxError::CreationError(format!(
                         "AssignProcessToJobObject failed: {}",

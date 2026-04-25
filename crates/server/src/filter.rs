@@ -8,42 +8,112 @@ use std::collections::HashSet;
 
 /// Read-only commands that are safe for any remote client.
 const REMOTE_SAFE_COMMANDS: &[&str] = &[
-    "ls", "dir", "cat", "head", "tail", "less", "more",
-    "grep", "find", "wc", "sort", "uniq", "diff", "cmp",
-    "file", "stat", "readlink", "which", "type",
-    "pwd", "echo", "date", "whoami", "hostname", "uname",
-    "git status", "git log", "git diff", "git show",
-    "git branch", "git tag", "git remote",
-    "cargo check", "cargo metadata", "cargo tree",
-    "rustc --version", "cargo --version",
-    "true", "false", "test",
+    "ls",
+    "dir",
+    "cat",
+    "head",
+    "tail",
+    "less",
+    "more",
+    "grep",
+    "find",
+    "wc",
+    "sort",
+    "uniq",
+    "diff",
+    "cmp",
+    "file",
+    "stat",
+    "readlink",
+    "which",
+    "type",
+    "pwd",
+    "echo",
+    "date",
+    "whoami",
+    "hostname",
+    "uname",
+    "git status",
+    "git log",
+    "git diff",
+    "git show",
+    "git branch",
+    "git tag",
+    "git remote",
+    "cargo check",
+    "cargo metadata",
+    "cargo tree",
+    "rustc --version",
+    "cargo --version",
+    "true",
+    "false",
+    "test",
 ];
 
 /// Additional commands allowed in bridge sessions (limited writes, no destructive ops).
 const BRIDGE_EXTRA_COMMANDS: &[&str] = &[
-    "mkdir", "touch", "cp", "mv", "sed", "awk",
-    "git add", "git commit", "git stash", "git checkout",
-    "cargo build", "cargo test", "cargo fmt", "cargo clippy", "cargo doc",
-    "npm install", "npm run", "npm test", "npm run build",
-    "pnpm install", "pnpm run", "pnpm test",
-    "yarn install", "yarn run", "yarn test",
-    "python", "python3", "node", "cargo run",
+    "mkdir",
+    "touch",
+    "cp",
+    "mv",
+    "sed",
+    "awk",
+    "git add",
+    "git commit",
+    "git stash",
+    "git checkout",
+    "cargo build",
+    "cargo test",
+    "cargo fmt",
+    "cargo clippy",
+    "cargo doc",
+    "npm install",
+    "npm run",
+    "npm test",
+    "npm run build",
+    "pnpm install",
+    "pnpm run",
+    "pnpm test",
+    "yarn install",
+    "yarn run",
+    "yarn test",
+    "python",
+    "python3",
+    "node",
+    "cargo run",
 ];
 
 /// Commands that are never allowed (destructive/dangerous).
 const NEVER_ALLOWED: &[&str] = &[
-    "rm -rf", "rm -r", "rm -f",
-    "dd if=", "mkfs", "format",
-    "chmod 777", "chmod -R 777",
-    "curl", "wget",  // network access
-    "sudo", "su", "passwd",  // privilege escalation
-    "kill", "killall", "pkill",  // process termination
-    "shutdown", "reboot", "halt",  // system control
-    "crontab", "at ",  // scheduling
-    "iptables", "ufw",  // firewall
-    "nc ", "ncat", "socat",  // raw networking
-    "> /dev/",  // device access via redirection
-    "eval ", "exec ",  // code execution in shell context
+    "rm -rf",
+    "rm -r",
+    "rm -f",
+    "dd if=",
+    "mkfs",
+    "format",
+    "chmod 777",
+    "chmod -R 777",
+    "curl",
+    "wget", // network access
+    "sudo",
+    "su",
+    "passwd", // privilege escalation
+    "kill",
+    "killall",
+    "pkill", // process termination
+    "shutdown",
+    "reboot",
+    "halt", // system control
+    "crontab",
+    "at ", // scheduling
+    "iptables",
+    "ufw", // firewall
+    "nc ",
+    "ncat",
+    "socat",   // raw networking
+    "> /dev/", // device access via redirection
+    "eval ",
+    "exec ", // code execution in shell context
 ];
 
 /// Filter commands based on client capabilities.
@@ -65,7 +135,9 @@ impl CommandFilter {
         }
 
         // Check if it matches an allowed read-only command
-        REMOTE_SAFE_COMMANDS.iter().any(|&allowed| command_starts_with(trimmed, allowed))
+        REMOTE_SAFE_COMMANDS
+            .iter()
+            .any(|&allowed| command_starts_with(trimmed, allowed))
     }
 
     /// Check if a command is safe for bridge sessions.
@@ -87,7 +159,9 @@ impl CommandFilter {
         }
 
         // Check bridge-extra commands
-        BRIDGE_EXTRA_COMMANDS.iter().any(|&allowed| command_starts_with(trimmed, allowed))
+        BRIDGE_EXTRA_COMMANDS
+            .iter()
+            .any(|&allowed| command_starts_with(trimmed, allowed))
     }
 
     /// Get the set of allowed commands for a given safety level.
@@ -119,13 +193,17 @@ fn is_dangerous(command: &str) -> bool {
         if blocked.ends_with(' ') {
             lower.starts_with(blocked) || lower == blocked.trim_end()
         } else {
-            lower == blocked || lower.starts_with(&format!("{blocked} ")) || lower.starts_with(&format!("{blocked}\t"))
+            lower == blocked
+                || lower.starts_with(&format!("{blocked} "))
+                || lower.starts_with(&format!("{blocked}\t"))
         }
     })
 }
 
 fn command_starts_with(command: &str, prefix: &str) -> bool {
-    command == prefix || command.starts_with(&format!("{prefix} ")) || command.starts_with(&format!("{prefix}\t"))
+    command == prefix
+        || command.starts_with(&format!("{prefix} "))
+        || command.starts_with(&format!("{prefix}\t"))
 }
 
 #[cfg(test)]

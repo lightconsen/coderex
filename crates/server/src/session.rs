@@ -5,9 +5,9 @@ use futures::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::time::{Duration, Instant};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::{Duration, Instant};
 use tokio::net::{TcpListener, TcpStream};
 use tokio_tungstenite::tungstenite::Message;
 use tracing::{debug, info, warn};
@@ -257,7 +257,8 @@ impl DaemonServer {
 
     /// Authenticate a new session with the given token.
     pub fn authenticate(&mut self, token: &str) -> Result<String, String> {
-        if !self.config.valid_keys.is_empty() && !self.config.valid_keys.iter().any(|k| k == token) {
+        if !self.config.valid_keys.is_empty() && !self.config.valid_keys.iter().any(|k| k == token)
+        {
             return Err("invalid API key".to_string());
         }
         if self.sessions.len() >= self.config.max_sessions {
@@ -351,7 +352,8 @@ impl DaemonServer {
 
     /// Update the atomic session counter (called after sessions change).
     fn sync_session_count(&self) {
-        self.session_count_atomic.store(self.sessions.len(), Ordering::Relaxed);
+        self.session_count_atomic
+            .store(self.sessions.len(), Ordering::Relaxed);
     }
 
     /// Start the WebSocket server and accept connections.
@@ -411,12 +413,7 @@ impl DaemonServer {
         };
 
         // First message must be auth token
-        let auth_msg = match tokio::time::timeout(
-            Duration::from_secs(10),
-            ws.next(),
-        )
-        .await
-        {
+        let auth_msg = match tokio::time::timeout(Duration::from_secs(10), ws.next()).await {
             Ok(Some(Ok(Message::Text(t)))) => t,
             Ok(Some(Ok(other))) => {
                 warn!("expected auth text, got: {other:?}");
@@ -461,9 +458,7 @@ impl DaemonServer {
             Err(e) => {
                 warn!("authentication failed: {e}");
                 let _ = ws
-                    .send(Message::Text(
-                        format!(r#"{{"error":"{e}"}}"#).into(),
-                    ))
+                    .send(Message::Text(format!(r#"{{"error":"{e}"}}"#).into()))
                     .await;
                 return;
             }
@@ -485,7 +480,9 @@ impl DaemonServer {
         let mut limiter = TokenBucket::new(self.config.rate_limit_per_minute, refill_rate);
 
         // Send session-ready event
-        let ready = WsEvent::SessionReady { session_id: session_id.clone() };
+        let ready = WsEvent::SessionReady {
+            session_id: session_id.clone(),
+        };
         let _ = ws
             .send(Message::Text(serde_json::to_string(&ready).unwrap().into()))
             .await;
@@ -562,7 +559,10 @@ impl DaemonServer {
 
         match req.kind {
             WsRequestKind::Query { content } => {
-                debug!("query from session {_session_id}: {}", content.chars().take(80).collect::<String>());
+                debug!(
+                    "query from session {_session_id}: {}",
+                    content.chars().take(80).collect::<String>()
+                );
                 // In production, this routes to QueryEngine.
                 // For now, echo back as a query response to confirm the protocol works.
                 WsResponse {
@@ -572,12 +572,10 @@ impl DaemonServer {
                     },
                 }
             }
-            WsRequestKind::Interrupt => {
-                WsResponse {
-                    id: req.id,
-                    kind: WsResponseKind::QueryDone,
-                }
-            }
+            WsRequestKind::Interrupt => WsResponse {
+                id: req.id,
+                kind: WsResponseKind::QueryDone,
+            },
             WsRequestKind::Ping => WsResponse::pong(&req.id),
         }
     }
@@ -606,7 +604,10 @@ async fn run_health_server(port: u16, session_count: Arc<AtomicUsize>) {
     }
 }
 
-async fn handle_health_request(stream: TcpStream, session_count: Arc<AtomicUsize>) -> std::io::Result<()> {
+async fn handle_health_request(
+    stream: TcpStream,
+    session_count: Arc<AtomicUsize>,
+) -> std::io::Result<()> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     let (mut reader, mut writer) = stream.into_split();

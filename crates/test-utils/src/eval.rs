@@ -22,7 +22,9 @@
 //! # }
 //! ```
 
-use crate::mock_api::{MockApiClient, MockResponseType, mock_response, mock_response_with_tool_calls};
+use crate::mock_api::{
+    MockApiClient, MockResponseType, mock_response, mock_response_with_tool_calls,
+};
 use crate::rig::{StubOkToolExecutor, TestRigBuilder};
 use coderex_core::types::{EngineEvent, ToolCall};
 
@@ -166,10 +168,12 @@ fn check_assertion(
 ) -> AssertionResult {
     match assertion {
         EvalAssertion::ToolCalled { name } => {
-            let found = events.iter().any(|e| matches!(
-                e,
-                EngineEvent::ToolCallStart { name: n, .. } if n == name
-            ));
+            let found = events.iter().any(|e| {
+                matches!(
+                    e,
+                    EngineEvent::ToolCallStart { name: n, .. } if n == name
+                )
+            });
             AssertionResult {
                 assertion: assertion.clone(),
                 passed: found,
@@ -181,10 +185,12 @@ fn check_assertion(
             }
         }
         EvalAssertion::ToolNotCalled { name } => {
-            let found = events.iter().any(|e| matches!(
-                e,
-                EngineEvent::ToolCallStart { name: n, .. } if n == name
-            ));
+            let found = events.iter().any(|e| {
+                matches!(
+                    e,
+                    EngineEvent::ToolCallStart { name: n, .. } if n == name
+                )
+            });
             AssertionResult {
                 assertion: assertion.clone(),
                 passed: !found,
@@ -251,7 +257,10 @@ fn check_assertion(
                 })
                 .collect();
 
-            let passed = types.is_empty() || event_types.windows(types.len()).any(|w| w == types.as_slice());
+            let passed = types.is_empty()
+                || event_types
+                    .windows(types.len())
+                    .any(|w| w == types.as_slice());
             AssertionResult {
                 assertion: assertion.clone(),
                 passed,
@@ -263,7 +272,10 @@ fn check_assertion(
             }
         }
         EvalAssertion::TerminalReason { reason: expected } => {
-            let actual = reason.as_ref().map(|r| r.to_string()).unwrap_or_else(|e| format!("error: {e}"));
+            let actual = reason
+                .as_ref()
+                .map(|r| r.to_string())
+                .unwrap_or_else(|e| format!("error: {e}"));
             let passed = actual == *expected;
             AssertionResult {
                 assertion: assertion.clone(),
@@ -329,7 +341,11 @@ mod tests {
             ]
         );
 
-        assert!(result.passed, "eval should pass: {:?}", result.assertion_results);
+        assert!(
+            result.passed,
+            "eval should pass: {:?}",
+            result.assertion_results
+        );
     }
 
     #[tokio::test]
@@ -342,7 +358,11 @@ mod tests {
             ]
         );
 
-        assert!(result.passed, "eval should pass: {:?}", result.assertion_results);
+        assert!(
+            result.passed,
+            "eval should pass: {:?}",
+            result.assertion_results
+        );
     }
 
     #[tokio::test]
@@ -358,6 +378,10 @@ mod tests {
             ]
         );
 
-        assert!(result.passed, "eval should pass: {:?}", result.assertion_results);
+        assert!(
+            result.passed,
+            "eval should pass: {:?}",
+            result.assertion_results
+        );
     }
 }

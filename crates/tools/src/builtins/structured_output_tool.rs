@@ -37,15 +37,23 @@ impl Tool for StructuredOutputTool {
         }
     }
 
-    async fn execute(&self, input: ToolInput, _ctx: ToolContext<'_>) -> Result<ToolOutput, ToolError> {
-        let schema = input.arguments.get("json_schema").ok_or_else(|| ToolError::InvalidInput {
-            message: "missing required field: json_schema".into(),
-        })?;
+    async fn execute(
+        &self,
+        input: ToolInput,
+        _ctx: ToolContext<'_>,
+    ) -> Result<ToolOutput, ToolError> {
+        let schema = input
+            .arguments
+            .get("json_schema")
+            .ok_or_else(|| ToolError::InvalidInput {
+                message: "missing required field: json_schema".into(),
+            })?;
         let output_str = extract_string(&input.arguments, "output")?;
 
-        let value: serde_json::Value = serde_json::from_str(&output_str).map_err(|e| ToolError::InvalidInput {
-            message: format!("output is not valid JSON: {e}"),
-        })?;
+        let value: serde_json::Value =
+            serde_json::from_str(&output_str).map_err(|e| ToolError::InvalidInput {
+                message: format!("output is not valid JSON: {e}"),
+            })?;
 
         let result = jsonschema_validation(schema, &value);
 
@@ -68,7 +76,10 @@ struct ValidationResult {
 }
 
 /// Basic JSON schema validation (supports type, required, properties, items, enum).
-fn jsonschema_validation(schema: &serde_json::Value, value: &serde_json::Value) -> ValidationResult {
+fn jsonschema_validation(
+    schema: &serde_json::Value,
+    value: &serde_json::Value,
+) -> ValidationResult {
     validate_node(schema, value, &"$".to_string())
 }
 
@@ -78,7 +89,10 @@ fn validate_node(
     path: &str,
 ) -> ValidationResult {
     let Some(obj) = schema.as_object() else {
-        return ValidationResult { is_valid: true, error: String::new() };
+        return ValidationResult {
+            is_valid: true,
+            error: String::new(),
+        };
     };
 
     // Type check
@@ -164,7 +178,10 @@ fn validate_node(
         }
     }
 
-    ValidationResult { is_valid: true, error: String::new() }
+    ValidationResult {
+        is_valid: true,
+        error: String::new(),
+    }
 }
 
 fn extract_string(args: &serde_json::Value, key: &str) -> Result<String, ToolError> {
@@ -179,8 +196,8 @@ fn extract_string(args: &serde_json::Value, key: &str) -> Result<String, ToolErr
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tool::ToolContext;
     use crate::context::ExecutionContext;
+    use crate::tool::ToolContext;
     use std::collections::HashMap;
     use std::path::Path;
     use std::sync::Arc;

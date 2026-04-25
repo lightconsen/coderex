@@ -161,16 +161,9 @@ impl ToolRegistry {
             .iter()
             .map(|(k, v)| (k.clone(), Arc::clone(v)))
             .collect();
-        tools.extend(
-            self.gated
-                .iter()
-                .map(|(k, v)| (k.clone(), Arc::clone(v))),
-        );
+        tools.extend(self.gated.iter().map(|(k, v)| (k.clone(), Arc::clone(v))));
         let mcp = self.dynamic_mcp.read();
-        tools.extend(
-            mcp.iter()
-                .map(|(k, v)| (k.clone(), Arc::clone(v))),
-        );
+        tools.extend(mcp.iter().map(|(k, v)| (k.clone(), Arc::clone(v))));
         tools
     }
 
@@ -178,7 +171,11 @@ impl ToolRegistry {
     ///
     /// Applies tier filtering, context allowlists, and deny rules.
     #[allow(clippy::significant_drop_tightening)]
-    pub fn available_tool_names(&self, context: ExecutionContext, feature_flags_enabled: bool) -> Vec<String> {
+    pub fn available_tool_names(
+        &self,
+        context: ExecutionContext,
+        feature_flags_enabled: bool,
+    ) -> Vec<String> {
         let mcp = self.dynamic_mcp.read();
         let mut names: Vec<String> = self
             .baseline

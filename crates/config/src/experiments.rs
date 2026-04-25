@@ -1,8 +1,8 @@
 //! Remote experiment configuration sources.
 
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
-use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 /// Trait for remote experiment configuration sources.
@@ -123,9 +123,8 @@ impl<S: ExperimentSource + 'static> ExperimentSource for CachedExperimentSource<
     async fn fetch_experiments(&self) -> Result<HashMap<String, bool>, ExperimentError> {
         if self.is_fresh() {
             // Return cached data
-            let content = std::fs::read_to_string(&self.cache_path).map_err(|e| {
-                ExperimentError::Cache(std::io::Error::other(e))
-            })?;
+            let content = std::fs::read_to_string(&self.cache_path)
+                .map_err(|e| ExperimentError::Cache(std::io::Error::other(e)))?;
             let cached: CachedData = serde_json::from_str(&content).map_err(|e| {
                 ExperimentError::Cache(std::io::Error::new(std::io::ErrorKind::InvalidData, e))
             })?;
@@ -177,7 +176,7 @@ pub enum ExperimentError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use wiremock::{matchers::method, Mock, MockServer, ResponseTemplate};
+    use wiremock::{Mock, MockServer, ResponseTemplate, matchers::method};
 
     fn test_client() -> reqwest::Client {
         // Disable env proxy so tests against a local MockServer aren't routed
@@ -228,7 +227,10 @@ mod tests {
 
         assert!(result.is_err());
         let err = result.unwrap_err();
-        assert!(matches!(err, ExperimentError::HttpError { status: 500, .. }));
+        assert!(matches!(
+            err,
+            ExperimentError::HttpError { status: 500, .. }
+        ));
     }
 
     #[tokio::test]
@@ -261,7 +263,11 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let cache_path = tmp.path().join("experiments.json");
         let http = HttpExperimentSource::with_client(server.uri(), test_client());
-        let cached = CachedExperimentSource::new(http, cache_path.clone(), std::time::Duration::from_secs(60));
+        let cached = CachedExperimentSource::new(
+            http,
+            cache_path.clone(),
+            std::time::Duration::from_secs(60),
+        );
 
         // First fetch hits HTTP
         let result1 = cached.fetch_experiments().await.unwrap();

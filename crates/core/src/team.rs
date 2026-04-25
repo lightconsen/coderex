@@ -233,17 +233,13 @@ impl TeamManager {
         team.is_deleted = true;
         team.members.clear();
 
-        self.teams.remove(team_id).ok_or_else(|| {
-            TeamError::NotFound(team_id.to_string())
-        })
+        self.teams
+            .remove(team_id)
+            .ok_or_else(|| TeamError::NotFound(team_id.to_string()))
     }
 
     /// Add a member to a team.
-    pub fn add_member(
-        &mut self,
-        team_id: &str,
-        member: TeamMember,
-    ) -> Result<(), TeamError> {
+    pub fn add_member(&mut self, team_id: &str, member: TeamMember) -> Result<(), TeamError> {
         let team = self
             .teams
             .get_mut(team_id)
@@ -258,11 +254,7 @@ impl TeamManager {
     }
 
     /// Remove a member from a team.
-    pub fn remove_member(
-        &mut self,
-        team_id: &str,
-        member_id: &str,
-    ) -> Result<(), TeamError> {
+    pub fn remove_member(&mut self, team_id: &str, member_id: &str) -> Result<(), TeamError> {
         let team = self
             .teams
             .get_mut(team_id)
@@ -281,11 +273,7 @@ impl TeamManager {
     }
 
     /// Add a task to a team's shared view.
-    pub fn add_shared_task(
-        &mut self,
-        team_id: &str,
-        task: SharedTask,
-    ) -> Result<(), TeamError> {
+    pub fn add_shared_task(&mut self, team_id: &str, task: SharedTask) -> Result<(), TeamError> {
         let team = self
             .teams
             .get_mut(team_id)

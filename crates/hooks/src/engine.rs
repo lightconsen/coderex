@@ -208,7 +208,8 @@ impl HookRegistry {
     #[must_use]
     pub fn matches_for_event(&self, event: &HookEvent) -> Vec<&HookConfig> {
         let event_name = event_name_str(*event);
-        let mut hooks: Vec<_> = self.hooks
+        let mut hooks: Vec<_> = self
+            .hooks
             .iter()
             .filter(|h| h.event == event_name || h.event == "*")
             .collect();
@@ -218,7 +219,8 @@ impl HookRegistry {
 
     /// Find hooks matching the given event name string, sorted by priority (highest first).
     fn matches_for_event_name(&self, event_name: &str) -> Vec<&HookConfig> {
-        let mut hooks: Vec<_> = self.hooks
+        let mut hooks: Vec<_> = self
+            .hooks
             .iter()
             .filter(|h| h.event == event_name || h.event == "*")
             .collect();
@@ -267,7 +269,8 @@ impl HookRegistry {
         for hook in matching {
             let hook = hook.clone();
             let input = input.clone();
-            let handle = tokio::spawn(async move { execute_hook_with_timeout(&hook, &input).await });
+            let handle =
+                tokio::spawn(async move { execute_hook_with_timeout(&hook, &input).await });
             handles.push(handle);
         }
         let mut results = Vec::new();
@@ -563,10 +566,7 @@ const fn event_name_str(event: HookEvent) -> &'static str {
 
 /// Helper to spawn a hook process (exposed for testing).
 #[cfg(test)]
-pub fn spawn_hook_process(
-    command: &str,
-    _input: &str,
-) -> std::process::Child {
+pub fn spawn_hook_process(command: &str, _input: &str) -> std::process::Child {
     use std::process::{Command as StdCommand, Stdio};
     StdCommand::new("sh")
         .arg("-c")
@@ -607,7 +607,11 @@ mod tests {
     #[test]
     fn hook_registry_starts_empty() {
         let registry = HookRegistry::new();
-        assert!(registry.matches_for_event(&HookEvent::SessionStart).is_empty());
+        assert!(
+            registry
+                .matches_for_event(&HookEvent::SessionStart)
+                .is_empty()
+        );
     }
 
     #[test]
@@ -649,7 +653,10 @@ mod tests {
             max_file_size_mb: None,
         });
 
-        assert_eq!(registry.matches_for_event(&HookEvent::SessionStart).len(), 1);
+        assert_eq!(
+            registry.matches_for_event(&HookEvent::SessionStart).len(),
+            1
+        );
         assert_eq!(registry.matches_for_event(&HookEvent::Stop).len(), 1);
     }
 
@@ -672,7 +679,11 @@ mod tests {
     #[test]
     fn load_from_settings_null_returns_empty() {
         let registry = HookRegistry::load_from_settings(&serde_json::Value::Null).unwrap();
-        assert!(registry.matches_for_event(&HookEvent::SessionStart).is_empty());
+        assert!(
+            registry
+                .matches_for_event(&HookEvent::SessionStart)
+                .is_empty()
+        );
     }
 
     #[test]

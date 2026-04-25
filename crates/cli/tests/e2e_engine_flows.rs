@@ -20,7 +20,9 @@ async fn engine_completes_simple_prompt() {
 
     let events = rig.drain_events();
     assert!(
-        events.iter().any(|e| matches!(e, EngineEvent::TextDelta { .. })),
+        events
+            .iter()
+            .any(|e| matches!(e, EngineEvent::TextDelta { .. })),
         "expected at least one text delta, got: {events:?}"
     );
 }
@@ -36,9 +38,7 @@ async fn engine_handles_tool_call() {
                 input: serde_json::json!({"path": "hello.txt"}),
             }],
         )),
-        MockResponseType::Static(mock_response(
-            "Done reading the file.",
-        )),
+        MockResponseType::Static(mock_response("Done reading the file.")),
     ]);
 
     let mut rig = TestRigBuilder::new()
@@ -52,22 +52,22 @@ async fn engine_handles_tool_call() {
 
     let events = rig.drain_events();
     assert!(
-        events.iter().any(|e| matches!(e, EngineEvent::ToolCallStart { .. })),
+        events
+            .iter()
+            .any(|e| matches!(e, EngineEvent::ToolCallStart { .. })),
         "expected ToolCallStart"
     );
     assert!(
-        events.iter().any(|e| matches!(e, EngineEvent::ToolCallEnd { .. })),
+        events
+            .iter()
+            .any(|e| matches!(e, EngineEvent::ToolCallEnd { .. })),
         "expected ToolCallEnd"
     );
 }
 
 #[tokio::test]
 async fn engine_tracks_api_calls() {
-    let api = MockApiClient::with_mixed(vec![
-        MockResponseType::Static(mock_response(
-            "Hello.",
-        )),
-    ]);
+    let api = MockApiClient::with_mixed(vec![MockResponseType::Static(mock_response("Hello."))]);
 
     let api_clone = api.clone();
     let mut rig = TestRigBuilder::new()
@@ -92,9 +92,7 @@ async fn tool_result_contains_stub_output() {
                 input: serde_json::json!({"path": "test.txt"}),
             }],
         )),
-        MockResponseType::Static(mock_response(
-            "All done.",
-        )),
+        MockResponseType::Static(mock_response("All done.")),
     ]);
 
     let mut rig = TestRigBuilder::new()

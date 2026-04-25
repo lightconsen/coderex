@@ -29,7 +29,11 @@ async fn read_tool_reads_file() {
         ))
         .await;
     assert!(reason.is_ok(), "submit failed: {:?}", reason);
-    assert_eq!(reason.unwrap(), TerminalReason::Completed, "expected Completed");
+    assert_eq!(
+        reason.unwrap(),
+        TerminalReason::Completed,
+        "expected Completed"
+    );
 
     let events = rig.collect_events().await;
 

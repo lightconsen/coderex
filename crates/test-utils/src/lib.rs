@@ -6,13 +6,16 @@
 
 #![warn(missing_docs)]
 
+pub mod eval;
+pub mod mock_api;
 pub mod rig;
 pub mod snapshot;
 pub mod wire_client;
-pub mod mock_api;
-pub mod eval;
 
-pub use rig::{TestRig, TestRigBuilder, StubOkToolExecutor};
+pub use eval::{AssertionResult, EvalAssertion, EvalResult, EvalScenario, EventType, run_eval};
+pub use mock_api::{
+    MockApiClient, MockResponseType, mock_response, mock_response_with_tool_calls,
+    mock_streaming_response,
+};
+pub use rig::{StubOkToolExecutor, TestRig, TestRigBuilder};
 pub use wire_client::{WireTestClient, WireTestClientBuilder};
-pub use mock_api::{MockApiClient, MockResponseType, mock_response, mock_response_with_tool_calls, mock_streaming_response};
-pub use eval::{EvalScenario, EvalAssertion, EvalResult, AssertionResult, EventType, run_eval};

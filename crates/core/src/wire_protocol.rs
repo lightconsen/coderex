@@ -211,7 +211,10 @@ impl From<UsageSummary> for WireEvent {
 pub fn encode_event(event: &WireEvent) -> String {
     match serde_json::to_string(event) {
         Ok(json) => format!("{json}\n"),
-        Err(e) => format!("{{\"type\":\"error\",\"message\":{}}}\n", serde_json::json!(e.to_string())),
+        Err(e) => format!(
+            "{{\"type\":\"error\",\"message\":{}}}\n",
+            serde_json::json!(e.to_string())
+        ),
     }
 }
 
@@ -220,7 +223,10 @@ pub fn encode_event(event: &WireEvent) -> String {
 pub fn encode_request(req: &WireRequest) -> String {
     match serde_json::to_string(req) {
         Ok(json) => format!("{json}\n"),
-        Err(e) => format!("{{\"type\":\"error\",\"message\":{}}}\n", serde_json::json!(e.to_string())),
+        Err(e) => format!(
+            "{{\"type\":\"error\",\"message\":{}}}\n",
+            serde_json::json!(e.to_string())
+        ),
     }
 }
 

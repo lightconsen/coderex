@@ -8,11 +8,9 @@
 
 use std::collections::HashMap;
 
-use coderex_hooks::{
-    HookAction, HookConfig, HookInput, HookRegistry,
-};
-use coderex_hooks::events::HookEvent;
 use coderex_core::hook_executor::HookExecutor;
+use coderex_hooks::events::HookEvent;
+use coderex_hooks::{HookAction, HookConfig, HookInput, HookRegistry};
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
@@ -66,7 +64,9 @@ async fn hook_sessionstart_fires_and_returns_continue() {
     let mut registry = HookRegistry::new();
     registry.register(config("SessionStart", r#"echo '{"action":"continue"}'"#));
 
-    let results = registry.execute_sync(&HookEvent::SessionStart, &input("SessionStart")).await;
+    let results = registry
+        .execute_sync(&HookEvent::SessionStart, &input("SessionStart"))
+        .await;
     assert_eq!(results.len(), 1);
 
     let result = results[0].as_ref().unwrap();
@@ -83,7 +83,9 @@ async fn hook_sessionstart_receives_input_on_stdin() {
         r#"python3 -c "import sys; line=sys.stdin.read(); print('{\"action\":\"continue\", \"additional_context\": \"' + line[:20] + '\"}')" 2>/dev/null || python -c "import sys; line=sys.stdin.read(); print('{\"action\":\"continue\", \"additional_context\": \"' + line[:20] + '\"}')""#,
     ));
 
-    let results = registry.execute_sync(&HookEvent::SessionStart, &input("SessionStart")).await;
+    let results = registry
+        .execute_sync(&HookEvent::SessionStart, &input("SessionStart"))
+        .await;
     let result = results[0].as_ref().unwrap();
     assert!(matches!(result.hook_result.action, HookAction::Continue));
     // The hook should have received the JSON input on stdin (starts with {"event":)
@@ -102,9 +104,14 @@ async fn hook_userpromptsubmit_can_modify_input() {
         r#"echo '{"action":"continue", "updated_input": "modified prompt"}'"#,
     ));
 
-    let results = registry.execute_sync(&HookEvent::UserPromptSubmit, &input("UserPromptSubmit")).await;
+    let results = registry
+        .execute_sync(&HookEvent::UserPromptSubmit, &input("UserPromptSubmit"))
+        .await;
     let result = results[0].as_ref().unwrap();
-    assert_eq!(result.hook_result.updated_input, Some("modified prompt".to_string()));
+    assert_eq!(
+        result.hook_result.updated_input,
+        Some("modified prompt".to_string())
+    );
 }
 
 #[tokio::test]
@@ -115,7 +122,9 @@ async fn hook_userpromptsubmit_stop_prevents_processing() {
         r#"echo '{"action":"stop", "suppress_output": true}'"#,
     ));
 
-    let results = registry.execute_sync(&HookEvent::UserPromptSubmit, &input("UserPromptSubmit")).await;
+    let results = registry
+        .execute_sync(&HookEvent::UserPromptSubmit, &input("UserPromptSubmit"))
+        .await;
     let result = results[0].as_ref().unwrap();
     assert!(matches!(result.hook_result.action, HookAction::Stop));
     assert!(result.hook_result.suppress_output);
@@ -128,12 +137,11 @@ async fn hook_userpromptsubmit_stop_prevents_processing() {
 #[tokio::test]
 async fn hook_pretooluse_can_stop_tool_execution() {
     let mut registry = HookRegistry::new();
-    registry.register(config(
-        "PreToolUse",
-        r#"echo '{"action":"stop"}'"#,
-    ));
+    registry.register(config("PreToolUse", r#"echo '{"action":"stop"}'"#));
 
-    let results = registry.execute_sync(&HookEvent::PreToolUse, &input("PreToolUse")).await;
+    let results = registry
+        .execute_sync(&HookEvent::PreToolUse, &input("PreToolUse"))
+        .await;
     let result = results[0].as_ref().unwrap();
     assert!(matches!(result.hook_result.action, HookAction::Stop));
 }
@@ -146,7 +154,9 @@ async fn hook_pretooluse_continue_allows_tool_execution() {
         r#"echo '{"action":"continue", "watch_paths": ["/src", "/tests"]}'"#,
     ));
 
-    let results = registry.execute_sync(&HookEvent::PreToolUse, &input("PreToolUse")).await;
+    let results = registry
+        .execute_sync(&HookEvent::PreToolUse, &input("PreToolUse"))
+        .await;
     let result = results[0].as_ref().unwrap();
     assert!(matches!(result.hook_result.action, HookAction::Continue));
     assert_eq!(result.hook_result.watch_paths, vec!["/src", "/tests"]);
@@ -164,10 +174,15 @@ async fn hook_posttooluse_fires_after_success() {
         r#"echo '{"action":"continue", "additional_context": "tool succeeded"}'"#,
     ));
 
-    let results = registry.execute_sync(&HookEvent::PostToolUse, &input("PostToolUse")).await;
+    let results = registry
+        .execute_sync(&HookEvent::PostToolUse, &input("PostToolUse"))
+        .await;
     let result = results[0].as_ref().unwrap();
     assert!(matches!(result.hook_result.action, HookAction::Continue));
-    assert_eq!(result.hook_result.additional_context, Some("tool succeeded".to_string()));
+    assert_eq!(
+        result.hook_result.additional_context,
+        Some("tool succeeded".to_string())
+    );
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -182,10 +197,15 @@ async fn hook_posttoolusefailure_fires_after_failure() {
         r#"echo '{"action":"continue", "additional_context": "tool failed, retrying"}'"#,
     ));
 
-    let results = registry.execute_sync(&HookEvent::PostToolUseFailure, &input("PostToolUseFailure")).await;
+    let results = registry
+        .execute_sync(&HookEvent::PostToolUseFailure, &input("PostToolUseFailure"))
+        .await;
     let result = results[0].as_ref().unwrap();
     assert!(matches!(result.hook_result.action, HookAction::Continue));
-    assert_eq!(result.hook_result.additional_context, Some("tool failed, retrying".to_string()));
+    assert_eq!(
+        result.hook_result.additional_context,
+        Some("tool failed, retrying".to_string())
+    );
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -200,7 +220,9 @@ async fn hook_stop_fires_on_stop_request() {
         r#"echo '{"action":"continue", "suppress_output": true}'"#,
     ));
 
-    let results = registry.execute_sync(&HookEvent::Stop, &input("Stop")).await;
+    let results = registry
+        .execute_sync(&HookEvent::Stop, &input("Stop"))
+        .await;
     let result = results[0].as_ref().unwrap();
     assert!(matches!(result.hook_result.action, HookAction::Continue));
     assert!(result.hook_result.suppress_output);
@@ -218,7 +240,9 @@ async fn hook_precompact_fires_before_compaction() {
         r#"echo '{"action":"continue", "additional_context": "compact starting"}'"#,
     ));
 
-    let results = registry.execute_sync(&HookEvent::PreCompact, &input("PreCompact")).await;
+    let results = registry
+        .execute_sync(&HookEvent::PreCompact, &input("PreCompact"))
+        .await;
     let result = results[0].as_ref().unwrap();
     assert!(matches!(result.hook_result.action, HookAction::Continue));
 }
@@ -235,7 +259,9 @@ async fn hook_postcompact_fires_after_compaction() {
         r#"echo '{"action":"continue", "additional_context": "compact complete"}'"#,
     ));
 
-    let results = registry.execute_sync(&HookEvent::PostCompact, &input("PostCompact")).await;
+    let results = registry
+        .execute_sync(&HookEvent::PostCompact, &input("PostCompact"))
+        .await;
     let result = results[0].as_ref().unwrap();
     assert!(matches!(result.hook_result.action, HookAction::Continue));
 }
@@ -252,7 +278,9 @@ async fn hook_cwdchanged_fires_on_directory_change() {
         r#"echo '{"action":"continue", "watch_paths": [".coderex"]}'"#,
     ));
 
-    let results = registry.execute_sync(&HookEvent::CwdChanged, &input("CwdChanged")).await;
+    let results = registry
+        .execute_sync(&HookEvent::CwdChanged, &input("CwdChanged"))
+        .await;
     let result = results[0].as_ref().unwrap();
     assert!(matches!(result.hook_result.action, HookAction::Continue));
     assert!(!result.hook_result.watch_paths.is_empty());
@@ -278,10 +306,7 @@ async fn hook_wildcard_matches_all_events() {
         HookEvent::CwdChanged,
     ] {
         let results = registry.execute_sync(&event, &input("test")).await;
-        assert!(
-            !results.is_empty(),
-            "wildcard hook should match {event:?}"
-        );
+        assert!(!results.is_empty(), "wildcard hook should match {event:?}");
     }
 }
 
@@ -290,14 +315,22 @@ async fn hook_priority_runs_highest_first() {
     let mut registry = HookRegistry::new();
     registry.register(HookConfig {
         priority: 1,
-        ..config("PreToolUse", r#"echo '{"action":"continue", "updated_input": "high"}'"#)
+        ..config(
+            "PreToolUse",
+            r#"echo '{"action":"continue", "updated_input": "high"}'"#,
+        )
     });
     registry.register(HookConfig {
         priority: 0,
-        ..config("PreToolUse", r#"echo '{"action":"continue", "updated_input": "low"}'"#)
+        ..config(
+            "PreToolUse",
+            r#"echo '{"action":"continue", "updated_input": "low"}'"#,
+        )
     });
 
-    let results = registry.execute_sync(&HookEvent::PreToolUse, &input("PreToolUse")).await;
+    let results = registry
+        .execute_sync(&HookEvent::PreToolUse, &input("PreToolUse"))
+        .await;
     assert_eq!(results.len(), 2);
     // Highest priority runs first
     assert_eq!(
@@ -318,12 +351,11 @@ async fn hook_timeout_kills_long_running_hook() {
         ..config("Stop", "sleep 10")
     });
 
-    let results = registry.execute_sync(&HookEvent::Stop, &input("Stop")).await;
+    let results = registry
+        .execute_sync(&HookEvent::Stop, &input("Stop"))
+        .await;
     assert_eq!(results.len(), 1);
-    assert!(
-        results[0].is_err(),
-        "long-running hook should time out"
-    );
+    assert!(results[0].is_err(), "long-running hook should time out");
 }
 
 #[tokio::test]
@@ -338,7 +370,9 @@ async fn hook_async_execution_runs_concurrently() {
         r#"echo '{"action":"continue", "additional_context": "async2"}'"#,
     ));
 
-    let results = registry.execute_async(&HookEvent::SessionStart, &input("SessionStart")).await;
+    let results = registry
+        .execute_async(&HookEvent::SessionStart, &input("SessionStart"))
+        .await;
     assert_eq!(results.len(), 2);
     let contexts: Vec<_> = results
         .iter()
@@ -356,10 +390,7 @@ async fn hook_fire_hook_trait_impl_combines_results() {
         "UserPromptSubmit",
         r#"echo '{"action":"continue", "updated_input": "first"}'"#,
     ));
-    registry.register(config(
-        "UserPromptSubmit",
-        r#"echo '{"action":"stop"}'"#,
-    ));
+    registry.register(config("UserPromptSubmit", r#"echo '{"action":"stop"}'"#));
 
     let mut context = HashMap::new();
     context.insert("session_id".to_string(), "sess_123".to_string());
@@ -409,7 +440,11 @@ fn hook_load_from_settings_parses_hooks_array() {
 #[test]
 fn hook_load_from_settings_null_returns_empty() {
     let registry = HookRegistry::load_from_settings(&serde_json::Value::Null).unwrap();
-    assert!(registry.matches_for_event(&HookEvent::SessionStart).is_empty());
+    assert!(
+        registry
+            .matches_for_event(&HookEvent::SessionStart)
+            .is_empty()
+    );
 }
 
 #[tokio::test]
@@ -420,7 +455,9 @@ async fn hook_dry_run_suppresses_stop_action() {
         ..config("PreToolUse", r#"echo '{"action":"stop"}'"#)
     });
 
-    let results = registry.execute_sync(&HookEvent::PreToolUse, &input("PreToolUse")).await;
+    let results = registry
+        .execute_sync(&HookEvent::PreToolUse, &input("PreToolUse"))
+        .await;
     let result = results[0].as_ref().unwrap();
     // In dry-run mode, stop is converted to continue
     assert!(matches!(result.hook_result.action, HookAction::Continue));
@@ -438,15 +475,22 @@ async fn hook_env_variables_are_injected() {
         env,
     ));
 
-    let results = registry.execute_sync(&HookEvent::SessionStart, &input("SessionStart")).await;
+    let results = registry
+        .execute_sync(&HookEvent::SessionStart, &input("SessionStart"))
+        .await;
     let result = results[0].as_ref().unwrap();
-    assert_eq!(result.hook_result.additional_context, Some("custom_value".to_string()));
+    assert_eq!(
+        result.hook_result.additional_context,
+        Some("custom_value".to_string())
+    );
 }
 
 #[tokio::test]
 async fn hook_no_match_returns_empty_results() {
     let registry = HookRegistry::new();
-    let results = registry.execute_sync(&HookEvent::SessionStart, &input("SessionStart")).await;
+    let results = registry
+        .execute_sync(&HookEvent::SessionStart, &input("SessionStart"))
+        .await;
     assert!(results.is_empty(), "no hooks registered = no results");
 }
 
@@ -458,7 +502,9 @@ async fn hook_permission_decision_parsed_from_output() {
         r#"echo '{"action":"continue", "permission_decision": {"allow": true, "allow_for_path": "/tmp", "reason": "safe path"}}'"#,
     ));
 
-    let results = registry.execute_sync(&HookEvent::PermissionRequest, &input("PermissionRequest")).await;
+    let results = registry
+        .execute_sync(&HookEvent::PermissionRequest, &input("PermissionRequest"))
+        .await;
     let result = results[0].as_ref().unwrap();
     let decision = result.hook_result.permission_decision.as_ref().unwrap();
     assert!(decision.allow);
@@ -469,12 +515,11 @@ async fn hook_permission_decision_parsed_from_output() {
 #[tokio::test]
 async fn hook_nonzero_exit_continues_by_default() {
     let mut registry = HookRegistry::new();
-    registry.register(config(
-        "SessionStart",
-        "exit 1",
-    ));
+    registry.register(config("SessionStart", "exit 1"));
 
-    let results = registry.execute_sync(&HookEvent::SessionStart, &input("SessionStart")).await;
+    let results = registry
+        .execute_sync(&HookEvent::SessionStart, &input("SessionStart"))
+        .await;
     let result = results[0].as_ref().unwrap();
     // Non-zero exit with no stdout should default to Continue
     assert!(matches!(result.hook_result.action, HookAction::Continue));
@@ -484,12 +529,11 @@ async fn hook_nonzero_exit_continues_by_default() {
 #[tokio::test]
 async fn hook_empty_stdout_continues_by_default() {
     let mut registry = HookRegistry::new();
-    registry.register(config(
-        "SessionStart",
-        "echo -n",
-    ));
+    registry.register(config("SessionStart", "echo -n"));
 
-    let results = registry.execute_sync(&HookEvent::SessionStart, &input("SessionStart")).await;
+    let results = registry
+        .execute_sync(&HookEvent::SessionStart, &input("SessionStart"))
+        .await;
     let result = results[0].as_ref().unwrap();
     assert!(matches!(result.hook_result.action, HookAction::Continue));
 }

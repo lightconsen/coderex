@@ -5,11 +5,11 @@
 //! - In-process transport for MCP and SDK control channels
 //! - Mock transport for testing
 
-use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use thiserror::Error;
 use tokio::sync::mpsc;
 use tokio::time::Duration;
-use thiserror::Error;
 
 /// Errors from transport operations.
 #[derive(Debug, Error)]
@@ -119,10 +119,7 @@ impl InProcessTransport {
     ///
     /// Returns two transports that can communicate with each other
     /// via in-process channels.
-    pub fn create_pair(
-        id_a: String,
-        id_b: String,
-    ) -> (Self, Self) {
+    pub fn create_pair(id_a: String, id_b: String) -> (Self, Self) {
         let (tx_a, rx_a) = mpsc::unbounded_channel::<TransportMessage>();
         let (tx_b, rx_b) = mpsc::unbounded_channel::<TransportMessage>();
 
@@ -263,10 +260,7 @@ mod tests {
 
     #[tokio::test]
     async fn in_process_transport_create_pair() {
-        let (mut a, mut b) = InProcessTransport::create_pair(
-            "client_a".into(),
-            "client_b".into(),
-        );
+        let (mut a, mut b) = InProcessTransport::create_pair("client_a".into(), "client_b".into());
 
         a.connect().await.unwrap();
         b.connect().await.unwrap();
@@ -277,10 +271,7 @@ mod tests {
 
     #[tokio::test]
     async fn in_process_transport_send_receive() {
-        let (mut a, mut b) = InProcessTransport::create_pair(
-            "sender".into(),
-            "receiver".into(),
-        );
+        let (mut a, mut b) = InProcessTransport::create_pair("sender".into(), "receiver".into());
 
         a.connect().await.unwrap();
         b.connect().await.unwrap();
@@ -302,10 +293,7 @@ mod tests {
 
     #[tokio::test]
     async fn in_process_transport_disconnect() {
-        let (mut transport, _) = InProcessTransport::create_pair(
-            "temp".into(),
-            "peer".into(),
-        );
+        let (mut transport, _) = InProcessTransport::create_pair("temp".into(), "peer".into());
 
         transport.connect().await.unwrap();
         assert!(transport.is_connected());
@@ -351,9 +339,7 @@ mod tests {
             r#type: "heartbeat".into(),
             correlation_id: None,
             payload: r#"{"status": "ok"}"#.into(),
-            metadata: HashMap::from([
-                ("source".into(), "bridge".into()),
-            ]),
+            metadata: HashMap::from([("source".into(), "bridge".into())]),
         };
         assert_eq!(msg.r#type, "heartbeat");
         assert!(msg.metadata.contains_key("source"));
@@ -374,10 +360,7 @@ mod tests {
 
     #[tokio::test]
     async fn receive_timeout_returns_message_when_available() {
-        let (mut a, mut b) = InProcessTransport::create_pair(
-            "sender".into(),
-            "receiver".into(),
-        );
+        let (mut a, mut b) = InProcessTransport::create_pair("sender".into(), "receiver".into());
         a.connect().await.unwrap();
         b.connect().await.unwrap();
 
@@ -395,10 +378,7 @@ mod tests {
 
     #[tokio::test]
     async fn receive_timeout_returns_error_on_expiry() {
-        let (mut a, mut b) = InProcessTransport::create_pair(
-            "a".into(),
-            "b".into(),
-        );
+        let (mut a, mut b) = InProcessTransport::create_pair("a".into(), "b".into());
         a.connect().await.unwrap();
         b.connect().await.unwrap();
 
@@ -409,7 +389,9 @@ mod tests {
         });
 
         let result = a.receive_timeout(Duration::from_millis(50)).await;
-        assert!(matches!(result, Err(TransportError::ReceiveFailed(msg)) if msg.contains("timed out")));
+        assert!(
+            matches!(result, Err(TransportError::ReceiveFailed(msg)) if msg.contains("timed out"))
+        );
 
         handle.abort();
     }
@@ -426,10 +408,7 @@ mod tests {
 
     #[tokio::test]
     async fn bidirectional_communication() {
-        let (mut a, mut b) = InProcessTransport::create_pair(
-            "alice".into(),
-            "bob".into(),
-        );
+        let (mut a, mut b) = InProcessTransport::create_pair("alice".into(), "bob".into());
 
         a.connect().await.unwrap();
         b.connect().await.unwrap();

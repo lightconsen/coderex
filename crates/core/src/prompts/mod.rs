@@ -22,21 +22,28 @@ pub mod features {
     pub mod session_title;
 }
 
-pub use features::agent_generation::{generate_agent, generate_agent_prompt, AgentSpec};
-pub use features::agent_summary::{generate_away_summary, generate_team_status, summarize_agent_activity};
-pub use features::compact_summary::{generate_compact_summary, generate_compact_summary_from_messages};
-pub use features::magic_docs::{generate_codebase_overview, generate_docs_for_code, generate_readme};
+pub use features::agent_generation::{AgentSpec, generate_agent, generate_agent_prompt};
+pub use features::agent_summary::{
+    generate_away_summary, generate_team_status, summarize_agent_activity,
+};
+pub use features::compact_summary::{
+    generate_compact_summary, generate_compact_summary_from_messages,
+};
+pub use features::magic_docs::{
+    generate_codebase_overview, generate_docs_for_code, generate_readme,
+};
 pub use features::memory_extraction::{extract_memories, extract_single_memory};
 pub use features::permission_explainer::{explain_permission, explain_permission_from_value};
 pub use features::prompt_suggestion::{suggest_next_action, suggest_prompts};
 pub use features::session_memory::{create_session_memory, update_session_memory};
-pub use features::session_title::{generate_session_title, generate_session_title_from_messages, parse_title};
+pub use features::session_title::{
+    generate_session_title, generate_session_title_from_messages, parse_title,
+};
 
 // ─── Session Title ──────────────────────────────────────────────────────────
 
 /// System prompt for generating a session title.
-pub const SESSION_TITLE_SYSTEM: &str =
-    "Generate a concise 3-7 word sentence-case title that captures the main topic \
+pub const SESSION_TITLE_SYSTEM: &str = "Generate a concise 3-7 word sentence-case title that captures the main topic \
      of this conversation. Return ONLY a JSON object: {\"title\": \"...\"}";
 
 /// User prompt template for session title generation.
@@ -50,8 +57,7 @@ pub fn session_title_user_prompt(conversation: &str) -> String {
 // ─── Permission Explanation ─────────────────────────────────────────────────
 
 /// System prompt for explaining tool call risks.
-pub const PERMISSION_EXPLAIN_SYSTEM: &str =
-    "You are a security advisor. Explain the potential risks of a tool call \
+pub const PERMISSION_EXPLAIN_SYSTEM: &str = "You are a security advisor. Explain the potential risks of a tool call \
      in 1-2 clear sentences. Focus on concrete risks, not generic warnings. \
      If the tool call appears safe, say so briefly.";
 
@@ -84,8 +90,7 @@ pub fn compact_summary_user_prompt(summary_request: &str) -> String {
 
 /// System prompt for session memory updates (reuses main system prompt for cache).
 /// The user prompt constrains behavior.
-pub const SESSION_MEMORY_UPDATE_INSTRUCTION: &str =
-    "Update the session memory file based on the conversation above. \
+pub const SESSION_MEMORY_UPDATE_INSTRUCTION: &str = "Update the session memory file based on the conversation above. \
      This is NOT part of the user conversation — do not add the note-taking process to notes. \
      Use the Edit tool to update the memory file. \
      Keep information density high and actionable. \
@@ -95,8 +100,7 @@ pub const SESSION_MEMORY_UPDATE_INSTRUCTION: &str =
 // ─── Extract Memories ───────────────────────────────────────────────────────
 
 /// System prompt for extracting long-term memories.
-pub const EXTRACT_MEMORIES_SYSTEM: &str =
-    "You are a memory extraction subagent. Analyze the recent conversation \
+pub const EXTRACT_MEMORIES_SYSTEM: &str = "You are a memory extraction subagent. Analyze the recent conversation \
      and extract information worth preserving long-term. Do NOT grep code or \
      run git commands to verify content — only analyze the messages. \
      Write memory files to the memory directory following the established format.";
@@ -104,8 +108,7 @@ pub const EXTRACT_MEMORIES_SYSTEM: &str =
 // ─── Agent Summary (for coordinator sub-agents) ────────────────────────────
 
 /// System prompt for summarizing a sub-agent's progress.
-pub const AGENT_SUMMARY_SYSTEM: &str =
-    "Summarize what the agent is currently doing in 3-5 words. \
+pub const AGENT_SUMMARY_SYSTEM: &str = "Summarize what the agent is currently doing in 3-5 words. \
      Use present continuous tense (e.g., 'Reading runAgent.ts', 'Fixing null check in validate.ts'). \
      Mention file or function names, not branch names.";
 
@@ -185,7 +188,9 @@ pub fn compose_system_prompt_for_profiles(profiles: &[PromptProfile]) -> String 
     }
 
     let mut sections = Vec::new();
-    let needs_default = profiles.iter().any(|profile| prompt_profile_spec(*profile).include_default_agent)
+    let needs_default = profiles
+        .iter()
+        .any(|profile| prompt_profile_spec(*profile).include_default_agent)
         && !profiles.contains(&PromptProfile::DefaultAgent);
 
     if needs_default {
@@ -221,34 +226,28 @@ pub fn default_allowed_tools_for_profiles(profiles: &[PromptProfile]) -> Option<
     if tools.is_empty() { None } else { Some(tools) }
 }
 
-const DEFAULT_AGENT_SYSTEM: &str =
-    "You are an expert software engineer and coding agent. Help the user with \
+const DEFAULT_AGENT_SYSTEM: &str = "You are an expert software engineer and coding agent. Help the user with \
      coding tasks including reading, writing, editing, and debugging code. \
      Use tools to inspect and modify files. Think through problems step by step.";
 
-const ADVISOR_SYSTEM: &str =
-    "You are a senior technical advisor. Focus on guidance, architecture advice, \
+const ADVISOR_SYSTEM: &str = "You are a senior technical advisor. Focus on guidance, architecture advice, \
      and recommendations rather than directly implementing changes. Explain your \
      reasoning and suggest approaches with trade-offs.";
 
-const BUG_HUNTER_SYSTEM: &str =
-    "You are a bug hunting specialist. Systematically review code for bugs, \
+const BUG_HUNTER_SYSTEM: &str = "You are a bug hunting specialist. Systematically review code for bugs, \
      edge cases, security issues, and potential failures. Be thorough and \
      methodical — check for null cases, off-by-one errors, resource leaks, \
      and concurrency issues.";
 
-const REVIEWER_SYSTEM: &str =
-    "You are a code review specialist. Review code for correctness, \
+const REVIEWER_SYSTEM: &str = "You are a code review specialist. Review code for correctness, \
      maintainability, performance, security, and adherence to conventions. \
      Provide constructive feedback with specific examples and suggestions.";
 
-const SECURITY_REVIEWER_SYSTEM: &str =
-    "You are a security review specialist. Review code and diffs for injection risks, \
+const SECURITY_REVIEWER_SYSTEM: &str = "You are a security review specialist. Review code and diffs for injection risks, \
      authn/authz flaws, data exposure, unsafe shelling out, insecure defaults, \
      and trust-boundary mistakes. Prioritize concrete security findings and mitigations.";
 
-const MEMORY_UPDATER_SYSTEM: &str =
-    "You are a session memory maintenance agent. Update the session memory \
+const MEMORY_UPDATER_SYSTEM: &str = "You are a session memory maintenance agent. Update the session memory \
      file based on the conversation. Write high-density, actionable technical \
      content. Always update the Current State section.";
 
@@ -297,10 +296,8 @@ mod tests {
 
     #[test]
     fn composed_profiles_include_default_once() {
-        let prompt = compose_system_prompt_for_profiles(&[
-            PromptProfile::Advisor,
-            PromptProfile::Reviewer,
-        ]);
+        let prompt =
+            compose_system_prompt_for_profiles(&[PromptProfile::Advisor, PromptProfile::Reviewer]);
         assert!(prompt.contains("expert software engineer and coding agent"));
         assert!(prompt.contains("senior technical advisor"));
         assert!(prompt.contains("code review specialist"));

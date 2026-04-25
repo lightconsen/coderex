@@ -6,18 +6,20 @@ use std::sync::Arc;
 /// Register session management commands.
 pub fn register(registry: &mut CommandRegistry) {
     // /clear — clear the current session messages
-    registry.register(SlashCommand::local(
-        "clear",
-        "Clear the current session",
-        true,
-        true,
-        true,
-        Arc::new(|ctx: &CommandContext, _args: &[String]| {
-            CommandResult::success(format!("Session '{}' cleared", ctx.session_id))
-                .with_state_change(true)
-        }),
-    )
-    .with_destructive());
+    registry.register(
+        SlashCommand::local(
+            "clear",
+            "Clear the current session",
+            true,
+            true,
+            true,
+            Arc::new(|ctx: &CommandContext, _args: &[String]| {
+                CommandResult::success(format!("Session '{}' cleared", ctx.session_id))
+                    .with_state_change(true)
+            }),
+        )
+        .with_destructive(),
+    );
 
     // /exit — graceful exit
     registry.register(SlashCommand::local(

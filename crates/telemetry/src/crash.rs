@@ -53,10 +53,7 @@ impl CrashReporter {
         std::panic::set_hook(Box::new(move |info| {
             let report = CrashReport {
                 panic_info: format!("{info}"),
-                backtrace: Some(format!(
-                    "{:?}",
-                    std::backtrace::Backtrace::force_capture()
-                )),
+                backtrace: Some(format!("{:?}", std::backtrace::Backtrace::force_capture())),
                 timestamp: chrono::Utc::now(),
             };
 

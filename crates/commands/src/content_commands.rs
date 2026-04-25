@@ -77,7 +77,11 @@ mod tests {
 
     #[test]
     fn compact_triggers() {
-        let reg = { let mut r = CommandRegistry::new(); register(&mut r); r };
+        let reg = {
+            let mut r = CommandRegistry::new();
+            register(&mut r);
+            r
+        };
         let result = reg.execute("compact", &ctx(), &[]);
         assert!(result.output.contains("Compacting"));
         assert!(result.state_changed);
@@ -85,7 +89,11 @@ mod tests {
 
     #[test]
     fn help_shows_commands() {
-        let reg = { let mut r = CommandRegistry::new(); register(&mut r); r };
+        let reg = {
+            let mut r = CommandRegistry::new();
+            register(&mut r);
+            r
+        };
         let result = reg.execute("help", &ctx(), &[]);
         assert!(result.output.contains("clear"));
         assert!(result.output.contains("config"));
@@ -94,14 +102,22 @@ mod tests {
 
     #[test]
     fn help_for_specific_command() {
-        let reg = { let mut r = CommandRegistry::new(); register(&mut r); r };
+        let reg = {
+            let mut r = CommandRegistry::new();
+            register(&mut r);
+            r
+        };
         let result = reg.execute("help", &ctx(), &["clear".into()]);
         assert!(result.output.contains("/clear"));
     }
 
     #[test]
     fn version_shows_info() {
-        let reg = { let mut r = CommandRegistry::new(); register(&mut r); r };
+        let reg = {
+            let mut r = CommandRegistry::new();
+            register(&mut r);
+            r
+        };
         let result = reg.execute("version", &ctx(), &[]);
         assert!(result.output.contains("CodeRex"));
     }
@@ -112,7 +128,11 @@ mod tests {
             version: "1.2.3".into(),
             ..ctx()
         };
-        let reg = { let mut r = CommandRegistry::new(); register(&mut r); r };
+        let reg = {
+            let mut r = CommandRegistry::new();
+            register(&mut r);
+            r
+        };
         let result = reg.execute("version", &c, &[]);
         assert!(result.output.contains("1.2.3"));
     }

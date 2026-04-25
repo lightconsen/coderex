@@ -12,7 +12,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::{mpsc, oneshot, Mutex};
+use tokio::sync::{Mutex, mpsc, oneshot};
 
 /// A request for user confirmation to execute a tool.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -208,9 +208,7 @@ mod tests {
         };
 
         let request_clone = request.clone();
-        let handle = tokio::spawn(async move {
-            bus_clone.request(request_clone).await
-        });
+        let handle = tokio::spawn(async move { bus_clone.request(request_clone).await });
 
         let received = bus.next_request().await.unwrap();
         assert_eq!(received.id, "req_1");
@@ -237,14 +235,13 @@ mod tests {
         };
 
         let bus_clone = bus.clone();
-        let handle = tokio::spawn(async move {
-            bus_clone.request(request).await
-        });
+        let handle = tokio::spawn(async move { bus_clone.request(request).await });
 
         let received = bus.next_request().await.unwrap();
         assert!(received.allow_session);
 
-        bus.respond("req_2", ConfirmationResponse::ApproveSession).await;
+        bus.respond("req_2", ConfirmationResponse::ApproveSession)
+            .await;
 
         let response = handle.await.unwrap().unwrap();
         assert_eq!(response, ConfirmationResponse::ApproveSession);
@@ -265,9 +262,7 @@ mod tests {
         };
 
         let bus_clone = bus.clone();
-        let handle = tokio::spawn(async move {
-            bus_clone.request(request).await
-        });
+        let handle = tokio::spawn(async move { bus_clone.request(request).await });
 
         let received = bus.next_request().await.unwrap();
         assert_eq!(received.tool_name, "rm");

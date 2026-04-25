@@ -69,19 +69,31 @@ impl Tool for ChromeListTabsTool {
         let client = get_client(&ctx).unwrap_or_default();
         if !client.is_connected().await {
             return Err(ToolError::InvalidInput {
-                message: "Chrome DevTools not connected. Start Chrome with --remote-debugging-port=9222".into(),
+                message:
+                    "Chrome DevTools not connected. Start Chrome with --remote-debugging-port=9222"
+                        .into(),
             });
         }
-        let tabs = client.list_tabs().await.map_err(|e| ToolError::InvalidInput {
-            message: e.to_string(),
-        })?;
+        let tabs = client
+            .list_tabs()
+            .await
+            .map_err(|e| ToolError::InvalidInput {
+                message: e.to_string(),
+            })?;
 
-        let json = serde_json::to_string_pretty(&tabs.iter().map(|t| serde_json::json!({
-            "id": t.id,
-            "title": t.title,
-            "url": t.url,
-        })).collect::<Vec<_>>()
-        ).unwrap_or_default();
+        let json = serde_json::to_string_pretty(
+            &tabs
+                .iter()
+                .map(|t| {
+                    serde_json::json!({
+                        "id": t.id,
+                        "title": t.title,
+                        "url": t.url,
+                    })
+                })
+                .collect::<Vec<_>>(),
+        )
+        .unwrap_or_default();
 
         Ok(ToolOutput {
             output: format!("Open tabs:\n{json}"),
@@ -130,13 +142,18 @@ impl Tool for ChromeNavigateTool {
         let client = get_client(&ctx).unwrap_or_default();
         if !client.is_connected().await {
             return Err(ToolError::InvalidInput {
-                message: "Chrome DevTools not connected. Start Chrome with --remote-debugging-port=9222".into(),
+                message:
+                    "Chrome DevTools not connected. Start Chrome with --remote-debugging-port=9222"
+                        .into(),
             });
         }
 
-        let ws_url = client.navigate(&url).await.map_err(|e| ToolError::InvalidInput {
-            message: e.to_string(),
-        })?;
+        let ws_url = client
+            .navigate(&url)
+            .await
+            .map_err(|e| ToolError::InvalidInput {
+                message: e.to_string(),
+            })?;
 
         Ok(ToolOutput {
             output: format!("Navigated to: {url}\nDebugger: {ws_url}"),
@@ -186,15 +203,16 @@ impl Tool for ChromeExecuteJsTool {
         let ws_url = extract_string(&input.arguments, "ws_url")?;
         let client = get_client(&ctx).unwrap_or_default();
 
-        let result = client
-            .execute_js(&ws_url, &expression)
-            .await
-            .map_err(|e| ToolError::InvalidInput {
-                message: e.to_string(),
-            })?;
+        let result =
+            client
+                .execute_js(&ws_url, &expression)
+                .await
+                .map_err(|e| ToolError::InvalidInput {
+                    message: e.to_string(),
+                })?;
 
-        let output = serde_json::to_string_pretty(&result.get("result").unwrap_or(&result)
-        ).unwrap_or_else(|_| result.to_string());
+        let output = serde_json::to_string_pretty(&result.get("result").unwrap_or(&result))
+            .unwrap_or_else(|_| result.to_string());
 
         Ok(ToolOutput {
             output,
@@ -306,8 +324,7 @@ impl Tool for ChromeGetContentTool {
             })?;
 
         // Convert HTML to readable text
-        let text = crate::builtins::web_fetch_tool::html_to_markdown(&content
-        );
+        let text = crate::builtins::web_fetch_tool::html_to_markdown(&content);
 
         Ok(ToolOutput {
             output: text,

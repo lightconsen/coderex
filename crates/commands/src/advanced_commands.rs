@@ -36,8 +36,7 @@ pub fn register(registry: &mut CommandRegistry) {
         Arc::new(|_ctx: &CommandContext, _args: &[String]| {
             let bridge_url = std::env::var("CODEREX_BRIDGE_URL").ok();
             if bridge_url.as_ref().map(|s| !s.is_empty()).unwrap_or(false) {
-                CommandResult::success("Kicked Bridge connection.")
-                    .with_state_change(true)
+                CommandResult::success("Kicked Bridge connection.").with_state_change(true)
             } else {
                 CommandResult::success("No active Bridge connections to kick.")
             }
@@ -66,8 +65,10 @@ pub fn register(registry: &mut CommandRegistry) {
         true,
         Arc::new(|ctx: &CommandContext, _args: &[String]| {
             if ctx.is_feature_enabled("ultraplan") {
-                CommandResult::success("Ultra Plan Mode activated.\n(Detailed multi-phase planning enabled)")
-                    .with_state_change(true)
+                CommandResult::success(
+                    "Ultra Plan Mode activated.\n(Detailed multi-phase planning enabled)",
+                )
+                .with_state_change(true)
             } else {
                 CommandResult::error("ultraplan feature is not enabled.")
             }
@@ -129,15 +130,23 @@ pub fn register(registry: &mut CommandRegistry) {
                             let lines: Vec<&str> = content.lines().collect();
                             total_msgs = lines.len();
                             let _total = total_msgs;
-                            output.push_str(&format!("Session {}: {} messages\n\n", ctx.session_id, total_msgs));
+                            output.push_str(&format!(
+                                "Session {}: {} messages\n\n",
+                                ctx.session_id, total_msgs
+                            ));
                             for line in lines.iter().take(10) {
                                 if let Ok(msg) = serde_json::from_str::<serde_json::Value>(line) {
                                     if let Some(role) = msg.get("role").and_then(|r| r.as_str()) {
-                                        let preview = msg.get("content")
+                                        let preview = msg
+                                            .get("content")
                                             .and_then(|c| c.as_str())
                                             .map(|s| {
                                                 let s = s.trim();
-                                                if s.len() > 60 { format!("{}...", &s[..57]) } else { s.to_string() }
+                                                if s.len() > 60 {
+                                                    format!("{}...", &s[..57])
+                                                } else {
+                                                    s.to_string()
+                                                }
                                             })
                                             .unwrap_or_else(|| "(non-text)".to_string());
                                         let role_label = match role {
@@ -147,12 +156,16 @@ pub fn register(registry: &mut CommandRegistry) {
                                             "system" => "System",
                                             _ => role,
                                         };
-                                        output.push_str(&format!("  [{}] {}\n", role_label, preview));
+                                        output
+                                            .push_str(&format!("  [{}] {}\n", role_label, preview));
                                     }
                                 }
                             }
                             if total_msgs > 10 {
-                                output.push_str(&format!("  ... and {} more messages\n", total_msgs - 10));
+                                output.push_str(&format!(
+                                    "  ... and {} more messages\n",
+                                    total_msgs - 10
+                                ));
                             }
                         }
                     } else {
@@ -213,28 +226,44 @@ mod tests {
 
     #[test]
     fn bridge_status() {
-        let reg = { let mut r = CommandRegistry::new(); register(&mut r); r };
+        let reg = {
+            let mut r = CommandRegistry::new();
+            register(&mut r);
+            r
+        };
         let result = reg.execute("bridge", &ctx(), &[]);
         assert!(result.output.contains("Not running"));
     }
 
     #[test]
     fn bridge_kick_none() {
-        let reg = { let mut r = CommandRegistry::new(); register(&mut r); r };
+        let reg = {
+            let mut r = CommandRegistry::new();
+            register(&mut r);
+            r
+        };
         let result = reg.execute("bridge-kick", &ctx(), &[]);
         assert!(result.output.contains("No active"));
     }
 
     #[test]
     fn teleport_registry_stub() {
-        let reg = { let mut r = CommandRegistry::new(); register(&mut r); r };
+        let reg = {
+            let mut r = CommandRegistry::new();
+            register(&mut r);
+            r
+        };
         let result = reg.execute("teleport", &ctx(), &[]);
         assert!(result.output.contains("handled by the REPL"));
     }
 
     #[test]
     fn ultraplans_feature_gated() {
-        let reg = { let mut r = CommandRegistry::new(); register(&mut r); r };
+        let reg = {
+            let mut r = CommandRegistry::new();
+            register(&mut r);
+            r
+        };
         let result = reg.execute("ultraplan", &ctx(), &[]);
         assert!(result.output.contains("not enabled"));
     }
@@ -243,8 +272,15 @@ mod tests {
     fn ultraplans_when_enabled() {
         let mut flags = std::collections::HashMap::new();
         flags.insert("ultraplan".into(), true);
-        let c = CommandContext { feature_flags: flags, ..ctx() };
-        let reg = { let mut r = CommandRegistry::new(); register(&mut r); r };
+        let c = CommandContext {
+            feature_flags: flags,
+            ..ctx()
+        };
+        let reg = {
+            let mut r = CommandRegistry::new();
+            register(&mut r);
+            r
+        };
         let result = reg.execute("ultraplan", &c, &[]);
         assert!(result.output.contains("Ultra Plan Mode"));
         assert!(result.state_changed);
@@ -252,35 +288,55 @@ mod tests {
 
     #[test]
     fn insights() {
-        let reg = { let mut r = CommandRegistry::new(); register(&mut r); r };
+        let reg = {
+            let mut r = CommandRegistry::new();
+            register(&mut r);
+            r
+        };
         let result = reg.execute("insights", &ctx(), &[]);
         assert!(result.output.contains("Project Insights"));
     }
 
     #[test]
     fn thinkback_feature_gated() {
-        let reg = { let mut r = CommandRegistry::new(); register(&mut r); r };
+        let reg = {
+            let mut r = CommandRegistry::new();
+            register(&mut r);
+            r
+        };
         let result = reg.execute("thinkback", &ctx(), &[]);
         assert!(result.output.contains("not enabled"));
     }
 
     #[test]
     fn thinkback_play_feature_gated() {
-        let reg = { let mut r = CommandRegistry::new(); register(&mut r); r };
+        let reg = {
+            let mut r = CommandRegistry::new();
+            register(&mut r);
+            r
+        };
         let result = reg.execute("thinkback-play", &ctx(), &[]);
         assert!(result.output.contains("not enabled"));
     }
 
     #[test]
     fn statusline_config() {
-        let reg = { let mut r = CommandRegistry::new(); register(&mut r); r };
+        let reg = {
+            let mut r = CommandRegistry::new();
+            register(&mut r);
+            r
+        };
         let result = reg.execute("statusline", &ctx(), &[]);
         assert!(result.output.contains("Statusline Configuration"));
     }
 
     #[test]
     fn statusline_uses_agent_backend() {
-        let reg = { let mut r = CommandRegistry::new(); register(&mut r); r };
+        let reg = {
+            let mut r = CommandRegistry::new();
+            register(&mut r);
+            r
+        };
         let cmd = reg.find("statusline").unwrap();
         assert!(cmd.uses_agent_backend);
     }

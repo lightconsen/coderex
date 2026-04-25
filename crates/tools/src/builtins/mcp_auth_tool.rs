@@ -43,12 +43,15 @@ impl Tool for McpAuthTool {
         }
     }
 
-    async fn execute(&self, input: ToolInput, _ctx: ToolContext<'_>) -> Result<ToolOutput, ToolError> {
+    async fn execute(
+        &self,
+        input: ToolInput,
+        _ctx: ToolContext<'_>,
+    ) -> Result<ToolOutput, ToolError> {
         let server_url = extract_string(&input.arguments, "server_url")?;
-        let client_id = extract_string(&input.arguments, "client_id")
-            .unwrap_or_else(|_| "coderex-cli".into());
-        let scope = extract_string(&input.arguments, "scope")
-            .unwrap_or_else(|_| "mcp".into());
+        let client_id =
+            extract_string(&input.arguments, "client_id").unwrap_or_else(|_| "coderex-cli".into());
+        let scope = extract_string(&input.arguments, "scope").unwrap_or_else(|_| "mcp".into());
 
         // Generate a random state parameter
         let state = format!("coderex-{}", uuid::Uuid::new_v4());
@@ -108,9 +111,10 @@ impl Tool for McpAuthTool {
             });
         }
 
-        let token_resp: serde_json::Value = resp.json().await.map_err(|e| ToolError::InvalidInput {
-            message: format!("failed to parse token response: {e}"),
-        })?;
+        let token_resp: serde_json::Value =
+            resp.json().await.map_err(|e| ToolError::InvalidInput {
+                message: format!("failed to parse token response: {e}"),
+            })?;
 
         let access_token = token_resp
             .get("access_token")
@@ -128,24 +132,28 @@ impl Tool for McpAuthTool {
             .get("refresh_token")
             .and_then(|v| v.as_str())
             .map(String::from);
-        let _ = persist_token(&server_url, &client_id, access_token, expires_in, refresh_token.as_deref());
+        let _ = persist_token(
+            &server_url,
+            &client_id,
+            access_token,
+            expires_in,
+            refresh_token.as_deref(),
+        );
 
         Ok(ToolOutput {
             output: serde_json::json!({
                 "authenticated": true,
                 "auth_url": auth_url,
                 "access_token": access_token,
-            }).to_string(),
+            })
+            .to_string(),
             is_display: true,
         })
     }
 }
 
 /// Wait for an OAuth callback on localhost:8765 that matches the expected state.
-async fn wait_for_callback(
-    expected_state: &str,
-    timeout: Duration,
-) -> Result<String, String> {
+async fn wait_for_callback(expected_state: &str, timeout: Duration) -> Result<String, String> {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:8765")
         .await
         .map_err(|e| format!("failed to bind callback listener: {e}"))?;
@@ -179,27 +187,17 @@ async fn wait_for_callback(
             let query_end = line.find(' ').unwrap_or(line.len());
             let query = &line[query_start + 1..query_end];
 
-            let params: std::collections::HashMap<&str, &str> = query
-                .split('&')
-                .filter_map(|p| p.split_once('='))
-                .collect();
+            let params: std::collections::HashMap<&str, &str> =
+                query.split('&').filter_map(|p| p.split_once('=')).collect();
 
             let received_state = params.get("state").copied().unwrap_or("");
             if received_state != expected_state {
-                let _ = send_http_response(
-                    &mut stream,
-                    400,
-                    "Invalid state parameter",
-                ).await;
+                let _ = send_http_response(&mut stream, 400, "Invalid state parameter").await;
                 continue;
             }
 
             let Some(code) = params.get("code").copied() else {
-                let _ = send_http_response(
-                    &mut stream,
-                    400,
-                    "Missing authorization code",
-                ).await;
+                let _ = send_http_response(&mut stream, 400, "Missing authorization code").await;
                 continue;
             };
 
@@ -207,7 +205,8 @@ async fn wait_for_callback(
                 &mut stream,
                 200,
                 "Authentication successful! You can close this window.",
-            ).await;
+            )
+            .await;
 
             return Ok::<String, String>(code.to_string());
         }
@@ -327,8 +326,8 @@ fn extract_string(args: &serde_json::Value, key: &str) -> Result<String, ToolErr
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tool::ToolContext;
     use crate::context::ExecutionContext;
+    use crate::tool::ToolContext;
     use std::collections::HashMap;
     use std::path::Path;
     use std::sync::Arc;

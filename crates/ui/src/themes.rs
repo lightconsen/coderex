@@ -170,7 +170,9 @@ fn color_to_string(c: &Color) -> String {
 }
 
 fn parse_color_or(s: &str, default: Color, _field: &str) -> Result<Color, String> {
-    parse_color(s).ok_or_else(|| format!("invalid color: {s}")).or(Ok(default))
+    parse_color(s)
+        .ok_or_else(|| format!("invalid color: {s}"))
+        .or(Ok(default))
 }
 
 impl Default for Theme {
@@ -479,7 +481,10 @@ impl ThemeManager {
         if names.is_empty() {
             return &self.active;
         }
-        let current_idx = names.iter().position(|n| n == &self.active.name).unwrap_or(0);
+        let current_idx = names
+            .iter()
+            .position(|n| n == &self.active.name)
+            .unwrap_or(0);
         let next_idx = (current_idx + 1) % names.len();
         let _ = self.switch(&names[next_idx]);
         &self.active
@@ -507,24 +512,29 @@ impl ThemeManager {
             }
 
             use notify::{EventKind, RecursiveMode, Watcher as _};
-            let mut watcher = match notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
-                if let Ok(event) = res {
-                    if matches!(event.kind, EventKind::Modify(_) | EventKind::Create(_) | EventKind::Remove(_)) {
-                        let has_json = event.paths.iter().any(|p| {
-                            p.extension().and_then(|e| e.to_str()) == Some("json")
-                        });
-                        if has_json {
-                            let _ = tx.send(());
+            let mut watcher =
+                match notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
+                    if let Ok(event) = res {
+                        if matches!(
+                            event.kind,
+                            EventKind::Modify(_) | EventKind::Create(_) | EventKind::Remove(_)
+                        ) {
+                            let has_json = event
+                                .paths
+                                .iter()
+                                .any(|p| p.extension().and_then(|e| e.to_str()) == Some("json"));
+                            if has_json {
+                                let _ = tx.send(());
+                            }
                         }
                     }
-                }
-            }) {
-                Ok(w) => w,
-                Err(e) => {
-                    tracing::warn!("Failed to create theme watcher: {e}");
-                    return;
-                }
-            };
+                }) {
+                    Ok(w) => w,
+                    Err(e) => {
+                        tracing::warn!("Failed to create theme watcher: {e}");
+                        return;
+                    }
+                };
 
             if let Err(e) = watcher.watch(&dir, RecursiveMode::NonRecursive) {
                 tracing::warn!("Failed to watch theme directory: {e}");

@@ -241,10 +241,8 @@ impl UiState {
             }
             EngineEvent::PermissionExplanation { tool, explanation } => {
                 // Store explanation in transcript as an advisory note.
-                self.transcript.push(TranscriptEntry::PermissionExplanation {
-                    tool,
-                    explanation,
-                });
+                self.transcript
+                    .push(TranscriptEntry::PermissionExplanation { tool, explanation });
             }
         }
     }
@@ -259,11 +257,7 @@ impl UiState {
     }
 
     fn complete_tool_call(&mut self, id: &str, result: &ToolResult) {
-        if let Some(pos) = self
-            .active_tool_calls
-            .iter()
-            .position(|c| c.id == id)
-        {
+        if let Some(pos) = self.active_tool_calls.iter().position(|c| c.id == id) {
             let active = self.active_tool_calls.remove(pos);
             self.transcript
                 .push(TranscriptEntry::ToolCall(ToolCallRecord {
@@ -374,7 +368,15 @@ impl Runtime {
         let ui_tx_clone = ui_tx.clone();
 
         let task = tokio::spawn(async move {
-            Self::run(ui_tx_clone, ui_rx, engine_rx, shutdown_rx, state_for_run, intent_tx).await;
+            Self::run(
+                ui_tx_clone,
+                ui_rx,
+                engine_rx,
+                shutdown_rx,
+                state_for_run,
+                intent_tx,
+            )
+            .await;
         });
 
         let runtime = Runtime {
@@ -399,7 +401,7 @@ impl Runtime {
         state: Arc<Mutex<UiState>>,
         intent_tx: mpsc::UnboundedSender<UiIntent>,
     ) {
-        use tokio::time::{interval, Duration};
+        use tokio::time::{Duration, interval};
         let mut tick = interval(Duration::from_millis(100));
 
         loop {
@@ -431,10 +433,7 @@ impl Runtime {
 
     /// Apply a UI event to the shared state and return any intent
     /// produced (e.g. submit, interrupt).
-    pub fn handle_ui_event(
-        event: UiEvent,
-        state: &Arc<Mutex<UiState>>,
-    ) -> UiIntent {
+    pub fn handle_ui_event(event: UiEvent, state: &Arc<Mutex<UiState>>) -> UiIntent {
         let mut state = state.lock().expect("ui state poisoned");
         match event {
             UiEvent::KeyPress { code, modifiers } => {
@@ -554,10 +553,7 @@ mod tests {
     #[test]
     fn handle_key_accumulates_input() {
         let mut state = UiState::new();
-        assert_eq!(
-            state.handle_key("h", &[]),
-            UiIntent::None
-        );
+        assert_eq!(state.handle_key("h", &[]), UiIntent::None);
         state.handle_key("i", &[]);
         assert_eq!(state.input_buffer, "hi");
     }
@@ -683,7 +679,10 @@ mod tests {
     fn resize_updates_size_in_state() {
         let state = Arc::new(Mutex::new(UiState::new()));
         let intent = Runtime::handle_ui_event(
-            UiEvent::Resize { cols: 120, rows: 40 },
+            UiEvent::Resize {
+                cols: 120,
+                rows: 40,
+            },
             &state,
         );
         assert_eq!(intent, UiIntent::None);

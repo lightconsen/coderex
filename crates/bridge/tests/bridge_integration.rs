@@ -115,7 +115,10 @@ fn env_registration_poller_with_custom_url() {
 async fn env_registration_fails_without_server() {
     let poller = BridgeWorkPoller::new("env_1".into(), 5);
     let result = poller.register().await;
-    assert!(result.is_err(), "registration should fail without a control plane server");
+    assert!(
+        result.is_err(),
+        "registration should fail without a control plane server"
+    );
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -227,9 +230,7 @@ fn work_assignment_events_are_broadcast() {
     });
 
     let event = rx.try_recv().unwrap();
-    assert!(
-        matches!(event, BridgeEvent::SessionSpawned { session_id, .. } if session_id == "s1")
-    );
+    assert!(matches!(event, BridgeEvent::SessionSpawned { session_id, .. } if session_id == "s1"));
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -254,12 +255,16 @@ fn permission_forwarding_respond_grants() {
     let request_id = bridge.request_permission("s1", "Read", "secret.txt");
     assert!(!bridge.is_permission_resolved(&request_id));
 
-    let resolved = bridge.respond_to_permission(&request_id, PermissionResponse::Allow { always: false });
+    let resolved =
+        bridge.respond_to_permission(&request_id, PermissionResponse::Allow { always: false });
     assert!(resolved);
     assert!(bridge.is_permission_resolved(&request_id));
 
     let response = bridge.get_permission_response(&request_id);
-    assert!(matches!(response, Some(PermissionResponse::Allow { always: false })));
+    assert!(matches!(
+        response,
+        Some(PermissionResponse::Allow { always: false })
+    ));
 }
 
 #[test]
@@ -518,11 +523,14 @@ fn disconnect_recovery_session_state_after_disconnect() {
     let mut bridge = test_bridge(tmp.path());
 
     // Manually inject a session
-    bridge.sessions.insert("s1".into(), ManagedSession {
-        state_machine: BridgeSessionStateMachine::new("s1".into()),
-        work_dir: PathBuf::from("/tmp/s1"),
-        worktree_created: false,
-    });
+    bridge.sessions.insert(
+        "s1".into(),
+        ManagedSession {
+            state_machine: BridgeSessionStateMachine::new("s1".into()),
+            work_dir: PathBuf::from("/tmp/s1"),
+            worktree_created: false,
+        },
+    );
 
     let recovery = bridge.create_recovery_state("s1");
     assert!(recovery.is_some());
@@ -536,16 +544,22 @@ fn disconnect_recovery_all_active_sessions() {
     let tmp = tempfile::tempdir().unwrap();
     let mut bridge = test_bridge(tmp.path());
 
-    bridge.sessions.insert("s1".into(), ManagedSession {
-        state_machine: BridgeSessionStateMachine::new("s1".into()),
-        work_dir: PathBuf::from("/tmp/s1"),
-        worktree_created: false,
-    });
-    bridge.sessions.insert("s2".into(), coderex_bridge::orchestrator::ManagedSession {
-        state_machine: BridgeSessionStateMachine::new("s2".into()),
-        work_dir: PathBuf::from("/tmp/s2"),
-        worktree_created: true,
-    });
+    bridge.sessions.insert(
+        "s1".into(),
+        ManagedSession {
+            state_machine: BridgeSessionStateMachine::new("s1".into()),
+            work_dir: PathBuf::from("/tmp/s1"),
+            worktree_created: false,
+        },
+    );
+    bridge.sessions.insert(
+        "s2".into(),
+        coderex_bridge::orchestrator::ManagedSession {
+            state_machine: BridgeSessionStateMachine::new("s2".into()),
+            work_dir: PathBuf::from("/tmp/s2"),
+            worktree_created: true,
+        },
+    );
 
     let states = bridge.all_recovery_states();
     assert_eq!(states.len(), 2);
@@ -561,7 +575,11 @@ async fn disconnect_recovery_full_lifecycle_with_recovery() {
     bridge.connect().await.unwrap();
 
     // Spawn a session
-    let assignment = sample_assignment("s1", tmp.path().join("work").to_str().unwrap(), SpawnMode::SingleSession);
+    let assignment = sample_assignment(
+        "s1",
+        tmp.path().join("work").to_str().unwrap(),
+        SpawnMode::SingleSession,
+    );
     bridge.spawn_session(&assignment).await.unwrap();
 
     // Permission flow
@@ -604,7 +622,11 @@ async fn archive_and_cleanup_integration() {
     let mut bridge = test_bridge(tmp.path());
     bridge.connect().await.unwrap();
 
-    let assignment = sample_assignment("s1", tmp.path().join("work").to_str().unwrap(), SpawnMode::SingleSession);
+    let assignment = sample_assignment(
+        "s1",
+        tmp.path().join("work").to_str().unwrap(),
+        SpawnMode::SingleSession,
+    );
     bridge.spawn_session(&assignment).await.unwrap();
 
     let usage = UsageStats {
@@ -630,7 +652,8 @@ fn state_machine_valid_transitions() {
     sm.transition(BridgeSessionState::CreatingWorktree).unwrap();
     sm.transition(BridgeSessionState::Spawning).unwrap();
     sm.transition(BridgeSessionState::Running).unwrap();
-    sm.transition(BridgeSessionState::AwaitingPermission).unwrap();
+    sm.transition(BridgeSessionState::AwaitingPermission)
+        .unwrap();
     sm.transition(BridgeSessionState::Running).unwrap();
     sm.transition(BridgeSessionState::Archiving).unwrap();
     sm.transition(BridgeSessionState::CleaningUp).unwrap();

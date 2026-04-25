@@ -29,11 +29,13 @@ fn copy_to_clipboard(text: &str) -> Result<(), String> {
 
     if let Some(mut stdin) = child.stdin.take() {
         use std::io::Write;
-        stdin.write_all(text.as_bytes())
+        stdin
+            .write_all(text.as_bytes())
             .map_err(|e| format!("failed to write to clipboard: {e}"))?;
     }
 
-    let status = child.wait()
+    let status = child
+        .wait()
         .map_err(|e| format!("clipboard command did not finish: {e}"))?;
     if status.success() {
         Ok(())
@@ -136,7 +138,10 @@ pub fn register(registry: &mut CommandRegistry) {
                 return CommandResult::error(format!("Not a directory: {}", ctx.cwd));
             }
 
-            let max_depth = args.first().and_then(|s| s.parse::<usize>().ok()).unwrap_or(2);
+            let max_depth = args
+                .first()
+                .and_then(|s| s.parse::<usize>().ok())
+                .unwrap_or(2);
             let max_files = 100;
 
             let mut entries = Vec::new();
@@ -146,7 +151,12 @@ pub fn register(registry: &mut CommandRegistry) {
                 .filter_entry(|e| {
                     e.file_name()
                         .to_str()
-                        .map(|n| !n.starts_with('.') && n != "node_modules" && n != "target" && n != ".git")
+                        .map(|n| {
+                            !n.starts_with('.')
+                                && n != "node_modules"
+                                && n != "target"
+                                && n != ".git"
+                        })
                         .unwrap_or(false)
                 })
                 .take(max_files)
@@ -220,7 +230,9 @@ pub fn register(registry: &mut CommandRegistry) {
                 }
                 CommandResult::success(output)
             } else {
-                CommandResult::error("ctx_viz feature is not enabled. Set feature flag 'ctx_viz' to enable.")
+                CommandResult::error(
+                    "ctx_viz feature is not enabled. Set feature flag 'ctx_viz' to enable.",
+                )
             }
         }),
     ));
@@ -244,7 +256,12 @@ pub fn register(registry: &mut CommandRegistry) {
                         .filter_entry(|e| {
                             e.file_name()
                                 .to_str()
-                                .map(|n| !n.starts_with('.') && n != "node_modules" && n != "target" && n != ".git")
+                                .map(|n| {
+                                    !n.starts_with('.')
+                                        && n != "node_modules"
+                                        && n != "target"
+                                        && n != ".git"
+                                })
                                 .unwrap_or(false)
                         })
                         .filter(|e| e.as_ref().map(|e| e.file_type().is_file()).unwrap_or(false))
@@ -273,7 +290,11 @@ mod tests {
 
     #[test]
     fn copy_specific_messages() {
-        let reg = { let mut r = CommandRegistry::new(); register(&mut r); r };
+        let reg = {
+            let mut r = CommandRegistry::new();
+            register(&mut r);
+            r
+        };
         let result = reg.execute("copy", &ctx(), &["3".into(), "5".into()]);
         // May succeed or fail depending on platform clipboard, but output mentions the messages
         assert!(result.output.contains("3") && result.output.contains("5"));
@@ -286,7 +307,11 @@ mod tests {
             cwd: tmp.path().to_string_lossy().to_string(),
             ..ctx()
         };
-        let reg = { let mut r = CommandRegistry::new(); register(&mut r); r };
+        let reg = {
+            let mut r = CommandRegistry::new();
+            register(&mut r);
+            r
+        };
         let result = reg.execute("init", &c, &[]);
         assert!(result.output.contains("CLAUDE.md"));
         assert!(result.state_changed);
@@ -301,14 +326,22 @@ mod tests {
             cwd: tmp.path().to_string_lossy().to_string(),
             ..ctx()
         };
-        let reg = { let mut r = CommandRegistry::new(); register(&mut r); r };
+        let reg = {
+            let mut r = CommandRegistry::new();
+            register(&mut r);
+            r
+        };
         let result = reg.execute("init", &c, &[]);
         assert!(result.output.contains("already initialized"));
     }
 
     #[test]
     fn summary_shows_stats() {
-        let reg = { let mut r = CommandRegistry::new(); register(&mut r); r };
+        let reg = {
+            let mut r = CommandRegistry::new();
+            register(&mut r);
+            r
+        };
         let result = reg.execute("summary", &ctx(), &[]);
         assert!(result.output.contains("Session Summary"));
         assert!(result.output.contains("Messages"));
@@ -324,10 +357,16 @@ mod tests {
             cwd: tmp.path().to_string_lossy().to_string(),
             ..ctx()
         };
-        let reg = { let mut r = CommandRegistry::new(); register(&mut r); r };
+        let reg = {
+            let mut r = CommandRegistry::new();
+            register(&mut r);
+            r
+        };
         let result = reg.execute("files", &c, &[]);
         // Output should contain either file names or be empty if filtered
-        let has_files = result.output.contains("Cargo.toml") || result.output.contains("src") || result.output.contains("No files");
+        let has_files = result.output.contains("Cargo.toml")
+            || result.output.contains("src")
+            || result.output.contains("No files");
         assert!(has_files, "files output: {}", result.output);
     }
 
@@ -339,23 +378,37 @@ mod tests {
             cwd: tmp.path().to_string_lossy().to_string(),
             ..ctx()
         };
-        let reg = { let mut r = CommandRegistry::new(); register(&mut r); r };
+        let reg = {
+            let mut r = CommandRegistry::new();
+            register(&mut r);
+            r
+        };
         let result = reg.execute("files", &c, &["1".into()]);
         // Output should contain the file or report no files
-        let has_files = result.output.contains("a.txt") || result.output.contains("No files") || result.output.contains("depth");
+        let has_files = result.output.contains("a.txt")
+            || result.output.contains("No files")
+            || result.output.contains("depth");
         assert!(has_files, "files output: {}", result.output);
     }
 
     #[test]
     fn context_shows_assembly() {
-        let reg = { let mut r = CommandRegistry::new(); register(&mut r); r };
+        let reg = {
+            let mut r = CommandRegistry::new();
+            register(&mut r);
+            r
+        };
         let result = reg.execute("context", &ctx(), &[]);
         assert!(result.output.contains("Context Assembly"));
     }
 
     #[test]
     fn ctx_viz_feature_gated() {
-        let reg = { let mut r = CommandRegistry::new(); register(&mut r); r };
+        let reg = {
+            let mut r = CommandRegistry::new();
+            register(&mut r);
+            r
+        };
         let result = reg.execute("ctx_viz", &ctx(), &[]);
         assert!(result.output.contains("Error"));
         assert!(result.output.contains("not enabled"));
@@ -365,15 +418,26 @@ mod tests {
     fn ctx_viz_when_enabled() {
         let mut flags = std::collections::HashMap::new();
         flags.insert("ctx_viz".into(), true);
-        let c = CommandContext { feature_flags: flags, ..ctx() };
-        let reg = { let mut r = CommandRegistry::new(); register(&mut r); r };
+        let c = CommandContext {
+            feature_flags: flags,
+            ..ctx()
+        };
+        let reg = {
+            let mut r = CommandRegistry::new();
+            register(&mut r);
+            r
+        };
         let result = reg.execute("ctx_viz", &c, &[]);
         assert!(result.output.contains("Context Visualization"));
     }
 
     #[test]
     fn add_dir_requires_path() {
-        let reg = { let mut r = CommandRegistry::new(); register(&mut r); r };
+        let reg = {
+            let mut r = CommandRegistry::new();
+            register(&mut r);
+            r
+        };
         let result = reg.execute("add-dir", &ctx(), &[]);
         assert!(result.output.contains("Usage"));
     }
@@ -387,7 +451,11 @@ mod tests {
             cwd: tmp.path().to_string_lossy().to_string(),
             ..ctx()
         };
-        let reg = { let mut r = CommandRegistry::new(); register(&mut r); r };
+        let reg = {
+            let mut r = CommandRegistry::new();
+            register(&mut r);
+            r
+        };
         let result = reg.execute("add-dir", &c, &["src".into()]);
         assert!(result.output.contains("src"));
         assert!(result.state_changed);
@@ -400,7 +468,11 @@ mod tests {
             cwd: tmp.path().to_string_lossy().to_string(),
             ..ctx()
         };
-        let reg = { let mut r = CommandRegistry::new(); register(&mut r); r };
+        let reg = {
+            let mut r = CommandRegistry::new();
+            register(&mut r);
+            r
+        };
         let result = reg.execute("add-dir", &c, &["nonexistent".into()]);
         assert!(result.output.contains("not found"));
     }

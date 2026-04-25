@@ -5,12 +5,12 @@
 //! 6.5 SendMessage, 6.6 worktree isolation, 6.7 tool whitelist
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use coderex_agents::{
-    AgentManager, AgentResult, AgentStatus, AgentType, ForkedContext, SpawnOptions,
-    TeammateEvent, Thoroughness,
+    AgentManager, AgentResult, AgentStatus, AgentType, ForkedContext, SpawnOptions, TeammateEvent,
+    Thoroughness,
 };
 
 fn test_manager() -> AgentManager {
@@ -197,7 +197,9 @@ async fn agent_send_message_to_running_agent_succeeds() {
     .unwrap();
 
     // Now the agent is Running, send_message should succeed
-    let result = mgr.send_message("running_agent_1", "please also check tests").await;
+    let result = mgr
+        .send_message("running_agent_1", "please also check tests")
+        .await;
     assert!(result.is_ok());
 }
 

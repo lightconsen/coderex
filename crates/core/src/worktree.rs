@@ -248,9 +248,7 @@ impl WorktreeManager {
             .map_err(|e| WorktreeError::GitCommand(e.to_string()))?;
 
         if !output.status.success() {
-            return Err(WorktreeError::GitCommand(
-                "not a git repository".into(),
-            ));
+            return Err(WorktreeError::GitCommand("not a git repository".into()));
         }
 
         let branch = String::from_utf8_lossy(&output.stdout);

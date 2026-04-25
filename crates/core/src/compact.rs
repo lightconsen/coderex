@@ -118,10 +118,7 @@ fn summarize_tool_result(tr: &ToolResult) -> Message {
             &tr.output[..max_len]
         )
     } else {
-        format!(
-            "[Tool '{}'] {}",
-            tr.tool_call_id, tr.output
-        )
+        format!("[Tool '{}'] {}", tr.tool_call_id, tr.output)
     };
     Message::system(summary)
 }
@@ -150,7 +147,8 @@ pub fn auto_compact(messages: &[Message], threshold: usize) -> CompactResult {
     let tokens_after_micro = total_token_estimate(&micro.messages);
     if tokens_after_micro <= threshold {
         return CompactResult {
-            tokens_removed: tokens_after_micro.saturating_sub(total_token_estimate(&micro.messages)),
+            tokens_removed: tokens_after_micro
+                .saturating_sub(total_token_estimate(&micro.messages)),
             ..micro
         };
     }
@@ -161,8 +159,7 @@ pub fn auto_compact(messages: &[Message], threshold: usize) -> CompactResult {
         .iter()
         .enumerate()
         .filter(|(_, m)| {
-            matches!(m.role, Role::Assistant)
-                && matches!(&m.content, MessageContent::Text(_))
+            matches!(m.role, Role::Assistant) && matches!(&m.content, MessageContent::Text(_))
         })
         .map(|(i, _)| i)
         .collect();
@@ -212,9 +209,7 @@ pub fn reactive_compact(messages: &[Message], keep_recent_turns: usize) -> Compa
     }
 
     // Always preserve the first user message
-    let first_user_idx = messages
-        .iter()
-        .position(|m| matches!(m.role, Role::User));
+    let first_user_idx = messages.iter().position(|m| matches!(m.role, Role::User));
 
     // Work backwards to find the start of the last N turns
     // A "turn" starts with a User message
@@ -302,9 +297,7 @@ pub fn snip_compact(messages: &[Message], target_tokens: usize) -> CompactResult
     }
 
     // Find the first user message (always preserve)
-    let first_user_idx = messages
-        .iter()
-        .position(|m| matches!(m.role, Role::User));
+    let first_user_idx = messages.iter().position(|m| matches!(m.role, Role::User));
 
     // Walk backwards accumulating tokens
     let mut accumulated = 0usize;
@@ -490,10 +483,7 @@ mod tests {
 
     #[test]
     fn auto_compact_does_not_trigger_below_threshold() {
-        let messages = vec![
-            make_user_text("hello"),
-            make_assistant_text("world"),
-        ];
+        let messages = vec![make_user_text("hello"), make_assistant_text("world")];
 
         let result = auto_compact(&messages, 10000);
         // Under threshold, should effectively be a no-op or micro
@@ -528,7 +518,9 @@ mod tests {
         let mut messages = Vec::new();
         messages.push(make_user_text("start"));
         for i in 0..20 {
-            messages.push(make_assistant_text(&format!("long response {}", i).repeat(50)));
+            messages.push(make_assistant_text(
+                &format!("long response {}", i).repeat(50),
+            ));
         }
         messages.push(make_user_text("final"));
 

@@ -1,7 +1,7 @@
 //! TaskList tool — list all tasks.
 
 use crate::context::{ToolError, ToolOutput};
-use crate::task_store::{TaskStatus, TASK_STORE_KEY};
+use crate::task_store::{TASK_STORE_KEY, TaskStatus};
 use crate::tool::{Tool, ToolContext, ToolDescriptor, ToolInput, ToolTier};
 use async_trait::async_trait;
 use std::sync::Arc;
@@ -36,13 +36,17 @@ impl Tool for TaskListTool {
         }
     }
 
-    async fn execute(&self, input: ToolInput, ctx: ToolContext<'_>) -> Result<ToolOutput, ToolError> {
+    async fn execute(
+        &self,
+        input: ToolInput,
+        ctx: ToolContext<'_>,
+    ) -> Result<ToolOutput, ToolError> {
         let store = get_store(&ctx).ok_or_else(|| ToolError::InvalidInput {
             message: "task store not available".into(),
         })?;
 
-        let status_filter = extract_string_opt(&input.arguments, "status")
-            .map(|s| match s.as_str() {
+        let status_filter =
+            extract_string_opt(&input.arguments, "status").map(|s| match s.as_str() {
                 "pending" => TaskStatus::Pending,
                 "in_progress" => TaskStatus::InProgress,
                 "completed" => TaskStatus::Completed,
@@ -61,9 +65,10 @@ impl Tool for TaskListTool {
 }
 
 fn get_store(ctx: &ToolContext<'_>) -> Option<Arc<crate::task_store::TaskStore>> {
-    ctx.extra
-        .get(TASK_STORE_KEY)
-        .and_then(|v| v.downcast_ref::<Arc<crate::task_store::TaskStore>>().map(Arc::clone))
+    ctx.extra.get(TASK_STORE_KEY).and_then(|v| {
+        v.downcast_ref::<Arc<crate::task_store::TaskStore>>()
+            .map(Arc::clone)
+    })
 }
 
 fn extract_string_opt(args: &serde_json::Value, key: &str) -> Option<String> {
@@ -73,9 +78,9 @@ fn extract_string_opt(args: &serde_json::Value, key: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::context::ExecutionContext;
     use crate::task_store::{TaskRecord, TaskStore};
     use crate::tool::ToolContext;
-    use crate::context::ExecutionContext;
     use std::collections::HashMap;
     use std::path::Path;
 
@@ -101,7 +106,11 @@ mod tests {
     async fn task_list_returns_all() {
         let output = TaskListTool
             .execute(
-                ToolInput { call_id: "1".into(), name: "TaskList".into(), arguments: serde_json::json!({}) },
+                ToolInput {
+                    call_id: "1".into(),
+                    name: "TaskList".into(),
+                    arguments: serde_json::json!({}),
+                },
                 test_ctx(),
             )
             .await
@@ -114,7 +123,11 @@ mod tests {
     async fn task_list_filters_by_status() {
         let output = TaskListTool
             .execute(
-                ToolInput { call_id: "1".into(), name: "TaskList".into(), arguments: serde_json::json!({ "status": "completed" }) },
+                ToolInput {
+                    call_id: "1".into(),
+                    name: "TaskList".into(),
+                    arguments: serde_json::json!({ "status": "completed" }),
+                },
                 test_ctx(),
             )
             .await

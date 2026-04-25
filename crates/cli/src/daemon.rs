@@ -57,7 +57,9 @@ pub fn stop_daemon() -> Result<String, String> {
 
     if !is_process_running(pid) {
         let _ = remove_pid_file();
-        return Err(format!("Process {pid} is not running. Cleaned up stale PID file."));
+        return Err(format!(
+            "Process {pid} is not running. Cleaned up stale PID file."
+        ));
     }
 
     #[cfg(unix)]
@@ -78,7 +80,9 @@ pub fn stop_daemon() -> Result<String, String> {
     std::thread::sleep(std::time::Duration::from_millis(500));
 
     if is_process_running(pid) {
-        Ok(format!("Sent SIGTERM to process {pid}. Server is shutting down..."))
+        Ok(format!(
+            "Sent SIGTERM to process {pid}. Server is shutting down..."
+        ))
     } else {
         let _ = remove_pid_file();
         Ok(format!("Process {pid} has stopped. PID file cleaned."))

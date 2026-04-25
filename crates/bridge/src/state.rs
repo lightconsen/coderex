@@ -163,44 +163,67 @@ mod tests {
 
     #[test]
     fn preparing_to_spawning_or_worktree() {
-        assert!(BridgeSessionState::Preparing.can_transition_to(&BridgeSessionState::CreatingWorktree));
+        assert!(
+            BridgeSessionState::Preparing.can_transition_to(&BridgeSessionState::CreatingWorktree)
+        );
         assert!(BridgeSessionState::Preparing.can_transition_to(&BridgeSessionState::Spawning));
     }
 
     #[test]
     fn worktree_to_spawning() {
-        assert!(BridgeSessionState::CreatingWorktree.can_transition_to(&BridgeSessionState::Spawning));
+        assert!(
+            BridgeSessionState::CreatingWorktree.can_transition_to(&BridgeSessionState::Spawning)
+        );
     }
 
     #[test]
     fn spawning_to_running_or_failed() {
         assert!(BridgeSessionState::Spawning.can_transition_to(&BridgeSessionState::Running));
-        assert!(BridgeSessionState::Spawning.can_transition_to(&BridgeSessionState::Failed("oops".into())));
+        assert!(
+            BridgeSessionState::Spawning
+                .can_transition_to(&BridgeSessionState::Failed("oops".into()))
+        );
     }
 
     #[test]
     fn running_to_various() {
-        assert!(BridgeSessionState::Running.can_transition_to(&BridgeSessionState::AwaitingPermission));
+        assert!(
+            BridgeSessionState::Running.can_transition_to(&BridgeSessionState::AwaitingPermission)
+        );
         assert!(BridgeSessionState::Running.can_transition_to(&BridgeSessionState::Archiving));
-        assert!(BridgeSessionState::Running.can_transition_to(&BridgeSessionState::Failed("error".into())));
+        assert!(
+            BridgeSessionState::Running
+                .can_transition_to(&BridgeSessionState::Failed("error".into()))
+        );
     }
 
     #[test]
     fn awaiting_permission_back_to_running() {
-        assert!(BridgeSessionState::AwaitingPermission.can_transition_to(&BridgeSessionState::Running));
-        assert!(BridgeSessionState::AwaitingPermission.can_transition_to(&BridgeSessionState::Failed("denied".into())));
+        assert!(
+            BridgeSessionState::AwaitingPermission.can_transition_to(&BridgeSessionState::Running)
+        );
+        assert!(
+            BridgeSessionState::AwaitingPermission
+                .can_transition_to(&BridgeSessionState::Failed("denied".into()))
+        );
     }
 
     #[test]
     fn archiving_to_cleaning_up() {
         assert!(BridgeSessionState::Archiving.can_transition_to(&BridgeSessionState::CleaningUp));
-        assert!(BridgeSessionState::Archiving.can_transition_to(&BridgeSessionState::Failed("archive error".into())));
+        assert!(
+            BridgeSessionState::Archiving
+                .can_transition_to(&BridgeSessionState::Failed("archive error".into()))
+        );
     }
 
     #[test]
     fn cleaning_up_to_completed_or_failed() {
         assert!(BridgeSessionState::CleaningUp.can_transition_to(&BridgeSessionState::Completed));
-        assert!(BridgeSessionState::CleaningUp.can_transition_to(&BridgeSessionState::Failed("cleanup error".into())));
+        assert!(
+            BridgeSessionState::CleaningUp
+                .can_transition_to(&BridgeSessionState::Failed("cleanup error".into()))
+        );
     }
 
     #[test]

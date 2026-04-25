@@ -59,21 +59,19 @@ impl BridgePermissionRouter {
     }
 
     /// Create a new permission request.
-    pub fn create_request(
-        &mut self,
-        session_id: String,
-        tool: String,
-        args: String,
-    ) -> String {
+    pub fn create_request(&mut self, session_id: String, tool: String, args: String) -> String {
         let id = format!("perm_{}", self.next_id);
         self.next_id += 1;
-        self.pending.insert(id.clone(), PendingPermission {
-            id: id.clone(),
-            session_id,
-            tool,
-            args,
-            resolved: false,
-        });
+        self.pending.insert(
+            id.clone(),
+            PendingPermission {
+                id: id.clone(),
+                session_id,
+                tool,
+                args,
+                resolved: false,
+            },
+        );
         id
     }
 

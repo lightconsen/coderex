@@ -122,11 +122,8 @@ impl Statusline {
             return truncate_to_width(&text, width);
         }
 
-        let mut segments: Vec<String> = vec![
-            "○".into(),
-            self.model.clone(),
-            self.session_title.clone(),
-        ];
+        let mut segments: Vec<String> =
+            vec!["○".into(), self.model.clone(), self.session_title.clone()];
 
         if self.show_tokens {
             segments.push(format!("tok:{},", self.total_tokens));

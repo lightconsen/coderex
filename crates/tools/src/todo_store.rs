@@ -67,7 +67,9 @@ pub struct TodoStore {
 impl TodoStore {
     /// Create an empty todo store.
     pub fn new() -> Self {
-        Self { items: Mutex::new(Vec::new()) }
+        Self {
+            items: Mutex::new(Vec::new()),
+        }
     }
 
     /// Replace the entire todo list.

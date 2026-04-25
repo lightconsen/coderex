@@ -118,18 +118,24 @@ impl ToolExecutor {
             let tool_name = desc.name.clone();
             let lock = self.get_lock(&tool_name).await;
             let _guard = lock.lock().await;
-            timeout(self.config.default_timeout, tool.execute(input.clone(), ctx))
-                .await
-                .map_err(|_| ToolError::Timeout {
-                    timeout: self.config.default_timeout,
-                })?
+            timeout(
+                self.config.default_timeout,
+                tool.execute(input.clone(), ctx),
+            )
+            .await
+            .map_err(|_| ToolError::Timeout {
+                timeout: self.config.default_timeout,
+            })?
         } else {
             // Concurrency-safe tools run without serialization
-            timeout(self.config.default_timeout, tool.execute(input.clone(), ctx))
-                .await
-                .map_err(|_| ToolError::Timeout {
-                    timeout: self.config.default_timeout,
-                })?
+            timeout(
+                self.config.default_timeout,
+                tool.execute(input.clone(), ctx),
+            )
+            .await
+            .map_err(|_| ToolError::Timeout {
+                timeout: self.config.default_timeout,
+            })?
         };
 
         let result = result.map(|output| self.truncate_output(output));
@@ -137,7 +143,9 @@ impl ToolExecutor {
         // Cache successful read-only results
         if desc.is_read_only {
             if let (Some(cache), Ok(output)) = (&self.cache, &result) {
-                cache.insert(&desc.name, &input.arguments, output.clone()).await;
+                cache
+                    .insert(&desc.name, &input.arguments, output.clone())
+                    .await;
             }
         }
 
@@ -157,8 +165,7 @@ impl ToolExecutor {
     ) -> Vec<Result<ToolOutput, ToolError>> {
         let mut all_results: Vec<Option<Result<ToolOutput, ToolError>>> =
             std::iter::repeat_with(|| None).take(calls.len()).collect();
-        let mut to_spawn: Vec<(usize, Arc<dyn Tool>, ToolInput, ToolContext<'static>)> =
-            Vec::new();
+        let mut to_spawn: Vec<(usize, Arc<dyn Tool>, ToolInput, ToolContext<'static>)> = Vec::new();
 
         // Phase 1: check cache
         for (idx, (tool, input, ctx)) in calls.into_iter().enumerate() {
@@ -192,22 +199,29 @@ impl ToolExecutor {
                     let is_read_only = desc.is_read_only;
                     let tool_name = desc.name.clone();
 
-                    let result = match tokio::time::timeout(exec_timeout, tool.execute(input.clone(), ctx)).await {
-                        Ok(Ok(mut output)) => {
-                            if output.output.len() > max_output_bytes {
-                                output.output.truncate(max_output_bytes);
-                                output.output.push_str("\n... [truncated]");
+                    let result =
+                        match tokio::time::timeout(exec_timeout, tool.execute(input.clone(), ctx))
+                            .await
+                        {
+                            Ok(Ok(mut output)) => {
+                                if output.output.len() > max_output_bytes {
+                                    output.output.truncate(max_output_bytes);
+                                    output.output.push_str("\n... [truncated]");
+                                }
+                                Ok(output)
                             }
-                            Ok(output)
-                        }
-                        Ok(Err(e)) => Err(e),
-                        Err(_) => Err(ToolError::Timeout { timeout: exec_timeout }),
-                    };
+                            Ok(Err(e)) => Err(e),
+                            Err(_) => Err(ToolError::Timeout {
+                                timeout: exec_timeout,
+                            }),
+                        };
 
                     // Cache successful read-only results
                     if is_read_only {
                         if let (Some(cache), Ok(output)) = (&cache, &result) {
-                            cache.insert(&tool_name, &input.arguments, output.clone()).await;
+                            cache
+                                .insert(&tool_name, &input.arguments, output.clone())
+                                .await;
                         }
                     }
 
@@ -229,11 +243,14 @@ impl ToolExecutor {
             }
         }
 
-        all_results.into_iter().map(|r| {
-            r.unwrap_or(Err(ToolError::InvalidInput {
-                message: "internal batch error".into(),
-            }))
-        }).collect()
+        all_results
+            .into_iter()
+            .map(|r| {
+                r.unwrap_or(Err(ToolError::InvalidInput {
+                    message: "internal batch error".into(),
+                }))
+            })
+            .collect()
     }
 }
 
@@ -246,10 +263,7 @@ mod tests {
     use std::path::Path;
 
     fn test_ctx() -> ToolContext<'static> {
-        ToolContext::new(
-            crate::context::ExecutionContext::Normal,
-            Path::new("/tmp"),
-        )
+        ToolContext::new(crate::context::ExecutionContext::Normal, Path::new("/tmp"))
     }
 
     fn test_input(msg: &str) -> ToolInput {

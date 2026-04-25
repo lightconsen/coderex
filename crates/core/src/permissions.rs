@@ -7,8 +7,7 @@ use std::path::Path;
 use thiserror::Error;
 
 /// Permission mode controlling how tool approvals work.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[derive(Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum PermissionMode {
     /// Default: ask before dangerous operations.
     #[default]
@@ -24,7 +23,6 @@ pub enum PermissionMode {
     /// Auto: use heuristics to decide (safe ops auto-approved).
     Auto,
 }
-
 
 impl PermissionMode {
     /// Returns true if this mode is fully read-only.
@@ -287,38 +285,41 @@ impl PermissionChecker {
         // Check for explicit deny rules first (deny takes priority)
         for rule in &self.rules {
             if rule.action == PermissionAction::Deny
-                && Self::rule_matches(rule, tool_name, path_str.as_deref()) {
-                    return PermissionResult::Deny {
-                        reason: Self::rule_reason(rule, tool_name),
-                    };
-                }
+                && Self::rule_matches(rule, tool_name, path_str.as_deref())
+            {
+                return PermissionResult::Deny {
+                    reason: Self::rule_reason(rule, tool_name),
+                };
+            }
         }
 
         // Check for explicit allow rules
         for rule in &self.rules {
             if rule.action == PermissionAction::Allow
-                && Self::rule_matches(rule, tool_name, path_str.as_deref()) {
-                    if rule.path_matchers.is_empty() {
-                        return PermissionResult::Allow;
-                    }
-                    return PermissionResult::AllowForPath {
-                        patterns: rule
-                            .path_matchers
-                            .iter()
-                            .map(|m| m.glob().to_string())
-                            .collect(),
-                    };
+                && Self::rule_matches(rule, tool_name, path_str.as_deref())
+            {
+                if rule.path_matchers.is_empty() {
+                    return PermissionResult::Allow;
                 }
+                return PermissionResult::AllowForPath {
+                    patterns: rule
+                        .path_matchers
+                        .iter()
+                        .map(|m| m.glob().to_string())
+                        .collect(),
+                };
+            }
         }
 
         // Check for ask rules
         for rule in &self.rules {
             if rule.action == PermissionAction::Ask
-                && Self::rule_matches(rule, tool_name, path_str.as_deref()) {
-                    return PermissionResult::Ask {
-                        reason: Self::rule_reason(rule, tool_name),
-                    };
-                }
+                && Self::rule_matches(rule, tool_name, path_str.as_deref())
+            {
+                return PermissionResult::Ask {
+                    reason: Self::rule_reason(rule, tool_name),
+                };
+            }
         }
 
         // Default: dangerous tools require approval, safe tools allowed
@@ -326,15 +327,11 @@ impl PermissionChecker {
             if self.mode == PermissionMode::Auto {
                 // Auto mode: safe-ish operations auto-approved
                 return PermissionResult::Ask {
-                    reason: format!(
-                        "tool '{tool_name}' requires approval (auto mode)"
-                    ),
+                    reason: format!("tool '{tool_name}' requires approval (auto mode)"),
                 };
             }
             PermissionResult::Ask {
-                reason: format!(
-                    "tool '{tool_name}' requires approval (dangerous operation)"
-                ),
+                reason: format!("tool '{tool_name}' requires approval (dangerous operation)"),
             }
         } else {
             PermissionResult::Allow
@@ -386,7 +383,9 @@ impl PermissionChecker {
     #[must_use]
     pub fn is_dangerous_tool(&self, tool_name: &str) -> bool {
         let lower = tool_name.to_lowercase();
-        self.dangerous_tools.iter().any(|t| t.eq_ignore_ascii_case(&lower))
+        self.dangerous_tools
+            .iter()
+            .any(|t| t.eq_ignore_ascii_case(&lower))
     }
 
     /// Check if a tool is read-only (safe for plan mode).
@@ -394,15 +393,22 @@ impl PermissionChecker {
     pub fn is_tool_read_only(&self, tool_name: &str) -> bool {
         matches!(
             tool_name.to_lowercase().as_str(),
-            "read" | "ls" | "grep" | "glob"
-                | "web_search" | "web_fetch" | "grep_code"
-                | "file_search" | "notebook_read"
+            "read"
+                | "ls"
+                | "grep"
+                | "glob"
+                | "web_search"
+                | "web_fetch"
+                | "grep_code"
+                | "file_search"
+                | "notebook_read"
         )
     }
 
     /// Check if a rule matches the given tool and path.
     fn rule_matches(rule: &CompiledRule, tool_name: &str, path: Option<&str>) -> bool {
-        let name_matches = rule.tool_name.is_empty() || rule.tool_name.eq_ignore_ascii_case(tool_name);
+        let name_matches =
+            rule.tool_name.is_empty() || rule.tool_name.eq_ignore_ascii_case(tool_name);
         if !name_matches {
             return false;
         }
@@ -440,8 +446,14 @@ mod tests {
     #[test]
     fn bypass_mode_allows_everything() {
         let checker = PermissionChecker::new(PermissionMode::BypassPermissions);
-        assert!(matches!(checker.check("bash", None), PermissionResult::Allow));
-        assert!(matches!(checker.check("write", None), PermissionResult::Allow));
+        assert!(matches!(
+            checker.check("bash", None),
+            PermissionResult::Allow
+        ));
+        assert!(matches!(
+            checker.check("write", None),
+            PermissionResult::Allow
+        ));
     }
 
     #[test]
@@ -456,8 +468,14 @@ mod tests {
     #[test]
     fn plan_mode_allows_only_readonly_tools() {
         let checker = PermissionChecker::new(PermissionMode::Plan);
-        assert!(matches!(checker.check("read", None), PermissionResult::Allow));
-        assert!(matches!(checker.check("grep", None), PermissionResult::Allow));
+        assert!(matches!(
+            checker.check("read", None),
+            PermissionResult::Allow
+        ));
+        assert!(matches!(
+            checker.check("grep", None),
+            PermissionResult::Allow
+        ));
         assert!(matches!(
             checker.check("bash", None),
             PermissionResult::Deny { .. }
@@ -471,7 +489,10 @@ mod tests {
     #[test]
     fn dangerous_tools_require_approval_in_default_mode() {
         let checker = PermissionChecker::new(PermissionMode::Default);
-        assert!(matches!(checker.check("read", None), PermissionResult::Allow));
+        assert!(matches!(
+            checker.check("read", None),
+            PermissionResult::Allow
+        ));
         assert!(matches!(
             checker.check("bash", None),
             PermissionResult::Ask { .. }
@@ -531,7 +552,10 @@ mod tests {
     fn session_approvals_cached() {
         let mut checker = PermissionChecker::new(PermissionMode::Default);
         checker.record_session_approval("bash".into(), true);
-        assert!(matches!(checker.check("bash", None), PermissionResult::Allow));
+        assert!(matches!(
+            checker.check("bash", None),
+            PermissionResult::Allow
+        ));
 
         checker.clear_session_approvals();
         assert!(matches!(
@@ -570,9 +594,15 @@ mod tests {
     fn default_mode_auto_for_safe_tools() {
         let checker = PermissionChecker::new(PermissionMode::Default);
         // Safe tools should be allowed
-        assert!(matches!(checker.check("read", None), PermissionResult::Allow));
+        assert!(matches!(
+            checker.check("read", None),
+            PermissionResult::Allow
+        ));
         assert!(matches!(checker.check("ls", None), PermissionResult::Allow));
-        assert!(matches!(checker.check("grep", None), PermissionResult::Allow));
+        assert!(matches!(
+            checker.check("grep", None),
+            PermissionResult::Allow
+        ));
     }
 
     #[test]
@@ -620,13 +650,19 @@ mod tests {
         checker.enter_plan_mode();
         assert!(matches!(checker.mode(), PermissionMode::Plan));
         // Plan mode denies write/bash
-        assert!(matches!(checker.check("bash", None), PermissionResult::Deny { .. }));
+        assert!(matches!(
+            checker.check("bash", None),
+            PermissionResult::Deny { .. }
+        ));
 
         let restored = checker.exit_plan_mode();
         assert!(restored.is_some());
         assert!(matches!(restored.unwrap(), PermissionMode::Default));
         // Restored mode: dangerous tools require approval
-        assert!(matches!(checker.check("bash", None), PermissionResult::Ask { .. }));
+        assert!(matches!(
+            checker.check("bash", None),
+            PermissionResult::Ask { .. }
+        ));
     }
 
     #[test]
@@ -680,7 +716,10 @@ mod tests {
     fn permission_mode_display() {
         assert_eq!(PermissionMode::Default.to_string(), "default");
         assert_eq!(PermissionMode::AcceptEdits.to_string(), "accept-edits");
-        assert_eq!(PermissionMode::BypassPermissions.to_string(), "bypass-permissions");
+        assert_eq!(
+            PermissionMode::BypassPermissions.to_string(),
+            "bypass-permissions"
+        );
         assert_eq!(PermissionMode::DontAsk.to_string(), "dont-ask");
         assert_eq!(PermissionMode::Plan.to_string(), "plan");
         assert_eq!(PermissionMode::Auto.to_string(), "auto");

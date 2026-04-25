@@ -84,11 +84,12 @@ pub fn register(registry: &mut CommandRegistry) {
         true,
         Arc::new(|_ctx: &CommandContext, args: &[String]| {
             if args.is_empty() {
-                CommandResult::success("Usage: /issue create <title> | /issue list | /issue <number>")
+                CommandResult::success(
+                    "Usage: /issue create <title> | /issue list | /issue <number>",
+                )
             } else if args[0] == "create" {
                 let title = args[1..].join(" ");
-                CommandResult::success(format!("Issue created: {title}"))
-                    .with_state_change(true)
+                CommandResult::success(format!("Issue created: {title}")).with_state_change(true)
             } else if args[0] == "list" {
                 CommandResult::success("Issues:\n  No open issues.")
             } else {
@@ -116,8 +117,12 @@ pub fn register(registry: &mut CommandRegistry) {
                 }
                 CommandResult::success(output)
             } else {
-                CommandResult::success(format!("Setting env: {} = {}", args[0], args.get(1).map(|s| s.as_str()).unwrap_or("")))
-                    .with_state_change(true)
+                CommandResult::success(format!(
+                    "Setting env: {} = {}",
+                    args[0],
+                    args.get(1).map(|s| s.as_str()).unwrap_or("")
+                ))
+                .with_state_change(true)
             }
         }),
     ));
@@ -146,8 +151,7 @@ pub fn register(registry: &mut CommandRegistry) {
         true,
         true,
         Arc::new(|_ctx: &CommandContext, _args: &[String]| {
-            CommandResult::success("OAuth token refreshed.")
-                .with_state_change(true)
+            CommandResult::success("OAuth token refreshed.").with_state_change(true)
         }),
     ));
 
@@ -231,12 +235,17 @@ pub fn register(registry: &mut CommandRegistry) {
                         if args.len() < 2 {
                             CommandResult::error("Usage: /history search <query>")
                         } else {
-                            CommandResult::success(format!("Search for '{}' — use /history in the REPL to see results.", args[1..].join(" ")))
+                            CommandResult::success(format!(
+                                "Search for '{}' — use /history in the REPL to see results.",
+                                args[1..].join(" ")
+                            ))
                         }
                     }
                     _ => {
                         let n: usize = args[0].parse().unwrap_or(20);
-                        CommandResult::success(format!("Showing last {n} commands. Use /history in the REPL for full history."))
+                        CommandResult::success(format!(
+                            "Showing last {n} commands. Use /history in the REPL for full history."
+                        ))
                     }
                 }
             }
@@ -255,7 +264,11 @@ mod tests {
 
     #[test]
     fn advisor_mode() {
-        let reg = { let mut r = CommandRegistry::new(); register(&mut r); r };
+        let reg = {
+            let mut r = CommandRegistry::new();
+            register(&mut r);
+            r
+        };
         let result = reg.execute("advisor", &ctx(), &[]);
         assert!(result.output.contains("Advisor mode"));
         assert!(result.extra_context.is_some());
@@ -265,35 +278,55 @@ mod tests {
 
     #[test]
     fn btw_requires_arg() {
-        let reg = { let mut r = CommandRegistry::new(); register(&mut r); r };
+        let reg = {
+            let mut r = CommandRegistry::new();
+            register(&mut r);
+            r
+        };
         let result = reg.execute("btw", &ctx(), &[]);
         assert!(result.output.contains("Usage"));
     }
 
     #[test]
     fn btw_adds_context() {
-        let reg = { let mut r = CommandRegistry::new(); register(&mut r); r };
+        let reg = {
+            let mut r = CommandRegistry::new();
+            register(&mut r);
+            r
+        };
         let result = reg.execute("btw", &ctx(), &["important".into(), "context".into()]);
         assert!(result.extra_context.is_some());
     }
 
     #[test]
     fn good_claude() {
-        let reg = { let mut r = CommandRegistry::new(); register(&mut r); r };
+        let reg = {
+            let mut r = CommandRegistry::new();
+            register(&mut r);
+            r
+        };
         let result = reg.execute("good-claude", &ctx(), &[]);
         assert!(result.output.contains("Thanks"));
     }
 
     #[test]
     fn stickers_feature_gated() {
-        let reg = { let mut r = CommandRegistry::new(); register(&mut r); r };
+        let reg = {
+            let mut r = CommandRegistry::new();
+            register(&mut r);
+            r
+        };
         let result = reg.execute("stickers", &ctx(), &[]);
         assert!(result.output.contains("not enabled"));
     }
 
     #[test]
     fn bughunter_mode() {
-        let reg = { let mut r = CommandRegistry::new(); register(&mut r); r };
+        let reg = {
+            let mut r = CommandRegistry::new();
+            register(&mut r);
+            r
+        };
         let result = reg.execute("bughunter", &ctx(), &[]);
         assert!(result.output.contains("Bug Hunter"));
         assert!(result.extra_context.is_some());
@@ -303,36 +336,60 @@ mod tests {
 
     #[test]
     fn issue_usage() {
-        let reg = { let mut r = CommandRegistry::new(); register(&mut r); r };
+        let reg = {
+            let mut r = CommandRegistry::new();
+            register(&mut r);
+            r
+        };
         let result = reg.execute("issue", &ctx(), &[]);
         assert!(result.output.contains("Usage"));
     }
 
     #[test]
     fn issue_create() {
-        let reg = { let mut r = CommandRegistry::new(); register(&mut r); r };
-        let result = reg.execute("issue", &ctx(), &["create".into(), "fix".into(), "bug".into()]);
+        let reg = {
+            let mut r = CommandRegistry::new();
+            register(&mut r);
+            r
+        };
+        let result = reg.execute(
+            "issue",
+            &ctx(),
+            &["create".into(), "fix".into(), "bug".into()],
+        );
         assert!(result.output.contains("fix bug"));
         assert!(result.state_changed);
     }
 
     #[test]
     fn issue_list() {
-        let reg = { let mut r = CommandRegistry::new(); register(&mut r); r };
+        let reg = {
+            let mut r = CommandRegistry::new();
+            register(&mut r);
+            r
+        };
         let result = reg.execute("issue", &ctx(), &["list".into()]);
         assert!(result.output.contains("No open issues"));
     }
 
     #[test]
     fn issue_view_number() {
-        let reg = { let mut r = CommandRegistry::new(); register(&mut r); r };
+        let reg = {
+            let mut r = CommandRegistry::new();
+            register(&mut r);
+            r
+        };
         let result = reg.execute("issue", &ctx(), &["42".into()]);
         assert!(result.output.contains("42"));
     }
 
     #[test]
     fn env_empty() {
-        let reg = { let mut r = CommandRegistry::new(); register(&mut r); r };
+        let reg = {
+            let mut r = CommandRegistry::new();
+            register(&mut r);
+            r
+        };
         let result = reg.execute("env", &ctx(), &[]);
         assert!(result.output.contains("Environment"));
     }
@@ -342,29 +399,48 @@ mod tests {
         let mut env = std::collections::HashMap::new();
         env.insert("HOME".into(), "/home/user".into());
         let c = CommandContext { env, ..ctx() };
-        let reg = { let mut r = CommandRegistry::new(); register(&mut r); r };
+        let reg = {
+            let mut r = CommandRegistry::new();
+            register(&mut r);
+            r
+        };
         let result = reg.execute("env", &c, &[]);
         assert!(result.output.contains("HOME"));
     }
 
     #[test]
     fn diff_empty() {
-        let reg = { let mut r = CommandRegistry::new(); register(&mut r); r };
+        let reg = {
+            let mut r = CommandRegistry::new();
+            register(&mut r);
+            r
+        };
         let result = reg.execute("diff", &ctx(), &[]);
         assert!(result.output.contains("No changes"));
     }
 
     #[test]
     fn diff_with_changes() {
-        let c = CommandContext { git_status: "M file.txt\nA new.txt".into(), ..ctx() };
-        let reg = { let mut r = CommandRegistry::new(); register(&mut r); r };
+        let c = CommandContext {
+            git_status: "M file.txt\nA new.txt".into(),
+            ..ctx()
+        };
+        let reg = {
+            let mut r = CommandRegistry::new();
+            register(&mut r);
+            r
+        };
         let result = reg.execute("diff", &c, &[]);
         assert!(result.output.contains("file.txt"));
     }
 
     #[test]
     fn oauth_refresh() {
-        let reg = { let mut r = CommandRegistry::new(); register(&mut r); r };
+        let reg = {
+            let mut r = CommandRegistry::new();
+            register(&mut r);
+            r
+        };
         let result = reg.execute("oauth-refresh", &ctx(), &[]);
         assert!(result.output.contains("refreshed"));
         assert!(result.state_changed);
@@ -372,7 +448,11 @@ mod tests {
 
     #[test]
     fn backfill_sessions() {
-        let reg = { let mut r = CommandRegistry::new(); register(&mut r); r };
+        let reg = {
+            let mut r = CommandRegistry::new();
+            register(&mut r);
+            r
+        };
         let result = reg.execute("backfill-sessions", &ctx(), &[]);
         assert!(result.output.contains("Backfilling"));
         assert!(result.state_changed);
@@ -380,7 +460,11 @@ mod tests {
 
     #[test]
     fn feedback_help() {
-        let reg = { let mut r = CommandRegistry::new(); register(&mut r); r };
+        let reg = {
+            let mut r = CommandRegistry::new();
+            register(&mut r);
+            r
+        };
         let result = reg.execute("feedback", &ctx(), &[]);
         assert!(result.output.contains("Use /feedback"));
     }

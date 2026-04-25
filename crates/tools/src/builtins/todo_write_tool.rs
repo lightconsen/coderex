@@ -1,7 +1,7 @@
 //! TodoWrite tool — create/update structured task list.
 
 use crate::context::{ToolError, ToolOutput};
-use crate::todo_store::{TodoItem, TodoStatus, TODO_STORE_KEY};
+use crate::todo_store::{TODO_STORE_KEY, TodoItem, TodoStatus};
 use crate::tool::{Tool, ToolContext, ToolDescriptor, ToolInput, ToolTier};
 use async_trait::async_trait;
 use serde::Deserialize;
@@ -50,7 +50,11 @@ impl Tool for TodoWriteTool {
         }
     }
 
-    async fn execute(&self, input: ToolInput, ctx: ToolContext<'_>) -> Result<ToolOutput, ToolError> {
+    async fn execute(
+        &self,
+        input: ToolInput,
+        ctx: ToolContext<'_>,
+    ) -> Result<ToolOutput, ToolError> {
         let todos_value = input
             .arguments
             .get("todos")
@@ -58,8 +62,8 @@ impl Tool for TodoWriteTool {
                 message: "missing required field: todos".into(),
             })?;
 
-        let todos_raw: Vec<TodoInput> = serde_json::from_value(todos_value.clone())
-            .map_err(|e| ToolError::InvalidInput {
+        let todos_raw: Vec<TodoInput> =
+            serde_json::from_value(todos_value.clone()).map_err(|e| ToolError::InvalidInput {
                 message: format!("invalid todos format: {e}"),
             })?;
 
@@ -97,17 +101,18 @@ struct TodoInput {
 }
 
 fn get_store(ctx: &ToolContext<'_>) -> Option<Arc<crate::todo_store::TodoStore>> {
-    ctx.extra
-        .get(TODO_STORE_KEY)
-        .and_then(|v| v.downcast_ref::<Arc<crate::todo_store::TodoStore>>().map(Arc::clone))
+    ctx.extra.get(TODO_STORE_KEY).and_then(|v| {
+        v.downcast_ref::<Arc<crate::todo_store::TodoStore>>()
+            .map(Arc::clone)
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::context::ExecutionContext;
     use crate::todo_store::TodoStore;
     use crate::tool::ToolContext;
-    use crate::context::ExecutionContext;
     use std::collections::HashMap;
     use std::path::Path;
 
@@ -139,10 +144,7 @@ mod tests {
             { "subject": "task2", "status": "in_progress" }
         ]);
 
-        let output = TodoWriteTool
-            .execute(todo_input(todos), ctx)
-            .await
-            .unwrap();
+        let output = TodoWriteTool.execute(todo_input(todos), ctx).await.unwrap();
         assert!(output.output.contains("2 todo"));
     }
 
@@ -172,10 +174,7 @@ mod tests {
         let ctx = ToolContext::new(ExecutionContext::Normal, Path::new("/tmp"));
         let todos = serde_json::json!([{ "subject": "task1", "status": "pending" }]);
         // Should not error even without a store
-        let output = TodoWriteTool
-            .execute(todo_input(todos), ctx)
-            .await
-            .unwrap();
+        let output = TodoWriteTool.execute(todo_input(todos), ctx).await.unwrap();
         assert!(output.output.contains("1 todo"));
     }
 }

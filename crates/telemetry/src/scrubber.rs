@@ -24,37 +24,29 @@ impl Scrubber {
         let mut patterns = Vec::new();
 
         // Email addresses
-        if let Ok(re) = Regex::new(
-            r#"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}"#
-        ) {
+        if let Ok(re) = Regex::new(r#"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}"#) {
             patterns.push((re, "<EMAIL>".to_string()));
         }
 
         // IPv4 addresses
-        if let Ok(re) = Regex::new(
-            r#"\b(?:[0-9]{1,3}\.){3}[0-9]{1,3}\b"#
-        ) {
+        if let Ok(re) = Regex::new(r#"\b(?:[0-9]{1,3}\.){3}[0-9]{1,3}\b"#) {
             patterns.push((re, "<IP>".to_string()));
         }
 
         // IPv6 addresses (simplified — matches common forms)
-        if let Ok(re) = Regex::new(
-            r#"\b(?:[0-9a-fA-F]{1,4}:){2,7}[0-9a-fA-F]{1,4}\b"#
-        ) {
+        if let Ok(re) = Regex::new(r#"\b(?:[0-9a-fA-F]{1,4}:){2,7}[0-9a-fA-F]{1,4}\b"#) {
             patterns.push((re, "<IP>".to_string()));
         }
 
         // API keys — common patterns (hex strings, base64-like)
         if let Ok(re) = Regex::new(
-            r#"\b(?:sk-|api[_-]?key|token|secret)[_-]?[=:]?\s*["']?[a-zA-Z0-9_\-]{20,}["']?"#
+            r#"\b(?:sk-|api[_-]?key|token|secret)[_-]?[=:]?\s*["']?[a-zA-Z0-9_\-]{20,}["']?"#,
         ) {
             patterns.push((re, "<API_KEY>".to_string()));
         }
 
         // Home directory paths — attempt to catch /home/username or /Users/username
-        if let Ok(re) = Regex::new(
-            r#"(/(?:home|Users)/)[^/\s]+"#
-        ) {
+        if let Ok(re) = Regex::new(r#"(/(?:home|Users)/)[^/\s]+"#) {
             patterns.push((re, "${1}<USER>".to_string()));
         }
 
@@ -77,7 +69,9 @@ impl Scrubber {
             TelemetryEvent::Error { message, .. } => {
                 *message = self.scrub(message);
             }
-            TelemetryEvent::ApiCall { provider, model, .. } => {
+            TelemetryEvent::ApiCall {
+                provider, model, ..
+            } => {
                 *provider = self.scrub(provider);
                 *model = self.scrub(model);
             }
@@ -108,7 +102,10 @@ mod tests {
     fn scrub_home_path() {
         let scrubber = Scrubber::new();
         let text = "File at /home/alice/project/src/main.rs";
-        assert_eq!(scrubber.scrub(text), "File at /home/<USER>/project/src/main.rs");
+        assert_eq!(
+            scrubber.scrub(text),
+            "File at /home/<USER>/project/src/main.rs"
+        );
     }
 
     #[test]

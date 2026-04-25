@@ -103,7 +103,9 @@ impl OAuthManager {
         let content = std::fs::read_to_string(&path)?;
         let store: TokenStore = serde_json::from_str(&content)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-        Ok(Self { states: store.states })
+        Ok(Self {
+            states: store.states,
+        })
     }
 
     /// Save tokens to the default persistence file.
@@ -125,7 +127,11 @@ impl OAuthManager {
     pub fn token_path() -> std::path::PathBuf {
         std::env::var("HOME")
             .or_else(|_| std::env::var("USERPROFILE"))
-            .map(|h| std::path::PathBuf::from(h).join(".coderex").join("mcp_tokens.json"))
+            .map(|h| {
+                std::path::PathBuf::from(h)
+                    .join(".coderex")
+                    .join("mcp_tokens.json")
+            })
             .unwrap_or_else(|_| std::path::PathBuf::from(".coderex/mcp_tokens.json"))
     }
 

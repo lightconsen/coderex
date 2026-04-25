@@ -292,10 +292,8 @@ mod tests {
         let base = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(base.path().join("worktrees/s1")).unwrap();
         std::fs::create_dir_all(base.path().join("sessions/s1")).unwrap();
-        let mut mgr = BridgeCleanupManager::new(
-            base.path().join("worktrees"),
-            base.path().join("sessions"),
-        );
+        let mut mgr =
+            BridgeCleanupManager::new(base.path().join("worktrees"), base.path().join("sessions"));
         let report = mgr.cleanup("s1").unwrap();
         assert!(report.worktree_removed);
         assert!(report.session_dir_removed);
@@ -304,10 +302,8 @@ mod tests {
     #[test]
     fn cleanup_nonexistent_is_ok() {
         let base = tempfile::tempdir().unwrap();
-        let mut mgr = BridgeCleanupManager::new(
-            base.path().join("worktrees"),
-            base.path().join("sessions"),
-        );
+        let mut mgr =
+            BridgeCleanupManager::new(base.path().join("worktrees"), base.path().join("sessions"));
         let report = mgr.cleanup("nonexistent").unwrap();
         assert!(!report.worktree_removed);
         assert!(!report.session_dir_removed);
@@ -335,7 +331,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let writer = BridgeArchiveWriter::new(dir.path().to_path_buf());
         let rt = tokio::runtime::Runtime::new().unwrap();
-        rt.block_on(writer.archive("s1", "line\n", sample_usage(), "completed")).unwrap();
+        rt.block_on(writer.archive("s1", "line\n", sample_usage(), "completed"))
+            .unwrap();
 
         let metadata = writer.load_metadata("s1");
         assert!(metadata.is_some());
@@ -377,7 +374,11 @@ mod tests {
             "status": "completed",
             "archived_at": "2026-01-01T00:00:00Z"
         });
-        std::fs::write(session_dir.join("metadata.json"), serde_json::to_string(&future_meta).unwrap()).unwrap();
+        std::fs::write(
+            session_dir.join("metadata.json"),
+            serde_json::to_string(&future_meta).unwrap(),
+        )
+        .unwrap();
 
         let writer = BridgeArchiveWriter::new(dir.path().to_path_buf());
         assert!(writer.load_metadata("s1").is_none());

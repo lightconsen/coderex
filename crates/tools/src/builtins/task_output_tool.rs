@@ -41,9 +41,17 @@ impl Tool for TaskOutputTool {
         }
     }
 
-    async fn execute(&self, input: ToolInput, ctx: ToolContext<'_>) -> Result<ToolOutput, ToolError> {
+    async fn execute(
+        &self,
+        input: ToolInput,
+        ctx: ToolContext<'_>,
+    ) -> Result<ToolOutput, ToolError> {
         let task_id = extract_string(&input.arguments, "taskId")?;
-        let block = input.arguments.get("block").and_then(|v| v.as_bool()).unwrap_or(false);
+        let block = input
+            .arguments
+            .get("block")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
         let timeout_secs = input
             .arguments
             .get("timeout")
@@ -58,9 +66,11 @@ impl Tool for TaskOutputTool {
             message: format!("task '{task_id}' not found"),
         })?;
 
-        let output_path = task.output_file_path.ok_or_else(|| ToolError::InvalidInput {
-            message: format!("task '{task_id}' has no output file"),
-        })?;
+        let output_path = task
+            .output_file_path
+            .ok_or_else(|| ToolError::InvalidInput {
+                message: format!("task '{task_id}' has no output file"),
+            })?;
 
         // If block mode, wait for file
         if block {
@@ -74,9 +84,10 @@ impl Tool for TaskOutputTool {
             }
         }
 
-        let content = std::fs::read_to_string(&output_path).map_err(|e| ToolError::InvalidInput {
-            message: format!("failed to read output file: {e}"),
-        })?;
+        let content =
+            std::fs::read_to_string(&output_path).map_err(|e| ToolError::InvalidInput {
+                message: format!("failed to read output file: {e}"),
+            })?;
 
         let truncated = if content.len() > MAX_OUTPUT_CHARS {
             format!("{}\n\n... (truncated)", &content[..MAX_OUTPUT_CHARS])
@@ -92,9 +103,10 @@ impl Tool for TaskOutputTool {
 }
 
 fn get_store(ctx: &ToolContext<'_>) -> Option<Arc<crate::task_store::TaskStore>> {
-    ctx.extra
-        .get(TASK_STORE_KEY)
-        .and_then(|v| v.downcast_ref::<Arc<crate::task_store::TaskStore>>().map(Arc::clone))
+    ctx.extra.get(TASK_STORE_KEY).and_then(|v| {
+        v.downcast_ref::<Arc<crate::task_store::TaskStore>>()
+            .map(Arc::clone)
+    })
 }
 
 fn extract_string(args: &serde_json::Value, key: &str) -> Result<String, ToolError> {
@@ -110,9 +122,9 @@ fn extract_string(args: &serde_json::Value, key: &str) -> Result<String, ToolErr
 #[allow(dead_code)]
 mod tests {
     use super::*;
+    use crate::context::ExecutionContext;
     use crate::task_store::{TaskRecord, TaskStore};
     use crate::tool::ToolContext;
-    use crate::context::ExecutionContext;
     use std::collections::HashMap;
     use std::path::Path;
 
@@ -146,7 +158,11 @@ mod tests {
 
         let result = TaskOutputTool
             .execute(
-                ToolInput { call_id: "1".into(), name: "TaskOutput".into(), arguments: serde_json::json!({ "taskId": "2" }) },
+                ToolInput {
+                    call_id: "1".into(),
+                    name: "TaskOutput".into(),
+                    arguments: serde_json::json!({ "taskId": "2" }),
+                },
                 ctx,
             )
             .await;

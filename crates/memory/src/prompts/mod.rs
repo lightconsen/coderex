@@ -5,9 +5,7 @@
 //! memory compaction, etc.).
 
 /// Re-export core memory prompt constants for convenience.
-pub use coderex_core::prompts::{
-    EXTRACT_MEMORIES_SYSTEM, SESSION_MEMORY_UPDATE_INSTRUCTION,
-};
+pub use coderex_core::prompts::{EXTRACT_MEMORIES_SYSTEM, SESSION_MEMORY_UPDATE_INSTRUCTION};
 
 /// Assemble a session memory update user prompt from current memory and
 /// recent conversation excerpt.
@@ -32,9 +30,7 @@ pub fn extract_memories_user_prompt(conversation: &str, existing_topics: &str) -
     let context = if existing_topics.is_empty() {
         String::new()
     } else {
-        format!(
-            "Existing memory topics (update if needed):\n{existing_topics}\n\n"
-        )
+        format!("Existing memory topics (update if needed):\n{existing_topics}\n\n")
     };
     format!(
         "{context}\

@@ -15,8 +15,8 @@ fn find_free_port() -> u16 {
 
 /// Start the static-anthropic-server binary on a free port.
 fn start_server(port: u16) -> Child {
-    let responses_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("tests/data/static_responses.json");
+    let responses_path =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data/static_responses.json");
 
     assert!(
         responses_path.exists(),
@@ -109,10 +109,7 @@ async fn static_server_loads_responses_and_serves_tool_use() {
         text.contains("tool_use"),
         "expected tool_use in response, got: {text}"
     );
-    assert!(
-        text.contains("Write"),
-        "expected Write tool, got: {text}"
-    );
+    assert!(text.contains("Write"), "expected Write tool, got: {text}");
     assert!(
         text.contains("src/lib.rs"),
         "expected file path in tool input"

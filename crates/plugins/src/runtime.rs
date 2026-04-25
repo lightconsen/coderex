@@ -150,16 +150,18 @@ impl PluginProcess {
         cmd.stderr(Stdio::piped());
         cmd.kill_on_drop(true);
 
-        let mut process = cmd.spawn().map_err(|e| {
-            format!("failed to spawn plugin '{}': {e}", self.command)
-        })?;
+        let mut process = cmd
+            .spawn()
+            .map_err(|e| format!("failed to spawn plugin '{}': {e}", self.command))?;
 
-        let stdin = process.stdin.take().ok_or_else(|| {
-            "failed to take stdin from plugin process".to_string()
-        })?;
-        let stdout = process.stdout.take().ok_or_else(|| {
-            "failed to take stdout from plugin process".to_string()
-        })?;
+        let stdin = process
+            .stdin
+            .take()
+            .ok_or_else(|| "failed to take stdin from plugin process".to_string())?;
+        let stdout = process
+            .stdout
+            .take()
+            .ok_or_else(|| "failed to take stdout from plugin process".to_string())?;
 
         self.process = Some(process);
         self.stdin = Some(stdin);
@@ -178,7 +180,9 @@ impl PluginProcess {
             }
         });
 
-        let result = self.send_request("coderex/initialize", Some(init_params)).await?;
+        let result = self
+            .send_request("coderex/initialize", Some(init_params))
+            .await?;
         self.initialized = true;
         Ok(result)
     }
@@ -193,16 +197,14 @@ impl PluginProcess {
     }
 
     /// Execute a plugin command.
-    pub async fn execute_command(
-        &mut self,
-        name: &str,
-        args: &[String],
-    ) -> Result<String, String> {
+    pub async fn execute_command(&mut self, name: &str, args: &[String]) -> Result<String, String> {
         let params = serde_json::json!({
             "name": name,
             "args": args,
         });
-        let result = self.send_request("coderex/commands/execute", Some(params)).await?;
+        let result = self
+            .send_request("coderex/commands/execute", Some(params))
+            .await?;
         match result {
             Value::String(s) => Ok(s),
             other => Ok(other.to_string()),
@@ -219,16 +221,14 @@ impl PluginProcess {
     }
 
     /// Execute a plugin skill.
-    pub async fn execute_skill(
-        &mut self,
-        name: &str,
-        context: &Value,
-    ) -> Result<String, String> {
+    pub async fn execute_skill(&mut self, name: &str, context: &Value) -> Result<String, String> {
         let params = serde_json::json!({
             "name": name,
             "context": context,
         });
-        let result = self.send_request("coderex/skills/execute", Some(params)).await?;
+        let result = self
+            .send_request("coderex/skills/execute", Some(params))
+            .await?;
         match result {
             Value::String(s) => Ok(s),
             other => Ok(other.to_string()),
@@ -288,7 +288,10 @@ impl PluginProcess {
         Ok(())
     }
 
-    async fn write_notification(&mut self, notification: &JsonRpcNotification) -> Result<(), String> {
+    async fn write_notification(
+        &mut self,
+        notification: &JsonRpcNotification,
+    ) -> Result<(), String> {
         let stdin = self.stdin.as_mut().ok_or("stdin not available")?;
         let line = serde_json::to_string(&notification)
             .map_err(|e| format!("failed to serialize notification: {e}"))?;
@@ -369,9 +372,10 @@ impl PluginProcess {
         let _ = self.send_notification("coderex/shutdown", None).await;
 
         if let Some(ref mut process) = self.process {
-            process.kill().await.map_err(|e| {
-                format!("failed to kill plugin process: {e}")
-            })?;
+            process
+                .kill()
+                .await
+                .map_err(|e| format!("failed to kill plugin process: {e}"))?;
             let _ = process.wait().await;
         }
         self.process = None;
@@ -388,14 +392,20 @@ mod tests {
 
     #[tokio::test]
     async fn new_process_not_initialized() {
-        let process = PluginProcess::new("echo", vec![], HashMap::new(), std::path::PathBuf::from("/"));
+        let process = PluginProcess::new(
+            "echo",
+            vec![],
+            HashMap::new(),
+            std::path::PathBuf::from("/"),
+        );
         assert!(!process.is_initialized());
         assert!(!process.is_running());
     }
 
     #[tokio::test]
     async fn spawn_valid_process() {
-        let mut process = PluginProcess::new("cat", vec![], HashMap::new(), std::path::PathBuf::from("/"));
+        let mut process =
+            PluginProcess::new("cat", vec![], HashMap::new(), std::path::PathBuf::from("/"));
         let result = process.spawn().await;
         assert!(result.is_ok(), "spawn failed: {result:?}");
         assert!(process.is_running());
@@ -416,7 +426,8 @@ mod tests {
 
     #[tokio::test]
     async fn terminate_clears_state() {
-        let mut process = PluginProcess::new("cat", vec![], HashMap::new(), std::path::PathBuf::from("/"));
+        let mut process =
+            PluginProcess::new("cat", vec![], HashMap::new(), std::path::PathBuf::from("/"));
         process.spawn().await.unwrap();
         assert!(process.is_running());
         process.terminate().await.unwrap();
@@ -449,7 +460,8 @@ mod tests {
 
     #[test]
     fn error_response() {
-        let json = r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32601,"message":"Method not found"}}"#;
+        let json =
+            r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32601,"message":"Method not found"}}"#;
         let response: JsonRpcResponse = serde_json::from_str(json).unwrap();
         assert!(response.error.is_some());
         let err = response.error.unwrap();

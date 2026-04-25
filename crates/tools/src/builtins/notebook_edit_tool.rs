@@ -62,20 +62,28 @@ impl Tool for NotebookEditTool {
         }
     }
 
-    async fn execute(&self, input: ToolInput, _ctx: ToolContext<'_>) -> Result<ToolOutput, ToolError> {
+    async fn execute(
+        &self,
+        input: ToolInput,
+        _ctx: ToolContext<'_>,
+    ) -> Result<ToolOutput, ToolError> {
         let notebook_path = extract_string(&input.arguments, "notebook_path")?;
         let new_source = extract_string(&input.arguments, "new_source")?;
         let cell_id = extract_string_opt(&input.arguments, "cell_id");
-        let cell_type = extract_string_opt(&input.arguments, "cell_type").unwrap_or_else(|| "code".into());
-        let edit_mode = extract_string_opt(&input.arguments, "edit_mode").unwrap_or_else(|| "replace".into());
+        let cell_type =
+            extract_string_opt(&input.arguments, "cell_type").unwrap_or_else(|| "code".into());
+        let edit_mode =
+            extract_string_opt(&input.arguments, "edit_mode").unwrap_or_else(|| "replace".into());
 
-        let content = std::fs::read_to_string(&notebook_path).map_err(|e| ToolError::InvalidInput {
-            message: format!("failed to read notebook: {e}"),
-        })?;
+        let content =
+            std::fs::read_to_string(&notebook_path).map_err(|e| ToolError::InvalidInput {
+                message: format!("failed to read notebook: {e}"),
+            })?;
 
-        let mut notebook: Notebook = serde_json::from_str(&content).map_err(|e| ToolError::InvalidInput {
-            message: format!("invalid notebook format: {e}"),
-        })?;
+        let mut notebook: Notebook =
+            serde_json::from_str(&content).map_err(|e| ToolError::InvalidInput {
+                message: format!("invalid notebook format: {e}"),
+            })?;
 
         match edit_mode.as_str() {
             "replace" => {
@@ -84,7 +92,11 @@ impl Tool for NotebookEditTool {
                         message: "cell_id is required for replace mode".into(),
                     });
                 };
-                let Some(cell) = notebook.cells.iter_mut().find(|c| c.id.as_deref() == Some(&cid)) else {
+                let Some(cell) = notebook
+                    .cells
+                    .iter_mut()
+                    .find(|c| c.id.as_deref() == Some(&cid))
+                else {
                     return Err(ToolError::InvalidInput {
                         message: format!("cell '{cid}' not found"),
                     });
@@ -103,7 +115,12 @@ impl Tool for NotebookEditTool {
                 };
                 let idx = cell_id
                     .as_ref()
-                    .and_then(|cid| notebook.cells.iter().position(|c| c.id.as_deref() == Some(cid)))
+                    .and_then(|cid| {
+                        notebook
+                            .cells
+                            .iter()
+                            .position(|c| c.id.as_deref() == Some(cid))
+                    })
                     .map(|i| i + 1)
                     .unwrap_or(notebook.cells.len());
                 notebook.cells.insert(idx, new_cell);
@@ -129,9 +146,10 @@ impl Tool for NotebookEditTool {
             }
         }
 
-        let new_content = serde_json::to_string_pretty(&notebook).map_err(|e| ToolError::InvalidInput {
-            message: format!("failed to serialize notebook: {e}"),
-        })?;
+        let new_content =
+            serde_json::to_string_pretty(&notebook).map_err(|e| ToolError::InvalidInput {
+                message: format!("failed to serialize notebook: {e}"),
+            })?;
 
         std::fs::write(&notebook_path, new_content).map_err(|e| ToolError::InvalidInput {
             message: format!("failed to write notebook: {e}"),
@@ -173,8 +191,8 @@ fn extract_string_opt(args: &serde_json::Value, key: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tool::ToolContext;
     use crate::context::ExecutionContext;
+    use crate::tool::ToolContext;
     use std::collections::HashMap;
     use std::path::Path;
     use std::sync::Arc;

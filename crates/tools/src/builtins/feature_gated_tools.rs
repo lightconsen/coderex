@@ -79,8 +79,8 @@ pub fn register_feature_gated_tools(reg: &mut ToolRegistry) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tool::ToolContext;
     use crate::context::ExecutionContext;
+    use crate::tool::ToolContext;
     use std::collections::HashMap;
     use std::path::Path;
 

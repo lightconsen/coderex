@@ -7,8 +7,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::Mutex as TokioMutex;
 
 /// Plugin lifecycle state.
@@ -316,10 +316,7 @@ impl PluginManager {
             // Clean up plugin directory if it exists
             if handle.path.exists() {
                 if let Err(e) = std::fs::remove_dir_all(&handle.path) {
-                    tracing::warn!(
-                        "failed to remove plugin directory for '{}': {e}",
-                        name
-                    );
+                    tracing::warn!("failed to remove plugin directory for '{}': {e}", name);
                 }
             }
             self.needs_refresh.store(true, Ordering::SeqCst);
@@ -333,7 +330,9 @@ impl PluginManager {
     ///
     /// Discovers commands and skills dynamically from the plugin process.
     pub async fn spawn_plugin(&self, name: &str) -> Result<(), String> {
-        let handle = self.plugins.get(name)
+        let handle = self
+            .plugins
+            .get(name)
             .ok_or_else(|| format!("plugin '{}' not found", name))?;
 
         let manifest_path = handle.path.join("plugin.json");
@@ -353,9 +352,10 @@ impl PluginManager {
             let mut instance = PluginWasmInstance::new(&wasm_path)
                 .map_err(|e| format!("failed to load WASM plugin '{name}': {e}"))?;
 
-            instance.initialize().await.map_err(|e| {
-                format!("WASM plugin '{name}' initialize failed: {e}")
-            })?;
+            instance
+                .initialize()
+                .await
+                .map_err(|e| format!("WASM plugin '{name}' initialize failed: {e}"))?;
 
             let discovered_commands: Vec<String> = match instance.list_commands().await {
                 Ok(cmds) => cmds.into_iter().map(|c| c.name).collect(),
@@ -379,18 +379,21 @@ impl PluginManager {
                 entry.skills = discovered_skills;
             }
 
-            self.active_wasm_instances.insert(name.to_string(), instance);
+            self.active_wasm_instances
+                .insert(name.to_string(), instance);
             tracing::info!(plugin = %name, "WASM plugin loaded successfully");
             return Ok(());
         }
 
         if manifest.runtime != RuntimeType::Process {
-            return Err(format!("plugin '{}' has unsupported runtime '{}'", name, manifest.runtime));
+            return Err(format!(
+                "plugin '{}' has unsupported runtime '{}'",
+                name, manifest.runtime
+            ));
         }
 
         // Determine entrypoint
-        let entrypoint = manifest.entrypoint.as_deref()
-            .unwrap_or("bin/plugin");
+        let entrypoint = manifest.entrypoint.as_deref().unwrap_or("bin/plugin");
 
         // Split entrypoint into command and args (supports "node index.js")
         let parts: Vec<&str> = entrypoint.split_whitespace().collect();
@@ -401,12 +404,7 @@ impl PluginManager {
         let cmd = parts[0].to_string();
         let args: Vec<String> = parts[1..].iter().map(|s| s.to_string()).collect();
 
-        let mut process = PluginProcess::new(
-            cmd,
-            args,
-            manifest.env,
-            handle.path.clone(),
-        );
+        let mut process = PluginProcess::new(cmd, args, manifest.env, handle.path.clone());
 
         process.spawn().await?;
         process.initialize().await?;
@@ -557,10 +555,14 @@ impl PluginManager {
     ///
     /// Validates that the URL is HTTPS and, if an allowlist is configured,
     /// that the domain is trusted.
-    pub fn register_marketplace(&self, name: String, base_url: String) -> Result<(), MarketplaceError> {
+    pub fn register_marketplace(
+        &self,
+        name: String,
+        base_url: String,
+    ) -> Result<(), MarketplaceError> {
         // Parse and validate URL structure
-        let parsed = url::Url::parse(&base_url)
-            .map_err(|e| MarketplaceError::InvalidUrl(format!("{e}")))?;
+        let parsed =
+            url::Url::parse(&base_url).map_err(|e| MarketplaceError::InvalidUrl(format!("{e}")))?;
 
         // Enforce HTTPS
         if parsed.scheme() != "https" {
@@ -570,9 +572,10 @@ impl PluginManager {
         // Check allowlist if configured
         if !self.marketplace_allowlist.is_empty() {
             let host = parsed.host_str().unwrap_or("");
-            let allowed = self.marketplace_allowlist.iter().any(|d| {
-                host == d.as_str() || host.ends_with(&format!(".{d}"))
-            });
+            let allowed = self
+                .marketplace_allowlist
+                .iter()
+                .any(|d| host == d.as_str() || host.ends_with(&format!(".{d}")));
             if !allowed {
                 return Err(MarketplaceError::NotAllowed(base_url));
             }
@@ -583,13 +586,16 @@ impl PluginManager {
             .build()
             .unwrap_or_default();
 
-        self.marketplaces.insert(name.clone(), MarketplaceConnection {
-            name,
-            base_url,
-            client,
-            list_endpoint: "/api/plugins".into(),
-            download_endpoint: "/api/plugins/{name}/download".into(),
-        });
+        self.marketplaces.insert(
+            name.clone(),
+            MarketplaceConnection {
+                name,
+                base_url,
+                client,
+                list_endpoint: "/api/plugins".into(),
+                download_endpoint: "/api/plugins/{name}/download".into(),
+            },
+        );
         Ok(())
     }
 
@@ -644,10 +650,7 @@ impl PluginManager {
                     }
                 }
                 Err(e) => {
-                    tracing::warn!(
-                        "failed to connect to marketplace '{}': {e}",
-                        conn.name
-                    );
+                    tracing::warn!("failed to connect to marketplace '{}': {e}", conn.name);
                 }
             }
         }
@@ -662,7 +665,10 @@ impl PluginManager {
             Some(v) => v,
             None => return true,
         };
-        match (semver::Version::parse(min), semver::Version::parse(&self.app_version)) {
+        match (
+            semver::Version::parse(min),
+            semver::Version::parse(&self.app_version),
+        ) {
             (Ok(min_v), Ok(app_v)) => app_v >= min_v,
             _ => {
                 tracing::warn!("failed to parse version strings for compatibility check");
@@ -719,7 +725,10 @@ impl PluginManager {
 
         // Check if already installed
         if target_dir.exists() {
-            return Err(format!("plugin '{}' is already installed at {:?}", plugin.name, target_dir));
+            return Err(format!(
+                "plugin '{}' is already installed at {:?}",
+                plugin.name, target_dir
+            ));
         }
 
         // Mark as installing
@@ -740,7 +749,10 @@ impl PluginManager {
         let _ = std::fs::remove_dir_all(&temp_dir); // clean up any previous failed attempt
 
         if let Err(e) = std::fs::create_dir_all(&temp_dir) {
-            self.set_plugin_state(&plugin.name, PluginState::Error(format!("temp dir creation failed: {e}")));
+            self.set_plugin_state(
+                &plugin.name,
+                PluginState::Error(format!("temp dir creation failed: {e}")),
+            );
             return Err(format!("failed to create temp dir: {e}"));
         }
 
@@ -786,7 +798,10 @@ impl PluginManager {
         // Extract the archive into the temp directory
         if let Err(e) = Self::extract_archive(&bytes, &temp_dir) {
             let _ = std::fs::remove_dir_all(&temp_dir);
-            self.set_plugin_state(&plugin.name, PluginState::Error(format!("extraction failed: {e}")));
+            self.set_plugin_state(
+                &plugin.name,
+                PluginState::Error(format!("extraction failed: {e}")),
+            );
             return Err(e);
         }
 
@@ -795,7 +810,10 @@ impl PluginManager {
             Ok(m) => m,
             Err(e) => {
                 let _ = std::fs::remove_dir_all(&temp_dir);
-                self.set_plugin_state(&plugin.name, PluginState::Error(format!("validation failed: {e}")));
+                self.set_plugin_state(
+                    &plugin.name,
+                    PluginState::Error(format!("validation failed: {e}")),
+                );
                 return Err(e);
             }
         };
@@ -852,11 +870,7 @@ impl PluginManager {
         };
         self.plugins.insert(plugin.name.clone(), handle);
 
-        tracing::info!(
-            "installed plugin '{}' v{}",
-            plugin.name,
-            plugin.version
-        );
+        tracing::info!("installed plugin '{}' v{}", plugin.name, plugin.version);
 
         self.mark_needs_refresh();
         Ok(target_dir)
@@ -896,34 +910,32 @@ impl PluginManager {
             }
 
             match std::fs::read_to_string(&manifest_path) {
-                Ok(content) => {
-                    match serde_json::from_str::<PluginManifest>(&content) {
-                        Ok(manifest) => {
-                            if self.is_version_compatible(manifest.min_version.as_deref()) {
-                                plugin.version = manifest.version;
-                                plugin.commands = manifest.commands;
-                                plugin.skills = manifest.skills;
-                                plugin.state = PluginState::Active;
-                                tracing::info!(
-                                    plugin = %plugin.name,
-                                    retry = plugin.retry_count,
-                                    "plugin recovered from error state"
-                                );
-                            } else {
-                                plugin.state = PluginState::Error(format!(
-                                    "incompatible version (retry {}/{})",
-                                    plugin.retry_count, plugin.max_retries
-                                ));
-                            }
-                        }
-                        Err(e) => {
+                Ok(content) => match serde_json::from_str::<PluginManifest>(&content) {
+                    Ok(manifest) => {
+                        if self.is_version_compatible(manifest.min_version.as_deref()) {
+                            plugin.version = manifest.version;
+                            plugin.commands = manifest.commands;
+                            plugin.skills = manifest.skills;
+                            plugin.state = PluginState::Active;
+                            tracing::info!(
+                                plugin = %plugin.name,
+                                retry = plugin.retry_count,
+                                "plugin recovered from error state"
+                            );
+                        } else {
                             plugin.state = PluginState::Error(format!(
-                                "manifest parse failed: {e} (retry {}/{})",
+                                "incompatible version (retry {}/{})",
                                 plugin.retry_count, plugin.max_retries
                             ));
                         }
                     }
-                }
+                    Err(e) => {
+                        plugin.state = PluginState::Error(format!(
+                            "manifest parse failed: {e} (retry {}/{})",
+                            plugin.retry_count, plugin.max_retries
+                        ));
+                    }
+                },
                 Err(e) => {
                     plugin.state = PluginState::Error(format!(
                         "manifest read failed: {e} (retry {}/{})",
@@ -954,13 +966,16 @@ impl PluginManager {
         let updated_plugins: Vec<(&MarketplacePlugin, &PluginManifest)> = marketplace_plugins
             .iter()
             .filter_map(|mp| {
-                local_plugins.iter().find(|lp| lp.name == mp.name).map(|lp| {
-                    if mp.version != lp.version {
-                        (mp, lp)
-                    } else {
-                        (mp, lp) // Include even if same version for completeness
-                    }
-                })
+                local_plugins
+                    .iter()
+                    .find(|lp| lp.name == mp.name)
+                    .map(|lp| {
+                        if mp.version != lp.version {
+                            (mp, lp)
+                        } else {
+                            (mp, lp) // Include even if same version for completeness
+                        }
+                    })
             })
             .filter(|(mp, lp)| mp.version != lp.version)
             .collect();
@@ -1066,24 +1081,33 @@ impl PluginManager {
             None => return Err("plugin signature missing but public key is configured".into()),
         };
 
-        let key_bytes = hex::decode(key_hex)
-            .map_err(|e| format!("invalid public key hex: {e}"))?;
+        let key_bytes = hex::decode(key_hex).map_err(|e| format!("invalid public key hex: {e}"))?;
         if key_bytes.len() != 32 {
-            return Err(format!("invalid public key length: expected 32, got {}", key_bytes.len()));
+            return Err(format!(
+                "invalid public key length: expected 32, got {}",
+                key_bytes.len()
+            ));
         }
 
-        let sig_bytes = hex::decode(sig_hex)
-            .map_err(|e| format!("invalid signature hex: {e}"))?;
+        let sig_bytes = hex::decode(sig_hex).map_err(|e| format!("invalid signature hex: {e}"))?;
         if sig_bytes.len() != 64 {
-            return Err(format!("invalid signature length: expected 64, got {}", sig_bytes.len()));
+            return Err(format!(
+                "invalid signature length: expected 64, got {}",
+                sig_bytes.len()
+            ));
         }
 
         let verifying_key = ed25519_dalek::VerifyingKey::from_bytes(
-            &key_bytes.try_into().map_err(|_| "public key conversion failed")?
-        ).map_err(|e| format!("invalid Ed25519 public key: {e}"))?;
+            &key_bytes
+                .try_into()
+                .map_err(|_| "public key conversion failed")?,
+        )
+        .map_err(|e| format!("invalid Ed25519 public key: {e}"))?;
 
         let signature = ed25519_dalek::Signature::from_bytes(
-            &sig_bytes.try_into().map_err(|_| "signature conversion failed")?
+            &sig_bytes
+                .try_into()
+                .map_err(|_| "signature conversion failed")?,
         );
 
         verifying_key
@@ -1101,8 +1125,10 @@ impl PluginManager {
     /// Returns `Err` if a dependency cycle is detected or a required
     /// dependency is missing.
     pub fn resolve_load_order(&self) -> Result<Vec<String>, String> {
-        let mut in_degrees: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
-        let mut adjacency: std::collections::HashMap<String, Vec<String>> = std::collections::HashMap::new();
+        let mut in_degrees: std::collections::HashMap<String, usize> =
+            std::collections::HashMap::new();
+        let mut adjacency: std::collections::HashMap<String, Vec<String>> =
+            std::collections::HashMap::new();
         let mut plugin_names: std::collections::HashSet<String> = std::collections::HashSet::new();
 
         // Build graph
@@ -1131,7 +1157,10 @@ impl PluginManager {
             };
 
             for dep in deps {
-                adjacency.entry(dep.clone()).or_default().push(plugin.name.clone());
+                adjacency
+                    .entry(dep.clone())
+                    .or_default()
+                    .push(plugin.name.clone());
                 *in_degrees.entry(plugin.name.clone()).or_insert(0) += 1;
                 if !plugin_names.contains(&dep) {
                     return Err(format!(
@@ -1226,7 +1255,11 @@ impl MarketplaceReconciler {
     }
 
     /// Run one reconciliation cycle.
-    pub async fn reconcile(&self, manager: &PluginManager, install_dir: Option<&PathBuf>) -> Result<ReconciliationReport, String> {
+    pub async fn reconcile(
+        &self,
+        manager: &PluginManager,
+        install_dir: Option<&PathBuf>,
+    ) -> Result<ReconciliationReport, String> {
         let report = manager.reconcile().await?;
 
         if self.auto_install {
@@ -1236,11 +1269,7 @@ impl MarketplaceReconciler {
                 let failed = results.iter().filter(|r| r.is_err()).count();
 
                 if installed > 0 {
-                    tracing::info!(
-                        "auto-installed {} plugins, {} failed",
-                        installed,
-                        failed
-                    );
+                    tracing::info!("auto-installed {} plugins, {} failed", installed, failed);
                 }
             }
         }
@@ -1328,9 +1357,12 @@ mod tests {
     fn all_commands_and_skills() {
         let mgr = PluginManager::new();
         let m1 = PluginManifest {
-            name: "a".into(), version: "1".into(),
-            description: String::new(), author: String::new(),
-            min_version: None, commands: vec!["cmd1".into()],
+            name: "a".into(),
+            version: "1".into(),
+            description: String::new(),
+            author: String::new(),
+            min_version: None,
+            commands: vec!["cmd1".into()],
             skills: vec!["sk1".into()],
             dependencies: Vec::new(),
             signature: None,
@@ -1339,9 +1371,12 @@ mod tests {
             env: HashMap::new(),
         };
         let m2 = PluginManifest {
-            name: "b".into(), version: "1".into(),
-            description: String::new(), author: String::new(),
-            min_version: None, commands: vec!["cmd2".into()],
+            name: "b".into(),
+            version: "1".into(),
+            description: String::new(),
+            author: String::new(),
+            min_version: None,
+            commands: vec!["cmd2".into()],
             skills: vec!["sk2".into()],
             dependencies: Vec::new(),
             signature: None,
@@ -1358,7 +1393,8 @@ mod tests {
     #[test]
     fn marketplace_registration() {
         let mgr = PluginManager::new();
-        let result = mgr.register_marketplace("main".into(), "https://marketplace.example.com".into());
+        let result =
+            mgr.register_marketplace("main".into(), "https://marketplace.example.com".into());
         assert!(result.is_ok(), "marketplace registration should succeed");
     }
 
@@ -1565,21 +1601,39 @@ mod tests {
         std::fs::create_dir_all(&derived_dir).unwrap();
 
         let m1 = PluginManifest {
-            name: "base".into(), version: "1".into(),
-            description: String::new(), author: String::new(),
-            min_version: None, commands: vec![], skills: vec![],
-            dependencies: Vec::new(), signature: None,
+            name: "base".into(),
+            version: "1".into(),
+            description: String::new(),
+            author: String::new(),
+            min_version: None,
+            commands: vec![],
+            skills: vec![],
+            dependencies: Vec::new(),
+            signature: None,
             ..Default::default()
         };
         let m2 = PluginManifest {
-            name: "derived".into(), version: "1".into(),
-            description: String::new(), author: String::new(),
-            min_version: None, commands: vec![], skills: vec![],
-            dependencies: vec!["base".into()], signature: None,
+            name: "derived".into(),
+            version: "1".into(),
+            description: String::new(),
+            author: String::new(),
+            min_version: None,
+            commands: vec![],
+            skills: vec![],
+            dependencies: vec!["base".into()],
+            signature: None,
             ..Default::default()
         };
-        std::fs::write(base_dir.join("plugin.json"), serde_json::to_string(&m1).unwrap()).unwrap();
-        std::fs::write(derived_dir.join("plugin.json"), serde_json::to_string(&m2).unwrap()).unwrap();
+        std::fs::write(
+            base_dir.join("plugin.json"),
+            serde_json::to_string(&m1).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(
+            derived_dir.join("plugin.json"),
+            serde_json::to_string(&m2).unwrap(),
+        )
+        .unwrap();
 
         mgr.load_plugin(m1, base_dir);
         mgr.load_plugin(m2, derived_dir);
@@ -1599,21 +1653,39 @@ mod tests {
         std::fs::create_dir_all(&b_dir).unwrap();
 
         let m1 = PluginManifest {
-            name: "a".into(), version: "1".into(),
-            description: String::new(), author: String::new(),
-            min_version: None, commands: vec![], skills: vec![],
-            dependencies: vec!["b".into()], signature: None,
+            name: "a".into(),
+            version: "1".into(),
+            description: String::new(),
+            author: String::new(),
+            min_version: None,
+            commands: vec![],
+            skills: vec![],
+            dependencies: vec!["b".into()],
+            signature: None,
             ..Default::default()
         };
         let m2 = PluginManifest {
-            name: "b".into(), version: "1".into(),
-            description: String::new(), author: String::new(),
-            min_version: None, commands: vec![], skills: vec![],
-            dependencies: vec!["a".into()], signature: None,
+            name: "b".into(),
+            version: "1".into(),
+            description: String::new(),
+            author: String::new(),
+            min_version: None,
+            commands: vec![],
+            skills: vec![],
+            dependencies: vec!["a".into()],
+            signature: None,
             ..Default::default()
         };
-        std::fs::write(a_dir.join("plugin.json"), serde_json::to_string(&m1).unwrap()).unwrap();
-        std::fs::write(b_dir.join("plugin.json"), serde_json::to_string(&m2).unwrap()).unwrap();
+        std::fs::write(
+            a_dir.join("plugin.json"),
+            serde_json::to_string(&m1).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(
+            b_dir.join("plugin.json"),
+            serde_json::to_string(&m2).unwrap(),
+        )
+        .unwrap();
 
         mgr.load_plugin(m1, a_dir);
         mgr.load_plugin(m2, b_dir);
@@ -1627,10 +1699,15 @@ mod tests {
     fn retry_failed_plugins_recoverable() {
         let mgr = PluginManager::new();
         let manifest = PluginManifest {
-            name: "broken".into(), version: "1.0.0".into(),
-            description: String::new(), author: String::new(),
-            min_version: None, commands: vec![], skills: vec![],
-            dependencies: Vec::new(), signature: None,
+            name: "broken".into(),
+            version: "1.0.0".into(),
+            description: String::new(),
+            author: String::new(),
+            min_version: None,
+            commands: vec![],
+            skills: vec![],
+            dependencies: Vec::new(),
+            signature: None,
             ..Default::default()
         };
         mgr.load_plugin(manifest.clone(), PathBuf::from("/tmp"));
@@ -1655,7 +1732,8 @@ mod tests {
             "https://example.com".into(),
             "/v2/plugins".into(),
             "/v2/plugins/{name}/dl".into(),
-        ).unwrap();
+        )
+        .unwrap();
 
         let conn = mgr.marketplaces.get("custom").unwrap();
         assert_eq!(conn.list_endpoint, "/v2/plugins");

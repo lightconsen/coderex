@@ -1,5 +1,8 @@
 //! Terminal UI rendering via ratatui.
 
+use crate::message_list::MessageRole;
+use crate::state::UiState;
+use crate::statusline::Statusline;
 use crossterm::execute;
 use crossterm::terminal::{EnterAlternateScreen, LeaveAlternateScreen};
 use ratatui::Frame;
@@ -10,9 +13,6 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 use std::io::Stdout;
 use std::sync::OnceLock;
-use crate::message_list::MessageRole;
-use crate::state::UiState;
-use crate::statusline::Statusline;
 
 /// Lazy-initialized syntax highlighter for the TUI.
 fn syntax_highlighter() -> &'static coderex_core::syntax::SyntaxHighlighter {
@@ -98,18 +98,22 @@ impl TerminalUi {
             let is_compact = area.height < 20;
 
             // Determine chunk heights
-            let inline_palette_height = if is_compact { 0 } else { inline_palette_height(state) };
+            let inline_palette_height = if is_compact {
+                0
+            } else {
+                inline_palette_height(state)
+            };
             let show_statusline = !is_compact;
             let show_notif = state.notifications.active_count() > 0 && !is_compact;
 
             let show_perm_bar = !is_compact;
             let constraints = vec![
-                Constraint::Min(1),                                           // message area
-                Constraint::Length(inline_palette_height),                    // inline command hint
-                Constraint::Length(if show_notif { 1 } else { 0 }),           // notification bar
-                Constraint::Length(if show_statusline { 1 } else { 0 }),      // statusline (thinking)
-                Constraint::Length(1),                                        // input line
-                Constraint::Length(if show_perm_bar { 1 } else { 0 }),        // permission bar
+                Constraint::Min(1),                                      // message area
+                Constraint::Length(inline_palette_height),               // inline command hint
+                Constraint::Length(if show_notif { 1 } else { 0 }),      // notification bar
+                Constraint::Length(if show_statusline { 1 } else { 0 }), // statusline (thinking)
+                Constraint::Length(1),                                   // input line
+                Constraint::Length(if show_perm_bar { 1 } else { 0 }),   // permission bar
             ];
 
             let chunks = Layout::default()
@@ -155,7 +159,11 @@ impl TerminalUi {
             }
 
             // Input line
-            let input_idx = if show_perm_bar { chunks.len() - 2 } else { chunks.len() - 1 };
+            let input_idx = if show_perm_bar {
+                chunks.len() - 2
+            } else {
+                chunks.len() - 1
+            };
             render_input(frame, chunks[input_idx], &state.input);
 
             // Permission bar (below input)
@@ -176,9 +184,13 @@ impl TerminalUi {
 /// Compute the height of the inline palette area (0 = hidden).
 fn inline_palette_height(state: &UiState) -> u16 {
     use crate::overlay::Overlay;
-    let Some(overlay) = state.overlays.top() else { return 0 };
+    let Some(overlay) = state.overlays.top() else {
+        return 0;
+    };
     match overlay {
-        Overlay::CommandPalette { query, commands, .. } if query.starts_with('/') => {
+        Overlay::CommandPalette {
+            query, commands, ..
+        } if query.starts_with('/') => {
             // Header line + up to 5 visible commands, capped at remaining terminal space
             let count = commands.len().min(5);
             ((count + 1) as u16).min(6)
@@ -190,9 +202,10 @@ fn inline_palette_height(state: &UiState) -> u16 {
 /// Check whether the active overlay is an inline `/` palette.
 fn is_inline_palette(state: &UiState) -> bool {
     use crate::overlay::Overlay;
-    state.overlays.top().map_or(false, |o| {
-        matches!(o, Overlay::CommandPalette { query, .. } if query.starts_with('/'))
-    })
+    state.overlays.top().map_or(
+        false,
+        |o| matches!(o, Overlay::CommandPalette { query, .. } if query.starts_with('/')),
+    )
 }
 
 /// Word-wrap text to the given display width.
@@ -242,7 +255,11 @@ fn message_display_height(msg: &crate::message_list::Message, width: usize) -> u
     let wrapped = wrap_text(&msg.content, wrap_width);
     let mut height = wrapped.len().max(1);
     if msg.tool_name.is_some()
-        && matches!(msg.role, crate::message_list::MessageRole::ToolCall | crate::message_list::MessageRole::ToolResult)
+        && matches!(
+            msg.role,
+            crate::message_list::MessageRole::ToolCall
+                | crate::message_list::MessageRole::ToolResult
+        )
     {
         height += 1;
     }
@@ -377,13 +394,17 @@ fn render_messages(frame: &mut Frame, area: ratatui::layout::Rect, state: &mut U
         // Handle folded messages
         if msg.folded {
             let style = Style::default().fg(Color::DarkGray);
-            let fold_indicator = format!("▸ {} [+{} lines folded]", match msg.role {
-                MessageRole::User => "User",
-                MessageRole::Assistant => "Assistant",
-                MessageRole::ToolResult => "Tool Result",
-                MessageRole::ToolCall => "Tool Call",
-                MessageRole::System => "System",
-            }, message_display_height(msg, width).saturating_sub(1));
+            let fold_indicator = format!(
+                "▸ {} [+{} lines folded]",
+                match msg.role {
+                    MessageRole::User => "User",
+                    MessageRole::Assistant => "Assistant",
+                    MessageRole::ToolResult => "Tool Result",
+                    MessageRole::ToolCall => "Tool Call",
+                    MessageRole::System => "System",
+                },
+                message_display_height(msg, width).saturating_sub(1)
+            );
             lines.push(Line::from(Span::styled(fold_indicator, style)));
             continue;
         }
@@ -401,7 +422,11 @@ fn render_messages(frame: &mut Frame, area: ratatui::layout::Rect, state: &mut U
 
         // In compact mode, truncate long messages to single line
         if is_compact && message_display_height(msg, width) > 3 {
-            let truncated = msg.content.chars().take(width.saturating_sub(prefix_width)).collect::<String>();
+            let truncated = msg
+                .content
+                .chars()
+                .take(width.saturating_sub(prefix_width))
+                .collect::<String>();
             lines.push(Line::from(vec![
                 Span::styled(prefix, style),
                 Span::styled(truncated, style.add_modifier(Modifier::DIM)),
@@ -508,8 +533,7 @@ fn render_messages(frame: &mut Frame, area: ratatui::layout::Rect, state: &mut U
         lines.extend(render_welcome_art());
     }
 
-    let paragraph = Paragraph::new(lines)
-        .block(Block::default().borders(Borders::NONE));
+    let paragraph = Paragraph::new(lines).block(Block::default().borders(Borders::NONE));
     frame.render_widget(paragraph, area);
 }
 
@@ -552,7 +576,11 @@ fn render_welcome_art() -> Vec<Line<'static>> {
 }
 
 /// Render a compact notification bar above the statusline.
-fn render_notification_bar(frame: &mut Frame, area: ratatui::layout::Rect, center: &mut crate::notification_center::NotificationCenter) {
+fn render_notification_bar(
+    frame: &mut Frame,
+    area: ratatui::layout::Rect,
+    center: &mut crate::notification_center::NotificationCenter,
+) {
     use crate::notification_center::NotificationKind;
 
     if let Some(notif) = center.latest() {
@@ -564,7 +592,12 @@ fn render_notification_bar(frame: &mut Frame, area: ratatui::layout::Rect, cente
             NotificationKind::Teaser => ("✦", Color::Magenta),
             NotificationKind::Progress => ("⟳", Color::Cyan),
         };
-        let text = format!(" {} {}  ({} unseen)", icon, notif.message, center.unseen_count());
+        let text = format!(
+            " {} {}  ({} unseen)",
+            icon,
+            notif.message,
+            center.unseen_count()
+        );
         let line = Line::from(Span::styled(
             text,
             Style::default().fg(color).bg(Color::Black),
@@ -652,7 +685,12 @@ fn render_input(frame: &mut Frame, area: ratatui::layout::Rect, input: &crate::i
 /// Render the inline command palette just above the statusline / input line.
 fn render_inline_palette(frame: &mut Frame, area: ratatui::layout::Rect, state: &UiState) {
     use crate::overlay::Overlay;
-    let Some(Overlay::CommandPalette { query, commands, selected }) = state.overlays.top() else {
+    let Some(Overlay::CommandPalette {
+        query,
+        commands,
+        selected,
+    }) = state.overlays.top()
+    else {
         return;
     };
 
@@ -660,12 +698,19 @@ fn render_inline_palette(frame: &mut Frame, area: ratatui::layout::Rect, state: 
 
     // Header
     lines.push(Line::from(vec![
-        Span::styled("Commands ", Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            "Commands ",
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
+        ),
         Span::styled(format!("[{query}]"), Style::default().fg(Color::Gray)),
     ]));
 
     let visible_count = commands.len().min(area.height as usize - 1);
-    let start = selected.saturating_sub(visible_count - 1).min(commands.len().saturating_sub(visible_count));
+    let start = selected
+        .saturating_sub(visible_count - 1)
+        .min(commands.len().saturating_sub(visible_count));
 
     for i in start..(start + visible_count).min(commands.len()) {
         let style = if i == *selected {
@@ -676,21 +721,38 @@ fn render_inline_palette(frame: &mut Frame, area: ratatui::layout::Rect, state: 
         lines.push(Line::from(Span::styled(commands[i].clone(), style)));
     }
 
-    let paragraph = Paragraph::new(lines)
-        .block(Block::default().borders(Borders::NONE).style(Style::default().bg(Color::DarkGray)));
+    let paragraph = Paragraph::new(lines).block(
+        Block::default()
+            .borders(Borders::NONE)
+            .style(Style::default().bg(Color::DarkGray)),
+    );
     frame.render_widget(paragraph, area);
 }
 
 fn render_overlay(frame: &mut Frame, area: ratatui::layout::Rect, state: &UiState) {
     use crate::overlay::Overlay;
-    let Some(overlay) = state.overlays.top() else { return };
+    let Some(overlay) = state.overlays.top() else {
+        return;
+    };
 
     let content = match overlay {
-        Overlay::PermissionDialog { tool, args, always_option } => {
+        Overlay::PermissionDialog {
+            tool,
+            args,
+            always_option,
+        } => {
             format!(
                 "Permission Request\nTool: {tool}\nArgs: {args}\n[a] Allow once  [d] Deny{}{}",
-                if *always_option { "  [A] Always allow" } else { "" },
-                if *always_option { "" } else { "\n[a] Allow once" }
+                if *always_option {
+                    "  [A] Always allow"
+                } else {
+                    ""
+                },
+                if *always_option {
+                    ""
+                } else {
+                    "\n[a] Allow once"
+                }
             )
         }
         Overlay::Notification { message, level } => {

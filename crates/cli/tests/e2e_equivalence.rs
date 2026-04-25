@@ -88,13 +88,17 @@ fn run(cwd: &Path, prompt: &str, timeout_secs: u64) -> CoderexOutput {
 
     let stdout_thread = thread::spawn(move || {
         let mut buf = String::new();
-        BufReader::new(stdout_handle).read_to_string(&mut buf).unwrap_or(0);
+        BufReader::new(stdout_handle)
+            .read_to_string(&mut buf)
+            .unwrap_or(0);
         buf
     });
 
     let stderr_thread = thread::spawn(move || {
         let mut buf = String::new();
-        BufReader::new(stderr_handle).read_to_string(&mut buf).unwrap_or(0);
+        BufReader::new(stderr_handle)
+            .read_to_string(&mut buf)
+            .unwrap_or(0);
         buf
     });
 
@@ -123,7 +127,16 @@ fn run(cwd: &Path, prompt: &str, timeout_secs: u64) -> CoderexOutput {
     }
 }
 
-fn run_with_args(cwd: &Path, prompt: &str, extra_args: &[&str], timeout_secs: u64) -> CoderexOutput {
+fn run_with_args(
+    cwd: &Path,
+    prompt: &str,
+    extra_args: &[&str],
+    timeout_secs: u64,
+) -> CoderexOutput {
+    eprintln!(
+        "DEBUG run_with_args: prompt={:?}, extra_args={:?}",
+        prompt, extra_args
+    );
     let mut cmd = Command::new(binary_path());
     cmd.arg("-p")
         .args(extra_args)
@@ -145,13 +158,17 @@ fn run_with_args(cwd: &Path, prompt: &str, extra_args: &[&str], timeout_secs: u6
 
     let stdout_thread = thread::spawn(move || {
         let mut buf = String::new();
-        BufReader::new(stdout_handle).read_to_string(&mut buf).unwrap_or(0);
+        BufReader::new(stdout_handle)
+            .read_to_string(&mut buf)
+            .unwrap_or(0);
         buf
     });
 
     let stderr_thread = thread::spawn(move || {
         let mut buf = String::new();
-        BufReader::new(stderr_handle).read_to_string(&mut buf).unwrap_or(0);
+        BufReader::new(stderr_handle)
+            .read_to_string(&mut buf)
+            .unwrap_or(0);
         buf
     });
 
@@ -197,13 +214,17 @@ fn run_command(cwd: &Path, args: &[&str], timeout_secs: u64) -> CoderexOutput {
 
     let stdout_thread = thread::spawn(move || {
         let mut buf = String::new();
-        BufReader::new(stdout_handle).read_to_string(&mut buf).unwrap_or(0);
+        BufReader::new(stdout_handle)
+            .read_to_string(&mut buf)
+            .unwrap_or(0);
         buf
     });
 
     let stderr_thread = thread::spawn(move || {
         let mut buf = String::new();
-        BufReader::new(stderr_handle).read_to_string(&mut buf).unwrap_or(0);
+        BufReader::new(stderr_handle)
+            .read_to_string(&mut buf)
+            .unwrap_or(0);
         buf
     });
 
@@ -310,10 +331,26 @@ edition = "2021"
 "#;
     std::fs::create_dir_all(dir.join("src")).unwrap();
     std::fs::write(dir.join("Cargo.toml"), cargo_toml).unwrap();
-    std::fs::write(dir.join("src/lib.rs"), "pub fn hello() -> &'static str { \"hi\" }\n").unwrap();
-    std::fs::write(dir.join("src/middleware.rs"), "pub fn log_request(path: &str) { println!(\"request: {}\", path); }\n").unwrap();
-    std::fs::write(dir.join("src/routes.rs"), "pub fn get_user(id: u64) -> String { format!(\"user_{}\", id) }\n").unwrap();
-    std::fs::write(dir.join("src/models.rs"), "pub struct User { pub id: u64 }\n").unwrap();
+    std::fs::write(
+        dir.join("src/lib.rs"),
+        "pub fn hello() -> &'static str { \"hi\" }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("src/middleware.rs"),
+        "pub fn log_request(path: &str) { println!(\"request: {}\", path); }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("src/routes.rs"),
+        "pub fn get_user(id: u64) -> String { format!(\"user_{}\", id) }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("src/models.rs"),
+        "pub struct User { pub id: u64 }\n",
+    )
+    .unwrap();
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -340,11 +377,24 @@ fn engine_multi_turn_tool_loop() {
     create_rust_lib(dir.path());
 
     // This prompt triggers a tool call (Write) then expects a follow-up text response
-    let out = run(dir.path(), "Add a fibonacci function to src/lib.rs with a test.", 120);
+    let out = run(
+        dir.path(),
+        "Add a fibonacci function to src/lib.rs with a test.",
+        120,
+    );
     eprintln!("stdout:\n{}", out.stdout);
 
-    assert_response_contains(&out.stdout, &["fibonacci", "done", "added", "function"], "expected fibonacci discussion");
-    soft_check_file(dir.path(), "src/lib.rs", "fibonacci", "fibonacci function added");
+    assert_response_contains(
+        &out.stdout,
+        &["fibonacci", "done", "added", "function"],
+        "expected fibonacci discussion",
+    );
+    soft_check_file(
+        dir.path(),
+        "src/lib.rs",
+        "fibonacci",
+        "fibonacci function added",
+    );
 }
 
 #[test]
@@ -376,7 +426,10 @@ fn engine_max_turns_termination() {
     eprintln!("stdout:\n{}", out.stdout);
 
     // Should exit cleanly within timeout (allow generous margin for live API latency)
-    assert!(out.duration < Duration::from_secs(180), "should terminate within max-turns limit");
+    assert!(
+        out.duration < Duration::from_secs(180),
+        "should terminate within max-turns limit"
+    );
 }
 
 #[test]
@@ -386,10 +439,17 @@ fn engine_error_recovery_nonexistent_file() {
     create_rust_lib(dir.path());
 
     // Ask to read a non-existent file — engine should handle gracefully
-    let out = run(dir.path(), "Read the content of src/nonexistent.rs and report what you find.", 120);
+    let out = run(
+        dir.path(),
+        "Read the content of src/nonexistent.rs and report what you find.",
+        120,
+    );
     eprintln!("stdout:\n{}", out.stdout);
 
-    assert!(!out.stdout.trim().is_empty(), "expected non-empty error-handling response");
+    assert!(
+        !out.stdout.trim().is_empty(),
+        "expected non-empty error-handling response"
+    );
 }
 
 #[test]
@@ -411,7 +471,10 @@ fn engine_multi_turn_5_rounds() {
     // All 5 turns are tool calls (Bash) with no assistant text, so stdout is empty.
     // Verify the engine ran all 5 turns and exited cleanly.
     assert_eq!(out.exit_code, Some(0), "expected clean exit after 5 turns");
-    assert!(out.duration < Duration::from_secs(120), "should complete within timeout");
+    assert!(
+        out.duration < Duration::from_secs(120),
+        "should complete within timeout"
+    );
 }
 
 #[test]
@@ -431,7 +494,9 @@ fn engine_termination_budget_exhausted() {
 
     // Budget exhaustion may produce an error or truncated response
     assert!(
-        out.exit_code != Some(0) || out.stdout.to_lowercase().contains("budget") || out.stdout.to_lowercase().contains("exhaust"),
+        out.exit_code != Some(0)
+            || out.stdout.to_lowercase().contains("budget")
+            || out.stdout.to_lowercase().contains("exhaust"),
         "expected budget exhaustion signal, got exit={:?} stdout={}",
         out.exit_code,
         out.stdout
@@ -491,7 +556,8 @@ fn engine_structured_output() {
     create_rust_lib(dir.path());
 
     // Create a simple JSON schema file
-    let schema = r#"{"type":"object","properties":{"greeting":{"type":"string"}},"required":["greeting"]}"#;
+    let schema =
+        r#"{"type":"object","properties":{"greeting":{"type":"string"}},"required":["greeting"]}"#;
     let schema_path = dir.path().join("schema.json");
     std::fs::write(&schema_path, schema).unwrap();
 
@@ -527,7 +593,15 @@ fn tool_read_file() {
         &["--dangerously-skip-permissions", "--max-turns", "5"],
         180,
     );
-    eprintln!("stdout:\n{}", out.stdout);
+    eprintln!(
+        "stdout (first 2000 chars):\n{}",
+        &out.stdout[..out.stdout.len().min(2000)]
+    );
+    eprintln!(
+        "stderr (last 2000 chars):\n{}",
+        &out.stderr[out.stderr.len().saturating_sub(2000)..]
+    );
+    eprintln!("exit_code: {:?}", out.exit_code);
 
     // Verify the read tool actually executed by checking the LLM mentions
     // content from the file (an `add` function is defined in the stub lib).
@@ -544,10 +618,19 @@ fn tool_write_new_file() {
     let dir = tempfile::tempdir().unwrap();
     create_rust_lib(dir.path());
 
-    let out = run(dir.path(), "Create src/utils.rs with a helper function `greet(name: &str) -> String`.", 120);
+    let out = run(
+        dir.path(),
+        "Create src/utils.rs with a helper function `greet(name: &str) -> String`.",
+        120,
+    );
     eprintln!("stdout:\n{}", out.stdout);
 
-    soft_check_file(dir.path(), "src/utils.rs", "greet", "greet function created");
+    soft_check_file(
+        dir.path(),
+        "src/utils.rs",
+        "greet",
+        "greet function created",
+    );
 }
 
 #[test]
@@ -556,7 +639,11 @@ fn tool_edit_existing_file() {
     let dir = tempfile::tempdir().unwrap();
     create_rust_lib(dir.path());
 
-    let out = run(dir.path(), "In src/lib.rs, change the add function to multiply instead.", 120);
+    let out = run(
+        dir.path(),
+        "In src/lib.rs, change the add function to multiply instead.",
+        120,
+    );
     eprintln!("stdout:\n{}", out.stdout);
 
     soft_check_file(dir.path(), "src/lib.rs", "multiply", "multiply operation");
@@ -571,7 +658,11 @@ fn tool_bash_execution() {
     let out = run(dir.path(), "Run `cargo test` and report the results.", 120);
     eprintln!("stdout:\n{}", out.stdout);
 
-    assert_response_contains(&out.stdout, &["test", "running", "passed", "result"], "expected test results");
+    assert_response_contains(
+        &out.stdout,
+        &["test", "running", "passed", "result"],
+        "expected test results",
+    );
 }
 
 #[test]
@@ -581,12 +672,20 @@ fn tool_glob_file_discovery() {
     create_rust_lib(dir.path());
     std::fs::write(dir.path().join("src/main.rs"), "fn main() {}\n").unwrap();
 
-    let out = run(dir.path(), "List all Rust source files in this project.", 120);
+    let out = run(
+        dir.path(),
+        "List all Rust source files in this project.",
+        120,
+    );
     eprintln!("stdout:\n{}", out.stdout);
 
     // Recorded LLM response is a tutorial about listing .rs files; verify
     // it mentions relevant file-discovery terms.
-    assert_response_contains(&out.stdout, &["find", ".rs"], "expected file discovery response");
+    assert_response_contains(
+        &out.stdout,
+        &["find", ".rs"],
+        "expected file discovery response",
+    );
 }
 
 #[test]
@@ -595,10 +694,18 @@ fn tool_grep_search() {
     let dir = tempfile::tempdir().unwrap();
     create_rust_lib(dir.path());
 
-    let out = run(dir.path(), "Search for all function definitions in src/lib.rs.", 120);
+    let out = run(
+        dir.path(),
+        "Search for all function definitions in src/lib.rs.",
+        120,
+    );
     eprintln!("stdout:\n{}", out.stdout);
 
-    assert_response_contains(&out.stdout, &["fn", "add", "function"], "expected function search results");
+    assert_response_contains(
+        &out.stdout,
+        &["fn", "add", "function"],
+        "expected function search results",
+    );
 }
 
 #[test]
@@ -612,7 +719,11 @@ fn tool_dangerous_command_blocked() {
 
     // Recorded LLM refusal explains why the command is dangerous; verify
     // refusal language is present rather than checking for command absence.
-    assert_response_contains(&out.stdout, &["can't", "destructive"], "expected refusal or warning");
+    assert_response_contains(
+        &out.stdout,
+        &["can't", "destructive"],
+        "expected refusal or warning",
+    );
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -634,7 +745,10 @@ fn permission_default_allows_reads() {
     );
     eprintln!("stdout:\n{}", out.stdout);
 
-    assert!(!out.stdout.trim().is_empty(), "expected response in default mode");
+    assert!(
+        !out.stdout.trim().is_empty(),
+        "expected response in default mode"
+    );
 }
 
 #[test]
@@ -652,7 +766,10 @@ fn permission_accept_edits_auto_allows_writes() {
     eprintln!("stdout:\n{}", out.stdout);
 
     // In accept-edits mode, writes should proceed without manual confirmation
-    assert!(!out.stdout.trim().is_empty(), "expected response in accept-edits mode");
+    assert!(
+        !out.stdout.trim().is_empty(),
+        "expected response in accept-edits mode"
+    );
 }
 
 #[test]
@@ -671,7 +788,10 @@ fn permission_plan_mode_readonly() {
     eprintln!("stdout:\n{}", out.stdout);
 
     // Should either refuse to write or explain it's in plan mode
-    assert!(!out.stdout.trim().is_empty(), "expected response in plan mode");
+    assert!(
+        !out.stdout.trim().is_empty(),
+        "expected response in plan mode"
+    );
 }
 
 #[test]
@@ -690,7 +810,11 @@ fn permission_bypass_dangerous() {
     eprintln!("stdout:\n{}", out.stdout);
 
     // Recorded LLM refusal explains the danger; verify refusal language is present.
-    assert_response_contains(&out.stdout, &["can't", "destructive"], "expected refusal or warning");
+    assert_response_contains(
+        &out.stdout,
+        &["can't", "destructive"],
+        "expected refusal or warning",
+    );
 }
 
 #[test]
@@ -734,7 +858,10 @@ fn permission_default_dangerous_shell_needs_confirmation() {
     // Bash was denied, so the command should not have executed.
     // We verify by checking stdout contains the mock text response
     // rather than actual file listing output.
-    assert!(!out.stdout.trim().is_empty(), "expected response after denied bash");
+    assert!(
+        !out.stdout.trim().is_empty(),
+        "expected response after denied bash"
+    );
 }
 
 #[test]
@@ -814,11 +941,19 @@ fn memory_session_messages_accumulate() {
     create_rust_lib(dir.path());
 
     // Single prompt that triggers a tool call then expects context awareness
-    let out = run(dir.path(), "Add a fibonacci function to src/lib.rs. Then tell me what you just added.", 180);
+    let out = run(
+        dir.path(),
+        "Add a fibonacci function to src/lib.rs. Then tell me what you just added.",
+        180,
+    );
     eprintln!("stdout:\n{}", out.stdout);
 
     // The model should reference its own previous action
-    assert_response_contains(&out.stdout, &["fibonacci", "added", "function"], "expected self-reference");
+    assert_response_contains(
+        &out.stdout,
+        &["fibonacci", "added", "function"],
+        "expected self-reference",
+    );
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -865,7 +1000,11 @@ fn hook_settings_load_without_crash() {
     eprintln!("stderr:\n{}", out.stderr);
 
     // Should complete without error (hooks are loaded but not wired to engine in headless mode)
-    assert_eq!(out.exit_code, Some(0), "CLI should not crash with hook settings loaded");
+    assert_eq!(
+        out.exit_code,
+        Some(0),
+        "CLI should not crash with hook settings loaded"
+    );
     assert!(!out.stdout.is_empty(), "expected some output");
 }
 
@@ -976,7 +1115,10 @@ fn config_cli_model_override() {
     );
     eprintln!("stdout:\n{}", out.stdout);
 
-    assert!(!out.stdout.trim().is_empty(), "expected response with model override");
+    assert!(
+        !out.stdout.trim().is_empty(),
+        "expected response with model override"
+    );
 }
 
 #[test]
@@ -988,12 +1130,18 @@ fn config_cli_system_prompt_override() {
     let out = run_with_args(
         dir.path(),
         "What is your role?",
-        &["--system-prompt", "You are a Rust compiler. Only output code."],
+        &[
+            "--system-prompt",
+            "You are a Rust compiler. Only output code.",
+        ],
         60,
     );
     eprintln!("stdout:\n{}", out.stdout);
 
-    assert!(!out.stdout.trim().is_empty(), "expected response with custom system prompt");
+    assert!(
+        !out.stdout.trim().is_empty(),
+        "expected response with custom system prompt"
+    );
 }
 
 #[test]
@@ -1011,7 +1159,10 @@ fn config_cli_allowed_tools() {
     );
     eprintln!("stdout:\n{}", out.stdout);
 
-    assert!(!out.stdout.trim().is_empty(), "expected response with allowed-tools restriction");
+    assert!(
+        !out.stdout.trim().is_empty(),
+        "expected response with allowed-tools restriction"
+    );
 }
 
 #[test]
@@ -1036,7 +1187,10 @@ fn config_cli_settings_override() {
     );
     eprintln!("stdout:\n{}", out.stdout);
 
-    assert!(!out.stdout.trim().is_empty(), "expected response with --settings override");
+    assert!(
+        !out.stdout.trim().is_empty(),
+        "expected response with --settings override"
+    );
 }
 
 #[test]
@@ -1088,12 +1242,7 @@ fn config_cli_project_settings_loaded() {
     )
     .unwrap();
 
-    let out = run_with_args(
-        dir.path(),
-        "Say hello briefly.",
-        &["--setting-sources"],
-        60,
-    );
+    let out = run_with_args(dir.path(), "Say hello briefly.", &["--setting-sources"], 60);
     eprintln!("stdout:\n{}", out.stdout);
 
     // The project config should be loaded and visible in setting-sources output
@@ -1163,7 +1312,10 @@ fn api_client_budget_tracking() {
 
     assert!(!out.stdout.trim().is_empty(), "expected response");
     // Budget-aware requests should complete within reasonable time
-    assert!(out.duration < Duration::from_secs(30), "budget tracking should prevent runaway requests");
+    assert!(
+        out.duration < Duration::from_secs(30),
+        "budget tracking should prevent runaway requests"
+    );
 }
 
 #[test]
@@ -1194,7 +1346,10 @@ fn api_client_model_flag_selects_model() {
         out.stdout
     );
     // The API call should still produce a response
-    assert!(!out.stdout.trim().is_empty(), "expected response with model override");
+    assert!(
+        !out.stdout.trim().is_empty(),
+        "expected response with model override"
+    );
 }
 
 #[test]
@@ -1235,7 +1390,8 @@ fn mcp_cli_list_empty() {
     let dir = tempfile::tempdir().unwrap();
     let out = run_command(dir.path(), &["mcp", "list"], 60);
     assert!(
-        out.stdout.contains("Configured MCP servers:") || out.stdout.contains("No MCP config found"),
+        out.stdout.contains("Configured MCP servers:")
+            || out.stdout.contains("No MCP config found"),
         "expected empty MCP list header, got: {}",
         out.stdout
     );
@@ -1265,11 +1421,7 @@ fn mcp_cli_list_with_config() {
 fn mcp_cli_add_server() {
     let dir = tempfile::tempdir().unwrap();
 
-    let out = run_command(
-        dir.path(),
-        &["mcp", "add", "test-server", "echo hello"],
-        60,
-    );
+    let out = run_command(dir.path(), &["mcp", "add", "test-server", "echo hello"], 60);
     assert!(
         out.stdout.contains("Added MCP server 'test-server'"),
         "expected add confirmation, got: {}",
@@ -1404,7 +1556,12 @@ fn parity_tool_sequence_idempotent() {
 
     // Tools are not yet advertised to the live LLM, so use soft checks.
     soft_check_file(dir.path(), "src/lib.rs", "triple", "first run added triple");
-    soft_check_file(dir2.path(), "src/lib.rs", "triple", "second run added triple");
+    soft_check_file(
+        dir2.path(),
+        "src/lib.rs",
+        "triple",
+        "second run added triple",
+    );
 }
 
 #[test]
@@ -1414,7 +1571,11 @@ fn parity_error_handling_graceful() {
     create_rust_lib(dir.path());
 
     // Ask for something impossible — should not panic
-    let out = run(dir.path(), "Read the file /root/secret.txt and tell me its contents.", 120);
+    let out = run(
+        dir.path(),
+        "Read the file /root/secret.txt and tell me its contents.",
+        120,
+    );
     eprintln!("stdout:\n{}", out.stdout);
 
     // Should get a response (possibly error explanation) rather than crashing

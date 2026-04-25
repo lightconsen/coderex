@@ -91,8 +91,8 @@ impl UrlValidator {
     ///
     /// Checks scheme, host, and port against configured rules.
     pub fn validate(&self, url: &str) -> Result<(), UrlValidationError> {
-        let parsed = reqwest::Url::parse(url)
-            .map_err(|e| UrlValidationError::InvalidUrl(e.to_string()))?;
+        let parsed =
+            reqwest::Url::parse(url).map_err(|e| UrlValidationError::InvalidUrl(e.to_string()))?;
 
         // Scheme check
         let scheme = parsed.scheme();
@@ -176,8 +176,7 @@ impl SsrfGuard {
     /// This resolves the host and checks the resulting IP address.
     /// For best security, run this *before* making the HTTP request.
     pub fn guard(url: &str) -> Result<(), SsrfError> {
-        let parsed = reqwest::Url::parse(url)
-            .map_err(|e| SsrfError::InvalidUrl(e.to_string()))?;
+        let parsed = reqwest::Url::parse(url).map_err(|e| SsrfError::InvalidUrl(e.to_string()))?;
 
         let host = parsed
             .host_str()
@@ -196,14 +195,11 @@ impl SsrfGuard {
             || lower == "::1"
             || lower.ends_with(".localhost")
         {
-            return Err(SsrfError::Localhost {
-                host: host.into(),
-            });
+            return Err(SsrfError::Localhost { host: host.into() });
         }
 
         // Resolve host to IP addresses
-        let addrs: Vec<_> = match std::net::ToSocketAddrs::to_socket_addrs(&format!("{host}:80"))
-        {
+        let addrs: Vec<_> = match std::net::ToSocketAddrs::to_socket_addrs(&format!("{host}:80")) {
             Ok(iter) => iter.map(|a| a.ip()).collect(),
             Err(_) => {
                 return Err(SsrfError::ResolutionFailed(host.into()));
@@ -501,10 +497,7 @@ mod tests {
     fn interpolate_simple_var() {
         // PATH exists on all platforms
         let path_val = std::env::var("PATH").expect("PATH should be set");
-        assert_eq!(
-            EnvInterpolator::interpolate("${PATH}").unwrap(),
-            path_val
-        );
+        assert_eq!(EnvInterpolator::interpolate("${PATH}").unwrap(), path_val);
     }
 
     #[test]
@@ -518,10 +511,7 @@ mod tests {
     #[test]
     fn interpolate_dollar_var_form() {
         let path_val = std::env::var("PATH").expect("PATH should be set");
-        assert_eq!(
-            EnvInterpolator::interpolate("$PATH").unwrap(),
-            path_val
-        );
+        assert_eq!(EnvInterpolator::interpolate("$PATH").unwrap(), path_val);
     }
 
     #[test]

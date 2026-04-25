@@ -114,7 +114,11 @@ impl StateDelta {
 /// Returns a `StateDelta` containing only the entries that differ
 /// between `old_state` and `new_state`.
 #[must_use]
-pub fn compute_delta(base_revision: &str, old_state: &HashMap<String, String>, new_state: &HashMap<String, String>) -> StateDelta {
+pub fn compute_delta(
+    base_revision: &str,
+    old_state: &HashMap<String, String>,
+    new_state: &HashMap<String, String>,
+) -> StateDelta {
     let mut delta = StateDelta::new(base_revision);
 
     // Find new or changed entries
@@ -410,7 +414,10 @@ mod tests {
     use super::*;
 
     fn make_state(pairs: &[(&str, &str)]) -> HashMap<String, String> {
-        pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
     }
 
     #[test]
@@ -426,7 +433,9 @@ mod tests {
         let new = make_state(&[("a", "1"), ("b", "2")]);
         let delta = compute_delta("rev1", &old, &new);
         assert_eq!(delta.len(), 1);
-        assert!(matches!(&delta.operations[0], DeltaOp::Upsert { key, value } if key == "b" && value == "2"));
+        assert!(
+            matches!(&delta.operations[0], DeltaOp::Upsert { key, value } if key == "b" && value == "2")
+        );
     }
 
     #[test]
@@ -435,7 +444,9 @@ mod tests {
         let new = make_state(&[("a", "updated")]);
         let delta = compute_delta("rev1", &old, &new);
         assert_eq!(delta.len(), 1);
-        assert!(matches!(&delta.operations[0], DeltaOp::Upsert { key, value } if key == "a" && value == "updated"));
+        assert!(
+            matches!(&delta.operations[0], DeltaOp::Upsert { key, value } if key == "a" && value == "updated")
+        );
     }
 
     #[test]

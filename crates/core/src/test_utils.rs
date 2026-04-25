@@ -63,7 +63,10 @@ impl MockApiClient {
 
     /// Enqueue an error response.
     pub fn enqueue_error(&self, message: &str) {
-        self.responses.lock().unwrap().push_back(Err(ApiError::Auth(message.into())));
+        self.responses
+            .lock()
+            .unwrap()
+            .push_back(Err(ApiError::Auth(message.into())));
     }
 
     /// Enqueue a stream of events.

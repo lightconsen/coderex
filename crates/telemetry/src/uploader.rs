@@ -142,8 +142,7 @@ impl Clone for TelemetryUploader {
 impl TelemetryUploader {
     /// Create a new uploader.
     pub fn new(db_path: PathBuf, config: TelemetryConfig) -> Self {
-        let mut builder = reqwest::Client::builder()
-            .timeout(Duration::from_secs(30));
+        let mut builder = reqwest::Client::builder().timeout(Duration::from_secs(30));
 
         if let Some(ref pem) = config.pinned_cert_pem {
             match reqwest::Certificate::from_pem(pem.as_bytes()) {
@@ -306,9 +305,7 @@ impl TelemetryUploader {
                 }
             }
             Err(e) => {
-                return Err(TelemetryError::Upload(format!(
-                    "crash upload failed: {e}"
-                )));
+                return Err(TelemetryError::Upload(format!("crash upload failed: {e}")));
             }
         }
 
@@ -318,8 +315,8 @@ impl TelemetryUploader {
 
 /// Compress a JSON value into a gzip-encoded byte vector.
 fn compress_json(value: &serde_json::Value) -> Result<Vec<u8>, TelemetryError> {
-    use flate2::write::GzEncoder;
     use flate2::Compression;
+    use flate2::write::GzEncoder;
     use std::io::Write;
 
     let json = serde_json::to_vec(value)?;
@@ -351,7 +348,10 @@ mod tests {
             crash_endpoint: Some("https://example.com/crashes".into()),
             ..Default::default()
         };
-        assert_eq!(config.resolve_crash_endpoint(), "https://example.com/crashes");
+        assert_eq!(
+            config.resolve_crash_endpoint(),
+            "https://example.com/crashes"
+        );
     }
 
     #[test]

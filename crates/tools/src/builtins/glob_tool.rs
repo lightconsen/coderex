@@ -42,7 +42,11 @@ impl Tool for GlobTool {
         }
     }
 
-    async fn execute(&self, input: ToolInput, ctx: ToolContext<'_>) -> Result<ToolOutput, ToolError> {
+    async fn execute(
+        &self,
+        input: ToolInput,
+        ctx: ToolContext<'_>,
+    ) -> Result<ToolOutput, ToolError> {
         let pattern = extract_string(&input.arguments, "pattern")?;
         let path = input
             .arguments
@@ -51,7 +55,8 @@ impl Tool for GlobTool {
             .map(String::from);
 
         let root = path
-            .as_ref().map_or_else(|| ctx.cwd.to_path_buf(), PathBuf::from);
+            .as_ref()
+            .map_or_else(|| ctx.cwd.to_path_buf(), PathBuf::from);
 
         let glob = GlobBuilder::new(&pattern)
             .literal_separator(true)
@@ -62,16 +67,14 @@ impl Tool for GlobTool {
         let matcher = glob.compile_matcher();
 
         let mut matches = Vec::new();
-        let walker = walkdir::WalkDir::new(&root)
-            .into_iter()
-            .filter_entry(|e| {
-                if e.file_type().is_dir() {
-                    let name = e.file_name().to_string_lossy();
-                    name != ".git"
-                } else {
-                    true
-                }
-            });
+        let walker = walkdir::WalkDir::new(&root).into_iter().filter_entry(|e| {
+            if e.file_type().is_dir() {
+                let name = e.file_name().to_string_lossy();
+                name != ".git"
+            } else {
+                true
+            }
+        });
 
         for entry in walker {
             let entry = entry.map_err(|e| ToolError::InvalidInput {
@@ -79,10 +82,7 @@ impl Tool for GlobTool {
             })?;
 
             if entry.file_type().is_file() {
-                let relative = entry
-                    .path()
-                    .strip_prefix(&root)
-                    .unwrap_or(entry.path());
+                let relative = entry.path().strip_prefix(&root).unwrap_or(entry.path());
                 if matcher.is_match(relative) {
                     matches.push(relative.to_string_lossy().to_string());
                 }
@@ -117,8 +117,8 @@ fn extract_string(args: &serde_json::Value, key: &str) -> Result<String, ToolErr
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tool::ToolContext;
     use crate::context::ExecutionContext;
+    use crate::tool::ToolContext;
     use std::path::Path;
 
     fn test_ctx(cwd: &Path) -> ToolContext<'_> {
@@ -141,7 +141,10 @@ mod tests {
         std::fs::write(tmp.path().join("readme.md"), "").unwrap();
 
         let output = GlobTool
-            .execute(glob_input_with_path("*.rs", tmp.path().to_str().unwrap()), test_ctx(tmp.path()))
+            .execute(
+                glob_input_with_path("*.rs", tmp.path().to_str().unwrap()),
+                test_ctx(tmp.path()),
+            )
             .await
             .unwrap();
         assert!(output.output.contains("test.rs"));
@@ -155,7 +158,10 @@ mod tests {
         std::fs::write(tmp.path().join("file.txt"), "").unwrap();
 
         let output = GlobTool
-            .execute(glob_input_with_path("*.xyz", tmp.path().to_str().unwrap()), test_ctx(tmp.path()))
+            .execute(
+                glob_input_with_path("*.xyz", tmp.path().to_str().unwrap()),
+                test_ctx(tmp.path()),
+            )
             .await
             .unwrap();
         assert!(output.output.is_empty() || output.output.contains("truncated"));
@@ -169,7 +175,10 @@ mod tests {
         std::fs::write(sub.join("lib.rs"), "").unwrap();
 
         let output = GlobTool
-            .execute(glob_input_with_path("**/*.rs", tmp.path().to_str().unwrap()), test_ctx(tmp.path()))
+            .execute(
+                glob_input_with_path("**/*.rs", tmp.path().to_str().unwrap()),
+                test_ctx(tmp.path()),
+            )
             .await
             .unwrap();
         assert!(output.output.contains("lib.rs"));
@@ -184,7 +193,10 @@ mod tests {
         std::fs::write(tmp.path().join("file.txt"), "").unwrap();
 
         let output = GlobTool
-            .execute(glob_input_with_path("config", tmp.path().to_str().unwrap()), test_ctx(tmp.path()))
+            .execute(
+                glob_input_with_path("config", tmp.path().to_str().unwrap()),
+                test_ctx(tmp.path()),
+            )
             .await
             .unwrap();
         // .git/config should be skipped
@@ -199,11 +211,18 @@ mod tests {
         }
 
         let output = GlobTool
-            .execute(glob_input_with_path("*.txt", tmp.path().to_str().unwrap()), test_ctx(tmp.path()))
+            .execute(
+                glob_input_with_path("*.txt", tmp.path().to_str().unwrap()),
+                test_ctx(tmp.path()),
+            )
             .await
             .unwrap();
         assert!(output.output.contains("truncated"));
-        let line_count = output.output.lines().filter(|l| !l.is_empty() && !l.starts_with("...")).count();
+        let line_count = output
+            .output
+            .lines()
+            .filter(|l| !l.is_empty() && !l.starts_with("..."))
+            .count();
         assert_eq!(line_count, MAX_RESULTS);
     }
 }

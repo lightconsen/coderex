@@ -41,7 +41,9 @@ impl McpResourceRegistry {
     /// Create a new empty registry.
     #[must_use]
     pub fn new() -> Self {
-        Self { resources: Vec::new() }
+        Self {
+            resources: Vec::new(),
+        }
     }
 
     /// Register a discovered resource.
@@ -123,16 +125,22 @@ mod tests {
     fn filter_by_mime_prefix() {
         let mut reg = McpResourceRegistry::new();
         reg.register(McpResource {
-            uri: "file:///a.txt".into(), name: "a".into(),
-            mime_type: "text/plain".into(), description: None,
+            uri: "file:///a.txt".into(),
+            name: "a".into(),
+            mime_type: "text/plain".into(),
+            description: None,
         });
         reg.register(McpResource {
-            uri: "file:///b.json".into(), name: "b".into(),
-            mime_type: "application/json".into(), description: None,
+            uri: "file:///b.json".into(),
+            name: "b".into(),
+            mime_type: "application/json".into(),
+            description: None,
         });
         reg.register(McpResource {
-            uri: "file:///c.html".into(), name: "c".into(),
-            mime_type: "text/html".into(), description: None,
+            uri: "file:///c.html".into(),
+            name: "c".into(),
+            mime_type: "text/html".into(),
+            description: None,
         });
         let text = reg.by_mime_prefix("text/");
         assert_eq!(text.len(), 2);

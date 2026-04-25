@@ -57,20 +57,26 @@ impl LspConnection {
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .spawn()
-            .map_err(|e| ToolError::Io(std::io::Error::new(
+            .map_err(|e| {
+                ToolError::Io(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    format!("failed to spawn language server: {e}"),
+                ))
+            })?;
+
+        let stdin = process.stdin.take().ok_or_else(|| {
+            ToolError::Io(std::io::Error::new(
                 std::io::ErrorKind::Other,
-                format!("failed to spawn language server: {e}"),
-            )))?;
+                "failed to capture stdin".to_string(),
+            ))
+        })?;
 
-        let stdin = process.stdin.take().ok_or_else(|| ToolError::Io(std::io::Error::new(
-            std::io::ErrorKind::Other,
-            "failed to capture stdin".to_string(),
-        )))?;
-
-        let stdout = process.stdout.take().ok_or_else(|| ToolError::Io(std::io::Error::new(
-            std::io::ErrorKind::Other,
-            "failed to capture stdout".to_string(),
-        )))?;
+        let stdout = process.stdout.take().ok_or_else(|| {
+            ToolError::Io(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "failed to capture stdout".to_string(),
+            ))
+        })?;
 
         let mut conn = Self {
             process,
@@ -106,11 +112,7 @@ impl LspConnection {
     }
 
     /// Send a JSON-RPC request and return the result as JSON.
-    fn send_request_raw(
-        &mut self,
-        method: &str,
-        params: Value,
-    ) -> Result<Value, ToolError> {
+    fn send_request_raw(&mut self, method: &str, params: Value) -> Result<Value, ToolError> {
         self.request_id += 1;
         let id = self.request_id;
 
@@ -152,7 +154,9 @@ impl LspConnection {
         self.stdin
             .write_all(header.as_bytes())
             .map_err(ToolError::Io)?;
-        self.stdin.write_all(body.as_bytes()).map_err(ToolError::Io)?;
+        self.stdin
+            .write_all(body.as_bytes())
+            .map_err(ToolError::Io)?;
         self.stdin.flush().map_err(ToolError::Io)
     }
 
@@ -160,9 +164,7 @@ impl LspConnection {
     fn read_response(&mut self) -> Result<Value, ToolError> {
         loop {
             let mut line = String::new();
-            let n = self.stdout
-                .read_line(&mut line)
-                .map_err(ToolError::Io)?;
+            let n = self.stdout.read_line(&mut line).map_err(ToolError::Io)?;
             if n == 0 {
                 return Err(ToolError::InvalidInput {
                     message: "server closed connection".to_string(),
@@ -247,11 +249,15 @@ impl Tool for LspTool {
         }
     }
 
-    async fn execute(&self, input: ToolInput, ctx: ToolContext<'_>) -> Result<ToolOutput, ToolError> {
+    async fn execute(
+        &self,
+        input: ToolInput,
+        ctx: ToolContext<'_>,
+    ) -> Result<ToolOutput, ToolError> {
         let operation_str = extract_string(&input.arguments, "operation")?;
-        let operation = operation_str.parse::<LspOperation>().map_err(|e| ToolError::InvalidInput {
-            message: e,
-        })?;
+        let operation = operation_str
+            .parse::<LspOperation>()
+            .map_err(|e| ToolError::InvalidInput { message: e })?;
 
         let server_cmd = extract_string(&input.arguments, "server_command")
             .unwrap_or_else(|_| "typescript-language-server".into());
@@ -271,9 +277,7 @@ impl Tool for LspTool {
         let mut conn = LspConnection::spawn(&server_cmd, &args, &root_uri)?;
 
         let result = match operation {
-            LspOperation::WorkspaceSymbol => {
-                self.workspace_symbols(&mut conn, &input.arguments)
-            }
+            LspOperation::WorkspaceSymbol => self.workspace_symbols(&mut conn, &input.arguments),
             LspOperation::Hover => self.hover(&mut conn, &input.arguments),
             LspOperation::Definition => self.definition(&mut conn, &input.arguments),
             LspOperation::References => self.references(&mut conn, &input.arguments),
@@ -302,12 +306,19 @@ impl LspTool {
             arr.iter()
                 .filter_map(|s| {
                     let name = s["name"].as_str().unwrap_or("?").to_string();
-                    let kind = s["kind"].as_u64().map(|k| format!("kind:{k}")).unwrap_or_default();
+                    let kind = s["kind"]
+                        .as_u64()
+                        .map(|k| format!("kind:{k}"))
+                        .unwrap_or_default();
                     let loc = &s["location"];
                     let uri = loc["uri"].as_str().unwrap_or("?");
                     let start_line = loc["range"]["start"]["line"].as_u64().map_or(0, |l| l + 1);
-                    let start_col = loc["range"]["start"]["character"].as_u64().map_or(0, |c| c + 1);
-                    Some(format!("  {name} ({kind}) — {uri}:{start_line}:{start_col}"))
+                    let start_col = loc["range"]["start"]["character"]
+                        .as_u64()
+                        .map_or(0, |c| c + 1);
+                    Some(format!(
+                        "  {name} ({kind}) — {uri}:{start_line}:{start_col}"
+                    ))
                 })
                 .collect()
         });
@@ -352,7 +363,9 @@ impl LspTool {
         } else if let Some(arr) = contents.as_array() {
             arr.iter()
                 .filter_map(|v| {
-                    v.get("value").and_then(Value::as_str).map(String::from)
+                    v.get("value")
+                        .and_then(Value::as_str)
+                        .map(String::from)
                         .or_else(|| v.as_str().map(String::from))
                 })
                 .collect::<Vec<_>>()
@@ -390,7 +403,9 @@ impl LspTool {
                 .collect()
         } else if let Some(uri) = response["uri"].as_str() {
             let start_line = response["range"]["start"]["line"].as_u64().unwrap_or(0);
-            let start_col = response["range"]["start"]["character"].as_u64().unwrap_or(0);
+            let start_col = response["range"]["start"]["character"]
+                .as_u64()
+                .unwrap_or(0);
             vec![(uri, start_line + 1, start_col + 1)]
         } else {
             vec![]
@@ -421,18 +436,16 @@ impl LspTool {
 
         let response = conn.send_request_raw("textDocument/references", params)?;
 
-        let locations: Vec<(&str, u64, u64)> = response
-            .as_array()
-            .map_or(vec![], |arr| {
-                arr.iter()
-                    .filter_map(|loc| {
-                        let uri = loc["uri"].as_str()?;
-                        let start_line = loc["range"]["start"]["line"].as_u64()?;
-                        let start_col = loc["range"]["start"]["character"].as_u64()?;
-                        Some((uri, start_line + 1, start_col + 1))
-                    })
-                    .collect()
-            });
+        let locations: Vec<(&str, u64, u64)> = response.as_array().map_or(vec![], |arr| {
+            arr.iter()
+                .filter_map(|loc| {
+                    let uri = loc["uri"].as_str()?;
+                    let start_line = loc["range"]["start"]["line"].as_u64()?;
+                    let start_col = loc["range"]["start"]["character"].as_u64()?;
+                    Some((uri, start_line + 1, start_col + 1))
+                })
+                .collect()
+        });
 
         let count = locations.len();
         let mut output = format!("Found {count} reference(s):\n");
@@ -463,8 +476,8 @@ fn extract_number(args: &Value, key: &str) -> Option<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tool::ToolContext;
     use crate::context::ExecutionContext;
+    use crate::tool::ToolContext;
     use std::path::Path;
 
     fn test_ctx(cwd: &Path) -> ToolContext<'_> {
@@ -527,9 +540,18 @@ mod tests {
 
     #[test]
     fn extract_number_parses_various_values() {
-        assert_eq!(extract_number(&serde_json::json!({ "line": 0 }), "line"), Some(0));
-        assert_eq!(extract_number(&serde_json::json!({ "line": 42 }), "line"), Some(42));
+        assert_eq!(
+            extract_number(&serde_json::json!({ "line": 0 }), "line"),
+            Some(0)
+        );
+        assert_eq!(
+            extract_number(&serde_json::json!({ "line": 42 }), "line"),
+            Some(42)
+        );
         assert_eq!(extract_number(&serde_json::json!({}), "line"), None);
-        assert_eq!(extract_number(&serde_json::json!({ "line": "abc" }), "line"), None);
+        assert_eq!(
+            extract_number(&serde_json::json!({ "line": "abc" }), "line"),
+            None
+        );
     }
 }

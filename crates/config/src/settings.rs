@@ -72,8 +72,14 @@ impl ConfigDiff {
         }
         let mut lines = vec![format!("Config diff ({} change(s)):", self.changes.len())];
         for entry in &self.changes {
-            let default_str = entry.default.as_ref().map_or("null".to_string(), |v| v.to_string());
-            let current_str = entry.current.as_ref().map_or("null".to_string(), |v| v.to_string());
+            let default_str = entry
+                .default
+                .as_ref()
+                .map_or("null".to_string(), |v| v.to_string());
+            let current_str = entry
+                .current
+                .as_ref()
+                .map_or("null".to_string(), |v| v.to_string());
             lines.push(format!(
                 "  {}  (default: {}, current: {} [from: {}])",
                 entry.key, default_str, current_str, entry.source,
@@ -164,10 +170,7 @@ impl Settings {
             if !valid_modes.contains(&mode.as_str()) {
                 return Err(ConfigError::Validation {
                     field: "permission_mode".to_string(),
-                    message: format!(
-                        "must be one of: {}",
-                        valid_modes.join(", ")
-                    ),
+                    message: format!("must be one of: {}", valid_modes.join(", ")),
                 });
             }
         }
@@ -216,12 +219,18 @@ impl Settings {
         Self {
             config_version: other.config_version.max(self.config_version),
             model: other.model.clone().or_else(|| self.model.clone()),
-            permission_mode: other.permission_mode.clone().or_else(|| self.permission_mode.clone()),
+            permission_mode: other
+                .permission_mode
+                .clone()
+                .or_else(|| self.permission_mode.clone()),
             max_budget_usd: other.max_budget_usd.or(self.max_budget_usd),
             telemetry_enabled: other.telemetry_enabled.or(self.telemetry_enabled),
             telemetry: other.telemetry.clone().or_else(|| self.telemetry.clone()),
             hooks: other.hooks.clone().or_else(|| self.hooks.clone()),
-            mcp_servers: other.mcp_servers.clone().or_else(|| self.mcp_servers.clone()),
+            mcp_servers: other
+                .mcp_servers
+                .clone()
+                .or_else(|| self.mcp_servers.clone()),
             api_key: other.api_key.clone().or_else(|| self.api_key.clone()),
         }
     }
@@ -236,8 +245,14 @@ impl Settings {
         let current_json = serde_json::to_value(self).unwrap_or_default();
 
         let keys = [
-            "model", "permission_mode", "max_budget_usd",
-            "telemetry_enabled", "telemetry", "hooks", "mcp_servers", "api_key",
+            "model",
+            "permission_mode",
+            "max_budget_usd",
+            "telemetry_enabled",
+            "telemetry",
+            "hooks",
+            "mcp_servers",
+            "api_key",
         ];
         let mut changes = Vec::new();
 
@@ -372,12 +387,14 @@ impl ConfigService {
 
         let user = self
             .load_user_config()
-            .inspect_err(|e| tracing::debug!("user config not loaded: {e}")).unwrap_or(None)
+            .inspect_err(|e| tracing::debug!("user config not loaded: {e}"))
+            .unwrap_or(None)
             .unwrap_or_default();
 
         let project = self
             .load_project_config()
-            .inspect_err(|e| tracing::debug!("project config not loaded: {e}")).unwrap_or(None)
+            .inspect_err(|e| tracing::debug!("project config not loaded: {e}"))
+            .unwrap_or(None)
             .unwrap_or_default();
 
         let mut merged = defaults.merge(&user).merge(&project);
@@ -409,8 +426,15 @@ fn load_settings_file(path: &Path, source: &str) -> Result<Option<Settings>, Con
     if let Ok(value) = serde_json::from_str::<serde_json::Value>(&content) {
         if let Some(obj) = value.as_object() {
             let known_fields = [
-                "config_version", "model", "permission_mode", "max_budget_usd",
-                "telemetry_enabled", "telemetry", "hooks", "mcp_servers", "api_key",
+                "config_version",
+                "model",
+                "permission_mode",
+                "max_budget_usd",
+                "telemetry_enabled",
+                "telemetry",
+                "hooks",
+                "mcp_servers",
+                "api_key",
             ];
             for key in obj.keys() {
                 if !known_fields.contains(&key.as_str()) {
@@ -421,10 +445,11 @@ fn load_settings_file(path: &Path, source: &str) -> Result<Option<Settings>, Con
         }
     }
 
-    let mut settings: Settings = serde_json::from_str(&content).map_err(|source| ConfigError::Json {
-        path: path.to_path_buf(),
-        source,
-    })?;
+    let mut settings: Settings =
+        serde_json::from_str(&content).map_err(|source| ConfigError::Json {
+            path: path.to_path_buf(),
+            source,
+        })?;
 
     // Migrate and validate
     migrate_settings(&mut settings, source);
@@ -441,16 +466,10 @@ fn load_settings_file(path: &Path, source: &str) -> Result<Option<Settings>, Con
 /// Get the Claude config home directory (~/.coderex or CLAUDE_CONFIG_DIR override).
 #[must_use]
 pub fn config_home() -> PathBuf {
-    std::env::var("CLAUDE_CONFIG_DIR")
-        .ok()
-        .map_or_else(
-            || {
-                home::home_dir()
-                    .unwrap_or_default()
-                    .join(".coderex")
-            },
-            PathBuf::from,
-        )
+    std::env::var("CLAUDE_CONFIG_DIR").ok().map_or_else(
+        || home::home_dir().unwrap_or_default().join(".coderex"),
+        PathBuf::from,
+    )
 }
 
 /// Resolve an API key reference. If it starts with `keyring://`, look it up
@@ -499,17 +518,18 @@ impl ConfigWatcher {
         let (tx, _rx) = tokio::sync::watch::channel(());
         let tx_clone = tx.clone();
 
-        let mut watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
-            if let Ok(event) = res {
-                match event.kind {
-                    EventKind::Modify(_) | EventKind::Create(_) | EventKind::Remove(_) => {
-                        let _ = tx_clone.send(());
-                        tracing::debug!("config file change detected");
+        let mut watcher =
+            notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
+                if let Ok(event) = res {
+                    match event.kind {
+                        EventKind::Modify(_) | EventKind::Create(_) | EventKind::Remove(_) => {
+                            let _ = tx_clone.send(());
+                            tracing::debug!("config file change detected");
+                        }
+                        _ => {}
                     }
-                    _ => {}
                 }
-            }
-        })?;
+            })?;
 
         for path in paths {
             let p = path.as_ref();
@@ -572,7 +592,9 @@ mod tests {
             ..Default::default()
         };
         let err = settings.validate().unwrap_err();
-        assert!(matches!(err, ConfigError::Validation { ref field, .. } if field == "max_budget_usd"));
+        assert!(
+            matches!(err, ConfigError::Validation { ref field, .. } if field == "max_budget_usd")
+        );
     }
 
     #[test]
@@ -582,7 +604,9 @@ mod tests {
             ..Default::default()
         };
         let err = settings.validate().unwrap_err();
-        assert!(matches!(err, ConfigError::Validation { ref field, .. } if field == "permission_mode"));
+        assert!(
+            matches!(err, ConfigError::Validation { ref field, .. } if field == "permission_mode")
+        );
     }
 
     #[test]
@@ -618,10 +642,7 @@ mod tests {
 
     #[test]
     fn settings_resolve_with_missing_files_falls_back_to_defaults() {
-        let service = ConfigService::new(
-            PathBuf::from("/nonexistent/settings.json"),
-            None,
-        );
+        let service = ConfigService::new(PathBuf::from("/nonexistent/settings.json"), None);
         let resolved = service.resolve().unwrap();
         assert_eq!(resolved.model, Some("claude-sonnet-4-6".into()));
         assert_eq!(resolved.permission_mode, Some("default".into()));
@@ -732,7 +753,9 @@ mod tests {
         let path = tmp.join("coderex_test_unknown_field.json");
         std::fs::write(&path, r#"{"model":"test","unknown_key":"value"}"#).unwrap();
         let result = load_settings_file(&path, "test");
-        assert!(matches!(result, Err(ConfigError::UnknownField { ref field }) if field == "unknown_key"));
+        assert!(
+            matches!(result, Err(ConfigError::UnknownField { ref field }) if field == "unknown_key")
+        );
         let _ = std::fs::remove_file(&path);
     }
 

@@ -199,9 +199,7 @@ pub fn coordinator_tool_whitelist() -> Vec<&'static str> {
 /// Check if a tool name is available in CoordinatorMode.
 #[must_use]
 pub fn is_coordinator_tool(tool_name: &str) -> bool {
-    coordinator_tool_whitelist()
-        .iter()
-        .any(|&t| t == tool_name)
+    coordinator_tool_whitelist().iter().any(|&t| t == tool_name)
 }
 
 #[cfg(test)]
@@ -239,7 +237,10 @@ mod tests {
     fn phase_display() {
         assert_eq!(CoordinatorPhase::Research.to_string(), "research");
         assert_eq!(CoordinatorPhase::Synthesis.to_string(), "synthesis");
-        assert_eq!(CoordinatorPhase::Implementation.to_string(), "implementation");
+        assert_eq!(
+            CoordinatorPhase::Implementation.to_string(),
+            "implementation"
+        );
         assert_eq!(CoordinatorPhase::Verification.to_string(), "verification");
     }
 

@@ -35,10 +35,13 @@ impl WebFetchCache {
     }
 
     pub async fn set(&self, url: String, content: String) {
-        self.entries.write().await.insert(url, CacheEntry {
-            content,
-            fetched_at: std::time::Instant::now(),
-        });
+        self.entries.write().await.insert(
+            url,
+            CacheEntry {
+                content,
+                fetched_at: std::time::Instant::now(),
+            },
+        );
     }
 }
 
@@ -93,7 +96,11 @@ impl Tool for WebFetchTool {
         }
     }
 
-    async fn execute(&self, input: ToolInput, _ctx: ToolContext<'_>) -> Result<ToolOutput, ToolError> {
+    async fn execute(
+        &self,
+        input: ToolInput,
+        _ctx: ToolContext<'_>,
+    ) -> Result<ToolOutput, ToolError> {
         let url = extract_string(&input.arguments, "url")?;
         let prompt = extract_string(&input.arguments, "prompt")?;
 
@@ -129,7 +136,10 @@ impl Tool for WebFetchTool {
             } else {
                 reqwest::redirect::Policy::custom(move |attempt| {
                     if let Some(host) = attempt.url().host_str() {
-                        if allowed.iter().any(|d| host == d.as_str() || host.ends_with(&format!(".{d}"))) {
+                        if allowed
+                            .iter()
+                            .any(|d| host == d.as_str() || host.ends_with(&format!(".{d}")))
+                        {
                             return attempt.follow();
                         }
                     }
@@ -174,9 +184,7 @@ impl Tool for WebFetchTool {
             markdown
         };
 
-        let output = format!(
-            "Fetched: {url}\n\nExtracting: {prompt}\n\n---\n{content}"
-        );
+        let output = format!("Fetched: {url}\n\nExtracting: {prompt}\n\n---\n{content}");
 
         Ok(ToolOutput {
             output,
@@ -193,8 +201,7 @@ fn get_cache(ctx: &ToolContext<'_>) -> Option<Arc<WebFetchCache>> {
 
 /// Convert HTML to plain text/markdown.
 pub fn html_to_markdown(html: &str) -> String {
-    html2text::from_read(html.as_bytes(), 80)
-        .unwrap_or_else(|_| strip_tags_fallback(html))
+    html2text::from_read(html.as_bytes(), 80).unwrap_or_else(|_| strip_tags_fallback(html))
 }
 
 fn strip_tags_fallback(html: &str) -> String {
@@ -210,10 +217,7 @@ fn strip_tags_fallback(html: &str) -> String {
             result.push(c);
         }
     }
-    result
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
+    result.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 fn extract_string(args: &serde_json::Value, key: &str) -> Result<String, ToolError> {
@@ -228,8 +232,8 @@ fn extract_string(args: &serde_json::Value, key: &str) -> Result<String, ToolErr
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tool::ToolContext;
     use crate::context::ExecutionContext;
+    use crate::tool::ToolContext;
     use std::path::Path;
 
     fn test_ctx() -> ToolContext<'static> {
@@ -275,7 +279,9 @@ mod tests {
     #[tokio::test]
     async fn webfetch_cache_stores_result() {
         let cache = Arc::new(WebFetchCache::default());
-        cache.set("http://test.com".into(), "cached content".into()).await;
+        cache
+            .set("http://test.com".into(), "cached content".into())
+            .await;
         let got = cache.get("http://test.com").await;
         assert_eq!(got, Some("cached content".into()));
     }

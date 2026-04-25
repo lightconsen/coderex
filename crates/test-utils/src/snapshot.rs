@@ -49,7 +49,10 @@ pub enum RedactedEvent {
     /// Tool call started.
     ToolCallStart { id: String, name: String },
     /// Tool call completed.
-    ToolCallEnd { id: String, result: RedactedToolResult },
+    ToolCallEnd {
+        id: String,
+        result: RedactedToolResult,
+    },
     /// Compact boundary.
     CompactBoundary,
     /// Permission request.

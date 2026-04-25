@@ -6,7 +6,12 @@ use coderex_commands::registry::{CommandContext, CommandRegistry};
 use coderex_core::types::ModelId;
 
 fn test_ctx(cwd: &str) -> CommandContext {
-    CommandContext::new(cwd.into(), "e2e_test".into(), "E2E Test".into(), ModelId::sonnet())
+    CommandContext::new(
+        cwd.into(),
+        "e2e_test".into(),
+        "E2E Test".into(),
+        ModelId::sonnet(),
+    )
 }
 
 // E2E: User asks question → fails fast without QueryEngine
@@ -22,7 +27,9 @@ async fn e2e_user_query_gets_response() {
 #[tokio::test]
 async fn e2e_slash_clear_resets_session() {
     let mut repl = coderex_cli::ReplLoop::new("/src".into(), ModelId::sonnet());
-    repl.run_headless("Hello").await.expect_err("should fail without engine");
+    repl.run_headless("Hello")
+        .await
+        .expect_err("should fail without engine");
     let result = repl.run_headless("/clear").await.unwrap();
     assert!(!result.is_empty());
 }
@@ -40,7 +47,9 @@ async fn e2e_slash_help_shows_commands() {
 async fn e2e_slash_status_shows_info() {
     let mut repl = coderex_cli::ReplLoop::new("/src".into(), ModelId::sonnet());
     let result = repl.run_headless("/status").await.unwrap();
-    assert!(result.contains("System Status") || result.contains("coderex") || result.contains("Status"));
+    assert!(
+        result.contains("System Status") || result.contains("coderex") || result.contains("Status")
+    );
 }
 
 // E2E: Slash command /compact → compacts session
@@ -106,9 +115,15 @@ fn e2e_vim_toggle() {
 async fn e2e_clear_after_messages() {
     let mut repl = coderex_cli::ReplLoop::new("/src".into(), ModelId::sonnet());
 
-    repl.run_headless("Message 1").await.expect_err("should fail without engine");
-    repl.run_headless("Message 2").await.expect_err("should fail without engine");
-    repl.run_headless("Message 3").await.expect_err("should fail without engine");
+    repl.run_headless("Message 1")
+        .await
+        .expect_err("should fail without engine");
+    repl.run_headless("Message 2")
+        .await
+        .expect_err("should fail without engine");
+    repl.run_headless("Message 3")
+        .await
+        .expect_err("should fail without engine");
 
     let result = repl.run_headless("/clear").await.unwrap();
     assert!(!result.is_empty());

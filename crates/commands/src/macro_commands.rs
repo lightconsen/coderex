@@ -109,7 +109,10 @@ mod tests {
         let mut reg = MacroRegistry::new();
         reg.set_file_path(tmp.path().join("macros.json"));
 
-        reg.define("deploy", vec!["compact".into(), "commit".into(), "exit".into()]);
+        reg.define(
+            "deploy",
+            vec!["compact".into(), "commit".into(), "exit".into()],
+        );
         assert!(reg.has("deploy"));
         assert_eq!(reg.get("deploy").unwrap().len(), 3);
     }

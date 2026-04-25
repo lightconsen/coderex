@@ -70,8 +70,15 @@ pub struct RemoteState {
 
 impl RemoteState {
     /// Add a remote entry to the state.
-    pub fn add(&mut self, topic: String, checksum: MemoryChecksum, tombstoned: bool, updated_at: DateTime<Utc>) {
-        self.entries.insert(topic, (checksum, tombstoned, updated_at));
+    pub fn add(
+        &mut self,
+        topic: String,
+        checksum: MemoryChecksum,
+        tombstoned: bool,
+        updated_at: DateTime<Utc>,
+    ) {
+        self.entries
+            .insert(topic, (checksum, tombstoned, updated_at));
     }
 }
 
@@ -110,7 +117,10 @@ impl InMemoryRelay {
 
     /// Upsert an entry on the relay.
     pub async fn upsert(&self, entry: TeamMemoryEntry) {
-        self.entries.write().await.insert(entry.topic.clone(), entry);
+        self.entries
+            .write()
+            .await
+            .insert(entry.topic.clone(), entry);
     }
 
     /// Get all entry summaries for state comparison.
@@ -187,7 +197,11 @@ impl TeamMemorySyncService {
     /// Create a new team memory sync service.
     #[must_use]
     pub fn new(repo_id: String, memory_dir: PathBuf) -> Self {
-        Self { repo_id, memory_dir, org_id: None }
+        Self {
+            repo_id,
+            memory_dir,
+            org_id: None,
+        }
     }
 
     /// Create a new team memory sync service scoped to an organization.
@@ -308,10 +322,8 @@ impl TeamMemorySyncService {
     #[must_use]
     pub fn compute_sync_delta(&self, remote: &RemoteState) -> SyncResult {
         let local_entries = self.list().unwrap_or_default();
-        let local_map: HashMap<String, &TeamMemoryEntry> = local_entries
-            .iter()
-            .map(|e| (e.topic.clone(), e))
-            .collect();
+        let local_map: HashMap<String, &TeamMemoryEntry> =
+            local_entries.iter().map(|e| (e.topic.clone(), e)).collect();
 
         // Find local entries that need to be sent (different checksum or new)
         let mut to_send = Vec::new();
@@ -401,8 +413,7 @@ impl TeamMemorySyncService {
     /// Write an entry to disk.
     fn write_entry(&self, entry: &TeamMemoryEntry) -> std::io::Result<()> {
         let path = self.entry_path(&entry.topic);
-        let serialized = serde_json::to_string_pretty(entry)
-            .map_err(std::io::Error::other)?;
+        let serialized = serde_json::to_string_pretty(entry).map_err(std::io::Error::other)?;
         std::fs::write(&path, serialized)
     }
 
@@ -426,7 +437,9 @@ mod tests {
     #[test]
     fn upsert_creates_new_entry() {
         let (svc, _tmp) = temp_service();
-        let entry = svc.upsert("architecture", "Uses layered architecture").unwrap();
+        let entry = svc
+            .upsert("architecture", "Uses layered architecture")
+            .unwrap();
         assert_eq!(entry.topic, "architecture");
         assert_eq!(entry.content, "Uses layered architecture");
         assert!(!entry.tombstoned);
@@ -517,7 +530,12 @@ mod tests {
         let checksum_different = MemoryChecksum::from_content("v2");
         let mut remote = RemoteState::default();
         let now = Utc::now();
-        remote.add("shared".to_string(), checksum_different, false, now + chrono::Duration::seconds(10));
+        remote.add(
+            "shared".to_string(),
+            checksum_different,
+            false,
+            now + chrono::Duration::seconds(10),
+        );
 
         let delta = svc.compute_sync_delta(&remote);
 
@@ -543,16 +561,14 @@ mod tests {
     #[test]
     fn apply_remote_adds_new_entries() {
         let (svc, _tmp) = temp_service();
-        let remote_entries = vec![
-            TeamMemoryEntry {
-                topic: "remote-a".to_string(),
-                content: "from remote".to_string(),
-                checksum: MemoryChecksum::from_content("from remote"),
-                created_at: Utc::now(),
-                updated_at: Utc::now(),
-                tombstoned: false,
-            },
-        ];
+        let remote_entries = vec![TeamMemoryEntry {
+            topic: "remote-a".to_string(),
+            content: "from remote".to_string(),
+            checksum: MemoryChecksum::from_content("from remote"),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            tombstoned: false,
+        }];
 
         let count = svc.apply_remote(remote_entries).unwrap();
         assert_eq!(count, 1);
@@ -567,16 +583,14 @@ mod tests {
         svc.upsert("local", "newer content").unwrap();
 
         let older = Utc::now() - chrono::Duration::hours(1);
-        let remote_entries = vec![
-            TeamMemoryEntry {
-                topic: "local".to_string(),
-                content: "old content".to_string(),
-                checksum: MemoryChecksum::from_content("old content"),
-                created_at: older,
-                updated_at: older,
-                tombstoned: false,
-            },
-        ];
+        let remote_entries = vec![TeamMemoryEntry {
+            topic: "local".to_string(),
+            content: "old content".to_string(),
+            checksum: MemoryChecksum::from_content("old content"),
+            created_at: older,
+            updated_at: older,
+            tombstoned: false,
+        }];
 
         let count = svc.apply_remote(remote_entries).unwrap();
         assert_eq!(count, 0);
@@ -691,14 +705,16 @@ mod tests {
         let transport = RelayTransport::new(relay.clone());
 
         // Push an entry to the relay directly
-        relay.upsert(TeamMemoryEntry {
-            topic: "test-topic".into(),
-            content: "test content".into(),
-            checksum: MemoryChecksum::from_content("test content"),
-            created_at: Utc::now(),
-            updated_at: Utc::now(),
-            tombstoned: false,
-        }).await;
+        relay
+            .upsert(TeamMemoryEntry {
+                topic: "test-topic".into(),
+                content: "test content".into(),
+                checksum: MemoryChecksum::from_content("test content"),
+                created_at: Utc::now(),
+                updated_at: Utc::now(),
+                tombstoned: false,
+            })
+            .await;
 
         let state = transport.fetch_remote_state().await.unwrap();
         assert!(state.entries.contains_key("test-topic"));
@@ -709,19 +725,20 @@ mod tests {
         let relay = InMemoryRelay::new();
         let transport = RelayTransport::new(relay.clone());
 
-        let entries = vec![
-            TeamMemoryEntry {
-                topic: "new-entry".into(),
-                content: "hello".into(),
-                checksum: MemoryChecksum::from_content("hello"),
-                created_at: Utc::now(),
-                updated_at: Utc::now(),
-                tombstoned: false,
-            },
-        ];
+        let entries = vec![TeamMemoryEntry {
+            topic: "new-entry".into(),
+            content: "hello".into(),
+            checksum: MemoryChecksum::from_content("hello"),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            tombstoned: false,
+        }];
 
         transport.send_delta(&entries).await.unwrap();
-        let fetched = transport.fetch_entries(&["new-entry".to_string()]).await.unwrap();
+        let fetched = transport
+            .fetch_entries(&["new-entry".to_string()])
+            .await
+            .unwrap();
         assert_eq!(fetched.len(), 1);
         assert_eq!(fetched[0].content, "hello");
     }
@@ -747,9 +764,16 @@ mod tests {
         let delta2 = svc2.compute_sync_delta(&remote_state);
 
         // Fetch full content from relay and apply
-        let remote_entries = transport2.fetch_entries(
-            &delta2.to_receive.iter().map(|e| e.topic.clone()).collect::<Vec<_>>()
-        ).await.unwrap();
+        let remote_entries = transport2
+            .fetch_entries(
+                &delta2
+                    .to_receive
+                    .iter()
+                    .map(|e| e.topic.clone())
+                    .collect::<Vec<_>>(),
+            )
+            .await
+            .unwrap();
         svc2.apply_remote(remote_entries).unwrap();
 
         let local = svc2.read("local-topic").unwrap().unwrap();

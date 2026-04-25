@@ -50,7 +50,8 @@ pub async fn extract_single_memory_ai(
     conversation: &str,
     topic: &str,
 ) -> Result<bool, MemoryWorkflowError> {
-    let Some(content) = prompts::extract_single_memory(api_client, conversation, topic).await? else {
+    let Some(content) = prompts::extract_single_memory(api_client, conversation, topic).await?
+    else {
         return Ok(false);
     };
 
@@ -67,9 +68,7 @@ mod tests {
     async fn extract_long_term_memories_ai_persists() {
         let tmp = tempfile::tempdir().unwrap();
         let store = LongTermStore::new(tmp.path().to_path_buf());
-        let api = MockApi::new(
-            r#"[{"file": "test_topic", "content": "test memory content"}]"#
-        );
+        let api = MockApi::new(r#"[{"file": "test_topic", "content": "test memory content"}]"#);
 
         let result = extract_long_term_memories_ai(&api, &store, "conversation text").await;
         assert!(result.is_ok());

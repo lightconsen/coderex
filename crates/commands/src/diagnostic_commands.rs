@@ -16,15 +16,28 @@ pub fn register(registry: &mut CommandRegistry) {
             let mut lines = Vec::<String>::new();
             lines.push("System Status".to_string());
             lines.push("─────────────".to_string());
-            lines.push(format!("Session: {} ({})", ctx.session_id, ctx.session_title));
+            lines.push(format!(
+                "Session: {} ({})",
+                ctx.session_id, ctx.session_title
+            ));
             lines.push(format!("Model: {}", ctx.model.0));
             lines.push(format!("Messages: {}", ctx.message_count));
             lines.push(format!("Cost: ${:.4}", ctx.cost_usd));
             lines.push(format!("Git Branch: {}", ctx.git_branch));
-            lines.push(format!("MCP: {}", if ctx.mcp_connected { "Connected" } else { "Disconnected" }));
+            lines.push(format!(
+                "MCP: {}",
+                if ctx.mcp_connected {
+                    "Connected"
+                } else {
+                    "Disconnected"
+                }
+            ));
             lines.push(format!("Hooks: {} active", ctx.active_hooks));
             lines.push(format!("Elapsed: {}s", ctx.elapsed_secs));
-            lines.push(format!("API Key: {}", if ctx.api_key_set { "Set" } else { "Not set" }));
+            lines.push(format!(
+                "API Key: {}",
+                if ctx.api_key_set { "Set" } else { "Not set" }
+            ));
             CommandResult::success(lines.join("\n"))
         }),
     ));
@@ -79,7 +92,9 @@ pub fn register(registry: &mut CommandRegistry) {
             // Feature flags summary
             let enabled = ctx.feature_flags.values().filter(|&&v| v).count();
             let disabled = ctx.feature_flags.len() - enabled;
-            checks.push(format!("[✓] Feature flags: {enabled} enabled, {disabled} disabled"));
+            checks.push(format!(
+                "[✓] Feature flags: {enabled} enabled, {disabled} disabled"
+            ));
 
             let summary = if issues == 0 {
                 "All critical checks passed."
@@ -111,7 +126,11 @@ mod tests {
 
     #[test]
     fn status_shows_info() {
-        let reg = { let mut r = CommandRegistry::new(); register(&mut r); r };
+        let reg = {
+            let mut r = CommandRegistry::new();
+            register(&mut r);
+            r
+        };
         let result = reg.execute("status", &ctx(), &[]);
         assert!(result.output.contains("Session"));
         assert!(result.output.contains("Model"));
@@ -121,7 +140,11 @@ mod tests {
 
     #[test]
     fn doctor_all_good() {
-        let reg = { let mut r = CommandRegistry::new(); register(&mut r); r };
+        let reg = {
+            let mut r = CommandRegistry::new();
+            register(&mut r);
+            r
+        };
         let result = reg.execute("doctor", &ctx(), &[]);
         assert!(result.output.contains("All critical checks"));
         assert!(!result.output.contains("issue(s)"));
@@ -129,16 +152,30 @@ mod tests {
 
     #[test]
     fn doctor_missing_api_key() {
-        let c = CommandContext { api_key_set: false, ..ctx() };
-        let reg = { let mut r = CommandRegistry::new(); register(&mut r); r };
+        let c = CommandContext {
+            api_key_set: false,
+            ..ctx()
+        };
+        let reg = {
+            let mut r = CommandRegistry::new();
+            register(&mut r);
+            r
+        };
         let result = reg.execute("doctor", &c, &[]);
         assert!(result.output.contains("API key is NOT set"));
     }
 
     #[test]
     fn doctor_no_git() {
-        let c = CommandContext { git_branch: String::new(), ..ctx() };
-        let reg = { let mut r = CommandRegistry::new(); register(&mut r); r };
+        let c = CommandContext {
+            git_branch: String::new(),
+            ..ctx()
+        };
+        let reg = {
+            let mut r = CommandRegistry::new();
+            register(&mut r);
+            r
+        };
         let result = reg.execute("doctor", &c, &[]);
         assert!(result.output.contains("No git repository"));
     }

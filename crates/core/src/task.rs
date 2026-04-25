@@ -299,7 +299,9 @@ impl TaskManager {
             .tasks
             .get(id)
             .ok_or_else(|| TaskError::NotFound(id.to_string()))?;
-        handle.get_output().map_err(|_| TaskError::NotFound(id.to_string()))
+        handle
+            .get_output()
+            .map_err(|_| TaskError::NotFound(id.to_string()))
     }
 
     /// Set a task as the foreground task.
@@ -623,13 +625,22 @@ mod tests {
     fn is_valid_transition_correct() {
         assert!(is_valid_transition(TaskState::Pending, TaskState::Running));
         assert!(is_valid_transition(TaskState::Pending, TaskState::Stopped));
-        assert!(is_valid_transition(TaskState::Running, TaskState::Completed));
+        assert!(is_valid_transition(
+            TaskState::Running,
+            TaskState::Completed
+        ));
         assert!(is_valid_transition(TaskState::Running, TaskState::Failed));
         assert!(is_valid_transition(TaskState::Running, TaskState::Stopped));
-        assert!(!is_valid_transition(TaskState::Completed, TaskState::Running));
+        assert!(!is_valid_transition(
+            TaskState::Completed,
+            TaskState::Running
+        ));
         assert!(!is_valid_transition(TaskState::Failed, TaskState::Pending));
         assert!(!is_valid_transition(TaskState::Stopped, TaskState::Running));
-        assert!(!is_valid_transition(TaskState::Pending, TaskState::Completed));
+        assert!(!is_valid_transition(
+            TaskState::Pending,
+            TaskState::Completed
+        ));
     }
 
     #[test]

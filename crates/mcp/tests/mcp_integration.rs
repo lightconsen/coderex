@@ -9,6 +9,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use coderex_core::tool_executor::ToolExecutor;
 use coderex_mcp::channel::JsonRpcChannel;
 use coderex_mcp::config::{McpConfig, McpServerConfig};
 use coderex_mcp::manager::McpManager;
@@ -18,7 +19,6 @@ use coderex_mcp::resources::{McpResource, McpResourceRegistry};
 use coderex_mcp::result_adapter::McpResultAdapter;
 use coderex_mcp::server::{McpServer, ServerStatus};
 use coderex_mcp::tool_executor::McpToolExecutor;
-use coderex_core::tool_executor::ToolExecutor;
 
 // ═══════════════════════════════════════════════════════════════════════════
 //  Mock MCP Server Script (Python)
@@ -206,11 +206,14 @@ async fn tool_discovery_manager_discovers_and_registers() {
     let script = mock_server_path();
     let mgr = McpManager::new();
     let mut config = McpConfig::new();
-    config.add_server("mock", McpServerConfig {
-        command: script.to_str().unwrap().into(),
-        args: vec![],
-        env: HashMap::new(),
-    });
+    config.add_server(
+        "mock",
+        McpServerConfig {
+            command: script.to_str().unwrap().into(),
+            args: vec![],
+            env: HashMap::new(),
+        },
+    );
     mgr.load_config(&config);
 
     mgr.start_all().await;
@@ -233,7 +236,9 @@ async fn tool_discovery_proxy_call() {
     let channel = server.channel().unwrap();
     let proxy = McpToolProxy::with_channel("test", "mock_read_file", channel);
 
-    let result = proxy.call(serde_json::json!({"path": "/tmp/test.txt"})).await;
+    let result = proxy
+        .call(serde_json::json!({"path": "/tmp/test.txt"}))
+        .await;
     assert!(result.is_ok(), "proxy call failed: {result:?}");
 
     let value = result.unwrap();
@@ -249,17 +254,24 @@ async fn tool_discovery_executor_routes_to_mcp() {
     let script = mock_server_path();
     let mgr = McpManager::new();
     let mut config = McpConfig::new();
-    config.add_server("mock", McpServerConfig {
-        command: script.to_str().unwrap().into(),
-        args: vec![],
-        env: HashMap::new(),
-    });
+    config.add_server(
+        "mock",
+        McpServerConfig {
+            command: script.to_str().unwrap().into(),
+            args: vec![],
+            env: HashMap::new(),
+        },
+    );
     mgr.load_config(&config);
     mgr.start_all().await;
 
     let executor = McpToolExecutor::new(std::sync::Arc::new(mgr));
     let outcome = executor
-        .execute("tc_1", "mock_read_file", &serde_json::json!({"path": "/tmp/test.txt"}))
+        .execute(
+            "tc_1",
+            "mock_read_file",
+            &serde_json::json!({"path": "/tmp/test.txt"}),
+        )
         .await;
 
     assert!(!outcome.result.is_error);
@@ -292,11 +304,14 @@ async fn resource_discovery_manager_discovers_and_registers() {
     let script = mock_server_path();
     let mgr = McpManager::new();
     let mut config = McpConfig::new();
-    config.add_server("mock", McpServerConfig {
-        command: script.to_str().unwrap().into(),
-        args: vec![],
-        env: HashMap::new(),
-    });
+    config.add_server(
+        "mock",
+        McpServerConfig {
+            command: script.to_str().unwrap().into(),
+            args: vec![],
+            env: HashMap::new(),
+        },
+    );
     mgr.load_config(&config);
 
     mgr.start_all().await;
@@ -348,7 +363,11 @@ fn oauth_new_state_not_authenticated() {
 #[test]
 fn oauth_update_tokens_authenticates() {
     let mut state = McpOAuthState::new("http://localhost:8080", "client1");
-    state.update_tokens("access_token_abc".into(), Some("refresh_token_xyz".into()), 3600);
+    state.update_tokens(
+        "access_token_abc".into(),
+        Some("refresh_token_xyz".into()),
+        3600,
+    );
 
     assert!(state.is_authenticated());
     assert!(!state.is_expired());
@@ -467,16 +486,22 @@ async fn connection_manager_stop_all_shuts_down_servers() {
     let script = mock_server_path();
     let mgr = McpManager::new();
     let mut config = McpConfig::new();
-    config.add_server("mock1", McpServerConfig {
-        command: script.to_str().unwrap().into(),
-        args: vec![],
-        env: HashMap::new(),
-    });
-    config.add_server("mock2", McpServerConfig {
-        command: script.to_str().unwrap().into(),
-        args: vec![],
-        env: HashMap::new(),
-    });
+    config.add_server(
+        "mock1",
+        McpServerConfig {
+            command: script.to_str().unwrap().into(),
+            args: vec![],
+            env: HashMap::new(),
+        },
+    );
+    config.add_server(
+        "mock2",
+        McpServerConfig {
+            command: script.to_str().unwrap().into(),
+            args: vec![],
+            env: HashMap::new(),
+        },
+    );
     mgr.load_config(&config);
 
     mgr.start_all().await;
@@ -528,11 +553,17 @@ fn config_save_load_roundtrip() {
     let path = dir.path().join(".mcp.json");
 
     let mut config = McpConfig::new();
-    config.add_server("filesystem", McpServerConfig {
-        command: "npx".into(),
-        args: vec!["@modelcontextprotocol/server-filesystem".into(), "/tmp".into()],
-        env: HashMap::new(),
-    });
+    config.add_server(
+        "filesystem",
+        McpServerConfig {
+            command: "npx".into(),
+            args: vec![
+                "@modelcontextprotocol/server-filesystem".into(),
+                "/tmp".into(),
+            ],
+            env: HashMap::new(),
+        },
+    );
 
     config.save(&path).unwrap();
     let loaded = McpConfig::load(&path).unwrap();

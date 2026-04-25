@@ -1,8 +1,8 @@
 //! Bridge heartbeat, WebSocket disconnect/reconnect, and state recovery.
 
 use serde::{Deserialize, Serialize};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use tokio::sync::Notify;
 use tokio::time::Duration;
 

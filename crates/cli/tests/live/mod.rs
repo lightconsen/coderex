@@ -9,8 +9,8 @@ use coderex_core::permissions::PermissionMode;
 use coderex_core::types::ModelId;
 use coderex_test_utils::{TestRig, TestRigBuilder};
 use coderex_tools::{
-    register_builtin_tools, ExecutionConfig, ExecutionContext, RegistryToolDispatcher,
-    ToolExecutor, ToolRegistry,
+    ExecutionConfig, ExecutionContext, RegistryToolDispatcher, ToolExecutor, ToolRegistry,
+    register_builtin_tools,
 };
 use std::path::PathBuf;
 use std::sync::Arc;

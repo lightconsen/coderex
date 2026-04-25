@@ -56,7 +56,9 @@ impl OverlayStack {
     /// Create a new empty overlay stack.
     #[must_use]
     pub fn new() -> Self {
-        Self { overlays: Vec::new() }
+        Self {
+            overlays: Vec::new(),
+        }
     }
 
     /// Push an overlay on top.
@@ -94,7 +96,10 @@ impl OverlayStack {
 
     /// Update the command palette query and filter commands.
     pub fn update_palette_query(&mut self, _query: &str) {
-        if let Some(Overlay::CommandPalette { commands, selected, .. }) = self.overlays.last_mut() {
+        if let Some(Overlay::CommandPalette {
+            commands, selected, ..
+        }) = self.overlays.last_mut()
+        {
             // Filter would happen here; for now just update query
             let _ = (commands, selected);
         }
@@ -102,7 +107,10 @@ impl OverlayStack {
 
     /// Move selection in command palette.
     pub fn move_palette_selection(&mut self, delta: isize) {
-        if let Some(Overlay::CommandPalette { commands, selected, .. }) = self.overlays.last_mut() {
+        if let Some(Overlay::CommandPalette {
+            commands, selected, ..
+        }) = self.overlays.last_mut()
+        {
             if commands.is_empty() {
                 return;
             }
@@ -175,7 +183,12 @@ mod tests {
             args: "rm -rf /tmp/test".into(),
             always_option: true,
         });
-        if let Some(Overlay::PermissionDialog { tool, always_option, .. }) = stack.top() {
+        if let Some(Overlay::PermissionDialog {
+            tool,
+            always_option,
+            ..
+        }) = stack.top()
+        {
             assert_eq!(tool, "Bash");
             assert!(*always_option);
         } else {

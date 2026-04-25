@@ -334,7 +334,8 @@ mod tests {
 
     #[test]
     fn feature_flags_from_parse_enables_and_disables() {
-        let flags = FeatureFlags::parse("+daemon,+streaming_tool_execution,-streaming_tool_execution");
+        let flags =
+            FeatureFlags::parse("+daemon,+streaming_tool_execution,-streaming_tool_execution");
         assert!(flags.daemon);
         assert!(!flags.streaming_tool_execution);
     }

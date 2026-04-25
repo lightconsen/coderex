@@ -85,7 +85,13 @@ impl SessionMemoryStore {
         self.facts
             .read()
             .get(&session_id)
-            .map(|facts| facts.iter().filter(|f| f.category == category).cloned().collect())
+            .map(|facts| {
+                facts
+                    .iter()
+                    .filter(|f| f.category == category)
+                    .cloned()
+                    .collect()
+            })
             .unwrap_or_default()
     }
 
@@ -98,8 +104,8 @@ impl SessionMemoryStore {
             guard.get(&session_id).cloned()
         };
         if let Some(session_facts) = facts {
-            let serialized = serde_json::to_string_pretty(&session_facts)
-                .map_err(std::io::Error::other)?;
+            let serialized =
+                serde_json::to_string_pretty(&session_facts).map_err(std::io::Error::other)?;
             std::fs::write(dir.join("facts.json"), serialized)?;
         }
         Ok(())
@@ -112,9 +118,8 @@ impl SessionMemoryStore {
             return Ok(Vec::new());
         }
         let content = std::fs::read_to_string(&path)?;
-        let facts: Vec<SessionFact> = serde_json::from_str(&content).map_err(|e| {
-            std::io::Error::new(std::io::ErrorKind::InvalidData, e)
-        })?;
+        let facts: Vec<SessionFact> = serde_json::from_str(&content)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
         self.facts.write().insert(session_id, facts.clone());
         Ok(facts)
     }
@@ -150,7 +155,10 @@ mod tests {
         let (store, _tmp) = temp_store();
         let sid = Uuid::new_v4();
 
-        store.extract_fact(sid, test_fact(sid, "uses Cargo workspace", FactCategory::ProjectStructure));
+        store.extract_fact(
+            sid,
+            test_fact(sid, "uses Cargo workspace", FactCategory::ProjectStructure),
+        );
 
         let facts = store.get_facts(sid);
         assert_eq!(facts.len(), 1);
@@ -163,9 +171,15 @@ mod tests {
         let (store, _tmp) = temp_store();
         let sid = Uuid::new_v4();
 
-        store.extract_fact(sid, test_fact(sid, "uses Cargo", FactCategory::ProjectStructure));
+        store.extract_fact(
+            sid,
+            test_fact(sid, "uses Cargo", FactCategory::ProjectStructure),
+        );
         store.extract_fact(sid, test_fact(sid, "uses tokio", FactCategory::Dependency));
-        store.extract_fact(sid, test_fact(sid, "prefers sonnet", FactCategory::UserPreference));
+        store.extract_fact(
+            sid,
+            test_fact(sid, "prefers sonnet", FactCategory::UserPreference),
+        );
 
         let deps = store.get_facts_by_category(sid, FactCategory::Dependency);
         assert_eq!(deps.len(), 1);
@@ -180,7 +194,10 @@ mod tests {
         let (store, _tmp) = temp_store();
         let sid = Uuid::new_v4();
 
-        store.extract_fact(sid, test_fact(sid, "uses Cargo workspace", FactCategory::ProjectStructure));
+        store.extract_fact(
+            sid,
+            test_fact(sid, "uses Cargo workspace", FactCategory::ProjectStructure),
+        );
         store.persist(sid).unwrap();
 
         let loaded = store.load(sid).unwrap();

@@ -4,10 +4,7 @@
 //! The concrete implementations live in `session_memory_agent` and
 //! `extract_memories`.
 
-
-pub use crate::extract_memories::{
-    extract_long_term_memories_ai, extract_single_memory_ai,
-};
+pub use crate::extract_memories::{extract_long_term_memories_ai, extract_single_memory_ai};
 pub use crate::session_memory_agent::update_session_memory_ai;
 
 /// Errors from AI memory workflows.
@@ -29,14 +26,20 @@ pub(crate) mod tests {
     use coderex_core::api_client::{ApiClient, ApiResponse, StreamEvent};
     use coderex_core::tool_executor::ToolInfo;
     use coderex_core::types::{ModelId, UsageSummary};
-    use std::pin::Pin;
     use futures::Stream;
+    use std::pin::Pin;
 
     #[derive(Clone)]
-    pub struct MockApi { pub response_content: String }
+    pub struct MockApi {
+        pub response_content: String,
+    }
 
     impl MockApi {
-        pub fn new(content: &str) -> Self { Self { response_content: content.into() } }
+        pub fn new(content: &str) -> Self {
+            Self {
+                response_content: content.into(),
+            }
+        }
     }
 
     #[async_trait::async_trait]

@@ -84,11 +84,7 @@ impl SyntaxHighlighter {
     /// Highlight source code for a given language.
     ///
     /// Returns a vector of lines, each containing a vector of tokens.
-    pub fn highlight(
-        &self,
-        source: &str,
-        language: &str,
-    ) -> Result<Vec<Vec<Token>>, SyntaxError> {
+    pub fn highlight(&self, source: &str, language: &str) -> Result<Vec<Vec<Token>>, SyntaxError> {
         let syntax = self
             .syntax_set
             .find_syntax_by_name(language)
@@ -113,11 +109,7 @@ impl SyntaxHighlighter {
     }
 
     /// Highlight and render as ANSI-colored text for terminal output.
-    pub fn highlight_ansi(
-        &self,
-        source: &str,
-        language: &str,
-    ) -> Result<String, SyntaxError> {
+    pub fn highlight_ansi(&self, source: &str, language: &str) -> Result<String, SyntaxError> {
         let tokens = self.highlight(source, language)?;
 
         let mut output = String::new();
@@ -164,8 +156,12 @@ fn style_to_token(style: Style, text: &str) -> Token {
     Token {
         text: text.to_string(),
         foreground: format!("{:02x}{:02x}{:02x}", fg.r, fg.g, fg.b),
-        is_bold: style.font_style.contains(syntect::highlighting::FontStyle::BOLD),
-        is_italic: style.font_style.contains(syntect::highlighting::FontStyle::ITALIC),
+        is_bold: style
+            .font_style
+            .contains(syntect::highlighting::FontStyle::BOLD),
+        is_italic: style
+            .font_style
+            .contains(syntect::highlighting::FontStyle::ITALIC),
     }
 }
 
@@ -282,9 +278,6 @@ mod tests {
         let result = SyntaxHighlighter::with_theme("nonexistent_theme_xyz".into());
 
         assert!(result.is_err());
-        assert!(matches!(
-            result.unwrap_err(),
-            SyntaxError::ThemeNotFound(_)
-        ));
+        assert!(matches!(result.unwrap_err(), SyntaxError::ThemeNotFound(_)));
     }
 }

@@ -32,9 +32,7 @@ async fn start_server(config: ServerConfig) -> SocketAddr {
 }
 
 /// Connect a WebSocket client to the server.
-async fn ws_connect(
-    addr: SocketAddr,
-) -> tokio_tungstenite::WebSocketStream<tokio::net::TcpStream> {
+async fn ws_connect(addr: SocketAddr) -> tokio_tungstenite::WebSocketStream<tokio::net::TcpStream> {
     let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
     let url = format!("ws://{addr}");
     let (ws, _) = tokio_tungstenite::client_async(url, stream).await.unwrap();
@@ -47,7 +45,9 @@ async fn ws_auth(
     token: &str,
 ) -> String {
     let auth = serde_json::json!({"token": token});
-    ws.send(Message::Text(auth.to_string().into())).await.unwrap();
+    ws.send(Message::Text(auth.to_string().into()))
+        .await
+        .unwrap();
 
     // Read session_id response
     let text = ws_recv_text(ws).await;
@@ -174,7 +174,10 @@ async fn websocket_auth_raw_token_fallback() {
 
     let text = ws_recv_text(&mut ws).await;
     let parsed: serde_json::Value = serde_json::from_str(&text).unwrap();
-    assert!(parsed.get("session_id").is_some(), "expected session_id, got: {text}");
+    assert!(
+        parsed.get("session_id").is_some(),
+        "expected session_id, got: {text}"
+    );
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -276,12 +279,13 @@ async fn structured_io_invalid_json_error_response() {
     let resp_text = ws_recv_text(&mut ws).await;
     let resp: serde_json::Value = serde_json::from_str(&resp_text).unwrap();
     assert_eq!(resp.get("type").unwrap(), "error");
-    assert!(resp
-        .get("message")
-        .unwrap()
-        .as_str()
-        .unwrap()
-        .contains("invalid JSON"));
+    assert!(
+        resp.get("message")
+            .unwrap()
+            .as_str()
+            .unwrap()
+            .contains("invalid JSON")
+    );
 }
 
 #[tokio::test]
@@ -387,7 +391,10 @@ async fn idle_cleanup_activity_resets_timer() {
     tokio::time::sleep(Duration::from_millis(60)).await;
 
     let removed = server.cleanup_idle();
-    assert!(removed.is_empty(), "session should not be cleaned up after activity");
+    assert!(
+        removed.is_empty(),
+        "session should not be cleaned up after activity"
+    );
     assert_eq!(server.session_count(), 1);
 }
 

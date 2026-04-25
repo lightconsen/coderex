@@ -40,7 +40,11 @@ impl Tool for WebSearchTool {
         }
     }
 
-    async fn execute(&self, input: ToolInput, _ctx: ToolContext<'_>) -> Result<ToolOutput, ToolError> {
+    async fn execute(
+        &self,
+        input: ToolInput,
+        _ctx: ToolContext<'_>,
+    ) -> Result<ToolOutput, ToolError> {
         let query = extract_string(&input.arguments, "query")?;
         let allowed_domains = extract_string_array(&input.arguments, "allowed_domains");
         let blocked_domains = extract_string_array(&input.arguments, "blocked_domains");
@@ -64,9 +68,13 @@ impl Tool for WebSearchTool {
         // Use DuckDuckGo HTML search as a simple backend-free search
         let url = format!("https://html.duckduckgo.com/html/?q={}", url_encode(&query));
 
-        let resp = client.get(&url).send().await.map_err(|e| ToolError::InvalidInput {
-            message: format!("search failed: {e}"),
-        })?;
+        let resp = client
+            .get(&url)
+            .send()
+            .await
+            .map_err(|e| ToolError::InvalidInput {
+                message: format!("search failed: {e}"),
+            })?;
 
         if !resp.status().is_success() {
             return Err(ToolError::InvalidInput {
@@ -82,7 +90,13 @@ impl Tool for WebSearchTool {
 
         let mut output = format!("Search results for: \"{query}\"\n\n");
         for (i, r) in results.iter().take(MAX_RESULTS).enumerate() {
-            output.push_str(&format!("{}. [{}]({})\n   {}\n\n", i + 1, r.title, r.url, r.snippet));
+            output.push_str(&format!(
+                "{}. [{}]({})\n   {}\n\n",
+                i + 1,
+                r.title,
+                r.url,
+                r.snippet
+            ));
         }
 
         if results.is_empty() {
@@ -194,8 +208,8 @@ fn extract_string_array(args: &serde_json::Value, key: &str) -> Vec<String> {
 #[allow(dead_code)]
 mod tests {
     use super::*;
-    use crate::tool::ToolContext;
     use crate::context::ExecutionContext;
+    use crate::tool::ToolContext;
     use std::path::Path;
 
     fn test_ctx() -> ToolContext<'static> {

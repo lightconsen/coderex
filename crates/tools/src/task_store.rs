@@ -108,7 +108,9 @@ impl TaskStore {
     /// Load tasks from a JSONL file if the storage path is set and the file exists.
     pub fn load(&self) -> Result<(), String> {
         let guard = self.storage_path.lock();
-        let path = guard.as_ref().ok_or_else(|| "no storage path set".to_string())?;
+        let path = guard
+            .as_ref()
+            .ok_or_else(|| "no storage path set".to_string())?;
         if !path.exists() {
             return Ok(());
         }
@@ -129,7 +131,9 @@ impl TaskStore {
     /// Persist all non-deleted tasks to the JSONL file.
     pub fn save(&self) -> Result<(), String> {
         let guard = self.storage_path.lock();
-        let path = guard.as_ref().ok_or_else(|| "no storage path set".to_string())?;
+        let path = guard
+            .as_ref()
+            .ok_or_else(|| "no storage path set".to_string())?;
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).map_err(|e| format!("failed to create dir: {e}"))?;
         }
@@ -167,9 +171,7 @@ impl TaskStore {
     pub fn list(&self, status_filter: Option<TaskStatus>) -> Vec<TaskRecord> {
         self.tasks
             .iter()
-            .filter(|r| {
-                status_filter.map_or(true, |s| r.value().status == s)
-            })
+            .filter(|r| status_filter.map_or(true, |s| r.value().status == s))
             .map(|r| r.value().clone())
             .collect()
     }
@@ -282,7 +284,13 @@ mod tests {
     fn task_store_update() {
         let store = TaskStore::new();
         store.create(TaskRecord::new("1", "old"));
-        let ok = store.update("1", Some(TaskStatus::InProgress), Some("new".to_string()), None, None);
+        let ok = store.update(
+            "1",
+            Some(TaskStatus::InProgress),
+            Some("new".to_string()),
+            None,
+            None,
+        );
         assert!(ok);
         let got = store.get("1").unwrap();
         assert_eq!(got.subject, "new");

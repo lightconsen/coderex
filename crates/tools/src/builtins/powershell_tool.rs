@@ -51,7 +51,11 @@ impl Tool for PowerShellTool {
         }
     }
 
-    async fn execute(&self, input: ToolInput, ctx: ToolContext<'_>) -> Result<ToolOutput, ToolError> {
+    async fn execute(
+        &self,
+        input: ToolInput,
+        ctx: ToolContext<'_>,
+    ) -> Result<ToolOutput, ToolError> {
         let command = extract_string(&input.arguments, "command")?;
         let timeout_secs = extract_number(&input.arguments, "timeout")
             .unwrap_or(DEFAULT_TIMEOUT_SECS as i64)
@@ -125,8 +129,8 @@ fn extract_number(args: &serde_json::Value, key: &str) -> Option<i64> {
 #[allow(dead_code)]
 mod tests {
     use super::*;
-    use crate::tool::ToolContext;
     use crate::context::ExecutionContext;
+    use crate::tool::ToolContext;
     use std::path::Path;
 
     fn test_ctx(cwd: &Path) -> ToolContext<'_> {

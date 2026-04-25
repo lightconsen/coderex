@@ -20,20 +20,25 @@ use std::path::Path;
 /// Returns `None` for tools that don't spawn subprocesses or access the
 /// filesystem, so they run without sandbox overhead.
 #[must_use]
-pub fn default_sandbox_config(tool_name: &str, cwd: &Path) -> Option<coderex_core::sandbox::SandboxConfig> {
+pub fn default_sandbox_config(
+    tool_name: &str,
+    cwd: &Path,
+) -> Option<coderex_core::sandbox::SandboxConfig> {
     let canonical_cwd = std::fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf());
 
     match tool_name {
-        "Bash" | "bash" | "PowerShell" | "powershell" => Some(coderex_core::sandbox::SandboxConfig {
-            allowed_read_paths: vec![canonical_cwd.clone()],
-            allowed_write_paths: vec![canonical_cwd.clone()],
-            allowed_exec_paths: system_exec_paths(),
-            additional_working_dirs: vec![canonical_cwd],
-            max_open_files: Some(256),
-            max_memory_bytes: Some(512 * 1024 * 1024), // 512 MB
-            max_cpu_seconds: Some(300),                // 5 minutes
-            allow_network: false,
-        }),
+        "Bash" | "bash" | "PowerShell" | "powershell" => {
+            Some(coderex_core::sandbox::SandboxConfig {
+                allowed_read_paths: vec![canonical_cwd.clone()],
+                allowed_write_paths: vec![canonical_cwd.clone()],
+                allowed_exec_paths: system_exec_paths(),
+                additional_working_dirs: vec![canonical_cwd],
+                max_open_files: Some(256),
+                max_memory_bytes: Some(512 * 1024 * 1024), // 512 MB
+                max_cpu_seconds: Some(300),                // 5 minutes
+                allow_network: false,
+            })
+        }
         "Edit" | "edit" | "Write" | "write" => Some(coderex_core::sandbox::SandboxConfig {
             allowed_read_paths: vec![canonical_cwd.clone()],
             allowed_write_paths: vec![canonical_cwd.clone()],
@@ -101,7 +106,9 @@ pub fn is_path_allowed(path: &std::path::Path, allowed: &[std::path::PathBuf]) -
         Ok(p) => p,
         Err(_) => path.to_path_buf(),
     };
-    allowed.iter().any(|allowed_path| canonical.starts_with(allowed_path))
+    allowed
+        .iter()
+        .any(|allowed_path| canonical.starts_with(allowed_path))
 }
 
 #[cfg(test)]

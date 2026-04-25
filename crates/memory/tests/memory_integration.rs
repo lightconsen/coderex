@@ -88,12 +88,18 @@ fn long_term_memory_survives_store_restart() {
     let store = LongTermStore::new(tmp.path().to_path_buf());
 
     // Write flat-topic memory
-    store.write("project_conventions", "Use kebab-case for CLI flags.").unwrap();
+    store
+        .write("project_conventions", "Use kebab-case for CLI flags.")
+        .unwrap();
 
     // Write hierarchical-key memory
     let key = MemoryKey::from_str("project/backend/auth");
     store
-        .write_with_key("auth_flow", &key, "OAuth2 with PKCE, refresh token rotation.")
+        .write_with_key(
+            "auth_flow",
+            &key,
+            "OAuth2 with PKCE, refresh token rotation.",
+        )
         .unwrap();
 
     // "Restart" — drop and recreate store pointing at same path
@@ -122,8 +128,12 @@ fn long_term_memory_search_finds_entries_after_restart() {
     let tmp = tempfile::tempdir().unwrap();
     let store = LongTermStore::new(tmp.path().to_path_buf());
 
-    store.write("rust_conventions", "Prefer Result over panic.").unwrap();
-    store.write("ci_setup", "GitHub Actions with cargo nextest.").unwrap();
+    store
+        .write("rust_conventions", "Prefer Result over panic.")
+        .unwrap();
+    store
+        .write("ci_setup", "GitHub Actions with cargo nextest.")
+        .unwrap();
 
     let restarted = LongTermStore::new(tmp.path().to_path_buf());
 
@@ -167,10 +177,10 @@ fn session_index_auto_updates_and_lists_recent() {
     index.create(&meta2).unwrap();
 
     // Auto-update: update_last_active and cost
+    index.update_last_active("sess-001", &Utc::now()).unwrap();
     index
-        .update_last_active("sess-001", &Utc::now())
+        .update_cost_and_tokens("sess-001", 0.25, 2048)
         .unwrap();
-    index.update_cost_and_tokens("sess-001", 0.25, 2048).unwrap();
 
     // List recent
     let recent = index.list_recent(10).unwrap();
@@ -378,7 +388,9 @@ fn new_long_term_store_loads_previous_entries() {
     assert!(api.is_some());
     assert!(api.unwrap().content.contains("HATEOAS"));
 
-    let db = new_store.read_by_key(&MemoryKey::from_str("infra/database")).unwrap();
+    let db = new_store
+        .read_by_key(&MemoryKey::from_str("infra/database"))
+        .unwrap();
     assert!(db.is_some());
     assert!(db.unwrap().content.contains("deadpool"));
 
@@ -394,7 +406,10 @@ fn session_memory_load_nonexistent_returns_empty() {
     let sid = Uuid::new_v4();
 
     let loaded = store.load(sid).unwrap();
-    assert!(loaded.is_empty(), "loading nonexistent session should return empty vec");
+    assert!(
+        loaded.is_empty(),
+        "loading nonexistent session should return empty vec"
+    );
 
     let facts = store.get_facts(sid);
     assert!(facts.is_empty());

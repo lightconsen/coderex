@@ -269,13 +269,11 @@ impl LongTermStore {
             return Ok(None);
         }
         let content = std::fs::read_to_string(path)?;
-        let mut entry: MemoryEntry = serde_json::from_str(&content).map_err(|e| {
-            std::io::Error::new(std::io::ErrorKind::InvalidData, e)
-        })?;
+        let mut entry: MemoryEntry = serde_json::from_str(&content)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
         entry.access_count += 1;
         entry.updated_at = Utc::now();
-        let updated = serde_json::to_string(&entry)
-            .map_err(std::io::Error::other)?;
+        let updated = serde_json::to_string(&entry).map_err(std::io::Error::other)?;
         std::fs::write(path, updated)?;
         Ok(Some(entry))
     }
@@ -322,8 +320,7 @@ impl LongTermStore {
             }
         };
 
-        let serialized = serde_json::to_string_pretty(&entry)
-            .map_err(std::io::Error::other)?;
+        let serialized = serde_json::to_string_pretty(&entry).map_err(std::io::Error::other)?;
         std::fs::write(path, serialized)
     }
 
@@ -359,11 +356,7 @@ impl LongTermStore {
     }
 
     /// Recursively scan a directory for `.json` memory entries.
-    fn scan_dir(
-        &self,
-        dir: &Path,
-        callback: &mut dyn FnMut(MemoryEntry),
-    ) -> std::io::Result<()> {
+    fn scan_dir(&self, dir: &Path, callback: &mut dyn FnMut(MemoryEntry)) -> std::io::Result<()> {
         if !dir.exists() {
             return Ok(());
         }
@@ -426,7 +419,9 @@ mod tests {
     #[test]
     fn write_then_read_returns_same_content() {
         let (store, _tmp) = temp_store();
-        store.write("project-structure", "The project uses Cargo workspace").unwrap();
+        store
+            .write("project-structure", "The project uses Cargo workspace")
+            .unwrap();
 
         let entry = store.read("project-structure").unwrap().unwrap();
         assert_eq!(entry.topic, "project-structure");
@@ -548,9 +543,7 @@ mod tests {
                 "React components",
             )
             .unwrap();
-        store
-            .write("flat-topic", "no hierarchy")
-            .unwrap();
+        store.write("flat-topic", "no hierarchy").unwrap();
 
         let backend = store
             .read_by_prefix(&MemoryKey::from_str("project/backend"))

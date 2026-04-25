@@ -112,16 +112,18 @@ impl JsonRpcChannel {
         cmd.stderr(Stdio::piped());
         cmd.kill_on_drop(true);
 
-        let mut process = cmd.spawn().map_err(|e| {
-            format!("failed to spawn '{}': {e}", self.command)
-        })?;
+        let mut process = cmd
+            .spawn()
+            .map_err(|e| format!("failed to spawn '{}': {e}", self.command))?;
 
-        let stdin = process.stdin.take().ok_or_else(|| {
-            "failed to take stdin from child process".to_string()
-        })?;
-        let stdout = process.stdout.take().ok_or_else(|| {
-            "failed to take stdout from child process".to_string()
-        })?;
+        let stdin = process
+            .stdin
+            .take()
+            .ok_or_else(|| "failed to take stdin from child process".to_string())?;
+        let stdout = process
+            .stdout
+            .take()
+            .ok_or_else(|| "failed to take stdout from child process".to_string())?;
 
         self.process = Some(process);
         self.stdin = Some(stdin);
@@ -195,16 +197,16 @@ impl JsonRpcChannel {
     /// Write a request to stdin.
     async fn write_request(&mut self, request: &JsonRpcRequest) -> Result<(), String> {
         let stdin = self.stdin.as_mut().ok_or("stdin not available")?;
-        let line = serde_json::to_string(&request).map_err(|e| {
-            format!("failed to serialize request: {e}")
-        })?;
+        let line = serde_json::to_string(&request)
+            .map_err(|e| format!("failed to serialize request: {e}"))?;
         stdin
             .write_all(format!("{line}\n").as_bytes())
             .await
             .map_err(|e| format!("failed to write to stdin: {e}"))?;
-        stdin.flush().await.map_err(|e| {
-            format!("failed to flush stdin: {e}")
-        })?;
+        stdin
+            .flush()
+            .await
+            .map_err(|e| format!("failed to flush stdin: {e}"))?;
         Ok(())
     }
 
@@ -214,16 +216,16 @@ impl JsonRpcChannel {
         notification: &JsonRpcNotification,
     ) -> Result<(), String> {
         let stdin = self.stdin.as_mut().ok_or("stdin not available")?;
-        let line = serde_json::to_string(&notification).map_err(|e| {
-            format!("failed to serialize notification: {e}")
-        })?;
+        let line = serde_json::to_string(&notification)
+            .map_err(|e| format!("failed to serialize notification: {e}"))?;
         stdin
             .write_all(format!("{line}\n").as_bytes())
             .await
             .map_err(|e| format!("failed to write to stdin: {e}"))?;
-        stdin.flush().await.map_err(|e| {
-            format!("failed to flush stdin: {e}")
-        })?;
+        stdin
+            .flush()
+            .await
+            .map_err(|e| format!("failed to flush stdin: {e}"))?;
         Ok(())
     }
 
@@ -248,9 +250,8 @@ impl JsonRpcChannel {
                 continue;
             }
 
-            let response: JsonRpcResponse = serde_json::from_str(trimmed).map_err(|e| {
-                format!("failed to parse JSON-RPC response: {e}, raw: {trimmed}")
-            })?;
+            let response: JsonRpcResponse = serde_json::from_str(trimmed)
+                .map_err(|e| format!("failed to parse JSON-RPC response: {e}, raw: {trimmed}"))?;
 
             if response.id == expected_id {
                 if let Some(error) = response.error {
@@ -300,9 +301,10 @@ impl JsonRpcChannel {
     /// Terminate the process.
     pub async fn terminate(&mut self) -> Result<(), String> {
         if let Some(ref mut process) = self.process {
-            process.kill().await.map_err(|e| {
-                format!("failed to kill process: {e}")
-            })?;
+            process
+                .kill()
+                .await
+                .map_err(|e| format!("failed to kill process: {e}"))?;
             let _ = process.wait().await;
         }
         self.process = None;
@@ -337,11 +339,7 @@ mod tests {
 
     #[tokio::test]
     async fn spawn_invalid_command_fails() {
-        let mut channel = JsonRpcChannel::new(
-            "nonexistent_command_xyz",
-            vec![],
-            HashMap::new(),
-        );
+        let mut channel = JsonRpcChannel::new("nonexistent_command_xyz", vec![], HashMap::new());
         let result = channel.spawn().await;
         assert!(result.is_err());
     }
@@ -388,7 +386,8 @@ mod tests {
 
     #[tokio::test]
     async fn response_parsing() {
-        let json = r#"{"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text","text":"hello"}]}}"#;
+        let json =
+            r#"{"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text","text":"hello"}]}}"#;
         let response: JsonRpcResponse = serde_json::from_str(json).unwrap();
         assert_eq!(response.id, 1);
         assert!(response.result.is_some());
@@ -397,7 +396,8 @@ mod tests {
 
     #[tokio::test]
     async fn error_response() {
-        let json = r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32601,"message":"Method not found"}}"#;
+        let json =
+            r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32601,"message":"Method not found"}}"#;
         let response: JsonRpcResponse = serde_json::from_str(json).unwrap();
         assert!(response.error.is_some());
         let err = response.error.unwrap();

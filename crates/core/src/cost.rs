@@ -120,7 +120,9 @@ pub fn load_pricing_from_path(path: &Path) -> HashMap<String, ModelPricing> {
 #[must_use]
 pub fn load_user_pricing() -> HashMap<String, ModelPricing> {
     if let Ok(home) = std::env::var("HOME") {
-        let path = std::path::PathBuf::from(home).join(".coderex").join("pricing.json");
+        let path = std::path::PathBuf::from(home)
+            .join(".coderex")
+            .join("pricing.json");
         return load_pricing_from_path(&path);
     }
     HashMap::new()

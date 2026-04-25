@@ -18,9 +18,7 @@ pub struct RateLimitConfig {
 
 impl Default for RateLimitConfig {
     fn default() -> Self {
-        Self {
-            max_per_minute: 30,
-        }
+        Self { max_per_minute: 30 }
     }
 }
 

@@ -152,7 +152,10 @@ impl TelemetryHandle {
 ///
 /// If the worker panics, it is respawned (up to 3 times) after a 10s cooldown.
 /// A fresh SQLite connection is opened on each respawn to avoid poisoning.
-fn spawn_worker_with_recovery(receiver: mpsc::Receiver<WorkerCommand>, db_path: std::path::PathBuf) {
+fn spawn_worker_with_recovery(
+    receiver: mpsc::Receiver<WorkerCommand>,
+    db_path: std::path::PathBuf,
+) {
     std::thread::spawn(move || {
         let mut respawn_count = 0;
         const MAX_RESPAWNS: usize = 3;
@@ -160,8 +163,8 @@ fn spawn_worker_with_recovery(receiver: mpsc::Receiver<WorkerCommand>, db_path: 
 
         loop {
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                let store = TelemetryStore::open(&db_path)
-                    .expect("telemetry worker failed to open store");
+                let store =
+                    TelemetryStore::open(&db_path).expect("telemetry worker failed to open store");
                 run_store_worker(&receiver, &store);
             }));
 

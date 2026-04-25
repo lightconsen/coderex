@@ -39,7 +39,10 @@ async fn default_mode_read_auto_allowed() {
         .evaluate("Read", "{}".into(), None, ctx())
         .await
         .unwrap();
-    assert!(result.is_allowed(), "Read should be auto-allowed in Default mode");
+    assert!(
+        result.is_allowed(),
+        "Read should be auto-allowed in Default mode"
+    );
 }
 
 #[tokio::test]
@@ -49,7 +52,10 @@ async fn default_mode_grep_auto_allowed() {
         .evaluate("Grep", "{}".into(), None, ctx())
         .await
         .unwrap();
-    assert!(result.is_allowed(), "Grep should be auto-allowed in Default mode");
+    assert!(
+        result.is_allowed(),
+        "Grep should be auto-allowed in Default mode"
+    );
 }
 
 #[tokio::test]
@@ -59,7 +65,10 @@ async fn default_mode_glob_auto_allowed() {
         .evaluate("Glob", "{}".into(), None, ctx())
         .await
         .unwrap();
-    assert!(result.is_allowed(), "Glob should be auto-allowed in Default mode");
+    assert!(
+        result.is_allowed(),
+        "Glob should be auto-allowed in Default mode"
+    );
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -196,10 +205,7 @@ async fn plan_mode_allows_read_only_tools() {
             .evaluate(tool, "{}".into(), None, ctx())
             .await
             .unwrap();
-        assert!(
-            result.is_allowed(),
-            "{tool} should be allowed in Plan mode"
-        );
+        assert!(result.is_allowed(), "{tool} should be allowed in Plan mode");
     }
 }
 
@@ -246,7 +252,10 @@ async fn path_allowlist_allows_matching_paths() {
         .await
         .unwrap();
     assert!(
-        matches!(result, PermissionResult::Allow | PermissionResult::AllowForPath { .. }),
+        matches!(
+            result,
+            PermissionResult::Allow | PermissionResult::AllowForPath { .. }
+        ),
         "Write to /tmp should be allowed, got: {result:?}"
     );
 }
@@ -383,7 +392,12 @@ async fn background_agent_deny_hook_blocks_in_background_mode() {
 async fn permission_request_contains_correct_fields() {
     let mut engine = make_engine(PermissionMode::Default);
     let (request, result) = engine
-        .evaluate("Write", "{\"file\":\"test.txt\"}".into(), Some(Path::new("/tmp/test.txt").to_path_buf()), ctx())
+        .evaluate(
+            "Write",
+            "{\"file\":\"test.txt\"}".into(),
+            Some(Path::new("/tmp/test.txt").to_path_buf()),
+            ctx(),
+        )
         .await
         .unwrap();
 

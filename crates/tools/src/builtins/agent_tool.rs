@@ -89,13 +89,33 @@ impl Tool for AgentTool {
         }
     }
 
-    async fn execute(&self, input: ToolInput, _ctx: ToolContext<'_>) -> Result<ToolOutput, ToolError> {
+    async fn execute(
+        &self,
+        input: ToolInput,
+        _ctx: ToolContext<'_>,
+    ) -> Result<ToolOutput, ToolError> {
         let description = extract_string(&input.arguments, "description")?;
         let prompt = extract_string(&input.arguments, "prompt")?;
-        let background = input.arguments.get("run_in_background").and_then(|v| v.as_bool()).unwrap_or(false);
-        let subagent_type = input.arguments.get("subagent_type").and_then(|v| v.as_str()).unwrap_or("general_purpose");
-        let model_override = input.arguments.get("model").and_then(|v| v.as_str()).map(String::from);
-        let isolation = input.arguments.get("isolation").and_then(|v| v.as_str()).map(String::from);
+        let background = input
+            .arguments
+            .get("run_in_background")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let subagent_type = input
+            .arguments
+            .get("subagent_type")
+            .and_then(|v| v.as_str())
+            .unwrap_or("general_purpose");
+        let model_override = input
+            .arguments
+            .get("model")
+            .and_then(|v| v.as_str())
+            .map(String::from);
+        let isolation = input
+            .arguments
+            .get("isolation")
+            .and_then(|v| v.as_str())
+            .map(String::from);
 
         if let Some(ref manager) = self.manager {
             use coderex_agents::manager::SpawnOptions;
@@ -121,14 +141,7 @@ impl Tool for AgentTool {
 
             let mut mgr = manager.lock().await;
             let instance = mgr
-                .spawn_agent(
-                    agent_type,
-                    &prompt,
-                    options,
-                    &self.session_id,
-                    &self.cwd,
-                    0,
-                )
+                .spawn_agent(agent_type, &prompt, options, &self.session_id, &self.cwd, 0)
                 .await
                 .map_err(|e| ToolError::InvalidInput {
                     message: format!("failed to spawn agent: {e}"),
@@ -150,12 +163,12 @@ impl Tool for AgentTool {
             }
 
             // Synchronous: wait for completion and return the agent's output
-            let result = mgr
-                .wait_for_completion(&agent_id)
-                .await
-                .map_err(|e| ToolError::InvalidInput {
-                    message: format!("agent execution failed: {e}"),
-                })?;
+            let result =
+                mgr.wait_for_completion(&agent_id)
+                    .await
+                    .map_err(|e| ToolError::InvalidInput {
+                        message: format!("agent execution failed: {e}"),
+                    })?;
 
             return Ok(ToolOutput {
                 output: serde_json::json!({
@@ -196,8 +209,8 @@ fn extract_string(args: &serde_json::Value, key: &str) -> Result<String, ToolErr
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tool::ToolContext;
     use crate::context::ExecutionContext;
+    use crate::tool::ToolContext;
     use std::collections::HashMap;
     use std::path::Path;
     use std::sync::Arc;

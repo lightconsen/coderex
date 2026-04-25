@@ -9,7 +9,7 @@ use std::str::FromStr;
 use std::sync::Arc;
 use thiserror::Error;
 use tokio::process::Command;
-use tokio::sync::{mpsc, RwLock};
+use tokio::sync::{RwLock, mpsc};
 
 /// A single cron job.
 #[derive(Debug, Clone)]
@@ -338,10 +338,15 @@ mod tests {
         // chrono: Mon=1, ..., Sat=6, Sun=7
         for dt in &nexts {
             let weekday = dt.weekday().number_from_monday();
-            assert!((1..=5).contains(&weekday), "expected weekday, got {weekday} ({:?})", dt.weekday());
+            assert!(
+                (1..=5).contains(&weekday),
+                "expected weekday, got {weekday} ({:?})",
+                dt.weekday()
+            );
         }
         // Should have 5 distinct days
-        let distinct_days: std::collections::HashSet<_> = nexts.iter().map(|dt| dt.date_naive()).collect();
+        let distinct_days: std::collections::HashSet<_> =
+            nexts.iter().map(|dt| dt.date_naive()).collect();
         assert!(distinct_days.len() >= 3);
     }
 
@@ -363,7 +368,10 @@ mod tests {
     fn invalid_cron_returns_error() {
         let result = CronSchedule::new("invalid");
         assert!(result.is_err());
-        assert!(matches!(result.unwrap_err(), CronError::InvalidExpression(_)));
+        assert!(matches!(
+            result.unwrap_err(),
+            CronError::InvalidExpression(_)
+        ));
     }
 
     #[test]
@@ -416,12 +424,14 @@ mod tests {
         assert!(runner.list_jobs().await.is_empty());
 
         // Add a job
-        runner.add_job(CronJob {
-            id: "test_1".into(),
-            schedule: CronSchedule::new("0 * * * *").unwrap(),
-            command: "echo hello".into(),
-            enabled: true,
-        }).await;
+        runner
+            .add_job(CronJob {
+                id: "test_1".into(),
+                schedule: CronSchedule::new("0 * * * *").unwrap(),
+                command: "echo hello".into(),
+                enabled: true,
+            })
+            .await;
 
         let jobs = runner.list_jobs().await;
         assert_eq!(jobs.len(), 1);

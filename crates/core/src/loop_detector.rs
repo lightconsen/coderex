@@ -99,7 +99,10 @@ impl LoopDetector {
 
     /// Record the tool calls from a completed turn.
     pub fn record_turn(&mut self, calls: &[ToolCall]) {
-        let fingerprint: TurnFingerprint = calls.iter().map(ToolCallFingerprint::from_tool_call).collect();
+        let fingerprint: TurnFingerprint = calls
+            .iter()
+            .map(ToolCallFingerprint::from_tool_call)
+            .collect();
         self.history.push_back(fingerprint);
         while self.history.len() > self.max_history {
             self.history.pop_front();
@@ -272,7 +275,14 @@ mod tests {
 
         detector.record_turn(&calls);
         assert!(
-            matches!(detector.check(), LoopDetection::LoopDetected { period: 1, repetitions: 3, .. }),
+            matches!(
+                detector.check(),
+                LoopDetection::LoopDetected {
+                    period: 1,
+                    repetitions: 3,
+                    ..
+                }
+            ),
             "expected loop detected, got {:?}",
             detector.check()
         );
@@ -282,7 +292,10 @@ mod tests {
     fn detects_alternation() {
         let mut detector = LoopDetector::with_thresholds(10, 3);
         let calls_a = vec![make_call("read", serde_json::json!({"path": "/tmp"}))];
-        let calls_b = vec![make_call("write", serde_json::json!({"path": "/tmp", "content": "x"}))];
+        let calls_b = vec![make_call(
+            "write",
+            serde_json::json!({"path": "/tmp", "content": "x"}),
+        )];
 
         detector.record_turn(&calls_a);
         detector.record_turn(&calls_b);
@@ -293,7 +306,14 @@ mod tests {
         detector.record_turn(&calls_a);
         detector.record_turn(&calls_b);
         assert!(
-            matches!(detector.check(), LoopDetection::LoopDetected { period: 2, repetitions: 3, .. }),
+            matches!(
+                detector.check(),
+                LoopDetection::LoopDetected {
+                    period: 2,
+                    repetitions: 3,
+                    ..
+                }
+            ),
             "expected alternation loop, got {:?}",
             detector.check()
         );
@@ -328,7 +348,10 @@ mod tests {
         detector.record_turn(&calls);
         detector.record_turn(&calls);
         detector.record_turn(&calls);
-        assert!(matches!(detector.check(), LoopDetection::LoopDetected { .. }));
+        assert!(matches!(
+            detector.check(),
+            LoopDetection::LoopDetected { .. }
+        ));
 
         // Add enough diverse turns to push the loop out of history
         detector.record_turn(&[make_call("write", serde_json::json!({"path": "/tmp"}))]);

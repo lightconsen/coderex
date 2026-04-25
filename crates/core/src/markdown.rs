@@ -2,9 +2,7 @@
 //!
 //! Wraps `comrak` for Markdown → HTML and Markdown → text conversion.
 
-use comrak::{
-    format_html, format_commonmark, parse_document, Arena, ComrakOptions,
-};
+use comrak::{Arena, ComrakOptions, format_commonmark, format_html, parse_document};
 use std::collections::HashMap;
 use thiserror::Error;
 
@@ -71,18 +69,14 @@ impl Default for MarkdownConfig {
 }
 
 /// Convert Markdown to HTML.
-pub fn markdown_to_html(
-    input: &str,
-    config: &MarkdownConfig,
-) -> Result<String, MarkdownError> {
+pub fn markdown_to_html(input: &str, config: &MarkdownConfig) -> Result<String, MarkdownError> {
     let arena = Arena::new();
     let options = build_options(config);
 
     let root = parse_document(&arena, input, &options);
 
     let mut html = Vec::new();
-    format_html(root, &options, &mut html)
-        .map_err(|e| MarkdownError::Render(e.to_string()))?;
+    format_html(root, &options, &mut html).map_err(|e| MarkdownError::Render(e.to_string()))?;
 
     String::from_utf8(html).map_err(|e| MarkdownError::Render(e.to_string()))
 }
@@ -121,7 +115,11 @@ pub fn extract_frontmatter(input: &str) -> Option<HashMap<String, String>> {
         if let Some((key, value)) = line.split_once(':') {
             map.insert(
                 key.trim().to_string(),
-                value.trim().trim_matches('"').trim_matches('\'').to_string(),
+                value
+                    .trim()
+                    .trim_matches('"')
+                    .trim_matches('\'')
+                    .to_string(),
             );
         }
     }
@@ -159,7 +157,11 @@ pub fn strip_markdown(input: &str) -> String {
         .join("\n");
 
     // Remove bold/italic
-    result = result.replace("**", "").replace('*', "").replace("__", "").replace('_', "");
+    result = result
+        .replace("**", "")
+        .replace('*', "")
+        .replace("__", "")
+        .replace('_', "");
 
     // Remove links but keep text
     result = result.replace(['[', ']'], "");
@@ -243,7 +245,8 @@ mod tests {
 
     #[test]
     fn strip_markdown_removes_formatting() {
-        let input = "# Header\n\n**Bold** and *italic* text.\n\n- [ ] Task\n\n`code`\n\n[link](url)";
+        let input =
+            "# Header\n\n**Bold** and *italic* text.\n\n- [ ] Task\n\n`code`\n\n[link](url)";
         let plain = strip_markdown(input);
 
         assert!(plain.contains("Header"));

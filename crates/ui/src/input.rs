@@ -242,9 +242,12 @@ impl InputBuffer {
                 }
                 None
             }
-            InputAction::PageUp | InputAction::PageDown | InputAction::TabComplete | InputAction::SelectAll | InputAction::Interrupt | InputAction::Ignore => {
-                None
-            }
+            InputAction::PageUp
+            | InputAction::PageDown
+            | InputAction::TabComplete
+            | InputAction::SelectAll
+            | InputAction::Interrupt
+            | InputAction::Ignore => None,
         }
     }
 
@@ -500,10 +503,10 @@ mod tests {
         buf.apply(&InputAction::InsertChar('中'));
         buf.apply(&InputAction::InsertChar('b'));
         // "a中b" — byte positions: a=0, 中=1, b=4; display columns: a=1, 中=3, b=4
-        assert_eq!(buf.byte_from_column(0), 0);  // before 'a'
-        assert_eq!(buf.byte_from_column(1), 1);  // before '中'
-        assert_eq!(buf.byte_from_column(2), 1);  // middle of '中', rounds down
-        assert_eq!(buf.byte_from_column(3), 4);  // before 'b'
-        assert_eq!(buf.byte_from_column(4), 5);  // after 'b' (text.len())
+        assert_eq!(buf.byte_from_column(0), 0); // before 'a'
+        assert_eq!(buf.byte_from_column(1), 1); // before '中'
+        assert_eq!(buf.byte_from_column(2), 1); // middle of '中', rounds down
+        assert_eq!(buf.byte_from_column(3), 4); // before 'b'
+        assert_eq!(buf.byte_from_column(4), 5); // after 'b' (text.len())
     }
 }

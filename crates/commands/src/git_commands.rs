@@ -36,8 +36,7 @@ fn run_gh(dir: &std::path::Path, args: &[&str]) -> Result<String, String> {
 
 /// Get the current git branch.
 fn current_branch(dir: &std::path::Path) -> String {
-    run_git(dir, &["branch", "--show-current"])
-        .unwrap_or_else(|_| "detached HEAD".to_string())
+    run_git(dir, &["branch", "--show-current"]).unwrap_or_else(|_| "detached HEAD".to_string())
 }
 
 /// Register Git/PR commands.
@@ -255,18 +254,24 @@ pub fn register(registry: &mut CommandRegistry) {
             let dir = std::path::Path::new(&ctx.cwd);
             if args.is_empty() {
                 let branch = current_branch(dir);
-                let all_branches = run_git(dir, &["branch", "--format", "%(refname:short)"])
-                    .unwrap_or_default();
+                let all_branches =
+                    run_git(dir, &["branch", "--format", "%(refname:short)"]).unwrap_or_default();
                 let branch_list: Vec<&str> = all_branches.lines().take(20).collect();
                 CommandResult::success(format!(
                     "Current branch: {branch}\n\nBranches:\n{}",
-                    branch_list.iter().map(|b| format!("  {b}")).collect::<Vec<_>>().join("\n")
+                    branch_list
+                        .iter()
+                        .map(|b| format!("  {b}"))
+                        .collect::<Vec<_>>()
+                        .join("\n")
                 ))
             } else if args[0] == "create" {
                 let name = args.get(1).map(|s| s.as_str()).unwrap_or("new-branch");
                 match run_git(dir, &["checkout", "-b", name]) {
-                    Ok(_) => CommandResult::success(format!("Branch '{name}' created and checked out"))
-                        .with_state_change(true),
+                    Ok(_) => {
+                        CommandResult::success(format!("Branch '{name}' created and checked out"))
+                            .with_state_change(true)
+                    }
                     Err(e) => CommandResult::error(format!("Branch creation failed: {e}")),
                 }
             } else {
@@ -350,7 +355,11 @@ mod tests {
         std::fs::write(tmp.path().join("test.txt"), "hello").unwrap();
         let ctx = ctx_in_dir(tmp.path());
 
-        let reg = { let mut r = CommandRegistry::new(); register(&mut r); r };
+        let reg = {
+            let mut r = CommandRegistry::new();
+            register(&mut r);
+            r
+        };
         let result = reg.execute("commit", &ctx, &["add test file".into()]);
         assert!(result.output.contains("Commit created"));
         assert!(result.output.contains("add test file"));
@@ -363,7 +372,11 @@ mod tests {
         init_git_repo(tmp.path());
         let ctx = ctx_in_dir(tmp.path());
 
-        let reg = { let mut r = CommandRegistry::new(); register(&mut r); r };
+        let reg = {
+            let mut r = CommandRegistry::new();
+            register(&mut r);
+            r
+        };
         let result = reg.execute("commit", &ctx, &["nothing new".into()]);
         // Either reports nothing to commit or creates an empty commit message
         let out = result.output.to_lowercase();
@@ -377,7 +390,11 @@ mod tests {
         std::fs::write(tmp.path().join("test.txt"), "hello").unwrap();
         let ctx = ctx_in_dir(tmp.path());
 
-        let reg = { let mut r = CommandRegistry::new(); register(&mut r); r };
+        let reg = {
+            let mut r = CommandRegistry::new();
+            register(&mut r);
+            r
+        };
         let result = reg.execute("commit", &ctx, &["fix".into(), "the".into(), "bug".into()]);
         assert!(result.output.contains("fix the bug"));
     }
@@ -389,7 +406,11 @@ mod tests {
         std::fs::write(tmp.path().join("test.txt"), "hello").unwrap();
         let ctx = ctx_in_dir(tmp.path());
 
-        let reg = { let mut r = CommandRegistry::new(); register(&mut r); r };
+        let reg = {
+            let mut r = CommandRegistry::new();
+            register(&mut r);
+            r
+        };
         let result = reg.execute("commit-push-pr", &ctx, &["add feature".into()]);
         // Without a remote, push should fail but we handle gracefully
         assert!(result.output.contains("committed") || result.output.contains("failed"));
@@ -408,7 +429,9 @@ mod tests {
         assert!(result.output.contains("Code Review"));
         assert!(result.output.contains("Branch"));
         assert_eq!(result.prompt_profile, Some(PromptProfile::Reviewer));
-        let context = result.extra_context.expect("review should inject diff context");
+        let context = result
+            .extra_context
+            .expect("review should inject diff context");
         assert!(context.contains("Review the current git diff"));
         assert!(context.contains("Diff:"));
         assert!(context.contains("README"));
@@ -456,7 +479,11 @@ mod tests {
         init_git_repo(tmp.path());
         let ctx = ctx_in_dir(tmp.path());
 
-        let reg = { let mut r = CommandRegistry::new(); register(&mut r); r };
+        let reg = {
+            let mut r = CommandRegistry::new();
+            register(&mut r);
+            r
+        };
         let result = reg.execute("autofix-pr", &ctx, &[]);
         assert!(result.output.contains("Analyzing PR"));
     }
@@ -467,7 +494,11 @@ mod tests {
         init_git_repo(tmp.path());
         let ctx = ctx_in_dir(tmp.path());
 
-        let reg = { let mut r = CommandRegistry::new(); register(&mut r); r };
+        let reg = {
+            let mut r = CommandRegistry::new();
+            register(&mut r);
+            r
+        };
         let result = reg.execute("pr_comments", &ctx, &[]);
         assert!(result.output.contains("No PR") || result.output.contains("Found"));
     }
@@ -478,9 +509,17 @@ mod tests {
         init_git_repo(tmp.path());
         let ctx = ctx_in_dir(tmp.path());
 
-        let reg = { let mut r = CommandRegistry::new(); register(&mut r); r };
+        let reg = {
+            let mut r = CommandRegistry::new();
+            register(&mut r);
+            r
+        };
         let result = reg.execute("branch", &ctx, &[]);
-        assert!(result.output.contains("master") || result.output.contains("main") || result.output.contains("branch"));
+        assert!(
+            result.output.contains("master")
+                || result.output.contains("main")
+                || result.output.contains("branch")
+        );
     }
 
     #[test]
@@ -492,7 +531,11 @@ mod tests {
         run_git(tmp.path(), &["checkout", "master"]).ok();
         let ctx = ctx_in_dir(tmp.path());
 
-        let reg = { let mut r = CommandRegistry::new(); register(&mut r); r };
+        let reg = {
+            let mut r = CommandRegistry::new();
+            register(&mut r);
+            r
+        };
         let result = reg.execute("branch", &ctx, &["feature".into()]);
         assert!(result.output.contains("Switched") || result.output.contains("feature"));
         assert!(result.state_changed);
@@ -504,7 +547,11 @@ mod tests {
         init_git_repo(tmp.path());
         let ctx = ctx_in_dir(tmp.path());
 
-        let reg = { let mut r = CommandRegistry::new(); register(&mut r); r };
+        let reg = {
+            let mut r = CommandRegistry::new();
+            register(&mut r);
+            r
+        };
         let result = reg.execute("branch", &ctx, &["create".into(), "hotfix".into()]);
         assert!(result.output.contains("hotfix"));
         assert!(result.state_changed);

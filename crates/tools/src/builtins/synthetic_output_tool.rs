@@ -36,9 +36,14 @@ impl Tool for SyntheticOutputTool {
         }
     }
 
-    async fn execute(&self, input: ToolInput, _ctx: ToolContext<'_>) -> Result<ToolOutput, ToolError> {
+    async fn execute(
+        &self,
+        input: ToolInput,
+        _ctx: ToolContext<'_>,
+    ) -> Result<ToolOutput, ToolError> {
         let content = extract_string(&input.arguments, "content")?;
-        let format = extract_string_opt(&input.arguments, "format").unwrap_or_else(|| "plain".into());
+        let format =
+            extract_string_opt(&input.arguments, "format").unwrap_or_else(|| "plain".into());
 
         let formatted = match format.as_str() {
             "json" => serde_json::json!({ "content": content }).to_string(),
@@ -69,8 +74,8 @@ fn extract_string_opt(args: &serde_json::Value, key: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tool::ToolContext;
     use crate::context::ExecutionContext;
+    use crate::tool::ToolContext;
     use std::collections::HashMap;
     use std::path::Path;
     use std::sync::Arc;

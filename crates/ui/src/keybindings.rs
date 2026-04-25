@@ -85,7 +85,8 @@ impl Keymap {
 
     /// Bind a key combination to a named action.
     pub fn bind(&mut self, code: KeyCode, modifiers: KeyModifiers, action: impl Into<String>) {
-        self.bindings.insert(KeyTrigger::new(code, modifiers), action.into());
+        self.bindings
+            .insert(KeyTrigger::new(code, modifiers), action.into());
     }
 
     /// Look up the action for a key event.

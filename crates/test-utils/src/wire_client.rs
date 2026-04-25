@@ -123,11 +123,8 @@ impl WireTestClient {
 
         let mut events = Vec::new();
         while tokio::time::Instant::now() < deadline {
-            match tokio::time::timeout(
-                std::time::Duration::from_millis(100),
-                self.next_event(),
-            )
-            .await
+            match tokio::time::timeout(std::time::Duration::from_millis(100), self.next_event())
+                .await
             {
                 Ok(Ok(Some(event))) => {
                     let is_end = matches!(event, WireEvent::SessionEnd);

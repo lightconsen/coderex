@@ -37,7 +37,11 @@ impl Tool for TaskGetTool {
         }
     }
 
-    async fn execute(&self, input: ToolInput, ctx: ToolContext<'_>) -> Result<ToolOutput, ToolError> {
+    async fn execute(
+        &self,
+        input: ToolInput,
+        ctx: ToolContext<'_>,
+    ) -> Result<ToolOutput, ToolError> {
         let task_id = extract_string(&input.arguments, "taskId")?;
 
         let store = get_store(&ctx).ok_or_else(|| ToolError::InvalidInput {
@@ -60,9 +64,10 @@ impl Tool for TaskGetTool {
 }
 
 fn get_store(ctx: &ToolContext<'_>) -> Option<Arc<crate::task_store::TaskStore>> {
-    ctx.extra
-        .get(TASK_STORE_KEY)
-        .and_then(|v| v.downcast_ref::<Arc<crate::task_store::TaskStore>>().map(Arc::clone))
+    ctx.extra.get(TASK_STORE_KEY).and_then(|v| {
+        v.downcast_ref::<Arc<crate::task_store::TaskStore>>()
+            .map(Arc::clone)
+    })
 }
 
 fn extract_string(args: &serde_json::Value, key: &str) -> Result<String, ToolError> {
@@ -77,9 +82,9 @@ fn extract_string(args: &serde_json::Value, key: &str) -> Result<String, ToolErr
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::context::ExecutionContext;
     use crate::task_store::{TaskRecord, TaskStore};
     use crate::tool::ToolContext;
-    use crate::context::ExecutionContext;
     use std::collections::HashMap;
     use std::path::Path;
 
@@ -100,7 +105,11 @@ mod tests {
     async fn task_get_returns_task() {
         let output = TaskGetTool
             .execute(
-                ToolInput { call_id: "1".into(), name: "TaskGet".into(), arguments: serde_json::json!({ "taskId": "1" }) },
+                ToolInput {
+                    call_id: "1".into(),
+                    name: "TaskGet".into(),
+                    arguments: serde_json::json!({ "taskId": "1" }),
+                },
                 test_ctx(),
             )
             .await
@@ -112,7 +121,11 @@ mod tests {
     async fn task_get_not_found() {
         let result = TaskGetTool
             .execute(
-                ToolInput { call_id: "1".into(), name: "TaskGet".into(), arguments: serde_json::json!({ "taskId": "999" }) },
+                ToolInput {
+                    call_id: "1".into(),
+                    name: "TaskGet".into(),
+                    arguments: serde_json::json!({ "taskId": "999" }),
+                },
                 test_ctx(),
             )
             .await;

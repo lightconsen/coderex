@@ -177,7 +177,10 @@ impl VimState {
             return match event.code {
                 KeyCode::Char('u') => VimAction::HalfPageUp,
                 KeyCode::Char('d') => VimAction::HalfPageDown,
-                KeyCode::Char('c') => { self.mode = VimMode::Normal; VimAction::Escape }
+                KeyCode::Char('c') => {
+                    self.mode = VimMode::Normal;
+                    VimAction::Escape
+                }
                 _ => VimAction::Ignore,
             };
         }

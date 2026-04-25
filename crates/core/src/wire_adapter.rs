@@ -47,10 +47,12 @@ pub fn engine_event_to_wire(event: &EngineEvent) -> Option<WireEvent> {
         EngineEvent::Notification { message } => WireEvent::Notification {
             message: message.clone(),
         },
-        EngineEvent::PermissionExplanation { tool, explanation } => WireEvent::PermissionExplanation {
-            tool: tool.clone(),
-            explanation: explanation.clone(),
-        },
+        EngineEvent::PermissionExplanation { tool, explanation } => {
+            WireEvent::PermissionExplanation {
+                tool: tool.clone(),
+                explanation: explanation.clone(),
+            }
+        }
     })
 }
 
@@ -93,10 +95,12 @@ pub fn wire_event_to_engine(event: &WireEvent) -> Option<EngineEvent> {
         WireEvent::Notification { message } => EngineEvent::Notification {
             message: message.clone(),
         },
-        WireEvent::PermissionExplanation { tool, explanation } => EngineEvent::PermissionExplanation {
-            tool: tool.clone(),
-            explanation: explanation.clone(),
-        },
+        WireEvent::PermissionExplanation { tool, explanation } => {
+            EngineEvent::PermissionExplanation {
+                tool: tool.clone(),
+                explanation: explanation.clone(),
+            }
+        }
         WireEvent::UsageSummary { .. }
         | WireEvent::TurnStart { .. }
         | WireEvent::TurnEnd { .. }

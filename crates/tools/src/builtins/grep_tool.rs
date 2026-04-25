@@ -48,47 +48,55 @@ impl Tool for GrepTool {
         }
     }
 
-    async fn execute(&self, input: ToolInput, ctx: ToolContext<'_>) -> Result<ToolOutput, ToolError> {
+    async fn execute(
+        &self,
+        input: ToolInput,
+        ctx: ToolContext<'_>,
+    ) -> Result<ToolOutput, ToolError> {
         let pattern = extract_string(&input.arguments, "pattern")?;
         let path = input
             .arguments
             .get("path")
             .and_then(|v| v.as_str())
             .map(String::from);
-        let output_mode = extract_string_opt(&input.arguments, "output_mode").unwrap_or_else(|| "content".into());
+        let output_mode =
+            extract_string_opt(&input.arguments, "output_mode").unwrap_or_else(|| "content".into());
         let glob_pattern = extract_string_opt(&input.arguments, "glob");
         let context = extract_number(&input.arguments, "-C").unwrap_or(0) as usize;
         let after = extract_number(&input.arguments, "-A").unwrap_or(context as i64) as usize;
         let before = extract_number(&input.arguments, "-B").unwrap_or(context as i64) as usize;
-        let head_limit = extract_number(&input.arguments, "head_limit").unwrap_or(MAX_RESULTS as i64) as usize;
+        let head_limit =
+            extract_number(&input.arguments, "head_limit").unwrap_or(MAX_RESULTS as i64) as usize;
 
         let regex = Regex::new(&pattern).map_err(|e| ToolError::InvalidInput {
             message: format!("invalid regex pattern: {e}"),
         })?;
 
         let root = path
-            .as_ref().map_or_else(|| ctx.cwd.to_path_buf(), PathBuf::from);
+            .as_ref()
+            .map_or_else(|| ctx.cwd.to_path_buf(), PathBuf::from);
 
-        let glob_matcher = glob_pattern.as_ref().map(|p| {
-            globset::Glob::new(p)
-                .map(|g| g.compile_matcher())
-                .map_err(|e| ToolError::InvalidInput {
-                    message: format!("invalid glob: {e}"),
-                })
-        }).transpose()?;
+        let glob_matcher = glob_pattern
+            .as_ref()
+            .map(|p| {
+                globset::Glob::new(p)
+                    .map(|g| g.compile_matcher())
+                    .map_err(|e| ToolError::InvalidInput {
+                        message: format!("invalid glob: {e}"),
+                    })
+            })
+            .transpose()?;
 
         let mut results = Vec::new();
 
-        let walker = walkdir::WalkDir::new(&root)
-            .into_iter()
-            .filter_entry(|e| {
-                if e.file_type().is_dir() {
-                    let name = e.file_name().to_string_lossy();
-                    name != ".git"
-                } else {
-                    true
-                }
-            });
+        let walker = walkdir::WalkDir::new(&root).into_iter().filter_entry(|e| {
+            if e.file_type().is_dir() {
+                let name = e.file_name().to_string_lossy();
+                name != ".git"
+            } else {
+                true
+            }
+        });
 
         for entry in walker {
             let entry = match entry {
@@ -123,10 +131,7 @@ impl Tool for GrepTool {
                         let start = i.saturating_sub(before);
                         let end = (i + 1 + after).min(lines.len());
 
-                        let rel = entry
-                            .path()
-                            .strip_prefix(&root)
-                            .unwrap_or(entry.path());
+                        let rel = entry.path().strip_prefix(&root).unwrap_or(entry.path());
 
                         for j in start..end {
                             let prefix = if j == i { ">" } else { " " };
@@ -141,18 +146,12 @@ impl Tool for GrepTool {
             }
 
             if file_matched && matches!(output_mode.as_str(), "files_with_matches") {
-                let rel = entry
-                    .path()
-                    .strip_prefix(&root)
-                    .unwrap_or(entry.path());
+                let rel = entry.path().strip_prefix(&root).unwrap_or(entry.path());
                 results.push(rel.display().to_string());
             }
 
             if file_matched && matches!(output_mode.as_str(), "count") {
-                let rel = entry
-                    .path()
-                    .strip_prefix(&root)
-                    .unwrap_or(entry.path());
+                let rel = entry.path().strip_prefix(&root).unwrap_or(entry.path());
                 let count = regex.find_iter(&content).count();
                 results.push(format!("{}:{count}", rel.display()));
             }
@@ -194,8 +193,8 @@ fn extract_number(args: &serde_json::Value, key: &str) -> Option<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tool::ToolContext;
     use crate::context::ExecutionContext;
+    use crate::tool::ToolContext;
     use std::path::Path;
 
     fn test_ctx(cwd: &Path) -> ToolContext<'_> {
@@ -220,11 +219,18 @@ mod tests {
     #[tokio::test]
     async fn grep_pattern_match_single_file() {
         let tmp = tempfile::tempdir().unwrap();
-        std::fs::write(tmp.path().join("test.txt"), "hello world\nfoo bar\nhello again").unwrap();
+        std::fs::write(
+            tmp.path().join("test.txt"),
+            "hello world\nfoo bar\nhello again",
+        )
+        .unwrap();
 
         let output = GrepTool
             .execute(
-                grep_input("hello", serde_json::json!({ "path": tmp.path().to_str().unwrap() })),
+                grep_input(
+                    "hello",
+                    serde_json::json!({ "path": tmp.path().to_str().unwrap() }),
+                ),
                 test_ctx(tmp.path()),
             )
             .await
@@ -242,10 +248,13 @@ mod tests {
 
         let output = GrepTool
             .execute(
-                grep_input("match", serde_json::json!({
-                    "path": tmp.path().to_str().unwrap(),
-                    "output_mode": "files_with_matches"
-                })),
+                grep_input(
+                    "match",
+                    serde_json::json!({
+                        "path": tmp.path().to_str().unwrap(),
+                        "output_mode": "files_with_matches"
+                    }),
+                ),
                 test_ctx(tmp.path()),
             )
             .await
@@ -262,10 +271,13 @@ mod tests {
 
         let output = GrepTool
             .execute(
-                grep_input("x", serde_json::json!({
-                    "path": tmp.path().to_str().unwrap(),
-                    "output_mode": "count"
-                })),
+                grep_input(
+                    "x",
+                    serde_json::json!({
+                        "path": tmp.path().to_str().unwrap(),
+                        "output_mode": "count"
+                    }),
+                ),
                 test_ctx(tmp.path()),
             )
             .await
@@ -281,11 +293,14 @@ mod tests {
 
         let output = GrepTool
             .execute(
-                grep_input("TARGET", serde_json::json!({
-                    "path": tmp.path().to_str().unwrap(),
-                    "-B": 1,
-                    "-A": 1
-                })),
+                grep_input(
+                    "TARGET",
+                    serde_json::json!({
+                        "path": tmp.path().to_str().unwrap(),
+                        "-B": 1,
+                        "-A": 1
+                    }),
+                ),
                 test_ctx(tmp.path()),
             )
             .await
@@ -298,21 +313,31 @@ mod tests {
     #[tokio::test]
     async fn grep_head_limit_truncation() {
         let tmp = tempfile::tempdir().unwrap();
-        let content = (0..50).map(|i| format!("line {i} test")).collect::<Vec<_>>().join("\n");
+        let content = (0..50)
+            .map(|i| format!("line {i} test"))
+            .collect::<Vec<_>>()
+            .join("\n");
         std::fs::write(tmp.path().join("test.txt"), &content).unwrap();
 
         let output = GrepTool
             .execute(
-                grep_input("test", serde_json::json!({
-                    "path": tmp.path().to_str().unwrap(),
-                    "head_limit": 5
-                })),
+                grep_input(
+                    "test",
+                    serde_json::json!({
+                        "path": tmp.path().to_str().unwrap(),
+                        "head_limit": 5
+                    }),
+                ),
                 test_ctx(tmp.path()),
             )
             .await
             .unwrap();
         assert!(output.output.contains("truncated"));
-        let match_lines: Vec<_> = output.output.lines().filter(|l| !l.is_empty() && !l.starts_with("...")).collect();
+        let match_lines: Vec<_> = output
+            .output
+            .lines()
+            .filter(|l| !l.is_empty() && !l.starts_with("..."))
+            .collect();
         assert_eq!(match_lines.len(), 5);
     }
 
@@ -323,9 +348,12 @@ mod tests {
 
         let output = GrepTool
             .execute(
-                grep_input("notfound", serde_json::json!({
-                    "path": tmp.path().to_str().unwrap(),
-                })),
+                grep_input(
+                    "notfound",
+                    serde_json::json!({
+                        "path": tmp.path().to_str().unwrap(),
+                    }),
+                ),
                 test_ctx(tmp.path()),
             )
             .await

@@ -15,7 +15,11 @@ fn stress_large_message_list() {
     view.set_visible_count(100);
     // Add 5000 messages
     for i in 0..5000 {
-        let role = if i % 2 == 0 { MessageRole::User } else { MessageRole::Assistant };
+        let role = if i % 2 == 0 {
+            MessageRole::User
+        } else {
+            MessageRole::Assistant
+        };
         view.push(Message {
             role,
             content: CompactString::new(format!("Message {i}")),
@@ -39,10 +43,16 @@ fn stress_virtualization_scroll() {
     let mut view = MessageView::new(100);
     view.set_visible_count(100);
     for i in 0..10000 {
-        let role = if i % 2 == 0 { MessageRole::User } else { MessageRole::Assistant };
+        let role = if i % 2 == 0 {
+            MessageRole::User
+        } else {
+            MessageRole::Assistant
+        };
         view.push(Message {
             role,
-            content: CompactString::new(format!("A very long message number {i} with extra content to make it more realistic")),
+            content: CompactString::new(format!(
+                "A very long message number {i} with extra content to make it more realistic"
+            )),
             tool_name: None,
             streaming: false,
             folded: false,
@@ -70,7 +80,12 @@ fn stress_command_registry_many_lookups() {
     let mut reg = CommandRegistry::new();
     coderex_commands::registry::register_all_commands(&mut reg);
 
-    let ctx = CommandContext::new("/src".into(), "stress".into(), "Stress".into(), ModelId::sonnet());
+    let ctx = CommandContext::new(
+        "/src".into(),
+        "stress".into(),
+        "Stress".into(),
+        ModelId::sonnet(),
+    );
 
     // Execute 1000 commands
     for _ in 0..1000 {
@@ -150,7 +165,7 @@ fn stress_theme_manager_many_themes() {
 // Stress: Input buffer with many operations
 #[test]
 fn stress_input_buffer_many_operations() {
-    use coderex_ui::input::{InputBuffer, InputAction};
+    use coderex_ui::input::{InputAction, InputBuffer};
 
     let mut buf = InputBuffer::new();
 
@@ -186,10 +201,10 @@ fn stress_vim_many_operations() {
 
     // Execute 1000 vim commands
     for _ in 0..250 {
-        state.handle_key(key('j'));  // down
-        state.handle_key(key('k'));  // up
-        state.handle_key(key('h'));  // left
-        state.handle_key(key('l'));  // right
+        state.handle_key(key('j')); // down
+        state.handle_key(key('k')); // up
+        state.handle_key(key('h')); // left
+        state.handle_key(key('l')); // right
     }
 
     // Should still be in normal mode
@@ -303,9 +318,9 @@ fn stress_overlay_stack_many() {
 // Stress: Export many messages
 #[test]
 fn stress_export_many_messages() {
+    use coderex_core::types::Message;
     use coderex_ui::export::{ExportFormat, export_messages};
     use coderex_ui::selector::MessageSelector;
-    use coderex_core::types::Message;
 
     let messages: Vec<Message> = (0..1000)
         .map(|i| {

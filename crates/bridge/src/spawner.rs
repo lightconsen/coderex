@@ -1,8 +1,8 @@
 //! Bridge session spawner — worktree creation, session directory preparation, and SSH remote spawning.
 
+use crate::poller::SpawnMode;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
-use crate::poller::SpawnMode;
 
 /// Spawn configuration for a session.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -54,20 +54,19 @@ impl BridgeSessionSpawner {
     #[allow(clippy::unused_async)]
     pub async fn spawn(&self, config: SpawnConfig) -> Result<SpawnResult, String> {
         match config.mode {
-            SpawnMode::SingleSession => {
-                self.spawn_single(config).await
-            }
-            SpawnMode::SameDir => {
-                self.spawn_same_dir(config).await
-            }
-            SpawnMode::Worktree => {
-                self.spawn_worktree(config).await
-            }
-            SpawnMode::Ssh { ref host, ref remote_path, ref identity_file } => {
+            SpawnMode::SingleSession => self.spawn_single(config).await,
+            SpawnMode::SameDir => self.spawn_same_dir(config).await,
+            SpawnMode::Worktree => self.spawn_worktree(config).await,
+            SpawnMode::Ssh {
+                ref host,
+                ref remote_path,
+                ref identity_file,
+            } => {
                 let host = host.clone();
                 let remote_path = remote_path.clone();
                 let identity_file = identity_file.clone();
-                self.spawn_ssh(config, &host, &remote_path, identity_file.as_deref()).await
+                self.spawn_ssh(config, &host, &remote_path, identity_file.as_deref())
+                    .await
             }
         }
     }
@@ -98,12 +97,7 @@ impl BridgeSessionSpawner {
 
         if !worktree_path.exists() {
             let output = std::process::Command::new("git")
-                .args([
-                    "worktree",
-                    "add",
-                    worktree_path.to_str().unwrap(),
-                    branch,
-                ])
+                .args(["worktree", "add", worktree_path.to_str().unwrap(), branch])
                 .current_dir(&self.repo_root)
                 .output()
                 .map_err(|e| format!("git worktree add failed: {e}"))?;
@@ -137,11 +131,7 @@ impl BridgeSessionSpawner {
         let worktree_path = self.worktree_base.join(session_id);
         if worktree_path.exists() {
             std::process::Command::new("git")
-                .args([
-                    "worktree",
-                    "remove",
-                    worktree_path.to_str().unwrap(),
-                ])
+                .args(["worktree", "remove", worktree_path.to_str().unwrap()])
                 .current_dir(&self.repo_root)
                 .output()
                 .map_err(|e| format!("git worktree remove failed: {e}"))?;
@@ -165,12 +155,9 @@ impl BridgeSessionSpawner {
         // Build the SSH session using the system ssh command.
         // Note: identity_file support requires MuxConfig; for now
         // we rely on the user's ssh config (~/.ssh/config) for key selection.
-        let session = openssh::Session::connect(
-            host,
-            openssh::KnownHosts::Accept,
-        )
-        .await
-        .map_err(|e| format!("ssh connect failed: {e}"))?;
+        let session = openssh::Session::connect(host, openssh::KnownHosts::Accept)
+            .await
+            .map_err(|e| format!("ssh connect failed: {e}"))?;
 
         // Create session directory on remote: ssh host mkdir -p /path
         let output = session
@@ -320,7 +307,11 @@ mod tests {
             identity_file: Some("~/.ssh/id_ed25519".into()),
         };
         match &ssh_mode {
-            SpawnMode::Ssh { host, remote_path, identity_file } => {
+            SpawnMode::Ssh {
+                host,
+                remote_path,
+                identity_file,
+            } => {
                 assert_eq!(host, "user@remote");
                 assert_eq!(remote_path, "/tmp/work");
                 assert_eq!(identity_file, &Some("~/.ssh/id_ed25519".into()));

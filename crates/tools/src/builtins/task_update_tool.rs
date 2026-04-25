@@ -1,7 +1,7 @@
 //! TaskUpdate tool — update a task's status or description.
 
 use crate::context::{ToolError, ToolOutput};
-use crate::task_store::{TaskStatus, TASK_STORE_KEY};
+use crate::task_store::{TASK_STORE_KEY, TaskStatus};
 use crate::tool::{Tool, ToolContext, ToolDescriptor, ToolInput, ToolTier};
 use async_trait::async_trait;
 use std::sync::Arc;
@@ -41,7 +41,11 @@ impl Tool for TaskUpdateTool {
         }
     }
 
-    async fn execute(&self, input: ToolInput, ctx: ToolContext<'_>) -> Result<ToolOutput, ToolError> {
+    async fn execute(
+        &self,
+        input: ToolInput,
+        ctx: ToolContext<'_>,
+    ) -> Result<ToolOutput, ToolError> {
         let task_id = extract_string(&input.arguments, "taskId")?;
         let status = extract_string_opt(&input.arguments, "status").map(|s| match s.as_str() {
             "pending" => TaskStatus::Pending,
@@ -68,9 +72,10 @@ impl Tool for TaskUpdateTool {
 }
 
 fn get_store(ctx: &ToolContext<'_>) -> Option<Arc<crate::task_store::TaskStore>> {
-    ctx.extra
-        .get(TASK_STORE_KEY)
-        .and_then(|v| v.downcast_ref::<Arc<crate::task_store::TaskStore>>().map(Arc::clone))
+    ctx.extra.get(TASK_STORE_KEY).and_then(|v| {
+        v.downcast_ref::<Arc<crate::task_store::TaskStore>>()
+            .map(Arc::clone)
+    })
 }
 
 fn extract_string(args: &serde_json::Value, key: &str) -> Result<String, ToolError> {
@@ -89,9 +94,9 @@ fn extract_string_opt(args: &serde_json::Value, key: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::context::ExecutionContext;
     use crate::task_store::{TaskRecord, TaskStore};
     use crate::tool::ToolContext;
-    use crate::context::ExecutionContext;
     use std::collections::HashMap;
     use std::path::Path;
 
@@ -112,7 +117,11 @@ mod tests {
     async fn task_update_changes_status() {
         let output = TaskUpdateTool
             .execute(
-                ToolInput { call_id: "1".into(), name: "TaskUpdate".into(), arguments: serde_json::json!({ "taskId": "1", "status": "completed" }) },
+                ToolInput {
+                    call_id: "1".into(),
+                    name: "TaskUpdate".into(),
+                    arguments: serde_json::json!({ "taskId": "1", "status": "completed" }),
+                },
                 test_ctx(),
             )
             .await
@@ -124,7 +133,11 @@ mod tests {
     async fn task_update_nonexistent_returns_false() {
         let output = TaskUpdateTool
             .execute(
-                ToolInput { call_id: "1".into(), name: "TaskUpdate".into(), arguments: serde_json::json!({ "taskId": "999", "status": "completed" }) },
+                ToolInput {
+                    call_id: "1".into(),
+                    name: "TaskUpdate".into(),
+                    arguments: serde_json::json!({ "taskId": "999", "status": "completed" }),
+                },
                 test_ctx(),
             )
             .await

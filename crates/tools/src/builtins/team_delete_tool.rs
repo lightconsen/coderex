@@ -1,6 +1,6 @@
 //! TeamDelete tool — delete an existing team (baseline tool).
 
-use crate::builtins::team_create_tool::{TeamManagerHandle, TEAM_MANAGER_KEY};
+use crate::builtins::team_create_tool::{TEAM_MANAGER_KEY, TeamManagerHandle};
 use crate::context::{ToolError, ToolOutput};
 use crate::tool::{Tool, ToolContext, ToolDescriptor, ToolInput, ToolTier};
 use async_trait::async_trait;
@@ -32,7 +32,11 @@ impl Tool for TeamDeleteTool {
         }
     }
 
-    async fn execute(&self, input: ToolInput, ctx: ToolContext<'_>) -> Result<ToolOutput, ToolError> {
+    async fn execute(
+        &self,
+        input: ToolInput,
+        ctx: ToolContext<'_>,
+    ) -> Result<ToolOutput, ToolError> {
         let team_id = input
             .arguments
             .get("team_id")
@@ -72,8 +76,12 @@ mod tests {
 
     struct StubManager;
     impl TeamManagerHandle for StubManager {
-        fn create_team(&self, _name: &str) -> Result<String, String> { Ok("x".into()) }
-        fn delete_team(&self, _id: &str) -> Result<(), String> { Ok(()) }
+        fn create_team(&self, _name: &str) -> Result<String, String> {
+            Ok("x".into())
+        }
+        fn delete_team(&self, _id: &str) -> Result<(), String> {
+            Ok(())
+        }
     }
 
     #[tokio::test]
@@ -87,10 +95,17 @@ mod tests {
             cwd: Path::new("/tmp"),
             extra: Arc::new(extra),
         };
-        let out = TeamDeleteTool.execute(
-            ToolInput { call_id: "1".into(), name: "TeamDelete".into(), arguments: serde_json::json!({"team_id": "team_1"}) },
-            ctx,
-        ).await.unwrap();
+        let out = TeamDeleteTool
+            .execute(
+                ToolInput {
+                    call_id: "1".into(),
+                    name: "TeamDelete".into(),
+                    arguments: serde_json::json!({"team_id": "team_1"}),
+                },
+                ctx,
+            )
+            .await
+            .unwrap();
         assert!(out.output.contains("team_1"));
     }
 }

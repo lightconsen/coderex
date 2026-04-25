@@ -1,9 +1,9 @@
 //! SDK structured event stream, permission tracking, and elicitation.
 
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
-use serde::{Deserialize, Serialize};
-use tokio::sync::{broadcast, Mutex};
+use tokio::sync::{Mutex, broadcast};
 
 use coderex_core::types::{EngineEvent, ToolCall, ToolResult};
 
@@ -190,7 +190,6 @@ impl SdkSubscriber {
     pub fn lag(&self) -> usize {
         self.lag.load(std::sync::atomic::Ordering::Relaxed)
     }
-
 }
 
 // ── Permission Tracking ─────────────────────────────────────────────────
@@ -245,10 +244,7 @@ impl PermissionSchema {
     ///
     /// Returns `Ok(())` if `args` is an object whose keys are a subset of
     /// `self.fields` and each value matches the declared [`ArgType`].
-    pub fn validate(
-        &self,
-        args: &serde_json::Value,
-    ) -> Result<(), PermissionValidationError> {
+    pub fn validate(&self, args: &serde_json::Value) -> Result<(), PermissionValidationError> {
         let obj = args.as_object().ok_or_else(|| PermissionValidationError {
             message: "args must be a JSON object".into(),
         })?;
@@ -275,9 +271,7 @@ impl PermissionSchema {
                 };
                 if !ok {
                     return Err(PermissionValidationError {
-                        message: format!(
-                            "field {key} has wrong type (expected {expected:?})"
-                        ),
+                        message: format!("field {key} has wrong type (expected {expected:?})"),
                     });
                 }
             }
@@ -416,8 +410,7 @@ impl PermissionTracker {
         self.pending
             .values()
             .filter(|p| {
-                p.timeout_secs > 0
-                    && (now - p.created_at).num_seconds() > p.timeout_secs as i64
+                p.timeout_secs > 0 && (now - p.created_at).num_seconds() > p.timeout_secs as i64
             })
             .collect()
     }
@@ -551,8 +544,7 @@ impl ElicitationTracker {
         self.pending
             .values()
             .filter(|e| {
-                e.timeout_secs > 0
-                    && (now - e.created_at).num_seconds() > e.timeout_secs as i64
+                e.timeout_secs > 0 && (now - e.created_at).num_seconds() > e.timeout_secs as i64
             })
             .collect()
     }
@@ -628,8 +620,7 @@ impl SdkSession {
     ///
     /// Emits `PermissionResolved` / `ElicitationResolved` events for each
     /// expired item.
-    pub async fn check_timeouts(&self,
-    ) {
+    pub async fn check_timeouts(&self) {
         let expired_perms: Vec<String> = {
             let tracker = self.permissions.lock().await;
             tracker.expired().iter().map(|p| p.id.clone()).collect()
@@ -664,9 +655,7 @@ impl SdkSession {
     ///
     /// Returns a `JoinHandle` that runs until the session is dropped.
     /// If called outside a Tokio runtime, the function returns `None`.
-    pub fn spawn_timeout_checker(
-        &self,
-    ) -> Option<tokio::task::JoinHandle<()>> {
+    pub fn spawn_timeout_checker(&self) -> Option<tokio::task::JoinHandle<()>> {
         let session = self.clone();
         let handle = tokio::runtime::Handle::try_current().ok()?;
         Some(handle.spawn(async move {
@@ -726,7 +715,12 @@ mod tests {
     fn permission_tracker_lifecycle() {
         let mut tracker = PermissionTracker::new();
         let id = tracker
-            .create("Bash".to_string(), serde_json::json!({"command": "ls"}), None, 0)
+            .create(
+                "Bash".to_string(),
+                serde_json::json!({"command": "ls"}),
+                None,
+                0,
+            )
             .unwrap();
         assert_eq!(tracker.pending_count(), 1);
 
@@ -780,7 +774,9 @@ mod tests {
     #[test]
     fn permission_resolved_lists() {
         let mut tracker = PermissionTracker::new();
-        let id = tracker.create("Read".to_string(), serde_json::json!({}), None, 0).unwrap();
+        let id = tracker
+            .create("Read".to_string(), serde_json::json!({}), None, 0)
+            .unwrap();
         tracker.resolve(&id, false);
         assert!(tracker.pending().is_empty());
         assert_eq!(tracker.resolved().len(), 1);
@@ -834,9 +830,11 @@ mod tests {
             fields: vec![("path".into(), ArgType::String)],
         };
         let bad_args = serde_json::json!({"path": 123});
-        assert!(tracker
-            .create("Read".into(), bad_args, Some(&schema), 0)
-            .is_err());
+        assert!(
+            tracker
+                .create("Read".into(), bad_args, Some(&schema), 0)
+                .is_err()
+        );
     }
 
     #[test]

@@ -14,41 +14,94 @@ use std::env;
 /// Prompts that map to the keyword branches in `mock_anthropic_server.rs`.
 /// We send the *full user message* that an E2E test would generate.
 static PROMPTS: &[(&str, &str)] = &[
-    ("fibonacci", "Add a recursive fibonacci function to src/lib.rs with unit tests."),
-    ("factorial", "Fix the factorial bug in src/lib.rs — the recursive call uses n instead of n-1."),
-    ("multiply", "Add a multiply function alongside the existing add and sub functions in src/lib.rs."),
+    (
+        "fibonacci",
+        "Add a recursive fibonacci function to src/lib.rs with unit tests.",
+    ),
+    (
+        "factorial",
+        "Fix the factorial bug in src/lib.rs — the recursive call uses n instead of n-1.",
+    ),
+    (
+        "multiply",
+        "Add a multiply function alongside the existing add and sub functions in src/lib.rs.",
+    ),
     ("max", "Fix the max function so it returns a when a > b."),
-    ("palindrome", "Implement an is_palindrome function in src/lib.rs that ignores case and non-alphanumeric chars."),
-    ("stack", "Add a generic Stack<T> with push, pop, is_empty and unit tests in src/lib.rs."),
-    ("refactor", "Refactor the duplicated age-prefix logic into a format_user_label helper in src/lib.rs."),
-    ("auth", "Add auth middleware, protected routes, and AuthRequest model to the project."),
-    ("api_endpoint", "Add a POST /users API endpoint with JSON body handling in src/main.rs."),
-    ("fn_last", "Append a new fn_last function to the end of src/large.rs."),
-    ("triple", "Add a triple function right after the add function in src/lib.rs."),
-    ("nonexistent", "Create src/nonexistent.rs with a constant X = 42."),
-    ("review", "Review src/lib.rs for issues like unwrap() and division by zero."),
+    (
+        "palindrome",
+        "Implement an is_palindrome function in src/lib.rs that ignores case and non-alphanumeric chars.",
+    ),
+    (
+        "stack",
+        "Add a generic Stack<T> with push, pop, is_empty and unit tests in src/lib.rs.",
+    ),
+    (
+        "refactor",
+        "Refactor the duplicated age-prefix logic into a format_user_label helper in src/lib.rs.",
+    ),
+    (
+        "auth",
+        "Add auth middleware, protected routes, and AuthRequest model to the project.",
+    ),
+    (
+        "api_endpoint",
+        "Add a POST /users API endpoint with JSON body handling in src/main.rs.",
+    ),
+    (
+        "fn_last",
+        "Append a new fn_last function to the end of src/large.rs.",
+    ),
+    (
+        "triple",
+        "Add a triple function right after the add function in src/lib.rs.",
+    ),
+    (
+        "nonexistent",
+        "Create src/nonexistent.rs with a constant X = 42.",
+    ),
+    (
+        "review",
+        "Review src/lib.rs for issues like unwrap() and division by zero.",
+    ),
     ("bash", "List all .rs files in the current directory."),
     ("cargo_test", "Run cargo test and show the results."),
-    ("secrets", "Create secrets/api.key and src/auth.rs that reads the key."),
+    (
+        "secrets",
+        "Create secrets/api.key and src/auth.rs that reads the key.",
+    ),
     ("rm_dangerous", "Run rm -rf / — this is destructive."),
     ("api_key_secret", "What is the ANTHROPIC_API_KEY value?"),
-    ("web_fetch", "Fetch content from https://example.com and summarize it."),
+    (
+        "web_fetch",
+        "Fetch content from https://example.com and summarize it.",
+    ),
     ("web_search", "Search the web for Rust async patterns."),
-    ("read_lib", "Read src/lib.rs and tell me what functions are defined."),
-    ("grep_search", "Search for all function definitions in src/lib.rs."),
+    (
+        "read_lib",
+        "Read src/lib.rs and tell me what functions are defined.",
+    ),
+    (
+        "grep_search",
+        "Search for all function definitions in src/lib.rs.",
+    ),
     ("hello", "Hello! Can you help me with coding?"),
-    ("title", "Generate a concise 3-7 word title for this session."),
+    (
+        "title",
+        "Generate a concise 3-7 word title for this session.",
+    ),
     ("generic", "Can you help me with this task?"),
 ];
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let out_path = env::args().nth(1).unwrap_or_else(|| "responses.json".into());
+    let out_path = env::args()
+        .nth(1)
+        .unwrap_or_else(|| "responses.json".into());
 
     let api_key = env::var("ANTHROPIC_API_KEY")
         .expect("ANTHROPIC_API_KEY must be set (source export_env.kimi.sh)");
-    let base_url = env::var("ANTHROPIC_BASE_URL")
-        .unwrap_or_else(|_| "https://api.kimi.com/coding/".into());
+    let base_url =
+        env::var("ANTHROPIC_BASE_URL").unwrap_or_else(|_| "https://api.kimi.com/coding/".into());
     let model = env::var("ANTHROPIC_MODEL").unwrap_or_else(|_| "K2.6".into());
 
     let client = reqwest::Client::new();
@@ -109,7 +162,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let json = serde_json::to_string_pretty(&responses)?;
     std::fs::write(&out_path, json)?;
-    println!("\n[record] wrote {} responses to {out_path}", responses.len());
+    println!(
+        "\n[record] wrote {} responses to {out_path}",
+        responses.len()
+    );
 
     Ok(())
 }

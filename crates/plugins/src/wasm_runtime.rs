@@ -99,7 +99,9 @@ impl PluginWasmInstance {
                 "version": env!("CARGO_PKG_VERSION")
             }
         });
-        let result = self.call_with_json("coderex_initialize", Some(&config.to_string())).await?;
+        let result = self
+            .call_with_json("coderex_initialize", Some(&config.to_string()))
+            .await?;
         self.initialized = true;
         Ok(result)
     }
@@ -123,13 +125,9 @@ impl PluginWasmInstance {
     }
 
     /// Execute a plugin command.
-    pub async fn execute_command(
-        &mut self,
-        name: &str,
-        args: &[String],
-    ) -> Result<String, String> {
-        let args_json = serde_json::to_string(args)
-            .map_err(|e| format!("failed to serialize args: {e}"))?;
+    pub async fn execute_command(&mut self, name: &str, args: &[String]) -> Result<String, String> {
+        let args_json =
+            serde_json::to_string(args).map_err(|e| format!("failed to serialize args: {e}"))?;
         let result = self
             .call_with_two_strings("coderex_command_execute", name, &args_json)
             .await?;
@@ -349,8 +347,7 @@ fn read_cstring(
         }
     }
     let bytes = &mem_data[offset..end];
-    String::from_utf8(bytes.to_vec())
-        .map_err(|e| format!("WASM string is not valid UTF-8: {e}"))
+    String::from_utf8(bytes.to_vec()).map_err(|e| format!("WASM string is not valid UTF-8: {e}"))
 }
 
 #[cfg(test)]

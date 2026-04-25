@@ -122,7 +122,11 @@ struct SkillFrontmatter {
     #[serde(default, deserialize_with = "deserialize_string_or_list")]
     hooks: Vec<String>,
     agent: Option<String>,
-    #[serde(default, alias = "allowed_tools", deserialize_with = "deserialize_string_or_list")]
+    #[serde(
+        default,
+        alias = "allowed_tools",
+        deserialize_with = "deserialize_string_or_list"
+    )]
     allowed_tools: Vec<String>,
     #[serde(default)]
     description: String,
@@ -455,7 +459,10 @@ This is the script content.
 
     #[test]
     fn loader_nonexistent_dir_is_silent() {
-        let mut loader = SkillLoader::new(PathBuf::from("/nonexistent"), PathBuf::from("/also-nonexistent"));
+        let mut loader = SkillLoader::new(
+            PathBuf::from("/nonexistent"),
+            PathBuf::from("/also-nonexistent"),
+        );
         loader.load_all(None);
         assert!(loader.list().is_empty());
     }
@@ -503,13 +510,25 @@ This is the script content.
         let mut loader = SkillLoader::new(dir.path().to_path_buf(), PathBuf::new());
         loader.load_all(None);
         loader.add_mcp_skill(SkillMetadata {
-            name: "m".into(), hooks: vec![], agent: None,
-            allowed_tools: vec![], description: String::new(), enabled: true,
+            name: "m".into(),
+            hooks: vec![],
+            agent: None,
+            allowed_tools: vec![],
+            description: String::new(),
+            enabled: true,
         });
 
         let counts = loader.count_by_source();
-        assert!(counts.iter().any(|(s, c)| matches!(s, SkillSource::Bundled) && *c == 1));
-        assert!(counts.iter().any(|(s, c)| matches!(s, SkillSource::Mcp) && *c == 1));
+        assert!(
+            counts
+                .iter()
+                .any(|(s, c)| matches!(s, SkillSource::Bundled) && *c == 1)
+        );
+        assert!(
+            counts
+                .iter()
+                .any(|(s, c)| matches!(s, SkillSource::Mcp) && *c == 1)
+        );
     }
 
     #[test]
@@ -519,7 +538,8 @@ This is the script content.
         std::fs::create_dir_all(&skills_dir).unwrap();
         std::fs::write(skills_dir.join("repo.md"), skill_content()).unwrap();
 
-        let mut loader = SkillLoader::new(PathBuf::from("/nonexistent"), PathBuf::from("/nonexistent"));
+        let mut loader =
+            SkillLoader::new(PathBuf::from("/nonexistent"), PathBuf::from("/nonexistent"));
         loader.load_all(Some(repo.path()));
 
         assert_eq!(loader.enabled().len(), 1);

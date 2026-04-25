@@ -57,12 +57,21 @@ impl Tool for AskUserQuestionTool {
         }
     }
 
-    async fn execute(&self, input: ToolInput, ctx: ToolContext<'_>) -> Result<ToolOutput, ToolError> {
-        let questions = input.arguments.get("questions").ok_or_else(|| ToolError::InvalidInput {
-            message: "missing required field: questions".into(),
-        })?;
+    async fn execute(
+        &self,
+        input: ToolInput,
+        ctx: ToolContext<'_>,
+    ) -> Result<ToolOutput, ToolError> {
+        let questions =
+            input
+                .arguments
+                .get("questions")
+                .ok_or_else(|| ToolError::InvalidInput {
+                    message: "missing required field: questions".into(),
+                })?;
 
-        let question_values: Vec<serde_json::Value> = questions.as_array()
+        let question_values: Vec<serde_json::Value> = questions
+            .as_array()
             .ok_or_else(|| ToolError::InvalidInput {
                 message: "questions must be an array".into(),
             })?
@@ -74,9 +83,12 @@ impl Tool for AskUserQuestionTool {
         tx.send(crate::tool::ElicitRequest {
             questions: question_values,
             response_tx,
-        }).await.map_err(|_| ToolError::ElicitationUnavailable)?;
+        })
+        .await
+        .map_err(|_| ToolError::ElicitationUnavailable)?;
 
-        let answers = response_rx.await
+        let answers = response_rx
+            .await
             .map_err(|_| ToolError::ElicitationUnavailable)?;
 
         Ok(ToolOutput {
@@ -89,8 +101,8 @@ impl Tool for AskUserQuestionTool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tool::ToolContext;
     use crate::context::ExecutionContext;
+    use crate::tool::ToolContext;
     use std::collections::HashMap;
     use std::path::Path;
     use std::sync::Arc;
@@ -161,7 +173,9 @@ mod tests {
 
         let request = rx.recv().await.expect("should receive elicit request");
         assert_eq!(request.questions.len(), 1);
-        let _ = request.response_tx.send(serde_json::json!({ "answer": "A" }));
+        let _ = request
+            .response_tx
+            .send(serde_json::json!({ "answer": "A" }));
 
         let output = handle.await.unwrap().unwrap();
         assert!(output.output.contains("A"));

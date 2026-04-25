@@ -17,8 +17,12 @@ pub fn register(registry: &mut CommandRegistry) {
                 CommandResult::success("IDE: Not connected\nUse /ide connect to link your IDE.")
             } else {
                 match args[0].as_str() {
-                    "connect" => CommandResult::success("Connecting to IDE...").with_state_change(true),
-                    "disconnect" => CommandResult::success("Disconnected from IDE.").with_state_change(true),
+                    "connect" => {
+                        CommandResult::success("Connecting to IDE...").with_state_change(true)
+                    }
+                    "disconnect" => {
+                        CommandResult::success("Disconnected from IDE.").with_state_change(true)
+                    }
                     _ => CommandResult::error("Usage: /ide [connect|disconnect]"),
                 }
             }
@@ -70,7 +74,10 @@ chrome_get_content    — Extract page HTML as markdown"
         true,
         true,
         Arc::new(|_ctx: &CommandContext, _args: &[String]| {
-            let has_desktop = std::env::var("CODEREX_DESKTOP").ok().map(|s| !s.is_empty()).unwrap_or(false);
+            let has_desktop = std::env::var("CODEREX_DESKTOP")
+                .ok()
+                .map(|s| !s.is_empty())
+                .unwrap_or(false);
             if has_desktop {
                 CommandResult::success("Desktop App: Connected\nRunning with desktop integration.")
             } else {
@@ -87,11 +94,16 @@ chrome_get_content    — Extract page HTML as markdown"
         true,
         true,
         Arc::new(|_ctx: &CommandContext, _args: &[String]| {
-            let has_mobile = std::env::var("CODEREX_MOBILE").ok().map(|s| !s.is_empty()).unwrap_or(false);
+            let has_mobile = std::env::var("CODEREX_MOBILE")
+                .ok()
+                .map(|s| !s.is_empty())
+                .unwrap_or(false);
             if has_mobile {
                 CommandResult::success("Mobile: Active\nMobile client connected via Bridge.")
             } else {
-                CommandResult::success("Mobile: No active connections\nUse Bridge to connect mobile clients.")
+                CommandResult::success(
+                    "Mobile: No active connections\nUse Bridge to connect mobile clients.",
+                )
             }
         }),
     ));
@@ -107,7 +119,9 @@ chrome_get_content    — Extract page HTML as markdown"
             if ctx.is_feature_enabled("voice_mode") {
                 CommandResult::success("Voice Mode: Toggled")
             } else {
-                CommandResult::error("Voice mode is not available. Enable the voice_mode feature flag.")
+                CommandResult::error(
+                    "Voice mode is not available. Enable the voice_mode feature flag.",
+                )
             }
         }),
     ));
@@ -121,8 +135,11 @@ chrome_get_content    — Extract page HTML as markdown"
         true,
         Arc::new(|ctx: &CommandContext, _args: &[String]| {
             let new_state = !ctx.vim_mode;
-            CommandResult::success(format!("Vim mode: {}", if new_state { "enabled" } else { "disabled" }))
-                .with_state_change(true)
+            CommandResult::success(format!(
+                "Vim mode: {}",
+                if new_state { "enabled" } else { "disabled" }
+            ))
+            .with_state_change(true)
         }),
     ));
 
@@ -145,8 +162,7 @@ chrome_get_content    — Extract page HTML as markdown"
                 }
                 CommandResult::success(output)
             } else {
-                CommandResult::success(format!("Setting env: {}", args[0]))
-                    .with_state_change(true)
+                CommandResult::success(format!("Setting env: {}", args[0])).with_state_change(true)
             }
         }),
     ));
@@ -160,12 +176,15 @@ chrome_get_content    — Extract page HTML as markdown"
         true,
         Arc::new(|_ctx: &CommandContext, _args: &[String]| {
             let bridge_url = std::env::var("CODEREX_BRIDGE_URL").ok();
-            let api_key_set = std::env::var("ANTHROPIC_API_KEY").ok().map(|s| !s.is_empty()).unwrap_or(false)
-                || std::env::var("OPENAI_API_KEY").ok().map(|s| !s.is_empty()).unwrap_or(false);
-            let mut lines = vec![
-                "Remote Setup".to_string(),
-                "───────────".to_string(),
-            ];
+            let api_key_set = std::env::var("ANTHROPIC_API_KEY")
+                .ok()
+                .map(|s| !s.is_empty())
+                .unwrap_or(false)
+                || std::env::var("OPENAI_API_KEY")
+                    .ok()
+                    .map(|s| !s.is_empty())
+                    .unwrap_or(false);
+            let mut lines = vec!["Remote Setup".to_string(), "───────────".to_string()];
             if api_key_set {
                 lines.push("API key: configured".to_string());
             } else {
@@ -220,14 +239,22 @@ mod tests {
 
     #[test]
     fn ide_not_connected() {
-        let reg = { let mut r = CommandRegistry::new(); register(&mut r); r };
+        let reg = {
+            let mut r = CommandRegistry::new();
+            register(&mut r);
+            r
+        };
         let result = reg.execute("ide", &ctx(), &[]);
         assert!(result.output.contains("Not connected"));
     }
 
     #[test]
     fn ide_connect() {
-        let reg = { let mut r = CommandRegistry::new(); register(&mut r); r };
+        let reg = {
+            let mut r = CommandRegistry::new();
+            register(&mut r);
+            r
+        };
         let result = reg.execute("ide", &ctx(), &["connect".into()]);
         assert!(result.output.contains("Connecting"));
         assert!(result.state_changed);
@@ -235,35 +262,55 @@ mod tests {
 
     #[test]
     fn chrome_not_connected() {
-        let reg = { let mut r = CommandRegistry::new(); register(&mut r); r };
+        let reg = {
+            let mut r = CommandRegistry::new();
+            register(&mut r);
+            r
+        };
         let result = reg.execute("chrome", &ctx(), &[]);
         assert!(result.output.contains("Not connected"));
     }
 
     #[test]
     fn desktop_not_detected() {
-        let reg = { let mut r = CommandRegistry::new(); register(&mut r); r };
+        let reg = {
+            let mut r = CommandRegistry::new();
+            register(&mut r);
+            r
+        };
         let result = reg.execute("desktop", &ctx(), &[]);
         assert!(result.output.contains("terminal mode"));
     }
 
     #[test]
     fn mobile_no_connections() {
-        let reg = { let mut r = CommandRegistry::new(); register(&mut r); r };
+        let reg = {
+            let mut r = CommandRegistry::new();
+            register(&mut r);
+            r
+        };
         let result = reg.execute("mobile", &ctx(), &[]);
         assert!(result.output.contains("No active connections"));
     }
 
     #[test]
     fn voice_feature_gated() {
-        let reg = { let mut r = CommandRegistry::new(); register(&mut r); r };
+        let reg = {
+            let mut r = CommandRegistry::new();
+            register(&mut r);
+            r
+        };
         let result = reg.execute("voice", &ctx(), &[]);
         assert!(result.output.contains("not available"));
     }
 
     #[test]
     fn vim_toggle() {
-        let reg = { let mut r = CommandRegistry::new(); register(&mut r); r };
+        let reg = {
+            let mut r = CommandRegistry::new();
+            register(&mut r);
+            r
+        };
         // Default is false
         let result = reg.execute("vim", &ctx(), &[]);
         assert!(result.output.contains("enabled"));
@@ -272,15 +319,26 @@ mod tests {
 
     #[test]
     fn vim_already_on() {
-        let c = CommandContext { vim_mode: true, ..ctx() };
-        let reg = { let mut r = CommandRegistry::new(); register(&mut r); r };
+        let c = CommandContext {
+            vim_mode: true,
+            ..ctx()
+        };
+        let reg = {
+            let mut r = CommandRegistry::new();
+            register(&mut r);
+            r
+        };
         let result = reg.execute("vim", &c, &[]);
         assert!(result.output.contains("disabled"));
     }
 
     #[test]
     fn remote_env_empty() {
-        let reg = { let mut r = CommandRegistry::new(); register(&mut r); r };
+        let reg = {
+            let mut r = CommandRegistry::new();
+            register(&mut r);
+            r
+        };
         let result = reg.execute("remote-env", &ctx(), &[]);
         assert!(result.output.contains("none set"));
     }
@@ -290,14 +348,22 @@ mod tests {
         let mut env = std::collections::HashMap::new();
         env.insert("PATH".into(), "/usr/bin".into());
         let c = CommandContext { env, ..ctx() };
-        let reg = { let mut r = CommandRegistry::new(); register(&mut r); r };
+        let reg = {
+            let mut r = CommandRegistry::new();
+            register(&mut r);
+            r
+        };
         let result = reg.execute("remote-env", &c, &[]);
         assert!(result.output.contains("PATH"));
     }
 
     #[test]
     fn remote_setup_instructions() {
-        let reg = { let mut r = CommandRegistry::new(); register(&mut r); r };
+        let reg = {
+            let mut r = CommandRegistry::new();
+            register(&mut r);
+            r
+        };
         let result = reg.execute("remote-setup", &ctx(), &[]);
         assert!(result.output.contains("API key"));
         assert!(result.output.contains("Bridge"));
@@ -305,7 +371,11 @@ mod tests {
 
     #[test]
     fn statusline_setup_opens_wizard() {
-        let reg = { let mut r = CommandRegistry::new(); register(&mut r); r };
+        let reg = {
+            let mut r = CommandRegistry::new();
+            register(&mut r);
+            r
+        };
         let result = reg.execute("statusline-setup", &ctx(), &[]);
         assert!(result.output.contains("Statusline Setup"));
         assert!(result.state_changed);

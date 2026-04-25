@@ -48,12 +48,7 @@ impl SessionStore {
         self.conn.execute(
             "INSERT OR REPLACE INTO sessions (id, auth_token, created_at, last_activity)
              VALUES (?1, ?2, ?3, ?4)",
-            [
-                &session.id,
-                &session.auth_token,
-                &session.created_at,
-                &now,
-            ],
+            [&session.id, &session.auth_token, &session.created_at, &now],
         )?;
         debug!("Saved session {}", session.id);
         Ok(())
@@ -62,7 +57,7 @@ impl SessionStore {
     /// Load all active sessions from the database.
     pub fn load_all(&self) -> Result<Vec<PersistedSession>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, auth_token, created_at, last_activity FROM sessions ORDER BY created_at"
+            "SELECT id, auth_token, created_at, last_activity FROM sessions ORDER BY created_at",
         )?;
         let rows = stmt.query_map([], |row| {
             Ok(PersistedSession {
@@ -82,10 +77,8 @@ impl SessionStore {
 
     /// Remove a session from the database.
     pub fn remove(&mut self, session_id: &str) -> Result<()> {
-        self.conn.execute(
-            "DELETE FROM sessions WHERE id = ?1",
-            [session_id],
-        )?;
+        self.conn
+            .execute("DELETE FROM sessions WHERE id = ?1", [session_id])?;
         debug!("Removed session {} from store", session_id);
         Ok(())
     }

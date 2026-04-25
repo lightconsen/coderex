@@ -1,8 +1,8 @@
 //! SQLite session metadata index.
 
 use chrono::{DateTime, Utc};
-use rusqlite::params;
 use rusqlite::Connection;
+use rusqlite::params;
 use std::collections::HashMap;
 use std::path::Path;
 use thiserror::Error;
@@ -135,15 +135,18 @@ impl SessionIndex {
 
     /// List the most recent sessions.
     pub fn list_recent(&self, limit: usize) -> Result<Vec<SessionMeta>, SessionIndexError> {
-        let mut stmt = self.conn.prepare(
-            "SELECT * FROM sessions ORDER BY last_active_at DESC LIMIT ?1",
-        )?;
+        let mut stmt = self
+            .conn
+            .prepare("SELECT * FROM sessions ORDER BY last_active_at DESC LIMIT ?1")?;
         let rows = stmt.query_map([limit], row_to_meta)?;
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
 
     /// List all sessions for a project.
-    pub fn list_by_project(&self, project_path: &str) -> Result<Vec<SessionMeta>, SessionIndexError> {
+    pub fn list_by_project(
+        &self,
+        project_path: &str,
+    ) -> Result<Vec<SessionMeta>, SessionIndexError> {
         let mut stmt = self.conn.prepare(
             "SELECT * FROM sessions WHERE project_path = ?1 ORDER BY last_active_at DESC",
         )?;
@@ -167,11 +170,7 @@ impl SessionIndex {
     /// Search sessions by full-text query on title and tags.
     ///
     /// Returns matching sessions ordered by last_active_at.
-    pub fn search(
-        &self,
-        query: &str,
-        limit: usize,
-    ) -> Result<Vec<SessionMeta>, SessionIndexError> {
+    pub fn search(&self, query: &str, limit: usize) -> Result<Vec<SessionMeta>, SessionIndexError> {
         let search_term = format!("{}*", query);
         let mut stmt = self.conn.prepare(
             "SELECT s.* FROM sessions s
@@ -214,11 +213,7 @@ impl SessionIndex {
     /// Tokenizes the content, stores term frequencies in the `tfidf` table.
     /// On subsequent `search_semantic` calls, query tokens are compared
     /// against stored term frequencies using cosine similarity.
-    pub fn index_content(
-        &self,
-        session_id: &str,
-        content: &str,
-    ) -> Result<(), SessionIndexError> {
+    pub fn index_content(&self, session_id: &str, content: &str) -> Result<(), SessionIndexError> {
         self.conn.execute(
             "DELETE FROM session_tfidf WHERE session_id = ?1",
             [session_id],
@@ -240,14 +235,13 @@ impl SessionIndex {
 
         // Update document frequency count
         for term in terms.keys() {
-            self.conn.execute(
-                "UPDATE session_idf SET df = df + 1 WHERE term = ?1",
-                [term],
-            )?;
+            self.conn
+                .execute("UPDATE session_idf SET df = df + 1 WHERE term = ?1", [term])?;
             if self.conn.execute(
                 "INSERT OR IGNORE INTO session_idf (term, df) VALUES (?1, 1)",
                 [term],
-            )? == 0 {
+            )? == 0
+            {
                 // Already existed, df was updated above
             }
         }
@@ -281,9 +275,9 @@ impl SessionIndex {
         let doc_count = doc_count.max(1);
 
         // Load all stored TF values into memory
-        let mut stmt = self.conn.prepare(
-            "SELECT session_id, term, tf FROM session_tfidf",
-        )?;
+        let mut stmt = self
+            .conn
+            .prepare("SELECT session_id, term, tf FROM session_tfidf")?;
         let rows = stmt.query_map([], |row| {
             let sid: String = row.get(0)?;
             let term: String = row.get(1)?;
@@ -534,9 +528,15 @@ mod tests {
     fn semantic_search_finds_indexed_content() {
         let (index, _tmp) = temp_index();
 
-        index.index_content("sess_auth", "authentication login oauth2 token session").unwrap();
-        index.index_content("sess_ui", "react component button styling css").unwrap();
-        index.index_content("sess_db", "database migration postgresql schema").unwrap();
+        index
+            .index_content("sess_auth", "authentication login oauth2 token session")
+            .unwrap();
+        index
+            .index_content("sess_ui", "react component button styling css")
+            .unwrap();
+        index
+            .index_content("sess_db", "database migration postgresql schema")
+            .unwrap();
 
         let results = index.search_semantic("authentication token", 3).unwrap();
         assert!(!results.is_empty());
@@ -560,10 +560,9 @@ mod tests {
         let (index, _tmp) = temp_index();
 
         for i in 0..5 {
-            index.index_content(
-                &format!("sem_{i}"),
-                &format!("test session number {i}"),
-            ).unwrap();
+            index
+                .index_content(&format!("sem_{i}"), &format!("test session number {i}"))
+                .unwrap();
         }
 
         let results = index.search_semantic("test session", 2).unwrap();

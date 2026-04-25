@@ -67,7 +67,10 @@ pub fn load_custom_agents() -> HashMap<String, CustomAgentDef> {
 
 /// Resolve a custom agent definition by name.
 #[must_use]
-pub fn get_custom_agent<'a>(name: &str, agents: &'a HashMap<String, CustomAgentDef>) -> Option<&'a CustomAgentDef> {
+pub fn get_custom_agent<'a>(
+    name: &str,
+    agents: &'a HashMap<String, CustomAgentDef>,
+) -> Option<&'a CustomAgentDef> {
     agents.get(name)
 }
 
@@ -92,7 +95,8 @@ mod tests {
         };
 
         let mut file = std::fs::File::create(agents_dir.join("test.json")).unwrap();
-        file.write_all(serde_json::to_string(&def).unwrap().as_bytes()).unwrap();
+        file.write_all(serde_json::to_string(&def).unwrap().as_bytes())
+            .unwrap();
 
         // Temporarily override home dir by creating a custom loader
         // Since load_custom_agents uses home::home_dir(), we can't easily

@@ -100,7 +100,11 @@ mod tests {
 
     #[test]
     fn config_shows_current_state() {
-        let reg = { let mut r = CommandRegistry::new(); register(&mut r); r };
+        let reg = {
+            let mut r = CommandRegistry::new();
+            register(&mut r);
+            r
+        };
         let result = reg.execute("config", &ctx(), &[]);
         assert!(result.output.contains("Model"));
         assert!(result.output.contains("Permissions"));
@@ -108,7 +112,11 @@ mod tests {
 
     #[test]
     fn config_key_sets_value() {
-        let reg = { let mut r = CommandRegistry::new(); register(&mut r); r };
+        let reg = {
+            let mut r = CommandRegistry::new();
+            register(&mut r);
+            r
+        };
         let result = reg.execute("config", &ctx(), &["model".into()]);
         assert!(result.output.contains("model"));
         assert!(result.state_changed);
@@ -116,14 +124,22 @@ mod tests {
 
     #[test]
     fn model_switch_requires_arg() {
-        let reg = { let mut r = CommandRegistry::new(); register(&mut r); r };
+        let reg = {
+            let mut r = CommandRegistry::new();
+            register(&mut r);
+            r
+        };
         let result = reg.execute("model", &ctx(), &[]);
         assert!(result.output.contains("Usage"));
     }
 
     #[test]
     fn model_switch_to_opus() {
-        let reg = { let mut r = CommandRegistry::new(); register(&mut r); r };
+        let reg = {
+            let mut r = CommandRegistry::new();
+            register(&mut r);
+            r
+        };
         let result = reg.execute("model", &ctx(), &["opus".into()]);
         assert!(result.output.contains("claude-opus"));
         assert!(result.state_changed);
@@ -131,28 +147,44 @@ mod tests {
 
     #[test]
     fn model_switch_to_haiku() {
-        let reg = { let mut r = CommandRegistry::new(); register(&mut r); r };
+        let reg = {
+            let mut r = CommandRegistry::new();
+            register(&mut r);
+            r
+        };
         let result = reg.execute("model", &ctx(), &["haiku".into()]);
         assert!(result.output.contains("haiku"));
     }
 
     #[test]
     fn model_switch_unknown() {
-        let reg = { let mut r = CommandRegistry::new(); register(&mut r); r };
+        let reg = {
+            let mut r = CommandRegistry::new();
+            register(&mut r);
+            r
+        };
         let result = reg.execute("model", &ctx(), &["unknown-model".into()]);
         assert!(result.output.contains("unknown-model"));
     }
 
     #[test]
     fn permissions_shows_current() {
-        let reg = { let mut r = CommandRegistry::new(); register(&mut r); r };
+        let reg = {
+            let mut r = CommandRegistry::new();
+            register(&mut r);
+            r
+        };
         let result = reg.execute("permissions", &ctx(), &[]);
         assert!(result.output.contains("permission mode"));
     }
 
     #[test]
     fn permissions_set_bypass() {
-        let reg = { let mut r = CommandRegistry::new(); register(&mut r); r };
+        let reg = {
+            let mut r = CommandRegistry::new();
+            register(&mut r);
+            r
+        };
         let result = reg.execute("permissions", &ctx(), &["bypass".into()]);
         assert!(result.output.contains("BypassPermissions"));
         assert!(result.state_changed);
@@ -160,14 +192,22 @@ mod tests {
 
     #[test]
     fn permissions_set_plan() {
-        let reg = { let mut r = CommandRegistry::new(); register(&mut r); r };
+        let reg = {
+            let mut r = CommandRegistry::new();
+            register(&mut r);
+            r
+        };
         let result = reg.execute("permissions", &ctx(), &["plan".into()]);
         assert!(result.output.contains("Plan"));
     }
 
     #[test]
     fn permissions_set_unknown_mode() {
-        let reg = { let mut r = CommandRegistry::new(); register(&mut r); r };
+        let reg = {
+            let mut r = CommandRegistry::new();
+            register(&mut r);
+            r
+        };
         let result = reg.execute("permissions", &ctx(), &["foobar".into()]);
         assert!(result.output.contains("Error"));
     }

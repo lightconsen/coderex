@@ -2,17 +2,17 @@
 
 #![warn(missing_docs)]
 
-pub mod transcript;
-pub mod session_index;
-pub mod long_term;
-pub mod session_memory;
-pub mod team_memory;
-pub mod auto_dream;
 pub mod ai_workflow;
-pub mod session_memory_agent;
-pub mod extract_memories;
-pub mod prompts;
+pub mod auto_dream;
 pub mod concurrent;
+pub mod extract_memories;
+pub mod long_term;
+pub mod prompts;
+pub mod session_index;
+pub mod session_memory;
+pub mod session_memory_agent;
+pub mod team_memory;
+pub mod transcript;
 
 #[cfg(feature = "encryption")]
 pub mod transcript_crypto;
@@ -20,15 +20,13 @@ pub mod transcript_crypto;
 #[cfg(feature = "team-http")]
 pub mod team_http;
 
+pub use auto_dream::{AutoDream, DreamCheckResult, DreamConfig, DreamSession};
+pub use concurrent::{ConcurrentLongTermStore, ConcurrentTranscriptStore, SharedSessionIndex};
 pub use long_term::{LongTermStore, MemoryEntry, MemoryKey};
 pub use team_memory::{
-    TeamMemoryEntry, TeamMemorySyncService, MemoryChecksum,
-    SyncResult, RemoteState, TeamSyncTransport,
+    MemoryChecksum, RemoteState, SyncResult, TeamMemoryEntry, TeamMemorySyncService,
+    TeamSyncTransport,
 };
-pub use auto_dream::{
-    AutoDream, DreamConfig, DreamCheckResult, DreamSession,
-};
-pub use concurrent::{ConcurrentTranscriptStore, ConcurrentLongTermStore, SharedSessionIndex};
 
 #[cfg(feature = "encryption")]
 pub use transcript_crypto::{derive_cipher, generate_master_key};

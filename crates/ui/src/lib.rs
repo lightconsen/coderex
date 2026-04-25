@@ -2,6 +2,7 @@
 
 #![warn(missing_docs)]
 
+pub mod export;
 pub mod input;
 pub mod keybindings;
 pub mod message_list;
@@ -16,7 +17,6 @@ pub mod statusline_setup;
 pub mod terminal;
 pub mod themes;
 pub mod vim;
-pub mod export;
 
 #[cfg(feature = "voice")]
 pub mod voice;

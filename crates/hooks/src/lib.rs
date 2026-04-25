@@ -8,4 +8,6 @@ pub mod stop_hook;
 
 pub use engine::{HookConfig, HookInput, HookMatcher, HookRegistry};
 pub use events::{HookAction, HookError, HookPermissionDecision, HookResult};
-pub use stop_hook::{execute_stop_hook, should_proceed_with_compact, StopHookContext, StopHookDecision};
+pub use stop_hook::{
+    StopHookContext, StopHookDecision, execute_stop_hook, should_proceed_with_compact,
+};

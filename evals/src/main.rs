@@ -8,7 +8,7 @@
 //! cargo run --bin eval-runner
 //! ```
 
-use coderex_test_utils::{EvalAssertion, run_eval, EvalScenario};
+use coderex_test_utils::{EvalAssertion, EvalScenario, run_eval};
 use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
@@ -22,18 +22,22 @@ async fn main() {
     println!("╚══════════════════════════════════════════════════════════════╝");
     println!();
 
-    let scenarios = vec![
-        tool_call_eval(),
-        no_tool_eval(),
-        streaming_text_eval(),
-    ];
+    let scenarios = vec![tool_call_eval(), no_tool_eval(), streaming_text_eval()];
 
     let mut passed = 0;
     let mut failed = 0;
 
     for scenario in scenarios {
         let result = run_eval(scenario).await;
-        println!("  {:.<50} {}", result.name, if result.passed { "✓ PASS" } else { "✗ FAIL" });
+        println!(
+            "  {:.<50} {}",
+            result.name,
+            if result.passed {
+                "✓ PASS"
+            } else {
+                "✗ FAIL"
+            }
+        );
 
         if !result.passed {
             failed += 1;
@@ -77,8 +81,12 @@ fn tool_call_eval() -> EvalScenario {
             "Done reading the file.".into(),
         ],
         assertions: vec![
-            EvalAssertion::ToolCalled { name: "Read".into() },
-            EvalAssertion::OutputContains { text: "stub ok: Read".into() },
+            EvalAssertion::ToolCalled {
+                name: "Read".into(),
+            },
+            EvalAssertion::OutputContains {
+                text: "stub ok: Read".into(),
+            },
         ],
         tool_executor: None,
     }
@@ -89,7 +97,9 @@ fn no_tool_eval() -> EvalScenario {
         name: "no_tool/simple_response".into(),
         responses: vec!["Hello, world!".into()],
         assertions: vec![
-            EvalAssertion::ToolNotCalled { name: "Read".into() },
+            EvalAssertion::ToolNotCalled {
+                name: "Read".into(),
+            },
             EvalAssertion::TextDeltaCount { min: 1 },
         ],
         tool_executor: None,
@@ -102,7 +112,9 @@ fn streaming_text_eval() -> EvalScenario {
         responses: vec!["This is a streaming response.".into()],
         assertions: vec![
             EvalAssertion::TextDeltaCount { min: 1 },
-            EvalAssertion::ToolNotCalled { name: "Bash".into() },
+            EvalAssertion::ToolNotCalled {
+                name: "Bash".into(),
+            },
         ],
         tool_executor: None,
     }

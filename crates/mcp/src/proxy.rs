@@ -65,9 +65,10 @@ impl McpToolProxy {
 
     /// Execute the tool with the given arguments.
     pub async fn call(&self, args: Value) -> Result<Value, String> {
-        let channel = self.channel.as_ref().ok_or_else(|| {
-            format!("MCP server '{}' not connected", self.server)
-        })?;
+        let channel = self
+            .channel
+            .as_ref()
+            .ok_or_else(|| format!("MCP server '{}' not connected", self.server))?;
 
         let mut ch = channel.lock().await;
 
@@ -92,7 +93,9 @@ impl McpToolRegistry {
     /// Create a new empty registry.
     #[must_use]
     pub fn new() -> Self {
-        Self { tools: HashMap::new() }
+        Self {
+            tools: HashMap::new(),
+        }
     }
 
     /// Register a discovered tool.

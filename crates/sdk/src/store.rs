@@ -62,17 +62,14 @@ impl SessionStore {
     /// Load tracker state from disk.
     ///
     /// Returns `(PermissionTracker, ElicitationTracker)`.
-    pub async fn load(
-        &self,
-    ) -> Result<(PermissionTracker, ElicitationTracker), StoreError> {
+    pub async fn load(&self) -> Result<(PermissionTracker, ElicitationTracker), StoreError> {
         let json = tokio::fs::read_to_string(&self.path).await?;
         let snapshot: SessionSnapshot = serde_json::from_str(&json)?;
         Ok((snapshot.permissions, snapshot.elicitations))
     }
 
     /// Remove the persisted file, if it exists.
-    pub async fn remove(&self,
-    ) -> Result<(), StoreError> {
+    pub async fn remove(&self) -> Result<(), StoreError> {
         if self.path.exists() {
             tokio::fs::remove_file(&self.path).await?;
         }

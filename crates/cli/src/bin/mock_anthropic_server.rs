@@ -76,15 +76,25 @@ fn handle_connection(mut stream: TcpStream) {
         || body_str.contains("\\\"type\\\": \\\"object\\\"")
         || body_str.contains("\\\"type\\\":\\\"object\\\"")
         || body_str.contains("json_schema");
-    eprintln!("[mock] prompt='{prompt}' has_tool_result={has_tool_result} is_streaming={is_streaming} turn={turn_number} json_schema={has_json_schema}");
+    eprintln!(
+        "[mock] prompt='{prompt}' has_tool_result={has_tool_result} is_streaming={is_streaming} turn={turn_number} json_schema={has_json_schema}"
+    );
     if !has_tool_result {
-        eprintln!("[mock] body snippet: {}", &body_str.chars().take(500).collect::<String>());
+        eprintln!(
+            "[mock] body snippet: {}",
+            &body_str.chars().take(500).collect::<String>()
+        );
     }
 
     // Simulate API errors for retry testing
     let p_lower = prompt.to_lowercase();
-    if p_lower.contains("simulate error") || p_lower.contains("force error") || p_lower.contains("trigger error") {
-        let _ = stream.write_all(b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+    if p_lower.contains("simulate error")
+        || p_lower.contains("force error")
+        || p_lower.contains("trigger error")
+    {
+        let _ = stream.write_all(
+            b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        );
         let _ = stream.flush();
         return;
     }
@@ -190,9 +200,7 @@ fn resolve_text_response(prompt: &str) -> &str {
         p if p.contains("large") || p.contains("fn_last") => {
             "Done! Appended `fn_last` to the end of `src/large.rs`."
         }
-        p if p.contains("triple") => {
-            "Done! Added `triple` right after the `add` function."
-        }
+        p if p.contains("triple") => "Done! Added `triple` right after the `add` function.",
         p if p.contains("nonexistent") || p.contains("error") => {
             "Done! Created `src/nonexistent.rs` with `pub const X: i32 = 42;`."
         }
@@ -351,18 +359,29 @@ fn tool_to_json(tool: &Tool) -> (String, String) {
     match tool {
         Tool::Write { file, content } => {
             let escaped = json_escape_string(content);
-            ("Write".into(), format!(r#"{{"file_path":"{file}","content":"{escaped}"}}"#))
+            (
+                "Write".into(),
+                format!(r#"{{"file_path":"{file}","content":"{escaped}"}}"#),
+            )
         }
-        Tool::Edit { file, old_string, new_string } => {
+        Tool::Edit {
+            file,
+            old_string,
+            new_string,
+        } => {
             let old_e = json_escape_string(old_string);
             let new_e = json_escape_string(new_string);
-            ("Edit".into(), format!(r#"{{"file_path":"{file}","old_string":"{old_e}","new_string":"{new_e}"}}"#))
+            (
+                "Edit".into(),
+                format!(
+                    r#"{{"file_path":"{file}","old_string":"{old_e}","new_string":"{new_e}"}}"#
+                ),
+            )
         }
-        Tool::Bash { command } => {
-            ("Bash".into(), format!(r#"{{"command":"{command}"}}"#))
-        }
+        Tool::Bash { command } => ("Bash".into(), format!(r#"{{"command":"{command}"}}"#)),
         Tool::Read { file } => {
-            let _content = std::fs::read_to_string(file).unwrap_or_else(|_| format!("// File not found: {file}"));
+            let _content = std::fs::read_to_string(file)
+                .unwrap_or_else(|_| format!("// File not found: {file}"));
             ("Read".into(), format!(r#"{{"file_path":"{file}"}}"#))
         }
     }
@@ -383,10 +402,21 @@ fn json_escape_string(s: &str) -> String {
 
 #[derive(Debug)]
 enum Tool {
-    Write { file: String, content: String },
-    Edit { file: String, old_string: String, new_string: String },
-    Bash { command: String },
-    Read { file: String },
+    Write {
+        file: String,
+        content: String,
+    },
+    Edit {
+        file: String,
+        old_string: String,
+        new_string: String,
+    },
+    Bash {
+        command: String,
+    },
+    Read {
+        file: String,
+    },
 }
 
 fn select_tools(prompt: &str) -> Vec<Tool> {
@@ -591,7 +621,8 @@ async fn main() {
         vec![Tool::Edit {
             file: "src/large.rs".into(),
             old_string: "pub fn fn_9999() -> i32 { 9999 }\n".into(),
-            new_string: "pub fn fn_9999() -> i32 { 9999 }\npub fn fn_last() -> i32 { 9999 }\n".into(),
+            new_string: "pub fn fn_9999() -> i32 { 9999 }\npub fn fn_last() -> i32 { 9999 }\n"
+                .into(),
         }]
     } else if p.contains("triple") {
         vec![Tool::Write {

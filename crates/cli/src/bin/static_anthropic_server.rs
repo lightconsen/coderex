@@ -26,8 +26,7 @@ struct StaticResponses {
 impl StaticResponses {
     fn load(path: &str) -> Self {
         let content = fs::read_to_string(path).unwrap_or_else(|_| "{}".into());
-        let texts: HashMap<String, String> =
-            serde_json::from_str(&content).unwrap_or_default();
+        let texts: HashMap<String, String> = serde_json::from_str(&content).unwrap_or_default();
         Self { texts }
     }
 
@@ -210,7 +209,10 @@ fn resolve_text_response(prompt: &str, responses: &StaticResponses) -> String {
     let p = prompt.to_lowercase();
 
     if p.contains("fibonacci") {
-        responses.resolve("fibonacci", "Done! I've added the recursive fibonacci function.")
+        responses.resolve(
+            "fibonacci",
+            "Done! I've added the recursive fibonacci function.",
+        )
     } else if p.contains("factorial") || p.contains("bug") {
         responses.resolve("factorial", "Fixed! The factorial bug has been corrected.")
     } else if p.contains("multiply") {
@@ -218,7 +220,10 @@ fn resolve_text_response(prompt: &str, responses: &StaticResponses) -> String {
     } else if p.contains("max") {
         responses.resolve("max", "Fixed! The max function now works correctly.")
     } else if p.contains("palindrome") {
-        responses.resolve("palindrome", "Implemented! The is_palindrome function is ready.")
+        responses.resolve(
+            "palindrome",
+            "Implemented! The is_palindrome function is ready.",
+        )
     } else if p.contains("stack") {
         responses.resolve("stack", "Done! Added the generic Stack<T> with tests.")
     } else if p.contains("format_user_label") || p.contains("refactor") {
@@ -236,12 +241,18 @@ fn resolve_text_response(prompt: &str, responses: &StaticResponses) -> String {
     } else if p.contains("review") {
         responses.resolve("review", "Review complete. Found potential issues.")
     } else if p.contains("rm -rf") || p.contains("dangerous") {
-        responses.resolve("rm_dangerous", "I can't run that destructive command. It would damage the system.")
+        responses.resolve(
+            "rm_dangerous",
+            "I can't run that destructive command. It would damage the system.",
+        )
     } else if p.contains("cargo test") || p.contains("test results") {
         responses.resolve("cargo_test", "Running tests... All passed.")
     } else if p.contains("secrets") || p.contains("api.key") {
         responses.resolve("secrets", "Created the secrets file and auth module.")
-    } else if p.contains("rust source files") || p.contains("glob") || p.contains("list all") && p.contains("files") {
+    } else if p.contains("rust source files")
+        || p.contains("glob")
+        || p.contains("list all") && p.contains("files")
+    {
         responses.resolve("bash", "Here are the files in the directory.")
     } else if p.contains("bash") || p.contains("list") || p.contains("files") {
         responses.resolve("bash", "Here are the files in the directory.")
@@ -377,19 +388,27 @@ fn tool_to_json(tool: &Tool) -> (String, String) {
     match tool {
         Tool::Write { file, content } => {
             let escaped = json_escape_string(content);
-            ("Write".into(), format!(r#"{{"file_path":"{file}","content":"{escaped}"}}"#))
+            (
+                "Write".into(),
+                format!(r#"{{"file_path":"{file}","content":"{escaped}"}}"#),
+            )
         }
-        Tool::Edit { file, old_string, new_string } => {
+        Tool::Edit {
+            file,
+            old_string,
+            new_string,
+        } => {
             let old_e = json_escape_string(old_string);
             let new_e = json_escape_string(new_string);
-            ("Edit".into(), format!(r#"{{"file_path":"{file}","old_string":"{old_e}","new_string":"{new_e}"}}"#))
+            (
+                "Edit".into(),
+                format!(
+                    r#"{{"file_path":"{file}","old_string":"{old_e}","new_string":"{new_e}"}}"#
+                ),
+            )
         }
-        Tool::Bash { command } => {
-            ("Bash".into(), format!(r#"{{"command":"{command}"}}"#))
-        }
-        Tool::Read { file } => {
-            ("Read".into(), format!(r#"{{"file_path":"{file}"}}"#))
-        }
+        Tool::Bash { command } => ("Bash".into(), format!(r#"{{"command":"{command}"}}"#)),
+        Tool::Read { file } => ("Read".into(), format!(r#"{{"file_path":"{file}"}}"#)),
     }
 }
 
@@ -408,10 +427,21 @@ fn json_escape_string(s: &str) -> String {
 
 #[derive(Debug)]
 enum Tool {
-    Write { file: String, content: String },
-    Edit { file: String, old_string: String, new_string: String },
-    Bash { command: String },
-    Read { file: String },
+    Write {
+        file: String,
+        content: String,
+    },
+    Edit {
+        file: String,
+        old_string: String,
+        new_string: String,
+    },
+    Bash {
+        command: String,
+    },
+    Read {
+        file: String,
+    },
 }
 
 fn select_tools(prompt: &str) -> Vec<Tool> {
@@ -616,7 +646,8 @@ async fn main() {
         vec![Tool::Edit {
             file: "src/large.rs".into(),
             old_string: "pub fn fn_9999() -> i32 { 9999 }\n".into(),
-            new_string: "pub fn fn_9999() -> i32 { 9999 }\npub fn fn_last() -> i32 { 9999 }\n".into(),
+            new_string: "pub fn fn_9999() -> i32 { 9999 }\npub fn fn_last() -> i32 { 9999 }\n"
+                .into(),
         }]
     } else if p.contains("triple") {
         vec![Tool::Write {
