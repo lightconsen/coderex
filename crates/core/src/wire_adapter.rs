@@ -16,9 +16,10 @@ pub fn engine_event_to_wire(event: &EngineEvent) -> Option<WireEvent> {
         EngineEvent::TextDelta(delta) => WireEvent::TextDelta {
             delta: delta.clone(),
         },
-        EngineEvent::ToolCallStart { id, name } => WireEvent::ToolCallStart {
+        EngineEvent::ToolCallStart { id, name, summary } => WireEvent::ToolCallStart {
             id: id.clone(),
             name: name.clone(),
+            summary: summary.clone(),
         },
         EngineEvent::ToolCallEnd { id, result } => WireEvent::ToolCallEnd {
             id: id.clone(),
@@ -64,9 +65,10 @@ pub fn engine_event_to_wire(event: &EngineEvent) -> Option<WireEvent> {
 pub fn wire_event_to_engine(event: &WireEvent) -> Option<EngineEvent> {
     Some(match event {
         WireEvent::TextDelta { delta } => EngineEvent::TextDelta(delta.clone()),
-        WireEvent::ToolCallStart { id, name } => EngineEvent::ToolCallStart {
+        WireEvent::ToolCallStart { id, name, summary } => EngineEvent::ToolCallStart {
             id: id.clone(),
             name: name.clone(),
+            summary: summary.clone(),
         },
         WireEvent::ToolCallEnd { id, result } => EngineEvent::ToolCallEnd {
             id: id.clone(),

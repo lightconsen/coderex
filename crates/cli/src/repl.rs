@@ -16,7 +16,7 @@ use coderex_core::prompts;
 use coderex_core::query_profiles::{ModelProfile, PromptProfile, QueryKind, QueryRequest};
 use coderex_core::state::SessionState;
 use coderex_core::types::ModelId;
-use coderex_core::types::{EngineEvent, Message};
+use coderex_core::types::{EngineEvent, Message, ToolCall};
 use coderex_memory::{
     DreamCheckResult, ai_workflow,
     auto_dream::{AutoDream, DreamConfig},
@@ -51,6 +51,60 @@ struct SessionEffects {
     extra_context: Vec<String>,
     /// Whether a title has been generated for this session.
     title_generated: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum InteractivePhase {
+    Idle,
+    Planning,
+    Thinking,
+    RunningTool(String),
+    WaitingForPermission(String),
+}
+
+impl InteractivePhase {
+    fn reset(&mut self) {
+        *self = Self::Idle;
+    }
+
+    fn note_text_delta(&mut self) {
+        if !matches!(self, Self::RunningTool(_)) {
+            *self = Self::Thinking;
+        }
+    }
+
+    fn note_tool_start(&mut self, summary: &str) {
+        *self = Self::RunningTool(summary.to_string());
+    }
+
+    fn note_tool_end(&mut self) {
+        *self = Self::Thinking;
+    }
+
+    fn note_permission_request(&mut self, tool: &str, args: &serde_json::Value) {
+        *self = Self::WaitingForPermission(permission_activity_label(
+            &ToolCall::summarize_activity(tool, args),
+        ));
+    }
+
+    fn status_label(&self) -> Option<String> {
+        match self {
+            Self::Idle => None,
+            Self::Planning => Some("Planning...".into()),
+            Self::Thinking => Some("Thinking...".into()),
+            Self::RunningTool(summary) | Self::WaitingForPermission(summary) => {
+                Some(summary.clone())
+            }
+        }
+    }
+}
+
+fn permission_activity_label(summary: &str) -> String {
+    if summary.is_empty() {
+        "Waiting for permission...".into()
+    } else {
+        format!("Waiting for permission: {summary}")
+    }
 }
 
 /// Result from a completed background task, delivered to the UI.
@@ -891,7 +945,7 @@ impl ReplLoop {
 
     /// Run the interactive REPL with full ratatui TUI.
     pub async fn run_tui(&mut self) -> Result<()> {
-        use coderex_ui::input::InputAction;
+        use coderex_ui::input::{InputAction, InputBuffer};
         use coderex_ui::message_list::{Message, MessageRole};
         use coderex_ui::overlay::Overlay;
         use coderex_ui::state::{UiState, ViewMode};
@@ -911,7 +965,7 @@ impl ReplLoop {
         ui_state.messages.push(Message {
             role: MessageRole::System,
             content: format!(
-                "CodeRex v{} | model: {} | cwd: {} | Type /help for commands, Ctrl+C to exit",
+                "CodeRex v{} | model: {} | cwd: {} | Type /help for commands, Ctrl+C to clear, Ctrl+D to exit",
                 env!("CARGO_PKG_VERSION"),
                 self.model.0,
                 self.cwd
@@ -943,6 +997,7 @@ impl ReplLoop {
         let mut event_rx = self.event_rx.take();
         let mut vim = VimState::new_insert();
         let mut thinking = false;
+        let mut phase = InteractivePhase::Idle;
         let mut query_done_rx: Option<
             tokio::sync::oneshot::Receiver<(QueryEngine, Result<TerminalReason, String>)>,
         > = None;
@@ -956,12 +1011,12 @@ impl ReplLoop {
             // Sync statusline from REPL state
             self.sync_statusline(&mut ui_state.statusline);
             ui_state.statusline.thinking = thinking;
+            ui_state.statusline.plan_status = None;
             if thinking {
                 ui_state.statusline.spinner_frame =
                     ui_state.statusline.spinner_frame.wrapping_add(1);
-                if ui_state.statusline.thinking_label.is_none() {
-                    ui_state.statusline.thinking_label = Some("Thinking".into());
-                }
+                ui_state.statusline.thinking_label =
+                    phase.status_label().or_else(|| Some("Thinking...".into()));
                 if ui_state.statusline.thinking_started.is_none() {
                     ui_state.statusline.thinking_started = Some(std::time::Instant::now());
                 }
@@ -1045,6 +1100,7 @@ impl ReplLoop {
                             {
                                 if thinking {
                                     thinking = false;
+                                    phase.reset();
                                     query_done_rx = None;
                                     if let Some(last) = ui_state.messages.messages.last_mut() {
                                         if last.role == MessageRole::Assistant {
@@ -1055,9 +1111,19 @@ impl ReplLoop {
                                         }
                                     }
                                     continue;
-                                } else {
-                                    break Ok(());
                                 }
+                                if !ui_state.input.text.is_empty() {
+                                    ui_state.input = InputBuffer::new();
+                                } else if ui_state.overlays.is_active() {
+                                    ui_state.overlays.clear();
+                                }
+                                continue;
+                            }
+
+                            if key.code == KeyCode::Char('d')
+                                && key.modifiers.contains(KeyModifiers::CONTROL)
+                            {
+                                break Ok(());
                             }
 
                             // Shift+Tab: cycle permission mode
@@ -1117,6 +1183,7 @@ impl ReplLoop {
                                             &text,
                                             &mut ui_state,
                                             &mut thinking,
+                                            &mut phase,
                                             &mut query_done_rx,
                                             &mut elicit_rx,
                                         ).await;
@@ -1125,6 +1192,7 @@ impl ReplLoop {
                                 VimAction::Escape => {
                                     if thinking {
                                         thinking = false;
+                                        phase.reset();
                                         query_done_rx = None;
                                         elicit_rx = None;
                                         if let Some(last) = ui_state.messages.messages.last_mut() {
@@ -1323,6 +1391,7 @@ impl ReplLoop {
                     self.forward_engine_event(&engine_event);
                     match engine_event {
                         EngineEvent::TextDelta(delta) => {
+                            phase.note_text_delta();
                             if let Some(last) = ui_state.messages.messages.last_mut() {
                                 if last.role == MessageRole::Assistant && last.streaming {
                                     let mut content = last.content.to_string();
@@ -1331,16 +1400,18 @@ impl ReplLoop {
                                 }
                             }
                         }
-                        EngineEvent::ToolCallStart { name, .. } => {
+                        EngineEvent::ToolCallStart { name, summary, .. } => {
+                            phase.note_tool_start(&summary);
                             ui_state.messages.push(Message {
                                 role: MessageRole::ToolCall,
-                                content: format!("Calling {name}...").into(),
+                                content: summary.into(),
                                 tool_name: Some(name.into()),
                                 streaming: false,
                             folded: false,
                             });
                         }
                         EngineEvent::ToolCallEnd { result, .. } => {
+                            phase.note_tool_end();
                             let content = if result.is_error {
                                 format!("Error: {}", result.output)
                             } else {
@@ -1354,9 +1425,19 @@ impl ReplLoop {
                             folded: false,
                             });
                         }
-                        EngineEvent::PermissionRequest { tool, .. } => {
+                        EngineEvent::PermissionRequest { tool, args, .. } => {
+                            let label =
+                                permission_activity_label(&ToolCall::summarize_activity(&tool, &args));
+                            phase.note_permission_request(&tool, &args);
+                            ui_state.messages.push(Message {
+                                role: MessageRole::System,
+                                content: label.clone().into(),
+                                tool_name: None,
+                                streaming: false,
+                                folded: false,
+                            });
                             ui_state.overlays.push(Overlay::Notification {
-                                message: format!("Permission required: {tool}"),
+                                message: label,
                                 level: coderex_ui::overlay::NotificationLevel::Warning,
                             });
                         }
@@ -1371,6 +1452,7 @@ impl ReplLoop {
                     query_done_rx = None;
                     elicit_rx = None;
                     thinking = false;
+                    phase.reset();
 
                     if let Some(last) = ui_state.messages.messages.last_mut() {
                         if last.role == MessageRole::Assistant {
@@ -2374,6 +2456,7 @@ impl ReplLoop {
         text: &str,
         ui_state: &mut coderex_ui::state::UiState,
         thinking: &mut bool,
+        phase: &mut InteractivePhase,
         query_done_rx: &mut Option<
             tokio::sync::oneshot::Receiver<(QueryEngine, Result<TerminalReason, String>)>,
         >,
@@ -2477,6 +2560,7 @@ impl ReplLoop {
             *query_done_rx = Some(rx);
             *elicit_rx = Some(erx);
             *thinking = true;
+            *phase = InteractivePhase::Planning;
         } else {
             ui_state.messages.push(coderex_ui::message_list::Message {
                 role: coderex_ui::message_list::MessageRole::Assistant,
@@ -2500,6 +2584,11 @@ impl ReplLoop {
         let result = self.commands.execute(cmd_name, &ctx, args);
         self.apply_command_effects(&result);
 
+        if cmd_name == "clear" && result.state_changed {
+            self.clear_tui_session(ui_state, result.output.clone());
+            return;
+        }
+
         ui_state.messages.push(coderex_ui::message_list::Message {
             role: if result.scrollable {
                 coderex_ui::message_list::MessageRole::Assistant
@@ -2507,6 +2596,24 @@ impl ReplLoop {
                 coderex_ui::message_list::MessageRole::System
             },
             content: result.output.into(),
+            tool_name: None,
+            streaming: false,
+            folded: false,
+        });
+    }
+
+    fn clear_tui_session(&mut self, ui_state: &mut coderex_ui::state::UiState, message: String) {
+        self.history.clear();
+        ui_state.messages = coderex_ui::message_list::MessageView::new(1000);
+        ui_state.overlays.clear();
+        ui_state.notifications.dismiss_all();
+        ui_state.input = coderex_ui::input::InputBuffer::new();
+        ui_state.statusline.last_duration = None;
+        ui_state.statusline.thinking = false;
+        ui_state.statusline.thinking_label = None;
+        ui_state.messages.push(coderex_ui::message_list::Message {
+            role: coderex_ui::message_list::MessageRole::System,
+            content: message.into(),
             tool_name: None,
             streaming: false,
             folded: false,
@@ -3467,5 +3574,40 @@ mod tests {
     fn current_git_branch_falls_back() {
         let branch = current_git_branch("/nonexistent");
         assert!(branch.is_empty());
+    }
+
+    #[test]
+    fn interactive_phase_labels_track_activity() {
+        let mut phase = InteractivePhase::Planning;
+        assert_eq!(phase.status_label().as_deref(), Some("Planning..."));
+
+        phase.note_text_delta();
+        assert_eq!(phase.status_label().as_deref(), Some("Thinking..."));
+
+        phase.note_tool_start("Running cargo test -p coderex-cli...");
+        assert_eq!(
+            phase.status_label().as_deref(),
+            Some("Running cargo test -p coderex-cli...")
+        );
+
+        phase.note_permission_request("Read", &serde_json::json!({"file_path":"src/lib.rs"}));
+        assert_eq!(
+            phase.status_label().as_deref(),
+            Some("Waiting for permission: Reading src/lib.rs...")
+        );
+
+        phase.note_tool_end();
+        assert_eq!(phase.status_label().as_deref(), Some("Thinking..."));
+
+        phase.reset();
+        assert!(phase.status_label().is_none());
+    }
+
+    #[test]
+    fn permission_activity_labels_are_user_facing() {
+        assert_eq!(
+            permission_activity_label("Running cargo test -p coderex-cli..."),
+            "Waiting for permission: Running cargo test -p coderex-cli..."
+        );
     }
 }

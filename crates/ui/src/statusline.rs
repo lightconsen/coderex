@@ -113,7 +113,7 @@ impl Statusline {
 
         // After a turn completes, show elapsed time for a short while.
         if let Some(dur) = self.last_duration {
-            let text = format!("Churned for {}", Self::fmt_duration(dur));
+            let text = format!("Completed in {}", Self::fmt_duration(dur));
             let display_width = UnicodeWidthStr::width(text.as_str());
             if display_width <= width {
                 let pad = width.saturating_sub(display_width);
@@ -280,14 +280,14 @@ mod tests {
     }
 
     #[test]
-    fn churned_for_shows_after_completion() {
+    fn completed_duration_shows_after_completion() {
         let sl = Statusline {
             thinking: false,
             last_duration: Some(Duration::from_secs(7 * 60 + 27)),
             ..Statusline::new()
         };
         let rendered = sl.render(200);
-        assert!(rendered.contains("Churned for"));
+        assert!(rendered.contains("Completed in"));
         assert!(rendered.contains("7m 27s"));
     }
 
@@ -302,5 +302,19 @@ mod tests {
         let rendered = sl.render(200);
         assert!(rendered.contains("Step 2/5"));
         assert!(rendered.contains("Running tests"));
+    }
+
+    #[test]
+    fn thinking_label_shows_elapsed_time() {
+        let sl = Statusline {
+            thinking: true,
+            thinking_label: Some("Planning...".into()),
+            thinking_started: Some(Instant::now() - Duration::from_secs(65)),
+            spinner_frame: 0,
+            ..Statusline::new()
+        };
+        let rendered = sl.render(200);
+        assert!(rendered.contains("Planning..."));
+        assert!(rendered.contains("1m "));
     }
 }

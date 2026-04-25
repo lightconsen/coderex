@@ -758,7 +758,9 @@ fn custom_pricing_override() {
 
 #[tokio::test]
 async fn anthropic_client_sends_coderex_identity_headers_and_metadata() {
-    let _guard = env_lock().lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let _guard = env_lock()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let (base_url, handle) = capture_single_request(serde_json::json!({
         "content": [{"type": "text", "text": "ok"}],
         "usage": {"input_tokens": 1, "output_tokens": 1},
@@ -803,7 +805,9 @@ async fn anthropic_client_sends_coderex_identity_headers_and_metadata() {
 
 #[tokio::test]
 async fn anthropic_kimi_profile_suppresses_structured_tools() {
-    let _guard = env_lock().lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let _guard = env_lock()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let (base_url, handle) = capture_single_request(serde_json::json!({
         "content": [{"type": "text", "text": "ok"}],
         "usage": {"input_tokens": 1, "output_tokens": 1},
@@ -835,7 +839,9 @@ async fn anthropic_kimi_profile_suppresses_structured_tools() {
 
 #[tokio::test]
 async fn openai_provider_sends_coderex_identity_headers_and_metadata() {
-    let _guard = env_lock().lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let _guard = env_lock()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let (base_url, handle) = capture_single_request(serde_json::json!({
         "choices": [{
             "message": {"content": "ok"},
@@ -879,7 +885,10 @@ async fn openai_provider_sends_coderex_identity_headers_and_metadata() {
         Some("sess-openai")
     );
     assert_eq!(
-        captured.headers.get("x-coderex-agent-id").map(String::as_str),
+        captured
+            .headers
+            .get("x-coderex-agent-id")
+            .map(String::as_str),
         Some("agent-openai")
     );
     assert_eq!(
@@ -902,12 +911,17 @@ async fn openai_provider_sends_coderex_identity_headers_and_metadata() {
     assert_eq!(metadata_json["session_id"], "sess-openai");
     assert_eq!(metadata_json["device_id"], "dev-openai");
     assert_eq!(metadata_json["turn_id"], "7");
-    assert_eq!(captured.body["metadata"]["session_context"]["agent_id"], "agent-openai");
+    assert_eq!(
+        captured.body["metadata"]["session_context"]["agent_id"],
+        "agent-openai"
+    );
 }
 
 #[tokio::test]
 async fn openai_provider_streaming_emits_text_tool_and_usage_events() {
-    let _guard = env_lock().lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let _guard = env_lock()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let sse = concat!(
         "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"I will \",\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"Read\",\"arguments\":\"{\\\"file\\\":\\\"src/\"}}]},\"finish_reason\":null}]}\n\n",
         "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"check it\",\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"lib.rs\\\"}\"}}]},\"finish_reason\":null}]}\n\n",
@@ -968,7 +982,9 @@ async fn openai_provider_streaming_emits_text_tool_and_usage_events() {
 
 #[tokio::test]
 async fn openai_provider_streaming_falls_back_to_non_streaming_request() {
-    let _guard = env_lock().lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let _guard = env_lock()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let stream_failure = "HTTP/1.1 500 Internal Server Error\r\nContent-Type: text/plain\r\nContent-Length: 4\r\nConnection: close\r\n\r\noops".to_string();
     let json_body = serde_json::json!({
         "choices": [{
@@ -1007,7 +1023,9 @@ async fn openai_provider_streaming_falls_back_to_non_streaming_request() {
 
 #[tokio::test]
 async fn openai_responses_provider_uses_responses_payload_shape() {
-    let _guard = env_lock().lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let _guard = env_lock()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let (base_url, handle) = capture_single_request(serde_json::json!({
         "status": "completed",
         "output": [
@@ -1058,12 +1076,17 @@ async fn openai_responses_provider_uses_responses_payload_shape() {
     assert!(captured.body.get("input").is_some());
     assert!(captured.body.get("messages").is_none());
     assert_eq!(captured.body["tool_choice"], "auto");
-    assert_eq!(captured.body["metadata"]["session_context"]["turn_id"], "11");
+    assert_eq!(
+        captured.body["metadata"]["session_context"]["turn_id"],
+        "11"
+    );
 }
 
 #[tokio::test]
 async fn provider_router_forwards_request_context_to_provider_headers() {
-    let _guard = env_lock().lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let _guard = env_lock()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let (base_url, handle) = capture_single_request(serde_json::json!({
         "choices": [{
             "message": {"content": "ok"},
@@ -1075,9 +1098,7 @@ async fn provider_router_forwards_request_context_to_provider_headers() {
 
     let mut model_router = ModelRouter::new("test-router");
     model_router.add_provider(Box::new(OpenAiCompatibleProvider::new(
-        "openai",
-        base_url,
-        "test-key",
+        "openai", base_url, "test-key",
     )));
     let router = ProviderRouter::from_model_router(model_router);
     let request_client = router.with_request_context(RequestContext {
@@ -1097,11 +1118,17 @@ async fn provider_router_forwards_request_context_to_provider_headers() {
 
     let captured = handle.await.expect("server join");
     assert_eq!(
-        captured.headers.get("x-coderex-session-id").map(String::as_str),
+        captured
+            .headers
+            .get("x-coderex-session-id")
+            .map(String::as_str),
         Some("sess-router")
     );
     assert_eq!(
-        captured.headers.get("x-coderex-agent-id").map(String::as_str),
+        captured
+            .headers
+            .get("x-coderex-agent-id")
+            .map(String::as_str),
         Some("agent-router")
     );
     assert_eq!(captured.body["metadata"]["session_context"]["turn_id"], "3");
@@ -1109,7 +1136,9 @@ async fn provider_router_forwards_request_context_to_provider_headers() {
 
 #[tokio::test]
 async fn provider_errors_surface_request_diagnostics() {
-    let _guard = env_lock().lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let _guard = env_lock()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let raw_response = "HTTP/1.1 403 Forbidden\r\nContent-Type: text/plain\r\nContent-Length: 34\r\nx-request-id: srv-123\r\nConnection: close\r\n\r\nonly available for Coding Agents".to_string();
     let (base_url, _handle) = capture_requests_with_raw_responses(vec![raw_response]).await;
 

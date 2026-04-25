@@ -72,10 +72,8 @@ fn handle_connection(mut stream: TcpStream) {
     let is_streaming = body_str.contains("\"stream\":true");
     let turn_number = count_tool_results(&body_str) + 1;
     // Schema may be embedded in the system prompt string (escaped quotes) or as raw JSON.
-    let has_json_schema = body_str.contains("\"type\":\"object\"")
-        || body_str.contains("\\\"type\\\": \\\"object\\\"")
-        || body_str.contains("\\\"type\\\":\\\"object\\\"")
-        || body_str.contains("json_schema");
+    let has_json_schema = body_str.contains("You must respond with ONLY valid JSON")
+        || body_str.contains("respond with JSON matching this schema");
     eprintln!(
         "[mock] prompt='{prompt}' has_tool_result={has_tool_result} is_streaming={is_streaming} turn={turn_number} json_schema={has_json_schema}"
     );
@@ -109,6 +107,8 @@ fn handle_connection(mut stream: TcpStream) {
         } else if has_json_schema {
             // Structured output mode — return JSON matching the schema
             build_json_sse_response(r#"{"greeting": "Hello!"}"#)
+        } else if !has_tool_result && should_stream_text_response(&prompt) {
+            build_text_response(&prompt)
         } else if has_tool_result {
             build_text_response(&prompt)
         } else {
@@ -240,6 +240,13 @@ fn resolve_text_response(prompt: &str) -> &str {
         }
         _ => "Done!",
     }
+}
+
+fn should_stream_text_response(prompt: &str) -> bool {
+    let p = prompt.to_lowercase();
+    ((p.contains("hello") || p.contains("hi")) && !p.contains("file"))
+        || p.contains("cargo test")
+        || p.contains("test results")
 }
 
 fn build_text_response(prompt: &str) -> String {

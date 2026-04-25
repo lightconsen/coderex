@@ -87,6 +87,66 @@ pub struct ToolCall {
     pub input: serde_json::Value,
 }
 
+impl ToolCall {
+    /// Build a short, safe activity summary for interactive UI surfaces.
+    #[must_use]
+    pub fn activity_summary(&self) -> String {
+        Self::summarize_activity(&self.name, &self.input)
+    }
+
+    /// Build a short, safe activity summary for a tool name and input payload.
+    #[must_use]
+    pub fn summarize_activity(name: &str, input: &serde_json::Value) -> String {
+        match name.to_ascii_lowercase().as_str() {
+            "read" => extract_tool_string(input, &["file_path", "path", "file"])
+                .map(|path| format!("Reading {}...", summarize_tool_text(path)))
+                .unwrap_or_else(|| "Reading files...".into()),
+            "grep" | "rg" => extract_tool_string(input, &["pattern"])
+                .map(|pattern| format!("Searching for {}...", summarize_tool_text(pattern)))
+                .unwrap_or_else(|| "Searching code...".into()),
+            "glob" => extract_tool_string(input, &["pattern"])
+                .map(|pattern| {
+                    format!("Finding files matching {}...", summarize_tool_text(pattern))
+                })
+                .unwrap_or_else(|| "Discovering files...".into()),
+            "bash" | "shell" => extract_tool_string(input, &["command", "cmd"])
+                .map(|command| format!("Running {}...", summarize_tool_text(command)))
+                .unwrap_or_else(|| "Running shell command...".into()),
+            "write" => extract_tool_string(input, &["file_path", "path", "file"])
+                .map(|path| format!("Writing {}...", summarize_tool_text(path)))
+                .unwrap_or_else(|| "Writing file...".into()),
+            "edit" => extract_tool_string(input, &["file_path", "path", "file"])
+                .map(|path| format!("Updating {}...", summarize_tool_text(path)))
+                .unwrap_or_else(|| "Applying changes...".into()),
+            "apply_patch" => "Applying changes...".into(),
+            "task" => "Delegating task...".into(),
+            "web_fetch" => extract_tool_string(input, &["url"])
+                .map(|url| format!("Fetching {}...", summarize_tool_text(url)))
+                .unwrap_or_else(|| "Fetching from the web...".into()),
+            "web_search" => extract_tool_string(input, &["query"])
+                .map(|query| format!("Searching the web for {}...", summarize_tool_text(query)))
+                .unwrap_or_else(|| "Searching the web...".into()),
+            _ => format!("Running {name}..."),
+        }
+    }
+}
+
+fn extract_tool_string<'a>(input: &'a serde_json::Value, keys: &[&str]) -> Option<&'a str> {
+    keys.iter()
+        .find_map(|key| input.get(*key).and_then(serde_json::Value::as_str))
+}
+
+fn summarize_tool_text(text: &str) -> String {
+    let collapsed = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    const MAX_CHARS: usize = 60;
+    if collapsed.chars().count() <= MAX_CHARS {
+        collapsed
+    } else {
+        let clipped: String = collapsed.chars().take(MAX_CHARS - 3).collect();
+        format!("{clipped}...")
+    }
+}
+
 /// The result of a tool execution.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolResult {
@@ -187,6 +247,8 @@ pub enum EngineEvent {
         id: String,
         /// Tool name.
         name: String,
+        /// Safe activity summary for interactive UI surfaces.
+        summary: String,
     },
     /// A tool call has completed.
     ToolCallEnd {
@@ -357,5 +419,35 @@ mod tests {
         let json = serde_json::to_string(&content).unwrap();
         let decoded: MessageContent = serde_json::from_str(&json).unwrap();
         assert!(matches!(decoded, MessageContent::ToolCall(_)));
+    }
+
+    #[test]
+    fn tool_call_activity_summary_uses_safe_specific_labels() {
+        assert_eq!(
+            ToolCall::summarize_activity("Read", &serde_json::json!({"file_path":"src/lib.rs"})),
+            "Reading src/lib.rs..."
+        );
+        assert_eq!(
+            ToolCall::summarize_activity(
+                "Bash",
+                &serde_json::json!({"command":"cargo test -p coderex-cli"})
+            ),
+            "Running cargo test -p coderex-cli..."
+        );
+        assert_eq!(
+            ToolCall::summarize_activity("Write", &serde_json::json!({"file_path":"src/lib.rs"})),
+            "Writing src/lib.rs..."
+        );
+    }
+
+    #[test]
+    fn tool_call_activity_summary_truncates_long_inputs() {
+        let summary = ToolCall::summarize_activity(
+            "Bash",
+            &serde_json::json!({"command":"cargo test -p coderex-cli --test very_long_case_name -- --ignored --nocapture --exact"}),
+        );
+        assert!(summary.starts_with("Running cargo test -p coderex-cli"));
+        assert!(summary.ends_with("..."));
+        assert!(summary.chars().count() <= 71);
     }
 }

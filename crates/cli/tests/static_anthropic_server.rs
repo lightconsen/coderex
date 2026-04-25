@@ -16,7 +16,7 @@ fn find_free_port() -> u16 {
 /// Start the static-anthropic-server binary on a free port.
 fn start_server(port: u16) -> Child {
     let responses_path =
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data/static_responses.json");
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/responses.json");
 
     assert!(
         responses_path.exists(),

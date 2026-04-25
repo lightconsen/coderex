@@ -110,10 +110,8 @@ fn handle_connection(mut stream: TcpStream, responses: std::sync::Arc<StaticResp
     let has_tool_result = body_str.contains("\"type\":\"tool_result\"");
     let is_streaming = body_str.contains("\"stream\":true");
     let turn_number = count_tool_results(&body_str) + 1;
-    let has_json_schema = body_str.contains("\"type\":\"object\"")
-        || body_str.contains("\\\"type\\\": \\\"object\\\"")
-        || body_str.contains("\\\"type\\\":\\\"object\\\"")
-        || body_str.contains("json_schema");
+    let has_json_schema = body_str.contains("You must respond with ONLY valid JSON")
+        || body_str.contains("respond with JSON matching this schema");
 
     eprintln!(
         "[static] prompt='{}' has_tool_result={} is_streaming={} turn={} json_schema={}",
@@ -144,6 +142,8 @@ fn handle_connection(mut stream: TcpStream, responses: std::sync::Arc<StaticResp
             build_sequence_tool_response(turn_number)
         } else if has_json_schema {
             build_json_sse_response(r#"{"greeting": "Hello!"}"#)
+        } else if !has_tool_result && should_stream_text_response(&prompt) {
+            build_text_response(&prompt, &responses)
         } else if has_tool_result {
             build_text_response(&prompt, &responses)
         } else {
@@ -271,6 +271,13 @@ fn resolve_text_response(prompt: &str, responses: &StaticResponses) -> String {
     } else {
         responses.resolve("generic", "Done!")
     }
+}
+
+fn should_stream_text_response(prompt: &str) -> bool {
+    let p = prompt.to_lowercase();
+    ((p.contains("hello") || p.contains("hi")) && !p.contains("file"))
+        || p.contains("cargo test")
+        || p.contains("test results")
 }
 
 fn build_text_response(prompt: &str, responses: &StaticResponses) -> String {

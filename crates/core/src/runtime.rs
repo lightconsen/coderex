@@ -60,6 +60,8 @@ pub struct ActiveToolCall {
     pub id: String,
     /// Tool name.
     pub name: String,
+    /// Safe activity summary.
+    pub summary: String,
 }
 
 /// A pending permission prompt the UI must surface.
@@ -202,8 +204,9 @@ impl UiState {
     pub fn apply_engine_event(&mut self, event: EngineEvent) {
         match event {
             EngineEvent::TextDelta(text) => self.push_text_delta(&text),
-            EngineEvent::ToolCallStart { id, name } => {
-                self.active_tool_calls.push(ActiveToolCall { id, name });
+            EngineEvent::ToolCallStart { id, name, summary } => {
+                self.active_tool_calls
+                    .push(ActiveToolCall { id, name, summary });
             }
             EngineEvent::ToolCallEnd { id, result } => {
                 self.complete_tool_call(&id, &result);
@@ -614,8 +617,10 @@ mod tests {
         state.apply_engine_event(EngineEvent::ToolCallStart {
             id: "tc1".into(),
             name: "read".into(),
+            summary: "Reading src/lib.rs...".into(),
         });
         assert_eq!(state.active_tool_calls.len(), 1);
+        assert_eq!(state.active_tool_calls[0].summary, "Reading src/lib.rs...");
 
         state.apply_engine_event(EngineEvent::ToolCallEnd {
             id: "tc1".into(),
@@ -665,6 +670,7 @@ mod tests {
         state.apply_engine_event(EngineEvent::ToolCallStart {
             id: "tc1".into(),
             name: "read".into(),
+            summary: "Reading src/lib.rs...".into(),
         });
         state.apply_engine_event(EngineEvent::SessionEnd);
         assert!(state.session_ended);

@@ -219,10 +219,11 @@ The engine emits events via an `mpsc::unbounded_channel`:
 
 ```rust
 pub enum EngineEvent {
-    TextDelta(String),           // Streaming text chunk
-    ToolCallStart { id, name },  // Tool execution started
-    ToolCallDone { id, output }, // Tool execution completed
-    SessionEnd,                  // Turn completed
+    TextDelta(String),                       // Streaming text chunk
+    ToolCallStart { id, name, summary },    // Tool execution started
+    ToolCallEnd { id, result },             // Tool execution completed
+    PermissionRequest { id, tool, args },   // User approval required
+    SessionEnd,                             // Turn completed
 }
 ```
 

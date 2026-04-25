@@ -385,7 +385,9 @@ impl OpenAiCompatibleProvider {
             "max_output_tokens": max_tokens,
         });
         if stream {
-            body.as_object_mut().unwrap().insert("stream".into(), true.into());
+            body.as_object_mut()
+                .unwrap()
+                .insert("stream".into(), true.into());
         }
         self.attach_metadata(&mut body, request_id);
 
@@ -575,10 +577,7 @@ impl OpenAiCompatibleProvider {
             content,
             tool_calls,
             usage,
-            stop_reason: json["status"]
-                .as_str()
-                .unwrap_or("completed")
-                .to_string(),
+            stop_reason: json["status"].as_str().unwrap_or("completed").to_string(),
         }
     }
 
@@ -607,7 +606,11 @@ impl OpenAiCompatibleProvider {
             ProviderApiStyle::OpenAiResponses => "/v1/responses",
             _ => "/v1/chat/completions",
         };
-        format!("{}{}", self.base_url.strip_suffix('/').unwrap_or(&self.base_url), path)
+        format!(
+            "{}{}",
+            self.base_url.strip_suffix('/').unwrap_or(&self.base_url),
+            path
+        )
     }
 
     fn format_error_message(
@@ -972,7 +975,11 @@ fn parse_openai_chat_sse_message(message: &str, state: &mut OpenAiSseState) -> V
 
             if choice
                 .get("finish_reason")
-                .or_else(|| choice.get("delta").and_then(|delta| delta.get("finish_reason")))
+                .or_else(|| {
+                    choice
+                        .get("delta")
+                        .and_then(|delta| delta.get("finish_reason"))
+                })
                 .and_then(serde_json::Value::as_str)
                 .is_some()
             {
@@ -1191,21 +1198,28 @@ fn parse_openai_responses_sse_message(
                     if !buffered.is_empty() {
                         events.push(StreamEvent::ToolCallBlockEnd {
                             id: id.clone(),
-                            input: serde_json::from_str(buffered).unwrap_or(serde_json::Value::Null),
+                            input: serde_json::from_str(buffered)
+                                .unwrap_or(serde_json::Value::Null),
                         });
                     } else {
                         let input = item["arguments"]
                             .as_str()
                             .and_then(|args| serde_json::from_str(args).ok())
                             .unwrap_or(serde_json::Value::Null);
-                        events.push(StreamEvent::ToolCallBlockEnd { id: id.clone(), input });
+                        events.push(StreamEvent::ToolCallBlockEnd {
+                            id: id.clone(),
+                            input,
+                        });
                     }
                 }
                 tool_state.remove(&id);
             }
         }
         Some("response.completed") => {
-            if let Some(usage) = value.get("response").and_then(|response| response.get("usage")) {
+            if let Some(usage) = value
+                .get("response")
+                .and_then(|response| response.get("usage"))
+            {
                 events.push(StreamEvent::UsageSummary(UsageSummary {
                     input_tokens: usage["input_tokens"].as_u64().unwrap_or(0) as usize,
                     output_tokens: usage["output_tokens"].as_u64().unwrap_or(0) as usize,

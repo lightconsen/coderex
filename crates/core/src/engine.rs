@@ -2204,12 +2204,7 @@ impl QueryEngine {
                     text_so_far.push_str(text);
                     let _ = self.event_tx.send(EngineEvent::TextDelta(text.clone()));
                 }
-                StreamEvent::ToolCallBlockStart { ref id, ref name } => {
-                    let _ = self.event_tx.send(EngineEvent::ToolCallStart {
-                        id: id.clone(),
-                        name: name.clone(),
-                    });
-                }
+                StreamEvent::ToolCallBlockStart { .. } => {}
                 StreamEvent::ToolCallBlockEnd { .. } => {
                     // Completion handled below via assembler.process_event
                 }
@@ -2343,6 +2338,12 @@ impl QueryEngine {
             });
             return Ok(Some(result));
         }
+
+        let _ = self.event_tx.send(EngineEvent::ToolCallStart {
+            id: call.id.clone(),
+            name: call.name.clone(),
+            summary: call.activity_summary(),
+        });
 
         // 3. Permission check
         let (_request, perm_result) = self
@@ -2531,6 +2532,10 @@ impl QueryEngine {
         let _ = self.event_tx.send(EngineEvent::ToolCallStart {
             id: elevation.tool_call_id.clone(),
             name: elevation.tool_name.clone(),
+            summary: crate::types::ToolCall::summarize_activity(
+                &elevation.tool_name,
+                &elevation.input,
+            ),
         });
 
         // Fire PreToolUse hook
@@ -3362,6 +3367,9 @@ mod tests {
     #[tokio::test]
     async fn handle_elicitation_stores_response() {
         let (mut engine, _rx, _session) = make_test_engine();
+        engine.set_elicitation_handler(Box::new(
+            crate::elicitation::SdkElicitationHandler::default(),
+        ));
         let budget = TokenBudget::with_defaults();
         let mut turn = TurnRuntime::new(budget);
 
@@ -3386,17 +3394,20 @@ mod tests {
 
     #[tokio::test]
     async fn elicitation_heuristic_triggers_in_execute_turn() {
-        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
 
         struct StatefulMock {
-            call_count: AtomicUsize,
+            call_count: Arc<AtomicUsize>,
         }
 
         #[async_trait::async_trait]
         impl ApiClient for StatefulMock {
             fn clone_box(&self) -> Box<dyn ApiClient> {
                 Box::new(StatefulMock {
-                    call_count: AtomicUsize::new(self.call_count.load(Ordering::SeqCst)),
+                    call_count: Arc::clone(&self.call_count),
                 })
             }
 
@@ -3474,7 +3485,7 @@ mod tests {
         let perm_engine = PermissionEngine::new(checker);
         let session = SessionState::new(std::path::PathBuf::from("/tmp/test"));
         let api = StatefulMock {
-            call_count: AtomicUsize::new(0),
+            call_count: Arc::new(AtomicUsize::new(0)),
         };
         let mut engine =
             QueryEngine::new(Box::new(api), ModelId::sonnet(), session, perm_engine, tx);

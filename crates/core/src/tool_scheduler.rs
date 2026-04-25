@@ -17,7 +17,7 @@ use crate::hook_executor::HookExecutor;
 use crate::permission_engine::PermissionEngine;
 use crate::permissions::PermissionResult;
 use crate::tool_executor::{ToolDispatchOutcome, ToolExecutor};
-use crate::types::{EngineEvent, ToolResult};
+use crate::types::{EngineEvent, ToolCall, ToolResult};
 use std::collections::HashMap;
 use tokio::sync::mpsc;
 
@@ -96,6 +96,7 @@ pub async fn run_tool_calls(
         let _ = event_tx.send(EngineEvent::ToolCallStart {
             id: call.id.clone(),
             name: call.name.clone(),
+            summary: ToolCall::summarize_activity(&call.name, &call.input),
         });
 
         // 3. PreToolUse hook

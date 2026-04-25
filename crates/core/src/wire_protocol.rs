@@ -37,6 +37,8 @@ pub enum WireEvent {
         id: String,
         /// Tool name.
         name: String,
+        /// Safe activity summary for interactive UI surfaces.
+        summary: String,
     },
     /// A tool call has completed.
     ToolCallEnd {
@@ -271,6 +273,7 @@ mod tests {
         let event = WireEvent::ToolCallStart {
             id: "tc_1".into(),
             name: "Read".into(),
+            summary: "Reading src/lib.rs...".into(),
         };
         let json = encode_event(&event);
         let decoded = decode_event(&json).unwrap().unwrap();
