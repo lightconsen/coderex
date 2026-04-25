@@ -25,6 +25,38 @@ pub enum ModelProfile {
 }
 
 impl ModelProfile {
+    fn runtime_env_keys(&self) -> &'static [&'static str] {
+        match self {
+            Self::Main => &["CODEREX_MAIN_MODEL", "ANTHROPIC_MODEL", "OPENAI_MODEL"],
+            Self::Lightweight => &[
+                "CODEREX_LIGHTWEIGHT_MODEL",
+                "ANTHROPIC_LIGHTWEIGHT_MODEL",
+                "OPENAI_LIGHTWEIGHT_MODEL",
+                "CODEREX_MAIN_MODEL",
+                "ANTHROPIC_MODEL",
+                "OPENAI_MODEL",
+            ],
+            Self::Background => &[
+                "CODEREX_BACKGROUND_MODEL",
+                "ANTHROPIC_BACKGROUND_MODEL",
+                "OPENAI_BACKGROUND_MODEL",
+                "CODEREX_MAIN_MODEL",
+                "ANTHROPIC_MODEL",
+                "OPENAI_MODEL",
+            ],
+        }
+    }
+
+    fn resolve_with_lookup(&self, mut lookup: impl FnMut(&str) -> Option<String>) -> ModelId {
+        self.runtime_env_keys()
+            .iter()
+            .find_map(|key| lookup(key))
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+            .map(ModelId)
+            .unwrap_or_else(|| self.resolve())
+    }
+
     /// Resolve the model profile to a concrete ModelId.
     #[must_use]
     pub fn resolve(&self) -> ModelId {
@@ -33,6 +65,16 @@ impl ModelProfile {
             Self::Lightweight => ModelId::haiku(),
             Self::Background => ModelId::sonnet(),
         }
+    }
+
+    /// Resolve the model profile for the current runtime environment.
+    ///
+    /// This keeps the canonical built-in defaults from [`Self::resolve`] but
+    /// allows live provider runs to honor configured model overrides such as
+    /// `ANTHROPIC_MODEL=qwen3.6-plus`.
+    #[must_use]
+    pub fn resolve_runtime(&self) -> ModelId {
+        self.resolve_with_lookup(|key| std::env::var(key).ok())
     }
 }
 
@@ -208,6 +250,22 @@ mod tests {
     #[test]
     fn model_profile_default_is_main() {
         assert_eq!(ModelProfile::default(), ModelProfile::Main);
+    }
+
+    #[test]
+    fn model_profile_runtime_respects_env_override() {
+        assert_eq!(
+            ModelProfile::Main.resolve_with_lookup(|key| {
+                (key == "ANTHROPIC_MODEL").then(|| "qwen3.6-plus".to_string())
+            }),
+            ModelId("qwen3.6-plus".into())
+        );
+        assert_eq!(
+            ModelProfile::Lightweight.resolve_with_lookup(|key| {
+                (key == "ANTHROPIC_MODEL").then(|| "qwen3.6-plus".to_string())
+            }),
+            ModelId("qwen3.6-plus".into())
+        );
     }
 
     #[test]

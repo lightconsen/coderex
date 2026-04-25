@@ -89,7 +89,7 @@ pub async fn extract_single_memory(
         api_client,
         system,
         &user,
-        &ModelProfile::Lightweight.resolve(),
+        &ModelProfile::Lightweight.resolve_runtime(),
         256,
     )
     .await?;

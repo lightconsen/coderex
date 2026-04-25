@@ -28,7 +28,7 @@ pub async fn explain_permission(
         api_client,
         system,
         &user,
-        &ModelProfile::Main.resolve(),
+        &ModelProfile::Main.resolve_runtime(),
         256,
     )
     .await?;

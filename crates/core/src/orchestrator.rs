@@ -16,7 +16,7 @@ use crate::permission_engine::{ExplainPermissionHook, PermissionEngine};
 use crate::permissions::{PermissionChecker, PermissionMode};
 use crate::query_profiles::{ModelProfile, PromptProfile, QueryKind, QueryRequest};
 use crate::state::SessionState;
-use crate::types::{EngineEvent, Message, ModelId, UsageSummary};
+use crate::types::{EngineEvent, ModelId, UsageSummary};
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::mpsc;
@@ -206,7 +206,7 @@ impl Orchestrator {
         request: &QueryRequest,
     ) -> Result<QueryResult, OrchestratorError> {
         // Force lightweight model regardless of request
-        let model = ModelProfile::Lightweight.resolve();
+        let model = ModelProfile::Lightweight.resolve_runtime();
         let system = request.custom_system_prompt.clone().unwrap_or_else(|| {
             crate::prompts::compose_system_prompt_for_profiles(&[request.prompt_profile])
         });
@@ -269,7 +269,7 @@ impl Orchestrator {
 
     /// Resolve a model profile to a concrete model.
     fn resolve_model(&self, profile: &ModelProfile) -> ModelId {
-        profile.resolve()
+        profile.resolve_runtime()
     }
 
     /// Build the system prompt for a request.
@@ -291,10 +291,10 @@ impl Orchestrator {
 
     /// Build a message list from a user prompt string.
     fn build_messages(user_prompt: &str) -> Vec<serde_json::Value> {
-        let msg = Message::user(user_prompt);
-        serde_json::to_value(&msg)
-            .map(|v| vec![v])
-            .unwrap_or_default()
+        vec![serde_json::json!({
+            "role": "user",
+            "content": user_prompt,
+        })]
     }
 
     /// Build SubmitOptions from a QueryRequest.
@@ -388,7 +388,7 @@ pub async fn run_lightweight_query(
         api_client,
         system_prompt,
         user_prompt,
-        &ModelProfile::Lightweight.resolve(),
+        &ModelProfile::Lightweight.resolve_runtime(),
         max_tokens.min(1024),
     )
     .await
@@ -470,13 +470,7 @@ pub async fn run_forked_agent(
         append_system_prompt: None,
         prompt_profile: PromptProfile::DefaultAgent,
         allowed_tools: effective_tools,
-        model_profile: if model == &ModelProfile::Lightweight.resolve() {
-            ModelProfile::Lightweight
-        } else if model == &ModelProfile::Background.resolve() {
-            ModelProfile::Background
-        } else {
-            ModelProfile::Main
-        },
+        model_profile: infer_model_profile(model),
         inherit_session: parent_context.is_some(),
         stream: false,
         max_tokens,
@@ -484,7 +478,30 @@ pub async fn run_forked_agent(
         provider_hints: std::collections::HashMap::new(),
     };
 
-    run_engine_query(api_client, &request).await
+    run_engine_query_with_model(api_client, &request, model.clone()).await
+}
+
+async fn run_forked_agent_with_profile(
+    api_client: &dyn ApiClient,
+    system_prompt: &str,
+    user_prompt: &str,
+    parent_context: Option<&str>,
+    allowed_tools: Option<&[String]>,
+    model_profile: ModelProfile,
+    max_tokens: u32,
+    writable: bool,
+) -> Result<QueryResult, OrchestratorError> {
+    run_forked_agent(
+        api_client,
+        system_prompt,
+        user_prompt,
+        parent_context,
+        allowed_tools,
+        &model_profile.resolve_runtime(),
+        max_tokens,
+        writable,
+    )
+    .await
 }
 
 /// Run a background feature through the shared background/forked-agent lane.
@@ -507,17 +524,27 @@ pub async fn run_background_feature(
         background_feature_label(kind)
     );
 
-    run_forked_agent(
+    run_forked_agent_with_profile(
         api_client,
         &decorated_system,
         &user_prompt,
         parent_context.as_deref(),
         allowed_tools.as_deref(),
-        &ModelProfile::Background.resolve(),
+        ModelProfile::Background,
         max_tokens,
         writable,
     )
     .await
+}
+
+fn infer_model_profile(model: &ModelId) -> ModelProfile {
+    if model == &ModelProfile::Lightweight.resolve() {
+        ModelProfile::Lightweight
+    } else if model == &ModelProfile::Background.resolve() {
+        ModelProfile::Background
+    } else {
+        ModelProfile::Main
+    }
 }
 
 /// Run the main agent loop through a real QueryEngine execution path.
@@ -532,6 +559,14 @@ async fn run_engine_query(
     api_client: &dyn ApiClient,
     request: &QueryRequest,
 ) -> Result<QueryResult, OrchestratorError> {
+    run_engine_query_with_model(api_client, request, request.model_profile.resolve_runtime()).await
+}
+
+async fn run_engine_query_with_model(
+    api_client: &dyn ApiClient,
+    request: &QueryRequest,
+    model: ModelId,
+) -> Result<QueryResult, OrchestratorError> {
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let session = SessionState::new(cwd);
     let checker = PermissionChecker::new(PermissionMode::default());
@@ -541,7 +576,7 @@ async fn run_engine_query(
     let (event_tx, mut event_rx) = mpsc::unbounded_channel::<EngineEvent>();
     let mut engine = QueryEngine::new(
         api_client.clone_box(),
-        request.model_profile.resolve(),
+        model,
         session,
         permission_engine,
         event_tx,
@@ -706,7 +741,8 @@ mod tests {
     fn build_messages_creates_valid_json() {
         let msgs = Orchestrator::build_messages("hello");
         assert_eq!(msgs.len(), 1);
-        assert!(msgs[0].get("role").unwrap().as_str().unwrap() == "User");
+        assert_eq!(msgs[0]["role"].as_str(), Some("user"));
+        assert_eq!(msgs[0]["content"].as_str(), Some("hello"));
     }
 
     #[tokio::test]
@@ -813,6 +849,6 @@ mod tests {
 
         let calls = api.call_log();
         assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].2, ModelProfile::Background.resolve().0);
+        assert_eq!(calls[0].2, ModelProfile::Background.resolve_runtime().0);
     }
 }

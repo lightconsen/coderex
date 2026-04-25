@@ -54,7 +54,7 @@ pub async fn generate_agent(
         api_client,
         system,
         &user,
-        &ModelProfile::Main.resolve(),
+        &ModelProfile::Main.resolve_runtime(),
         512,
     )
     .await?;
@@ -124,7 +124,7 @@ pub async fn generate_agent_prompt(
         api_client,
         system,
         &user,
-        &ModelProfile::Main.resolve(),
+        &ModelProfile::Main.resolve_runtime(),
         512,
     )
     .await?;

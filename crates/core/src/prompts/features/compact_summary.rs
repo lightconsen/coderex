@@ -30,7 +30,7 @@ pub async fn generate_compact_summary(
         api_client,
         system,
         &full_user,
-        &ModelProfile::Main.resolve(),
+        &ModelProfile::Main.resolve_runtime(),
         512,
     )
     .await?;

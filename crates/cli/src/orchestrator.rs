@@ -514,8 +514,14 @@ impl StartupOrchestrator {
         settings = overrides.apply(settings);
 
         tracing::info!(
-            "settings loaded: model={}",
-            settings.model.as_deref().unwrap_or("default")
+            "settings loaded: model={}, effective_model={}",
+            settings.model.as_deref().unwrap_or("default"),
+            std::env::var("ANTHROPIC_MODEL")
+                .or_else(|_| std::env::var("OPENAI_MODEL"))
+                .ok()
+                .filter(|model| !model.is_empty())
+                .or_else(|| settings.model.clone())
+                .unwrap_or_else(|| "default".into())
         );
 
         // --setting-sources: print where each value came from
