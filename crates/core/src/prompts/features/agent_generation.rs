@@ -67,28 +67,35 @@ fn parse_agent_spec(content: &str) -> Result<AgentSpec, OrchestratorError> {
     let value: serde_json::Value = serde_json::from_str(content)
         .map_err(|e| OrchestratorError::Config(format!("invalid agent spec JSON: {e}")))?;
 
-    let name = value.get("name")
+    let name = value
+        .get("name")
         .and_then(|v| v.as_str())
         .ok_or_else(|| OrchestratorError::Config("missing 'name' field".into()))?
         .to_string();
 
-    let system_prompt = value.get("system_prompt")
+    let system_prompt = value
+        .get("system_prompt")
         .and_then(|v| v.as_str())
         .ok_or_else(|| OrchestratorError::Config("missing 'system_prompt' field".into()))?
         .to_string();
 
-    let description = value.get("description")
+    let description = value
+        .get("description")
         .and_then(|v| v.as_str())
         .unwrap_or(&name)
         .to_string();
 
-    let allowed_tools = value.get("allowed_tools")
+    let allowed_tools = value
+        .get("allowed_tools")
         .and_then(|v| v.as_array())
-        .map(|arr| arr.iter()
-            .filter_map(|v| v.as_str().map(String::from))
-            .collect());
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        });
 
-    let model_profile = value.get("model_profile")
+    let model_profile = value
+        .get("model_profile")
         .and_then(|v| v.as_str())
         .unwrap_or("Main")
         .to_string();
@@ -129,15 +136,22 @@ pub async fn generate_agent_prompt(
 mod tests {
     use super::*;
     use crate::api_client::{ApiResponse, StreamEvent};
+    use crate::tool_executor::ToolInfo;
     use crate::types::{ModelId, UsageSummary};
-    use std::pin::Pin;
     use futures::Stream;
+    use std::pin::Pin;
 
     #[derive(Clone)]
-    struct MockApi { response_content: String }
+    struct MockApi {
+        response_content: String,
+    }
 
     impl MockApi {
-        fn new(content: &str) -> Self { Self { response_content: content.into() } }
+        fn new(content: &str) -> Self {
+            Self {
+                response_content: content.into(),
+            }
+        }
     }
 
     #[async_trait::async_trait]
@@ -210,13 +224,15 @@ mod tests {
 
     #[tokio::test]
     async fn generate_agent_returns_spec() {
-        let api = MockApi::new(r#"{
+        let api = MockApi::new(
+            r#"{
             "name": "test_agent",
             "system_prompt": "You are a test agent.",
             "description": "Tests things",
             "allowed_tools": null,
             "model_profile": "Main"
-        }"#);
+        }"#,
+        );
         let spec = generate_agent(&api, "a testing agent").await;
         assert!(spec.is_ok());
         assert_eq!(spec.unwrap().name, "test_agent");

@@ -96,7 +96,8 @@ fn parse_string_array(content: &str) -> Vec<String> {
         Ok(v) => v,
         Err(_) => {
             // Fallback: treat each non-empty line as a suggestion
-            return content.lines()
+            return content
+                .lines()
                 .map(|l| l.trim())
                 .filter(|l| !l.is_empty())
                 .map(String::from)
@@ -104,7 +105,9 @@ fn parse_string_array(content: &str) -> Vec<String> {
         }
     };
 
-    let Some(arr) = value.as_array() else { return Vec::new() };
+    let Some(arr) = value.as_array() else {
+        return Vec::new();
+    };
 
     arr.iter()
         .filter_map(|v| v.as_str().map(String::from))
@@ -115,15 +118,22 @@ fn parse_string_array(content: &str) -> Vec<String> {
 mod tests {
     use super::*;
     use crate::api_client::{ApiResponse, StreamEvent};
+    use crate::tool_executor::ToolInfo;
     use crate::types::{ModelId, UsageSummary};
-    use std::pin::Pin;
     use futures::Stream;
+    use std::pin::Pin;
 
     #[derive(Clone)]
-    struct MockApi { response_content: String }
+    struct MockApi {
+        response_content: String,
+    }
 
     impl MockApi {
-        fn new(content: &str) -> Self { Self { response_content: content.into() } }
+        fn new(content: &str) -> Self {
+            Self {
+                response_content: content.into(),
+            }
+        }
     }
 
     #[async_trait::async_trait]
@@ -194,7 +204,10 @@ mod tests {
     #[tokio::test]
     async fn suggest_next_action_returns_suggestion() {
         let api = MockApi::new("Now write unit tests for the new function.");
-        let steps = vec!["Implemented the function".into(), "Added type signatures".into()];
+        let steps = vec![
+            "Implemented the function".into(),
+            "Added type signatures".into(),
+        ];
         let next = suggest_next_action(&api, "Implement foo", &steps).await;
         assert!(next.is_ok());
     }

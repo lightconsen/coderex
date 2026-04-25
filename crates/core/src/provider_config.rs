@@ -8,6 +8,7 @@
 
 use crate::api_client::ApiConfig;
 use crate::model_router::ModelRouter;
+use crate::provider_router::ProviderRouter;
 use crate::providers::{AnthropicProvider, OpenAiCompatibleProvider};
 use std::collections::{BTreeMap, HashMap};
 
@@ -114,7 +115,7 @@ impl ProviderConfig {
     ///
     /// Providers are added in priority order: Anthropic > OpenAI > Groq > custom.
     #[must_use]
-    pub fn build_router(&self) -> ModelRouter {
+    pub fn build_router(&self) -> ProviderRouter {
         let mut router =
             ModelRouter::new("default").with_fallback_providers(self.fallback_providers.clone());
 
@@ -184,7 +185,7 @@ impl ProviderConfig {
             router.add_provider(Box::new(provider));
         }
 
-        router
+        ProviderRouter::from_model_router(router)
     }
 }
 

@@ -40,9 +40,13 @@ pub async fn summarize_agent_activity(
     )
     .await?;
 
-    Ok(result.content.lines().next()
+    Ok(result
+        .content
+        .lines()
+        .next()
         .unwrap_or(&result.content)
-        .chars().take(60)
+        .chars()
+        .take(60)
         .collect())
 }
 
@@ -94,7 +98,8 @@ pub async fn generate_team_status(
     api_client: &dyn ApiClient,
     agent_summaries: &[(String, String)],
 ) -> Result<String, OrchestratorError> {
-    let system = "You are a project coordinator. Format a team status report from individual agent updates.";
+    let system =
+        "You are a project coordinator. Format a team status report from individual agent updates.";
     let input = agent_summaries
         .iter()
         .map(|(name, summary)| format!("- **{name}**: {summary}"))
@@ -123,15 +128,22 @@ pub async fn generate_team_status(
 mod tests {
     use super::*;
     use crate::api_client::{ApiResponse, StreamEvent};
+    use crate::tool_executor::ToolInfo;
     use crate::types::{ModelId, UsageSummary};
-    use std::pin::Pin;
     use futures::Stream;
+    use std::pin::Pin;
 
     #[derive(Clone)]
-    struct MockApi { response_content: String }
+    struct MockApi {
+        response_content: String,
+    }
 
     impl MockApi {
-        fn new(content: &str) -> Self { Self { response_content: content.into() } }
+        fn new(content: &str) -> Self {
+            Self {
+                response_content: content.into(),
+            }
+        }
     }
 
     #[async_trait::async_trait]
@@ -176,7 +188,8 @@ mod tests {
     #[tokio::test]
     async fn summarize_agent_activity_returns_short_summary() {
         let api = MockApi::new("Reading engine.rs for tool execution logic");
-        let summary = summarize_agent_activity(&api, "agent read 5 files, searched for 'tool'").await;
+        let summary =
+            summarize_agent_activity(&api, "agent read 5 files, searched for 'tool'").await;
         assert!(summary.is_ok());
         assert!(summary.unwrap().len() <= 60);
     }

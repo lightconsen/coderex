@@ -81,15 +81,22 @@ pub async fn create_session_memory(
 mod tests {
     use super::*;
     use crate::api_client::{ApiResponse, StreamEvent};
+    use crate::tool_executor::ToolInfo;
     use crate::types::{ModelId, UsageSummary};
-    use std::pin::Pin;
     use futures::Stream;
+    use std::pin::Pin;
 
     #[derive(Clone)]
-    struct MockApi { response_content: String }
+    struct MockApi {
+        response_content: String,
+    }
 
     impl MockApi {
-        fn new(content: &str) -> Self { Self { response_content: content.into() } }
+        fn new(content: &str) -> Self {
+            Self {
+                response_content: content.into(),
+            }
+        }
     }
 
     #[async_trait::async_trait]
@@ -135,7 +142,8 @@ mod tests {
     async fn update_session_memory_returns_updated_content() {
         let api = MockApi::new("---\nname: session\nCurrent State: Auth middleware fixed.\n");
         let current = "---\nname: session\nCurrent State: Starting.\n";
-        let updated = update_session_memory(&api, current, "user: fixed auth bug in middleware.rs").await;
+        let updated =
+            update_session_memory(&api, current, "user: fixed auth bug in middleware.rs").await;
         assert!(updated.is_ok());
         assert!(!updated.unwrap().is_empty());
     }

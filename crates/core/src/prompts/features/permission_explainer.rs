@@ -44,8 +44,8 @@ pub async fn explain_permission_from_value(
     tool_name: &str,
     tool_input: serde_json::Value,
 ) -> Result<String, OrchestratorError> {
-    let input_str = serde_json::to_string_pretty(&tool_input)
-        .unwrap_or_else(|_| tool_input.to_string());
+    let input_str =
+        serde_json::to_string_pretty(&tool_input).unwrap_or_else(|_| tool_input.to_string());
     explain_permission(api_client, tool_name, &input_str).await
 }
 
@@ -53,15 +53,22 @@ pub async fn explain_permission_from_value(
 mod tests {
     use super::*;
     use crate::api_client::{ApiResponse, StreamEvent};
+    use crate::tool_executor::ToolInfo;
     use crate::types::{ModelId, UsageSummary};
-    use std::pin::Pin;
     use futures::Stream;
+    use std::pin::Pin;
 
     #[derive(Clone)]
-    struct MockApi { response_content: String }
+    struct MockApi {
+        response_content: String,
+    }
 
     impl MockApi {
-        fn new(content: &str) -> Self { Self { response_content: content.into() } }
+        fn new(content: &str) -> Self {
+            Self {
+                response_content: content.into(),
+            }
+        }
     }
 
     #[async_trait::async_trait]

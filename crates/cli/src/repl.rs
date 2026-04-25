@@ -1604,6 +1604,8 @@ impl ReplLoop {
             inherit_session: true,
             stream: true,
             max_tokens: 4096,
+            agent_id: None,
+            provider_hints: HashMap::new(),
         }
     }
 

@@ -99,6 +99,8 @@ pub struct ApiConfig {
     pub device_id: Option<String>,
     /// Client name used in identity headers.
     pub client_name: String,
+    /// Per-request context propagated from the engine.
+    pub request_context: Option<RequestContext>,
 }
 
 /// Controls how request metadata is attached to provider requests.
@@ -108,6 +110,23 @@ pub enum MetadataPolicy {
     None,
     /// Attach session-level metadata.
     Session,
+}
+
+/// Per-request context propagated from the engine/orchestrator into provider transport.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RequestContext {
+    /// Session identifier.
+    pub session_id: Option<String>,
+    /// Device identifier.
+    pub device_id: Option<String>,
+    /// Turn identifier within the session.
+    pub turn_id: Option<String>,
+    /// Optional agent identifier for forked/background flows.
+    pub agent_id: Option<String>,
+    /// Request correlation id.
+    pub request_id: Option<String>,
+    /// Provider-specific hints for shaping the transport.
+    pub provider_hints: BTreeMap<String, String>,
 }
 
 impl ApiConfig {
@@ -126,6 +145,7 @@ impl ApiConfig {
             session_id: std::env::var("CODEREX_SESSION_ID").ok(),
             device_id: std::env::var("CODEREX_DEVICE_ID").ok(),
             client_name: "cli".into(),
+            request_context: None,
         }
     }
 
@@ -176,6 +196,13 @@ impl ApiConfig {
     #[must_use]
     pub fn with_device_id(mut self, device_id: impl Into<String>) -> Self {
         self.device_id = Some(device_id.into());
+        self
+    }
+
+    /// Attach per-request context propagated from the engine.
+    #[must_use]
+    pub fn with_request_context(mut self, context: RequestContext) -> Self {
+        self.request_context = Some(context);
         self
     }
 }
@@ -235,6 +262,11 @@ pub enum StreamEvent {
 pub trait ApiClient: Send + Sync {
     /// Clone the trait object into a boxed clone.
     fn clone_box(&self) -> Box<dyn ApiClient>;
+
+    /// Clone the client with per-request context.
+    fn with_request_context(&self, _context: RequestContext) -> Box<dyn ApiClient> {
+        self.clone_box()
+    }
 
     /// Send a non-streaming message to the API.
     async fn create_message(
@@ -297,6 +329,14 @@ impl AnthropicApiClient {
     #[must_use]
     pub fn new_with_client(config: ApiConfig, client: Client) -> Self {
         Self { config, client }
+    }
+
+    /// Clone this client with per-request context.
+    #[must_use]
+    pub fn cloned_with_request_context(&self, context: RequestContext) -> Self {
+        let mut cloned = self.clone();
+        cloned.config.request_context = Some(context);
+        cloned
     }
 
     /// Resolve the model string from a ModelId.
@@ -375,22 +415,45 @@ impl AnthropicApiClient {
         );
     }
 
+    fn format_error_message(
+        &self,
+        request_id: &str,
+        server_request_id: Option<&str>,
+        message: String,
+        fallback_reason: Option<&str>,
+    ) -> String {
+        let mut diagnostics = format!("request_id={request_id}");
+        if let Some(server_request_id) = server_request_id.filter(|id| !id.is_empty()) {
+            diagnostics.push_str(&format!(", server_request_id={server_request_id}"));
+        }
+        if let Some(fallback_reason) = fallback_reason {
+            diagnostics.push_str(&format!(", fallback_reason={fallback_reason}"));
+        }
+        format!("{message} [{diagnostics}]")
+    }
+
     fn build_metadata_user_id(&self, request_id: &str) -> String {
         let session_id = self
             .config
-            .session_id
-            .clone()
+            .request_context
+            .as_ref()
+            .and_then(|ctx| ctx.session_id.clone())
+            .or_else(|| self.config.session_id.clone())
             .or_else(|| std::env::var("CODEREX_SESSION_ID").ok())
             .unwrap_or_else(|| "unknown".into());
         let device_id = self
             .config
-            .device_id
-            .clone()
+            .request_context
+            .as_ref()
+            .and_then(|ctx| ctx.device_id.clone())
+            .or_else(|| self.config.device_id.clone())
             .or_else(|| std::env::var("CODEREX_DEVICE_ID").ok())
             .unwrap_or_else(|| "unknown".into());
         serde_json::json!({
             "device_id": device_id,
             "session_id": session_id,
+            "turn_id": self.config.request_context.as_ref().and_then(|ctx| ctx.turn_id.clone()).unwrap_or_else(|| "unknown".into()),
+            "agent_id": self.config.request_context.as_ref().and_then(|ctx| ctx.agent_id.clone()).unwrap_or_else(|| "main".into()),
             "client": self.config.client_name,
             "request_id": request_id,
         })
@@ -410,12 +473,25 @@ impl AnthropicApiClient {
 
         if let Some(session_id) = self
             .config
-            .session_id
-            .clone()
+            .request_context
+            .as_ref()
+            .and_then(|ctx| ctx.session_id.clone())
+            .or_else(|| self.config.session_id.clone())
             .or_else(|| std::env::var("CODEREX_SESSION_ID").ok())
         {
             if !session_id.trim().is_empty() {
                 req = req.header("X-CodeRex-Session-Id", session_id);
+            }
+        }
+
+        if let Some(agent_id) = self
+            .config
+            .request_context
+            .as_ref()
+            .and_then(|ctx| ctx.agent_id.clone())
+        {
+            if !agent_id.trim().is_empty() {
+                req = req.header("X-CodeRex-Agent-Id", agent_id);
             }
         }
 
@@ -444,10 +520,16 @@ impl AnthropicApiClient {
             if obj.contains_key("metadata") {
                 return;
             }
+            let session_context = serde_json::json!({
+                "session_id": self.config.request_context.as_ref().and_then(|ctx| ctx.session_id.clone()).or_else(|| self.config.session_id.clone()).unwrap_or_else(|| "unknown".into()),
+                "turn_id": self.config.request_context.as_ref().and_then(|ctx| ctx.turn_id.clone()).unwrap_or_else(|| "unknown".into()),
+                "agent_id": self.config.request_context.as_ref().and_then(|ctx| ctx.agent_id.clone()).unwrap_or_else(|| "main".into()),
+            });
             obj.insert(
                 "metadata".to_string(),
                 serde_json::json!({
                     "user_id": self.build_metadata_user_id(request_id),
+                    "session_context": session_context,
                 }),
             );
         }
@@ -496,6 +578,10 @@ impl ApiClient for AnthropicApiClient {
             config: self.config.clone(),
             client: self.client.clone(),
         })
+    }
+
+    fn with_request_context(&self, context: RequestContext) -> Box<dyn ApiClient> {
+        Box::new(self.cloned_with_request_context(context))
     }
 
     async fn create_message(
@@ -590,7 +676,12 @@ impl ApiClient for AnthropicApiClient {
                     .and_then(|v| v.to_str().ok())
                     .map(str::to_string);
                 if status >= 400 {
-                    let err_text = resp.text().await.unwrap_or_default();
+                    let err_text = self.format_error_message(
+                        &request_id,
+                        server_request_id.as_deref(),
+                        resp.text().await.unwrap_or_default(),
+                        None,
+                    );
                     if err_text.to_ascii_lowercase().contains("coding agent")
                         || err_text.to_ascii_lowercase().contains("access policy")
                     {
@@ -784,7 +875,12 @@ impl ApiClient for AnthropicApiClient {
                             .and_then(|v| v.to_str().ok())
                             .map(str::to_string);
                         if status >= 400 {
-                            let err_text = resp.text().await.unwrap_or_default();
+                            let err_text = temp_client.format_error_message(
+                                &request_id,
+                                server_request_id.as_deref(),
+                                resp.text().await.unwrap_or_default(),
+                                None,
+                            );
                             if err_text.to_ascii_lowercase().contains("coding agent")
                                 || err_text.to_ascii_lowercase().contains("access policy")
                             {

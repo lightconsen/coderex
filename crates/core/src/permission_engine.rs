@@ -114,10 +114,8 @@ impl PendingPermissionStore {
         let Some(path) = &self.persist_path else {
             return Ok(());
         };
-        let json = serde_json::to_string_pretty(
-            &self.pending.values().collect::<Vec<_>>(),
-        )
-        .map_err(|e| PermissionRequestError::PersistFailed(e.to_string()))?;
+        let json = serde_json::to_string_pretty(&self.pending.values().collect::<Vec<_>>())
+            .map_err(|e| PermissionRequestError::PersistFailed(e.to_string()))?;
         std::fs::write(path, json)
             .map_err(|e| PermissionRequestError::PersistFailed(e.to_string()))?;
         Ok(())
@@ -241,7 +239,8 @@ impl PermissionEngine {
 
         // Phase 3: Confirmation bus (if configured and result needs user input)
         let result = match result {
-            PermissionResult::Ask { ref reason } | PermissionResult::AskForSession { ref reason } => {
+            PermissionResult::Ask { ref reason }
+            | PermissionResult::AskForSession { ref reason } => {
                 if let Some(ref bus) = self.confirmation_bus {
                     let confirmation_req = ConfirmationRequest {
                         id: id.clone(),
@@ -429,7 +428,11 @@ impl PermissionHook for AutoApproveHook {
         request: &PermissionRequest,
         _mode: crate::permissions::PermissionMode,
     ) -> Result<Option<PermissionResult>, PermissionRequestError> {
-        if self.tool_names.iter().any(|t| t.eq_ignore_ascii_case(&request.tool_name)) {
+        if self
+            .tool_names
+            .iter()
+            .any(|t| t.eq_ignore_ascii_case(&request.tool_name))
+        {
             Ok(Some(PermissionResult::Allow))
         } else {
             Ok(None)
@@ -484,8 +487,7 @@ impl AutoClassifierHook {
 }
 
 /// System prompt for the auto-classifier.
-const AUTO_CLASSIFIER_SYSTEM: &str =
-    "You are a security classifier. Given a tool name and its arguments, \
+const AUTO_CLASSIFIER_SYSTEM: &str = "You are a security classifier. Given a tool name and its arguments, \
      classify the risk level as exactly one word: safe, caution, or dangerous. \
      Respond with ONLY the classification word.\n\n\
      safe = read-only or harmless operations (read, grep, ls, web_search, etc.)\n\
@@ -544,7 +546,8 @@ impl PermissionHook for AutoClassifierHook {
 mod tests {
     use super::*;
     use crate::permissions::{PermissionChecker, PermissionMode};
-    use crate::types::ModelId;
+    use crate::tool_executor::ToolInfo;
+    use crate::types::{ModelId, UsageSummary};
 
     fn make_request(tool: &str) -> PermissionRequest {
         PermissionRequest {
@@ -561,7 +564,10 @@ mod tests {
     async fn noop_hook_passes_through() {
         let hook = NoOpPermissionHook;
         let request = make_request("bash");
-        let result = hook.evaluate(&request, PermissionMode::Default).await.unwrap();
+        let result = hook
+            .evaluate(&request, PermissionMode::Default)
+            .await
+            .unwrap();
         assert!(result.is_none());
     }
 
@@ -569,12 +575,18 @@ mod tests {
     async fn auto_approve_hook_approves_matching_tool() {
         let hook = AutoApproveHook::for_tools(vec!["read".into()]);
         let request = make_request("read");
-        let result = hook.evaluate(&request, PermissionMode::Default).await.unwrap();
+        let result = hook
+            .evaluate(&request, PermissionMode::Default)
+            .await
+            .unwrap();
         assert!(matches!(result, Some(PermissionResult::Allow)));
 
         // Non-matching tool should pass through
         let request2 = make_request("bash");
-        let result2 = hook.evaluate(&request2, PermissionMode::Default).await.unwrap();
+        let result2 = hook
+            .evaluate(&request2, PermissionMode::Default)
+            .await
+            .unwrap();
         assert!(result2.is_none());
     }
 
@@ -593,7 +605,10 @@ mod tests {
             created_at: Utc::now(),
         };
 
-        let result = hook.evaluate(&request, PermissionMode::Default).await.unwrap();
+        let result = hook
+            .evaluate(&request, PermissionMode::Default)
+            .await
+            .unwrap();
         assert!(matches!(result, Some(PermissionResult::Deny { .. })));
     }
 
@@ -710,7 +725,6 @@ mod tests {
     #[tokio::test]
     async fn explain_permission_hook_passes_through() {
         use crate::api_client::{ApiClient, ApiResponse, StreamEvent};
-        use crate::types::UsageSummary;
         use futures::Stream;
         use std::pin::Pin;
 
@@ -758,7 +772,10 @@ mod tests {
 
         let hook = ExplainPermissionHook::new(Box::new(MockApiClient));
         let request = make_request("Write");
-        let result = hook.evaluate(&request, PermissionMode::Default).await.unwrap();
+        let result = hook
+            .evaluate(&request, PermissionMode::Default)
+            .await
+            .unwrap();
         // Should always pass through (not short-circuit)
         assert!(result.is_none());
     }
@@ -766,7 +783,6 @@ mod tests {
     #[tokio::test]
     async fn auto_classifier_allows_safe_in_auto_mode() {
         use crate::api_client::{ApiClient, ApiResponse, StreamEvent};
-        use crate::types::UsageSummary;
         use futures::Stream;
         use std::pin::Pin;
 
@@ -876,7 +892,6 @@ mod tests {
     #[tokio::test]
     async fn auto_classifier_passes_through_in_non_auto_mode() {
         use crate::api_client::{ApiClient, ApiResponse, StreamEvent};
-        use crate::types::UsageSummary;
         use futures::Stream;
         use std::pin::Pin;
 
@@ -914,7 +929,10 @@ mod tests {
 
         let hook = AutoClassifierHook::new(Box::new(NeverCalled));
         let request = make_request("read");
-        let result = hook.evaluate(&request, PermissionMode::Default).await.unwrap();
+        let result = hook
+            .evaluate(&request, PermissionMode::Default)
+            .await
+            .unwrap();
         assert!(result.is_none());
     }
 
@@ -939,7 +957,9 @@ mod tests {
 
         let req = bus_clone.next_request().await.unwrap();
         assert_eq!(req.tool_name, "bash");
-        bus_clone.respond(&req.id, ConfirmationResponse::Approved).await;
+        bus_clone
+            .respond(&req.id, ConfirmationResponse::Approved)
+            .await;
 
         let result = handle.await.unwrap();
         assert!(matches!(result, PermissionResult::Allow));
@@ -965,7 +985,9 @@ mod tests {
         });
 
         let req = bus_clone.next_request().await.unwrap();
-        bus_clone.respond(&req.id, ConfirmationResponse::Denied).await;
+        bus_clone
+            .respond(&req.id, ConfirmationResponse::Denied)
+            .await;
 
         let result = handle.await.unwrap();
         assert!(matches!(result, PermissionResult::Deny { .. }));
@@ -992,7 +1014,9 @@ mod tests {
         });
 
         let req = bus_clone.next_request().await.unwrap();
-        bus_clone.respond(&req.id, ConfirmationResponse::ApproveSession).await;
+        bus_clone
+            .respond(&req.id, ConfirmationResponse::ApproveSession)
+            .await;
 
         let result = handle.await.unwrap();
         assert!(matches!(result, PermissionResult::Allow));

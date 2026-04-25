@@ -486,9 +486,9 @@ Session sharing and directory switching:
 
 ---
 
-## 14. Provider Interaction Design
+## 14. Provider Interaction Architecture
 
-This section consolidates the provider interaction contract for CodeRex (Anthropic-compatible / OpenAI-compatible / platform gateways).
+This section documents the provider/LLM interaction architecture that is implemented in CodeRex today.
 
 ### 14.1 Goals
 
@@ -501,32 +501,35 @@ This section consolidates the provider interaction contract for CodeRex (Anthrop
 
 ```text
 QueryEngine
-  -> ProviderRouter
-      -> ProviderAdapter (Anthropic/OpenAI/Kimi/DashScope...)
-          -> HTTP Transport
+  -> ApiClient::with_request_context(RequestContext)
+      -> ProviderRouter
+          -> ModelRouter
+              -> ProviderAdapter
+                  -> reqwest transport + SSE/parser logic
 ```
 
-- `QueryEngine`: turn state machine, tool loop, permissions, budgets
-- `ProviderRouter`: selects provider profile by model/config
-- `ProviderAdapter`: request shaping, stream parsing, error normalization
-- `HTTP Transport`: timeout, retry, proxy, request-id injection
+- `QueryEngine` (`crates/core/src/engine.rs`): builds provider-facing messages, assembles `RequestContext`, and owns the turn/tool loop.
+- `ProviderRouter` (`crates/core/src/provider_router.rs`): explicit routing boundary used by the engine.
+- `ModelRouter` (`crates/core/src/model_router.rs`): priority/fallback chain, model filtering, fallback allowlist, and per-request context propagation.
+- `ProviderAdapter` (`AnthropicProvider`, `OpenAiCompatibleProvider`): provider-specific request shaping, stream parsing, capability checks, and error normalization.
+- Transport is currently implemented inside the adapters (`AnthropicApiClient` / `OpenAiCompatibleProvider`) rather than as a standalone shared `HttpTransport` type.
 
 ### 14.3 Unified Internal Request Model
 
-Core fields used regardless of provider API style:
+The provider-facing request shape is normalized around:
 
-- `system_prompt`
+- `system`
 - `messages`
 - `tools`
-- `tool_choice`
-- `thinking` / `effort`
-- `output_config` (structured output / budget)
-- `session_context` (`session_id`, `turn_id`, `agent_id`)
-- `provider_hints` (profile-specific hints)
+- `max_tokens`
+- `stream`
+- `RequestContext { session_id, device_id, turn_id, agent_id, request_id, provider_hints }`
+
+`RequestContext` is built in the engine, threaded through `ApiClient::with_request_context`, and consumed by the router/adapters to shape headers, metadata, API style, and diagnostics.
 
 ### 14.4 Provider Profile Contract
 
-Each provider profile should define:
+Provider profiles are resolved by `ResolvedProviderProfile` and currently define:
 
 - `api_style`: `anthropic_messages` | `openai_chat` | `openai_responses`
 - base URL + path behavior
@@ -535,20 +538,34 @@ Each provider profile should define:
 - tool-call capability flags (structured stream, parallel tools, etc.)
 - error mapping policy
 
+Implemented profile families:
+
+- `anthropic`
+- `dashscope`
+- `kimi`
+- `openai`
+- `groq`
+- `custom`
+
+The capability matrix is represented by `ProviderCapabilities` and is used to suppress unsupported structured-tool paths (for example, Kimi).
+
 ### 14.5 Identity and Session Signals
 
-For each main-thread request, include at least:
+For each main-thread request, CodeRex now standardizes:
 
 - `User-Agent: CodeRex/<version> (<os>; <arch>)`
 - `X-CodeRex-Session-Id: <session_id>`
 - `X-CodeRex-Client: cli`
-- `metadata.user_id` (JSON string containing `device_id` + `session_id`)
+- `metadata.user_id` (JSON string containing `device_id`, `session_id`, `turn_id`, `agent_id`, `client`, `request_id`)
+- `metadata.session_context` (`session_id`, `turn_id`, `agent_id`)
 
-Optional signals:
+Additional signals when available:
 
 - `X-CodeRex-Agent-Id`
 - `X-CodeRex-Request-Id` (local request correlation id)
 - provider-specific headers from the selected profile
+
+DashScope-specific headers are injected for DashScope profiles. Both Anthropic-compatible and OpenAI-compatible paths now emit the same CodeRex identity/session shape.
 
 ### 14.6 Tool Calling Path
 
@@ -566,6 +583,18 @@ Fallback path (compatibility only):
 3. Execute and inject canonical `tool_result`
 4. Record `fallback_reason` for diagnostics/governance
 
+Implemented structured paths:
+
+- Anthropic messages SSE
+- OpenAI chat-completions SSE
+- OpenAI responses SSE
+
+Implemented compatibility paths:
+
+- pseudo-tool parsing in the engine
+- Kimi tool suppression with text-tool fallback
+- headless single-read normalization in the CLI for `Read ...` workflows
+
 ### 14.7 Tool Execution Orchestration
 
 - Concurrency-safe (read-only) tools may run in parallel
@@ -575,13 +604,12 @@ Fallback path (compatibility only):
 
 ### 14.8 Error Model and Recovery
 
-Normalized error classes:
+Current error normalization is two-layered:
 
-- `AuthError`
-- `AccessPolicyError` (e.g. “only available for Coding Agents”)
-- `RateLimitError`
-- `TransientError`
-- `InvalidRequestError`
+- transport/API layer: `ApiError::{Auth, AccessPolicy, Response, Http, RetryExhausted, InvalidModel}`
+- provider/router layer: `ProviderErrorKind::{Auth, AccessPolicy, RateLimit, Retryable, InvalidRequest, Unavailable, Unknown}`
+
+Access-policy failures such as “only available for Coding Agents” are classified explicitly and do not trigger provider fallback.
 
 Recovery order:
 
@@ -590,35 +618,52 @@ Recovery order:
 3. Optional fallback provider (if policy allows)
 4. User-facing actionable error with request id
 
+Returned provider error messages now include local and server request identifiers when available.
+
 ### 14.9 Observability
 
-Per request, track:
+Per request, CodeRex now logs/tracks:
 
 - local `request_id` + provider `server_request_id` (if available)
 - provider/profile/model/base_url
-- header policy version (without sensitive values)
 - fallback flags (`tool_fallback`, `streaming_fallback`)
 - tool execution stats (concurrency, failures, cancellations)
 - token/latency/cost metrics
 
+Request start / response logs include provider, profile, model, base URL, request IDs, and fallback flags.
+
 ### 14.10 Configuration Surface
 
-Recommended config extensions:
+Implemented configuration surface:
 
 - `provider_profile`
 - `custom_headers`
 - `metadata_policy`
 - `fallback_providers`
+- `session_id`
+- `device_id`
+
+Primary env sources today:
+
+- `CODEREX_PROVIDER_PROFILE`
+- `CODEREX_CUSTOM_HEADERS`
+- `CODEREX_FALLBACK_PROVIDERS`
+- `CODEREX_SESSION_ID`
+- `CODEREX_DEVICE_ID`
 
 Policy: safe defaults, explicit overrides, auditable behavior.
 
 ### 14.11 Alignment with Current CodeRex
 
-1. Move header/metadata injection to profile-driven rules
-2. Keep text pseudo-call parsing as secondary path
-3. Standardize `X-CodeRex-Session-Id` and `metadata.user_id`
-4. Add provider capability matrix for tool-stream support
-5. Surface fallback reasons + request ids in debug output
+Implemented:
+
+1. Explicit `ProviderRouter -> ModelRouter -> ProviderAdapter` layering
+2. Shared `RequestContext` propagation from engine to transport
+3. Standardized `X-CodeRex-Session-Id`, `X-CodeRex-Agent-Id`, and `metadata.user_id`
+4. Provider capability matrix for structured tool use / streaming decisions
+5. Real `OpenAiResponses` request and stream handling
+6. Request/server request IDs surfaced in provider diagnostics
+7. Text pseudo-call parsing retained as the compatibility path
 
 ### 14.12 Non-Goals
 

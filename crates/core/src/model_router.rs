@@ -15,7 +15,7 @@
 //! router.add_provider(Box::new(AnthropicProvider::new(config)));
 //! ```
 
-use crate::api_client::{ApiClient, ApiError, ApiResponse, StreamEvent};
+use crate::api_client::{ApiClient, ApiError, ApiResponse, RequestContext, StreamEvent};
 use crate::provider::{Provider, ProviderError, provider_error_to_api};
 use crate::tool_executor::ToolInfo;
 use crate::types::ModelId;
@@ -56,6 +56,8 @@ pub struct ModelRouter {
     max_fallbacks: u32,
     /// Optional explicit fallback provider allowlist.
     fallback_providers: Vec<String>,
+    /// Optional per-request context propagated into providers.
+    request_context: Option<RequestContext>,
 }
 
 impl std::fmt::Debug for ModelRouter {
@@ -78,6 +80,7 @@ impl ModelRouter {
             routes: Vec::new(),
             max_fallbacks: 2,
             fallback_providers: Vec::new(),
+            request_context: None,
         }
     }
 
@@ -128,6 +131,31 @@ impl ModelRouter {
         self.routes.sort_by_key(|r| r.priority);
     }
 
+    /// Clone this router as a concrete value.
+    #[must_use]
+    pub fn clone_box_router(&self) -> Self {
+        let mut router = Self::new(self.name.clone()).with_max_fallbacks(self.max_fallbacks);
+        router = router.with_fallback_providers(self.fallback_providers.clone());
+        router.request_context = self.request_context.clone();
+        for entry in &self.routes {
+            router.routes.push(RouteEntry {
+                provider: entry.provider.clone_box(),
+                priority: entry.priority,
+                models: entry.models.clone(),
+            });
+        }
+        router.routes.sort_by_key(|route| route.priority);
+        router
+    }
+
+    /// Clone this router with per-request context.
+    #[must_use]
+    pub fn clone_with_request_context(&self, context: RequestContext) -> Self {
+        let mut router = self.clone_box_router();
+        router.request_context = Some(context);
+        router
+    }
+
     /// Get eligible providers for a model.
     fn eligible_providers(&self, model: &ModelId) -> Vec<Box<dyn Provider>> {
         self.routes
@@ -145,6 +173,14 @@ impl ModelRouter {
 
     fn providers_for_request(&self, model: &ModelId) -> Vec<Box<dyn Provider>> {
         let eligible = self.eligible_providers(model);
+        let eligible: Vec<_> = if let Some(context) = self.request_context.clone() {
+            eligible
+                .into_iter()
+                .map(|provider| provider.with_request_context(context.clone()))
+                .collect()
+        } else {
+            eligible
+        };
         if self.fallback_providers.is_empty() || eligible.len() <= 1 {
             return eligible;
         }
@@ -260,12 +296,11 @@ impl ModelRouter {
 #[async_trait]
 impl ApiClient for ModelRouter {
     fn clone_box(&self) -> Box<dyn ApiClient> {
-        let mut router = ModelRouter::new(self.name.clone()).with_max_fallbacks(self.max_fallbacks);
-        router = router.with_fallback_providers(self.fallback_providers.clone());
-        for entry in &self.routes {
-            router.add_provider_with_priority(entry.provider.clone_box(), entry.priority);
-        }
-        Box::new(router)
+        Box::new(self.clone_box_router())
+    }
+
+    fn with_request_context(&self, context: RequestContext) -> Box<dyn ApiClient> {
+        Box::new(self.clone_with_request_context(context))
     }
 
     async fn create_message(

@@ -4,7 +4,7 @@
 //! using a lightweight model query.
 
 use crate::api_client::ApiClient;
-use crate::orchestrator::{QueryResult, OrchestratorError, run_lightweight_query};
+use crate::orchestrator::{OrchestratorError, QueryResult, run_lightweight_query};
 
 /// Generates a session title from the first user message.
 ///
@@ -21,13 +21,7 @@ pub async fn generate_session_title(
     let system = crate::prompts::SESSION_TITLE_SYSTEM;
     let user = crate::prompts::session_title_user_prompt(user_message);
 
-    let result = run_lightweight_query(
-        api_client,
-        system,
-        &user,
-        128,
-    )
-    .await?;
+    let result = run_lightweight_query(api_client, system, &user, 128).await?;
 
     Ok(parse_title(&result))
 }
@@ -60,9 +54,13 @@ pub fn parse_title(result: &QueryResult) -> String {
         }
     }
     // Fallback: take first line or first 60 chars
-    result.content.lines().next()
+    result
+        .content
+        .lines()
+        .next()
         .unwrap_or(&result.content)
-        .chars().take(60)
+        .chars()
+        .take(60)
         .collect()
 }
 
@@ -70,15 +68,22 @@ pub fn parse_title(result: &QueryResult) -> String {
 mod tests {
     use super::*;
     use crate::api_client::{ApiResponse, StreamEvent};
+    use crate::tool_executor::ToolInfo;
     use crate::types::{ModelId, UsageSummary};
-    use std::pin::Pin;
     use futures::Stream;
+    use std::pin::Pin;
 
     #[derive(Clone)]
-    struct MockApi { response_content: String }
+    struct MockApi {
+        response_content: String,
+    }
 
     impl MockApi {
-        fn new(content: &str) -> Self { Self { response_content: content.into() } }
+        fn new(content: &str) -> Self {
+            Self {
+                response_content: content.into(),
+            }
+        }
     }
 
     #[async_trait::async_trait]
@@ -139,8 +144,10 @@ mod tests {
     fn parse_title_json() {
         let result = QueryResult {
             content: r#"{"title": "Add logging"}"#.into(),
-            input_tokens: 50, output_tokens: 10,
-            cache_read_tokens: 0, cache_creation_tokens: 0,
+            input_tokens: 50,
+            output_tokens: 10,
+            cache_read_tokens: 0,
+            cache_creation_tokens: 0,
         };
         assert_eq!(parse_title(&result), "Add logging");
     }
@@ -149,8 +156,10 @@ mod tests {
     fn parse_title_text_fallback() {
         let result = QueryResult {
             content: "Some plain text response".into(),
-            input_tokens: 50, output_tokens: 10,
-            cache_read_tokens: 0, cache_creation_tokens: 0,
+            input_tokens: 50,
+            output_tokens: 10,
+            cache_read_tokens: 0,
+            cache_creation_tokens: 0,
         };
         let title = parse_title(&result);
         assert_eq!(title, "Some plain text response");
@@ -161,8 +170,10 @@ mod tests {
         let long = "a".repeat(100);
         let result = QueryResult {
             content: long.clone(),
-            input_tokens: 50, output_tokens: 10,
-            cache_read_tokens: 0, cache_creation_tokens: 0,
+            input_tokens: 50,
+            output_tokens: 10,
+            cache_read_tokens: 0,
+            cache_creation_tokens: 0,
         };
         assert_eq!(parse_title(&result).len(), 60);
     }

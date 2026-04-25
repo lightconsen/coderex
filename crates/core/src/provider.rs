@@ -8,7 +8,7 @@
 //! and implements [`ApiClient`](crate::api_client::ApiClient) to provide
 //! unified access with fallback chains.
 
-use crate::api_client::{ApiError, ApiResponse};
+use crate::api_client::{ApiError, ApiResponse, RequestContext};
 use crate::tool_executor::ToolInfo;
 use crate::types::ModelId;
 use async_trait::async_trait;
@@ -131,6 +131,11 @@ impl ResolvedProviderProfile {
     ) -> Self {
         let explicit = profile_hint.unwrap_or_default().to_ascii_lowercase();
         let host = base_url.to_ascii_lowercase();
+        let style = if explicit.contains("responses") {
+            ProviderApiStyle::OpenAiResponses
+        } else {
+            default_style
+        };
         let name = if explicit.contains("dashscope") || host.contains("dashscope") {
             "dashscope"
         } else if explicit.contains("kimi")
@@ -148,7 +153,7 @@ impl ResolvedProviderProfile {
             "custom"
         };
 
-        match (name, default_style) {
+        match (name, style) {
             ("anthropic", ProviderApiStyle::AnthropicMessages) => Self {
                 name,
                 api_style: ProviderApiStyle::AnthropicMessages,
@@ -190,7 +195,7 @@ impl ResolvedProviderProfile {
             },
             ("kimi", _) => Self {
                 name,
-                api_style: default_style,
+                api_style: style,
                 capabilities: ProviderCapabilities {
                     streaming: true,
                     tool_use: false,
@@ -203,7 +208,7 @@ impl ResolvedProviderProfile {
             },
             ("groq", _) | ("openai", _) | ("custom", _) => Self {
                 name,
-                api_style: default_style,
+                api_style: style,
                 capabilities: ProviderCapabilities {
                     streaming: true,
                     tool_use: true,
@@ -216,7 +221,7 @@ impl ResolvedProviderProfile {
             },
             _ => Self {
                 name,
-                api_style: default_style,
+                api_style: style,
                 capabilities: ProviderCapabilities {
                     streaming: true,
                     tool_use: true,
@@ -239,6 +244,11 @@ pub trait Provider: Send + Sync {
 
     /// Provider capabilities.
     fn capabilities(&self) -> ProviderCapabilities;
+
+    /// Clone the provider with per-request context.
+    fn with_request_context(&self, _context: RequestContext) -> Box<dyn Provider> {
+        self.clone_box()
+    }
 
     /// Send a non-streaming message.
     ///

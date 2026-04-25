@@ -39,7 +39,9 @@ impl ModelProfile {
 // ─── Prompt Profile ─────────────────────────────────────────────────────────
 
 /// Selects which system prompt profile to use.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, Default, serde::Serialize, serde::Deserialize,
+)]
 pub enum PromptProfile {
     /// Default agent system prompt (general coding).
     #[default]
@@ -101,6 +103,10 @@ pub struct QueryRequest {
     pub stream: bool,
     /// Maximum tokens for the response.
     pub max_tokens: u32,
+    /// Optional logical agent identifier.
+    pub agent_id: Option<String>,
+    /// Provider-specific transport hints.
+    pub provider_hints: std::collections::HashMap<String, String>,
 }
 
 impl QueryRequest {
@@ -118,6 +124,8 @@ impl QueryRequest {
             inherit_session: false,
             stream: false,
             max_tokens: 1024,
+            agent_id: None,
+            provider_hints: std::collections::HashMap::new(),
         }
     }
 
@@ -135,6 +143,8 @@ impl QueryRequest {
             inherit_session: false,
             stream: false,
             max_tokens: 512,
+            agent_id: None,
+            provider_hints: std::collections::HashMap::new(),
         }
     }
 
@@ -156,6 +166,8 @@ impl QueryRequest {
             inherit_session: false,
             stream: false,
             max_tokens: 128,
+            agent_id: None,
+            provider_hints: std::collections::HashMap::new(),
         }
     }
 
@@ -176,6 +188,8 @@ impl QueryRequest {
             inherit_session: false,
             stream: false,
             max_tokens: 256,
+            agent_id: None,
+            provider_hints: std::collections::HashMap::new(),
         }
     }
 }
@@ -248,9 +262,12 @@ mod tests {
             inherit_session: true,
             stream: true,
             max_tokens: 4096,
+            agent_id: Some("agent-1".into()),
+            provider_hints: std::collections::HashMap::new(),
         };
         assert_eq!(req.custom_system_prompt.as_deref(), Some("custom"));
         assert_eq!(req.append_system_prompt.as_deref(), Some("append"));
         assert_eq!(req.allowed_tools.as_deref().unwrap(), &["Read"]);
+        assert_eq!(req.agent_id.as_deref(), Some("agent-1"));
     }
 }

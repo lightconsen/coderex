@@ -29,6 +29,7 @@ pub mod prompt;
 pub mod prompts;
 pub mod provider;
 pub mod provider_config;
+pub mod provider_router;
 pub mod providers;
 pub mod query_profiles;
 pub mod runtime;
@@ -138,5 +139,6 @@ pub use provider::{
     ResolvedProviderProfile, classify_api_error, provider_error_to_api,
 };
 pub use provider_config::{NamedProviderEndpoint, ProviderConfig, ProviderEndpoint};
+pub use provider_router::ProviderRouter;
 
 pub mod test_utils;

@@ -3,7 +3,9 @@
 //! Wraps the existing [`AnthropicApiClient`](crate::api_client::AnthropicApiClient)
 //! logic in the [`Provider`](crate::provider::Provider) trait.
 
-use crate::api_client::{AnthropicApiClient, ApiClient, ApiConfig, ApiResponse, StreamEvent};
+use crate::api_client::{
+    AnthropicApiClient, ApiClient, ApiConfig, ApiResponse, RequestContext, StreamEvent,
+};
 use crate::provider::{Provider, ProviderCapabilities, ProviderError, classify_api_error};
 use crate::types::ModelId;
 use async_trait::async_trait;
@@ -40,6 +42,12 @@ impl Provider for AnthropicProvider {
 
     fn capabilities(&self) -> ProviderCapabilities {
         self.client.resolved_profile().capabilities
+    }
+
+    fn with_request_context(&self, context: RequestContext) -> Box<dyn Provider> {
+        Box::new(Self::from_client(
+            self.client.cloned_with_request_context(context),
+        ))
     }
 
     async fn create_message(

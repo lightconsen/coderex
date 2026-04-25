@@ -111,9 +111,7 @@ pub struct Orchestrator {
 impl Orchestrator {
     /// Create a new orchestrator.
     #[must_use]
-    pub fn new(
-        api_client: Box<dyn ApiClient>,
-    ) -> Self {
+    pub fn new(api_client: Box<dyn ApiClient>) -> Self {
         Self {
             api_client,
             default_model: ModelProfile::Main,
@@ -152,7 +150,10 @@ impl Orchestrator {
     ///
     /// In a full implementation, this would invoke `QueryEngine` directly.
     /// Here we provide the routing and parameter translation layer.
-    async fn run_main_agent(&self, request: &QueryRequest) -> Result<QueryResult, OrchestratorError> {
+    async fn run_main_agent(
+        &self,
+        request: &QueryRequest,
+    ) -> Result<QueryResult, OrchestratorError> {
         run_main_agent_with_engine(self.api_client.as_ref(), request).await
     }
 
@@ -160,11 +161,14 @@ impl Orchestrator {
     ///
     /// Typical uses: permission explanation, mode classification,
     /// memory selection, model validation.
-    pub async fn run_side_query(&self, request: &QueryRequest) -> Result<QueryResult, OrchestratorError> {
+    pub async fn run_side_query(
+        &self,
+        request: &QueryRequest,
+    ) -> Result<QueryResult, OrchestratorError> {
         let model = self.resolve_model(&request.model_profile);
-        let system = request.custom_system_prompt
-            .clone()
-            .unwrap_or_else(|| crate::prompts::compose_system_prompt_for_profiles(&[request.prompt_profile]));
+        let system = request.custom_system_prompt.clone().unwrap_or_else(|| {
+            crate::prompts::compose_system_prompt_for_profiles(&[request.prompt_profile])
+        });
 
         let mut user_text = request.user_prompt.clone();
         if let Some(ref append) = request.append_system_prompt {
@@ -179,7 +183,8 @@ impl Orchestrator {
             1024
         };
 
-        let response = self.api_client
+        let response = self
+            .api_client
             .create_message(&system, &messages, &model, max_tokens, &[])
             .await?;
 
@@ -196,12 +201,15 @@ impl Orchestrator {
     ///
     /// Typical uses: session title, rename, date parsing, shell prefix,
     /// tool use summary, hook evaluation.
-    pub async fn run_lightweight_query(&self, request: &QueryRequest) -> Result<QueryResult, OrchestratorError> {
+    pub async fn run_lightweight_query(
+        &self,
+        request: &QueryRequest,
+    ) -> Result<QueryResult, OrchestratorError> {
         // Force lightweight model regardless of request
         let model = ModelProfile::Lightweight.resolve();
-        let system = request.custom_system_prompt
-            .clone()
-            .unwrap_or_else(|| crate::prompts::compose_system_prompt_for_profiles(&[request.prompt_profile]));
+        let system = request.custom_system_prompt.clone().unwrap_or_else(|| {
+            crate::prompts::compose_system_prompt_for_profiles(&[request.prompt_profile])
+        });
 
         let messages = Self::build_messages(&request.user_prompt);
         let max_tokens = if request.max_tokens > 0 {
@@ -210,7 +218,8 @@ impl Orchestrator {
             512
         };
 
-        let response = self.api_client
+        let response = self
+            .api_client
             .create_message(&system, &messages, &model, max_tokens, &[])
             .await?;
 
@@ -234,7 +243,10 @@ impl Orchestrator {
     /// - operate under a restricted tool whitelist
     /// - use a different model profile (e.g., Background)
     /// - produce results that are recycled back into the main session
-    async fn run_forked_agent(&self, request: &QueryRequest) -> Result<QueryResult, OrchestratorError> {
+    async fn run_forked_agent(
+        &self,
+        request: &QueryRequest,
+    ) -> Result<QueryResult, OrchestratorError> {
         let system = self.build_system_prompt(request);
         let parent_context = if request.inherit_session {
             Some("Inherited parent-session context is available for this sub-task.")
@@ -280,7 +292,9 @@ impl Orchestrator {
     /// Build a message list from a user prompt string.
     fn build_messages(user_prompt: &str) -> Vec<serde_json::Value> {
         let msg = Message::user(user_prompt);
-        serde_json::to_value(&msg).map(|v| vec![v]).unwrap_or_default()
+        serde_json::to_value(&msg)
+            .map(|v| vec![v])
+            .unwrap_or_default()
     }
 
     /// Build SubmitOptions from a QueryRequest.
@@ -305,7 +319,9 @@ impl Orchestrator {
         request: &QueryRequest,
     ) -> Result<TerminalReason, String> {
         let options = self.build_submit_options(request);
-        engine.submit_streaming(request.user_prompt.clone(), options).await
+        engine
+            .submit_streaming(request.user_prompt.clone(), options)
+            .await
     }
 
     /// Run a background feature through this orchestrator's API client.
@@ -325,14 +341,15 @@ fn build_options_from_request(request: &QueryRequest) -> SubmitOptions {
     if let Some(ref prompt) = request.custom_system_prompt {
         options.custom_system_prompt = Some(prompt.clone());
     } else {
-        options.custom_system_prompt = Some(
-            crate::prompts::compose_system_prompt_for_profiles(&[request.prompt_profile]),
-        );
+        options.custom_system_prompt = Some(crate::prompts::compose_system_prompt_for_profiles(&[
+            request.prompt_profile,
+        ]));
     }
     options.append_system_prompt = request.append_system_prompt.clone();
-    options.allowed_tools_override = request.allowed_tools.clone().or_else(|| {
-        crate::prompts::default_allowed_tools_for_profiles(&[request.prompt_profile])
-    });
+    options.allowed_tools_override = request
+        .allowed_tools
+        .clone()
+        .or_else(|| crate::prompts::default_allowed_tools_for_profiles(&[request.prompt_profile]));
     options
 }
 
@@ -463,6 +480,8 @@ pub async fn run_forked_agent(
         inherit_session: parent_context.is_some(),
         stream: false,
         max_tokens,
+        agent_id: None,
+        provider_hints: std::collections::HashMap::new(),
     };
 
     run_engine_query(api_client, &request).await
@@ -599,9 +618,10 @@ mod tests {
     use super::*;
     use crate::api_client::{ApiClient, ApiResponse, StreamEvent};
     use crate::test_utils::MockApiClient;
+    use crate::tool_executor::ToolInfo;
     use crate::types::UsageSummary;
-    use std::pin::Pin;
     use futures::Stream;
+    use std::pin::Pin;
 
     #[derive(Clone)]
     struct MockApi;
@@ -675,6 +695,8 @@ mod tests {
             inherit_session: false,
             stream: true,
             max_tokens: 4096,
+            agent_id: None,
+            provider_hints: std::collections::HashMap::new(),
         };
         let result = orchestrator.run(request).await;
         assert!(result.is_ok());
@@ -701,6 +723,8 @@ mod tests {
             inherit_session: true,
             stream: false,
             max_tokens: 2048,
+            agent_id: None,
+            provider_hints: std::collections::HashMap::new(),
         };
         let result = orchestrator.run(request).await;
         assert!(result.is_ok());
@@ -722,6 +746,8 @@ mod tests {
             inherit_session: false,
             stream: false,
             max_tokens: 64,
+            agent_id: None,
+            provider_hints: std::collections::HashMap::new(),
         };
 
         let result = orchestrator.run(request).await;

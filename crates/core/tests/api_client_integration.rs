@@ -8,12 +8,13 @@ use std::sync::{Mutex, OnceLock};
 
 use async_trait::async_trait;
 use coderex_core::api_client::{
-    AnthropicApiClient, ApiClient, ApiConfig, ApiError, ApiResponse, StreamEvent,
+    AnthropicApiClient, ApiClient, ApiConfig, ApiError, ApiResponse, RequestContext, StreamEvent,
 };
 use coderex_core::budget::{BudgetThresholds, TokenBudget};
 use coderex_core::cost::{CostTracker, ModelPricing, pricing_for_model};
 use coderex_core::model_router::ModelRouter;
 use coderex_core::provider::{Provider, ProviderCapabilities, ProviderError, ProviderErrorKind};
+use coderex_core::provider_router::ProviderRouter;
 use coderex_core::providers::OpenAiCompatibleProvider;
 use coderex_core::tool_executor::ToolInfo;
 use coderex_core::types::{ModelId, UsageSummary};
@@ -757,7 +758,7 @@ fn custom_pricing_override() {
 
 #[tokio::test]
 async fn anthropic_client_sends_coderex_identity_headers_and_metadata() {
-    let _guard = env_lock().lock().expect("env lock");
+    let _guard = env_lock().lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     let (base_url, handle) = capture_single_request(serde_json::json!({
         "content": [{"type": "text", "text": "ok"}],
         "usage": {"input_tokens": 1, "output_tokens": 1},
@@ -802,7 +803,7 @@ async fn anthropic_client_sends_coderex_identity_headers_and_metadata() {
 
 #[tokio::test]
 async fn anthropic_kimi_profile_suppresses_structured_tools() {
-    let _guard = env_lock().lock().expect("env lock");
+    let _guard = env_lock().lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     let (base_url, handle) = capture_single_request(serde_json::json!({
         "content": [{"type": "text", "text": "ok"}],
         "usage": {"input_tokens": 1, "output_tokens": 1},
@@ -834,7 +835,7 @@ async fn anthropic_kimi_profile_suppresses_structured_tools() {
 
 #[tokio::test]
 async fn openai_provider_sends_coderex_identity_headers_and_metadata() {
-    let _guard = env_lock().lock().expect("env lock");
+    let _guard = env_lock().lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     let (base_url, handle) = capture_single_request(serde_json::json!({
         "choices": [{
             "message": {"content": "ok"},
@@ -849,7 +850,15 @@ async fn openai_provider_sends_coderex_identity_headers_and_metadata() {
     let provider = OpenAiCompatibleProvider::new("openai", base_url, "test-key")
         .with_provider_profile("dashscope")
         .with_default_headers(headers)
-        .with_session_context("sess-openai", "dev-openai");
+        .with_session_context("sess-openai", "dev-openai")
+        .with_request_context(RequestContext {
+            session_id: Some("sess-openai".into()),
+            device_id: Some("dev-openai".into()),
+            turn_id: Some("7".into()),
+            agent_id: Some("agent-openai".into()),
+            request_id: None,
+            provider_hints: Default::default(),
+        });
     let resp = provider
         .create_message("system", &[], &ModelId("gpt-4o".into()), 32, &[])
         .await
@@ -870,6 +879,10 @@ async fn openai_provider_sends_coderex_identity_headers_and_metadata() {
         Some("sess-openai")
     );
     assert_eq!(
+        captured.headers.get("x-coderex-agent-id").map(String::as_str),
+        Some("agent-openai")
+    );
+    assert_eq!(
         captured.headers.get("x-test").map(String::as_str),
         Some("1")
     );
@@ -881,13 +894,20 @@ async fn openai_provider_sends_coderex_identity_headers_and_metadata() {
         Some("api_key")
     );
     assert!(captured.headers.contains_key("user-agent"));
-    assert_eq!(captured.body["metadata"]["sessionId"], "sess-openai");
-    assert_eq!(captured.body["metadata"]["deviceId"], "dev-openai");
+    let metadata_user_id = captured.body["metadata"]["user_id"]
+        .as_str()
+        .expect("metadata.user_id string");
+    let metadata_json: serde_json::Value =
+        serde_json::from_str(metadata_user_id).expect("metadata json");
+    assert_eq!(metadata_json["session_id"], "sess-openai");
+    assert_eq!(metadata_json["device_id"], "dev-openai");
+    assert_eq!(metadata_json["turn_id"], "7");
+    assert_eq!(captured.body["metadata"]["session_context"]["agent_id"], "agent-openai");
 }
 
 #[tokio::test]
 async fn openai_provider_streaming_emits_text_tool_and_usage_events() {
-    let _guard = env_lock().lock().expect("env lock");
+    let _guard = env_lock().lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     let sse = concat!(
         "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"I will \",\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"Read\",\"arguments\":\"{\\\"file\\\":\\\"src/\"}}]},\"finish_reason\":null}]}\n\n",
         "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"check it\",\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"lib.rs\\\"}\"}}]},\"finish_reason\":null}]}\n\n",
@@ -948,7 +968,7 @@ async fn openai_provider_streaming_emits_text_tool_and_usage_events() {
 
 #[tokio::test]
 async fn openai_provider_streaming_falls_back_to_non_streaming_request() {
-    let _guard = env_lock().lock().expect("env lock");
+    let _guard = env_lock().lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     let stream_failure = "HTTP/1.1 500 Internal Server Error\r\nContent-Type: text/plain\r\nContent-Length: 4\r\nConnection: close\r\n\r\noops".to_string();
     let json_body = serde_json::json!({
         "choices": [{
@@ -983,4 +1003,122 @@ async fn openai_provider_streaming_falls_back_to_non_streaming_request() {
     assert_eq!(captured.len(), 2);
     assert_eq!(captured[0].body["stream"], true);
     assert!(captured[1].body.get("stream").is_none());
+}
+
+#[tokio::test]
+async fn openai_responses_provider_uses_responses_payload_shape() {
+    let _guard = env_lock().lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let (base_url, handle) = capture_single_request(serde_json::json!({
+        "status": "completed",
+        "output": [
+            {
+                "type": "message",
+                "content": [{"type": "output_text", "text": "ok"}]
+            },
+            {
+                "type": "function_call",
+                "call_id": "call_1",
+                "name": "Read",
+                "arguments": "{\"file\":\"src/lib.rs\"}"
+            }
+        ],
+        "usage": {"input_tokens": 2, "output_tokens": 3}
+    }))
+    .await;
+
+    let tool = ToolInfo {
+        name: "Read".into(),
+        description: "Read a file".into(),
+        input_schema: serde_json::json!({
+            "type": "object",
+            "properties": { "file": { "type": "string" } },
+            "required": ["file"]
+        }),
+    };
+    let provider = OpenAiCompatibleProvider::new("openai", base_url, "test-key")
+        .with_provider_profile("openai-responses")
+        .with_request_context(RequestContext {
+            session_id: Some("sess-responses".into()),
+            device_id: Some("dev-responses".into()),
+            turn_id: Some("11".into()),
+            agent_id: Some("agent-responses".into()),
+            request_id: None,
+            provider_hints: Default::default(),
+        });
+
+    let resp = provider
+        .create_message("system", &[], &ModelId("gpt-4o".into()), 32, &[tool])
+        .await
+        .expect("responses request should succeed");
+    assert_eq!(resp.content, "ok");
+    assert_eq!(resp.tool_calls.len(), 1);
+    assert_eq!(resp.tool_calls[0].name, "Read");
+
+    let captured = handle.await.expect("server join");
+    assert!(captured.body.get("input").is_some());
+    assert!(captured.body.get("messages").is_none());
+    assert_eq!(captured.body["tool_choice"], "auto");
+    assert_eq!(captured.body["metadata"]["session_context"]["turn_id"], "11");
+}
+
+#[tokio::test]
+async fn provider_router_forwards_request_context_to_provider_headers() {
+    let _guard = env_lock().lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let (base_url, handle) = capture_single_request(serde_json::json!({
+        "choices": [{
+            "message": {"content": "ok"},
+            "finish_reason": "stop"
+        }],
+        "usage": {"prompt_tokens": 1, "completion_tokens": 1}
+    }))
+    .await;
+
+    let mut model_router = ModelRouter::new("test-router");
+    model_router.add_provider(Box::new(OpenAiCompatibleProvider::new(
+        "openai",
+        base_url,
+        "test-key",
+    )));
+    let router = ProviderRouter::from_model_router(model_router);
+    let request_client = router.with_request_context(RequestContext {
+        session_id: Some("sess-router".into()),
+        device_id: Some("dev-router".into()),
+        turn_id: Some("3".into()),
+        agent_id: Some("agent-router".into()),
+        request_id: None,
+        provider_hints: Default::default(),
+    });
+
+    let resp = request_client
+        .create_message("system", &[], &ModelId("gpt-4o".into()), 32, &[])
+        .await
+        .expect("routed request should succeed");
+    assert_eq!(resp.content, "ok");
+
+    let captured = handle.await.expect("server join");
+    assert_eq!(
+        captured.headers.get("x-coderex-session-id").map(String::as_str),
+        Some("sess-router")
+    );
+    assert_eq!(
+        captured.headers.get("x-coderex-agent-id").map(String::as_str),
+        Some("agent-router")
+    );
+    assert_eq!(captured.body["metadata"]["session_context"]["turn_id"], "3");
+}
+
+#[tokio::test]
+async fn provider_errors_surface_request_diagnostics() {
+    let _guard = env_lock().lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let raw_response = "HTTP/1.1 403 Forbidden\r\nContent-Type: text/plain\r\nContent-Length: 34\r\nx-request-id: srv-123\r\nConnection: close\r\n\r\nonly available for Coding Agents".to_string();
+    let (base_url, _handle) = capture_requests_with_raw_responses(vec![raw_response]).await;
+
+    let provider = OpenAiCompatibleProvider::new("openai", base_url, "test-key");
+    let err = provider
+        .create_message("system", &[], &ModelId("gpt-4o".into()), 32, &[])
+        .await
+        .expect_err("request should fail");
+
+    assert!(err.message.contains("request_id="));
+    assert!(err.message.contains("server_request_id=srv-123"));
 }

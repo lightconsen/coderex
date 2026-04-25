@@ -57,7 +57,9 @@ fn parse_memory_entries(content: &str) -> Vec<(String, String)> {
         Err(_) => return Vec::new(),
     };
 
-    let Some(arr) = value.as_array() else { return Vec::new() };
+    let Some(arr) = value.as_array() else {
+        return Vec::new();
+    };
 
     arr.iter()
         .filter_map(|entry| {
@@ -104,15 +106,22 @@ pub async fn extract_single_memory(
 mod tests {
     use super::*;
     use crate::api_client::{ApiResponse, StreamEvent};
+    use crate::tool_executor::ToolInfo;
     use crate::types::{ModelId, UsageSummary};
-    use std::pin::Pin;
     use futures::Stream;
+    use std::pin::Pin;
 
     #[derive(Clone)]
-    struct MockApi { response_content: String }
+    struct MockApi {
+        response_content: String,
+    }
 
     impl MockApi {
-        fn new(content: &str) -> Self { Self { response_content: content.into() } }
+        fn new(content: &str) -> Self {
+            Self {
+                response_content: content.into(),
+            }
+        }
     }
 
     #[async_trait::async_trait]
@@ -181,7 +190,7 @@ mod tests {
     #[tokio::test]
     async fn extract_memories_returns_entries() {
         let api = MockApi::new(
-            r#"[{"file": "feedback_testing.md", "content": "user wants terse responses"}]"#
+            r#"[{"file": "feedback_testing.md", "content": "user wants terse responses"}]"#,
         );
         let memories = extract_memories(&api, "conversation here", "/memory").await;
         assert!(memories.is_ok());
