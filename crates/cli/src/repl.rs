@@ -1002,6 +1002,7 @@ impl ReplLoop {
             tokio::sync::oneshot::Receiver<(QueryEngine, Result<TerminalReason, String>)>,
         > = None;
         let mut elicit_rx: Option<tokio::sync::mpsc::Receiver<coderex_tools::ElicitRequest>> = None;
+        let mut queued_prompts = std::collections::VecDeque::<String>::new();
 
         let result = loop {
             if !self.running {
@@ -1186,6 +1187,7 @@ impl ReplLoop {
                                             &mut phase,
                                             &mut query_done_rx,
                                             &mut elicit_rx,
+                                            &mut queued_prompts,
                                         ).await;
                                     }
                                 }
@@ -1487,6 +1489,17 @@ impl ReplLoop {
                             });
                         }
                     }
+
+                    if let Some(next_prompt) = queued_prompts.pop_front() {
+                        self.start_tui_query(
+                            next_prompt,
+                            &mut ui_state,
+                            &mut thinking,
+                            &mut phase,
+                            &mut query_done_rx,
+                            &mut elicit_rx,
+                        );
+                    }
                 }
 
                 Some((job_id, prompt)) = async {
@@ -1764,6 +1777,10 @@ impl ReplLoop {
             options.max_turns = turns;
         }
         options.include_partial_messages = self.include_partial_messages;
+        // In the interactive REPL, assistant clarification questions should stay in the
+        // transcript as normal messages. The engine's fallback elicitation prompt writes to
+        // stderr/stdin directly, which breaks the TUI and duplicates the normal next-turn flow.
+        options.handle_elicitation = false;
 
         options
     }
@@ -2461,6 +2478,7 @@ impl ReplLoop {
             tokio::sync::oneshot::Receiver<(QueryEngine, Result<TerminalReason, String>)>,
         >,
         elicit_rx: &mut Option<tokio::sync::mpsc::Receiver<coderex_tools::ElicitRequest>>,
+        queued_prompts: &mut std::collections::VecDeque<String>,
     ) {
         // Clear previous turn's duration display so it doesn't linger.
         ui_state.statusline.last_duration = None;
@@ -2535,32 +2553,23 @@ impl ReplLoop {
                 .await;
             return;
         } else if self.engine.is_some() {
-            // Start streaming assistant placeholder
+            self.start_tui_query(
+                text.to_string(),
+                ui_state,
+                thinking,
+                phase,
+                query_done_rx,
+                elicit_rx,
+            );
+        } else if *thinking || query_done_rx.is_some() {
+            queued_prompts.push_back(text.to_string());
             ui_state.messages.push(coderex_ui::message_list::Message {
-                role: coderex_ui::message_list::MessageRole::Assistant,
-                content: "".into(),
+                role: coderex_ui::message_list::MessageRole::System,
+                content: "[Queued until current turn finishes]".into(),
                 tool_name: None,
-                streaming: true,
+                streaming: false,
                 folded: false,
             });
-
-            let options = self.build_submit_options();
-            let mut engine = self.engine.take().unwrap();
-            let prompt = text.to_string();
-            let (tx, rx) = tokio::sync::oneshot::channel();
-            let (elicit_tx, erx) = tokio::sync::mpsc::channel(4);
-            if let Some(ref dispatcher) = self.dispatcher {
-                dispatcher.set_elicit_tx(Some(elicit_tx));
-            }
-            self.query_start_time = Some(std::time::Instant::now());
-            tokio::spawn(async move {
-                let result = engine.submit_streaming(prompt, options).await;
-                let _ = tx.send((engine, result));
-            });
-            *query_done_rx = Some(rx);
-            *elicit_rx = Some(erx);
-            *thinking = true;
-            *phase = InteractivePhase::Planning;
         } else {
             ui_state.messages.push(coderex_ui::message_list::Message {
                 role: coderex_ui::message_list::MessageRole::Assistant,
@@ -2570,6 +2579,43 @@ impl ReplLoop {
                 folded: false,
             });
         }
+    }
+
+    fn start_tui_query(
+        &mut self,
+        prompt: String,
+        ui_state: &mut coderex_ui::state::UiState,
+        thinking: &mut bool,
+        phase: &mut InteractivePhase,
+        query_done_rx: &mut Option<
+            tokio::sync::oneshot::Receiver<(QueryEngine, Result<TerminalReason, String>)>,
+        >,
+        elicit_rx: &mut Option<tokio::sync::mpsc::Receiver<coderex_tools::ElicitRequest>>,
+    ) {
+        ui_state.messages.push(coderex_ui::message_list::Message {
+            role: coderex_ui::message_list::MessageRole::Assistant,
+            content: "".into(),
+            tool_name: None,
+            streaming: true,
+            folded: false,
+        });
+
+        let options = self.build_submit_options();
+        let mut engine = self.engine.take().unwrap();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let (elicit_tx, erx) = tokio::sync::mpsc::channel(4);
+        if let Some(ref dispatcher) = self.dispatcher {
+            dispatcher.set_elicit_tx(Some(elicit_tx));
+        }
+        self.query_start_time = Some(std::time::Instant::now());
+        tokio::spawn(async move {
+            let result = engine.submit_streaming(prompt, options).await;
+            let _ = tx.send((engine, result));
+        });
+        *query_done_rx = Some(rx);
+        *elicit_rx = Some(erx);
+        *thinking = true;
+        *phase = InteractivePhase::Planning;
     }
 
     /// Execute a single command through the registry and display the result in the TUI.
@@ -3568,6 +3614,7 @@ mod tests {
             options.allowed_tools_override.unwrap(),
             vec!["Read", "Grep"]
         );
+        assert!(!options.handle_elicitation);
     }
 
     #[test]

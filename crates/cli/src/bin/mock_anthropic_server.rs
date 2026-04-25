@@ -170,6 +170,12 @@ fn count_tool_results(body: &str) -> usize {
 
 fn resolve_text_response(prompt: &str) -> &str {
     match prompt.to_lowercase().as_str() {
+        p if p.contains("long response") => {
+            "This is a long interactive response used to verify that the TUI keeps the latest lines visible. It should continue across many wrapped lines without being visually clipped in the middle of the transcript. The renderer should keep the newest portion of the assistant output on screen as the response grows. TAIL: final sentence visible."
+        }
+        p if p.contains("ask a question") || p.contains("ask question") => {
+            "Which approach would you prefer?"
+        }
         p if p.contains("fibonacci") => {
             "Done! I've added the recursive `fibonacci` function and its test to `src/lib.rs`."
         }
@@ -245,6 +251,9 @@ fn resolve_text_response(prompt: &str) -> &str {
 fn should_stream_text_response(prompt: &str) -> bool {
     let p = prompt.to_lowercase();
     ((p.contains("hello") || p.contains("hi")) && !p.contains("file"))
+        || p.contains("long response")
+        || p.contains("ask a question")
+        || p.contains("ask question")
         || p.contains("cargo test")
         || p.contains("test results")
 }

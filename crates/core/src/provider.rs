@@ -122,6 +122,26 @@ pub struct ResolvedProviderProfile {
 }
 
 impl ResolvedProviderProfile {
+    fn generic_capabilities() -> ProviderCapabilities {
+        ProviderCapabilities {
+            streaming: true,
+            tool_use: true,
+            structured_tool_streaming: true,
+            parallel_tool_calls: true,
+            text_tool_fallback: true,
+            prompt_caching: false,
+            vision: false,
+        }
+    }
+
+    fn anthropic_capabilities() -> ProviderCapabilities {
+        ProviderCapabilities {
+            prompt_caching: true,
+            vision: true,
+            ..Self::generic_capabilities()
+        }
+    }
+
     /// Resolve a provider profile from explicit hint and base URL.
     #[must_use]
     pub fn resolve(
@@ -157,54 +177,17 @@ impl ResolvedProviderProfile {
             ("anthropic", ProviderApiStyle::AnthropicMessages) => Self {
                 name,
                 api_style: ProviderApiStyle::AnthropicMessages,
-                capabilities: ProviderCapabilities {
-                    streaming: true,
-                    tool_use: true,
-                    structured_tool_streaming: true,
-                    parallel_tool_calls: true,
-                    text_tool_fallback: true,
-                    prompt_caching: true,
-                    vision: true,
-                },
+                capabilities: Self::anthropic_capabilities(),
             },
             ("dashscope", ProviderApiStyle::AnthropicMessages) => Self {
                 name,
                 api_style: ProviderApiStyle::AnthropicMessages,
-                capabilities: ProviderCapabilities {
-                    streaming: true,
-                    tool_use: true,
-                    structured_tool_streaming: true,
-                    parallel_tool_calls: true,
-                    text_tool_fallback: true,
-                    prompt_caching: true,
-                    vision: true,
-                },
+                capabilities: Self::anthropic_capabilities(),
             },
             ("dashscope", ProviderApiStyle::OpenAiChat) => Self {
                 name,
                 api_style: ProviderApiStyle::OpenAiChat,
-                capabilities: ProviderCapabilities {
-                    streaming: true,
-                    tool_use: true,
-                    structured_tool_streaming: true,
-                    parallel_tool_calls: true,
-                    text_tool_fallback: true,
-                    prompt_caching: false,
-                    vision: false,
-                },
-            },
-            ("kimi", _) => Self {
-                name,
-                api_style: style,
-                capabilities: ProviderCapabilities {
-                    streaming: true,
-                    tool_use: false,
-                    structured_tool_streaming: false,
-                    parallel_tool_calls: false,
-                    text_tool_fallback: true,
-                    prompt_caching: false,
-                    vision: false,
-                },
+                capabilities: Self::generic_capabilities(),
             },
             ("groq", _) | ("openai", _) | ("custom", _) => Self {
                 name,
@@ -222,15 +205,7 @@ impl ResolvedProviderProfile {
             _ => Self {
                 name,
                 api_style: style,
-                capabilities: ProviderCapabilities {
-                    streaming: true,
-                    tool_use: true,
-                    structured_tool_streaming: true,
-                    parallel_tool_calls: true,
-                    text_tool_fallback: true,
-                    prompt_caching: matches!(default_style, ProviderApiStyle::AnthropicMessages),
-                    vision: matches!(default_style, ProviderApiStyle::AnthropicMessages),
-                },
+                capabilities: Self::generic_capabilities(),
             },
         }
     }
@@ -343,7 +318,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn resolve_kimi_profile_disables_structured_tools() {
+    fn resolve_anthropic_compatible_profile_uses_generic_capabilities() {
         let profile = ResolvedProviderProfile::resolve(
             Some("kimi"),
             "https://api.kimi.com/coding/",
@@ -351,9 +326,12 @@ mod tests {
         );
 
         assert_eq!(profile.name, "kimi");
-        assert!(!profile.capabilities.tool_use);
-        assert!(!profile.capabilities.structured_tool_streaming);
+        assert!(profile.capabilities.tool_use);
+        assert!(profile.capabilities.structured_tool_streaming);
+        assert!(profile.capabilities.parallel_tool_calls);
         assert!(profile.capabilities.text_tool_fallback);
+        assert!(!profile.capabilities.prompt_caching);
+        assert!(!profile.capabilities.vision);
     }
 
     #[test]

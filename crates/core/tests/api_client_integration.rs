@@ -804,7 +804,7 @@ async fn anthropic_client_sends_coderex_identity_headers_and_metadata() {
 }
 
 #[tokio::test]
-async fn anthropic_kimi_profile_suppresses_structured_tools() {
+async fn anthropic_compatible_profile_forwards_structured_tools() {
     let _guard = env_lock()
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -831,10 +831,16 @@ async fn anthropic_kimi_profile_suppresses_structured_tools() {
     let _ = client
         .create_message("system", &[], &ModelId::sonnet(), 32, &[tool])
         .await
-        .expect("kimi anthropic request should succeed");
+        .expect("anthropic-compatible request should succeed");
 
     let captured = handle.await.expect("server join");
-    assert!(captured.body.get("tools").is_none());
+    let tools = captured
+        .body
+        .get("tools")
+        .and_then(serde_json::Value::as_array)
+        .expect("anthropic-compatible request should include structured tools");
+    assert_eq!(tools.len(), 1);
+    assert_eq!(tools[0]["name"], "Read");
 }
 
 #[tokio::test]

@@ -796,23 +796,8 @@ impl QueryEngine {
     }
 
     fn infer_read_tool_call_from_user_prompt(&self, turn: &TurnRuntime) -> Option<ToolCall> {
-        let mut canonical_read_name: Option<String> = None;
-        for info in self.tools.list_tools() {
-            if info.name.eq_ignore_ascii_case("read") {
-                canonical_read_name = Some(info.name);
-                break;
-            }
-        }
-        let read_name = canonical_read_name?;
-
-        let user_text = turn.messages.iter().rev().find_map(|m| {
-            if matches!(m.role, crate::types::Role::User) {
-                if let crate::types::MessageContent::Text(t) = &m.content {
-                    return Some(t.trim().to_string());
-                }
-            }
-            None
-        })?;
+        let read_name = self.canonical_tool_name("read")?;
+        let user_text = Self::latest_user_text(turn)?;
 
         let mut parts = user_text.split_whitespace();
         let first = parts.next()?;
@@ -836,6 +821,133 @@ impl QueryEngine {
             name: read_name,
             input: serde_json::json!({ "file_path": candidate }),
         })
+    }
+
+    fn canonical_tool_name(&self, tool_name: &str) -> Option<String> {
+        self.tools
+            .list_tools()
+            .into_iter()
+            .find(|info| info.name.eq_ignore_ascii_case(tool_name))
+            .map(|info| info.name)
+    }
+
+    fn latest_user_text(turn: &TurnRuntime) -> Option<String> {
+        turn.messages.iter().rev().find_map(|m| {
+            if matches!(m.role, crate::types::Role::User) {
+                if let crate::types::MessageContent::Text(t) = &m.content {
+                    return Some(t.trim().to_string());
+                }
+            }
+            None
+        })
+    }
+
+    fn infer_current_dir_tool_call_from_user_prompt(&self, turn: &TurnRuntime) -> Option<ToolCall> {
+        let tool_name = self.canonical_tool_name("currentdir")?;
+        let user_text = Self::latest_user_text(turn)?;
+        if !Self::is_current_dir_prompt(&user_text) {
+            return None;
+        }
+
+        Some(ToolCall {
+            id: format!("inferred_current_dir_{}", self.current_turn + 1),
+            name: tool_name,
+            input: serde_json::json!({}),
+        })
+    }
+
+    fn infer_list_dir_tool_call_from_user_prompt(&self, turn: &TurnRuntime) -> Option<ToolCall> {
+        let tool_name = self.canonical_tool_name("listdir")?;
+        let user_text = Self::latest_user_text(turn)?;
+        if !Self::is_list_dir_prompt(&user_text) {
+            return None;
+        }
+
+        Some(ToolCall {
+            id: format!("inferred_list_dir_{}", self.current_turn + 1),
+            name: tool_name,
+            input: serde_json::json!({}),
+        })
+    }
+
+    fn infer_read_only_tool_call_from_text(&self, text: &str) -> Option<ToolCall> {
+        let lower = text.to_ascii_lowercase();
+        if lower.contains("`pwd`") {
+            let tool_name = self.canonical_tool_name("currentdir")?;
+            return Some(ToolCall {
+                id: format!("inferred_current_dir_{}", self.current_turn + 1),
+                name: tool_name,
+                input: serde_json::json!({}),
+            });
+        }
+        if lower.contains("`ls -la`") || lower.contains("`ls`") {
+            let tool_name = self.canonical_tool_name("listdir")?;
+            return Some(ToolCall {
+                id: format!("inferred_list_dir_{}", self.current_turn + 1),
+                name: tool_name,
+                input: serde_json::json!({}),
+            });
+        }
+        None
+    }
+
+    fn is_current_dir_prompt(prompt: &str) -> bool {
+        let prompt = prompt.to_ascii_lowercase();
+        prompt.contains("current dir")
+            || prompt.contains("current directory")
+            || prompt.contains("working directory")
+            || prompt.contains("where am i")
+            || prompt.contains(" pwd")
+            || prompt.starts_with("pwd")
+    }
+
+    fn is_list_dir_prompt(prompt: &str) -> bool {
+        let prompt = prompt.to_ascii_lowercase();
+        prompt.contains("list files")
+            || prompt.contains("list the files")
+            || prompt.contains("list the file")
+            || prompt.contains("show files")
+            || prompt.contains("show the files")
+            || prompt.contains("show file in this dir")
+            || prompt.contains("show file in this directory")
+            || prompt.contains("list the contents")
+            || prompt.contains("show the contents")
+            || prompt.contains("what files are in")
+            || prompt.contains("what is in this dir")
+            || prompt.contains("what's in this dir")
+            || prompt.contains("ls -la")
+    }
+
+    fn infer_fallback_tool_call(
+        &self,
+        turn: &TurnRuntime,
+        assistant_text: &str,
+    ) -> Option<ToolCall> {
+        self.infer_read_tool_call_from_user_prompt(turn)
+            .or_else(|| self.infer_current_dir_tool_call_from_user_prompt(turn))
+            .or_else(|| self.infer_list_dir_tool_call_from_user_prompt(turn))
+            .or_else(|| self.infer_read_only_tool_call_from_text(assistant_text))
+    }
+
+    fn should_short_circuit_directory_turn(tool_calls: &[ToolCall]) -> bool {
+        !tool_calls.is_empty()
+            && tool_calls
+                .iter()
+                .all(|tc| Self::is_directory_tool_name(&tc.name))
+    }
+
+    fn is_directory_tool_name(name: &str) -> bool {
+        name.eq_ignore_ascii_case("currentdir") || name.eq_ignore_ascii_case("listdir")
+    }
+
+    fn dedupe_directory_tool_calls(tool_calls: &mut Vec<ToolCall>) {
+        if !Self::should_short_circuit_directory_turn(tool_calls) {
+            return;
+        }
+
+        let mut seen = std::collections::HashSet::new();
+        tool_calls
+            .retain(|call| seen.insert((call.name.to_ascii_lowercase(), call.input.to_string())));
     }
 
     fn persist_assistant_tool_calls(&mut self, turn: &mut TurnRuntime, tool_calls: &[ToolCall]) {
@@ -1468,10 +1580,11 @@ impl QueryEngine {
             tool_calls = self.extract_inline_tool_calls_from_text(&content);
         }
         if tool_calls.is_empty() {
-            if let Some(inferred) = self.infer_read_tool_call_from_user_prompt(turn) {
+            if let Some(inferred) = self.infer_fallback_tool_call(turn, &content) {
                 tool_calls.push(inferred);
             }
         }
+        Self::dedupe_directory_tool_calls(&mut tool_calls);
         let fallback_tool_calls =
             !tool_calls.is_empty() && tool_calls.iter().all(Self::is_fallback_tool_call);
         let short_circuit_read_turn = self.infer_read_tool_call_from_user_prompt(turn).is_some()
@@ -1479,6 +1592,7 @@ impl QueryEngine {
             && tool_calls
                 .iter()
                 .all(|tc| tc.name.eq_ignore_ascii_case("read"));
+        let short_circuit_directory_turn = Self::should_short_circuit_directory_turn(&tool_calls);
 
         if tool_calls.is_empty() {
             // No tool calls — turn is complete
@@ -1564,12 +1678,13 @@ impl QueryEngine {
         // Phase 6: Apply tool results
         turn.transition_to(TurnState::ApplyToolResults);
         for result in &tool_results {
-            if !fallback_tool_calls && !short_circuit_read_turn {
+            if !fallback_tool_calls && !short_circuit_read_turn && !short_circuit_directory_turn {
                 let msg = Message::tool(result.clone());
                 self.session.messages.push(msg);
             }
             if (fallback_tool_calls
                 || short_circuit_read_turn
+                || short_circuit_directory_turn
                 || result.tool_call_id.starts_with("inferred_read_"))
                 && !result.output.is_empty()
                 && !Self::content_mentions_tool_output(&content, &result.output)
@@ -1609,7 +1724,7 @@ impl QueryEngine {
             .fire_turn_end_hook(turn_number, &api_response.stop_reason)
             .await;
 
-        if fallback_tool_calls || short_circuit_read_turn {
+        if fallback_tool_calls || short_circuit_read_turn || short_circuit_directory_turn {
             return Ok(TerminalReason::Completed);
         }
 
@@ -1723,10 +1838,11 @@ impl QueryEngine {
             tool_calls = self.extract_inline_tool_calls_from_text(&content);
         }
         if tool_calls.is_empty() {
-            if let Some(inferred) = self.infer_read_tool_call_from_user_prompt(turn) {
+            if let Some(inferred) = self.infer_fallback_tool_call(turn, &content) {
                 tool_calls.push(inferred);
             }
         }
+        Self::dedupe_directory_tool_calls(&mut tool_calls);
         let fallback_tool_calls =
             !tool_calls.is_empty() && tool_calls.iter().all(Self::is_fallback_tool_call);
         let short_circuit_read_turn = self.infer_read_tool_call_from_user_prompt(turn).is_some()
@@ -1734,6 +1850,7 @@ impl QueryEngine {
             && tool_calls
                 .iter()
                 .all(|tc| tc.name.eq_ignore_ascii_case("read"));
+        let short_circuit_directory_turn = Self::should_short_circuit_directory_turn(&tool_calls);
 
         if tool_calls.is_empty() {
             // No tool calls — turn complete
@@ -1793,12 +1910,13 @@ impl QueryEngine {
         // Phase 6: Apply tool results
         turn.transition_to(TurnState::ApplyToolResults);
         for result in &tool_results {
-            if !fallback_tool_calls && !short_circuit_read_turn {
+            if !fallback_tool_calls && !short_circuit_read_turn && !short_circuit_directory_turn {
                 let msg = Message::tool(result.clone());
                 self.session.messages.push(msg);
             }
             if (fallback_tool_calls
                 || short_circuit_read_turn
+                || short_circuit_directory_turn
                 || result.tool_call_id.starts_with("inferred_read_"))
                 && !result.output.is_empty()
                 && !Self::content_mentions_tool_output(&content, &result.output)
@@ -1830,7 +1948,7 @@ impl QueryEngine {
         self.cost_tracker.end_turn(turn_number, &usage, &self.model);
         let _ = self.fire_turn_end_hook(turn_number, "end_turn").await;
 
-        if fallback_tool_calls || short_circuit_read_turn {
+        if fallback_tool_calls || short_circuit_read_turn || short_circuit_directory_turn {
             return Ok(TerminalReason::Completed);
         }
 
@@ -2197,6 +2315,7 @@ impl QueryEngine {
         let mut early_results: Vec<ToolResult> = Vec::new();
         let mut deferred_calls: Vec<ToolCall> = Vec::new();
         let mut stream_failed = false;
+        let mut stop_after_directory_call = false;
 
         while let Some(event) = stream.next().await {
             match event.clone() {
@@ -2232,6 +2351,10 @@ impl QueryEngine {
             // Process event through assembler and execute completed tool calls
             // immediately while the stream is still running (early execution).
             for call in assembler.process_event(event) {
+                if Self::is_directory_tool_name(&call.name) {
+                    stop_after_directory_call = true;
+                    break;
+                }
                 match self.execute_early_tool_call(call, options).await {
                     Ok(Some(result)) => early_results.push(result),
                     Ok(None) => { /* deferred — call already tracked */ }
@@ -2240,15 +2363,20 @@ impl QueryEngine {
                     }
                 }
             }
+            if stop_after_directory_call {
+                break;
+            }
         }
 
         // Finalize any remaining pending calls from stream end
-        for call in assembler.process_event(StreamEvent::StreamEnd) {
-            match self.execute_early_tool_call(call, options).await {
-                Ok(Some(result)) => early_results.push(result),
-                Ok(None) => { /* deferred */ }
-                Err(e) => {
-                    tracing::warn!("early tool execution failed: {e}");
+        if !stop_after_directory_call {
+            for call in assembler.process_event(StreamEvent::StreamEnd) {
+                match self.execute_early_tool_call(call, options).await {
+                    Ok(Some(result)) => early_results.push(result),
+                    Ok(None) => { /* deferred */ }
+                    Err(e) => {
+                        tracing::warn!("early tool execution failed: {e}");
+                    }
                 }
             }
         }
@@ -3269,6 +3397,59 @@ mod tests {
         }
     }
 
+    struct CatalogReadDirExecutor;
+
+    #[async_trait::async_trait]
+    impl crate::tool_executor::ToolExecutor for CatalogReadDirExecutor {
+        fn list_tools(&self) -> Vec<crate::tool_executor::ToolInfo> {
+            vec![
+                crate::tool_executor::ToolInfo {
+                    name: "Read".into(),
+                    description: "read".into(),
+                    input_schema: serde_json::json!({
+                        "type": "object",
+                        "properties": {
+                            "file_path": { "type": "string" }
+                        }
+                    }),
+                },
+                crate::tool_executor::ToolInfo {
+                    name: "CurrentDir".into(),
+                    description: "current directory".into(),
+                    input_schema: serde_json::json!({
+                        "type": "object",
+                        "properties": {}
+                    }),
+                },
+                crate::tool_executor::ToolInfo {
+                    name: "ListDir".into(),
+                    description: "list directory".into(),
+                    input_schema: serde_json::json!({
+                        "type": "object",
+                        "properties": {
+                            "path": { "type": "string" }
+                        }
+                    }),
+                },
+            ]
+        }
+
+        async fn execute(
+            &self,
+            tool_call_id: &str,
+            tool_name: &str,
+            _input: &serde_json::Value,
+        ) -> crate::tool_executor::ToolDispatchOutcome {
+            crate::tool_executor::ToolDispatchOutcome {
+                result: ToolResult {
+                    tool_call_id: tool_call_id.to_string(),
+                    output: format!("stub ok: {tool_name}"),
+                    is_error: false,
+                },
+            }
+        }
+    }
+
     #[test]
     fn extract_inline_tool_calls_parses_known_tool_call() {
         let (mut engine, _rx, _session) = make_test_engine();
@@ -3302,6 +3483,88 @@ mod tests {
         let call = engine.infer_read_tool_call_from_user_prompt(&turn).unwrap();
         assert_eq!(call.name, "Read");
         assert_eq!(call.input["file_path"], "src/lib.rs");
+    }
+
+    #[test]
+    fn infer_current_dir_tool_call_from_user_prompt() {
+        let (mut engine, _rx, _session) = make_test_engine();
+        engine.set_tool_executor(Box::new(CatalogReadDirExecutor));
+        let mut turn = TurnRuntime::new(TokenBudget::with_defaults());
+        turn.messages.push(Message::user("show current dir"));
+
+        let call = engine
+            .infer_current_dir_tool_call_from_user_prompt(&turn)
+            .unwrap();
+        assert_eq!(call.name, "CurrentDir");
+        assert_eq!(call.input, serde_json::json!({}));
+    }
+
+    #[test]
+    fn infer_list_dir_tool_call_from_user_prompt() {
+        let (mut engine, _rx, _session) = make_test_engine();
+        engine.set_tool_executor(Box::new(CatalogReadDirExecutor));
+        let mut turn = TurnRuntime::new(TokenBudget::with_defaults());
+        turn.messages
+            .push(Message::user("list the file in this dir"));
+
+        let call = engine
+            .infer_list_dir_tool_call_from_user_prompt(&turn)
+            .unwrap();
+        assert_eq!(call.name, "ListDir");
+        assert_eq!(call.input, serde_json::json!({}));
+    }
+
+    #[test]
+    fn infer_read_only_tool_call_from_assistant_text_fallback() {
+        let (mut engine, _rx, _session) = make_test_engine();
+        engine.set_tool_executor(Box::new(CatalogReadDirExecutor));
+
+        let call = engine
+            .infer_read_only_tool_call_from_text("I'll use `ls -la` to get a detailed listing.")
+            .unwrap();
+        assert_eq!(call.name, "ListDir");
+        assert_eq!(call.input, serde_json::json!({}));
+    }
+
+    #[test]
+    fn current_dir_and_list_dir_turns_short_circuit() {
+        let tool_calls = vec![
+            ToolCall {
+                id: "tc_1".into(),
+                name: "CurrentDir".into(),
+                input: serde_json::json!({}),
+            },
+            ToolCall {
+                id: "tc_2".into(),
+                name: "ListDir".into(),
+                input: serde_json::json!({}),
+            },
+        ];
+
+        assert!(QueryEngine::should_short_circuit_directory_turn(
+            &tool_calls
+        ));
+    }
+
+    #[test]
+    fn duplicate_directory_tool_calls_are_deduped() {
+        let mut tool_calls = vec![
+            ToolCall {
+                id: "tc_1".into(),
+                name: "CurrentDir".into(),
+                input: serde_json::json!({}),
+            },
+            ToolCall {
+                id: "tc_2".into(),
+                name: "CurrentDir".into(),
+                input: serde_json::json!({}),
+            },
+        ];
+
+        QueryEngine::dedupe_directory_tool_calls(&mut tool_calls);
+
+        assert_eq!(tool_calls.len(), 1);
+        assert_eq!(tool_calls[0].name, "CurrentDir");
     }
 
     #[test]

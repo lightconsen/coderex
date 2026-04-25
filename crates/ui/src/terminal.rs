@@ -533,8 +533,17 @@ fn render_messages(frame: &mut Frame, area: ratatui::layout::Rect, state: &mut U
         lines.extend(render_welcome_art());
     }
 
+    lines = trim_lines_to_viewport(lines, viewport_height);
+
     let paragraph = Paragraph::new(lines).block(Block::default().borders(Borders::NONE));
     frame.render_widget(paragraph, area);
+}
+
+fn trim_lines_to_viewport(mut lines: Vec<Line>, viewport_height: usize) -> Vec<Line> {
+    if viewport_height == 0 || lines.len() <= viewport_height {
+        return lines;
+    }
+    lines.split_off(lines.len() - viewport_height)
 }
 
 /// Dynamic welcome art — cycles between T-Rex ASCII, tips, and hints.
@@ -839,5 +848,19 @@ mod tests {
         let lines = wrap_text("hello", 0);
         assert_eq!(lines.len(), 1);
         assert_eq!(lines[0], "hello");
+    }
+
+    #[test]
+    fn trim_lines_to_viewport_keeps_latest_lines() {
+        let lines = vec![
+            Line::from("line 1"),
+            Line::from("line 2"),
+            Line::from("line 3"),
+            Line::from("line 4"),
+        ];
+        let trimmed = trim_lines_to_viewport(lines, 2);
+        assert_eq!(trimmed.len(), 2);
+        assert_eq!(trimmed[0].to_string(), "line 3");
+        assert_eq!(trimmed[1].to_string(), "line 4");
     }
 }

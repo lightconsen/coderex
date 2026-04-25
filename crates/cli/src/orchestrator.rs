@@ -340,10 +340,6 @@ impl StartupOrchestrator {
         }
 
         tracing::info!("CodeRex ready");
-        eprintln!(
-            "[DEBUG] args.print = {}, args.prompt = {:?}",
-            args.print, args.prompt
-        );
 
         // Determine model: ANTHROPIC_MODEL / OPENAI_MODEL env → settings → default
         let model = std::env::var("ANTHROPIC_MODEL")

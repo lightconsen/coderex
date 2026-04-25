@@ -304,6 +304,7 @@ fn startup_renders_prompt_and_default_regions() {
     assert!(screen.contains("claude-sonnet-4-6"));
     assert!(screen.contains("Permissions: default"));
     assert!(session.raw_text().contains("❯"));
+    assert!(!session.raw_text().contains("[DEBUG] args.print"));
 }
 
 #[test]
@@ -371,6 +372,29 @@ fn single_prompt_gets_response() {
     session.send_line("hello");
     let screen = session.wait_for_any_text(&["Hello!", "happy to help"], SCREEN_TIMEOUT);
     assert!(screen.contains("Hello!"));
+}
+
+#[test]
+fn question_response_stays_in_transcript_without_raw_elicitation_prompt() {
+    let dir = setup_project_dir();
+    let (_server, mut session) = session_with_static_server(dir.path());
+    session.wait_for_text("CodeRex v", SCREEN_TIMEOUT);
+    session.send_line("ask a question");
+    let screen = session.wait_for_text("Which approach would you prefer?", SCREEN_TIMEOUT);
+    assert!(screen.contains("Which approach would you prefer?"));
+    assert!(!screen.contains("[Query]"));
+    assert!(!screen.contains("Type your answer and press Enter."));
+    assert!(!screen.contains("Continue — Proceed with the current approach"));
+}
+
+#[test]
+fn long_response_keeps_tail_visible_in_tui() {
+    let dir = setup_project_dir();
+    let (_server, mut session) = session_with_static_server(dir.path());
+    session.wait_for_text("CodeRex v", SCREEN_TIMEOUT);
+    session.send_line("long response");
+    let screen = session.wait_for_text("TAIL: final sentence visible.", SCREEN_TIMEOUT);
+    assert!(screen.contains("TAIL: final sentence visible."));
 }
 
 #[test]
@@ -448,6 +472,28 @@ fn interactive_kimi_live_smoke() {
         LIVE_TIMEOUT,
     );
     assert!(screen.contains("src/lib.rs") || screen.contains("Completed in"));
+}
+
+#[test]
+#[ignore = "requires live Kimi environment"]
+fn interactive_kimi_directory_listing_smoke() {
+    if !have_live_env() || !provider_env_matches("k2") {
+        return;
+    }
+    let dir = setup_project_dir();
+    let mut session = PtySession::launch(
+        dir.path(),
+        &[],
+        &live_model().unwrap_or_else(|| "K2.6".into()),
+    );
+    session.wait_for_text("CodeRex v", LIVE_TIMEOUT);
+    session.send_line("show current dir");
+    let screen = session.wait_for_any_text(&["coderex", "/tmp", "tmp"], LIVE_TIMEOUT);
+    assert!(screen.contains("coderex") || screen.contains("/tmp") || screen.contains("tmp"));
+
+    session.send_line("list the files in this dir");
+    let screen = session.wait_for_any_text(&["Cargo.toml", "src", ".coderex"], LIVE_TIMEOUT);
+    assert!(screen.contains("Cargo.toml") || screen.contains("src") || screen.contains(".coderex"));
 }
 
 #[test]

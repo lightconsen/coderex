@@ -5,11 +5,11 @@ use tracing_subscriber::{EnvFilter, fmt, layer::SubscriberExt, util::SubscriberI
 /// Initialize the tracing subscriber.
 ///
 /// Controls:
-/// - `CODEREX_LOG` — log level filter (default: `info`)
+/// - `CODEREX_LOG` — log level filter (default: `off`)
 /// - `CODEREX_LOG_FORMAT` — output format: `pretty` (default) or `json`
 /// - `CODEREX_LOG_FILE` — optional file path for additional file output
 pub fn init_tracing() {
-    let filter = EnvFilter::try_from_env("CODEREX_LOG").unwrap_or_else(|_| EnvFilter::new("info"));
+    let filter = EnvFilter::try_from_env("CODEREX_LOG").unwrap_or_else(|_| EnvFilter::new("off"));
 
     let format_json = std::env::var("CODEREX_LOG_FORMAT")
         .map(|v| v == "json")

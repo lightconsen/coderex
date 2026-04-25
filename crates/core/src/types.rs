@@ -109,6 +109,10 @@ impl ToolCall {
                     format!("Finding files matching {}...", summarize_tool_text(pattern))
                 })
                 .unwrap_or_else(|| "Discovering files...".into()),
+            "currentdir" | "current_dir" => "Checking current directory...".into(),
+            "listdir" | "list_dir" => extract_tool_string(input, &["path"])
+                .map(|path| format!("Listing files in {}...", summarize_tool_text(path)))
+                .unwrap_or_else(|| "Listing files in current directory...".into()),
             "bash" | "shell" => extract_tool_string(input, &["command", "cmd"])
                 .map(|command| format!("Running {}...", summarize_tool_text(command)))
                 .unwrap_or_else(|| "Running shell command...".into()),
@@ -437,6 +441,14 @@ mod tests {
         assert_eq!(
             ToolCall::summarize_activity("Write", &serde_json::json!({"file_path":"src/lib.rs"})),
             "Writing src/lib.rs..."
+        );
+        assert_eq!(
+            ToolCall::summarize_activity("CurrentDir", &serde_json::json!({})),
+            "Checking current directory..."
+        );
+        assert_eq!(
+            ToolCall::summarize_activity("ListDir", &serde_json::json!({})),
+            "Listing files in current directory..."
         );
     }
 
