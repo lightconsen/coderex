@@ -1,6 +1,6 @@
 //! Terminal UI rendering via ratatui.
 
-use crate::message_list::MessageRole;
+use crate::message_list::{Message, MessageRole};
 use crate::state::UiState;
 use crate::statusline::Statusline;
 use crossterm::execute;
@@ -348,6 +348,7 @@ fn render_messages(frame: &mut Frame, area: ratatui::layout::Rect, state: &mut U
     let width = area.width as usize;
     let viewport_height = area.height as usize;
     let is_compact = area.height < 10;
+    state.messages.viewport_height = viewport_height;
 
     // Clean up expired notifications
     state.notifications.cleanup();
@@ -362,21 +363,38 @@ fn render_messages(frame: &mut Frame, area: ratatui::layout::Rect, state: &mut U
         }
     }
 
-    // Count how many messages fit from `start` downward.
-    let mut visible_count = 0;
-    let mut accumulated = 0;
-    for i in state.messages.start..state.messages.messages.len() {
-        let h = heights[i];
-        if accumulated + h > viewport_height {
-            break;
+    let at_bottom = state.messages.is_at_bottom()
+        && (state.messages.visible_count == 0
+            || state.messages.start + state.messages.visible_count.max(1)
+                >= state.messages.messages.len().saturating_sub(1));
+
+    if state.messages.scroll_offset > 0 {
+        let mut lines = render_all_message_lines(&state.messages.messages, width, is_compact);
+        if lines.is_empty() {
+            lines.extend(render_welcome_art());
         }
-        accumulated += h;
-        visible_count += 1;
+        state.messages.total_height = lines.len();
+        let max_scroll = lines.len().saturating_sub(viewport_height);
+        state.messages.scroll_offset = state.messages.scroll_offset.min(max_scroll);
+        lines = trim_lines_to_viewport_with_scroll(
+            lines,
+            viewport_height,
+            state.messages.scroll_offset,
+        );
+        let paragraph = Paragraph::new(lines).block(Block::default().borders(Borders::NONE));
+        frame.render_widget(paragraph, area);
+        return;
     }
-    visible_count = visible_count.max(1);
+
+    let (start, mut visible_count, mut accumulated) = if at_bottom {
+        bottom_message_window(&heights, viewport_height)
+    } else {
+        visible_message_window(&heights, state.messages.start, viewport_height)
+    };
+    state.messages.start = start;
 
     // Fill remaining viewport space with older messages so history stays visible.
-    while state.messages.start > 0 {
+    while !at_bottom && state.messages.start > 0 {
         let h = heights[state.messages.start - 1];
         if accumulated + h > viewport_height {
             break;
@@ -391,85 +409,154 @@ fn render_messages(frame: &mut Frame, area: ratatui::layout::Rect, state: &mut U
     let mut lines: Vec<Line> = Vec::new();
 
     for msg in visible {
-        // Handle folded messages
-        if msg.folded {
-            let style = Style::default().fg(Color::DarkGray);
-            let fold_indicator = format!(
-                "▸ {} [+{} lines folded]",
-                match msg.role {
-                    MessageRole::User => "User",
-                    MessageRole::Assistant => "Assistant",
-                    MessageRole::ToolResult => "Tool Result",
-                    MessageRole::ToolCall => "Tool Call",
-                    MessageRole::System => "System",
-                },
-                message_display_height(msg, width).saturating_sub(1)
-            );
-            lines.push(Line::from(Span::styled(fold_indicator, style)));
-            continue;
+        append_message_lines(&mut lines, msg, width, is_compact);
+    }
+
+    // If no messages, show dynamic welcome art
+    if lines.is_empty() {
+        lines.extend(render_welcome_art());
+    }
+
+    state.messages.total_height = lines.len();
+    lines = trim_lines_to_viewport(lines, viewport_height);
+
+    let paragraph = Paragraph::new(lines).block(Block::default().borders(Borders::NONE));
+    frame.render_widget(paragraph, area);
+}
+
+fn visible_message_window(
+    heights: &[usize],
+    start: usize,
+    viewport_height: usize,
+) -> (usize, usize, usize) {
+    let start = start.min(heights.len());
+    if heights.is_empty() {
+        return (start, 0, 0);
+    }
+
+    let mut visible_count = 0;
+    let mut accumulated = 0;
+    for i in start..heights.len() {
+        let h = heights[i];
+        if accumulated + h > viewport_height {
+            // A single long assistant response can be taller than the entire
+            // viewport. Include the overflowing final message and let line
+            // trimming show its tail instead of dropping it completely.
+            if visible_count == 0 || i == heights.len() - 1 {
+                accumulated += h;
+                visible_count += 1;
+            }
+            break;
         }
+        accumulated += h;
+        visible_count += 1;
+    }
 
-        let (prefix, style) = match msg.role {
-            MessageRole::User => ("▸ ", Style::default().fg(Color::Green)),
-            MessageRole::Assistant => ("◂ ", Style::default().fg(Color::Cyan)),
-            MessageRole::ToolResult => ("✓ ", Style::default().fg(Color::Yellow)),
-            MessageRole::ToolCall => ("⚙ ", Style::default().fg(Color::Magenta)),
-            MessageRole::System => ("⋮ ", Style::default().fg(Color::Gray)),
-        };
+    (start, visible_count.max(1), accumulated)
+}
 
-        let prefix_width = unicode_width::UnicodeWidthStr::width(prefix);
-        let wrap_width = width.saturating_sub(prefix_width);
+fn bottom_message_window(heights: &[usize], viewport_height: usize) -> (usize, usize, usize) {
+    if heights.is_empty() {
+        return (0, 0, 0);
+    }
 
-        // In compact mode, truncate long messages to single line
-        if is_compact && message_display_height(msg, width) > 3 {
-            let truncated = msg
-                .content
-                .chars()
-                .take(width.saturating_sub(prefix_width))
-                .collect::<String>();
-            lines.push(Line::from(vec![
-                Span::styled(prefix, style),
-                Span::styled(truncated, style.add_modifier(Modifier::DIM)),
-            ]));
-            continue;
+    let mut start = heights.len();
+    let mut visible_count = 0;
+    let mut accumulated = 0;
+    for i in (0..heights.len()).rev() {
+        let h = heights[i];
+        if accumulated + h > viewport_height {
+            start = i;
+            accumulated += h;
+            visible_count += 1;
+            break;
         }
+        start = i;
+        accumulated += h;
+        visible_count += 1;
+    }
 
-        // Use syntax highlighting for assistant messages that contain code blocks.
-        let use_highlight = msg.role == MessageRole::Assistant && msg.content.contains("```");
+    (start, visible_count.max(1), accumulated)
+}
 
-        if use_highlight && !msg.streaming {
-            let spans = highlight_spans(&msg.content, style);
-            // Flatten spans into wrapped lines.
-            let mut line_spans: Vec<Span> = Vec::new();
-            let mut line_width = prefix_width;
-            let mut is_first_line = true;
+fn render_all_message_lines(
+    messages: &[Message],
+    width: usize,
+    is_compact: bool,
+) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    for msg in messages {
+        append_message_lines(&mut lines, msg, width, is_compact);
+    }
+    lines
+}
 
-            for span in spans {
-                let span_text = span.content.to_string();
-                for word in span_text.split_whitespace() {
-                    let word_width = unicode_width::UnicodeWidthStr::width(word);
-                    let space = if line_spans.is_empty() { 0 } else { 1 };
-                    if line_width + space + word_width > width && !line_spans.is_empty() {
-                        // Flush current line
-                        let mut final_spans = if is_first_line {
-                            vec![Span::styled(prefix, style)]
-                        } else {
-                            vec![Span::styled(" ".repeat(prefix_width), style)]
-                        };
-                        final_spans.extend(std::mem::take(&mut line_spans));
-                        lines.push(Line::from(final_spans));
-                        line_width = prefix_width;
-                        is_first_line = false;
-                    }
-                    if !line_spans.is_empty() {
-                        line_spans.push(Span::styled(" ", style));
-                        line_width += 1;
-                    }
-                    line_spans.push(Span::styled(word.to_string(), span.style));
-                    line_width += word_width;
-                }
-                // Preserve newlines within the span text
-                if span_text.ends_with('\n') {
+fn append_message_lines(
+    lines: &mut Vec<Line<'static>>,
+    msg: &Message,
+    width: usize,
+    is_compact: bool,
+) {
+    // Handle folded messages
+    if msg.folded {
+        let style = Style::default().fg(Color::DarkGray);
+        let fold_indicator = format!(
+            "▸ {} [+{} lines folded]",
+            match msg.role {
+                MessageRole::User => "User",
+                MessageRole::Assistant => "Assistant",
+                MessageRole::ToolResult => "Tool Result",
+                MessageRole::ToolCall => "Tool Call",
+                MessageRole::System => "System",
+            },
+            message_display_height(msg, width).saturating_sub(1)
+        );
+        lines.push(Line::from(Span::styled(fold_indicator, style)));
+        return;
+    }
+
+    let (prefix, style) = match msg.role {
+        MessageRole::User => ("▸ ", Style::default().fg(Color::Green)),
+        MessageRole::Assistant => ("◂ ", Style::default().fg(Color::Cyan)),
+        MessageRole::ToolResult => ("✓ ", Style::default().fg(Color::Yellow)),
+        MessageRole::ToolCall => ("⚙ ", Style::default().fg(Color::Magenta)),
+        MessageRole::System => ("⋮ ", Style::default().fg(Color::Gray)),
+    };
+
+    let prefix_width = unicode_width::UnicodeWidthStr::width(prefix);
+    let wrap_width = width.saturating_sub(prefix_width);
+
+    // In compact mode, truncate long messages to single line
+    if is_compact && message_display_height(msg, width) > 3 {
+        let truncated = msg
+            .content
+            .chars()
+            .take(width.saturating_sub(prefix_width))
+            .collect::<String>();
+        lines.push(Line::from(vec![
+            Span::styled(prefix, style),
+            Span::styled(truncated, style.add_modifier(Modifier::DIM)),
+        ]));
+        return;
+    }
+
+    // Use syntax highlighting for assistant messages that contain code blocks.
+    let use_highlight = msg.role == MessageRole::Assistant && msg.content.contains("```");
+
+    if use_highlight && !msg.streaming {
+        let spans = highlight_spans(&msg.content, style);
+        // Flatten spans into wrapped lines.
+        let mut line_spans: Vec<Span> = Vec::new();
+        let mut line_width = prefix_width;
+        let mut is_first_line = true;
+
+        for span in spans {
+            let span_text = span.content.to_string();
+            for word in span_text.split_whitespace() {
+                let word_width = unicode_width::UnicodeWidthStr::width(word);
+                let space = if line_spans.is_empty() { 0 } else { 1 };
+                if line_width + space + word_width > width && !line_spans.is_empty() {
+                    // Flush current line
                     let mut final_spans = if is_first_line {
                         vec![Span::styled(prefix, style)]
                     } else {
@@ -480,63 +567,71 @@ fn render_messages(frame: &mut Frame, area: ratatui::layout::Rect, state: &mut U
                     line_width = prefix_width;
                     is_first_line = false;
                 }
+                if !line_spans.is_empty() {
+                    line_spans.push(Span::styled(" ", style));
+                    line_width += 1;
+                }
+                line_spans.push(Span::styled(word.to_string(), span.style));
+                line_width += word_width;
             }
-
-            if !line_spans.is_empty() {
+            // Preserve newlines within the span text
+            if span_text.ends_with('\n') {
                 let mut final_spans = if is_first_line {
                     vec![Span::styled(prefix, style)]
                 } else {
                     vec![Span::styled(" ".repeat(prefix_width), style)]
                 };
-                final_spans.extend(line_spans);
+                final_spans.extend(std::mem::take(&mut line_spans));
                 lines.push(Line::from(final_spans));
-            }
-        } else {
-            let wrapped = wrap_text(&msg.content, wrap_width);
-            for (i, text) in wrapped.into_iter().enumerate() {
-                if i == 0 {
-                    lines.push(Line::from(vec![
-                        Span::styled(prefix, style),
-                        if msg.streaming {
-                            Span::styled(text, style.add_modifier(Modifier::DIM))
-                        } else {
-                            Span::raw(text)
-                        },
-                    ]));
-                } else {
-                    let indent = " ".repeat(prefix_width);
-                    lines.push(Line::from(vec![
-                        Span::styled(indent, style),
-                        if msg.streaming {
-                            Span::styled(text, style.add_modifier(Modifier::DIM))
-                        } else {
-                            Span::raw(text)
-                        },
-                    ]));
-                }
+                line_width = prefix_width;
+                is_first_line = false;
             }
         }
 
-        // Show tool name for tool messages
-        if let (Some(tool), MessageRole::ToolCall | MessageRole::ToolResult) =
-            (&msg.tool_name, msg.role)
-        {
-            lines.push(Line::from(Span::styled(
-                format!("  [{tool}]"),
-                Style::default().fg(Color::DarkGray),
-            )));
+        if !line_spans.is_empty() {
+            let mut final_spans = if is_first_line {
+                vec![Span::styled(prefix, style)]
+            } else {
+                vec![Span::styled(" ".repeat(prefix_width), style)]
+            };
+            final_spans.extend(line_spans);
+            lines.push(Line::from(final_spans));
+        }
+    } else {
+        let wrapped = wrap_text(&msg.content, wrap_width);
+        for (i, text) in wrapped.into_iter().enumerate() {
+            if i == 0 {
+                lines.push(Line::from(vec![
+                    Span::styled(prefix, style),
+                    if msg.streaming {
+                        Span::styled(text, style.add_modifier(Modifier::DIM))
+                    } else {
+                        Span::raw(text)
+                    },
+                ]));
+            } else {
+                let indent = " ".repeat(prefix_width);
+                lines.push(Line::from(vec![
+                    Span::styled(indent, style),
+                    if msg.streaming {
+                        Span::styled(text, style.add_modifier(Modifier::DIM))
+                    } else {
+                        Span::raw(text)
+                    },
+                ]));
+            }
         }
     }
 
-    // If no messages, show dynamic welcome art
-    if lines.is_empty() {
-        lines.extend(render_welcome_art());
+    // Show tool name for tool messages
+    if let (Some(tool), MessageRole::ToolCall | MessageRole::ToolResult) =
+        (&msg.tool_name, msg.role)
+    {
+        lines.push(Line::from(Span::styled(
+            format!("  [{tool}]"),
+            Style::default().fg(Color::DarkGray),
+        )));
     }
-
-    lines = trim_lines_to_viewport(lines, viewport_height);
-
-    let paragraph = Paragraph::new(lines).block(Block::default().borders(Borders::NONE));
-    frame.render_widget(paragraph, area);
 }
 
 fn trim_lines_to_viewport(mut lines: Vec<Line>, viewport_height: usize) -> Vec<Line> {
@@ -544,6 +639,27 @@ fn trim_lines_to_viewport(mut lines: Vec<Line>, viewport_height: usize) -> Vec<L
         return lines;
     }
     lines.split_off(lines.len() - viewport_height)
+}
+
+fn trim_lines_to_viewport_with_scroll(
+    lines: Vec<Line<'static>>,
+    viewport_height: usize,
+    scroll_offset: usize,
+) -> Vec<Line<'static>> {
+    if viewport_height == 0 || lines.len() <= viewport_height {
+        return lines;
+    }
+
+    let end = lines
+        .len()
+        .saturating_sub(scroll_offset)
+        .max(viewport_height);
+    let start = end.saturating_sub(viewport_height);
+    lines
+        .into_iter()
+        .skip(start)
+        .take(viewport_height)
+        .collect()
 }
 
 /// Dynamic welcome art — cycles between T-Rex ASCII, tips, and hints.
@@ -884,5 +1000,59 @@ mod tests {
         assert_eq!(trimmed.len(), 2);
         assert_eq!(trimmed[0].to_string(), "line 3");
         assert_eq!(trimmed[1].to_string(), "line 4");
+    }
+
+    #[test]
+    fn trim_lines_to_viewport_scrolls_from_bottom() {
+        let lines = vec![
+            Line::from("line 1"),
+            Line::from("line 2"),
+            Line::from("line 3"),
+            Line::from("line 4"),
+            Line::from("line 5"),
+        ];
+        let trimmed = trim_lines_to_viewport_with_scroll(lines, 2, 2);
+
+        assert_eq!(trimmed.len(), 2);
+        assert_eq!(trimmed[0].to_string(), "line 2");
+        assert_eq!(trimmed[1].to_string(), "line 3");
+    }
+
+    #[test]
+    fn visible_window_includes_overflowing_final_message() {
+        let heights = vec![1, 80];
+        let (_start, count, accumulated) = visible_message_window(&heights, 0, 20);
+
+        assert_eq!(count, 2);
+        assert_eq!(accumulated, 81);
+    }
+
+    #[test]
+    fn visible_window_includes_single_overflowing_message() {
+        let heights = vec![80];
+        let (_start, count, accumulated) = visible_message_window(&heights, 0, 20);
+
+        assert_eq!(count, 1);
+        assert_eq!(accumulated, 80);
+    }
+
+    #[test]
+    fn bottom_window_skips_middle_overflow_and_keeps_latest_response() {
+        let heights = vec![1, 1, 80, 1, 80];
+        let (start, count, accumulated) = bottom_message_window(&heights, 20);
+
+        assert_eq!(start, 4);
+        assert_eq!(count, 1);
+        assert_eq!(accumulated, 80);
+    }
+
+    #[test]
+    fn bottom_window_keeps_latest_small_messages() {
+        let heights = vec![1, 80, 1, 2];
+        let (start, count, accumulated) = bottom_message_window(&heights, 20);
+
+        assert_eq!(start, 1);
+        assert_eq!(count, 3);
+        assert_eq!(accumulated, 83);
     }
 }

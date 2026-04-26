@@ -50,7 +50,7 @@ The target feeling is:
 The user should be able to see status updates such as:
 
 - `Thinking...`
-- `Planning next step...`
+- `Planning...`
 - `Reading src/lib.rs...`
 - `Running cargo test -p coderex-cli...`
 - `Applying patch to 2 files...`
@@ -61,7 +61,7 @@ Each of these should show a live elapsed timer while active.
 Example:
 
 ```text
-◐ Planning next step...  (3s)
+◐ Planning...  (3s)
 ◓ Reading src/lib.rs...  (5s)
 ◑ Running cargo test -p coderex-cli...  (19s)
 ```
@@ -279,7 +279,7 @@ Extend the current statusline to show:
 Examples:
 
 - `◐ Thinking...  (2s)`
-- `◓ Planning next step...  (4s)`
+- `◓ Planning...  (4s)`
 - `◑ Step 2/5: Running tests  (21s)`
 - `Waiting for permission: Write  (8s)`
 - `Completed in 27s`
@@ -291,7 +291,6 @@ turn.
 
 Examples:
 
-- `Planning next step...`
 - `Read src/lib.rs`
 - `Running cargo test -p coderex-cli`
 - `Applied patch to 2 files`

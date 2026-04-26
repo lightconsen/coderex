@@ -235,6 +235,14 @@ impl PtySession {
         self.send_bytes(b"\x1b[B");
     }
 
+    fn page_up(&mut self) {
+        self.send_bytes(b"\x1b[5~");
+    }
+
+    fn page_down(&mut self) {
+        self.send_bytes(b"\x1b[6~");
+    }
+
     fn left(&mut self) {
         self.send_bytes(b"\x1b[D");
     }
@@ -507,6 +515,7 @@ fn single_prompt_gets_response() {
     session.send_line("hello");
     let screen = session.wait_for_any_text(&["Hello!", "happy to help"], SCREEN_TIMEOUT);
     assert!(screen.contains("Hello!"));
+    assert!(!screen.contains("Planning next step"));
 }
 
 #[test]
@@ -533,6 +542,42 @@ fn long_response_keeps_tail_visible_in_tui() {
     session.send_line("long response");
     let screen = session.wait_for_text("TAIL: final sentence visible.", SCREEN_TIMEOUT);
     assert!(screen.contains("TAIL: final sentence visible."));
+}
+
+#[test]
+fn long_response_does_not_hide_following_turn() {
+    let dir = setup_project_dir();
+    let (_server, mut session) = session_with_static_server(dir.path());
+    session.wait_for_text("CodeRex v", SCREEN_TIMEOUT);
+    session.send_line("very long response");
+    session.wait_for_text("VERY_LONG_TAIL", SCREEN_TIMEOUT);
+    session.send_line("long response");
+    let screen = session.wait_for_text("TAIL: final sentence visible.", SCREEN_TIMEOUT);
+    assert!(screen.contains("TAIL: final sentence visible."));
+}
+
+#[test]
+fn message_area_scrolls_while_footer_stays_fixed() {
+    let dir = setup_project_dir();
+    let (_server, mut session) = session_with_static_server(dir.path());
+    session.wait_for_text("CodeRex v", SCREEN_TIMEOUT);
+    session.send_line("very long response");
+    session.wait_for_text("VERY_LONG_TAIL", SCREEN_TIMEOUT);
+
+    for _ in 0..12 {
+        session.page_up();
+    }
+    let screen = session.wait_for_text("very long response line 0", SCREEN_TIMEOUT);
+    assert!(screen.contains("❯"));
+    assert!(screen.contains("Permissions:"));
+    assert!(!screen.contains("VERY_LONG_TAIL"));
+
+    for _ in 0..12 {
+        session.page_down();
+    }
+    let screen = session.wait_for_text("VERY_LONG_TAIL", SCREEN_TIMEOUT);
+    assert!(screen.contains("❯"));
+    assert!(screen.contains("Permissions:"));
 }
 
 #[test]
@@ -717,14 +762,13 @@ fn plan_and_activity_overlays_render_details() {
     session.wait_for_text("Hello!", SCREEN_TIMEOUT);
 
     session.send_line("/plan");
-    let screen = session.wait_for_any_text(&["Current Plan", "Planning next step"], SCREEN_TIMEOUT);
-    assert!(screen.contains("Current Plan") || screen.contains("Planning next step"));
+    let screen = session.wait_for_any_text(&["Current Plan", "Planning"], SCREEN_TIMEOUT);
+    assert!(screen.contains("Current Plan") || screen.contains("Planning"));
     session.esc();
 
     session.send_line("/activity");
-    let screen =
-        session.wait_for_any_text(&["Recent Activity", "Planning next step"], SCREEN_TIMEOUT);
-    assert!(screen.contains("Recent Activity") || screen.contains("Planning next step"));
+    let screen = session.wait_for_text("Recent Activity", SCREEN_TIMEOUT);
+    assert!(screen.contains("Recent Activity"));
 }
 
 #[test]
@@ -835,15 +879,9 @@ fn resume_restores_persisted_plan_and_activity() {
         assert!(resumed.contains("Loaded"));
 
         session.send_line("/activity");
-        let activity = session.wait_for_any_text(
-            &["Planning next step", "Reading src/lib.rs", "Reading files"],
-            SCREEN_TIMEOUT,
-        );
-        assert!(
-            activity.contains("Planning next step")
-                || activity.contains("Reading src/lib.rs")
-                || activity.contains("Reading files")
-        );
+        let activity =
+            session.wait_for_any_text(&["Reading src/lib.rs", "Reading files"], SCREEN_TIMEOUT);
+        assert!(activity.contains("Reading src/lib.rs") || activity.contains("Reading files"));
 
         session.send_line("/plan");
         let plan = session.wait_for_any_text(

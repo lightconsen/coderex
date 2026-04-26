@@ -931,14 +931,61 @@ impl QueryEngine {
     }
 
     fn should_short_circuit_directory_turn(tool_calls: &[ToolCall]) -> bool {
-        !tool_calls.is_empty()
-            && tool_calls
-                .iter()
-                .all(|tc| Self::is_directory_tool_name(&tc.name))
+        !tool_calls.is_empty() && tool_calls.iter().all(Self::is_directory_tool_call)
     }
 
     fn is_directory_tool_name(name: &str) -> bool {
         name.eq_ignore_ascii_case("currentdir") || name.eq_ignore_ascii_case("listdir")
+    }
+
+    fn is_directory_tool_call(call: &ToolCall) -> bool {
+        Self::is_directory_tool_name(&call.name)
+            || (call.name.eq_ignore_ascii_case("bash")
+                && Self::is_read_only_directory_bash_call(&call.input))
+    }
+
+    fn is_read_only_directory_bash_call(input: &serde_json::Value) -> bool {
+        let Some(command) = input
+            .get("command")
+            .or_else(|| input.get("cmd"))
+            .and_then(serde_json::Value::as_str)
+        else {
+            return false;
+        };
+        let command = command.trim();
+        if command.is_empty() {
+            return false;
+        }
+        let lower = command.to_ascii_lowercase();
+        if lower.contains(';')
+            || lower.contains("&&")
+            || lower.contains("||")
+            || lower.contains('>')
+            || lower.contains('<')
+            || lower.contains('`')
+            || lower.contains("$(")
+        {
+            return false;
+        }
+
+        if lower == "pwd" || lower.starts_with("pwd ") {
+            return true;
+        }
+        if lower == "ls" || lower.starts_with("ls ") {
+            return true;
+        }
+        if (lower.starts_with("find . ") || lower == "find .")
+            && !lower.contains(" -exec")
+            && !lower.contains(" -delete")
+            && !lower.contains(" -ok")
+        {
+            return true;
+        }
+        if lower == "tree" || lower.starts_with("tree ") {
+            return true;
+        }
+
+        false
     }
 
     fn dedupe_directory_tool_calls(tool_calls: &mut Vec<ToolCall>) {
@@ -2362,7 +2409,7 @@ impl QueryEngine {
             // Process event through assembler and execute completed tool calls
             // immediately while the stream is still running (early execution).
             for call in assembler.process_event(event) {
-                if Self::is_directory_tool_name(&call.name) {
+                if Self::is_directory_tool_call(&call) {
                     stop_after_directory_call = true;
                     break;
                 }
@@ -3553,6 +3600,32 @@ mod tests {
         ];
 
         assert!(QueryEngine::should_short_circuit_directory_turn(
+            &tool_calls
+        ));
+    }
+
+    #[test]
+    fn read_only_directory_bash_turns_short_circuit() {
+        let tool_calls = vec![ToolCall {
+            id: "tc_1".into(),
+            name: "Bash".into(),
+            input: serde_json::json!({"command": "find . -maxdepth 1 -type f"}),
+        }];
+
+        assert!(QueryEngine::should_short_circuit_directory_turn(
+            &tool_calls
+        ));
+    }
+
+    #[test]
+    fn compound_bash_commands_do_not_short_circuit() {
+        let tool_calls = vec![ToolCall {
+            id: "tc_1".into(),
+            name: "Bash".into(),
+            input: serde_json::json!({"command": "ls && rm file"}),
+        }];
+
+        assert!(!QueryEngine::should_short_circuit_directory_turn(
             &tool_calls
         ));
     }

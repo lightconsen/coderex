@@ -1404,7 +1404,7 @@ impl ReplLoop {
         use coderex_ui::state::{UiState, ViewMode};
         use coderex_ui::terminal::TerminalUi;
         use coderex_ui::vim::{VimAction, VimMode, VimState};
-        use crossterm::event::{Event, KeyCode, KeyModifiers};
+        use crossterm::event::{Event, KeyCode, KeyModifiers, MouseEventKind};
         use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
         use std::time::Duration;
 
@@ -1883,6 +1883,16 @@ impl ReplLoop {
                                             KeyCode::End => {
                                                 ui_state.input.apply(&InputAction::MoveToEnd);
                                             }
+                                            KeyCode::PageUp => {
+                                                let page =
+                                                    ui_state.messages.viewport_height.saturating_sub(2).max(1);
+                                                ui_state.messages.scroll_up(page);
+                                            }
+                                            KeyCode::PageDown => {
+                                                let page =
+                                                    ui_state.messages.viewport_height.saturating_sub(2).max(1);
+                                                ui_state.messages.scroll_down_by(page);
+                                            }
                                             _ => {}
                                         }
                                     } else if self.vim_mode_enabled {
@@ -1937,19 +1947,28 @@ impl ReplLoop {
                                     }
                                 }
                                 VimAction::PageUp => {
-                                    ui_state.messages.scroll_up(5);
+                                    let page =
+                                        ui_state.messages.viewport_height.saturating_sub(2).max(1);
+                                    ui_state.messages.scroll_up(page);
                                 }
                                 VimAction::PageDown => {
-                                    ui_state.messages.scroll_down();
+                                    let page =
+                                        ui_state.messages.viewport_height.saturating_sub(2).max(1);
+                                    ui_state.messages.scroll_down_by(page);
                                 }
                                 VimAction::HalfPageUp => {
-                                    ui_state.messages.scroll_up(10);
+                                    let half_page =
+                                        (ui_state.messages.viewport_height / 2).max(1);
+                                    ui_state.messages.scroll_up(half_page);
                                 }
                                 VimAction::HalfPageDown => {
-                                    ui_state.messages.scroll_down();
+                                    let half_page =
+                                        (ui_state.messages.viewport_height / 2).max(1);
+                                    ui_state.messages.scroll_down_by(half_page);
                                 }
                                 VimAction::JumpTop => {
                                     ui_state.messages.start = 0;
+                                    ui_state.messages.scroll_offset = usize::MAX;
                                 }
                                 VimAction::JumpBottom => {
                                     ui_state.messages.scroll_to_bottom();
@@ -2042,10 +2061,19 @@ impl ReplLoop {
                                 self.update_slash_suggestions(&mut ui_state);
                             }
                         }
+                        Event::Mouse(mouse) => {
+                            match mouse.kind {
+                                MouseEventKind::ScrollUp => ui_state.messages.scroll_up(3),
+                                MouseEventKind::ScrollDown => ui_state.messages.scroll_down_by(3),
+                                _ => {}
+                            }
+                        }
                         Event::Resize(_, _) => {}
                         _ => {}
                     }
                 }
+
+                _ = tokio::time::sleep(Duration::from_millis(100)), if thinking => {}
 
                 Some(engine_event) = async {
                     event_rx.as_mut().unwrap().recv().await
@@ -3250,6 +3278,9 @@ impl ReplLoop {
     ) {
         // Clear previous turn's duration display so it doesn't linger.
         ui_state.statusline.last_duration = None;
+        ui_state.statusline.thinking_started = None;
+        ui_state.statusline.spinner_frame = 0;
+        ui_state.messages.scroll_to_bottom();
 
         // If there's a pending elicitation, treat this input as the answer.
         if let Some(tx) = self.pending_elicitation.take() {
@@ -3519,6 +3550,10 @@ impl ReplLoop {
         elicit_rx: &mut Option<tokio::sync::mpsc::Receiver<coderex_tools::ElicitRequest>>,
         tui_elicit_rx: &mut Option<tokio::sync::mpsc::Receiver<TuiElicitationRequest>>,
     ) {
+        ui_state.statusline.last_duration = None;
+        ui_state.statusline.thinking_started = None;
+        ui_state.statusline.spinner_frame = 0;
+        ui_state.messages.scroll_to_bottom();
         ui_state.messages.push(coderex_ui::message_list::Message {
             role: coderex_ui::message_list::MessageRole::Assistant,
             content: "".into(),
@@ -3539,8 +3574,7 @@ impl ReplLoop {
         self.query_start_time = Some(std::time::Instant::now());
         ui_state.plan.reset();
         ui_state.permission_bar.clear_status();
-        set_plan_step(ui_state, "Planning next step");
-        push_activity_row(ui_state, "Planning next step");
+        set_plan_step(ui_state, "Planning");
         self.persist_interactive_snapshot(ui_state);
         tokio::spawn(async move {
             let result = engine.submit_streaming(prompt, options).await;

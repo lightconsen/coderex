@@ -3,9 +3,11 @@
 //! These tests exercise the full QueryEngine with a mock API client,
 //! verifying end-to-end behavior without hitting real LLM APIs.
 
+use coderex_core::api_client::StreamEvent;
 use coderex_core::engine::TerminalReason;
 use coderex_core::types::EngineEvent;
 use coderex_core::types::ToolCall;
+use coderex_core::types::UsageSummary;
 use coderex_test_utils::{
     MockApiClient, MockResponseType, StubOkToolExecutor, TestRig, TestRigBuilder, mock_response,
     mock_response_with_tool_calls,
@@ -79,6 +81,53 @@ async fn engine_tracks_api_calls() {
 
     // The mock API should have been called exactly once
     assert_eq!(api_clone.call_count(), 1);
+}
+
+#[tokio::test]
+async fn read_only_directory_bash_tool_does_not_trigger_second_model_turn() {
+    let api = MockApiClient::with_mixed(vec![MockResponseType::Streaming(vec![
+        StreamEvent::ToolCallBlockStart {
+            id: "tc_1".into(),
+            name: "Bash".into(),
+        },
+        StreamEvent::ToolCallInputDelta {
+            id: "tc_1".into(),
+            delta: r#"{"command":"ls -la"}"#.into(),
+        },
+        StreamEvent::ToolCallBlockEnd {
+            id: "tc_1".into(),
+            input: serde_json::json!({"command": "ls -la"}),
+        },
+        StreamEvent::UsageSummary(UsageSummary {
+            input_tokens: 10,
+            output_tokens: 5,
+            cache_read_tokens: 0,
+            cache_creation_tokens: 0,
+        }),
+        StreamEvent::StreamEnd,
+    ])]);
+
+    let api_clone = api.clone();
+    let mut rig = TestRigBuilder::new()
+        .with_api_client(Box::new(api))
+        .with_tool_executor(Box::new(StubOkToolExecutor))
+        .build()
+        .await;
+
+    let reason = rig
+        .engine
+        .submit_streaming("list files in this dir".into(), Default::default())
+        .await
+        .unwrap();
+    assert!(matches!(reason, TerminalReason::Completed));
+    assert_eq!(api_clone.call_count(), 1);
+
+    let starts = rig
+        .drain_events()
+        .into_iter()
+        .filter(|event| matches!(event, EngineEvent::ToolCallStart { .. }))
+        .count();
+    assert_eq!(starts, 1);
 }
 
 #[tokio::test]

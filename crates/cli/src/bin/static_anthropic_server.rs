@@ -208,7 +208,16 @@ fn count_tool_results(body: &str) -> usize {
 fn resolve_text_response(prompt: &str, responses: &StaticResponses) -> String {
     let p = prompt.to_lowercase();
 
-    if p.contains("long response") {
+    if p.contains("very long response") || p.contains("verylongresponse") {
+        let mut lines = Vec::new();
+        for i in 0..80 {
+            lines.push(format!(
+                "This is very long response line {i}, used to verify that overflowing assistant messages do not hide later turns."
+            ));
+        }
+        lines.push("VERY_LONG_TAIL: final long response line visible.".into());
+        lines.join("\n")
+    } else if p.contains("long response") {
         [
             "This is a long interactive response used to verify that the TUI keeps the latest lines visible.",
             "It should continue across many wrapped lines without being visually clipped in the middle of the transcript.",
@@ -287,6 +296,7 @@ fn should_stream_text_response(prompt: &str) -> bool {
     let p = prompt.to_lowercase();
     ((p.contains("hello") || p.contains("hi")) && !p.contains("file"))
         || p.contains("long response")
+        || p.contains("longresponse")
         || p.contains("ask a question")
         || p.contains("ask question")
         || p.contains("cargo test")

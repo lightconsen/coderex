@@ -73,6 +73,8 @@ pub enum Step {
     Backspace,
     Up,
     Down,
+    PageUp,
+    PageDown,
     Left,
     Right,
     Resize {
@@ -193,6 +195,8 @@ fn execute_step(session: &mut PtySession, step: &Step) -> Result<()> {
         Step::Backspace => session.backspace()?,
         Step::Up => session.up()?,
         Step::Down => session.down()?,
+        Step::PageUp => session.page_up()?,
+        Step::PageDown => session.page_down()?,
         Step::Left => session.left()?,
         Step::Right => session.right()?,
         Step::Resize { rows, cols } => session.resize(*rows, *cols)?,
@@ -580,6 +584,14 @@ impl PtySession {
 
     fn down(&mut self) -> Result<()> {
         self.send_bytes(b"\x1b[B")
+    }
+
+    fn page_up(&mut self) -> Result<()> {
+        self.send_bytes(b"\x1b[5~")
+    }
+
+    fn page_down(&mut self) -> Result<()> {
+        self.send_bytes(b"\x1b[6~")
     }
 
     fn left(&mut self) -> Result<()> {

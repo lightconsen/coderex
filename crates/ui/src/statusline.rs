@@ -84,21 +84,23 @@ impl Statusline {
                 .map(|s| Self::fmt_duration(s.elapsed()))
                 .unwrap_or_default();
 
-            let label = if let Some(ref plan) = self.plan_status {
+            let label = if let Some(ref active) = self.thinking_label {
                 if elapsed.is_empty() {
-                    format!("{plan}")
+                    active.clone()
+                } else {
+                    format!("{active}  ({elapsed})")
+                }
+            } else if let Some(ref plan) = self.plan_status {
+                if elapsed.is_empty() {
+                    plan.clone()
                 } else {
                     format!("{plan}  ({elapsed})")
                 }
             } else {
-                let base = self
-                    .thinking_label
-                    .as_ref()
-                    .map_or("Thinking...".into(), |l| l.clone());
                 if elapsed.is_empty() {
-                    base
+                    "Thinking...".into()
                 } else {
-                    format!("{base}  ({elapsed})")
+                    format!("Thinking...  ({elapsed})")
                 }
             };
 
@@ -302,6 +304,20 @@ mod tests {
         let rendered = sl.render(200);
         assert!(rendered.contains("Step 2/5"));
         assert!(rendered.contains("Running tests"));
+    }
+
+    #[test]
+    fn active_thinking_label_takes_priority_over_plan_status() {
+        let sl = Statusline {
+            thinking: true,
+            thinking_label: Some("Thinking...".into()),
+            plan_status: Some("Planning".into()),
+            spinner_frame: 0,
+            ..Statusline::new()
+        };
+        let rendered = sl.render(200);
+        assert!(rendered.contains("Thinking..."));
+        assert!(!rendered.contains("Planning"));
     }
 
     #[test]

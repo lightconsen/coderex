@@ -43,6 +43,10 @@ pub struct MessageView {
     pub visible_count: usize,
     /// Total height of all messages (for scroll bar).
     pub total_height: usize,
+    /// Last rendered message-area height.
+    pub viewport_height: usize,
+    /// Number of rendered lines scrolled up from the newest content.
+    pub scroll_offset: usize,
 }
 
 impl MessageView {
@@ -54,6 +58,8 @@ impl MessageView {
             start: 0,
             visible_count: 0,
             total_height: 0,
+            viewport_height: 0,
+            scroll_offset: 0,
         }
     }
 
@@ -61,9 +67,7 @@ impl MessageView {
     pub fn push(&mut self, msg: Message) {
         self.messages.push(msg);
         // Auto-scroll to bottom if near bottom
-        let vc = self.visible_count.max(1);
-        let at_bottom = self.start + vc >= self.messages.len().saturating_sub(1);
-        if at_bottom {
+        if self.is_at_bottom() {
             self.scroll_to_bottom();
         }
     }
@@ -72,17 +76,27 @@ impl MessageView {
     pub fn scroll_to_bottom(&mut self) {
         let total = self.messages.len();
         self.start = total.saturating_sub(self.visible_count.max(1));
+        self.scroll_offset = 0;
     }
 
-    /// Scroll up by n messages.
+    /// Scroll up by n rendered lines.
     pub fn scroll_up(&mut self, n: usize) {
         self.start = self.start.saturating_sub(n);
+        self.scroll_offset = self.scroll_offset.saturating_add(n);
     }
 
-    /// Scroll down by n messages.
+    /// Scroll down by one rendered line.
     pub fn scroll_down(&mut self) {
         let max_start = self.messages.len().saturating_sub(self.visible_count);
         self.start = (self.start + 1).min(max_start);
+        self.scroll_offset = self.scroll_offset.saturating_sub(1);
+    }
+
+    /// Scroll down by n rendered lines.
+    pub fn scroll_down_by(&mut self, n: usize) {
+        let max_start = self.messages.len().saturating_sub(self.visible_count);
+        self.start = (self.start + n).min(max_start);
+        self.scroll_offset = self.scroll_offset.saturating_sub(n);
     }
 
     /// Get the visible messages.
@@ -112,7 +126,7 @@ impl MessageView {
     /// Check if the view is scrolled to the bottom.
     #[must_use]
     pub fn is_at_bottom(&self) -> bool {
-        self.start + self.visible_count >= self.messages.len()
+        self.scroll_offset == 0
     }
 }
 
