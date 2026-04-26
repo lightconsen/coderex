@@ -291,6 +291,7 @@ turn.
 
 Examples:
 
+- `Planning next step...`
 - `Read src/lib.rs`
 - `Running cargo test -p coderex-cli`
 - `Applied patch to 2 files`

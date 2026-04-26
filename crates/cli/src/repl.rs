@@ -3574,7 +3574,8 @@ impl ReplLoop {
         self.query_start_time = Some(std::time::Instant::now());
         ui_state.plan.reset();
         ui_state.permission_bar.clear_status();
-        set_plan_step(ui_state, "Planning");
+        set_plan_step(ui_state, "Planning next step");
+        push_activity_row(ui_state, "Planning next step");
         self.persist_interactive_snapshot(ui_state);
         tokio::spawn(async move {
             let result = engine.submit_streaming(prompt, options).await;

@@ -243,17 +243,17 @@ fn wrap_text(text: &str, width: usize) -> Vec<String> {
 
 /// Compute how many terminal rows a message occupies at the given width.
 fn message_display_height(msg: &crate::message_list::Message, width: usize) -> usize {
-    let prefix = match msg.role {
-        crate::message_list::MessageRole::User => "▸ ",
-        crate::message_list::MessageRole::Assistant => "◂ ",
-        crate::message_list::MessageRole::ToolResult => "✓ ",
-        crate::message_list::MessageRole::ToolCall => "⚙ ",
-        crate::message_list::MessageRole::System => "⋮ ",
-    };
+    let prefix = message_prefix(msg.role);
     let prefix_width = unicode_width::UnicodeWidthStr::width(prefix);
     let wrap_width = width.saturating_sub(prefix_width);
     let wrapped = wrap_text(&msg.content, wrap_width);
     let mut height = wrapped.len().max(1);
+    if matches!(
+        msg.role,
+        crate::message_list::MessageRole::User | crate::message_list::MessageRole::Assistant
+    ) {
+        height += 1;
+    }
     if msg.tool_name.is_some()
         && matches!(
             msg.role,
@@ -264,6 +264,16 @@ fn message_display_height(msg: &crate::message_list::Message, width: usize) -> u
         height += 1;
     }
     height
+}
+
+fn message_prefix(role: crate::message_list::MessageRole) -> &'static str {
+    match role {
+        crate::message_list::MessageRole::User => "● ",
+        crate::message_list::MessageRole::Assistant => "◆ ",
+        crate::message_list::MessageRole::ToolResult => "✓ ",
+        crate::message_list::MessageRole::ToolCall => "⚙ ",
+        crate::message_list::MessageRole::System => "· ",
+    }
 }
 
 /// Convert a hex colour string (#RRGGBB) to a ratatui `Color`.
@@ -497,6 +507,13 @@ fn append_message_lines(
     width: usize,
     is_compact: bool,
 ) {
+    if !is_compact
+        && !lines.is_empty()
+        && matches!(msg.role, MessageRole::User | MessageRole::Assistant)
+    {
+        lines.push(Line::from(""));
+    }
+
     // Handle folded messages
     if msg.folded {
         let style = Style::default().fg(Color::DarkGray);
@@ -515,12 +532,17 @@ fn append_message_lines(
         return;
     }
 
-    let (prefix, style) = match msg.role {
-        MessageRole::User => ("▸ ", Style::default().fg(Color::Green)),
-        MessageRole::Assistant => ("◂ ", Style::default().fg(Color::Cyan)),
-        MessageRole::ToolResult => ("✓ ", Style::default().fg(Color::Yellow)),
-        MessageRole::ToolCall => ("⚙ ", Style::default().fg(Color::Magenta)),
-        MessageRole::System => ("⋮ ", Style::default().fg(Color::Gray)),
+    let prefix = message_prefix(msg.role);
+    let style = match msg.role {
+        MessageRole::User => Style::default()
+            .fg(Color::Green)
+            .add_modifier(Modifier::BOLD),
+        MessageRole::Assistant => Style::default()
+            .fg(Color::LightGreen)
+            .add_modifier(Modifier::BOLD),
+        MessageRole::ToolResult => Style::default().fg(Color::Yellow),
+        MessageRole::ToolCall => Style::default().fg(Color::Magenta),
+        MessageRole::System => Style::default().fg(Color::Gray),
     };
 
     let prefix_width = unicode_width::UnicodeWidthStr::width(prefix);
@@ -771,7 +793,7 @@ fn render_statusline(frame: &mut Frame, area: ratatui::layout::Rect, statusline:
         .collect::<Vec<_>>();
     let line = Line::from(spans);
     let paragraph = Paragraph::new(line)
-        .style(Style::default().fg(Color::White).bg(Color::DarkGray))
+        .style(Style::default().fg(Color::White))
         .alignment(Alignment::Left);
     frame.render_widget(paragraph, area);
 }
@@ -782,11 +804,13 @@ fn render_permission_bar(
     bar: &crate::permission_bar::PermissionBar,
 ) {
     let color = bar.color();
-    let rendered = bar.render(area.width as usize);
-    let line = Line::from(Span::styled(
-        rendered,
-        Style::default().fg(color).bg(Color::Black),
-    ));
+    let left_padding = 2usize.min(area.width as usize);
+    let rendered = format!(
+        "{}{}",
+        " ".repeat(left_padding),
+        bar.render((area.width as usize).saturating_sub(left_padding))
+    );
+    let line = Line::from(Span::styled(rendered, Style::default().fg(color)));
     let paragraph = Paragraph::new(line).alignment(Alignment::Left);
     frame.render_widget(paragraph, area);
 }
@@ -1016,6 +1040,32 @@ mod tests {
         assert_eq!(trimmed.len(), 2);
         assert_eq!(trimmed[0].to_string(), "line 2");
         assert_eq!(trimmed[1].to_string(), "line 3");
+    }
+
+    #[test]
+    fn message_lines_use_distinct_role_prefixes_and_spacing() {
+        let messages = vec![
+            Message {
+                role: MessageRole::User,
+                content: "hello".into(),
+                tool_name: None,
+                streaming: false,
+                folded: false,
+            },
+            Message {
+                role: MessageRole::Assistant,
+                content: "hi there".into(),
+                tool_name: None,
+                streaming: false,
+                folded: false,
+            },
+        ];
+
+        let lines = render_all_message_lines(&messages, 80, false);
+
+        assert_eq!(lines[0].to_string(), "● hello");
+        assert_eq!(lines[1].to_string(), "");
+        assert_eq!(lines[2].to_string(), "◆ hi there");
     }
 
     #[test]
