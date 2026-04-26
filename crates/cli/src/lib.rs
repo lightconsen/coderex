@@ -5,6 +5,7 @@ pub mod daemon;
 pub mod orchestrator;
 pub mod recovery;
 pub mod repl;
+pub mod session_resume;
 pub mod tracing_setup;
 pub mod version;
 pub mod welcome;

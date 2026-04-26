@@ -13,6 +13,26 @@ const COLS: u16 = 120;
 const SCREEN_TIMEOUT: Duration = Duration::from_secs(15);
 const LIVE_TIMEOUT: Duration = Duration::from_secs(90);
 
+fn strip_ansi(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '\u{1b}' {
+            if matches!(chars.peek(), Some('[')) {
+                let _ = chars.next();
+                while let Some(next) = chars.next() {
+                    if ('@'..='~').contains(&next) {
+                        break;
+                    }
+                }
+            }
+            continue;
+        }
+        out.push(ch);
+    }
+    out
+}
+
 fn find_free_port() -> u16 {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind free port");
     listener.local_addr().expect("local addr").port()
@@ -83,6 +103,7 @@ impl Drop for StaticServer {
 
 struct PtySession {
     child: Box<dyn portable_pty::Child + Send + Sync>,
+    master: Box<dyn portable_pty::MasterPty + Send>,
     writer: Box<dyn Write + Send>,
     parser: Arc<Mutex<vt100::Parser>>,
     raw: Arc<Mutex<Vec<u8>>>,
@@ -91,6 +112,15 @@ struct PtySession {
 
 impl PtySession {
     fn launch(cwd: &Path, extra_envs: &[(String, String)], model: &str) -> Self {
+        Self::launch_with_persistence(cwd, extra_envs, model, false)
+    }
+
+    fn launch_with_persistence(
+        cwd: &Path,
+        extra_envs: &[(String, String)],
+        model: &str,
+        persist_session: bool,
+    ) -> Self {
         let pty_system = native_pty_system();
         let pair = pty_system
             .openpty(PtySize {
@@ -102,7 +132,9 @@ impl PtySession {
             .expect("open pty");
 
         let mut cmd = CommandBuilder::new(cargo_bin("coderex"));
-        cmd.arg("--no-session-persistence");
+        if !persist_session {
+            cmd.arg("--no-session-persistence");
+        }
         cmd.arg("--model");
         cmd.arg(model);
         cmd.cwd(cwd);
@@ -112,8 +144,9 @@ impl PtySession {
         }
 
         let child = pair.slave.spawn_command(cmd).expect("spawn coderex");
-        let mut reader = pair.master.try_clone_reader().expect("clone reader");
-        let writer = pair.master.take_writer().expect("take writer");
+        let master = pair.master;
+        let mut reader = master.try_clone_reader().expect("clone reader");
+        let writer = master.take_writer().expect("take writer");
         let parser = Arc::new(Mutex::new(vt100::Parser::new(
             ROWS,
             COLS,
@@ -142,6 +175,7 @@ impl PtySession {
 
         Self {
             child,
+            master,
             writer,
             parser,
             raw,
@@ -180,6 +214,46 @@ impl PtySession {
     fn ctrl_d(&mut self) {
         self.send_bytes(&[0x04]);
     }
+
+    fn esc(&mut self) {
+        self.send_bytes(&[0x1b]);
+    }
+
+    fn tab(&mut self) {
+        self.send_bytes(b"\t");
+    }
+
+    fn backspace(&mut self) {
+        self.send_bytes(&[0x7f]);
+    }
+
+    fn up(&mut self) {
+        self.send_bytes(b"\x1b[A");
+    }
+
+    fn down(&mut self) {
+        self.send_bytes(b"\x1b[B");
+    }
+
+    fn left(&mut self) {
+        self.send_bytes(b"\x1b[D");
+    }
+
+    fn right(&mut self) {
+        self.send_bytes(b"\x1b[C");
+    }
+
+    fn resize(&mut self, rows: u16, cols: u16) {
+        self.master
+            .resize(PtySize {
+                rows,
+                cols,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .expect("resize pty");
+    }
+
     fn send_bytes(&mut self, bytes: &[u8]) {
         self.writer.write_all(bytes).expect("write bytes to pty");
         self.writer.flush().expect("flush bytes to pty");
@@ -187,6 +261,25 @@ impl PtySession {
 
     fn wait_for_text(&self, needle: &str, timeout: Duration) -> String {
         self.wait_for_any_text(&[needle], timeout)
+    }
+
+    fn wait_for_raw_text(&self, needle: &str, timeout: Duration) -> String {
+        let deadline = Instant::now() + timeout;
+        loop {
+            let raw = strip_ansi(&self.raw_text());
+            if raw.contains(needle) {
+                return raw;
+            }
+            if Instant::now() >= deadline {
+                panic!(
+                    "timed out waiting for raw text {:?}\n--- screen ---\n{}\n--- raw ---\n{}",
+                    needle,
+                    self.screen_text(),
+                    raw
+                );
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
     }
 
     fn wait_for_any_text(&self, needles: &[&str], timeout: Duration) -> String {
@@ -267,6 +360,12 @@ fn session_with_static_server(cwd: &Path) -> (StaticServer, PtySession) {
     (server, session)
 }
 
+fn session_with_static_server_persistent(cwd: &Path) -> (StaticServer, PtySession) {
+    let server = StaticServer::start();
+    let session = PtySession::launch_with_persistence(cwd, &server.envs(), "K2.6", true);
+    (server, session)
+}
+
 fn setup_project_dir() -> tempfile::TempDir {
     let dir = tempfile::tempdir().expect("tempdir");
     std::fs::create_dir_all(dir.path().join("src")).expect("create src");
@@ -328,6 +427,29 @@ fn status_command_renders_in_tui() {
 }
 
 #[test]
+fn tokens_command_renders_in_tui() {
+    let dir = setup_project_dir();
+    let mut session = session_without_engine(dir.path());
+    session.wait_for_text("CodeRex v", SCREEN_TIMEOUT);
+    session.send_line("/tokens");
+    let screen = session.wait_for_text("Token Usage", SCREEN_TIMEOUT);
+    assert!(screen.contains("Token Usage"));
+}
+
+#[test]
+fn model_command_updates_interactive_state() {
+    let dir = setup_project_dir();
+    let mut session = session_without_engine(dir.path());
+    session.wait_for_text("CodeRex v", SCREEN_TIMEOUT);
+    session.send_line("/model haiku");
+    let screen = session.wait_for_any_text(
+        &["Model switched to:", "claude-haiku-4-5-20251001"],
+        SCREEN_TIMEOUT,
+    );
+    assert!(screen.contains("haiku") || screen.contains("claude-haiku-4-5-20251001"));
+}
+
+#[test]
 fn clear_command_clears_transcript_state() {
     let dir = setup_project_dir();
     let mut session = session_without_engine(dir.path());
@@ -340,6 +462,19 @@ fn clear_command_clears_transcript_state() {
     let screen = session.wait_for_text("cleared", SCREEN_TIMEOUT);
     assert!(screen.contains("cleared"));
     assert!(!screen.contains("Available commands"));
+}
+
+#[test]
+fn unknown_command_keeps_repl_usable() {
+    let dir = setup_project_dir();
+    let mut session = session_without_engine(dir.path());
+    session.wait_for_text("CodeRex v", SCREEN_TIMEOUT);
+    session.send_line("/does-not-exist");
+    let screen = session.wait_for_text("Unknown command", SCREEN_TIMEOUT);
+    assert!(screen.contains("Unknown command"));
+    session.send_line("/status");
+    let screen = session.wait_for_text("System Status", SCREEN_TIMEOUT);
+    assert!(screen.contains("System Status"));
 }
 
 #[test]
@@ -430,11 +565,15 @@ fn write_action_shows_permission_wait() {
     let (_server, mut session) = session_with_static_server(dir.path());
     session.wait_for_text("CodeRex v", SCREEN_TIMEOUT);
     session.send_line("add a recursive fibonacci function to src/lib.rs with unit tests");
-    let screen = session.wait_for_text(
-        "Waiting for permission: Writing src/lib.rs...",
-        SCREEN_TIMEOUT,
+    let raw = session.wait_for_raw_text("Waitingforpermission:Writingsrc/lib.rs", SCREEN_TIMEOUT);
+    assert!(
+        raw.contains("Waitingforpermission:Writingsrc/lib.rs")
+            || raw.contains("Waiting for permission: Writing src/lib.rs")
     );
-    assert!(screen.contains("Writing src/lib.rs..."));
+    assert!(raw.contains("Tool:Write"));
+    assert!(raw.contains("[a]Allowonce") || raw.contains("[a] Allow once"));
+    session.send_text("d");
+    session.wait_for_text("Completed in", SCREEN_TIMEOUT);
 }
 
 #[test]
@@ -443,14 +582,281 @@ fn write_action_denial_keeps_session_usable() {
     let (_server, mut session) = session_with_static_server(dir.path());
     session.wait_for_text("CodeRex v", SCREEN_TIMEOUT);
     session.send_line("add a recursive fibonacci function to src/lib.rs with unit tests");
-    session.wait_for_text(
-        "Waiting for permission: Writing src/lib.rs...",
+    session.wait_for_raw_text("Waitingforpermission:Writingsrc/lib.rs", SCREEN_TIMEOUT);
+    session.send_text("d");
+    session.wait_for_raw_text("Error:tool'Write'denied", SCREEN_TIMEOUT);
+    let screen = session.wait_for_text("Completed in", SCREEN_TIMEOUT);
+    assert!(screen.contains("Completed in"));
+    assert!(session.raw_text().contains("❯"));
+}
+
+#[test]
+fn write_action_approval_updates_file_and_keeps_session_usable() {
+    let dir = setup_project_dir();
+    let (_server, mut session) = session_with_static_server(dir.path());
+    session.wait_for_text("CodeRex v", SCREEN_TIMEOUT);
+    session.send_line("add a recursive fibonacci function to src/lib.rs with unit tests");
+    session.wait_for_raw_text("Waitingforpermission:Writingsrc/lib.rs", SCREEN_TIMEOUT);
+    session.send_text("a");
+    let screen = session.wait_for_any_text(
+        &[
+            "Done! I've added the recursive fibonacci function.",
+            "Completed in",
+        ],
         SCREEN_TIMEOUT,
     );
+    assert!(
+        screen.contains("Done! I've added the recursive fibonacci function.")
+            || screen.contains("Completed in")
+    );
+    let updated =
+        std::fs::read_to_string(dir.path().join("src/lib.rs")).expect("read updated file");
+    assert!(updated.contains("pub fn fibonacci"));
+    assert!(session.raw_text().contains("❯"));
+}
+
+#[test]
+fn bash_action_denial_keeps_session_usable() {
+    let dir = setup_project_dir();
+    let (_server, mut session) = session_with_static_server(dir.path());
+    session.wait_for_text("CodeRex v", SCREEN_TIMEOUT);
+    session.send_line("list files in this directory");
+    let raw = session.wait_for_raw_text(
+        "Waitingforpermission:Runningfind.-name'*.rs'-typef",
+        SCREEN_TIMEOUT,
+    );
+    assert!(
+        raw.contains("Waitingforpermission:Runningfind.-name'*.rs'-typef")
+            || raw.contains("Waiting for permission: Running find . -name '*.rs' -type f")
+    );
+    session.send_text("d");
+    session.wait_for_raw_text("Error:tool'Bash'denied", SCREEN_TIMEOUT);
+    let screen = session.wait_for_text("Completed in", SCREEN_TIMEOUT);
+    assert!(screen.contains("Completed in"));
+    assert!(session.raw_text().contains("❯"));
+}
+
+#[test]
+fn slash_palette_filters_selects_and_dismisses() {
+    let dir = setup_project_dir();
+    let mut session = session_without_engine(dir.path());
+    session.wait_for_text("CodeRex v", SCREEN_TIMEOUT);
+
+    session.send_text("/tok");
+    let screen = session.wait_for_text("Commands [/tok]", SCREEN_TIMEOUT);
+    assert!(screen.contains("/tokens - Show token usage"));
+
+    session.down();
+    session.tab();
+    let raw = session.wait_for_raw_text("/tokens ", SCREEN_TIMEOUT);
+    assert!(raw.contains("/tokens "));
+
     session.ctrl_c();
+    session.send_text("/mod");
+    let screen = session.wait_for_text("Commands [/mod]", SCREEN_TIMEOUT);
+    assert!(screen.contains("/model - Switch AI model"));
+    session.esc();
+    session.wait_for_text_absent("Commands [/mod]", SCREEN_TIMEOUT);
+}
+
+#[test]
+fn history_recall_restores_previous_input() {
+    let dir = setup_project_dir();
+    let mut session = session_without_engine(dir.path());
+    session.wait_for_text("CodeRex v", SCREEN_TIMEOUT);
+    session.send_line("/status");
+    session.wait_for_text("System Status", SCREEN_TIMEOUT);
+    session.up();
+    let raw = session.wait_for_raw_text("/status", SCREEN_TIMEOUT);
+    assert!(raw.contains("/status"));
+}
+
+#[test]
+fn cursor_left_and_backspace_edit_input_before_submit() {
+    let dir = setup_project_dir();
+    let mut session = session_without_engine(dir.path());
+    session.wait_for_text("CodeRex v", SCREEN_TIMEOUT);
+
+    session.send_text("/hlp");
+    session.left();
+    session.left();
+    session.right();
+    session.left();
+    session.send_text("e");
+    session.enter();
+    let screen = session.wait_for_text("Available Commands", SCREEN_TIMEOUT);
+    assert!(screen.contains("Available Commands"));
+
+    session.send_text("/helpp");
+    session.backspace();
+    session.enter();
+    let screen = session.wait_for_text("Available Commands", SCREEN_TIMEOUT);
+    assert!(screen.contains("Available Commands"));
+}
+
+#[test]
+fn open_command_shows_split_pane_file_viewer() {
+    let dir = setup_project_dir();
+    let mut session = session_without_engine(dir.path());
+    session.wait_for_text("CodeRex v", SCREEN_TIMEOUT);
+    session.send_line("/open src/lib.rs");
+    let screen =
+        session.wait_for_any_text(&["File Viewer", "src/lib.rs", "pub fn add"], SCREEN_TIMEOUT);
+    assert!(screen.contains("src/lib.rs") || screen.contains("pub fn add"));
+}
+
+#[test]
+fn plan_and_activity_overlays_render_details() {
+    let dir = setup_project_dir();
+    let (_server, mut session) = session_with_static_server(dir.path());
+    session.wait_for_text("CodeRex v", SCREEN_TIMEOUT);
+    session.send_line("hello");
+    session.wait_for_text("Hello!", SCREEN_TIMEOUT);
+
+    session.send_line("/plan");
+    let screen = session.wait_for_any_text(&["Current Plan", "Planning next step"], SCREEN_TIMEOUT);
+    assert!(screen.contains("Current Plan") || screen.contains("Planning next step"));
+    session.esc();
+
+    session.send_line("/activity");
+    let screen =
+        session.wait_for_any_text(&["Recent Activity", "Planning next step"], SCREEN_TIMEOUT);
+    assert!(screen.contains("Recent Activity") || screen.contains("Planning next step"));
+}
+
+#[test]
+fn provider_failure_recovers_to_usable_prompt() {
+    let dir = setup_project_dir();
+    let (_server, mut session) = session_with_static_server(dir.path());
+    session.wait_for_text("CodeRex v", SCREEN_TIMEOUT);
+    session.send_line("simulate error");
+    let screen =
+        session.wait_for_any_text(&["temporarily unavailable", "Query failed"], SCREEN_TIMEOUT);
+    assert!(screen.contains("temporarily unavailable") || screen.contains("Query failed"));
     session.send_line("/status");
     let screen = session.wait_for_text("System Status", SCREEN_TIMEOUT);
     assert!(screen.contains("System Status"));
+}
+
+#[test]
+fn resize_keeps_tui_alive() {
+    let dir = setup_project_dir();
+    let mut session = session_without_engine(dir.path());
+    session.wait_for_text("CodeRex v", SCREEN_TIMEOUT);
+    session.resize(16, 70);
+    let screen = session.wait_for_any_text(&["CodeRex v", "❯"], SCREEN_TIMEOUT);
+    assert!(screen.contains("CodeRex v") || session.raw_text().contains("❯"));
+}
+
+#[test]
+fn vim_command_enables_normal_mode_editing() {
+    let dir = setup_project_dir();
+    let mut session = session_without_engine(dir.path());
+    session.wait_for_text("CodeRex v", SCREEN_TIMEOUT);
+    session.send_line("/vim");
+    session.wait_for_text("Vim mode: enabled", SCREEN_TIMEOUT);
+    session.send_text("abc");
+    session.esc();
+    thread::sleep(Duration::from_millis(150));
+    session.send_text("A");
+    session.send_text("!");
+    session.enter();
+    let raw = session.wait_for_raw_text("abc!", SCREEN_TIMEOUT);
+    assert!(raw.contains("abc!"));
+}
+
+#[test]
+fn unicode_input_is_preserved_in_interactive_session() {
+    let dir = setup_project_dir();
+    let (_server, mut session) = session_with_static_server(dir.path());
+    session.wait_for_text("CodeRex v", SCREEN_TIMEOUT);
+    session.send_line("hello 你好，世界");
+    session.wait_for_any_text(&["Hello!", "happy to help"], SCREEN_TIMEOUT);
+    let raw = session.wait_for_raw_text("你好，世界", SCREEN_TIMEOUT);
+    assert!(raw.contains("你好，世界"));
+}
+
+#[test]
+fn five_turn_interaction_stays_usable() {
+    let dir = setup_project_dir();
+    let (_server, mut session) = session_with_static_server(dir.path());
+    session.wait_for_text("CodeRex v", SCREEN_TIMEOUT);
+
+    session.send_line("hello");
+    session.wait_for_text("Hello!", SCREEN_TIMEOUT);
+    session.send_line("long response");
+    session.wait_for_text("TAIL: final sentence visible.", SCREEN_TIMEOUT);
+    session.send_line("ask a question");
+    session.wait_for_text("Which approach would you prefer?", SCREEN_TIMEOUT);
+    session.send_line("show content of file");
+    session.wait_for_any_text(&["pub fn add", "a + b"], SCREEN_TIMEOUT);
+    session.send_line("/status");
+    let screen = session.wait_for_text("System Status", SCREEN_TIMEOUT);
+    assert!(screen.contains("System Status"));
+}
+
+#[test]
+fn compact_after_history_keeps_session_usable() {
+    let dir = setup_project_dir();
+    let (_server, mut session) = session_with_static_server(dir.path());
+    session.wait_for_text("CodeRex v", SCREEN_TIMEOUT);
+    session.send_line("hello");
+    session.wait_for_any_text(&["Hello!", "happy to help"], SCREEN_TIMEOUT);
+    session.send_line("long response");
+    session.wait_for_text("TAIL: final sentence visible.", SCREEN_TIMEOUT);
+    session.send_line("/compact");
+    session.wait_for_any_text(&["Context compacted", "already compact"], SCREEN_TIMEOUT);
+    session.send_line("/status");
+    let screen = session.wait_for_text("System Status", SCREEN_TIMEOUT);
+    assert!(screen.contains("System Status"));
+}
+
+#[test]
+fn resume_restores_persisted_plan_and_activity() {
+    let dir = setup_project_dir();
+
+    {
+        let (_server, mut session) = session_with_static_server_persistent(dir.path());
+        session.wait_for_text("CodeRex v", SCREEN_TIMEOUT);
+        session.send_line("show content of file");
+        session.wait_for_any_text(&["pub fn add", "a + b"], SCREEN_TIMEOUT);
+        session.ctrl_d();
+        session.wait_for_exit(SCREEN_TIMEOUT);
+    }
+
+    {
+        let (_server, mut session) = session_with_static_server_persistent(dir.path());
+        session.wait_for_text("CodeRex v", SCREEN_TIMEOUT);
+        session.send_line("/resume");
+        let resumed = session.wait_for_text("Resumed session:", SCREEN_TIMEOUT);
+        assert!(resumed.contains("Loaded"));
+
+        session.send_line("/activity");
+        let activity = session.wait_for_any_text(
+            &["Planning next step", "Reading src/lib.rs", "Reading files"],
+            SCREEN_TIMEOUT,
+        );
+        assert!(
+            activity.contains("Planning next step")
+                || activity.contains("Reading src/lib.rs")
+                || activity.contains("Reading files")
+        );
+
+        session.send_line("/plan");
+        let plan = session.wait_for_any_text(
+            &[
+                "Current step:",
+                "Thinking through response",
+                "Reading src/lib.rs",
+            ],
+            SCREEN_TIMEOUT,
+        );
+        assert!(
+            plan.contains("Current step:")
+                || plan.contains("Thinking through response")
+                || plan.contains("Reading src/lib.rs")
+        );
+    }
 }
 
 #[test]

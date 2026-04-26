@@ -2,6 +2,7 @@
 
 use crate::cli::Cli;
 use crate::daemon;
+use crate::session_resume;
 use anyhow::{Result, bail};
 #[cfg(feature = "enterprise")]
 use coderex_config::config_home;
@@ -1531,13 +1532,21 @@ impl StartupOrchestrator {
 
     #[allow(clippy::unused_async)]
     async fn run_resume(&self, cwd: &str, session_id: &str, model: ModelId) -> Result<()> {
-        let messages = Self::load_resume_messages(cwd, session_id)?;
+        let resolved_session_id = if session_id.eq_ignore_ascii_case("latest") {
+            session_resume::latest_session_id(cwd).ok_or_else(|| {
+                anyhow::anyhow!("No transcript found to resume in .coderex/transcripts")
+            })?
+        } else {
+            session_id.to_string()
+        };
+        let messages = Self::load_resume_messages(cwd, &resolved_session_id)?;
 
         tracing::info!(
-            "Resuming session {session_id}: {} messages loaded",
+            "Resuming session {}: {} messages loaded",
+            resolved_session_id,
             messages.len()
         );
-        println!("Resuming session: {session_id}");
+        println!("Resuming session: {resolved_session_id}");
         println!("Loaded {} messages from transcript", messages.len());
 
         // Show a summary of the conversation history
@@ -1568,6 +1577,7 @@ impl StartupOrchestrator {
         } else {
             crate::repl::ReplLoop::new(cwd.to_string(), model)
         };
+        repl.with_resume_session(Some(resolved_session_id));
         if let Some(ref pm) = self.ctx.plugin_manager {
             repl.with_plugin_manager(Arc::clone(pm));
         }
@@ -1579,42 +1589,12 @@ impl StartupOrchestrator {
         cwd: &str,
         session_id: &str,
     ) -> Result<Vec<coderex_core::types::Message>> {
-        use coderex_memory::transcript::TranscriptStore;
-
-        let transcript_dir = std::path::Path::new(cwd).join(".coderex/transcripts");
-        let store = TranscriptStore::new(transcript_dir.clone());
-        let messages = store.read_all_skip_first_prompt(session_id)?;
-
-        if messages.is_empty() {
-            bail!("No transcript found for session '{session_id}' in {transcript_dir:?}");
-        }
-
-        Ok(messages)
+        session_resume::load_resume_messages(cwd, session_id)
     }
 
     /// Find the most recent session ID from the transcripts directory.
     fn find_latest_session(&self) -> Option<String> {
-        let transcript_dir = std::path::Path::new(&self.ctx.cwd).join(".coderex/transcripts");
-        if !transcript_dir.exists() {
-            return None;
-        }
-        let mut latest: Option<(std::time::SystemTime, String)> = None;
-        if let Ok(entries) = std::fs::read_dir(&transcript_dir) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if path.is_dir() {
-                    if let Ok(meta) = entry.metadata() {
-                        if let Ok(modified) = meta.modified() {
-                            let name = path.file_name()?.to_string_lossy().to_string();
-                            if latest.as_ref().map_or(true, |(t, _)| modified > *t) {
-                                latest = Some((modified, name));
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        latest.map(|(_, name)| name)
+        session_resume::latest_session_id(&self.ctx.cwd)
     }
 }
 

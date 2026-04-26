@@ -35,8 +35,8 @@ pub fn register(registry: &mut CommandRegistry) {
                 output.push_str("Commands (use /<command>):\n");
                 output.push_str("  Session:  /clear, /exit, /session, /resume, /rename, /rewind\n");
                 output.push_str("  Config:   /config, /model, /permissions, /theme, /hooks, /mcp, /plugin, /memory, /skills, /tasks, /plan\n");
-                output.push_str("  Stats:    /stats, /cost, /usage, /status, /doctor\n");
-                output.push_str("  Content:  /compact, /help, /version, /copy, /init, /summary, /files, /context, /add-dir\n");
+                output.push_str("  Stats:    /stats, /cost, /usage, /tokens, /status, /doctor\n");
+                output.push_str("  Content:  /compact, /help, /version, /copy, /init, /summary, /files, /open, /context, /add-dir\n");
                 output.push_str("  Git/PR:   /commit, /commit-push-pr, /review, /security-review, /branch, /diff\n");
                 output.push_str("  Advanced: /bridge, /insights, /statusline\n");
                 output.push_str("  Misc:     /advisor, /btw, /good-claude, /bughunter, /issue, /env\n");

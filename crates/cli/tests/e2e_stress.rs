@@ -301,6 +301,7 @@ fn stress_overlay_stack_many() {
         stack.push(Overlay::PermissionDialog {
             tool: format!("tool-{i}"),
             args: format!("args-{i}"),
+            risk_summary: "stress test".into(),
             always_option: false,
         });
     }

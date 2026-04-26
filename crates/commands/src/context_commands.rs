@@ -1,4 +1,4 @@
-//! Content & context commands: /copy, /init, /summary, /files, /context, /ctx_viz, /add-dir.
+//! Content & context commands: /copy, /init, /summary, /files, /open, /context, /ctx_viz, /add-dir.
 
 use crate::registry::{CommandContext, CommandRegistry, CommandResult, SlashCommand};
 use std::sync::Arc;
@@ -180,6 +180,35 @@ pub fn register(registry: &mut CommandRegistry) {
                     max_files,
                     entries.join("\n")
                 ))
+            }
+        }),
+    ));
+
+    // /open — preview a file in the interactive split pane
+    registry.register(SlashCommand::local(
+        "open",
+        "Open a file in the interactive viewer",
+        true,
+        true,
+        true,
+        Arc::new(|ctx: &CommandContext, args: &[String]| {
+            let Some(path_arg) = args.first() else {
+                return CommandResult::error("Usage: /open <path>");
+            };
+            let raw = std::path::PathBuf::from(path_arg);
+            let path = if raw.is_absolute() {
+                raw
+            } else {
+                std::path::Path::new(&ctx.cwd).join(raw)
+            };
+            match std::fs::read_to_string(&path) {
+                Ok(content) => CommandResult::success(format!(
+                    "Opened {}\n\n{}",
+                    path_arg,
+                    content.lines().take(40).collect::<Vec<_>>().join("\n")
+                ))
+                .with_state_change(true),
+                Err(err) => CommandResult::error(format!("Failed to open {}: {}", path_arg, err)),
             }
         }),
     ));
@@ -475,5 +504,40 @@ mod tests {
         };
         let result = reg.execute("add-dir", &c, &["nonexistent".into()]);
         assert!(result.output.contains("not found"));
+    }
+
+    #[test]
+    fn open_requires_path() {
+        let reg = {
+            let mut r = CommandRegistry::new();
+            register(&mut r);
+            r
+        };
+        let result = reg.execute("open", &ctx(), &[]);
+        assert!(result.output.contains("Usage: /open"));
+    }
+
+    #[test]
+    fn open_reads_file_preview() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("src")).unwrap();
+        std::fs::write(
+            tmp.path().join("src/lib.rs"),
+            "pub fn add(a: i32, b: i32) -> i32 { a + b }\n",
+        )
+        .unwrap();
+        let c = CommandContext {
+            cwd: tmp.path().display().to_string(),
+            ..ctx()
+        };
+        let reg = {
+            let mut r = CommandRegistry::new();
+            register(&mut r);
+            r
+        };
+        let result = reg.execute("open", &c, &["src/lib.rs".into()]);
+        assert!(result.output.contains("Opened src/lib.rs"));
+        assert!(result.output.contains("pub fn add"));
+        assert!(result.state_changed);
     }
 }

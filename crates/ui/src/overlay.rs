@@ -9,6 +9,8 @@ pub enum Overlay {
         tool: String,
         /// Tool arguments.
         args: String,
+        /// Risk summary or explanation for the user.
+        risk_summary: String,
         /// Whether this is a one-time or always-allow request.
         always_option: bool,
     },
@@ -27,6 +29,13 @@ pub enum Overlay {
         commands: Vec<String>,
         /// Currently selected index.
         selected: usize,
+    },
+    /// Generic detail viewer used for plan, activity, failure, and notification inspection.
+    Detail {
+        /// Overlay title.
+        title: String,
+        /// Overlay body content.
+        body: String,
     },
     /// Confirmation dialog.
     Confirm {
@@ -181,6 +190,7 @@ mod tests {
         stack.push(Overlay::PermissionDialog {
             tool: "Bash".into(),
             args: "rm -rf /tmp/test".into(),
+            risk_summary: "Destructive shell command".into(),
             always_option: true,
         });
         if let Some(Overlay::PermissionDialog {

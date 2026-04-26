@@ -16,6 +16,7 @@ use tokio::time::Instant;
 use crate::api_client::{ApiClient, ApiResponse, RequestContext, StreamEvent};
 use crate::budget::TokenBudget;
 use crate::compact::{self, CompactResult, CompactStrategy};
+use crate::confirmation_bus::ConfirmationBus;
 use crate::cost::CostTracker;
 use crate::elicitation::{ElicitationHandler, ElicitationResult, ReplElicitationHandler};
 use crate::hook_executor::{HookExecutor, HookFireResult, NoOpHookExecutor};
@@ -1108,6 +1109,16 @@ impl QueryEngine {
     #[must_use]
     pub fn permission_checker(&self) -> Arc<std::sync::Mutex<PermissionChecker>> {
         self.permission_engine.checker()
+    }
+
+    /// Configure the confirmation bus used for interactive permission prompts.
+    pub fn set_confirmation_bus(&mut self, bus: ConfirmationBus) {
+        self.permission_engine.set_confirmation_bus(bus);
+    }
+
+    /// Disable interactive confirmation bus routing.
+    pub fn clear_confirmation_bus(&mut self) {
+        self.permission_engine.clear_confirmation_bus();
     }
 
     /// Set the coordinator state for multi-phase workflows.

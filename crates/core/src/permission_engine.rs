@@ -248,7 +248,10 @@ impl PermissionEngine {
                         arguments: request.arguments.clone(),
                         path: request.path.clone(),
                         reason: reason.clone(),
-                        allow_session: matches!(result, PermissionResult::AskForSession { .. }),
+                        allow_session: matches!(
+                            result,
+                            PermissionResult::Ask { .. } | PermissionResult::AskForSession { .. }
+                        ),
                         context: request.context.clone(),
                     };
 

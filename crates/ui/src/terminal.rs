@@ -95,7 +95,7 @@ impl TerminalUi {
     pub fn draw(&mut self, state: &mut UiState) -> std::io::Result<()> {
         self.terminal.draw(|frame| {
             let area = frame.area();
-            let is_compact = area.height < 20;
+            let is_compact = state.force_compact || area.height < 20;
 
             // Determine chunk heights
             let inline_palette_height = if is_compact {
@@ -550,7 +550,7 @@ fn trim_lines_to_viewport(mut lines: Vec<Line>, viewport_height: usize) -> Vec<L
 fn render_welcome_art() -> Vec<Line<'static>> {
     const TIPS: &[&str] = &[
         "  Tip: Press / for commands, Ctrl+C to interrupt.",
-        "  Tip: Press Esc to enter Vim normal mode.",
+        "  Tip: Type /vim to enable Vim keybindings.",
         "  Tip: Use Ctrl+F to search messages.",
         "  Tip: Press Ctrl+P for the command palette.",
         "  Tip: Type /help to see all available commands.",
@@ -716,7 +716,17 @@ fn render_inline_palette(frame: &mut Frame, area: ratatui::layout::Rect, state: 
         Span::styled(format!("[{query}]"), Style::default().fg(Color::Gray)),
     ]));
 
-    let visible_count = commands.len().min(area.height as usize - 1);
+    let available_rows = area.height.saturating_sub(1) as usize;
+    let visible_count = commands.len().min(available_rows);
+    if visible_count == 0 {
+        let paragraph = Paragraph::new(lines).block(
+            Block::default()
+                .borders(Borders::NONE)
+                .style(Style::default().bg(Color::DarkGray)),
+        );
+        frame.render_widget(paragraph, area);
+        return;
+    }
     let start = selected
         .saturating_sub(visible_count - 1)
         .min(commands.len().saturating_sub(visible_count));
@@ -748,10 +758,11 @@ fn render_overlay(frame: &mut Frame, area: ratatui::layout::Rect, state: &UiStat
         Overlay::PermissionDialog {
             tool,
             args,
+            risk_summary,
             always_option,
         } => {
             format!(
-                "Permission Request\nTool: {tool}\nArgs: {args}\n[a] Allow once  [d] Deny{}{}",
+                "Permission Request\nTool: {tool}\nArgs: {args}\nRisk: {risk_summary}\nState: waiting for input\n[a] Allow once  [d] Deny{}{}",
                 if *always_option {
                     "  [A] Always allow"
                 } else {
@@ -771,12 +782,23 @@ fn render_overlay(frame: &mut Frame, area: ratatui::layout::Rect, state: &UiStat
             // Inline palette is handled separately; skip here.
             return;
         }
+        Overlay::Detail { title, body } => {
+            let _ = title;
+            body.clone()
+        }
         Overlay::Confirm { message } => {
             format!("{message}\n[y/n]")
         }
     };
 
-    let block = Block::default().borders(Borders::ALL).title("Overlay");
+    let title = match overlay {
+        Overlay::PermissionDialog { .. } => "Permission Details",
+        Overlay::Notification { .. } => "Notification",
+        Overlay::Detail { title, .. } => title.as_str(),
+        Overlay::CommandPalette { .. } => "Commands",
+        Overlay::Confirm { .. } => "Confirm",
+    };
+    let block = Block::default().borders(Borders::ALL).title(title);
     let paragraph = Paragraph::new(content).block(block);
 
     // Center the overlay

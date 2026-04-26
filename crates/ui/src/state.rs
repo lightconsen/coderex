@@ -53,6 +53,90 @@ impl Default for LayoutMode {
     }
 }
 
+/// A single visible plan step in the interactive TUI.
+#[derive(Debug, Clone, Default)]
+pub struct PlanStep {
+    /// Short user-facing label.
+    pub label: String,
+    /// Whether this step has completed.
+    pub complete: bool,
+}
+
+/// Lightweight plan state for the current interactive turn.
+#[derive(Debug, Clone, Default)]
+pub struct InteractivePlan {
+    /// Visible steps tracked for the current turn.
+    pub steps: Vec<PlanStep>,
+    /// Zero-based current step index.
+    pub current_step: usize,
+    /// Label for the active step.
+    pub current_label: Option<String>,
+}
+
+impl InteractivePlan {
+    /// Clear the current plan.
+    pub fn reset(&mut self) {
+        self.steps.clear();
+        self.current_step = 0;
+        self.current_label = None;
+    }
+
+    /// Render a short statusline label like "Step 2/4: Running tests".
+    #[must_use]
+    pub fn status_label(&self) -> Option<String> {
+        let total = self.steps.len();
+        let label = self.current_label.as_ref()?;
+        if total == 0 {
+            Some(label.clone())
+        } else {
+            Some(format!(
+                "Step {}/{}: {}",
+                self.current_step.saturating_add(1).min(total),
+                total,
+                label
+            ))
+        }
+    }
+
+    /// Render the full plan for an overlay.
+    #[must_use]
+    pub fn render_detail(&self) -> String {
+        if self.steps.is_empty() {
+            return "No active plan.\nStart a turn to populate the current plan.".into();
+        }
+
+        let mut lines = Vec::with_capacity(self.steps.len() + 2);
+        lines.push(format!(
+            "Current step: {}/{}",
+            self.current_step.saturating_add(1).min(self.steps.len()),
+            self.steps.len()
+        ));
+        lines.push(String::new());
+        for (idx, step) in self.steps.iter().enumerate() {
+            let marker = if step.complete {
+                "[x]"
+            } else if idx == self.current_step {
+                "[>]"
+            } else {
+                "[ ]"
+            };
+            lines.push(format!("{marker} {}", step.label));
+        }
+        lines.join("\n")
+    }
+}
+
+/// Richer permission-request details for overlays and notifications.
+#[derive(Debug, Clone, Default)]
+pub struct PermissionDetail {
+    /// Requested tool/action.
+    pub tool: String,
+    /// Raw tool arguments summary.
+    pub args: String,
+    /// Risk summary or explanation shown to the user.
+    pub risk_summary: String,
+}
+
 /// UI state, owned exclusively by the rendering thread.
 #[derive(Debug)]
 pub struct UiState {
@@ -76,6 +160,14 @@ pub struct UiState {
     pub statusline_setup: StatuslineSetup,
     /// Notification center.
     pub notifications: NotificationCenter,
+    /// Lightweight plan state for the current interactive turn.
+    pub plan: InteractivePlan,
+    /// Recent concise system activity rows for overlays and notifications.
+    pub activity_log: Vec<String>,
+    /// Details for the currently pending permission request.
+    pub permission_detail: Option<PermissionDetail>,
+    /// Whether compact mode is forced even on large terminals.
+    pub force_compact: bool,
     /// Layout mode (single pane or split view).
     pub layout_mode: LayoutMode,
     /// Content shown in the left pane of split view.
@@ -99,6 +191,10 @@ impl UiState {
             permission_bar: PermissionBar::new(),
             statusline_setup: StatuslineSetup::new(),
             notifications: NotificationCenter::new(),
+            plan: InteractivePlan::default(),
+            activity_log: Vec::new(),
+            permission_detail: None,
+            force_compact: false,
             layout_mode: LayoutMode::SinglePane,
             left_pane_content: String::new(),
             left_pane_title: String::new(),

@@ -1,9 +1,11 @@
 //! REPL loop — interactive conversation with the QueryEngine.
 
+use crate::session_resume;
 use anyhow::Result;
 use coderex_commands::registry::{CommandContext, CommandRegistry, CommandResult};
 use coderex_commands::{CommandHistory, MacroRegistry};
 use coderex_core::api_client::ApiClient;
+use coderex_core::confirmation_bus::{ConfirmationBus, ConfirmationRequest, ConfirmationResponse};
 use coderex_core::engine::{QueryEngine, SubmitOptions, TerminalReason};
 use coderex_core::orchestrator::{
     BackgroundFeatureKind, BackgroundFeatureRequest, background_feature_label,
@@ -107,6 +109,240 @@ fn permission_activity_label(summary: &str) -> String {
     }
 }
 
+fn normalize_plan_label(label: &str) -> String {
+    let trimmed = label.trim();
+    let trimmed = trimmed.trim_end_matches('.');
+    let trimmed = trimmed.trim_end_matches("...");
+    if trimmed.is_empty() {
+        "Working".into()
+    } else {
+        trimmed.into()
+    }
+}
+
+fn push_activity_row(ui_state: &mut coderex_ui::state::UiState, label: &str) {
+    let concise = normalize_plan_label(label);
+    let duplicate = ui_state
+        .activity_log
+        .last()
+        .is_some_and(|last| last == &concise);
+    if duplicate {
+        return;
+    }
+
+    ui_state.activity_log.push(concise.clone());
+    if ui_state.activity_log.len() > 25 {
+        let excess = ui_state.activity_log.len() - 25;
+        ui_state.activity_log.drain(..excess);
+    }
+
+    ui_state.messages.push(coderex_ui::message_list::Message {
+        role: coderex_ui::message_list::MessageRole::System,
+        content: concise.into(),
+        tool_name: None,
+        streaming: false,
+        folded: false,
+    });
+}
+
+fn set_plan_step(ui_state: &mut coderex_ui::state::UiState, label: &str) {
+    let normalized = normalize_plan_label(label);
+    if let Some(current) = ui_state.plan.steps.get_mut(ui_state.plan.current_step) {
+        if current.label == normalized && !current.complete {
+            ui_state.plan.current_label = Some(normalized);
+            return;
+        }
+        current.complete = true;
+    }
+
+    ui_state.plan.steps.push(coderex_ui::state::PlanStep {
+        label: normalized.clone(),
+        complete: false,
+    });
+    ui_state.plan.current_step = ui_state.plan.steps.len().saturating_sub(1);
+    ui_state.plan.current_label = Some(normalized);
+}
+
+fn complete_plan(ui_state: &mut coderex_ui::state::UiState) {
+    if let Some(current) = ui_state.plan.steps.get_mut(ui_state.plan.current_step) {
+        current.complete = true;
+    }
+}
+
+fn selected_palette_command(ui_state: &coderex_ui::state::UiState) -> Option<String> {
+    let coderex_ui::overlay::Overlay::CommandPalette {
+        commands, selected, ..
+    } = ui_state.overlays.top()?
+    else {
+        return None;
+    };
+
+    commands
+        .get(*selected)
+        .and_then(|entry| entry.split_whitespace().next())
+        .map(ToString::to_string)
+}
+
+fn show_detail_overlay(
+    ui_state: &mut coderex_ui::state::UiState,
+    title: impl Into<String>,
+    body: impl Into<String>,
+) {
+    ui_state
+        .overlays
+        .push(coderex_ui::overlay::Overlay::Detail {
+            title: title.into(),
+            body: body.into(),
+        });
+}
+
+fn permission_request_args(arguments: &str) -> serde_json::Value {
+    serde_json::from_str(arguments).unwrap_or_else(|_| serde_json::Value::String(arguments.into()))
+}
+
+fn sync_permission_overlay(
+    ui_state: &mut coderex_ui::state::UiState,
+    tool: &str,
+    args: &str,
+    risk_summary: &str,
+    always_option: bool,
+) {
+    ui_state.permission_detail = Some(coderex_ui::state::PermissionDetail {
+        tool: tool.to_string(),
+        args: args.to_string(),
+        risk_summary: risk_summary.to_string(),
+    });
+
+    if matches!(
+        ui_state.overlays.top(),
+        Some(coderex_ui::overlay::Overlay::PermissionDialog { .. })
+    ) {
+        ui_state.overlays.pop();
+    }
+
+    ui_state
+        .overlays
+        .push(coderex_ui::overlay::Overlay::PermissionDialog {
+            tool: tool.to_string(),
+            args: args.to_string(),
+            risk_summary: risk_summary.to_string(),
+            always_option,
+        });
+}
+
+fn clear_permission_overlay(ui_state: &mut coderex_ui::state::UiState) {
+    ui_state.permission_detail = None;
+    ui_state.permission_bar.clear_pending();
+    if matches!(
+        ui_state.overlays.top(),
+        Some(coderex_ui::overlay::Overlay::PermissionDialog { .. })
+    ) {
+        ui_state.overlays.pop();
+    }
+}
+
+fn core_message_to_ui_message(
+    message: &coderex_core::types::Message,
+) -> coderex_ui::message_list::Message {
+    let (role, content, tool_name) = match (&message.role, &message.content) {
+        (coderex_core::types::Role::User, coderex_core::types::MessageContent::Text(text)) => (
+            coderex_ui::message_list::MessageRole::User,
+            text.clone(),
+            None,
+        ),
+        (coderex_core::types::Role::Assistant, coderex_core::types::MessageContent::Text(text)) => {
+            (
+                coderex_ui::message_list::MessageRole::Assistant,
+                text.clone(),
+                None,
+            )
+        }
+        (coderex_core::types::Role::System, coderex_core::types::MessageContent::Text(text)) => (
+            coderex_ui::message_list::MessageRole::System,
+            text.clone(),
+            None,
+        ),
+        (coderex_core::types::Role::Tool, coderex_core::types::MessageContent::ToolCall(call)) => (
+            coderex_ui::message_list::MessageRole::ToolCall,
+            call.activity_summary(),
+            Some(call.name.clone()),
+        ),
+        (
+            coderex_core::types::Role::Tool,
+            coderex_core::types::MessageContent::ToolResult(result),
+        ) => (
+            coderex_ui::message_list::MessageRole::ToolResult,
+            result.output.clone(),
+            Some(result.tool_call_id.clone()),
+        ),
+        (_, content) => (
+            coderex_ui::message_list::MessageRole::System,
+            format!("{content:?}"),
+            None,
+        ),
+    };
+
+    coderex_ui::message_list::Message {
+        role,
+        content: content.into(),
+        tool_name: tool_name.map(Into::into),
+        streaming: false,
+        folded: false,
+    }
+}
+
+fn restore_transcript_messages(
+    ui_state: &mut coderex_ui::state::UiState,
+    messages: &[coderex_core::types::Message],
+) {
+    ui_state.messages = coderex_ui::message_list::MessageView::new(1000);
+    ui_state.messages.start = 0;
+    for message in messages {
+        ui_state.messages.push(core_message_to_ui_message(message));
+    }
+}
+
+fn apply_interactive_snapshot(
+    ui_state: &mut coderex_ui::state::UiState,
+    snapshot: &session_resume::InteractiveResumeSnapshot,
+) {
+    ui_state.plan.steps = snapshot
+        .plan
+        .steps
+        .iter()
+        .map(|step| coderex_ui::state::PlanStep {
+            label: step.label.clone(),
+            complete: step.complete,
+        })
+        .collect();
+    ui_state.plan.current_step = snapshot.plan.current_step;
+    ui_state.plan.current_label = snapshot.plan.current_label.clone();
+    ui_state.activity_log = snapshot.activity_log.clone();
+}
+
+fn build_interactive_snapshot(
+    ui_state: &coderex_ui::state::UiState,
+    session_title: Option<String>,
+) -> session_resume::InteractiveResumeSnapshot {
+    session_resume::InteractiveResumeSnapshot {
+        session_title,
+        plan: session_resume::PersistedInteractivePlan {
+            steps: ui_state
+                .plan
+                .steps
+                .iter()
+                .map(|step| session_resume::PersistedPlanStep {
+                    label: step.label.clone(),
+                    complete: step.complete,
+                })
+                .collect(),
+            current_step: ui_state.plan.current_step,
+            current_label: ui_state.plan.current_label.clone(),
+        },
+        activity_log: ui_state.activity_log.clone(),
+    }
+}
+
 /// Result from a completed background task, delivered to the UI.
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
@@ -191,6 +427,8 @@ pub struct ReplLoop {
     dispatcher: Option<Arc<RegistryToolDispatcher>>,
     /// Pending elicitation response sender — when set, user input is treated as an answer.
     pending_elicitation: Option<tokio::sync::oneshot::Sender<serde_json::Value>>,
+    /// Confirmation bus for interactive permission requests.
+    confirmation_bus: Option<ConfirmationBus>,
     /// Receiver for cron job fire events.
     cron_rx: Option<tokio::sync::mpsc::UnboundedReceiver<(String, String)>>,
     /// SDK session for headless/structured event consumers.
@@ -243,6 +481,10 @@ pub struct ReplLoop {
     debug_file: Option<std::path::PathBuf>,
     /// When the current query started (for elapsed-time display).
     query_start_time: Option<std::time::Instant>,
+    /// Whether Vim keybindings are enabled for interactive input.
+    vim_mode_enabled: bool,
+    /// Session id to resume into the current interactive loop.
+    resume_session: Option<String>,
 }
 
 /// Wrapper that implements `ToolExecutor` for `Arc<dyn ToolExecutor>`.
@@ -334,6 +576,7 @@ impl ReplLoop {
             _primary_tool_executor: None,
             dispatcher: None,
             pending_elicitation: None,
+            confirmation_bus: None,
             cron_rx: None,
             sdk_session: None,
             _sdk_timeout_handle: None,
@@ -362,6 +605,8 @@ impl ReplLoop {
             tmux_enabled: false,
             debug_file: None,
             query_start_time: None,
+            vim_mode_enabled: false,
+            resume_session: None,
         };
         this.init_command_persistence();
         this
@@ -382,6 +627,7 @@ impl ReplLoop {
         let session_id = session.session_id;
         let checker = PermissionChecker::new(PermissionMode::default());
         let mut permission_engine = PermissionEngine::new(checker);
+        let confirmation_bus = ConfirmationBus::new(10);
         let perm_path = std::path::PathBuf::from(&cwd)
             .join(".coderex")
             .join("permissions.json");
@@ -491,6 +737,7 @@ impl ReplLoop {
             _primary_tool_executor: Some(primary_executor),
             dispatcher: Some(dispatcher),
             pending_elicitation: None,
+            confirmation_bus: Some(confirmation_bus),
             cron_rx: Some(cron_rx),
             sdk_session: Some(sdk_session),
             _sdk_timeout_handle: sdk_timeout_handle,
@@ -519,6 +766,8 @@ impl ReplLoop {
             tmux_enabled: false,
             debug_file: None,
             query_start_time: None,
+            vim_mode_enabled: false,
+            resume_session: None,
         };
         this.init_command_persistence();
         this
@@ -618,6 +867,10 @@ impl ReplLoop {
 
     pub fn with_fork_session(&mut self, fork: Option<String>) {
         self.fork_session = fork;
+    }
+
+    pub fn with_resume_session(&mut self, session_id: Option<String>) {
+        self.resume_session = session_id;
     }
 
     pub fn with_from_pr(&mut self, from_pr: Option<String>) {
@@ -722,57 +975,29 @@ impl ReplLoop {
             }
         }
 
-        // 6. Fork session — load existing messages
-        if let Some(ref fork_id) = self.fork_session {
-            if let Some(ref mut engine) = self.engine {
-                let transcript_dir = std::path::Path::new(&self.cwd).join(".coderex/transcripts");
-                if transcript_dir.exists() {
-                    let store = coderex_memory::transcript::TranscriptStore::new(transcript_dir);
-                    if let Ok(msgs) = store.read_all_skip_first_prompt(fork_id) {
-                        let mut session = engine.session().clone();
-                        session.messages = msgs;
-                        engine.set_session(session);
-                    }
-                }
+        // 6. Resume or fork an existing transcript into the current engine session
+        if let Some(session_id) = self.resume_session.clone() {
+            if let Err(err) = self.load_session_state(&session_id, true) {
+                tracing::warn!("Failed to restore resumed session {session_id}: {err}");
+            }
+        } else if let Some(fork_id) = self.fork_session.clone() {
+            if let Err(err) = self.load_session_state(&fork_id, false) {
+                tracing::warn!("Failed to load fork session {fork_id}: {err}");
             }
         }
 
         // 7. Replay user messages from most recent session
         if self.replay_user_messages {
             if let Some(ref mut engine) = self.engine {
-                let transcript_dir = std::path::Path::new(&self.cwd).join(".coderex/transcripts");
-                if transcript_dir.exists() {
-                    if let Ok(entries) = std::fs::read_dir(&transcript_dir) {
-                        let mut latest: Option<(std::time::SystemTime, String)> = None;
-                        for entry in entries.flatten() {
-                            let path = entry.path();
-                            if path.is_dir() {
-                                if let Ok(meta) = entry.metadata() {
-                                    if let Ok(modified) = meta.modified() {
-                                        let name = path
-                                            .file_name()
-                                            .map(|n| n.to_string_lossy().to_string())
-                                            .unwrap_or_default();
-                                        if latest.as_ref().map_or(true, |(t, _)| modified > *t) {
-                                            latest = Some((modified, name));
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        if let Some((_, session_id)) = latest {
-                            let store =
-                                coderex_memory::transcript::TranscriptStore::new(transcript_dir);
-                            if let Ok(msgs) = store.read_all_skip_first_prompt(&session_id) {
-                                let user_msgs: Vec<_> = msgs
-                                    .into_iter()
-                                    .filter(|m| matches!(m.role, coderex_core::types::Role::User))
-                                    .collect();
-                                let mut session = engine.session().clone();
-                                session.messages.extend(user_msgs);
-                                engine.set_session(session);
-                            }
-                        }
+                if let Some(session_id) = session_resume::latest_session_id(&self.cwd) {
+                    if let Ok(msgs) = session_resume::load_resume_messages(&self.cwd, &session_id) {
+                        let user_msgs: Vec<_> = msgs
+                            .into_iter()
+                            .filter(|m| matches!(m.role, coderex_core::types::Role::User))
+                            .collect();
+                        let mut session = engine.session().clone();
+                        session.messages.extend(user_msgs);
+                        engine.set_session(session);
                     }
                 }
             }
@@ -844,6 +1069,165 @@ impl ReplLoop {
             }
         }
         entries.join("\n")
+    }
+
+    fn current_session_id(&self) -> Option<String> {
+        self.engine
+            .as_ref()
+            .map(|engine| engine.session().session_id.to_string())
+    }
+
+    fn current_session_title(&self) -> Option<String> {
+        self.engine
+            .as_ref()
+            .and_then(|engine| engine.session().title.clone())
+    }
+
+    fn load_session_state(
+        &mut self,
+        session_id: &str,
+        replace_session_id: bool,
+    ) -> std::result::Result<
+        (
+            Vec<coderex_core::types::Message>,
+            Option<session_resume::InteractiveResumeSnapshot>,
+        ),
+        String,
+    > {
+        let messages = session_resume::load_resume_messages(&self.cwd, session_id)
+            .map_err(|e| e.to_string())?;
+        let snapshot = session_resume::load_snapshot(&self.cwd, session_id);
+
+        if let Some(ref mut engine) = self.engine {
+            let mut session = engine.session().clone();
+            if replace_session_id {
+                if let Ok(parsed) = uuid::Uuid::parse_str(session_id) {
+                    session.session_id = parsed;
+                }
+            }
+            session.messages = messages.clone();
+            if session.title.is_none() {
+                session.title = snapshot
+                    .as_ref()
+                    .and_then(|state| state.session_title.clone());
+            }
+            engine.set_session(session);
+        }
+
+        self.history = messages
+            .iter()
+            .filter_map(|message| match (&message.role, &message.content) {
+                (
+                    coderex_core::types::Role::User,
+                    coderex_core::types::MessageContent::Text(text),
+                ) => Some(text.clone()),
+                _ => None,
+            })
+            .collect();
+
+        Ok((messages, snapshot))
+    }
+
+    fn persist_interactive_snapshot(&self, ui_state: &coderex_ui::state::UiState) {
+        if self.no_persistence {
+            return;
+        }
+        let Some(engine) = self.engine.as_ref() else {
+            return;
+        };
+        let session = engine.session();
+        let session_id = session.session_id.to_string();
+        let transcript_store = coderex_memory::transcript::TranscriptStore::new(
+            session_resume::transcript_dir(&self.cwd),
+        );
+        if let Err(err) = transcript_store.rewrite(&session_id, &session.messages) {
+            tracing::warn!("Failed to persist transcript for {session_id}: {err}");
+        }
+        let snapshot = build_interactive_snapshot(ui_state, self.current_session_title());
+        if let Err(err) = session_resume::save_snapshot(&self.cwd, &session_id, &snapshot) {
+            tracing::warn!("Failed to persist interactive snapshot for {session_id}: {err}");
+        }
+    }
+
+    fn clear_interactive_snapshot(&self, session_id: Option<&str>) {
+        if self.no_persistence {
+            return;
+        }
+        let session_id = session_id
+            .map(ToString::to_string)
+            .or_else(|| self.current_session_id());
+        if let Some(session_id) = session_id {
+            if let Err(err) = session_resume::remove_snapshot(&self.cwd, &session_id) {
+                tracing::warn!("Failed to remove interactive snapshot for {session_id}: {err}");
+            }
+        }
+    }
+
+    fn reset_restored_ui(&self, ui_state: &mut coderex_ui::state::UiState) {
+        ui_state.overlays.clear();
+        ui_state.notifications.dismiss_all();
+        ui_state.input = coderex_ui::input::InputBuffer::new();
+        ui_state.plan.reset();
+        ui_state.activity_log.clear();
+        ui_state.permission_bar.clear_status();
+        clear_permission_overlay(ui_state);
+        ui_state.layout_mode = coderex_ui::state::LayoutMode::SinglePane;
+        ui_state.left_pane_content.clear();
+        ui_state.left_pane_title.clear();
+        ui_state.statusline.last_duration = None;
+        ui_state.statusline.thinking = false;
+        ui_state.statusline.thinking_label = None;
+    }
+
+    fn restore_session_into_ui(
+        &self,
+        ui_state: &mut coderex_ui::state::UiState,
+        messages: &[coderex_core::types::Message],
+        snapshot: Option<&session_resume::InteractiveResumeSnapshot>,
+    ) {
+        self.reset_restored_ui(ui_state);
+        restore_transcript_messages(ui_state, messages);
+        if let Some(snapshot) = snapshot {
+            apply_interactive_snapshot(ui_state, snapshot);
+        }
+    }
+
+    fn resume_tui_session(
+        &mut self,
+        requested_session: Option<&str>,
+        ui_state: &mut coderex_ui::state::UiState,
+    ) -> std::result::Result<String, String> {
+        let session_id = requested_session
+            .map(ToString::to_string)
+            .or_else(|| session_resume::latest_session_id(&self.cwd))
+            .ok_or_else(|| {
+                "No previous sessions found in .coderex/transcripts for this workspace.".to_string()
+            })?;
+        let (messages, snapshot) = self.load_session_state(&session_id, true)?;
+        self.restore_session_into_ui(ui_state, &messages, snapshot.as_ref());
+
+        let mut message = format!(
+            "Resumed session: {session_id}\nLoaded {} messages from transcript.",
+            messages.len()
+        );
+        if let Some(summary) = snapshot
+            .as_ref()
+            .and_then(|state| state.unfinished_context())
+        {
+            message.push_str("\n\n");
+            message.push_str(&summary);
+        }
+
+        ui_state.messages.push(coderex_ui::message_list::Message {
+            role: coderex_ui::message_list::MessageRole::System,
+            content: message.clone().into(),
+            tool_name: None,
+            streaming: false,
+            folded: false,
+        });
+        ui_state.notifications.info(format!("Resumed {session_id}"));
+        self.persist_interactive_snapshot(ui_state);
+        Ok(message)
     }
 
     /// Forward an engine event into the SDK session's broadcast stream.
@@ -960,21 +1344,82 @@ impl ReplLoop {
         terminal_ui.enter()?;
 
         let mut ui_state = UiState::new();
+        let mut confirmation_rx = if let Some(bus) = self.confirmation_bus.clone() {
+            if let Some(engine) = self.engine.as_mut() {
+                engine.set_confirmation_bus(bus.clone());
+            }
+            let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<ConfirmationRequest>();
+            tokio::spawn(async move {
+                while let Some(request) = bus.next_request().await {
+                    if tx.send(request).is_err() {
+                        break;
+                    }
+                }
+            });
+            Some(rx)
+        } else {
+            None
+        };
 
-        // Welcome message
-        ui_state.messages.push(Message {
-            role: MessageRole::System,
-            content: format!(
-                "CodeRex v{} | model: {} | cwd: {} | Type /help for commands, Ctrl+C to clear, Ctrl+D to exit",
-                env!("CARGO_PKG_VERSION"),
-                self.model.0,
-                self.cwd
-            )
-            .into(),
-            tool_name: None,
-            streaming: false,
-            folded: false,
-        });
+        if let Some(ref engine) = self.engine {
+            if !engine.session().messages.is_empty() {
+                let snapshot = session_resume::load_snapshot(
+                    &self.cwd,
+                    &engine.session().session_id.to_string(),
+                );
+                self.restore_session_into_ui(
+                    &mut ui_state,
+                    &engine.session().messages,
+                    snapshot.as_ref(),
+                );
+                if self.resume_session.is_some() {
+                    let mut note = format!(
+                        "Resumed session: {}\nLoaded {} messages from transcript.",
+                        engine.session().session_id,
+                        engine.session().messages.len()
+                    );
+                    if let Some(summary) = snapshot.and_then(|state| state.unfinished_context()) {
+                        note.push_str("\n\n");
+                        note.push_str(&summary);
+                    }
+                    ui_state.messages.push(Message {
+                        role: MessageRole::System,
+                        content: note.into(),
+                        tool_name: None,
+                        streaming: false,
+                        folded: false,
+                    });
+                }
+            } else {
+                ui_state.messages.push(Message {
+                    role: MessageRole::System,
+                    content: format!(
+                        "CodeRex v{} | model: {} | cwd: {} | Type /help for commands, Ctrl+C to clear, Ctrl+D to exit",
+                        env!("CARGO_PKG_VERSION"),
+                        self.model.0,
+                        self.cwd
+                    )
+                    .into(),
+                    tool_name: None,
+                    streaming: false,
+                    folded: false,
+                });
+            }
+        } else {
+            ui_state.messages.push(Message {
+                role: MessageRole::System,
+                content: format!(
+                    "CodeRex v{} | model: {} | cwd: {} | Type /help for commands, Ctrl+C to clear, Ctrl+D to exit",
+                    env!("CARGO_PKG_VERSION"),
+                    self.model.0,
+                    self.cwd
+                )
+                .into(),
+                tool_name: None,
+                streaming: false,
+                folded: false,
+            });
+        }
 
         // Crossterm event channel — read in a blocking thread
         let (ct_tx, mut ct_rx) = tokio::sync::mpsc::unbounded_channel::<crossterm::event::Event>();
@@ -1003,6 +1448,7 @@ impl ReplLoop {
         > = None;
         let mut elicit_rx: Option<tokio::sync::mpsc::Receiver<coderex_tools::ElicitRequest>> = None;
         let mut queued_prompts = std::collections::VecDeque::<String>::new();
+        let mut pending_confirmation: Option<ConfirmationRequest> = None;
 
         let result = loop {
             if !self.running {
@@ -1012,7 +1458,11 @@ impl ReplLoop {
             // Sync statusline from REPL state
             self.sync_statusline(&mut ui_state.statusline);
             ui_state.statusline.thinking = thinking;
-            ui_state.statusline.plan_status = None;
+            ui_state.statusline.plan_status = if thinking {
+                ui_state.plan.status_label()
+            } else {
+                None
+            };
             if thinking {
                 ui_state.statusline.spinner_frame =
                     ui_state.statusline.spinner_frame.wrapping_add(1);
@@ -1099,18 +1549,39 @@ impl ReplLoop {
                             if key.code == KeyCode::Char('c')
                                 && key.modifiers.contains(KeyModifiers::CONTROL)
                             {
+                                if let Some(request) = pending_confirmation.take() {
+                                    self.respond_to_confirmation(
+                                        request,
+                                        ConfirmationResponse::Denied,
+                                        &mut ui_state,
+                                        &mut phase,
+                                    )
+                                    .await;
+                                    continue;
+                                }
                                 if thinking {
                                     thinking = false;
                                     phase.reset();
                                     query_done_rx = None;
-                                    if let Some(last) = ui_state.messages.messages.last_mut() {
-                                        if last.role == MessageRole::Assistant {
-                                            last.streaming = false;
-                                            let mut msg = last.content.to_string();
-                                            msg.push_str(" (interrupted)");
-                                            last.content = msg.into();
-                                        }
+                                    elicit_rx = None;
+                                    self.pending_elicitation = None;
+                                    clear_permission_overlay(&mut ui_state);
+                                    if let Some(last) = ui_state
+                                        .messages
+                                        .messages
+                                        .iter_mut()
+                                        .rev()
+                                        .find(|msg| msg.role == MessageRole::Assistant && msg.streaming)
+                                    {
+                                        last.streaming = false;
+                                        let mut msg = last.content.to_string();
+                                        msg.push_str(" (interrupted)");
+                                        last.content = msg.into();
                                     }
+                                    if let Some(ref dispatcher) = self.dispatcher {
+                                        dispatcher.set_elicit_tx(None);
+                                    }
+                                    pending_confirmation = None;
                                     continue;
                                 }
                                 if !ui_state.input.text.is_empty() {
@@ -1176,6 +1647,95 @@ impl ReplLoop {
                                 continue;
                             }
 
+                            if matches!(
+                                ui_state.overlays.top(),
+                                Some(coderex_ui::overlay::Overlay::PermissionDialog { .. })
+                            ) {
+                                match key.code {
+                                    KeyCode::Char('a') => {
+                                        if let Some(request) = pending_confirmation.take() {
+                                            self.respond_to_confirmation(
+                                                request,
+                                                ConfirmationResponse::Approved,
+                                                &mut ui_state,
+                                                &mut phase,
+                                            )
+                                            .await;
+                                        }
+                                    }
+                                    KeyCode::Char('A') => {
+                                        if let Some(request) = pending_confirmation.take() {
+                                            self.respond_to_confirmation(
+                                                request,
+                                                ConfirmationResponse::ApproveSession,
+                                                &mut ui_state,
+                                                &mut phase,
+                                            )
+                                            .await;
+                                        }
+                                    }
+                                    KeyCode::Char('d') | KeyCode::Char('D') | KeyCode::Esc => {
+                                        if let Some(request) = pending_confirmation.take() {
+                                            self.respond_to_confirmation(
+                                                request,
+                                                ConfirmationResponse::Denied,
+                                                &mut ui_state,
+                                                &mut phase,
+                                            )
+                                            .await;
+                                        } else {
+                                            clear_permission_overlay(&mut ui_state);
+                                        }
+                                    }
+                                    _ => {}
+                                }
+                                continue;
+                            }
+
+                            let inline_palette_active = matches!(
+                                ui_state.overlays.top(),
+                                Some(coderex_ui::overlay::Overlay::CommandPalette { query, .. })
+                                    if query.starts_with('/')
+                            );
+                            if inline_palette_active {
+                                match key.code {
+                                    KeyCode::Up => {
+                                        ui_state.overlays.move_palette_selection(-1);
+                                        continue;
+                                    }
+                                    KeyCode::Down => {
+                                        ui_state.overlays.move_palette_selection(1);
+                                        continue;
+                                    }
+                                    KeyCode::Tab => {
+                                        if let Some(command) = selected_palette_command(&ui_state) {
+                                            ui_state.input.text = format!("{command} ");
+                                            ui_state.input.cursor = ui_state.input.text.len();
+                                            self.update_slash_suggestions(&mut ui_state);
+                                        }
+                                        continue;
+                                    }
+                                    KeyCode::Esc if vim.is_insert() => {
+                                        if matches!(
+                                            ui_state.overlays.top(),
+                                            Some(coderex_ui::overlay::Overlay::CommandPalette { .. })
+                                        ) {
+                                            ui_state.overlays.pop();
+                                        }
+                                        continue;
+                                    }
+                                    _ => {}
+                                }
+                            }
+
+                            if !self.vim_mode_enabled && key.code == KeyCode::Esc {
+                                if ui_state.overlays.is_active() {
+                                    ui_state.overlays.clear();
+                                }
+                                ui_state.active_view = ViewMode::MainRepl;
+                                continue;
+                            }
+
                             let action = vim.handle_key(key);
                             match action {
                                 VimAction::Submit => {
@@ -1197,13 +1757,20 @@ impl ReplLoop {
                                         phase.reset();
                                         query_done_rx = None;
                                         elicit_rx = None;
-                                        if let Some(last) = ui_state.messages.messages.last_mut() {
-                                            if last.role == MessageRole::Assistant {
-                                                last.streaming = false;
-                                                let mut msg = last.content.to_string();
-                                                msg.push_str(" (cancelled)");
-                                                last.content = msg.into();
-                                            }
+                                        self.pending_elicitation = None;
+                                        pending_confirmation = None;
+                                        clear_permission_overlay(&mut ui_state);
+                                        if let Some(last) = ui_state
+                                            .messages
+                                            .messages
+                                            .iter_mut()
+                                            .rev()
+                                            .find(|msg| msg.role == MessageRole::Assistant && msg.streaming)
+                                        {
+                                            last.streaming = false;
+                                            let mut msg = last.content.to_string();
+                                            msg.push_str(" (cancelled)");
+                                            last.content = msg.into();
                                         }
                                         if let Some(ref dispatcher) = self.dispatcher {
                                             dispatcher.set_elicit_tx(None);
@@ -1245,6 +1812,8 @@ impl ReplLoop {
                                             }
                                             _ => {}
                                         }
+                                    } else if self.vim_mode_enabled {
+                                        vim.mode = VimMode::Insert;
                                     }
                                 }
                                 VimAction::Left => {
@@ -1372,9 +1941,27 @@ impl ReplLoop {
                                 }
                                 VimAction::Repeat
                                 | VimAction::Ignore
-                                | VimAction::Append
-                                | VimAction::InsertAtEnd
-                                | VimAction::InsertAtStart => {}
+                                => {}
+                                VimAction::Append => {
+                                    if self.vim_mode_enabled {
+                                        if ui_state.input.cursor < ui_state.input.text.len() {
+                                            ui_state.input.cursor += 1;
+                                        }
+                                        vim.mode = VimMode::Insert;
+                                    }
+                                }
+                                VimAction::InsertAtEnd => {
+                                    if self.vim_mode_enabled {
+                                        ui_state.input.cursor = ui_state.input.text.len();
+                                        vim.mode = VimMode::Insert;
+                                    }
+                                }
+                                VimAction::InsertAtStart => {
+                                    if self.vim_mode_enabled {
+                                        ui_state.input.cursor = 0;
+                                        vim.mode = VimMode::Insert;
+                                    }
+                                }
                             }
 
                             // Sync slash-command suggestion overlay when typing in insert mode.
@@ -1394,29 +1981,44 @@ impl ReplLoop {
                     match engine_event {
                         EngineEvent::TextDelta(delta) => {
                             phase.note_text_delta();
-                            if let Some(last) = ui_state.messages.messages.last_mut() {
-                                if last.role == MessageRole::Assistant && last.streaming {
-                                    let mut content = last.content.to_string();
-                                    content.push_str(&delta);
-                                    last.content = content.into();
-                                }
+                            set_plan_step(&mut ui_state, "Thinking through response");
+                            if let Some(last) = ui_state
+                                .messages
+                                .messages
+                                .iter_mut()
+                                .rev()
+                                .find(|msg| msg.role == MessageRole::Assistant)
+                            {
+                                let mut content = last.content.to_string();
+                                content.push_str(&delta);
+                                last.content = content.into();
+                                last.streaming = true;
                             }
+                            self.persist_interactive_snapshot(&ui_state);
                         }
                         EngineEvent::ToolCallStart { name, summary, .. } => {
                             phase.note_tool_start(&summary);
+                            set_plan_step(&mut ui_state, &summary);
+                            push_activity_row(&mut ui_state, &summary);
                             ui_state.messages.push(Message {
                                 role: MessageRole::ToolCall,
                                 content: summary.into(),
                                 tool_name: Some(name.into()),
                                 streaming: false,
-                            folded: false,
+                                folded: false,
                             });
+                            self.persist_interactive_snapshot(&ui_state);
                         }
                         EngineEvent::ToolCallEnd { result, .. } => {
                             phase.note_tool_end();
+                            complete_plan(&mut ui_state);
+                            pending_confirmation = None;
+                            clear_permission_overlay(&mut ui_state);
                             let content = if result.is_error {
+                                ui_state.notifications.err("Tool failed");
                                 format!("Error: {}", result.output)
                             } else {
+                                ui_state.notifications.success("Tool completed");
                                 result.output
                             };
                             ui_state.messages.push(Message {
@@ -1424,27 +2026,76 @@ impl ReplLoop {
                                 content: content.into(),
                                 tool_name: None,
                                 streaming: false,
-                            folded: false,
+                                folded: false,
                             });
+                            self.persist_interactive_snapshot(&ui_state);
                         }
                         EngineEvent::PermissionRequest { tool, args, .. } => {
                             let label =
                                 permission_activity_label(&ToolCall::summarize_activity(&tool, &args));
                             phase.note_permission_request(&tool, &args);
-                            ui_state.messages.push(Message {
-                                role: MessageRole::System,
-                                content: label.clone().into(),
-                                tool_name: None,
-                                streaming: false,
-                                folded: false,
-                            });
-                            ui_state.overlays.push(Overlay::Notification {
-                                message: label,
-                                level: coderex_ui::overlay::NotificationLevel::Warning,
-                            });
+                            set_plan_step(&mut ui_state, &label);
+                            push_activity_row(&mut ui_state, &label);
+                            ui_state.permission_bar.set_pending(label.clone());
+                            sync_permission_overlay(
+                                &mut ui_state,
+                                &tool,
+                                &args.to_string(),
+                                "Awaiting approval",
+                                true,
+                            );
+                            ui_state.notifications.warn(label);
+                            self.persist_interactive_snapshot(&ui_state);
+                        }
+                        EngineEvent::PermissionExplanation { tool, explanation } => {
+                            if let Some(detail) = ui_state.permission_detail.as_mut() {
+                                if detail.tool.eq_ignore_ascii_case(&tool) {
+                                    detail.risk_summary = explanation.clone();
+                                }
+                            }
+                            if matches!(
+                                ui_state.overlays.top(),
+                                Some(Overlay::PermissionDialog { .. })
+                            ) {
+                                let args = ui_state
+                                    .permission_detail
+                                    .as_ref()
+                                    .map(|detail| detail.args.clone())
+                                    .unwrap_or_default();
+                                sync_permission_overlay(
+                                    &mut ui_state,
+                                    &tool,
+                                    &args,
+                                    &explanation,
+                                    true,
+                                );
+                            }
+                            self.persist_interactive_snapshot(&ui_state);
                         }
                         _ => {}
                     }
+                }
+
+                Some(request) = async {
+                    confirmation_rx.as_mut().unwrap().recv().await
+                }, if confirmation_rx.is_some() => {
+                    let args = permission_request_args(&request.arguments);
+                    let label =
+                        permission_activity_label(&ToolCall::summarize_activity(&request.tool_name, &args));
+                    phase.note_permission_request(&request.tool_name, &args);
+                    set_plan_step(&mut ui_state, &label);
+                    push_activity_row(&mut ui_state, &label);
+                    ui_state.permission_bar.set_pending(label.clone());
+                    sync_permission_overlay(
+                        &mut ui_state,
+                        &request.tool_name,
+                        &request.arguments,
+                        &request.reason,
+                        request.allow_session,
+                    );
+                    ui_state.notifications.warn(&label);
+                    pending_confirmation = Some(request);
+                    self.persist_interactive_snapshot(&ui_state);
                 }
 
                 Some((engine, result)) = async {
@@ -1453,13 +2104,21 @@ impl ReplLoop {
                     self.engine = Some(engine);
                     query_done_rx = None;
                     elicit_rx = None;
+                    self.pending_elicitation = None;
+                    pending_confirmation = None;
                     thinking = false;
                     phase.reset();
+                    complete_plan(&mut ui_state);
+                    clear_permission_overlay(&mut ui_state);
 
-                    if let Some(last) = ui_state.messages.messages.last_mut() {
-                        if last.role == MessageRole::Assistant {
-                            last.streaming = false;
-                        }
+                    if let Some(last) = ui_state
+                        .messages
+                        .messages
+                        .iter_mut()
+                        .rev()
+                        .find(|msg| msg.role == MessageRole::Assistant && msg.streaming)
+                    {
+                        last.streaming = false;
                     }
 
                     match result {
@@ -1475,11 +2134,43 @@ impl ReplLoop {
                             });
                         }
                         Ok(_) => {
+                            let turn_start = ui_state
+                                .messages
+                                .messages
+                                .iter()
+                                .rposition(|msg| msg.role == MessageRole::User)
+                                .unwrap_or(0);
+                            let turn_slice = &ui_state.messages.messages[turn_start..];
+                            let assistant_empty = turn_slice
+                                .iter()
+                                .rev()
+                                .find(|msg| msg.role == MessageRole::Assistant)
+                                .is_some_and(|msg| msg.content.trim().is_empty());
+                            let had_tool_activity = turn_slice.iter().any(|msg| {
+                                matches!(
+                                    msg.role,
+                                    MessageRole::ToolCall | MessageRole::ToolResult
+                                )
+                            });
+                            if assistant_empty && !had_tool_activity {
+                                let message =
+                                    "Query failed: provider returned no visible response.".to_string();
+                                ui_state.notifications.err(&message);
+                                ui_state.messages.push(Message {
+                                    role: MessageRole::System,
+                                    content: message.into(),
+                                    tool_name: None,
+                                    streaming: false,
+                                    folded: false,
+                                });
+                            }
+                            ui_state.notifications.success("Turn completed");
                             // Trigger background features after successful turn
                             let prompt_text = self.history.last().cloned().unwrap_or_default();
                             self.trigger_background_features(&prompt_text).await;
                         }
                         Err(e) => {
+                            ui_state.notifications.err("Turn failed");
                             ui_state.messages.push(Message {
                                 role: MessageRole::System,
                                 content: format!("Query failed: {e}").into(),
@@ -1487,8 +2178,15 @@ impl ReplLoop {
                                 streaming: false,
                             folded: false,
                             });
+                            show_detail_overlay(
+                                &mut ui_state,
+                                "Failure Details",
+                                format!("Query failed: {e}"),
+                            );
                         }
                     }
+
+                    self.persist_interactive_snapshot(&ui_state);
 
                     if let Some(next_prompt) = queued_prompts.pop_front() {
                         self.start_tui_query(
@@ -1600,7 +2298,7 @@ impl ReplLoop {
                     let mut ctx = self.build_context();
                     ctx.pipe_input = pipe_input;
                     let result = self.commands.execute(name, &ctx, &args);
-                    self.apply_command_effects(&result);
+                    self.sync_command_state(name, &result);
                     outputs.push(result.output.clone());
                     pipe_input = Some(result.output);
                 }
@@ -1611,7 +2309,7 @@ impl ReplLoop {
             self.command_history.append(cmd_name, &args);
             let ctx = self.build_context();
             let result = self.commands.execute(cmd_name, &ctx, &args);
-            self.apply_command_effects(&result);
+            self.sync_command_state(cmd_name, &result);
             Ok(result.output)
         } else if self.engine.is_some() {
             // 14.1: Route to QueryEngine instead of placeholder
@@ -1931,7 +2629,7 @@ impl ReplLoop {
     /// Keeps the first user message and the most recent 3 turns.
     #[allow(dead_code)]
     async fn compact_context(&mut self, ui_state: &mut coderex_ui::state::UiState) -> String {
-        let Some(ref mut engine) = self.engine else {
+        let Some(engine) = self.engine.as_mut() else {
             return "No engine configured.".into();
         };
         let result = engine.compact_session_messages(3);
@@ -1939,51 +2637,8 @@ impl ReplLoop {
             return "Context is already compact.".into();
         }
         // Sync UI message list: rebuild from compacted messages
-        ui_state.messages.messages.clear();
-        ui_state.messages.start = 0;
-        for msg in &result.messages {
-            let (role, content, tool_name) = match (&msg.role, &msg.content) {
-                (coderex_core::types::Role::User, coderex_core::types::MessageContent::Text(t)) => {
-                    (coderex_ui::message_list::MessageRole::User, t.clone(), None)
-                }
-                (
-                    coderex_core::types::Role::Assistant,
-                    coderex_core::types::MessageContent::Text(t),
-                ) => (
-                    coderex_ui::message_list::MessageRole::Assistant,
-                    t.clone(),
-                    None,
-                ),
-                (
-                    coderex_core::types::Role::System,
-                    coderex_core::types::MessageContent::Text(t),
-                ) => (
-                    coderex_ui::message_list::MessageRole::System,
-                    t.clone(),
-                    None,
-                ),
-                (
-                    coderex_core::types::Role::Tool,
-                    coderex_core::types::MessageContent::ToolResult(tr),
-                ) => (
-                    coderex_ui::message_list::MessageRole::ToolResult,
-                    tr.output.clone(),
-                    Some(tr.tool_call_id.clone().into()),
-                ),
-                (_, c) => (
-                    coderex_ui::message_list::MessageRole::System,
-                    format!("{c:?}"),
-                    None,
-                ),
-            };
-            ui_state.messages.push(coderex_ui::message_list::Message {
-                role,
-                content: content.into(),
-                tool_name: tool_name.map(|t: String| t.into()),
-                streaming: false,
-                folded: false,
-            });
-        }
+        restore_transcript_messages(ui_state, &result.messages);
+        self.persist_interactive_snapshot(ui_state);
         format!(
             "Context compacted: {} tokens removed, {} messages remaining.",
             result.tokens_removed,
@@ -2267,6 +2922,18 @@ impl ReplLoop {
         }
     }
 
+    /// Apply command effects that mutate persistent REPL state.
+    fn sync_command_state(&mut self, cmd_name: &str, result: &CommandResult) -> bool {
+        self.apply_command_effects(result);
+
+        if cmd_name == "vim" && result.state_changed {
+            self.vim_mode_enabled = !self.vim_mode_enabled;
+            return true;
+        }
+
+        false
+    }
+
     fn extract_read_path(prompt: &str) -> Option<String> {
         let mut parts = prompt.split_whitespace();
         let first = parts.next()?;
@@ -2367,6 +3034,13 @@ impl ReplLoop {
             if let Some(ref client) = self.api_client {
                 if let Ok(title) = prompts::generate_session_title(client.as_ref(), prompt).await {
                     self.session_effects.title_generated = true;
+                    if let Some(ref mut engine) = self.engine {
+                        let mut session = engine.session().clone();
+                        if session.title.is_none() {
+                            session.title = Some(title.clone());
+                            engine.set_session(session);
+                        }
+                    }
                     if !output.is_empty() {
                         output.insert_str(0, &format!("[Session title: {title}]\n"));
                     } else {
@@ -2512,6 +3186,152 @@ impl ReplLoop {
                     self.running = false;
                     return;
                 }
+                "tokens" => {
+                    self.execute_and_display_command("usage", &[], ui_state)
+                        .await;
+                    return;
+                }
+                "compact" => {
+                    let msg = self.compact_context(ui_state).await;
+                    ui_state.notifications.info(&msg);
+                    ui_state.messages.push(coderex_ui::message_list::Message {
+                        role: coderex_ui::message_list::MessageRole::System,
+                        content: msg.into(),
+                        tool_name: None,
+                        streaming: false,
+                        folded: false,
+                    });
+                    return;
+                }
+                "model" => {
+                    if let Some(model) = args.first() {
+                        let mapped = match model.to_lowercase().as_str() {
+                            "opus" => ModelId::opus(),
+                            "sonnet" => ModelId::sonnet(),
+                            "haiku" => ModelId::haiku(),
+                            other => ModelId(other.to_string()),
+                        };
+                        self.model = mapped;
+                    }
+                    self.execute_and_display_command(cmd_name, &args, ui_state)
+                        .await;
+                    return;
+                }
+                "vim" => {
+                    let ctx = self.build_context();
+                    let result = self.commands.execute("vim", &ctx, &args);
+                    let toggled = self.sync_command_state("vim", &result);
+                    if toggled {
+                        ui_state.notifications.info(&result.output);
+                    }
+                    ui_state.messages.push(coderex_ui::message_list::Message {
+                        role: coderex_ui::message_list::MessageRole::System,
+                        content: result.output.into(),
+                        tool_name: None,
+                        streaming: false,
+                        folded: false,
+                    });
+                    return;
+                }
+                "plan" => {
+                    let registry_output =
+                        self.commands.execute("plan", &self.build_context(), &args);
+                    let body = ui_state.plan.render_detail();
+                    show_detail_overlay(ui_state, "Current Plan", body);
+                    if !registry_output.output.is_empty() {
+                        ui_state.messages.push(coderex_ui::message_list::Message {
+                            role: coderex_ui::message_list::MessageRole::System,
+                            content: registry_output.output.into(),
+                            tool_name: None,
+                            streaming: false,
+                            folded: false,
+                        });
+                    }
+                    return;
+                }
+                "resume" => {
+                    if *thinking || query_done_rx.is_some() {
+                        let message =
+                            "Finish or cancel the active turn before resuming another session.";
+                        ui_state.notifications.warn(message);
+                        ui_state.messages.push(coderex_ui::message_list::Message {
+                            role: coderex_ui::message_list::MessageRole::System,
+                            content: message.into(),
+                            tool_name: None,
+                            streaming: false,
+                            folded: false,
+                        });
+                        return;
+                    }
+                    match self.resume_tui_session(args.first().map(String::as_str), ui_state) {
+                        Ok(_) => {}
+                        Err(err) => {
+                            ui_state.notifications.err(&err);
+                            ui_state.messages.push(coderex_ui::message_list::Message {
+                                role: coderex_ui::message_list::MessageRole::System,
+                                content: format!("Error: {err}").into(),
+                                tool_name: None,
+                                streaming: false,
+                                folded: false,
+                            });
+                        }
+                    }
+                    return;
+                }
+                "activity" => {
+                    let body = if ui_state.activity_log.is_empty() {
+                        "No recent activity yet.".to_string()
+                    } else {
+                        ui_state.activity_log.join("\n")
+                    };
+                    show_detail_overlay(ui_state, "Recent Activity", body);
+                    return;
+                }
+                "open" => {
+                    if args.is_empty() {
+                        ui_state.messages.push(coderex_ui::message_list::Message {
+                            role: coderex_ui::message_list::MessageRole::System,
+                            content: "Usage: /open <path>".into(),
+                            tool_name: None,
+                            streaming: false,
+                            folded: false,
+                        });
+                        ui_state.notifications.warn("Usage: /open <path>");
+                        return;
+                    }
+                    let raw_path = std::path::PathBuf::from(&args[0]);
+                    let path = if raw_path.is_absolute() {
+                        raw_path
+                    } else {
+                        std::path::Path::new(&self.cwd).join(raw_path)
+                    };
+                    match std::fs::read_to_string(&path) {
+                        Ok(content) => {
+                            ui_state.left_pane_content = content;
+                            ui_state.left_pane_title = args[0].clone();
+                            ui_state.layout_mode =
+                                coderex_ui::state::LayoutMode::HorizontalSplit { left_percent: 50 };
+                            ui_state
+                                .notifications
+                                .success(format!("Opened {}", args[0]));
+                            push_activity_row(ui_state, &format!("Opened {}", args[0]));
+                            self.persist_interactive_snapshot(ui_state);
+                        }
+                        Err(err) => {
+                            let detail = format!("Failed to open {}: {}", args[0], err);
+                            ui_state.notifications.err(&detail);
+                            show_detail_overlay(ui_state, "Failure Details", detail.clone());
+                            ui_state.messages.push(coderex_ui::message_list::Message {
+                                role: coderex_ui::message_list::MessageRole::System,
+                                content: detail.into(),
+                                tool_name: None,
+                                streaming: false,
+                                folded: false,
+                            });
+                        }
+                    }
+                    return;
+                }
                 _ => {}
             }
 
@@ -2608,6 +3428,11 @@ impl ReplLoop {
             dispatcher.set_elicit_tx(Some(elicit_tx));
         }
         self.query_start_time = Some(std::time::Instant::now());
+        ui_state.plan.reset();
+        ui_state.permission_bar.clear_status();
+        set_plan_step(ui_state, "Planning next step");
+        push_activity_row(ui_state, "Planning next step");
+        self.persist_interactive_snapshot(ui_state);
         tokio::spawn(async move {
             let result = engine.submit_streaming(prompt, options).await;
             let _ = tx.send((engine, result));
@@ -2616,6 +3441,46 @@ impl ReplLoop {
         *elicit_rx = Some(erx);
         *thinking = true;
         *phase = InteractivePhase::Planning;
+    }
+
+    async fn respond_to_confirmation(
+        &self,
+        request: ConfirmationRequest,
+        response: ConfirmationResponse,
+        ui_state: &mut coderex_ui::state::UiState,
+        phase: &mut InteractivePhase,
+    ) {
+        if let Some(bus) = self.confirmation_bus.as_ref() {
+            let _ = bus.respond(&request.id, response).await;
+        }
+
+        let args = permission_request_args(&request.arguments);
+        let activity = ToolCall::summarize_activity(&request.tool_name, &args);
+        let approved = matches!(
+            response,
+            ConfirmationResponse::Approved | ConfirmationResponse::ApproveSession
+        );
+        let resolution = match response {
+            ConfirmationResponse::Approved => format!("approved {activity}"),
+            ConfirmationResponse::ApproveSession => {
+                format!("approved {activity} for the session")
+            }
+            ConfirmationResponse::Denied => format!("denied {activity}"),
+        };
+
+        clear_permission_overlay(ui_state);
+        ui_state
+            .permission_bar
+            .set_resolution(approved, activity.clone());
+        push_activity_row(ui_state, &resolution);
+        phase.note_tool_end();
+
+        if approved {
+            ui_state.notifications.success(&resolution);
+        } else {
+            ui_state.notifications.warn(&resolution);
+        }
+        self.persist_interactive_snapshot(ui_state);
     }
 
     /// Execute a single command through the registry and display the result in the TUI.
@@ -2628,7 +3493,7 @@ impl ReplLoop {
         self.command_history.append(cmd_name, args);
         let ctx = self.build_context();
         let result = self.commands.execute(cmd_name, &ctx, args);
-        self.apply_command_effects(&result);
+        self.sync_command_state(cmd_name, &result);
 
         if cmd_name == "clear" && result.state_changed {
             self.clear_tui_session(ui_state, result.output.clone());
@@ -2649,11 +3514,16 @@ impl ReplLoop {
     }
 
     fn clear_tui_session(&mut self, ui_state: &mut coderex_ui::state::UiState, message: String) {
+        let prior_session_id = self.current_session_id();
         self.history.clear();
         ui_state.messages = coderex_ui::message_list::MessageView::new(1000);
         ui_state.overlays.clear();
         ui_state.notifications.dismiss_all();
         ui_state.input = coderex_ui::input::InputBuffer::new();
+        ui_state.plan.reset();
+        ui_state.activity_log.clear();
+        ui_state.permission_bar.clear_status();
+        clear_permission_overlay(ui_state);
         ui_state.statusline.last_duration = None;
         ui_state.statusline.thinking = false;
         ui_state.statusline.thinking_label = None;
@@ -2664,6 +3534,7 @@ impl ReplLoop {
             streaming: false,
             folded: false,
         });
+        self.clear_interactive_snapshot(prior_session_id.as_deref());
     }
 
     /// Execute piped commands: split on `|`, run sequentially, pass output as pipe_input.
@@ -2691,7 +3562,7 @@ impl ReplLoop {
             ctx.pipe_input = pipe_input;
 
             let result = self.commands.execute(cmd_name, &ctx, &args);
-            self.apply_command_effects(&result);
+            self.sync_command_state(cmd_name, &result);
             outputs.push(result.output.clone());
             pipe_input = Some(result.output);
         }
@@ -2720,7 +3591,7 @@ impl ReplLoop {
             self.command_history.append(cmd_name, &args);
             let ctx = self.build_context();
             let result = self.commands.execute(cmd_name, &ctx, &args);
-            self.apply_command_effects(&result);
+            self.sync_command_state(cmd_name, &result);
             ui_state.messages.push(coderex_ui::message_list::Message {
                 role: if result.scrollable {
                     coderex_ui::message_list::MessageRole::Assistant
@@ -2912,7 +3783,7 @@ impl ReplLoop {
         self.command_history.append(cmd_name, &args);
         let ctx = self.build_context();
         let result = self.commands.execute(cmd_name, &ctx, &args);
-        self.apply_command_effects(&result);
+        self.sync_command_state(cmd_name, &result);
         writeln!(stdout, "{}", result.output)?;
         Ok(())
     }
@@ -2949,7 +3820,7 @@ impl ReplLoop {
             ctx.pipe_input = pipe_input;
 
             let result = self.commands.execute(cmd_name, &ctx, &args);
-            self.apply_command_effects(&result);
+            self.sync_command_state(cmd_name, &result);
             writeln!(stdout, "{}", result.output)?;
             pipe_input = Some(result.output);
         }
@@ -2970,7 +3841,7 @@ impl ReplLoop {
             self.command_history.append(cmd_name, &args);
             let ctx = self.build_context();
             let result = self.commands.execute(cmd_name, &ctx, &args);
-            self.apply_command_effects(&result);
+            self.sync_command_state(cmd_name, &result);
             writeln!(stdout, "{}", result.output)?;
         } else {
             writeln!(stdout, "[Macro] {trimmed}")?;
@@ -3335,13 +4206,42 @@ impl ReplLoop {
     }
 
     fn build_context(&self) -> CommandContext {
+        let (session_id, session_title, message_count, permission_mode) =
+            if let Some(ref engine) = self.engine {
+                let session = engine.session();
+                let permission_mode = engine
+                    .permission_checker()
+                    .lock()
+                    .map(|checker| checker.mode())
+                    .unwrap_or_default();
+                (
+                    session.session_id.to_string(),
+                    session
+                        .title
+                        .clone()
+                        .unwrap_or_else(|| "REPL Session".to_string()),
+                    session.messages.len(),
+                    permission_mode,
+                )
+            } else {
+                (
+                    "repl_session".to_string(),
+                    "REPL Session".to_string(),
+                    self.history.len(),
+                    PermissionMode::default(),
+                )
+            };
+
         let mut ctx = CommandContext::new(
             self.cwd.clone(),
-            "repl_session".into(),
-            "REPL Session".into(),
+            session_id,
+            session_title,
             self.model.clone(),
         );
-        ctx.message_count = self.history.len();
+        ctx.message_count = message_count;
+        ctx.permission_mode = permission_mode;
+        ctx.vim_mode = self.vim_mode_enabled;
+        ctx.git_branch = current_git_branch(&self.cwd);
         ctx.version = env!("CARGO_PKG_VERSION").to_string();
         ctx.feature_flags = HashMap::new();
         if let Some(ref engine) = self.engine {

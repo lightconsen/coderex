@@ -1,4 +1,4 @@
-//! Stats commands: /stats, /cost, /usage.
+//! Stats commands: /stats, /cost, /usage, /tokens.
 
 use crate::registry::{CommandContext, CommandRegistry, CommandResult, SlashCommand};
 use std::sync::Arc;
@@ -59,6 +59,30 @@ pub fn register(registry: &mut CommandRegistry) {
     // /usage — show token usage
     registry.register(SlashCommand::local(
         "usage",
+        "Show token usage",
+        true,
+        true,
+        true,
+        Arc::new(|ctx: &CommandContext, _args: &[String]| {
+            let total = ctx.input_tokens
+                + ctx.output_tokens
+                + ctx.cache_read_tokens
+                + ctx.cache_creation_tokens;
+            let output = format!(
+                "Token Usage\n───────────\nInput:          {:>8} tokens\nOutput:         {:>8} tokens\nCache Read:     {:>8} tokens\nCache Creation: {:>8} tokens\n───────────\nTotal:          {:>8} tokens",
+                ctx.input_tokens,
+                ctx.output_tokens,
+                ctx.cache_read_tokens,
+                ctx.cache_creation_tokens,
+                total,
+            );
+            CommandResult::success(output)
+        }),
+    ));
+
+    // /tokens — alias for /usage
+    registry.register(SlashCommand::local(
+        "tokens",
         "Show token usage",
         true,
         true,
@@ -150,5 +174,17 @@ mod tests {
         assert!(result.output.contains("5000"));
         assert!(result.output.contains("3000"));
         assert!(result.output.contains("9500"));
+    }
+
+    #[test]
+    fn tokens_alias_matches_usage() {
+        let reg = {
+            let mut r = CommandRegistry::new();
+            register(&mut r);
+            r
+        };
+        let usage = reg.execute("usage", &ctx(), &[]);
+        let tokens = reg.execute("tokens", &ctx(), &[]);
+        assert_eq!(usage.output, tokens.output);
     }
 }
