@@ -516,10 +516,13 @@ fn question_response_stays_in_transcript_without_raw_elicitation_prompt() {
     session.wait_for_text("CodeRex v", SCREEN_TIMEOUT);
     session.send_line("ask a question");
     let screen = session.wait_for_text("Which approach would you prefer?", SCREEN_TIMEOUT);
+    let raw = strip_ansi(&session.raw_text());
     assert!(screen.contains("Which approach would you prefer?"));
     assert!(!screen.contains("[Query]"));
     assert!(!screen.contains("Type your answer and press Enter."));
     assert!(!screen.contains("Continue — Proceed with the current approach"));
+    assert!(!raw.contains("[Query]"));
+    assert!(!raw.contains("Enter a number or type a custom response"));
 }
 
 #[test]

@@ -350,6 +350,9 @@ fn build_options_from_request(request: &QueryRequest) -> SubmitOptions {
         .allowed_tools
         .clone()
         .or_else(|| crate::prompts::default_allowed_tools_for_profiles(&[request.prompt_profile]));
+    if !matches!(request.kind, QueryKind::MainAgent) {
+        options.handle_elicitation = false;
+    }
     options
 }
 
@@ -850,5 +853,35 @@ mod tests {
         let calls = api.call_log();
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].2, ModelProfile::Background.resolve_runtime().0);
+    }
+
+    #[test]
+    fn non_main_requests_disable_fallback_elicitation() {
+        let base = QueryRequest {
+            kind: QueryKind::MainAgent,
+            user_prompt: "hello".into(),
+            custom_system_prompt: None,
+            append_system_prompt: None,
+            prompt_profile: PromptProfile::DefaultAgent,
+            allowed_tools: None,
+            model_profile: ModelProfile::Main,
+            inherit_session: false,
+            stream: true,
+            max_tokens: 128,
+            agent_id: None,
+            provider_hints: std::collections::HashMap::new(),
+        };
+
+        assert!(build_options_from_request(&base).handle_elicitation);
+
+        for kind in [
+            QueryKind::SideQuery,
+            QueryKind::Lightweight,
+            QueryKind::ForkedAgent,
+        ] {
+            let mut request = base.clone();
+            request.kind = kind;
+            assert!(!build_options_from_request(&request).handle_elicitation);
+        }
     }
 }

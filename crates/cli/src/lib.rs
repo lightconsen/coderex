@@ -2,6 +2,7 @@
 
 pub mod cli;
 pub mod daemon;
+pub mod interactive_e2e;
 pub mod orchestrator;
 pub mod recovery;
 pub mod repl;

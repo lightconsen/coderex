@@ -6,6 +6,7 @@ use coderex_commands::registry::{CommandContext, CommandRegistry, CommandResult}
 use coderex_commands::{CommandHistory, MacroRegistry};
 use coderex_core::api_client::ApiClient;
 use coderex_core::confirmation_bus::{ConfirmationBus, ConfirmationRequest, ConfirmationResponse};
+use coderex_core::elicitation::{ElicitationHandler, ElicitationResponse, ElicitationResult};
 use coderex_core::engine::{QueryEngine, SubmitOptions, TerminalReason};
 use coderex_core::orchestrator::{
     BackgroundFeatureKind, BackgroundFeatureRequest, background_feature_label,
@@ -355,6 +356,74 @@ struct BackgroundTaskResult {
     success: bool,
     /// Output content (result text or error message).
     content: String,
+}
+
+/// A clarification request emitted from the engine into the TUI.
+#[derive(Debug)]
+struct TuiElicitationRequest {
+    /// The question text already shown by the assistant.
+    prompt: String,
+    /// Channel to send the user's answer back to the engine.
+    response_tx: tokio::sync::oneshot::Sender<serde_json::Value>,
+}
+
+/// Elicitation handler for the full-screen TUI.
+///
+/// This keeps clarification prompts inside the TUI state instead of writing
+/// directly to stderr and corrupting the screen.
+#[derive(Debug, Clone)]
+struct TuiElicitationHandler {
+    tx: tokio::sync::mpsc::Sender<TuiElicitationRequest>,
+}
+
+impl TuiElicitationHandler {
+    fn new(tx: tokio::sync::mpsc::Sender<TuiElicitationRequest>) -> Self {
+        Self { tx }
+    }
+}
+
+#[async_trait::async_trait]
+impl ElicitationHandler for TuiElicitationHandler {
+    async fn request(
+        &self,
+        questions: Vec<coderex_core::elicitation::ElicitationQuestion>,
+    ) -> ElicitationResult {
+        let Some(question) = questions.first() else {
+            return ElicitationResult::Cancelled;
+        };
+
+        let (response_tx, response_rx) = tokio::sync::oneshot::channel();
+        let request = TuiElicitationRequest {
+            prompt: question.question.clone(),
+            response_tx,
+        };
+
+        if self.tx.send(request).await.is_err() {
+            return ElicitationResult::Cancelled;
+        }
+
+        match response_rx.await {
+            Ok(value) => {
+                let answer = value
+                    .get("answer")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::trim)
+                    .filter(|text| !text.is_empty())
+                    .map(ToString::to_string);
+
+                if let Some(other_text) = answer {
+                    ElicitationResult::Responded(ElicitationResponse {
+                        request_id: question.header.clone(),
+                        selected: Vec::new(),
+                        other_text: Some(other_text),
+                    })
+                } else {
+                    ElicitationResult::Cancelled
+                }
+            }
+            Err(_) => ElicitationResult::Cancelled,
+        }
+    }
 }
 
 /// Handle for an active background task.
@@ -1447,6 +1516,7 @@ impl ReplLoop {
             tokio::sync::oneshot::Receiver<(QueryEngine, Result<TerminalReason, String>)>,
         > = None;
         let mut elicit_rx: Option<tokio::sync::mpsc::Receiver<coderex_tools::ElicitRequest>> = None;
+        let mut tui_elicit_rx: Option<tokio::sync::mpsc::Receiver<TuiElicitationRequest>> = None;
         let mut queued_prompts = std::collections::VecDeque::<String>::new();
         let mut pending_confirmation: Option<ConfirmationRequest> = None;
 
@@ -1564,6 +1634,7 @@ impl ReplLoop {
                                     phase.reset();
                                     query_done_rx = None;
                                     elicit_rx = None;
+                                    tui_elicit_rx = None;
                                     self.pending_elicitation = None;
                                     clear_permission_overlay(&mut ui_state);
                                     if let Some(last) = ui_state
@@ -1747,6 +1818,7 @@ impl ReplLoop {
                                             &mut phase,
                                             &mut query_done_rx,
                                             &mut elicit_rx,
+                                            &mut tui_elicit_rx,
                                             &mut queued_prompts,
                                         ).await;
                                     }
@@ -1757,6 +1829,7 @@ impl ReplLoop {
                                         phase.reset();
                                         query_done_rx = None;
                                         elicit_rx = None;
+                                        tui_elicit_rx = None;
                                         self.pending_elicitation = None;
                                         pending_confirmation = None;
                                         clear_permission_overlay(&mut ui_state);
@@ -2104,6 +2177,7 @@ impl ReplLoop {
                     self.engine = Some(engine);
                     query_done_rx = None;
                     elicit_rx = None;
+                    tui_elicit_rx = None;
                     self.pending_elicitation = None;
                     pending_confirmation = None;
                     thinking = false;
@@ -2189,14 +2263,15 @@ impl ReplLoop {
                     self.persist_interactive_snapshot(&ui_state);
 
                     if let Some(next_prompt) = queued_prompts.pop_front() {
-                        self.start_tui_query(
-                            next_prompt,
-                            &mut ui_state,
-                            &mut thinking,
-                            &mut phase,
-                            &mut query_done_rx,
-                            &mut elicit_rx,
-                        );
+                            self.start_tui_query(
+                                next_prompt,
+                                &mut ui_state,
+                                &mut thinking,
+                                &mut phase,
+                                &mut query_done_rx,
+                                &mut elicit_rx,
+                                &mut tui_elicit_rx,
+                            );
                     }
                 }
 
@@ -2248,6 +2323,24 @@ impl ReplLoop {
                         streaming: false,
                         folded: false,
                     });
+                    self.pending_elicitation = Some(request.response_tx);
+                }
+
+                Some(request) = async {
+                    tui_elicit_rx.as_mut().unwrap().recv().await
+                }, if tui_elicit_rx.is_some() => {
+                    thinking = false;
+                    phase.reset();
+                    if let Some(last) = ui_state
+                        .messages
+                        .messages
+                        .iter_mut()
+                        .rev()
+                        .find(|msg| msg.role == MessageRole::Assistant && msg.streaming)
+                    {
+                        last.streaming = false;
+                    }
+                    ui_state.notifications.info(&request.prompt);
                     self.pending_elicitation = Some(request.response_tx);
                 }
 
@@ -3152,6 +3245,7 @@ impl ReplLoop {
             tokio::sync::oneshot::Receiver<(QueryEngine, Result<TerminalReason, String>)>,
         >,
         elicit_rx: &mut Option<tokio::sync::mpsc::Receiver<coderex_tools::ElicitRequest>>,
+        tui_elicit_rx: &mut Option<tokio::sync::mpsc::Receiver<TuiElicitationRequest>>,
         queued_prompts: &mut std::collections::VecDeque<String>,
     ) {
         // Clear previous turn's duration display so it doesn't linger.
@@ -3159,8 +3253,19 @@ impl ReplLoop {
 
         // If there's a pending elicitation, treat this input as the answer.
         if let Some(tx) = self.pending_elicitation.take() {
+            self.history.push(text.to_string());
+            ui_state.messages.push(coderex_ui::message_list::Message {
+                role: coderex_ui::message_list::MessageRole::User,
+                content: text.into(),
+                tool_name: None,
+                streaming: false,
+                folded: false,
+            });
             let answer = serde_json::json!({ "answer": text });
             let _ = tx.send(answer);
+            *thinking = true;
+            *phase = InteractivePhase::Thinking;
+            self.persist_interactive_snapshot(ui_state);
             return;
         }
 
@@ -3380,6 +3485,7 @@ impl ReplLoop {
                 phase,
                 query_done_rx,
                 elicit_rx,
+                tui_elicit_rx,
             );
         } else if *thinking || query_done_rx.is_some() {
             queued_prompts.push_back(text.to_string());
@@ -3411,6 +3517,7 @@ impl ReplLoop {
             tokio::sync::oneshot::Receiver<(QueryEngine, Result<TerminalReason, String>)>,
         >,
         elicit_rx: &mut Option<tokio::sync::mpsc::Receiver<coderex_tools::ElicitRequest>>,
+        tui_elicit_rx: &mut Option<tokio::sync::mpsc::Receiver<TuiElicitationRequest>>,
     ) {
         ui_state.messages.push(coderex_ui::message_list::Message {
             role: coderex_ui::message_list::MessageRole::Assistant,
@@ -3424,6 +3531,8 @@ impl ReplLoop {
         let mut engine = self.engine.take().unwrap();
         let (tx, rx) = tokio::sync::oneshot::channel();
         let (elicit_tx, erx) = tokio::sync::mpsc::channel(4);
+        let (tui_elicit_tx, terx) = tokio::sync::mpsc::channel(1);
+        engine.set_elicitation_handler(Box::new(TuiElicitationHandler::new(tui_elicit_tx)));
         if let Some(ref dispatcher) = self.dispatcher {
             dispatcher.set_elicit_tx(Some(elicit_tx));
         }
@@ -3439,6 +3548,7 @@ impl ReplLoop {
         });
         *query_done_rx = Some(rx);
         *elicit_rx = Some(erx);
+        *tui_elicit_rx = Some(terx);
         *thinking = true;
         *phase = InteractivePhase::Planning;
     }

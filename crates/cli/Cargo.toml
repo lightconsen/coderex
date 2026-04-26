@@ -26,6 +26,10 @@ path = "src/bin/record_anthropic_responses.rs"
 name = "static-anthropic-server"
 path = "src/bin/static_anthropic_server.rs"
 
+[[bin]]
+name = "coderex-interactive-e2e"
+path = "src/bin/coderex_interactive_e2e.rs"
+
 [dependencies]
 coderex-core = { path = "../core" }
 coderex-tools = { path = "../tools" }
@@ -59,6 +63,8 @@ async-trait.workspace = true
 crossterm.workspace = true
 compact_str.workspace = true
 uuid.workspace = true
+portable-pty = "0.8"
+vt100 = "0.15"
 
 [dev-dependencies]
 assert_cmd.workspace = true
@@ -69,8 +75,6 @@ ratatui.workspace = true
 crossterm.workspace = true
 serde_json.workspace = true
 coderex-test-utils = { path = "../test-utils" }
-portable-pty = "0.8"
-vt100 = "0.15"
 
 # ─── Release Tier Features ──────────────────────────────────────────────────
 # Each tier enables everything below it.
