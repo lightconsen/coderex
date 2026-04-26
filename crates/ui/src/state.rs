@@ -9,6 +9,7 @@ use crate::search::SearchState;
 use crate::selector::MessageSelector;
 use crate::statusline::Statusline;
 use crate::statusline_setup::StatuslineSetup;
+use crate::themes::Theme;
 
 /// The active view mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -160,6 +161,8 @@ pub struct UiState {
     pub statusline_setup: StatuslineSetup,
     /// Notification center.
     pub notifications: NotificationCenter,
+    /// Active semantic color theme.
+    pub theme: Theme,
     /// Lightweight plan state for the current interactive turn.
     pub plan: InteractivePlan,
     /// Recent concise system activity rows for overlays and notifications.
@@ -191,6 +194,7 @@ impl UiState {
             permission_bar: PermissionBar::new(),
             statusline_setup: StatuslineSetup::new(),
             notifications: NotificationCenter::new(),
+            theme: Theme::dark(),
             plan: InteractivePlan::default(),
             activity_log: Vec::new(),
             permission_detail: None,

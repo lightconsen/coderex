@@ -1602,9 +1602,7 @@ impl QueryEngine {
 
         // Parse the response
         let content = self.validate_structured_output(api_response.content.clone());
-        let assistant_msg = Message::assistant(content.clone());
-        turn.messages.push(assistant_msg.clone());
-        self.session.messages.push(assistant_msg);
+        self.push_visible_assistant_message(turn, content.clone());
 
         // Elicitation heuristic: if the assistant asks a short question, prompt the user
         let mut api_response = api_response;
@@ -1625,9 +1623,7 @@ impl QueryEngine {
                         .record_usage(&api_response.usage, &self.model);
                     self.last_usage = Some(api_response.usage);
                     let new_content = self.validate_structured_output(api_response.content.clone());
-                    let elic_assistant = Message::assistant(new_content);
-                    turn.messages.push(elic_assistant.clone());
-                    self.session.messages.push(elic_assistant);
+                    self.push_visible_assistant_message(turn, new_content);
                 }
             }
         }
@@ -1671,9 +1667,7 @@ impl QueryEngine {
                         .record_usage(&api_response.usage, &self.model);
                     self.last_usage = Some(api_response.usage);
                     let content = self.validate_structured_output(api_response.content.clone());
-                    let assistant_msg = Message::assistant(content);
-                    turn.messages.push(assistant_msg.clone());
-                    self.session.messages.push(assistant_msg);
+                    self.push_visible_assistant_message(turn, content);
 
                     // After recovery retry, check if we still need to compact
                     if !turn.budget.should_continue() {
@@ -1849,9 +1843,7 @@ impl QueryEngine {
         content = self.validate_structured_output(content);
 
         // Save assistant message
-        let assistant_msg = Message::assistant(content.clone());
-        turn.messages.push(assistant_msg.clone());
-        self.session.messages.push(assistant_msg);
+        self.push_visible_assistant_message(turn, content.clone());
 
         // Elicitation heuristic: if the assistant asks a short question, prompt the user
         if options.handle_elicitation && content.trim().ends_with('?') && content.len() < 200 {
@@ -1874,9 +1866,7 @@ impl QueryEngine {
                     tool_calls = new_tool_calls;
                     early_results = new_early_results;
                     usage = new_usage;
-                    let elic_assistant = Message::assistant(content.clone());
-                    turn.messages.push(elic_assistant.clone());
-                    self.session.messages.push(elic_assistant);
+                    self.push_visible_assistant_message(turn, content.clone());
                 }
             }
         }
@@ -1926,9 +1916,7 @@ impl QueryEngine {
                     turn.budget.record_tokens(&usage);
                     self.cost_tracker.record_usage(&usage, &self.model);
                     self.last_usage = Some(usage);
-                    let assistant_msg = Message::assistant(content);
-                    turn.messages.push(assistant_msg.clone());
-                    self.session.messages.push(assistant_msg);
+                    self.push_visible_assistant_message(turn, content);
 
                     if !turn.budget.should_continue() {
                         turn.terminate(TerminalReason::BudgetExhausted);
@@ -2035,6 +2023,15 @@ impl QueryEngine {
                 format!("{content}{warning}")
             }
         }
+    }
+
+    fn push_visible_assistant_message(&mut self, turn: &mut TurnRuntime, content: String) {
+        if content.trim().is_empty() {
+            return;
+        }
+        let assistant_msg = Message::assistant(content);
+        turn.messages.push(assistant_msg.clone());
+        self.session.messages.push(assistant_msg);
     }
 
     /// Build the prompt context from session state.
@@ -2909,6 +2906,47 @@ mod tests {
         }
     }
 
+    struct EmptyStreamingApiClient;
+
+    #[async_trait::async_trait]
+    impl ApiClient for EmptyStreamingApiClient {
+        fn clone_box(&self) -> Box<dyn ApiClient> {
+            Box::new(EmptyStreamingApiClient)
+        }
+
+        async fn create_message(
+            &self,
+            _system: &str,
+            _messages: &[serde_json::Value],
+            _model: &ModelId,
+            _max_tokens: u32,
+            _tools: &[crate::tool_executor::ToolInfo],
+        ) -> Result<ApiResponse, crate::api_client::ApiError> {
+            Ok(ApiResponse {
+                content: String::new(),
+                tool_calls: Vec::new(),
+                usage: UsageSummary {
+                    input_tokens: 1,
+                    output_tokens: 0,
+                    cache_read_tokens: 0,
+                    cache_creation_tokens: 0,
+                },
+                stop_reason: "end_turn".into(),
+            })
+        }
+
+        async fn create_message_streaming(
+            &self,
+            _system: &str,
+            _messages: &[serde_json::Value],
+            _model: &ModelId,
+            _max_tokens: u32,
+            _tools: &[crate::tool_executor::ToolInfo],
+        ) -> std::pin::Pin<Box<dyn futures::Stream<Item = StreamEvent> + Send + 'static>> {
+            Box::pin(futures::stream::iter([StreamEvent::StreamEnd]))
+        }
+    }
+
     #[test]
     fn turn_state_user_waiting_only_on_specific_states() {
         assert!(TurnState::AwaitPermission.is_user_waiting());
@@ -3144,6 +3182,42 @@ mod tests {
         assert_eq!(results.len(), 1);
         assert!(results[0].is_error);
         assert!(results[0].output.contains("blocked"));
+    }
+
+    #[tokio::test]
+    async fn empty_streaming_response_is_not_persisted_as_assistant_message() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let checker = PermissionChecker::new(PermissionMode::BypassPermissions);
+        let perm_engine = PermissionEngine::new(checker);
+        let session = SessionState::new(std::path::PathBuf::from("/tmp/test"));
+        let mut engine = QueryEngine::new(
+            Box::new(EmptyStreamingApiClient),
+            ModelId::sonnet(),
+            session,
+            perm_engine,
+            tx,
+        );
+        engine.set_tool_executor(Box::new(StubOkToolExecutor));
+
+        engine
+            .submit_streaming("first".into(), SubmitOptions::default())
+            .await
+            .unwrap();
+        engine
+            .submit_streaming("second".into(), SubmitOptions::default())
+            .await
+            .unwrap();
+
+        let roles = engine
+            .session
+            .messages
+            .iter()
+            .map(|msg| msg.role)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            roles,
+            vec![crate::types::Role::User, crate::types::Role::User]
+        );
     }
 
     #[test]

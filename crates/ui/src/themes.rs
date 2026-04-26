@@ -25,6 +25,12 @@ pub struct Theme {
     pub accent: Color,
     /// Secondary accent color.
     pub accent_secondary: Color,
+    /// User prompt marker/title color.
+    pub user: Color,
+    /// Assistant marker/title color.
+    pub assistant: Color,
+    /// Tool call/result marker color.
+    pub tool: Color,
     /// Status bar background.
     pub statusbar_bg: Color,
     /// Status bar text.
@@ -70,6 +76,12 @@ struct ThemeData {
     dim: String,
     accent: String,
     accent_secondary: String,
+    #[serde(default)]
+    user: Option<String>,
+    #[serde(default)]
+    assistant: Option<String>,
+    #[serde(default)]
+    tool: Option<String>,
     statusbar_bg: String,
     statusbar_fg: String,
     error: String,
@@ -98,6 +110,9 @@ impl From<&Theme> for ThemeData {
             dim: color_to_string(&t.dim),
             accent: color_to_string(&t.accent),
             accent_secondary: color_to_string(&t.accent_secondary),
+            user: Some(color_to_string(&t.user)),
+            assistant: Some(color_to_string(&t.assistant)),
+            tool: Some(color_to_string(&t.tool)),
             statusbar_bg: color_to_string(&t.statusbar_bg),
             statusbar_fg: color_to_string(&t.statusbar_fg),
             error: color_to_string(&t.error),
@@ -129,6 +144,9 @@ impl TryFrom<ThemeData> for Theme {
             dim: parse_color_or(&d.dim, Color::DarkGray, "dim")?,
             accent: parse_color_or(&d.accent, Color::Blue, "accent")?,
             accent_secondary: parse_color_or(&d.accent_secondary, Color::Cyan, "accent_secondary")?,
+            user: parse_optional_color_or(&d.user, Color::Blue, "user")?,
+            assistant: parse_optional_color_or(&d.assistant, Color::Green, "assistant")?,
+            tool: parse_optional_color_or(&d.tool, Color::Magenta, "tool")?,
             statusbar_bg: parse_color_or(&d.statusbar_bg, Color::DarkGray, "statusbar_bg")?,
             statusbar_fg: parse_color_or(&d.statusbar_fg, Color::White, "statusbar_fg")?,
             error: parse_color_or(&d.error, Color::Red, "error")?,
@@ -175,6 +193,17 @@ fn parse_color_or(s: &str, default: Color, _field: &str) -> Result<Color, String
         .or(Ok(default))
 }
 
+fn parse_optional_color_or(
+    s: &Option<String>,
+    default: Color,
+    field: &str,
+) -> Result<Color, String> {
+    match s {
+        Some(value) => parse_color_or(value, default, field),
+        None => Ok(default),
+    }
+}
+
 impl Default for Theme {
     fn default() -> Self {
         Self::dark()
@@ -190,25 +219,28 @@ impl Theme {
             background: Color::Reset,
             foreground: Color::Reset,
             dim: Color::DarkGray,
-            accent: Color::Blue,
-            accent_secondary: Color::Cyan,
-            statusbar_bg: Color::DarkGray,
-            statusbar_fg: Color::White,
-            error: Color::Red,
-            warning: Color::Yellow,
-            success: Color::Green,
-            border: Color::DarkGray,
-            selection_bg: Color::DarkGray,
-            selection_fg: Color::White,
+            accent: Color::Rgb(96, 165, 250),
+            accent_secondary: Color::Rgb(45, 212, 191),
+            user: Color::Rgb(96, 165, 250),
+            assistant: Color::Rgb(74, 222, 128),
+            tool: Color::Rgb(45, 212, 191),
+            statusbar_bg: Color::Reset,
+            statusbar_fg: Color::Rgb(229, 231, 235),
+            error: Color::Rgb(248, 113, 113),
+            warning: Color::Rgb(251, 191, 36),
+            success: Color::Rgb(34, 197, 94),
+            border: Color::Rgb(75, 85, 99),
+            selection_bg: Color::Rgb(31, 41, 55),
+            selection_fg: Color::Rgb(229, 231, 235),
             input_bg: Color::Reset,
-            input_fg: Color::Reset,
-            overlay_bg: Color::Black,
-            overlay_border: Color::Gray,
-            vim_normal: Color::Cyan,
-            vim_insert: Color::Green,
-            notif_info: Color::Blue,
-            notif_warning: Color::Yellow,
-            notif_error: Color::Red,
+            input_fg: Color::Rgb(229, 231, 235),
+            overlay_bg: Color::Reset,
+            overlay_border: Color::Rgb(75, 85, 99),
+            vim_normal: Color::Rgb(45, 212, 191),
+            vim_insert: Color::Rgb(74, 222, 128),
+            notif_info: Color::Rgb(96, 165, 250),
+            notif_warning: Color::Rgb(251, 191, 36),
+            notif_error: Color::Rgb(248, 113, 113),
         }
     }
 
@@ -217,28 +249,31 @@ impl Theme {
     pub fn light() -> Self {
         Self {
             name: "light".into(),
-            background: Color::White,
-            foreground: Color::Black,
-            dim: Color::DarkGray,
-            accent: Color::Blue,
-            accent_secondary: Color::Cyan,
-            statusbar_bg: Color::DarkGray,
-            statusbar_fg: Color::White,
-            error: Color::Red,
-            warning: Color::Yellow,
-            success: Color::Green,
-            border: Color::Gray,
-            selection_bg: Color::Rgb(173, 216, 230),
-            selection_fg: Color::Black,
-            input_bg: Color::White,
-            input_fg: Color::Black,
-            overlay_bg: Color::White,
-            overlay_border: Color::DarkGray,
-            vim_normal: Color::Blue,
-            vim_insert: Color::Green,
-            notif_info: Color::Blue,
-            notif_warning: Color::Yellow,
-            notif_error: Color::Red,
+            background: Color::Reset,
+            foreground: Color::Rgb(17, 24, 39),
+            dim: Color::Rgb(107, 114, 128),
+            accent: Color::Rgb(37, 99, 235),
+            accent_secondary: Color::Rgb(13, 148, 136),
+            user: Color::Rgb(37, 99, 235),
+            assistant: Color::Rgb(22, 163, 74),
+            tool: Color::Rgb(13, 148, 136),
+            statusbar_bg: Color::Reset,
+            statusbar_fg: Color::Rgb(17, 24, 39),
+            error: Color::Rgb(220, 38, 38),
+            warning: Color::Rgb(180, 83, 9),
+            success: Color::Rgb(22, 163, 74),
+            border: Color::Rgb(209, 213, 219),
+            selection_bg: Color::Rgb(243, 244, 246),
+            selection_fg: Color::Rgb(17, 24, 39),
+            input_bg: Color::Reset,
+            input_fg: Color::Rgb(17, 24, 39),
+            overlay_bg: Color::Reset,
+            overlay_border: Color::Rgb(209, 213, 219),
+            vim_normal: Color::Rgb(37, 99, 235),
+            vim_insert: Color::Rgb(22, 163, 74),
+            notif_info: Color::Rgb(37, 99, 235),
+            notif_warning: Color::Rgb(180, 83, 9),
+            notif_error: Color::Rgb(220, 38, 38),
         }
     }
 
@@ -252,6 +287,9 @@ impl Theme {
             dim: Color::Gray,
             accent: Color::Yellow,
             accent_secondary: Color::Cyan,
+            user: Color::Yellow,
+            assistant: Color::Green,
+            tool: Color::Cyan,
             statusbar_bg: Color::Black,
             statusbar_fg: Color::Yellow,
             error: Color::Red,
@@ -282,6 +320,9 @@ impl Theme {
             dim: Color::Rgb(86, 95, 137),
             accent: Color::Rgb(122, 162, 247),
             accent_secondary: Color::Rgb(125, 207, 255),
+            user: Color::Rgb(122, 162, 247),
+            assistant: Color::Rgb(158, 206, 106),
+            tool: Color::Rgb(125, 207, 255),
             statusbar_bg: Color::Rgb(46, 46, 76),
             statusbar_fg: Color::Rgb(192, 202, 245),
             error: Color::Rgb(247, 118, 142),
@@ -312,6 +353,36 @@ impl Theme {
     pub fn to_json(&self) -> Result<String, String> {
         let data = ThemeData::from(self);
         serde_json::to_string_pretty(&data).map_err(|e| e.to_string())
+    }
+
+    /// Stable signature used to invalidate cached rendered TUI lines.
+    #[must_use]
+    pub fn render_signature(&self) -> u64 {
+        let colors = [
+            &self.foreground,
+            &self.dim,
+            &self.accent,
+            &self.accent_secondary,
+            &self.user,
+            &self.assistant,
+            &self.tool,
+            &self.error,
+            &self.warning,
+            &self.success,
+            &self.border,
+            &self.selection_bg,
+            &self.selection_fg,
+            &self.input_fg,
+            &self.overlay_border,
+        ];
+        let mut signature = 14_695_981_039_346_656_037_u64;
+        for color in colors {
+            for byte in color_to_string(color).as_bytes() {
+                signature ^= u64::from(*byte);
+                signature = signature.wrapping_mul(1_099_511_628_211);
+            }
+        }
+        signature
     }
 }
 

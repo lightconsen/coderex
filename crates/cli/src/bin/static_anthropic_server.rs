@@ -107,7 +107,7 @@ fn handle_connection(mut stream: TcpStream, responses: std::sync::Arc<StaticResp
     let body_str = String::from_utf8_lossy(&body);
 
     let prompt = extract_last_user_prompt(&body_str);
-    let has_tool_result = body_str.contains("\"type\":\"tool_result\"");
+    let has_tool_result = latest_user_message_has_tool_result(&body_str);
     let is_streaming = body_str.contains("\"stream\":true");
     let turn_number = count_tool_results(&body_str) + 1;
     let has_json_schema = body_str.contains("You must respond with ONLY valid JSON")
@@ -176,13 +176,52 @@ fn extract_last_user_prompt(body: &str) -> String {
     if let Some(messages) = value.get("messages").and_then(|m| m.as_array()) {
         for msg in messages.iter().rev() {
             if msg.get("role").and_then(|r| r.as_str()) == Some("user") {
-                if let Some(text) = msg.get("content").and_then(|c| c.as_str()) {
-                    return text.to_string();
+                if let Some(content) = msg.get("content") {
+                    if let Some(text) = content.as_str() {
+                        return text.to_string();
+                    }
+                    if let Some(parts) = content.as_array() {
+                        for part in parts {
+                            if part.get("type").and_then(|t| t.as_str()) == Some("text") {
+                                if let Some(text) = part.get("text").and_then(|t| t.as_str()) {
+                                    if !text.is_empty() {
+                                        return text.to_string();
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
             }
         }
     }
     String::new()
+}
+
+fn latest_user_message_has_tool_result(body: &str) -> bool {
+    let value: serde_json::Value = serde_json::from_str(body).unwrap_or_default();
+    let Some(messages) = value.get("messages").and_then(|m| m.as_array()) else {
+        return false;
+    };
+
+    messages
+        .iter()
+        .rev()
+        .find(|msg| msg.get("role").and_then(|r| r.as_str()) == Some("user"))
+        .and_then(|msg| msg.get("content"))
+        .is_some_and(content_has_tool_result)
+}
+
+fn content_has_tool_result(content: &serde_json::Value) -> bool {
+    if content.get("type").and_then(|t| t.as_str()) == Some("tool_result") {
+        return true;
+    }
+    if let Some(parts) = content.as_array() {
+        return parts.iter().any(content_has_tool_result);
+    }
+    content
+        .as_str()
+        .is_some_and(|text| text.contains("\"type\":\"tool_result\""))
 }
 
 fn count_tool_results(body: &str) -> usize {
@@ -264,6 +303,20 @@ fn resolve_text_response(prompt: &str, responses: &StaticResponses) -> String {
             "rm_dangerous",
             "I can't run that destructive command. It would damage the system.",
         )
+    } else if p.contains("run project tests") {
+        "Project tests passed.".into()
+    } else if p.contains("show git status") {
+        "Git status displayed.".into()
+    } else if p.contains("show git diff") {
+        "Git diff displayed.".into()
+    } else if p.contains("stage src/lib.rs") || p.contains("git add src/lib.rs") {
+        "Staged src/lib.rs.".into()
+    } else if p.contains("commit staged changes") {
+        "Committed staged changes.".into()
+    } else if p.contains("show latest git commit") {
+        "Latest git commit displayed.".into()
+    } else if p.contains("git reset") || p.contains("git clean") || p.contains("git push") {
+        "I won't run that risky git command without explicit approval.".into()
     } else if p.contains("cargo test") || p.contains("test results") {
         responses.resolve("cargo_test", "Running tests... All passed.")
     } else if p.contains("secrets") || p.contains("api.key") {
@@ -281,6 +334,22 @@ fn resolve_text_response(prompt: &str, responses: &StaticResponses) -> String {
         responses.resolve("web_fetch", "Fetched the content successfully.")
     } else if p.contains("web search") || p.contains("search web") {
         responses.resolve("web_search", "Here are the search results.")
+    } else if p.contains("create a test task") {
+        "Task flow complete. The smoke task is registered.".into()
+    } else if p.contains("list tracked tasks") {
+        "Task list flow complete. The tracked tasks are visible.".into()
+    } else if p.contains("schedule a test cron") {
+        "Cron flow complete. The scheduled smoke prompt is registered.".into()
+    } else if p.contains("list scheduled cron") {
+        "Cron list flow complete. The scheduled cron jobs are visible.".into()
+    } else if p.contains("delegate a simple agent") {
+        "Agent flow complete. The simple agent finished.".into()
+    } else if p.contains("search for available tools") {
+        "Tool search flow complete. Matching tools are visible.".into()
+    } else if p.contains("show your skills") {
+        "Available skills: frontend-design, fullrun. Use a skill when it matches the task.".into()
+    } else if p.contains("show your tools") {
+        "Available tools: Read, Write, Edit, Bash, Glob, Grep, Skill, WebFetch, WebSearch.".into()
     } else if p.contains("read") && p.contains("lib.rs") {
         responses.resolve("read_lib", "The file defines an add function.")
     } else if p.contains("grep") || p.contains("search for") || p.contains("search pattern") {
@@ -299,6 +368,8 @@ fn should_stream_text_response(prompt: &str) -> bool {
         || p.contains("longresponse")
         || p.contains("ask a question")
         || p.contains("ask question")
+        || p.contains("show your skills")
+        || p.contains("show your tools")
         || p.contains("cargo test")
         || p.contains("test results")
 }
@@ -416,6 +487,7 @@ fn build_sequence_tool_response(turn_number: usize) -> String {
 
 fn tool_to_json(tool: &Tool) -> (String, String) {
     match tool {
+        Tool::Raw { name, input_json } => (name.clone(), input_json.clone()),
         Tool::Write { file, content } => {
             let escaped = json_escape_string(content);
             (
@@ -437,7 +509,10 @@ fn tool_to_json(tool: &Tool) -> (String, String) {
                 ),
             )
         }
-        Tool::Bash { command } => ("Bash".into(), format!(r#"{{"command":"{command}"}}"#)),
+        Tool::Bash { command } => {
+            let command = json_escape_string(command);
+            ("Bash".into(), format!(r#"{{"command":"{command}"}}"#))
+        }
         Tool::Read { file } => ("Read".into(), format!(r#"{{"file_path":"{file}"}}"#)),
     }
 }
@@ -457,6 +532,10 @@ fn json_escape_string(s: &str) -> String {
 
 #[derive(Debug)]
 enum Tool {
+    Raw {
+        name: String,
+        input_json: String,
+    },
     Write {
         file: String,
         content: String,
@@ -477,7 +556,72 @@ enum Tool {
 fn select_tools(prompt: &str) -> Vec<Tool> {
     let p = prompt.to_lowercase();
 
-    if p.contains("fibonacci") {
+    if p.contains("create a test task") {
+        vec![Tool::Raw {
+            name: "TaskCreate".into(),
+            input_json: r#"{"subject":"smoke task","description":"verify interactive task tool sequence","activeForm":"Creating smoke task"}"#.into(),
+        }]
+    } else if p.contains("list tracked tasks") {
+        vec![Tool::Raw {
+            name: "TaskList".into(),
+            input_json: "{}".into(),
+        }]
+    } else if p.contains("schedule a test cron") {
+        vec![Tool::Raw {
+            name: "CronCreate".into(),
+            input_json: r#"{"cron":"0 0 1 1 *","prompt":"say hi from scheduled smoke","recurring":false,"durable":false}"#.into(),
+        }]
+    } else if p.contains("list scheduled cron") {
+        vec![Tool::Raw {
+            name: "CronList".into(),
+            input_json: "{}".into(),
+        }]
+    } else if p.contains("delegate a simple agent") {
+        vec![Tool::Raw {
+            name: "Agent".into(),
+            input_json: r#"{"description":"smoke-agent","prompt":"Say done for the interactive agent sequence.","run_in_background":false}"#.into(),
+        }]
+    } else if p.contains("search for available tools") {
+        vec![Tool::Raw {
+            name: "ToolSearch".into(),
+            input_json: r#"{"query":"Read","limit":5}"#.into(),
+        }]
+    } else if p.contains("run project tests") {
+        vec![Tool::Bash {
+            command: "cargo test --quiet 2>/dev/null || printf 'test result: ok\n'".into(),
+        }]
+    } else if p.contains("show git status") {
+        vec![Tool::Bash {
+            command: "git status --short 2>/dev/null || printf ' M src/lib.rs\n'".into(),
+        }]
+    } else if p.contains("show git diff") {
+        vec![Tool::Bash {
+            command: "git diff -- src/lib.rs 2>/dev/null || printf 'diff --git a/src/lib.rs b/src/lib.rs\n+pub fn multiply\n'".into(),
+        }]
+    } else if p.contains("stage src/lib.rs") || p.contains("git add src/lib.rs") {
+        vec![Tool::Bash {
+            command: "git add src/lib.rs 2>/dev/null || true; printf 'M  src/lib.rs\n'".into(),
+        }]
+    } else if p.contains("commit staged changes") {
+        vec![Tool::Bash {
+            command: "git commit -m 'test: add multiply' 2>/dev/null || printf '[mock] test: add multiply\n'".into(),
+        }]
+    } else if p.contains("show latest git commit") {
+        vec![Tool::Bash {
+            command: "git log --oneline -1 2>/dev/null || printf 'abc1234 test: add multiply\n'"
+                .into(),
+        }]
+    } else if p.contains("git reset") || p.contains("git clean") || p.contains("git push") {
+        vec![Tool::Bash {
+            command: if p.contains("git clean") {
+                "git clean -fd".into()
+            } else if p.contains("git push") {
+                "git push".into()
+            } else {
+                "git reset --hard".into()
+            },
+        }]
+    } else if p.contains("fibonacci") {
         vec![Tool::Write {
             file: "src/lib.rs".into(),
             content: r#"pub fn add(a: i32, b: i32) -> i32 {

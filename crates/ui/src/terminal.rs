@@ -3,6 +3,7 @@
 use crate::message_list::{Message, MessageRole};
 use crate::state::UiState;
 use crate::statusline::Statusline;
+use crate::themes::Theme;
 use crossterm::execute;
 use crossterm::terminal::{EnterAlternateScreen, LeaveAlternateScreen};
 use ratatui::Frame;
@@ -149,13 +150,18 @@ impl TerminalUi {
             // Notification bar (index 2)
             if show_notif {
                 let notif_idx = if inline_palette_height > 0 { 2 } else { 1 };
-                render_notification_bar(frame, chunks[notif_idx], &mut state.notifications);
+                render_notification_bar(
+                    frame,
+                    chunks[notif_idx],
+                    &mut state.notifications,
+                    &state.theme,
+                );
             }
 
             // Statusline (above input)
             if show_statusline {
                 let sl_idx = 1 + (inline_palette_height > 0) as usize + (show_notif) as usize;
-                render_statusline(frame, chunks[sl_idx], &state.statusline);
+                render_statusline(frame, chunks[sl_idx], &state.statusline, &state.theme);
             }
 
             // Input line
@@ -164,12 +170,12 @@ impl TerminalUi {
             } else {
                 chunks.len() - 1
             };
-            render_input(frame, chunks[input_idx], &state.input);
+            render_input(frame, chunks[input_idx], &state.input, &state.theme);
 
             // Permission bar (below input)
             if show_perm_bar {
                 let perm_idx = chunks.len() - 1;
-                render_permission_bar(frame, chunks[perm_idx], &state.permission_bar);
+                render_permission_bar(frame, chunks[perm_idx], &state.permission_bar, &state.theme);
             }
 
             // Overlay (only non-palette overlays; palette is rendered inline)
@@ -285,7 +291,7 @@ fn hex_to_color(hex: &str) -> Color {
         let b = u8::from_str_radix(&hex[4..6], 16).unwrap_or(255);
         Color::Rgb(r, g, b)
     } else {
-        Color::White
+        Color::Reset
     }
 }
 
@@ -379,15 +385,31 @@ fn render_messages(frame: &mut Frame, area: ratatui::layout::Rect, state: &mut U
                 >= state.messages.messages.len().saturating_sub(1));
 
     if state.messages.scroll_offset > 0 {
-        let mut lines = render_all_message_lines(&state.messages.messages, width, is_compact);
-        if lines.is_empty() {
-            lines.extend(render_welcome_art());
+        let signature = message_render_signature(&state.messages.messages, &state.theme);
+        let cache_valid = state.messages.render_cache.width == width
+            && state.messages.render_cache.is_compact == is_compact
+            && state.messages.render_cache.signature == signature;
+        if !cache_valid {
+            let mut lines =
+                render_all_message_lines(&state.messages.messages, width, is_compact, &state.theme);
+            if lines.is_empty() {
+                lines.extend(render_welcome_art(&state.theme));
+            }
+            state.messages.render_cache.width = width;
+            state.messages.render_cache.is_compact = is_compact;
+            state.messages.render_cache.signature = signature;
+            state.messages.render_cache.lines = lines;
         }
-        state.messages.total_height = lines.len();
-        let max_scroll = lines.len().saturating_sub(viewport_height);
+        state.messages.total_height = state.messages.render_cache.lines.len();
+        let max_scroll = state
+            .messages
+            .render_cache
+            .lines
+            .len()
+            .saturating_sub(viewport_height);
         state.messages.scroll_offset = state.messages.scroll_offset.min(max_scroll);
-        lines = trim_lines_to_viewport_with_scroll(
-            lines,
+        let lines = slice_lines_to_viewport_with_scroll(
+            &state.messages.render_cache.lines,
             viewport_height,
             state.messages.scroll_offset,
         );
@@ -419,12 +441,12 @@ fn render_messages(frame: &mut Frame, area: ratatui::layout::Rect, state: &mut U
     let mut lines: Vec<Line> = Vec::new();
 
     for msg in visible {
-        append_message_lines(&mut lines, msg, width, is_compact);
+        append_message_lines(&mut lines, msg, width, is_compact, &state.theme);
     }
 
     // If no messages, show dynamic welcome art
     if lines.is_empty() {
-        lines.extend(render_welcome_art());
+        lines.extend(render_welcome_art(&state.theme));
     }
 
     state.messages.total_height = lines.len();
@@ -493,12 +515,32 @@ fn render_all_message_lines(
     messages: &[Message],
     width: usize,
     is_compact: bool,
+    theme: &Theme,
 ) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
     for msg in messages {
-        append_message_lines(&mut lines, msg, width, is_compact);
+        append_message_lines(&mut lines, msg, width, is_compact, theme);
     }
     lines
+}
+
+fn message_render_signature(messages: &[Message], theme: &Theme) -> u64 {
+    let mut signature = (messages.len() as u64) ^ theme.render_signature();
+    for (idx, msg) in messages.iter().enumerate() {
+        signature = signature
+            .wrapping_mul(16_777_619)
+            .wrapping_add(idx as u64)
+            .wrapping_add((msg.role as u8) as u64)
+            .wrapping_add((msg.content.len() as u64) << 8)
+            .wrapping_add((msg.streaming as u64) << 48)
+            .wrapping_add((msg.folded as u64) << 49);
+        if let Some(tool) = &msg.tool_name {
+            signature = signature
+                .wrapping_mul(16_777_619)
+                .wrapping_add(tool.len() as u64);
+        }
+    }
+    signature
 }
 
 fn append_message_lines(
@@ -506,6 +548,7 @@ fn append_message_lines(
     msg: &Message,
     width: usize,
     is_compact: bool,
+    theme: &Theme,
 ) {
     if !is_compact
         && !lines.is_empty()
@@ -516,7 +559,7 @@ fn append_message_lines(
 
     // Handle folded messages
     if msg.folded {
-        let style = Style::default().fg(Color::DarkGray);
+        let style = Style::default().fg(theme.dim);
         let fold_indicator = format!(
             "▸ {} [+{} lines folded]",
             match msg.role {
@@ -534,16 +577,15 @@ fn append_message_lines(
 
     let prefix = message_prefix(msg.role);
     let style = match msg.role {
-        MessageRole::User => Style::default()
-            .fg(Color::Green)
-            .add_modifier(Modifier::BOLD),
+        MessageRole::User => Style::default().fg(theme.user).add_modifier(Modifier::BOLD),
         MessageRole::Assistant => Style::default()
-            .fg(Color::LightGreen)
+            .fg(theme.assistant)
             .add_modifier(Modifier::BOLD),
-        MessageRole::ToolResult => Style::default().fg(Color::Yellow),
-        MessageRole::ToolCall => Style::default().fg(Color::Magenta),
-        MessageRole::System => Style::default().fg(Color::Gray),
+        MessageRole::ToolResult => Style::default().fg(theme.tool),
+        MessageRole::ToolCall => Style::default().fg(theme.tool),
+        MessageRole::System => Style::default().fg(theme.dim),
     };
+    let body_style = Style::default().fg(theme.foreground);
 
     let prefix_width = unicode_width::UnicodeWidthStr::width(prefix);
     let wrap_width = width.saturating_sub(prefix_width);
@@ -566,7 +608,7 @@ fn append_message_lines(
     let use_highlight = msg.role == MessageRole::Assistant && msg.content.contains("```");
 
     if use_highlight && !msg.streaming {
-        let spans = highlight_spans(&msg.content, style);
+        let spans = highlight_spans(&msg.content, body_style);
         // Flatten spans into wrapped lines.
         let mut line_spans: Vec<Span> = Vec::new();
         let mut line_width = prefix_width;
@@ -582,7 +624,7 @@ fn append_message_lines(
                     let mut final_spans = if is_first_line {
                         vec![Span::styled(prefix, style)]
                     } else {
-                        vec![Span::styled(" ".repeat(prefix_width), style)]
+                        vec![Span::styled(" ".repeat(prefix_width), body_style)]
                     };
                     final_spans.extend(std::mem::take(&mut line_spans));
                     lines.push(Line::from(final_spans));
@@ -590,7 +632,7 @@ fn append_message_lines(
                     is_first_line = false;
                 }
                 if !line_spans.is_empty() {
-                    line_spans.push(Span::styled(" ", style));
+                    line_spans.push(Span::styled(" ", body_style));
                     line_width += 1;
                 }
                 line_spans.push(Span::styled(word.to_string(), span.style));
@@ -601,7 +643,7 @@ fn append_message_lines(
                 let mut final_spans = if is_first_line {
                     vec![Span::styled(prefix, style)]
                 } else {
-                    vec![Span::styled(" ".repeat(prefix_width), style)]
+                    vec![Span::styled(" ".repeat(prefix_width), body_style)]
                 };
                 final_spans.extend(std::mem::take(&mut line_spans));
                 lines.push(Line::from(final_spans));
@@ -614,7 +656,7 @@ fn append_message_lines(
             let mut final_spans = if is_first_line {
                 vec![Span::styled(prefix, style)]
             } else {
-                vec![Span::styled(" ".repeat(prefix_width), style)]
+                vec![Span::styled(" ".repeat(prefix_width), body_style)]
             };
             final_spans.extend(line_spans);
             lines.push(Line::from(final_spans));
@@ -626,9 +668,9 @@ fn append_message_lines(
                 lines.push(Line::from(vec![
                     Span::styled(prefix, style),
                     if msg.streaming {
-                        Span::styled(text, style.add_modifier(Modifier::DIM))
+                        Span::styled(text, body_style.add_modifier(Modifier::DIM))
                     } else {
-                        Span::raw(text)
+                        Span::styled(text, body_style)
                     },
                 ]));
             } else {
@@ -636,9 +678,9 @@ fn append_message_lines(
                 lines.push(Line::from(vec![
                     Span::styled(indent, style),
                     if msg.streaming {
-                        Span::styled(text, style.add_modifier(Modifier::DIM))
+                        Span::styled(text, body_style.add_modifier(Modifier::DIM))
                     } else {
-                        Span::raw(text)
+                        Span::styled(text, body_style)
                     },
                 ]));
             }
@@ -651,7 +693,7 @@ fn append_message_lines(
     {
         lines.push(Line::from(Span::styled(
             format!("  [{tool}]"),
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(theme.dim),
         )));
     }
 }
@@ -663,13 +705,13 @@ fn trim_lines_to_viewport(mut lines: Vec<Line>, viewport_height: usize) -> Vec<L
     lines.split_off(lines.len() - viewport_height)
 }
 
-fn trim_lines_to_viewport_with_scroll(
-    lines: Vec<Line<'static>>,
+fn slice_lines_to_viewport_with_scroll(
+    lines: &[Line<'static>],
     viewport_height: usize,
     scroll_offset: usize,
 ) -> Vec<Line<'static>> {
     if viewport_height == 0 || lines.len() <= viewport_height {
-        return lines;
+        return lines.to_vec();
     }
 
     let end = lines
@@ -677,15 +719,11 @@ fn trim_lines_to_viewport_with_scroll(
         .saturating_sub(scroll_offset)
         .max(viewport_height);
     let start = end.saturating_sub(viewport_height);
-    lines
-        .into_iter()
-        .skip(start)
-        .take(viewport_height)
-        .collect()
+    lines[start..end.min(lines.len())].to_vec()
 }
 
 /// Dynamic welcome art — cycles between T-Rex ASCII, tips, and hints.
-fn render_welcome_art() -> Vec<Line<'static>> {
+fn render_welcome_art(theme: &Theme) -> Vec<Line<'static>> {
     const TIPS: &[&str] = &[
         "  Tip: Press / for commands, Ctrl+C to interrupt.",
         "  Tip: Type /vim to enable Vim keybindings.",
@@ -702,7 +740,7 @@ fn render_welcome_art() -> Vec<Line<'static>> {
     for line in T_REX.lines() {
         lines.push(Line::from(Span::styled(
             line.to_string(),
-            Style::default().fg(Color::Green),
+            Style::default().fg(theme.assistant),
         )));
     }
     lines.push(Line::from(Span::raw("")));
@@ -711,12 +749,12 @@ fn render_welcome_art() -> Vec<Line<'static>> {
     let tip = TIPS[0]; // In production, rotate based on frame count
     lines.push(Line::from(Span::styled(
         tip.to_string(),
-        Style::default().fg(Color::DarkGray),
+        Style::default().fg(theme.dim),
     )));
 
     lines.push(Line::from(Span::styled(
         "  Welcome to CodeRex. Type a message and press Enter.".to_string(),
-        Style::default().fg(Color::DarkGray),
+        Style::default().fg(theme.dim),
     )));
 
     lines
@@ -727,17 +765,18 @@ fn render_notification_bar(
     frame: &mut Frame,
     area: ratatui::layout::Rect,
     center: &mut crate::notification_center::NotificationCenter,
+    theme: &Theme,
 ) {
     use crate::notification_center::NotificationKind;
 
     if let Some(notif) = center.latest() {
         let (icon, color) = match notif.kind {
-            NotificationKind::Info => ("ℹ", Color::Blue),
-            NotificationKind::Warning => ("⚠", Color::Yellow),
-            NotificationKind::Error => ("✗", Color::Red),
-            NotificationKind::Success => ("✓", Color::Green),
-            NotificationKind::Teaser => ("✦", Color::Magenta),
-            NotificationKind::Progress => ("⟳", Color::Cyan),
+            NotificationKind::Info => ("ℹ", theme.notif_info),
+            NotificationKind::Warning => ("⚠", theme.notif_warning),
+            NotificationKind::Error => ("✗", theme.notif_error),
+            NotificationKind::Success => ("✓", theme.success),
+            NotificationKind::Teaser => ("✦", theme.tool),
+            NotificationKind::Progress => ("⟳", theme.accent_secondary),
         };
         let text = format!(
             " {} {}  ({} unseen)",
@@ -745,10 +784,7 @@ fn render_notification_bar(
             notif.message,
             center.unseen_count()
         );
-        let line = Line::from(Span::styled(
-            text,
-            Style::default().fg(color).bg(Color::Black),
-        ));
+        let line = Line::from(Span::styled(text, Style::default().fg(color)));
         let paragraph = Paragraph::new(line);
         frame.render_widget(paragraph, area);
 
@@ -767,7 +803,7 @@ fn render_left_pane(frame: &mut Frame, area: ratatui::layout::Rect, state: &UiSt
     let wrapped = wrap_text(content, area.width.saturating_sub(2) as usize);
     let lines: Vec<Line> = wrapped
         .into_iter()
-        .map(|s| Line::from(Span::styled(s, Style::default().fg(Color::White))))
+        .map(|s| Line::from(Span::styled(s, Style::default().fg(state.theme.foreground))))
         .collect();
 
     let title = if state.left_pane_title.is_empty() {
@@ -779,13 +815,18 @@ fn render_left_pane(frame: &mut Frame, area: ratatui::layout::Rect, state: &UiSt
     let block = Block::default()
         .borders(Borders::ALL)
         .title(title)
-        .style(Style::default().fg(Color::Gray));
+        .style(Style::default().fg(state.theme.border));
 
     let paragraph = Paragraph::new(lines).block(block);
     frame.render_widget(paragraph, area);
 }
 
-fn render_statusline(frame: &mut Frame, area: ratatui::layout::Rect, statusline: &Statusline) {
+fn render_statusline(
+    frame: &mut Frame,
+    area: ratatui::layout::Rect,
+    statusline: &Statusline,
+    theme: &Theme,
+) {
     let rendered = statusline.render(area.width as usize);
     let spans = rendered
         .split(" | ")
@@ -793,7 +834,7 @@ fn render_statusline(frame: &mut Frame, area: ratatui::layout::Rect, statusline:
         .collect::<Vec<_>>();
     let line = Line::from(spans);
     let paragraph = Paragraph::new(line)
-        .style(Style::default().fg(Color::White))
+        .style(Style::default().fg(theme.statusbar_fg))
         .alignment(Alignment::Left);
     frame.render_widget(paragraph, area);
 }
@@ -802,8 +843,9 @@ fn render_permission_bar(
     frame: &mut Frame,
     area: ratatui::layout::Rect,
     bar: &crate::permission_bar::PermissionBar,
+    theme: &Theme,
 ) {
-    let color = bar.color();
+    let color = bar.color(theme);
     let left_padding = 2usize.min(area.width as usize);
     let rendered = format!(
         "{}{}",
@@ -815,13 +857,21 @@ fn render_permission_bar(
     frame.render_widget(paragraph, area);
 }
 
-fn render_input(frame: &mut Frame, area: ratatui::layout::Rect, input: &crate::input::InputBuffer) {
+fn render_input(
+    frame: &mut Frame,
+    area: ratatui::layout::Rect,
+    input: &crate::input::InputBuffer,
+    theme: &Theme,
+) {
     let cursor = input.cursor.min(input.text.len());
-    let mut spans: Vec<Span> = vec![Span::raw("❯ "), Span::raw(input.text.clone())];
+    let mut spans: Vec<Span> = vec![
+        Span::styled("❯ ", Style::default().fg(theme.accent)),
+        Span::styled(input.text.clone(), Style::default().fg(theme.input_fg)),
+    ];
     if let Some(ref sug) = input.suggestion {
         spans.push(Span::styled(
             format!("  {sug}"),
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(theme.dim),
         ));
     }
     let line = Line::from(spans);
@@ -850,10 +900,10 @@ fn render_inline_palette(frame: &mut Frame, area: ratatui::layout::Rect, state: 
         Span::styled(
             "Commands ",
             Style::default()
-                .fg(Color::White)
+                .fg(state.theme.foreground)
                 .add_modifier(Modifier::BOLD),
         ),
-        Span::styled(format!("[{query}]"), Style::default().fg(Color::Gray)),
+        Span::styled(format!("[{query}]"), Style::default().fg(state.theme.dim)),
     ]));
 
     let available_rows = area.height.saturating_sub(1) as usize;
@@ -862,7 +912,7 @@ fn render_inline_palette(frame: &mut Frame, area: ratatui::layout::Rect, state: 
         let paragraph = Paragraph::new(lines).block(
             Block::default()
                 .borders(Borders::NONE)
-                .style(Style::default().bg(Color::DarkGray)),
+                .style(Style::default().fg(state.theme.foreground)),
         );
         frame.render_widget(paragraph, area);
         return;
@@ -873,9 +923,11 @@ fn render_inline_palette(frame: &mut Frame, area: ratatui::layout::Rect, state: 
 
     for i in start..(start + visible_count).min(commands.len()) {
         let style = if i == *selected {
-            Style::default().fg(Color::Black).bg(Color::Cyan)
+            Style::default()
+                .fg(state.theme.selection_fg)
+                .bg(state.theme.selection_bg)
         } else {
-            Style::default().fg(Color::White)
+            Style::default().fg(state.theme.foreground)
         };
         lines.push(Line::from(Span::styled(commands[i].clone(), style)));
     }
@@ -883,7 +935,7 @@ fn render_inline_palette(frame: &mut Frame, area: ratatui::layout::Rect, state: 
     let paragraph = Paragraph::new(lines).block(
         Block::default()
             .borders(Borders::NONE)
-            .style(Style::default().bg(Color::DarkGray)),
+            .style(Style::default().fg(state.theme.foreground)),
     );
     frame.render_widget(paragraph, area);
 }
@@ -938,8 +990,13 @@ fn render_overlay(frame: &mut Frame, area: ratatui::layout::Rect, state: &UiStat
         Overlay::CommandPalette { .. } => "Commands",
         Overlay::Confirm { .. } => "Confirm",
     };
-    let block = Block::default().borders(Borders::ALL).title(title);
-    let paragraph = Paragraph::new(content).block(block);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(title)
+        .style(Style::default().fg(state.theme.overlay_border));
+    let paragraph = Paragraph::new(content)
+        .style(Style::default().fg(state.theme.foreground))
+        .block(block);
 
     // Center the overlay
     let w = 50.min(area.width - 4);
@@ -1035,7 +1092,7 @@ mod tests {
             Line::from("line 4"),
             Line::from("line 5"),
         ];
-        let trimmed = trim_lines_to_viewport_with_scroll(lines, 2, 2);
+        let trimmed = slice_lines_to_viewport_with_scroll(&lines, 2, 2);
 
         assert_eq!(trimmed.len(), 2);
         assert_eq!(trimmed[0].to_string(), "line 2");
@@ -1061,7 +1118,8 @@ mod tests {
             },
         ];
 
-        let lines = render_all_message_lines(&messages, 80, false);
+        let theme = Theme::dark();
+        let lines = render_all_message_lines(&messages, 80, false, &theme);
 
         assert_eq!(lines[0].to_string(), "● hello");
         assert_eq!(lines[1].to_string(), "");

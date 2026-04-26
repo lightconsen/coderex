@@ -552,6 +552,8 @@ pub struct ReplLoop {
     query_start_time: Option<std::time::Instant>,
     /// Whether Vim keybindings are enabled for interactive input.
     vim_mode_enabled: bool,
+    /// Active TUI theme name.
+    current_theme: String,
     /// Session id to resume into the current interactive loop.
     resume_session: Option<String>,
 }
@@ -599,16 +601,19 @@ impl coderex_core::tool_executor::ToolExecutor for PluginToolFallbackExecutor {
     ) -> coderex_core::tool_executor::ToolDispatchOutcome {
         let primary = self.primary.execute(tool_call_id, tool_name, input).await;
 
-        let is_not_found = primary.result.is_error
-            && (primary.result.output.contains("not found")
-                || primary.result.output.contains("not registered"));
-
-        if is_not_found {
+        if primary.result.is_error && primary_tool_was_missing(&primary.result.output, tool_name) {
             self.plugin.execute(tool_call_id, tool_name, input).await
         } else {
             primary
         }
     }
+}
+
+fn primary_tool_was_missing(output: &str, tool_name: &str) -> bool {
+    output == format!("tool '{tool_name}' not found in registry")
+        || output.starts_with(&format!(
+            "tool '{tool_name}' is not registered in this engine;"
+        ))
 }
 
 impl ReplLoop {
@@ -675,6 +680,7 @@ impl ReplLoop {
             debug_file: None,
             query_start_time: None,
             vim_mode_enabled: false,
+            current_theme: "dark".into(),
             resume_session: None,
         };
         this.init_command_persistence();
@@ -836,6 +842,7 @@ impl ReplLoop {
             debug_file: None,
             query_start_time: None,
             vim_mode_enabled: false,
+            current_theme: "dark".into(),
             resume_session: None,
         };
         this.init_command_persistence();
@@ -3052,7 +3059,24 @@ impl ReplLoop {
             return true;
         }
 
+        if cmd_name == "theme" && result.state_changed {
+            if let Some(theme_name) = result.output.strip_prefix("Theme changed to: ") {
+                self.current_theme = theme_name.trim().to_string();
+                return true;
+            }
+        }
+
         false
+    }
+
+    fn apply_tui_theme(&self, ui_state: &mut coderex_ui::state::UiState, theme_name: &str) -> bool {
+        let manager = coderex_ui::themes::ThemeManager::new();
+        if let Some(theme) = manager.get_theme(theme_name) {
+            ui_state.theme = theme.clone();
+            true
+        } else {
+            false
+        }
     }
 
     fn extract_read_path(prompt: &str) -> Option<String> {
@@ -3639,6 +3663,15 @@ impl ReplLoop {
         let ctx = self.build_context();
         let result = self.commands.execute(cmd_name, &ctx, args);
         self.sync_command_state(cmd_name, &result);
+        if cmd_name == "theme" && result.state_changed {
+            if let Some(theme_name) = args.first() {
+                if self.apply_tui_theme(ui_state, theme_name) {
+                    ui_state
+                        .notifications
+                        .info(format!("Theme changed to: {theme_name}"));
+                }
+            }
+        }
 
         if cmd_name == "clear" && result.state_changed {
             self.clear_tui_session(ui_state, result.output.clone());
@@ -4386,6 +4419,7 @@ impl ReplLoop {
         ctx.message_count = message_count;
         ctx.permission_mode = permission_mode;
         ctx.vim_mode = self.vim_mode_enabled;
+        ctx.theme = self.current_theme.clone();
         ctx.git_branch = current_git_branch(&self.cwd);
         ctx.version = env!("CARGO_PKG_VERSION").to_string();
         ctx.feature_flags = HashMap::new();
@@ -4491,6 +4525,30 @@ mod tests {
         }
     }
 
+    #[derive(Clone)]
+    struct FixedResultToolExecutor {
+        output: String,
+        is_error: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl CoreToolExecutor for FixedResultToolExecutor {
+        async fn execute(
+            &self,
+            tool_call_id: &str,
+            _tool_name: &str,
+            _input: &serde_json::Value,
+        ) -> ToolDispatchOutcome {
+            ToolDispatchOutcome {
+                result: ToolResult {
+                    tool_call_id: tool_call_id.to_string(),
+                    output: self.output.clone(),
+                    is_error: self.is_error,
+                },
+            }
+        }
+    }
+
     #[test]
     fn parse_empty_returns_none() {
         assert!(parse_input("").is_none());
@@ -4563,6 +4621,54 @@ mod tests {
         let tools = wrapped.list_tools();
         assert_eq!(tools.len(), 1);
         assert_eq!(tools[0].name, "Read");
+    }
+
+    #[tokio::test]
+    async fn plugin_fallback_preserves_primary_tool_errors_that_mention_not_found() {
+        let primary_output =
+            "Skill 'frontend-design' not found.\nAvailable skills: pdf".to_string();
+        let inner: Arc<dyn CoreToolExecutor + Send + Sync> = Arc::new(FixedResultToolExecutor {
+            output: primary_output.clone(),
+            is_error: true,
+        });
+        let primary = ArcToolExecutor(inner);
+        let plugin = Arc::new(coderex_plugins::tool_executor::PluginToolExecutor::new(
+            Arc::new(coderex_plugins::plugins::PluginManager::new()),
+        ));
+        let wrapped = PluginToolFallbackExecutor { primary, plugin };
+
+        let result = wrapped
+            .execute(
+                "tool_1",
+                "Skill",
+                &serde_json::json!({"skill":"frontend-design"}),
+            )
+            .await
+            .result;
+
+        assert_eq!(result.output, primary_output);
+        assert!(result.is_error);
+    }
+
+    #[tokio::test]
+    async fn plugin_fallback_runs_only_when_primary_tool_is_missing() {
+        let inner: Arc<dyn CoreToolExecutor + Send + Sync> = Arc::new(FixedResultToolExecutor {
+            output: "tool 'PluginCommand' not found in registry".into(),
+            is_error: true,
+        });
+        let primary = ArcToolExecutor(inner);
+        let plugin = Arc::new(coderex_plugins::tool_executor::PluginToolExecutor::new(
+            Arc::new(coderex_plugins::plugins::PluginManager::new()),
+        ));
+        let wrapped = PluginToolFallbackExecutor { primary, plugin };
+
+        let result = wrapped
+            .execute("tool_1", "PluginCommand", &serde_json::json!({}))
+            .await
+            .result;
+
+        assert_eq!(result.output, "Plugin tool 'PluginCommand' not found");
+        assert!(result.is_error);
     }
 
     #[test]

@@ -132,11 +132,21 @@ async fn accept_edits_mode_allows_read() {
     assert!(result.is_allowed());
 }
 
-// Note: In the current implementation, AcceptEdits behaves like Default
-// for dangerous tools because the PermissionChecker does not have special
-// handling for AcceptEdits beyond what Default provides.
 #[tokio::test]
-async fn accept_edits_mode_dangerous_tools_still_require_approval() {
+async fn accept_edits_mode_auto_allows_write() {
+    let mut engine = make_engine(PermissionMode::AcceptEdits);
+    let (_req, result) = engine
+        .evaluate("Write", "{}".into(), None, ctx())
+        .await
+        .unwrap();
+    assert!(
+        result.is_allowed(),
+        "Write should be allowed in AcceptEdits mode"
+    );
+}
+
+#[tokio::test]
+async fn accept_edits_mode_shell_still_requires_approval() {
     let mut engine = make_engine(PermissionMode::AcceptEdits);
     let (_req, result) = engine
         .evaluate("Bash", "{}".into(), None, ctx())

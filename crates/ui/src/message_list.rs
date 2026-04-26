@@ -1,6 +1,7 @@
 //! Message list — user/assistant/tool message rendering with virtualization.
 
 use compact_str::CompactString;
+use ratatui::text::Line;
 
 /// Type of message role.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -32,6 +33,19 @@ pub struct Message {
     pub folded: bool,
 }
 
+/// Cached fully-rendered transcript lines used for fast scrollback.
+#[derive(Debug, Default)]
+pub struct RenderedMessageCache {
+    /// Width used to render the cached lines.
+    pub width: usize,
+    /// Whether compact rendering was used.
+    pub is_compact: bool,
+    /// Lightweight signature of the message list at render time.
+    pub signature: u64,
+    /// Rendered transcript lines.
+    pub lines: Vec<Line<'static>>,
+}
+
 /// Virtualized viewport into a message list.
 #[derive(Debug)]
 pub struct MessageView {
@@ -47,6 +61,8 @@ pub struct MessageView {
     pub viewport_height: usize,
     /// Number of rendered lines scrolled up from the newest content.
     pub scroll_offset: usize,
+    /// Cache for rendered transcript lines while scrolling through history.
+    pub render_cache: RenderedMessageCache,
 }
 
 impl MessageView {
@@ -60,6 +76,7 @@ impl MessageView {
             total_height: 0,
             viewport_height: 0,
             scroll_offset: 0,
+            render_cache: RenderedMessageCache::default(),
         }
     }
 

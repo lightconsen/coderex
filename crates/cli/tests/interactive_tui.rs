@@ -112,7 +112,7 @@ struct PtySession {
 
 impl PtySession {
     fn launch(cwd: &Path, extra_envs: &[(String, String)], model: &str) -> Self {
-        Self::launch_with_persistence(cwd, extra_envs, model, false)
+        Self::launch_with_args(cwd, extra_envs, model, false, &[])
     }
 
     fn launch_with_persistence(
@@ -120,6 +120,16 @@ impl PtySession {
         extra_envs: &[(String, String)],
         model: &str,
         persist_session: bool,
+    ) -> Self {
+        Self::launch_with_args(cwd, extra_envs, model, persist_session, &[])
+    }
+
+    fn launch_with_args(
+        cwd: &Path,
+        extra_envs: &[(String, String)],
+        model: &str,
+        persist_session: bool,
+        args: &[&str],
     ) -> Self {
         let pty_system = native_pty_system();
         let pair = pty_system
@@ -137,6 +147,9 @@ impl PtySession {
         }
         cmd.arg("--model");
         cmd.arg(model);
+        for arg in args {
+            cmd.arg(arg);
+        }
         cmd.cwd(cwd);
         cmd.env("CODEREX_LOG", "off");
         for (key, value) in extra_envs {
@@ -368,6 +381,12 @@ fn session_with_static_server(cwd: &Path) -> (StaticServer, PtySession) {
     (server, session)
 }
 
+fn session_with_static_server_args(cwd: &Path, args: &[&str]) -> (StaticServer, PtySession) {
+    let server = StaticServer::start();
+    let session = PtySession::launch_with_args(cwd, &server.envs(), "K2.6", false, args);
+    (server, session)
+}
+
 fn session_with_static_server_persistent(cwd: &Path) -> (StaticServer, PtySession) {
     let server = StaticServer::start();
     let session = PtySession::launch_with_persistence(cwd, &server.envs(), "K2.6", true);
@@ -383,6 +402,123 @@ fn setup_project_dir() -> tempfile::TempDir {
     )
     .expect("write src/lib.rs");
     dir
+}
+
+fn setup_git_project_dir() -> tempfile::TempDir {
+    let dir = setup_project_dir();
+    std::fs::write(
+        dir.path().join("Cargo.toml"),
+        "[package]\nname = \"sequence-fixture\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    )
+    .expect("write Cargo.toml");
+
+    for args in [
+        &["init", "-q"][..],
+        &["config", "user.email", "sequence@example.invalid"][..],
+        &["config", "user.name", "Sequence Test"][..],
+        &["add", "Cargo.toml", "src/lib.rs"][..],
+        &["commit", "-q", "-m", "initial fixture"][..],
+    ] {
+        let status = Command::new("git")
+            .args(args)
+            .current_dir(dir.path())
+            .status()
+            .expect("run git setup command");
+        assert!(status.success(), "git setup command failed: {args:?}");
+    }
+
+    dir
+}
+
+fn approve_permission(session: &mut PtySession, raw_needle: &str) {
+    session.wait_for_raw_text(raw_needle, SCREEN_TIMEOUT);
+    session.send_text("a");
+}
+
+fn approve_permission_for_command(session: &mut PtySession, screen_needle: &str) {
+    session.wait_for_text("Permission Request", SCREEN_TIMEOUT);
+    session.wait_for_text(screen_needle, SCREEN_TIMEOUT);
+    session.send_text("a");
+}
+
+fn deny_permission(session: &mut PtySession, raw_needle: &str) {
+    session.wait_for_raw_text(raw_needle, SCREEN_TIMEOUT);
+    session.send_text("d");
+}
+
+fn deny_permission_for_tool(session: &mut PtySession, tool_needle: &str) {
+    session.wait_for_text("Permission Request", SCREEN_TIMEOUT);
+    session.wait_for_text(tool_needle, SCREEN_TIMEOUT);
+    session.send_text("d");
+}
+
+struct InteractionStep<'a> {
+    input: &'a str,
+    expect_any: &'a [&'a str],
+    wait_for_completion: bool,
+}
+
+impl<'a> InteractionStep<'a> {
+    fn prompt(input: &'a str, expect_any: &'a [&'a str]) -> Self {
+        Self {
+            input,
+            expect_any,
+            wait_for_completion: true,
+        }
+    }
+
+    fn slash(input: &'a str, expect_any: &'a [&'a str]) -> Self {
+        Self {
+            input,
+            expect_any,
+            wait_for_completion: false,
+        }
+    }
+}
+
+fn run_interaction_sequence(
+    session: &mut PtySession,
+    steps: &[InteractionStep<'_>],
+    forbidden_raw: &[&str],
+) {
+    for step in steps {
+        assert!(
+            !step.expect_any.contains(&"Completed in"),
+            "`Completed in` is only a lifecycle check; each step must assert a semantic result"
+        );
+        session.send_line(step.input);
+        session.wait_for_any_text(step.expect_any, SCREEN_TIMEOUT);
+        if step.wait_for_completion {
+            session.wait_for_text("Completed in", SCREEN_TIMEOUT);
+        }
+    }
+
+    let raw = strip_ansi(&session.raw_text());
+    for forbidden in forbidden_raw {
+        assert!(
+            !raw.contains(forbidden),
+            "interactive sequence emitted forbidden raw text {forbidden:?}"
+        );
+    }
+    assert!(raw.contains("❯"));
+}
+
+fn assert_raw_contains_any(session: &PtySession, needles: &[&str], context: &str) {
+    let raw = strip_ansi(&session.raw_text());
+    assert!(
+        needles.iter().any(|needle| raw.contains(needle)),
+        "expected raw output for {context} to contain one of {needles:?}\n--- raw ---\n{raw}"
+    );
+}
+
+fn assert_raw_absent(session: &PtySession, needles: &[&str]) {
+    let raw = strip_ansi(&session.raw_text());
+    for needle in needles {
+        assert!(
+            !raw.contains(needle),
+            "raw output unexpectedly contained {needle:?}\n--- raw ---\n{raw}"
+        );
+    }
 }
 
 fn have_live_env() -> bool {
@@ -844,6 +980,404 @@ fn five_turn_interaction_stays_usable() {
 }
 
 #[test]
+fn reported_skills_tools_sequence_stays_usable() {
+    let dir = setup_project_dir();
+    let (_server, mut session) = session_with_static_server(dir.path());
+    session.wait_for_text("CodeRex v", SCREEN_TIMEOUT);
+
+    run_interaction_sequence(
+        &mut session,
+        &[
+            InteractionStep::prompt("hi", &["Hello!"]),
+            InteractionStep::prompt("show your skills", &["Available skills:"]),
+            InteractionStep::prompt("show your tools", &["Available tools:"]),
+            InteractionStep::prompt("show your skills", &["Available skills:"]),
+            InteractionStep::prompt("show your tools", &["Available tools:"]),
+            InteractionStep::prompt("hi", &["Hello!"]),
+        ],
+        &[
+            "Plugin tool 'Skill' not found",
+            "provider returned no visible response",
+        ],
+    );
+}
+
+#[test]
+fn mixed_prompt_tool_sequence_matrix_stays_usable() {
+    let dir = setup_project_dir();
+    let (_server, mut session) = session_with_static_server(dir.path());
+    session.wait_for_text("CodeRex v", SCREEN_TIMEOUT);
+
+    run_interaction_sequence(
+        &mut session,
+        &[
+            InteractionStep::prompt("hi", &["Hello!"]),
+            InteractionStep::prompt("search for available tools", &["Tool search flow complete"]),
+            InteractionStep::prompt("show content of file", &["pub fn add", "a + b"]),
+            InteractionStep::prompt(
+                "create a test task",
+                &["[TaskCreate]", "Running TaskCreate"],
+            ),
+            InteractionStep::prompt(
+                "list tracked tasks",
+                &["smoke task", "[TaskList]", "Task list flow complete"],
+            ),
+            InteractionStep::prompt(
+                "schedule a test cron",
+                &["[CronCreate]", "Running CronCreate"],
+            ),
+            InteractionStep::prompt(
+                "list scheduled cron",
+                &[
+                    "say hi from scheduled smoke",
+                    "[CronList]",
+                    "Cron list flow complete",
+                ],
+            ),
+            InteractionStep::prompt(
+                "delegate a simple agent",
+                &["agent-smoke-agent", "[Agent]", "Agent flow complete"],
+            ),
+            InteractionStep::prompt("show your tools", &["Available tools:"]),
+            InteractionStep::prompt("hi", &["Hello!"]),
+        ],
+        &[
+            "provider returned no visible response",
+            "Plugin tool 'Skill' not found",
+            "MCP resource handle not available",
+        ],
+    );
+
+    assert_raw_contains_any(&session, &["ToolSearch"], "tool search path");
+    assert_raw_contains_any(&session, &["smoketask"], "task create/list result");
+    assert_raw_contains_any(
+        &session,
+        &["sayhifromscheduledsmoke"],
+        "cron create/list result",
+    );
+    assert_raw_contains_any(&session, &["agent-smoke-agent"], "agent result");
+}
+
+#[test]
+fn read_search_list_sequence_matrix_stays_usable() {
+    let dir = setup_project_dir();
+    let (_server, mut session) = session_with_static_server(dir.path());
+    session.wait_for_text("CodeRex v", SCREEN_TIMEOUT);
+
+    session.send_line("show content of file");
+    session.wait_for_any_text(&["pub fn add", "a + b"], SCREEN_TIMEOUT);
+    session.wait_for_text("Completed in", SCREEN_TIMEOUT);
+    assert_raw_contains_any(&session, &["pubfnadd"], "read file content");
+
+    session.send_line("search for add function");
+    approve_permission(&mut session, r#"Args:{"command":"grep-rn'fn'src/"}"#);
+    session.wait_for_any_text(
+        &["src/lib.rs", "Found the matching functions"],
+        SCREEN_TIMEOUT,
+    );
+    session.wait_for_text("Completed in", SCREEN_TIMEOUT);
+    assert_raw_contains_any(&session, &["grep-rn'fn'src/", "src/lib.rs"], "grep output");
+
+    session.send_line("list files in this directory");
+    approve_permission(&mut session, r#"Args:{"command":"find.-name'*.rs'-typef"}"#);
+    session.wait_for_any_text(&["src/lib.rs", "Here are the files"], SCREEN_TIMEOUT);
+    session.wait_for_text("Completed in", SCREEN_TIMEOUT);
+    assert_raw_contains_any(
+        &session,
+        &["find.-name'*.rs'-typef", "src/lib.rs"],
+        "list output",
+    );
+
+    session.send_line("/status");
+    let screen = session.wait_for_text("System Status", SCREEN_TIMEOUT);
+    assert!(screen.contains("System Status"));
+}
+
+#[test]
+fn code_write_and_git_sequence_matrix_stays_usable() {
+    let dir = setup_git_project_dir();
+    let (_server, mut session) = session_with_static_server(dir.path());
+    session.wait_for_text("CodeRex v", SCREEN_TIMEOUT);
+
+    session.send_line("add multiply function to src/lib.rs");
+    approve_permission(&mut session, "Waitingforpermission:Writingsrc/lib.rs");
+    session.wait_for_text("Completed in", SCREEN_TIMEOUT);
+    let updated = std::fs::read_to_string(dir.path().join("src/lib.rs")).expect("read src/lib.rs");
+    assert!(updated.contains("pub fn multiply"));
+
+    session.send_line("run project tests");
+    approve_permission_for_command(&mut session, "Running cargo test --quiet");
+    session.wait_for_text("Completed in", SCREEN_TIMEOUT);
+    assert_raw_contains_any(
+        &session,
+        &["testresult:ok", "Projecttestspassed"],
+        "project test output",
+    );
+
+    session.send_line("show git status");
+    approve_permission_for_command(&mut session, "Running git status --short");
+    session.wait_for_text("Completed in", SCREEN_TIMEOUT);
+    assert_raw_contains_any(
+        &session,
+        &["Msrc/lib.rs", "Gitstatusdisplayed"],
+        "git status output",
+    );
+
+    session.send_line("show git diff");
+    approve_permission_for_command(&mut session, "Running git diff -- src/lib.rs");
+    session.wait_for_text("Completed in", SCREEN_TIMEOUT);
+    assert_raw_contains_any(&session, &["multiply", "+pubfnmultiply"], "git diff output");
+
+    session.send_line("stage src/lib.rs");
+    approve_permission_for_command(&mut session, "Running git add src/lib.rs");
+    session.wait_for_text("Completed in", SCREEN_TIMEOUT);
+    assert_raw_contains_any(
+        &session,
+        &["Msrc/lib.rs", "Stagedsrc/lib.rs"],
+        "git add output",
+    );
+
+    session.send_line("commit staged changes");
+    approve_permission_for_command(&mut session, "Running git commit -m");
+    session.wait_for_text("Completed in", SCREEN_TIMEOUT);
+    assert_raw_contains_any(
+        &session,
+        &["test:addmultiply", "Committedstagedchanges"],
+        "git commit output",
+    );
+
+    session.send_line("show latest git commit");
+    approve_permission_for_command(&mut session, "Running git log --oneline -1");
+    session.wait_for_text("Completed in", SCREEN_TIMEOUT);
+    assert_raw_contains_any(
+        &session,
+        &["test:addmultiply", "Latestgitcommitdisplayed"],
+        "git log output",
+    );
+
+    session.send_line("/activity");
+    let screen = session.wait_for_any_text(
+        &["Recent Activity", "Running git log", "Running git commit"],
+        SCREEN_TIMEOUT,
+    );
+    assert!(
+        screen.contains("Recent Activity")
+            || screen.contains("Running git log")
+            || screen.contains("Running git commit")
+    );
+}
+
+#[test]
+fn dangerous_git_deny_sequence_matrix_stays_usable() {
+    let dir = setup_git_project_dir();
+    let (_server, mut session) = session_with_static_server(dir.path());
+    session.wait_for_text("CodeRex v", SCREEN_TIMEOUT);
+
+    session.send_line("run git reset --hard");
+    deny_permission(&mut session, r#"Args:{"command":"gitreset--hard"}"#);
+    session.wait_for_raw_text("Error:tool'Bash'denied", SCREEN_TIMEOUT);
+    session.wait_for_text("Completed in", SCREEN_TIMEOUT);
+
+    session.send_line("show git status");
+    approve_permission_for_command(&mut session, "Running git status --short");
+    session.wait_for_text("Completed in", SCREEN_TIMEOUT);
+    assert_raw_contains_any(
+        &session,
+        &["Msrc/lib.rs", "Gitstatusdisplayed"],
+        "post-denial git status output",
+    );
+
+    session.send_line("hi");
+    session.wait_for_text("Hello!", SCREEN_TIMEOUT);
+    session.wait_for_text("Completed in", SCREEN_TIMEOUT);
+
+    let raw = strip_ansi(&session.raw_text());
+    assert!(!raw.contains("provider returned no visible response"));
+    assert!(!raw.contains("Plugin tool 'Skill' not found"));
+}
+
+#[test]
+fn permission_mode_sequence_matrix_enforces_expected_policy() {
+    // Default: read-only tools run without prompting.
+    {
+        let dir = setup_project_dir();
+        let (_server, mut session) =
+            session_with_static_server_args(dir.path(), &["--permissions", "default"]);
+        session.wait_for_text("CodeRex v", SCREEN_TIMEOUT);
+        session.send_line("show content of file");
+        session.wait_for_any_text(&["pub fn add", "a + b"], SCREEN_TIMEOUT);
+        session.wait_for_text("Completed in", SCREEN_TIMEOUT);
+        assert_raw_absent(&session, &["PermissionRequest", "Waitingforpermission"]);
+    }
+
+    // Default: dangerous file edits ask and can be denied without side effects.
+    {
+        let dir = setup_project_dir();
+        let (_server, mut session) =
+            session_with_static_server_args(dir.path(), &["--permissions", "default"]);
+        session.wait_for_text("CodeRex v", SCREEN_TIMEOUT);
+        session.send_line("add a recursive fibonacci function to src/lib.rs with unit tests");
+        deny_permission(&mut session, "Waitingforpermission:Writingsrc/lib.rs");
+        session.wait_for_raw_text("Error:tool'Write'denied", SCREEN_TIMEOUT);
+        session.wait_for_text("Completed in", SCREEN_TIMEOUT);
+        let content = std::fs::read_to_string(dir.path().join("src/lib.rs")).unwrap_or_default();
+        assert!(!content.contains("fibonacci"));
+    }
+
+    // Accept-edits: file edits auto-run, but shell commands still ask.
+    {
+        let dir = setup_project_dir();
+        let (_server, mut session) =
+            session_with_static_server_args(dir.path(), &["--permissions", "accept-edits"]);
+        session.wait_for_text("CodeRex v", SCREEN_TIMEOUT);
+        session.send_line("add multiply function to src/lib.rs");
+        session.wait_for_text("Completed in", SCREEN_TIMEOUT);
+        let content = std::fs::read_to_string(dir.path().join("src/lib.rs")).unwrap_or_default();
+        assert!(content.contains("pub fn multiply"));
+        assert_raw_absent(&session, &["Waitingforpermission:Writingsrc/lib.rs"]);
+
+        session.send_line("list files in this directory");
+        deny_permission_for_tool(&mut session, "Tool: Bash");
+        session.wait_for_raw_text("Error:tool'Bash'denied", SCREEN_TIMEOUT);
+        session.wait_for_text("Completed in", SCREEN_TIMEOUT);
+    }
+
+    // Plan: reads are allowed, mutations are denied without prompting.
+    {
+        let dir = setup_project_dir();
+        let (_server, mut session) =
+            session_with_static_server_args(dir.path(), &["--permissions", "plan"]);
+        session.wait_for_text("CodeRex v", SCREEN_TIMEOUT);
+        session.send_line("show content of file");
+        session.wait_for_any_text(&["pub fn add", "a + b"], SCREEN_TIMEOUT);
+        session.wait_for_text("Completed in", SCREEN_TIMEOUT);
+
+        session.send_line("add multiply function to src/lib.rs");
+        session.wait_for_raw_text("Error:tool'Write'denied", SCREEN_TIMEOUT);
+        session.wait_for_text("Completed in", SCREEN_TIMEOUT);
+        let content = std::fs::read_to_string(dir.path().join("src/lib.rs")).unwrap_or_default();
+        assert!(!content.contains("pub fn multiply"));
+        assert_raw_absent(&session, &["PermissionRequest"]);
+    }
+
+    // Dont-ask: dangerous operations are denied without prompting.
+    {
+        let dir = setup_project_dir();
+        let (_server, mut session) =
+            session_with_static_server_args(dir.path(), &["--permissions", "dont-ask"]);
+        session.wait_for_text("CodeRex v", SCREEN_TIMEOUT);
+        session.send_line("add multiply function to src/lib.rs");
+        session.wait_for_raw_text("Error:tool'Write'denied", SCREEN_TIMEOUT);
+        session.wait_for_text("Completed in", SCREEN_TIMEOUT);
+        let content = std::fs::read_to_string(dir.path().join("src/lib.rs")).unwrap_or_default();
+        assert!(!content.contains("pub fn multiply"));
+        assert_raw_absent(&session, &["PermissionRequest"]);
+    }
+
+    // Bypass-permissions: dangerous file edits and shell commands auto-run.
+    {
+        let dir = setup_project_dir();
+        let (_server, mut session) =
+            session_with_static_server_args(dir.path(), &["--permissions", "bypass-permissions"]);
+        session.wait_for_text("CodeRex v", SCREEN_TIMEOUT);
+        session.send_line("add multiply function to src/lib.rs");
+        session.wait_for_text("Completed in", SCREEN_TIMEOUT);
+        let content = std::fs::read_to_string(dir.path().join("src/lib.rs")).unwrap_or_default();
+        assert!(content.contains("pub fn multiply"));
+
+        session.send_line("list files in this directory");
+        session.wait_for_any_text(&["src/lib.rs", "Here are the files"], SCREEN_TIMEOUT);
+        session.wait_for_text("Completed in", SCREEN_TIMEOUT);
+        assert_raw_absent(&session, &["PermissionRequest", "Waitingforpermission"]);
+    }
+
+    // --dangerously-skip-permissions is an alias for full bypass.
+    {
+        let dir = setup_project_dir();
+        let (_server, mut session) =
+            session_with_static_server_args(dir.path(), &["--dangerously-skip-permissions"]);
+        session.wait_for_text("CodeRex v", SCREEN_TIMEOUT);
+        session.send_line("add multiply function to src/lib.rs");
+        session.wait_for_text("Completed in", SCREEN_TIMEOUT);
+        let content = std::fs::read_to_string(dir.path().join("src/lib.rs")).unwrap_or_default();
+        assert!(content.contains("pub fn multiply"));
+        assert_raw_absent(&session, &["PermissionRequest", "Waitingforpermission"]);
+    }
+}
+
+#[test]
+fn extension_slash_sequence_matrix_stays_usable() {
+    let dir = setup_project_dir();
+    let mut session = session_without_engine(dir.path());
+    session.wait_for_text("CodeRex v", SCREEN_TIMEOUT);
+
+    run_interaction_sequence(
+        &mut session,
+        &[
+            InteractionStep::slash("/tasks", &["Tasks:", "Task files"]),
+            InteractionStep::slash("/mcp", &["MCP:"]),
+            InteractionStep::slash("/plugin", &["plugins", "Installed plugins"]),
+            InteractionStep::slash("/skills", &["Skills:", "skills loaded"]),
+            InteractionStep::slash("/hooks", &["Active hooks", "No hooks"]),
+            InteractionStep::slash("/memory", &["Memory:"]),
+            InteractionStep::slash("/status", &["System Status"]),
+        ],
+        &[
+            "provider returned no visible response",
+            "Plugin tool 'Skill' not found",
+        ],
+    );
+}
+
+#[test]
+fn ui_recovery_sequence_matrix_stays_usable() {
+    let dir = setup_project_dir();
+    let (_server, mut session) = session_with_static_server(dir.path());
+    session.wait_for_text("CodeRex v", SCREEN_TIMEOUT);
+
+    session.send_line("/theme light");
+    session.wait_for_text("Theme changed to: light", SCREEN_TIMEOUT);
+    session.send_line("/theme dark");
+    session.wait_for_text("Theme changed to: dark", SCREEN_TIMEOUT);
+
+    session.send_line("very long response");
+    session.wait_for_text("VERY_LONG_TAIL", SCREEN_TIMEOUT);
+    for _ in 0..4 {
+        session.page_up();
+    }
+    session.wait_for_text("very long response line", SCREEN_TIMEOUT);
+    for _ in 0..4 {
+        session.page_down();
+    }
+    session.wait_for_text("VERY_LONG_TAIL", SCREEN_TIMEOUT);
+
+    session.send_line("simulate error");
+    session.wait_for_any_text(&["temporarily unavailable", "Query failed"], SCREEN_TIMEOUT);
+    session.send_line("/status");
+    session.wait_for_text("System Status", SCREEN_TIMEOUT);
+    session.send_line("hi");
+    session.wait_for_text("Hello!", SCREEN_TIMEOUT);
+    session.wait_for_text("Completed in", SCREEN_TIMEOUT);
+}
+
+#[test]
+fn theme_command_switches_interactive_theme_and_stays_usable() {
+    let dir = setup_project_dir();
+    let mut session = session_without_engine(dir.path());
+    session.wait_for_text("CodeRex v", SCREEN_TIMEOUT);
+
+    session.send_line("/theme light");
+    session.wait_for_text("Theme changed to: light", SCREEN_TIMEOUT);
+    session.send_line("/theme dark");
+    session.wait_for_text("Theme changed to: dark", SCREEN_TIMEOUT);
+    session.send_line("/theme tokyo-night");
+    session.wait_for_text("Theme changed to: tokyo-night", SCREEN_TIMEOUT);
+    session.send_line("/status");
+    let screen = session.wait_for_text("System Status", SCREEN_TIMEOUT);
+    assert!(screen.contains("System Status"));
+}
+
+#[test]
 fn compact_after_history_keeps_session_usable() {
     let dir = setup_project_dir();
     let (_server, mut session) = session_with_static_server(dir.path());
@@ -921,11 +1455,16 @@ fn interactive_kimi_live_smoke() {
     );
     session.wait_for_text("CodeRex v", LIVE_TIMEOUT);
     session.send_line("Use the Read tool to show content of src/lib.rs and summarize it");
-    let screen = session.wait_for_any_text(
-        &["Completed in", "Reading src/lib.rs...", "src/lib.rs"],
+    session.wait_for_any_text(
+        &["Reading src/lib.rs...", "pub fn add", "a + b"],
         LIVE_TIMEOUT,
     );
-    assert!(screen.contains("src/lib.rs") || screen.contains("Completed in"));
+    session.wait_for_text("Completed in", LIVE_TIMEOUT);
+    assert_raw_contains_any(&session, &["pubfnadd", "a+b"], "live Kimi read tool output");
+    assert_raw_absent(
+        &session,
+        &["provider returned no visible response", "Query failed"],
+    );
 }
 
 #[test]
@@ -964,9 +1503,14 @@ fn interactive_qwen_live_smoke() {
     );
     session.wait_for_text("CodeRex v", LIVE_TIMEOUT);
     session.send_line("Use the Read tool to show content of src/lib.rs and summarize it");
-    let screen = session.wait_for_any_text(
-        &["Completed in", "Reading src/lib.rs...", "src/lib.rs"],
+    session.wait_for_any_text(
+        &["Reading src/lib.rs...", "pub fn add", "a + b"],
         LIVE_TIMEOUT,
     );
-    assert!(screen.contains("src/lib.rs") || screen.contains("Completed in"));
+    session.wait_for_text("Completed in", LIVE_TIMEOUT);
+    assert_raw_contains_any(&session, &["pubfnadd", "a+b"], "live Qwen read tool output");
+    assert_raw_absent(
+        &session,
+        &["provider returned no visible response", "Query failed"],
+    );
 }

@@ -74,6 +74,8 @@ pub fn register(registry: &mut CommandRegistry) {
                     || theme_dir.is_dir()
                     || new_theme == "light"
                     || new_theme == "dark"
+                    || new_theme == "high-contrast"
+                    || new_theme == "tokyo-night"
                 {
                     CommandResult::success(format!("Theme changed to: {}", args[0]))
                         .with_state_change(true)

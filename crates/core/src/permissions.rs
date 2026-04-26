@@ -271,6 +271,9 @@ impl PermissionChecker {
                 reason: format!("tool '{tool_name}' is not allowed in plan mode"),
             };
         }
+        if self.mode == PermissionMode::AcceptEdits && self.is_edit_tool(tool_name) {
+            return PermissionResult::Allow;
+        }
 
         // Session-level cache
         if let Some(&approved) = self.session_approvals.get(tool_name) {
@@ -386,6 +389,15 @@ impl PermissionChecker {
         self.dangerous_tools
             .iter()
             .any(|t| t.eq_ignore_ascii_case(&lower))
+    }
+
+    /// Check if a tool edits local files.
+    #[must_use]
+    pub fn is_edit_tool(&self, tool_name: &str) -> bool {
+        matches!(
+            tool_name.to_lowercase().as_str(),
+            "write" | "edit" | "multi_edit" | "notebook_edit"
+        )
     }
 
     /// Check if a tool is read-only (safe for plan mode).

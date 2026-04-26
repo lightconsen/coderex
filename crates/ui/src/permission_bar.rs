@@ -3,6 +3,8 @@
 use coderex_core::permissions::PermissionMode;
 use ratatui::style::Color;
 
+use crate::themes::Theme;
+
 /// Permission bar data to render below the input line.
 #[derive(Debug, Clone)]
 pub struct PermissionBar {
@@ -82,22 +84,22 @@ impl PermissionBar {
 
     /// Foreground colour for the current mode.
     #[must_use]
-    pub fn color(&self) -> Color {
+    pub fn color(&self, theme: &Theme) -> Color {
         if let Some(status) = &self.status {
             return match status.kind {
-                PermissionStatusKind::Pending => Color::Yellow,
-                PermissionStatusKind::Approved => Color::Green,
-                PermissionStatusKind::Denied => Color::Red,
+                PermissionStatusKind::Pending => theme.warning,
+                PermissionStatusKind::Approved => theme.success,
+                PermissionStatusKind::Denied => theme.error,
             };
         }
 
         match self.mode {
-            PermissionMode::Default => Color::Yellow,
-            PermissionMode::AcceptEdits => Color::Green,
-            PermissionMode::BypassPermissions => Color::Red,
-            PermissionMode::DontAsk => Color::Magenta,
-            PermissionMode::Plan => Color::Cyan,
-            PermissionMode::Auto => Color::Blue,
+            PermissionMode::Default => theme.warning,
+            PermissionMode::AcceptEdits => theme.success,
+            PermissionMode::BypassPermissions => theme.error,
+            PermissionMode::DontAsk => theme.tool,
+            PermissionMode::Plan => theme.accent_secondary,
+            PermissionMode::Auto => theme.accent,
         }
     }
 
