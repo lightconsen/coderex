@@ -4,6 +4,19 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+    inputs:
+      live_provider:
+        description: "Optional live provider smoke target"
+        required: false
+        default: "none"
+        type: choice
+        options:
+          - none
+          - kimi
+          - qwen
 
 env:
   CARGO_TERM_COLOR: always
@@ -36,6 +49,39 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: taiki-e/install-action@nextest
       - run: cargo nextest run --workspace
+
+  code-agent-benchmark:
+    name: Code Agent Benchmark
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: scripts/test-code-agent-benchmark.sh mock
+
+  nightly-mock-depth:
+    name: Nightly Mock Depth
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: scripts/test-interactive-mock.sh full
+      - run: cargo test -p coderex-cli --test e2e_stress -- --nocapture
+
+  live-provider-smoke:
+    name: Live Provider Smoke
+    if: github.event_name == 'workflow_dispatch' && inputs.live_provider != 'none'
+    runs-on: ubuntu-latest
+    env:
+      CODEREX_SKIP_ENV_SOURCE: "1"
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+      ANTHROPIC_BASE_URL: ${{ secrets.ANTHROPIC_BASE_URL }}
+      ANTHROPIC_MODEL: ${{ secrets.ANTHROPIC_MODEL }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: scripts/test-interactive-live.sh "${{ inputs.live_provider }}" smoke
+      - run: scripts/test-code-agent-benchmark.sh live "${{ inputs.live_provider }}"
 
   doc:
     name: Docs

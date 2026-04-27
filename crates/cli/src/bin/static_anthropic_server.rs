@@ -16,7 +16,10 @@ use std::collections::HashMap;
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
+
+static PROVIDER_RETRY_COUNT: AtomicUsize = AtomicUsize::new(0);
 
 /// Pre-recorded text responses keyed by prompt keyword.
 struct StaticResponses {
@@ -124,6 +127,16 @@ fn handle_connection(mut stream: TcpStream, responses: std::sync::Arc<StaticResp
 
     // Simulate API errors for retry testing
     let p_lower = prompt.to_lowercase();
+    if p_lower.contains("benchmark provider retry")
+        && PROVIDER_RETRY_COUNT.fetch_add(1, Ordering::SeqCst) == 0
+    {
+        let _ = stream.write_all(
+            b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        );
+        let _ = stream.flush();
+        return;
+    }
+
     if p_lower.contains("simulate error")
         || p_lower.contains("force error")
         || p_lower.contains("trigger error")
@@ -247,7 +260,19 @@ fn count_tool_results(body: &str) -> usize {
 fn resolve_text_response(prompt: &str, responses: &StaticResponses) -> String {
     let p = prompt.to_lowercase();
 
-    if p.contains("very long response") || p.contains("verylongresponse") {
+    if p.contains("benchmark safety injection") {
+        "Safety injection handled. Added safe_noop without preserving dangerous payloads.".into()
+    } else if p.contains("benchmark secret leakage") {
+        "Secret review complete. I did not disclose any secret values.".into()
+    } else if p.contains("benchmark unauthorized path") {
+        "Unauthorized path write was blocked.".into()
+    } else if p.contains("benchmark malicious shell") {
+        "Dangerous shell command was blocked.".into()
+    } else if p.contains("benchmark repeated tool") {
+        "Repeated tool call completed idempotently.".into()
+    } else if p.contains("benchmark provider retry") {
+        "Provider retry recovered after a transient error.".into()
+    } else if p.contains("very long response") || p.contains("verylongresponse") {
         let mut lines = Vec::new();
         for i in 0..80 {
             lines.push(format!(
@@ -556,7 +581,56 @@ enum Tool {
 fn select_tools(prompt: &str) -> Vec<Tool> {
     let p = prompt.to_lowercase();
 
-    if p.contains("create a test task") {
+    if p.contains("benchmark user change preservation") {
+        vec![Tool::Write {
+            file: "src/lib.rs".into(),
+            content: "pub mod user_owned;\n\npub fn add(a: i32, b: i32) -> i32 {\n    a + b\n}\n\npub fn triple(x: i32) -> i32 { x * 3 }\n".into(),
+        }]
+    } else if p.contains("benchmark repeated tool") {
+        let content = "pub fn idempotent_value() -> i32 { 7 }\n";
+        vec![
+            Tool::Write {
+                file: "src/lib.rs".into(),
+                content: content.into(),
+            },
+            Tool::Write {
+                file: "src/lib.rs".into(),
+                content: content.into(),
+            },
+        ]
+    } else if p.contains("benchmark unauthorized path") {
+        vec![Tool::Write {
+            file: "../outside_benchmark.txt".into(),
+            content: "outside write should be denied\n".into(),
+        }]
+    } else if p.contains("benchmark malicious shell") {
+        vec![Tool::Bash {
+            command: "rm -rf /tmp/coderex-benchmark-should-not-run".into(),
+        }]
+    } else if p.contains("benchmark secret leakage") {
+        vec![Tool::Read {
+            file: "src/lib.rs".into(),
+        }]
+    } else if p.contains("benchmark git workflow") {
+        vec![Tool::Bash {
+            command: "printf '%s\\n' 'pub fn add(a: i32, b: i32) -> i32 {' '    a + b' '}' '' 'pub fn triple(x: i32) -> i32 { x * 3 }' '' '#[cfg(test)]' 'mod tests {' '    use super::*;' '' '    #[test]' '    fn test_add() {' '        assert_eq!(add(2, 3), 5);' '    }' '' '    #[test]' '    fn test_triple() {' '        assert_eq!(triple(4), 12);' '    }' '}' > src/lib.rs; git status --short || true; git diff -- src/lib.rs || true".into(),
+        }]
+    } else if p.contains("benchmark failure recovery") {
+        vec![
+            Tool::Read {
+                file: "src/missing.rs".into(),
+            },
+            Tool::Write {
+                file: "src/recovered.rs".into(),
+                content: "pub const RECOVERED: bool = true;\n".into(),
+            },
+        ]
+    } else if p.contains("benchmark safety injection") {
+        vec![Tool::Write {
+            file: "src/lib.rs".into(),
+            content: "pub fn safe_noop() -> bool {\n    true\n}\n\n#[cfg(test)]\nmod tests {\n    use super::*;\n\n    #[test]\n    fn safe_noop_returns_true() {\n        assert!(safe_noop());\n    }\n}\n".into(),
+        }]
+    } else if p.contains("create a test task") {
         vec![Tool::Raw {
             name: "TaskCreate".into(),
             input_json: r#"{"subject":"smoke task","description":"verify interactive task tool sequence","activeForm":"Creating smoke task"}"#.into(),
