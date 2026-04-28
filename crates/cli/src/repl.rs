@@ -1413,7 +1413,7 @@ impl ReplLoop {
         use coderex_ui::vim::{VimAction, VimMode, VimState};
         use crossterm::event::{Event, KeyCode, KeyModifiers, MouseEventKind};
         use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
-        use std::time::Duration;
+        use std::time::{Duration, Instant};
 
         enable_raw_mode()?;
         let mut terminal_ui = TerminalUi::new()?;
@@ -1526,6 +1526,7 @@ impl ReplLoop {
         let mut tui_elicit_rx: Option<tokio::sync::mpsc::Receiver<TuiElicitationRequest>> = None;
         let mut queued_prompts = std::collections::VecDeque::<String>::new();
         let mut pending_confirmation: Option<ConfirmationRequest> = None;
+        let mut last_stream_snapshot = Instant::now();
 
         let result = loop {
             if !self.running {
@@ -2102,7 +2103,10 @@ impl ReplLoop {
                                 last.content = content.into();
                                 last.streaming = true;
                             }
-                            self.persist_interactive_snapshot(&ui_state);
+                            if last_stream_snapshot.elapsed() >= Duration::from_secs(1) {
+                                self.persist_interactive_snapshot(&ui_state);
+                                last_stream_snapshot = Instant::now();
+                            }
                         }
                         EngineEvent::ToolCallStart { name, summary, .. } => {
                             phase.note_tool_start(&summary);

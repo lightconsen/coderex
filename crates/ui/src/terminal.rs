@@ -252,8 +252,7 @@ fn message_display_height(msg: &crate::message_list::Message, width: usize) -> u
     let prefix = message_prefix(msg.role);
     let prefix_width = unicode_width::UnicodeWidthStr::width(prefix);
     let wrap_width = width.saturating_sub(prefix_width);
-    let wrapped = wrap_text(&msg.content, wrap_width);
-    let mut height = wrapped.len().max(1);
+    let mut height = wrapped_line_count(&msg.content, wrap_width);
     if matches!(
         msg.role,
         crate::message_list::MessageRole::User | crate::message_list::MessageRole::Assistant
@@ -270,6 +269,37 @@ fn message_display_height(msg: &crate::message_list::Message, width: usize) -> u
         height += 1;
     }
     height
+}
+
+fn wrapped_line_count(text: &str, width: usize) -> usize {
+    if width == 0 {
+        return 1;
+    }
+
+    let mut lines = 0usize;
+    for paragraph in text.split('\n') {
+        let mut current_width = 0usize;
+        let mut current_empty = true;
+        for word in paragraph.split_whitespace() {
+            let word_width = unicode_width::UnicodeWidthStr::width(word);
+            let space = if current_empty { 0 } else { 1 };
+            if current_width + space + word_width > width {
+                lines += 1;
+                current_width = 0;
+                current_empty = true;
+            }
+            if !current_empty {
+                current_width += 1;
+            }
+            current_width += word_width;
+            current_empty = false;
+        }
+        if !current_empty {
+            lines += 1;
+        }
+    }
+
+    lines.max(1)
 }
 
 fn message_prefix(role: crate::message_list::MessageRole) -> &'static str {
@@ -369,21 +399,6 @@ fn render_messages(frame: &mut Frame, area: ratatui::layout::Rect, state: &mut U
     // Clean up expired notifications
     state.notifications.cleanup();
 
-    // Compute each message's height so we can determine how many fit.
-    let mut heights: Vec<usize> = Vec::with_capacity(state.messages.messages.len());
-    for msg in &state.messages.messages {
-        if msg.folded {
-            heights.push(1);
-        } else {
-            heights.push(message_display_height(msg, width));
-        }
-    }
-
-    let at_bottom = state.messages.is_at_bottom()
-        && (state.messages.visible_count == 0
-            || state.messages.start + state.messages.visible_count.max(1)
-                >= state.messages.messages.len().saturating_sub(1));
-
     if state.messages.scroll_offset > 0 {
         let signature = message_render_signature(&state.messages.messages, &state.theme);
         let cache_valid = state.messages.render_cache.width == width
@@ -417,6 +432,23 @@ fn render_messages(frame: &mut Frame, area: ratatui::layout::Rect, state: &mut U
         frame.render_widget(paragraph, area);
         return;
     }
+
+    // Only the bottom/non-cached path needs per-message heights. The scrollback
+    // path above slices cached rendered lines directly, keeping wheel/PageUp
+    // redraws independent of transcript size.
+    let mut heights: Vec<usize> = Vec::with_capacity(state.messages.messages.len());
+    for msg in &state.messages.messages {
+        if msg.folded {
+            heights.push(1);
+        } else {
+            heights.push(message_display_height(msg, width));
+        }
+    }
+
+    let at_bottom = state.messages.is_at_bottom()
+        && (state.messages.visible_count == 0
+            || state.messages.start + state.messages.visible_count.max(1)
+                >= state.messages.messages.len().saturating_sub(1));
 
     let (start, mut visible_count, mut accumulated) = if at_bottom {
         bottom_message_window(&heights, viewport_height)
@@ -1067,6 +1099,24 @@ mod tests {
         let lines = wrap_text("hello", 0);
         assert_eq!(lines.len(), 1);
         assert_eq!(lines[0], "hello");
+    }
+
+    #[test]
+    fn wrapped_line_count_matches_wrap_text_without_allocating_lines() {
+        for (text, width) in [
+            ("hello world foo", 10),
+            ("a\nb\nc", 80),
+            ("single", 80),
+            ("supercalifragilistic", 5),
+            ("", 80),
+            ("two  spaces and\ttabs", 8),
+        ] {
+            assert_eq!(
+                wrapped_line_count(text, width),
+                wrap_text(text, width).len().max(1),
+                "mismatch for {text:?} at width {width}"
+            );
+        }
     }
 
     #[test]
