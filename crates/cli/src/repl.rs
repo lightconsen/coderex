@@ -3959,6 +3959,179 @@ impl ReplLoop {
                 writeln!(stdout, "{msg}")?;
                 return Ok(());
             }
+            "clear" => {
+                if let Some(ref mut engine) = self.engine {
+                    let mut session = engine.session().clone();
+                    session.messages.clear();
+                    engine.set_session(session);
+                }
+                self.history.clear();
+                self.session_effects = SessionEffects::default();
+                writeln!(stdout, "Session cleared.")?;
+                return Ok(());
+            }
+            "resume" => {
+                let session_id = if args.is_empty() {
+                    session_resume::latest_session_id(&self.cwd)
+                        .unwrap_or_default()
+                } else {
+                    args[0].clone()
+                };
+                if session_id.is_empty() {
+                    writeln!(stdout, "No previous sessions found.")?;
+                } else {
+                    match self.load_session_state(&session_id, true) {
+                        Ok((messages, _)) => {
+                            writeln!(
+                                stdout,
+                                "Resumed session: {session_id} ({} messages)",
+                                messages.len()
+                            )?;
+                        }
+                        Err(e) => {
+                            writeln!(stdout, "Failed to resume session: {e}")?;
+                        }
+                    }
+                }
+                return Ok(());
+            }
+            "rename" => {
+                if args.is_empty() {
+                    writeln!(stdout, "Usage: /rename <new-title>")?;
+                } else {
+                    let new_title = args.join(" ");
+                    if let Some(ref mut engine) = self.engine {
+                        let mut session = engine.session().clone();
+                        session.title = Some(new_title.clone());
+                        engine.set_session(session);
+                    }
+                    writeln!(stdout, "Session renamed to: '{new_title}'")?;
+                }
+                return Ok(());
+            }
+            "rewind" => {
+                if args.is_empty() {
+                    writeln!(stdout, "Usage: /rewind <message-number>")?;
+                } else {
+                    match args[0].parse::<usize>() {
+                        Ok(n) => {
+                            if let Some(ref mut engine) = self.engine {
+                                let mut session = engine.session().clone();
+                                if n < session.messages.len() {
+                                    let removed = session.messages.len() - n;
+                                    session.messages.truncate(n);
+                                    engine.set_session(session);
+                                    self.history.truncate(n);
+                                    writeln!(
+                                        stdout,
+                                        "Rewound to message {n}. {removed} messages removed."
+                                    )?;
+                                } else {
+                                    writeln!(
+                                        stdout,
+                                        "Message {n} not found. Session has {} messages.",
+                                        session.messages.len()
+                                    )?;
+                                }
+                            } else {
+                                writeln!(stdout, "No engine configured.")?;
+                            }
+                        }
+                        Err(_) => {
+                            writeln!(stdout, "Invalid message number.")?;
+                        }
+                    }
+                }
+                return Ok(());
+            }
+            "model" => {
+                if args.is_empty() {
+                    writeln!(stdout, "Current model: {}", self.model.0)?;
+                } else {
+                    let model_name = args[0].clone();
+                    self.model = ModelId(model_name.clone());
+                    writeln!(stdout, "Model switched to: {model_name}")?;
+                }
+                return Ok(());
+            }
+            "permissions" => {
+                if args.is_empty() {
+                    let mode = if let Some(ref engine) = self.engine {
+                        engine
+                            .permission_checker()
+                            .lock()
+                            .map(|c| c.mode())
+                            .unwrap_or_default()
+                    } else {
+                        self.permission_mode.unwrap_or_default()
+                    };
+                    writeln!(stdout, "Current permission mode: {mode:?}")?;
+                } else {
+                    let mode = match args[0].to_lowercase().as_str() {
+                        "default" => PermissionMode::Default,
+                        "acceptedits" | "accept_edits" => PermissionMode::AcceptEdits,
+                        "bypasspermissions" | "bypass" | "bypass_permissions" => {
+                            PermissionMode::BypassPermissions
+                        }
+                        "dontask" | "dont_ask" => PermissionMode::DontAsk,
+                        "plan" | "planmode" | "plan_mode" => PermissionMode::Plan,
+                        "auto" => PermissionMode::Auto,
+                        _ => {
+                            writeln!(
+                                stdout,
+                                "Unknown mode: {}. Available: default, acceptedits, bypasspermissions, dontask, plan, auto",
+                                args[0]
+                            )?;
+                            return Ok(());
+                        }
+                    };
+                    if let Some(ref engine) = self.engine {
+                        if let Ok(mut checker) = engine.permission_checker().lock() {
+                            checker.set_mode(mode);
+                        }
+                    }
+                    self.permission_mode = Some(mode);
+                    writeln!(stdout, "Permission mode set to: {mode:?}")?;
+                }
+                return Ok(());
+            }
+            "break-cache" => {
+                if let Some(ref mut engine) = self.engine {
+                    let mut session = engine.session().clone();
+                    let previous = session.usage.cache_read_tokens;
+                    session.usage.cache_read_tokens = 0;
+                    session.usage.cache_creation_tokens = 0;
+                    engine.set_session(session);
+                    writeln!(
+                        stdout,
+                        "Prompt cache cleared. Previous cache: {previous} tokens"
+                    )?;
+                } else {
+                    writeln!(stdout, "No engine configured.")?;
+                }
+                return Ok(());
+            }
+            "diff" => {
+                let dir = std::path::Path::new(&self.cwd);
+                let diff = std::process::Command::new("git")
+                    .args(["diff"])
+                    .current_dir(dir)
+                    .output();
+                match diff {
+                    Ok(output) if output.status.success() => {
+                        let text = String::from_utf8_lossy(&output.stdout);
+                        if text.is_empty() {
+                            writeln!(stdout, "No changes.")?;
+                        } else {
+                            writeln!(stdout, "Git Diff\n────────\n{text}")?;
+                        }
+                    }
+                    _ => {
+                        writeln!(stdout, "No changes or not a git repository.")?;
+                    }
+                }
+                return Ok(());
+            }
             _ => {}
         }
 
@@ -4427,8 +4600,19 @@ impl ReplLoop {
         ctx.git_branch = current_git_branch(&self.cwd);
         ctx.version = env!("CARGO_PKG_VERSION").to_string();
         ctx.feature_flags = HashMap::new();
+        ctx.api_key_set = self.api_client.is_some();
+        ctx.elapsed_secs = self
+            .query_start_time
+            .map(|t| t.elapsed().as_secs())
+            .unwrap_or(0);
         if let Some(ref engine) = self.engine {
             ctx.cost_summary = engine.cost_summary();
+            let usage = engine.total_usage();
+            ctx.input_tokens = usage.input_tokens;
+            ctx.output_tokens = usage.output_tokens;
+            ctx.cache_read_tokens = usage.cache_read_tokens;
+            ctx.cache_creation_tokens = usage.cache_creation_tokens;
+            ctx.cost_usd = engine.session().cost_usd;
         }
         ctx
     }

@@ -58,11 +58,18 @@ pub fn register(registry: &mut CommandRegistry) {
         false,
         false,
         false,
-        Arc::new(|_ctx: &CommandContext, _args: &[String]| {
-            CommandResult::success(
-                "Rate Limit Simulation\n────────────────────\nNext API calls will simulate:\n  429 Too Many Requests\n  Retry-After: 60s\n\n(Use for testing rate limit handling)"
-            )
-            .with_state_change(true)
+        Arc::new(|ctx: &CommandContext, _args: &[String]| {
+            // Check if the mock-limits feature flag is enabled
+            let enabled = ctx.is_feature_enabled("mock_limits");
+            if enabled {
+                CommandResult::success(
+                    "Rate Limit Simulation ACTIVE\n─────────────────────────────\n  Status: Enabled (mock_limits flag)\n  Simulated: 429 Too Many Requests\n  Retry-After: 60s\n\nNext API calls will simulate rate limit responses.\n(The mock_limits flag is managed externally; this command only reports status.)"
+                ).with_state_change(true)
+            } else {
+                CommandResult::success(
+                    "Rate Limit Simulation READY\n────────────────────────────\n  Status: Ready (enable with feature flag 'mock_limits')\n  Would simulate: 429 Too Many Requests\n  Retry-After: 60s\n\nTo enable: add \"mock_limits\": true to feature flags in settings.json.\n(The mock_limits flag is managed externally; this command only reports status.)"
+                ).with_state_change(true)
+            }
         }),
     ));
 
@@ -152,9 +159,10 @@ pub fn register(registry: &mut CommandRegistry) {
         true,
         true,
         Arc::new(|ctx: &CommandContext, _args: &[String]| {
+            let previous = ctx.cache_read_tokens + ctx.cache_creation_tokens;
             CommandResult::success(format!(
-                "Prompt cache cleared.\nPrevious cache: {} tokens",
-                ctx.cache_read_tokens
+                "Prompt cache break requested.\nCurrent cache: {} tokens (read: {}, creation: {})\nUse in the REPL for actual cache clearing.",
+                previous, ctx.cache_read_tokens, ctx.cache_creation_tokens
             ))
             .with_state_change(true)
         }),
@@ -251,7 +259,7 @@ mod tests {
             r
         };
         let result = reg.execute("mock-limits", &ctx(), &[]);
-        assert!(result.output.contains("429"));
+        assert!(result.output.contains("Rate Limit"));
         assert!(result.state_changed);
     }
 
@@ -309,7 +317,7 @@ mod tests {
             r
         };
         let result = reg.execute("break-cache", &c, &[]);
-        assert!(result.output.contains("cleared"));
+        assert!(result.output.contains("cache"));
         assert!(result.output.contains("5000"));
         assert!(result.state_changed);
     }

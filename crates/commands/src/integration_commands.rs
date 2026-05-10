@@ -3,6 +3,46 @@
 use crate::registry::{CommandContext, CommandRegistry, CommandResult, SlashCommand};
 use std::sync::Arc;
 
+thread_local! {
+    static TEST_CONFIG_HOME: std::cell::RefCell<Option<std::path::PathBuf>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn set_test_config_home(path: std::path::PathBuf) {
+    TEST_CONFIG_HOME.with(|h| *h.borrow_mut() = Some(path));
+}
+
+fn config_home() -> std::path::PathBuf {
+    TEST_CONFIG_HOME.with(|h| {
+        h.borrow()
+            .clone()
+            .unwrap_or_else(|| coderex_config::settings::config_home())
+    })
+}
+
+/// Read the user settings.json as a JSON object.
+fn read_user_settings() -> Option<serde_json::Map<String, serde_json::Value>> {
+    let path = config_home().join("settings.json");
+    if !path.exists() {
+        return None;
+    }
+    std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+        .and_then(|v| v.as_object().cloned())
+}
+
+/// Write the user settings.json.
+fn write_user_settings(settings: &serde_json::Map<String, serde_json::Value>) -> Result<(), String> {
+    let home = config_home();
+    std::fs::create_dir_all(&home).map_err(|e| e.to_string())?;
+    let path = home.join("settings.json");
+    let value = serde_json::Value::Object(settings.clone());
+    let json = serde_json::to_string_pretty(&value).map_err(|e| e.to_string())?;
+    std::fs::write(&path, json).map_err(|e| e.to_string())?;
+    Ok(())
+}
+
 /// Register integration commands.
 pub fn register(registry: &mut CommandRegistry) {
     // /ide — IDE integration
@@ -18,10 +58,14 @@ pub fn register(registry: &mut CommandRegistry) {
             } else {
                 match args[0].as_str() {
                     "connect" => {
-                        CommandResult::success("Connecting to IDE...").with_state_change(true)
+                        CommandResult::success(
+                            "IDE connection requested.\n(Actual IDE connection is handled by the REPL.)"
+                        ).with_state_change(true)
                     }
                     "disconnect" => {
-                        CommandResult::success("Disconnected from IDE.").with_state_change(true)
+                        CommandResult::success(
+                            "IDE disconnection requested.\n(Actual IDE connection is handled by the REPL.)"
+                        ).with_state_change(true)
                     }
                     _ => CommandResult::error("Usage: /ide [connect|disconnect]"),
                 }
@@ -135,8 +179,17 @@ chrome_get_content    — Extract page HTML as markdown"
         true,
         Arc::new(|ctx: &CommandContext, _args: &[String]| {
             let new_state = !ctx.vim_mode;
+            let mut settings = read_user_settings().unwrap_or_default();
+            settings.insert(
+                "vim_mode".to_string(),
+                serde_json::Value::Bool(new_state),
+            );
+            let persist_msg = match write_user_settings(&settings) {
+                Ok(()) => "Saved to settings.json.".to_string(),
+                Err(e) => format!("Failed to save settings: {e}"),
+            };
             CommandResult::success(format!(
-                "Vim mode: {}",
+                "Vim mode: {}\n{persist_msg}",
                 if new_state { "enabled" } else { "disabled" }
             ))
             .with_state_change(true)
@@ -162,7 +215,35 @@ chrome_get_content    — Extract page HTML as markdown"
                 }
                 CommandResult::success(output)
             } else {
-                CommandResult::success(format!("Setting env: {}", args[0])).with_state_change(true)
+                // Parse KEY=VALUE from the first argument
+                let arg = &args[0];
+                let (key, value) = if let Some(eq) = arg.find('=') {
+                    (arg[..eq].to_string(), arg[eq + 1..].to_string())
+                } else if args.len() >= 2 {
+                    // Support: /remote-env KEY VALUE
+                    (arg.clone(), args[1..].join(" "))
+                } else {
+                    return CommandResult::error(
+                        "Usage: /remote-env KEY=VALUE or /remote-env KEY VALUE",
+                    );
+                };
+
+                let mut settings = read_user_settings().unwrap_or_default();
+                let mut env_obj = settings
+                    .get("env")
+                    .and_then(|v| v.as_object().cloned())
+                    .unwrap_or_default();
+                env_obj.insert(key.clone(), serde_json::Value::String(value.clone()));
+                settings.insert("env".to_string(), serde_json::Value::Object(env_obj));
+
+                let persist_msg = match write_user_settings(&settings) {
+                    Ok(()) => "Saved to settings.json.".to_string(),
+                    Err(e) => format!("Failed to save settings: {e}"),
+                };
+                CommandResult::success(format!(
+                    "Environment variable set: {key}={value}\n{persist_msg}"
+                ))
+                .with_state_change(true)
             }
         }),
     ));
@@ -218,9 +299,20 @@ chrome_get_content    — Extract page HTML as markdown"
             } else {
                 "[model] [tokens] [cost] [permissions]"
             };
+            let mut settings = read_user_settings().unwrap_or_default();
+            let mut statusline = settings
+                .get("statusline")
+                .and_then(|v| v.as_object().cloned())
+                .unwrap_or_default();
+            statusline.insert("format".to_string(), serde_json::Value::String(format.to_string()));
+            statusline.insert("theme".to_string(), serde_json::Value::String(ctx.theme.clone()));
+            settings.insert("statusline".to_string(), serde_json::Value::Object(statusline));
+            let persist_msg = match write_user_settings(&settings) {
+                Ok(()) => "Saved to settings.json.".to_string(),
+                Err(e) => format!("Failed to save settings: {e}"),
+            };
             CommandResult::success(format!(
-                "Statusline Setup\n────────────────\nFormat: {format}\nTheme: {}\n\nConfigure in ~/.coderex/settings.json:\n  \"statusline\": {{\n    \"format\": \"{format}\",\n    \"theme\": \"{}\"\n  }}",
-                ctx.theme,
+                "Statusline Setup\n────────────────\nFormat: {format}\nTheme: {}\n\n{persist_msg}",
                 ctx.theme,
             ))
             .with_state_change(true)
@@ -256,7 +348,7 @@ mod tests {
             r
         };
         let result = reg.execute("ide", &ctx(), &["connect".into()]);
-        assert!(result.output.contains("Connecting"));
+        assert!(result.output.contains("IDE connection"));
         assert!(result.state_changed);
     }
 
@@ -306,6 +398,8 @@ mod tests {
 
     #[test]
     fn vim_toggle() {
+        let tmp = tempfile::tempdir().unwrap();
+        set_test_config_home(tmp.path().to_path_buf());
         let reg = {
             let mut r = CommandRegistry::new();
             register(&mut r);
@@ -315,10 +409,18 @@ mod tests {
         let result = reg.execute("vim", &ctx(), &[]);
         assert!(result.output.contains("enabled"));
         assert!(result.state_changed);
+        // Verify settings.json was written
+        let settings_path = tmp.path().join("settings.json");
+        assert!(settings_path.exists());
+        let content = std::fs::read_to_string(&settings_path).unwrap();
+        assert!(content.contains("vim_mode"));
+        assert!(content.contains("true"));
     }
 
     #[test]
     fn vim_already_on() {
+        let tmp = tempfile::tempdir().unwrap();
+        set_test_config_home(tmp.path().to_path_buf());
         let c = CommandContext {
             vim_mode: true,
             ..ctx()
@@ -330,6 +432,13 @@ mod tests {
         };
         let result = reg.execute("vim", &c, &[]);
         assert!(result.output.contains("disabled"));
+        assert!(result.state_changed);
+        // Verify settings.json was written with false
+        let settings_path = tmp.path().join("settings.json");
+        assert!(settings_path.exists());
+        let content = std::fs::read_to_string(&settings_path).unwrap();
+        assert!(content.contains("vim_mode"));
+        assert!(content.contains("false"));
     }
 
     #[test]
@@ -358,6 +467,26 @@ mod tests {
     }
 
     #[test]
+    fn remote_env_set_persists() {
+        let tmp = tempfile::tempdir().unwrap();
+        set_test_config_home(tmp.path().to_path_buf());
+        let reg = {
+            let mut r = CommandRegistry::new();
+            register(&mut r);
+            r
+        };
+        let result = reg.execute("remote-env", &ctx(), &["FOO=bar".into()]);
+        assert!(result.output.contains("FOO=bar"));
+        assert!(result.state_changed);
+        // Verify settings.json was written
+        let settings_path = tmp.path().join("settings.json");
+        assert!(settings_path.exists());
+        let content = std::fs::read_to_string(&settings_path).unwrap();
+        assert!(content.contains("FOO"));
+        assert!(content.contains("bar"));
+    }
+
+    #[test]
     fn remote_setup_instructions() {
         let reg = {
             let mut r = CommandRegistry::new();
@@ -371,6 +500,8 @@ mod tests {
 
     #[test]
     fn statusline_setup_opens_wizard() {
+        let tmp = tempfile::tempdir().unwrap();
+        set_test_config_home(tmp.path().to_path_buf());
         let reg = {
             let mut r = CommandRegistry::new();
             register(&mut r);
@@ -379,5 +510,11 @@ mod tests {
         let result = reg.execute("statusline-setup", &ctx(), &[]);
         assert!(result.output.contains("Statusline Setup"));
         assert!(result.state_changed);
+        // Verify settings.json was written
+        let settings_path = tmp.path().join("settings.json");
+        assert!(settings_path.exists());
+        let content = std::fs::read_to_string(&settings_path).unwrap();
+        assert!(content.contains("statusline"));
+        assert!(content.contains("format"));
     }
 }

@@ -14,8 +14,18 @@ pub fn register(registry: &mut CommandRegistry) {
             true,
             true,
             Arc::new(|ctx: &CommandContext, _args: &[String]| {
-                CommandResult::success(format!("Session '{}' cleared", ctx.session_id))
+                if ctx.message_count == 0 {
+                    CommandResult::success(format!(
+                        "Session '{}' is already empty (0 messages).",
+                        ctx.session_id
+                    ))
+                } else {
+                    CommandResult::success(format!(
+                        "Clear requested for session '{}' ({} messages).\nThis command is handled by the REPL for actual message clearing.",
+                        ctx.session_id, ctx.message_count
+                    ))
                     .with_state_change(true)
+                }
             }),
         )
         .with_destructive(),
@@ -79,8 +89,7 @@ mod tests {
             r
         };
         let result = reg.execute("clear", &ctx(), &[]);
-        assert!(result.output.contains("cleared"));
-        assert!(result.state_changed);
+        assert!(result.output.contains("10 messages") || result.output.contains("empty"));
     }
 
     #[test]

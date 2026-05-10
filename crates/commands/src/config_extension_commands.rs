@@ -3,9 +3,44 @@
 use crate::registry::{CommandContext, CommandRegistry, CommandResult, SlashCommand};
 use std::sync::Arc;
 
-/// Get the Claude config home directory.
+thread_local! {
+    static TEST_CONFIG_HOME: std::cell::RefCell<Option<std::path::PathBuf>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn set_test_config_home(path: std::path::PathBuf) {
+    TEST_CONFIG_HOME.with(|h| *h.borrow_mut() = Some(path));
+}
+
 fn config_home() -> std::path::PathBuf {
-    coderex_config::settings::config_home()
+    TEST_CONFIG_HOME.with(|h| {
+        h.borrow()
+            .clone()
+            .unwrap_or_else(|| coderex_config::settings::config_home())
+    })
+}
+
+/// Read the user settings.json as a JSON object.
+fn read_user_settings() -> Option<serde_json::Map<String, serde_json::Value>> {
+    let path = config_home().join("settings.json");
+    if !path.exists() {
+        return None;
+    }
+    std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+        .and_then(|v| v.as_object().cloned())
+}
+
+/// Write the user settings.json.
+fn write_user_settings(settings: &serde_json::Map<String, serde_json::Value>) -> Result<(), String> {
+    let home = config_home();
+    std::fs::create_dir_all(&home).map_err(|e| e.to_string())?;
+    let path = home.join("settings.json");
+    let value = serde_json::Value::Object(settings.clone());
+    let json = serde_json::to_string_pretty(&value).map_err(|e| e.to_string())?;
+    std::fs::write(&path, json).map_err(|e| e.to_string())?;
+    Ok(())
 }
 
 /// List items in a directory matching a pattern, returning their names.
@@ -77,8 +112,12 @@ pub fn register(registry: &mut CommandRegistry) {
                     || new_theme == "high-contrast"
                     || new_theme == "tokyo-night"
                 {
-                    CommandResult::success(format!("Theme changed to: {}", args[0]))
-                        .with_state_change(true)
+                    let mut settings = read_user_settings().unwrap_or_default();
+                    settings.insert("theme".to_string(), serde_json::Value::String(new_theme.clone()));
+                    let _ = write_user_settings(&settings);
+                    CommandResult::success(format!(
+                        "Theme changed to: {new_theme}\nSaved to settings.json.",
+                    )).with_state_change(true)
                 } else {
                     let available = list_dir_items(&themes_path);
                     let hint = if !available.is_empty() {
@@ -413,6 +452,8 @@ mod tests {
 
     #[test]
     fn theme_changes() {
+        let tmp = tempfile::tempdir().unwrap();
+        set_test_config_home(tmp.path().to_path_buf());
         let reg = {
             let mut r = CommandRegistry::new();
             register(&mut r);
@@ -421,6 +462,8 @@ mod tests {
         let result = reg.execute("theme", &ctx(), &["dark".into()]);
         assert!(result.output.contains("dark"));
         assert!(result.state_changed);
+        // Verify settings.json was written
+        assert!(tmp.path().join("settings.json").exists());
     }
 
     #[test]

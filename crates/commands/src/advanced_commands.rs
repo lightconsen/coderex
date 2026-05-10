@@ -3,6 +3,46 @@
 use crate::registry::{CommandContext, CommandRegistry, CommandResult, SlashCommand};
 use std::sync::Arc;
 
+thread_local! {
+    static TEST_CONFIG_HOME: std::cell::RefCell<Option<std::path::PathBuf>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn set_test_config_home(path: std::path::PathBuf) {
+    TEST_CONFIG_HOME.with(|h| *h.borrow_mut() = Some(path));
+}
+
+fn config_home() -> std::path::PathBuf {
+    TEST_CONFIG_HOME.with(|h| {
+        h.borrow()
+            .clone()
+            .unwrap_or_else(|| coderex_config::settings::config_home())
+    })
+}
+
+/// Read the user settings.json as a JSON object.
+fn read_user_settings() -> Option<serde_json::Map<String, serde_json::Value>> {
+    let path = config_home().join("settings.json");
+    if !path.exists() {
+        return None;
+    }
+    std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+        .and_then(|v| v.as_object().cloned())
+}
+
+/// Write the user settings.json.
+fn write_user_settings(settings: &serde_json::Map<String, serde_json::Value>) -> Result<(), String> {
+    let home = config_home();
+    std::fs::create_dir_all(&home).map_err(|e| e.to_string())?;
+    let path = home.join("settings.json");
+    let value = serde_json::Value::Object(settings.clone());
+    let json = serde_json::to_string_pretty(&value).map_err(|e| e.to_string())?;
+    std::fs::write(&path, json).map_err(|e| e.to_string())?;
+    Ok(())
+}
+
 /// Register advanced commands.
 pub fn register(registry: &mut CommandRegistry) {
     // /bridge — Bridge status/management
@@ -36,7 +76,9 @@ pub fn register(registry: &mut CommandRegistry) {
         Arc::new(|_ctx: &CommandContext, _args: &[String]| {
             let bridge_url = std::env::var("CODEREX_BRIDGE_URL").ok();
             if bridge_url.as_ref().map(|s| !s.is_empty()).unwrap_or(false) {
-                CommandResult::success("Kicked Bridge connection.").with_state_change(true)
+                CommandResult::success(
+                    "Bridge kick requested.\n(Actual connection management is handled by the REPL or Bridge daemon.)"
+                ).with_state_change(true)
             } else {
                 CommandResult::success("No active Bridge connections to kick.")
             }
@@ -65,9 +107,18 @@ pub fn register(registry: &mut CommandRegistry) {
         true,
         Arc::new(|ctx: &CommandContext, _args: &[String]| {
             if ctx.is_feature_enabled("ultraplan") {
-                CommandResult::success(
-                    "Ultra Plan Mode activated.\n(Detailed multi-phase planning enabled)",
-                )
+                let mut settings = read_user_settings().unwrap_or_default();
+                settings.insert(
+                    "ultraplan".to_string(),
+                    serde_json::Value::Bool(true),
+                );
+                let persist_msg = match write_user_settings(&settings) {
+                    Ok(()) => "Saved to settings.json.".to_string(),
+                    Err(e) => format!("Failed to save settings: {e}"),
+                };
+                CommandResult::success(format!(
+                    "Ultra Plan Mode activated.\n(Detailed multi-phase planning enabled)\n{persist_msg}",
+                ))
                 .with_state_change(true)
             } else {
                 CommandResult::error("ultraplan feature is not enabled.")
@@ -191,9 +242,21 @@ pub fn register(registry: &mut CommandRegistry) {
         true,
         Arc::new(|ctx: &CommandContext, _args: &[String]| {
             if ctx.is_feature_enabled("thinkback") {
-                CommandResult::success(
-                    "Thinkback Play\n─────────────\n(Executing learnings from historical sessions...)"
-                ).with_state_change(true)
+                let transcript_dir = std::path::Path::new(&ctx.cwd).join(".coderex/transcripts");
+                let mut found = 0;
+                if transcript_dir.exists() {
+                    if let Ok(entries) = std::fs::read_dir(&transcript_dir) {
+                        for entry in entries.flatten() {
+                            let path = entry.path();
+                            if path.extension().is_some_and(|e| e == "jsonl") {
+                                found += 1;
+                            }
+                        }
+                    }
+                }
+                CommandResult::success(format!(
+                    "Thinkback Play\n─────────────\nFound {found} transcript file(s).\nUse /thinkback to review before executing.\n(Execution is handled by the REPL.)"
+                )).with_state_change(true)
             } else {
                 CommandResult::error("thinkback feature is not enabled.")
             }
@@ -270,6 +333,8 @@ mod tests {
 
     #[test]
     fn ultraplans_when_enabled() {
+        let tmp = tempfile::tempdir().unwrap();
+        set_test_config_home(tmp.path().to_path_buf());
         let mut flags = std::collections::HashMap::new();
         flags.insert("ultraplan".into(), true);
         let c = CommandContext {
@@ -284,6 +349,12 @@ mod tests {
         let result = reg.execute("ultraplan", &c, &[]);
         assert!(result.output.contains("Ultra Plan Mode"));
         assert!(result.state_changed);
+        // Verify settings.json was written
+        let settings_path = tmp.path().join("settings.json");
+        assert!(settings_path.exists());
+        let content = std::fs::read_to_string(&settings_path).unwrap();
+        assert!(content.contains("ultraplan"));
+        assert!(content.contains("true"));
     }
 
     #[test]

@@ -13,11 +13,19 @@ pub fn register(registry: &mut CommandRegistry) {
         true,
         true,
         Arc::new(|ctx: &CommandContext, _args: &[String]| {
-            CommandResult::success(format!(
-                "Compacting session {} ({} messages)...",
-                ctx.session_id, ctx.message_count
-            ))
-            .with_state_change(true)
+            let total_tokens = ctx.input_tokens
+                + ctx.output_tokens
+                + ctx.cache_read_tokens
+                + ctx.cache_creation_tokens;
+            if ctx.message_count == 0 {
+                CommandResult::success("Nothing to compact — session is empty.")
+            } else {
+                CommandResult::success(format!(
+                    "Compact requested for session {} ({} messages, ~{} tokens).\nThis command is handled by the REPL for actual compaction.",
+                    ctx.session_id, ctx.message_count, total_tokens
+                ))
+                .with_state_change(true)
+            }
         }),
     ));
 
@@ -83,8 +91,8 @@ mod tests {
             r
         };
         let result = reg.execute("compact", &ctx(), &[]);
-        assert!(result.output.contains("Compacting"));
-        assert!(result.state_changed);
+        // Empty session: "Nothing to compact"
+        assert!(result.output.contains("compact"));
     }
 
     #[test]

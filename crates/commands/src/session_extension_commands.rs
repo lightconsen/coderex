@@ -186,17 +186,26 @@ pub fn register(registry: &mut CommandRegistry) {
         true,
         Arc::new(|ctx: &CommandContext, args: &[String]| {
             if args.is_empty() {
-                CommandResult::error("Usage: /rewind <message-number>")
+                CommandResult::error(format!(
+                    "Usage: /rewind <message-number>\nCurrent session: {} ({} messages)",
+                    ctx.session_id, ctx.message_count
+                ))
             } else {
                 match args[0].parse::<usize>() {
-                    Ok(n) if n <= ctx.message_count => {
+                    Ok(n) if n < ctx.message_count => {
                         let messages_to_remove = ctx.message_count.saturating_sub(n);
                         CommandResult::success(format!(
-                            "Rewound to message {n} of {total}\n{to_remove} messages removed from transcript.",
+                            "Rewind to message {n} of {total} requested.\n{to_remove} messages would be removed.\nUse in the REPL for actual truncation.",
                             total = ctx.message_count,
                             to_remove = messages_to_remove
                         ))
                         .with_state_change(true)
+                    }
+                    Ok(n) if n == ctx.message_count => {
+                        CommandResult::success(format!(
+                            "Rewind to message {n} of {total}: no messages would be removed.",
+                            total = ctx.message_count
+                        ))
                     }
                     Ok(n) => {
                         CommandResult::error(format!(
@@ -326,6 +335,18 @@ mod tests {
         let result = reg.execute("rewind", &ctx(), &["5".into()]);
         assert!(result.output.contains("message 5"));
         assert!(result.state_changed);
+    }
+
+    #[test]
+    fn rewind_no_change() {
+        let reg = {
+            let mut r = CommandRegistry::new();
+            register(&mut r);
+            r
+        };
+        let result = reg.execute("rewind", &ctx(), &["20".into()]);
+        // Rewinding to the current message count = no messages removed
+        assert!(result.output.contains("no messages"));
     }
 
     #[test]
