@@ -677,6 +677,9 @@ pub struct QueryEngine {
     team_context: Option<Arc<std::sync::Mutex<crate::team_context::TeamContext>>>,
     /// Optional coordinator state for multi-phase workflows.
     coordinator: Option<crate::coordinator::CoordinatorState>,
+    /// Optional persistent session memory that survives compaction.
+    /// Implemented by `coderex-memory`; absent → no memory work happens.
+    session_memory: Option<Arc<dyn crate::session_memory::SessionMemoryBackend>>,
 }
 
 /// A denied tool call that should be summarized in the next turn.
@@ -1097,6 +1100,7 @@ impl QueryEngine {
             last_successful_response: None,
             team_context: None,
             coordinator: None,
+            session_memory: None,
         }
     }
 
@@ -1128,6 +1132,72 @@ impl QueryEngine {
     /// by removing old messages and writing a compact boundary marker.
     pub fn set_transcript_path(&mut self, path: PathBuf) {
         self.transcript_path = Some(path);
+    }
+
+    /// Attach a persistent session-memory backend.
+    ///
+    /// When set (and `CompactConfig::session_memory_enabled`), compaction
+    /// refreshes the memory document and injects it alongside the summary.
+    pub fn set_session_memory(
+        &mut self,
+        backend: Arc<dyn crate::session_memory::SessionMemoryBackend>,
+    ) {
+        self.session_memory = Some(backend);
+    }
+
+    /// Refresh the session-memory document at compaction time and return the
+    /// summary text with the memory injected.
+    ///
+    /// No backend attached (or disabled in config) → returns the summary
+    /// unchanged with zero extra LLM calls, which keeps existing mock tests
+    /// structurally unaffected. On any LLM or backend failure the summary is
+    /// returned unchanged — compaction always succeeds, and stale memory is
+    /// never injected as if current.
+    async fn refresh_session_memory(&self, summary_text: &str, summary_input: &[String]) -> String {
+        let backend = match self
+            .session_memory
+            .as_ref()
+            .filter(|_| self.compact_config.session_memory_enabled)
+        {
+            Some(b) => b,
+            None => return summary_text.to_string(),
+        };
+
+        let excerpt = summary_input.join("\n\n");
+        let session_id = self.session.session_id.to_string();
+        let current = backend.load_memory(&session_id).await.unwrap_or_default();
+
+        let update = if current.trim().is_empty() {
+            crate::prompts::create_session_memory(self.api_client.as_ref(), &excerpt).await
+        } else {
+            crate::prompts::update_session_memory(self.api_client.as_ref(), &current, &excerpt)
+                .await
+        };
+
+        match update {
+            Ok(updated) if !updated.trim().is_empty() => {
+                backend.save_memory(&session_id, &updated).await;
+                format!("{summary_text}\n\n<session_memory>\n{updated}\n</session_memory>")
+            }
+            Ok(_) => {
+                tracing::warn!("SessionMemory: update produced empty content — skipping injection");
+                summary_text.to_string()
+            }
+            Err(e) => {
+                tracing::warn!("SessionMemory: update failed ({e}) — skipping injection");
+                summary_text.to_string()
+            }
+        }
+    }
+
+    /// Micro-compact parameters derived from `CompactConfig`.
+    fn micro_params(&self) -> compact::MicroCompactParams {
+        compact::MicroCompactParams {
+            keep_recent: 5,
+            min_result_tokens: self.compact_config.micro_min_result_tokens,
+            head_tokens: self.compact_config.micro_head_tokens,
+            tail_tokens: self.compact_config.micro_tail_tokens,
+        }
     }
 
     /// Set the team context for multi-agent collaboration.
@@ -2215,6 +2285,12 @@ impl QueryEngine {
             }
             match summary_result {
                 Ok(summary_text) if !summary_text.trim().is_empty() => {
+                    // Refresh the persistent session memory from the same
+                    // summarized interval and merge it into the summary.
+                    // Box::pin breaks the future-size cycle through the
+                    // nested background-feature call chain.
+                    let summary_text =
+                        Box::pin(self.refresh_session_memory(&summary_text, &summary_input)).await;
                     let mut result = compact::assemble_summary_result(
                         &turn.messages,
                         &split,
@@ -2248,7 +2324,7 @@ impl QueryEngine {
 
         // ── Rule-based fallback (existing strategies) ──
         let result: CompactResult = match strategy {
-            CompactStrategy::Micro => compact::micro_compact(&turn.messages, 5),
+            CompactStrategy::Micro => compact::micro_compact(&turn.messages, self.micro_params()),
             CompactStrategy::Auto => {
                 compact::auto_compact(&turn.messages, self.compact_config.auto_compact_threshold)
             }
@@ -2324,6 +2400,7 @@ impl QueryEngine {
             "messages_remaining".to_string(),
             messages_remaining.to_string(),
         );
+        ctx.insert("strategy".to_string(), format!("{:?}", result.strategy));
         let post_compact_result = self
             .fire_hook("PostCompact", "compact_complete", &ctx)
             .await;

@@ -735,6 +735,12 @@ impl ReplLoop {
         );
 
         let mut engine = engine;
+        // Persistent session memory that survives compaction.
+        engine.set_session_memory(Arc::new(
+            coderex_memory::session_memory_backend::StoreSessionMemoryBackend::new(Arc::clone(
+                &session_memory_store,
+            )),
+        ));
         let mut registry = ToolRegistry::new();
         register_builtin_tools(&mut registry);
         let registry = Arc::new(registry);
@@ -3972,8 +3978,7 @@ impl ReplLoop {
             }
             "resume" => {
                 let session_id = if args.is_empty() {
-                    session_resume::latest_session_id(&self.cwd)
-                        .unwrap_or_default()
+                    session_resume::latest_session_id(&self.cwd).unwrap_or_default()
                 } else {
                     args[0].clone()
                 };

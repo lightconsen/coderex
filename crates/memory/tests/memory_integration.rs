@@ -414,3 +414,39 @@ fn session_memory_load_nonexistent_returns_empty() {
     let facts = store.get_facts(sid);
     assert!(facts.is_empty());
 }
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  4.7 SessionMemoryBackend — trait-object roundtrip through the store
+// ═══════════════════════════════════════════════════════════════════════════
+
+#[tokio::test]
+async fn session_memory_backend_trait_object_roundtrip() {
+    use coderex_core::session_memory::SessionMemoryBackend;
+    use coderex_memory::session_memory_backend::StoreSessionMemoryBackend;
+
+    let dir = tempfile::tempdir().unwrap();
+    let store = std::sync::Arc::new(SessionMemoryStore::new(dir.path().join("session")));
+    let backend: std::sync::Arc<dyn SessionMemoryBackend> =
+        std::sync::Arc::new(StoreSessionMemoryBackend::new(store));
+    let sid = Uuid::new_v4();
+
+    assert_eq!(backend.load_memory(&sid.to_string()).await, None);
+    backend
+        .save_memory(&sid.to_string(), "Current State: compaction wired.")
+        .await;
+    assert_eq!(
+        backend.load_memory(&sid.to_string()).await.as_deref(),
+        Some("Current State: compaction wired.")
+    );
+
+    // Persistence survives a fresh store over the same directory.
+    let reloaded = SessionMemoryStore::new(dir.path().join("session"));
+    reloaded.load(sid).unwrap();
+    assert_eq!(
+        reloaded
+            .get_facts_by_category(sid, FactCategory::Architecture)
+            .pop()
+            .map(|f| f.fact),
+        Some("Current State: compaction wired.".to_string())
+    );
+}

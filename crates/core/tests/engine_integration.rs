@@ -876,3 +876,277 @@ async fn engine_allowed_tools_override_blocks_unlisted() {
         "write tool should be blocked by allowed_tools_override"
     );
 }
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  1.8 Compaction + session memory
+// ═══════════════════════════════════════════════════════════════════════════
+
+use coderex_core::session_memory::SessionMemoryBackend;
+use coderex_core::types::Message;
+
+/// Mock that replays responses and records every request (max_tokens +
+/// serialized messages) so tests can assert on the LLM call sequence.
+struct RecordingMock {
+    responses: Vec<ApiResponse>,
+    call_count: std::sync::Arc<AtomicUsize>,
+    requests: std::sync::Arc<std::sync::Mutex<Vec<(u32, String)>>>,
+    /// When set, `create_message` fails for any request whose serialized
+    /// messages contain this substring.
+    fail_on_substring: Option<String>,
+}
+
+impl RecordingMock {
+    fn new(responses: Vec<ApiResponse>) -> Self {
+        Self {
+            responses,
+            call_count: std::sync::Arc::new(AtomicUsize::new(0)),
+            requests: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+            fail_on_substring: None,
+        }
+    }
+
+    /// When set, `create_message` fails for any request whose serialized
+    /// messages contain this substring.
+    fn failing_on(mut self, needle: &str) -> Self {
+        self.fail_on_substring = Some(needle.to_string());
+        self
+    }
+
+    fn calls_handle(&self) -> std::sync::Arc<AtomicUsize> {
+        std::sync::Arc::clone(&self.call_count)
+    }
+
+    fn requests_handle(&self) -> std::sync::Arc<std::sync::Mutex<Vec<(u32, String)>>> {
+        std::sync::Arc::clone(&self.requests)
+    }
+}
+
+#[async_trait]
+impl ApiClient for RecordingMock {
+    fn clone_box(&self) -> Box<dyn ApiClient> {
+        Box::new(Self {
+            responses: self.responses.clone(),
+            call_count: std::sync::Arc::clone(&self.call_count),
+            requests: std::sync::Arc::clone(&self.requests),
+            fail_on_substring: self.fail_on_substring.clone(),
+        })
+    }
+
+    async fn create_message(
+        &self,
+        _system: &str,
+        messages: &[serde_json::Value],
+        _model: &ModelId,
+        max_tokens: u32,
+        _tools: &[ToolInfo],
+    ) -> Result<ApiResponse, ApiError> {
+        if let Some(needle) = &self.fail_on_substring {
+            if serde_json::to_string(messages)
+                .unwrap_or_default()
+                .contains(needle.as_str())
+            {
+                return Err(ApiError::Http("background feature unavailable".into()));
+            }
+        }
+        self.requests.lock().unwrap().push((
+            max_tokens,
+            serde_json::to_string(messages).unwrap_or_default(),
+        ));
+        let idx = self.call_count.fetch_add(1, Ordering::SeqCst);
+        let resp = if idx < self.responses.len() {
+            self.responses[idx].clone()
+        } else {
+            self.responses.last().unwrap().clone()
+        };
+        Ok(resp)
+    }
+
+    async fn create_message_streaming(
+        &self,
+        _system: &str,
+        _messages: &[serde_json::Value],
+        _model: &ModelId,
+        _max_tokens: u32,
+        _tools: &[ToolInfo],
+    ) -> Pin<Box<dyn Stream<Item = StreamEvent> + Send + 'static>> {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let _ = tx.send(StreamEvent::StreamEnd);
+        Box::pin(futures::stream::unfold(rx, |mut rx| async move {
+            rx.recv().await.map(|item| (item, rx))
+        }))
+    }
+}
+
+/// Test double for the session-memory backend: serves a stored document and
+/// records every save.
+struct RecordingMemoryBackend {
+    stored: std::sync::Mutex<std::collections::HashMap<String, String>>,
+    saved: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+}
+
+impl RecordingMemoryBackend {
+    fn new() -> std::sync::Arc<Self> {
+        std::sync::Arc::new(Self {
+            stored: std::sync::Mutex::new(std::collections::HashMap::new()),
+            saved: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+        })
+    }
+}
+
+#[async_trait]
+impl SessionMemoryBackend for RecordingMemoryBackend {
+    async fn load_memory(&self, session_id: &str) -> Option<String> {
+        self.stored.lock().unwrap().get(session_id).cloned()
+    }
+
+    async fn save_memory(&self, session_id: &str, content: &str) {
+        self.saved.lock().unwrap().push(content.to_string());
+        self.stored
+            .lock()
+            .unwrap()
+            .insert(session_id.to_string(), content.to_string());
+    }
+}
+
+/// A session with enough turns for `summary_split(…, 3)` to yield a
+/// non-empty, ≥2-message summarize range.
+fn session_with_history() -> SessionState {
+    let mut session = SessionState::new(std::path::PathBuf::from("/tmp/test"));
+    session.messages.push(Message::user("start"));
+    session.messages.push(Message::assistant("a1"));
+    session.messages.push(Message::user("u2"));
+    session.messages.push(Message::assistant("a2"));
+    session.messages.push(Message::user("u3"));
+    session.messages.push(Message::assistant("a3"));
+    session.messages.push(Message::user("u4"));
+    session.messages.push(Message::assistant("a4"));
+    session
+}
+
+/// Response whose usage exceeds the test's tiny budget, triggering
+/// budget-exhaustion → compact recovery.
+fn budget_trigger_response() -> ApiResponse {
+    ApiResponse {
+        content: "Working on it.".into(),
+        tool_calls: Vec::new(),
+        usage: UsageSummary {
+            input_tokens: 10,
+            output_tokens: 2_000, // budget is 1_000
+            cache_read_tokens: 0,
+            cache_creation_tokens: 0,
+        },
+        stop_reason: "end_turn".into(),
+    }
+}
+
+#[tokio::test]
+async fn compact_recovery_injects_session_memory() {
+    let responses = vec![
+        budget_trigger_response(),
+        text_response("Summary: the task is mid-flight."), // LLM summary
+        text_response("Current State: auth fixed.\nKey Decisions: use bcrypt."),
+        text_response("Done."), // retry after compaction
+    ];
+    let mock = RecordingMock::new(responses);
+    let requests = mock.requests_handle();
+    let tools = Box::new(EchoToolExecutor);
+    let (mut engine, _rx) = make_engine(Box::new(mock), tools);
+    engine.set_session(session_with_history());
+    let backend = RecordingMemoryBackend::new();
+    let saved_handle = std::sync::Arc::clone(&backend.saved);
+    let backend_dyn: std::sync::Arc<dyn SessionMemoryBackend> = backend;
+    engine.set_session_memory(backend_dyn);
+
+    let mut options = SubmitOptions::default();
+    options.task_budget_tokens = 1_000;
+    options.handle_elicitation = false;
+
+    // The engine does not reset turn_tokens after compaction, so a
+    // compaction triggered by budget exhaustion ends the turn exhausted.
+    let result = engine.submit("finish it".into(), options).await.unwrap();
+    assert_eq!(result, TerminalReason::BudgetExhausted);
+
+    // The refreshed memory document was persisted through the backend.
+    let saved = saved_handle.lock().unwrap();
+    assert_eq!(saved.len(), 1);
+    assert!(saved[0].contains("Current State: auth fixed."));
+    drop(saved);
+
+    // The post-compaction retry request carries the injected memory section.
+    let requests = requests.lock().unwrap();
+    assert!(
+        requests
+            .iter()
+            .any(|(_, msgs)| msgs.contains("<session_memory>")
+                && msgs.contains("Current State: auth fixed.")),
+        "post-compaction request should carry the injected <session_memory>"
+    );
+}
+
+#[tokio::test]
+async fn compact_recovery_survives_memory_update_failure() {
+    let responses = vec![
+        budget_trigger_response(),
+        text_response("Summary: the task is mid-flight."),
+        text_response("Done."),
+    ];
+    // The session-memory create prompt is identifiable by its opening line.
+    let mock = RecordingMock::new(responses).failing_on("Create a new session memory file");
+    let requests = mock.requests_handle();
+    let tools = Box::new(EchoToolExecutor);
+    let (mut engine, _rx) = make_engine(Box::new(mock), tools);
+    engine.set_session(session_with_history());
+    let backend = RecordingMemoryBackend::new();
+    let saved_handle = std::sync::Arc::clone(&backend.saved);
+    let backend_dyn: std::sync::Arc<dyn SessionMemoryBackend> = backend;
+    engine.set_session_memory(backend_dyn);
+
+    let mut options = SubmitOptions::default();
+    options.task_budget_tokens = 1_000;
+    options.handle_elicitation = false;
+
+    // Compaction (and the whole turn) still succeeds.
+    // The engine does not reset turn_tokens after compaction, so a
+    // compaction triggered by budget exhaustion ends the turn exhausted.
+    let result = engine.submit("finish it".into(), options).await.unwrap();
+    assert_eq!(result, TerminalReason::BudgetExhausted);
+
+    // No memory was persisted, and no <session_memory> was injected.
+    assert!(saved_handle.lock().unwrap().is_empty());
+    let requests = requests.lock().unwrap();
+    assert!(
+        !requests
+            .iter()
+            .any(|(_, msgs)| msgs.contains("<session_memory>"))
+    );
+}
+
+#[tokio::test]
+async fn compact_recovery_no_extra_llm_call_without_backend() {
+    // trigger → summary → retry: exactly 3 LLM calls with no backend.
+    let responses = vec![
+        budget_trigger_response(),
+        text_response("Summary: the task is mid-flight."),
+        text_response("Done."),
+    ];
+    let mock = RecordingMock::new(responses);
+    let calls = mock.calls_handle();
+    let tools = Box::new(EchoToolExecutor);
+    let (mut engine, _rx) = make_engine(Box::new(mock), tools);
+    engine.set_session(session_with_history());
+
+    let mut options = SubmitOptions::default();
+    options.task_budget_tokens = 1_000;
+    options.handle_elicitation = false;
+
+    // The engine does not reset turn_tokens after compaction, so a
+    // compaction triggered by budget exhaustion ends the turn exhausted.
+    let result = engine.submit("finish it".into(), options).await.unwrap();
+    assert_eq!(result, TerminalReason::BudgetExhausted);
+
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        3,
+        "compaction without a memory backend must not add LLM calls"
+    );
+}

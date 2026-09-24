@@ -35,6 +35,7 @@ pub mod query_profiles;
 pub mod runtime;
 pub mod sandbox;
 pub mod scheduler;
+pub mod session_memory;
 pub mod shell_security;
 pub mod state;
 pub mod stop_hook;
@@ -51,9 +52,9 @@ pub mod wire_transport;
 pub mod worktree;
 
 pub use compact::{
-    CompactResult, CompactStrategy, auto_compact, compact_boundary_message,
+    CompactResult, CompactStrategy, MicroCompactParams, auto_compact, compact_boundary_message,
     insert_compact_boundary, micro_compact, reactive_compact, select_compact_strategy,
-    should_auto_compact, should_reactive_compact, snip_compact,
+    should_auto_compact, should_reactive_compact, snip_compact, truncate_tool_output,
 };
 pub use file_traversal::{
     FileIterator, TraversalConfig, TraversalError, collect_files, count_files, traverse,
@@ -65,6 +66,7 @@ pub use markdown::{
 };
 pub use prompt::{AssembledContext, CompactConfig, PromptBlock, PromptCompiler, PromptContext};
 pub use scheduler::{CronError, CronJob, CronRunner, CronSchedule, next_cron_time, validate_cron};
+pub use session_memory::SessionMemoryBackend;
 pub use syntax::{SyntaxError, SyntaxHighlighter, Token};
 
 pub use engine::{

@@ -77,6 +77,17 @@ pub struct CompactConfig {
     pub summary_input_max_tokens: usize,
     /// Max tokens for the summary output.
     pub summary_output_max_tokens: u32,
+    /// Only truncate tool results larger than this many tokens during
+    /// micro compact (smaller results are left byte-identical so the
+    /// prompt cache over them is preserved).
+    pub micro_min_result_tokens: usize,
+    /// Head tokens kept of a truncated tool result (paths/commands).
+    pub micro_head_tokens: usize,
+    /// Tail tokens kept of a truncated tool result (final output).
+    pub micro_tail_tokens: usize,
+    /// Whether compaction refreshes and injects session memory
+    /// (requires a session-memory backend attached to the engine).
+    pub session_memory_enabled: bool,
 }
 
 impl Default for CompactConfig {
@@ -92,6 +103,10 @@ impl Default for CompactConfig {
             max_consecutive_failures: 3,
             summary_input_max_tokens: 20_000,
             summary_output_max_tokens: 4_096,
+            micro_min_result_tokens: 2_000,
+            micro_head_tokens: 1_000,
+            micro_tail_tokens: 500,
+            session_memory_enabled: true,
         }
     }
 }

@@ -11,6 +11,7 @@ pub mod prompts;
 pub mod session_index;
 pub mod session_memory;
 pub mod session_memory_agent;
+pub mod session_memory_backend;
 pub mod team_memory;
 pub mod transcript;
 

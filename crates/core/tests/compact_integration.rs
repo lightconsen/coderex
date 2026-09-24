@@ -6,14 +6,14 @@
 //! 7.4 snip compact, 7.5 compact boundary, 7.6 dead loop protection
 
 use coderex_core::compact::{
-    CompactResult, CompactStrategy, auto_compact, compact_boundary_message,
+    CompactResult, CompactStrategy, MicroCompactParams, auto_compact, compact_boundary_message,
     insert_compact_boundary, micro_compact, reactive_compact, select_compact_strategy,
     should_auto_compact, should_reactive_compact, snip_compact,
 };
 use coderex_core::stop_hook::{
     StopHookContext, StopHookDecision, evaluate_stop_hook, should_proceed_with_compact,
 };
-use coderex_core::types::{Message, MessageContent, ModelId, Role, ToolResult};
+use coderex_core::types::{Message, MessageContent, ModelId, Role, ToolCall, ToolResult};
 
 // ═══════════════════════════════════════════════════════════════════════════
 //  Helpers
@@ -35,6 +35,26 @@ fn make_tool_result(output: &str) -> Message {
     })
 }
 
+/// A paired assistant ToolCall + tool result exchange, as produced by a
+/// real turn — `micro_compact` resolves the tool name from the ToolCall side.
+fn make_tool_exchange(id: &str, name: &str, output: &str) -> Vec<Message> {
+    vec![
+        Message {
+            role: Role::Assistant,
+            content: MessageContent::ToolCall(ToolCall {
+                id: id.into(),
+                name: name.into(),
+                input: serde_json::json!({}),
+            }),
+        },
+        Message::tool(ToolResult {
+            tool_call_id: id.into(),
+            output: output.to_string(),
+            is_error: false,
+        }),
+    ]
+}
+
 fn make_long_messages(count: usize) -> Vec<Message> {
     let mut messages = Vec::new();
     messages.push(make_user("initial query"));
@@ -47,34 +67,104 @@ fn make_long_messages(count: usize) -> Vec<Message> {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-//  7.1 Micro Compact — summarize early tool results, preserve recent
+//  7.1 Micro Compact — shrink early tool results, preserve recent + identity
 // ═══════════════════════════════════════════════════════════════════════════
 
 #[test]
 fn micro_compact_summarizes_early_tool_results() {
-    let messages = vec![
-        make_tool_result("old output 1"),
-        make_tool_result("old output 2"),
-        make_tool_result("recent"),
-    ];
+    let mut messages = Vec::new();
+    messages.extend(make_tool_exchange("tc_1", "read", &"x".repeat(40_000)));
+    messages.extend(make_tool_exchange("tc_2", "read", &"y".repeat(40_000)));
+    messages.extend(make_tool_exchange("tc_3", "read", "recent"));
 
-    let result = micro_compact(&messages, 1);
+    let result = micro_compact(
+        &messages,
+        MicroCompactParams {
+            keep_recent: 1,
+            min_result_tokens: 100,
+            ..MicroCompactParams::default()
+        },
+    );
 
     assert_eq!(result.strategy, CompactStrategy::Micro);
     assert!(result.tokens_removed > 0);
     // Last tool result preserved
-    let last = &result.messages[2];
+    let last = &result.messages[5];
     assert!(matches!(last.content, MessageContent::ToolResult(_)));
-    // Earlier ones summarized (converted to system messages)
-    assert!(matches!(result.messages[0].role, Role::System));
-    assert!(matches!(result.messages[1].role, Role::System));
+    // Earlier ones keep their identity: Tool role, same tool_call_id,
+    // shrunk output with elision marker.
+    for (i, id) in [(1, "tc_1"), (3, "tc_2")] {
+        assert!(matches!(result.messages[i].role, Role::Tool));
+        if let MessageContent::ToolResult(tr) = &result.messages[i].content {
+            assert_eq!(tr.tool_call_id, id);
+            assert!(tr.output.contains("tokens elided"));
+        } else {
+            panic!("expected tool result at index {i}");
+        }
+    }
+}
+
+#[test]
+fn micro_compact_preserves_pairing() {
+    let mut messages = Vec::new();
+    messages.extend(make_tool_exchange("tc_1", "read", &"x".repeat(40_000)));
+    messages.extend(make_tool_exchange("tc_2", "read", "recent"));
+
+    let result = micro_compact(
+        &messages,
+        MicroCompactParams {
+            keep_recent: 1,
+            min_result_tokens: 100,
+            ..MicroCompactParams::default()
+        },
+    );
+
+    // The assistant tool_use id still matches the tool_result tool_call_id
+    // after compaction — provider pairing survives.
+    if let MessageContent::ToolCall(tc) = &result.messages[0].content {
+        if let MessageContent::ToolResult(tr) = &result.messages[1].content {
+            assert_eq!(tc.id, tr.tool_call_id);
+        } else {
+            panic!("expected tool result");
+        }
+    } else {
+        panic!("expected tool call");
+    }
+}
+
+#[test]
+fn micro_compact_unknown_tool_untouched() {
+    let mut messages = Vec::new();
+    messages.extend(make_tool_exchange(
+        "tc_1",
+        "custom_remote_tool",
+        &"x".repeat(40_000),
+    ));
+    messages.extend(make_tool_exchange("tc_2", "read", "recent"));
+
+    let result = micro_compact(
+        &messages,
+        MicroCompactParams {
+            keep_recent: 1,
+            min_result_tokens: 100,
+            ..MicroCompactParams::default()
+        },
+    );
+
+    // Non-whitelisted tool output kept verbatim.
+    assert_eq!(result.tokens_removed, 0);
+    if let MessageContent::ToolResult(tr) = &result.messages[1].content {
+        assert_eq!(tr.output, "x".repeat(40_000));
+    } else {
+        panic!("expected tool result");
+    }
 }
 
 #[test]
 fn micro_compact_no_op_when_few_tool_results() {
     let messages = vec![make_user("hello"), make_tool_result("only result")];
 
-    let result = micro_compact(&messages, 5);
+    let result = micro_compact(&messages, MicroCompactParams::default());
     assert_eq!(result.tokens_removed, 0);
     assert!(matches!(
         result.messages[1].content,
@@ -84,7 +174,7 @@ fn micro_compact_no_op_when_few_tool_results() {
 
 #[test]
 fn micro_compact_empty_messages() {
-    let result = micro_compact(&[], 1);
+    let result = micro_compact(&[], MicroCompactParams::default());
     assert_eq!(result.tokens_removed, 0);
     assert!(result.messages.is_empty());
 }
@@ -488,14 +578,25 @@ fn compact_pipeline_micro_then_auto() {
     let mut messages = Vec::new();
     messages.push(make_user("start"));
     for i in 0..5 {
-        messages.push(make_tool_result(&format!("tool output {}", i).repeat(500)));
+        messages.extend(make_tool_exchange(
+            &format!("tc_{i}"),
+            "read",
+            &format!("tool output {i}").repeat(2000),
+        ));
         messages.push(make_assistant(&format!("response {}", i).repeat(200)));
     }
     messages.push(make_user("end"));
 
     // First apply micro
-    let micro = micro_compact(&messages, 1);
+    let micro = micro_compact(
+        &messages,
+        MicroCompactParams {
+            keep_recent: 1,
+            ..MicroCompactParams::default()
+        },
+    );
     assert_eq!(micro.strategy, CompactStrategy::Micro);
+    assert!(micro.tokens_removed > 0);
 
     // Then apply auto on the result
     let auto = auto_compact(&micro.messages, 100);
@@ -526,7 +627,7 @@ fn compact_preserves_message_count_with_no_tool_results() {
     ];
 
     // Micro with no tool results should be a no-op
-    let result = micro_compact(&messages, 1);
+    let result = micro_compact(&messages, MicroCompactParams::default());
     assert_eq!(result.tokens_removed, 0);
     assert_eq!(result.messages.len(), 4);
 }

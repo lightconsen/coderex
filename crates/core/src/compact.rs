@@ -61,13 +61,75 @@ fn total_token_estimate(messages: &[Message]) -> usize {
 
 // ─── Micro Compact ──────────────────────────────────────────────────────────
 
-/// Apply micro compact: replace early tool results with short summaries.
+/// Parameters for cache-friendly micro compact.
+#[derive(Debug, Clone, Copy)]
+pub struct MicroCompactParams {
+    /// Keep the last N tool-result messages verbatim.
+    pub keep_recent: usize,
+    /// Only truncate tool results larger than this (tokens, chars/4 estimate).
+    pub min_result_tokens: usize,
+    /// Head tokens kept of a truncated tool result (paths/commands live here).
+    pub head_tokens: usize,
+    /// Tail tokens kept of a truncated tool result (final output lives here).
+    pub tail_tokens: usize,
+}
+
+impl Default for MicroCompactParams {
+    fn default() -> Self {
+        Self {
+            keep_recent: 5,
+            min_result_tokens: 2_000,
+            head_tokens: 1_000,
+            tail_tokens: 500,
+        }
+    }
+}
+
+/// Tools whose results are safe to truncate in micro compact.
 ///
-/// Keeps the last `keep_recent` tool result messages intact. Earlier ones
-/// are replaced with a summary message (first 200 chars of output + "...").
+/// Read/search/shell results are re-derivable (re-run the command, re-read
+/// the file); mutating or remote tools outside this list keep their output
+/// verbatim.
+const MICRO_COMPACT_TOOLS: &[&str] = &[
+    "read",
+    "shell",
+    "bash",
+    "grep",
+    "rg",
+    "glob",
+    "websearch",
+    "web_search",
+    "webfetch",
+    "web_fetch",
+    "edit",
+    "write",
+    "apply_patch",
+];
+
+fn is_micro_compactable(name: &str) -> bool {
+    MICRO_COMPACT_TOOLS.contains(&name.to_ascii_lowercase().as_str())
+}
+
+/// Apply micro compact: shrink early whitelisted tool results in place.
+///
+/// Keeps the last `keep_recent` tool result messages verbatim. Earlier
+/// ones belonging to whitelisted tools and larger than
+/// `min_result_tokens` have their output truncated (head + tail kept,
+/// middle elided). The message identity — role, `tool_call_id`,
+/// `is_error` — is preserved so provider-side tool_use/tool_result
+/// pairing and any prompt cache over the structure survive compaction.
 #[must_use]
-pub fn micro_compact(messages: &[Message], keep_recent: usize) -> CompactResult {
+pub fn micro_compact(messages: &[Message], params: MicroCompactParams) -> CompactResult {
     let tokens_before = total_token_estimate(messages);
+
+    // Map tool_call_id → tool name from the assistant ToolCall messages.
+    let tool_names: std::collections::HashMap<&str, &str> = messages
+        .iter()
+        .filter_map(|m| match &m.content {
+            MessageContent::ToolCall(tc) => Some((tc.id.as_str(), tc.name.as_str())),
+            _ => None,
+        })
+        .collect();
 
     // Find indices of tool result messages
     let tool_result_indices: Vec<usize> = messages
@@ -77,7 +139,7 @@ pub fn micro_compact(messages: &[Message], keep_recent: usize) -> CompactResult 
         .map(|(i, _)| i)
         .collect();
 
-    if tool_result_indices.len() <= keep_recent {
+    if tool_result_indices.len() <= params.keep_recent {
         // Nothing to compact — all tool results are within keep_recent
         return CompactResult {
             strategy: CompactStrategy::Micro,
@@ -88,13 +150,32 @@ pub fn micro_compact(messages: &[Message], keep_recent: usize) -> CompactResult 
         };
     }
 
-    // Summarize tool results beyond keep_recent from the end
-    let summarize_count = tool_result_indices.len() - keep_recent;
+    // Shrink tool results beyond keep_recent from the end
+    let summarize_count = tool_result_indices.len() - params.keep_recent;
     let mut result = messages.to_vec();
 
     for idx in tool_result_indices.iter().take(summarize_count) {
-        if let MessageContent::ToolResult(tr) = &result[*idx].content.clone() {
-            result[*idx] = summarize_tool_result(tr);
+        if let MessageContent::ToolResult(tr) = &result[*idx].content {
+            // Conservative: leave unpaired, non-whitelisted or small results
+            // intact — never rewrite content we don't actually shrink.
+            let name = tool_names.get(tr.tool_call_id.as_str()).copied();
+            let Some(name) = name else { continue };
+            if !is_micro_compactable(name) {
+                continue;
+            }
+            if PromptCompiler::estimate_tokens(&tr.output) <= params.min_result_tokens {
+                continue;
+            }
+            let truncated =
+                truncate_tool_output(&tr.output, params.head_tokens, params.tail_tokens);
+            result[*idx] = Message {
+                role: Role::Tool,
+                content: MessageContent::ToolResult(ToolResult {
+                    tool_call_id: tr.tool_call_id.clone(),
+                    output: truncated,
+                    is_error: tr.is_error,
+                }),
+            };
         }
     }
 
@@ -108,19 +189,26 @@ pub fn micro_compact(messages: &[Message], keep_recent: usize) -> CompactResult 
     }
 }
 
-/// Replace a ToolResult with a short summary message.
-fn summarize_tool_result(tr: &ToolResult) -> Message {
-    let max_len = 200;
-    let summary = if tr.output.len() > max_len {
-        format!(
-            "[Tool '{}' output truncated] {}",
-            tr.tool_call_id,
-            &tr.output[..max_len]
-        )
-    } else {
-        format!("[Tool '{}'] {}", tr.tool_call_id, tr.output)
-    };
-    Message::system(summary)
+/// Truncate a tool output keeping head and tail with a token-denominated
+/// elision marker.
+///
+/// Tool outputs tend to start with the command/path (head is signal) and end
+/// with the result (tail is signal); the middle is where redundancy lives.
+/// The 2:1 head:tail split reflects that tool outputs are more
+/// path/command-heavy up front than plain prose.
+#[must_use]
+pub fn truncate_tool_output(output: &str, head_tokens: usize, tail_tokens: usize) -> String {
+    if PromptCompiler::estimate_tokens(output) <= head_tokens + tail_tokens {
+        return output.to_string();
+    }
+    let head_chars = head_tokens * 4;
+    let tail_chars = tail_tokens * 4;
+    let chars: Vec<char> = output.chars().collect();
+    let elided_tokens = PromptCompiler::estimate_tokens(output) - head_tokens - tail_tokens;
+    let head_part: String = chars[..head_chars.min(chars.len())].iter().collect();
+    let tail_start = chars.len().saturating_sub(tail_chars);
+    let tail_part: String = chars[tail_start..].iter().collect();
+    format!("{head_part}\n[... ~{elided_tokens} tokens elided ...]\n{tail_part}")
 }
 
 // ─── Auto Compact ───────────────────────────────────────────────────────────
@@ -142,7 +230,7 @@ pub const fn should_auto_compact(
 #[must_use]
 pub fn auto_compact(messages: &[Message], threshold: usize) -> CompactResult {
     // First apply micro compact
-    let micro = micro_compact(messages, 5);
+    let micro = micro_compact(messages, MicroCompactParams::default());
 
     let tokens_after_micro = total_token_estimate(&micro.messages);
     if tokens_after_micro <= threshold {
@@ -652,6 +740,27 @@ mod tests {
         })
     }
 
+    /// A paired assistant ToolCall + tool result exchange, as produced by
+    /// a real turn. `micro_compact` needs the ToolCall side to resolve the
+    /// tool name for the whitelist check.
+    fn make_tool_exchange(id: &str, name: &str, output: &str) -> Vec<Message> {
+        vec![
+            Message {
+                role: Role::Assistant,
+                content: MessageContent::ToolCall(crate::types::ToolCall {
+                    id: id.into(),
+                    name: name.into(),
+                    input: serde_json::json!({}),
+                }),
+            },
+            Message::tool(ToolResult {
+                tool_call_id: id.into(),
+                output: output.to_string(),
+                is_error: false,
+            }),
+        ]
+    }
+
     fn make_assistant_text(text: &str) -> Message {
         Message::assistant(text)
     }
@@ -665,39 +774,188 @@ mod tests {
         let mut messages = Vec::new();
         messages.push(make_user_text("hello"));
         messages.push(make_assistant_text("sure"));
-        messages.push(make_tool_result(&"x".repeat(1000))); // large tool result
+        messages.extend(make_tool_exchange("tc_1", "read", &"x".repeat(40_000))); // large read result
         messages.push(make_user_text("next"));
         messages.push(make_assistant_text("ok"));
-        messages.push(make_tool_result("small"));
+        messages.extend(make_tool_exchange("tc_2", "read", "small"));
 
-        let result = micro_compact(&messages, 1);
+        let result = micro_compact(
+            &messages,
+            MicroCompactParams {
+                keep_recent: 1,
+                ..Default::default()
+            },
+        );
 
         // Should have reduced token count
         assert!(result.tokens_removed > 0);
-        assert_eq!(result.messages.len(), messages.len()); // same count, but some summarized
+        assert_eq!(result.messages.len(), messages.len()); // same count, output shrunk
     }
 
     #[test]
     fn micro_compact_preserves_recent_tool_results() {
-        let messages = vec![
-            make_tool_result("old_result_1"),
-            make_tool_result("old_result_2"),
-            make_tool_result("recent_result"),
-        ];
+        let mut messages = Vec::new();
+        messages.extend(make_tool_exchange("tc_1", "read", &"a".repeat(40_000)));
+        messages.extend(make_tool_exchange("tc_2", "read", &"b".repeat(40_000)));
+        messages.extend(make_tool_exchange("tc_3", "read", "recent_result"));
 
-        let result = micro_compact(&messages, 1);
+        let result = micro_compact(
+            &messages,
+            MicroCompactParams {
+                keep_recent: 1,
+                ..Default::default()
+            },
+        );
 
         // Last tool result should be intact
-        let last = &result.messages[2];
+        let last = &result.messages[5];
         if let MessageContent::ToolResult(tr) = &last.content {
             assert_eq!(tr.output, "recent_result");
         } else {
             panic!("expected tool result");
         }
 
-        // Earlier ones should be summarized (converted to system messages)
-        let first = &result.messages[0];
-        assert!(matches!(first.role, Role::System));
+        // Earlier ones keep their message identity (Tool role, same id)
+        // and their output is shrunk, not converted to a system message.
+        let first = &result.messages[1];
+        assert!(matches!(first.role, Role::Tool));
+        if let MessageContent::ToolResult(tr) = &first.content {
+            assert_eq!(tr.tool_call_id, "tc_1");
+            assert!(tr.output.contains("tokens elided"));
+        } else {
+            panic!("expected tool result");
+        }
+    }
+
+    #[test]
+    fn micro_compact_preserves_tool_result_identity() {
+        let mut messages = Vec::new();
+        messages.extend(make_tool_exchange("tc_1", "read", &"y".repeat(40_000)));
+        messages.extend(make_tool_exchange("tc_2", "read", "recent"));
+
+        let result = micro_compact(
+            &messages,
+            MicroCompactParams {
+                keep_recent: 1,
+                ..Default::default()
+            },
+        );
+
+        // Message count unchanged, role/tool_call_id/is_error unchanged.
+        assert_eq!(result.messages.len(), messages.len());
+        let first = &result.messages[1];
+        assert!(matches!(first.role, Role::Tool));
+        if let MessageContent::ToolResult(tr) = &first.content {
+            assert_eq!(tr.tool_call_id, "tc_1");
+            assert!(!tr.is_error);
+            assert!(tr.output.len() < 40_000);
+            assert!(tr.output.contains("tokens elided"));
+        } else {
+            panic!("expected tool result");
+        }
+    }
+
+    #[test]
+    fn micro_compact_respects_tool_whitelist() {
+        let mut messages = Vec::new();
+        messages.extend(make_tool_exchange("tc_1", "task", &"z".repeat(40_000)));
+        messages.extend(make_tool_exchange(
+            "tc_2",
+            "unknown_tool",
+            &"z".repeat(40_000),
+        ));
+        messages.extend(make_tool_exchange("tc_3", "read", "recent"));
+
+        let result = micro_compact(
+            &messages,
+            MicroCompactParams {
+                keep_recent: 1,
+                ..Default::default()
+            },
+        );
+
+        // Non-whitelisted tools keep their output verbatim.
+        assert_eq!(result.tokens_removed, 0);
+        if let MessageContent::ToolResult(tr) = &result.messages[1].content {
+            assert_eq!(tr.output, "z".repeat(40_000));
+        } else {
+            panic!("expected tool result");
+        }
+    }
+
+    #[test]
+    fn micro_compact_leaves_small_results_intact() {
+        let mut messages = Vec::new();
+        messages.extend(make_tool_exchange("tc_1", "read", "tiny output"));
+        messages.extend(make_tool_exchange("tc_2", "read", "recent"));
+
+        let result = micro_compact(
+            &messages,
+            MicroCompactParams {
+                keep_recent: 1,
+                ..Default::default()
+            },
+        );
+
+        // Small results are not rewritten (no-op preserves cache).
+        assert_eq!(result.tokens_removed, 0);
+        if let MessageContent::ToolResult(tr) = &result.messages[1].content {
+            assert_eq!(tr.output, "tiny output");
+        } else {
+            panic!("expected tool result");
+        }
+    }
+
+    #[test]
+    fn micro_compact_unpaired_result_untouched() {
+        let messages = vec![
+            make_tool_result(&"orphan".repeat(2000)),
+            make_tool_result("recent"),
+        ];
+
+        let result = micro_compact(
+            &messages,
+            MicroCompactParams {
+                keep_recent: 1,
+                ..Default::default()
+            },
+        );
+
+        // No paired ToolCall → conservative no-op.
+        assert_eq!(result.tokens_removed, 0);
+        assert!(matches!(result.messages[0].role, Role::Tool));
+    }
+
+    #[test]
+    fn truncate_tool_output_keeps_head_and_tail_with_token_marker() {
+        let output = format!(
+            "{}\n{}\n{}",
+            "h".repeat(4000),
+            "-".repeat(8000),
+            "t".repeat(2000)
+        );
+        let truncated = truncate_tool_output(&output, 1_000, 500);
+
+        assert!(truncated.len() < output.len());
+        assert!(truncated.starts_with(&"h".repeat(4000)));
+        assert!(truncated.ends_with(&"t".repeat(2000)));
+        assert!(truncated.contains("tokens elided"));
+    }
+
+    #[test]
+    fn truncate_tool_output_passthrough_below_threshold() {
+        let output = "small output";
+        assert_eq!(truncate_tool_output(output, 1_000, 500), output);
+    }
+
+    #[test]
+    fn truncate_tool_output_multibyte_safe() {
+        // Emoji + CJK: naive byte slicing would panic here.
+        let output = "🦀".repeat(5000) + &"汉".repeat(5000);
+        let truncated = truncate_tool_output(&output, 100, 50);
+
+        assert!(truncated.contains("tokens elided"));
+        assert!(truncated.chars().count() < output.chars().count());
     }
 
     #[test]
