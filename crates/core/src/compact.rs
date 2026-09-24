@@ -406,6 +406,240 @@ pub fn select_compact_strategy(
     CompactStrategy::Snip
 }
 
+// ─── LLM Summary Compaction ─────────────────────────────────────────────────
+
+/// The interval of messages that an LLM summary compaction replaces.
+///
+/// `kept_head` preserves the original intent (first user message region),
+/// `kept_tail` preserves the live working set (recent turns). Everything
+/// strictly between the two is summarized by the LLM.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SummarySplit {
+    /// Index of the first message NOT preserved — where summarization starts.
+    pub summarize_from: usize,
+    /// Index of the first preserved recent message (end of summarize range).
+    pub summarize_to: usize,
+}
+
+/// Compute the summarize range for LLM summary compaction.
+///
+/// Invariants (enforced by tests below):
+/// - the first user message is always preserved verbatim,
+/// - the last `keep_recent_turns` * complete turns (user + response) are
+///   always preserved,
+/// - the range is empty when there is nothing worth summarizing.
+#[must_use]
+pub fn summary_split(messages: &[Message], keep_recent_turns: usize) -> SummarySplit {
+    let summarize_from = first_user_index(messages).map_or(0, |i| i + 1);
+    let summarize_to = tail_start(messages, keep_recent_turns);
+    SummarySplit {
+        summarize_from: summarize_from.min(summarize_to),
+        summarize_to,
+    }
+}
+
+/// Index of the first user message (preserved verbatim, intent anchor).
+fn first_user_index(messages: &[Message]) -> Option<usize> {
+    messages.iter().position(|m| matches!(m.role, Role::User))
+}
+
+/// Index where the preserved recent tail starts.
+///
+/// Walks backwards counting user messages as turn starts; the tail begins
+/// after `keep_recent_turns` user messages have been seen.
+fn tail_start(messages: &[Message], keep_recent_turns: usize) -> usize {
+    let mut turns_seen = 0usize;
+    for i in (0..messages.len()).rev() {
+        if matches!(messages[i].role, Role::User) {
+            turns_seen += 1;
+            if turns_seen > keep_recent_turns {
+                return i + 1;
+            }
+        }
+    }
+    0
+}
+
+/// Render a message for the summarizer input.
+fn render_message_for_summary(msg: &Message) -> String {
+    match &msg.content {
+        MessageContent::Text(s) => format!("[{:?}] {}", msg.role, s),
+        MessageContent::ToolCall(tc) => {
+            let json = serde_json::to_string(tc).unwrap_or_default();
+            format!("[{:?}] tool call: {}", msg.role, json)
+        }
+        MessageContent::ToolResult(tr) => format!(
+            "[tool result for {}] {}",
+            tr.tool_call_id,
+            truncate_middle(&tr.output, 1_500)
+        ),
+    }
+}
+
+/// Render the summarize range into summarizer input, capped to
+/// `max_tokens` (chars/4 heuristic, matching `PromptCompiler`).
+///
+/// When over budget, whole messages are dropped from the front of the range
+/// (oldest first) until it fits — the tail of the range is the most
+/// decision-dense, so it is always kept.
+#[must_use]
+pub fn build_summary_input(
+    messages: &[Message],
+    split: &SummarySplit,
+    max_tokens: usize,
+) -> Vec<String> {
+    let range = messages
+        .get(split.summarize_from..split.summarize_to)
+        .unwrap_or(&[]);
+    let rendered: Vec<String> = range.iter().map(render_message_for_summary).collect();
+
+    let max_chars = max_tokens.saturating_mul(4);
+    let mut total = rendered.iter().map(String::len).sum::<usize>();
+    let mut start = 0usize;
+    while total > max_chars && start < rendered.len() {
+        total -= rendered[start].len();
+        start += 1;
+    }
+    rendered[start..].to_vec()
+}
+
+/// Assemble post-compaction messages for LLM summary compaction.
+///
+/// Result layout: `[preserved head..] [boundary] [summary] [preserved tail..]`
+/// — the boundary separates the original head from the generated summary so
+/// the model knows everything before it is elided.
+#[must_use]
+pub fn assemble_summary_result(
+    messages: &[Message],
+    split: &SummarySplit,
+    summary_text: &str,
+    tokens_before: usize,
+    tokens_after: usize,
+) -> CompactResult {
+    let mut result: Vec<Message> = Vec::new();
+    // Preserved head (original intent).
+    result.extend_from_slice(&messages[..split.summarize_from]);
+    // Boundary marker between original head and generated summary.
+    if split.summarize_from > 0 {
+        result.push(compact_boundary_message());
+    }
+    // Generated summary as a user message (models treat user-provided
+    // handoff context as most salient).
+    result.push(Message::user(format!(
+        "<context_summary>\n{summary_text}\n</context_summary>\n\
+         (The above is a summary of earlier conversation. Earlier messages \
+         have been compacted away. Continue from where the summary leaves off.)"
+    )));
+    // Preserved tail (live working set).
+    result.extend_from_slice(&messages[split.summarize_to..]);
+
+    CompactResult {
+        strategy: CompactStrategy::Auto,
+        messages: result,
+        tokens_removed: tokens_before.saturating_sub(tokens_after),
+        boundary_inserted: true,
+        boundary_index: Some(split.summarize_from),
+    }
+}
+
+/// Truncate a long string in the middle, keeping head and tail.
+///
+/// Tool outputs tend to start with the command/path (head is signal) and end
+/// with the result (tail is signal); the middle is where redundancy lives.
+#[must_use]
+pub fn truncate_middle(text: &str, max_chars: usize) -> String {
+    if text.chars().count() <= max_chars {
+        return text.to_string();
+    }
+    const ELIDER_EXTRA: usize = 40; // "\n[... N chars elided ...]\n" headroom
+    let budget = max_chars.saturating_sub(ELIDER_EXTRA);
+    let head = budget * 2 / 3;
+    let tail = budget - head;
+    let chars: Vec<char> = text.chars().collect();
+    let elided = chars.len() - head - tail;
+    let head_part: String = chars[..head].iter().collect();
+    let tail_part: String = chars[chars.len() - tail..].iter().collect();
+    format!("{head_part}\n[... {elided} chars elided ...]\n{tail_part}")
+}
+
+// ─── Post-Compact File Restore ──────────────────────────────────────────────
+
+/// File-path-like input keys for read-style tools.
+const FILE_PATH_KEYS: &[&str] = &["file_path", "path", "filename", "file"];
+
+/// Extract the most recent file paths read inside the summarized interval.
+///
+/// Scans tool calls (and tool results echoing their inputs) in
+/// `messages[split.summarize_from..split.summarize_to]`, collecting paths
+/// from read-style tools; returns at most `max_files`, most recent last.
+///
+/// Used to build the post-compact restore hint so the agent knows which
+/// files' contents were compacted away and can re-read them on demand.
+#[must_use]
+pub fn extract_recent_file_paths(
+    messages: &[Message],
+    split: &SummarySplit,
+    max_files: usize,
+) -> Vec<String> {
+    if max_files == 0 {
+        return Vec::new();
+    }
+    let range = messages
+        .get(split.summarize_from..split.summarize_to)
+        .unwrap_or(&[]);
+
+    let is_read_tool = |name: &str| {
+        name.eq_ignore_ascii_case("read")
+            || name.eq_ignore_ascii_case("file_read")
+            || name.eq_ignore_ascii_case("cat")
+    };
+
+    let mut paths: Vec<String> = Vec::new();
+    for msg in range {
+        if let MessageContent::ToolCall(tc) = &msg.content {
+            if !is_read_tool(&tc.name) {
+                continue;
+            }
+            for key in FILE_PATH_KEYS {
+                if let Some(path) = tc.input.get(*key).and_then(|v| v.as_str()) {
+                    let path = path.trim().to_string();
+                    if !path.is_empty() && !paths.contains(&path) {
+                        paths.push(path);
+                    }
+                    break;
+                }
+            }
+        }
+    }
+
+    // Most recent files matter most: take from the end.
+    let start = paths.len().saturating_sub(max_files);
+    paths.split_off(start)
+}
+
+/// Build the post-compact file-restore message.
+///
+/// Returns `None` when there are no file paths to restore.
+#[must_use]
+pub fn file_restore_message(paths: &[String]) -> Option<Message> {
+    if paths.is_empty() {
+        return None;
+    }
+    let list = paths
+        .iter()
+        .map(|p| format!("- {p}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    Some(Message::user(format!(
+        "<post_compact_file_restore>\n\
+         The following files were read earlier in this conversation, but their \
+         contents were compacted away with the summarized history:\n\n{list}\n\n\
+         Re-read any of them with the Read tool if their contents matter for \
+         the current work.\n\
+         </post_compact_file_restore>"
+    )))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -601,5 +835,173 @@ mod tests {
         let model = ModelId("custom-model".into());
         let strategy = select_compact_strategy("end_turn", 110_000, &model, false);
         assert!(matches!(strategy, CompactStrategy::Auto));
+    }
+
+    // ═════════════════════════════════════════════════════════════════════
+    //  LLM Summary Compaction
+    // ═════════════════════════════════════════════════════════════════════
+
+    fn make_conversation(turns: usize) -> Vec<Message> {
+        let mut messages = vec![make_user_text("build the parser module")];
+        for i in 0..turns {
+            messages.push(make_assistant_text(&format!("working on step {i}")));
+            messages.push(make_tool_result(&format!("output {i}").repeat(50)));
+            messages.push(make_user_text(&format!("turn {i} feedback")));
+        }
+        messages
+    }
+
+    #[test]
+    fn summary_split_preserves_first_user_message_and_tail() {
+        let messages = make_conversation(6);
+        let split = summary_split(&messages, 3);
+        // Head preserved: the first user message.
+        assert_eq!(split.summarize_from, 1);
+        // Layout: [0]=head user; turn i occupies assistant/tool/user at
+        // 3i+1..3i+3, so turn users sit at 3,6,9,12,15,18. The last 3
+        // complete turns (turns 3-5) begin at turn 3's assistant, index 10.
+        assert_eq!(split.summarize_to, 10);
+        // And the summarized interval covers turns 0-2.
+        assert_eq!(split.summarize_from.min(split.summarize_to), 1);
+    }
+
+    #[test]
+    fn summary_split_empty_range_when_few_turns() {
+        let messages = make_conversation(2);
+        let split = summary_split(&messages, 3);
+        // Nothing to summarize: tail covers everything after the head.
+        assert!(split.summarize_from >= split.summarize_to);
+    }
+
+    #[test]
+    fn assemble_summary_result_layout() {
+        let messages = make_conversation(6);
+        let split = summary_split(&messages, 3);
+        let result = assemble_summary_result(&messages, &split, "summary text", 1000, 200);
+        assert!(result.boundary_inserted);
+        assert_eq!(result.strategy, CompactStrategy::Auto);
+        // Layout: head..boundary..summary..tail
+        let boundary_idx = result.boundary_index.unwrap();
+        assert!(boundary_idx > 0);
+        let summary_msg = &result.messages[boundary_idx + 1];
+        let text = match &summary_msg.content {
+            MessageContent::Text(t) => t,
+            _ => panic!("summary must be text"),
+        };
+        assert!(text.contains("<context_summary>"));
+        assert!(text.contains("summary text"));
+        // Tail preserved: last message matches original last message.
+        assert_eq!(
+            result.messages.last().unwrap().role,
+            messages.last().unwrap().role
+        );
+    }
+
+    #[test]
+    fn build_summary_input_respects_token_budget() {
+        let messages = make_conversation(8);
+        let split = summary_split(&messages, 3);
+        // Force a tiny budget: max_tokens in chars/4 units.
+        let input = build_summary_input(&messages, &split, 200);
+        let total_chars: usize = input.iter().map(String::len).sum();
+        assert!(total_chars <= 200 * 4 + 4, "got {total_chars} chars");
+        assert!(!input.is_empty());
+    }
+
+    #[test]
+    fn truncate_middle_keeps_head_and_tail() {
+        let long = "a".repeat(500) + "MIDDLE_MARKER" + &"z".repeat(500);
+        let out = truncate_middle(&long, 100);
+        assert!(out.contains("MIDDLE_MARKER") == false);
+        assert!(out.starts_with('a'));
+        assert!(out.ends_with('z'));
+        assert!(out.contains("chars elided"));
+        // Short input passes through.
+        assert_eq!(truncate_middle("short", 100), "short");
+    }
+
+    #[test]
+    fn warning_threshold_below_auto_threshold() {
+        let cfg = crate::prompt::CompactConfig::default();
+        assert!(cfg.warning_threshold() <= cfg.auto_compact_threshold);
+    }
+
+    #[test]
+    fn resolve_auto_threshold_uses_window_when_known() {
+        let cfg = crate::prompt::CompactConfig::default();
+        // 200K window − 4K summary reserve − 13K buffer
+        assert_eq!(cfg.resolve_auto_threshold(200_000), 183_000);
+        // Unknown window falls back to configured value.
+        assert_eq!(cfg.resolve_auto_threshold(0), cfg.auto_compact_threshold);
+    }
+
+    #[test]
+    fn extract_recent_file_paths_from_read_tool_calls() {
+        let mut messages = vec![make_user_text("build the parser module")];
+        // Summarized interval: two reads, one write, one other read.
+        for (name, input) in [
+            ("read", serde_json::json!({"file_path": "src/a.rs"})),
+            ("Write", serde_json::json!({"file_path": "src/b.rs"})),
+            ("read", serde_json::json!({"path": "docs/guide.md"})),
+            ("read", serde_json::json!({"file_path": "src/parser.rs"})),
+        ] {
+            messages.push(Message {
+                role: Role::Assistant,
+                content: MessageContent::ToolCall(crate::types::ToolCall {
+                    id: format!("tc_{name}_{input}"),
+                    name: name.into(),
+                    input,
+                }),
+            });
+        }
+        let split = SummarySplit {
+            summarize_from: 1,
+            summarize_to: messages.len(),
+        };
+        let paths = extract_recent_file_paths(&messages, &split, 5);
+        // Write excluded; reads captured in order.
+        assert_eq!(paths, vec!["src/a.rs", "docs/guide.md", "src/parser.rs"]);
+    }
+
+    #[test]
+    fn extract_recent_file_paths_caps_and_takes_most_recent() {
+        let mut messages = vec![make_user_text("read many files")];
+        for i in 0..8 {
+            messages.push(Message {
+                role: Role::Assistant,
+                content: MessageContent::ToolCall(crate::types::ToolCall {
+                    id: format!("tc_{i}"),
+                    name: "read".into(),
+                    input: serde_json::json!({"file_path": format!("f{i}.rs")}),
+                }),
+            });
+        }
+        let split = SummarySplit {
+            summarize_from: 1,
+            summarize_to: messages.len(),
+        };
+        let paths = extract_recent_file_paths(&messages, &split, 5);
+        assert_eq!(paths.len(), 5);
+        // Most recent kept: f3..f7.
+        assert_eq!(paths.first().unwrap(), "f3.rs");
+        assert_eq!(paths.last().unwrap(), "f7.rs");
+    }
+
+    #[test]
+    fn file_restore_message_empty_when_no_paths() {
+        assert!(file_restore_message(&[]).is_none());
+    }
+
+    #[test]
+    fn file_restore_message_lists_paths() {
+        let msg = file_restore_message(&["a.rs".into(), "b.md".into()]).unwrap();
+        let text = match &msg.content {
+            MessageContent::Text(t) => t,
+            _ => panic!("must be text"),
+        };
+        assert!(text.contains("<post_compact_file_restore>"));
+        assert!(text.contains("- a.rs"));
+        assert!(text.contains("- b.md"));
+        assert!(text.contains("Re-read"));
     }
 }

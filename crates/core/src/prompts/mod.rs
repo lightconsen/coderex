@@ -74,15 +74,41 @@ pub fn permission_explain_user_prompt(tool_name: &str, tool_input: &str) -> Stri
 // ─── Compact Summary ────────────────────────────────────────────────────────
 
 /// System prompt for compact summary generation.
-pub const COMPACT_SUMMARY_SYSTEM: &str =
-    "You are a helpful AI assistant tasked with summarizing conversations.";
+///
+/// Framed as a handoff document (codex-style): the summary is written for
+/// another LLM that will resume the task with no other context.
+pub const COMPACT_SUMMARY_SYSTEM: &str = "You are writing a handoff summary for another LLM that will resume the task with no other context. Create a detailed, structured summary of the conversation so far, capturing everything essential for continuing the work seamlessly.";
 
 /// User prompt template for compact summary.
+///
+/// Nine-section structure (adapted from industry best practice for compaction
+/// prompts): intent, concepts, files, errors, problem solving, user messages,
+/// pending tasks, current work, next step. Sections may be omitted when the
+/// conversation contains nothing relevant; order is fixed.
 pub fn compact_summary_user_prompt(summary_request: &str) -> String {
+    let focus_line = if summary_request.trim().is_empty() {
+        String::new()
+    } else {
+        format!("\nAdditional focus: {summary_request}\n")
+    };
     format!(
-        "Please summarize the conversation above for future reference.\n\
-         Include key decisions, file paths, and current state of work.\n\
-         {summary_request}"
+        "Your summary must include the following sections (in this order). \
+         Keep each section dense and factual; include verbatim quotes for critical items.\n\
+         \n\
+         1. Primary Request and Intent: all explicit user requests and intents.\n\
+         2. Key Technical Concepts: technologies, frameworks, constraints.\n\
+         3. Files and Code Sections: files examined/modified/created, with paths \
+         and important code snippets where applicable.\n\
+         4. Errors and fixes: errors encountered and how they were resolved, \
+         including any user corrections.\n\
+         5. Problem Solving: problems solved and ongoing troubleshooting.\n\
+         6. All User Messages: list ALL user messages that are not tool results.\n\
+         7. Pending Tasks: tasks explicitly requested but not yet done.\n\
+         8. Current Work: what was being worked on immediately before this summary.\n\
+         9. Next Step: the next step, directly in line with the most recent user \
+         request. Include a verbatim quote showing where work left off. \
+         If the task was concluded, omit this section.\n\
+         {focus_line}"
     )
 }
 
@@ -290,8 +316,28 @@ mod tests {
     #[test]
     fn compact_summary_prompt_is_well_formed() {
         let prompt = compact_summary_user_prompt("Focus on the auth changes.");
-        assert!(prompt.contains("summarize"));
-        assert!(prompt.contains("auth changes"));
+        assert!(COMPACT_SUMMARY_SYSTEM.contains("handoff"));
+        assert!(prompt.contains("Focus on the auth changes"));
+        // Nine-section structure present
+        for section in [
+            "Primary Request and Intent",
+            "Key Technical Concepts",
+            "Files and Code Sections",
+            "Errors and fixes",
+            "Problem Solving",
+            "All User Messages",
+            "Pending Tasks",
+            "Current Work",
+            "Next Step",
+        ] {
+            assert!(prompt.contains(section), "missing section: {section}");
+        }
+    }
+
+    #[test]
+    fn compact_summary_prompt_with_empty_focus_has_no_focus_line() {
+        let prompt = compact_summary_user_prompt("");
+        assert!(!prompt.contains("Additional focus"));
     }
 
     #[test]

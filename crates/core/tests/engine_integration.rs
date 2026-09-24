@@ -147,16 +147,21 @@ impl ApiClient for TextMock {
 }
 
 /// Returns a sequence of responses, cycling the last one.
+///
+/// The call counter is shared through `Arc` because the engine clones the
+/// client for every request (via `with_request_context`) — a bare counter
+/// would be copied per clone and never advance, making every turn return
+/// the first response.
 struct SequenceMock {
     responses: Vec<ApiResponse>,
-    call_count: AtomicUsize,
+    call_count: std::sync::Arc<AtomicUsize>,
 }
 
 impl SequenceMock {
     fn new(responses: Vec<ApiResponse>) -> Self {
         Self {
             responses,
-            call_count: AtomicUsize::new(0),
+            call_count: std::sync::Arc::new(AtomicUsize::new(0)),
         }
     }
 }
@@ -166,7 +171,7 @@ impl ApiClient for SequenceMock {
     fn clone_box(&self) -> Box<dyn ApiClient> {
         Box::new(SequenceMock {
             responses: self.responses.clone(),
-            call_count: AtomicUsize::new(self.call_count.load(Ordering::SeqCst)),
+            call_count: std::sync::Arc::clone(&self.call_count),
         })
     }
 
@@ -327,8 +332,10 @@ async fn multi_turn_tool_call_then_text() {
         .unwrap();
     assert_eq!(result, TerminalReason::Completed);
 
-    // Should have 4 messages: user, assistant(1), tool_result, assistant(2)
-    assert_eq!(engine.session().messages.len(), 4);
+    // Session shape (5): user, assistant(text preamble), assistant(tool_call),
+    // tool_result, assistant(2). The engine persists the assistant turn as
+    // two messages when a structured tool call accompanies visible text.
+    assert_eq!(engine.session().messages.len(), 5);
 
     // Verify tool events were emitted
     let events = drain_events(&mut rx).await;
@@ -358,15 +365,17 @@ async fn multi_turn_context_accumulated() {
 
     engine.submit("run echo".into(), options).await.unwrap();
 
-    // After the conversation, the session should have all messages
+    // After the conversation, the session should have all messages.
+    // 5 messages: user, assistant(text), assistant(tool_call), tool, assistant.
     let msgs = &engine.session().messages;
-    assert_eq!(msgs.len(), 4);
+    assert_eq!(msgs.len(), 5);
 
-    // Message roles should be: User, Assistant, Tool, Assistant
+    // Message roles: User, Assistant(text), Assistant(tool_call), Tool, Assistant
     assert!(matches!(msgs[0].role, coderex_core::types::Role::User));
     assert!(matches!(msgs[1].role, coderex_core::types::Role::Assistant));
-    assert!(matches!(msgs[2].role, coderex_core::types::Role::Tool));
-    assert!(matches!(msgs[3].role, coderex_core::types::Role::Assistant));
+    assert!(matches!(msgs[2].role, coderex_core::types::Role::Assistant));
+    assert!(matches!(msgs[3].role, coderex_core::types::Role::Tool));
+    assert!(matches!(msgs[4].role, coderex_core::types::Role::Assistant));
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

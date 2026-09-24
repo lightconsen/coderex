@@ -60,6 +60,23 @@ pub struct CompactConfig {
     pub snip_target_tokens: usize,
     /// Maximum recovery retries before giving up.
     pub max_recovery_retries: u32,
+    /// Tokens above the warning line produce a `CompactWarning` event
+    /// (UI hint only — no compaction is triggered).
+    pub warning_buffer_tokens: usize,
+    /// Tokens reserved at the end of the context window for the compaction
+    /// summary output itself. The trigger threshold must leave room for it.
+    pub summary_output_reserve_tokens: usize,
+    /// Safety buffer between the compaction trigger point and the effective
+    /// context window, absorbing token-estimation error.
+    pub trigger_buffer_tokens: usize,
+    /// Stop auto-compaction after this many consecutive failures (circuit
+    /// breaker — prevents retry storms against an irrecoverable context).
+    pub max_consecutive_failures: u32,
+    /// Maximum tokens of conversation text fed into the summarizer.
+    /// Guards the summary request itself against blowing the window.
+    pub summary_input_max_tokens: usize,
+    /// Max tokens for the summary output.
+    pub summary_output_max_tokens: u32,
 }
 
 impl Default for CompactConfig {
@@ -69,7 +86,37 @@ impl Default for CompactConfig {
             reactive_compact_threshold: 180_000,
             snip_target_tokens: 80_000,
             max_recovery_retries: 3,
+            warning_buffer_tokens: 20_000,
+            summary_output_reserve_tokens: 4_000,
+            trigger_buffer_tokens: 13_000,
+            max_consecutive_failures: 3,
+            summary_input_max_tokens: 20_000,
+            summary_output_max_tokens: 4_096,
         }
+    }
+}
+
+impl CompactConfig {
+    /// Threshold at which a warning (not a compaction) is emitted.
+    #[must_use]
+    pub const fn warning_threshold(&self) -> usize {
+        self.auto_compact_threshold
+            .saturating_sub(self.warning_buffer_tokens)
+    }
+
+    /// Resolve the auto-compact threshold from the model's context window.
+    ///
+    /// `threshold = effective_window − summary_reserve − trigger_buffer`,
+    /// falling back to the configured `auto_compact_threshold` when the
+    /// window is unknown (0).
+    #[must_use]
+    pub const fn resolve_auto_threshold(&self, context_window: usize) -> usize {
+        if context_window == 0 {
+            return self.auto_compact_threshold;
+        }
+        context_window
+            .saturating_sub(self.summary_output_reserve_tokens)
+            .saturating_sub(self.trigger_buffer_tokens)
     }
 }
 

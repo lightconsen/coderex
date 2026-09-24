@@ -537,6 +537,8 @@ pub struct TurnRuntime {
     pub budget: TokenBudget,
     /// Compact/recovery retry counter.
     pub recovery_count: u32,
+    /// Consecutive compact failures (circuit breaker for auto-compaction).
+    pub compact_failures: u32,
     /// Whether the stop hook is active.
     pub stop_hook_active: bool,
     /// Terminal reason (set when state transitions to Terminated).
@@ -556,6 +558,7 @@ impl TurnRuntime {
             pending_elicitation: None,
             budget,
             recovery_count: 0,
+            compact_failures: 0,
             stop_hook_active: false,
             terminal_reason: None,
         }
@@ -721,7 +724,7 @@ impl QueryEngine {
             None
         }
 
-        fn is_ident_char(b: u8) -> bool {
+        const fn is_ident_char(b: u8) -> bool {
             b.is_ascii_alphanumeric() || b == b'_'
         }
 
@@ -1015,11 +1018,11 @@ impl QueryEngine {
             .filter(|m| !matches!(m.role, crate::types::Role::System))
             .filter_map(|m| {
                 let role_str = match (&m.role, &m.content) {
-                    (crate::types::Role::User, _) => "user",
-                    (crate::types::Role::Assistant, _) => "assistant",
-                    (crate::types::Role::Tool, crate::types::MessageContent::ToolResult(_)) => {
+                    (crate::types::Role::User, _)
+                    | (crate::types::Role::Tool, crate::types::MessageContent::ToolResult(_)) => {
                         "user"
                     }
+                    (crate::types::Role::Assistant, _) => "assistant",
                     _ => return None,
                 };
                 let content = match &m.content {
@@ -2101,6 +2104,11 @@ impl QueryEngine {
         );
     }
 
+    /// Check whether a summarization attempt failed (used by the PTL retry).
+    fn summary_result_is_err(r: &Result<String, crate::orchestrator::OrchestratorError>) -> bool {
+        r.is_err()
+    }
+
     /// Run compact recovery when context is too large.
     #[allow(clippy::unused_async)]
     async fn run_compact_recovery(
@@ -2155,7 +2163,90 @@ impl QueryEngine {
             tracing::warn!("PreCompact hook errors: {:?}", pre_compact_result.errors);
         }
 
-        // Apply the compact strategy
+        // Circuit breaker: stop auto-compacting against an irrecoverable
+        // context (e.g., context_window exceeded by a single message).
+        if turn.compact_failures >= self.compact_config.max_consecutive_failures {
+            return Err(format!(
+                "CompactRecovery: {} consecutive compact failures — stopping auto-retry. \
+                 Use /compact manually or start a new session.",
+                turn.compact_failures
+            ));
+        }
+
+        // ── LLM summary compaction (preferred path) ──
+        // Preserve head (first user message) and tail (recent turns) verbatim;
+        // LLM-summarize the interval in between. Falls back to rule-based
+        // strategies on any failure.
+        let tokens_before = estimated_tokens;
+        let split = compact::summary_split(&turn.messages, 3);
+        let summary_input = compact::build_summary_input(
+            &turn.messages,
+            &split,
+            self.compact_config.summary_input_max_tokens,
+        );
+
+        if summary_input.len() >= 2 {
+            // PTL resilience: if the summary request fails (e.g., the input
+            // itself is too long), retry once with half the input budget —
+            // `build_summary_input` re-caps by dropping the oldest messages.
+            let mut summary_result = crate::prompts::generate_compact_summary(
+                self.api_client.as_ref(),
+                &summary_input.join("\n\n"),
+                None,
+                self.compact_config.summary_output_max_tokens,
+            )
+            .await;
+            if Self::summary_result_is_err(&summary_result) {
+                tracing::warn!("CompactRecovery: summary failed — retrying with half input budget");
+                let halved = compact::build_summary_input(
+                    &turn.messages,
+                    &split,
+                    self.compact_config.summary_input_max_tokens / 2,
+                );
+                if halved.len() >= 2 {
+                    summary_result = crate::prompts::generate_compact_summary(
+                        self.api_client.as_ref(),
+                        &halved.join("\n\n"),
+                        None,
+                        self.compact_config.summary_output_max_tokens,
+                    )
+                    .await;
+                }
+            }
+            match summary_result {
+                Ok(summary_text) if !summary_text.trim().is_empty() => {
+                    let mut result = compact::assemble_summary_result(
+                        &turn.messages,
+                        &split,
+                        &summary_text,
+                        tokens_before,
+                        0,
+                    );
+                    // Post-compact restore: breadcrumb the file paths whose
+                    // contents were compacted away so the agent can re-read.
+                    let restored_paths =
+                        compact::extract_recent_file_paths(&turn.messages, &split, 5);
+                    if let Some(restore_msg) = compact::file_restore_message(&restored_paths) {
+                        result.messages.push(restore_msg);
+                    }
+                    turn.compact_failures = 0;
+                    self.finish_compaction(turn, result).await;
+                    return Ok(());
+                }
+                Ok(_) => {
+                    tracing::warn!("CompactRecovery: LLM summary empty — falling back to rules");
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "CompactRecovery: LLM summary failed ({e}) — falling back to rules"
+                    );
+                }
+            }
+        } else {
+            tracing::debug!("CompactRecovery: summarize range too small — rule-based path");
+        }
+
+        // ── Rule-based fallback (existing strategies) ──
         let result: CompactResult = match strategy {
             CompactStrategy::Micro => compact::micro_compact(&turn.messages, 5),
             CompactStrategy::Auto => {
@@ -2166,6 +2257,30 @@ impl QueryEngine {
                 compact::snip_compact(&turn.messages, self.compact_config.snip_target_tokens)
             }
         };
+
+        self.finish_compaction(turn, result).await;
+        Ok(())
+    }
+
+    /// Shared tail of every compaction path: tokens bookkeeping, boundary
+    /// event, transcript persistence, retry counters, and the PostCompact hook.
+    ///
+    /// The compaction-failure circuit breaker is driven here: an attempt that
+    /// fails to shrink the context counts as a failure and resets on progress,
+    /// so `run_compact_recovery` stops retrying once the context is
+    /// irrecoverable.
+    async fn finish_compaction(&self, turn: &mut TurnRuntime, mut result: CompactResult) {
+        // Recompute tokens removed from the actual post-compaction messages.
+        let tokens_after = PromptCompiler::estimate_message_tokens(&result.messages);
+        let tokens_before = PromptCompiler::estimate_message_tokens(&turn.messages);
+        result.tokens_removed = tokens_before.saturating_sub(tokens_after);
+
+        // Circuit breaker accounting: no progress counts as a failure.
+        if tokens_after >= tokens_before {
+            turn.compact_failures = turn.compact_failures.saturating_add(1);
+        } else {
+            turn.compact_failures = 0;
+        }
 
         // Check if compact boundary was inserted
         if result.boundary_inserted {
@@ -2221,8 +2336,6 @@ impl QueryEngine {
             result.tokens_removed,
             turn.messages.len(),
         );
-
-        Ok(())
     }
 
     /// Write a full replacement to the transcript file with the given messages.
