@@ -33,7 +33,9 @@ fn read_user_settings() -> Option<serde_json::Map<String, serde_json::Value>> {
 }
 
 /// Write the user settings.json.
-fn write_user_settings(settings: &serde_json::Map<String, serde_json::Value>) -> Result<(), String> {
+fn write_user_settings(
+    settings: &serde_json::Map<String, serde_json::Value>,
+) -> Result<(), String> {
     let home = config_home();
     std::fs::create_dir_all(&home).map_err(|e| e.to_string())?;
     let path = home.join("settings.json");

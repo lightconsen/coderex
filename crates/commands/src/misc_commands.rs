@@ -113,10 +113,8 @@ pub fn register(registry: &mut CommandRegistry) {
                     }
                     Ok(out) => {
                         let err = String::from_utf8_lossy(&out.stderr);
-                        CommandResult::success(format!(
-                            "Issue prepared: {title}\n(gh CLI: {err})",
-                        ))
-                        .with_state_change(true)
+                        CommandResult::success(format!("Issue prepared: {title}\n(gh CLI: {err})",))
+                            .with_state_change(true)
                     }
                     Err(e) => CommandResult::success(format!(
                         "Issue prepared: {title}\n(gh CLI not available: {e})",
@@ -138,7 +136,9 @@ pub fn register(registry: &mut CommandRegistry) {
                             CommandResult::success(format!("Open Issues:\n{text}"))
                         }
                     }
-                    _ => CommandResult::success("Issues:\n  No open issues (gh CLI unavailable or not a repo)."),
+                    _ => CommandResult::success(
+                        "Issues:\n  No open issues (gh CLI unavailable or not a repo).",
+                    ),
                 }
             } else {
                 CommandResult::success(format!("Viewing issue: {}", args[0]))
@@ -172,9 +172,9 @@ pub fn register(registry: &mut CommandRegistry) {
                 let key = &args[0];
                 match std::env::var(key) {
                     Ok(value) => CommandResult::success(format!("{key}={value}")),
-                    Err(_) => CommandResult::error(format!(
-                        "Environment variable '{key}' not set."
-                    )),
+                    Err(_) => {
+                        CommandResult::error(format!("Environment variable '{key}' not set."))
+                    }
                 }
             }
         }),

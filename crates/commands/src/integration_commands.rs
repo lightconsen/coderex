@@ -33,7 +33,9 @@ fn read_user_settings() -> Option<serde_json::Map<String, serde_json::Value>> {
 }
 
 /// Write the user settings.json.
-fn write_user_settings(settings: &serde_json::Map<String, serde_json::Value>) -> Result<(), String> {
+fn write_user_settings(
+    settings: &serde_json::Map<String, serde_json::Value>,
+) -> Result<(), String> {
     let home = config_home();
     std::fs::create_dir_all(&home).map_err(|e| e.to_string())?;
     let path = home.join("settings.json");
@@ -180,10 +182,7 @@ chrome_get_content    — Extract page HTML as markdown"
         Arc::new(|ctx: &CommandContext, _args: &[String]| {
             let new_state = !ctx.vim_mode;
             let mut settings = read_user_settings().unwrap_or_default();
-            settings.insert(
-                "vim_mode".to_string(),
-                serde_json::Value::Bool(new_state),
-            );
+            settings.insert("vim_mode".to_string(), serde_json::Value::Bool(new_state));
             let persist_msg = match write_user_settings(&settings) {
                 Ok(()) => "Saved to settings.json.".to_string(),
                 Err(e) => format!("Failed to save settings: {e}"),
@@ -304,9 +303,18 @@ chrome_get_content    — Extract page HTML as markdown"
                 .get("statusline")
                 .and_then(|v| v.as_object().cloned())
                 .unwrap_or_default();
-            statusline.insert("format".to_string(), serde_json::Value::String(format.to_string()));
-            statusline.insert("theme".to_string(), serde_json::Value::String(ctx.theme.clone()));
-            settings.insert("statusline".to_string(), serde_json::Value::Object(statusline));
+            statusline.insert(
+                "format".to_string(),
+                serde_json::Value::String(format.to_string()),
+            );
+            statusline.insert(
+                "theme".to_string(),
+                serde_json::Value::String(ctx.theme.clone()),
+            );
+            settings.insert(
+                "statusline".to_string(),
+                serde_json::Value::Object(statusline),
+            );
             let persist_msg = match write_user_settings(&settings) {
                 Ok(()) => "Saved to settings.json.".to_string(),
                 Err(e) => format!("Failed to save settings: {e}"),

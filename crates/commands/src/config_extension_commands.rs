@@ -33,7 +33,9 @@ fn read_user_settings() -> Option<serde_json::Map<String, serde_json::Value>> {
 }
 
 /// Write the user settings.json.
-fn write_user_settings(settings: &serde_json::Map<String, serde_json::Value>) -> Result<(), String> {
+fn write_user_settings(
+    settings: &serde_json::Map<String, serde_json::Value>,
+) -> Result<(), String> {
     let home = config_home();
     std::fs::create_dir_all(&home).map_err(|e| e.to_string())?;
     let path = home.join("settings.json");
@@ -113,11 +115,15 @@ pub fn register(registry: &mut CommandRegistry) {
                     || new_theme == "tokyo-night"
                 {
                     let mut settings = read_user_settings().unwrap_or_default();
-                    settings.insert("theme".to_string(), serde_json::Value::String(new_theme.clone()));
+                    settings.insert(
+                        "theme".to_string(),
+                        serde_json::Value::String(new_theme.clone()),
+                    );
                     let _ = write_user_settings(&settings);
                     CommandResult::success(format!(
                         "Theme changed to: {new_theme}\nSaved to settings.json.",
-                    )).with_state_change(true)
+                    ))
+                    .with_state_change(true)
                 } else {
                     let available = list_dir_items(&themes_path);
                     let hint = if !available.is_empty() {
