@@ -247,6 +247,18 @@ impl UiState {
                 self.transcript
                     .push(TranscriptEntry::PermissionExplanation { tool, explanation });
             }
+            EngineEvent::StreamInterrupted {
+                reason,
+                partial_len,
+                will_retry,
+            } => {
+                // Advisory: log the interruption; UI surfaces reset their
+                // partial buffer when `will_retry` is set.
+                tracing::info!(
+                    "stream interrupted ({reason}, {} bytes partial, will_retry={will_retry})",
+                    partial_len
+                );
+            }
         }
     }
 

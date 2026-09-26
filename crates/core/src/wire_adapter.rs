@@ -54,6 +54,15 @@ pub fn engine_event_to_wire(event: &EngineEvent) -> Option<WireEvent> {
                 explanation: explanation.clone(),
             }
         }
+        EngineEvent::StreamInterrupted {
+            reason,
+            partial_len,
+            will_retry,
+        } => WireEvent::StreamInterrupted {
+            reason: reason.clone(),
+            partial_len: *partial_len,
+            will_retry: *will_retry,
+        },
     })
 }
 
@@ -103,6 +112,15 @@ pub fn wire_event_to_engine(event: &WireEvent) -> Option<EngineEvent> {
                 explanation: explanation.clone(),
             }
         }
+        WireEvent::StreamInterrupted {
+            reason,
+            partial_len,
+            will_retry,
+        } => EngineEvent::StreamInterrupted {
+            reason: reason.clone(),
+            partial_len: *partial_len,
+            will_retry: *will_retry,
+        },
         WireEvent::UsageSummary { .. }
         | WireEvent::TurnStart { .. }
         | WireEvent::TurnEnd { .. }

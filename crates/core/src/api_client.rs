@@ -248,6 +248,9 @@ pub enum StreamEvent {
     },
     /// Token usage summary (emitted at end of stream).
     UsageSummary(UsageSummary),
+    /// Provider stop reason observed at end of stream
+    /// ("end_turn", "max_tokens", "tool_use", "length", ...).
+    StopReason(String),
     /// Stream completed.
     StreamEnd,
     /// Error during streaming.
@@ -945,43 +948,62 @@ impl ApiClient for AnthropicApiClient {
 struct SseParserState {
     /// Maps content block index -> tool_call_id for tool_use blocks.
     index_to_id: std::collections::HashMap<usize, String>,
+    /// Input-JSON deltas that arrived before their `content_block_start`.
+    /// Buffered and flushed once the mapping is known.
+    deferred_deltas: Vec<(usize, String)>,
 }
 
 fn parse_sse_stream(
     stream: impl futures::Stream<Item = Result<bytes::Bytes, reqwest::Error>> + Send + 'static,
 ) -> impl futures::Stream<Item = StreamEvent> + Send + 'static {
+    use crate::stream_utils::Utf8ChunkDecoder;
     use futures::StreamExt;
 
     let pinned = Box::pin(stream);
 
     futures::stream::unfold(
-        (pinned, String::new(), SseParserState::default()),
-        |(mut inner, mut buffer, mut state)| async move {
+        (
+            pinned,
+            String::new(),
+            SseParserState::default(),
+            Utf8ChunkDecoder::new(),
+            Vec::<StreamEvent>::new(),
+        ),
+        |(mut inner, mut buffer, mut state, mut decoder, mut outbox)| async move {
             loop {
-                if let Some(pos) = find_sse_message_boundary(&buffer) {
+                if let Some(event) = (!outbox.is_empty()).then(|| outbox.remove(0)) {
+                    return Some((event, (inner, buffer, state, decoder, outbox)));
+                }
+
+                if let Some(pos) = crate::stream_utils::find_sse_message_boundary(&buffer) {
                     let message = buffer[..pos].to_string();
                     buffer.drain(..=pos);
 
-                    if let Some(event) = parse_sse_message(&message, &mut state) {
-                        return Some((event, (inner, buffer, state)));
+                    let parsed = parse_sse_message(&message, &mut state);
+                    let mut it = parsed.into_iter();
+                    if let Some(first) = it.next() {
+                        outbox = it.collect();
+                        return Some((first, (inner, buffer, state, decoder, outbox)));
                     }
                     continue;
                 }
 
                 match inner.next().await {
                     Some(Ok(chunk)) => {
-                        // Lossy decode: invalid UTF-8 sequences become U+FFFD
-                        // instead of silently dropping bytes.
-                        buffer.push_str(&String::from_utf8_lossy(&chunk));
+                        // Incremental decode: incomplete trailing multibyte
+                        // sequences are held back instead of becoming U+FFFD.
+                        buffer.push_str(&decoder.push(&chunk));
                     }
                     Some(Err(e)) => {
                         tracing::warn!("SSE stream network error: {e}");
+                        buffer.push_str(&decoder.finish());
                         return Some((
                             StreamEvent::Error(ApiError::from(e)),
-                            (inner, buffer, state),
+                            (inner, buffer, state, decoder, outbox),
                         ));
                     }
                     None => {
+                        buffer.push_str(&decoder.finish());
                         return None;
                     }
                 }
@@ -991,82 +1013,138 @@ fn parse_sse_stream(
     .chain(futures::stream::once(async move { StreamEvent::StreamEnd }))
 }
 
-/// Find the position of the next SSE message boundary (`\n\n` or `\r\n\r\n`).
-fn find_sse_message_boundary(buffer: &str) -> Option<usize> {
-    // Check for \r\n\r\n first (CRLF, used by some proxies/servers)
-    if let Some(pos) = buffer.find("\r\n\r\n") {
-        return Some(pos + 3); // include one CRLF
-    }
-    // Fall back to \n\n (LF, standard SSE)
-    buffer
-        .as_bytes()
-        .windows(2)
-        .position(|w| w == b"\n\n")
-        .map(|pos| pos + 1) // include one newline
-}
-
-/// Parse a single SSE message block into a `StreamEvent`.
-fn parse_sse_message(message: &str, state: &mut SseParserState) -> Option<StreamEvent> {
+/// Parse a single SSE message block into zero or more `StreamEvent`s.
+///
+/// `message_delta` may carry both usage and stop reason; callers consume the
+/// returned events in order.
+fn parse_sse_message(message: &str, state: &mut SseParserState) -> Vec<StreamEvent> {
     // Filter out SSE comment lines (starting with ':') and blank lines,
     // then extract the first `data:` line.
-    let data_line = message
+    let Some(data_line) = message
         .lines()
         .filter(|line| {
             let trimmed = line.trim();
             !trimmed.is_empty() && !trimmed.starts_with(':')
         })
-        .find(|line| line.starts_with("data:"))?;
-    let json_str = data_line.strip_prefix("data:").map(|s| s.trim_start())?;
-
-    let value: serde_json::Value = serde_json::from_str(json_str).ok()?;
-    let event_type = value.get("type").and_then(|v| v.as_str())?;
+        .find(|line| line.starts_with("data:"))
+    else {
+        return Vec::new();
+    };
+    let Some(json_str) = data_line.strip_prefix("data:").map(|s| s.trim_start()) else {
+        return Vec::new();
+    };
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(json_str) else {
+        return Vec::new();
+    };
+    let Some(event_type) = value.get("type").and_then(|v| v.as_str()) else {
+        return Vec::new();
+    };
 
     match event_type {
         "content_block_start" => {
-            let index = value.get("index").and_then(serde_json::Value::as_u64)? as usize;
-            let block = value.get("content_block")?;
-            let block_type = block.get("type")?.as_str()?;
-            match block_type {
-                "tool_use" => {
-                    let id = block.get("id")?.as_str()?.to_string();
-                    let name = block.get("name")?.as_str()?.to_string();
-                    state.index_to_id.insert(index, id.clone());
-                    Some(StreamEvent::ToolCallBlockStart { id, name })
+            let Some(index) = value
+                .get("index")
+                .and_then(serde_json::Value::as_u64)
+                .map(|i| i as usize)
+            else {
+                return Vec::new();
+            };
+            let Some(block) = value.get("content_block") else {
+                return Vec::new();
+            };
+            let Some("tool_use") = block.get("type").and_then(serde_json::Value::as_str) else {
+                return Vec::new();
+            };
+            let Some(id) = block.get("id").and_then(serde_json::Value::as_str) else {
+                return Vec::new();
+            };
+            let Some(name) = block.get("name").and_then(serde_json::Value::as_str) else {
+                return Vec::new();
+            };
+            let id = id.to_string();
+            state.index_to_id.insert(index, id.clone());
+            let mut out = vec![StreamEvent::ToolCallBlockStart {
+                id: id.clone(),
+                name: name.to_string(),
+            }];
+            // Flush any input deltas that arrived before the mapping existed.
+            let deferred = std::mem::take(&mut state.deferred_deltas);
+            for (didx, delta) in deferred {
+                if didx == index {
+                    out.push(StreamEvent::ToolCallInputDelta {
+                        id: id.clone(),
+                        delta,
+                    });
+                } else {
+                    state.deferred_deltas.push((didx, delta));
                 }
-                _ => None,
             }
+            out
         }
         "content_block_delta" => {
-            let index = value.get("index").and_then(serde_json::Value::as_u64)? as usize;
-            let delta = value.get("delta")?;
-            let delta_type = delta.get("type")?.as_str()?;
+            let Some(index) = value
+                .get("index")
+                .and_then(serde_json::Value::as_u64)
+                .map(|i| i as usize)
+            else {
+                return Vec::new();
+            };
+            let Some(delta) = value.get("delta") else {
+                return Vec::new();
+            };
+            let Some(delta_type) = delta.get("type").and_then(serde_json::Value::as_str) else {
+                return Vec::new();
+            };
             match delta_type {
                 "text_delta" => {
-                    let text = delta.get("text")?.as_str()?;
+                    let Some(text) = delta.get("text").and_then(serde_json::Value::as_str) else {
+                        return Vec::new();
+                    };
                     if text.is_empty() {
-                        None
+                        Vec::new()
                     } else {
-                        Some(StreamEvent::TextDelta(text.to_string()))
+                        vec![StreamEvent::TextDelta(text.to_string())]
                     }
                 }
                 "input_json_delta" => {
-                    let id = state.index_to_id.get(&index)?.clone();
-                    let partial_json = delta.get("partial_json")?.as_str()?;
-                    Some(StreamEvent::ToolCallInputDelta {
-                        id,
-                        delta: partial_json.to_string(),
-                    })
+                    let Some(partial_json) = delta
+                        .get("partial_json")
+                        .and_then(serde_json::Value::as_str)
+                    else {
+                        return Vec::new();
+                    };
+                    let partial_json = partial_json.to_string();
+                    match state.index_to_id.get(&index) {
+                        Some(id) => vec![StreamEvent::ToolCallInputDelta {
+                            id: id.clone(),
+                            delta: partial_json,
+                        }],
+                        None => {
+                            // Mapping not yet established: buffer the delta
+                            // until `content_block_start` registers the index.
+                            state.deferred_deltas.push((index, partial_json));
+                            Vec::new()
+                        }
+                    }
                 }
-                _ => None,
+                _ => Vec::new(),
             }
         }
         "content_block_stop" => {
-            let index = value.get("index").and_then(serde_json::Value::as_u64)? as usize;
-            let id = state.index_to_id.remove(&index)?.clone();
-            Some(StreamEvent::ToolCallBlockEnd {
+            let Some(index) = value
+                .get("index")
+                .and_then(serde_json::Value::as_u64)
+                .map(|i| i as usize)
+            else {
+                return Vec::new();
+            };
+            let Some(id) = state.index_to_id.remove(&index) else {
+                return Vec::new();
+            };
+            vec![StreamEvent::ToolCallBlockEnd {
                 id,
                 input: serde_json::Value::Null,
-            })
+            }]
         }
         "message_delta" => {
             #[allow(clippy::cast_possible_truncation)]
@@ -1088,12 +1166,28 @@ fn parse_sse_message(message: &str, state: &mut SseParserState) -> Option<Stream
                     .and_then(serde_json::Value::as_u64)
                     .unwrap_or(0) as usize,
             });
-            usage.map(StreamEvent::UsageSummary)
+            let stop_reason = value
+                .get("delta")
+                .and_then(|d| d.get("stop_reason"))
+                .and_then(serde_json::Value::as_str)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string);
+            let mut events = Vec::with_capacity(2);
+            if let Some(u) = usage {
+                events.push(StreamEvent::UsageSummary(u));
+            }
+            if let Some(r) = stop_reason {
+                events.push(StreamEvent::StopReason(r));
+            }
+            events
         }
-        _ => None,
+        _ => Vec::new(),
     }
 }
-fn is_retryable(error: &ApiError) -> bool {
+/// Classify an error as retryable (transient): timeouts, connection failures,
+/// server errors and rate limits. Auth/policy and other 4xx errors are not.
+#[must_use]
+pub fn is_retryable(error: &ApiError) -> bool {
     match error {
         ApiError::Http(msg) => msg.contains("timeout") || msg.contains("connect"),
         ApiError::Response { status, .. } => *status >= 500 || *status == 429,
@@ -1250,17 +1344,17 @@ mod tests {
     fn parse_sse_message_text_delta() {
         let msg = "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"Hello\"}}\n\n";
         let mut state = SseParserState::default();
-        let event = parse_sse_message(msg, &mut state);
-        assert!(matches!(event, Some(StreamEvent::TextDelta(ref t)) if t == "Hello"));
+        let events = parse_sse_message(msg, &mut state);
+        assert!(matches!(events.as_slice(), [StreamEvent::TextDelta(t)] if t == "Hello"));
     }
 
     #[test]
     fn parse_sse_message_tool_use_start() {
         let msg = "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_01ABC\",\"name\":\"read\",\"input\":{}}}\n\n";
         let mut state = SseParserState::default();
-        let event = parse_sse_message(msg, &mut state);
+        let events = parse_sse_message(msg, &mut state);
         assert!(
-            matches!(event, Some(StreamEvent::ToolCallBlockStart { ref id, ref name }) if id == "toolu_01ABC" && name == "read")
+            matches!(events.as_slice(), [StreamEvent::ToolCallBlockStart { id, name }] if id == "toolu_01ABC" && name == "read")
         );
         assert_eq!(state.index_to_id.get(&1), Some(&"toolu_01ABC".to_string()));
     }
@@ -1271,9 +1365,9 @@ mod tests {
         state.index_to_id.insert(1, "toolu_01ABC".to_string());
 
         let msg = "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"file\\\":\\\"test.txt\\\"}\"}}\n\n";
-        let event = parse_sse_message(msg, &mut state);
+        let events = parse_sse_message(msg, &mut state);
         assert!(
-            matches!(event, Some(StreamEvent::ToolCallInputDelta { ref id, ref delta }) if id == "toolu_01ABC" && delta == "{\"file\":\"test.txt\"}")
+            matches!(events.as_slice(), [StreamEvent::ToolCallInputDelta { id, delta }] if id == "toolu_01ABC" && delta == "{\"file\":\"test.txt\"}")
         );
     }
 
@@ -1284,9 +1378,9 @@ mod tests {
 
         let msg =
             "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":1}\n\n";
-        let event = parse_sse_message(msg, &mut state);
+        let events = parse_sse_message(msg, &mut state);
         assert!(
-            matches!(event, Some(StreamEvent::ToolCallBlockEnd { ref id, ref input }) if id == "toolu_01ABC" && input.is_null())
+            matches!(events.as_slice(), [StreamEvent::ToolCallBlockEnd { id, input }] if id == "toolu_01ABC" && input.is_null())
         );
         assert!(!state.index_to_id.contains_key(&1));
     }
@@ -1295,9 +1389,9 @@ mod tests {
     fn parse_sse_message_usage_summary() {
         let msg = "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"input_tokens\":100,\"output_tokens\":50}}\n\n";
         let mut state = SseParserState::default();
-        let event = parse_sse_message(msg, &mut state);
+        let events = parse_sse_message(msg, &mut state);
         assert!(
-            matches!(event, Some(StreamEvent::UsageSummary(ref u)) if u.input_tokens == 100 && u.output_tokens == 50)
+            matches!(events.as_slice(), [StreamEvent::UsageSummary(u), StreamEvent::StopReason(r)] if u.input_tokens == 100 && u.output_tokens == 50 && r == "end_turn")
         );
     }
 
@@ -1305,16 +1399,16 @@ mod tests {
     fn parse_sse_message_ignores_unknown_types() {
         let msg = "event: ping\ndata: {\"type\":\"ping\"}\n\n";
         let mut state = SseParserState::default();
-        let event = parse_sse_message(msg, &mut state);
-        assert!(event.is_none());
+        let events = parse_sse_message(msg, &mut state);
+        assert!(events.is_empty());
     }
 
     #[test]
     fn parse_sse_message_ignores_text_block_start() {
         let msg = "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n";
         let mut state = SseParserState::default();
-        let event = parse_sse_message(msg, &mut state);
-        assert!(event.is_none());
+        let events = parse_sse_message(msg, &mut state);
+        assert!(events.is_empty());
     }
 
     #[tokio::test]
@@ -1345,7 +1439,7 @@ data: {"type":"message_stop"}
         let stream = futures::stream::iter(vec![Ok(bytes::Bytes::from(sse))]);
         let events: Vec<StreamEvent> = parse_sse_stream(stream).collect().await;
 
-        assert_eq!(events.len(), 6); // text + tool_start + tool_delta + tool_end + usage + stream_end
+        assert_eq!(events.len(), 7); // text + tool_start + tool_delta + tool_end + usage + stop_reason + stream_end
         assert!(matches!(&events[0], StreamEvent::TextDelta(t) if t == "I'll read the file."));
         assert!(
             matches!(&events[1], StreamEvent::ToolCallBlockStart { id, name } if id == "toolu_01XYZ" && name == "read")
@@ -1359,6 +1453,7 @@ data: {"type":"message_stop"}
         assert!(
             matches!(&events[4], StreamEvent::UsageSummary(u) if u.input_tokens == 10 && u.output_tokens == 20)
         );
+        assert!(matches!(&events[5], StreamEvent::StopReason(r) if r == "end_turn"));
     }
 
     #[tokio::test]

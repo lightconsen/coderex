@@ -897,13 +897,16 @@ struct OpenAiToolCallState {
 fn parse_openai_chat_sse_stream(
     stream: impl futures::Stream<Item = Result<bytes::Bytes, reqwest::Error>> + Send + 'static,
 ) -> impl futures::Stream<Item = StreamEvent> + Send + 'static {
+    use crate::stream_utils::Utf8ChunkDecoder;
+
     async_stream::stream! {
         let mut inner = Box::pin(stream);
         let mut buffer = String::new();
         let mut state = OpenAiSseState::default();
+        let mut decoder = Utf8ChunkDecoder::new();
 
         loop {
-            if let Some(pos) = find_sse_message_boundary(&buffer) {
+            if let Some(pos) = crate::stream_utils::find_sse_message_boundary(&buffer) {
                 let message = buffer[..pos].to_string();
                 buffer.drain(..=pos);
                 for event in parse_openai_chat_sse_message(&message, &mut state) {
@@ -913,12 +916,20 @@ fn parse_openai_chat_sse_stream(
             }
 
             match inner.next().await {
-                Some(Ok(chunk)) => buffer.push_str(&String::from_utf8_lossy(&chunk)),
+                Some(Ok(chunk)) => {
+                    // Incremental decode: incomplete trailing multibyte
+                    // sequences are held back instead of becoming U+FFFD.
+                    buffer.push_str(&decoder.push(&chunk));
+                }
                 Some(Err(err)) => {
+                    buffer.push_str(&decoder.finish());
                     yield StreamEvent::Error(ApiError::from(err));
                     break;
                 }
-                None => break,
+                None => {
+                    buffer.push_str(&decoder.finish());
+                    break;
+                }
             }
         }
 
@@ -927,17 +938,6 @@ fn parse_openai_chat_sse_stream(
         }
         yield StreamEvent::StreamEnd;
     }
-}
-
-fn find_sse_message_boundary(buffer: &str) -> Option<usize> {
-    if let Some(pos) = buffer.find("\r\n\r\n") {
-        return Some(pos + 3);
-    }
-    buffer
-        .as_bytes()
-        .windows(2)
-        .position(|w| w == b"\n\n")
-        .map(|pos| pos + 1)
 }
 
 fn parse_openai_chat_sse_message(message: &str, state: &mut OpenAiSseState) -> Vec<StreamEvent> {
@@ -973,7 +973,7 @@ fn parse_openai_chat_sse_message(message: &str, state: &mut OpenAiSseState) -> V
                 }
             }
 
-            if choice
+            if let Some(finish_reason) = choice
                 .get("finish_reason")
                 .or_else(|| {
                     choice
@@ -981,9 +981,11 @@ fn parse_openai_chat_sse_message(message: &str, state: &mut OpenAiSseState) -> V
                         .and_then(|delta| delta.get("finish_reason"))
                 })
                 .and_then(serde_json::Value::as_str)
-                .is_some()
             {
                 events.extend(finish_openai_chat_tool_calls(state));
+                if !finish_reason.is_empty() {
+                    events.push(StreamEvent::StopReason(finish_reason.to_string()));
+                }
             }
         }
     }
@@ -1102,13 +1104,16 @@ fn finish_openai_chat_tool_calls(state: &mut OpenAiSseState) -> Vec<StreamEvent>
 fn parse_openai_responses_sse_stream(
     stream: impl futures::Stream<Item = Result<bytes::Bytes, reqwest::Error>> + Send + 'static,
 ) -> impl futures::Stream<Item = StreamEvent> + Send + 'static {
+    use crate::stream_utils::Utf8ChunkDecoder;
+
     async_stream::stream! {
         let mut inner = Box::pin(stream);
         let mut buffer = String::new();
         let mut tool_state = std::collections::HashMap::<String, (String, String, bool)>::new();
+        let mut decoder = Utf8ChunkDecoder::new();
 
         loop {
-            if let Some(pos) = find_sse_message_boundary(&buffer) {
+            if let Some(pos) = crate::stream_utils::find_sse_message_boundary(&buffer) {
                 let message = buffer[..pos].to_string();
                 buffer.drain(..=pos);
                 for event in parse_openai_responses_sse_message(&message, &mut tool_state) {
@@ -1118,12 +1123,20 @@ fn parse_openai_responses_sse_stream(
             }
 
             match inner.next().await {
-                Some(Ok(chunk)) => buffer.push_str(&String::from_utf8_lossy(&chunk)),
+                Some(Ok(chunk)) => {
+                    // Incremental decode: incomplete trailing multibyte
+                    // sequences are held back instead of becoming U+FFFD.
+                    buffer.push_str(&decoder.push(&chunk));
+                }
                 Some(Err(err)) => {
+                    buffer.push_str(&decoder.finish());
                     yield StreamEvent::Error(ApiError::from(err));
                     break;
                 }
-                None => break,
+                None => {
+                    buffer.push_str(&decoder.finish());
+                    break;
+                }
             }
         }
 
@@ -1226,6 +1239,27 @@ fn parse_openai_responses_sse_message(
                     cache_read_tokens: 0,
                     cache_creation_tokens: 0,
                 }));
+            }
+            if let Some(status) = value
+                .get("response")
+                .and_then(|response| response.get("status"))
+                .and_then(serde_json::Value::as_str)
+            {
+                if !status.is_empty() {
+                    events.push(StreamEvent::StopReason(status.to_string()));
+                }
+            }
+        }
+        Some("response.incomplete") => {
+            if let Some(reason) = value
+                .get("response")
+                .and_then(|response| response.get("incomplete_details"))
+                .and_then(|details| details.get("reason"))
+                .and_then(serde_json::Value::as_str)
+            {
+                events.push(StreamEvent::StopReason(reason.to_string()));
+            } else {
+                events.push(StreamEvent::StopReason("incomplete".to_string()));
             }
         }
         Some("response.failed") => {
@@ -1345,8 +1379,10 @@ mod tests {
         assert!(
             matches!(&events[1], StreamEvent::ToolCallBlockEnd { id, input } if id == "call_1" && input.is_null())
         );
+        // finish_reason now also emits a StopReason event after finalization.
+        assert!(matches!(&events[2], StreamEvent::StopReason(r) if r == "tool_calls"));
         assert!(
-            matches!(&events[2], StreamEvent::UsageSummary(usage) if usage.input_tokens == 2 && usage.output_tokens == 3)
+            matches!(&events[3], StreamEvent::UsageSummary(usage) if usage.input_tokens == 2 && usage.output_tokens == 3)
         );
     }
 

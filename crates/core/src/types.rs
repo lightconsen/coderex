@@ -309,6 +309,16 @@ pub enum EngineEvent {
         /// Generated explanation text.
         explanation: String,
     },
+    /// The streaming response was interrupted mid-turn.
+    StreamInterrupted {
+        /// "error" (failed; partial content may be missing) or the provider
+        /// stop reason such as "max_tokens" (legitimate truncation).
+        reason: String,
+        /// Length of partial text already delivered to the UI.
+        partial_len: usize,
+        /// Whether the engine will automatically re-request.
+        will_retry: bool,
+    },
 }
 
 #[cfg(test)]

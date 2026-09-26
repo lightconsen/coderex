@@ -9,6 +9,7 @@
 pub mod api_client;
 pub mod budget;
 pub mod compact;
+pub mod compaction_backend;
 pub mod confirmation_bus;
 pub mod coordinator;
 pub mod cost;
@@ -39,6 +40,7 @@ pub mod session_memory;
 pub mod shell_security;
 pub mod state;
 pub mod stop_hook;
+pub mod stream_utils;
 pub mod syntax;
 pub mod task;
 pub mod team;
@@ -56,6 +58,7 @@ pub use compact::{
     insert_compact_boundary, micro_compact, reactive_compact, select_compact_strategy,
     should_auto_compact, should_reactive_compact, snip_compact, truncate_tool_output,
 };
+pub use compaction_backend::{CompactionBackend, CompactionKind, CompactionRequest};
 pub use file_traversal::{
     FileIterator, TraversalConfig, TraversalError, collect_files, count_files, traverse,
 };

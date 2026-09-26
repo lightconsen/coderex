@@ -123,6 +123,15 @@ pub enum WireEvent {
         /// Generated explanation text.
         explanation: String,
     },
+    /// The streaming response was interrupted mid-turn.
+    StreamInterrupted {
+        /// "error" or the provider stop reason (e.g. "max_tokens").
+        reason: String,
+        /// Length of partial text already delivered.
+        partial_len: usize,
+        /// Whether the engine will automatically re-request.
+        will_retry: bool,
+    },
 }
 
 /// Requests sent by the client over the wire.

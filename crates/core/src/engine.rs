@@ -8,7 +8,7 @@
 //! 5. Compact/recovery if needed
 //! 6. Finalize and emit events
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio::time::Instant;
@@ -192,6 +192,14 @@ pub struct StreamingToolCallAssembler {
     pending: HashMap<String, (String, String)>,
     /// Completed tool calls.
     completed: Vec<ToolCall>,
+    /// Ids already completed (success or malformed-completion) — duplicate
+    /// `ToolCallBlockEnd`s for the same id (OpenAI Responses emits the final
+    /// item twice in some paths) are ignored instead of re-completed.
+    completed_ids: HashSet<String>,
+    /// Number of tool calls whose accumulated JSON failed to parse.
+    malformed_count: usize,
+    /// Ids of tool calls whose accumulated JSON failed to parse.
+    malformed_ids: Vec<String>,
     /// Text content accumulated alongside tool calls.
     text_content: String,
     /// Whether any tool calls have been seen.
@@ -207,6 +215,9 @@ impl StreamingToolCallAssembler {
             completed: Vec::new(),
             text_content: String::new(),
             has_tool_calls: false,
+            completed_ids: HashSet::new(),
+            malformed_count: 0,
+            malformed_ids: Vec::new(),
         }
     }
 
@@ -232,48 +243,75 @@ impl StreamingToolCallAssembler {
                 Vec::new()
             }
             StreamEvent::ToolCallBlockEnd { id, input } => {
-                let completed = if let Some((name, builder)) = self.pending.remove(&id) {
-                    let input = if input.is_null() {
-                        match serde_json::from_str(&builder) {
-                            Ok(v) => v,
-                            Err(e) => {
-                                tracing::warn!(
-                                    "tool call {id} ({name}) has malformed JSON input: {e}\naccumulated: {builder}"
-                                );
-                                return Vec::new();
-                            }
-                        }
-                    } else {
-                        input
-                    };
-                    let call = ToolCall { id, name, input };
-                    self.completed.push(call.clone());
-                    vec![call]
-                } else {
-                    Vec::new()
+                let Some((name, builder)) = self.pending.remove(&id) else {
+                    if self.completed_ids.contains(&id) {
+                        // Duplicate BlockEnd for an already-completed call
+                        // (OpenAI Responses emits it twice).
+                        return Vec::new();
+                    }
+                    tracing::warn!("tool call block end for unseen id {id} — ignored");
+                    return Vec::new();
                 };
-                completed
+                let input = if input.is_null() {
+                    match serde_json::from_str(&builder) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            // Complete with empty input instead of dropping:
+                            // a dropped call leaves a persisted tool_use
+                            // without a tool_result, breaking the next
+                            // request's message contract. An empty input
+                            // flows through the normal pipeline and fails
+                            // cleanly (missing required args -> error
+                            // ToolResult back to the model).
+                            tracing::warn!(
+                                "tool call {id} ({name}) has malformed JSON input: {e}\naccumulated: {builder}"
+                            );
+                            self.malformed_count += 1;
+                            self.malformed_ids.push(id.clone());
+                            serde_json::Value::Object(Default::default())
+                        }
+                    }
+                } else {
+                    input
+                };
+                self.completed_ids.insert(id.clone());
+                let call = ToolCall { id, name, input };
+                self.completed.push(call.clone());
+                vec![call]
             }
             StreamEvent::StreamEnd => {
                 // Finalize any pending tool calls from accumulated JSON
                 let mut calls = Vec::new();
                 for (id, (name, builder)) in self.pending.drain() {
-                    match serde_json::from_str(&builder) {
-                        Ok(input) => {
-                            let call = ToolCall { id, name, input };
-                            self.completed.push(call.clone());
-                            calls.push(call);
-                        }
+                    let input = match serde_json::from_str(&builder) {
+                        Ok(input) => input,
                         Err(e) => {
+                            // Same empty-input completion as BlockEnd: the
+                            // message contract must hold.
                             tracing::warn!(
                                 "tool call {id} ({name}) has malformed JSON input at stream end: {e}\naccumulated: {builder}"
                             );
+                            self.malformed_count += 1;
+                            self.malformed_ids.push(id.clone());
+                            let call = ToolCall {
+                                id: id.clone(),
+                                name,
+                                input: serde_json::Value::Object(Default::default()),
+                            };
+                            self.completed.push(call.clone());
+                            calls.push(call);
+                            continue;
                         }
-                    }
+                    };
+                    let call = ToolCall { id, name, input };
+                    self.completed.push(call.clone());
+                    calls.push(call);
                 }
                 calls
             }
-            StreamEvent::UsageSummary(_) | StreamEvent::Error(_) => Vec::new(),
+            StreamEvent::UsageSummary(_) | StreamEvent::Error(_) | StreamEvent::StopReason(_) => {
+                Vec::new()
+            }
         }
     }
 
@@ -287,6 +325,12 @@ impl StreamingToolCallAssembler {
     #[must_use]
     pub const fn has_tool_calls(&self) -> bool {
         self.has_tool_calls
+    }
+
+    /// Number of tool calls whose accumulated JSON failed to parse.
+    #[must_use]
+    pub const fn malformed_count(&self) -> usize {
+        self.malformed_count
     }
 
     /// Get completed tool calls (consumes them).
@@ -680,6 +724,9 @@ pub struct QueryEngine {
     /// Optional persistent session memory that survives compaction.
     /// Implemented by `coderex-memory`; absent → no memory work happens.
     session_memory: Option<Arc<dyn crate::session_memory::SessionMemoryBackend>>,
+    /// Optional compaction backend (the local/remote dual-track seam).
+    /// Absent → the built-in local LLM summary path is used.
+    compaction_backend: Option<Arc<dyn crate::compaction_backend::CompactionBackend>>,
 }
 
 /// A denied tool call that should be summarized in the next turn.
@@ -1101,6 +1148,7 @@ impl QueryEngine {
             team_context: None,
             coordinator: None,
             session_memory: None,
+            compaction_backend: None,
         }
     }
 
@@ -1143,6 +1191,19 @@ impl QueryEngine {
         backend: Arc<dyn crate::session_memory::SessionMemoryBackend>,
     ) {
         self.session_memory = Some(backend);
+    }
+
+    /// Attach a compaction backend (the local/remote dual-track seam).
+    ///
+    /// When set, compaction consults this backend for the summary step
+    /// before falling back to the built-in local LLM path; on backend error
+    /// or an empty summary the built-in path (then rules) still runs. No
+    /// backend attached (the default) → behavior unchanged.
+    pub fn set_compaction_backend(
+        &mut self,
+        backend: Arc<dyn crate::compaction_backend::CompactionBackend>,
+    ) {
+        self.compaction_backend = Some(backend);
     }
 
     /// Refresh the session-memory document at compaction time and return the
@@ -2174,9 +2235,63 @@ impl QueryEngine {
         );
     }
 
-    /// Check whether a summarization attempt failed (used by the PTL retry).
-    fn summary_result_is_err(r: &Result<String, crate::orchestrator::OrchestratorError>) -> bool {
-        r.is_err()
+    /// Summarize a conversation interval via the attached compaction
+    /// backend (local/remote dual-track seam).
+    ///
+    /// With no backend attached this is exactly the built-in local LLM
+    /// summary. With a backend attached, a backend failure or empty summary
+    /// falls back to the built-in local path — the backend is an
+    /// optimization, never a new failure mode. Both paths collapse to
+    /// `Result<String, String>` so the PTL retry and rule-based fallback
+    /// below treat them uniformly. No remote compaction implementation
+    /// exists yet; a backend is opt-in via `set_compaction_backend` and
+    /// absent by default.
+    async fn summarize_for_compaction(
+        &self,
+        conversation: &str,
+        max_tokens: u32,
+    ) -> Result<String, String> {
+        let local = || async {
+            crate::prompts::generate_compact_summary(
+                self.api_client.as_ref(),
+                conversation,
+                None,
+                max_tokens,
+            )
+            .await
+            .map_err(|e| e.to_string())
+        };
+        let Some(backend) = self.compaction_backend.as_ref() else {
+            return local().await;
+        };
+        tracing::info!(
+            "CompactRecovery: summarizing via compaction backend '{}'",
+            backend.name()
+        );
+        match backend
+            .summarize(crate::compaction_backend::CompactionRequest {
+                conversation: conversation.to_string(),
+                focus: None,
+                max_output_tokens: max_tokens,
+            })
+            .await
+        {
+            Ok(text) if !text.trim().is_empty() => Ok(text),
+            Ok(_) => {
+                tracing::warn!(
+                    "CompactionBackend '{}': empty summary — falling back to local summary",
+                    backend.name()
+                );
+                local().await
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "CompactionBackend '{}': failed ({e}) — falling back to local summary",
+                    backend.name()
+                );
+                local().await
+            }
+        }
     }
 
     /// Run compact recovery when context is too large.
@@ -2259,14 +2374,13 @@ impl QueryEngine {
             // PTL resilience: if the summary request fails (e.g., the input
             // itself is too long), retry once with half the input budget —
             // `build_summary_input` re-caps by dropping the oldest messages.
-            let mut summary_result = crate::prompts::generate_compact_summary(
-                self.api_client.as_ref(),
-                &summary_input.join("\n\n"),
-                None,
-                self.compact_config.summary_output_max_tokens,
-            )
-            .await;
-            if Self::summary_result_is_err(&summary_result) {
+            let mut summary_result = self
+                .summarize_for_compaction(
+                    &summary_input.join("\n\n"),
+                    self.compact_config.summary_output_max_tokens,
+                )
+                .await;
+            if summary_result.is_err() {
                 tracing::warn!("CompactRecovery: summary failed — retrying with half input budget");
                 let halved = compact::build_summary_input(
                     &turn.messages,
@@ -2274,13 +2388,12 @@ impl QueryEngine {
                     self.compact_config.summary_input_max_tokens / 2,
                 );
                 if halved.len() >= 2 {
-                    summary_result = crate::prompts::generate_compact_summary(
-                        self.api_client.as_ref(),
-                        &halved.join("\n\n"),
-                        None,
-                        self.compact_config.summary_output_max_tokens,
-                    )
-                    .await;
+                    summary_result = self
+                        .summarize_for_compaction(
+                            &halved.join("\n\n"),
+                            self.compact_config.summary_output_max_tokens,
+                        )
+                        .await;
                 }
             }
             match summary_result {
@@ -2528,6 +2641,10 @@ impl QueryEngine {
         use futures::StreamExt;
         use std::collections::HashSet;
 
+        /// Maximum total attempts for a streaming request:
+        /// 1 initial + `MAX_STREAM_ATTEMPTS - 1` auto-retries.
+        const MAX_STREAM_ATTEMPTS: u32 = 3;
+
         let system = turn
             .messages
             .iter()
@@ -2540,118 +2657,167 @@ impl QueryEngine {
             .join("\n\n");
 
         let messages = Self::provider_messages(&turn.messages);
-
         let tools = self.tools.list_tools();
-        let request_client = self
-            .api_client
-            .with_request_context(self.build_request_context(self.current_turn, options));
-        let mut stream = request_client
-            .create_message_streaming(&system, &messages, &self.model, 4096, &tools)
-            .await;
 
-        let mut assembler = StreamingToolCallAssembler::new();
-        let mut usage = UsageSummary {
-            input_tokens: 0,
-            output_tokens: 0,
-            cache_read_tokens: 0,
-            cache_creation_tokens: 0,
-        };
-        let mut text_so_far = String::new();
-        let mut early_results: Vec<ToolResult> = Vec::new();
-        let mut deferred_calls: Vec<ToolCall> = Vec::new();
-        let mut stream_failed = false;
-        let mut stop_after_directory_call = false;
+        let mut attempt: u32 = 0;
+        loop {
+            attempt += 1;
+            let request_client = self
+                .api_client
+                .with_request_context(self.build_request_context(self.current_turn, options));
+            let mut stream = request_client
+                .create_message_streaming(&system, &messages, &self.model, 4096, &tools)
+                .await;
 
-        while let Some(event) = stream.next().await {
-            match event.clone() {
-                StreamEvent::TextDelta(ref text) => {
-                    text_so_far.push_str(text);
-                    let _ = self.event_tx.send(EngineEvent::TextDelta(text.clone()));
+            // Per-attempt state: discarded entirely on retry.
+            let mut assembler = StreamingToolCallAssembler::new();
+            let mut usage = UsageSummary {
+                input_tokens: 0,
+                output_tokens: 0,
+                cache_read_tokens: 0,
+                cache_creation_tokens: 0,
+            };
+            let mut text_so_far = String::new();
+            let mut early_results: Vec<ToolResult> = Vec::new();
+            let mut deferred_calls: Vec<ToolCall> = Vec::new();
+            let mut stream_failed = false;
+            let mut stop_after_directory_call = false;
+            let mut stop_reason: Option<String> = None;
+            let mut retry_requested = false;
+
+            while let Some(event) = stream.next().await {
+                match event.clone() {
+                    StreamEvent::TextDelta(ref text) => {
+                        text_so_far.push_str(text);
+                        let _ = self.event_tx.send(EngineEvent::TextDelta(text.clone()));
+                    }
+                    StreamEvent::ToolCallBlockStart { .. } => {}
+                    StreamEvent::ToolCallBlockEnd { .. } => {
+                        // Completion handled below via assembler.process_event
+                    }
+                    StreamEvent::ToolCallInputDelta { ref id, ref delta } => {
+                        tracing::trace!("tool call input delta for {id}: {} bytes", delta.len());
+                    }
+                    StreamEvent::UsageSummary(ref u) => {
+                        usage = u.clone();
+                    }
+                    StreamEvent::StopReason(ref r) => {
+                        stop_reason = Some(r.clone());
+                    }
+                    StreamEvent::StreamEnd => {
+                        // Finalize pending tool calls — handled after loop
+                    }
+                    StreamEvent::Error(ref e) => {
+                        if attempt < MAX_STREAM_ATTEMPTS && crate::api_client::is_retryable(e) {
+                            tracing::warn!(
+                                "streaming network error on attempt {attempt} ({} bytes received): {e} — retrying from scratch",
+                                text_so_far.len()
+                            );
+                            let _ = self.event_tx.send(EngineEvent::StreamInterrupted {
+                                reason: "error".into(),
+                                partial_len: text_so_far.len(),
+                                will_retry: true,
+                            });
+                            tokio::time::sleep(std::time::Duration::from_millis(
+                                500u64 << (attempt - 1),
+                            ))
+                            .await;
+                            retry_requested = true;
+                            break; // discard everything; outer loop re-requests
+                        }
+                        tracing::warn!(
+                            "streaming network error ({} bytes received so far): {e}",
+                            text_so_far.len()
+                        );
+                        stream_failed = true;
+                        // Fail-open: stop consuming the stream but return
+                        // whatever partial text and tool calls we have.
+                        break;
+                    }
                 }
-                StreamEvent::ToolCallBlockStart { .. } => {}
-                StreamEvent::ToolCallBlockEnd { .. } => {
-                    // Completion handled below via assembler.process_event
+
+                // Process event through assembler and execute completed tool
+                // calls immediately while the stream is still running.
+                for call in assembler.process_event(event) {
+                    if Self::is_directory_tool_call(&call) {
+                        stop_after_directory_call = true;
+                        break;
+                    }
+                    match self.execute_early_tool_call(call, options).await {
+                        Ok(Some(result)) => early_results.push(result),
+                        Ok(None) => { /* deferred — call already tracked */ }
+                        Err(e) => {
+                            tracing::warn!("early tool execution failed: {e}");
+                        }
+                    }
                 }
-                StreamEvent::ToolCallInputDelta { ref id, ref delta } => {
-                    tracing::trace!("tool call input delta for {id}: {} bytes", delta.len());
-                }
-                StreamEvent::UsageSummary(ref u) => {
-                    usage = u.clone();
-                }
-                StreamEvent::StreamEnd => {
-                    // Finalize pending tool calls — handled after loop
-                }
-                StreamEvent::Error(ref e) => {
-                    tracing::warn!(
-                        "streaming network error ({} bytes received so far): {e}",
-                        text_so_far.len()
-                    );
-                    stream_failed = true;
-                    // Fail-open: stop consuming the stream but return whatever
-                    // partial text and tool calls we have gathered so far.
+                if stop_after_directory_call {
                     break;
                 }
             }
 
-            // Process event through assembler and execute completed tool calls
-            // immediately while the stream is still running (early execution).
-            for call in assembler.process_event(event) {
-                if Self::is_directory_tool_call(&call) {
-                    stop_after_directory_call = true;
-                    break;
-                }
-                match self.execute_early_tool_call(call, options).await {
-                    Ok(Some(result)) => early_results.push(result),
-                    Ok(None) => { /* deferred — call already tracked */ }
-                    Err(e) => {
-                        tracing::warn!("early tool execution failed: {e}");
+            if !stop_after_directory_call && !retry_requested {
+                // Stream ended — finalize any remaining pending calls.
+                for call in assembler.process_event(StreamEvent::StreamEnd) {
+                    match self.execute_early_tool_call(call, options).await {
+                        Ok(Some(result)) => early_results.push(result),
+                        Ok(None) => { /* deferred */ }
+                        Err(e) => {
+                            tracing::warn!("early tool execution failed: {e}");
+                        }
                     }
                 }
             }
-            if stop_after_directory_call {
-                break;
-            }
-        }
 
-        // Finalize any remaining pending calls from stream end
-        if !stop_after_directory_call {
-            for call in assembler.process_event(StreamEvent::StreamEnd) {
-                match self.execute_early_tool_call(call, options).await {
-                    Ok(Some(result)) => early_results.push(result),
-                    Ok(None) => { /* deferred */ }
-                    Err(e) => {
-                        tracing::warn!("early tool execution failed: {e}");
-                    }
+            // A retryable mid-stream error with retry attempts left:
+            // restart the request from scratch.
+            if retry_requested {
+                continue;
+            }
+
+            // Partition completed calls: early-executed vs deferred.
+            let early_ids: HashSet<String> = early_results
+                .iter()
+                .map(|r| r.tool_call_id.clone())
+                .collect();
+            let all_completed = assembler.take_completed();
+            for call in all_completed {
+                if !early_ids.contains(&call.id) {
+                    deferred_calls.push(call);
                 }
             }
-        }
 
-        // Partition completed calls: early-executed vs deferred.
-        let early_ids: HashSet<String> = early_results
-            .iter()
-            .map(|r| r.tool_call_id.clone())
-            .collect();
-        let all_completed = assembler.take_completed();
-        for call in all_completed {
-            if !early_ids.contains(&call.id) {
-                deferred_calls.push(call);
+            if stream_failed
+                && text_so_far.is_empty()
+                && early_results.is_empty()
+                && deferred_calls.is_empty()
+            {
+                tracing::info!(
+                    "streaming request yielded no usable events; retrying same turn non-streaming"
+                );
+                if let Ok(resp) = self.send_request(turn, options).await {
+                    return Ok((resp.content, resp.tool_calls, Vec::new(), resp.usage));
+                }
             }
-        }
 
-        if stream_failed
-            && text_so_far.is_empty()
-            && early_results.is_empty()
-            && deferred_calls.is_empty()
-        {
-            tracing::info!(
-                "streaming request yielded no usable events; retrying same turn non-streaming"
-            );
-            if let Ok(resp) = self.send_request(turn, options).await {
-                return Ok((resp.content, resp.tool_calls, Vec::new(), resp.usage));
+            if stream_failed {
+                let _ = self.event_tx.send(EngineEvent::StreamInterrupted {
+                    reason: "error".into(),
+                    partial_len: text_so_far.len(),
+                    will_retry: false,
+                });
+            } else if matches!(stop_reason.as_deref(), Some("max_tokens") | Some("length")) {
+                // Legitimate provider-completed truncation: not an error and
+                // not retryable (re-requesting would loop and double cost).
+                let _ = self.event_tx.send(EngineEvent::StreamInterrupted {
+                    reason: stop_reason.clone().unwrap_or_default(),
+                    partial_len: text_so_far.len(),
+                    will_retry: false,
+                });
             }
-        }
 
-        Ok((text_so_far, deferred_calls, early_results, usage))
+            return Ok((text_so_far, deferred_calls, early_results, usage));
+        }
     }
 
     /// Execute a single tool call immediately during streaming.

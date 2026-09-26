@@ -1150,3 +1150,165 @@ async fn compact_recovery_no_extra_llm_call_without_backend() {
         "compaction without a memory backend must not add LLM calls"
     );
 }
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  1.9 Compaction backend abstraction (local/remote dual-track seam)
+// ═══════════════════════════════════════════════════════════════════════════
+
+use coderex_core::compaction_backend::{CompactionBackend, CompactionKind, CompactionRequest};
+
+/// Stub compaction backend: records every request and serves a canned
+/// summary (or fails, to exercise the fallback path).
+struct StubCompactionBackend {
+    summary: Result<String, String>,
+    called: std::sync::Arc<std::sync::Mutex<Vec<CompactionRequest>>>,
+}
+
+impl StubCompactionBackend {
+    fn ok(
+        summary: &str,
+    ) -> (
+        std::sync::Arc<Self>,
+        std::sync::Arc<std::sync::Mutex<Vec<CompactionRequest>>>,
+    ) {
+        let called = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        (
+            std::sync::Arc::new(Self {
+                summary: Ok(summary.to_string()),
+                called: std::sync::Arc::clone(&called),
+            }),
+            called,
+        )
+    }
+
+    fn failing() -> (
+        std::sync::Arc<Self>,
+        std::sync::Arc<std::sync::Mutex<Vec<CompactionRequest>>>,
+    ) {
+        let called = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        (
+            std::sync::Arc::new(Self {
+                summary: Err("remote compaction unavailable".into()),
+                called: std::sync::Arc::clone(&called),
+            }),
+            called,
+        )
+    }
+}
+
+#[async_trait]
+impl CompactionBackend for StubCompactionBackend {
+    fn kind(&self) -> CompactionKind {
+        CompactionKind::Remote
+    }
+
+    fn name(&self) -> &str {
+        "stub-remote"
+    }
+
+    async fn summarize(&self, request: CompactionRequest) -> Result<String, String> {
+        self.called.lock().unwrap().push(request);
+        self.summary.clone()
+    }
+}
+
+#[tokio::test]
+async fn compaction_backend_serves_summary_before_local_path() {
+    // trigger → (backend summary, no local LLM call) → retry → done
+    let responses = vec![budget_trigger_response(), text_response("Done.")];
+    let mock = RecordingMock::new(responses);
+    let calls = mock.calls_handle();
+    let tools = Box::new(EchoToolExecutor);
+    let (mut engine, _rx) = make_engine(Box::new(mock), tools);
+    engine.set_session(session_with_history());
+    let (backend, backend_calls) = StubCompactionBackend::ok("Remote summary: task mid-flight.");
+    let backend_dyn: std::sync::Arc<dyn CompactionBackend> = backend;
+    engine.set_compaction_backend(backend_dyn);
+
+    let mut options = SubmitOptions::default();
+    options.task_budget_tokens = 1_000;
+    options.handle_elicitation = false;
+
+    // The engine does not reset turn_tokens after compaction, so a
+    // compaction triggered by budget exhaustion ends the turn exhausted.
+    let result = engine.submit("finish it".into(), options).await.unwrap();
+    assert_eq!(result, TerminalReason::BudgetExhausted);
+
+    // The backend was consulted exactly once with the summarized interval.
+    let called = backend_calls.lock().unwrap();
+    assert_eq!(
+        called.len(),
+        1,
+        "compaction backend should be consulted once"
+    );
+    assert!(
+        called[0].conversation.contains("[User]"),
+        "backend receives rendered conversation"
+    );
+    drop(called);
+
+    // trigger + retry only — the local summary LLM call never happened.
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn compaction_backend_failure_falls_back_to_local_summary() {
+    // trigger → backend fails → local LLM summary → retry → done
+    let responses = vec![
+        budget_trigger_response(),
+        text_response("Local summary: task mid-flight."), // local fallback path
+        text_response("Done."),
+    ];
+    let mock = RecordingMock::new(responses);
+    let calls = mock.calls_handle();
+    let tools = Box::new(EchoToolExecutor);
+    let (mut engine, _rx) = make_engine(Box::new(mock), tools);
+    engine.set_session(session_with_history());
+    let (backend, backend_calls) = StubCompactionBackend::failing();
+    let backend_dyn: std::sync::Arc<dyn CompactionBackend> = backend;
+    engine.set_compaction_backend(backend_dyn);
+
+    let mut options = SubmitOptions::default();
+    options.task_budget_tokens = 1_000;
+    options.handle_elicitation = false;
+
+    let result = engine.submit("finish it".into(), options).await.unwrap();
+    assert_eq!(result, TerminalReason::BudgetExhausted);
+
+    // Backend consulted once (failed); the local summary path then ran and
+    // succeeded, so the PTL half-budget retry never fired.
+    assert_eq!(backend_calls.lock().unwrap().len(), 1);
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        3,
+        "backend failure must fall back to the local LLM summary"
+    );
+}
+
+#[tokio::test]
+async fn compaction_without_backend_uses_local_path_unchanged() {
+    // Baseline: no backend attached → exactly trigger + summary + retry.
+    let responses = vec![
+        budget_trigger_response(),
+        text_response("Summary: the task is mid-flight."),
+        text_response("Done."),
+    ];
+    let mock = RecordingMock::new(responses);
+    let calls = mock.calls_handle();
+    let tools = Box::new(EchoToolExecutor);
+    let (mut engine, _rx) = make_engine(Box::new(mock), tools);
+    engine.set_session(session_with_history());
+
+    let mut options = SubmitOptions::default();
+    options.task_budget_tokens = 1_000;
+    options.handle_elicitation = false;
+
+    let result = engine.submit("finish it".into(), options).await.unwrap();
+    assert_eq!(result, TerminalReason::BudgetExhausted);
+
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        3,
+        "default local path unchanged"
+    );
+}

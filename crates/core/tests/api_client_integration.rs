@@ -976,7 +976,11 @@ async fn openai_provider_streaming_emits_text_tool_and_usage_events() {
         matches!(&events[5], StreamEvent::ToolCallBlockEnd { id, input } if id == "call_1" && input.is_null())
     );
     assert!(
-        matches!(&events[6], StreamEvent::UsageSummary(usage) if usage.input_tokens == 9 && usage.output_tokens == 4)
+        matches!(&events[6], StreamEvent::StopReason(r) if r == "tool_calls"),
+        "finish_reason should surface as StopReason; events = {events:?}"
+    );
+    assert!(
+        matches!(&events[7], StreamEvent::UsageSummary(usage) if usage.input_tokens == 9 && usage.output_tokens == 4)
     );
     assert!(matches!(events.last(), Some(StreamEvent::StreamEnd)));
 
