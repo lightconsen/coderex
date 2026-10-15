@@ -12,4 +12,4 @@ pub mod proxy;
 pub mod resources;
 pub mod result_adapter;
 pub mod server;
-pub mod tool_executor;
+pub mod tool;

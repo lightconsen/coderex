@@ -62,6 +62,17 @@ pub enum ToolError {
     /// User input required but elicitation channel unavailable.
     #[error("user input required but elicitation channel unavailable")]
     ElicitationUnavailable,
+    /// The tool ran but the work it delegated to failed.
+    ///
+    /// Used by tools that hand the call to something outside the process
+    /// (an MCP server, a remote endpoint) and get a failure back.
+    #[error("tool '{name}' failed: {message}")]
+    Execution {
+        /// The name of the tool that failed.
+        name: String,
+        /// The failure message.
+        message: String,
+    },
 }
 
 /// Output from a successful tool execution.

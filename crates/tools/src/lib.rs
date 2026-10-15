@@ -33,5 +33,7 @@ pub use registry::{ToolDenyRule, ToolNotFoundError, ToolRegistry};
 pub use sandbox_policy::{default_sandbox_config, is_path_allowed};
 pub use task_store::{TASK_STORE_KEY, TaskRecord, TaskStatus, TaskStore};
 pub use todo_store::{TODO_STORE_KEY, TodoItem, TodoStatus, TodoStore};
-pub use tool::{ElicitRequest, InterruptBehavior, Tool, ToolInput, ToolTier};
+pub use tool::{
+    ElicitRequest, InterruptBehavior, Tool, ToolContext, ToolDescriptor, ToolInput, ToolTier,
+};
 pub use tool_cache::{ToolCache, ToolCacheConfig};

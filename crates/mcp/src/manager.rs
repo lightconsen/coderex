@@ -6,6 +6,8 @@ use crate::oauth::OAuthManager;
 use crate::proxy::{McpToolInfo, McpToolProxy, McpToolRegistry};
 use crate::resources::{McpResource, McpResourceContent, McpResourceRegistry};
 use crate::server::{McpServer, ServerStatus};
+use crate::tool::McpTool;
+use coderex_tools::ToolRegistry;
 use dashmap::DashMap;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -294,6 +296,18 @@ impl McpManager {
     /// Register a discovered resource in the registry.
     pub fn register_resource(&self, resource: McpResource) {
         self.resources.lock().unwrap().register(resource);
+    }
+
+    /// Register every discovered tool into `registry`.
+    ///
+    /// This is what puts MCP tools on the same execution path as built-ins:
+    /// the registry's dispatcher applies its timeouts, output limits, and
+    /// concurrency rules to them like any other tool. Safe to call before the
+    /// servers are up — each tool resolves its connection when it is called.
+    pub fn register_tools_into(self: &Arc<Self>, registry: &ToolRegistry) {
+        for info in self.list_tool_info() {
+            registry.register_dynamic(Arc::new(McpTool::new(info, Arc::clone(self))));
+        }
     }
 
     /// Get a tool proxy for executing an MCP tool (if server is running).

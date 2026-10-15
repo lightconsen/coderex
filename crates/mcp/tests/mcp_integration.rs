@@ -18,7 +18,10 @@ use coderex_mcp::proxy::McpToolProxy;
 use coderex_mcp::resources::{McpResource, McpResourceRegistry};
 use coderex_mcp::result_adapter::McpResultAdapter;
 use coderex_mcp::server::{McpServer, ServerStatus};
-use coderex_mcp::tool_executor::McpToolExecutor;
+use coderex_tools::{
+    ExecutionConfig, ExecutionContext, RegistryToolDispatcher, ToolExecutor as ToolsExecutor,
+    ToolRegistry,
+};
 
 // ═══════════════════════════════════════════════════════════════════════════
 //  Mock MCP Server Script (Python)
@@ -251,9 +254,9 @@ async fn tool_discovery_proxy_call() {
 }
 
 #[tokio::test]
-async fn tool_discovery_executor_routes_to_mcp() {
+async fn discovered_tools_run_through_the_registry_dispatcher() {
     let script = mock_server_path();
-    let mgr = McpManager::new();
+    let mgr = std::sync::Arc::new(McpManager::new());
     let mut config = McpConfig::new();
     config.add_server(
         "mock",
@@ -266,9 +269,22 @@ async fn tool_discovery_executor_routes_to_mcp() {
     );
     mgr.load_config(&config);
     mgr.start_all().await;
+    mgr.discover_all_tools().await;
 
-    let executor = McpToolExecutor::new(std::sync::Arc::new(mgr));
-    let outcome = executor
+    // Registering the discovered tools is all it takes: from here they are
+    // ordinary registry tools with no MCP-specific execution path.
+    let mut registry = ToolRegistry::new();
+    mgr.register_tools_into(&mut registry);
+    assert!(registry.get_tool_arc("mcp__mock__mock_read_file").is_some());
+
+    let dispatcher = RegistryToolDispatcher::new(
+        std::sync::Arc::new(registry),
+        std::sync::Arc::new(ToolsExecutor::new(ExecutionConfig::default())),
+        ExecutionContext::Normal,
+        PathBuf::from("/tmp"),
+    );
+
+    let outcome = dispatcher
         .execute(
             "tc_1",
             "mcp__mock__mock_read_file",
@@ -276,8 +292,10 @@ async fn tool_discovery_executor_routes_to_mcp() {
         )
         .await;
 
-    assert!(!outcome.result.is_error);
+    assert!(!outcome.result.is_error, "{:?}", outcome.result.output);
     assert!(outcome.result.output.contains("Executed mock_read_file"));
+
+    mgr.stop_all().await;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

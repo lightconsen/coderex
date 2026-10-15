@@ -35,6 +35,9 @@ pub struct SessionContext {
     pub remote_barrier: Option<LoadingBarrier>,
     /// MCP server connections initialized.
     pub mcp_ready: bool,
+    /// Live MCP servers and their discovered tools, kept for the session so
+    /// the tools can be registered into the tool registry.
+    pub mcp_manager: Option<Arc<coderex_mcp::manager::McpManager>>,
     /// MCP-discovered skills registered during InitMcp.
     pub mcp_skills: Vec<coderex_plugins::skills::SkillMetadata>,
     /// Memory subsystem initialized.
@@ -178,6 +181,7 @@ impl StartupOrchestrator {
                 #[cfg(feature = "enterprise")]
                 remote_barrier: None,
                 mcp_ready: false,
+                mcp_manager: None,
                 mcp_skills: Vec::new(),
                 memory_ready: false,
                 remote_services_ready: false,
@@ -876,7 +880,7 @@ impl StartupOrchestrator {
     /// InitMcp: initialize MCP server connections (non-blocking, fail-open).
     async fn phase_init_mcp(&mut self) -> Result<()> {
         let settings = self.ctx.settings.clone().unwrap_or_default();
-        let manager = coderex_mcp::manager::McpManager::new();
+        let manager = Arc::new(coderex_mcp::manager::McpManager::new());
         let mut config_loaded = false;
 
         // Load from custom --mcp-config or default .mcp.json
@@ -947,6 +951,10 @@ impl StartupOrchestrator {
             }
 
             self.ctx.mcp_ready = true;
+            // Keep the connections alive: the REPL registers the discovered
+            // tools into its registry, and they resolve their connection
+            // through this manager at call time.
+            self.ctx.mcp_manager = Some(Arc::clone(&manager));
         } else {
             tracing::debug!("no MCP servers configured");
         }
@@ -1050,6 +1058,9 @@ impl StartupOrchestrator {
 
     /// Configure a ReplLoop with all CLI-derived settings.
     fn configure_repl(&self, repl: &mut crate::repl::ReplLoop) {
+        if let Some(ref manager) = self.ctx.mcp_manager {
+            repl.with_mcp_manager(Arc::clone(manager));
+        }
         repl.with_skip_permissions(self.ctx.skip_permissions);
         let perm_mode = self
             .ctx

@@ -42,6 +42,14 @@ pub struct RegistryToolDispatcher {
 }
 
 impl RegistryToolDispatcher {
+    /// The registry this dispatcher resolves tools from.
+    ///
+    /// Lets callers add tools discovered after construction (MCP servers).
+    #[must_use]
+    pub fn registry(&self) -> &Arc<ToolRegistry> {
+        &self.registry
+    }
+
     /// Construct a new dispatcher for the given registry and execution
     /// environment.
     #[must_use]
@@ -248,6 +256,9 @@ impl CoreToolExecutor for RegistryToolDispatcher {
                         format!(
                             "tool '{tool_name}' requires user input but no elicitation channel is available"
                         )
+                    }
+                    ToolError::Execution { name, message } => {
+                        format!("tool '{name}' failed: {message}")
                     }
                 };
                 ToolDispatchOutcome {

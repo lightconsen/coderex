@@ -497,6 +497,12 @@ pub struct ReplLoop {
     dispatcher: Option<Arc<RegistryToolDispatcher>>,
     /// Sub-agent lifecycle manager shared with the registered Agent tool.
     agent_manager: Option<Arc<tokio::sync::Mutex<AgentManager>>>,
+    /// The live MCP servers, filled in by `with_mcp_manager`.
+    ///
+    /// A slot rather than a plain field because the sub-agent tool factory is
+    /// built before the MCP servers are attached, and reads this when it later
+    /// builds a child registry.
+    mcp_manager: Arc<std::sync::RwLock<Option<Arc<coderex_mcp::manager::McpManager>>>>,
     /// Pending elicitation response sender — when set, user input is treated as an answer.
     pending_elicitation: Option<tokio::sync::oneshot::Sender<serde_json::Value>>,
     /// Confirmation bus for interactive permission requests.
@@ -653,6 +659,7 @@ impl ReplLoop {
             _primary_tool_executor: None,
             dispatcher: None,
             agent_manager: None,
+            mcp_manager: Arc::new(std::sync::RwLock::new(None)),
             pending_elicitation: None,
             confirmation_bus: None,
             cron_rx: None,
@@ -751,9 +758,15 @@ impl ReplLoop {
         agent_manager.set_model(model.clone());
         agent_manager.set_event_sender(event_tx);
         agent_manager.set_permission_checker(engine.permission_checker());
-        agent_manager.set_tool_executor_factory(|cwd, sandbox| {
+        let mcp_slot: Arc<std::sync::RwLock<Option<Arc<coderex_mcp::manager::McpManager>>>> =
+            Arc::new(std::sync::RwLock::new(None));
+        let mcp_for_subagents = Arc::clone(&mcp_slot);
+        agent_manager.set_tool_executor_factory(move |cwd, sandbox| {
             let mut registry = ToolRegistry::new();
             register_builtin_tools(&mut registry);
+            if let Some(mcp) = mcp_for_subagents.read().unwrap().as_ref() {
+                mcp.register_tools_into(&registry);
+            }
             let executor = Arc::new(ToolsExecutor::new(ExecutionConfig::default()));
             let mut dispatcher = RegistryToolDispatcher::new(
                 Arc::new(registry),
@@ -855,6 +868,7 @@ impl ReplLoop {
             _primary_tool_executor: Some(primary_executor),
             dispatcher: Some(dispatcher),
             agent_manager: Some(agent_manager),
+            mcp_manager: mcp_slot,
             pending_elicitation: None,
             confirmation_bus: Some(confirmation_bus),
             cron_rx: Some(cron_rx),
@@ -891,6 +905,22 @@ impl ReplLoop {
         };
         this.init_command_persistence();
         this
+    }
+
+    /// Wire the MCP manager into this REPL loop.
+    ///
+    /// Keeps the live server connections for the session and registers the
+    /// tools they expose into the same registry as the built-in tools, so
+    /// there is one execution path rather than a separate MCP one.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the MCP slot's lock is poisoned.
+    pub fn with_mcp_manager(&mut self, mcp_manager: Arc<coderex_mcp::manager::McpManager>) {
+        if let Some(ref dispatcher) = self.dispatcher {
+            mcp_manager.register_tools_into(dispatcher.registry());
+        }
+        *self.mcp_manager.write().expect("MCP slot poisoned") = Some(mcp_manager);
     }
 
     /// Wire a plugin manager into this REPL loop.
@@ -5185,5 +5215,35 @@ mod tests {
         }
         assert!(saw_started, "missing sub-agent start event");
         assert!(saw_completed, "missing sub-agent completion event");
+    }
+
+    #[tokio::test]
+    async fn mcp_tools_join_the_registry_the_model_dispatches_through() {
+        let api = ReadThenAnswerApi {
+            call: Arc::new(std::sync::Mutex::new(0)),
+            expected_contents: "unused",
+        };
+        let mut repl = ReplLoop::with_engine(Box::new(api), "/tmp".into(), ModelId::sonnet());
+
+        let manager = Arc::new(coderex_mcp::manager::McpManager::new());
+        manager.register_tool(coderex_mcp::proxy::McpToolInfo {
+            server: "mock".into(),
+            name: "ping".into(),
+            description: "Ping the mock server".into(),
+            input_schema: serde_json::json!({"type": "object"}),
+        });
+
+        repl.with_mcp_manager(Arc::clone(&manager));
+
+        let dispatcher = repl.dispatcher.take().unwrap();
+        let registry = dispatcher.registry();
+        assert!(
+            registry.get_tool_arc("mcp__mock__ping").is_some(),
+            "MCP tool did not reach the registry the model dispatches through"
+        );
+        assert!(
+            registry.get_tool_arc("Bash").is_some(),
+            "built-in tools disappeared"
+        );
     }
 }

@@ -116,6 +116,16 @@ impl ToolRegistry {
         }
     }
 
+    /// Register a dynamically discovered tool.
+    ///
+    /// Unlike [`register`](Self::register), this takes `&self`: dynamic tools
+    /// (MCP servers) appear while the session is already running, after the
+    /// registry has been shared.
+    pub fn register_dynamic(&self, tool: BoxedTool) {
+        let descriptor = tool.descriptor();
+        self.dynamic_mcp.write().insert(descriptor.name, tool);
+    }
+
     /// Add a deny rule to the registry.
     pub fn add_deny_rule(&mut self, rule: ToolDenyRule) {
         self.deny_rules.push(rule);
