@@ -17,6 +17,7 @@ pub mod elicitation;
 pub mod engine;
 pub mod file_traversal;
 pub mod fuzzy_matcher;
+pub mod hook_events;
 pub mod hook_executor;
 pub mod hook_security;
 pub mod loop_detector;

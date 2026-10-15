@@ -207,7 +207,7 @@ impl HookRegistry {
     /// Find hooks matching the given event, sorted by priority (highest first).
     #[must_use]
     pub fn matches_for_event(&self, event: &HookEvent) -> Vec<&HookConfig> {
-        let event_name = event_name_str(*event);
+        let event_name = event.as_str();
         let mut hooks: Vec<_> = self
             .hooks
             .iter()
@@ -536,34 +536,6 @@ fn build_hook_env(hook: &HookConfig, input: &HookInput) -> HashMap<String, Strin
     env
 }
 
-/// Convert a HookEvent to its string name.
-const fn event_name_str(event: HookEvent) -> &'static str {
-    match event {
-        HookEvent::PreToolUse => "PreToolUse",
-        HookEvent::PostToolUse => "PostToolUse",
-        HookEvent::PostToolUseFailure => "PostToolUseFailure",
-        HookEvent::UserPromptSubmit => "UserPromptSubmit",
-        HookEvent::SessionStart => "SessionStart",
-        HookEvent::Setup => "Setup",
-        HookEvent::SubagentStart => "SubagentStart",
-        HookEvent::Notification => "Notification",
-        HookEvent::PermissionRequest => "PermissionRequest",
-        HookEvent::PermissionDenied => "PermissionDenied",
-        HookEvent::CwdChanged => "CwdChanged",
-        HookEvent::FileChanged => "FileChanged",
-        HookEvent::WorktreeCreate => "WorktreeCreate",
-        HookEvent::PreCompact => "PreCompact",
-        HookEvent::PostCompact => "PostCompact",
-        HookEvent::Stop => "Stop",
-        HookEvent::SubagentStop => "SubagentStop",
-        HookEvent::TaskCompleted => "TaskCompleted",
-        HookEvent::TeammateIdle => "TeammateIdle",
-        HookEvent::Elicitation => "Elicitation",
-        HookEvent::ElicitationResult => "ElicitationResult",
-        HookEvent::TurnEnd => "TurnEnd",
-    }
-}
-
 /// Helper to spawn a hook process (exposed for testing).
 #[cfg(test)]
 pub fn spawn_hook_process(command: &str, _input: &str) -> std::process::Child {
@@ -821,10 +793,25 @@ mod tests {
     }
 
     #[test]
-    fn event_name_str_maps_correctly() {
-        assert_eq!(event_name_str(HookEvent::PreToolUse), "PreToolUse");
-        assert_eq!(event_name_str(HookEvent::PostCompact), "PostCompact");
-        assert_eq!(event_name_str(HookEvent::Stop), "Stop");
+    fn event_as_str_maps_correctly() {
+        assert_eq!(HookEvent::PreToolUse.as_str(), "PreToolUse");
+        assert_eq!(HookEvent::PostToolUseFailure.as_str(), "PostToolUseFailure");
+        assert_eq!(HookEvent::PostCompact.as_str(), "PostCompact");
+        assert_eq!(HookEvent::Stop.as_str(), "Stop");
+    }
+
+    #[test]
+    fn event_name_round_trips_and_accepts_legacy_alias() {
+        use std::str::FromStr;
+        for event in <HookEvent as strum::IntoEnumIterator>::iter() {
+            assert_eq!(HookEvent::from_str(event.as_str()), Ok(event));
+        }
+        // 历史写法仍可解析到同一事件
+        assert_eq!(
+            HookEvent::from_str("PostToolUseFail"),
+            Ok(HookEvent::PostToolUseFailure)
+        );
+        assert!(HookEvent::from_str("NoSuchEvent").is_err());
     }
 
     #[tokio::test]

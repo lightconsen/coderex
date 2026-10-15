@@ -13,6 +13,7 @@
 //! and maximum throughput for safe tools.
 
 use crate::engine::{DeniedToolCall, PendingToolCall, SubmitOptions};
+use crate::hook_events;
 use crate::hook_executor::HookExecutor;
 use crate::permission_engine::PermissionEngine;
 use crate::permissions::PermissionResult;
@@ -103,7 +104,9 @@ pub async fn run_tool_calls(
         let mut ctx = HashMap::new();
         ctx.insert("tool_call_id".to_string(), call.id.clone());
         ctx.insert("tool_input".to_string(), call.input.to_string());
-        let pre_hook = hooks.fire_hook("PreToolUse", &call.name, &ctx).await;
+        let pre_hook = hooks
+            .fire_hook(hook_events::PRE_TOOL_USE, &call.name, &ctx)
+            .await;
         if pre_hook.stop {
             denied_tools.push(DeniedToolCall {
                 name: call.name.clone(),
@@ -157,7 +160,9 @@ pub async fn run_tool_calls(
                 let mut ctx = HashMap::new();
                 ctx.insert("tool_call_id".to_string(), call.id.clone());
                 ctx.insert("reason".to_string(), reason.clone());
-                let fail_result = hooks.fire_hook("PostToolUseFail", &call.name, &ctx).await;
+                let fail_result = hooks
+                    .fire_hook(hook_events::POST_TOOL_USE_FAILURE, &call.name, &ctx)
+                    .await;
                 if !fail_result.errors.is_empty() {
                     tracing::warn!(
                         "PostToolUseFail hook errors for {}: {:?}",
@@ -184,7 +189,9 @@ pub async fn run_tool_calls(
                 let mut ctx = HashMap::new();
                 ctx.insert("tool_call_id".to_string(), call.id.clone());
                 ctx.insert("reason".to_string(), reason.clone());
-                let fail_result = hooks.fire_hook("PostToolUseFail", &call.name, &ctx).await;
+                let fail_result = hooks
+                    .fire_hook(hook_events::POST_TOOL_USE_FAILURE, &call.name, &ctx)
+                    .await;
                 if !fail_result.errors.is_empty() {
                     tracing::warn!(
                         "PostToolUseFail hook errors for {}: {:?}",
@@ -243,7 +250,9 @@ pub async fn run_tool_calls(
             "tool_output_len".to_string(),
             result.output.len().to_string(),
         );
-        let post_result = hooks.fire_hook("PostToolUse", &call.name, &ctx).await;
+        let post_result = hooks
+            .fire_hook(hook_events::POST_TOOL_USE, &call.name, &ctx)
+            .await;
         if !post_result.errors.is_empty() {
             tracing::warn!(
                 "PostToolUse hook errors for {}: {:?}",

@@ -19,6 +19,7 @@ use crate::compact::{self, CompactResult, CompactStrategy};
 use crate::confirmation_bus::ConfirmationBus;
 use crate::cost::CostTracker;
 use crate::elicitation::{ElicitationHandler, ElicitationResult, ReplElicitationHandler};
+use crate::hook_events;
 use crate::hook_executor::{HookExecutor, HookFireResult, NoOpHookExecutor};
 use crate::loop_detector::{LoopDetection, LoopDetector};
 use crate::permission_engine::{PermissionEngine, PermissionResponse};
@@ -1455,7 +1456,7 @@ impl QueryEngine {
         ctx.insert("turn_number".to_string(), turn_number.to_string());
         ctx.insert("stop_reason".to_string(), stop_reason.to_string());
         self.hooks
-            .fire_hook("TurnEnd", &format!("turn_{turn_number}"), &ctx)
+            .fire_hook(hook_events::TURN_END, &format!("turn_{turn_number}"), &ctx)
             .await
     }
 
@@ -1715,7 +1716,9 @@ impl QueryEngine {
             .as_deref()
             .unwrap_or_else(|| options.append_system_prompt.as_deref().unwrap_or(""));
         let ctx = std::collections::HashMap::new();
-        let hook_result = self.fire_hook("UserPromptSubmit", user_prompt, &ctx).await;
+        let hook_result = self
+            .fire_hook(hook_events::USER_PROMPT_SUBMIT, user_prompt, &ctx)
+            .await;
         if hook_result.stop {
             turn.terminate(TerminalReason::Completed);
             return Ok(TerminalReason::Completed);
@@ -1954,7 +1957,9 @@ impl QueryEngine {
             .as_deref()
             .unwrap_or_else(|| options.append_system_prompt.as_deref().unwrap_or(""));
         let ctx = std::collections::HashMap::new();
-        let hook_result = self.fire_hook("UserPromptSubmit", user_prompt, &ctx).await;
+        let hook_result = self
+            .fire_hook(hook_events::USER_PROMPT_SUBMIT, user_prompt, &ctx)
+            .await;
         if hook_result.stop {
             turn.terminate(TerminalReason::Completed);
             return Ok(TerminalReason::Completed);
@@ -2343,7 +2348,9 @@ impl QueryEngine {
         let mut ctx = std::collections::HashMap::new();
         ctx.insert("strategy".to_string(), format!("{strategy:?}"));
         ctx.insert("estimated_tokens".to_string(), estimated_tokens.to_string());
-        let pre_compact_result = self.fire_hook("PreCompact", "compact_recovery", &ctx).await;
+        let pre_compact_result = self
+            .fire_hook(hook_events::PRE_COMPACT, "compact_recovery", &ctx)
+            .await;
         if !pre_compact_result.errors.is_empty() {
             tracing::warn!("PreCompact hook errors: {:?}", pre_compact_result.errors);
         }
@@ -2515,7 +2522,7 @@ impl QueryEngine {
         );
         ctx.insert("strategy".to_string(), format!("{:?}", result.strategy));
         let post_compact_result = self
-            .fire_hook("PostCompact", "compact_complete", &ctx)
+            .fire_hook(hook_events::POST_COMPACT, "compact_complete", &ctx)
             .await;
         if !post_compact_result.errors.is_empty() {
             tracing::warn!("PostCompact hook errors: {:?}", post_compact_result.errors);
@@ -2860,7 +2867,10 @@ impl QueryEngine {
         let mut ctx = std::collections::HashMap::new();
         ctx.insert("tool_call_id".to_string(), call.id.clone());
         ctx.insert("tool_input".to_string(), call.input.to_string());
-        let pre_hook = self.hooks.fire_hook("PreToolUse", &call.name, &ctx).await;
+        let pre_hook = self
+            .hooks
+            .fire_hook(hook_events::PRE_TOOL_USE, &call.name, &ctx)
+            .await;
         if pre_hook.stop {
             self.denied_tools.push(DeniedToolCall {
                 name: call.name.clone(),
@@ -2907,7 +2917,10 @@ impl QueryEngine {
                     "tool_output_len".to_string(),
                     result.output.len().to_string(),
                 );
-                let post_result = self.hooks.fire_hook("PostToolUse", &call.name, &ctx).await;
+                let post_result = self
+                    .hooks
+                    .fire_hook(hook_events::POST_TOOL_USE, &call.name, &ctx)
+                    .await;
                 if !post_result.errors.is_empty() {
                     tracing::warn!(
                         "PostToolUse hook errors for {}: {:?}",
@@ -2942,7 +2955,7 @@ impl QueryEngine {
                 ctx.insert("reason".to_string(), reason.clone());
                 let fail_result = self
                     .hooks
-                    .fire_hook("PostToolUseFail", &call.name, &ctx)
+                    .fire_hook(hook_events::POST_TOOL_USE_FAILURE, &call.name, &ctx)
                     .await;
                 if !fail_result.errors.is_empty() {
                     tracing::warn!(
@@ -2972,7 +2985,7 @@ impl QueryEngine {
                 ctx.insert("reason".to_string(), reason.clone());
                 let fail_result = self
                     .hooks
-                    .fire_hook("PostToolUseFail", &call.name, &ctx)
+                    .fire_hook(hook_events::POST_TOOL_USE_FAILURE, &call.name, &ctx)
                     .await;
                 if !fail_result.errors.is_empty() {
                     tracing::warn!(
@@ -3082,7 +3095,7 @@ impl QueryEngine {
         ctx.insert("tool_call_id".to_string(), elevation.tool_call_id.clone());
         ctx.insert("tool_input".to_string(), elevation.input.to_string());
         let pre_hook = self
-            .fire_hook("PreToolUse", &elevation.tool_name, &ctx)
+            .fire_hook(hook_events::PRE_TOOL_USE, &elevation.tool_name, &ctx)
             .await;
         if pre_hook.stop {
             // Restore mode
