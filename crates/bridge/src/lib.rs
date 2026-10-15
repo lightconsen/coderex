@@ -8,6 +8,7 @@ pub mod heartbeat;
 pub mod orchestrator;
 pub mod permission;
 pub mod poller;
+pub mod relay;
 pub mod spawner;
 pub mod state;
 pub mod teleport;

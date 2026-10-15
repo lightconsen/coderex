@@ -9,6 +9,7 @@ use crate::heartbeat::{
 };
 use crate::permission::{BridgePermissionRouter, PermissionResponse};
 use crate::poller::{BridgeWorkPoller, SpawnMode, WorkAssignment};
+use crate::relay::{ApprovedIntent, RelayApprovalGate, RelayDenial};
 use crate::spawner::{BridgeSessionSpawner, SpawnConfig, SpawnResult};
 use crate::state::{BridgeSessionState, BridgeSessionStateMachine};
 use crate::transport::Transport;
@@ -101,6 +102,8 @@ pub struct Bridge {
     spawner: BridgeSessionSpawner,
     /// Permission router for tool call authorization.
     permission_router: BridgePermissionRouter,
+    /// Confirmations the person has given, for relayed calls to match against.
+    relay_approvals: RelayApprovalGate,
     /// Archive writer for session snapshots.
     archive_writer: BridgeArchiveWriter,
     /// Cleanup manager for resource teardown.
@@ -152,6 +155,7 @@ impl Bridge {
             poller,
             spawner,
             permission_router: BridgePermissionRouter::new(),
+            relay_approvals: RelayApprovalGate::new(),
             archive_writer,
             cleanup_manager: BridgeCleanupManager::new(
                 config.worktree_base.clone(),
@@ -205,15 +209,32 @@ impl Bridge {
     }
 
     /// Submit a permission response for a pending request.
+    ///
+    /// An approval also becomes the confirmation a relayed call has to present:
+    /// it records what the person approved, keyed by the request they approved
+    /// it for.
     pub fn respond_to_permission(
         &mut self,
         request_id: &str,
         response: PermissionResponse,
     ) -> bool {
+        let pending = self.permission_router.get_pending(request_id).cloned();
         let resolved = self.permission_router.respond(request_id, response);
         if resolved {
             if let Some(resp) = self.permission_router.get_response(request_id) {
                 let allowed = matches!(resp, PermissionResponse::Allow { .. });
+                if allowed {
+                    if let Some(ref request) = pending {
+                        self.relay_approvals.confirm(
+                            request_id,
+                            ApprovedIntent::for_call(
+                                &request.session_id,
+                                &request.tool,
+                                &request.args,
+                            ),
+                        );
+                    }
+                }
                 self.emit(BridgeEvent::PermissionResolved {
                     request_id: request_id.to_string(),
                     allowed,
@@ -221,6 +242,30 @@ impl Bridge {
             }
         }
         resolved
+    }
+
+    /// Check a relayed call against the confirmations the person has given.
+    ///
+    /// The call has to carry both binding headers and match an unspent
+    /// confirmation; anything else is refused as the gateway refuses it — 403
+    /// with [`crate::relay::UNAPPROVED_ERROR_CODE`]. `header` looks a header up
+    /// by lowercase name.
+    pub fn authorize_relay_call(
+        &mut self,
+        header: impl Fn(&str) -> Option<String>,
+    ) -> Result<(), RelayDenial> {
+        self.relay_approvals.authorize_headers(header)
+    }
+
+    /// Withdraw a confirmation whose request was cancelled before it was used.
+    pub fn withdraw_relay_approval(&mut self, request_id: &str) -> bool {
+        self.relay_approvals.withdraw(request_id)
+    }
+
+    /// How many confirmations are waiting to be spent.
+    #[must_use]
+    pub fn outstanding_relay_approvals(&self) -> usize {
+        self.relay_approvals.outstanding()
     }
 
     /// Get the heartbeat status.
@@ -528,6 +573,92 @@ mod tests {
         let config = test_config(base);
         let (a, _b) = InProcessTransport::create_pair("bridge".into(), "remote".into());
         Bridge::new(config, Box::new(a))
+    }
+
+    fn relay_headers(id: &str, intent: &ApprovedIntent) -> impl Fn(&str) -> Option<String> {
+        let id = id.to_string();
+        let encoded = intent.encode();
+        move |name: &str| match name {
+            crate::relay::TOOL_USE_ID_HEADER => Some(id.clone()),
+            crate::relay::APPROVED_INTENT_HEADER => Some(encoded.clone()),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn an_approval_becomes_the_confirmation_a_relay_call_presents() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut bridge = test_bridge(tmp.path());
+        let args = r#"{"command":"ls"}"#;
+        let request_id = bridge.request_permission("sess_1", "Bash", args);
+        let intent = ApprovedIntent::for_call("sess_1", "Bash", args);
+
+        // Before the person answers, the call has nothing to match.
+        assert!(matches!(
+            bridge.authorize_relay_call(relay_headers(&request_id, &intent)),
+            Err(RelayDenial::Unapproved { .. })
+        ));
+
+        assert!(bridge.respond_to_permission(
+            &request_id,
+            PermissionResponse::Allow { always: false }
+        ));
+        assert_eq!(bridge.outstanding_relay_approvals(), 1);
+        assert!(bridge
+            .authorize_relay_call(relay_headers(&request_id, &intent))
+            .is_ok());
+
+        // The confirmation authorised that one call.
+        assert_eq!(bridge.outstanding_relay_approvals(), 0);
+        assert!(bridge
+            .authorize_relay_call(relay_headers(&request_id, &intent))
+            .is_err());
+    }
+
+    #[test]
+    fn a_denied_request_confirms_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut bridge = test_bridge(tmp.path());
+        let request_id = bridge.request_permission("sess_1", "Bash", "ls");
+
+        assert!(bridge.respond_to_permission(&request_id, PermissionResponse::Deny));
+        assert_eq!(bridge.outstanding_relay_approvals(), 0);
+    }
+
+    #[test]
+    fn an_approval_does_not_cover_a_different_call() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut bridge = test_bridge(tmp.path());
+        let request_id = bridge.request_permission("sess_1", "Bash", r#"{"command":"ls"}"#);
+        assert!(bridge.respond_to_permission(
+            &request_id,
+            PermissionResponse::Allow { always: false }
+        ));
+
+        let other = ApprovedIntent::for_call("sess_1", "Bash", r#"{"command":"rm -rf /"}"#);
+        assert!(matches!(
+            bridge.authorize_relay_call(relay_headers(&request_id, &other)),
+            Err(RelayDenial::Unapproved { .. })
+        ));
+        assert_eq!(bridge.outstanding_relay_approvals(), 1);
+    }
+
+    #[test]
+    fn a_withdrawn_approval_is_gone() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut bridge = test_bridge(tmp.path());
+        let request_id = bridge.request_permission("sess_1", "Bash", "ls");
+        assert!(bridge.respond_to_permission(
+            &request_id,
+            PermissionResponse::Allow { always: false }
+        ));
+
+        assert!(bridge.withdraw_relay_approval(&request_id));
+        let intent = ApprovedIntent::for_call("sess_1", "Bash", "ls");
+        assert!(matches!(
+            bridge.authorize_relay_call(relay_headers(&request_id, &intent)),
+            Err(RelayDenial::Unapproved { .. })
+        ));
     }
 
     #[test]

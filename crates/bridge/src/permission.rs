@@ -75,6 +75,12 @@ impl BridgePermissionRouter {
         id
     }
 
+    /// Look up a pending request.
+    #[must_use]
+    pub fn get_pending(&self, request_id: &str) -> Option<&PendingPermission> {
+        self.pending.get(request_id)
+    }
+
     /// Submit a response to a permission request.
     pub fn respond(&mut self, request_id: &str, response: PermissionResponse) -> bool {
         if let Some(req) = self.pending.get_mut(request_id) {
