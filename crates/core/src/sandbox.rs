@@ -184,6 +184,200 @@ impl PlatformSandbox {
 
 // ─── Linux: rlimit + seccomp ────────────────────────────────────────────────
 
+/// seccomp audit token and syscall allowlist for the current target.
+///
+/// The audit token is the filter's first comparison and a mismatch is fatal by
+/// design, so hard-coding one architecture's token makes the filter kill every
+/// process on any other architecture at its first syscall — the sandbox would
+/// appear to work while silently killing everything it wrapped.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+mod seccomp_arch {
+    /// `AUDIT_ARCH_X86_64`.
+    pub(super) const AUDIT_ARCH: u32 = 0xC000_003E;
+
+    /// Syscalls a shell-command profile may use.
+    pub(super) const ALLOWED: &[i64] = &[
+        libc::SYS_read,
+        libc::SYS_write,
+        libc::SYS_open,
+        libc::SYS_close,
+        libc::SYS_fstat,
+        libc::SYS_lseek,
+        libc::SYS_mmap,
+        libc::SYS_mprotect,
+        libc::SYS_munmap,
+        libc::SYS_brk,
+        libc::SYS_rt_sigaction,
+        libc::SYS_rt_sigprocmask,
+        libc::SYS_rt_sigreturn,
+        libc::SYS_ioctl,
+        libc::SYS_pread64,
+        libc::SYS_pwrite64,
+        libc::SYS_readv,
+        libc::SYS_writev,
+        libc::SYS_access,
+        libc::SYS_pipe,
+        libc::SYS_dup,
+        libc::SYS_dup2,
+        libc::SYS_nanosleep,
+        libc::SYS_getpid,
+        libc::SYS_clone,
+        libc::SYS_fork,
+        libc::SYS_vfork,
+        libc::SYS_execve,
+        libc::SYS_exit,
+        libc::SYS_wait4,
+        libc::SYS_kill,
+        libc::SYS_uname,
+        libc::SYS_fcntl,
+        libc::SYS_getdents,
+        libc::SYS_getcwd,
+        libc::SYS_chdir,
+        libc::SYS_mkdir,
+        libc::SYS_rmdir,
+        libc::SYS_creat,
+        libc::SYS_unlink,
+        libc::SYS_readlink,
+        libc::SYS_chmod,
+        libc::SYS_umask,
+        libc::SYS_getuid,
+        libc::SYS_getgid,
+        libc::SYS_geteuid,
+        libc::SYS_getegid,
+        libc::SYS_setpgid,
+        libc::SYS_getppid,
+        libc::SYS_getpgrp,
+        libc::SYS_arch_prctl,
+        libc::SYS_futex,
+        libc::SYS_getdents64,
+        libc::SYS_set_tid_address,
+        libc::SYS_exit_group,
+        libc::SYS_openat,
+        libc::SYS_mkdirat,
+        libc::SYS_fchownat,
+        libc::SYS_newfstatat,
+        libc::SYS_unlinkat,
+        libc::SYS_renameat,
+        libc::SYS_readlinkat,
+        libc::SYS_fchmodat,
+        libc::SYS_faccessat,
+        libc::SYS_set_robust_list,
+        libc::SYS_get_robust_list,
+        libc::SYS_prlimit64,
+        libc::SYS_getrandom,
+        libc::SYS_execveat,
+    ];
+
+    /// Network syscalls, allowed only when the config permits network access.
+    pub(super) const NETWORK: &[i64] = &[
+        libc::SYS_socket,
+        libc::SYS_connect,
+        libc::SYS_accept,
+        libc::SYS_sendto,
+        libc::SYS_recvfrom,
+        libc::SYS_sendmsg,
+        libc::SYS_recvmsg,
+        libc::SYS_shutdown,
+        libc::SYS_bind,
+        libc::SYS_listen,
+        libc::SYS_getsockname,
+        libc::SYS_getpeername,
+        libc::SYS_socketpair,
+        libc::SYS_setsockopt,
+        libc::SYS_getsockopt,
+        libc::SYS_accept4,
+    ];
+}
+
+/// seccomp audit token and syscall allowlist for aarch64 (asm-generic).
+#[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+mod seccomp_arch {
+    /// `AUDIT_ARCH_AARCH64`.
+    pub(super) const AUDIT_ARCH: u32 = 0xC000_00B7;
+
+    /// Syscalls a shell-command profile may use.
+    pub(super) const ALLOWED: &[i64] = &[
+        libc::SYS_getcwd,
+        libc::SYS_eventfd2,
+        libc::SYS_dup,
+        libc::SYS_dup3,
+        libc::SYS_fcntl,
+        libc::SYS_ioctl,
+        libc::SYS_mkdirat,
+        libc::SYS_unlinkat,
+        libc::SYS_renameat,
+        libc::SYS_faccessat,
+        libc::SYS_chdir,
+        libc::SYS_fchmodat,
+        libc::SYS_fchownat,
+        libc::SYS_openat,
+        libc::SYS_close,
+        libc::SYS_pipe2,
+        libc::SYS_getdents64,
+        libc::SYS_lseek,
+        libc::SYS_read,
+        libc::SYS_write,
+        libc::SYS_readv,
+        libc::SYS_writev,
+        libc::SYS_pread64,
+        libc::SYS_pwrite64,
+        libc::SYS_signalfd4,
+        libc::SYS_readlinkat,
+        libc::SYS_newfstatat,
+        libc::SYS_fstat,
+        libc::SYS_exit,
+        libc::SYS_exit_group,
+        libc::SYS_set_tid_address,
+        libc::SYS_futex,
+        libc::SYS_set_robust_list,
+        libc::SYS_get_robust_list,
+        libc::SYS_nanosleep,
+        libc::SYS_kill,
+        libc::SYS_rt_sigaction,
+        libc::SYS_rt_sigprocmask,
+        libc::SYS_rt_sigreturn,
+        libc::SYS_setpgid,
+        libc::SYS_uname,
+        libc::SYS_umask,
+        libc::SYS_getpid,
+        libc::SYS_getppid,
+        libc::SYS_getuid,
+        libc::SYS_geteuid,
+        libc::SYS_getgid,
+        libc::SYS_getegid,
+        libc::SYS_brk,
+        libc::SYS_munmap,
+        libc::SYS_clone,
+        libc::SYS_execve,
+        libc::SYS_mmap,
+        libc::SYS_mprotect,
+        libc::SYS_wait4,
+        libc::SYS_prlimit64,
+        libc::SYS_getrandom,
+        libc::SYS_execveat,
+    ];
+
+    /// Network syscalls, allowed only when the config permits network access.
+    pub(super) const NETWORK: &[i64] = &[
+        libc::SYS_socket,
+        libc::SYS_socketpair,
+        libc::SYS_bind,
+        libc::SYS_listen,
+        libc::SYS_accept,
+        libc::SYS_connect,
+        libc::SYS_getsockname,
+        libc::SYS_getpeername,
+        libc::SYS_sendto,
+        libc::SYS_recvfrom,
+        libc::SYS_setsockopt,
+        libc::SYS_getsockopt,
+        libc::SYS_shutdown,
+        libc::SYS_sendmsg,
+        libc::SYS_recvmsg,
+        libc::SYS_accept4,
+    ];
+}
+
 #[cfg(target_os = "linux")]
 mod linux_impl {
     use super::{SandboxConfig, SandboxError};
@@ -203,7 +397,7 @@ mod linux_impl {
             let config = self.config.clone();
             let apply = move || -> Result<(), std::io::Error> {
                 Self::apply_rlimits(&config)?;
-                Self::apply_seccomp()?;
+                Self::apply_seccomp(config.allow_network)?;
                 Ok(())
             };
             // SAFETY: pre_exec runs in the child process before exec().
@@ -260,12 +454,11 @@ mod linux_impl {
 
         // ─── seccomp BPF ─────────────────────────────────────────────────────
 
-        fn apply_seccomp() -> Result<(), std::io::Error> {
+        fn apply_seccomp(allow_network: bool) -> Result<(), std::io::Error> {
             // Raw constants — libc may not expose all of these.
             const PR_SET_NO_NEW_PRIVS: libc::c_int = 38;
             const PR_SET_SECCOMP: libc::c_int = 22;
             const SECCOMP_MODE_FILTER: libc::c_int = 2;
-            const AUDIT_ARCH_X86_64: u32 = 0xC000_003E;
             const SECCOMP_RET_ALLOW: u32 = 0x7FFF_0000;
             const SECCOMP_RET_KILL: u32 = 0x0000_0000;
 
@@ -291,79 +484,10 @@ mod linux_impl {
                 filter: *const sock_filter,
             }
 
-            // x86_64 syscall numbers for a safe shell-command profile.
-            const ALLOWED: &[i64] = &[
-                0,   // read
-                1,   // write
-                2,   // open
-                3,   // close
-                5,   // fstat
-                8,   // lseek
-                9,   // mmap
-                10,  // mprotect
-                11,  // munmap
-                12,  // brk
-                13,  // rt_sigaction
-                14,  // rt_sigprocmask
-                15,  // rt_sigreturn
-                16,  // ioctl
-                17,  // pread64
-                18,  // pwrite64
-                19,  // readv
-                20,  // writev
-                21,  // access
-                22,  // pipe
-                32,  // dup
-                33,  // dup2
-                35,  // nanosleep
-                39,  // getpid
-                56,  // clone
-                57,  // fork
-                58,  // vfork
-                59,  // execve
-                60,  // exit
-                61,  // wait4
-                62,  // kill
-                63,  // uname
-                72,  // fcntl
-                78,  // getdents
-                79,  // getcwd
-                80,  // chdir
-                83,  // mkdir
-                84,  // rmdir
-                85,  // creat
-                87,  // unlink
-                89,  // readlink
-                90,  // chmod
-                95,  // umask
-                102, // getuid
-                104, // getgid
-                107, // geteuid
-                108, // getegid
-                109, // setpgid
-                110, // getppid
-                111, // getpgrp
-                158, // arch_prctl
-                217, // getdents64
-                218, // set_tid_address
-                231, // exit_group
-                257, // openat
-                258, // mkdirat
-                260, // fchownat
-                262, // newfstatat
-                263, // unlinkat
-                264, // renameat
-                267, // readlinkat
-                268, // fchmodat
-                269, // faccessat
-                273, // set_robust_list
-                274, // get_robust_list
-                302, // prlimit64
-                318, // getrandom
-                322, // execveat
-            ];
-
-            let mut filter: Vec<sock_filter> = Vec::with_capacity(4 + ALLOWED.len() * 2 + 1);
+            // The arch token and syscall numbers are target-specific and live
+            // in `seccomp_arch`; using another architecture's table kills every
+            // wrapped process at its first syscall.
+            const ALLOWED: &[i64] = super::seccomp_arch::ALLOWED;
 
             // load arch @ offset 0
             filter.push(sock_filter {
@@ -372,12 +496,12 @@ mod linux_impl {
                 jf: 0,
                 k: 0,
             });
-            // if arch == AUDIT_ARCH_X86_64, continue; else kill
+            // if arch == AUDIT_ARCH, continue; else kill
             filter.push(sock_filter {
                 code: BPF_JMP + BPF_JEQ + BPF_K,
                 jt: 0,
                 jf: 1,
-                k: AUDIT_ARCH_X86_64,
+                k: super::seccomp_arch::AUDIT_ARCH,
             });
             filter.push(sock_filter {
                 code: BPF_RET + BPF_K,
@@ -394,8 +518,18 @@ mod linux_impl {
                 k: 4,
             });
 
+            // Network syscalls are absent from the base list, and the default
+            // action is to kill — so without this the sandbox would block
+            // network even when the config allows it.
+            let mut allowed: Vec<i64> = ALLOWED.to_vec();
+            if allow_network {
+                allowed.extend_from_slice(super::seccomp_arch::NETWORK);
+            }
+
+            let mut filter: Vec<sock_filter> = Vec::with_capacity(4 + allowed.len() * 2 + 1);
+
             // one JEQ + RET_ALLOW pair per allowed syscall
-            for &nr in ALLOWED {
+            for &nr in &allowed {
                 filter.push(sock_filter {
                     code: BPF_JMP + BPF_JEQ + BPF_K,
                     jt: 0,
@@ -915,5 +1049,51 @@ mod tests {
         let child = cmd.spawn().unwrap();
         handle.post_spawn(&child).unwrap();
         let _ = child.wait_with_output();
+    }
+}
+
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+mod seccomp_arch_tests {
+    use super::seccomp_arch;
+
+    /// A mismatch here is what the filter kills on, so the token must be the
+    /// one matching the architecture the syscall numbers were taken from.
+    #[test]
+    fn audit_token_matches_the_syscall_table_architecture() {
+        #[cfg(target_arch = "x86_64")]
+        assert_eq!(seccomp_arch::AUDIT_ARCH, 0xC000_003E);
+        #[cfg(target_arch = "aarch64")]
+        assert_eq!(seccomp_arch::AUDIT_ARCH, 0xC000_00B7);
+    }
+
+    #[test]
+    fn allowlist_is_non_empty_and_free_of_duplicates() {
+        let allowed = seccomp_arch::ALLOWED;
+        assert!(!allowed.is_empty());
+        let unique: std::collections::HashSet<_> = allowed.iter().collect();
+        assert_eq!(unique.len(), allowed.len(), "duplicate syscall in ALLOWED");
+        assert!(
+            allowed.iter().all(|&nr| nr >= 0),
+            "syscall numbers are non-negative"
+        );
+    }
+
+    /// The filter's default action is to kill, so a network syscall reaches the
+    /// network only if it is explicitly listed. Listing one in both tables
+    /// would make `allow_network: false` meaningless.
+    #[test]
+    fn network_syscalls_are_separate_from_the_base_allowlist() {
+        let base: std::collections::HashSet<_> = seccomp_arch::ALLOWED.iter().collect();
+        for nr in seccomp_arch::NETWORK {
+            assert!(
+                !base.contains(nr),
+                "syscall {nr} is in both ALLOWED and NETWORK — the base profile \
+                 would permit network access regardless of config"
+            );
+        }
+        assert!(!seccomp_arch::NETWORK.is_empty());
     }
 }
