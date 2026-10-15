@@ -1087,12 +1087,24 @@ mod tests {
         assert!(matches!(strategy, CompactStrategy::Snip));
     }
 
+    /// An unrecognised model must not be assumed to have the largest window we
+    /// know about. At a conservative 32K window, 110k estimated tokens is past
+    /// the reactive line — compacting early beats overflowing the model.
     #[test]
-    fn select_strategy_over_auto_threshold_is_auto_for_default_window() {
-        // Default window is 200K: auto=100K, reactive=180K
+    fn unknown_model_compacts_against_a_conservative_window() {
         let model = ModelId("custom-model".into());
+        assert_eq!(model.context_window(), crate::types::UNKNOWN_CONTEXT_WINDOW);
+
         let strategy = select_compact_strategy("end_turn", 110_000, &model, false);
+        assert!(matches!(strategy, CompactStrategy::Reactive));
+
+        // Just over the auto line for that conservative window.
+        let strategy = select_compact_strategy("end_turn", 17_000, &model, false);
         assert!(matches!(strategy, CompactStrategy::Auto));
+
+        // Under it: no compaction needed yet.
+        let strategy = select_compact_strategy("end_turn", 5_000, &model, false);
+        assert!(matches!(strategy, CompactStrategy::Snip));
     }
 
     // ═════════════════════════════════════════════════════════════════════

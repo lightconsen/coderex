@@ -199,14 +199,40 @@ impl ModelId {
     }
 
     /// Return the model's context window size in tokens.
+    ///
+    /// Compaction thresholds are derived from this value (50% trigger, 90%
+    /// reactive), so over-reporting it means context overflows before anything
+    /// compacts. Known Claude models are matched by family prefix so dated
+    /// variants (`claude-sonnet-4-6-20260101`) resolve correctly; anything
+    /// unrecognised — a gateway alias, a local model, a future release — gets
+    /// a deliberately conservative floor rather than the largest window we
+    /// happen to know, so the failure mode is early compaction rather than a
+    /// hard context-length error.
     #[must_use]
     pub fn context_window(&self) -> usize {
-        match self.0.as_str() {
-            "claude-opus-4-6" | "claude-sonnet-4-6" | "claude-haiku-4-5-20251001" => 200_000,
-            _ => 200_000,
+        Self::context_window_for(&self.0)
+    }
+
+    /// Context window for a raw model name.
+    #[must_use]
+    pub fn context_window_for(name: &str) -> usize {
+        // Claude families all ship a 200k window today.
+        if name.starts_with("claude-") {
+            return CLAUDE_CONTEXT_WINDOW;
         }
+        UNKNOWN_CONTEXT_WINDOW
     }
 }
+
+/// Context window for Claude model families.
+pub const CLAUDE_CONTEXT_WINDOW: usize = 200_000;
+
+/// Conservative window assumed for models we cannot identify.
+///
+/// Chosen so that an unknown model compacts early instead of overflowing: a
+/// wrong guess that is too small costs some context, a wrong guess that is too
+/// large loses the conversation.
+pub const UNKNOWN_CONTEXT_WINDOW: usize = 32_000;
 
 /// Lifecycle events for a sub-agent.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -471,5 +497,57 @@ mod tests {
         assert!(summary.starts_with("Running cargo test -p coderex-cli"));
         assert!(summary.ends_with("..."));
         assert!(summary.chars().count() <= 71);
+    }
+}
+
+#[cfg(test)]
+mod context_window_tests {
+    use super::*;
+
+    #[test]
+    fn known_families_report_their_full_window() {
+        assert_eq!(ModelId::opus().context_window(), CLAUDE_CONTEXT_WINDOW);
+        assert_eq!(ModelId::sonnet().context_window(), CLAUDE_CONTEXT_WINDOW);
+        assert_eq!(ModelId::haiku().context_window(), CLAUDE_CONTEXT_WINDOW);
+    }
+
+    /// Dated releases and aliases must resolve by family, not by exact string.
+    #[test]
+    fn family_prefix_covers_dated_variants() {
+        for name in [
+            "claude-sonnet-4-6-20260101",
+            "claude-opus-4-6-20260215",
+            "claude-3-5-haiku-20241022",
+        ] {
+            assert_eq!(
+                ModelId(name.to_string()).context_window(),
+                CLAUDE_CONTEXT_WINDOW,
+                "{name} should resolve to the Claude window"
+            );
+        }
+    }
+
+    /// The bug this guards: an unknown model previously reported 200k, so
+    /// compaction would not trigger until ~180k tokens.
+    #[test]
+    fn unknown_models_are_conservative_not_maximal() {
+        for name in ["gpt-4o", "local-llama-3", "my-gateway-alias"] {
+            let window = ModelId(name.to_string()).context_window();
+            assert_eq!(window, UNKNOWN_CONTEXT_WINDOW, "{name}");
+            assert!(
+                window < CLAUDE_CONTEXT_WINDOW,
+                "unknown models must not claim the largest known window"
+            );
+        }
+    }
+
+    #[test]
+    fn case_sensitivity_is_a_known_limitation() {
+        // Model ids are lowercase in practice; document the boundary rather
+        // than silently normalising, so a mismatch shows up in the window.
+        assert_eq!(
+            ModelId("CLAUDE-SONNET-4-6".to_string()).context_window(),
+            UNKNOWN_CONTEXT_WINDOW
+        );
     }
 }
