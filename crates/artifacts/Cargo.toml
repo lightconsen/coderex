@@ -1,0 +1,28 @@
+[package]
+name = "coderex-artifacts"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Artifact publishing — local store, page server, shared database, and the Artifact tool family"
+
+[lints]
+workspace = true
+
+[dependencies]
+coderex-tools = { path = "../tools" }
+
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+chrono.workspace = true
+uuid.workspace = true
+sha2.workspace = true
+base64.workspace = true
+home.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
