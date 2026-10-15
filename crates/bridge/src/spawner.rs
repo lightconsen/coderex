@@ -148,14 +148,13 @@ impl BridgeSessionSpawner {
         config: SpawnConfig,
         host: &str,
         remote_path: &str,
-        _identity_file: Option<&str>,
+        identity_file: Option<&str>,
     ) -> Result<SpawnResult, String> {
         let session_dir = format!("{remote_path}/{}", config.session_id);
 
-        // Build the SSH session using the system ssh command.
-        // Note: identity_file support requires MuxConfig; for now
-        // we rely on the user's ssh config (~/.ssh/config) for key selection.
-        let session = openssh::Session::connect(host, openssh::KnownHosts::Accept)
+        let builder = ssh_builder(identity_file)?;
+        let session = builder
+            .connect(host)
             .await
             .map_err(|e| format!("ssh connect failed: {e}"))?;
 
@@ -195,11 +194,127 @@ impl BridgeSessionSpawner {
     }
 }
 
+/// How a bridge SSH connection treats the host's key.
+///
+/// `Accept` is what this used to do, and it is not a check at all: whatever
+/// key the far side presents is taken, including one that differs from what
+/// the host used last time. Anything able to answer for that host — a
+/// hijacked route, a poisoned DNS entry — then gets the session. `Add` is the
+/// policy `ssh` itself applies: an unknown host is recorded on first contact,
+/// and every connection after that has to match what was recorded.
+const fn host_key_policy() -> openssh::KnownHosts {
+    openssh::KnownHosts::Add
+}
+
+/// Build the SSH session builder for a remote session.
+fn ssh_builder(identity_file: Option<&str>) -> Result<openssh::SessionBuilder, String> {
+    let identity_file = resolve_identity_file(identity_file)?;
+
+    let mut builder = openssh::SessionBuilder::default();
+    builder.known_hosts_check(host_key_policy());
+    if let Some(path) = identity_file {
+        builder.keyfile(path);
+    }
+
+    Ok(builder)
+}
+
+/// Resolve the key a remote session connects with.
+///
+/// A configured identity file is the key that gets used; naming one that is
+/// not there is an error rather than a silent fall back to the agent, which
+/// would put the session on a key the caller did not choose.
+fn resolve_identity_file(identity_file: Option<&str>) -> Result<Option<PathBuf>, String> {
+    let Some(path) = identity_file else {
+        return Ok(None);
+    };
+
+    let path = expand_tilde(path)?;
+    if !path.is_file() {
+        return Err(format!("ssh identity file not found: {}", path.display()));
+    }
+    Ok(Some(path))
+}
+
+/// Expand a leading `~` to the home directory.
+fn expand_tilde(path: &str) -> Result<PathBuf, String> {
+    let Some(rest) = path
+        .strip_prefix("~/")
+        .or_else(|| path.strip_prefix('~').filter(|r| r.is_empty()))
+    else {
+        return Ok(PathBuf::from(path));
+    };
+
+    let home = home::home_dir()
+        .ok_or_else(|| format!("cannot expand '~' in '{path}': home directory is unknown"))?;
+    Ok(if rest.is_empty() {
+        home
+    } else {
+        home.join(rest)
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     use std::path::Path;
+
+    #[test]
+    fn ssh_verifies_the_host_key() {
+        let policy = host_key_policy();
+
+        assert!(
+            matches!(policy, openssh::KnownHosts::Add),
+            "host key policy is {policy:?}"
+        );
+        // `Accept` takes whatever key the far side presents, including one
+        // that changed since the last connection.
+        assert!(!matches!(policy, openssh::KnownHosts::Accept));
+    }
+
+    #[test]
+    fn ssh_builder_uses_a_named_identity_file() {
+        let key = tempfile::NamedTempFile::new().unwrap();
+        let resolved = resolve_identity_file(Some(key.path().to_str().unwrap())).unwrap();
+        assert_eq!(resolved.as_deref(), Some(key.path()));
+
+        let builder = ssh_builder(Some(key.path().to_str().unwrap()));
+        assert!(builder.is_ok(), "{builder:?}");
+    }
+
+    #[test]
+    fn ssh_builder_refuses_an_identity_file_that_is_not_there() {
+        let err = resolve_identity_file(Some("/nonexistent/id_ed25519")).unwrap_err();
+        assert!(err.contains("/nonexistent/id_ed25519"), "{err}");
+        assert!(err.contains("not found"), "{err}");
+    }
+
+    #[test]
+    fn ssh_builder_expands_a_leading_tilde() {
+        let home = home::home_dir().unwrap();
+        let missing = "~/coderex-no-such-key";
+        let err = resolve_identity_file(Some(missing)).unwrap_err();
+
+        let expected = home.join("coderex-no-such-key");
+        assert!(err.contains(&expected.display().to_string()), "{err}");
+        assert!(!err.contains(missing), "tilde was not expanded: {err}");
+    }
+
+    #[test]
+    fn ssh_builder_without_an_identity_file_falls_back_to_the_agent() {
+        assert_eq!(resolve_identity_file(None).unwrap(), None);
+        assert!(ssh_builder(None).is_ok());
+    }
+
+    #[test]
+    fn expand_tilde_leaves_other_paths_alone() {
+        assert_eq!(expand_tilde("/tmp/key").unwrap(), PathBuf::from("/tmp/key"));
+        assert_eq!(expand_tilde("key").unwrap(), PathBuf::from("key"));
+        // Only a bare `~` or `~/…` is expanded; `~user` is a path of its own.
+        assert_eq!(expand_tilde("~user/key").unwrap(), PathBuf::from("~user/key"));
+        assert_eq!(expand_tilde("~").unwrap(), home::home_dir().unwrap());
+    }
 
     fn temp_dirs() -> (PathBuf, PathBuf, PathBuf) {
         let base = tempfile::tempdir().unwrap().keep();
