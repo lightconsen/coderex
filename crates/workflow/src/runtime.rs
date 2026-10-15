@@ -22,7 +22,6 @@ use boa_engine::{
     Context, JsNativeError, JsResult, JsString, JsValue, NativeFunction, Source, js_string,
     object::ObjectInitializer, property::Attribute,
 };
-use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
