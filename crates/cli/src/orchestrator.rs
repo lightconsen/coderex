@@ -168,6 +168,27 @@ impl Default for StartupOrchestrator {
     }
 }
 
+/// Build a plugin manager, taking the signing key from the environment.
+///
+/// The key is the trust anchor for plugin signatures, so it comes from the
+/// process environment — a source a repository cannot write — rather than from
+/// anything a plugin package carries.
+fn plugin_manager_with_signing_key() -> coderex_plugins::plugins::PluginManager {
+    let mut manager = coderex_plugins::plugins::PluginManager::new();
+    if manager.set_public_key_from_env() {
+        tracing::info!(
+            "plugin signature verification enabled from {}",
+            coderex_plugins::plugins::PLUGIN_PUBLIC_KEY_ENV
+        );
+    } else {
+        tracing::debug!(
+            "no {} set — plugin signatures are not checked and installs are marked unverified",
+            coderex_plugins::plugins::PLUGIN_PUBLIC_KEY_ENV
+        );
+    }
+    manager
+}
+
 impl StartupOrchestrator {
     /// Create a new orchestrator.
     #[must_use]
@@ -770,7 +791,7 @@ impl StartupOrchestrator {
 
     /// InitPlugins: discover, load, and spawn plugins from plugin directories.
     async fn phase_init_plugins(&mut self) -> Result<()> {
-        let mut manager = coderex_plugins::plugins::PluginManager::new();
+        let mut manager = plugin_manager_with_signing_key();
         let mut plugin_dirs: Vec<std::path::PathBuf> = Vec::new();
 
         // Project-local plugins
@@ -843,7 +864,7 @@ impl StartupOrchestrator {
 
     /// ReconcileMarketplaces: sync marketplace state.
     async fn phase_reconcile_marketplaces(&self) -> Result<()> {
-        let manager = coderex_plugins::plugins::PluginManager::new();
+        let manager = plugin_manager_with_signing_key();
         let reconciler = coderex_plugins::plugins::MarketplaceReconciler::new(300);
 
         // Register marketplace if configured via environment
@@ -1469,7 +1490,7 @@ impl StartupOrchestrator {
             }
             Some(crate::cli::PluginAction::Install { source }) => {
                 println!("Installing plugin from '{source}'...");
-                let manager = coderex_plugins::plugins::PluginManager::new();
+                let manager = plugin_manager_with_signing_key();
                 let plugin = coderex_plugins::plugins::MarketplacePlugin {
                     name: source.clone(),
                     version: "latest".into(),
@@ -1505,7 +1526,7 @@ impl StartupOrchestrator {
             }
             Some(crate::cli::PluginAction::Update) => {
                 println!("Updating plugins...");
-                let manager = coderex_plugins::plugins::PluginManager::new();
+                let manager = plugin_manager_with_signing_key();
                 let reconciler = coderex_plugins::plugins::MarketplaceReconciler::new(300);
                 match reconciler.reconcile(&manager, Some(&install_dir)).await {
                     Ok(report) => {

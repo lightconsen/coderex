@@ -47,6 +47,11 @@ pub struct PluginHandle {
     pub retry_count: u32,
     /// Maximum retry attempts before giving up.
     pub max_retries: u32,
+    /// Whether the installed archive matched a configured signing key.
+    ///
+    /// False means the code was installed without anything having been
+    /// checked — either no key is configured or the plugin predates it.
+    pub verified: bool,
 }
 
 /// Plugin runtime type.
@@ -108,6 +113,18 @@ pub struct PluginManifest {
     /// Environment variables for the plugin process.
     #[serde(default)]
     pub env: HashMap<String, String>,
+}
+
+/// Environment variable carrying the plugin signing key.
+pub const PLUGIN_PUBLIC_KEY_ENV: &str = "CODEREX_PLUGIN_PUBLIC_KEY";
+
+/// What a signature check against the configured key concluded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SignatureCheck {
+    /// A configured key matched the archive.
+    Verified,
+    /// No key is configured, so nothing was checked.
+    Unverified,
 }
 
 /// Marketplace plugin listing.
@@ -267,6 +284,7 @@ impl PluginManager {
                 skills: Vec::new(),
                 retry_count: 0,
                 max_retries: 3,
+                verified: false,
             };
             self.plugins.insert(handle.name.clone(), handle);
             return;
@@ -281,6 +299,10 @@ impl PluginManager {
             skills: manifest.skills.clone(),
             retry_count: 0,
             max_retries: 3,
+            // A plugin loaded from a directory has no archive to check, so
+            // nothing about it was verified. Only an install against a
+            // configured key sets this.
+            verified: false,
         };
         self.plugins.insert(manifest.name.clone(), handle);
 
@@ -535,6 +557,7 @@ impl PluginManager {
                 skills: h.skills.clone(),
                 retry_count: h.retry_count,
                 max_retries: h.max_retries,
+                verified: h.verified,
             }
         })
     }
@@ -741,6 +764,7 @@ impl PluginManager {
             skills: Vec::new(),
             retry_count: 0,
             max_retries: 3,
+            verified: false,
         };
         self.plugins.insert(plugin.name.clone(), handle);
 
@@ -831,14 +855,26 @@ impl PluginManager {
             return Err(msg);
         }
 
-        // Signature verification
-        if let Err(e) = self.verify_signature(&bytes, manifest.signature.as_deref()) {
-            let _ = std::fs::remove_dir_all(&temp_dir);
-            self.set_plugin_state(
-                &plugin.name,
-                PluginState::Error(format!("signature verification failed: {e}")),
+        // Signature verification. A configured key makes a signature
+        // mandatory: a plugin that cannot be checked is not installed.
+        let signature = match self.verify_signature(&bytes, manifest.signature.as_deref()) {
+            Ok(check) => check,
+            Err(e) => {
+                let _ = std::fs::remove_dir_all(&temp_dir);
+                self.set_plugin_state(
+                    &plugin.name,
+                    PluginState::Error(format!("signature verification failed: {e}")),
+                );
+                return Err(e);
+            }
+        };
+        let verified = matches!(signature, SignatureCheck::Verified);
+        if !verified {
+            tracing::warn!(
+                plugin = %plugin.name,
+                "installing unsigned plugin: no signing key is configured, so nothing about \
+                 this archive has been checked"
             );
-            return Err(e);
         }
 
         // Atomically rename temp dir to final location
@@ -867,6 +903,7 @@ impl PluginManager {
             skills: manifest.skills,
             retry_count: 0,
             max_retries: 3,
+            verified,
         };
         self.plugins.insert(plugin.name.clone(), handle);
 
@@ -1058,27 +1095,54 @@ impl PluginManager {
     }
 
     /// Set the Ed25519 public key for signature verification (hex-encoded).
+    ///
+    /// This is the trust anchor: it has to come from whoever runs CodeRex
+    /// (see [`Self::set_public_key_from_env`]), never from the package being
+    /// checked. With a key set, an archive that does not match it is refused.
     pub fn set_public_key(&mut self, key_hex: impl Into<String>) {
         self.public_key = Some(key_hex.into());
     }
 
+    /// Take the signing key from the environment, if it is set.
+    ///
+    /// The environment is the one source a repository cannot write, which is
+    /// what makes it a usable trust anchor. Returns whether a key was found.
+    pub fn set_public_key_from_env(&mut self) -> bool {
+        self.apply_public_key(std::env::var(PLUGIN_PUBLIC_KEY_ENV).ok())
+    }
+
+    /// Take the signing key from a raw configuration value.
+    ///
+    /// An unset or blank value leaves any existing key alone and reports that
+    /// nothing was configured.
+    fn apply_public_key(&mut self, key: Option<String>) -> bool {
+        match key {
+            Some(key) if !key.trim().is_empty() => {
+                self.set_public_key(key.trim().to_string());
+                true
+            }
+            _ => false,
+        }
+    }
+
     /// Verify a plugin archive signature using the configured public key.
     ///
-    /// Returns `Ok(true)` if no signature is required (no public key set),
-    /// `Ok(true)` if signature is valid, and `Err` if verification fails.
+    /// Verified means a configured key matched the archive. Unverified means
+    /// there was no key to check against — the caller has to decide whether an
+    /// unchecked plugin is acceptable; this never reports a check that did not
+    /// happen. `Err` is a plugin that had to be checked and was not, or did not
+    /// match: with a key configured, a missing or wrong signature is fatal.
     pub fn verify_signature(
         &self,
         archive_bytes: &[u8],
         signature_hex: Option<&str>,
-    ) -> Result<bool, String> {
-        let key_hex = match &self.public_key {
-            Some(k) => k,
-            None => return Ok(true), // no key configured — fail-open
+    ) -> Result<SignatureCheck, String> {
+        let Some(key_hex) = &self.public_key else {
+            return Ok(SignatureCheck::Unverified);
         };
 
-        let sig_hex = match signature_hex {
-            Some(s) => s,
-            None => return Err("plugin signature missing but public key is configured".into()),
+        let Some(sig_hex) = signature_hex else {
+            return Err("plugin signature missing but public key is configured".into());
         };
 
         let key_bytes = hex::decode(key_hex).map_err(|e| format!("invalid public key hex: {e}"))?;
@@ -1114,7 +1178,7 @@ impl PluginManager {
             .verify(archive_bytes, &signature)
             .map_err(|e| format!("signature verification failed: {e}"))?;
 
-        Ok(true)
+        Ok(SignatureCheck::Verified)
     }
 
     /// Resolve plugin dependencies and return load order.
@@ -1313,6 +1377,8 @@ mod tests {
         let plugin = mgr.get_plugin("test-plugin").unwrap();
         assert_eq!(plugin.commands, vec!["cmd1"]);
         assert_eq!(plugin.skills, vec!["skill1"]);
+        // A plugin loaded from a directory has no archive to check.
+        assert!(!plugin.verified);
     }
 
     #[test]
@@ -1575,10 +1641,10 @@ mod tests {
     }
 
     #[test]
-    fn signature_verification_without_key_passes() {
+    fn signature_verification_without_key_reports_that_nothing_was_checked() {
         let mgr = PluginManager::new();
         let result = mgr.verify_signature(b"any data", None);
-        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), SignatureCheck::Unverified);
     }
 
     #[test]
@@ -1588,6 +1654,44 @@ mod tests {
         mgr.set_public_key("0000000000000000000000000000000000000000000000000000000000000000");
         let result = mgr.verify_signature(b"any data", None);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn a_signature_that_does_not_match_the_key_is_refused() {
+        let mut mgr = PluginManager::new();
+        // The key ed25519-dalek signs with below, but the archive is different.
+        let signing = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
+        mgr.set_public_key(hex::encode(signing.verifying_key().to_bytes()));
+
+        let signature = ed25519_dalek::Signer::sign(&signing, b"the real archive");
+        let sig_hex = hex::encode(signature.to_bytes());
+
+        assert_eq!(
+            mgr.verify_signature(b"the real archive", Some(&sig_hex))
+                .unwrap(),
+            SignatureCheck::Verified
+        );
+        assert!(mgr
+            .verify_signature(b"a swapped archive", Some(&sig_hex))
+            .is_err());
+    }
+
+    #[test]
+    fn a_configured_signing_key_makes_signatures_mandatory() {
+        let mut mgr = PluginManager::new();
+        assert!(!mgr.apply_public_key(None));
+        assert!(!mgr.apply_public_key(Some("   ".into())));
+        // Nothing configured, so nothing is required of the plugin.
+        assert_eq!(
+            mgr.verify_signature(b"anything", None).unwrap(),
+            SignatureCheck::Unverified
+        );
+
+        assert!(mgr.apply_public_key(Some(" abcd ".into())));
+        assert_eq!(
+            mgr.verify_signature(b"anything", None).unwrap_err(),
+            "plugin signature missing but public key is configured"
+        );
     }
 
     #[test]
