@@ -1211,6 +1211,7 @@ impl StartupOrchestrator {
 
         let config = ServerConfig {
             valid_keys,
+            allow_anonymous: false,
             idle_timeout: std::time::Duration::from_secs(idle_timeout),
             max_sessions: 100,
             rate_limit_per_minute: 60,
