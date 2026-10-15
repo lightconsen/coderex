@@ -128,6 +128,20 @@ impl BashAst {
             .unwrap_or_default()
     }
 
+    /// The first program in this command that changes privilege, if any.
+    ///
+    /// Approving one of these like any other command does not make it work: it
+    /// still runs as the calling user, or fails. The caller has to decide about
+    /// privilege explicitly, which is a different question from "allow this
+    /// command?".
+    #[must_use]
+    pub fn privilege_escalation(&self) -> Option<String> {
+        self.commands.iter().find_map(|cmd| {
+            let program = cmd.program.rsplit('/').next().unwrap_or(&cmd.program);
+            matches!(program, "sudo" | "su").then(|| program.to_string())
+        })
+    }
+
     /// Returns true if any command is classified as dangerous.
     #[must_use]
     pub fn is_dangerous(&self) -> bool {

@@ -237,6 +237,25 @@ impl PermissionEngine {
             checker.check(tool_name, path_ref)
         };
 
+        // Phase 2.5: privilege escalation
+        //
+        // A command that runs as another user is a different question from
+        // "allow this command?": approving it once still runs it as the caller,
+        // or fails. Surface it as an elevation request so the caller can decide
+        // about privilege explicitly — this is the only producer of
+        // `PermissionResult::Elevated`, and without it the elevation flow
+        // downstream is unreachable.
+        let result = match result {
+            PermissionResult::Ask { .. } | PermissionResult::AskForSession { .. } => {
+                privilege_escalation_in(tool_name, &request.arguments).map_or(result, |program| {
+                    PermissionResult::Elevated {
+                        reason: format!("{program} runs the command as another user"),
+                    }
+                })
+            }
+            other => other,
+        };
+
         // Phase 3: Confirmation bus (if configured and result needs user input)
         let result = match result {
             PermissionResult::Ask { ref reason }
@@ -543,6 +562,22 @@ impl PermissionHook for AutoClassifierHook {
             }
         }
     }
+}
+
+/// The privilege-changing program in a shell tool call, if any.
+///
+/// Only shell tools carry a command to inspect; every other tool has no
+/// privilege question to answer.
+fn privilege_escalation_in(tool_name: &str, arguments: &str) -> Option<String> {
+    if !tool_name.eq_ignore_ascii_case("bash") && !tool_name.eq_ignore_ascii_case("powershell") {
+        return None;
+    }
+    let parsed: serde_json::Value = serde_json::from_str(arguments).ok()?;
+    let command = parsed
+        .get("command")
+        .or_else(|| parsed.get("cmd"))
+        .and_then(serde_json::Value::as_str)?;
+    crate::shell_security::BashAst::parse(command).privilege_escalation()
 }
 
 #[cfg(test)]
@@ -1027,5 +1062,82 @@ mod tests {
         // Second request: should be auto-approved via session cache
         // Note: engine was moved into the spawn, so we test via a new engine
         // with the same checker (session approvals are in the checker)
+    }
+
+    /// The elevation flow downstream is only reachable if something produces
+    /// `PermissionResult::Elevated`. A command that runs as another user is the
+    /// case the variant exists for.
+    #[tokio::test]
+    async fn sudo_command_becomes_an_elevation_request() {
+        let mut engine = PermissionEngine::new(PermissionChecker::new(PermissionMode::Default));
+        let (_request, result) = engine
+            .evaluate(
+                "bash",
+                serde_json::json!({ "command": "sudo rm -rf /tmp/x" }).to_string(),
+                None,
+                HashMap::new(),
+            )
+            .await
+            .unwrap();
+        match result {
+            PermissionResult::Elevated { reason } => {
+                assert!(reason.contains("sudo"), "{reason}");
+            }
+            other => panic!("expected Elevated, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn absolute_path_to_sudo_is_still_detected() {
+        let mut engine = PermissionEngine::new(PermissionChecker::new(PermissionMode::Default));
+        let (_request, result) = engine
+            .evaluate(
+                "bash",
+                serde_json::json!({ "command": "/usr/bin/su -c 'id'" }).to_string(),
+                None,
+                HashMap::new(),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(result, PermissionResult::Elevated { .. }));
+    }
+
+    /// An ordinary dangerous command keeps its plain approval question — only
+    /// privilege changes are a different question.
+    #[tokio::test]
+    async fn ordinary_bash_command_still_asks() {
+        let mut engine = PermissionEngine::new(PermissionChecker::new(PermissionMode::Default));
+        let (_request, result) = engine
+            .evaluate(
+                "bash",
+                serde_json::json!({ "command": "rm -rf /tmp/x" }).to_string(),
+                None,
+                HashMap::new(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            matches!(result, PermissionResult::Ask { .. }),
+            "expected Ask, got {result:?}"
+        );
+    }
+
+    /// A tool with no command has no privilege question to answer.
+    #[tokio::test]
+    async fn non_shell_tool_never_elevates() {
+        let mut engine = PermissionEngine::new(PermissionChecker::new(PermissionMode::Default));
+        let (_request, result) = engine
+            .evaluate(
+                "write",
+                serde_json::json!({ "command": "sudo rm -rf /" }).to_string(),
+                None,
+                HashMap::new(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            !matches!(result, PermissionResult::Elevated { .. }),
+            "only shell tools can elevate, got {result:?}"
+        );
     }
 }
