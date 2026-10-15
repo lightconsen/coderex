@@ -821,7 +821,7 @@ impl QueryEngine {
             compact_config: config,
             hooks: Box::new(NoOpHookExecutor),
             tools: Box::new(NoOpToolExecutor),
-            elicitation_handler: Box::new(ReplElicitationHandler),
+            elicitation_handler: Box::new(ReplElicitationHandler::default()),
             transcript_path: None,
             last_usage: None,
             loop_detector: Some(LoopDetector::new()),

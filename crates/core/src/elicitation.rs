@@ -70,7 +70,48 @@ pub trait ElicitationHandler: Send + Sync {
 /// Prints questions to stderr and reads user input from stdin.
 /// Supports both numbered-option selection and free-text responses.
 #[derive(Debug, Default)]
-pub struct ReplElicitationHandler;
+pub struct ReplElicitationHandler {
+    /// Answers to hand back instead of reading the terminal.
+    ///
+    /// `None` — the production case — reads stdin. Tests must not read the
+    /// process's stdin: whether it yields EOF depends on how the test binary
+    /// was launched, so a handler test either blocks forever under a live
+    /// terminal or passes for the wrong reason.
+    scripted: Option<std::sync::Mutex<std::collections::VecDeque<String>>>,
+}
+
+impl ReplElicitationHandler {
+    /// A handler that answers from a fixed script rather than the terminal.
+    ///
+    /// Each question consumes the next line; running out of lines is treated
+    /// the same as stdin reaching EOF.
+    #[must_use]
+    pub fn scripted<I, S>(lines: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        Self {
+            scripted: Some(std::sync::Mutex::new(
+                lines.into_iter().map(Into::into).collect(),
+            )),
+        }
+    }
+
+    /// Next line of input, or `None` when stdin reports EOF.
+    async fn read_line(&self) -> Option<String> {
+        if let Some(script) = &self.scripted {
+            return script.lock().ok()?.pop_front();
+        }
+        let stdin = tokio::io::stdin();
+        let mut reader = tokio::io::BufReader::new(stdin);
+        let mut line = String::new();
+        match reader.read_line(&mut line).await {
+            Ok(0) | Err(_) => None,
+            Ok(_) => Some(line),
+        }
+    }
+}
 
 #[async_trait]
 impl ElicitationHandler for ReplElicitationHandler {
@@ -92,12 +133,9 @@ impl ElicitationHandler for ReplElicitationHandler {
             let _ = write!(stderr, "> ");
             let _ = stderr.flush();
 
-            let stdin = tokio::io::stdin();
-            let mut reader = tokio::io::BufReader::new(stdin);
-            let mut line = String::new();
-            match reader.read_line(&mut line).await {
-                Ok(0) | Err(_) => return ElicitationResult::Cancelled,
-                Ok(_) => {
+            match self.read_line().await {
+                None => return ElicitationResult::Cancelled,
+                Some(line) => {
                     let trimmed = line.trim();
                     if trimmed.is_empty() {
                         return ElicitationResult::Cancelled;
@@ -229,11 +267,44 @@ mod tests {
         assert!(json.contains("Simple"));
     }
 
+    /// Exhausted input must cancel rather than block. Reading the real stdin
+    /// here would hang under a live terminal and pass only under CI.
     #[tokio::test]
-    async fn repl_handler_logs_and_returns_cancelled() {
-        let handler = ReplElicitationHandler;
+    async fn repl_handler_returns_cancelled_when_input_runs_out() {
+        let handler = ReplElicitationHandler::scripted(Vec::<String>::new());
         let result = handler.request(vec![make_question()]).await;
         assert!(matches!(result, ElicitationResult::Cancelled));
+    }
+
+    #[tokio::test]
+    async fn repl_handler_returns_cancelled_on_empty_line() {
+        let handler = ReplElicitationHandler::scripted([""]);
+        let result = handler.request(vec![make_question()]).await;
+        assert!(matches!(result, ElicitationResult::Cancelled));
+    }
+
+    #[tokio::test]
+    async fn repl_handler_selects_by_number() {
+        let handler = ReplElicitationHandler::scripted(["1"]);
+        let result = handler.request(vec![make_question()]).await;
+        match result {
+            ElicitationResult::Responded(response) => {
+                assert_eq!(response.selected.len(), 1);
+            }
+            other => panic!("expected a response, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn repl_handler_accepts_free_text() {
+        let handler = ReplElicitationHandler::scripted(["something else"]);
+        let result = handler.request(vec![make_question()]).await;
+        match result {
+            ElicitationResult::Responded(response) => {
+                assert_eq!(response.other_text.as_deref(), Some("something else"));
+            }
+            other => panic!("expected a response, got {other:?}"),
+        }
     }
 
     #[tokio::test]
