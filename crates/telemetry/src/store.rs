@@ -74,10 +74,15 @@ impl TelemetryStore {
 ",
         )?;
 
-        Ok(Self {
+        let store = Self {
             conn,
             db_path: path.to_path_buf(),
-        })
+        };
+        // Bound the store on open: the row-count trigger keeps the row count in
+        // hand, but a burst of large payloads could still grow the file past
+        // what the user expects to pay for on disk.
+        store.prune_to_size(DEFAULT_MAX_EVENT_STORE_BYTES)?;
+        Ok(store)
     }
 
     /// Insert a single event.
@@ -270,6 +275,13 @@ impl TelemetryStore {
     }
 }
 
+/// Cap on the on-disk event store.
+///
+/// The row-count trigger bounds how many events are kept, but payloads vary in
+/// size, so a count alone does not bound the file. Matches the crash store's
+/// pending-byte budget.
+pub const DEFAULT_MAX_EVENT_STORE_BYTES: i64 = 50 * 1024 * 1024;
+
 /// A telemetry event pending upload.
 #[derive(Debug, Clone)]
 pub struct PendingEvent {
@@ -401,6 +413,39 @@ mod tests {
         ];
         store.insert_batch(&events).unwrap();
         assert_eq!(store.event_count().unwrap(), 2);
+    }
+
+    /// `prune_to_size` bounds the file by bytes, which the row-count trigger
+    /// cannot do: a few large payloads occupy more disk than many small ones.
+    #[test]
+    fn prune_to_size_deletes_oldest_events_when_over_budget() {
+        let store = temp_store();
+
+        for i in 0..10 {
+            store
+                .insert(&TelemetryEvent::SessionStart {
+                    session_id: format!("s-{i}"),
+                    timestamp: chrono::Utc::now(),
+                })
+                .unwrap();
+        }
+        assert_eq!(store.pending_events(100).unwrap().len(), 10);
+
+        // A budget of zero cannot be satisfied, so everything is dropped — and
+        // the loop must terminate rather than spin.
+        let deleted = store.prune_to_size(0).unwrap();
+        assert_eq!(deleted, 10);
+        assert!(store.pending_events(100).unwrap().is_empty());
+
+        // A generous budget leaves the store alone.
+        store
+            .insert(&TelemetryEvent::SessionStart {
+                session_id: "kept".into(),
+                timestamp: chrono::Utc::now(),
+            })
+            .unwrap();
+        assert_eq!(store.prune_to_size(i64::MAX).unwrap(), 0);
+        assert_eq!(store.pending_events(100).unwrap().len(), 1);
     }
 
     #[test]

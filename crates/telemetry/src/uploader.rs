@@ -223,14 +223,13 @@ impl TelemetryUploader {
             }).collect::<Vec<_>>(),
         });
 
-        let body = compress_json(&payload)?;
+        let body = encode_json(&payload)?;
 
-        let mut request = self
-            .client
-            .post(&self.config.endpoint)
-            .header("content-type", "application/json")
-            .header("content-encoding", "gzip")
-            .body(body);
+        let mut request = body.apply(
+            self.client
+                .post(&self.config.endpoint)
+                .header("content-type", "application/json"),
+        );
 
         if let Some(ref key) = self.config.api_key {
             request = request.header("authorization", format!("Bearer {key}"));
@@ -278,15 +277,14 @@ impl TelemetryUploader {
             }).collect::<Vec<_>>(),
         });
 
-        let body = compress_json(&payload)?;
+        let body = encode_json(&payload)?;
         let crash_endpoint = self.config.resolve_crash_endpoint();
 
-        let mut request = self
-            .client
-            .post(&crash_endpoint)
-            .header("content-type", "application/json")
-            .header("content-encoding", "gzip")
-            .body(body);
+        let mut request = body.apply(
+            self.client
+                .post(&crash_endpoint)
+                .header("content-type", "application/json"),
+        );
 
         if let Some(ref key) = self.config.api_key {
             request = request.header("authorization", format!("Bearer {key}"));
@@ -314,19 +312,47 @@ impl TelemetryUploader {
 }
 
 /// Compress a JSON value into a gzip-encoded byte vector.
-fn compress_json(value: &serde_json::Value) -> Result<Vec<u8>, TelemetryError> {
+/// A serialized request body and whether it was gzip-encoded.
+///
+/// The encoder skips compression for payloads too small to benefit, so the
+/// caller cannot assume the bytes are gzipped — sending an uncompressed body
+/// under `content-encoding: gzip` makes the receiver fail to decode it.
+struct EncodedBody {
+    bytes: Vec<u8>,
+    gzipped: bool,
+}
+
+impl EncodedBody {
+    /// Apply the body and the matching `content-encoding` header, if any.
+    fn apply(self, request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        if self.gzipped {
+            request.header("content-encoding", "gzip").body(self.bytes)
+        } else {
+            request.body(self.bytes)
+        }
+    }
+}
+
+fn encode_json(value: &serde_json::Value) -> Result<EncodedBody, TelemetryError> {
     use flate2::Compression;
     use flate2::write::GzEncoder;
     use std::io::Write;
 
+    const COMPRESSION_FLOOR_BYTES: usize = 1024;
+
     let json = serde_json::to_vec(value)?;
-    // Skip compression for tiny payloads (< 1 KB)
-    if json.len() < 1024 {
-        return Ok(json);
+    if json.len() < COMPRESSION_FLOOR_BYTES {
+        return Ok(EncodedBody {
+            bytes: json,
+            gzipped: false,
+        });
     }
     let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
     encoder.write_all(&json)?;
-    encoder.finish().map_err(|e| TelemetryError::Io(e.into()))
+    Ok(EncodedBody {
+        bytes: encoder.finish().map_err(|e| TelemetryError::Io(e.into()))?,
+        gzipped: true,
+    })
 }
 
 #[cfg(test)]
@@ -383,10 +409,67 @@ mod tests {
     }
 
     #[test]
-    fn compress_json_smoke() {
+    fn small_payload_is_sent_uncompressed() {
         let val = serde_json::json!({"key": "value"});
-        let compressed = compress_json(&val).unwrap();
-        // Small payload should not be compressed
-        assert!(compressed.len() > 0);
+        let body = encode_json(&val).unwrap();
+        assert!(
+            !body.gzipped,
+            "a payload below the compression floor must not claim gzip"
+        );
+        // Still valid JSON on the wire — the receiver reads it as-is.
+        let round_trip: serde_json::Value =
+            serde_json::from_slice(&body.bytes).expect("uncompressed body is plain JSON");
+        assert_eq!(round_trip, val);
+    }
+
+    /// The bug this guards: the header was set unconditionally while the
+    /// encoder skipped compression for small payloads, so the receiver was told
+    /// to gunzip plain JSON. `apply` is the only place a body reaches the wire,
+    /// and it decides the header from the same value that produced the bytes.
+    #[test]
+    fn content_encoding_header_matches_the_body() {
+        let client = reqwest::Client::new();
+
+        let small = encode_json(&serde_json::json!({"a": 1})).unwrap();
+        assert!(!small.gzipped);
+        let req = small
+            .apply(client.post("http://localhost/"))
+            .build()
+            .unwrap();
+        assert!(
+            req.headers().get("content-encoding").is_none(),
+            "uncompressed body must not send content-encoding: gzip"
+        );
+
+        let large = encode_json(&serde_json::json!({ "e": vec!["y".repeat(64); 64] })).unwrap();
+        assert!(large.gzipped);
+        let req = large
+            .apply(client.post("http://localhost/"))
+            .build()
+            .unwrap();
+        assert_eq!(
+            req.headers()
+                .get("content-encoding")
+                .and_then(|v| v.to_str().ok()),
+            Some("gzip"),
+            "compressed body must declare gzip"
+        );
+    }
+
+    #[test]
+    fn large_payload_is_gzipped_and_decodes() {
+        let val = serde_json::json!({ "events": vec!["x".repeat(64); 64] });
+        let body = encode_json(&val).unwrap();
+        assert!(body.gzipped, "a large payload should be compressed");
+
+        // The header the sender sets must match what the bytes actually are.
+        use flate2::read::GzDecoder;
+        use std::io::Read;
+        let mut decoded = Vec::new();
+        GzDecoder::new(&body.bytes[..])
+            .read_to_end(&mut decoded)
+            .expect("body must be valid gzip when flagged as such");
+        let round_trip: serde_json::Value = serde_json::from_slice(&decoded).unwrap();
+        assert_eq!(round_trip, val);
     }
 }
