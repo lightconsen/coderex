@@ -927,13 +927,14 @@ impl StartupOrchestrator {
 
             // Bridge MCP-discovered tools to skills
             for tool in manager.list_tool_info() {
+                let qualified_name = tool.qualified_name();
                 self.ctx
                     .mcp_skills
                     .push(coderex_plugins::skills::SkillMetadata {
-                        name: tool.name.clone(),
+                        name: qualified_name.clone(),
                         hooks: vec!["post-query".into()],
                         agent: Some(tool.server.clone()),
-                        allowed_tools: vec![tool.name],
+                        allowed_tools: vec![qualified_name],
                         description: tool.description,
                         enabled: true,
                     });

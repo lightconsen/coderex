@@ -312,7 +312,7 @@ impl McpManager {
             .unwrap()
             .list()
             .iter()
-            .map(|t| t.name.clone())
+            .map(|t| t.qualified_name())
             .collect()
     }
 
@@ -525,7 +525,7 @@ mod tests {
 
         assert_eq!(mgr.tool_count(), 1);
         assert_eq!(mgr.resource_count(), 1);
-        assert!(mgr.list_tools().contains(&"read_file".to_string()));
+        assert!(mgr.list_tools().contains(&"mcp__fs__read_file".to_string()));
         assert!(
             mgr.list_resources()
                 .contains(&"file:///tmp/test.txt".to_string())
@@ -544,6 +544,6 @@ mod tests {
         });
 
         // Server not started, so proxy should be None
-        assert!(mgr.get_tool_proxy("read_file").is_none());
+        assert!(mgr.get_tool_proxy("mcp__fs__read_file").is_none());
     }
 }

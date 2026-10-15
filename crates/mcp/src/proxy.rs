@@ -20,6 +20,17 @@ pub struct McpToolInfo {
     pub input_schema: Value,
 }
 
+impl McpToolInfo {
+    /// Public, collision-free name used by the model and permission rules.
+    ///
+    /// The raw `name` remains unchanged because it is what the MCP server
+    /// expects in `tools/call`.
+    #[must_use]
+    pub fn qualified_name(&self) -> String {
+        format!("mcp__{}__{}", self.server, self.name)
+    }
+}
+
 /// Proxy for calling an MCP tool on a remote server.
 #[derive(Debug)]
 pub struct McpToolProxy {
@@ -98,9 +109,9 @@ impl McpToolRegistry {
         }
     }
 
-    /// Register a discovered tool.
+    /// Register a discovered tool under its server-qualified public name.
     pub fn register(&mut self, info: McpToolInfo) {
-        self.tools.insert(info.name.clone(), info);
+        self.tools.insert(info.qualified_name(), info);
     }
 
     /// Look up a tool by name.
@@ -165,16 +176,39 @@ mod tests {
         let tool = sample_tool();
         reg.register(tool);
         assert_eq!(reg.len(), 1);
-        let got = reg.get("read_file").unwrap();
+        let got = reg.get("mcp__filesystem__read_file").unwrap();
         assert_eq!(got.server, "filesystem");
         assert_eq!(got.description, "Read a file");
+    }
+
+    #[test]
+    fn same_raw_tool_name_is_namespaced_by_server() {
+        let mut reg = McpToolRegistry::new();
+        reg.register(sample_tool());
+        reg.register(McpToolInfo {
+            server: "other".into(),
+            ..sample_tool()
+        });
+
+        assert_eq!(reg.len(), 2);
+        assert!(reg.get("read_file").is_none());
+        assert_eq!(
+            reg.get("mcp__filesystem__read_file")
+                .map(|info| info.server.as_str()),
+            Some("filesystem")
+        );
+        assert_eq!(
+            reg.get("mcp__other__read_file")
+                .map(|info| info.server.as_str()),
+            Some("other")
+        );
     }
 
     #[test]
     fn unregister() {
         let mut reg = McpToolRegistry::new();
         reg.register(sample_tool());
-        let removed = reg.unregister("read_file");
+        let removed = reg.unregister("mcp__filesystem__read_file");
         assert!(removed.is_some());
         assert!(reg.is_empty());
     }

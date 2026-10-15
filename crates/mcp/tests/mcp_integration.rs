@@ -221,8 +221,8 @@ async fn tool_discovery_manager_discovers_and_registers() {
     assert!(mgr.is_running("mock"));
     assert_eq!(mgr.tool_count(), 2);
     let tools = mgr.list_tools();
-    assert!(tools.contains(&"mock_read_file".to_string()));
-    assert!(tools.contains(&"mock_write_file".to_string()));
+    assert!(tools.contains(&"mcp__mock__mock_read_file".to_string()));
+    assert!(tools.contains(&"mcp__mock__mock_write_file".to_string()));
 
     mgr.stop_all().await;
 }
@@ -269,7 +269,7 @@ async fn tool_discovery_executor_routes_to_mcp() {
     let outcome = executor
         .execute(
             "tc_1",
-            "mock_read_file",
+            "mcp__mock__mock_read_file",
             &serde_json::json!({"path": "/tmp/test.txt"}),
         )
         .await;
