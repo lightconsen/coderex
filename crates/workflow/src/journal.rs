@@ -151,7 +151,7 @@ impl Journal {
         let text = match std::fs::read_to_string(&self.path) {
             Ok(text) => text,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                return Ok(Loaded::default())
+                return Ok(Loaded::default());
             }
             Err(error) => return Err(error),
         };
@@ -187,7 +187,7 @@ impl Journal {
         let text = match std::fs::read_to_string(&self.path) {
             Ok(text) => text,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                return Ok(RestoreState::Missing)
+                return Ok(RestoreState::Missing);
             }
             Err(error) => return Err(error),
         };
@@ -395,10 +395,7 @@ mod tests {
             disallowed_tools: vec!["Edit".into(), "Bash".into()],
             ..CallOptions::default()
         };
-        assert_eq!(
-            key_for(ROOT_KEY, "p", &one),
-            key_for(ROOT_KEY, "p", &other)
-        );
+        assert_eq!(key_for(ROOT_KEY, "p", &one), key_for(ROOT_KEY, "p", &other));
     }
 
     #[test]

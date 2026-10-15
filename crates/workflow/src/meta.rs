@@ -82,9 +82,8 @@ pub fn read(script: &str) -> Result<(Meta, String), MetaError> {
         .map(|offset| start + offset)
         .ok_or_else(|| MetaError::NotLiteral("no object follows the export".to_string()))?;
 
-    let end = matching_brace(script, open).ok_or_else(|| {
-        MetaError::Malformed("the meta object is not closed".to_string())
-    })?;
+    let end = matching_brace(script, open)
+        .ok_or_else(|| MetaError::Malformed("the meta object is not closed".to_string()))?;
 
     let object = &script[open..=end];
     let value = read_literal_object(object)?;
@@ -120,7 +119,7 @@ fn find_meta_start(script: &str) -> Option<usize> {
         break;
     }
 
-    rest.starts_with("export") .then_some(offset)
+    rest.starts_with("export").then_some(offset)
 }
 
 /// Find the brace that closes the one at `open`.
@@ -315,9 +314,7 @@ fn read_value(text: &str) -> Result<Literal, MetaError> {
         other => other
             .parse::<f64>()
             .map(Literal::Number)
-            .map_err(|_| {
-                MetaError::NotLiteral(format!("'{other}' would have to be evaluated"))
-            }),
+            .map_err(|_| MetaError::NotLiteral(format!("'{other}' would have to be evaluated"))),
     }
 }
 
@@ -339,9 +336,13 @@ fn unescape(text: &str) -> Result<String, MetaError> {
             Some(other) => {
                 return Err(MetaError::NotLiteral(format!(
                     "'\\{other}' is an escape this reader does not take"
-                )))
+                )));
             }
-            None => return Err(MetaError::Malformed("a string ends in a backslash".to_string())),
+            None => {
+                return Err(MetaError::Malformed(
+                    "a string ends in a backslash".to_string(),
+                ));
+            }
         }
     }
     Ok(out)
@@ -459,10 +460,7 @@ const found = await parallel([() => agent('look')])
         assert_eq!(meta.phases.len(), 2);
         assert_eq!(meta.phases[0].title, "Review");
         assert_eq!(meta.phases[1].detail.as_deref(), Some("two votes each"));
-        assert_eq!(
-            meta.phases[1].model.as_deref(),
-            Some("claude-sonnet-4-6")
-        );
+        assert_eq!(meta.phases[1].model.as_deref(), Some("claude-sonnet-4-6"));
 
         // The body is what runs, and it starts after the export.
         assert!(body.starts_with("phase('Review')"), "{body}");
@@ -529,7 +527,8 @@ body()"#;
 
     #[test]
     fn a_phase_without_a_title_is_refused() {
-        let script = "export const meta = { name: 'a', description: 'b', phases: [{ detail: 'x' }] }";
+        let script =
+            "export const meta = { name: 'a', description: 'b', phases: [{ detail: 'x' }] }";
         let error = read(script).unwrap_err();
         assert!(error.to_string().contains("phase title"), "{error}");
     }

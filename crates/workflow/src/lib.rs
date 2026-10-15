@@ -20,6 +20,10 @@
 
 pub mod journal;
 pub mod meta;
+pub mod runtime;
 
 pub use journal::{CallOptions, Entry, Journal, RestoreState, key_for};
 pub use meta::{Meta, MetaError, Phase, read};
+pub use runtime::{
+    AgentRequest, AgentRunner, Limits, Outcome, Progress, WorkflowError, new_run_id, run_script,
+};
