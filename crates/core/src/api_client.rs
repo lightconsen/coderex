@@ -81,6 +81,9 @@ pub struct ApiConfig {
     pub api_key: String,
     /// Base URL for the API (default: https://api.anthropic.com).
     pub base_url: String,
+    /// Set when this endpoint is a cloud provider rather than Anthropic's own
+    /// API: it decides the request path, the body, and the authentication.
+    pub cloud: Option<crate::providers::cloud::CloudEndpoint>,
     /// Maximum number of retry attempts for transient failures.
     pub max_retries: u32,
     /// Initial backoff duration for retries.
@@ -136,6 +139,7 @@ impl ApiConfig {
         Self {
             api_key,
             base_url: "https://api.anthropic.com".into(),
+            cloud: None,
             max_retries: 3,
             retry_backoff: Duration::from_secs(1),
             request_timeout_secs: 120,
@@ -364,6 +368,120 @@ impl AnthropicApiClient {
             std::env::consts::OS,
             std::env::consts::ARCH
         )
+    }
+
+    /// The URL a request goes to.
+    ///
+    /// A cloud provider puts the model in a path of its own — Bedrock names it
+    /// in the path, Vertex names the project, region, and model — so the URL
+    /// is built from the provider's shape rather than appended to a base.
+    fn request_url(&self, model_name: &str, streaming: bool) -> String {
+        let base = self.config.base_url.trim_end_matches('/');
+        let Some(cloud) = &self.config.cloud else {
+            return format!("{base}/v1/messages");
+        };
+
+        let shape = crate::providers::cloud::RequestShape::for_provider(cloud.kind);
+        let shape = if streaming {
+            shape.streaming(cloud.kind)
+        } else {
+            shape
+        };
+        format!(
+            "{base}{}",
+            shape.render_path(model_name, &cloud.project, &cloud.region)
+        )
+    }
+
+    /// Add what the provider needs to the request body.
+    fn shape_body(&self, body: &mut serde_json::Value, model_name: &str) {
+        let Some(cloud) = &self.config.cloud else {
+            return;
+        };
+        let shape = crate::providers::cloud::RequestShape::for_provider(cloud.kind);
+        shape.apply_to_body(body);
+
+        if shape.model_in_path {
+            if let Some(object) = body.as_object_mut() {
+                // The model is in the path now; Bedrock rejects a body that
+                // names it as well.
+                object.remove("model");
+            }
+        }
+        let _ = model_name;
+    }
+
+    /// Apply the endpoint's authentication to a request.
+    ///
+    /// The body is passed in because a signature covers it.
+    fn apply_auth(
+        &self,
+        req: reqwest::RequestBuilder,
+        url: &str,
+        body: &[u8],
+        request_id: &str,
+    ) -> reqwest::RequestBuilder {
+        use crate::providers::cloud::{AuthStyle, AwsCredentials, sign_v4, signing_service};
+
+        let Some(cloud) = &self.config.cloud else {
+            return if self.is_anthropic_api() {
+                req.header("x-api-key", &self.config.api_key)
+                    .header("anthropic-version", "2023-06-01")
+            } else {
+                req.header("Authorization", format!("Bearer {}", &self.config.api_key))
+            };
+        };
+
+        let shape = crate::providers::cloud::RequestShape::for_provider(cloud.kind);
+
+        // Headers the provider asks for by name; an empty value means unset.
+        let mut req = req;
+        for name in shape.extra_headers.keys() {
+            let value = header_value(name);
+            if !value.is_empty() {
+                req = req.header(name.as_str(), value);
+            }
+        }
+
+        match cloud.kind.auth() {
+            AuthStyle::AwsSigV4 => {
+                match AwsCredentials::from_env() {
+                    Some(credentials) => {
+                        let (host, path, query) = split_url(url);
+                        let timestamp = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
+                        let signed = sign_v4(
+                            &credentials,
+                            "POST",
+                            &host,
+                            &path,
+                            &query,
+                            body,
+                            &cloud.region,
+                            signing_service(cloud.kind),
+                            &timestamp,
+                        );
+                        tracing::debug!(
+                            provider = cloud.kind.name(),
+                            request_id = %request_id,
+                            "signed request with sigv4"
+                        );
+                        req.header("x-amz-date", signed.amz_date)
+                            .header("Authorization", signed.authorization)
+                    }
+                    // Bedrock and Mantle take a bearer token instead, which is
+                    // what makes them usable without an AWS SDK.
+                    None if cloud.kind.accepts_bearer() => {
+                        req.header("Authorization", format!("Bearer {}", &self.config.api_key))
+                    }
+                    None => req.header("Authorization", format!("Bearer {}", &self.config.api_key)),
+                }
+            }
+            AuthStyle::AzureApiKey => req.header("api-key", &self.config.api_key),
+            AuthStyle::GoogleAccessToken | AuthStyle::Bearer => {
+                req.header("Authorization", format!("Bearer {}", &self.config.api_key))
+            }
+            AuthStyle::AnthropicApiKey => req.header("x-api-key", &self.config.api_key),
+        }
     }
 
     pub(crate) fn resolved_profile(&self) -> ResolvedProviderProfile {
@@ -601,15 +719,8 @@ impl ApiClient for AnthropicApiClient {
             ));
         }
 
-        let url = format!(
-            "{}/v1/messages",
-            self.config
-                .base_url
-                .strip_suffix('/')
-                .unwrap_or(&self.config.base_url)
-        );
-
         let model_name = Self::resolve_model(model);
+        let url = self.request_url(model_name, false);
         let request_id = Uuid::new_v4().to_string();
 
         let mut body = serde_json::json!({
@@ -619,6 +730,7 @@ impl ApiClient for AnthropicApiClient {
             "max_tokens": max_tokens,
         });
         self.attach_metadata(&mut body, &request_id);
+        self.shape_body(&mut body, model_name);
 
         let capabilities = self.resolved_profile().capabilities;
         let tool_fallback = !tools.is_empty() && !capabilities.tool_use;
@@ -650,6 +762,11 @@ impl ApiClient for AnthropicApiClient {
                 .insert("tools".to_string(), serde_json::Value::Array(tools_json));
         }
 
+        // The bytes are serialized here rather than by `json()`, because a
+        // signed request has to hash exactly what it sends.
+        let body_bytes = serde_json::to_vec(&body)
+            .map_err(|e| ApiError::Http(format!("could not serialize the request: {e}")))?;
+
         let response = self
             .with_retry(|| async {
                 let mut req = self
@@ -660,16 +777,13 @@ impl ApiClient for AnthropicApiClient {
                     // version header even when the host is not api.anthropic.com.
                     .header("anthropic-version", "2023-06-01");
                 req = self.apply_standard_headers(req, &request_id);
+                req = self.apply_auth(req, &url, &body_bytes, &request_id);
 
-                if self.is_anthropic_api() {
-                    req = req
-                        .header("x-api-key", &self.config.api_key)
-                        .header("anthropic-version", "2023-06-01");
-                } else {
-                    req = req.header("Authorization", format!("Bearer {}", &self.config.api_key));
-                }
-
-                let resp = req.json(&body).send().await.map_err(ApiError::from)?;
+                let resp = req
+                    .body(body_bytes.clone())
+                    .send()
+                    .await
+                    .map_err(ApiError::from)?;
 
                 let status = resp.status().as_u16();
                 let server_request_id = resp
@@ -783,17 +897,8 @@ impl ApiClient for AnthropicApiClient {
             }));
         }
 
-        let url = format!(
-            "{}/v1/messages",
-            self.config
-                .base_url
-                .strip_suffix('/')
-                .unwrap_or(&self.config.base_url)
-        );
-
         let model_name = Self::resolve_model(model).to_string();
-        let api_key = self.config.api_key.clone();
-        let is_anthropic = self.is_anthropic_api();
+        let url = self.request_url(&model_name, true);
         let request_id = Uuid::new_v4().to_string();
         let mut body = serde_json::json!({
             "model": model_name.clone(),
@@ -803,6 +908,7 @@ impl ApiClient for AnthropicApiClient {
             "stream": true,
         });
         self.attach_metadata(&mut body, &request_id);
+        self.shape_body(&mut body, &model_name);
 
         let capabilities = self.resolved_profile().capabilities;
         let tool_fallback = !tools.is_empty() && !capabilities.tool_use;
@@ -858,15 +964,22 @@ impl ApiClient for AnthropicApiClient {
                     .header("anthropic-version", "2023-06-01");
                 req = temp_client.apply_standard_headers(req, &request_id);
 
-                if is_anthropic {
-                    req = req
-                        .header("x-api-key", &api_key)
-                        .header("anthropic-version", "2023-06-01");
-                } else {
-                    req = req.header("Authorization", format!("Bearer {}", &api_key));
-                }
+                let body_bytes = match serde_json::to_vec(&body) {
+                    Ok(bytes) => bytes,
+                    // This closure returns a stream, so a failure here is an
+                    // error event rather than a `Result`.
+                    Err(error) => {
+                        let message = format!("could not serialize the request: {error}");
+                        return futures::stream::once(async move {
+                            StreamEvent::Error(ApiError::Http(message))
+                        })
+                        .chain(futures::stream::once(async move { StreamEvent::StreamEnd }))
+                        .boxed();
+                    }
+                };
+                req = temp_client.apply_auth(req, &url, &body_bytes, &request_id);
 
-                let response = req.json(&body).send().await;
+                let response = req.body(body_bytes).send().await;
 
                 match response {
                     Ok(resp) => {
@@ -951,6 +1064,47 @@ struct SseParserState {
     /// Input-JSON deltas that arrived before their `content_block_start`.
     /// Buffered and flushed once the mapping is known.
     deferred_deltas: Vec<(usize, String)>,
+}
+
+/// The value of a provider header, read from the environment.
+///
+/// The one that matters is Bedrock's service tier, which is how a deployment
+/// asks for a capacity tier; unset means the provider's default.
+fn header_value(name: &str) -> String {
+    match name {
+        "X-Amzn-Bedrock-Service-Tier" => {
+            std::env::var("ANTHROPIC_BEDROCK_SERVICE_TIER").unwrap_or_default()
+        }
+        other => {
+            let key = format!("ANTHROPIC_{}", other.replace('-', "_").to_ascii_uppercase());
+            std::env::var(key).unwrap_or_default()
+        }
+    }
+}
+
+/// Split a URL into the host, path, and query a signature needs.
+fn split_url(url: &str) -> (String, String, String) {
+    let without_scheme = url.split_once("://").map_or(url, |(_, rest)| rest);
+
+    let (authority, rest) = match without_scheme.find('/') {
+        Some(index) => (&without_scheme[..index], &without_scheme[index..]),
+        None => (without_scheme, ""),
+    };
+
+    let (path, query) = match rest.split_once('?') {
+        Some((path, query)) => (path.to_string(), query.to_string()),
+        None => (
+            if rest.is_empty() {
+                "/".to_string()
+            } else {
+                rest.to_string()
+            },
+            String::new(),
+        ),
+    };
+
+    let host = authority.rsplit('@').next().unwrap_or(authority);
+    (host.to_string(), path, query)
 }
 
 fn parse_sse_stream(
@@ -1235,6 +1389,93 @@ mod tests {
             .await;
 
         assert!(matches!(result, Err(ApiError::Auth(_))));
+    }
+
+    fn cloud_client(
+        kind: crate::providers::cloud::ProviderKind,
+        region: &str,
+    ) -> AnthropicApiClient {
+        let mut config = ApiConfig::new("test-key".into());
+        config.base_url = crate::providers::default_base_url(kind, region);
+        config.cloud = Some(crate::providers::cloud::CloudEndpoint::new(kind, region));
+        AnthropicApiClient::new(config)
+    }
+
+    #[test]
+    fn a_plain_endpoint_still_uses_the_anthropic_path() {
+        let client = AnthropicApiClient::new(ApiConfig::new("k".into()));
+        assert_eq!(
+            client.request_url("claude-sonnet-4-6", false),
+            "https://api.anthropic.com/v1/messages"
+        );
+    }
+
+    #[test]
+    fn bedrock_names_the_model_in_the_path_and_stamps_the_body() {
+        let client = cloud_client(crate::providers::cloud::ProviderKind::Bedrock, "us-east-1");
+        assert_eq!(
+            client.request_url("claude-sonnet-4-6", false),
+            "https://bedrock-runtime.us-east-1.amazonaws.com/model/claude-sonnet-4-6/invoke"
+        );
+        assert_eq!(
+            client.request_url("claude-sonnet-4-6", true),
+            "https://bedrock-runtime.us-east-1.amazonaws.com/model/claude-sonnet-4-6/\
+             invoke-with-response-stream"
+        );
+
+        let mut body = serde_json::json!({"model": "claude-sonnet-4-6", "max_tokens": 10});
+        client.shape_body(&mut body, "claude-sonnet-4-6");
+        assert_eq!(body["anthropic_version"], "bedrock-2023-05-31");
+        // The model is in the path, so it leaves the body.
+        assert!(body.get("model").is_none(), "{body}");
+    }
+
+    #[test]
+    fn vertex_names_the_project_and_region_in_the_path() {
+        let mut client = cloud_client(crate::providers::cloud::ProviderKind::Vertex, "us-central1");
+        client.config.cloud = Some(
+            crate::providers::cloud::CloudEndpoint::new(
+                crate::providers::cloud::ProviderKind::Vertex,
+                "us-central1",
+            )
+            .with_project("my-project"),
+        );
+
+        assert_eq!(
+            client.request_url("claude-sonnet-4-6", false),
+            "https://us-central1-aiplatform.googleapis.com/v1/projects/my-project/locations/\
+             us-central1/publishers/anthropic/models/claude-sonnet-4-6:rawPredict"
+        );
+
+        let mut body = serde_json::json!({"model": "claude-sonnet-4-6"});
+        client.shape_body(&mut body, "claude-sonnet-4-6");
+        assert_eq!(body["anthropic_version"], "vertex-2023-10-16");
+        // Vertex keeps the model in the body as well as the path.
+        assert_eq!(body["model"], "claude-sonnet-4-6");
+    }
+
+    #[test]
+    fn a_url_is_split_the_way_a_signature_needs() {
+        assert_eq!(
+            split_url("https://bedrock-runtime.us-east-1.amazonaws.com/model/m/invoke"),
+            (
+                "bedrock-runtime.us-east-1.amazonaws.com".to_string(),
+                "/model/m/invoke".to_string(),
+                String::new()
+            )
+        );
+        assert_eq!(
+            split_url("https://example.com/path?a=1&b=2"),
+            (
+                "example.com".to_string(),
+                "/path".to_string(),
+                "a=1&b=2".to_string()
+            )
+        );
+        assert_eq!(
+            split_url("https://example.com"),
+            ("example.com".to_string(), "/".to_string(), String::new())
+        );
     }
 
     #[tokio::test]

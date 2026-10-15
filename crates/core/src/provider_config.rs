@@ -9,12 +9,20 @@
 use crate::api_client::ApiConfig;
 use crate::model_router::ModelRouter;
 use crate::provider_router::ProviderRouter;
+use crate::providers::cloud::{
+    CloudEndpoint, ProviderKind, SelectionInputs, default_base_url, foundry_base_url, select,
+    vertex_base_url,
+};
 use crate::providers::{AnthropicProvider, OpenAiCompatibleProvider};
 use std::collections::{BTreeMap, HashMap};
 
 /// Configuration for all providers.
 #[derive(Debug, Clone, Default)]
 pub struct ProviderConfig {
+    /// The cloud provider this deployment uses, if it is not Anthropic's own
+    /// API. Selected from the environment; it takes precedence over the plain
+    /// endpoint.
+    pub cloud: Option<CloudEndpoint>,
     /// Anthropic API configuration.
     pub anthropic: Option<ProviderEndpoint>,
     /// OpenAI API configuration.
@@ -58,6 +66,10 @@ impl ProviderConfig {
     #[must_use]
     pub fn from_env() -> Self {
         let mut config = Self::default();
+
+        // A cloud provider is selected, not detected: the deployment says
+        // which one it is, and that choice outranks the plain API key.
+        config.cloud = cloud_endpoint_from_env();
 
         if let Ok(key) = std::env::var("ANTHROPIC_API_KEY") {
             config.anthropic = Some(ProviderEndpoint {
@@ -119,7 +131,22 @@ impl ProviderConfig {
         let mut router =
             ModelRouter::new("default").with_fallback_providers(self.fallback_providers.clone());
 
-        if let Some(ref ep) = self.anthropic {
+        if let Some(ref endpoint) = self.cloud {
+            // The cloud provider replaces the plain endpoint rather than
+            // joining it: both answer the same API, and sending the work to
+            // whichever is first would make the choice of provider a race.
+            let key = self
+                .anthropic
+                .as_ref()
+                .map(|ep| ep.api_key.clone())
+                .or_else(|| std::env::var("ANTHROPIC_API_KEY").ok())
+                .unwrap_or_default();
+
+            let mut config = ApiConfig::new(key);
+            config.base_url = cloud_base_url(endpoint);
+            config.cloud = Some(endpoint.clone());
+            router.add_provider(Box::new(AnthropicProvider::new(config)));
+        } else if let Some(ref ep) = self.anthropic {
             let mut config = ApiConfig::new(ep.api_key.clone());
             if let Some(ref url) = ep.base_url {
                 config.base_url = url.clone();
@@ -236,5 +263,52 @@ mod tests {
         let router = config.build_router();
         // Router exists even if empty
         let _ = router;
+    }
+}
+
+/// The cloud deployment the environment asks for, if any.
+#[must_use]
+pub fn cloud_endpoint_from_env() -> Option<CloudEndpoint> {
+    let kind = select(&SelectionInputs::from_env());
+    if kind == ProviderKind::FirstParty {
+        return None;
+    }
+
+    let region = std::env::var("AWS_REGION")
+        .or_else(|_| std::env::var("AWS_DEFAULT_REGION"))
+        .or_else(|_| std::env::var("CLOUD_ML_REGION"))
+        .unwrap_or_else(|_| "us-east-1".to_string());
+
+    let endpoint = CloudEndpoint::new(kind, region);
+    match kind {
+        ProviderKind::Vertex => {
+            let project = std::env::var("ANTHROPIC_VERTEX_PROJECT_ID")
+                .or_else(|_| std::env::var("GOOGLE_CLOUD_PROJECT"))
+                .unwrap_or_default();
+            Some(endpoint.with_project(project))
+        }
+        _ => Some(endpoint),
+    }
+}
+
+/// The base URL a cloud deployment talks to.
+#[must_use]
+pub fn cloud_base_url(endpoint: &CloudEndpoint) -> String {
+    match endpoint.kind {
+        ProviderKind::Vertex => std::env::var("ANTHROPIC_VERTEX_BASE_URL")
+            .unwrap_or_else(|_| vertex_base_url(&endpoint.region)),
+        ProviderKind::Bedrock => std::env::var("ANTHROPIC_BEDROCK_BASE_URL")
+            .unwrap_or_else(|_| default_base_url(endpoint.kind, &endpoint.region)),
+        ProviderKind::Mantle => std::env::var("ANTHROPIC_BEDROCK_MANTLE_BASE_URL")
+            .unwrap_or_else(|_| default_base_url(endpoint.kind, &endpoint.region)),
+        ProviderKind::AnthropicAws => std::env::var("ANTHROPIC_AWS_BASE_URL")
+            .unwrap_or_else(|_| default_base_url(endpoint.kind, &endpoint.region)),
+        ProviderKind::Foundry => std::env::var("ANTHROPIC_FOUNDRY_BASE_URL").unwrap_or_else(|_| {
+            foundry_base_url(&std::env::var("ANTHROPIC_FOUNDRY_RESOURCE").unwrap_or_default())
+        }),
+        ProviderKind::Gateway => std::env::var("CODEREX_GATEWAY_URL").unwrap_or_default(),
+        ProviderKind::AnthropicGoogleCloud => std::env::var("ANTHROPIC_GOOGLE_CLOUD_BASE_URL")
+            .unwrap_or_else(|_| default_base_url(endpoint.kind, &endpoint.region)),
+        ProviderKind::FirstParty => default_base_url(endpoint.kind, &endpoint.region),
     }
 }
