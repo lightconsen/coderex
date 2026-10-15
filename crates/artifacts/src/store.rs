@@ -302,6 +302,16 @@ impl ArtifactStore {
         self.write_manifest(slug, &manifest)
     }
 
+    /// Write a manifest back, keyed by the slug it carries.
+    ///
+    /// Used by callers that changed something beside the page — an asset was
+    /// added or removed — and need the manifest to say so.
+    pub fn save_manifest(&self, manifest: &Manifest) -> Result<(), StoreError> {
+        let slug = Slug::parse(&manifest.slug)
+            .ok_or_else(|| StoreError::Invalid(format!("'{}' is not a slug", manifest.slug)))?;
+        self.write_manifest(&slug, manifest)
+    }
+
     fn manifest_path(&self, slug: &Slug) -> PathBuf {
         self.artifact_dir(slug).join("manifest.json")
     }
@@ -313,6 +323,15 @@ impl ArtifactStore {
             serde_json::to_vec_pretty(manifest).map_err(|e| StoreError::Io(e.to_string()))?;
         std::fs::write(self.manifest_path(slug), bytes).map_err(|e| StoreError::Io(e.to_string()))
     }
+}
+
+/// Where artifacts live when nothing else is configured.
+#[must_use]
+pub fn default_root() -> PathBuf {
+    home::home_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".coderex")
+        .join("artifacts")
 }
 
 /// Check a page against every publish limit before anything is written.

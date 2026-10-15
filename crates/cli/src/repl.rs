@@ -503,6 +503,12 @@ pub struct ReplLoop {
     /// built before the MCP servers are attached, and reads this when it later
     /// builds a child registry.
     mcp_manager: Arc<std::sync::RwLock<Option<Arc<coderex_mcp::manager::McpManager>>>>,
+    /// The server artifacts are published to, kept alive for the session.
+    ///
+    /// Dropping it would leave the model publishing pages nobody can open.
+    artifact_server: Option<coderex_artifacts::ArtifactServer>,
+    /// Where artifacts are stored, when it is not the default location.
+    artifact_store_root: Option<std::path::PathBuf>,
     /// Pending elicitation response sender — when set, user input is treated as an answer.
     pending_elicitation: Option<tokio::sync::oneshot::Sender<serde_json::Value>>,
     /// Confirmation bus for interactive permission requests.
@@ -660,6 +666,8 @@ impl ReplLoop {
             dispatcher: None,
             agent_manager: None,
             mcp_manager: Arc::new(std::sync::RwLock::new(None)),
+            artifact_server: None,
+            artifact_store_root: None,
             pending_elicitation: None,
             confirmation_bus: None,
             cron_rx: None,
@@ -869,6 +877,8 @@ impl ReplLoop {
             dispatcher: Some(dispatcher),
             agent_manager: Some(agent_manager),
             mcp_manager: mcp_slot,
+            artifact_server: None,
+            artifact_store_root: None,
             pending_elicitation: None,
             confirmation_bus: Some(confirmation_bus),
             cron_rx: Some(cron_rx),
@@ -905,6 +915,63 @@ impl ReplLoop {
         };
         this.init_command_persistence();
         this
+    }
+
+    /// Start serving artifacts and register the tool family.
+    ///
+    /// Failure is not fatal: a session that cannot publish still has every
+    /// other tool, so the reason is logged and the family is left out.
+    ///
+    /// The tools land in the registry's dynamic tier — the same tier MCP tools
+    /// use — because they arrive after the registry was shared. That keeps
+    /// them out of plan mode, which is what we want: publishing is not a
+    /// read-only planning action.
+    pub async fn start_artifact_serving(&mut self) {
+        let Some(dispatcher) = self.dispatcher.as_ref() else {
+            return;
+        };
+
+        let store = coderex_artifacts::ArtifactStore::open(
+            self.artifact_store_root
+                .clone()
+                .unwrap_or_else(coderex_artifacts::store::default_root),
+        );
+
+        // Prefer the well-known port so a URL stays valid across sessions; a
+        // free one is better than no server when it is taken.
+        let server = match coderex_artifacts::ArtifactServer::start(store.clone(), 8722).await {
+            Ok(server) => server,
+            Err(error) => {
+                tracing::debug!("artifact port 8722 unavailable ({error}); taking a free one");
+                match coderex_artifacts::ArtifactServer::start(store.clone(), 0).await {
+                    Ok(server) => server,
+                    Err(error) => {
+                        tracing::warn!("artifact serving unavailable: {error}");
+                        return;
+                    }
+                }
+            }
+        };
+
+        let service = Arc::new(coderex_artifacts::ArtifactService::new(
+            store,
+            server.origin(),
+            self.session_id
+                .map(|id| id.to_string())
+                .unwrap_or_else(|| "local".to_string()),
+        ));
+
+        for tool in coderex_artifacts::ArtifactTools::new(service).all() {
+            dispatcher.registry().register_dynamic(tool);
+        }
+        tracing::info!(origin = server.origin(), "artifacts are served locally");
+
+        self.artifact_server = Some(server);
+    }
+
+    /// Publish artifacts somewhere other than the default location.
+    pub fn with_artifact_store_root(&mut self, root: std::path::PathBuf) {
+        self.artifact_store_root = Some(root);
     }
 
     /// Wire the MCP manager into this REPL loop.
@@ -1488,6 +1555,12 @@ impl ReplLoop {
         use crossterm::event::{Event, KeyCode, KeyModifiers, MouseEventKind};
         use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
         use std::time::{Duration, Instant};
+
+        // Artifacts are published to a local origin, so the server has to be
+        // up before the model can publish anything. It is started here rather
+        // than where the registry is built because starting a server needs a
+        // runtime; the tools are registered onto the live registry instead.
+        self.start_artifact_serving().await;
 
         enable_raw_mode()?;
         let mut terminal_ui = TerminalUi::new()?;
@@ -5215,6 +5288,75 @@ mod tests {
         }
         assert!(saw_started, "missing sub-agent start event");
         assert!(saw_completed, "missing sub-agent completion event");
+    }
+
+    #[tokio::test]
+    async fn artifact_tools_join_the_registry_and_serve_a_real_page() {
+        let api = ReadThenAnswerApi {
+            call: Arc::new(std::sync::Mutex::new(0)),
+            expected_contents: "unused",
+        };
+        let mut repl = ReplLoop::with_engine(Box::new(api), "/tmp".into(), ModelId::sonnet());
+        let store = tempfile::tempdir().unwrap();
+        repl.with_artifact_store_root(store.path().to_path_buf());
+
+        repl.start_artifact_serving().await;
+        assert!(
+            repl.artifact_server.is_some(),
+            "the artifact server did not start"
+        );
+
+        let dispatcher = repl.dispatcher.take().unwrap();
+        let registry = dispatcher.registry();
+        for name in [
+            "Artifact",
+            "ArtifactData",
+            "ArtifactComments",
+            "ArtifactCheck",
+        ] {
+            assert!(
+                registry.get_tool_arc(name).is_some(),
+                "{name} was not registered"
+            );
+        }
+
+        // Publishing through the registered tool produces a page the server
+        // actually answers for.
+        let tool = registry.get_tool_arc("Artifact").unwrap();
+        let output = tool
+            .execute(
+                coderex_tools::ToolInput {
+                    call_id: "call_1".into(),
+                    name: "Artifact".into(),
+                    arguments: serde_json::json!({
+                        "title": "Session report",
+                        "files": { "index.html": "<html><body>hello</body></html>" }
+                    }),
+                },
+                coderex_tools::ToolContext::new(
+                    coderex_tools::ExecutionContext::Normal,
+                    std::path::Path::new("/tmp"),
+                ),
+            )
+            .await
+            .unwrap();
+
+        let url = output
+            .output
+            .lines()
+            .next()
+            .unwrap()
+            .split('(')
+            .nth(1)
+            .unwrap()
+            .trim_end_matches(')')
+            .to_string();
+        let body = reqwest::get(&url).await.unwrap().text().await.unwrap();
+        assert!(body.contains("hello"), "{body}");
+
+        if let Some(server) = repl.artifact_server.take() {
+            server.shutdown().await;
+        }
     }
 
     #[tokio::test]

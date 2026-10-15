@@ -17,8 +17,10 @@ pub mod db;
 pub mod limits;
 pub mod markers;
 pub mod server;
+pub mod service;
 pub mod slug;
 pub mod store;
+pub mod tool;
 
 pub use db::{ArtifactDb, BatchEntry, BatchOutcome, DbError, Document, Page as DbPage, Write};
 pub use limits::{
@@ -27,8 +29,10 @@ pub use limits::{
 };
 pub use markers::{Marker, attached_marker, deleted_marker, parse_markers};
 pub use server::ArtifactServer;
+pub use service::{ArtifactService, Comment, VerifyReport};
 pub use slug::{ArtifactUrl, Slug, parse_artifact_url};
 pub use store::{ArtifactStore, ENTRY_FILE, Manifest, Page, StoreError, Version};
+pub use tool::{ARTIFACT_TOOL, ArtifactTool, ArtifactTools, CHECK_TOOL, COMMENTS_TOOL, DATA_TOOL};
 
 /// The viewer origin used when none is configured.
 pub const DEFAULT_ORIGIN: &str = "http://127.0.0.1:8722";

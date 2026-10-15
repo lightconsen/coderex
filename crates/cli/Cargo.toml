@@ -38,6 +38,7 @@ coderex-commands = { path = "../commands" }
 coderex-hooks = { path = "../hooks" }
 coderex-memory = { path = "../memory" }
 coderex-mcp = { path = "../mcp" }
+coderex-artifacts = { path = "../artifacts" }
 coderex-plugins = { path = "../plugins" }
 coderex-bridge = { path = "../bridge" }
 coderex-server = { path = "../server" }
