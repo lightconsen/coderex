@@ -242,7 +242,31 @@ impl PermissionEngine {
             checker.check(tool_name, path_ref)
         };
 
-        // Phase 2.5: privilege escalation
+        // Phase 2.5: shell security analysis
+        //
+        // The checker sees only the tool name and path. Enrich its generic
+        // approval reason with the parsed command's destructive behavior, and
+        // inspect every stage of a compound command rather than just the first.
+        let shell_analysis = shell_security_in(tool_name, &request.arguments);
+        let result = match result {
+            PermissionResult::Ask { reason } => {
+                let reason = shell_analysis
+                    .as_ref()
+                    .filter(|ast| ast.needs_warning())
+                    .map_or(reason, crate::shell_security::BashAst::summary);
+                PermissionResult::Ask { reason }
+            }
+            PermissionResult::AskForSession { reason } => {
+                let reason = shell_analysis
+                    .as_ref()
+                    .filter(|ast| ast.needs_warning())
+                    .map_or(reason, crate::shell_security::BashAst::summary);
+                PermissionResult::AskForSession { reason }
+            }
+            other => other,
+        };
+
+        // Phase 2.6: privilege escalation
         //
         // A command that runs as another user is a different question from
         // "allow this command?": approving it once still runs it as the caller,
@@ -553,10 +577,19 @@ impl PermissionHook for AutoClassifierHook {
                     classification = %classification,
                     "auto-classifier result"
                 );
-                if classification.contains("safe") {
-                    Ok(Some(PermissionResult::Allow))
+                if classification == "safe" {
+                    // Model classification is advisory, never proof. A static
+                    // parse that finds destructive behavior wins over a model
+                    // saying the same command is safe (or merely "unsafe").
+                    if shell_security_in(&request.tool_name, &request.arguments)
+                        .is_some_and(|ast| ast.is_dangerous())
+                    {
+                        Ok(None)
+                    } else {
+                        Ok(Some(PermissionResult::Allow))
+                    }
                 } else {
-                    // caution or dangerous → fall through to checker
+                    // caution, dangerous, or an unexpected answer → fall through
                     Ok(None)
                 }
             }
@@ -569,11 +602,10 @@ impl PermissionHook for AutoClassifierHook {
     }
 }
 
-/// The privilege-changing program in a shell tool call, if any.
+/// Parse the shell command carried by a shell tool call, if present.
 ///
-/// Only shell tools carry a command to inspect; every other tool has no
-/// privilege question to answer.
-fn privilege_escalation_in(tool_name: &str, arguments: &str) -> Option<String> {
+/// Tool arguments in any other tool are data, not a command to analyze.
+fn shell_security_in(tool_name: &str, arguments: &str) -> Option<crate::shell_security::BashAst> {
     if !tool_name.eq_ignore_ascii_case("bash") && !tool_name.eq_ignore_ascii_case("powershell") {
         return None;
     }
@@ -582,7 +614,18 @@ fn privilege_escalation_in(tool_name: &str, arguments: &str) -> Option<String> {
         .get("command")
         .or_else(|| parsed.get("cmd"))
         .and_then(serde_json::Value::as_str)?;
-    crate::shell_security::BashAst::parse(command).privilege_escalation()
+    Some(crate::shell_security::BashAst::parse(command))
+}
+
+/// The privilege-changing program in a shell tool call, if any.
+///
+/// Only shell tools carry a command to inspect; every other tool has no
+/// privilege question to answer.
+fn privilege_escalation_in(tool_name: &str, arguments: &str) -> Option<String> {
+    if !tool_name.eq_ignore_ascii_case("bash") && !tool_name.eq_ignore_ascii_case("powershell") {
+        return None;
+    }
+    shell_security_in(tool_name, arguments)?.privilege_escalation()
 }
 
 #[cfg(test)]
@@ -1143,6 +1186,91 @@ mod tests {
         assert!(
             !matches!(result, PermissionResult::Elevated { .. }),
             "only shell tools can elevate, got {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn shell_analysis_enriches_approval_reason_and_covers_sequences() {
+        let mut engine = PermissionEngine::new(PermissionChecker::new(PermissionMode::Default));
+        let (_request, result) = engine
+            .evaluate(
+                "bash",
+                serde_json::json!({ "command": "echo ok && rm -f /tmp/x" }).to_string(),
+                None,
+                HashMap::new(),
+            )
+            .await
+            .unwrap();
+        match result {
+            PermissionResult::Ask { reason } => {
+                assert!(reason.contains("Dangerous"), "{reason}");
+                assert!(reason.contains("rm -f"), "{reason}");
+            }
+            other => panic!("expected Ask, got {other:?}"),
+        }
+    }
+
+    #[derive(Clone)]
+    struct StaticClassifier(&'static str);
+
+    #[async_trait]
+    impl crate::api_client::ApiClient for StaticClassifier {
+        fn clone_box(&self) -> Box<dyn crate::api_client::ApiClient> {
+            Box::new(self.clone())
+        }
+
+        async fn create_message(
+            &self,
+            _system: &str,
+            _messages: &[serde_json::Value],
+            _model: &crate::types::ModelId,
+            _max_tokens: u32,
+            _tools: &[crate::tool_executor::ToolInfo],
+        ) -> Result<crate::api_client::ApiResponse, crate::api_client::ApiError> {
+            Ok(crate::api_client::ApiResponse {
+                content: self.0.into(),
+                tool_calls: Vec::new(),
+                usage: crate::types::UsageSummary {
+                    input_tokens: 1,
+                    output_tokens: 1,
+                    cache_read_tokens: 0,
+                    cache_creation_tokens: 0,
+                },
+                stop_reason: "end_turn".into(),
+            })
+        }
+
+        async fn create_message_streaming(
+            &self,
+            _system: &str,
+            _messages: &[serde_json::Value],
+            _model: &crate::types::ModelId,
+            _max_tokens: u32,
+            _tools: &[crate::tool_executor::ToolInfo],
+        ) -> std::pin::Pin<
+            Box<dyn futures::Stream<Item = crate::api_client::StreamEvent> + Send + 'static>,
+        > {
+            Box::pin(futures::stream::empty())
+        }
+    }
+
+    #[tokio::test]
+    async fn auto_classifier_cannot_override_dangerous_shell_analysis() {
+        let hook = AutoClassifierHook::new(Box::new(StaticClassifier("safe")));
+        let mut request = make_request("bash");
+        request.arguments = serde_json::json!({ "command": "rm -rf /tmp/x" }).to_string();
+        let result = hook.evaluate(&request, PermissionMode::Auto).await.unwrap();
+        assert!(result.is_none(), "static danger must beat a safe verdict");
+    }
+
+    #[tokio::test]
+    async fn auto_classifier_does_not_treat_unsafe_as_safe() {
+        let hook = AutoClassifierHook::new(Box::new(StaticClassifier("unsafe")));
+        let request = make_request("read");
+        let result = hook.evaluate(&request, PermissionMode::Auto).await.unwrap();
+        assert!(
+            result.is_none(),
+            "the substring 'safe' must not be a verdict"
         );
     }
 }

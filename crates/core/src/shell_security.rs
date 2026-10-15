@@ -187,8 +187,9 @@ fn split_stages(command: &str) -> Vec<String> {
     let mut stages = Vec::new();
     let mut current = String::new();
     let mut in_quote: Option<char> = None;
+    let mut chars = command.chars().peekable();
 
-    for ch in command.chars() {
+    while let Some(ch) = chars.next() {
         match ch {
             '\'' | '"' if in_quote == Some(ch) => {
                 in_quote = None;
@@ -199,6 +200,16 @@ fn split_stages(command: &str) -> Vec<String> {
                 current.push(ch);
             }
             '|' if in_quote.is_none() => {
+                // A single pipe is a pipeline; `||` is a sequence separator.
+                // Both boundaries must be checked for destructive commands.
+                if chars.peek() == Some(&'|') {
+                    chars.next();
+                }
+                stages.push(current.trim().to_string());
+                current.clear();
+            }
+            '&' if in_quote.is_none() && chars.peek() == Some(&'&') => {
+                chars.next();
                 stages.push(current.trim().to_string());
                 current.clear();
             }
@@ -580,5 +591,27 @@ mod tests {
 
         let ast = BashAst::parse("rm -rf /tmp");
         assert!(ast.summary().starts_with("Dangerous:"));
+    }
+
+    #[test]
+    fn and_or_sequences_are_each_classified() {
+        let ast = BashAst::parse("echo ok && rm -f first || rm -f second");
+        assert_eq!(ast.commands.len(), 3);
+        assert!(ast.is_dangerous());
+        assert_eq!(ast.commands[1].program, "rm");
+        assert_eq!(ast.commands[2].program, "rm");
+    }
+
+    #[test]
+    fn quoted_and_or_stays_inside_one_command() {
+        let ast = BashAst::parse("echo 'a && b || c'");
+        assert_eq!(ast.commands.len(), 1);
+        assert!(!ast.is_dangerous());
+    }
+
+    #[test]
+    fn fd_merge_is_not_split_as_and() {
+        let ast = BashAst::parse("echo ok 2>&1");
+        assert_eq!(ast.commands.len(), 1);
     }
 }
