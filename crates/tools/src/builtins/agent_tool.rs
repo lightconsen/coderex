@@ -20,7 +20,7 @@ impl Default for AgentTool {
 }
 
 impl AgentTool {
-    /// Create a new AgentTool without a manager (returns stub output).
+    /// Create a new AgentTool without a manager; execution reports that delegation is unavailable.
     #[must_use]
     pub fn new() -> Self {
         Self {

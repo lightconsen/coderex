@@ -40,7 +40,7 @@ async fn agent_general_purpose_spawns_and_completes() {
         .await
         .unwrap();
 
-    assert_eq!(instance.status, AgentStatus::Completed);
+    assert_eq!(instance.status(), AgentStatus::Completed);
     assert!(instance.context.is_some());
     let ctx = instance.context.as_ref().unwrap();
     assert_eq!(ctx.parent_session_id, "sess_001");
@@ -72,7 +72,7 @@ async fn agent_explore_quick_thoroughness() {
         .unwrap();
 
     assert!(instance.prompt.contains("quick scan"));
-    assert_eq!(instance.status, AgentStatus::Completed);
+    assert_eq!(instance.status(), AgentStatus::Completed);
 }
 
 #[tokio::test]
@@ -142,7 +142,7 @@ async fn agent_plan_produces_implementation_plan() {
 
     assert!(instance.prompt.contains("planning agent"));
     assert!(instance.prompt.contains("implementation plans"));
-    assert_eq!(instance.status, AgentStatus::Completed);
+    assert_eq!(instance.status(), AgentStatus::Completed);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -173,7 +173,7 @@ async fn agent_background_spawn_returns_immediately() {
     // spawn_agent should return quickly (< 1s) even for background tasks
     assert!(start.elapsed() < std::time::Duration::from_secs(1));
     // In test mode without API client, the agent completes immediately
-    assert_eq!(instance.status, AgentStatus::Completed);
+    assert_eq!(instance.status(), AgentStatus::Completed);
     assert!(instance.options.run_in_background);
 }
 
@@ -360,7 +360,7 @@ async fn agent_stop_agent_changes_status() {
     let agent_id = mgr.list_agents()[0].task_handle.id.clone();
     mgr.stop_agent(&agent_id).await.unwrap();
 
-    assert_eq!(mgr.list_agents()[0].status, AgentStatus::Stopped);
+    assert_eq!(mgr.list_agents()[0].status(), AgentStatus::Stopped);
 }
 
 #[tokio::test]
@@ -413,7 +413,7 @@ async fn agent_verification_type_spawns() {
         .unwrap();
 
     assert!(instance.prompt.contains("verification agent"));
-    assert_eq!(instance.status, AgentStatus::Completed);
+    assert_eq!(instance.status(), AgentStatus::Completed);
 }
 
 #[tokio::test]
@@ -457,7 +457,7 @@ async fn agent_claude_code_guide_type_spawns() {
         .unwrap();
 
     assert!(instance.prompt.contains("Claude Code"));
-    assert_eq!(instance.status, AgentStatus::Completed);
+    assert_eq!(instance.status(), AgentStatus::Completed);
 }
 
 #[tokio::test]
@@ -478,7 +478,7 @@ async fn agent_statusline_setup_type_spawns() {
         .unwrap();
 
     assert!(instance.prompt.contains("status line"));
-    assert_eq!(instance.status, AgentStatus::Completed);
+    assert_eq!(instance.status(), AgentStatus::Completed);
 }
 
 #[tokio::test]

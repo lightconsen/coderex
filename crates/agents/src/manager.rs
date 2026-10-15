@@ -4,6 +4,8 @@
 //! tool whitelisting, messaging, resume support, and teammate events.
 
 use coderex_core::api_client::ApiClient;
+use coderex_core::confirmation_bus::ConfirmationBus;
+use coderex_core::elicitation::SdkElicitationHandler;
 use coderex_core::engine::{
     QueryEngine, StructuredOutputValidator, SubmitOptions, ValidationResult,
 };
@@ -24,7 +26,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 use thiserror::Error;
-use tokio::sync::{Mutex, Notify, broadcast, mpsc};
+use tokio::sync::{Mutex, broadcast, mpsc, watch};
 
 use crate::types::AgentType;
 
@@ -249,8 +251,10 @@ pub struct AgentInstance {
     pub options: SpawnOptions,
     /// Task handle for lifecycle tracking.
     pub task_handle: TaskHandle,
-    /// Agent current status.
-    pub status: AgentStatus,
+    /// Shared status channel, updated when the background task finishes.
+    status_tx: watch::Sender<AgentStatus>,
+    /// Receivers retain the latest status, so waiters cannot miss completion.
+    status_rx: watch::Receiver<AgentStatus>,
     /// Forked context from parent session.
     pub context: Option<ForkedContext>,
     /// Message channel to the agent.
@@ -263,8 +267,6 @@ pub struct AgentInstance {
     pub prompt: String,
     /// Background task handle for the running agent.
     pub task_join_handle: Option<tokio::task::JoinHandle<()>>,
-    /// Notification for synchronous waiters.
-    pub completion_notify: Option<Arc<Notify>>,
 }
 
 impl AgentInstance {
@@ -272,19 +274,26 @@ impl AgentInstance {
     #[must_use]
     pub fn new(agent_type: AgentType, options: SpawnOptions, task_handle: TaskHandle) -> Self {
         let model = options.model_override.clone();
+        let (status_tx, status_rx) = watch::channel(AgentStatus::Starting);
         Self {
             agent_type,
             options,
             task_handle,
-            status: AgentStatus::Starting,
+            status_tx,
+            status_rx,
             context: None,
             message_tx: None,
             output_file: None,
             model,
             prompt: String::new(),
             task_join_handle: None,
-            completion_notify: None,
         }
+    }
+
+    /// Return the latest lifecycle status, including background completion.
+    #[must_use]
+    pub fn status(&self) -> AgentStatus {
+        *self.status_rx.borrow()
     }
 }
 
@@ -314,6 +323,10 @@ pub enum TeammateEvent {
 /// Callback for receiving teammate events.
 pub type TeammateEventCallback = Box<dyn Fn(TeammateEvent) + Send + Sync + 'static>;
 
+/// Factory used to build an isolated tool executor for one sub-agent.
+type ToolExecutorFactory =
+    dyn Fn(PathBuf, Option<SandboxConfig>) -> Box<dyn ToolExecutor + Send + Sync> + Send + Sync;
+
 // ─── AgentManager ───────────────────────────────────────────────────────────
 
 /// Manages the lifecycle of sub-agents.
@@ -335,13 +348,17 @@ pub struct AgentManager {
     resumed_agents: Vec<String>,
     /// API client for forked/background AI execution.
     api_client: Option<Box<dyn ApiClient>>,
+    /// Default model inherited from the parent session.
+    model: ModelId,
     /// Event sender for forwarding agent events to the parent engine.
     event_tx: Option<mpsc::UnboundedSender<EngineEvent>>,
+    /// Parent permission state, sampled whenever a new agent starts.
+    permission_checker: Option<Arc<std::sync::Mutex<PermissionChecker>>>,
+    /// Interactive channel shared with the parent frontend.
+    confirmation_bus: Option<ConfirmationBus>,
     /// Factory for creating tool executors for spawned agents.
-    /// The optional `SandboxConfig` allows per-agent sandbox overrides.
-    tool_executor_factory: Option<
-        Arc<dyn Fn(Option<SandboxConfig>) -> Box<dyn ToolExecutor + Send + Sync> + Send + Sync>,
-    >,
+    /// The factory receives the agent working directory and optional sandbox override.
+    tool_executor_factory: Option<Arc<ToolExecutorFactory>>,
     /// Broadcast channel for agent observable events.
     agent_event_broadcast: Option<broadcast::Sender<AgentObservableEvent>>,
     /// Custom agent definitions loaded from config files.
@@ -363,15 +380,19 @@ impl AgentManager {
     /// Create a new AgentManager with the given task manager.
     #[must_use]
     pub fn new(task_manager: Arc<Mutex<TaskManager>>) -> Self {
+        let (agent_event_broadcast, _) = broadcast::channel(256);
         Self {
             task_manager,
             agents: HashMap::new(),
             event_callback: None,
             resumed_agents: Vec::new(),
             api_client: None,
+            model: ModelId::sonnet(),
             event_tx: None,
+            permission_checker: None,
+            confirmation_bus: None,
             tool_executor_factory: None,
-            agent_event_broadcast: None,
+            agent_event_broadcast: Some(agent_event_broadcast),
             custom_agents: crate::custom_agents::load_custom_agents(),
             test_mode: false,
         }
@@ -388,6 +409,11 @@ impl AgentManager {
         self.api_client = Some(client);
     }
 
+    /// Set the default model used when an agent has no explicit override.
+    pub fn set_model(&mut self, model: ModelId) {
+        self.model = model;
+    }
+
     /// Set the callback for teammate events.
     pub fn set_event_callback<F>(&mut self, callback: F)
     where
@@ -401,6 +427,16 @@ impl AgentManager {
         self.event_tx = Some(tx);
     }
 
+    /// Inherit the parent's current permission mode for each new agent.
+    pub fn set_permission_checker(&mut self, checker: Arc<std::sync::Mutex<PermissionChecker>>) {
+        self.permission_checker = Some(checker);
+    }
+
+    /// Route sub-agent approval prompts through the parent's frontend.
+    pub fn set_confirmation_bus(&mut self, bus: ConfirmationBus) {
+        self.confirmation_bus = Some(bus);
+    }
+
     /// Set the tool executor factory for spawned agents.
     ///
     /// Since `coderex-agents` cannot depend on `coderex-tools`, the caller
@@ -408,7 +444,10 @@ impl AgentManager {
     /// `ToolExecutor` implementation such as `RegistryToolDispatcher`.
     pub fn set_tool_executor_factory<F>(&mut self, factory: F)
     where
-        F: Fn(Option<SandboxConfig>) -> Box<dyn ToolExecutor + Send + Sync> + Send + Sync + 'static,
+        F: Fn(PathBuf, Option<SandboxConfig>) -> Box<dyn ToolExecutor + Send + Sync>
+            + Send
+            + Sync
+            + 'static,
     {
         self.tool_executor_factory = Some(Arc::new(factory));
     }
@@ -430,52 +469,40 @@ impl AgentManager {
 
     /// Wait for an agent to complete (synchronous execution).
     pub async fn wait_for_completion(&self, agent_id: &str) -> Result<AgentResult, AgentError> {
-        let agent = self
-            .agents
-            .get(agent_id)
-            .ok_or_else(|| AgentError::NotFound(agent_id.to_string()))?;
+        let (mut status_rx, output_file) = {
+            let agent = self
+                .agents
+                .get(agent_id)
+                .ok_or_else(|| AgentError::NotFound(agent_id.to_string()))?;
+            (agent.status_rx.clone(), agent.output_file.clone())
+        };
 
-        // If already in a terminal state, return immediately.
-        // This avoids a race where notify_waiters() fires before notified().await.
-        match agent.status {
-            AgentStatus::Completed | AgentStatus::Failed | AgentStatus::Stopped => {
-                let output = if let Some(ref path) = agent.output_file {
+        loop {
+            let status = *status_rx.borrow();
+            if matches!(
+                status,
+                AgentStatus::Completed | AgentStatus::Failed | AgentStatus::Stopped
+            ) {
+                let output = if let Some(ref path) = output_file {
                     tokio::fs::read_to_string(path).await.unwrap_or_default()
                 } else {
                     String::new()
                 };
-                let token_usage = Self::read_token_usage(agent.output_file.as_ref()).await;
+                let token_usage = Self::read_token_usage(output_file.as_ref()).await;
                 return Ok(AgentResult {
                     output,
-                    status: agent.status,
+                    status,
                     token_usage,
                 });
             }
-            _ => {}
+
+            // `watch` retains the terminal value. Even if the agent finished
+            // between the status read and this await, `changed()` returns
+            // immediately instead of losing the completion notification.
+            status_rx.changed().await.map_err(|_| {
+                AgentError::ChannelClosed(format!("agent {agent_id} stopped without a status"))
+            })?;
         }
-
-        if let Some(ref notify) = agent.completion_notify {
-            notify.notified().await;
-        }
-
-        let agent = self
-            .agents
-            .get(agent_id)
-            .ok_or_else(|| AgentError::NotFound(agent_id.to_string()))?;
-
-        let output = if let Some(ref path) = agent.output_file {
-            tokio::fs::read_to_string(path).await.unwrap_or_default()
-        } else {
-            String::new()
-        };
-
-        let token_usage = Self::read_token_usage(agent.output_file.as_ref()).await;
-
-        Ok(AgentResult {
-            output,
-            status: agent.status,
-            token_usage,
-        })
     }
 
     /// Read token usage from the companion `.meta.json` file for an agent.
@@ -555,11 +582,25 @@ impl AgentManager {
         // Set up message channel
         let (msg_tx, mut msg_rx) = mpsc::unbounded_channel::<AgentMessage>();
 
-        // Create output file path
+        // Create output file path. Keep agent artifacts out of the project
+        // unless the caller explicitly chose a working directory override.
         let output_file = options.cwd.as_ref().map_or_else(
-            || PathBuf::from(format!("/tmp/agent-{task_id}-output.txt")),
+            || {
+                std::env::temp_dir()
+                    .join("coderex-agents")
+                    .join(format!("agent-{task_id}-output.txt"))
+            },
             |d| d.join(format!("agent-{task_id}-output.txt")),
         );
+
+        if let Some(parent) = output_file.parent() {
+            tokio::fs::create_dir_all(parent).await.map_err(|error| {
+                AgentError::SpawnFailed(format!(
+                    "could not create agent output directory {}: {error}",
+                    parent.display()
+                ))
+            })?;
+        }
 
         let agent_type_name_str = agent_type_name(&agent_type);
         let system_prompt = system_prompt_for(&agent_type, prompt, &self.custom_agents);
@@ -586,19 +627,21 @@ impl AgentManager {
             }
         }
 
-        // Completion notification for synchronous waits
-        let completion_notify = Arc::new(Notify::new());
-        let completion_notify_for_task = Arc::clone(&completion_notify);
-
         let mut instance = AgentInstance::new(agent_type, options.clone(), task_handle);
         instance.context = Some(context);
         instance.message_tx = Some(msg_tx);
         instance.output_file = Some(output_file.clone());
-        instance.status = AgentStatus::Running;
+        let _ = instance.status_tx.send(AgentStatus::Running);
         instance.prompt = system_prompt.clone();
-        instance.completion_notify = Some(Arc::clone(&completion_notify));
 
         let agent_id = task_id.clone();
+        let working_directory = options.cwd.clone().unwrap_or_else(|| PathBuf::from(cwd));
+        let permission_mode = self
+            .permission_checker
+            .as_ref()
+            .map_or_else(PermissionMode::default, |checker| {
+                checker.lock().unwrap().mode()
+            });
 
         if let Some(ref api_client) = self.api_client {
             let client = api_client.clone_box();
@@ -606,7 +649,7 @@ impl AgentManager {
                 .model_override
                 .as_ref()
                 .map(|m| ModelId(m.clone()))
-                .unwrap_or_else(ModelId::sonnet);
+                .unwrap_or_else(|| self.model.clone());
             let max_tokens = options.max_tokens.unwrap_or(4096);
             let max_duration = options.max_duration_seconds.unwrap_or(600);
             let max_turns = options.max_turns.unwrap_or(50);
@@ -621,6 +664,10 @@ impl AgentManager {
             let event_tx = self.event_tx.clone();
             let tool_factory = self.tool_executor_factory.clone();
             let broadcast_tx = self.agent_event_broadcast.clone();
+            let confirmation_bus = self.confirmation_bus.clone();
+            let status_tx = instance.status_tx.clone();
+            let task_manager_for_task = Arc::clone(&self.task_manager);
+            let task_id_for_completion = agent_id.clone();
 
             let handle = tokio::spawn(async move {
                 let result = run_agent_task(
@@ -628,6 +675,9 @@ impl AgentManager {
                     model,
                     system_prompt,
                     user_prompt,
+                    working_directory,
+                    permission_mode,
+                    confirmation_bus,
                     max_tokens,
                     max_duration,
                     max_turns,
@@ -645,23 +695,34 @@ impl AgentManager {
                 )
                 .await;
 
-                // Write result to output file
-                if let Ok(ref result) = result {
-                    let _ = tokio::fs::write(&output_file, &result.output).await;
+                match &result {
+                    Ok(agent_result) => {
+                        let _ = status_tx.send(agent_result.status);
+                        let mut task_manager = task_manager_for_task.lock().await;
+                        if agent_result.status == AgentStatus::Completed {
+                            let _ = task_manager.mark_completed(&task_id_for_completion, Some(0));
+                        } else {
+                            let _ = task_manager.mark_failed(
+                                &task_id_for_completion,
+                                "agent execution failed".to_string(),
+                            );
+                        }
+                    }
+                    Err(error) => {
+                        let _ = status_tx.send(AgentStatus::Failed);
+                        let mut task_manager = task_manager_for_task.lock().await;
+                        let _ =
+                            task_manager.mark_failed(&task_id_for_completion, error.to_string());
+                    }
                 }
-
-                completion_notify_for_task.notify_waiters();
             });
 
             instance.task_join_handle = Some(handle);
         } else if cfg!(test) || self.test_mode {
             // Test convenience: write placeholder and complete immediately
-            let placeholder = format!(
-                "agent completed (no API client configured, no output file)\n\nAgent task: {prompt}"
-            );
+            let placeholder = format!("agent completed (test mode)\n\nAgent task: {prompt}");
             let _ = tokio::fs::write(&output_file, &placeholder).await;
-            instance.status = AgentStatus::Completed;
-            completion_notify.notify_waiters();
+            let _ = instance.status_tx.send(AgentStatus::Completed);
         } else {
             return Err(AgentError::Configuration(
                 "AgentManager requires an API client to spawn agents. \
@@ -695,7 +756,7 @@ impl AgentManager {
             .get(agent_id)
             .ok_or_else(|| AgentError::NotFound(agent_id.to_string()))?;
 
-        if agent.status != AgentStatus::Running {
+        if agent.status() != AgentStatus::Running {
             return Err(AgentError::NotRunning(agent_id.to_string()));
         }
 
@@ -731,7 +792,7 @@ impl AgentManager {
         let _ = task_manager.mark_completed(agent_id, Some(0));
         drop(task_manager);
 
-        instance.status = AgentStatus::Completed;
+        let _ = instance.status_tx.send(AgentStatus::Completed);
 
         // Emit teammate event
         self.emit_event(TeammateEvent::TaskCompleted {
@@ -768,7 +829,7 @@ impl AgentManager {
         let _ = task_manager.stop_task(agent_id);
         drop(task_manager);
 
-        instance.status = AgentStatus::Stopped;
+        let _ = instance.status_tx.send(AgentStatus::Stopped);
 
         Ok(())
     }
@@ -784,7 +845,7 @@ impl AgentManager {
     pub fn running_count(&self) -> usize {
         self.agents
             .values()
-            .filter(|a| a.status == AgentStatus::Running)
+            .filter(|a| a.status() == AgentStatus::Running)
             .count()
     }
 
@@ -823,7 +884,7 @@ impl AgentManager {
         let mut instance = AgentInstance::new(agent_type, options, task_handle);
         instance.context = Some(context);
         instance.message_tx = Some(msg_tx);
-        instance.status = AgentStatus::Running;
+        let _ = instance.status_tx.send(AgentStatus::Running);
 
         self.agents.insert(agent_id.to_string(), instance);
         self.resumed_agents.push(agent_id.to_string());
@@ -951,6 +1012,9 @@ async fn run_agent_task(
     model: ModelId,
     system_prompt: String,
     user_prompt: String,
+    working_directory: PathBuf,
+    permission_mode: PermissionMode,
+    confirmation_bus: Option<ConfirmationBus>,
     max_tokens: u32,
     max_duration: u64,
     max_turns: u32,
@@ -960,9 +1024,7 @@ async fn run_agent_task(
     output_file: PathBuf,
     agent_id: String,
     parent_event_tx: Option<mpsc::UnboundedSender<EngineEvent>>,
-    tool_factory: Option<
-        Arc<dyn Fn(Option<SandboxConfig>) -> Box<dyn ToolExecutor + Send + Sync> + Send + Sync>,
-    >,
+    tool_factory: Option<Arc<ToolExecutorFactory>>,
     broadcast_tx: Option<broadcast::Sender<AgentObservableEvent>>,
     retry_policy: Option<RetryPolicy>,
     output_schema: Option<serde_json::Value>,
@@ -1004,9 +1066,8 @@ async fn run_agent_task(
             attempt_prompt.push_str(&format!("\n\n[Message from parent]: {}", msg.content));
         }
 
-        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-        let session = SessionState::new(cwd);
-        let checker = PermissionChecker::new(PermissionMode::default());
+        let session = SessionState::new(working_directory.clone());
+        let checker = PermissionChecker::new(permission_mode);
         let permission_engine = PermissionEngine::new(checker);
 
         let (event_tx, mut event_rx) = mpsc::unbounded_channel::<EngineEvent>();
@@ -1019,8 +1080,15 @@ async fn run_agent_task(
             event_tx,
         );
 
+        // A sub-agent must never read from the parent's terminal directly.
+        // Interactive questions use the parent's structured channels instead.
+        engine.set_elicitation_handler(Box::new(SdkElicitationHandler::default()));
+        if let Some(bus) = confirmation_bus.clone() {
+            engine.set_confirmation_bus(bus);
+        }
+
         if let Some(ref factory) = tool_factory {
-            engine.set_tool_executor(factory(sandbox_config.clone()));
+            engine.set_tool_executor(factory(working_directory.clone(), sandbox_config.clone()));
         }
 
         let mut options = SubmitOptions::default();
@@ -1361,7 +1429,7 @@ mod tests {
             .unwrap();
 
         // Without an API client the agent completes immediately.
-        assert_eq!(instance.status, AgentStatus::Completed);
+        assert_eq!(instance.status(), AgentStatus::Completed);
         assert!(instance.context.is_some());
         let ctx = instance.context.as_ref().unwrap();
         assert_eq!(ctx.parent_session_id, "sess_1");
@@ -1449,7 +1517,7 @@ mod tests {
             .unwrap();
 
         assert!(event_received.load(std::sync::atomic::Ordering::SeqCst));
-        assert_eq!(mgr.list_agents()[0].status, AgentStatus::Completed);
+        assert_eq!(mgr.list_agents()[0].status(), AgentStatus::Completed);
     }
 
     #[tokio::test]
@@ -1498,7 +1566,7 @@ mod tests {
         let agent_id = mgr.list_agents()[0].task_handle.id.clone();
         mgr.stop_agent(&agent_id).await.unwrap();
 
-        assert_eq!(mgr.list_agents()[0].status, AgentStatus::Stopped);
+        assert_eq!(mgr.list_agents()[0].status(), AgentStatus::Stopped);
     }
 
     #[tokio::test]

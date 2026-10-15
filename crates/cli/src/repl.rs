@@ -2,6 +2,7 @@
 
 use crate::session_resume;
 use anyhow::Result;
+use coderex_agents::manager::AgentManager;
 use coderex_commands::registry::{CommandContext, CommandRegistry, CommandResult};
 use coderex_commands::{CommandHistory, MacroRegistry};
 use coderex_core::api_client::ApiClient;
@@ -29,7 +30,7 @@ use coderex_memory::{
 };
 use coderex_sdk::{SdkEvent, SdkSession};
 use coderex_tools::{
-    ChromeClient, CronScheduler, ExecutionConfig, ExecutionContext, RateLimiter,
+    AgentTool, ChromeClient, CronScheduler, ExecutionConfig, ExecutionContext, RateLimiter,
     RegistryToolDispatcher, TaskStore, ToolExecutor as ToolsExecutor, ToolRegistry,
     register_builtin_tools,
 };
@@ -494,6 +495,8 @@ pub struct ReplLoop {
         Option<Arc<dyn coderex_core::tool_executor::ToolExecutor + Send + Sync>>,
     /// Dispatcher reference for setting per-turn state (e.g., elicitation channel).
     dispatcher: Option<Arc<RegistryToolDispatcher>>,
+    /// Sub-agent lifecycle manager shared with the registered Agent tool.
+    agent_manager: Option<Arc<tokio::sync::Mutex<AgentManager>>>,
     /// Pending elicitation response sender — when set, user input is treated as an answer.
     pending_elicitation: Option<tokio::sync::oneshot::Sender<serde_json::Value>>,
     /// Confirmation bus for interactive permission requests.
@@ -649,6 +652,7 @@ impl ReplLoop {
             plugin_manager: None,
             _primary_tool_executor: None,
             dispatcher: None,
+            agent_manager: None,
             pending_elicitation: None,
             confirmation_bus: None,
             cron_rx: None,
@@ -731,7 +735,7 @@ impl ReplLoop {
             model.clone(),
             session,
             permission_engine,
-            event_tx,
+            event_tx.clone(),
         );
 
         let mut engine = engine;
@@ -741,8 +745,41 @@ impl ReplLoop {
                 &session_memory_store,
             )),
         ));
+
+        let mut agent_manager = AgentManager::standalone();
+        agent_manager.set_api_client(api_client.clone_box());
+        agent_manager.set_model(model.clone());
+        agent_manager.set_event_sender(event_tx);
+        agent_manager.set_permission_checker(engine.permission_checker());
+        agent_manager.set_tool_executor_factory(|cwd, sandbox| {
+            let mut registry = ToolRegistry::new();
+            register_builtin_tools(&mut registry);
+            let executor = Arc::new(ToolsExecutor::new(ExecutionConfig::default()));
+            let mut dispatcher = RegistryToolDispatcher::new(
+                Arc::new(registry),
+                executor,
+                ExecutionContext::Normal,
+                cwd,
+            );
+            dispatcher.set_sandbox_override(sandbox);
+            dispatcher.set_rate_limiter(Arc::new(RateLimiter::new()));
+            dispatcher.set_chrome_client(ChromeClient::new());
+            // The child registry intentionally has no nested AgentManager. A
+            // synchronous parent holds its manager while waiting, so nesting
+            // through that same manager could deadlock; the built-in Agent
+            // tool instead reports that nested delegation is unavailable.
+            Box::new(dispatcher)
+        });
+        let agent_manager = Arc::new(tokio::sync::Mutex::new(agent_manager));
+
         let mut registry = ToolRegistry::new();
         register_builtin_tools(&mut registry);
+        registry.register(Arc::new(
+            AgentTool::new()
+                .with_manager(Arc::clone(&agent_manager))
+                .with_session_id(session_id.to_string())
+                .with_cwd(cwd.clone()),
+        ));
         let registry = Arc::new(registry);
         let inner_executor = Arc::new(ToolsExecutor::new(ExecutionConfig::default()));
         let mut dispatcher = RegistryToolDispatcher::new(
@@ -817,6 +854,7 @@ impl ReplLoop {
             plugin_manager: None,
             _primary_tool_executor: Some(primary_executor),
             dispatcher: Some(dispatcher),
+            agent_manager: Some(agent_manager),
             pending_elicitation: None,
             confirmation_bus: Some(confirmation_bus),
             cron_rx: Some(cron_rx),
@@ -1429,6 +1467,9 @@ impl ReplLoop {
         let mut confirmation_rx = if let Some(bus) = self.confirmation_bus.clone() {
             if let Some(engine) = self.engine.as_mut() {
                 engine.set_confirmation_bus(bus.clone());
+            }
+            if let Some(manager) = self.agent_manager.as_ref() {
+                manager.lock().await.set_confirmation_bus(bus.clone());
             }
             let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<ConfirmationRequest>();
             tokio::spawn(async move {
@@ -4686,10 +4727,11 @@ pub fn parse_input(line: &str) -> Option<(&str, Vec<String>)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use coderex_core::api_client::{ApiError, ApiResponse, StreamEvent};
     use coderex_core::tool_executor::{
         ToolDispatchOutcome, ToolExecutor as CoreToolExecutor, ToolInfo,
     };
-    use coderex_core::types::ToolResult;
+    use coderex_core::types::{ToolResult, UsageSummary};
 
     #[derive(Clone)]
     struct StubToolExecutor {
@@ -4739,6 +4781,80 @@ mod tests {
                     is_error: self.is_error,
                 },
             }
+        }
+    }
+
+    /// Two-turn API double: the sub-agent must read `note.txt` with the real
+    /// tool dispatcher before it can produce the successful final answer.
+    #[derive(Clone)]
+    struct ReadThenAnswerApi {
+        call: Arc<std::sync::Mutex<usize>>,
+        expected_contents: &'static str,
+    }
+
+    #[async_trait::async_trait]
+    impl ApiClient for ReadThenAnswerApi {
+        fn clone_box(&self) -> Box<dyn ApiClient> {
+            Box::new(self.clone())
+        }
+
+        async fn create_message(
+            &self,
+            _system: &str,
+            messages: &[serde_json::Value],
+            _model: &ModelId,
+            _max_tokens: u32,
+            _tools: &[ToolInfo],
+        ) -> Result<ApiResponse, ApiError> {
+            let call = {
+                let mut call = self.call.lock().unwrap();
+                *call += 1;
+                *call
+            };
+            let usage = UsageSummary {
+                input_tokens: 1,
+                output_tokens: 1,
+                cache_read_tokens: 0,
+                cache_creation_tokens: 0,
+            };
+            if call == 1 {
+                return Ok(ApiResponse {
+                    content: String::new(),
+                    tool_calls: vec![ToolCall {
+                        id: "child_read".into(),
+                        name: "Read".into(),
+                        input: serde_json::json!({"file_path": "note.txt"}),
+                    }],
+                    usage,
+                    stop_reason: "tool_use".into(),
+                });
+            }
+
+            let saw_tool_output = messages
+                .iter()
+                .any(|message| message.to_string().contains(self.expected_contents));
+            Ok(ApiResponse {
+                content: if saw_tool_output {
+                    "sub-agent read the file"
+                } else {
+                    "sub-agent could not read the file"
+                }
+                .into(),
+                tool_calls: Vec::new(),
+                usage,
+                stop_reason: "end_turn".into(),
+            })
+        }
+
+        async fn create_message_streaming(
+            &self,
+            _system: &str,
+            _messages: &[serde_json::Value],
+            _model: &ModelId,
+            _max_tokens: u32,
+            _tools: &[ToolInfo],
+        ) -> std::pin::Pin<Box<dyn futures::Stream<Item = StreamEvent> + Send + 'static>> {
+            Box::pin(futures::stream::empty())
         }
     }
 
@@ -5000,5 +5116,74 @@ mod tests {
             permission_activity_label("Running cargo test -p coderex-cli..."),
             "Waiting for permission: Running cargo test -p coderex-cli..."
         );
+    }
+
+    #[tokio::test]
+    async fn agent_tool_runs_a_real_subagent_with_parent_tools_and_cwd() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join("note.txt"), "needle-from-child").unwrap();
+        let api = ReadThenAnswerApi {
+            call: Arc::new(std::sync::Mutex::new(0)),
+            expected_contents: "needle-from-child",
+        };
+        let mut repl = ReplLoop::with_engine(
+            Box::new(api),
+            temp.path().to_string_lossy().into_owned(),
+            ModelId::sonnet(),
+        );
+        let dispatcher = repl.dispatcher.take().unwrap();
+        let manager = repl.agent_manager.take().unwrap();
+
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            dispatcher.execute(
+                "parent_agent_call",
+                "Agent",
+                &serde_json::json!({
+                    "description": "read a local note",
+                    "prompt": "Read note.txt and report its contents"
+                }),
+            ),
+        )
+        .await
+        .expect("sub-agent did not complete");
+
+        assert!(
+            !outcome.result.is_error,
+            "agent tool failed: {}",
+            outcome.result.output
+        );
+        let payload: serde_json::Value = serde_json::from_str(&outcome.result.output).unwrap();
+        assert_eq!(payload["status"], "Completed");
+        assert_eq!(payload["output"], "sub-agent read the file");
+        let output_file = payload["output_file"].as_str().unwrap();
+        assert!(
+            std::path::Path::new(output_file).is_file(),
+            "missing sub-agent output: {output_file}"
+        );
+
+        let manager = manager.lock().await;
+        assert_eq!(manager.list_agents().len(), 1);
+        assert_eq!(
+            manager.list_agents()[0].status(),
+            coderex_agents::AgentStatus::Completed
+        );
+        drop(manager);
+
+        let mut saw_started = false;
+        let mut saw_completed = false;
+        while let Ok(event) = repl.event_rx.as_mut().unwrap().try_recv() {
+            if let EngineEvent::AgentEvent { event, .. } = event {
+                match event {
+                    coderex_core::types::AgentLifecycleEvent::Started => saw_started = true,
+                    coderex_core::types::AgentLifecycleEvent::Completed { .. } => {
+                        saw_completed = true;
+                    }
+                    _ => {}
+                }
+            }
+        }
+        assert!(saw_started, "missing sub-agent start event");
+        assert!(saw_completed, "missing sub-agent completion event");
     }
 }

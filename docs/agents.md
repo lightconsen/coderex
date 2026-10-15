@@ -155,8 +155,8 @@ All features are implemented. No known stubs.
 ```rust
 let mut mgr = AgentManager::standalone();
 mgr.set_api_client(api_client);
-mgr.set_tool_executor_factory(|sandbox| {
-    let mut dispatcher = create_dispatcher();
+mgr.set_tool_executor_factory(|cwd, sandbox| {
+    let mut dispatcher = create_dispatcher(cwd);
     dispatcher.set_sandbox_override(sandbox);
     Box::new(dispatcher)
 });
