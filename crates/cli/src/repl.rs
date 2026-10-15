@@ -575,6 +575,8 @@ pub struct ReplLoop {
     artifact_server: Option<coderex_artifacts::ArtifactServer>,
     /// Where artifacts are stored, when it is not the default location.
     artifact_store_root: Option<std::path::PathBuf>,
+    /// The turn currently running in a task, so a key handler can stop it.
+    running_query: Option<coderex_core::engine::InterruptHandle>,
     /// Pending elicitation response sender — when set, user input is treated as an answer.
     pending_elicitation: Option<tokio::sync::oneshot::Sender<serde_json::Value>>,
     /// Confirmation bus for interactive permission requests.
@@ -734,6 +736,7 @@ impl ReplLoop {
             mcp_manager: Arc::new(std::sync::RwLock::new(None)),
             artifact_server: None,
             artifact_store_root: None,
+            running_query: None,
             pending_elicitation: None,
             confirmation_bus: None,
             cron_rx: None,
@@ -969,6 +972,7 @@ impl ReplLoop {
             mcp_manager: mcp_slot,
             artifact_server: None,
             artifact_store_root: None,
+            running_query: None,
             pending_elicitation: None,
             confirmation_bus: Some(confirmation_bus),
             cron_rx: Some(cron_rx),
@@ -1878,6 +1882,12 @@ impl ReplLoop {
                                     continue;
                                 }
                                 if thinking {
+                                    // Tell the engine to stop before letting
+                                    // go of its result: the turn is abandoned
+                                    // *and* ended.
+                                    if let Some(handle) = self.running_query.take() {
+                                        handle.interrupt();
+                                    }
                                     thinking = false;
                                     phase.reset();
                                     query_done_rx = None;
@@ -2073,6 +2083,9 @@ impl ReplLoop {
                                 }
                                 VimAction::Escape => {
                                     if thinking {
+                                        if let Some(handle) = self.running_query.take() {
+                                            handle.interrupt();
+                                        }
                                         thinking = false;
                                         phase.reset();
                                         query_done_rx = None;
@@ -2454,6 +2467,7 @@ impl ReplLoop {
                     query_done_rx.as_mut().unwrap().await.ok()
                 }, if query_done_rx.is_some() => {
                     self.engine = Some(engine);
+                    self.running_query = None;
                     query_done_rx = None;
                     elicit_rx = None;
                     tui_elicit_rx = None;
@@ -3797,6 +3811,10 @@ impl ReplLoop {
 
         let options = self.build_submit_options();
         let mut engine = self.engine.take().unwrap();
+        // The engine moves into the task below, so the handle is what Ctrl+C
+        // can reach: without it the key abandoned the result while the work
+        // carried on.
+        self.running_query = Some(engine.interrupt_handle());
         let (tx, rx) = tokio::sync::oneshot::channel();
         let (elicit_tx, erx) = tokio::sync::mpsc::channel(4);
         let (tui_elicit_tx, terx) = tokio::sync::mpsc::channel(1);

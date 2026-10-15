@@ -648,6 +648,36 @@ impl TurnRuntime {
     }
 }
 
+// ─── Interrupts ─────────────────────────────────────────────────────────────
+
+/// A way to stop the turn an engine is running, from outside it.
+///
+/// `QueryEngine::interrupt` used to send an event and nothing else: the event
+/// was emitted, nothing listened for it, and the turn ran to completion — so
+/// Ctrl+C abandoned the *result* while the work carried on. This handle is
+/// what a caller outside the engine (a key handler, a parent task) can hold,
+/// and what the turn loop actually looks at.
+#[derive(Debug, Clone, Default)]
+pub struct InterruptHandle(Arc<std::sync::atomic::AtomicBool>);
+
+impl InterruptHandle {
+    /// Ask the running turn to stop at its next safe point.
+    pub fn interrupt(&self) {
+        self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Whether a stop has been asked for.
+    #[must_use]
+    pub fn is_interrupted(&self) -> bool {
+        self.0.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Clear the request, so the next turn runs.
+    pub fn clear(&self) {
+        self.0.store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
 // ─── QueryEngine ────────────────────────────────────────────────────────────
 
 /// QueryEngine — manages conversation turns with the AI model.
@@ -671,6 +701,8 @@ pub struct QueryEngine {
     session: SessionState,
     /// Cost tracker for billing.
     cost_tracker: CostTracker,
+    /// Whether the running turn has been asked to stop.
+    interrupt: InterruptHandle,
     /// Permission engine for tool approval.
     permission_engine: PermissionEngine,
     /// Event sender for streaming events to UI/SDK.
@@ -787,6 +819,7 @@ impl QueryEngine {
             model,
             session,
             cost_tracker: CostTracker::new(),
+            interrupt: InterruptHandle::default(),
             permission_engine,
             event_tx,
             current_turn: 0,
@@ -809,6 +842,14 @@ impl QueryEngine {
     }
 
     /// Set the elicitation handler.
+    /// Replace the client requests are sent through.
+    ///
+    /// Used when a session picks a provider after construction, and by tests
+    /// that need a model which behaves a particular way mid-turn.
+    pub fn set_api_client(&mut self, client: Box<dyn ApiClient>) {
+        self.api_client = client;
+    }
+
     pub fn set_elicitation_handler(&mut self, handler: Box<dyn ElicitationHandler + Send + Sync>) {
         self.elicitation_handler = handler;
     }
@@ -1208,6 +1249,9 @@ impl QueryEngine {
         self.session.messages.push(Message::user(prompt.clone()));
 
         // Main turn loop
+        // A request that arrives after an interrupt is a fresh one.
+        self.interrupt.clear();
+
         loop {
             if options.max_turns > 0 && turn_number > options.max_turns {
                 turn.terminate(TerminalReason::MaxTurnsReached);
@@ -1222,6 +1266,15 @@ impl QueryEngine {
                 Ok(reason) => {
                     self.current_turn = turn_number;
                     last_reason = reason.clone();
+
+                    // An interrupt that arrived while this turn was running —
+                    // during a tool, most often — ends the run here rather
+                    // than starting another turn.
+                    if self.interrupt.is_interrupted() {
+                        turn.terminate(TerminalReason::UserInterrupted);
+                        last_reason = TerminalReason::UserInterrupted;
+                        break;
+                    }
 
                     // Advance coordinator phase if present
                     if let Some(ref mut coordinator) = self.coordinator {
@@ -1302,6 +1355,9 @@ impl QueryEngine {
         self.session.messages.push(Message::user(prompt.clone()));
 
         // Main turn loop
+        // A request that arrives after an interrupt is a fresh one.
+        self.interrupt.clear();
+
         loop {
             if options.max_turns > 0 && turn_number > options.max_turns {
                 turn.terminate(TerminalReason::MaxTurnsReached);
@@ -1319,6 +1375,14 @@ impl QueryEngine {
                 Ok(reason) => {
                     self.current_turn = turn_number;
                     last_reason = reason.clone();
+
+                    // A turn that was interrupted ends here rather than
+                    // continuing into the work it was about to do.
+                    if self.interrupt.is_interrupted() {
+                        turn.terminate(TerminalReason::UserInterrupted);
+                        last_reason = TerminalReason::UserInterrupted;
+                        break;
+                    }
 
                     // Advance coordinator phase if present
                     if let Some(ref mut coordinator) = self.coordinator {
@@ -2309,6 +2373,12 @@ impl QueryEngine {
             let mut retry_requested = false;
 
             while let Some(event) = stream.next().await {
+                // Stop reading a stream the person has asked to abandon: the
+                // rest of it is tokens nobody is waiting for.
+                if self.interrupt.is_interrupted() {
+                    stream_failed = true;
+                    break;
+                }
                 match event.clone() {
                     StreamEvent::TextDelta(ref text) => {
                         text_so_far.push_str(text);
@@ -2414,6 +2484,21 @@ impl QueryEngine {
                 if let Ok(resp) = self.send_request(turn, options).await {
                     return Ok((resp.content, resp.tool_calls, Vec::new(), resp.usage));
                 }
+            }
+
+            // An interrupt is not a failure: nothing is wrong, the person
+            // asked for this to stop, and saying "error" would send whoever
+            // reads the event looking for a fault.
+            if self.interrupt.is_interrupted() {
+                let _ = self.event_tx.send(EngineEvent::StreamInterrupted {
+                    reason: "user".into(),
+                    partial_len: text_so_far.len(),
+                    will_retry: false,
+                });
+                // Whatever arrived before the interrupt is kept: a partial
+                // answer is what the person asked to stop at, and throwing it
+                // away would lose the tokens they already paid for.
+                return Ok((text_so_far, deferred_calls, early_results, usage));
             }
 
             if stream_failed {
@@ -2639,6 +2724,21 @@ impl QueryEngine {
         turn: &mut TurnRuntime,
         options: &SubmitOptions,
     ) -> Result<Vec<ToolResult>, String> {
+        // An interrupt that arrived while the model was answering stops the
+        // tools as well: the person asked for this to end, not for one more
+        // batch of edits to land.
+        if self.interrupt.is_interrupted() {
+            return Ok(turn
+                .pending_tool_calls
+                .iter()
+                .map(|call| ToolResult {
+                    tool_call_id: call.id.clone(),
+                    output: "the turn was interrupted".to_string(),
+                    is_error: true,
+                })
+                .collect());
+        }
+
         let outcome = tool_scheduler::run_tool_calls(
             &turn.pending_tool_calls,
             self.tools.as_ref(),
@@ -2863,9 +2963,23 @@ impl QueryEngine {
     }
 
     /// Interrupt the current turn (e.g., from Ctrl+C).
+    ///
+    /// Sets the flag the turn loop reads *and* emits the event: the event
+    /// tells a UI the session is ending, the flag is what actually stops the
+    /// work.
     pub fn interrupt(&self) {
-        // Signal the event loop to stop
+        self.interrupt_handle().interrupt();
         let _ = self.event_tx.send(EngineEvent::SessionEnd);
+    }
+
+    /// A handle for interrupting this engine from outside it.
+    ///
+    /// A caller that has moved the engine into a task — the TUI does — keeps
+    /// one of these instead, because it can no longer call `interrupt` on an
+    /// engine it does not own.
+    #[must_use]
+    pub fn interrupt_handle(&self) -> InterruptHandle {
+        self.interrupt.clone()
     }
 }
 
@@ -3181,6 +3295,313 @@ mod tests {
         let resp = result.unwrap();
         assert!(!resp.content.is_empty());
         assert!(resp.usage.output_tokens > 0);
+    }
+
+    /// An interrupt stops the work rather than only announcing itself. The
+    /// engine used to emit an event nothing listened for, so the turn ran to
+    /// completion while the caller believed it had stopped.
+    /// A model that interrupts the engine while it is answering — which is
+    /// when a person actually presses Ctrl+C.
+    struct InterruptingMock {
+        handle: InterruptHandle,
+        calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl ApiClient for InterruptingMock {
+        fn clone_box(&self) -> Box<dyn ApiClient> {
+            Box::new(Self {
+                handle: self.handle.clone(),
+                calls: std::sync::Arc::clone(&self.calls),
+            })
+        }
+
+        async fn create_message(
+            &self,
+            _system: &str,
+            _messages: &[serde_json::Value],
+            _model: &ModelId,
+            _max_tokens: u32,
+            _tools: &[crate::tool_executor::ToolInfo],
+        ) -> Result<ApiResponse, crate::api_client::ApiError> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            // The interrupt lands while the model is answering.
+            self.handle.interrupt();
+            Ok(ApiResponse {
+                content: "a first answer".into(),
+                tool_calls: Vec::new(),
+                usage: UsageSummary {
+                    input_tokens: 10,
+                    output_tokens: 5,
+                    cache_read_tokens: 0,
+                    cache_creation_tokens: 0,
+                },
+                stop_reason: "end_turn".into(),
+            })
+        }
+
+        async fn create_message_streaming(
+            &self,
+            system: &str,
+            messages: &[serde_json::Value],
+            model: &ModelId,
+            max_tokens: u32,
+            tools: &[crate::tool_executor::ToolInfo],
+        ) -> std::pin::Pin<
+            Box<dyn futures::Stream<Item = crate::api_client::StreamEvent> + Send + 'static>,
+        > {
+            let response = self
+                .create_message(system, messages, model, max_tokens, tools)
+                .await
+                .expect("the interrupting mock answers");
+            Box::pin(futures::stream::iter(vec![
+                crate::api_client::StreamEvent::TextDelta(response.content),
+                crate::api_client::StreamEvent::StopReason(response.stop_reason),
+                crate::api_client::StreamEvent::StreamEnd,
+            ]))
+        }
+    }
+
+    /// `interrupt()` sets the flag the turn loop reads, not only the event.
+    /// The event is what a UI listens for; the flag is what stops the work.
+    #[tokio::test]
+    async fn interrupting_the_engine_sets_the_flag_it_reads() {
+        let (engine, _rx, _session) = make_test_engine();
+        assert!(!engine.interrupt_handle().is_interrupted());
+
+        engine.interrupt();
+
+        assert!(engine.interrupt_handle().is_interrupted());
+    }
+
+    /// An interrupt that lands *between* turns — while a tool is running —
+    /// stops the run before the next request is sent. This is the window the
+    /// loop-top check exists for: without it the engine would ask the model
+    /// for another answer after the person had asked it to stop.
+    #[tokio::test]
+    async fn an_interrupt_between_turns_stops_before_the_next_request() {
+        /// Answers with a tool call once, then with text.
+        struct ToolThenText {
+            calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        }
+
+        #[async_trait::async_trait]
+        impl ApiClient for ToolThenText {
+            fn clone_box(&self) -> Box<dyn ApiClient> {
+                Box::new(Self {
+                    calls: std::sync::Arc::clone(&self.calls),
+                })
+            }
+
+            async fn create_message(
+                &self,
+                _system: &str,
+                _messages: &[serde_json::Value],
+                _model: &ModelId,
+                _max_tokens: u32,
+                _tools: &[crate::tool_executor::ToolInfo],
+            ) -> Result<ApiResponse, crate::api_client::ApiError> {
+                let call = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(ApiResponse {
+                    content: if call == 0 {
+                        String::new()
+                    } else {
+                        "done".into()
+                    },
+                    tool_calls: if call == 0 {
+                        vec![crate::types::ToolCall {
+                            id: "tc_1".into(),
+                            name: "bash".into(),
+                            input: serde_json::json!({"command": "true"}),
+                        }]
+                    } else {
+                        Vec::new()
+                    },
+                    usage: UsageSummary {
+                        input_tokens: 10,
+                        output_tokens: 5,
+                        cache_read_tokens: 0,
+                        cache_creation_tokens: 0,
+                    },
+                    stop_reason: if call == 0 { "tool_use" } else { "end_turn" }.into(),
+                })
+            }
+
+            async fn create_message_streaming(
+                &self,
+                system: &str,
+                messages: &[serde_json::Value],
+                model: &ModelId,
+                max_tokens: u32,
+                tools: &[crate::tool_executor::ToolInfo],
+            ) -> std::pin::Pin<
+                Box<dyn futures::Stream<Item = crate::api_client::StreamEvent> + Send + 'static>,
+            > {
+                let response = self
+                    .create_message(system, messages, model, max_tokens, tools)
+                    .await
+                    .expect("the mock answers");
+                let mut events = vec![crate::api_client::StreamEvent::StopReason(
+                    response.stop_reason.clone(),
+                )];
+                for call in &response.tool_calls {
+                    // A call needs its start, its input, and its end: the
+                    // assembler builds the call from the whole sequence.
+                    events.insert(
+                        0,
+                        crate::api_client::StreamEvent::ToolCallBlockStart {
+                            id: call.id.clone(),
+                            name: call.name.clone(),
+                        },
+                    );
+                    events.insert(
+                        1,
+                        crate::api_client::StreamEvent::ToolCallBlockEnd {
+                            id: call.id.clone(),
+                            input: call.input.clone(),
+                        },
+                    );
+                }
+                events.push(crate::api_client::StreamEvent::StreamEnd);
+                Box::pin(futures::stream::iter(events))
+            }
+        }
+
+        /// Interrupts the engine when the tool runs — the person pressing
+        /// Ctrl+C while something is executing.
+        struct InterruptingTools(InterruptHandle);
+
+        #[async_trait::async_trait]
+        impl crate::tool_executor::ToolExecutor for InterruptingTools {
+            async fn execute(
+                &self,
+                tool_call_id: &str,
+                _tool_name: &str,
+                _input: &serde_json::Value,
+            ) -> crate::tool_executor::ToolDispatchOutcome {
+                self.0.interrupt();
+                crate::tool_executor::ToolDispatchOutcome {
+                    result: ToolResult {
+                        tool_call_id: tool_call_id.to_string(),
+                        output: "the tool ran".to_string(),
+                        is_error: false,
+                    },
+                }
+            }
+
+            fn list_tools(&self) -> Vec<crate::tool_executor::ToolInfo> {
+                Vec::new()
+            }
+        }
+
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let session = SessionState::new(std::path::PathBuf::from("/tmp/test"));
+        let checker = PermissionChecker::new(PermissionMode::BypassPermissions);
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut engine = QueryEngine::new(
+            Box::new(ToolThenText {
+                calls: std::sync::Arc::clone(&calls),
+            }),
+            ModelId::sonnet(),
+            session,
+            PermissionEngine::new(checker),
+            tx,
+        );
+        engine.set_tool_executor(Box::new(InterruptingTools(engine.interrupt_handle())));
+
+        let reason = engine
+            .submit_streaming("run something".into(), SubmitOptions::default())
+            .await
+            .unwrap();
+
+        assert!(
+            matches!(reason, TerminalReason::UserInterrupted),
+            "expected an interrupt, got {reason:?}"
+        );
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the model was asked for another answer after the interrupt"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_interrupt_ends_the_turn_it_arrives_during() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let session = SessionState::new(std::path::PathBuf::from("/tmp/test"));
+        let checker = PermissionChecker::new(PermissionMode::BypassPermissions);
+        let mut engine = QueryEngine::new(
+            Box::new(MockApiClient),
+            ModelId::sonnet(),
+            session,
+            PermissionEngine::new(checker),
+            tx,
+        );
+
+        let handle = engine.interrupt_handle();
+        engine.set_api_client(Box::new(InterruptingMock {
+            handle,
+            calls: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        }));
+
+        let reason = engine
+            .submit_streaming("say something".into(), SubmitOptions::default())
+            .await
+            .unwrap();
+
+        assert!(
+            matches!(reason, TerminalReason::UserInterrupted),
+            "expected an interrupt, got {reason:?}"
+        );
+    }
+
+    /// And the next turn runs: a request that arrives after an interrupt is a
+    /// fresh one, not a continuation of the stopped one.
+    #[tokio::test]
+    async fn a_turn_after_an_interrupt_still_runs() {
+        let (mut engine, _rx, _session) = make_test_engine();
+        engine.interrupt();
+        let _ = engine
+            .submit_streaming("first".into(), SubmitOptions::default())
+            .await;
+
+        let reason = engine
+            .submit_streaming("second".into(), SubmitOptions::default())
+            .await
+            .unwrap();
+
+        assert!(
+            !matches!(reason, TerminalReason::UserInterrupted),
+            "the interrupt outlived the turn it was meant for: {reason:?}"
+        );
+    }
+
+    /// An interrupt that lands before the tools run stops them: the person
+    /// asked for the turn to end, not for one more batch of edits.
+    #[tokio::test]
+    async fn an_interrupt_stops_the_tools_from_running() {
+        let (mut engine, _rx, _session) = make_test_engine();
+        let budget = TokenBudget::with_defaults();
+        let mut turn = TurnRuntime::new(budget);
+        turn.pending_tool_calls.push(PendingToolCall {
+            id: "tc_1".into(),
+            name: "bash".into(),
+            input: serde_json::json!({"command": "touch /tmp/should-not-exist"}),
+        });
+
+        engine.interrupt_handle().interrupt();
+        let results = engine
+            .execute_tool_calls(&mut turn, &SubmitOptions::default())
+            .await
+            .unwrap();
+
+        assert_eq!(results.len(), 1);
+        assert!(results[0].is_error);
+        assert!(
+            results[0].output.contains("interrupted"),
+            "{}",
+            results[0].output
+        );
     }
 
     /// `TurnState::StopHooks` is entered before a turn closes, and the Stop
