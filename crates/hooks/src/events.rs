@@ -2,7 +2,13 @@
 
 use serde::{Deserialize, Serialize};
 
-/// All 22 hook events that can be triggered during the CodeRex lifecycle.
+/// The hook events CodeRex knows the names of.
+///
+/// A name here is not a promise that anything fires it. The events CodeRex
+/// actually fires are listed by [`HookEvent::is_triggered`], and every other
+/// variant is a reserved name: settings may use it, and
+/// [`HookRegistry`](crate::HookRegistry) reports it as inert on load rather
+/// than accepting a hook that can never run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, strum::EnumIter)]
 pub enum HookEvent {
     /// Before a tool is used.
@@ -72,8 +78,8 @@ impl HookEvent {
             Self::Setup => "Setup",
             Self::SubagentStart => "SubagentStart",
             Self::Notification => "Notification",
-            Self::PermissionRequest => "PermissionRequest",
-            Self::PermissionDenied => "PermissionDenied",
+            Self::PermissionRequest => coderex_core::hook_events::PERMISSION_REQUEST,
+            Self::PermissionDenied => coderex_core::hook_events::PERMISSION_DENIED,
             Self::CwdChanged => "CwdChanged",
             Self::FileChanged => "FileChanged",
             Self::WorktreeCreate => "WorktreeCreate",
@@ -87,6 +93,37 @@ impl HookEvent {
             Self::ElicitationResult => "ElicitationResult",
             Self::TurnEnd => coderex_core::hook_events::TURN_END,
         }
+    }
+}
+
+impl HookEvent {
+    /// Whether CodeRex fires this event anywhere.
+    ///
+    /// The firing sites, so this list can be checked against the code:
+    ///
+    /// - `UserPromptSubmit`, `TurnEnd`, `PreCompact`, `PostCompact` —
+    ///   `coderex_core::engine`
+    /// - `PreToolUse`, `PostToolUse`, `PostToolUseFailure`,
+    ///   `PermissionRequest`, `PermissionDenied` —
+    ///   `coderex_core::tool_scheduler`
+    ///
+    /// Everything else is a name CodeRex accepts but never fires. A hook
+    /// configured on one of those would install and then never run, so
+    /// [`HookRegistry`](crate::HookRegistry) warns about it at load.
+    #[must_use]
+    pub const fn is_triggered(self) -> bool {
+        matches!(
+            self,
+            Self::PreToolUse
+                | Self::PostToolUse
+                | Self::PostToolUseFailure
+                | Self::UserPromptSubmit
+                | Self::PermissionRequest
+                | Self::PermissionDenied
+                | Self::PreCompact
+                | Self::PostCompact
+                | Self::TurnEnd
+        )
     }
 }
 
@@ -203,6 +240,32 @@ mod tests {
     use super::*;
     use std::str::FromStr;
     use strum::IntoEnumIterator;
+
+    /// The events CodeRex fires, and only those. Anything else in the enum is
+    /// a name CodeRex knows but never fires, which a configured hook has to be
+    /// warned about.
+    #[test]
+    fn only_the_wired_events_report_as_triggered() {
+        let triggered: Vec<&str> = HookEvent::iter()
+            .filter(|event| event.is_triggered())
+            .map(HookEvent::as_str)
+            .collect();
+
+        assert_eq!(
+            triggered,
+            vec![
+                "PreToolUse",
+                "PostToolUse",
+                "PostToolUseFailure",
+                "UserPromptSubmit",
+                "PermissionRequest",
+                "PermissionDenied",
+                "PreCompact",
+                "PostCompact",
+                "TurnEnd",
+            ]
+        );
+    }
 
     #[test]
     fn event_names_are_unique_and_non_empty() {

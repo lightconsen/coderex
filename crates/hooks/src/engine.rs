@@ -179,7 +179,7 @@ impl HookRegistry {
             return Ok(Self::new());
         }
         let settings: HookSettings = serde_json::from_value(value.clone())?;
-        let hooks = settings
+        let hooks: Vec<HookConfig> = settings
             .hooks
             .into_iter()
             .map(|raw| HookConfig {
@@ -196,7 +196,34 @@ impl HookRegistry {
                 max_file_size_mb: raw.max_file_size_mb,
             })
             .collect();
+        Self::warn_about_inert_hooks(&hooks);
         Ok(Self { hooks })
+    }
+
+    /// Report hooks whose event nothing ever fires.
+    ///
+    /// A hook on an event CodeRex does not fire matches nothing and runs
+    /// never. That is indistinguishable from a working hook until someone
+    /// notices it did not run, so it is said out loud at load.
+    fn warn_about_inert_hooks(hooks: &[HookConfig]) {
+        for hook in hooks {
+            if hook.event == "*" {
+                continue;
+            }
+            match hook.event.parse::<HookEvent>() {
+                Ok(event) if event.is_triggered() => {}
+                Ok(event) => tracing::warn!(
+                    event = %event,
+                    command = %hook.command,
+                    "hook configured for an event CodeRex does not fire — it will never run"
+                ),
+                Err(unknown) => tracing::warn!(
+                    event = %unknown,
+                    command = %hook.command,
+                    "hook configured for an unknown event — it will never run"
+                ),
+            }
+        }
     }
 
     /// Register a hook configuration.

@@ -148,6 +148,19 @@ pub async fn run_tool_calls(
                     tool: call.name.clone(),
                     args: call.input.clone(),
                 });
+                let mut ctx = HashMap::new();
+                ctx.insert("tool_call_id".to_string(), call.id.clone());
+                ctx.insert("reason".to_string(), reason.clone());
+                let ask_result = hooks
+                    .fire_hook(hook_events::PERMISSION_REQUEST, &call.name, &ctx)
+                    .await;
+                if !ask_result.errors.is_empty() {
+                    tracing::warn!(
+                        "PermissionRequest hook errors for {}: {:?}",
+                        call.name,
+                        ask_result.errors
+                    );
+                }
                 denied_tools.push(DeniedToolCall {
                     name: call.name.clone(),
                     reason: reason.clone(),
@@ -191,6 +204,16 @@ pub async fn run_tool_calls(
                 let mut ctx = HashMap::new();
                 ctx.insert("tool_call_id".to_string(), call.id.clone());
                 ctx.insert("reason".to_string(), reason.clone());
+                let denied_result = hooks
+                    .fire_hook(hook_events::PERMISSION_DENIED, &call.name, &ctx)
+                    .await;
+                if !denied_result.errors.is_empty() {
+                    tracing::warn!(
+                        "PermissionDenied hook errors for {}: {:?}",
+                        call.name,
+                        denied_result.errors
+                    );
+                }
                 let fail_result = hooks
                     .fire_hook(hook_events::POST_TOOL_USE_FAILURE, &call.name, &ctx)
                     .await;
@@ -302,6 +325,113 @@ mod tests {
                 },
             }
         }
+    }
+
+    /// Records the events fired through it, so a test can assert that a
+    /// lifecycle point actually reaches the hook system.
+    #[derive(Default)]
+    struct RecordingHooks {
+        fired: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl RecordingHooks {
+        fn names(&self) -> Vec<String> {
+            self.fired.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl HookExecutor for RecordingHooks {
+        async fn fire_hook(
+            &self,
+            event_name: &str,
+            _input: &str,
+            _context: &HashMap<String, String>,
+        ) -> crate::hook_executor::HookFireResult {
+            self.fired.lock().unwrap().push(event_name.to_string());
+            crate::hook_executor::HookFireResult::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn a_tool_waiting_for_a_decision_fires_the_permission_hook() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let tools = MockToolExecutor;
+        let hooks = RecordingHooks::default();
+        // Default mode asks about a shell command, and no confirmation bus is
+        // wired here, so the call is reported as unapproved.
+        let mut perm_engine = PermissionEngine::new(crate::permissions::PermissionChecker::new(
+            crate::permissions::PermissionMode::Default,
+        ));
+        let mut denied = Vec::new();
+        let calls = vec![PendingToolCall {
+            id: "t1".into(),
+            name: "Bash".into(),
+            input: serde_json::json!({"command": "ls"}),
+        }];
+
+        let outcome = run_tool_calls(
+            &calls,
+            &tools,
+            &mut perm_engine,
+            &hooks,
+            &SubmitOptions::default(),
+            &tx,
+            &mut denied,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(outcome.results.len(), 1);
+        assert!(hooks.names().contains(&"PermissionRequest".to_string()));
+    }
+
+    #[tokio::test]
+    async fn a_refused_tool_fires_the_permission_denied_hook() {
+        use crate::permissions::{
+            PermissionAction, PermissionChecker, PermissionMode, PermissionRule,
+        };
+
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let tools = MockToolExecutor;
+        let hooks = RecordingHooks::default();
+        let mut checker = PermissionChecker::new(PermissionMode::Default);
+        checker
+            .add_rule(PermissionRule {
+                tool_name: "Write".into(),
+                action: PermissionAction::Deny,
+                paths: Vec::new(),
+                description: "denied by policy".into(),
+            })
+            .unwrap();
+        let mut perm_engine = PermissionEngine::new(checker);
+        let mut denied = Vec::new();
+        let calls = vec![PendingToolCall {
+            id: "t1".into(),
+            name: "Write".into(),
+            input: serde_json::Value::Null,
+        }];
+
+        let outcome = run_tool_calls(
+            &calls,
+            &tools,
+            &mut perm_engine,
+            &hooks,
+            &SubmitOptions::default(),
+            &tx,
+            &mut denied,
+        )
+        .await
+        .unwrap();
+
+        assert!(outcome.results[0].is_error);
+        assert_eq!(denied.len(), 1);
+        let fired = hooks.names();
+        assert!(fired.contains(&"PermissionDenied".to_string()), "{fired:?}");
+        assert!(
+            !fired.contains(&"PermissionRequest".to_string()),
+            "a refusal is not a request: {fired:?}"
+        );
     }
 
     #[tokio::test]

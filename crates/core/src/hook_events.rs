@@ -25,6 +25,10 @@ pub const PRE_COMPACT: &str = "PreCompact";
 pub const POST_COMPACT: &str = "PostCompact";
 /// At the end of a turn.
 pub const TURN_END: &str = "TurnEnd";
+/// When a tool call is waiting for the person's decision.
+pub const PERMISSION_REQUEST: &str = "PermissionRequest";
+/// When a tool call was refused.
+pub const PERMISSION_DENIED: &str = "PermissionDenied";
 
 #[cfg(test)]
 mod tests {
@@ -41,6 +45,8 @@ mod tests {
         assert_eq!(PRE_COMPACT, "PreCompact");
         assert_eq!(POST_COMPACT, "PostCompact");
         assert_eq!(TURN_END, "TurnEnd");
+        assert_eq!(PERMISSION_REQUEST, "PermissionRequest");
+        assert_eq!(PERMISSION_DENIED, "PermissionDenied");
     }
 
     #[test]
@@ -53,6 +59,8 @@ mod tests {
             PRE_COMPACT,
             POST_COMPACT,
             TURN_END,
+            PERMISSION_REQUEST,
+            PERMISSION_DENIED,
         ];
         let unique: std::collections::HashSet<_> = all.iter().collect();
         assert_eq!(unique.len(), all.len(), "hook event names must be distinct");
