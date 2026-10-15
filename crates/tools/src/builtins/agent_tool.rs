@@ -182,17 +182,16 @@ impl Tool for AgentTool {
             });
         }
 
-        // Fallback stub when no manager is attached
-        let agent_id = format!("agent-{description}");
-        let output_file = format!("/tmp/agent-{description}-output.txt");
-
-        Ok(ToolOutput {
-            output: serde_json::json!({
-                "agent_id": agent_id,
-                "output_file": if background { Some(output_file) } else { None },
-                "note": if background { "agent running in background (no manager attached)" } else { "agent completed synchronously (no manager attached)" }
-            }).to_string(),
-            is_display: true,
+        // No manager attached: report the failure rather than a fabricated
+        // one. The previous fallback answered with an agent id, a status of
+        // "completed", and an output-file path that was never written — the
+        // model had no way to tell that no sub-agent had run, and would go on
+        // to read a file that does not exist.
+        Err(ToolError::InvalidInput {
+            message: format!(
+                "cannot run sub-agent '{description}': this session has no agent manager \
+                 attached, so no sub-agent was started and no output was produced"
+            ),
         })
     }
 }
@@ -224,9 +223,12 @@ mod tests {
         }
     }
 
+    /// Without a manager the tool must not report success: it cannot start a
+    /// sub-agent, and claiming otherwise sends the model looking for output
+    /// that was never written.
     #[tokio::test]
-    async fn agent_returns_id() {
-        let output = AgentTool::new()
+    async fn agent_without_manager_reports_failure() {
+        let result = AgentTool::new()
             .execute(
                 ToolInput {
                     call_id: "1".into(),
@@ -238,14 +240,18 @@ mod tests {
                 },
                 test_ctx(),
             )
-            .await
-            .unwrap();
-        assert!(output.output.contains("agent"));
+            .await;
+        match result {
+            Err(ToolError::InvalidInput { message }) => {
+                assert!(message.contains("no agent manager"), "{message}");
+            }
+            other => panic!("expected a refusal, got {other:?}"),
+        }
     }
 
     #[tokio::test]
-    async fn agent_background_returns_output_file() {
-        let output = AgentTool::new()
+    async fn agent_without_manager_does_not_promise_an_output_file() {
+        let result = AgentTool::new()
             .execute(
                 ToolInput {
                     call_id: "1".into(),
@@ -258,9 +264,11 @@ mod tests {
                 },
                 test_ctx(),
             )
-            .await
-            .unwrap();
-        assert!(output.output.contains("output_file"));
+            .await;
+        assert!(
+            result.is_err(),
+            "a background agent that was never started must not report an output file"
+        );
     }
 
     #[tokio::test]
