@@ -12,7 +12,7 @@
 
 use crate::api_client::{ApiClient, ApiError};
 use crate::engine::{QueryEngine, SubmitOptions, TerminalReason};
-use crate::permission_engine::{ExplainPermissionHook, PermissionEngine};
+use crate::permission_engine::{BackgroundAgentDenyHook, ExplainPermissionHook, PermissionEngine};
 use crate::permissions::{PermissionChecker, PermissionMode};
 use crate::query_profiles::{ModelProfile, PromptProfile, QueryKind, QueryRequest};
 use crate::state::SessionState;
@@ -575,6 +575,7 @@ async fn run_engine_query_with_model(
     let checker = PermissionChecker::new(PermissionMode::default());
     let mut permission_engine = PermissionEngine::new(checker);
     permission_engine.add_hook(Arc::new(ExplainPermissionHook::new(api_client.clone_box())));
+    permission_engine.add_hook(Arc::new(BackgroundAgentDenyHook));
 
     let (event_tx, mut event_rx) = mpsc::unbounded_channel::<EngineEvent>();
     let mut engine = QueryEngine::new(

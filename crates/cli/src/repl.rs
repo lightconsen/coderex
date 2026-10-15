@@ -13,7 +13,7 @@ use coderex_core::orchestrator::{
     BackgroundFeatureKind, BackgroundFeatureRequest, background_feature_label,
 };
 use coderex_core::permission_engine::{
-    AutoClassifierHook, ExplainPermissionHook, PermissionEngine,
+    AutoClassifierHook, BackgroundAgentDenyHook, ExplainPermissionHook, PermissionEngine,
 };
 use coderex_core::permissions::{PermissionChecker, PermissionMode};
 use coderex_core::prompts;
@@ -798,6 +798,10 @@ impl ReplLoop {
             event_tx.clone(),
         )));
         permission_engine.add_hook(Arc::new(AutoClassifierHook::new(api_client.clone_box())));
+        // A background run is one nobody is watching, so the tools that would
+        // need watching are refused there. The hook existed and was tested;
+        // nothing registered it, so it never ran.
+        permission_engine.add_hook(Arc::new(BackgroundAgentDenyHook));
 
         let memory_base = std::path::PathBuf::from(&cwd)
             .join(".coderex")

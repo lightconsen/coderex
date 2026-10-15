@@ -156,6 +156,21 @@ impl CoreToolExecutor for RegistryToolDispatcher {
             }
         };
 
+        // Deny rules are checked here, with the call's own arguments: a rule
+        // written against a path can only be judged against the path this call
+        // is about to touch. Until this existed, `deny_rules` were consulted
+        // nowhere but the registry's own tests.
+        let paths = path_arguments(tool_name, input);
+        if let Some(reason) = self.registry.denial_for(tool_name, &paths, self.context) {
+            return ToolDispatchOutcome {
+                result: ToolResult {
+                    tool_call_id: tool_call_id.to_string(),
+                    output: reason,
+                    is_error: true,
+                },
+            };
+        }
+
         let mut ctx = ToolContext::new(self.context, &self.cwd);
 
         // Inject elicitation channel if available
@@ -273,16 +288,188 @@ impl CoreToolExecutor for RegistryToolDispatcher {
     }
 }
 
+/// The paths a tool call is about to touch.
+///
+/// A deny rule written against a path needs the path, and only the tool knows
+/// which argument carries it — so the ones that do are named here. Anything
+/// else is scanned for values that look like paths, because for a deny rule
+/// the safe direction to be wrong in is "matched".
+#[must_use]
+pub fn path_arguments(tool_name: &str, input: &Value) -> Vec<std::path::PathBuf> {
+    const PATH_FIELDS: [&str; 8] = [
+        "file_path",
+        "notebook_path",
+        "path",
+        "target",
+        "source",
+        "directory",
+        "cwd",
+        "file",
+    ];
+
+    let mut paths = Vec::new();
+    let Value::Object(map) = input else {
+        return paths;
+    };
+
+    // The field the tool actually uses, when it is one we know.
+    for field in PATH_FIELDS {
+        if let Some(Value::String(value)) = map.get(field) {
+            if !value.is_empty() {
+                paths.push(std::path::PathBuf::from(value));
+            }
+        }
+    }
+
+    // Lists of files (Write's `files`, SendFile's `file_paths`).
+    for field in ["files", "file_paths", "paths"] {
+        if let Some(Value::Array(values)) = map.get(field) {
+            for value in values {
+                match value {
+                    Value::String(path) => paths.push(std::path::PathBuf::from(path)),
+                    Value::Object(entry) => {
+                        if let Some(Value::String(path)) = entry.get("path") {
+                            paths.push(std::path::PathBuf::from(path));
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    // Nothing known: a rule is more useful over-matching than under-matching,
+    // so any string that looks like a path is offered to it.
+    if paths.is_empty() {
+        for value in map.values() {
+            if let Value::String(text) = value {
+                if text.starts_with('/') || text.starts_with("~") || text.contains('/') {
+                    paths.push(std::path::PathBuf::from(text));
+                }
+            }
+        }
+    }
+
+    paths
+}
+
+#[test]
+fn path_arguments_are_read_from_the_field_the_tool_uses() {
+    assert_eq!(
+        path_arguments("Read", &serde_json::json!({"file_path": "/etc/passwd"})),
+        vec![std::path::PathBuf::from("/etc/passwd")]
+    );
+    assert_eq!(
+        path_arguments("Edit", &serde_json::json!({"file_path": "src/lib.rs"})),
+        vec![std::path::PathBuf::from("src/lib.rs")]
+    );
+    assert_eq!(
+        path_arguments("Write", &serde_json::json!({"files": ["a.txt", "b.txt"]})),
+        vec![
+            std::path::PathBuf::from("a.txt"),
+            std::path::PathBuf::from("b.txt")
+        ]
+    );
+}
+
+/// A rule is more useful over-matching than under-matching, so a tool whose
+/// path field is not known still offers anything that looks like a path.
+#[test]
+fn an_unknown_tool_still_offers_what_looks_like_a_path() {
+    let found = path_arguments(
+        "SomethingNew",
+        &serde_json::json!({"where": "/etc/shadow", "name": "not-a-path"}),
+    );
+    assert_eq!(found, vec![std::path::PathBuf::from("/etc/shadow")]);
+}
+
+#[test]
+fn arguments_with_no_paths_offer_nothing() {
+    assert!(path_arguments("echo", &serde_json::json!({"message": "hello"})).is_empty());
+    assert!(path_arguments("echo", &serde_json::json!({})).is_empty());
+    assert!(path_arguments("echo", &serde_json::json!("not an object")).is_empty());
+}
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::builtins::EchoTool;
     use crate::executor::ExecutionConfig;
+    use crate::registry::ToolDenyRule;
 
     fn registry_with_echo() -> Arc<ToolRegistry> {
         let mut registry = ToolRegistry::new();
         registry.register(Arc::new(EchoTool));
         Arc::new(registry)
+    }
+
+    /// The check has to happen at dispatch, with the call's own arguments: a
+    /// rule written against a path is only meaningful against the path this
+    /// call is about to touch.
+    #[tokio::test]
+    async fn a_path_deny_rule_stops_the_call_it_matches() {
+        let mut registry = ToolRegistry::new();
+        registry.register(Arc::new(EchoTool));
+        registry.add_deny_rule(ToolDenyRule::for_paths(vec!["**/secrets/**".into()]));
+        let registry = Arc::new(registry);
+
+        let executor = Arc::new(InnerExecutor::new(ExecutionConfig::default()));
+        let dispatcher = RegistryToolDispatcher::new(
+            registry,
+            executor,
+            ExecutionContext::Normal,
+            PathBuf::from("/tmp"),
+        );
+
+        let denied = dispatcher
+            .execute(
+                "id-1",
+                "echo",
+                &serde_json::json!({"file_path": "/home/me/secrets/token", "message": "hi"}),
+            )
+            .await;
+        assert!(denied.result.is_error, "{:?}", denied.result);
+        assert!(
+            denied.result.output.contains("secrets/token"),
+            "{}",
+            denied.result.output
+        );
+
+        // The same call, touching somewhere else, runs.
+        let allowed = dispatcher
+            .execute(
+                "id-2",
+                "echo",
+                &serde_json::json!({"file_path": "/home/me/notes.md", "message": "hi"}),
+            )
+            .await;
+        assert!(!allowed.result.is_error, "{:?}", allowed.result);
+        assert_eq!(allowed.result.output, "hi");
+    }
+
+    #[tokio::test]
+    async fn a_tool_deny_rule_stops_the_tool() {
+        let mut registry = ToolRegistry::new();
+        registry.register(Arc::new(EchoTool));
+        registry.add_deny_rule(ToolDenyRule::for_tools(vec!["echo".into()]));
+        let registry = Arc::new(registry);
+
+        let executor = Arc::new(InnerExecutor::new(ExecutionConfig::default()));
+        let dispatcher = RegistryToolDispatcher::new(
+            registry,
+            executor,
+            ExecutionContext::Normal,
+            PathBuf::from("/tmp"),
+        );
+
+        let denied = dispatcher
+            .execute("id-1", "echo", &serde_json::json!({"message": "hi"}))
+            .await;
+        assert!(denied.result.is_error, "{:?}", denied.result);
+        assert!(
+            denied.result.output.contains("denied"),
+            "{}",
+            denied.result.output
+        );
     }
 
     #[tokio::test]

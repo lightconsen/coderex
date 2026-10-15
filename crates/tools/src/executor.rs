@@ -110,15 +110,7 @@ impl ToolExecutor {
             None => None,
         };
 
-        run_tool_call(
-            &desc,
-            tool,
-            &input,
-            ctx,
-            &self.config,
-            self.cache.as_ref(),
-        )
-        .await
+        run_tool_call(&desc, tool, &input, ctx, &self.config, self.cache.as_ref()).await
     }
 
     /// Execute multiple tool calls in concurrent batches.
@@ -144,10 +136,8 @@ impl ToolExecutor {
             if desc.is_read_only {
                 if let Some(ref cache) = self.cache {
                     if let Some(cached) = cache.get(&desc.name, &input.arguments).await {
-                        all_results[idx] = Some(Ok(truncate_output(
-                            cached,
-                            self.config.max_output_bytes,
-                        )));
+                        all_results[idx] =
+                            Some(Ok(truncate_output(cached, self.config.max_output_bytes)));
                         continue;
                     }
                 }
@@ -176,15 +166,9 @@ impl ToolExecutor {
                         None => None,
                     };
                     let desc = tool.descriptor();
-                    let result = run_tool_call(
-                        &desc,
-                        tool.as_ref(),
-                        &input,
-                        ctx,
-                        &config,
-                        cache.as_ref(),
-                    )
-                    .await;
+                    let result =
+                        run_tool_call(&desc, tool.as_ref(), &input, ctx, &config, cache.as_ref())
+                            .await;
 
                     (idx, result)
                 });
@@ -388,8 +372,16 @@ mod tests {
         let peak = Arc::new(AtomicUsize::new(0));
 
         let calls = vec![
-            (probe("edit", false, &inside, &peak), test_input("a"), test_ctx()),
-            (probe("edit", false, &inside, &peak), test_input("b"), test_ctx()),
+            (
+                probe("edit", false, &inside, &peak),
+                test_input("a"),
+                test_ctx(),
+            ),
+            (
+                probe("edit", false, &inside, &peak),
+                test_input("b"),
+                test_ctx(),
+            ),
         ];
 
         let results = executor.execute_many(calls).await;
@@ -409,8 +401,16 @@ mod tests {
         let peak = Arc::new(AtomicUsize::new(0));
 
         let calls = vec![
-            (probe("read", true, &inside, &peak), test_input("a"), test_ctx()),
-            (probe("read", true, &inside, &peak), test_input("b"), test_ctx()),
+            (
+                probe("read", true, &inside, &peak),
+                test_input("a"),
+                test_ctx(),
+            ),
+            (
+                probe("read", true, &inside, &peak),
+                test_input("b"),
+                test_ctx(),
+            ),
         ];
 
         let results = executor.execute_many(calls).await;

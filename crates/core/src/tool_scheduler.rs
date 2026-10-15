@@ -127,7 +127,12 @@ pub async fn run_tool_calls(
 
         // 4. Permission check
         let (_request, perm_result) = permission_engine
-            .evaluate(&call.name, call.input.to_string(), None, HashMap::new())
+            .evaluate(
+                &call.name,
+                call.input.to_string(),
+                None,
+                permission_context_for(options.agent_id.as_deref(), &call.id),
+            )
             .await
             .map_err(|e| format!("permission check failed: {e}"))?;
 
@@ -196,9 +201,11 @@ pub async fn run_tool_calls(
                     name: call.name.clone(),
                     reason: reason.clone(),
                 });
+                // The reason is the only thing that tells the model (and the
+                // person reading the transcript) what to do differently.
                 let result = ToolResult {
                     tool_call_id: call.id.clone(),
-                    output: format!("tool '{}' denied", call.name),
+                    output: format!("tool '{}' denied: {reason}", call.name),
                     is_error: true,
                 };
                 let mut ctx = HashMap::new();
@@ -299,6 +306,32 @@ pub async fn run_tool_calls(
         results,
         pending_elevations,
     })
+}
+
+/// The context a permission decision is made in.
+///
+/// `BackgroundAgentDenyHook` reads `execution_mode` to refuse tools in a
+/// background run, and every call site passed an empty map — a hook that could
+/// never fire. The mode comes from the submit options: a turn with an agent id
+/// is a forked or background flow, and one without is the person's own.
+pub(crate) fn permission_context_for(
+    agent_id: Option<&str>,
+    tool_call_id: &str,
+) -> HashMap<String, String> {
+    let mut context = HashMap::new();
+    context.insert(
+        "execution_mode".to_string(),
+        if agent_id.is_some() {
+            "background".to_string()
+        } else {
+            "interactive".to_string()
+        },
+    );
+    context.insert("tool_call_id".to_string(), tool_call_id.to_string());
+    if let Some(agent_id) = agent_id {
+        context.insert("agent_id".to_string(), agent_id.to_string());
+    }
+    context
 }
 
 #[cfg(test)]

@@ -50,21 +50,41 @@ impl ToolDenyRule {
     }
 
     /// Check if this rule applies to a given tool name in plan mode.
-    fn matches(&self, tool_name: &str, path_args: &[PathBuf], plan_mode: bool) -> bool {
+    ///
+    /// A path pattern is a glob, matched against the whole path: `**/secrets/**`
+    /// means that, and `/etc/passwd` means that file. The previous version
+    /// looked for the pattern as a *substring*, so `/etc/**` — which is what a
+    /// rule would be written as — matched nothing, and a deny rule that matches
+    /// nothing denies nothing.
+    pub fn matches(&self, tool_name: &str, path_args: &[PathBuf], plan_mode: bool) -> bool {
         if plan_mode && !self.applies_in_plan_mode {
             return false;
         }
         if !self.tool_names.is_empty() {
-            return self.tool_names.iter().any(|n| n == tool_name);
+            return self
+                .tool_names
+                .iter()
+                .any(|n| n.eq_ignore_ascii_case(tool_name));
         }
-        // Path-based rules match if any path arg matches a glob
-        if !self.path_globs.is_empty() {
-            for path in path_args {
-                for glob in &self.path_globs {
-                    if path.to_string_lossy().contains(glob) {
-                        return true;
-                    }
-                }
+
+        if self.path_globs.is_empty() {
+            return false;
+        }
+
+        for pattern in &self.path_globs {
+            let Ok(glob) = globset::Glob::new(pattern) else {
+                // A rule whose pattern will not compile can never match, which
+                // is the same as not being there — say so rather than let it
+                // look like protection.
+                tracing::warn!(
+                    pattern = %pattern,
+                    "deny rule has a pattern that is not a glob; it cannot match anything"
+                );
+                continue;
+            };
+            let matcher = glob.compile_matcher();
+            if path_args.iter().any(|path| matcher.is_match(path)) {
+                return true;
             }
         }
         false
@@ -275,12 +295,53 @@ impl ToolRegistry {
     }
 
     /// Check if a tool name is denied in the given context.
+    ///
+    /// Name-only: this answers "is this tool denied at all", which is what
+    /// listing tools needs. A rule that only names paths cannot be judged
+    /// without a call to judge it against — see [`Self::denial_for`].
     #[must_use]
     pub fn is_denied(&self, tool_name: &str, context: ExecutionContext) -> bool {
         let is_plan_mode = matches!(context, ExecutionContext::PlanMode);
         self.deny_rules
             .iter()
             .any(|rule| rule.matches(tool_name, &[], is_plan_mode))
+    }
+
+    /// Why a call is denied, if a rule denies it.
+    ///
+    /// This is the check that has to happen per call and with the call's own
+    /// arguments: a rule written against a path is only meaningful against the
+    /// path the tool is about to touch, and consulting it with an empty list
+    /// is the same as not having it.
+    #[must_use]
+    pub fn denial_for(
+        &self,
+        tool_name: &str,
+        paths: &[PathBuf],
+        context: ExecutionContext,
+    ) -> Option<String> {
+        let is_plan_mode = matches!(context, ExecutionContext::PlanMode);
+        self.deny_rules
+            .iter()
+            .find(|rule| rule.matches(tool_name, paths, is_plan_mode))
+            .map(|rule| {
+                if rule
+                    .tool_names
+                    .iter()
+                    .any(|n| n.eq_ignore_ascii_case(tool_name))
+                {
+                    format!("tool '{tool_name}' is denied by a rule")
+                } else {
+                    format!(
+                        "tool '{tool_name}' is denied for {}",
+                        paths
+                            .iter()
+                            .map(|path| path.display().to_string())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    )
+                }
+            })
     }
 
     /// Interrupt behavior for a named tool.
@@ -328,6 +389,73 @@ mod tests {
         let names: Vec<_> = descriptors.iter().map(|d| &d.name).collect();
         assert!(names.contains(&&"echo".to_string()));
         assert!(names.contains(&&"noop".to_string()));
+    }
+
+    /// A path rule is a glob over the whole path. Looking for the pattern as a
+    /// substring — which is what this used to do — means `/etc/**` matches
+    /// nothing, so a deny rule written the only way it can be written denies
+    /// nothing.
+    #[test]
+    fn a_path_deny_rule_matches_a_glob() {
+        let rule = ToolDenyRule::for_paths(vec![
+            "/etc/**".to_string(),
+            "**/secrets/**".to_string(),
+            "/tmp/exact.txt".to_string(),
+        ]);
+        let matches = |path: &str| rule.matches("Read", &[PathBuf::from(path)], false);
+
+        assert!(matches("/etc/passwd"));
+        assert!(matches("/etc/ssh/ssh_config"));
+        assert!(matches("/home/me/secrets/token"));
+        assert!(matches("/tmp/exact.txt"));
+
+        assert!(!matches("/tmp/notes.txt"));
+        assert!(
+            !matches("/home/me/secret-notes.md"),
+            "a prefix is not a match"
+        );
+        assert!(!matches("/etcetera/file"));
+    }
+
+    #[test]
+    fn a_path_rule_that_is_not_a_glob_matches_nothing() {
+        let rule = ToolDenyRule::for_paths(vec!["[unclosed".to_string()]);
+        assert!(!rule.matches("Read", &[PathBuf::from("/etc/passwd")], false));
+    }
+
+    #[test]
+    fn a_denial_says_which_of_the_two_it_was() {
+        let mut registry = ToolRegistry::new();
+        registry.add_deny_rule(ToolDenyRule::for_tools(vec!["Bash".into()]));
+        assert_eq!(
+            registry.denial_for("Bash", &[], ExecutionContext::Normal),
+            Some("tool 'Bash' is denied by a rule".to_string())
+        );
+        assert!(
+            registry
+                .denial_for("Read", &[], ExecutionContext::Normal)
+                .is_none()
+        );
+
+        let mut paths = ToolRegistry::new();
+        paths.add_deny_rule(ToolDenyRule::for_paths(vec!["**/secrets/**".into()]));
+        let reason = paths
+            .denial_for(
+                "Read",
+                &[PathBuf::from("/home/me/secrets/token")],
+                ExecutionContext::Normal,
+            )
+            .unwrap();
+        assert!(reason.contains("secrets/token"), "{reason}");
+        assert!(
+            paths
+                .denial_for(
+                    "Read",
+                    &[PathBuf::from("/home/me/notes.md")],
+                    ExecutionContext::Normal
+                )
+                .is_none()
+        );
     }
 
     #[test]

@@ -588,6 +588,12 @@ pub struct TurnRuntime {
     pub compact_failures: u32,
     /// Whether the stop hook is active.
     pub stop_hook_active: bool,
+    /// The agent this turn belongs to, when it is a forked or background run.
+    ///
+    /// Permission decisions read this: a background run is one the person is
+    /// not watching, which is a different question from the one they answer
+    /// interactively.
+    pub agent_id: Option<String>,
     /// Terminal reason (set when state transitions to Terminated).
     pub terminal_reason: Option<TerminalReason>,
 }
@@ -607,6 +613,7 @@ impl TurnRuntime {
             recovery_count: 0,
             compact_failures: 0,
             stop_hook_active: false,
+            agent_id: None,
             terminal_reason: None,
         }
     }
@@ -1205,6 +1212,7 @@ impl QueryEngine {
         };
 
         let mut turn = TurnRuntime::new(budget);
+        turn.agent_id = options.agent_id.clone();
         let mut turn_number = self.current_turn + 1;
         let mut last_reason = TerminalReason::Completed;
 
@@ -1298,6 +1306,7 @@ impl QueryEngine {
         };
 
         let mut turn = TurnRuntime::new(budget);
+        turn.agent_id = options.agent_id.clone();
         let mut turn_number = self.current_turn + 1;
         let mut last_reason = TerminalReason::Completed;
 
@@ -2509,7 +2518,7 @@ impl QueryEngine {
                 &call.name,
                 call.input.to_string(),
                 None,
-                std::collections::HashMap::new(),
+                crate::tool_scheduler::permission_context_for(turn.agent_id.as_deref(), &call.id),
             )
             .await
             .map_err(|e| format!("permission check failed: {e}"))?;
@@ -2585,9 +2594,11 @@ impl QueryEngine {
                     name: call.name.clone(),
                     reason: reason.clone(),
                 });
+                // The reason is the only thing that tells the model what to
+                // do differently.
                 let result = ToolResult {
                     tool_call_id: call.id.clone(),
-                    output: format!("tool '{}' denied", call.name),
+                    output: format!("tool '{}' denied: {reason}", call.name),
                     is_error: true,
                 };
                 let mut ctx = std::collections::HashMap::new();
@@ -2802,7 +2813,7 @@ impl QueryEngine {
                 &elevation.tool_name,
                 elevation.input.to_string(),
                 None,
-                std::collections::HashMap::new(),
+                permission_context_for(turn.agent_id.as_deref(), &elevation.tool_call_id),
             )
             .await;
 
@@ -2863,6 +2874,33 @@ impl QueryEngine {
         // Signal the event loop to stop
         let _ = self.event_tx.send(EngineEvent::SessionEnd);
     }
+}
+
+/// The context a permission decision is made in.
+///
+/// `BackgroundAgentDenyHook` reads `execution_mode` to refuse tools in a
+/// background run, and every call site passed an empty map — so a hook that
+/// was written, registered, and documented could never fire. The mode comes
+/// from the run this call belongs to: one with an agent id is a forked or
+/// background flow, one without is the person's own turn.
+fn permission_context_for(
+    agent_id: Option<&str>,
+    tool_call_id: &str,
+) -> std::collections::HashMap<String, String> {
+    let mut context = std::collections::HashMap::new();
+    context.insert(
+        "execution_mode".to_string(),
+        if agent_id.is_some() {
+            "background".to_string()
+        } else {
+            "interactive".to_string()
+        },
+    );
+    context.insert("tool_call_id".to_string(), tool_call_id.to_string());
+    if let Some(agent_id) = agent_id {
+        context.insert("agent_id".to_string(), agent_id.to_string());
+    }
+    context
 }
 
 #[cfg(test)]
@@ -3448,6 +3486,120 @@ mod tests {
     }
 
     // ─── Elevation Flow ────────────────────────────────────────────────────
+
+    /// The wiring, not just the helper: a turn that belongs to an agent runs
+    /// its tools through the permission engine with a background context, and
+    /// the hook that refuses tools in a background run refuses this one.
+    /// The wiring, not just the helper: a turn that belongs to an agent runs
+    /// its tools with a background context, and the hook that refuses tools in
+    /// a background run refuses this one. The same call in the person's own
+    /// turn is allowed.
+    #[tokio::test]
+    async fn a_background_turn_has_its_tools_denied_by_the_hook() {
+        let (mut engine, _rx, _session) = make_test_engine();
+        // As the session does.
+        engine.permission_engine.add_hook(std::sync::Arc::new(
+            crate::permission_engine::BackgroundAgentDenyHook,
+        ));
+        let budget = TokenBudget::with_defaults();
+
+        let background = SubmitOptions {
+            agent_id: Some("task_7".into()),
+            ..SubmitOptions::default()
+        };
+        let mut turn = TurnRuntime::new(budget.clone());
+        turn.agent_id = background.agent_id.clone();
+        turn.pending_tool_calls.push(PendingToolCall {
+            id: "tc_1".into(),
+            name: "bash".into(),
+            input: serde_json::json!({"command": "whoami"}),
+        });
+
+        let denied = engine
+            .execute_tool_calls(&mut turn, &background)
+            .await
+            .unwrap();
+        assert_eq!(denied.len(), 1);
+        assert!(denied[0].is_error, "{:?}", denied[0]);
+        assert!(
+            denied[0].output.contains("background"),
+            "expected a denial naming the background run, got {}",
+            denied[0].output
+        );
+
+        // The same call in the person's own turn runs.
+        let interactive = SubmitOptions::default();
+        let mut turn = TurnRuntime::new(budget);
+        turn.pending_tool_calls.push(PendingToolCall {
+            id: "tc_2".into(),
+            name: "bash".into(),
+            input: serde_json::json!({"command": "whoami"}),
+        });
+
+        let allowed = engine
+            .execute_tool_calls(&mut turn, &interactive)
+            .await
+            .unwrap();
+        assert_eq!(allowed.len(), 1);
+        assert!(!allowed[0].is_error, "{:?}", allowed[0]);
+    }
+
+    /// The hook that refuses tools in a background run reads `execution_mode`
+    /// from the permission context. Every call site used to hand it an empty
+    /// map, so it could never fire; these pin what it is handed now.
+    #[test]
+    fn a_permission_context_says_which_run_it_belongs_to() {
+        let interactive = permission_context_for(None, "tc_1");
+        assert_eq!(interactive["execution_mode"], "interactive");
+        assert_eq!(interactive["tool_call_id"], "tc_1");
+        assert!(!interactive.contains_key("agent_id"));
+
+        let background = permission_context_for(Some("task_7"), "tc_2");
+        assert_eq!(background["execution_mode"], "background");
+        assert_eq!(background["agent_id"], "task_7");
+    }
+
+    /// And the hook acts on it.
+    #[tokio::test]
+    async fn the_background_deny_hook_fires_when_the_run_is_a_background_one() {
+        use crate::permission_engine::PermissionRequest;
+        use crate::permission_engine::{BackgroundAgentDenyHook, PermissionHook};
+        use crate::permissions::PermissionMode;
+
+        let hook = BackgroundAgentDenyHook;
+        let request = |context: std::collections::HashMap<String, String>| PermissionRequest {
+            id: "req_1".into(),
+            tool_name: "Bash".into(),
+            arguments: "{}".into(),
+            path: None,
+            context,
+            created_at: chrono::Utc::now(),
+        };
+
+        let denied = hook
+            .evaluate(
+                &request(permission_context_for(Some("task_7"), "tc_1")),
+                PermissionMode::Default,
+            )
+            .await
+            .unwrap();
+        assert!(
+            matches!(
+                denied,
+                Some(crate::permissions::PermissionResult::Deny { .. })
+            ),
+            "{denied:?}"
+        );
+
+        let allowed = hook
+            .evaluate(
+                &request(permission_context_for(None, "tc_1")),
+                PermissionMode::Default,
+            )
+            .await
+            .unwrap();
+        assert!(allowed.is_none(), "{allowed:?}");
+    }
 
     #[tokio::test]
     async fn resolve_elevation_approved_succeeds_with_bypass() {
