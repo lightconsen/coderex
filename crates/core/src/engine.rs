@@ -610,8 +610,16 @@ impl TurnRuntime {
     }
 
     /// Reset for a new turn.
+    ///
+    /// `messages` is the per-request message list, rebuilt from scratch by
+    /// `build_context` each turn. It must be cleared here: the turn runtime is
+    /// reused across the whole `submit_streaming` loop, so a list left in place
+    /// would be extended again on every turn — duplicating the context
+    /// preamble, the system prompt, and the entire session history once per
+    /// turn, and growing the request body superlinearly.
     pub fn reset(&mut self) {
         self.state = TurnState::Initialize;
+        self.messages.clear();
         self.pending_tool_calls.clear();
         self.pending_permission = None;
         self.pending_elevation = None;
@@ -3397,7 +3405,38 @@ mod tests {
         assert_eq!(turn.state, TurnState::Initialize);
         assert!(turn.pending_tool_calls.is_empty());
         assert_eq!(turn.budget.turn_tokens, 0);
-        // Messages are preserved on reset (they belong to the session)
+        // `turn.messages` is the per-request list, not the session history —
+        // the session's messages live in `session.messages` and are re-extended
+        // by `build_context`. Leaving them here duplicated the preamble, system
+        // prompt and history once per turn.
+        assert!(
+            turn.messages.is_empty(),
+            "reset must clear the per-request message list"
+        );
+    }
+
+    /// Regression: the turn runtime is reused across the whole submit loop, so
+    /// a second `build_context` for the same runtime must not see the first
+    /// one's messages.
+    #[test]
+    fn rebuild_context_does_not_accumulate_messages() {
+        let (mut engine, _rx, mut session) = make_test_engine();
+        session.messages.push(Message::user("first"));
+
+        let mut turn = TurnRuntime::new(TokenBudget::with_defaults());
+
+        engine.build_context(&mut turn, &SubmitOptions::default());
+        let after_first = turn.messages.len();
+
+        // Same turn runtime reused for the next turn, as the submit loop does.
+        turn.reset();
+        engine.build_context(&mut turn, &SubmitOptions::default());
+        let after_second = turn.messages.len();
+
+        assert_eq!(
+            after_first, after_second,
+            "rebuilding context must be idempotent per turn, not append"
+        );
     }
 
     #[test]
