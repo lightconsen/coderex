@@ -94,96 +94,143 @@ impl TerminalUi {
 
     /// Draw a single frame.
     pub fn draw(&mut self, state: &mut UiState) -> std::io::Result<()> {
-        self.terminal.draw(|frame| {
-            let area = frame.area();
-            let is_compact = state.force_compact || area.height < 20;
-
-            // Determine chunk heights
-            let inline_palette_height = if is_compact {
-                0
-            } else {
-                inline_palette_height(state)
-            };
-            let show_statusline = !is_compact;
-            let show_notif = state.notifications.active_count() > 0 && !is_compact;
-
-            let show_perm_bar = !is_compact;
-            let constraints = vec![
-                Constraint::Min(1),                                      // message area
-                Constraint::Length(inline_palette_height),               // inline command hint
-                Constraint::Length(if show_notif { 1 } else { 0 }),      // notification bar
-                Constraint::Length(if show_statusline { 1 } else { 0 }), // statusline (thinking)
-                Constraint::Length(1),                                   // input line
-                Constraint::Length(if show_perm_bar { 1 } else { 0 }),   // permission bar
-            ];
-
-            let chunks = Layout::default()
-                .direction(Direction::Vertical)
-                .constraints(constraints)
-                .split(area);
-
-            // Message area (index 0) — may be split horizontally
-            let msg_area = chunks[0];
-            if let crate::state::LayoutMode::HorizontalSplit { left_percent } = state.layout_mode {
-                let pct = left_percent.clamp(10, 90) as u16;
-                let split_chunks = Layout::default()
-                    .direction(Direction::Horizontal)
-                    .constraints([
-                        Constraint::Percentage(pct),
-                        Constraint::Percentage(100 - pct),
-                    ])
-                    .split(msg_area);
-
-                // Left pane: file/content viewer
-                render_left_pane(frame, split_chunks[0], state);
-                // Right pane: messages
-                render_messages(frame, split_chunks[1], state);
-            } else {
-                render_messages(frame, msg_area, state);
-            }
-
-            // Inline palette (index 1)
-            if inline_palette_height > 0 {
-                render_inline_palette(frame, chunks[1], state);
-            }
-
-            // Notification bar (index 2)
-            if show_notif {
-                let notif_idx = if inline_palette_height > 0 { 2 } else { 1 };
-                render_notification_bar(
-                    frame,
-                    chunks[notif_idx],
-                    &mut state.notifications,
-                    &state.theme,
-                );
-            }
-
-            // Statusline (above input)
-            if show_statusline {
-                let sl_idx = 1 + (inline_palette_height > 0) as usize + (show_notif) as usize;
-                render_statusline(frame, chunks[sl_idx], &state.statusline, &state.theme);
-            }
-
-            // Input line
-            let input_idx = if show_perm_bar {
-                chunks.len() - 2
-            } else {
-                chunks.len() - 1
-            };
-            render_input(frame, chunks[input_idx], &state.input, &state.theme);
-
-            // Permission bar (below input)
-            if show_perm_bar {
-                let perm_idx = chunks.len() - 1;
-                render_permission_bar(frame, chunks[perm_idx], &state.permission_bar, &state.theme);
-            }
-
-            // Overlay (only non-palette overlays; palette is rendered inline)
-            if state.overlays.is_active() && !is_inline_palette(state) {
-                render_overlay(frame, area, state);
-            }
-        })?;
+        self.terminal.draw(|frame| render_frame(frame, state))?;
         Ok(())
+    }
+}
+
+/// Pane positions in the vertical layout.
+///
+/// `Layout::split` returns one rect per constraint, in order, even when a
+/// constraint resolves to zero height — it does not compact them away. Deriving
+/// an index from "which panes are visible" therefore points at the wrong rect:
+/// with the palette hidden and no notification, a computed statusline index of
+/// 1 lands on the zero-height palette slot and the line disappears. Index by the
+/// constraint position instead.
+const PALETTE_IDX: usize = 1;
+const NOTIFICATION_IDX: usize = 2;
+const STATUSLINE_IDX: usize = 3;
+const INPUT_IDX: usize = 4;
+const PERMISSION_IDX: usize = 5;
+
+/// The vertical pane stack, top to bottom.
+///
+/// Shared with the layout tests so both sides agree on what each index means.
+fn frame_constraints(
+    inline_palette_height: u16,
+    show_notif: bool,
+    show_statusline: bool,
+    show_perm_bar: bool,
+) -> Vec<Constraint> {
+    vec![
+        Constraint::Min(1),                                      // message area
+        Constraint::Length(inline_palette_height),               // inline command hint
+        Constraint::Length(if show_notif { 1 } else { 0 }),      // notification bar
+        Constraint::Length(if show_statusline { 1 } else { 0 }), // statusline (thinking)
+        Constraint::Length(1),                                   // input line
+        Constraint::Length(if show_perm_bar { 1 } else { 0 }),   // permission bar
+    ]
+}
+
+/// Lay out and paint one frame.
+///
+/// Separate from `draw` so a `TestBackend` can drive it: the pane indices
+/// below are the single place where layout order is decided, and getting one
+/// wrong makes a pane render into the wrong rect without any error.
+fn render_frame(frame: &mut Frame, state: &mut UiState) {
+    let area = frame.area();
+    let is_compact = state.force_compact || area.height < 20;
+
+    // Determine chunk heights
+    let inline_palette_height = if is_compact {
+        0
+    } else {
+        inline_palette_height(state)
+    };
+    let show_statusline = !is_compact;
+    let show_notif = state.notifications.active_count() > 0 && !is_compact;
+
+    let show_perm_bar = !is_compact;
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints(frame_constraints(
+            inline_palette_height,
+            show_notif,
+            show_statusline,
+            show_perm_bar,
+        ))
+        .split(area);
+
+    // `Layout::split` returns one rect per constraint, in order, even
+    // when a constraint resolves to zero height — it does not compact
+    // them away. Deriving an index from "which panes are visible"
+    // therefore points at the wrong rect: with the palette hidden and
+    // no notification, a computed statusline index of 1 lands on the
+    // zero-height palette slot and the line disappears. Index by the
+    // constraint position instead.
+    debug_assert_eq!(chunks.len(), PERMISSION_IDX + 1);
+
+    // Message area (index 0) — may be split horizontally
+    let msg_area = chunks[0];
+    if let crate::state::LayoutMode::HorizontalSplit { left_percent } = state.layout_mode {
+        let pct = left_percent.clamp(10, 90) as u16;
+        let split_chunks = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([
+                Constraint::Percentage(pct),
+                Constraint::Percentage(100 - pct),
+            ])
+            .split(msg_area);
+
+        // Left pane: file/content viewer
+        render_left_pane(frame, split_chunks[0], state);
+        // Right pane: messages
+        render_messages(frame, split_chunks[1], state);
+    } else {
+        render_messages(frame, msg_area, state);
+    }
+
+    // Inline palette (index 1)
+    if inline_palette_height > 0 {
+        render_inline_palette(frame, chunks[PALETTE_IDX], state);
+    }
+
+    // Notification bar (index 2)
+    if show_notif {
+        render_notification_bar(
+            frame,
+            chunks[NOTIFICATION_IDX],
+            &mut state.notifications,
+            &state.theme,
+        );
+    }
+
+    // Statusline (above input)
+    if show_statusline {
+        render_statusline(
+            frame,
+            chunks[STATUSLINE_IDX],
+            &state.statusline,
+            &state.theme,
+        );
+    }
+
+    // Input line
+    render_input(frame, chunks[INPUT_IDX], &state.input, &state.theme);
+
+    // Permission bar (below input)
+    if show_perm_bar {
+        render_permission_bar(
+            frame,
+            chunks[PERMISSION_IDX],
+            &state.permission_bar,
+            &state.theme,
+        );
+    }
+
+    // Overlay (only non-palette overlays; palette is rendered inline)
+    if state.overlays.is_active() && !is_inline_palette(state) {
+        render_overlay(frame, area, state);
     }
 }
 
@@ -1212,5 +1259,116 @@ mod tests {
         assert_eq!(start, 1);
         assert_eq!(count, 3);
         assert_eq!(accumulated, 83);
+    }
+}
+
+#[cfg(test)]
+mod layout_tests {
+    use super::*;
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+    use ratatui::buffer::Buffer;
+
+    fn row_text(buffer: &Buffer, y: u16) -> String {
+        (0..buffer.area.width)
+            .map(|x| buffer.cell((x, y)).map_or(" ", |c| c.symbol()))
+            .collect()
+    }
+
+    fn render_to_buffer(width: u16, height: u16, state: &mut UiState) -> Buffer {
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        terminal
+            .draw(|frame| render_frame(frame, state))
+            .expect("draw frame");
+        terminal.backend().buffer().clone()
+    }
+
+    /// The pane stack the renderer lays out, for the given visibility flags.
+    fn chunks_for(
+        height: u16,
+        palette: u16,
+        notif: bool,
+        statusline: bool,
+        perm: bool,
+    ) -> Vec<ratatui::layout::Rect> {
+        Layout::default()
+            .direction(Direction::Vertical)
+            .constraints(frame_constraints(palette, notif, statusline, perm))
+            .split(ratatui::layout::Rect::new(0, 0, 80, height))
+            .to_vec()
+    }
+
+    /// The regression: `Layout::split` keeps one rect per constraint even when a
+    /// constraint resolves to zero height, so indexing by "which panes are on"
+    /// pointed the input line and statusline at zero-height rects and both
+    /// silently vanished.
+    #[test]
+    fn input_and_statusline_render_on_their_own_panes() {
+        // Palette hidden, no notification: the case where the old computed
+        // index (1) landed on the zero-height palette rect.
+        let mut state = UiState::default();
+        let buffer = render_to_buffer(80, 30, &mut state);
+        let rows: Vec<String> = (0..30).map(|y| row_text(&buffer, y)).collect();
+
+        let chunks = chunks_for(30, 0, false, true, true);
+        let statusline_y = chunks[STATUSLINE_IDX].y;
+        let input_y = chunks[INPUT_IDX].y;
+
+        assert!(
+            chunks[STATUSLINE_IDX].height > 0,
+            "statusline pane has no height"
+        );
+        assert!(
+            !rows[statusline_y as usize].trim().is_empty(),
+            "statusline did not render on its pane (row {statusline_y}):\n{}",
+            rows.join("\n")
+        );
+        assert!(
+            rows[input_y as usize].contains('❯'),
+            "input line did not render on its pane (row {input_y}):\n{}",
+            rows.join("\n")
+        );
+    }
+
+    /// Compact mode hides the statusline and permission bar. The input line
+    /// keeps its own constraint, so it must still be laid out and drawn.
+    #[test]
+    fn input_renders_in_compact_mode() {
+        let mut state = UiState {
+            force_compact: true,
+            ..UiState::default()
+        };
+        let buffer = render_to_buffer(80, 12, &mut state);
+        let rows: Vec<String> = (0..12).map(|y| row_text(&buffer, y)).collect();
+
+        let chunks = chunks_for(12, 0, false, false, false);
+        let input_y = chunks[INPUT_IDX].y;
+        assert!(
+            chunks[INPUT_IDX].height > 0,
+            "input pane has no height in compact mode"
+        );
+        assert!(
+            rows[input_y as usize].contains('❯'),
+            "input line is not visible in compact mode (row {input_y}):\n{}",
+            rows.join("\n")
+        );
+    }
+
+    /// Every index the renderer uses must name the constraint it claims to.
+    #[test]
+    fn pane_indices_follow_the_constraint_order() {
+        let chunks = chunks_for(30, 4, true, true, true);
+        assert_eq!(chunks.len(), PERMISSION_IDX + 1, "one rect per constraint");
+        assert_eq!(chunks[PALETTE_IDX].height, 4, "palette");
+        assert_eq!(chunks[NOTIFICATION_IDX].height, 1, "notification");
+        assert_eq!(chunks[STATUSLINE_IDX].height, 1, "statusline");
+        assert_eq!(chunks[INPUT_IDX].height, 1, "input");
+        assert_eq!(chunks[PERMISSION_IDX].height, 1, "permission");
+        assert!(chunks[0].height > 1, "message area");
+        // Rects are contiguous and in order, top to bottom.
+        for pair in chunks.windows(2) {
+            assert_eq!(pair[0].y + pair[0].height, pair[1].y);
+        }
     }
 }
