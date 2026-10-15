@@ -12,6 +12,7 @@ workspace = true
 
 [dependencies]
 coderex-core = { path = "../core" }
+coderex-insights = { path = "../insights" }
 coderex-config = { path = "../config" }
 
 thiserror.workspace = true

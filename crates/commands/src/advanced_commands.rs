@@ -131,35 +131,35 @@ pub fn register(registry: &mut CommandRegistry) {
     // /insights — project insights
     registry.register(SlashCommand::local(
         "insights",
-        "Project insights and analysis",
+        "Analyze your sessions and write a report",
         true,
         true,
         true,
-        Arc::new(|ctx: &CommandContext, _args: &[String]| {
-            let cwd = std::path::Path::new(&ctx.cwd);
-            let mut file_count = 0;
-            let mut dir_count = 0;
-            if cwd.exists() {
-                if let Ok(entries) = std::fs::read_dir(cwd) {
-                    for entry in entries.flatten() {
-                        if entry.file_type().map(|t| t.is_file()).unwrap_or(false) {
-                            file_count += 1;
-                        } else if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
-                            dir_count += 1;
-                        }
+        Arc::new(|ctx: &CommandContext, args: &[String]| {
+            let transcripts =
+                coderex_insights::workspace_transcripts(std::path::Path::new(&ctx.cwd));
+            let root = args
+                .first()
+                .filter(|arg| !arg.starts_with('-'))
+                .map_or_else(coderex_insights::default_root, std::path::PathBuf::from);
+
+            match coderex_insights::run(&[transcripts], root) {
+                Ok(outcome) => {
+                    let mut report = format!(
+                        "{}\n\n{}",
+                        outcome.summary(),
+                        outcome.report.stable.display()
+                    );
+                    for finding in outcome.findings.iter().take(5) {
+                        report.push_str(&format!("\n• {} — {}", finding.title, finding.detail));
                     }
+                    for unreadable in &outcome.unreadable {
+                        report.push_str(&format!("\n(could not read {unreadable})"));
+                    }
+                    CommandResult::success(report)
                 }
+                Err(error) => CommandResult::error(format!("could not write the report: {error}")),
             }
-            let git_info = if ctx.git_branch.is_empty() {
-                "No git repository detected".to_string()
-            } else {
-                format!("Branch: {}\nStatus: {}", ctx.git_branch, ctx.git_status)
-            };
-            CommandResult::success(format!(
-                "Project Insights\n────────────────\nWorking Dir: {}\n{}\n\nFiles: {} | Directories: {}\nSession Messages: {}\nInput Tokens: {} | Output Tokens: {}\nCache Read: {} | Cache Creation: {}\nCost: ${:.4}",
-                ctx.cwd, git_info, file_count, dir_count, ctx.message_count,
-                ctx.input_tokens, ctx.output_tokens, ctx.cache_read_tokens, ctx.cache_creation_tokens, ctx.cost_usd
-            ))
         }),
     ));
 
@@ -360,14 +360,44 @@ mod tests {
     }
 
     #[test]
-    fn insights() {
+    fn insights_writes_a_report_for_the_workspace() {
         let reg = {
             let mut r = CommandRegistry::new();
             register(&mut r);
             r
         };
-        let result = reg.execute("insights", &ctx(), &[]);
-        assert!(result.output.contains("Project Insights"));
+
+        let workspace = tempfile::tempdir().unwrap();
+        let out_dir = tempfile::tempdir().unwrap();
+        let mut context = ctx();
+        context.cwd = workspace.path().to_string_lossy().to_string();
+
+        // A workspace with no transcripts is a sentence, not a failure.
+        let result = reg.execute(
+            "insights",
+            &context,
+            &[out_dir.path().to_string_lossy().to_string()],
+        );
+        assert!(result.output.contains("No sessions"), "{}", result.output);
+
+        // With one session written, the report is produced and named.
+        let transcripts = coderex_insights::workspace_transcripts(workspace.path());
+        std::fs::create_dir_all(&transcripts).unwrap();
+        std::fs::write(
+            transcripts.join("sess_1.jsonl"),
+            serde_json::to_string(&coderex_core::types::Message::user("fix the parser")).unwrap(),
+        )
+        .unwrap();
+
+        let result = reg.execute(
+            "insights",
+            &context,
+            &[out_dir.path().to_string_lossy().to_string()],
+        );
+        assert!(result.output.contains("1 session(s)"), "{}", result.output);
+        assert!(result.output.contains("report.html"), "{}", result.output);
+        assert!(out_dir.path().join("report.html").is_file());
+        assert!(out_dir.path().join("facets").join("sess_1.json").is_file());
     }
 
     #[test]
