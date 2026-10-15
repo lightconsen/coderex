@@ -5,6 +5,7 @@ members = [
     "crates/agents",
     "crates/artifacts",
     "crates/insights",
+    "crates/workflow",
     "crates/commands",
     "crates/hooks",
     "crates/memory",

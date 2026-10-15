@@ -1,0 +1,31 @@
+[package]
+name = "coderex-workflow"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Workflow runtime — deterministic JavaScript orchestration of sub-agents"
+
+[lints]
+workspace = true
+
+[dependencies]
+coderex-core = { path = "../core" }
+coderex-tools = { path = "../tools" }
+
+async-trait.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+chrono.workspace = true
+sha2.workspace = true
+uuid.workspace = true
+home.workspace = true
+futures.workspace = true
+boa_engine = "0.20"
+
+[dev-dependencies]
+tempfile.workspace = true
