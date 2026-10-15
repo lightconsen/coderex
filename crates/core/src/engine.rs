@@ -2552,7 +2552,9 @@ impl QueryEngine {
                 });
                 let result = ToolResult {
                     tool_call_id: call.id.clone(),
-                    output: format!("tool '{}' denied by user", call.name),
+                    output: crate::permissions::PermissionResult::unapproved_tool_message(
+                        &call.name, &reason,
+                    ),
                     is_error: true,
                 };
                 let mut ctx = std::collections::HashMap::new();

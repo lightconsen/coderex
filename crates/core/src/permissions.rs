@@ -108,6 +108,23 @@ pub enum PermissionResult {
 }
 
 impl PermissionResult {
+    /// Message for a tool result when an `Ask` reached the caller unresolved.
+    ///
+    /// [`PermissionEngine::evaluate`](crate::permission_engine::PermissionEngine::evaluate)
+    /// routes `Ask` through the confirmation bus when one is configured and
+    /// returns the user's actual answer. So an `Ask` that arrives at a caller
+    /// means no interactive channel was available — reporting it as "denied by
+    /// user" claims a decision nobody made, and hides the real cause from a
+    /// headless or SDK caller.
+    #[must_use]
+    pub fn unapproved_tool_message(tool_name: &str, reason: &str) -> String {
+        format!(
+            "tool '{tool_name}' requires approval but no confirmation channel is available: {reason}"
+        )
+    }
+}
+
+impl PermissionResult {
     /// Returns true if the operation can proceed without user input.
     #[must_use]
     pub const fn is_allowed(&self) -> bool {
@@ -751,5 +768,30 @@ mod tests {
             let parsed: PermissionMode = s.parse().unwrap();
             assert_eq!(parsed, mode);
         }
+    }
+}
+
+#[cfg(test)]
+mod unapproved_tool_message_tests {
+    use super::PermissionResult;
+
+    #[test]
+    fn message_names_the_tool_and_the_missing_channel() {
+        let msg = PermissionResult::unapproved_tool_message("Bash", "writes outside the worktree");
+        assert!(msg.contains("Bash"), "{msg}");
+        assert!(msg.contains("no confirmation channel"), "{msg}");
+        assert!(msg.contains("writes outside the worktree"), "{msg}");
+    }
+
+    /// The distinction this message exists to preserve: when the user really
+    /// was asked and refused, the engine resolves the ask itself and says
+    /// "denied by user". An unresolved ask must not borrow that wording.
+    #[test]
+    fn does_not_claim_a_denial_by_a_person() {
+        let msg = PermissionResult::unapproved_tool_message("Bash", "needs approval");
+        assert!(
+            !msg.contains("denied by user"),
+            "an unasked tool must not report a user denial: {msg}"
+        );
     }
 }
