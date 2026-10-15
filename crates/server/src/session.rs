@@ -163,6 +163,13 @@ pub struct Session {
 pub struct ServerConfig {
     /// Valid API keys for authentication.
     pub valid_keys: Vec<String>,
+    /// Serve without any API keys.
+    ///
+    /// Off by default: with no keys configured, an open server accepts any
+    /// token from anyone who can reach the port. Turning this on is an
+    /// explicit decision to run unauthenticated, and is meant for a loopback
+    /// development session rather than anything reachable from a network.
+    pub allow_anonymous: bool,
     /// Duration after which idle sessions are cleaned up.
     pub idle_timeout: Duration,
     /// Maximum number of concurrent sessions.
@@ -179,6 +186,7 @@ impl Default for ServerConfig {
     fn default() -> Self {
         Self {
             valid_keys: Vec::new(),
+            allow_anonymous: false,
             idle_timeout: Duration::from_secs(3600),
             max_sessions: 100,
             rate_limit_per_minute: 100,
@@ -199,6 +207,8 @@ pub struct DaemonServer {
     session_count_atomic: Arc<AtomicUsize>,
     /// Optional SQLite session store for persistence.
     store: Option<crate::persistence::SessionStore>,
+    /// Monotonic source of session ids.
+    next_session_id: u64,
 }
 
 impl Default for DaemonServer {
@@ -216,6 +226,7 @@ impl DaemonServer {
             config: ServerConfig::default(),
             session_count_atomic: Arc::new(AtomicUsize::new(0)),
             store: None,
+            next_session_id: 0,
         }
     }
 
@@ -227,6 +238,7 @@ impl DaemonServer {
             config: config.clone(),
             session_count_atomic: Arc::new(AtomicUsize::new(0)),
             store: None,
+            next_session_id: 0,
         };
 
         // Initialize persistence if configured
@@ -257,15 +269,26 @@ impl DaemonServer {
 
     /// Authenticate a new session with the given token.
     pub fn authenticate(&mut self, token: &str) -> Result<String, String> {
-        if !self.config.valid_keys.is_empty() && !self.config.valid_keys.iter().any(|k| k == token)
-        {
+        if self.config.valid_keys.is_empty() {
+            if !self.config.allow_anonymous {
+                return Err(
+                    "server has no API keys configured; set one, or enable anonymous \
+                     access explicitly for local development"
+                        .to_string(),
+                );
+            }
+        } else if !self.config.valid_keys.iter().any(|k| k == token) {
             return Err("invalid API key".to_string());
         }
         if self.sessions.len() >= self.config.max_sessions {
             return Err("max sessions reached".to_string());
         }
 
-        let id = format!("sess_{}", self.sessions.len() + 1);
+        // A counter, not `sessions.len()`: removing a session lowers the
+        // length, so the next id would repeat one still in the map and
+        // overwrite it.
+        self.next_session_id += 1;
+        let id = format!("sess_{}", self.next_session_id);
         let now = Instant::now();
         let session = Session {
             id: id.clone(),
@@ -651,6 +674,7 @@ mod tests {
     fn server_with_keys() -> DaemonServer {
         DaemonServer::with_config(ServerConfig {
             valid_keys: vec!["key1".to_string(), "key2".to_string()],
+            allow_anonymous: false,
             idle_timeout: Duration::from_secs(1),
             max_sessions: 10,
             rate_limit_per_minute: 100,
@@ -677,16 +701,62 @@ mod tests {
     }
 
     #[test]
-    fn authenticate_no_keys_allows_anything() {
+    fn unconfigured_server_refuses_every_token() {
+        // No keys and no explicit opt-in: this used to accept anyone who could
+        // reach the port.
         let mut server = DaemonServer::new();
+        let err = server.authenticate("anything").unwrap_err();
+        assert!(err.contains("no API keys"), "{err}");
+        assert!(server.get_session("sess_1").is_none());
+    }
+
+    #[test]
+    fn anonymous_access_is_an_explicit_opt_in() {
+        let mut server = DaemonServer::with_config(ServerConfig {
+            valid_keys: Vec::new(),
+            allow_anonymous: true,
+            idle_timeout: Duration::from_secs(1),
+            max_sessions: 10,
+            rate_limit_per_minute: 100,
+            health_port: None,
+            persist_path: None,
+        });
         let id = server.authenticate("anything").unwrap();
         assert!(server.get_session(&id).is_some());
+    }
+
+    /// Ids must not be reused: a counter derived from `sessions.len()` repeats
+    /// after a removal and overwrites a live session.
+    #[test]
+    fn session_ids_survive_a_removal() {
+        let mut server = DaemonServer::with_config(ServerConfig {
+            valid_keys: Vec::new(),
+            allow_anonymous: true,
+            idle_timeout: Duration::from_secs(1),
+            max_sessions: 10,
+            rate_limit_per_minute: 100,
+            health_port: None,
+            persist_path: None,
+        });
+        let first = server.authenticate("a").unwrap();
+        let second = server.authenticate("b").unwrap();
+        assert_ne!(first, second);
+
+        assert!(server.disconnect(&first));
+
+        let third = server.authenticate("c").unwrap();
+        assert_ne!(third, second, "a removed session's id must not be reused");
+        assert!(
+            server.get_session(&second).is_some(),
+            "the live session must not be overwritten"
+        );
     }
 
     #[test]
     fn cleanup_removes_idle_sessions() {
         let mut server = DaemonServer::with_config(ServerConfig {
             valid_keys: Vec::new(),
+            allow_anonymous: true,
             idle_timeout: Duration::from_millis(50),
             max_sessions: 10,
             rate_limit_per_minute: 100,
@@ -705,6 +775,7 @@ mod tests {
     fn record_activity_prevents_cleanup() {
         let mut server = DaemonServer::with_config(ServerConfig {
             valid_keys: Vec::new(),
+            allow_anonymous: true,
             idle_timeout: Duration::from_millis(50),
             max_sessions: 10,
             rate_limit_per_minute: 100,
@@ -725,6 +796,7 @@ mod tests {
     fn max_sessions_enforced() {
         let mut server = DaemonServer::with_config(ServerConfig {
             valid_keys: Vec::new(),
+            allow_anonymous: true,
             idle_timeout: Duration::from_secs(3600),
             max_sessions: 2,
             rate_limit_per_minute: 100,
