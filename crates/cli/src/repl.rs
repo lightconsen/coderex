@@ -440,6 +440,72 @@ struct BackgroundTask {
 
 /// The REPL event loop — reads user input, executes commands or queries.
 #[allow(missing_debug_implementations)]
+/// Runs a workflow's agents through the session's agent manager.
+///
+/// A workflow spawns agents the same way the Agent tool does; what it adds is
+/// being asked for them by a script, one at a time and in parallel.
+struct WorkflowAgentRunner {
+    manager: Arc<tokio::sync::Mutex<AgentManager>>,
+    session_id: String,
+    cwd: String,
+}
+
+#[async_trait::async_trait]
+impl coderex_workflow::AgentRunner for WorkflowAgentRunner {
+    async fn run(&self, request: coderex_workflow::AgentRequest) -> Result<Option<String>, String> {
+        use coderex_agents::manager::SpawnOptions;
+        use coderex_agents::types::{AgentType, Thoroughness};
+
+        // A tool the agent was told not to use cannot be spelled here, so the
+        // spawn is refused rather than run un-narrowed — the script asked for
+        // something narrower than this can provide.
+        if !request.disallowed_tools.is_empty() {
+            return Err(format!(
+                "this workflow asked to withhold {:?} from an agent, which this session cannot                  express; refusing the spawn rather than running it un-narrowed",
+                request.disallowed_tools
+            ));
+        }
+
+        let agent_type = match request.agent_type.as_deref() {
+            Some("explore") => AgentType::Explore {
+                thoroughness: Thoroughness::Medium,
+            },
+            Some("plan") => AgentType::Plan,
+            Some("verification") | Some("verify") => AgentType::Verification,
+            Some("claude_code_guide") => AgentType::ClaudeCodeGuide,
+            _ => AgentType::GeneralPurpose,
+        };
+
+        let options = SpawnOptions {
+            model_override: request.model.clone(),
+            isolation: request.isolation.clone(),
+            output_schema: request.schema.clone(),
+            ..Default::default()
+        };
+
+        let mut manager = self.manager.lock().await;
+        let instance = manager
+            .spawn_agent(
+                agent_type,
+                &request.prompt,
+                options,
+                &self.session_id,
+                &self.cwd,
+                0,
+            )
+            .await
+            .map_err(|error| format!("could not start the agent: {error}"))?;
+        let agent_id = instance.task_handle.id.clone();
+
+        let result = manager
+            .wait_for_completion(&agent_id)
+            .await
+            .map_err(|error| format!("the agent did not finish: {error}"))?;
+
+        Ok(Some(result.output))
+    }
+}
+
 pub struct ReplLoop {
     /// Command registry.
     commands: CommandRegistry,
@@ -800,6 +866,19 @@ impl ReplLoop {
                 .with_manager(Arc::clone(&agent_manager))
                 .with_session_id(session_id.to_string())
                 .with_cwd(cwd.clone()),
+        ));
+        // Workflow scripts spawn agents, so they are opt-in: the flag is what
+        // turns the tool from "not enabled" into callable.
+        let workflows_enabled = coderex_config::flags::FeatureFlags::from_env().workflow_scripts;
+        registry.register(Arc::new(
+            coderex_workflow::WorkflowTool::new(Arc::new(WorkflowAgentRunner {
+                manager: Arc::clone(&agent_manager),
+                session_id: session_id.to_string(),
+                cwd: cwd.clone(),
+            }))
+            .with_enabled(workflows_enabled)
+            .with_root(coderex_workflow::default_root())
+            .with_project_dir(std::path::Path::new(&cwd).join(".coderex/workflows")),
         ));
         let registry = Arc::new(registry);
         let inner_executor = Arc::new(ToolsExecutor::new(ExecutionConfig::default()));
@@ -5288,6 +5367,40 @@ mod tests {
         }
         assert!(saw_started, "missing sub-agent start event");
         assert!(saw_completed, "missing sub-agent completion event");
+    }
+
+    #[tokio::test]
+    async fn the_workflow_tool_is_registered_and_runs_a_script_through_the_session() {
+        let api = ReadThenAnswerApi {
+            call: Arc::new(std::sync::Mutex::new(0)),
+            expected_contents: "needle-from-child",
+        };
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join("note.txt"), "needle-from-child").unwrap();
+
+        let mut repl = ReplLoop::with_engine(
+            Box::new(api),
+            temp.path().to_string_lossy().into_owned(),
+            ModelId::sonnet(),
+        );
+        // Off by default: a workflow spawns agents.
+        let dispatcher = repl.dispatcher.take().unwrap();
+        let tool = dispatcher.registry().get_tool_arc("Workflow").unwrap();
+        let refused = tool
+            .execute(
+                coderex_tools::ToolInput {
+                    call_id: "c".into(),
+                    name: "Workflow".into(),
+                    arguments: serde_json::json!({"script": "export const meta = { name: 'a', description: 'b' }"}),
+                },
+                coderex_tools::ToolContext::new(
+                    coderex_tools::ExecutionContext::Normal,
+                    temp.path(),
+                ),
+            )
+            .await
+            .unwrap_err();
+        assert!(refused.to_string().contains("not enabled"), "{refused}");
     }
 
     #[tokio::test]
