@@ -105,6 +105,7 @@ async fn websocket_auth_valid_token_creates_session() {
         rate_limit_per_minute: 100,
         health_port: None,
         persist_path: None,
+        allow_anonymous: false,
     };
     let addr = start_server(config).await;
     let mut ws = ws_connect(addr).await;
@@ -122,6 +123,7 @@ async fn websocket_auth_invalid_token_rejected() {
         rate_limit_per_minute: 100,
         health_port: None,
         persist_path: None,
+        allow_anonymous: false,
     };
     let addr = start_server(config).await;
     let mut ws = ws_connect(addr).await;
@@ -147,6 +149,7 @@ async fn websocket_auth_max_sessions_enforced() {
         rate_limit_per_minute: 100,
         health_port: None,
         persist_path: None,
+        allow_anonymous: false,
     });
 
     server.authenticate("key1").unwrap();
@@ -165,6 +168,7 @@ async fn websocket_auth_raw_token_fallback() {
         rate_limit_per_minute: 100,
         health_port: None,
         persist_path: None,
+        allow_anonymous: false,
     };
     let addr = start_server(config).await;
     let mut ws = ws_connect(addr).await;
@@ -193,6 +197,7 @@ async fn structured_io_query_request_response() {
         rate_limit_per_minute: 100,
         health_port: None,
         persist_path: None,
+        allow_anonymous: false,
     };
     let addr = start_server(config).await;
     let mut ws = ws_connect(addr).await;
@@ -221,6 +226,7 @@ async fn structured_io_ping_pong() {
         rate_limit_per_minute: 100,
         health_port: None,
         persist_path: None,
+        allow_anonymous: false,
     };
     let addr = start_server(config).await;
     let mut ws = ws_connect(addr).await;
@@ -244,6 +250,7 @@ async fn structured_io_interrupt_returns_done() {
         rate_limit_per_minute: 100,
         health_port: None,
         persist_path: None,
+        allow_anonymous: false,
     };
     let addr = start_server(config).await;
     let mut ws = ws_connect(addr).await;
@@ -267,6 +274,7 @@ async fn structured_io_invalid_json_error_response() {
         rate_limit_per_minute: 100,
         health_port: None,
         persist_path: None,
+        allow_anonymous: false,
     };
     let addr = start_server(config).await;
     let mut ws = ws_connect(addr).await;
@@ -297,6 +305,7 @@ async fn structured_io_rate_limit_event() {
         rate_limit_per_minute: 3, // 3 tokens only
         health_port: None,
         persist_path: None,
+        allow_anonymous: false,
     };
     let addr = start_server(config).await;
     let mut ws = ws_connect(addr).await;
@@ -361,6 +370,7 @@ async fn idle_cleanup_removes_inactive_session() {
         rate_limit_per_minute: 100,
         health_port: None,
         persist_path: None,
+        allow_anonymous: true,
     });
 
     let id = server.authenticate("any-token").unwrap();
@@ -383,6 +393,7 @@ async fn idle_cleanup_activity_resets_timer() {
         rate_limit_per_minute: 100,
         health_port: None,
         persist_path: None,
+        allow_anonymous: true,
     });
 
     let id = server.authenticate("tok").unwrap();
@@ -411,6 +422,7 @@ async fn session_listing_active_sessions() {
         rate_limit_per_minute: 100,
         health_port: None,
         persist_path: None,
+        allow_anonymous: false,
     });
 
     server.authenticate("k1").unwrap();
@@ -429,6 +441,7 @@ async fn session_listing_after_disconnect() {
         rate_limit_per_minute: 100,
         health_port: None,
         persist_path: None,
+        allow_anonymous: false,
     });
 
     let id1 = server.authenticate("k1").unwrap();
@@ -450,6 +463,7 @@ async fn session_listing_count_atomic() {
         rate_limit_per_minute: 100,
         health_port: None,
         persist_path: None,
+        allow_anonymous: true,
     });
 
     assert_eq!(server.session_count(), 0);
@@ -472,6 +486,7 @@ async fn full_websocket_lifecycle_auth_query_disconnect() {
         rate_limit_per_minute: 100,
         health_port: None,
         persist_path: None,
+        allow_anonymous: false,
     };
     let addr = start_server(config).await;
     let mut ws = ws_connect(addr).await;
