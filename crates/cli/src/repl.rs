@@ -2627,59 +2627,24 @@ impl ReplLoop {
     /// Run a single query in non-interactive (headless) mode.
     pub async fn run_headless(&mut self, prompt: &str) -> Result<String> {
         if prompt.starts_with('/') {
-            // Check for macro expansion
-            let parts: Vec<&str> = prompt.split_whitespace().collect();
-            let cmd_name = parts[0].trim_start_matches('/');
-            if self.macro_registry.has(cmd_name) {
-                if let Some(commands) = self.macro_registry.get(cmd_name) {
-                    let cmds: Vec<String> = commands.to_vec();
-                    let mut outputs = Vec::new();
-                    for macro_cmd in cmds {
-                        let out = Box::pin(self.run_headless(&macro_cmd)).await?;
-                        outputs.push(out);
-                    }
-                    return Ok(outputs.join("\n"));
-                }
-            }
+            // Slash commands go through the same dispatch the interactive
+            // non-TUI path uses. That dispatch owns the built-ins which change
+            // the session — `/clear` clears, `/compact` compacts, `/model`
+            // switches — and keeping a second, shorter copy of that list here
+            // is how headless came to report commands it never actually ran.
+            let mut buffer: Vec<u8> = Vec::new();
+            self.execute_command(prompt, &mut buffer).await?;
+            return Ok(String::from_utf8_lossy(&buffer).into_owned());
+        }
 
-            // Check for pipe operator
-            if prompt.contains('|') {
-                let segments: Vec<&str> = prompt.trim_start_matches('/').split('|').collect();
-                let mut pipe_input: Option<String> = None;
-                let mut outputs = Vec::new();
-                for segment in &segments {
-                    let segment = segment.trim();
-                    if segment.is_empty() {
-                        continue;
-                    }
-                    let p: Vec<&str> = segment.split_whitespace().collect();
-                    let name = p[0];
-                    let args: Vec<String> = p[1..].iter().map(|s| s.to_string()).collect();
-                    self.command_history.append(name, &args);
-                    let mut ctx = self.build_context();
-                    ctx.pipe_input = pipe_input;
-                    let result = self.commands.execute(name, &ctx, &args);
-                    self.sync_command_state(name, &result);
-                    outputs.push(result.output.clone());
-                    pipe_input = Some(result.output);
-                }
-                return Ok(outputs.join("\n---\n"));
-            }
-
-            let args: Vec<String> = parts[1..].iter().map(|s| s.to_string()).collect();
-            self.command_history.append(cmd_name, &args);
-            let ctx = self.build_context();
-            let result = self.commands.execute(cmd_name, &ctx, &args);
-            self.sync_command_state(cmd_name, &result);
-            Ok(result.output)
-        } else if self.engine.is_some() {
-            // 14.1: Route to QueryEngine instead of placeholder
-            Ok(self.submit_prompt(prompt, true).await)
-        } else {
+        if self.engine.is_none() {
             return Err(anyhow::anyhow!(
                 "No QueryEngine configured. Set ANTHROPIC_API_KEY or run `coderex --api-key <key>`"
             ));
         }
+
+        // Route to the QueryEngine rather than a placeholder.
+        Ok(self.submit_prompt(prompt, true).await)
     }
 
     /// Drain pending events from the event channel, append text deltas to output,
@@ -3906,8 +3871,12 @@ impl ReplLoop {
             }
         }
 
-        if cmd_name == "clear" && result.state_changed {
-            self.clear_tui_session(ui_state, result.output.clone());
+        if cmd_name == "clear" && self.commands.find("clear").is_some() {
+            // Whatever the registry said about the message count, the session
+            // is cleared here, and the message says that rather than echoing
+            // how empty it already was.
+            let message = self.perform_session_clear();
+            self.clear_tui_session(ui_state, message);
             return;
         }
 
@@ -3922,6 +3891,33 @@ impl ReplLoop {
             streaming: false,
             folded: false,
         });
+    }
+
+    /// Clear the session and say what happened.
+    ///
+    /// One implementation for every entry point, because `/clear` that reports
+    /// success and leaves the conversation in place is worse than no `/clear`
+    /// at all — and the interactive, headless, and scripted paths had drifted
+    /// into exactly that: only the interactive one cleared anything.
+    fn perform_session_clear(&mut self) -> String {
+        let removed = self
+            .engine
+            .as_ref()
+            .map_or(0, |engine| engine.session().messages.len());
+
+        if let Some(ref mut engine) = self.engine {
+            let mut session = engine.session().clone();
+            session.messages.clear();
+            engine.set_session(session);
+        }
+        self.history.clear();
+        self.session_effects = SessionEffects::default();
+
+        if removed == 0 {
+            "Session cleared. (There was nothing in it.)".to_string()
+        } else {
+            format!("Session cleared. ({removed} message(s) removed)")
+        }
     }
 
     fn clear_tui_session(&mut self, ui_state: &mut coderex_ui::state::UiState, message: String) {
@@ -4072,295 +4068,274 @@ impl ReplLoop {
             }
         }
 
-        // Built-in REPL commands that don't go through registry
-        match cmd_name {
-            "exit" | "quit" => {
-                self.running = false;
-                writeln!(stdout, "Exiting...")?;
-                return Ok(());
-            }
-            "help" => {
-                self.show_help(stdout)?;
-                return Ok(());
-            }
-            "cancel" => {
-                self.cancel_background_tasks();
-                writeln!(stdout, "All background tasks cancelled.")?;
-                return Ok(());
-            }
-            "compact" => {
-                let msg = self.compact_context_non_tui().await;
-                writeln!(stdout, "{msg}")?;
-                return Ok(());
-            }
-            "agent-summary" => {
-                let msg = self.spawn_background_feature_by_kind(
-                    BackgroundFeatureKind::AgentSummary,
-                    "Summarize what the agent has done recently.".into(),
-                );
-                writeln!(stdout, "{msg}")?;
-                return Ok(());
-            }
-            "magic-docs" => {
-                let msg = self.spawn_background_feature_by_kind(
-                    BackgroundFeatureKind::MagicDocs,
-                    "Generate documentation for the current codebase.".into(),
-                );
-                writeln!(stdout, "{msg}")?;
-                return Ok(());
-            }
-            "generate-readme" => {
-                let msg = self.spawn_background_feature_by_kind(
-                    BackgroundFeatureKind::ReadmeGeneration,
-                    "Generate a README for the current project.".into(),
-                );
-                writeln!(stdout, "{msg}")?;
-                return Ok(());
-            }
-            "away-summary" => {
-                let msg = self.spawn_background_feature_by_kind(
-                    BackgroundFeatureKind::AwaySummary,
-                    "Summarize what happened while the user was away.".into(),
-                );
-                writeln!(stdout, "{msg}")?;
-                return Ok(());
-            }
-            "codebase-overview" => {
-                let msg = self.spawn_background_feature_by_kind(
-                    BackgroundFeatureKind::CodebaseOverview,
-                    "Generate a high-level overview of the codebase.".into(),
-                );
-                writeln!(stdout, "{msg}")?;
-                return Ok(());
-            }
-            "update-memory" => {
-                let msg = self.spawn_memory_update_task().await;
-                writeln!(stdout, "{msg}")?;
-                return Ok(());
-            }
-            "extract-memories" => {
-                let msg = self.spawn_memory_extraction_task().await;
-                writeln!(stdout, "{msg}")?;
-                return Ok(());
-            }
-            "agent-generation" => {
-                let description = args.join(" ");
-                if description.is_empty() {
-                    writeln!(stdout, "Usage: /agent-generation <description>")?;
-                } else {
-                    let msg = self.run_agent_generation(&description).await;
+        // Built-in REPL commands that don't go through registry.
+        //
+        // A session with slash commands turned off has none of these either:
+        // the built-ins are still slash commands, and running one anyway made
+        // `--no-slash-commands` a setting that only hid them from /help.
+        if !self.no_slash_commands {
+            match cmd_name {
+                "exit" | "quit" => {
+                    self.running = false;
+                    writeln!(stdout, "Exiting...")?;
+                    return Ok(());
+                }
+                "help" => {
+                    self.show_help(stdout)?;
+                    return Ok(());
+                }
+                "cancel" => {
+                    self.cancel_background_tasks();
+                    writeln!(stdout, "All background tasks cancelled.")?;
+                    return Ok(());
+                }
+                "compact" => {
+                    let msg = self.compact_context_non_tui().await;
                     writeln!(stdout, "{msg}")?;
+                    return Ok(());
                 }
-                return Ok(());
-            }
-            "auto-dream" => {
-                let msg = self.handle_auto_dream_command(&args);
-                writeln!(stdout, "{msg}")?;
-                return Ok(());
-            }
-            "team-memory" => {
-                let msg = self.handle_team_memory_command(&args).await;
-                writeln!(stdout, "{msg}")?;
-                return Ok(());
-            }
-            "workspace" => {
-                let msg = self.handle_workspace_command(&args);
-                writeln!(stdout, "{msg}")?;
-                return Ok(());
-            }
-            "recover" => {
-                let msg = self.handle_recover_command();
-                writeln!(stdout, "{msg}")?;
-                return Ok(());
-            }
-            "update-check" => {
-                let msg = self.handle_update_check_command().await;
-                writeln!(stdout, "{msg}")?;
-                return Ok(());
-            }
-            "feedback" => {
-                let msg = self.handle_feedback_command(&args).await;
-                writeln!(stdout, "{msg}")?;
-                return Ok(());
-            }
-            "teleport" => {
-                let msg = self.handle_teleport_command(&args).await;
-                writeln!(stdout, "{msg}")?;
-                return Ok(());
-            }
-            "clear" => {
-                if let Some(ref mut engine) = self.engine {
-                    let mut session = engine.session().clone();
-                    session.messages.clear();
-                    engine.set_session(session);
+                "agent-summary" => {
+                    let msg = self.spawn_background_feature_by_kind(
+                        BackgroundFeatureKind::AgentSummary,
+                        "Summarize what the agent has done recently.".into(),
+                    );
+                    writeln!(stdout, "{msg}")?;
+                    return Ok(());
                 }
-                self.history.clear();
-                self.session_effects = SessionEffects::default();
-                writeln!(stdout, "Session cleared.")?;
-                return Ok(());
-            }
-            "resume" => {
-                let session_id = if args.is_empty() {
-                    session_resume::latest_session_id(&self.cwd).unwrap_or_default()
-                } else {
-                    args[0].clone()
-                };
-                if session_id.is_empty() {
-                    writeln!(stdout, "No previous sessions found.")?;
-                } else {
-                    match self.load_session_state(&session_id, true) {
-                        Ok((messages, _)) => {
-                            writeln!(
-                                stdout,
-                                "Resumed session: {session_id} ({} messages)",
-                                messages.len()
-                            )?;
-                        }
-                        Err(e) => {
-                            writeln!(stdout, "Failed to resume session: {e}")?;
-                        }
+                "magic-docs" => {
+                    let msg = self.spawn_background_feature_by_kind(
+                        BackgroundFeatureKind::MagicDocs,
+                        "Generate documentation for the current codebase.".into(),
+                    );
+                    writeln!(stdout, "{msg}")?;
+                    return Ok(());
+                }
+                "generate-readme" => {
+                    let msg = self.spawn_background_feature_by_kind(
+                        BackgroundFeatureKind::ReadmeGeneration,
+                        "Generate a README for the current project.".into(),
+                    );
+                    writeln!(stdout, "{msg}")?;
+                    return Ok(());
+                }
+                "away-summary" => {
+                    let msg = self.spawn_background_feature_by_kind(
+                        BackgroundFeatureKind::AwaySummary,
+                        "Summarize what happened while the user was away.".into(),
+                    );
+                    writeln!(stdout, "{msg}")?;
+                    return Ok(());
+                }
+                "codebase-overview" => {
+                    let msg = self.spawn_background_feature_by_kind(
+                        BackgroundFeatureKind::CodebaseOverview,
+                        "Generate a high-level overview of the codebase.".into(),
+                    );
+                    writeln!(stdout, "{msg}")?;
+                    return Ok(());
+                }
+                "update-memory" => {
+                    let msg = self.spawn_memory_update_task().await;
+                    writeln!(stdout, "{msg}")?;
+                    return Ok(());
+                }
+                "extract-memories" => {
+                    let msg = self.spawn_memory_extraction_task().await;
+                    writeln!(stdout, "{msg}")?;
+                    return Ok(());
+                }
+                "agent-generation" => {
+                    let description = args.join(" ");
+                    if description.is_empty() {
+                        writeln!(stdout, "Usage: /agent-generation <description>")?;
+                    } else {
+                        let msg = self.run_agent_generation(&description).await;
+                        writeln!(stdout, "{msg}")?;
                     }
+                    return Ok(());
                 }
-                return Ok(());
-            }
-            "rename" => {
-                if args.is_empty() {
-                    writeln!(stdout, "Usage: /rename <new-title>")?;
-                } else {
-                    let new_title = args.join(" ");
-                    if let Some(ref mut engine) = self.engine {
-                        let mut session = engine.session().clone();
-                        session.title = Some(new_title.clone());
-                        engine.set_session(session);
-                    }
-                    writeln!(stdout, "Session renamed to: '{new_title}'")?;
+                "auto-dream" => {
+                    let msg = self.handle_auto_dream_command(&args);
+                    writeln!(stdout, "{msg}")?;
+                    return Ok(());
                 }
-                return Ok(());
-            }
-            "rewind" => {
-                if args.is_empty() {
-                    writeln!(stdout, "Usage: /rewind <message-number>")?;
-                } else {
-                    match args[0].parse::<usize>() {
-                        Ok(n) => {
-                            if let Some(ref mut engine) = self.engine {
-                                let mut session = engine.session().clone();
-                                if n < session.messages.len() {
-                                    let removed = session.messages.len() - n;
-                                    session.messages.truncate(n);
-                                    engine.set_session(session);
-                                    self.history.truncate(n);
-                                    writeln!(
-                                        stdout,
-                                        "Rewound to message {n}. {removed} messages removed."
-                                    )?;
-                                } else {
-                                    writeln!(
-                                        stdout,
-                                        "Message {n} not found. Session has {} messages.",
-                                        session.messages.len()
-                                    )?;
-                                }
-                            } else {
-                                writeln!(stdout, "No engine configured.")?;
+                "team-memory" => {
+                    let msg = self.handle_team_memory_command(&args).await;
+                    writeln!(stdout, "{msg}")?;
+                    return Ok(());
+                }
+                "workspace" => {
+                    let msg = self.handle_workspace_command(&args);
+                    writeln!(stdout, "{msg}")?;
+                    return Ok(());
+                }
+                "recover" => {
+                    let msg = self.handle_recover_command();
+                    writeln!(stdout, "{msg}")?;
+                    return Ok(());
+                }
+                "update-check" => {
+                    let msg = self.handle_update_check_command().await;
+                    writeln!(stdout, "{msg}")?;
+                    return Ok(());
+                }
+                "feedback" => {
+                    let msg = self.handle_feedback_command(&args).await;
+                    writeln!(stdout, "{msg}")?;
+                    return Ok(());
+                }
+                "teleport" => {
+                    let msg = self.handle_teleport_command(&args).await;
+                    writeln!(stdout, "{msg}")?;
+                    return Ok(());
+                }
+                "clear" => {
+                    let message = self.perform_session_clear();
+                    writeln!(stdout, "{message}")?;
+                    return Ok(());
+                }
+                "resume" => {
+                    let session_id = if args.is_empty() {
+                        session_resume::latest_session_id(&self.cwd).unwrap_or_default()
+                    } else {
+                        args[0].clone()
+                    };
+                    if session_id.is_empty() {
+                        writeln!(stdout, "No previous sessions found.")?;
+                    } else {
+                        match self.load_session_state(&session_id, true) {
+                            Ok((messages, _)) => {
+                                writeln!(
+                                    stdout,
+                                    "Resumed session: {session_id} ({} messages)",
+                                    messages.len()
+                                )?;
+                            }
+                            Err(e) => {
+                                writeln!(stdout, "Failed to resume session: {e}")?;
                             }
                         }
-                        Err(_) => {
-                            writeln!(stdout, "Invalid message number.")?;
-                        }
                     }
+                    return Ok(());
                 }
-                return Ok(());
-            }
-            "model" => {
-                if args.is_empty() {
-                    writeln!(stdout, "Current model: {}", self.model.0)?;
-                } else {
-                    let model_name = args[0].clone();
-                    self.model = ModelId(model_name.clone());
-                    writeln!(stdout, "Model switched to: {model_name}")?;
-                }
-                return Ok(());
-            }
-            "permissions" => {
-                if args.is_empty() {
-                    let mode = if let Some(ref engine) = self.engine {
-                        engine
-                            .permission_checker()
-                            .lock()
-                            .map(|c| c.mode())
-                            .unwrap_or_default()
+                "rename" => {
+                    if args.is_empty() {
+                        writeln!(stdout, "Usage: /rename <new-title>")?;
                     } else {
-                        self.permission_mode.unwrap_or_default()
-                    };
-                    writeln!(stdout, "Current permission mode: {mode:?}")?;
-                } else {
-                    let mode = match args[0].to_lowercase().as_str() {
-                        "default" => PermissionMode::Default,
-                        "acceptedits" | "accept_edits" => PermissionMode::AcceptEdits,
-                        "bypasspermissions" | "bypass" | "bypass_permissions" => {
-                            PermissionMode::BypassPermissions
+                        let new_title = args.join(" ");
+                        if let Some(ref mut engine) = self.engine {
+                            let mut session = engine.session().clone();
+                            session.title = Some(new_title.clone());
+                            engine.set_session(session);
                         }
-                        "dontask" | "dont_ask" => PermissionMode::DontAsk,
-                        "plan" | "planmode" | "plan_mode" => PermissionMode::Plan,
-                        "auto" => PermissionMode::Auto,
-                        _ => {
-                            writeln!(
-                                stdout,
-                                "Unknown mode: {}. Available: default, acceptedits, bypasspermissions, dontask, plan, auto",
-                                args[0]
-                            )?;
-                            return Ok(());
-                        }
-                    };
-                    if let Some(ref engine) = self.engine {
-                        if let Ok(mut checker) = engine.permission_checker().lock() {
-                            checker.set_mode(mode);
+                        writeln!(stdout, "Session renamed to: '{new_title}'")?;
+                    }
+                    return Ok(());
+                }
+                "rewind" => {
+                    if args.is_empty() {
+                        writeln!(stdout, "Usage: /rewind <message-number>")?;
+                    } else {
+                        match args[0].parse::<usize>() {
+                            Ok(n) => {
+                                if let Some(ref mut engine) = self.engine {
+                                    let mut session = engine.session().clone();
+                                    if n < session.messages.len() {
+                                        let removed = session.messages.len() - n;
+                                        session.messages.truncate(n);
+                                        engine.set_session(session);
+                                        self.history.truncate(n);
+                                        writeln!(
+                                            stdout,
+                                            "Rewound to message {n}. {removed} messages removed."
+                                        )?;
+                                    } else {
+                                        writeln!(
+                                            stdout,
+                                            "Message {n} not found. Session has {} messages.",
+                                            session.messages.len()
+                                        )?;
+                                    }
+                                } else {
+                                    writeln!(stdout, "No engine configured.")?;
+                                }
+                            }
+                            Err(_) => {
+                                writeln!(stdout, "Invalid message number.")?;
+                            }
                         }
                     }
-                    self.permission_mode = Some(mode);
-                    writeln!(stdout, "Permission mode set to: {mode:?}")?;
+                    return Ok(());
                 }
-                return Ok(());
-            }
-            "break-cache" => {
-                if let Some(ref mut engine) = self.engine {
-                    let mut session = engine.session().clone();
-                    let previous = session.usage.cache_read_tokens;
-                    session.usage.cache_read_tokens = 0;
-                    session.usage.cache_creation_tokens = 0;
-                    engine.set_session(session);
-                    writeln!(
-                        stdout,
-                        "Prompt cache cleared. Previous cache: {previous} tokens"
-                    )?;
-                } else {
-                    writeln!(stdout, "No engine configured.")?;
+                "model" => {
+                    if args.is_empty() {
+                        writeln!(stdout, "Current model: {}", self.model.0)?;
+                    } else {
+                        let model_name = args[0].clone();
+                        self.model = ModelId(model_name.clone());
+                        writeln!(stdout, "Model switched to: {model_name}")?;
+                    }
+                    return Ok(());
                 }
-                return Ok(());
-            }
-            "diff" => {
-                let dir = std::path::Path::new(&self.cwd);
-                let diff = std::process::Command::new("git")
-                    .args(["diff"])
-                    .current_dir(dir)
-                    .output();
-                match diff {
-                    Ok(output) if output.status.success() => {
-                        let text = String::from_utf8_lossy(&output.stdout);
-                        if text.is_empty() {
-                            writeln!(stdout, "No changes.")?;
+                "permissions" => {
+                    if args.is_empty() {
+                        let mode = if let Some(ref engine) = self.engine {
+                            engine
+                                .permission_checker()
+                                .lock()
+                                .map(|c| c.mode())
+                                .unwrap_or_default()
                         } else {
-                            writeln!(stdout, "Git Diff\n────────\n{text}")?;
+                            self.permission_mode.unwrap_or_default()
+                        };
+                        writeln!(stdout, "Current permission mode: {mode:?}")?;
+                    } else {
+                        let mode = match args[0].to_lowercase().as_str() {
+                            "default" => PermissionMode::Default,
+                            "acceptedits" | "accept_edits" => PermissionMode::AcceptEdits,
+                            "bypasspermissions" | "bypass" | "bypass_permissions" => {
+                                PermissionMode::BypassPermissions
+                            }
+                            "dontask" | "dont_ask" => PermissionMode::DontAsk,
+                            "plan" | "planmode" | "plan_mode" => PermissionMode::Plan,
+                            "auto" => PermissionMode::Auto,
+                            _ => {
+                                writeln!(
+                                    stdout,
+                                    "Unknown mode: {}. Available: default, acceptedits, bypasspermissions, dontask, plan, auto",
+                                    args[0]
+                                )?;
+                                return Ok(());
+                            }
+                        };
+                        if let Some(ref engine) = self.engine {
+                            if let Ok(mut checker) = engine.permission_checker().lock() {
+                                checker.set_mode(mode);
+                            }
                         }
+                        self.permission_mode = Some(mode);
+                        writeln!(stdout, "Permission mode set to: {mode:?}")?;
                     }
-                    _ => {
-                        writeln!(stdout, "No changes or not a git repository.")?;
-                    }
+                    return Ok(());
                 }
-                return Ok(());
+                "break-cache" => {
+                    if let Some(ref mut engine) = self.engine {
+                        let mut session = engine.session().clone();
+                        let previous = session.usage.cache_read_tokens;
+                        session.usage.cache_read_tokens = 0;
+                        session.usage.cache_creation_tokens = 0;
+                        engine.set_session(session);
+                        writeln!(
+                            stdout,
+                            "Prompt cache cleared. Previous cache: {previous} tokens"
+                        )?;
+                    } else {
+                        writeln!(stdout, "No engine configured.")?;
+                    }
+                    return Ok(());
+                }
+                _ => {}
             }
-            _ => {}
         }
 
         self.command_history.append(cmd_name, &args);
@@ -4387,6 +4362,7 @@ impl ReplLoop {
     ) -> std::io::Result<()> {
         let segments: Vec<&str> = line.trim_start_matches('/').split('|').collect();
         let mut pipe_input: Option<String> = None;
+        let mut written_any = false;
 
         for segment in &segments {
             let segment = segment.trim();
@@ -4394,17 +4370,27 @@ impl ReplLoop {
                 continue;
             }
             let parts: Vec<&str> = segment.split_whitespace().collect();
-            let cmd_name = parts[0];
+            // Every segment but the first arrives with its slash still on:
+            // `/diff | /env` splits into "/diff" and "/env", and the name is
+            // what the registry is asked for.
+            let cmd_name = parts[0].trim_start_matches('/');
             let args: Vec<String> = parts[1..].iter().map(|s| s.to_string()).collect();
 
             self.command_history.append(cmd_name, &args);
 
             let mut ctx = self.build_context();
-            ctx.pipe_input = pipe_input;
+            ctx.pipe_input = pipe_input.take();
 
             let result = self.commands.execute(cmd_name, &ctx, &args);
             self.sync_command_state(cmd_name, &result);
+
+            // A separator between segments: in a transcript, two commands'
+            // output running together reads as one.
+            if written_any {
+                writeln!(stdout, "---")?;
+            }
             writeln!(stdout, "{}", result.output)?;
+            written_any = true;
             pipe_input = Some(result.output);
         }
         Ok(())
@@ -4422,6 +4408,13 @@ impl ReplLoop {
             let cmd_name = parts[0].trim_start_matches('/');
             let args: Vec<String> = parts[1..].iter().map(|s| s.to_string()).collect();
             self.command_history.append(cmd_name, &args);
+
+            if cmd_name == "clear" && self.commands.find("clear").is_some() {
+                let message = self.perform_session_clear();
+                writeln!(stdout, "{message}")?;
+                return Ok(());
+            }
+
             let ctx = self.build_context();
             let result = self.commands.execute(cmd_name, &ctx, &args);
             self.sync_command_state(cmd_name, &result);
@@ -4670,7 +4663,7 @@ impl ReplLoop {
     async fn handle_feedback_command(&self, args: &[String]) -> String {
         let text = args.join(" ");
         if text.is_empty() {
-            return "Usage: /feedback <message> — generates a title for your feedback.".into();
+            return "Use /feedback <message> to generate a title for your feedback.".into();
         }
         let Some(ref client) = self.api_client else {
             return "No API client available.".into();

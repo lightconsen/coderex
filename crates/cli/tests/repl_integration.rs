@@ -154,14 +154,44 @@ fn run_headless_env_command() {
 }
 
 #[test]
-fn run_headless_diff_command() {
-    let mut repl = ReplLoop::new("/tmp".into(), ModelId::sonnet());
+fn run_headless_diff_command_outside_a_repository_says_so() {
+    // A directory that is not in a repository: the honest answer is that there
+    // is nothing to diff, not that nothing changed.
+    let dir = tempfile::tempdir().unwrap();
+    let mut repl = ReplLoop::new(dir.path().to_string_lossy().into_owned(), ModelId::sonnet());
     let rt = tokio::runtime::Runtime::new().unwrap();
     let result = rt.block_on(repl.run_headless("/diff")).unwrap();
-    // In a temp dir with no git repo, should show no changes
     assert!(
-        result.contains("No changes") || result.contains("Git Diff"),
-        "expected diff output, got: {result}"
+        result.contains("Not a git repository"),
+        "expected the reason, got: {result}"
+    );
+}
+
+#[test]
+fn run_headless_diff_command_in_a_clean_repository_shows_no_changes() {
+    let dir = tempfile::tempdir().unwrap();
+    for args in [
+        vec!["init", "--quiet"],
+        vec!["commit", "--quiet", "--allow-empty", "-m", "init"],
+    ] {
+        let status = std::process::Command::new("git")
+            .args(&args)
+            .current_dir(dir.path())
+            .env("GIT_AUTHOR_NAME", "test")
+            .env("GIT_AUTHOR_EMAIL", "test@example.com")
+            .env("GIT_COMMITTER_NAME", "test")
+            .env("GIT_COMMITTER_EMAIL", "test@example.com")
+            .output()
+            .expect("git");
+        assert!(status.status.success(), "{args:?} failed");
+    }
+
+    let mut repl = ReplLoop::new(dir.path().to_string_lossy().into_owned(), ModelId::sonnet());
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let result = rt.block_on(repl.run_headless("/diff")).unwrap();
+    assert!(
+        result.contains("No changes"),
+        "expected no changes, got: {result}"
     );
 }
 
@@ -206,14 +236,22 @@ fn run_headless_bughunter_mode_command() {
 
 #[test]
 fn run_headless_pipe_operator() {
-    let mut repl = ReplLoop::new("/tmp".into(), ModelId::sonnet());
+    let dir = tempfile::tempdir().unwrap();
+    let mut repl = ReplLoop::new(dir.path().to_string_lossy().into_owned(), ModelId::sonnet());
     let rt = tokio::runtime::Runtime::new().unwrap();
-    // Pipe /diff into /env (both are local commands)
-    let result = rt.block_on(repl.run_headless("/diff | /env")).unwrap();
-    // Should contain outputs from both commands separated by "---"
+
+    // Two commands that work in any directory — piping is what is under test
+    // here, and a command that depends on the checkout being a repository
+    // would make the test depend on where it runs.
+    let result = rt.block_on(repl.run_headless("/version | /env")).unwrap();
+
     assert!(
         result.contains("---"),
         "expected pipe separator, got: {result}"
+    );
+    assert!(
+        result.contains("CodeRex") && result.contains("Environment"),
+        "expected both commands' output, got: {result}"
     );
 }
 
@@ -416,14 +454,18 @@ fn run_headless_feedback_command() {
 //  14.10 OAuth Refresh Command
 // ═══════════════════════════════════════════════════════════════════════════
 
+/// The command reports the credential state and says plainly that no token
+/// was refreshed. It used to claim a refresh it never performed; this asserts
+/// the honest answer, so the claim cannot come back without the flow.
 #[test]
-fn run_headless_oauth_refresh_command() {
+fn run_headless_oauth_refresh_reports_credentials_without_claiming_a_refresh() {
     let mut repl = ReplLoop::new("/tmp".into(), ModelId::sonnet());
     let rt = tokio::runtime::Runtime::new().unwrap();
     let result = rt.block_on(repl.run_headless("/oauth-refresh")).unwrap();
+
     assert!(
-        result.contains("refreshed"),
-        "expected refresh output, got: {result}"
+        result.contains("No OAuth token was refreshed"),
+        "the command must not claim a refresh it did not do, got: {result}"
     );
 }
 

@@ -189,6 +189,29 @@ pub fn register(registry: &mut CommandRegistry) {
         true,
         Arc::new(|ctx: &CommandContext, args: &[String]| {
             let dir = std::path::Path::new(&ctx.cwd);
+
+            // Ask git whether this is a repository before asking for a diff.
+            // Reporting an empty diff for a directory git cannot read would
+            // say "nothing changed" about a place where nothing is known.
+            let inside = std::process::Command::new("git")
+                .args(["rev-parse", "--is-inside-work-tree"])
+                .current_dir(dir)
+                .output();
+            match inside {
+                Ok(out) if !out.status.success() => {
+                    return CommandResult::error(format!(
+                        "Not a git repository: {}\nThere is no diff to show.",
+                        ctx.cwd
+                    ));
+                }
+                Err(e) => {
+                    return CommandResult::error(format!(
+                        "Failed to run git: {e}\nEnsure git is installed."
+                    ));
+                }
+                Ok(_) => {}
+            }
+
             let mut cmd_args = vec!["diff"];
             // Support --cached/staged flag
             let cached = args.iter().any(|a| a == "--cached" || a == "--staged");
@@ -222,30 +245,62 @@ pub fn register(registry: &mut CommandRegistry) {
         }),
     ));
 
-    // /oauth-refresh — refresh OAuth token
+    // /oauth-refresh — report the credential state
+    //
+    // There is no OAuth token to refresh: CodeRex authenticates with an API key
+    // or, for the cloud providers, with credentials from the environment. The
+    // command used to say a token had been refreshed, which was not true of
+    // anything it did; it now says what it can see instead.
     registry.register(SlashCommand::local(
         "oauth-refresh",
-        "Refresh OAuth token",
+        "Check the credential state for the current model",
         true,
         true,
         true,
         Arc::new(|ctx: &CommandContext, _args: &[String]| {
-            // Check if any API key is configured
-            let has_key = std::env::var("ANTHROPIC_API_KEY").ok().map(|s| !s.is_empty()).unwrap_or(false)
-                || std::env::var("OPENAI_API_KEY").ok().map(|s| !s.is_empty()).unwrap_or(false)
-                || std::env::var("CODEREX_API_KEY").ok().map(|s| !s.is_empty()).unwrap_or(false)
-                || ctx.api_key_set;
-            if !has_key {
+            let key_vars = [
+                "ANTHROPIC_API_KEY",
+                "OPENAI_API_KEY",
+                "GROQ_API_KEY",
+                "CODEREX_API_KEY",
+                "CODEREX_PLUGIN_PUBLIC_KEY",
+            ];
+            let present: Vec<&str> = key_vars
+                .iter()
+                .copied()
+                .filter(|name| {
+                    std::env::var(name)
+                        .map(|value| !value.is_empty())
+                        .unwrap_or(false)
+                })
+                .collect();
+
+            let aws = coderex_core::providers::AwsCredentials::from_env().is_some();
+
+            if present.is_empty() && !aws && !ctx.api_key_set {
                 return CommandResult::error(
-                    "No API key found. Set ANTHROPIC_API_KEY or OPENAI_API_KEY environment variable."
+                    "No credential found. Set ANTHROPIC_API_KEY (or another provider's key, or \
+                     AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY for Bedrock).",
                 );
             }
-            // Registry commands cannot call OAuth provider endpoints directly.
-            // Report key presence and model; actual refresh is handled by the REPL or auth daemon.
-            CommandResult::success(format!(
-                "OAuth token present for model: {}.\n(Note: automatic token refresh requires OAuth2 provider configuration in settings.json)",
-                ctx.model.0
-            )).with_state_change(true)
+
+            let mut report = format!("Credentials for {}:\n", ctx.model.0);
+            if present.is_empty() {
+                report.push_str("  (no provider API key is set in the environment)\n");
+            } else {
+                report.push_str(&format!("  keys set: {}\n", present.join(", ")));
+            }
+            if aws {
+                report.push_str("  AWS credentials present (signed requests available)\n");
+            }
+            if ctx.api_key_set {
+                report.push_str("  a key was supplied to this session\n");
+            }
+            report.push_str(
+                "\nNo OAuth token was refreshed: this build authenticates with a key, so there \
+                 is no token to refresh. An OAuth login flow would have to be added first.",
+            );
+            CommandResult::success(report)
         }),
     ));
 
@@ -549,8 +604,14 @@ mod tests {
             r
         };
         let result = reg.execute("oauth-refresh", &ctx(), &[]);
-        // Without API key configured, should report no key found
-        assert!(result.output.contains("No API key") || result.output.contains("present"));
+        // Whatever the environment holds, the answer is about the credential
+        // state — and it never claims a token was refreshed.
+        assert!(
+            result.output.contains("No credential found")
+                || result.output.contains("No OAuth token was refreshed"),
+            "{}",
+            result.output
+        );
     }
 
     #[test]

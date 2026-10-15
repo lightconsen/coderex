@@ -83,29 +83,50 @@ async fn engine_tracks_api_calls() {
     assert_eq!(api_clone.call_count(), 1);
 }
 
+/// A turn that asks for a read-only shell command runs it, hands the result
+/// back, and takes the model's answer.
+///
+/// The mock answers twice because that is what a turn with a tool call is: the
+/// model asks, the tool runs, the model answers. Answering with the same tool
+/// call every time is not "one turn" — it is a session asking for the same
+/// command forever, and the loop detector stops it (see
+/// `a_model_that_repeats_one_tool_call_is_stopped`, which asserts exactly
+/// that).
 #[tokio::test]
-async fn read_only_directory_bash_tool_does_not_trigger_second_model_turn() {
-    let api = MockApiClient::with_mixed(vec![MockResponseType::Streaming(vec![
-        StreamEvent::ToolCallBlockStart {
-            id: "tc_1".into(),
-            name: "Bash".into(),
-        },
-        StreamEvent::ToolCallInputDelta {
-            id: "tc_1".into(),
-            delta: r#"{"command":"ls -la"}"#.into(),
-        },
-        StreamEvent::ToolCallBlockEnd {
-            id: "tc_1".into(),
-            input: serde_json::json!({"command": "ls -la"}),
-        },
-        StreamEvent::UsageSummary(UsageSummary {
-            input_tokens: 10,
-            output_tokens: 5,
-            cache_read_tokens: 0,
-            cache_creation_tokens: 0,
-        }),
-        StreamEvent::StreamEnd,
-    ])]);
+async fn a_read_only_shell_command_runs_and_the_turn_takes_the_answer() {
+    let api = MockApiClient::with_mixed(vec![
+        MockResponseType::Streaming(vec![
+            StreamEvent::ToolCallBlockStart {
+                id: "tc_1".into(),
+                name: "Bash".into(),
+            },
+            StreamEvent::ToolCallInputDelta {
+                id: "tc_1".into(),
+                delta: r#"{"command":"ls -la"}"#.into(),
+            },
+            StreamEvent::ToolCallBlockEnd {
+                id: "tc_1".into(),
+                input: serde_json::json!({"command": "ls -la"}),
+            },
+            StreamEvent::UsageSummary(UsageSummary {
+                input_tokens: 10,
+                output_tokens: 5,
+                cache_read_tokens: 0,
+                cache_creation_tokens: 0,
+            }),
+            StreamEvent::StreamEnd,
+        ]),
+        MockResponseType::Streaming(vec![
+            StreamEvent::TextDelta("The directory holds the usual files.".into()),
+            StreamEvent::UsageSummary(UsageSummary {
+                input_tokens: 20,
+                output_tokens: 8,
+                cache_read_tokens: 0,
+                cache_creation_tokens: 0,
+            }),
+            StreamEvent::StreamEnd,
+        ]),
+    ]);
 
     let api_clone = api.clone();
     let mut rig = TestRigBuilder::new()
@@ -119,15 +140,81 @@ async fn read_only_directory_bash_tool_does_not_trigger_second_model_turn() {
         .submit_streaming("list files in this dir".into(), Default::default())
         .await
         .unwrap();
-    assert!(matches!(reason, TerminalReason::Completed));
-    assert_eq!(api_clone.call_count(), 1);
 
-    let starts = rig
-        .drain_events()
-        .into_iter()
+    assert!(matches!(reason, TerminalReason::Completed), "{reason:?}");
+    // One call for the tool call, one for the answer.
+    assert_eq!(api_clone.call_count(), 2);
+
+    let events = rig.drain_events();
+    let starts = events
+        .iter()
         .filter(|event| matches!(event, EngineEvent::ToolCallStart { .. }))
         .count();
-    assert_eq!(starts, 1);
+    assert_eq!(starts, 1, "the command should run exactly once");
+
+    let ran = events
+        .iter()
+        .filter(|event| matches!(event, EngineEvent::ToolCallEnd { .. }))
+        .count();
+    assert_eq!(ran, 1, "the command should finish exactly once");
+}
+
+/// A model that keeps asking for the same command is a session going nowhere,
+/// and the engine stops it rather than running the command forever. This is
+/// the behaviour the read-only-command test above used to trip over.
+#[tokio::test]
+async fn a_model_that_repeats_one_tool_call_is_stopped() {
+    let repeated_tool_call = || {
+        MockResponseType::Streaming(vec![
+            StreamEvent::ToolCallBlockStart {
+                id: "tc_1".into(),
+                name: "Bash".into(),
+            },
+            StreamEvent::ToolCallBlockEnd {
+                id: "tc_1".into(),
+                input: serde_json::json!({"command": "ls -la"}),
+            },
+            StreamEvent::UsageSummary(UsageSummary {
+                input_tokens: 10,
+                output_tokens: 5,
+                cache_read_tokens: 0,
+                cache_creation_tokens: 0,
+            }),
+            StreamEvent::StreamEnd,
+        ])
+    };
+
+    let api = MockApiClient::with_mixed(vec![
+        repeated_tool_call(),
+        repeated_tool_call(),
+        repeated_tool_call(),
+        repeated_tool_call(),
+        repeated_tool_call(),
+    ]);
+    let api_clone = api.clone();
+
+    let mut rig = TestRigBuilder::new()
+        .with_api_client(Box::new(api))
+        .with_tool_executor(Box::new(StubOkToolExecutor))
+        .build()
+        .await;
+
+    let reason = rig
+        .engine
+        .submit_streaming("list files in this dir".into(), Default::default())
+        .await
+        .unwrap();
+
+    assert!(
+        matches!(reason, TerminalReason::LoopDetected { .. }),
+        "expected the loop detector to stop it, got {reason:?}"
+    );
+    // And it stopped well before the mock ran out of answers.
+    assert!(
+        api_clone.call_count() < 5,
+        "{} calls",
+        api_clone.call_count()
+    );
 }
 
 #[tokio::test]

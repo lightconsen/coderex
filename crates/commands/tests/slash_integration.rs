@@ -66,20 +66,34 @@ fn help_for_specific_command() {
     assert!(result.output.contains("/clear"));
 }
 
+/// The registry cannot clear a session — it has no engine — so `/clear` asks
+/// for one and flags the state change for whoever owns the session. The
+/// clearing itself is asserted where it happens: `repl_integration` for the
+/// headless path and `interactive_tui` for the interactive one.
 #[test]
-fn clear_command_clears_session() {
+fn clear_command_requests_a_clear_and_flags_it() {
     let reg = full_registry();
     let result = reg.execute("clear", &test_ctx(), &[]);
-    assert!(result.output.contains("cleared"));
-    assert!(result.state_changed);
+    assert!(result.state_changed, "{}", result.output);
+    assert!(
+        result.output.contains("Clear requested"),
+        "{}",
+        result.output
+    );
 }
 
+/// Same shape as `/clear`: compacting happens in the engine, and the registry
+/// can only ask for it.
 #[test]
-fn compact_command_triggers() {
+fn compact_command_requests_a_compaction_and_flags_it() {
     let reg = full_registry();
     let result = reg.execute("compact", &test_ctx(), &[]);
-    assert!(result.output.contains("Compacting"));
-    assert!(result.state_changed);
+    assert!(result.state_changed, "{}", result.output);
+    assert!(
+        result.output.contains("Compact requested"),
+        "{}",
+        result.output
+    );
 }
 
 #[test]
@@ -97,11 +111,28 @@ fn config_shows_current_state() {
     assert!(result.output.contains("Permissions:"));
 }
 
+/// A bare argument is not a way to set anything — `set <key> <value>` is, and
+/// that path writes to the user's settings file, so it is covered by the unit
+/// test that points the config home at a temporary directory. What is asserted
+/// here is the interface: a bare argument is refused with the usage, and the
+/// read commands work.
 #[test]
-fn config_sets_value_with_arg() {
+fn config_refuses_a_bare_argument_and_reads_settings() {
     let reg = full_registry();
     let result = reg.execute("config", &test_ctx(), &["model".into()]);
-    assert!(result.state_changed);
+    assert!(
+        result.output.contains("Usage: /config"),
+        "{}",
+        result.output
+    );
+    assert!(
+        !result.state_changed,
+        "nothing was changed: {}",
+        result.output
+    );
+
+    let listed = reg.execute("config", &test_ctx(), &["list".into()]);
+    assert!(listed.output.contains("settings"), "{}", listed.output);
 }
 
 #[test]
@@ -192,9 +223,48 @@ fn summary_shows_session_summary() {
 
 #[test]
 fn diff_shows_git_changes() {
+    let dir = tempfile::tempdir().unwrap();
+    let run = |args: &[&str]| {
+        let status = std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir.path())
+            .env("GIT_AUTHOR_NAME", "test")
+            .env("GIT_AUTHOR_EMAIL", "test@example.com")
+            .env("GIT_COMMITTER_NAME", "test")
+            .env("GIT_COMMITTER_EMAIL", "test@example.com")
+            .output()
+            .expect("git");
+        assert!(status.status.success(), "{args:?} failed");
+    };
+
+    run(&["init", "--quiet"]);
+    std::fs::write(dir.path().join("file.txt"), "before\n").unwrap();
+    run(&["add", "file.txt"]);
+    run(&["commit", "--quiet", "-m", "init"]);
+    std::fs::write(dir.path().join("file.txt"), "after\n").unwrap();
+
+    let mut context = test_ctx();
+    context.cwd = dir.path().to_string_lossy().into_owned();
+
     let reg = full_registry();
-    let result = reg.execute("diff", &test_ctx(), &[]);
-    assert!(result.output.contains("file.txt"));
+    let result = reg.execute("diff", &context, &[]);
+    assert!(result.output.contains("file.txt"), "{}", result.output);
+    assert!(result.output.contains("after"), "{}", result.output);
+}
+
+#[test]
+fn diff_outside_a_repository_says_so() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut context = test_ctx();
+    context.cwd = dir.path().to_string_lossy().into_owned();
+
+    let reg = full_registry();
+    let result = reg.execute("diff", &context, &[]);
+    assert!(
+        result.output.contains("Not a git repository"),
+        "{}",
+        result.output
+    );
 }
 
 #[test]
@@ -270,12 +340,21 @@ fn issue_create_with_title() {
     assert!(result.state_changed);
 }
 
+/// The command reports the credential state; it does not refresh anything,
+/// because this build has no OAuth token to refresh. The assertion says that,
+/// so a claim of refreshing cannot come back without the flow behind it.
 #[test]
-fn oauth_refresh_succeeds() {
+fn oauth_refresh_reports_the_credential_state() {
     let reg = full_registry();
     let result = reg.execute("oauth-refresh", &test_ctx(), &[]);
-    assert!(result.output.contains("refreshed"));
-    assert!(result.state_changed);
+    assert!(
+        result.output.contains("No credential found")
+            || result.output.contains("No OAuth token was refreshed"),
+        "{}",
+        result.output
+    );
+    // It describes state rather than changing it.
+    assert!(!result.state_changed, "{}", result.output);
 }
 
 #[test]

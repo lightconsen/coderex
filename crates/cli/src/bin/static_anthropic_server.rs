@@ -369,6 +369,12 @@ fn resolve_text_response(prompt: &str, responses: &StaticResponses) -> String {
         "Cron list flow complete. The scheduled cron jobs are visible.".into()
     } else if p.contains("delegate a simple agent") {
         "Agent flow complete. The simple agent finished.".into()
+    } else if p.contains("interactive agent sequence") {
+        // The sub-agent's own turn: the Agent tool passes a prompt through to a
+        // fresh agent, which asks the model again. Without an answer here the
+        // child fell back to the generic reply and the sequence under test was
+        // never actually exercised.
+        "agent-smoke-agent done.".into()
     } else if p.contains("search for available tools") {
         "Tool search flow complete. Matching tools are visible.".into()
     } else if p.contains("show your skills") {
