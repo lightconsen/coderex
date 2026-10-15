@@ -1,6 +1,6 @@
 //! MCP manager — coordinates servers, tools, resources, OAuth, and elicitation.
 
-use crate::config::McpConfig;
+use crate::config::{McpConfig, McpTransport};
 use crate::elicitation::ElicitationManager;
 use crate::oauth::OAuthManager;
 use crate::proxy::{McpToolInfo, McpToolProxy, McpToolRegistry};
@@ -68,12 +68,30 @@ impl McpManager {
     /// Load servers from a configuration.
     pub fn load_config(&self, config: &McpConfig) {
         for (name, server_config) in &config.mcp_servers {
-            let server = McpServer::new(
-                name.clone(),
-                server_config.command.clone(),
-                server_config.args.clone(),
-                server_config.env.clone(),
-            );
+            let server = match server_config.transport {
+                McpTransport::Stdio => McpServer::new(
+                    name.clone(),
+                    server_config.command.clone(),
+                    server_config.args.clone(),
+                    server_config.env.clone(),
+                ),
+                McpTransport::Sse | McpTransport::Http => {
+                    let Some(url) = server_config.url.clone() else {
+                        tracing::warn!(
+                            server = %name,
+                            transport = ?server_config.transport,
+                            "Skipping remote MCP server without a URL"
+                        );
+                        continue;
+                    };
+                    McpServer::new_http(
+                        name.clone(),
+                        url,
+                        server_config.transport,
+                        server_config.headers.clone(),
+                    )
+                }
+            };
             self.servers.insert(name.clone(), server);
         }
         self.needs_refresh.store(true, Ordering::SeqCst);
@@ -250,10 +268,7 @@ impl McpManager {
     /// Get a server by name.
     #[must_use]
     pub fn get_server(&self, name: &str) -> Option<McpServer> {
-        self.servers.get(name).map(|e| {
-            let s = e.value();
-            McpServer::new(&s.name, &s.command, s.args.clone(), s.env.clone())
-        })
+        self.servers.get(name).map(|entry| entry.value().clone())
     }
 
     /// List server names.
@@ -448,6 +463,7 @@ mod tests {
                 command: "echo".into(),
                 args: vec![],
                 env: HashMap::new(),
+                ..Default::default()
             },
         );
         mgr.load_config(&config);
@@ -465,6 +481,7 @@ mod tests {
                 command: "cat".into(),
                 args: vec![],
                 env: HashMap::new(),
+                ..Default::default()
             },
         );
         mgr.load_config(&config);
@@ -486,6 +503,7 @@ mod tests {
                 command: "npx".into(),
                 args: vec![],
                 env: HashMap::new(),
+                ..Default::default()
             },
         );
         mgr.load_config(&config);

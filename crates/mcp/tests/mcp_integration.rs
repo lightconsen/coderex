@@ -212,6 +212,7 @@ async fn tool_discovery_manager_discovers_and_registers() {
             command: script.to_str().unwrap().into(),
             args: vec![],
             env: HashMap::new(),
+            ..Default::default()
         },
     );
     mgr.load_config(&config);
@@ -260,6 +261,7 @@ async fn tool_discovery_executor_routes_to_mcp() {
             command: script.to_str().unwrap().into(),
             args: vec![],
             env: HashMap::new(),
+            ..Default::default()
         },
     );
     mgr.load_config(&config);
@@ -310,6 +312,7 @@ async fn resource_discovery_manager_discovers_and_registers() {
             command: script.to_str().unwrap().into(),
             args: vec![],
             env: HashMap::new(),
+            ..Default::default()
         },
     );
     mgr.load_config(&config);
@@ -492,6 +495,7 @@ async fn connection_manager_stop_all_shuts_down_servers() {
             command: script.to_str().unwrap().into(),
             args: vec![],
             env: HashMap::new(),
+            ..Default::default()
         },
     );
     config.add_server(
@@ -500,6 +504,7 @@ async fn connection_manager_stop_all_shuts_down_servers() {
             command: script.to_str().unwrap().into(),
             args: vec![],
             env: HashMap::new(),
+            ..Default::default()
         },
     );
     mgr.load_config(&config);
@@ -562,6 +567,7 @@ fn config_save_load_roundtrip() {
                 "/tmp".into(),
             ],
             env: HashMap::new(),
+            ..Default::default()
         },
     );
 

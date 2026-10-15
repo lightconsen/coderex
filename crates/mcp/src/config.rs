@@ -4,10 +4,34 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+/// Transport used to reach an MCP server.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum McpTransport {
+    /// Launch a subprocess and exchange newline-delimited JSON-RPC over stdio.
+    #[default]
+    Stdio,
+    /// Connect to a remote HTTP endpoint and read SSE-framed responses.
+    Sse,
+    /// Connect to a remote streamable-HTTP endpoint.
+    #[serde(alias = "streamable-http")]
+    Http,
+}
+
 /// Configuration for a single MCP server.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct McpServerConfig {
+    /// Transport to use. Defaults to stdio for backwards compatibility.
+    #[serde(default, rename = "type")]
+    pub transport: McpTransport,
+    /// Remote HTTP/SSE endpoint. Required when `transport` is not stdio.
+    #[serde(default)]
+    pub url: Option<String>,
+    /// Additional HTTP headers sent on every request.
+    #[serde(default)]
+    pub headers: HashMap<String, String>,
     /// The command to run the server.
+    #[serde(default)]
     pub command: String,
     /// Arguments to pass to the command.
     #[serde(default)]
@@ -21,7 +45,7 @@ pub struct McpServerConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct McpConfig {
     /// Named MCP server configurations.
-    #[serde(default)]
+    #[serde(default, alias = "mcpServers")]
     pub mcp_servers: HashMap<String, McpServerConfig>,
 }
 
@@ -108,6 +132,7 @@ mod tests {
                     "/tmp".into(),
                 ],
                 env: HashMap::new(),
+                ..Default::default()
             },
         );
         config
@@ -145,6 +170,7 @@ mod tests {
                 command: "echo".into(),
                 args: vec![],
                 env: HashMap::new(),
+                ..Default::default()
             },
         );
         config.add_server(
@@ -153,6 +179,7 @@ mod tests {
                 command: "echo".into(),
                 args: vec![],
                 env: HashMap::new(),
+                ..Default::default()
             },
         );
         let names = config.server_names();
@@ -170,6 +197,27 @@ mod tests {
         let loaded = McpConfig::load(&path).unwrap();
         assert!(!loaded.is_empty());
         assert_eq!(loaded.get_server("filesystem").unwrap().command, "npx");
+    }
+
+    #[test]
+    fn parses_http_transport_url_headers_and_alias() {
+        let config: McpConfig = serde_json::from_str(
+            r#"{
+                "mcpServers": {
+                    "remote": {
+                        "type": "streamable-http",
+                        "url": "http://localhost:3000/mcp",
+                        "headers": { "Authorization": "Bearer test" }
+                    }
+                }
+            }"#,
+        )
+        .unwrap();
+        let server = config.get_server("remote").unwrap();
+        assert_eq!(server.transport, McpTransport::Http);
+        assert_eq!(server.url.as_deref(), Some("http://localhost:3000/mcp"));
+        assert_eq!(server.headers["Authorization"], "Bearer test");
+        assert!(server.command.is_empty());
     }
 
     #[test]

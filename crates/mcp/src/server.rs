@@ -1,6 +1,7 @@
 //! MCP server lifecycle — stdio JSON-RPC server spawn and management.
 
 use crate::channel::JsonRpcChannel;
+use crate::config::McpTransport;
 use std::collections::HashMap;
 use std::sync::Arc;
 use thiserror::Error;
@@ -56,7 +57,7 @@ pub enum ServerStatus {
 }
 
 /// A running MCP server instance.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct McpServer {
     /// Server name/identifier.
     pub name: String,
@@ -66,6 +67,12 @@ pub struct McpServer {
     pub args: Vec<String>,
     /// Environment variables.
     pub env: HashMap<String, String>,
+    /// Transport used by this server.
+    pub transport: McpTransport,
+    /// Remote endpoint for HTTP/SSE transports.
+    pub url: Option<String>,
+    /// Additional HTTP headers for remote transports.
+    pub headers: HashMap<String, String>,
     /// Current status.
     pub status: ServerStatus,
     /// Number of reconnection attempts.
@@ -90,10 +97,53 @@ impl McpServer {
             command: command.into(),
             args,
             env,
+            transport: McpTransport::Stdio,
+            url: None,
+            headers: HashMap::new(),
             status: ServerStatus::Stopped,
             reconnect_count: 0,
             max_reconnects: 3,
             channel: None,
+        }
+    }
+
+    /// Create a remote HTTP or SSE server definition.
+    #[must_use]
+    pub fn new_http(
+        name: impl Into<String>,
+        url: impl Into<String>,
+        transport: McpTransport,
+        headers: HashMap<String, String>,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            command: String::new(),
+            args: Vec::new(),
+            env: HashMap::new(),
+            transport,
+            url: Some(url.into()),
+            headers,
+            status: ServerStatus::Stopped,
+            reconnect_count: 0,
+            max_reconnects: 3,
+            channel: None,
+        }
+    }
+
+    /// Build a fresh channel using this server's transport configuration.
+    fn create_channel(&self) -> Result<JsonRpcChannel, String> {
+        match self.transport {
+            McpTransport::Stdio => Ok(JsonRpcChannel::new(
+                self.command.clone(),
+                self.args.clone(),
+                self.env.clone(),
+            )),
+            McpTransport::Sse | McpTransport::Http => {
+                let url = self.url.as_deref().ok_or_else(|| {
+                    format!("remote MCP server '{}' has no URL configured", self.name)
+                })?;
+                JsonRpcChannel::new_http(url, self.headers.clone())
+            }
         }
     }
 
@@ -106,8 +156,13 @@ impl McpServer {
         }
         self.status = ServerStatus::Starting;
 
-        let mut channel =
-            JsonRpcChannel::new(self.command.clone(), self.args.clone(), self.env.clone());
+        let mut channel = self.create_channel().map_err(|error| {
+            self.status = ServerStatus::Errored;
+            McpServerError::Spawn {
+                name: self.name.clone(),
+                source: std::io::Error::new(std::io::ErrorKind::Other, error),
+            }
+        })?;
 
         channel.spawn().await.map_err(|e| {
             self.status = ServerStatus::Errored;
@@ -251,8 +306,13 @@ impl McpServer {
         self.channel = None;
 
         // Spawn fresh channel
-        let mut channel =
-            JsonRpcChannel::new(self.command.clone(), self.args.clone(), self.env.clone());
+        let mut channel = self.create_channel().map_err(|error| {
+            self.status = ServerStatus::Errored;
+            McpServerError::Spawn {
+                name: self.name.clone(),
+                source: std::io::Error::new(std::io::ErrorKind::Other, error),
+            }
+        })?;
 
         channel.spawn().await.map_err(|e| {
             self.status = ServerStatus::Errored;

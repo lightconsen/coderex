@@ -64,8 +64,10 @@ pub struct JsonRpcNotification {
 /// A channel for JSON-RPC communication over stdio with a subprocess.
 #[derive(Debug)]
 pub struct JsonRpcChannel {
-    /// The child process.
+    /// The child process (stdio transport only).
     process: Option<Child>,
+    /// Remote HTTP/SSE transport, when configured.
+    http: Option<crate::http::HttpChannel>,
     /// Stdin handle for writing requests.
     stdin: Option<ChildStdin>,
     /// Stdout reader for reading responses.
@@ -92,6 +94,7 @@ impl JsonRpcChannel {
     ) -> Self {
         Self {
             process: None,
+            http: None,
             stdin: None,
             stdout: None,
             next_id: AtomicU64::new(1),
@@ -102,8 +105,27 @@ impl JsonRpcChannel {
         }
     }
 
+    /// Create a remote HTTP or SSE channel.
+    pub fn new_http(url: &str, headers: HashMap<String, String>) -> Result<Self, String> {
+        Ok(Self {
+            process: None,
+            http: Some(crate::http::HttpChannel::new(url, headers)?),
+            stdin: None,
+            stdout: None,
+            next_id: AtomicU64::new(1),
+            command: String::new(),
+            args: Vec::new(),
+            env: HashMap::new(),
+            initialized: false,
+        })
+    }
+
     /// Spawn the subprocess and capture stdio handles.
     pub async fn spawn(&mut self) -> Result<(), String> {
+        if self.http.is_some() {
+            return Ok(());
+        }
+
         let mut cmd = Command::new(&self.command);
         cmd.args(&self.args);
         cmd.envs(&self.env);
@@ -176,6 +198,10 @@ impl JsonRpcChannel {
             params,
         };
 
+        if let Some(ref http) = self.http {
+            return http.send_request(&request).await;
+        }
+
         self.write_request(&request).await?;
         self.read_response(id).await
     }
@@ -191,6 +217,10 @@ impl JsonRpcChannel {
             method: method.to_string(),
             params,
         };
+        if let Some(ref http) = self.http {
+            return http.send_notification(&notification).await;
+        }
+
         self.write_notification(&notification).await
     }
 
@@ -268,6 +298,10 @@ impl JsonRpcChannel {
 
     /// Check if the channel is alive by attempting to read from stdout.
     pub async fn ping(&mut self) -> Result<(), String> {
+        if self.http.is_some() {
+            return self.send_request("ping", None).await.map(|_| ());
+        }
+
         // For MCP servers, we check if the process is still running
         if let Some(ref mut process) = self.process {
             match process.try_wait() {
@@ -295,11 +329,16 @@ impl JsonRpcChannel {
     /// Check if the process is still running.
     #[must_use]
     pub fn is_running(&self) -> bool {
-        self.process.is_some()
+        self.process.is_some() || self.http.is_some()
     }
 
     /// Terminate the process.
     pub async fn terminate(&mut self) -> Result<(), String> {
+        if self.http.take().is_some() {
+            self.initialized = false;
+            return Ok(());
+        }
+
         if let Some(ref mut process) = self.process {
             process
                 .kill()

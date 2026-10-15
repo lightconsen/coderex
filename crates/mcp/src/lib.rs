@@ -5,6 +5,7 @@
 pub mod channel;
 pub mod config;
 pub mod elicitation;
+mod http;
 pub mod manager;
 pub mod oauth;
 pub mod proxy;

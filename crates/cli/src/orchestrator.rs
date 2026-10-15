@@ -1387,6 +1387,7 @@ impl StartupOrchestrator {
                         command: cmd,
                         args,
                         env: std::collections::HashMap::new(),
+                        ..Default::default()
                     },
                 );
                 match config.save(&mcp_path) {
