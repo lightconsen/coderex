@@ -49,8 +49,8 @@ struct ApprovedCall {
 pub struct SchedulerOutcome {
     /// Results for all calls (approved, denied, blocked, etc.).
     pub results: Vec<ToolResult>,
-    /// If any tool required elevation, the last one is captured here.
-    pub pending_elevation: Option<crate::engine::PendingElevation>,
+    /// Calls that need an elevation decision, in their original order.
+    pub pending_elevations: Vec<crate::engine::PendingElevation>,
 }
 
 /// Execute pending tool calls with permission checks and hooks.
@@ -65,7 +65,7 @@ pub async fn run_tool_calls(
 ) -> Result<SchedulerOutcome, String> {
     let mut results: Vec<Option<ToolResult>> = vec![None; calls.len()];
     let mut approved: Vec<(usize, ApprovedCall)> = Vec::new();
-    let mut pending_elevation: Option<crate::engine::PendingElevation> = None;
+    let mut pending_elevations = Vec::new();
 
     // ─── Phase 1: Sequential validation ────────────────────────────────────
     for (idx, call) in calls.iter().enumerate() {
@@ -214,22 +214,21 @@ pub async fn run_tool_calls(
                     tool: call.name.clone(),
                     reason: reason.clone(),
                 });
-                pending_elevation = Some(crate::engine::PendingElevation {
+                pending_elevations.push(crate::engine::PendingElevation {
                     tool_call_id: call.id.clone(),
                     tool_name: call.name.clone(),
                     input: call.input.clone(),
                     request_id: elevation_id,
+                    reason,
                 });
-                let result = ToolResult {
+                // Keep a result slot so the outcome stays aligned with `calls`,
+                // but do not emit ToolCallEnd yet: the engine replaces this
+                // placeholder with the result of the user's elevation decision.
+                results[idx] = Some(ToolResult {
                     tool_call_id: call.id.clone(),
                     output: format!("tool '{}' requires elevated permissions", call.name),
                     is_error: true,
-                };
-                let _ = event_tx.send(EngineEvent::ToolCallEnd {
-                    id: call.id.clone(),
-                    result: result.clone(),
                 });
-                results[idx] = Some(result);
             }
         }
     }
@@ -275,7 +274,7 @@ pub async fn run_tool_calls(
 
     Ok(SchedulerOutcome {
         results,
-        pending_elevation,
+        pending_elevations,
     })
 }
 
@@ -344,7 +343,7 @@ mod tests {
         assert_eq!(outcome.results.len(), 2);
         assert_eq!(outcome.results[0].output, "executed read");
         assert_eq!(outcome.results[1].output, "executed read");
-        assert!(outcome.pending_elevation.is_none());
+        assert!(outcome.pending_elevations.is_empty());
 
         // Collect all events
         let mut events = Vec::new();

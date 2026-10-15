@@ -16,7 +16,7 @@ use tokio::time::Instant;
 use crate::api_client::{ApiClient, ApiResponse, RequestContext, StreamEvent};
 use crate::budget::TokenBudget;
 use crate::compact::{self, CompactResult, CompactStrategy};
-use crate::confirmation_bus::ConfirmationBus;
+use crate::confirmation_bus::{ConfirmationBus, ConfirmationRequest, ConfirmationResponse};
 use crate::cost::CostTracker;
 use crate::elicitation::{ElicitationHandler, ElicitationResult, ReplElicitationHandler};
 use crate::hook_events;
@@ -497,6 +497,8 @@ pub struct PendingElevation {
     pub input: serde_json::Value,
     /// Request ID for the event.
     pub request_id: String,
+    /// Why this call needs an explicit elevation decision.
+    pub reason: String,
 }
 
 /// A resolved elicitation response.
@@ -2255,7 +2257,7 @@ impl QueryEngine {
     /// execution after the stream), early-executed tool results, and usage.
     async fn send_request_streaming(
         &mut self,
-        turn: &TurnRuntime,
+        turn: &mut TurnRuntime,
         options: &SubmitOptions,
     ) -> Result<(String, Vec<ToolCall>, Vec<ToolResult>, UsageSummary), String> {
         use futures::StreamExt;
@@ -2358,7 +2360,7 @@ impl QueryEngine {
                 // Process event through assembler and execute completed tool
                 // calls immediately while the stream is still running.
                 for call in assembler.process_event(event) {
-                    match self.execute_early_tool_call(call, options).await {
+                    match self.execute_early_tool_call(turn, call, options).await {
                         Ok(Some(result)) => early_results.push(result),
                         Ok(None) => { /* deferred — call already tracked */ }
                         Err(e) => {
@@ -2371,7 +2373,7 @@ impl QueryEngine {
             if !retry_requested {
                 // Stream ended — finalize any remaining pending calls.
                 for call in assembler.process_event(StreamEvent::StreamEnd) {
-                    match self.execute_early_tool_call(call, options).await {
+                    match self.execute_early_tool_call(turn, call, options).await {
                         Ok(Some(result)) => early_results.push(result),
                         Ok(None) => { /* deferred */ }
                         Err(e) => {
@@ -2437,11 +2439,12 @@ impl QueryEngine {
     /// Runs the full validation pipeline (allowed_tools_override, PreToolUse
     /// hook, PermissionEngine) and executes the tool if allowed.
     ///
-    /// - `Ok(Some(result))` — tool was executed or denied immediately.
-    /// - `Ok(None)` — tool requires user interaction (Ask/AskForSession/Elevated);
-    ///   the caller should defer it for batch execution after streaming.
+    /// - `Ok(Some(result))` — the tool was executed, denied, or resolved after
+    ///   user interaction.
+    /// - `Ok(None)` — reserved for a deferred call with no immediate result.
     async fn execute_early_tool_call(
         &mut self,
+        turn: &mut TurnRuntime,
         call: ToolCall,
         options: &SubmitOptions,
     ) -> Result<Option<ToolResult>, String> {
@@ -2614,16 +2617,14 @@ impl QueryEngine {
                     tool: call.name.clone(),
                     reason: reason.clone(),
                 });
-                let result = ToolResult {
-                    tool_call_id: call.id.clone(),
-                    output: format!("tool '{}' requires elevated permissions", call.name),
-                    is_error: true,
-                };
-                let _ = self.event_tx.send(EngineEvent::ToolCallEnd {
-                    id: call.id.clone(),
-                    result: result.clone(),
+                turn.pending_elevation = Some(PendingElevation {
+                    tool_call_id: call.id,
+                    tool_name: call.name,
+                    input: call.input,
+                    request_id: elevation_id,
+                    reason,
                 });
-                Ok(Some(result))
+                self.resolve_pending_elevation(turn).await
             }
         }
     }
@@ -2645,11 +2646,86 @@ impl QueryEngine {
         )
         .await?;
 
-        if let Some(elevation) = outcome.pending_elevation {
+        let mut results = outcome.results;
+        for elevation in outcome.pending_elevations {
+            let tool_call_id = elevation.tool_call_id.clone();
             turn.pending_elevation = Some(elevation);
+            if let Some(result) = self.resolve_pending_elevation(turn).await? {
+                if let Some(slot) = results
+                    .iter_mut()
+                    .find(|result| result.tool_call_id == tool_call_id)
+                {
+                    *slot = result;
+                }
+            }
         }
         turn.pending_tool_calls.clear();
-        Ok(outcome.results)
+        Ok(results)
+    }
+
+    /// Ask the interactive frontend for an elevation decision, then resolve it.
+    ///
+    /// The confirmation bus is the same channel used by ordinary permission
+    /// prompts. Keeping the wait inside the engine is important: `submit` and
+    /// `submit_streaming` own the [`TurnRuntime`], so an external UI cannot call
+    /// [`Self::resolve_elevation`] while a query is running.
+    async fn resolve_pending_elevation(
+        &mut self,
+        turn: &mut TurnRuntime,
+    ) -> Result<Option<ToolResult>, String> {
+        let Some(elevation) = turn.pending_elevation.clone() else {
+            return Ok(None);
+        };
+
+        let response = if let Some(bus) = self.permission_engine.confirmation_bus() {
+            let previous_state = turn.state;
+            turn.transition_to(TurnState::AwaitPermission);
+            let response = bus
+                .request(ConfirmationRequest {
+                    id: elevation.request_id.clone(),
+                    tool_name: elevation.tool_name.clone(),
+                    arguments: elevation.input.to_string(),
+                    path: None,
+                    reason: elevation.reason.clone(),
+                    allow_session: false,
+                    context: HashMap::new(),
+                })
+                .await;
+            turn.transition_to(previous_state);
+            response
+        } else {
+            None
+        };
+
+        match response {
+            Some(ConfirmationResponse::Approved | ConfirmationResponse::ApproveSession) => {
+                self.resolve_elevation(turn, true).await
+            }
+            Some(ConfirmationResponse::Denied) => self.resolve_elevation(turn, false).await,
+            None => Ok(self.abandon_pending_elevation(turn)),
+        }
+    }
+
+    /// Finish an elevation that could not be presented to a user.
+    ///
+    /// A missing or closed confirmation channel is not a denial by the user.
+    /// Return that distinction to the model instead of leaving the tool call
+    /// pending forever or recording a fabricated refusal.
+    fn abandon_pending_elevation(&self, turn: &mut TurnRuntime) -> Option<ToolResult> {
+        let elevation = turn.pending_elevation.take()?;
+        let result = ToolResult {
+            tool_call_id: elevation.tool_call_id.clone(),
+            output: PermissionResult::unapproved_tool_message(
+                &elevation.tool_name,
+                &elevation.reason,
+            ),
+            is_error: true,
+        };
+        let _ = self.event_tx.send(EngineEvent::ToolCallEnd {
+            id: elevation.tool_call_id,
+            result: result.clone(),
+        });
+        Some(result)
     }
 
     /// Resolve a pending elevation request and retry the tool call with elevated permissions.
@@ -2671,11 +2747,16 @@ impl QueryEngine {
                 name: elevation.tool_name.clone(),
                 reason: "elevation denied by user".to_string(),
             });
-            return Ok(Some(ToolResult {
+            let result = ToolResult {
                 tool_call_id: elevation.tool_call_id.clone(),
                 output: format!("tool '{}' elevation denied", elevation.tool_name),
                 is_error: true,
-            }));
+            };
+            let _ = self.event_tx.send(EngineEvent::ToolCallEnd {
+                id: elevation.tool_call_id,
+                result: result.clone(),
+            });
+            return Ok(Some(result));
         }
 
         // Temporarily switch to BypassPermissions for the elevated call
@@ -2686,16 +2767,6 @@ impl QueryEngine {
             c.set_mode(PermissionMode::BypassPermissions);
             prev
         };
-
-        // Emit tool call start
-        let _ = self.event_tx.send(EngineEvent::ToolCallStart {
-            id: elevation.tool_call_id.clone(),
-            name: elevation.tool_name.clone(),
-            summary: crate::types::ToolCall::summarize_activity(
-                &elevation.tool_name,
-                &elevation.input,
-            ),
-        });
 
         // Fire PreToolUse hook
         let mut ctx = std::collections::HashMap::new();
@@ -2710,15 +2781,22 @@ impl QueryEngine {
                 let mut c = checker.lock().unwrap();
                 c.set_mode(prev_mode);
             }
-            return Ok(Some(ToolResult {
+            let result = ToolResult {
                 tool_call_id: elevation.tool_call_id.clone(),
                 output: "elevated tool execution stopped by hook".to_string(),
                 is_error: true,
-            }));
+            };
+            let _ = self.event_tx.send(EngineEvent::ToolCallEnd {
+                id: elevation.tool_call_id,
+                result: result.clone(),
+            });
+            return Ok(Some(result));
         }
 
-        // Re-run permission check (should now pass with BypassPermissions)
-        let (_request, perm_result) = self
+        // Re-run permission check (should now pass with BypassPermissions).
+        // Capture the result before `?` so an evaluation error cannot leave the
+        // shared checker stuck in BypassPermissions.
+        let permission_result = self
             .permission_engine
             .evaluate(
                 &elevation.tool_name,
@@ -2726,14 +2804,16 @@ impl QueryEngine {
                 None,
                 std::collections::HashMap::new(),
             )
-            .await
-            .map_err(|e| format!("permission check failed: {e}"))?;
+            .await;
 
         // Restore original mode
         {
             let mut c = checker.lock().unwrap();
             c.set_mode(prev_mode);
         }
+
+        let (_request, perm_result) =
+            permission_result.map_err(|e| format!("permission check failed: {e}"))?;
 
         let result = match perm_result {
             PermissionResult::Allow | PermissionResult::AllowForPath { .. } => {
@@ -3379,6 +3459,7 @@ mod tests {
             tool_name: "bash".into(),
             input: serde_json::json!({"command": "whoami"}),
             request_id: "elev_tc_elev".into(),
+            reason: "test elevation".into(),
         });
 
         let result = engine.resolve_elevation(&mut turn, true).await;
@@ -3399,6 +3480,7 @@ mod tests {
             tool_name: "write".into(),
             input: serde_json::json!({}),
             request_id: "elev_tc_elev".into(),
+            reason: "test elevation".into(),
         });
 
         let result = engine.resolve_elevation(&mut turn, false).await;
@@ -3418,6 +3500,166 @@ mod tests {
         assert!(result.unwrap().is_none());
     }
 
+    #[tokio::test]
+    async fn execute_tool_calls_drives_every_elevation_through_the_confirmation_bus() {
+        let (mut engine, mut rx, _session) = make_test_engine();
+        engine
+            .permission_checker()
+            .lock()
+            .unwrap()
+            .set_mode(PermissionMode::Default);
+        let bus = ConfirmationBus::new(4);
+        engine.set_confirmation_bus(bus.clone());
+
+        let responder = tokio::spawn(async move {
+            for expected_id in ["elev_tc_one", "elev_tc_two"] {
+                let request = bus.next_request().await.expect("elevation request");
+                assert_eq!(request.id, expected_id);
+                assert!(!request.allow_session);
+                assert!(request.reason.contains("sudo"));
+                assert!(
+                    bus.respond(&request.id, ConfirmationResponse::Approved)
+                        .await
+                );
+            }
+        });
+
+        let mut turn = TurnRuntime::new(TokenBudget::with_defaults());
+        turn.pending_tool_calls = vec![
+            PendingToolCall {
+                id: "tc_one".into(),
+                name: "bash".into(),
+                input: serde_json::json!({"command": "sudo whoami"}),
+            },
+            PendingToolCall {
+                id: "tc_two".into(),
+                name: "bash".into(),
+                input: serde_json::json!({"command": "sudo id"}),
+            },
+        ];
+
+        let results = engine
+            .execute_tool_calls(&mut turn, &SubmitOptions::default())
+            .await
+            .unwrap();
+        responder.await.unwrap();
+
+        assert_eq!(results.len(), 2);
+        assert!(results.iter().all(|result| !result.is_error));
+        assert!(turn.pending_elevation.is_none());
+        assert_eq!(
+            engine.permission_checker().lock().unwrap().mode(),
+            PermissionMode::Default
+        );
+
+        let mut events = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            events.push(event);
+        }
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, EngineEvent::ToolCallStart { .. }))
+                .count(),
+            2,
+            "retries must not duplicate ToolCallStart: {events:?}"
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, EngineEvent::ElevationRequest { .. }))
+                .count(),
+            2
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, EngineEvent::ToolCallEnd { .. }))
+                .count(),
+            2,
+            "each elevated call must finish exactly once: {events:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn elevation_without_a_confirmation_channel_is_not_a_user_denial() {
+        let (mut engine, mut rx, _session) = make_test_engine();
+        engine
+            .permission_checker()
+            .lock()
+            .unwrap()
+            .set_mode(PermissionMode::Default);
+        let mut turn = TurnRuntime::new(TokenBudget::with_defaults());
+        turn.pending_tool_calls = vec![PendingToolCall {
+            id: "tc_no_bus".into(),
+            name: "bash".into(),
+            input: serde_json::json!({"command": "sudo whoami"}),
+        }];
+
+        let results = engine
+            .execute_tool_calls(&mut turn, &SubmitOptions::default())
+            .await
+            .unwrap();
+
+        assert_eq!(results.len(), 1);
+        assert!(results[0].is_error);
+        assert!(results[0].output.contains("no confirmation channel"));
+        assert!(!results[0].output.contains("denied by user"));
+        assert!(engine.denied_tools().is_empty());
+        assert!(turn.pending_elevation.is_none());
+
+        let mut events = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            events.push(event);
+        }
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, EngineEvent::ToolCallEnd { .. }))
+                .count(),
+            1,
+            "an unresolved call still needs a terminal event: {events:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn early_streaming_elevation_waits_for_approval_and_executes() {
+        let (mut engine, _rx, _session) = make_test_engine();
+        engine
+            .permission_checker()
+            .lock()
+            .unwrap()
+            .set_mode(PermissionMode::Default);
+        let bus = ConfirmationBus::new(1);
+        engine.set_confirmation_bus(bus.clone());
+        let responder = tokio::spawn(async move {
+            let request = bus.next_request().await.expect("elevation request");
+            assert_eq!(request.id, "elev_tc_early");
+            bus.respond(&request.id, ConfirmationResponse::Approved)
+                .await;
+        });
+        let mut turn = TurnRuntime::new(TokenBudget::with_defaults());
+
+        let result = engine
+            .execute_early_tool_call(
+                &mut turn,
+                ToolCall {
+                    id: "tc_early".into(),
+                    name: "bash".into(),
+                    input: serde_json::json!({"command": "sudo whoami"}),
+                },
+                &SubmitOptions::default(),
+            )
+            .await
+            .unwrap()
+            .expect("resolved tool result");
+        responder.await.unwrap();
+
+        assert!(!result.is_error, "{}", result.output);
+        assert_eq!(result.output, "stub ok: bash");
+        assert!(turn.pending_elevation.is_none());
+    }
+
     #[test]
     fn pending_elevation_struct_fields() {
         let elev = PendingElevation {
@@ -3425,6 +3667,7 @@ mod tests {
             tool_name: "bash".into(),
             input: serde_json::json!({}),
             request_id: "elev_1".into(),
+            reason: "test elevation".into(),
         };
         assert_eq!(elev.tool_call_id, "tc_1");
         assert_eq!(elev.tool_name, "bash");

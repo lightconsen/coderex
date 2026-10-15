@@ -183,6 +183,11 @@ impl PermissionEngine {
         self.confirmation_bus = None;
     }
 
+    /// Clone the interactive channel for another permission flow in the engine.
+    pub(crate) fn confirmation_bus(&self) -> Option<ConfirmationBus> {
+        self.confirmation_bus.clone()
+    }
+
     /// Set the pending store persistence path.
     pub fn set_persist_path(&mut self, path: PathBuf) {
         self.pending = PendingPermissionStore::new(Some(path));
