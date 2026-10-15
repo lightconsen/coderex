@@ -166,7 +166,14 @@ impl Settings {
             }
         }
         if let Some(ref mode) = self.permission_mode {
-            let valid_modes = ["default", "accept-edits", "plan", "dont-ask"];
+            let valid_modes = [
+                "default",
+                "accept-edits",
+                "bypass-permissions",
+                "dont-ask",
+                "plan",
+                "auto",
+            ];
             if !valid_modes.contains(&mode.as_str()) {
                 return Err(ConfigError::Validation {
                     field: "permission_mode".to_string(),
@@ -415,6 +422,26 @@ impl ConfigService {
     }
 }
 
+/// Enforce which settings sources may relax tool-approval behavior.
+///
+/// Repository-controlled files must not be able to turn on automatic
+/// classification or bypass every prompt. Those modes are accepted only from
+/// user, flag, or managed policy settings; other sources silently fall back to
+/// the next more restrictive configuration layer.
+fn enforce_permission_source_policy(settings: &mut Settings, source: &str) {
+    let Some(mode) = settings.permission_mode.as_deref() else {
+        return;
+    };
+    let repo_controlled = matches!(source, "project" | "local");
+    let security_sensitive = matches!(mode, "auto" | "bypass-permissions");
+    if repo_controlled && security_sensitive {
+        tracing::warn!(
+            "settings permission_mode '{mode}' ignored — only user/flag/managed settings may enable it ({source} settings are repository-controllable)"
+        );
+        settings.permission_mode = None;
+    }
+}
+
 /// Load and deserialize a settings file, migrating and validating.
 fn load_settings_file(path: &Path, source: &str) -> Result<Option<Settings>, ConfigError> {
     if !path.exists() {
@@ -454,6 +481,7 @@ fn load_settings_file(path: &Path, source: &str) -> Result<Option<Settings>, Con
     // Migrate and validate
     migrate_settings(&mut settings, source);
     settings.validate()?;
+    enforce_permission_source_policy(&mut settings, source);
 
     // Write back migrated config
     if let Ok(migrated) = serde_json::to_string_pretty(&settings) {
@@ -757,6 +785,40 @@ mod tests {
             matches!(result, Err(ConfigError::UnknownField { ref field }) if field == "unknown_key")
         );
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn project_settings_cannot_enable_security_sensitive_modes() {
+        for mode in ["auto", "bypass-permissions"] {
+            let temp = tempfile::tempdir().unwrap();
+            let project_path = temp.path().join("project.json");
+            std::fs::write(&project_path, format!("{{\"permission_mode\":\"{mode}\"}}")).unwrap();
+            let service = ConfigService::new(temp.path().join("user.json"), Some(project_path));
+            let settings = service.resolve().unwrap();
+            assert_eq!(settings.permission_mode.as_deref(), Some("default"));
+        }
+    }
+
+    #[test]
+    fn user_and_runtime_sources_can_enable_security_sensitive_modes() {
+        let temp = tempfile::tempdir().unwrap();
+        let user_path = temp.path().join("user.json");
+        std::fs::write(&user_path, r#"{"permission_mode":"auto"}"#).unwrap();
+        let service = ConfigService::new(user_path, None);
+        assert_eq!(
+            service.resolve().unwrap().permission_mode.as_deref(),
+            Some("auto")
+        );
+
+        let overridden = RuntimeOverrides {
+            permission_mode: Some("bypass-permissions".into()),
+            ..Default::default()
+        }
+        .apply(Settings::defaults());
+        assert_eq!(
+            overridden.permission_mode.as_deref(),
+            Some("bypass-permissions")
+        );
     }
 
     #[test]
