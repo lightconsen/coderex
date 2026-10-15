@@ -52,6 +52,8 @@ pub struct PluginHandle {
     /// False means the code was installed without anything having been
     /// checked — either no key is configured or the plugin predates it.
     pub verified: bool,
+    /// When the last recovery attempt was made, for the backoff between them.
+    pub last_retry_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 /// Plugin runtime type.
@@ -285,6 +287,7 @@ impl PluginManager {
                 retry_count: 0,
                 max_retries: 3,
                 verified: false,
+                last_retry_at: None,
             };
             self.plugins.insert(handle.name.clone(), handle);
             return;
@@ -303,6 +306,7 @@ impl PluginManager {
             // nothing about it was verified. Only an install against a
             // configured key sets this.
             verified: false,
+            last_retry_at: None,
         };
         self.plugins.insert(manifest.name.clone(), handle);
 
@@ -558,6 +562,7 @@ impl PluginManager {
                 retry_count: h.retry_count,
                 max_retries: h.max_retries,
                 verified: h.verified,
+                last_retry_at: h.last_retry_at,
             }
         })
     }
@@ -765,6 +770,7 @@ impl PluginManager {
             retry_count: 0,
             max_retries: 3,
             verified: false,
+            last_retry_at: None,
         };
         self.plugins.insert(plugin.name.clone(), handle);
 
@@ -904,6 +910,7 @@ impl PluginManager {
             retry_count: 0,
             max_retries: 3,
             verified,
+            last_retry_at: None,
         };
         self.plugins.insert(plugin.name.clone(), handle);
 
@@ -934,7 +941,21 @@ impl PluginManager {
                 continue;
             }
 
+            // Back off between attempts, as the retry policy says it does: a
+            // plugin whose file is still being written recovers on the next
+            // attempt, and one that is broken does not get hammered.
+            if let Some(last) = plugin.last_retry_at {
+                let waited = chrono::Utc::now()
+                    .signed_duration_since(last)
+                    .to_std()
+                    .unwrap_or_default();
+                if waited < retry_backoff(plugin.retry_count) {
+                    continue;
+                }
+            }
+
             plugin.retry_count += 1;
+            plugin.last_retry_at = Some(chrono::Utc::now());
 
             // Attempt to re-read the manifest
             let manifest_path = plugin.path.join("plugin.json");
@@ -1342,6 +1363,17 @@ impl MarketplaceReconciler {
     }
 }
 
+/// How long to wait before the next recovery attempt.
+///
+/// Exponential from a second and capped at a minute: long enough that a
+/// half-written plugin file has settled, short enough that a plugin which
+/// becomes usable is picked up without a restart.
+#[must_use]
+fn retry_backoff(retry_count: u32) -> std::time::Duration {
+    let seconds = 1u64 << retry_count.min(6);
+    std::time::Duration::from_secs(seconds.min(60))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1671,9 +1703,10 @@ mod tests {
                 .unwrap(),
             SignatureCheck::Verified
         );
-        assert!(mgr
-            .verify_signature(b"a swapped archive", Some(&sig_hex))
-            .is_err());
+        assert!(
+            mgr.verify_signature(b"a swapped archive", Some(&sig_hex))
+                .is_err()
+        );
     }
 
     #[test]
@@ -1797,6 +1830,52 @@ mod tests {
         let result = mgr.resolve_load_order();
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("cycle"));
+    }
+
+    /// The retry backs off between attempts, as its documentation says it
+    /// does. Without the backoff the loop hammered a broken plugin as fast as
+    /// it was called.
+    #[test]
+    fn a_retry_waits_before_trying_again() {
+        let mgr = PluginManager::new();
+        let manifest = PluginManifest {
+            name: "broken".into(),
+            version: "1".into(),
+            description: String::new(),
+            author: String::new(),
+            min_version: None,
+            commands: Vec::new(),
+            skills: Vec::new(),
+            dependencies: Vec::new(),
+            signature: None,
+            runtime: RuntimeType::Process,
+            entrypoint: None,
+            env: HashMap::new(),
+        };
+        mgr.load_plugin(manifest, std::path::PathBuf::from("/nonexistent/broken"));
+        mgr.set_plugin_state("broken", PluginState::Error("broke".into()));
+
+        // The first attempt happens immediately.
+        mgr.retry_failed_plugins();
+        assert_eq!(mgr.get_plugin("broken").unwrap().retry_count, 1);
+        assert!(mgr.get_plugin("broken").unwrap().last_retry_at.is_some());
+
+        // The next one does not, while the backoff is still running.
+        mgr.retry_failed_plugins();
+        assert_eq!(
+            mgr.get_plugin("broken").unwrap().retry_count,
+            1,
+            "a retry happened without waiting"
+        );
+    }
+
+    #[test]
+    fn the_backoff_grows_and_is_capped() {
+        assert_eq!(retry_backoff(0), std::time::Duration::from_secs(1));
+        assert_eq!(retry_backoff(1), std::time::Duration::from_secs(2));
+        assert_eq!(retry_backoff(2), std::time::Duration::from_secs(4));
+        assert_eq!(retry_backoff(6), std::time::Duration::from_secs(60));
+        assert_eq!(retry_backoff(20), std::time::Duration::from_secs(60));
     }
 
     #[test]

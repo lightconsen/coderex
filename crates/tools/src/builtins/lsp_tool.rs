@@ -215,7 +215,11 @@ impl Tool for LspTool {
     fn descriptor(&self) -> ToolDescriptor {
         ToolDescriptor {
             name: "LSP".into(),
-            tier: ToolTier::FeatureGated,
+            // Registered unconditionally, implemented against `lsp-types`,
+            // and enabled: the gated tier was a leftover, and it cost the tool
+            // its place in the model's list on any session that had no feature
+            // flags on.
+            tier: ToolTier::Baseline,
             input_schema: serde_json::json!({
                 "type": "object",
                 "required": ["operation"],
@@ -485,10 +489,10 @@ mod tests {
     }
 
     #[test]
-    fn descriptor_is_feature_gated() {
+    fn descriptor_is_baseline_and_read_only() {
         let desc = LspTool.descriptor();
         assert_eq!(desc.name, "LSP");
-        assert!(matches!(desc.tier, ToolTier::FeatureGated));
+        assert!(matches!(desc.tier, ToolTier::Baseline));
         assert!(desc.is_read_only);
         assert!(!desc.is_concurrency_safe);
     }

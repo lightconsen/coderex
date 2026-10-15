@@ -7,14 +7,13 @@
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
-/// Find a free TCP port by binding to 127.0.0.1:0 and reading the assigned port.
-fn find_free_port() -> u16 {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind to find free port");
-    listener.local_addr().unwrap().port()
-}
-
-/// Start the static-anthropic-server binary on a free port.
-fn start_server(port: u16) -> Child {
+/// Start the static-anthropic-server binary and return it with the port it
+/// bound.
+///
+/// The port is read from the server rather than picked here and handed over:
+/// finding a free port and then binding it later is a race, and under a full
+/// workspace run another test wins it often enough to matter.
+fn start_server() -> (Child, u16) {
     let responses_path =
         std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/responses.json");
 
@@ -28,11 +27,11 @@ fn start_server(port: u16) -> Child {
     let binary_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../target/debug/static-anthropic-server");
 
-    let child = if binary_path.exists() {
+    let mut child = if binary_path.exists() {
         Command::new(&binary_path)
             .args([
                 "--port",
-                &port.to_string(),
+                "0",
                 "--responses",
                 responses_path.to_str().unwrap(),
             ])
@@ -48,7 +47,7 @@ fn start_server(port: u16) -> Child {
                 "static-anthropic-server",
                 "--",
                 "--port",
-                &port.to_string(),
+                "0",
                 "--responses",
                 responses_path.to_str().unwrap(),
             ])
@@ -58,7 +57,48 @@ fn start_server(port: u16) -> Child {
     }
     .expect("failed to spawn static-anthropic-server");
 
-    child
+    let stderr = child.stderr.take().expect("piped stderr");
+    let port = read_bound_port(stderr);
+
+    (child, port)
+}
+
+/// Read the port the server announces, then keep draining its log.
+///
+/// The server logs a line per request; a stderr pipe nobody reads fills up and
+/// blocks it, so the reader stays for the life of the process.
+fn read_bound_port(stderr: std::process::ChildStderr) -> u16 {
+    use std::io::{BufRead, BufReader};
+
+    let mut reader = BufReader::new(stderr);
+    let mut port = None;
+    let mut line = String::new();
+
+    while reader.read_line(&mut line).unwrap_or(0) > 0 {
+        if let Some(rest) = line.split("listening on ").nth(1) {
+            if let Some(found) = rest
+                .trim()
+                .rsplit(':')
+                .next()
+                .and_then(|value| value.parse::<u16>().ok())
+            {
+                port = Some(found);
+                break;
+            }
+        }
+        line.clear();
+    }
+
+    let port = port.expect("the server did not announce a port");
+
+    std::thread::spawn(move || {
+        let mut sink = String::new();
+        while reader.read_line(&mut sink).unwrap_or(0) > 0 {
+            sink.clear();
+        }
+    });
+
+    port
 }
 
 /// Wait for the server to be accepting connections.
@@ -78,8 +118,7 @@ async fn wait_for_server(port: u16, max_attempts: u32) {
 
 #[tokio::test]
 async fn static_server_loads_responses_and_serves_tool_use() {
-    let port = find_free_port();
-    let mut child = start_server(port);
+    let (mut child, port) = start_server();
 
     let addr = format!("http://127.0.0.1:{port}/v1/messages");
     wait_for_server(port, 50).await;
@@ -120,8 +159,7 @@ async fn static_server_loads_responses_and_serves_tool_use() {
 
 #[tokio::test]
 async fn static_server_serves_recorded_text_after_tool_result() {
-    let port = find_free_port();
-    let mut child = start_server(port);
+    let (mut child, port) = start_server();
 
     let addr = format!("http://127.0.0.1:{port}/v1/messages");
     wait_for_server(port, 50).await;
@@ -168,8 +206,7 @@ async fn static_server_serves_recorded_text_after_tool_result() {
 
 #[tokio::test]
 async fn static_server_returns_404_for_non_messages_endpoint() {
-    let port = find_free_port();
-    let mut child = start_server(port);
+    let (mut child, port) = start_server();
 
     let addr = format!("http://127.0.0.1:{port}/v1/models");
     wait_for_server(port, 50).await;
@@ -182,8 +219,7 @@ async fn static_server_returns_404_for_non_messages_endpoint() {
 
 #[tokio::test]
 async fn static_server_json_schema_mode_returns_structured_output() {
-    let port = find_free_port();
-    let mut child = start_server(port);
+    let (mut child, port) = start_server();
 
     let addr = format!("http://127.0.0.1:{port}/v1/messages");
     wait_for_server(port, 50).await;
@@ -218,8 +254,7 @@ async fn static_server_json_schema_mode_returns_structured_output() {
 
 #[tokio::test]
 async fn static_server_simulates_error_for_error_trigger_prompt() {
-    let port = find_free_port();
-    let mut child = start_server(port);
+    let (mut child, port) = start_server();
 
     let addr = format!("http://127.0.0.1:{port}/v1/messages");
     wait_for_server(port, 50).await;
@@ -247,8 +282,7 @@ async fn static_server_simulates_error_for_error_trigger_prompt() {
 
 #[tokio::test]
 async fn static_server_non_streaming_mode_returns_json() {
-    let port = find_free_port();
-    let mut child = start_server(port);
+    let (mut child, port) = start_server();
 
     let addr = format!("http://127.0.0.1:{port}/v1/messages");
     wait_for_server(port, 50).await;

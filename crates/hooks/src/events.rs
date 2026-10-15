@@ -85,7 +85,7 @@ impl HookEvent {
             Self::WorktreeCreate => "WorktreeCreate",
             Self::PreCompact => coderex_core::hook_events::PRE_COMPACT,
             Self::PostCompact => coderex_core::hook_events::POST_COMPACT,
-            Self::Stop => "Stop",
+            Self::Stop => coderex_core::hook_events::STOP,
             Self::SubagentStop => "SubagentStop",
             Self::TaskCompleted => "TaskCompleted",
             Self::TeammateIdle => "TeammateIdle",
@@ -101,7 +101,7 @@ impl HookEvent {
     ///
     /// The firing sites, so this list can be checked against the code:
     ///
-    /// - `UserPromptSubmit`, `TurnEnd`, `PreCompact`, `PostCompact` —
+    /// - `UserPromptSubmit`, `TurnEnd`, `Stop`, `PreCompact`, `PostCompact` —
     ///   `coderex_core::engine`
     /// - `PreToolUse`, `PostToolUse`, `PostToolUseFailure`,
     ///   `PermissionRequest`, `PermissionDenied` —
@@ -122,6 +122,7 @@ impl HookEvent {
                 | Self::PermissionDenied
                 | Self::PreCompact
                 | Self::PostCompact
+                | Self::Stop
                 | Self::TurnEnd
         )
     }
@@ -262,6 +263,7 @@ mod tests {
                 "PermissionDenied",
                 "PreCompact",
                 "PostCompact",
+                "Stop",
                 "TurnEnd",
             ]
         );

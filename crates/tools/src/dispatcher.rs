@@ -33,6 +33,10 @@ pub struct RegistryToolDispatcher {
     context: ExecutionContext,
     cwd: PathBuf,
     sandbox_enabled: bool,
+    /// Whether this session's feature flags are on, which decides whether a
+    /// gated tool is offered at all. Off until a session says otherwise: a
+    /// tool registered to be withheld should be withheld by default.
+    feature_flags_enabled: bool,
     sandbox_override: Option<coderex_core::sandbox::SandboxConfig>,
     task_store: Option<Arc<TaskStore>>,
     cron_scheduler: Option<Arc<CronScheduler>>,
@@ -42,6 +46,20 @@ pub struct RegistryToolDispatcher {
 }
 
 impl RegistryToolDispatcher {
+    /// The tool listing the model sees, by name.
+    #[cfg(test)]
+    fn listed_names(&self) -> Vec<String> {
+        self.list_tools()
+            .into_iter()
+            .map(|info| info.name)
+            .collect()
+    }
+
+    /// Tell the dispatcher whether the session's feature flags are on.
+    pub const fn set_feature_flags_enabled(&mut self, enabled: bool) {
+        self.feature_flags_enabled = enabled;
+    }
+
     /// The registry this dispatcher resolves tools from.
     ///
     /// Lets callers add tools discovered after construction (MCP servers).
@@ -66,6 +84,7 @@ impl RegistryToolDispatcher {
             context,
             cwd,
             sandbox_enabled,
+            feature_flags_enabled: false,
             sandbox_override: None,
             task_store: None,
             cron_scheduler: None,
@@ -121,9 +140,21 @@ impl RegistryToolDispatcher {
 #[async_trait::async_trait]
 impl CoreToolExecutor for RegistryToolDispatcher {
     fn list_tools(&self) -> Vec<coderex_core::tool_executor::ToolInfo> {
+        // What the model is told about is what it can call. `all_descriptors`
+        // is every registered tool, including the ones registered only to
+        // refuse — thirteen of them answer "feature-gated and not enabled" —
+        // and a tool the model is shown but cannot use is an invitation to
+        // waste a turn discovering that.
+        let available: std::collections::HashSet<String> = self
+            .registry
+            .available_tool_names(self.context, self.feature_flags_enabled)
+            .into_iter()
+            .collect();
+
         self.registry
             .all_descriptors()
             .into_iter()
+            .filter(|d| d.is_enabled && available.contains(&d.name))
             .map(|d| coderex_core::tool_executor::ToolInfo {
                 name: d.name.clone(),
                 description: d
@@ -353,42 +384,6 @@ pub fn path_arguments(tool_name: &str, input: &Value) -> Vec<std::path::PathBuf>
     paths
 }
 
-#[test]
-fn path_arguments_are_read_from_the_field_the_tool_uses() {
-    assert_eq!(
-        path_arguments("Read", &serde_json::json!({"file_path": "/etc/passwd"})),
-        vec![std::path::PathBuf::from("/etc/passwd")]
-    );
-    assert_eq!(
-        path_arguments("Edit", &serde_json::json!({"file_path": "src/lib.rs"})),
-        vec![std::path::PathBuf::from("src/lib.rs")]
-    );
-    assert_eq!(
-        path_arguments("Write", &serde_json::json!({"files": ["a.txt", "b.txt"]})),
-        vec![
-            std::path::PathBuf::from("a.txt"),
-            std::path::PathBuf::from("b.txt")
-        ]
-    );
-}
-
-/// A rule is more useful over-matching than under-matching, so a tool whose
-/// path field is not known still offers anything that looks like a path.
-#[test]
-fn an_unknown_tool_still_offers_what_looks_like_a_path() {
-    let found = path_arguments(
-        "SomethingNew",
-        &serde_json::json!({"where": "/etc/shadow", "name": "not-a-path"}),
-    );
-    assert_eq!(found, vec![std::path::PathBuf::from("/etc/shadow")]);
-}
-
-#[test]
-fn arguments_with_no_paths_offer_nothing() {
-    assert!(path_arguments("echo", &serde_json::json!({"message": "hello"})).is_empty());
-    assert!(path_arguments("echo", &serde_json::json!({})).is_empty());
-    assert!(path_arguments("echo", &serde_json::json!("not an object")).is_empty());
-}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -400,6 +395,87 @@ mod tests {
         let mut registry = ToolRegistry::new();
         registry.register(Arc::new(EchoTool));
         Arc::new(registry)
+    }
+
+    /// What the model is told about is what it can call: a tool that would answer
+    /// "feature-gated and not enabled" is not offered.
+    #[tokio::test]
+    async fn the_listing_leaves_out_tools_that_would_refuse() {
+        let mut registry = ToolRegistry::new();
+        registry.register(Arc::new(EchoTool));
+        crate::builtins::register_feature_gated_tools(&mut registry);
+        let registry = Arc::new(registry);
+
+        let executor = Arc::new(InnerExecutor::new(ExecutionConfig::default()));
+        let dispatcher = RegistryToolDispatcher::new(
+            registry,
+            executor,
+            ExecutionContext::Normal,
+            PathBuf::from("/tmp"),
+        );
+
+        let listed = dispatcher.listed_names();
+        assert!(listed.contains(&"echo".to_string()), "{listed:?}");
+        assert!(
+            !listed.iter().any(|name| name == "Monitor"),
+            "a disabled tool was offered: {listed:?}"
+        );
+    }
+
+    /// A tool a deny rule forbids is not offered either.
+    #[tokio::test]
+    async fn the_listing_leaves_out_denied_tools() {
+        let mut registry = ToolRegistry::new();
+        registry.register(Arc::new(EchoTool));
+        registry.add_deny_rule(ToolDenyRule::for_tools(vec!["echo".into()]));
+        let registry = Arc::new(registry);
+
+        let executor = Arc::new(InnerExecutor::new(ExecutionConfig::default()));
+        let dispatcher = RegistryToolDispatcher::new(
+            registry,
+            executor,
+            ExecutionContext::Normal,
+            PathBuf::from("/tmp"),
+        );
+
+        assert!(!dispatcher.listed_names().contains(&"echo".to_string()));
+    }
+
+    #[test]
+    fn path_arguments_are_read_from_the_field_the_tool_uses() {
+        assert_eq!(
+            path_arguments("Read", &serde_json::json!({"file_path": "/etc/passwd"})),
+            vec![std::path::PathBuf::from("/etc/passwd")]
+        );
+        assert_eq!(
+            path_arguments("Edit", &serde_json::json!({"file_path": "src/lib.rs"})),
+            vec![std::path::PathBuf::from("src/lib.rs")]
+        );
+        assert_eq!(
+            path_arguments("Write", &serde_json::json!({"files": ["a.txt", "b.txt"]})),
+            vec![
+                std::path::PathBuf::from("a.txt"),
+                std::path::PathBuf::from("b.txt")
+            ]
+        );
+    }
+
+    /// A rule is more useful over-matching than under-matching, so a tool whose
+    /// path field is not known still offers anything that looks like a path.
+    #[test]
+    fn an_unknown_tool_still_offers_what_looks_like_a_path() {
+        let found = path_arguments(
+            "SomethingNew",
+            &serde_json::json!({"where": "/etc/shadow", "name": "not-a-path"}),
+        );
+        assert_eq!(found, vec![std::path::PathBuf::from("/etc/shadow")]);
+    }
+
+    #[test]
+    fn arguments_with_no_paths_offer_nothing() {
+        assert!(path_arguments("echo", &serde_json::json!({"message": "hello"})).is_empty());
+        assert!(path_arguments("echo", &serde_json::json!({})).is_empty());
+        assert!(path_arguments("echo", &serde_json::json!("not an object")).is_empty());
     }
 
     /// The check has to happen at dispatch, with the call's own arguments: a

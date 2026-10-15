@@ -25,6 +25,8 @@ pub const PRE_COMPACT: &str = "PreCompact";
 pub const POST_COMPACT: &str = "PostCompact";
 /// At the end of a turn.
 pub const TURN_END: &str = "TurnEnd";
+/// When the assistant has finished responding and the turn is about to close.
+pub const STOP: &str = "Stop";
 /// When a tool call is waiting for the person's decision.
 pub const PERMISSION_REQUEST: &str = "PermissionRequest";
 /// When a tool call was refused.
@@ -45,6 +47,7 @@ mod tests {
         assert_eq!(PRE_COMPACT, "PreCompact");
         assert_eq!(POST_COMPACT, "PostCompact");
         assert_eq!(TURN_END, "TurnEnd");
+        assert_eq!(STOP, "Stop");
         assert_eq!(PERMISSION_REQUEST, "PermissionRequest");
         assert_eq!(PERMISSION_DENIED, "PermissionDenied");
     }
@@ -59,6 +62,7 @@ mod tests {
             PRE_COMPACT,
             POST_COMPACT,
             TURN_END,
+            STOP,
             PERMISSION_REQUEST,
             PERMISSION_DENIED,
         ];

@@ -60,12 +60,18 @@ impl McpResultAdapter {
                         .and_then(|m| m.as_str())
                         .unwrap_or("image/png");
                     let data = item.get("data").and_then(|d| d.as_str()).unwrap_or("");
-                    let truncated = if data.len() > 64 {
-                        format!("{}...[truncated]", &data[..64])
-                    } else {
-                        data.to_string()
-                    };
-                    format!("[Image: {mime}] {truncated}")
+
+                    // The tool result is text, so an image cannot travel in it
+                    // and the model cannot see one. Sixty-four characters of
+                    // base64 is not a smaller image — it is a broken one — so
+                    // say what came back and how big it is instead of pretending
+                    // to carry it. Carrying images needs content blocks the
+                    // pipeline does not have.
+                    format!(
+                        "[Image: {mime}, {}] the image itself is not passed on: tool results \
+                         are text",
+                        human_size(decoded_len(data))
+                    )
                 }
                 Some("resource") => {
                     if let Some(resource) = item.get("resource") {
@@ -96,6 +102,25 @@ impl McpResultAdapter {
         } else {
             parts.join("\n\n")
         }
+    }
+}
+
+/// How many bytes a base64 payload decodes to.
+fn decoded_len(data: &str) -> usize {
+    let padding = data.chars().rev().take_while(|c| *c == '=').count().min(2);
+    data.len().saturating_mul(3) / 4 - padding
+}
+
+/// A size a person reads at a glance.
+fn human_size(bytes: usize) -> String {
+    const KB: usize = 1024;
+    const MB: usize = KB * 1024;
+    if bytes >= MB {
+        format!("{:.1} MB", bytes as f64 / MB as f64)
+    } else if bytes >= KB {
+        format!("{:.1} KB", bytes as f64 / KB as f64)
+    } else {
+        format!("{bytes} B")
     }
 }
 
@@ -145,7 +170,40 @@ mod tests {
             "isError": false
         });
         let tr = McpResultAdapter::adapt("call-1", &result);
-        assert!(tr.output.contains("[Image: image/png]"));
+
+        assert!(tr.output.contains("[Image: image/png"), "{}", tr.output);
+        // `aGVsbG8=` decodes to five bytes, so the size is the real one rather
+        // than the length of the base64.
+        assert!(tr.output.contains("5 B"), "{}", tr.output);
+        assert!(tr.output.contains("text"), "{}", tr.output);
+    }
+
+    #[test]
+    fn an_image_larger_than_a_line_reports_its_size_not_a_prefix() {
+        let data = "A".repeat(4_000);
+        let result = serde_json::json!({
+            "content": [{"type": "image", "data": data, "mimeType": "image/jpeg"}],
+            "isError": false
+        });
+        let tr = McpResultAdapter::adapt("call-1", &result);
+
+        assert!(tr.output.contains("image/jpeg"), "{}", tr.output);
+        assert!(
+            !tr.output.contains("AAAA"),
+            "no base64 was inlined: {}",
+            tr.output
+        );
+        assert!(tr.output.len() < 200, "{}", tr.output);
+    }
+
+    #[test]
+    fn sizes_are_readable() {
+        assert_eq!(decoded_len(""), 0);
+        assert_eq!(decoded_len("aGVsbG8="), 5);
+        assert_eq!(decoded_len("AAAA"), 3);
+        assert_eq!(human_size(512), "512 B");
+        assert_eq!(human_size(2048), "2.0 KB");
+        assert_eq!(human_size(3 * 1024 * 1024), "3.0 MB");
     }
 
     #[test]

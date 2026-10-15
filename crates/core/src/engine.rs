@@ -648,40 +648,6 @@ impl TurnRuntime {
     }
 }
 
-// ─── TurnProgress ───────────────────────────────────────────────────────────
-
-/// Progress event emitted during turn execution.
-#[allow(missing_docs)]
-#[derive(Debug, Clone)]
-pub enum TurnProgress {
-    /// State transition occurred.
-    StateChanged { from: TurnState, to: TurnState },
-    /// A text delta was received from the model.
-    TextDelta(String),
-    /// A tool call was started.
-    ToolCallStarted { id: String, name: String },
-    /// A tool call completed.
-    ToolCallCompleted { id: String, result: ToolResult },
-    /// A permission request was emitted.
-    PermissionRequested {
-        id: String,
-        tool: String,
-        args: serde_json::Value,
-    },
-    /// An elicitation request was emitted.
-    ElicitationRequested { id: String, message: String },
-    /// A compact boundary was inserted.
-    CompactBoundary,
-    /// The turn completed.
-    TurnCompleted {
-        turn_number: u32,
-        usage: UsageSummary,
-        reason: TerminalReason,
-    },
-    /// An error occurred.
-    Error(String),
-}
-
 // ─── QueryEngine ────────────────────────────────────────────────────────────
 
 /// QueryEngine — manages conversation turns with the AI model.
@@ -1139,6 +1105,28 @@ impl QueryEngine {
         self.hooks.fire_hook(event_name, input, context).await
     }
 
+    /// Run the stop hooks, and enter the state that names them.
+    ///
+    /// `TurnState::StopHooks` was declared and never entered, and `Stop` was
+    /// one of the hook events nothing fired — the same gap seen from two
+    /// sides. The state is real now, and the hook fires in it: this is the
+    /// last point at which a hook can say something about the turn before it
+    /// is closed.
+    async fn run_stop_hooks(&self, turn: &mut TurnRuntime, turn_number: u32, stop_reason: &str) {
+        turn.transition_to(TurnState::StopHooks);
+
+        let mut ctx = std::collections::HashMap::new();
+        ctx.insert("turn_number".to_string(), turn_number.to_string());
+        ctx.insert("stop_reason".to_string(), stop_reason.to_string());
+        let result = self
+            .hooks
+            .fire_hook(hook_events::STOP, &format!("turn_{turn_number}"), &ctx)
+            .await;
+        if !result.errors.is_empty() {
+            tracing::warn!("Stop hook errors: {:?}", result.errors);
+        }
+    }
+
     /// Fire the TurnEnd hook.
     async fn fire_turn_end_hook(&self, turn_number: u32, stop_reason: &str) -> HookFireResult {
         let mut ctx = std::collections::HashMap::new();
@@ -1489,6 +1477,8 @@ impl QueryEngine {
                         return Ok(TerminalReason::BudgetExhausted);
                     }
 
+                    self.run_stop_hooks(turn, turn_number, &api_response.stop_reason)
+                        .await;
                     turn.transition_to(TurnState::Finalize);
                     self.cost_tracker
                         .end_turn(turn_number, &api_response.usage, &self.model);
@@ -1568,6 +1558,8 @@ impl QueryEngine {
             }
         }
 
+        self.run_stop_hooks(turn, turn_number, &api_response.stop_reason)
+            .await;
         turn.transition_to(TurnState::Finalize);
         self.cost_tracker
             .end_turn(turn_number, &api_response.usage, &self.model);
@@ -1705,6 +1697,7 @@ impl QueryEngine {
                         return Ok(TerminalReason::BudgetExhausted);
                     }
 
+                    self.run_stop_hooks(turn, turn_number, "end_turn").await;
                     turn.transition_to(TurnState::Finalize);
                     self.cost_tracker.end_turn(turn_number, &usage, &self.model);
                     let _ = self.fire_turn_end_hook(turn_number, "end_turn").await;
@@ -3188,6 +3181,24 @@ mod tests {
         let resp = result.unwrap();
         assert!(!resp.content.is_empty());
         assert!(resp.usage.output_tokens > 0);
+    }
+
+    /// `TurnState::StopHooks` is entered before a turn closes, and the Stop
+    /// hook fires in it — the state and the event were both declared, and
+    /// neither happened.
+    #[tokio::test]
+    async fn a_finished_turn_runs_the_stop_hooks() {
+        let (mut engine, _rx, _session) = make_test_engine();
+        let budget = TokenBudget::with_defaults();
+        let mut turn = TurnRuntime::new(budget);
+
+        engine.run_stop_hooks(&mut turn, 1, "end_turn").await;
+
+        assert!(
+            matches!(turn.state, TurnState::StopHooks),
+            "{:?}",
+            turn.state
+        );
     }
 
     #[tokio::test]

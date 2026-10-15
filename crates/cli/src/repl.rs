@@ -892,6 +892,13 @@ impl ReplLoop {
             ExecutionContext::Normal,
             std::path::PathBuf::from(&cwd),
         );
+        // Whether this session turned feature flags on decides whether a
+        // gated tool is offered at all — the tool listing the model sees is
+        // filtered by it.
+        dispatcher.set_feature_flags_enabled(
+            coderex_config::flags::FeatureFlags::from_env().capabilities()
+                != coderex_config::flags::CapabilitySet::empty(),
+        );
 
         // Shared task store with persistence
         let config_home = coderex_config::config_home();

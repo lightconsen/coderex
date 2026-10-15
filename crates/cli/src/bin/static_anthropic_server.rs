@@ -60,7 +60,14 @@ fn main() {
     let responses = std::sync::Arc::new(responses);
 
     let listener = TcpListener::bind(format!("127.0.0.1:{port}")).expect("bind");
-    eprintln!("[static-anthropic-server] http://127.0.0.1:{port}/v1/messages");
+
+    // Announce the address that was actually bound: with `--port 0` the OS
+    // picks one, and a caller has to be told which.
+    let bound = listener
+        .local_addr()
+        .expect("bound listener has an address");
+    eprintln!("[static-anthropic-server] listening on {bound}");
+    eprintln!("[static-anthropic-server] http://{bound}/v1/messages");
     eprintln!("[static-anthropic-server] responses loaded from: {responses_path}");
 
     for stream in listener.incoming() {
