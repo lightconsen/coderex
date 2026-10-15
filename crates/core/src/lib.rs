@@ -55,9 +55,10 @@ pub mod wire_transport;
 pub mod worktree;
 
 pub use compact::{
-    CompactResult, CompactStrategy, MicroCompactParams, auto_compact, compact_boundary_message,
-    insert_compact_boundary, micro_compact, reactive_compact, select_compact_strategy,
-    should_auto_compact, should_reactive_compact, snip_compact, truncate_tool_output,
+    CompactResult, CompactStrategy, CompactThresholds, ContextLevel, MicroCompactParams,
+    auto_compact, compact_boundary_message, insert_compact_boundary, micro_compact,
+    reactive_compact, select_compact_strategy, should_auto_compact, should_reactive_compact,
+    snip_compact, truncate_tool_output,
 };
 pub use compaction_backend::{CompactionBackend, CompactionKind, CompactionRequest};
 pub use file_traversal::{

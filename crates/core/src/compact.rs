@@ -6,7 +6,7 @@
 //! - **Reactive**: Auto + truncate older conversation turns
 //! - **Snip**: Truncate history at a boundary point, preserving essential context
 
-use crate::prompt::PromptCompiler;
+use crate::prompt::{CompactConfig, PromptCompiler};
 use crate::types::{Message, MessageContent, ModelId, Role, ToolResult};
 
 // ─── Compact Strategy ───────────────────────────────────────────────────────
@@ -463,35 +463,87 @@ fn insert_compact_boundary_messages(messages: &mut Vec<Message>) {
 
 // ─── Compact Strategy Selection ─────────────────────────────────────────────
 
+/// Where a session's context sits relative to the compaction lines.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContextLevel {
+    /// Room to spare.
+    Ok,
+    /// Approaching the line: worth telling the user, nothing to do yet.
+    Warn,
+    /// At the line: compact before sending another request.
+    Compact,
+    /// The window is spent; a request can no longer be sent.
+    Blocked,
+}
+
+/// The lines a session's context is measured against, in tokens.
+///
+/// Claude's arithmetic: the window is what the model can hold, some of it is
+/// held back for the reply and the system prompt, and compaction has to happen
+/// before the two collide.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CompactThresholds {
+    /// Compaction line: `window − min(output_reserve, 20 000) − 13 000`.
+    pub auto: usize,
+    /// Warning line, one buffer below the compaction line.
+    pub warn: usize,
+    /// Blocked line: `window − 3 000`.
+    pub blocked: usize,
+}
+
+impl CompactThresholds {
+    /// Resolve the lines for a model's context window.
+    #[must_use]
+    pub fn resolve(model: &ModelId, config: &CompactConfig) -> Self {
+        let window = model.context_window();
+        Self {
+            auto: config.resolve_auto_threshold(window),
+            warn: config.resolve_warning_threshold(window),
+            blocked: config.resolve_blocked_threshold(window),
+        }
+    }
+
+    /// Which line `estimated_tokens` has reached.
+    #[must_use]
+    pub const fn level(&self, estimated_tokens: usize) -> ContextLevel {
+        if estimated_tokens >= self.blocked {
+            ContextLevel::Blocked
+        } else if estimated_tokens >= self.auto {
+            ContextLevel::Compact
+        } else if estimated_tokens >= self.warn {
+            ContextLevel::Warn
+        } else {
+            ContextLevel::Ok
+        }
+    }
+}
+
 /// Select the appropriate compact strategy based on current state and model.
 ///
-/// Thresholds are computed as percentages of the model's context window:
-/// - auto: 50% of context window
-/// - reactive: 90% of context window
+/// The lines come from the model's context window (see [`CompactThresholds`]),
+/// not from a percentage of it: a 200K window compacts at 167K, not at 100K, so
+/// context is not thrown away while there is still room for it.
 #[must_use]
 pub fn select_compact_strategy(
     stop_reason: &str,
     estimated_tokens: usize,
     model: &ModelId,
-    budget_near_limit: bool,
+    config: &CompactConfig,
 ) -> CompactStrategy {
-    let window = model.context_window();
-    let auto_threshold = window * 50 / 100;
-    let reactive_threshold = window * 90 / 100;
-
     if stop_reason == "max_tokens" {
         return CompactStrategy::Reactive;
     }
-    if estimated_tokens > reactive_threshold {
-        return CompactStrategy::Reactive;
+
+    let thresholds = CompactThresholds::resolve(model, config);
+    match thresholds.level(estimated_tokens) {
+        // The window is spent: keep only what still fits.
+        ContextLevel::Blocked => CompactStrategy::Snip,
+        ContextLevel::Compact => CompactStrategy::Auto,
+        // Claude warns at this level rather than compacting. When a caller has
+        // asked for recovery anyway, the lightest pass is the right floor —
+        // never a truncation, which is what the most aggressive strategy does.
+        ContextLevel::Warn | ContextLevel::Ok => CompactStrategy::Micro,
     }
-    if estimated_tokens > auto_threshold {
-        return CompactStrategy::Auto;
-    }
-    if budget_near_limit {
-        return CompactStrategy::Micro;
-    }
-    CompactStrategy::Snip
 }
 
 // ─── LLM Summary Compaction ─────────────────────────────────────────────────
@@ -1057,54 +1109,123 @@ mod tests {
 
     #[test]
     fn select_strategy_max_tokens_is_reactive() {
-        let strategy = select_compact_strategy("max_tokens", 50000, &ModelId::sonnet(), false);
+        let strategy = select_compact_strategy(
+            "max_tokens",
+            50000,
+            &ModelId::sonnet(),
+            &CompactConfig::default(),
+        );
         assert!(matches!(strategy, CompactStrategy::Reactive));
     }
 
     #[test]
-    fn select_strategy_over_reactive_threshold_is_reactive() {
-        // Sonnet window = 200_000, reactive = 90% = 180_000
-        let strategy = select_compact_strategy("end_turn", 190_000, &ModelId::sonnet(), false);
-        assert!(matches!(strategy, CompactStrategy::Reactive));
+    fn sonnet_lines_come_from_the_window_arithmetic() {
+        let thresholds = CompactThresholds::resolve(&ModelId::sonnet(), &CompactConfig::default());
+
+        // 200_000 − min(20_000, 20_000) − 13_000
+        assert_eq!(thresholds.auto, 167_000);
+        assert_eq!(thresholds.warn, 147_000);
+        assert_eq!(thresholds.blocked, 197_000);
     }
 
     #[test]
-    fn select_strategy_over_auto_threshold_is_auto() {
-        // Sonnet window = 200_000, auto = 50% = 100_000
-        let strategy = select_compact_strategy("end_turn", 110_000, &ModelId::sonnet(), false);
+    fn select_strategy_over_the_compaction_line_is_auto() {
+        let strategy = select_compact_strategy(
+            "end_turn",
+            170_000,
+            &ModelId::sonnet(),
+            &CompactConfig::default(),
+        );
         assert!(matches!(strategy, CompactStrategy::Auto));
     }
 
     #[test]
-    fn select_strategy_budget_near_limit_is_micro() {
-        let strategy = select_compact_strategy("end_turn", 50000, &ModelId::sonnet(), true);
-        assert!(matches!(strategy, CompactStrategy::Micro));
+    fn select_strategy_below_the_lines_is_the_lightest_pass() {
+        // Compacting at half the window is what this used to do; a session at
+        // 110K on a 200K window still has room and must not be truncated.
+        for tokens in [50_000, 110_000, 146_999] {
+            let strategy = select_compact_strategy(
+                "end_turn",
+                tokens,
+                &ModelId::sonnet(),
+                &CompactConfig::default(),
+            );
+            assert!(
+                matches!(strategy, CompactStrategy::Micro),
+                "{tokens} tokens gave {strategy:?}"
+            );
+        }
     }
 
     #[test]
-    fn select_strategy_default_is_snip() {
-        let strategy = select_compact_strategy("end_turn", 50000, &ModelId::sonnet(), false);
+    fn select_strategy_above_the_blocked_line_keeps_only_what_fits() {
+        let strategy = select_compact_strategy(
+            "end_turn",
+            198_000,
+            &ModelId::sonnet(),
+            &CompactConfig::default(),
+        );
         assert!(matches!(strategy, CompactStrategy::Snip));
     }
 
     /// An unrecognised model must not be assumed to have the largest window we
-    /// know about. At a conservative 32K window, 110k estimated tokens is past
-    /// the reactive line — compacting early beats overflowing the model.
+    /// know about. At a conservative 32K window the reserves would consume the
+    /// whole window, so the floor applies and the line lands at half of it.
     #[test]
     fn unknown_model_compacts_against_a_conservative_window() {
         let model = ModelId("custom-model".into());
         assert_eq!(model.context_window(), crate::types::UNKNOWN_CONTEXT_WINDOW);
 
-        let strategy = select_compact_strategy("end_turn", 110_000, &model, false);
-        assert!(matches!(strategy, CompactStrategy::Reactive));
+        let thresholds = CompactThresholds::resolve(&model, &CompactConfig::default());
+        assert_eq!(thresholds.auto, 16_000);
+        assert_eq!(thresholds.warn, 8_000);
+        assert_eq!(thresholds.blocked, 29_000);
 
-        // Just over the auto line for that conservative window.
-        let strategy = select_compact_strategy("end_turn", 17_000, &model, false);
+        // Past the end of that window: keep only what fits.
+        let strategy =
+            select_compact_strategy("end_turn", 110_000, &model, &CompactConfig::default());
+        assert!(matches!(strategy, CompactStrategy::Snip));
+
+        // Just over the compaction line for that window.
+        let strategy =
+            select_compact_strategy("end_turn", 17_000, &model, &CompactConfig::default());
         assert!(matches!(strategy, CompactStrategy::Auto));
 
-        // Under it: no compaction needed yet.
-        let strategy = select_compact_strategy("end_turn", 5_000, &model, false);
-        assert!(matches!(strategy, CompactStrategy::Snip));
+        // Under every line: the lightest pass, not a truncation.
+        let strategy =
+            select_compact_strategy("end_turn", 5_000, &model, &CompactConfig::default());
+        assert!(matches!(strategy, CompactStrategy::Micro));
+    }
+
+    #[test]
+    fn a_configured_output_reserve_moves_the_line() {
+        let config = CompactConfig {
+            output_reserve_tokens: 4_000,
+            ..CompactConfig::default()
+        };
+        let thresholds = CompactThresholds::resolve(&ModelId::sonnet(), &config);
+        assert_eq!(thresholds.auto, 200_000 - 4_000 - 13_000);
+    }
+
+    #[test]
+    fn the_output_reserve_is_capped() {
+        let config = CompactConfig {
+            output_reserve_tokens: 100_000,
+            ..CompactConfig::default()
+        };
+        let thresholds = CompactThresholds::resolve(&ModelId::sonnet(), &config);
+        assert_eq!(
+            thresholds.auto,
+            200_000 - CompactConfig::MAX_OUTPUT_RESERVE_TOKENS - 13_000
+        );
+    }
+
+    #[test]
+    fn the_warning_line_keeps_a_band_on_a_small_window() {
+        // 20K below a 16K line would leave nothing on either side of it.
+        let thresholds =
+            CompactThresholds::resolve(&ModelId("custom-model".into()), &CompactConfig::default());
+        assert_eq!(thresholds.warn, thresholds.auto / 2);
     }
 
     // ═════════════════════════════════════════════════════════════════════
@@ -1199,10 +1320,20 @@ mod tests {
     #[test]
     fn resolve_auto_threshold_uses_window_when_known() {
         let cfg = crate::prompt::CompactConfig::default();
-        // 200K window − 4K summary reserve − 13K buffer
-        assert_eq!(cfg.resolve_auto_threshold(200_000), 183_000);
+        // 200K window − 20K output reserve − 13K buffer
+        assert_eq!(cfg.resolve_auto_threshold(200_000), 167_000);
         // Unknown window falls back to configured value.
         assert_eq!(cfg.resolve_auto_threshold(0), cfg.auto_compact_threshold);
+    }
+
+    #[test]
+    fn resolve_blocked_threshold_leaves_room_for_the_last_request() {
+        let cfg = crate::prompt::CompactConfig::default();
+        assert_eq!(cfg.resolve_blocked_threshold(200_000), 197_000);
+        assert_eq!(
+            cfg.resolve_blocked_threshold(0),
+            cfg.reactive_compact_threshold
+        );
     }
 
     #[test]

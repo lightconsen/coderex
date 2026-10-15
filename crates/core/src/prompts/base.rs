@@ -63,9 +63,14 @@ pub struct CompactConfig {
     /// Tokens above the warning line produce a `CompactWarning` event
     /// (UI hint only — no compaction is triggered).
     pub warning_buffer_tokens: usize,
-    /// Tokens reserved at the end of the context window for the compaction
-    /// summary output itself. The trigger threshold must leave room for it.
-    pub summary_output_reserve_tokens: usize,
+    /// Tokens held back for the model's own response on every request.
+    ///
+    /// The compaction line has to leave room for the reply, and Claude caps
+    /// that reserve at [`Self::MAX_OUTPUT_RESERVE_TOKENS`].
+    pub output_reserve_tokens: usize,
+    /// How close to the window's end a request can get before it can no longer
+    /// be sent.
+    pub blocked_margin_tokens: usize,
     /// Safety buffer between the compaction trigger point and the effective
     /// context window, absorbing token-estimation error.
     pub trigger_buffer_tokens: usize,
@@ -98,7 +103,8 @@ impl Default for CompactConfig {
             snip_target_tokens: 80_000,
             max_recovery_retries: 3,
             warning_buffer_tokens: 20_000,
-            summary_output_reserve_tokens: 4_000,
+            output_reserve_tokens: 20_000,
+            blocked_margin_tokens: 3_000,
             trigger_buffer_tokens: 13_000,
             max_consecutive_failures: 3,
             summary_input_max_tokens: 20_000,
@@ -112,7 +118,16 @@ impl Default for CompactConfig {
 }
 
 impl CompactConfig {
+    /// Ceiling on the response reserve the compaction line leaves room for.
+    ///
+    /// Claude's arithmetic uses `min(maxOutputTokens, 20 000)`; CodeRex does
+    /// not model per-model output caps, so the ceiling is the reserve.
+    pub const MAX_OUTPUT_RESERVE_TOKENS: usize = 20_000;
+
     /// Threshold at which a warning (not a compaction) is emitted.
+    ///
+    /// Used when the context window is unknown; a known window resolves its
+    /// own line through [`Self::resolve_warning_threshold`].
     #[must_use]
     pub const fn warning_threshold(&self) -> usize {
         self.auto_compact_threshold
@@ -121,17 +136,56 @@ impl CompactConfig {
 
     /// Resolve the auto-compact threshold from the model's context window.
     ///
-    /// `threshold = effective_window − summary_reserve − trigger_buffer`,
-    /// falling back to the configured `auto_compact_threshold` when the
-    /// window is unknown (0).
+    /// `threshold = window − min(output_reserve, 20 000) − trigger_buffer`,
+    /// falling back to the configured `auto_compact_threshold` when the window
+    /// is unknown (0).
+    ///
+    /// The reserves are sized for a large window. On a small one they would
+    /// eat it whole — the unknown-model window is 32K — so compaction never
+    /// drops below half the window.
     #[must_use]
     pub const fn resolve_auto_threshold(&self, context_window: usize) -> usize {
         if context_window == 0 {
             return self.auto_compact_threshold;
         }
-        context_window
-            .saturating_sub(self.summary_output_reserve_tokens)
-            .saturating_sub(self.trigger_buffer_tokens)
+        let reserve = if self.output_reserve_tokens < Self::MAX_OUTPUT_RESERVE_TOKENS {
+            self.output_reserve_tokens
+        } else {
+            Self::MAX_OUTPUT_RESERVE_TOKENS
+        };
+        let threshold =
+            context_window.saturating_sub(reserve.saturating_add(self.trigger_buffer_tokens));
+        let floor = context_window / 2;
+        if threshold < floor { floor } else { threshold }
+    }
+
+    /// Resolve the warning line: one buffer below the compaction line.
+    ///
+    /// The buffer is capped at half the compaction line for the same reason the
+    /// reserves are: on a small window a fixed 20K margin would put the warning
+    /// line at zero and warn about nothing.
+    #[must_use]
+    pub const fn resolve_warning_threshold(&self, context_window: usize) -> usize {
+        let auto = self.resolve_auto_threshold(context_window);
+        let margin = if self.warning_buffer_tokens < auto / 2 {
+            self.warning_buffer_tokens
+        } else {
+            auto / 2
+        };
+        auto.saturating_sub(margin)
+    }
+
+    /// Resolve the blocked line: how close to the window's end a request can
+    /// still be sent.
+    ///
+    /// Falls back to the configured `reactive_compact_threshold` when the
+    /// window is unknown (0).
+    #[must_use]
+    pub const fn resolve_blocked_threshold(&self, context_window: usize) -> usize {
+        if context_window == 0 {
+            return self.reactive_compact_threshold;
+        }
+        context_window.saturating_sub(self.blocked_margin_tokens)
     }
 }
 

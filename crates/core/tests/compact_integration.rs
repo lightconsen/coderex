@@ -5,11 +5,18 @@
 //! 7.1 micro compact, 7.2 auto compact, 7.3 reactive compact,
 //! 7.4 snip compact, 7.5 compact boundary, 7.6 dead loop protection
 
+use coderex_core::CompactConfig;
 use coderex_core::compact::{
     CompactResult, CompactStrategy, MicroCompactParams, auto_compact, compact_boundary_message,
     insert_compact_boundary, micro_compact, reactive_compact, select_compact_strategy,
     should_auto_compact, should_reactive_compact, snip_compact,
 };
+
+/// The default compact configuration — the lines every test below is written
+/// against.
+fn cfg() -> CompactConfig {
+    CompactConfig::default()
+}
 use coderex_core::stop_hook::{
     StopHookContext, StopHookDecision, evaluate_stop_hook, should_proceed_with_compact,
 };
@@ -516,57 +523,66 @@ fn should_proceed_returns_true_for_continue() {
 
 #[test]
 fn select_strategy_max_tokens_triggers_reactive() {
-    let strategy = select_compact_strategy("max_tokens", 50_000, &ModelId::sonnet(), false);
+    let strategy = select_compact_strategy("max_tokens", 50_000, &ModelId::sonnet(), &cfg());
     assert_eq!(strategy, CompactStrategy::Reactive);
 }
 
 #[test]
-fn select_strategy_over_reactive_threshold() {
-    // Sonnet context window = 200K, reactive threshold = 90% = 180K
-    let strategy = select_compact_strategy("end_turn", 190_000, &ModelId::sonnet(), false);
-    assert_eq!(strategy, CompactStrategy::Reactive);
-}
-
-#[test]
-fn select_strategy_over_auto_threshold() {
-    // Sonnet context window = 200K, auto threshold = 50% = 100K
-    let strategy = select_compact_strategy("end_turn", 110_000, &ModelId::sonnet(), false);
+fn select_strategy_over_the_compaction_line() {
+    // Sonnet window 200K; the line is 200K − 20K response reserve − 13K buffer.
+    let strategy = select_compact_strategy("end_turn", 170_000, &ModelId::sonnet(), &cfg());
     assert_eq!(strategy, CompactStrategy::Auto);
 }
 
 #[test]
-fn select_strategy_budget_near_limit_is_micro() {
-    let strategy = select_compact_strategy("end_turn", 10_000, &ModelId::sonnet(), true);
+fn select_strategy_below_the_lines_is_the_lightest_pass() {
+    // 110K on a 200K window still has room: this used to compact (50% rule)
+    // and no longer does.
+    let strategy = select_compact_strategy("end_turn", 110_000, &ModelId::sonnet(), &cfg());
+    assert_eq!(strategy, CompactStrategy::Micro);
+
+    let strategy = select_compact_strategy("end_turn", 10_000, &ModelId::sonnet(), &cfg());
     assert_eq!(strategy, CompactStrategy::Micro);
 }
 
 #[test]
-fn select_strategy_default_is_snip() {
-    let strategy = select_compact_strategy("end_turn", 10_000, &ModelId::sonnet(), false);
+fn select_strategy_past_the_blocked_line_keeps_only_what_fits() {
+    // Blocked line = window − 3K.
+    let strategy = select_compact_strategy("end_turn", 198_000, &ModelId::sonnet(), &cfg());
     assert_eq!(strategy, CompactStrategy::Snip);
 }
 
 #[test]
 fn select_strategy_small_model_window() {
-    // A model with a smaller window (default 200K)
+    // An unrecognised model gets the conservative 32K window, so the reserves
+    // would eat it whole and the line lands at half of it (16K).
     let model = ModelId("custom-small-model".into());
-    let strategy = select_compact_strategy("end_turn", 110_000, &model, false);
-    assert_eq!(strategy, CompactStrategy::Auto);
-}
+    assert_eq!(model.context_window(), 32_000);
 
-#[test]
-fn select_strategy_exactly_at_auto_threshold_falls_through() {
-    // Sonnet window = 200K, auto = 100K. Exactly at threshold falls through to Snip
-    // because select_compact_strategy uses > not >=
-    let strategy = select_compact_strategy("end_turn", 100_000, &ModelId::sonnet(), false);
+    let strategy = select_compact_strategy("end_turn", 17_000, &model, &cfg());
+    assert_eq!(strategy, CompactStrategy::Auto);
+
+    // 110K is past the end of that window entirely.
+    let strategy = select_compact_strategy("end_turn", 110_000, &model, &cfg());
     assert_eq!(strategy, CompactStrategy::Snip);
 }
 
 #[test]
-fn select_strategy_exactly_at_reactive_threshold_falls_through() {
-    // Sonnet window = 200K, reactive = 180K. Exactly at threshold falls through to Auto
-    let strategy = select_compact_strategy("end_turn", 180_000, &ModelId::sonnet(), false);
+fn select_strategy_exactly_at_the_auto_line_compacts() {
+    let strategy = select_compact_strategy("end_turn", 167_000, &ModelId::sonnet(), &cfg());
     assert_eq!(strategy, CompactStrategy::Auto);
+}
+
+#[test]
+fn select_strategy_exactly_at_the_blocked_line_keeps_only_what_fits() {
+    let strategy = select_compact_strategy("end_turn", 197_000, &ModelId::sonnet(), &cfg());
+    assert_eq!(strategy, CompactStrategy::Snip);
+}
+
+#[test]
+fn select_strategy_exactly_at_the_warning_line_is_the_lightest_pass() {
+    let strategy = select_compact_strategy("end_turn", 147_000, &ModelId::sonnet(), &cfg());
+    assert_eq!(strategy, CompactStrategy::Micro);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

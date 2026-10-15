@@ -1931,7 +1931,7 @@ impl QueryEngine {
             stop_reason,
             estimated_tokens,
             &self.model,
-            turn.budget.is_near_limit(),
+            &self.compact_config,
         );
 
         // Execute Stop hook with dead loop protection
