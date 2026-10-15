@@ -4,6 +4,7 @@ members = [
     "crates/tools",
     "crates/agents",
     "crates/artifacts",
+    "crates/insights",
     "crates/commands",
     "crates/hooks",
     "crates/memory",

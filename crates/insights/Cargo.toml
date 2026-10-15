@@ -1,0 +1,24 @@
+[package]
+name = "coderex-insights"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Session insights — read transcripts, extract what happened, and report on it"
+
+[lints]
+workspace = true
+
+[dependencies]
+coderex-core = { path = "../core" }
+
+thiserror.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+chrono.workspace = true
+tracing.workspace = true
+home.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
