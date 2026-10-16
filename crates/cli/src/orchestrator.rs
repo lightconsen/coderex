@@ -901,7 +901,9 @@ impl StartupOrchestrator {
     /// InitMcp: initialize MCP server connections (non-blocking, fail-open).
     async fn phase_init_mcp(&mut self) -> Result<()> {
         let settings = self.ctx.settings.clone().unwrap_or_default();
-        let manager = Arc::new(coderex_mcp::manager::McpManager::new());
+        // Starts with whatever the McpAuth tool persisted, so a server signed
+        // into in an earlier session is authenticated in this one.
+        let manager = Arc::new(coderex_mcp::manager::McpManager::new_with_stored_credentials());
         let mut config_loaded = false;
 
         // Load from custom --mcp-config or default .mcp.json

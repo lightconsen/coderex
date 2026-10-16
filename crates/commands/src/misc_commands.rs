@@ -247,10 +247,13 @@ pub fn register(registry: &mut CommandRegistry) {
 
     // /oauth-refresh — report the credential state
     //
-    // There is no OAuth token to refresh: CodeRex authenticates with an API key
-    // or, for the cloud providers, with credentials from the environment. The
-    // command used to say a token had been refreshed, which was not true of
-    // anything it did; it now says what it can see instead.
+    // There is no *model provider* OAuth token to refresh: CodeRex
+    // authenticates with an API key or, for the cloud providers, with
+    // credentials from the environment. The command used to say a token had
+    // been refreshed, which was not true of anything it did; it now says what
+    // it can see instead. MCP server tokens are a different thing and are
+    // refreshed by the MCP client on its own, so the report says so rather
+    // than implying no refresh exists anywhere.
     registry.register(SlashCommand::local(
         "oauth-refresh",
         "Check the credential state for the current model",
@@ -298,7 +301,9 @@ pub fn register(registry: &mut CommandRegistry) {
             }
             report.push_str(
                 "\nNo OAuth token was refreshed: this build authenticates with a key, so there \
-                 is no token to refresh. An OAuth login flow would have to be added first.",
+                 is no model-provider token to refresh. An OAuth login flow would have to be \
+                 added first.\nMCP server tokens are separate: they are refreshed by the MCP \
+                 client when a server connection is started, not by this command.",
             );
             CommandResult::success(report)
         }),

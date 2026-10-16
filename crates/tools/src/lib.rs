@@ -22,7 +22,8 @@ pub use builtins::{
     NotebookEditTool, PowerShellTool, ReadTool, RemoteTriggerTool, ReplTool, SendMessageTool,
     SkillTool, SleepTool, StructuredOutputTool, SyntheticOutputTool, TaskCreateTool, TaskGetTool,
     TaskListTool, TaskOutputTool, TaskStopTool, TaskUpdateTool, TodoWriteTool, ToolSearchTool,
-    WebFetchTool, WebSearchTool, WriteTool, register_builtin_tools,
+    WebFetchTool, WebSearchTool, WriteTool, default_token_path, persist_token_at,
+    register_builtin_tools,
 };
 pub use context::{ExecutionContext, ToolError, ToolOutput};
 pub use cron_scheduler::{CRON_SCHEDULER_KEY, CronJob, CronScheduler};

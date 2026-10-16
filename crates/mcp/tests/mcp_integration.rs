@@ -620,6 +620,37 @@ fn oauth_token_persistence_roundtrip() {
     let _ = std::fs::remove_file(OAuthManager::token_path());
 }
 
+/// The token the `McpAuth` tool writes has to be the token the MCP client
+/// reads. The two live in different crates and cannot share a type — the
+/// dependency runs `tools <- mcp` — so this is what keeps their idea of the
+/// file from drifting apart. Before it, the tool wrote a bare JSON array that
+/// `OAuthManager` could not parse, so a successful sign-in left the client
+/// with no credential at all.
+#[test]
+fn a_token_written_by_the_mcp_auth_tool_is_readable_by_the_oauth_manager() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("mcp_tokens.json");
+
+    coderex_tools::persist_token_at(
+        &path,
+        "https://mcp.example",
+        "coderex-cli",
+        "tool_access",
+        3600,
+        Some("tool_refresh"),
+    )
+    .unwrap();
+
+    let loaded = OAuthManager::load_tokens_from(&path).unwrap();
+    assert!(loaded.is_authenticated("https://mcp.example"));
+    let state = loaded.get("https://mcp.example").unwrap();
+    assert_eq!(state.access_token.as_deref(), Some("tool_access"));
+    assert_eq!(state.refresh_token.as_deref(), Some("tool_refresh"));
+    assert_eq!(state.client_id, "coderex-cli");
+    // The refresh path needs an endpoint; it derives the one the tool used.
+    assert_eq!(state.token_endpoint(), "https://mcp.example/oauth/token");
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 //  11.5 Connection Management — reconnect after failure
 // ═══════════════════════════════════════════════════════════════════════════

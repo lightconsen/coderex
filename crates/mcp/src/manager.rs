@@ -35,7 +35,11 @@ pub struct McpManager {
     /// Default cache TTL.
     cache_ttl: Duration,
     /// OAuth state.
-    oauth: OAuthManager,
+    ///
+    /// Behind a lock because resolving a credential for a remote server may
+    /// refresh it over the network, and that has to be able to happen from the
+    /// `&self` methods that start servers.
+    oauth: tokio::sync::Mutex<OAuthManager>,
     /// Elicitation state.
     elicitation: ElicitationManager,
     /// Whether a refresh (re-discovery) is needed.
@@ -60,11 +64,33 @@ impl McpManager {
             resources: Mutex::new(McpResourceRegistry::new()),
             resource_cache: Mutex::new(HashMap::new()),
             cache_ttl: Duration::from_secs(60),
-            oauth: OAuthManager::new(),
+            oauth: tokio::sync::Mutex::new(OAuthManager::new()),
             elicitation: ElicitationManager::new(),
             needs_refresh: AtomicBool::new(false),
             health_cancel: Mutex::new(None),
         }
+    }
+
+    /// Create a manager that starts with the tokens saved on disk.
+    ///
+    /// [`McpManager::new`] deliberately starts with no credentials so tests and
+    /// short-lived callers never read the user's token file. This constructor
+    /// is what the CLI uses: it picks up whatever the `McpAuth` tool persisted,
+    /// so a server signed into in one session is authenticated in the next. A
+    /// token file that cannot be read is logged and ignored — the manager comes
+    /// up unauthenticated rather than refusing to start.
+    #[must_use]
+    pub fn new_with_stored_credentials() -> Self {
+        let mut manager = Self::new();
+        match OAuthManager::load_tokens() {
+            Ok(stored) => {
+                manager.oauth = tokio::sync::Mutex::new(stored);
+            }
+            Err(error) => {
+                tracing::warn!("Could not read saved MCP tokens: {error}");
+            }
+        }
+        manager
     }
 
     /// Load servers from a configuration.
@@ -100,7 +126,56 @@ impl McpManager {
     }
 
     /// Spawn all registered servers and discover tools/resources.
+    ///
+    /// Remote servers get an `Authorization: Bearer` header built from the
+    /// stored OAuth token, if there is one. Resolving that token is where a
+    /// near-expiry token is refreshed, so a session that starts with a stale
+    /// token signs in again before it connects rather than failing on the first
+    /// request. Stdio servers are untouched: a subprocess is authenticated by
+    /// its environment, not by an HTTP header.
+    ///
+    /// The refresh is bounded by a timeout: startup waits on this, and a token
+    /// endpoint that never answers must not hold the session open.
     pub async fn start_all(&self) {
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(10))
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new());
+        let remote: Vec<(String, String)> = self
+            .servers
+            .iter()
+            .filter_map(|entry| {
+                entry
+                    .value()
+                    .url
+                    .clone()
+                    .map(|url| (entry.key().clone(), url))
+            })
+            .collect();
+
+        for (name, url) in remote {
+            let credential = {
+                let mut oauth = self.oauth.lock().await;
+                oauth.refresh_if_needed(&url, &client).await
+            };
+            match credential {
+                Ok(Some(token)) => {
+                    if let Some(mut server) = self.servers.get_mut(&name) {
+                        server
+                            .headers
+                            .insert("Authorization".to_string(), format!("Bearer {token}"));
+                    }
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    tracing::warn!(
+                        server = %name,
+                        "MCP OAuth credential could not be resolved, connecting without one: {error}"
+                    );
+                }
+            }
+        }
+
         for mut entry in self.servers.iter_mut() {
             let server = entry.value_mut();
             let _ = server.spawn().await;
@@ -448,16 +523,24 @@ impl McpManager {
     }
 
     /// Access the OAuth manager.
+    pub async fn oauth(&self) -> tokio::sync::MutexGuard<'_, OAuthManager> {
+        self.oauth.lock().await
+    }
+
+    /// Mutable access to the OAuth manager, without waiting on the lock.
+    ///
+    /// Needs `&mut self`, which is what makes it usable from setup code — the
+    /// running manager hands out [`McpManager::oauth`] instead.
     #[must_use]
-    pub fn oauth(&self) -> &OAuthManager {
-        &self.oauth
+    pub fn oauth_mut(&mut self) -> &mut OAuthManager {
+        self.oauth.get_mut()
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::McpServerConfig;
+    use crate::config::{McpServerConfig, McpTransport};
     use std::collections::HashMap;
 
     #[test]
@@ -577,5 +660,56 @@ mod tests {
 
         // Server not started, so proxy should be None
         assert!(mgr.get_tool_proxy("mcp__fs__read_file").is_none());
+    }
+
+    #[tokio::test]
+    async fn start_all_attaches_the_stored_oauth_token_to_remote_servers() {
+        // Port 1 refuses connections: the spawn is expected to fail. What is
+        // being checked is the header the server was configured with, which is
+        // set before the connection is attempted.
+        let url = "http://127.0.0.1:1/mcp";
+        let mut mgr = McpManager::new();
+        let mut state = crate::oauth::McpOAuthState::new(url, "client1");
+        state.update_tokens("token_abc".into(), None, 3600);
+        mgr.oauth_mut().register(state);
+
+        let mut config = McpConfig::new();
+        config.add_server(
+            "remote",
+            McpServerConfig {
+                transport: McpTransport::Http,
+                url: Some(url.into()),
+                ..Default::default()
+            },
+        );
+        mgr.load_config(&config);
+        mgr.start_all().await;
+
+        let server = mgr.get_server("remote").unwrap();
+        assert_eq!(
+            server.headers.get("Authorization").map(String::as_str),
+            Some("Bearer token_abc")
+        );
+    }
+
+    #[tokio::test]
+    async fn start_all_leaves_a_remote_server_without_a_token_alone() {
+        let url = "http://127.0.0.1:1/mcp";
+        let mgr = McpManager::new();
+
+        let mut config = McpConfig::new();
+        config.add_server(
+            "remote",
+            McpServerConfig {
+                transport: McpTransport::Http,
+                url: Some(url.into()),
+                ..Default::default()
+            },
+        );
+        mgr.load_config(&config);
+        mgr.start_all().await;
+
+        let server = mgr.get_server("remote").unwrap();
+        assert!(!server.headers.contains_key("Authorization"));
     }
 }

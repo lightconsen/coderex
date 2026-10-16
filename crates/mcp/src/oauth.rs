@@ -1,6 +1,61 @@
-//! MCP OAuth authentication flow.
+//! MCP OAuth token bookkeeping.
+//!
+//! What this module is: a store for the tokens an MCP server issued, and a
+//! refresh exchange that trades a refresh token for a fresh access token.
+//!
+//! What this module is not: a login. Nothing here starts an authorization
+//! flow, so nothing here can obtain a *first* token. The interactive
+//! authorization-code + PKCE flow lives in the `McpAuth` tool
+//! (`crates/tools/src/builtins/mcp_auth_tool.rs`) and is the only thing that
+//! can sign in. This module can keep a session alive once that has happened.
+//!
+//! A refresh needs the server to have handed out a refresh token in the first
+//! place. Servers that do not issue one are not refreshable here, and
+//! [`OAuthManager::refresh`] says so rather than pretending.
 
 use serde::{Deserialize, Serialize};
+use std::path::{Path, PathBuf};
+use thiserror::Error;
+
+/// Something went wrong while refreshing or reading a token.
+#[derive(Debug, Error)]
+pub enum OAuthError {
+    /// No token state is registered for this server URL.
+    #[error("no OAuth state is registered for {server_url}")]
+    UnknownServer {
+        /// The server URL that was looked up.
+        server_url: String,
+    },
+    /// The server never issued a refresh token, so there is nothing to trade.
+    #[error("no refresh token for {server_url}; run McpAuth to sign in again")]
+    NoRefreshToken {
+        /// The server URL that was looked up.
+        server_url: String,
+    },
+    /// The token endpoint could not be reached.
+    #[error("token endpoint request failed: {0}")]
+    Request(String),
+    /// The token endpoint answered with a non-success status.
+    #[error("token endpoint returned HTTP {status}: {body}")]
+    Rejected {
+        /// HTTP status code.
+        status: u16,
+        /// Response body, for the operator.
+        body: String,
+    },
+    /// The token endpoint answered, but not with a usable access token.
+    #[error("token response was not usable: {0}")]
+    Response(String),
+    /// The token file could not be read or written.
+    #[error("token store {path} could not be used: {source}")]
+    Store {
+        /// The file that failed.
+        path: String,
+        /// The underlying I/O error.
+        #[source]
+        source: std::io::Error,
+    },
+}
 
 /// OAuth state for an MCP server connection.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -10,16 +65,31 @@ pub struct McpOAuthState {
     /// OAuth client ID.
     pub client_id: String,
     /// OAuth client secret (if applicable).
+    ///
+    /// Public clients — the usual case for MCP servers — have none, so this is
+    /// optional both in the type and on disk.
+    #[serde(default)]
     pub client_secret: Option<String>,
     /// Access token.
+    #[serde(default)]
     pub access_token: Option<String>,
     /// Refresh token.
+    #[serde(default)]
     pub refresh_token: Option<String>,
     /// Token expiry timestamp (epoch seconds).
+    #[serde(default)]
     pub expires_at: Option<i64>,
     /// Scopes granted.
     #[serde(default)]
     pub scopes: Vec<String>,
+    /// The token endpoint to refresh against.
+    ///
+    /// Left unset by [`McpOAuthState::new`]; [`McpOAuthState::token_endpoint`]
+    /// then derives the conventional `{server_url}/oauth/token`, which is the
+    /// endpoint the `McpAuth` tool exchanged its code at. Set it explicitly
+    /// when a server advertises its endpoints somewhere else.
+    #[serde(default)]
+    pub token_endpoint: Option<String>,
 }
 
 impl McpOAuthState {
@@ -34,10 +104,14 @@ impl McpOAuthState {
             refresh_token: None,
             expires_at: None,
             scopes: Vec::new(),
+            token_endpoint: None,
         }
     }
 
     /// Check if the access token is expired.
+    ///
+    /// A state with no recorded expiry counts as expired: without one there is
+    /// no way to tell a fresh token from a stale one, so it is treated as stale.
     #[must_use]
     pub fn is_expired(&self) -> bool {
         match self.expires_at {
@@ -50,6 +124,10 @@ impl McpOAuthState {
     }
 
     /// Check if the token is near expiry (within 5 minutes).
+    ///
+    /// This is the trigger for [`OAuthManager::refresh_if_needed`]: a token
+    /// inside the window is replaced *before* it is handed out, so a caller
+    /// never receives one that is about to die mid-request.
     #[must_use]
     pub fn is_near_expiry(&self) -> bool {
         match self.expires_at {
@@ -67,6 +145,14 @@ impl McpOAuthState {
         self.access_token.is_some() && !self.is_expired()
     }
 
+    /// The endpoint a refresh is posted to.
+    #[must_use]
+    pub fn token_endpoint(&self) -> String {
+        self.token_endpoint
+            .clone()
+            .unwrap_or_else(|| format!("{}/oauth/token", self.server_url.trim_end_matches('/')))
+    }
+
     /// Update tokens from an OAuth flow.
     pub fn update_tokens(&mut self, access: String, refresh: Option<String>, expires_in: i64) {
         self.access_token = Some(access);
@@ -76,41 +162,76 @@ impl McpOAuthState {
 }
 
 /// Token store for persistence.
+///
+/// The on-disk shape is `{"states": [...]}`. `coderex-tools` mirrors this
+/// shape when the `McpAuth` tool writes a token (`persist_token_at`); there is
+/// no shared type because the dependency runs `tools <- mcp`, so this struct
+/// is the source of truth and any field change has to be made in both places.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct TokenStore {
     states: Vec<McpOAuthState>,
 }
 
 /// OAuth flow manager.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct OAuthManager {
     states: Vec<McpOAuthState>,
+    path: PathBuf,
+}
+
+impl Default for OAuthManager {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl OAuthManager {
-    /// Create a new OAuth manager.
+    /// Create a new OAuth manager backed by the default token file.
     #[must_use]
     pub fn new() -> Self {
-        Self { states: Vec::new() }
+        Self {
+            states: Vec::new(),
+            path: Self::token_path(),
+        }
+    }
+
+    /// Create a new OAuth manager backed by `path`.
+    #[must_use]
+    pub fn with_path(path: impl Into<PathBuf>) -> Self {
+        Self {
+            states: Vec::new(),
+            path: path.into(),
+        }
     }
 
     /// Load tokens from the default persistence file.
     pub fn load_tokens() -> Result<Self, std::io::Error> {
-        let path = Self::token_path();
+        Self::load_tokens_from(&Self::token_path())
+    }
+
+    /// Load tokens from `path`.
+    ///
+    /// A missing file is not an error — it just means nothing has signed in yet.
+    pub fn load_tokens_from(path: &Path) -> Result<Self, std::io::Error> {
         if !path.exists() {
-            return Ok(Self::new());
+            return Ok(Self::with_path(path));
         }
-        let content = std::fs::read_to_string(&path)?;
+        let content = std::fs::read_to_string(path)?;
         let store: TokenStore = serde_json::from_str(&content)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
         Ok(Self {
             states: store.states,
+            path: path.to_path_buf(),
         })
     }
 
     /// Save tokens to the default persistence file.
     pub fn save_tokens(&self) -> Result<(), std::io::Error> {
-        let path = Self::token_path();
+        self.save_tokens_to(&self.path)
+    }
+
+    /// Save tokens to `path`.
+    pub fn save_tokens_to(&self, path: &Path) -> Result<(), std::io::Error> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
@@ -119,7 +240,7 @@ impl OAuthManager {
         };
         let content = serde_json::to_string_pretty(&store)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-        std::fs::write(&path, content)
+        std::fs::write(path, content)
     }
 
     /// Default token file path: ~/.coderex/mcp_tokens.json
@@ -137,6 +258,7 @@ impl OAuthManager {
 
     /// Register a server for OAuth.
     pub fn register(&mut self, state: McpOAuthState) {
+        self.states.retain(|s| s.server_url != state.server_url);
         self.states.push(state);
     }
 
@@ -155,7 +277,7 @@ impl OAuthManager {
     /// Check if a server is authenticated.
     #[must_use]
     pub fn is_authenticated(&self, server_url: &str) -> bool {
-        self.get(server_url).map_or(false, |s| s.is_authenticated())
+        self.get(server_url).is_some_and(|s| s.is_authenticated())
     }
 
     /// List all registered server URLs.
@@ -163,11 +285,151 @@ impl OAuthManager {
     pub fn server_urls(&self) -> Vec<&str> {
         self.states.iter().map(|s| s.server_url.as_str()).collect()
     }
+
+    /// Trade the stored refresh token for a fresh access token.
+    ///
+    /// This is a real `grant_type=refresh_token` exchange against the server's
+    /// token endpoint, and the result is written back to the token file so a
+    /// rotated refresh token survives the process. It fails, rather than
+    /// returning the old token, when the server never issued a refresh token —
+    /// there is nothing this can do in that case.
+    ///
+    /// Servers that rotate refresh tokens are handled: a response that carries
+    /// a new `refresh_token` replaces the stored one, and a response that omits
+    /// it keeps the old one, which is what RFC 6749 §6 says happens.
+    pub async fn refresh(
+        &mut self,
+        server_url: &str,
+        client: &reqwest::Client,
+    ) -> Result<String, OAuthError> {
+        let Some(state) = self.get(server_url) else {
+            return Err(OAuthError::UnknownServer {
+                server_url: server_url.to_string(),
+            });
+        };
+        let Some(refresh_token) = state.refresh_token.clone() else {
+            return Err(OAuthError::NoRefreshToken {
+                server_url: server_url.to_string(),
+            });
+        };
+        let endpoint = state.token_endpoint();
+        let client_id = state.client_id.clone();
+        let client_secret = state.client_secret.clone();
+
+        let mut form = vec![
+            ("grant_type", "refresh_token".to_string()),
+            ("refresh_token", refresh_token),
+            ("client_id", client_id),
+        ];
+        if let Some(secret) = client_secret {
+            form.push(("client_secret", secret));
+        }
+
+        let response = client
+            .post(&endpoint)
+            .form(&form)
+            .send()
+            .await
+            .map_err(|e| OAuthError::Request(e.to_string()))?;
+
+        let status = response.status();
+        let body = response
+            .text()
+            .await
+            .map_err(|e| OAuthError::Request(e.to_string()))?;
+        if !status.is_success() {
+            return Err(OAuthError::Rejected {
+                status: status.as_u16(),
+                body,
+            });
+        }
+
+        let payload: serde_json::Value = serde_json::from_str(&body)
+            .map_err(|e| OAuthError::Response(format!("{e}: {body}")))?;
+        let access_token = payload
+            .get("access_token")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| OAuthError::Response(format!("no access_token in {body}")))?
+            .to_string();
+        let expires_in = payload
+            .get("expires_in")
+            .and_then(serde_json::Value::as_i64)
+            .unwrap_or(3600);
+        let rotated = payload
+            .get("refresh_token")
+            .and_then(|v| v.as_str())
+            .map(String::from);
+
+        let state = self
+            .get_mut(server_url)
+            .expect("state was found a moment ago and nothing removed it");
+        let refresh = rotated.or_else(|| state.refresh_token.clone());
+        state.update_tokens(access_token.clone(), refresh, expires_in);
+
+        // A rotated refresh token is worthless to anyone but the next process
+        // unless it reaches the file.
+        self.save_tokens().map_err(|source| OAuthError::Store {
+            path: self.path.display().to_string(),
+            source,
+        })?;
+
+        Ok(access_token)
+    }
+
+    /// The access token to send to `server_url`, refreshing it first if it is
+    /// inside the 5-minute expiry window.
+    ///
+    /// This is the call site for [`McpOAuthState::is_near_expiry`]. Returns
+    /// `Ok(None)` when there is no usable token — no state, or an expired one
+    /// with no refresh token — so the caller can connect unauthenticated and
+    /// let the server reject it, rather than pretending it has a credential.
+    ///
+    /// A failed refresh falls back to the current token while that token is
+    /// still valid, so a token endpoint that is briefly down does not break a
+    /// working session. Once the token has actually expired, the error is
+    /// returned.
+    pub async fn refresh_if_needed(
+        &mut self,
+        server_url: &str,
+        client: &reqwest::Client,
+    ) -> Result<Option<String>, OAuthError> {
+        let Some(state) = self.get(server_url) else {
+            return Ok(None);
+        };
+
+        if !state.is_near_expiry() {
+            return Ok(state.access_token.clone());
+        }
+
+        let still_valid = state.is_authenticated() && state.access_token.is_some();
+
+        if state.refresh_token.is_none() {
+            return Ok(still_valid.then(|| {
+                state
+                    .access_token
+                    .clone()
+                    .expect("still_valid checked the token was there")
+            }));
+        }
+
+        match self.refresh(server_url, client).await {
+            Ok(token) => Ok(Some(token)),
+            Err(error) => {
+                if still_valid {
+                    Ok(self.get(server_url).and_then(|s| s.access_token.clone()))
+                } else {
+                    Err(error)
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
 
     #[test]
     fn new_state_is_not_authenticated() {
@@ -224,19 +486,234 @@ mod tests {
 
     #[test]
     fn save_and_load_tokens_roundtrip() {
-        let mut mgr = OAuthManager::new();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mcp_tokens.json");
+
+        let mut mgr = OAuthManager::with_path(&path);
         let mut state = McpOAuthState::new("http://server1", "client1");
         state.update_tokens("access".into(), Some("refresh".into()), 3600);
         mgr.register(state);
 
         mgr.save_tokens().unwrap();
-        let loaded = OAuthManager::load_tokens().unwrap();
+        let loaded = OAuthManager::load_tokens_from(&path).unwrap();
         assert!(loaded.is_authenticated("http://server1"));
         let s = loaded.get("http://server1").unwrap();
         assert_eq!(s.access_token.as_ref().unwrap(), "access");
         assert_eq!(s.refresh_token.as_ref().unwrap(), "refresh");
+    }
 
-        // Clean up
-        let _ = std::fs::remove_file(OAuthManager::token_path());
+    #[test]
+    fn register_replaces_an_existing_entry_for_the_same_server() {
+        let mut mgr = OAuthManager::new();
+        mgr.register(McpOAuthState::new("http://server1", "old"));
+        mgr.register(McpOAuthState::new("http://server1", "new"));
+        assert_eq!(mgr.server_urls().len(), 1);
+        assert_eq!(mgr.get("http://server1").unwrap().client_id, "new");
+    }
+
+    /// A one-shot token endpoint that records the form body it was sent.
+    fn spawn_token_endpoint(
+        status: u16,
+        body: &'static str,
+    ) -> (String, std::thread::JoinHandle<String>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = Vec::new();
+            let mut chunk = [0_u8; 4096];
+            loop {
+                let count = stream.read(&mut chunk).unwrap();
+                if count == 0 {
+                    break;
+                }
+                request.extend_from_slice(&chunk[..count]);
+                let text = String::from_utf8_lossy(&request);
+                if let Some(head_end) = text.find("\r\n\r\n") {
+                    let length = text
+                        .lines()
+                        .find_map(|line| {
+                            let (name, value) = line.split_once(':')?;
+                            name.eq_ignore_ascii_case("content-length")
+                                .then(|| value.trim().parse::<usize>().ok())?
+                        })
+                        .unwrap_or(0);
+                    if request.len() >= head_end + 4 + length {
+                        break;
+                    }
+                }
+            }
+            let response = format!(
+                "HTTP/1.1 {status} OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            stream.write_all(response.as_bytes()).unwrap();
+            stream.flush().unwrap();
+            String::from_utf8_lossy(&request).into_owned()
+        });
+        (format!("http://{address}"), handle)
+    }
+
+    fn state_against(endpoint: &str, refresh: Option<&str>, expires_in: i64) -> McpOAuthState {
+        let mut state = McpOAuthState::new("http://mcp.example", "client1");
+        state.token_endpoint = Some(endpoint.to_string());
+        state.access_token = Some("old_access".into());
+        state.refresh_token = refresh.map(String::from);
+        state.expires_at = Some(chrono::Utc::now().timestamp() + expires_in);
+        state
+    }
+
+    #[tokio::test]
+    async fn refresh_posts_the_refresh_grant_and_stores_the_new_token() {
+        let (endpoint, server) = spawn_token_endpoint(
+            200,
+            r#"{"access_token":"new_access","refresh_token":"rotated","expires_in":1200}"#,
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mcp_tokens.json");
+
+        let mut mgr = OAuthManager::with_path(&path);
+        mgr.register(state_against(&endpoint, Some("refresh_me"), 60));
+
+        let token = mgr
+            .refresh("http://mcp.example", &reqwest::Client::new())
+            .await
+            .unwrap();
+        assert_eq!(token, "new_access");
+
+        let request = server.join().unwrap();
+        assert!(
+            request.contains("grant_type=refresh_token"),
+            "not a refresh grant: {request}"
+        );
+        assert!(
+            request.contains("refresh_token=refresh_me"),
+            "refresh token not sent: {request}"
+        );
+        assert!(
+            request.contains("client_id=client1"),
+            "client id not sent: {request}"
+        );
+
+        let state = mgr.get("http://mcp.example").unwrap();
+        assert_eq!(state.access_token.as_deref(), Some("new_access"));
+        assert_eq!(state.refresh_token.as_deref(), Some("rotated"));
+        assert!(state.is_authenticated());
+
+        // The rotated refresh token has to survive the process.
+        let on_disk = std::fs::read_to_string(&path).unwrap();
+        assert!(on_disk.contains("rotated"), "not persisted: {on_disk}");
+    }
+
+    #[tokio::test]
+    async fn refresh_keeps_the_old_refresh_token_when_the_server_does_not_rotate() {
+        let (endpoint, _server) =
+            spawn_token_endpoint(200, r#"{"access_token":"new_access","expires_in":1200}"#);
+        let mut mgr = OAuthManager::with_path(tempfile::tempdir().unwrap().path().join("t.json"));
+        mgr.register(state_against(&endpoint, Some("keep_me"), 60));
+
+        mgr.refresh("http://mcp.example", &reqwest::Client::new())
+            .await
+            .unwrap();
+
+        let state = mgr.get("http://mcp.example").unwrap();
+        assert_eq!(state.refresh_token.as_deref(), Some("keep_me"));
+    }
+
+    #[tokio::test]
+    async fn refresh_without_a_refresh_token_says_so() {
+        let mut mgr = OAuthManager::with_path(tempfile::tempdir().unwrap().path().join("t.json"));
+        mgr.register(state_against("http://127.0.0.1:1/token", None, 60));
+
+        let error = mgr
+            .refresh("http://mcp.example", &reqwest::Client::new())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, OAuthError::NoRefreshToken { .. }),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn refresh_reports_a_rejected_token_endpoint() {
+        let (endpoint, _server) = spawn_token_endpoint(400, r#"{"error":"invalid_grant"}"#);
+        let mut mgr = OAuthManager::with_path(tempfile::tempdir().unwrap().path().join("t.json"));
+        mgr.register(state_against(&endpoint, Some("stale"), 60));
+
+        let error = mgr
+            .refresh("http://mcp.example", &reqwest::Client::new())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, OAuthError::Rejected { status: 400, .. }),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn refresh_if_needed_leaves_a_fresh_token_alone() {
+        // Port 1 is closed: if the refresh path ran, this would fail loudly.
+        let mut mgr = OAuthManager::with_path(tempfile::tempdir().unwrap().path().join("t.json"));
+        mgr.register(state_against("http://127.0.0.1:1/token", Some("r"), 3600));
+
+        let token = mgr
+            .refresh_if_needed("http://mcp.example", &reqwest::Client::new())
+            .await
+            .unwrap();
+        assert_eq!(token.as_deref(), Some("old_access"));
+    }
+
+    #[tokio::test]
+    async fn refresh_if_needed_refreshes_a_token_inside_the_expiry_window() {
+        let (endpoint, server) = spawn_token_endpoint(
+            200,
+            r#"{"access_token":"refreshed","refresh_token":"r2","expires_in":3600}"#,
+        );
+        let mut mgr = OAuthManager::with_path(tempfile::tempdir().unwrap().path().join("t.json"));
+        // 60 seconds left: inside the 5-minute window, so is_near_expiry() is true.
+        mgr.register(state_against(&endpoint, Some("r1"), 60));
+        assert!(mgr.get("http://mcp.example").unwrap().is_near_expiry());
+
+        let token = mgr
+            .refresh_if_needed("http://mcp.example", &reqwest::Client::new())
+            .await
+            .unwrap();
+        assert_eq!(token.as_deref(), Some("refreshed"));
+        server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn refresh_if_needed_returns_none_for_an_expired_token_with_no_refresh_token() {
+        let mut mgr = OAuthManager::with_path(tempfile::tempdir().unwrap().path().join("t.json"));
+        mgr.register(state_against("http://127.0.0.1:1/token", None, -60));
+
+        let token = mgr
+            .refresh_if_needed("http://mcp.example", &reqwest::Client::new())
+            .await
+            .unwrap();
+        assert!(token.is_none());
+    }
+
+    #[tokio::test]
+    async fn refresh_if_needed_falls_back_to_a_still_valid_token_when_refresh_fails() {
+        let (endpoint, _server) = spawn_token_endpoint(500, r#"{"error":"boom"}"#);
+        let mut mgr = OAuthManager::with_path(tempfile::tempdir().unwrap().path().join("t.json"));
+        // Near expiry but not yet expired, and the endpoint is broken.
+        mgr.register(state_against(&endpoint, Some("r1"), 60));
+
+        let token = mgr
+            .refresh_if_needed("http://mcp.example", &reqwest::Client::new())
+            .await
+            .unwrap();
+        assert_eq!(token.as_deref(), Some("old_access"));
+    }
+
+    #[test]
+    fn token_endpoint_defaults_to_the_conventional_path() {
+        let mut state = McpOAuthState::new("http://mcp.example/", "client1");
+        assert_eq!(state.token_endpoint(), "http://mcp.example/oauth/token");
+        state.token_endpoint = Some("http://elsewhere/token".into());
+        assert_eq!(state.token_endpoint(), "http://elsewhere/token");
     }
 }
