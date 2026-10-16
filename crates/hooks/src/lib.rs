@@ -2,10 +2,15 @@
 
 #![warn(missing_docs)]
 
+pub mod action;
 pub mod engine;
 pub mod events;
 pub mod stop_hook;
 
+pub use action::{
+    AGENT_DEFAULT_MODEL, AGENT_DEFAULT_TIMEOUT_MS, ActionPrompt, HookActionRunner, McpToolHook,
+    PROMPT_DEFAULT_TIMEOUT_MS, interpolate_tool_input, substitute_arguments,
+};
 pub use engine::{HookConfig, HookInput, HookMatcher, HookRegistry, HookTier, HookType, HttpHook};
 pub use events::{
     HookAction, HookError, HookEvent, HookPermissionDecision, HookResult, UnknownHookEvent,

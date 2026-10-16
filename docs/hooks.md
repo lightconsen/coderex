@@ -11,13 +11,20 @@ prints a JSON result on stdout; a `PreToolUse` hook can deny a tool, a
 ## Key Types
 
 - **`HookRegistry`** (`engine.rs`) — holds hook definitions and matches them to
-  events. Implements `HookExecutor`, so it can be installed on the engine.
-- **`HookConfig`** (`engine.rs`) — one hook: `event`, `type`, `command`, `env`,
-  `cwd`, `timeout_ms`, `priority`, `dry_run`, the `ulimit` limits, and `tier`.
+  events. Implements `HookExecutor`, so it can be installed on the engine. It
+  also carries the injected [`HookActionRunner`], if the session supplied one.
+- **`HookConfig`** (`engine.rs`) — one hook: `event`, `type`, `command`,
+  `http`, `prompt`, `model`, `mcp`, `env`, `cwd`, `timeout_ms`, `priority`,
+  `dry_run`, the `ulimit` limits, and `tier`.
 - **`HookTier`** (`engine.rs`) — `Managed` / `Plugin` / `Core`. Decides chain
   order; see below.
 - **`HookType`** (`engine.rs`) — the `type` discriminator: `Command`, `Http`,
-  `Prompt`, `McpTool`, `Agent`. Only `Command` executes.
+  `Prompt`, `McpTool`, `Agent`. All five are implemented.
+- **`HookActionRunner`** (`action.rs`) — what the session must inject for
+  `prompt`, `agent`, and `mcp_tool` hooks: one query answered, or one MCP tool
+  called. See below.
+- **`ActionPrompt`** / **`McpToolHook`** (`action.rs`) — the request a runner
+  receives, and an `mcp_tool` hook's target (`server`, `tool`, `input`).
 - **`HookMatcher`** (`engine.rs`) — matches events by name.
 - **`HookInput`** (`engine.rs`) — the JSON written to a hook's stdin.
 - **`HookResult`** / **`HookAction`** / **`HookPermissionDecision`**
@@ -26,7 +33,8 @@ prints a JSON result on stdout; a `PreToolUse` hook can deny a tool, a
   exit code.
 - **`HookError`** (`events.rs`) — typed failure: `Timeout`, `SpawnFailed`,
   `InputNotDelivered`, `NoOutput`, `UnparseableOutput`, `ExecutionFailed`,
-  `InvalidCommand`, `JsonError`.
+  `InvalidCommand`, `JsonError`, `InvalidPromptHook`, `InvalidMcpToolHook`,
+  `InterpolationFailed`, `MissingActionRunner`.
 - **`HookFireResult`** (`crates/core/src/hook_executor.rs`) — the aggregate a
   firing site reads: `stop`, `updated_input`, `errors`, and `failed`.
 
@@ -49,10 +57,11 @@ engine.set_hooks(registry.into_executor());
 administrator-controlled source must use `from_settings_json_with_tier(value,
 HookTier::Managed)` so they can run ahead of repository-controlled hooks.
 
-**Status:** this API exists and is tested, but the CLI does not yet call it —
-`crates/cli/src/repl.rs` still constructs the engine with the default
-`NoOpHookExecutor`. Until that one line is wired, hooks are inert in the
-production binary no matter how they are configured.
+**Status:** wired. `crates/cli/src/repl.rs` calls `from_settings_json` and
+`into_executor` in `apply_cli_config`, so a configured hook actually fires. A
+session that wants the `prompt`, `agent`, and `mcp_tool` kinds must additionally
+call `set_action_runner` before `into_executor` (see the kinds section); without
+it those three kinds fail when they fire, which is a denial on a gating event.
 
 ## Chain order: managed → plugin → core
 
@@ -70,23 +79,70 @@ policy that is supposed to constrain it.
 
 ## Hook kinds (`type`)
 
-Claude has five kinds — `command`, `prompt`, `mcp_tool`, `http`, `agent`.
-CodeRex has two working kinds and three recognised-but-unimplemented ones:
+Claude has five kinds — `command`, `prompt`, `mcp_tool`, `http`, `agent` — and
+all five are implemented:
 
 | `type` | Status |
 |--------|--------|
 | `command` | **Implemented.** Runs `sh -c <command>` with the input JSON on stdin. |
 | `http` | **Implemented.** POSTs the input JSON to `url`; the response body is the answer. See below. |
-| `prompt` | Recognised, **skipped with a warning**. Needs a model/API client, which does not belong in this crate. |
-| `mcp_tool` | Recognised, **skipped with a warning**. Needs the MCP server registry, which lives in another crate. |
-| `agent` | Recognised, **skipped with a warning**. Same reason as `prompt`. |
+| `prompt` | **Implemented.** One query to a model; its text answer is the hook's answer. Needs a runner. |
+| `agent` | **Implemented.** The same call with a verifier framing, a cheap model by default, and a longer timeout. Needs a runner. |
+| `mcp_tool` | **Implemented.** Calls an MCP tool on a named server. Needs a runner. |
 
-A hook whose `type` is one of the three unimplemented kinds is **not** run as a
-command and **not** silently dropped — the loader logs a `warn!` naming the type
-and the event, and the other hooks in the same settings still load. An
-unrecognised `type` string (a typo) is a hard config error. A `command` hook
-with no `command` field is a hard config error. A hook with no `type` at all
+An unrecognised `type` string (a typo) is a hard config error. A hook missing
+the field its kind requires — no `command`, no `url`, no `prompt`, no
+`server`/`tool` — is a hard config error too. A hook with no `type` at all
 defaults to `command`, so existing settings keep working.
+
+### `prompt`, `agent`, and `mcp_tool` hooks
+
+These three kinds need something this crate deliberately does not have: a model
+client (`prompt`, `agent`) or the MCP server registry (`mcp_tool`).
+`coderex-core`'s API client and `coderex-mcp` are the *session's*, not the hook
+system's, so the session injects one implementation:
+
+```rust
+let mut registry = coderex_hooks::HookRegistry::from_settings_json(hooks)?;
+registry.set_action_runner(std::sync::Arc::new(SessionHookActionRunner::new(api, mcp)));
+engine.set_hooks(registry.into_executor());
+```
+
+`HookActionRunner` has two entry points: `answer(&ActionPrompt)` for one query,
+and `call_mcp_tool(server, tool, input)` for one MCP call. The runner returns the
+hook's answer as text, and that text is parsed with the **same** parser a
+`command` hook's stdout goes through — `{}` or `{"action":"continue"}` continues,
+`{"action":"stop"}` stops. So all five kinds share one answer format, and an
+empty or unparseable answer is a failure in all five.
+
+```json
+{ "event": "PreToolUse", "type": "prompt", "prompt": "Is this call safe? Here it is: $ARGUMENTS" }
+{ "event": "PreToolUse", "type": "agent", "prompt": "Verify this edit is complete: $ARGUMENTS", "model": "claude-sonnet-4-5" }
+{ "event": "PreToolUse", "type": "mcp_tool", "server": "policy", "tool": "check_path",
+  "input": { "path": "${tool_input.file_path}" } }
+```
+
+- **`$ARGUMENTS`** (or `${ARGUMENTS}`) in a `prompt` or `agent` prompt is
+  replaced with the hook input JSON — the same JSON a `command` hook receives on
+  stdin — so the hook can see what it is gating.
+- **`${tool_input.<path>}`** in an `mcp_tool` `input` resolves against the hook
+  input's `input` field, parsed as JSON. A path that does not resolve — because
+  the `input` field is absent, is not JSON, or the path does not exist — is a
+  **failure**, never an empty string: a hook must not silently call a tool with
+  a missing argument.
+- **Defaults differ by kind, on purpose.** `prompt` gets the session's model
+  (`model` is `None`) and a 5 s timeout; `agent` gets
+  `AGENT_DEFAULT_MODEL` (`claude-haiku-4-5-20251001`, the cheap one) and
+  `AGENT_DEFAULT_TIMEOUT_MS` (60 s), because a verifier that reads a workspace
+  runs longer than one question. An explicit `model`/`timeout_ms` wins for both.
+
+**No runner installed is a failure, not a skip.** A configured `prompt`,
+`agent`, or `mcp_tool` hook on a session that cannot run it produces
+`HookError::MissingActionRunner`, whose message says which kind could not run
+and what to call. On a gating event that failure becomes a deny — the whole
+point being that a gate this session cannot run must not read as an allow. The
+alternative (skipping the hook with a warning) would turn a configured policy
+into an open gate.
 
 ### `http` hooks
 
@@ -128,6 +184,15 @@ localhost or a private range. Both of those live in
 and `env_var_references` — which existed for this purpose and had no caller
 until now.
 
+### Fields accepted but not implemented
+
+`if`, `once`, `statusMessage`, and `continueOnBlock` are accepted in settings
+and have **no effect**; the loader logs a `warn!` naming them when a
+configuration sets one. They are a separate axis from the hook kind — `command`
+and `http` do not implement them either — so they are out of scope rather than
+half-wired per kind. A settings file written for the reference therefore still
+loads; it just does not get filtering, run-once, or the status line.
+
 ## Fail-closed contract
 
 Hooks gate work, so a gate that could not be answered must not read as an
@@ -144,7 +209,10 @@ these is true:
 - **The result could not be retrieved.** Non-zero exit, empty stdout, or stdout
   that is not a hook result. A hook that wants to continue must say so
   explicitly — `{}` or `{"action":"continue"}`. Silence is not consent.
-- **The hook could not answer.** A timeout, or a spawn failure.
+- **The hook could not answer.** A timeout, or a spawn failure. For `prompt`,
+  `agent`, and `mcp_tool` hooks, also: **no runner is installed** for the
+  session (`MissingActionRunner`), and — for `mcp_tool` — a `${tool_input.*}`
+  reference that does not resolve.
 
 On a **gating event** — `PreToolUse` (a `stop` denies the tool) and
 `UserPromptSubmit` (a `stop` refuses the prompt) — a failure sets both
@@ -222,12 +290,18 @@ codebase.
 ## Current status
 
 **Works:** registry and matching; chain order (tier then priority); the install
-API; `command` hooks with stdin/stdout; timeout; sandbox limits; dry-run;
-fail-closed failure classification and the deny-on-gate behaviour; inert-event
-and unsupported-type warnings; structured logging.
+API; all five hook kinds — `command` (stdin/stdout), `http` (POST), `prompt`
+and `agent` (one model query through an injected runner), and `mcp_tool` (one
+MCP call through the same runner); timeout; sandbox limits for `command`
+subprocesses; dry-run; fail-closed failure classification and the
+deny-on-gate behaviour; inert-event warnings; structured logging.
 
-**Not implemented:** the `prompt`, `mcp_tool`, and `agent` hook kinds
-(recognised, skipped, warned). Claude's `onFailure` knob (`continue` / `block`),
+**Not implemented:** Claude's `onFailure` knob (`continue` / `block`),
 `args`/exec form, `if` filters, `once`, `async`/`asyncRewake`, `statusMessage`,
-and per-event output schemas are also absent — the hook protocol here is the
-minimal one, and the fail-closed policy is fixed rather than configurable.
+`continueOnBlock`, and per-event output schemas — the hook protocol here is the
+minimal one, and the fail-closed policy is fixed rather than configurable. The
+four settings fields among those that a configuration can write are accepted
+and inert, with a load-time warning (see above). The action kinds also have no
+`cwd`/`env`/`ulimit` application: those are subprocess knobs, and no subprocess
+runs. `agent` is the same one-shot call as `prompt` with different defaults and
+a verifier framing rather than a multi-turn tool loop.

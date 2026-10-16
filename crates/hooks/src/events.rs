@@ -282,6 +282,45 @@ pub enum HookError {
     /// would send it to a destination the configuration did not name.
     #[error("hook endpoint answered {0}")]
     HttpStatus(u16),
+    /// A `prompt`, `agent`, or `mcp_tool` hook ran without a
+    /// [`HookActionRunner`](crate::HookActionRunner) installed.
+    ///
+    /// Those kinds need a model client or the MCP registry, neither of which
+    /// belongs in this crate, so the session that owns them injects a runner
+    /// with [`HookRegistry::set_action_runner`](crate::HookRegistry::set_action_runner).
+    /// Running without one is a **failure**, not a skip: hooks gate work, and a
+    /// gate that cannot run must deny on a gating event.
+    #[error(
+        "this session cannot run {kind} hooks: no action runner is installed. The session \
+         that owns the model client or the MCP registry must call \
+         HookRegistry::set_action_runner before installing the registry"
+    )]
+    MissingActionRunner {
+        /// The hook kind that could not run (`prompt`, `agent`, `mcp_tool`).
+        kind: &'static str,
+    },
+    /// Invalid configuration for a `prompt` or `agent` hook.
+    #[error("invalid prompt hook: {0}")]
+    InvalidPromptHook(String),
+    /// Invalid configuration for an `mcp_tool` hook.
+    #[error("invalid mcp_tool hook: {0}")]
+    InvalidMcpToolHook(String),
+    /// A `${tool_input.<path>}` reference in an `mcp_tool` hook's input could
+    /// not be resolved.
+    ///
+    /// A reference that cannot be resolved is a failure rather than an empty
+    /// substitution, so a hook cannot silently call a tool with a missing
+    /// argument.
+    #[error("hook tool input could not be interpolated: {0}")]
+    InterpolationFailed(String),
+    /// The session's own client could not carry out the hook's action.
+    ///
+    /// `prompt`, `agent` and `mcp_tool` run through the client the session
+    /// installed rather than through a subprocess, so their failures are that
+    /// client's — and a client that could not answer is a hook that did not
+    /// answer.
+    #[error("hook action failed: {0}")]
+    ActionFailed(String),
 }
 
 #[cfg(test)]

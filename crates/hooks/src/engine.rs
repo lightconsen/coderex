@@ -2,11 +2,16 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 
+use crate::action::{
+    AGENT_DEFAULT_MODEL, AGENT_DEFAULT_TIMEOUT_MS, ActionPrompt, HookActionRunner, McpToolHook,
+    PROMPT_DEFAULT_TIMEOUT_MS, interpolate_tool_input, parse_answer, substitute_arguments,
+};
 use crate::events::{HookAction, HookError, HookEvent, HookResult};
 use coderex_core::hook_executor::{HookExecutor, HookFireResult};
 
@@ -38,22 +43,24 @@ pub enum HookTier {
 
 /// What kind of action a hook takes when it fires.
 ///
-/// CodeRex implements [`HookType::Command`] (a subprocess). The other kinds are
-/// recognised so that a configuration naming one is reported rather than
-/// silently treated as a command; see [`HookRegistry::load_from_settings`].
+/// All five kinds the reference has are implemented. `command` and `http` are
+/// self-contained; `prompt`, `agent`, and `mcp_tool` need a client the hooks
+/// crate does not own, so they run through a
+/// [`HookActionRunner`] the session installs — and are a failure, not a skip,
+/// when none is installed (`HookError::MissingActionRunner`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum HookType {
-    /// Run a shell command (the only kind CodeRex executes).
+    /// Run a shell command.
     #[default]
     Command,
-    /// Call an HTTP endpoint. Recognised but not implemented.
+    /// Call an HTTP endpoint.
     Http,
-    /// Ask a model. Recognised but not implemented.
+    /// Ask a model one question; its text answer is the hook's answer.
     Prompt,
-    /// Call an MCP tool. Recognised but not implemented.
+    /// Call an MCP tool; its result is the hook's answer.
     McpTool,
-    /// Run an agent. Recognised but not implemented.
+    /// Ask a model as a verifier, with a cheap model and a longer timeout.
     Agent,
 }
 
@@ -149,6 +156,23 @@ pub struct HookConfig {
     /// Where an `http` hook sends its input (required for [`HookType::Http`]).
     #[serde(default)]
     pub http: Option<HttpHook>,
+    /// The prompt a `prompt` or `agent` hook sends (required for both kinds).
+    ///
+    /// `$ARGUMENTS` (or `${ARGUMENTS}`) is replaced with the hook input JSON
+    /// before the query is made.
+    #[serde(default)]
+    pub prompt: Option<String>,
+    /// The model a `prompt` or `agent` hook uses.
+    ///
+    /// `None` for a `prompt` hook means "the session's default". An `agent`
+    /// hook always carries one — the loader fills in
+    /// [`AGENT_DEFAULT_MODEL`](crate::action::AGENT_DEFAULT_MODEL) when the
+    /// configuration names none.
+    #[serde(default)]
+    pub model: Option<String>,
+    /// The MCP tool an `mcp_tool` hook calls (required for [`HookType::McpTool`]).
+    #[serde(default)]
+    pub mcp: Option<McpToolHook>,
     /// Optional environment variables to inject.
     #[serde(default)]
     pub env: HashMap<String, String>,
@@ -191,15 +215,22 @@ const fn default_timeout() -> u64 {
 impl HookConfig {
     /// What this hook should be called in a log line.
     ///
-    /// A hook names itself by its command or, for an `http` hook, by the URL it
-    /// posts to — `command` is empty for the latter, and a log line reading
+    /// A hook names itself by the target of its kind — its command, an `http`
+    /// hook's URL, an `mcp_tool` hook's tool, a `prompt`/`agent` hook's prompt.
+    /// `command` is empty for every kind but `command`, and a log line reading
     /// `hook_command=""` says nothing about which hook ran.
     #[must_use]
     pub fn label(&self) -> &str {
-        match self.http.as_ref() {
-            Some(http) => &http.url,
-            None => &self.command,
+        if let Some(http) = self.http.as_ref() {
+            return &http.url;
         }
+        if !self.command.is_empty() {
+            return &self.command;
+        }
+        if let Some(mcp) = self.mcp.as_ref() {
+            return &mcp.tool;
+        }
+        self.prompt.as_deref().unwrap_or_default()
     }
 }
 
@@ -291,6 +322,33 @@ pub struct RawHookConfig {
     /// Refuse an `http` endpoint on localhost or a private range.
     #[serde(default)]
     pub block_private_hosts: Option<bool>,
+    /// The prompt a `prompt` or `agent` hook sends.
+    #[serde(default)]
+    pub prompt: Option<String>,
+    /// The model a `prompt` or `agent` hook uses.
+    #[serde(default)]
+    pub model: Option<String>,
+    /// The MCP server an `mcp_tool` hook calls.
+    #[serde(default)]
+    pub server: Option<String>,
+    /// The MCP tool an `mcp_tool` hook calls.
+    #[serde(default)]
+    pub tool: Option<String>,
+    /// The tool input an `mcp_tool` hook passes.
+    #[serde(default)]
+    pub input: Option<serde_json::Value>,
+    /// Accepted but not implemented — see `warn_about_unimplemented_fields`.
+    #[serde(rename = "if", default)]
+    pub if_condition: Option<serde_json::Value>,
+    /// Accepted but not implemented.
+    #[serde(default)]
+    pub once: Option<bool>,
+    /// Accepted but not implemented.
+    #[serde(rename = "statusMessage", default)]
+    pub status_message: Option<String>,
+    /// Accepted but not implemented.
+    #[serde(rename = "continueOnBlock", default)]
+    pub continue_on_block: Option<bool>,
     /// Environment variables to inject.
     #[serde(default)]
     pub env: Option<HashMap<String, String>>,
@@ -318,6 +376,63 @@ pub struct RawHookConfig {
     /// Max file size MB.
     #[serde(default)]
     pub max_file_size_mb: Option<u64>,
+}
+
+/// The fields every hook kind shares, taken from its raw configuration.
+///
+/// The kind-specific fields (`command`, `http`, `prompt`/`model`, `mcp`) are
+/// filled in by the caller; the tier is assigned by the caller too, from where
+/// the settings came from.
+fn from_raw(raw: &RawHookConfig, timeout_ms: u64) -> HookConfig {
+    HookConfig {
+        event: raw.event.clone(),
+        kind: raw.kind,
+        command: String::new(),
+        http: None,
+        prompt: None,
+        model: None,
+        mcp: None,
+        env: raw.env.clone().unwrap_or_default(),
+        cwd: raw.cwd.clone(),
+        internal: raw.internal.unwrap_or(false),
+        timeout_ms,
+        priority: raw.priority.unwrap_or(0),
+        dry_run: raw.dry_run.unwrap_or(false),
+        max_cpu_seconds: raw.max_cpu_seconds,
+        max_memory_mb: raw.max_memory_mb,
+        max_file_size_mb: raw.max_file_size_mb,
+        tier: HookTier::Core,
+    }
+}
+
+/// Say which configured fields this build accepts but does not act on.
+///
+/// `if`, `once`, `statusMessage`, and `continueOnBlock` are a separate axis
+/// from the hook kind: no kind implements them, including `command` and
+/// `http`. They are accepted so a settings file written for the reference does
+/// not fail to load, but a person reading the output should not have to guess
+/// whether a configured `if` filtered anything.
+fn warn_about_unimplemented_fields(raw: &RawHookConfig) {
+    let mut declared = Vec::new();
+    if raw.if_condition.is_some() {
+        declared.push("if");
+    }
+    if raw.once.is_some() {
+        declared.push("once");
+    }
+    if raw.status_message.is_some() {
+        declared.push("statusMessage");
+    }
+    if raw.continue_on_block.is_some() {
+        declared.push("continueOnBlock");
+    }
+    if !declared.is_empty() {
+        tracing::warn!(
+            event = %raw.event,
+            fields = ?declared,
+            "hook sets fields CodeRex accepts but does not implement — they have no effect"
+        );
+    }
 }
 
 // ─── Hook Execution Result ──────────────────────────────────────────────────
@@ -353,25 +468,69 @@ pub struct HookInput {
 // ─── Hook Registry ──────────────────────────────────────────────────────────
 
 /// Registry of configured hooks.
-#[derive(Debug)]
 pub struct HookRegistry {
     hooks: Vec<HookConfig>,
+    /// Supplied by the session that owns a model client or the MCP registry;
+    /// see [`HookActionRunner`].
+    action_runner: Option<Arc<dyn HookActionRunner>>,
+}
+
+impl std::fmt::Debug for HookRegistry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HookRegistry")
+            .field("hooks", &self.hooks)
+            .field("action_runner", &self.action_runner.is_some())
+            .finish()
+    }
 }
 
 impl HookRegistry {
     /// Create an empty hook registry.
+    ///
+    /// No action runner is installed, so `prompt`, `agent`, and `mcp_tool`
+    /// hooks will fail when they fire until one is
+    /// [set](Self::set_action_runner).
     #[must_use]
     pub const fn new() -> Self {
-        Self { hooks: Vec::new() }
+        Self {
+            hooks: Vec::new(),
+            action_runner: None,
+        }
+    }
+
+    /// Install the runner a `prompt`, `agent`, or `mcp_tool` hook needs.
+    ///
+    /// The hooks crate cannot reach a model client or the MCP server registry,
+    /// so the session that owns them supplies one implementation — the same
+    /// injection shape as `coderex_tools::install_rule_exemptions`. This must
+    /// be called before [`into_executor`](Self::into_executor), since that
+    /// consumes the registry.
+    ///
+    /// Without a runner the three kinds are still **loaded**, and then
+    /// **fail** when they fire (`HookError::MissingActionRunner`) — a gating
+    /// event denies rather than quietly passing. That is deliberate: a
+    /// configured gate this session cannot run is a gate that must not read as
+    /// an allow.
+    pub fn set_action_runner(&mut self, runner: Arc<dyn HookActionRunner>) {
+        self.action_runner = Some(runner);
+    }
+
+    /// The runner installed on this registry, if any.
+    #[must_use]
+    pub fn action_runner(&self) -> Option<Arc<dyn HookActionRunner>> {
+        self.action_runner.clone()
     }
 
     /// Load hooks from a settings.json value, assigning every hook the given
     /// trust tier.
     ///
-    /// A hook whose `type` is a kind CodeRex does not execute is **skipped with
-    /// a loud warning**, not silently run as a command and not silently
-    /// dropped: only `command` hooks run. A `command` hook with no `command`
-    /// field is a configuration error and fails the load.
+    /// Every kind is loaded: `command`, `http`, `prompt`, `agent`, and
+    /// `mcp_tool`. The last three need a
+    /// [`HookActionRunner`] installed by the session (see
+    /// [`set_action_runner`](Self::set_action_runner)); without one they load
+    /// and then **fail when they fire**, they are not skipped. A hook missing
+    /// the field its kind requires — no `command`, no `url`, no `prompt`, no
+    /// `server`/`tool` — is a configuration error and fails the load.
     pub fn load_from_settings_with_tier(
         value: &serde_json::Value,
         tier: HookTier,
@@ -384,33 +543,22 @@ impl HookRegistry {
         let raw_hooks = serde_json::from_value::<HookSettingsValue>(value.clone())?.into_hooks();
         let mut hooks = Vec::with_capacity(raw_hooks.len());
         for raw in raw_hooks {
-            match raw.kind {
+            warn_about_unimplemented_fields(&raw);
+            let mut config = match raw.kind {
                 HookType::Command => {
-                    let Some(command) = raw.command else {
+                    let Some(command) = raw.command.clone() else {
                         return Err(HookError::InvalidCommand(format!(
                             "hook for event '{}' is type 'command' but has no 'command' field",
                             raw.event
                         )));
                     };
-                    hooks.push(HookConfig {
-                        event: raw.event,
-                        kind: HookType::Command,
+                    HookConfig {
                         command,
-                        http: None,
-                        env: raw.env.unwrap_or_default(),
-                        cwd: raw.cwd,
-                        internal: raw.internal.unwrap_or(false),
-                        timeout_ms: raw.timeout_ms.unwrap_or_else(default_timeout),
-                        priority: raw.priority.unwrap_or(0),
-                        dry_run: raw.dry_run.unwrap_or(false),
-                        max_cpu_seconds: raw.max_cpu_seconds,
-                        max_memory_mb: raw.max_memory_mb,
-                        max_file_size_mb: raw.max_file_size_mb,
-                        tier,
-                    });
+                        ..from_raw(&raw, raw.timeout_ms.unwrap_or_else(default_timeout))
+                    }
                 }
                 HookType::Http => {
-                    let Some(url) = raw.url else {
+                    let Some(url) = raw.url.clone() else {
                         return Err(HookError::InvalidHttpHook(format!(
                             "hook for event '{}' is type 'http' but has no 'url' field",
                             raw.event
@@ -418,38 +566,84 @@ impl HookRegistry {
                     };
                     let http = HttpHook {
                         url,
-                        headers: raw.headers.unwrap_or_default(),
-                        allowed_env_vars: raw.allowed_env_vars.unwrap_or_default(),
+                        headers: raw.headers.clone().unwrap_or_default(),
+                        allowed_env_vars: raw.allowed_env_vars.clone().unwrap_or_default(),
                         block_private_hosts: raw.block_private_hosts.unwrap_or(false),
                     };
                     http.validate()?;
-                    hooks.push(HookConfig {
-                        event: raw.event,
-                        kind: HookType::Http,
-                        command: String::new(),
+                    HookConfig {
                         http: Some(http),
-                        env: raw.env.unwrap_or_default(),
-                        cwd: raw.cwd,
-                        internal: raw.internal.unwrap_or(false),
-                        timeout_ms: raw.timeout_ms.unwrap_or_else(default_timeout),
-                        priority: raw.priority.unwrap_or(0),
-                        dry_run: raw.dry_run.unwrap_or(false),
-                        max_cpu_seconds: raw.max_cpu_seconds,
-                        max_memory_mb: raw.max_memory_mb,
-                        max_file_size_mb: raw.max_file_size_mb,
-                        tier,
-                    });
+                        ..from_raw(&raw, raw.timeout_ms.unwrap_or_else(default_timeout))
+                    }
                 }
-                unsupported => tracing::warn!(
-                    hook_type = unsupported.as_str(),
-                    event = %raw.event,
-                    "hook configured with a type CodeRex does not execute — skipping it; \
-                     'command' and 'http' hooks run"
-                ),
-            }
+                HookType::Prompt | HookType::Agent => {
+                    let Some(prompt) = raw.prompt.clone() else {
+                        return Err(HookError::InvalidPromptHook(format!(
+                            "hook for event '{}' is type '{}' but has no 'prompt' field",
+                            raw.event,
+                            raw.kind.as_str()
+                        )));
+                    };
+                    // The two kinds differ on purpose: an `agent` hook is a
+                    // verifier, so it gets the cheap model and a longer
+                    // timeout; a `prompt` hook is one question and keeps the
+                    // session's model.
+                    let agent = raw.kind == HookType::Agent;
+                    let timeout_ms = raw.timeout_ms.unwrap_or(if agent {
+                        AGENT_DEFAULT_TIMEOUT_MS
+                    } else {
+                        PROMPT_DEFAULT_TIMEOUT_MS
+                    });
+                    let model = if agent {
+                        Some(
+                            raw.model
+                                .clone()
+                                .unwrap_or_else(|| AGENT_DEFAULT_MODEL.to_string()),
+                        )
+                    } else {
+                        raw.model.clone()
+                    };
+                    HookConfig {
+                        prompt: Some(prompt),
+                        model,
+                        ..from_raw(&raw, timeout_ms)
+                    }
+                }
+                HookType::McpTool => {
+                    let Some(server) = raw.server.clone() else {
+                        return Err(HookError::InvalidMcpToolHook(format!(
+                            "hook for event '{}' is type 'mcp_tool' but has no 'server' field",
+                            raw.event
+                        )));
+                    };
+                    let Some(tool) = raw.tool.clone() else {
+                        return Err(HookError::InvalidMcpToolHook(format!(
+                            "hook for event '{}' is type 'mcp_tool' but has no 'tool' field",
+                            raw.event
+                        )));
+                    };
+                    let mcp = McpToolHook {
+                        server,
+                        tool,
+                        input: raw
+                            .input
+                            .clone()
+                            .unwrap_or_else(|| serde_json::Value::Object(serde_json::Map::new())),
+                    };
+                    HookConfig {
+                        mcp: Some(mcp),
+                        ..from_raw(&raw, raw.timeout_ms.unwrap_or_else(default_timeout))
+                    }
+                }
+            };
+            config.tier = tier;
+            hooks.push(config);
         }
         Self::warn_about_inert_hooks(&hooks);
-        Ok(Self { hooks })
+        Ok(Self {
+            hooks,
+            action_runner: None,
+        })
     }
 
     /// Load hooks from a settings.json value.
@@ -570,7 +764,8 @@ impl HookRegistry {
         let matching = self.matches_for_event_name(event_name);
         let mut results = Vec::new();
         for hook in matching {
-            let result = execute_hook_with_timeout(hook, input).await;
+            let result =
+                execute_hook_with_timeout(hook, input, self.action_runner.as_deref()).await;
             results.push(result);
         }
         results
@@ -585,7 +780,8 @@ impl HookRegistry {
         let matching = self.matches_for_event(event);
         let mut results = Vec::new();
         for hook in matching {
-            let result = execute_hook_with_timeout(hook, input).await;
+            let result =
+                execute_hook_with_timeout(hook, input, self.action_runner.as_deref()).await;
             results.push(result);
         }
         results
@@ -602,8 +798,10 @@ impl HookRegistry {
         for hook in matching {
             let hook = hook.clone();
             let input = input.clone();
-            let handle =
-                tokio::spawn(async move { execute_hook_with_timeout(&hook, &input).await });
+            let runner = self.action_runner.clone();
+            let handle = tokio::spawn(async move {
+                execute_hook_with_timeout(&hook, &input, runner.as_deref()).await
+            });
             handles.push(handle);
         }
         let mut results = Vec::new();
@@ -681,6 +879,7 @@ impl HookExecutor for HookRegistry {
 async fn execute_hook_with_timeout(
     hook: &HookConfig,
     input: &HookInput,
+    action_runner: Option<&dyn HookActionRunner>,
 ) -> Result<HookExecutionResult, HookError> {
     let start = std::time::Instant::now();
 
@@ -697,12 +896,9 @@ async fn execute_hook_with_timeout(
         match hook.kind {
             HookType::Command => execute_hook(hook, input).await,
             HookType::Http => execute_http_hook(hook, input).await,
-            // The loader refuses these, so this is only reachable for a
-            // `HookConfig` built by hand.
-            other => Err(HookError::InvalidCommand(format!(
-                "hook type '{}' is not executable",
-                other.as_str()
-            ))),
+            HookType::Prompt => execute_prompt_hook(hook, input, action_runner, false).await,
+            HookType::Agent => execute_prompt_hook(hook, input, action_runner, true).await,
+            HookType::McpTool => execute_mcp_tool_hook(hook, input, action_runner).await,
         }
     };
     let result = tokio::time::timeout(std::time::Duration::from_millis(timeout_ms), execution)
@@ -890,6 +1086,80 @@ async fn execute_http_hook(
     })
 }
 
+/// Ask a model one question and read the hook's answer from its reply.
+///
+/// Both `prompt` and `agent` hooks go through here: the difference is the
+/// framing ([`ActionPrompt::agent`]), the model the loader defaulted, and the
+/// timeout it defaulted — not the protocol.
+///
+/// Without an installed runner this is a **failure**, not a skip: the gate
+/// cannot be answered, and on a gating event that denies.
+async fn execute_prompt_hook(
+    hook: &HookConfig,
+    input: &HookInput,
+    action_runner: Option<&dyn HookActionRunner>,
+    agent: bool,
+) -> Result<HookExecutionResult, HookError> {
+    let kind = if agent { "agent" } else { "prompt" };
+    let runner = action_runner.ok_or(HookError::MissingActionRunner { kind })?;
+    let Some(prompt) = hook.prompt.as_deref() else {
+        return Err(HookError::InvalidPromptHook(format!(
+            "no 'prompt' configured for this {kind} hook"
+        )));
+    };
+
+    // The prompt sees what it is gating: the same JSON a command hook gets on
+    // stdin, substituted into `$ARGUMENTS`.
+    let input_json = serde_json::to_string(input)?;
+    let request = ActionPrompt {
+        prompt: substitute_arguments(prompt, &input_json),
+        model: hook.model.clone(),
+        agent,
+    };
+
+    let answer = runner.answer(&request).await?;
+    let hook_result = parse_answer(&answer)?;
+
+    Ok(HookExecutionResult {
+        hook_result,
+        stdout: answer,
+        stderr: String::new(),
+        exit_code: 0,
+    })
+}
+
+/// Call an MCP tool and read the hook's answer from its result.
+///
+/// The tool input's `${tool_input.<path>}` references are resolved against the
+/// hook input first; a reference that does not resolve fails the hook rather
+/// than reaching the tool with an empty argument. Without an installed runner
+/// this is a failure, exactly as for `prompt` and `agent`.
+async fn execute_mcp_tool_hook(
+    hook: &HookConfig,
+    input: &HookInput,
+    action_runner: Option<&dyn HookActionRunner>,
+) -> Result<HookExecutionResult, HookError> {
+    let runner = action_runner.ok_or(HookError::MissingActionRunner { kind: "mcp_tool" })?;
+    let Some(mcp) = hook.mcp.as_ref() else {
+        return Err(HookError::InvalidMcpToolHook(
+            "no 'server'/'tool' configured for this mcp_tool hook".to_string(),
+        ));
+    };
+
+    let tool_input = interpolate_tool_input(&mcp.input, input)?;
+    let answer = runner
+        .call_mcp_tool(&mcp.server, &mcp.tool, &tool_input)
+        .await?;
+    let hook_result = parse_answer(&answer)?;
+
+    Ok(HookExecutionResult {
+        hook_result,
+        stdout: answer,
+        stderr: String::new(),
+        exit_code: 0,
+    })
+}
+
 /// Classify the result of writing a hook's input to its stdin.
 ///
 /// A **broken pipe** is not a delivery failure. It means the hook closed stdin
@@ -911,7 +1181,7 @@ fn classify_input_write(result: std::io::Result<()>) -> Result<(), HookError> {
 }
 
 /// Parse a HookResult from a hook's stdout (single JSON line).
-fn parse_hook_output(stdout: &str) -> Result<HookResult, HookError> {
+pub(crate) fn parse_hook_output(stdout: &str) -> Result<HookResult, HookError> {
     let line = stdout.lines().next().ok_or(HookError::ExecutionFailed(0))?;
     parse_hook_output_line(line)
 }
@@ -1028,9 +1298,11 @@ mod tests {
     #[test]
     fn hook_registry_starts_empty() {
         let registry = HookRegistry::new();
-        assert!(registry
-            .matches_for_event(&HookEvent::SessionStart)
-            .is_empty());
+        assert!(
+            registry
+                .matches_for_event(&HookEvent::SessionStart)
+                .is_empty()
+        );
     }
 
     #[test]
@@ -1042,6 +1314,9 @@ mod tests {
             tier: HookTier::Core,
             command: "echo hello".to_string(),
             http: None,
+            prompt: None,
+            model: None,
+            mcp: None,
             env: HashMap::new(),
             cwd: None,
             internal: false,
@@ -1067,6 +1342,9 @@ mod tests {
             tier: HookTier::Core,
             command: "echo all".to_string(),
             http: None,
+            prompt: None,
+            model: None,
+            mcp: None,
             env: HashMap::new(),
             cwd: None,
             internal: false,
@@ -1116,9 +1394,11 @@ mod tests {
     #[test]
     fn load_from_settings_null_returns_empty() {
         let registry = HookRegistry::load_from_settings(&serde_json::Value::Null).unwrap();
-        assert!(registry
-            .matches_for_event(&HookEvent::SessionStart)
-            .is_empty());
+        assert!(
+            registry
+                .matches_for_event(&HookEvent::SessionStart)
+                .is_empty()
+        );
     }
 
     #[test]
@@ -1193,6 +1473,9 @@ mod tests {
             tier: HookTier::Core,
             command: "echo".to_string(),
             http: None,
+            prompt: None,
+            model: None,
+            mcp: None,
             env: HashMap::new(),
             cwd: None,
             internal: false,
@@ -1209,6 +1492,9 @@ mod tests {
             tier: HookTier::Core,
             command: "echo all".to_string(),
             http: None,
+            prompt: None,
+            model: None,
+            mcp: None,
             env: HashMap::new(),
             cwd: None,
             internal: false,
@@ -1240,6 +1526,9 @@ mod tests {
             tier: HookTier::Core,
             command: "echo".to_string(),
             http: None,
+            prompt: None,
+            model: None,
+            mcp: None,
             env: [("MY_VAR".to_string(), "my_val".to_string())]
                 .into_iter()
                 .collect(),
@@ -1294,6 +1583,9 @@ mod tests {
             tier: HookTier::Core,
             command: r#"echo '{"action":"continue"}'"#.to_string(),
             http: None,
+            prompt: None,
+            model: None,
+            mcp: None,
             env: HashMap::new(),
             cwd: None,
             internal: false,
@@ -1310,7 +1602,9 @@ mod tests {
             input: None,
             context: None,
         };
-        let result = execute_hook_with_timeout(&hook, &input).await.unwrap();
+        let result = execute_hook_with_timeout(&hook, &input, None)
+            .await
+            .unwrap();
         assert!(matches!(result.hook_result.action, HookAction::Continue));
         assert_eq!(result.exit_code, 0);
     }
@@ -1325,6 +1619,9 @@ mod tests {
             tier: HookTier::Core,
             command: "echo hello".to_string(),
             http: None,
+            prompt: None,
+            model: None,
+            mcp: None,
             env: HashMap::new(),
             cwd: None,
             internal: false,
@@ -1341,7 +1638,7 @@ mod tests {
             input: None,
             context: None,
         };
-        let result = execute_hook_with_timeout(&hook, &input).await;
+        let result = execute_hook_with_timeout(&hook, &input, None).await;
         assert!(matches!(result, Err(HookError::UnparseableOutput(_))));
     }
 
@@ -1353,6 +1650,9 @@ mod tests {
             tier: HookTier::Core,
             command: "sleep 10".to_string(),
             http: None,
+            prompt: None,
+            model: None,
+            mcp: None,
             env: HashMap::new(),
             cwd: None,
             internal: false,
@@ -1369,7 +1669,7 @@ mod tests {
             input: None,
             context: None,
         };
-        let result = execute_hook_with_timeout(&hook, &input).await;
+        let result = execute_hook_with_timeout(&hook, &input, None).await;
         assert!(matches!(result, Err(HookError::Timeout(50))));
     }
 
@@ -1381,6 +1681,9 @@ mod tests {
             tier: HookTier::Core,
             command: "echo test".to_string(),
             http: None,
+            prompt: None,
+            model: None,
+            mcp: None,
             env: HashMap::new(),
             cwd: None,
             internal: false,
@@ -1402,6 +1705,9 @@ mod tests {
             tier: HookTier::Core,
             command: "echo test".to_string(),
             http: None,
+            prompt: None,
+            model: None,
+            mcp: None,
             env: HashMap::new(),
             cwd: None,
             internal: false,
@@ -1426,6 +1732,9 @@ mod tests {
             kind: HookType::Command,
             command: command.to_string(),
             http: None,
+            prompt: None,
+            model: None,
+            mcp: None,
             env: HashMap::new(),
             cwd: None,
             internal: false,
@@ -1516,22 +1825,386 @@ mod tests {
         );
     }
 
-    /// A kind CodeRex does not execute is skipped, not run as a command and not
-    /// silently accepted — the other hooks in the same settings still load.
+    /// All five kinds load — none is skipped as "recognised but unimplemented".
     #[test]
-    fn unsupported_hook_type_is_skipped_not_run() {
+    fn every_hook_kind_loads() {
         let value = serde_json::json!({
             "hooks": [
                 { "event": "PreToolUse", "type": "prompt", "prompt": "is this ok?" },
                 { "event": "PreToolUse", "type": "mcp_tool", "server": "s", "tool": "t" },
                 { "event": "PreToolUse", "type": "agent", "prompt": "verify" },
+                { "event": "PreToolUse", "type": "http", "url": "https://example.test/hook" },
                 { "event": "PreToolUse", "command": "echo hi" }
             ]
         });
         let registry = HookRegistry::load_from_settings(&value).unwrap();
+        let kinds: Vec<HookType> = registry
+            .matches_for_event(&HookEvent::PreToolUse)
+            .iter()
+            .map(|h| h.kind)
+            .collect();
+        assert_eq!(
+            kinds,
+            vec![
+                HookType::Prompt,
+                HookType::McpTool,
+                HookType::Agent,
+                HookType::Http,
+                HookType::Command,
+            ]
+        );
+    }
+
+    /// A `prompt` hook with no `prompt` is a config error, and so is an
+    /// `agent` one: the field is what the kind *is*.
+    #[test]
+    fn a_prompt_or_agent_hook_without_a_prompt_is_a_config_error() {
+        for kind in ["prompt", "agent"] {
+            let value = serde_json::json!({
+                "hooks": [{ "event": "PreToolUse", "type": kind }]
+            });
+            assert!(
+                matches!(
+                    HookRegistry::load_from_settings(&value),
+                    Err(HookError::InvalidPromptHook(_))
+                ),
+                "a {kind} hook with no prompt must be refused"
+            );
+        }
+    }
+
+    /// An `mcp_tool` hook names a server and a tool; one without either is a
+    /// config error rather than a call to nothing.
+    #[test]
+    fn an_mcp_tool_hook_without_a_server_or_tool_is_a_config_error() {
+        for hook in [
+            serde_json::json!({ "event": "PreToolUse", "type": "mcp_tool", "tool": "t" }),
+            serde_json::json!({ "event": "PreToolUse", "type": "mcp_tool", "server": "s" }),
+        ] {
+            let value = serde_json::json!({ "hooks": [hook] });
+            assert!(
+                matches!(
+                    HookRegistry::load_from_settings(&value),
+                    Err(HookError::InvalidMcpToolHook(_))
+                ),
+                "an mcp_tool hook must name both server and tool"
+            );
+        }
+    }
+
+    /// The two model-backed kinds differ on purpose: an `agent` hook is a
+    /// verifier with a cheap model and a longer timeout, a `prompt` hook is one
+    /// question on the session's model.
+    #[test]
+    fn agent_and_prompt_hook_defaults_differ() {
+        let value = serde_json::json!({
+            "hooks": [
+                { "event": "PreToolUse", "type": "prompt", "prompt": "ask" },
+                { "event": "PreToolUse", "type": "agent", "prompt": "verify" }
+            ]
+        });
+        let registry = HookRegistry::load_from_settings(&value).unwrap();
         let matches = registry.matches_for_event(&HookEvent::PreToolUse);
-        assert_eq!(matches.len(), 1);
-        assert_eq!(matches[0].command, "echo hi");
+        let prompt = matches.iter().find(|h| h.kind == HookType::Prompt).unwrap();
+        let agent = matches.iter().find(|h| h.kind == HookType::Agent).unwrap();
+
+        assert_eq!(prompt.timeout_ms, crate::action::PROMPT_DEFAULT_TIMEOUT_MS);
+        assert_eq!(agent.timeout_ms, crate::action::AGENT_DEFAULT_TIMEOUT_MS);
+        assert_ne!(prompt.timeout_ms, agent.timeout_ms);
+        assert_eq!(prompt.model, None, "a prompt hook keeps the session model");
+        assert_eq!(
+            agent.model.as_deref(),
+            Some(crate::action::AGENT_DEFAULT_MODEL)
+        );
+    }
+
+    /// An explicit model and timeout still win over the kind's defaults.
+    #[test]
+    fn an_action_hook_keeps_an_explicit_model_and_timeout() {
+        let value = serde_json::json!({
+            "hooks": [{
+                "event": "PreToolUse", "type": "agent", "prompt": "verify",
+                "model": "some-model", "timeout_ms": 1234
+            }]
+        });
+        let registry = HookRegistry::load_from_settings(&value).unwrap();
+        let hook = &registry.matches_for_event(&HookEvent::PreToolUse)[0];
+        assert_eq!(hook.model.as_deref(), Some("some-model"));
+        assert_eq!(hook.timeout_ms, 1234);
+    }
+
+    /// `if`, `once`, `statusMessage`, and `continueOnBlock` are accepted — a
+    /// settings file written for the reference still loads — and do nothing.
+    #[test]
+    fn unimplemented_hook_fields_are_accepted_and_inert() {
+        let value = serde_json::json!({
+            "hooks": [{
+                "event": "PreToolUse", "type": "prompt", "prompt": "ask",
+                "if": "Bash(git*)", "once": true, "statusMessage": "checking",
+                "continueOnBlock": true
+            }]
+        });
+        let registry = HookRegistry::load_from_settings(&value).unwrap();
+        assert_eq!(registry.matches_for_event(&HookEvent::PreToolUse).len(), 1);
+    }
+
+    // ─── Action kinds: prompt, agent, mcp_tool ──────────────────────────────
+
+    fn prompt_config(kind: HookType, prompt: &str) -> HookConfig {
+        HookConfig {
+            event: "PreToolUse".to_string(),
+            kind,
+            prompt: Some(prompt.to_string()),
+            ..tiered("PreToolUse", "", HookTier::Core, 0)
+        }
+    }
+
+    fn mcp_config(input: serde_json::Value) -> HookConfig {
+        HookConfig {
+            event: "PreToolUse".to_string(),
+            kind: HookType::McpTool,
+            mcp: Some(crate::action::McpToolHook {
+                server: "files".to_string(),
+                tool: "stat".to_string(),
+                input,
+            }),
+            ..tiered("PreToolUse", "", HookTier::Core, 0)
+        }
+    }
+
+    fn action_input() -> HookInput {
+        HookInput {
+            event: "PreToolUse".to_string(),
+            session_id: Some("sess_1".to_string()),
+            input: Some(r#"{"file_path":"/etc/hosts"}"#.to_string()),
+            context: None,
+        }
+    }
+
+    /// Coerce a concrete test runner to what the dispatcher takes.
+    ///
+    /// Always `Some` by construction; the `Option` is the dispatcher's
+    /// parameter type, and the tests that omit a runner pass `None` directly.
+    #[allow(clippy::unnecessary_wraps)]
+    fn as_runner(runner: &Arc<crate::action::FakeRunner>) -> Option<&dyn HookActionRunner> {
+        Some(runner.as_ref() as &dyn HookActionRunner)
+    }
+
+    /// A `prompt` hook dispatches to the runner and its text answer is parsed
+    /// with the same parser every other kind uses.
+    #[tokio::test]
+    async fn a_prompt_hook_dispatches_to_the_runner() {
+        let runner = crate::action::FakeRunner::answering(
+            r#"{"action":"continue","additional_context":"looks fine"}"#,
+        );
+        let hook = prompt_config(HookType::Prompt, "is this ok?");
+        let result = execute_hook_with_timeout(&hook, &action_input(), as_runner(&runner))
+            .await
+            .unwrap();
+
+        assert!(matches!(result.hook_result.action, HookAction::Continue));
+        assert_eq!(
+            result.hook_result.additional_context.as_deref(),
+            Some("looks fine")
+        );
+        let prompts = runner.prompts();
+        assert_eq!(prompts.len(), 1);
+        assert!(!prompts[0].agent, "a prompt hook is not agent framing");
+        assert_eq!(
+            prompts[0].model, None,
+            "a prompt hook uses the session model"
+        );
+    }
+
+    /// An `agent` hook goes through the same call with the verifier framing.
+    #[tokio::test]
+    async fn an_agent_hook_dispatches_with_the_agent_framing() {
+        let runner = crate::action::FakeRunner::answering(r#"{"action":"stop"}"#);
+        let value = serde_json::json!({
+            "hooks": [{ "event": "PreToolUse", "type": "agent", "prompt": "verify $ARGUMENTS" }]
+        });
+        let hook = HookRegistry::load_from_settings(&value)
+            .unwrap()
+            .matches_for_event(&HookEvent::PreToolUse)[0]
+            .clone();
+        let result = execute_hook_with_timeout(&hook, &action_input(), as_runner(&runner))
+            .await
+            .unwrap();
+
+        assert!(matches!(result.hook_result.action, HookAction::Stop));
+        let prompts = runner.prompts();
+        assert!(prompts[0].agent, "an agent hook must say it is one");
+        assert_eq!(
+            prompts[0].model.as_deref(),
+            Some(crate::action::AGENT_DEFAULT_MODEL)
+        );
+        // The prompt sees the hook input JSON, with the `input` field escaped
+        // the way `serde_json` writes a string inside a string.
+        assert!(
+            prompts[0]
+                .prompt
+                .starts_with(r#"verify {"event":"PreToolUse""#),
+            "{}",
+            prompts[0].prompt
+        );
+        assert!(
+            prompts[0]
+                .prompt
+                .contains(r#"\"file_path\":\"/etc/hosts\""#)
+        );
+    }
+
+    /// `$ARGUMENTS` is how a prompt hook sees what it is gating: the hook input
+    /// JSON.
+    #[tokio::test]
+    async fn a_prompt_hook_sees_the_hook_input_as_arguments() {
+        let runner = crate::action::FakeRunner::answering("{}");
+        let hook = prompt_config(HookType::Prompt, "gate this: $ARGUMENTS");
+        execute_hook_with_timeout(&hook, &action_input(), as_runner(&runner))
+            .await
+            .unwrap();
+
+        let prompt = runner.prompts()[0].prompt.clone();
+        assert!(prompt.starts_with("gate this: {"), "{prompt}");
+        assert!(prompt.contains(r#""event":"PreToolUse""#), "{prompt}");
+        assert!(
+            prompt.contains(r#""input":"{\"file_path\":\"/etc/hosts\"}""#),
+            "{prompt}"
+        );
+    }
+
+    /// An `mcp_tool` hook calls the tool on the named server, with its
+    /// `${tool_input.*}` references resolved against the hook input.
+    #[tokio::test]
+    async fn an_mcp_tool_hook_calls_the_runner_with_resolved_input() {
+        let runner = crate::action::FakeRunner::answering(r#"{"action":"continue"}"#);
+        let hook = mcp_config(serde_json::json!({
+            "path": "${tool_input.file_path}",
+            "recursive": false
+        }));
+        let result = execute_hook_with_timeout(&hook, &action_input(), as_runner(&runner))
+            .await
+            .unwrap();
+
+        assert!(matches!(result.hook_result.action, HookAction::Continue));
+        let calls = runner.mcp_calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0, "files");
+        assert_eq!(calls[0].1, "stat");
+        assert_eq!(
+            calls[0].2,
+            serde_json::json!({"path": "/etc/hosts", "recursive": false})
+        );
+    }
+
+    /// A reference that does not resolve fails the hook rather than calling the
+    /// tool with an empty argument.
+    #[tokio::test]
+    async fn an_unresolvable_tool_input_reference_fails_the_hook() {
+        let runner = crate::action::FakeRunner::answering("{}");
+        let hook = mcp_config(serde_json::json!({ "path": "${tool_input.nope}" }));
+        let result = execute_hook_with_timeout(&hook, &action_input(), as_runner(&runner)).await;
+
+        assert!(
+            matches!(result, Err(HookError::InterpolationFailed(_))),
+            "{result:?}"
+        );
+        assert!(
+            runner.mcp_calls().is_empty(),
+            "the tool must not be called with a missing argument"
+        );
+    }
+
+    /// A kind that needs a runner, with none installed, is a failure — not a
+    /// silent continue. On a gating event that failure denies.
+    #[tokio::test]
+    async fn an_action_hook_without_a_runner_fails_and_denies_on_a_gate() {
+        for hook in [
+            prompt_config(HookType::Prompt, "ask"),
+            prompt_config(HookType::Agent, "verify"),
+            mcp_config(serde_json::json!({})),
+        ] {
+            let kind = hook.kind;
+            let mut registry = HookRegistry::new();
+            registry.register(hook);
+
+            let result = registry
+                .fire_hook("PreToolUse", "Bash", &HashMap::new())
+                .await;
+
+            assert!(result.failed, "{kind:?} without a runner is a failure");
+            assert!(result.stop, "{kind:?} failure must deny on a gating event");
+            assert!(
+                result
+                    .errors
+                    .iter()
+                    .any(|e| e.contains("this session cannot run")),
+                "the reason must say what is missing: {:?}",
+                result.errors
+            );
+        }
+    }
+
+    /// The same failure off a gating event is recorded, not turned into a stop
+    /// — there is nowhere to deny.
+    #[tokio::test]
+    async fn an_action_hook_without_a_runner_is_recorded_off_a_gate() {
+        let mut registry = HookRegistry::new();
+        registry.register(HookConfig {
+            event: "PostToolUse".to_string(),
+            ..prompt_config(HookType::Prompt, "ask")
+        });
+
+        let result = registry
+            .fire_hook("PostToolUse", "Bash", &HashMap::new())
+            .await;
+        assert!(result.failed);
+        assert!(!result.stop);
+    }
+
+    /// With a runner installed, a `prompt` hook's `stop` answer stops a gating
+    /// event — the failure above is about the missing runner, not about the
+    /// kind being inert.
+    #[tokio::test]
+    async fn a_prompt_hook_with_a_runner_can_stop_a_gating_event() {
+        let mut registry = HookRegistry::new();
+        registry.register(prompt_config(HookType::Prompt, "ask"));
+        registry.set_action_runner(crate::action::FakeRunner::answering(r#"{"action":"stop"}"#));
+
+        let result = registry
+            .fire_hook("PreToolUse", "Bash", &HashMap::new())
+            .await;
+        assert!(result.stop);
+        assert!(!result.failed);
+    }
+
+    /// An answer that is empty or not a hook result is a failure, exactly as
+    /// for a `command` hook's stdout.
+    #[tokio::test]
+    async fn an_action_hook_that_gives_no_answer_is_a_failure() {
+        for answer in ["", "the tool looks fine"] {
+            let runner = crate::action::FakeRunner::answering(answer);
+            let hook = prompt_config(HookType::Prompt, "ask");
+            let result =
+                execute_hook_with_timeout(&hook, &action_input(), as_runner(&runner)).await;
+            assert!(result.is_err(), "{answer:?} should not read as an answer");
+        }
+    }
+
+    /// A runner installed on the registry survives `into_executor`, which is
+    /// how the CLI installs one.
+    #[tokio::test]
+    async fn a_runner_survives_into_executor() {
+        let mut registry = HookRegistry::new();
+        registry.register(prompt_config(HookType::Prompt, "ask"));
+        registry.set_action_runner(crate::action::FakeRunner::answering("{}"));
+        assert!(registry.action_runner().is_some());
+
+        let executor = registry.into_executor();
+        let result = executor
+            .fire_hook("PreToolUse", "Bash", &HashMap::new())
+            .await;
+        assert!(!result.failed, "{:?}", result.errors);
     }
 
     /// An `http` hook loads, and names itself by its URL.

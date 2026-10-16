@@ -20,6 +20,9 @@ fn config(event: &str, command: &str) -> HookConfig {
         kind: HookType::Command,
         command: command.to_string(),
         http: None,
+        prompt: None,
+        model: None,
+        mcp: None,
         env: HashMap::new(),
         cwd: None,
         internal: false,
@@ -39,6 +42,9 @@ fn config_with_env(event: &str, command: &str, env: HashMap<String, String>) -> 
         kind: HookType::Command,
         command: command.to_string(),
         http: None,
+        prompt: None,
+        model: None,
+        mcp: None,
         env,
         cwd: None,
         internal: false,
@@ -672,6 +678,9 @@ fn http_config_with(
             allowed_env_vars,
             block_private_hosts: false,
         }),
+        prompt: None,
+        model: None,
+        mcp: None,
         env: HashMap::new(),
         cwd: None,
         internal: false,
@@ -781,10 +790,7 @@ async fn an_http_hook_that_answers_nonsense_denies() {
 /// body is the conversation — so it is a failure, not something to follow.
 #[tokio::test]
 async fn an_http_hook_redirect_is_a_failure() {
-    let endpoint = TestEndpoint::start(
-        "302 Found",
-        "",
-    );
+    let endpoint = TestEndpoint::start("302 Found", "");
     let mut registry = HookRegistry::new();
     // The endpoint answers 302; if the client followed redirects it would look
     // for a Location target and hang instead of failing.
@@ -806,10 +812,7 @@ async fn an_http_hook_sends_a_header_it_was_granted() {
     let endpoint = TestEndpoint::start("200 OK", r#"{"action":"continue"}"#);
     let mut registry = HookRegistry::new();
     let mut headers = HashMap::new();
-    headers.insert(
-        "authorization".to_string(),
-        "Bearer ${PATH}".to_string(),
-    );
+    headers.insert("authorization".to_string(), "Bearer ${PATH}".to_string());
     registry.register(http_config_with(
         "PreToolUse",
         &endpoint.url("/hook"),
@@ -828,4 +831,166 @@ async fn an_http_hook_sends_a_header_it_was_granted() {
         request.contains(&format!("authorization: Bearer {path}")),
         "the granted variable was not interpolated: {request}"
     );
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  Action kinds — `prompt`, `agent`, `mcp_tool`
+//
+//  These need a model client or the MCP registry, which the hooks crate does
+//  not own: the session injects a `HookActionRunner`. The runner below is
+//  implemented here as an *external* crate would implement it, which is half of
+//  what these tests pin — the other half is that the three kinds answer through
+//  the same parser, and that a kind with no runner denies on a gate.
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// A runner that answers from a script and records what it was asked.
+struct RecordingRunner {
+    answer: String,
+    prompts: std::sync::Mutex<Vec<coderex_hooks::ActionPrompt>>,
+    mcp_calls: std::sync::Mutex<Vec<(String, String, serde_json::Value)>>,
+}
+
+impl RecordingRunner {
+    fn answering(answer: &str) -> std::sync::Arc<Self> {
+        std::sync::Arc::new(Self {
+            answer: answer.to_string(),
+            prompts: std::sync::Mutex::new(Vec::new()),
+            mcp_calls: std::sync::Mutex::new(Vec::new()),
+        })
+    }
+
+    fn prompts(&self) -> Vec<coderex_hooks::ActionPrompt> {
+        self.prompts.lock().unwrap().clone()
+    }
+
+    fn mcp_calls(&self) -> Vec<(String, String, serde_json::Value)> {
+        self.mcp_calls.lock().unwrap().clone()
+    }
+}
+
+#[async_trait::async_trait]
+impl coderex_hooks::HookActionRunner for RecordingRunner {
+    async fn answer(
+        &self,
+        request: &coderex_hooks::ActionPrompt,
+    ) -> Result<String, coderex_hooks::HookError> {
+        self.prompts.lock().unwrap().push(request.clone());
+        Ok(self.answer.clone())
+    }
+
+    async fn call_mcp_tool(
+        &self,
+        server: &str,
+        tool: &str,
+        input: &serde_json::Value,
+    ) -> Result<String, coderex_hooks::HookError> {
+        self.mcp_calls
+            .lock()
+            .unwrap()
+            .push((server.to_string(), tool.to_string(), input.clone()));
+        Ok(self.answer.clone())
+    }
+}
+
+/// A `prompt` hook, an `agent` hook, and an `mcp_tool` hook all answer through
+/// the installed runner, and each one's answer is parsed the same way.
+#[tokio::test]
+async fn the_action_hook_kinds_dispatch_to_the_installed_runner() {
+    let hooks = serde_json::json!([
+        { "event": "PreToolUse", "type": "prompt", "prompt": "gate: $ARGUMENTS" },
+        { "event": "PreToolUse", "type": "agent", "prompt": "verify: $ARGUMENTS" },
+        {
+            "event": "PreToolUse", "type": "mcp_tool",
+            "server": "policy", "tool": "check",
+            "input": { "path": "${tool_input.file_path}" }
+        }
+    ]);
+
+    let runner =
+        RecordingRunner::answering(r#"{"action":"continue","additional_context":"answered"}"#);
+    let mut registry = HookRegistry::from_settings_json(&hooks).unwrap();
+    registry.set_action_runner(runner.clone());
+    let executor = registry.into_executor();
+
+    let result = executor
+        .fire_hook(
+            "PreToolUse",
+            r#"{"file_path":"/etc/hosts"}"#,
+            &HashMap::new(),
+        )
+        .await;
+
+    assert!(
+        !result.failed,
+        "the runner answered for every kind: {:?}",
+        result.errors
+    );
+    assert!(!result.stop);
+
+    let prompts = runner.prompts();
+    assert_eq!(prompts.len(), 2, "one query per model-backed hook");
+    assert!(
+        prompts.iter().any(|p| !p.agent) && prompts.iter().any(|p| p.agent),
+        "the `agent` kind must be distinguishable from the `prompt` kind"
+    );
+    assert!(prompts.iter().all(|p| p.prompt.contains("PreToolUse")));
+
+    let calls = runner.mcp_calls();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].0, "policy");
+    assert_eq!(calls[0].1, "check");
+    assert_eq!(calls[0].2, serde_json::json!({ "path": "/etc/hosts" }));
+}
+
+/// A hook of a kind this session cannot run is a failure, and on a gating event
+/// a failure denies. The check is that the tool would have been *stopped*, not
+/// that no error was logged.
+#[tokio::test]
+async fn an_action_hook_with_no_runner_denies_on_a_gate() {
+    let hooks = serde_json::json!([
+        { "event": "PreToolUse", "type": "prompt", "prompt": "is this ok?" }
+    ]);
+    let registry = HookRegistry::from_settings_json(&hooks).unwrap();
+
+    let result = registry
+        .fire_hook("PreToolUse", "Bash", &HashMap::new())
+        .await;
+
+    assert!(result.failed, "an unrunnable gate is a failure");
+    assert!(result.stop, "an unrunnable gate must deny");
+    assert!(
+        result
+            .errors
+            .iter()
+            .any(|e| e.contains("this session cannot run prompt hooks")),
+        "the reason must name the kind and the fix: {:?}",
+        result.errors
+    );
+}
+
+/// A `${tool_input.<path>}` reference that does not resolve is a failure — and
+/// on a gate, a denial, not a call to the tool with an empty argument.
+#[tokio::test]
+async fn an_unresolvable_mcp_tool_input_denies_on_a_gate() {
+    let hooks = serde_json::json!([
+        {
+            "event": "PreToolUse", "type": "mcp_tool",
+            "server": "policy", "tool": "check",
+            "input": { "path": "${tool_input.no_such_field}" }
+        }
+    ]);
+    let runner = RecordingRunner::answering(r#"{"action":"continue"}"#);
+    let mut registry = HookRegistry::from_settings_json(&hooks).unwrap();
+    registry.set_action_runner(runner.clone());
+
+    let result = registry
+        .fire_hook(
+            "PreToolUse",
+            r#"{"file_path":"/etc/hosts"}"#,
+            &HashMap::new(),
+        )
+        .await;
+
+    assert!(result.stop, "an unresolvable argument must deny the tool");
+    assert!(runner.mcp_calls().is_empty(), "the tool must not be called");
 }

@@ -1453,7 +1453,25 @@ impl ReplLoop {
         if let Some(ref hooks) = self.hooks_settings {
             if let Some(ref mut engine) = self.engine {
                 match coderex_hooks::HookRegistry::from_settings_json(hooks) {
-                    Ok(registry) => engine.set_hooks(registry.into_executor()),
+                    Ok(registry) => {
+                        // Three kinds — `prompt`, `agent`, `mcp_tool` — need a
+                        // model client and the tool registry, which the hooks
+                        // crate cannot reach. Without this they load and then
+                        // fail, which denies on a gating event.
+                        let mut registry = registry;
+                        if let (Some(api), Some(dispatcher)) =
+                            (self.api_client.as_ref(), self.dispatcher.as_ref())
+                        {
+                            registry.set_action_runner(Arc::new(
+                                crate::hook_actions::SessionHookActionRunner::new(
+                                    api.clone_box(),
+                                    Arc::clone(dispatcher) as Arc<dyn crate::hook_actions::HookToolCaller>,
+                                    self.model.clone(),
+                                ),
+                            ));
+                        }
+                        engine.set_hooks(registry.into_executor());
+                    }
                     Err(e) => tracing::warn!("hooks in settings were not loaded: {e}"),
                 }
             }
@@ -5377,12 +5395,24 @@ mod tests {
     #[derive(Clone)]
     struct CountingApi {
         turn_requests: Arc<std::sync::Mutex<usize>>,
+        /// What a side query (a hook's `prompt`, a title, a classifier) answers.
+        side_answer: &'static str,
     }
 
     impl CountingApi {
         fn new() -> Self {
             Self {
                 turn_requests: Arc::new(std::sync::Mutex::new(0)),
+                side_answer: "Side query answer",
+            }
+        }
+
+        /// A side query that answers with hook JSON, for the hook kinds that run
+        /// through the session's model client.
+        fn answering_hooks_with(answer: &'static str) -> Self {
+            Self {
+                turn_requests: Arc::new(std::sync::Mutex::new(0)),
+                side_answer: answer,
             }
         }
 
@@ -5406,7 +5436,7 @@ mod tests {
             _tools: &[ToolInfo],
         ) -> Result<ApiResponse, ApiError> {
             Ok(ApiResponse {
-                content: "Side query answer".into(),
+                content: self.side_answer.into(),
                 tool_calls: Vec::new(),
                 usage: UsageSummary {
                     input_tokens: 1,
@@ -5746,6 +5776,61 @@ mod tests {
             0,
             "a hook that failed was treated as 'continue' and the turn ran anyway"
         );
+    }
+
+    /// A `prompt` hook runs through the session's own model client — the wiring
+    /// `repl.rs` does when it installs the registry. An answer of `stop` must
+    /// keep the turn from reaching the model at all.
+    #[tokio::test]
+    async fn a_prompt_hook_answering_stop_keeps_the_turn_from_the_model() {
+        let temp = tempfile::tempdir().unwrap();
+        let hooks = serde_json::json!([{
+            "event": "UserPromptSubmit",
+            "type": "prompt",
+            "prompt": "may this run? $ARGUMENTS",
+        }]);
+
+        let api = CountingApi::answering_hooks_with("{\"action\":\"stop\"}");
+        let mut repl = ReplLoop::with_engine(
+            Box::new(api.clone()),
+            temp.path().to_string_lossy().into_owned(),
+            ModelId::sonnet(),
+        );
+        repl.with_hooks(Some(hooks));
+        repl.apply_cli_config();
+
+        repl.run_headless("Hello").await.unwrap();
+
+        assert_eq!(
+            api.turn_requests(),
+            0,
+            "a prompt hook that refused was ignored and the turn ran anyway"
+        );
+    }
+
+    /// And an answer of `continue` lets it through — which is what tells the
+    /// test above apart from "the hook never ran".
+    #[tokio::test]
+    async fn a_prompt_hook_answering_continue_lets_the_turn_run() {
+        let temp = tempfile::tempdir().unwrap();
+        let hooks = serde_json::json!([{
+            "event": "UserPromptSubmit",
+            "type": "prompt",
+            "prompt": "may this run? $ARGUMENTS",
+        }]);
+
+        let api = CountingApi::answering_hooks_with("{\"action\":\"continue\"}");
+        let mut repl = ReplLoop::with_engine(
+            Box::new(api.clone()),
+            temp.path().to_string_lossy().into_owned(),
+            ModelId::sonnet(),
+        );
+        repl.with_hooks(Some(hooks));
+        repl.apply_cli_config();
+
+        repl.run_headless("Hello").await.unwrap();
+
+        assert_eq!(api.turn_requests(), 1);
     }
 
     /// The hook is told which prompt it is gating. It used to be handed
