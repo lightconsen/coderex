@@ -38,7 +38,15 @@ pub struct RuleGroup {
     pub name: String,
     /// Human-readable description.
     pub description: String,
-    /// Priority (higher = evaluated first).
+    /// Ordering weight for this group's rules, higher first.
+    ///
+    /// Enabled groups are sorted by this value (descending; equal values keep
+    /// their configured order) and their rules are added to the checker in
+    /// that order. The checker evaluates every `Deny` rule before any `Allow`
+    /// rule, so priority only breaks ties between rules that share an action:
+    /// it selects which deny reason, or which allow path pattern, wins. It can
+    /// never let an allow outrank a deny — deny always wins. Use it to order
+    /// same-action rules, not to override the deny-over-allow precedence.
     pub priority: i32,
     /// Rules in this group.
     pub rules: Vec<PermissionRule>,
@@ -483,9 +491,25 @@ mod tests {
         ));
     }
 
+    /// Priority orders same-action rules, and nothing more: among deny rules
+    /// the higher-priority group's rule is reached first and its reason wins.
+    /// The "low" group is added first on purpose — if priority were ignored,
+    /// its rule would come first and its reason would surface instead.
     #[test]
-    fn group_priority_ordering() {
+    fn higher_priority_group_decides_among_same_action_rules() {
         let mut mgr = PermissionManager::new();
+        mgr.add_group(RuleGroup {
+            name: "low".into(),
+            description: String::new(),
+            priority: 1,
+            rules: vec![PermissionRule {
+                tool_name: "bash".into(),
+                action: PermissionAction::Deny,
+                paths: Vec::new(),
+                description: "low-priority deny".into(),
+            }],
+            enabled: true,
+        });
         mgr.add_group(RuleGroup {
             name: "high".into(),
             description: String::new(),
@@ -493,6 +517,34 @@ mod tests {
             rules: vec![PermissionRule {
                 tool_name: "bash".into(),
                 action: PermissionAction::Deny,
+                paths: Vec::new(),
+                description: "high-priority deny".into(),
+            }],
+            enabled: true,
+        });
+
+        match mgr.checker().check("bash", None) {
+            PermissionResult::Deny { reason } => {
+                assert!(reason.contains("high-priority"), "got: {reason}");
+            }
+            other => panic!("expected Deny, got {other:?}"),
+        }
+    }
+
+    /// The limit of priority: it cannot lift an allow above a deny. The allow
+    /// sits in the *higher*-priority group here, so a priority-ordered
+    /// evaluation would allow bash — the checker still denies it, because it
+    /// runs every deny rule before any allow rule.
+    #[test]
+    fn deny_wins_over_allow_regardless_of_group_priority() {
+        let mut mgr = PermissionManager::new();
+        mgr.add_group(RuleGroup {
+            name: "high".into(),
+            description: String::new(),
+            priority: 100,
+            rules: vec![PermissionRule {
+                tool_name: "bash".into(),
+                action: PermissionAction::Allow,
                 paths: Vec::new(),
                 description: String::new(),
             }],
@@ -504,18 +556,15 @@ mod tests {
             priority: 10,
             rules: vec![PermissionRule {
                 tool_name: "bash".into(),
-                action: PermissionAction::Allow,
+                action: PermissionAction::Deny,
                 paths: Vec::new(),
                 description: String::new(),
             }],
             enabled: true,
         });
 
-        // High priority group should be evaluated first
-        let checker = mgr.checker();
-        // Since deny rules have priority in PermissionChecker, bash should be denied
         assert!(matches!(
-            checker.check("bash", None),
+            mgr.checker().check("bash", None),
             PermissionResult::Deny { .. }
         ));
     }

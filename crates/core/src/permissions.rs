@@ -20,7 +20,15 @@ pub enum PermissionMode {
     DontAsk,
     /// Plan mode: read-only, no mutations.
     Plan,
-    /// Auto: use heuristics to decide (safe ops auto-approved).
+    /// Auto: [`PermissionMode::Default`] plus the auto-classifier hook.
+    ///
+    /// Inside this checker the mode is indistinguishable from `Default` — it
+    /// has no auto behaviour of its own and auto-approves nothing. What makes
+    /// it "auto" lives outside the checker: the CLI registers
+    /// [`AutoClassifierHook`](crate::permission_engine::AutoClassifierHook),
+    /// which is active only in this mode and can short-circuit an operation
+    /// the classifier judges safe. Without that hook, selecting `Auto` changes
+    /// nothing.
     Auto,
 }
 
@@ -342,14 +350,12 @@ impl PermissionChecker {
             }
         }
 
-        // Default: dangerous tools require approval, safe tools allowed
+        // Default: dangerous tools require approval, safe tools allowed.
+        //
+        // `Auto` takes this same path. The checker has no auto behaviour of its
+        // own — see `PermissionMode::Auto`; anything "auto" about the mode comes
+        // from the classifier hook the CLI registers ahead of the checker.
         if self.is_dangerous_tool(tool_name) {
-            if self.mode == PermissionMode::Auto {
-                // Auto mode: safe-ish operations auto-approved
-                return PermissionResult::Ask {
-                    reason: format!("tool '{tool_name}' requires approval (auto mode)"),
-                };
-            }
             PermissionResult::Ask {
                 reason: format!("tool '{tool_name}' requires approval (dangerous operation)"),
             }
@@ -641,6 +647,24 @@ mod tests {
             checker.check("bash", None),
             PermissionResult::Ask { .. }
         ));
+    }
+
+    /// `Auto` is not a behaviour in this checker: it is `Default` plus the
+    /// `AutoClassifierHook` the CLI registers. If the checker ever grows an
+    /// auto behaviour of its own, this equality breaks — which is the point.
+    #[test]
+    fn auto_mode_is_indistinguishable_from_default_in_the_checker() {
+        let auto = PermissionChecker::new(PermissionMode::Auto);
+        let default = PermissionChecker::new(PermissionMode::Default);
+        for tool in [
+            "read", "ls", "grep", "bash", "write", "edit", "multi_edit", "notebook_edit",
+        ] {
+            assert_eq!(
+                auto.check(tool, None),
+                default.check(tool, None),
+                "checker must treat Auto and Default identically for '{tool}'"
+            );
+        }
     }
 
     #[test]
