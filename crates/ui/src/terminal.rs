@@ -3,8 +3,10 @@
 use crate::message_list::{Message, MessageRole};
 use crate::state::UiState;
 use crate::statusline::Statusline;
+use crate::terminal_profile::TerminalProfile;
 use crate::themes::Theme;
-use crossterm::execute;
+use crossterm::event::{PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags};
+use crossterm::queue;
 use crossterm::terminal::{EnterAlternateScreen, LeaveAlternateScreen};
 use ratatui::Frame;
 use ratatui::backend::CrosstermBackend;
@@ -54,26 +56,43 @@ pub struct TerminalUi {
     terminal: ratatui::Terminal<CrosstermBackend<Stdout>>,
     #[allow(dead_code)]
     alternate: bool,
+    profile: TerminalProfile,
+    keyboard_pushed: bool,
 }
 
 impl TerminalUi {
     /// Create a new terminal UI.
+    ///
+    /// The terminal is identified here, once, from the environment. Nothing is
+    /// written to the terminal until [`TerminalUi::enter`].
     pub fn new() -> std::io::Result<Self> {
         let backend = CrosstermBackend::new(std::io::stdout());
         let terminal = ratatui::Terminal::new(backend)?;
         Ok(Self {
             terminal,
             alternate: false,
+            profile: TerminalProfile::from_env(),
+            keyboard_pushed: false,
         })
+    }
+
+    /// The terminal profile detected at construction.
+    #[must_use]
+    pub const fn profile(&self) -> &TerminalProfile {
+        &self.profile
+    }
+
+    /// Whether the keyboard-protocol flags are currently pushed.
+    #[must_use]
+    pub const fn keyboard_enhancement_active(&self) -> bool {
+        self.keyboard_pushed
     }
 
     /// Enter alternate screen.
     pub fn enter(&mut self) -> std::io::Result<()> {
-        execute!(
-            std::io::stdout(),
-            EnterAlternateScreen,
-            crossterm::event::EnableMouseCapture
-        )?;
+        let mut stdout = std::io::stdout();
+        enter_commands(&self.profile, &mut stdout)?;
+        self.keyboard_pushed = self.profile.keyboard_flags().is_some();
         self.alternate = true;
         self.terminal.clear()?;
         Ok(())
@@ -82,11 +101,9 @@ impl TerminalUi {
     /// Leave alternate screen.
     pub fn exit(&mut self) -> std::io::Result<()> {
         if self.alternate {
-            execute!(
-                std::io::stdout(),
-                LeaveAlternateScreen,
-                crossterm::event::DisableMouseCapture
-            )?;
+            let mut stdout = std::io::stdout();
+            exit_commands(self.keyboard_pushed, &mut stdout)?;
+            self.keyboard_pushed = false;
             self.alternate = false;
         }
         Ok(())
@@ -97,6 +114,43 @@ impl TerminalUi {
         self.terminal.draw(|frame| render_frame(frame, state))?;
         Ok(())
     }
+}
+
+/// Write the commands that put the terminal into TUI mode.
+///
+/// Split out from [`TerminalUi::enter`] so the exact byte sequence is testable:
+/// the keyboard push is only correct if it is actually emitted for a terminal
+/// that understands it, and omitted for one that does not. `queue!` is used
+/// rather than `execute!` so the bytes go to the writer on every platform —
+/// crossterm's `execute!` falls back to a WinAPI call, which has no keyboard
+/// protocol at all, and would make this untestable.
+fn enter_commands(profile: &TerminalProfile, out: &mut impl std::io::Write) -> std::io::Result<()> {
+    queue!(
+        out,
+        EnterAlternateScreen,
+        crossterm::event::EnableMouseCapture
+    )?;
+    if let Some(flags) = profile.keyboard_flags() {
+        queue!(out, PushKeyboardEnhancementFlags(flags))?;
+    }
+    out.flush()
+}
+
+/// Undo [`enter_commands`], in the reverse order.
+///
+/// `keyboard_pushed` is passed explicitly rather than re-derived from the
+/// profile: popping a level that was never pushed would corrupt the stack for
+/// whatever runs after CodeRex.
+fn exit_commands(keyboard_pushed: bool, out: &mut impl std::io::Write) -> std::io::Result<()> {
+    if keyboard_pushed {
+        queue!(out, PopKeyboardEnhancementFlags)?;
+    }
+    queue!(
+        out,
+        LeaveAlternateScreen,
+        crossterm::event::DisableMouseCapture
+    )?;
+    out.flush()
 }
 
 /// Pane positions in the vertical layout.
@@ -1094,6 +1148,64 @@ fn render_overlay(frame: &mut Frame, area: ratatui::layout::Rect, state: &UiStat
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn env<'a>(pairs: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<String> + 'a {
+        move |name| {
+            pairs
+                .iter()
+                .find(|(key, _)| *key == name)
+                .map(|(_, value)| (*value).to_string())
+        }
+    }
+
+    /// The keyboard push is the one startup byte sequence that depends on the
+    /// terminal, and it is a correctness matter: `\x1b[>1u` tells a capable
+    /// terminal to stop collapsing `Ctrl+I` into `Tab`.
+    #[test]
+    fn enter_pushes_keyboard_protocol_only_for_capable_terminals() {
+        let kitty = TerminalProfile::detect(&env(&[("KITTY_WINDOW_ID", "1")]));
+        let mut out = Vec::new();
+        enter_commands(&kitty, &mut out).expect("write enter commands");
+        let bytes = String::from_utf8(out).expect("utf8");
+        assert!(
+            bytes.contains("\x1b[>1u"),
+            "capable terminal did not get the disambiguation push: {bytes:?}"
+        );
+
+        let vscode = TerminalProfile::detect(&env(&[("TERM_PROGRAM", "vscode")]));
+        let mut out = Vec::new();
+        enter_commands(&vscode, &mut out).expect("write enter commands");
+        let bytes = String::from_utf8(out).expect("utf8");
+        assert!(
+            !bytes.contains("\x1b[>1u"),
+            "unverified terminal was pushed a protocol it may not speak: {bytes:?}"
+        );
+        // …but it still enters the alternate screen and captures the mouse.
+        assert!(
+            bytes.contains("\x1b[?1049h"),
+            "alt screen missing: {bytes:?}"
+        );
+    }
+
+    #[test]
+    fn exit_pops_only_what_was_pushed() {
+        let mut pushed = Vec::new();
+        exit_commands(true, &mut pushed).expect("write exit commands");
+        let bytes = String::from_utf8(pushed).expect("utf8");
+        assert!(
+            bytes.contains("\x1b[<1u"),
+            "pushed protocol was not popped: {bytes:?}"
+        );
+        assert!(bytes.contains("\x1b[?1049l"), "alt screen not left");
+
+        let mut never = Vec::new();
+        exit_commands(false, &mut never).expect("write exit commands");
+        let bytes = String::from_utf8(never).expect("utf8");
+        assert!(
+            !bytes.contains("\x1b[<1u"),
+            "popped a protocol level that was never pushed: {bytes:?}"
+        );
+    }
 
     #[test]
     fn terminal_new_succeeds() {

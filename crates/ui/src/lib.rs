@@ -14,6 +14,7 @@ pub mod state;
 pub mod statusline;
 pub mod statusline_setup;
 pub mod terminal;
+pub mod terminal_profile;
 pub mod themes;
 pub mod vim;
 

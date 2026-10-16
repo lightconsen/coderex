@@ -1,6 +1,6 @@
 //! Input handling — keyboard event processing and input buffer editing.
 
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use unicode_width::UnicodeWidthChar;
 
 /// A user input action derived from a key event.
@@ -46,13 +46,34 @@ pub enum InputAction {
     Ignore,
 }
 
+/// Drop the key events that are not a key going down.
+///
+/// Windows reports releases unconditionally, and the kitty keyboard protocol
+/// reports them when `REPORT_EVENT_TYPES` is on. Applying a release as if it
+/// were a press types every character twice, so the filter belongs at the
+/// boundary where raw events come in.
+///
+/// `Repeat` is kept: an autorepeating key is a real keypress.
+#[must_use]
+pub fn key_press(event: KeyEvent) -> Option<KeyEvent> {
+    (event.kind != KeyEventKind::Release).then_some(event)
+}
+
 /// Convert a key event to an input action.
 #[must_use]
 pub fn key_event_to_action(event: KeyEvent) -> InputAction {
+    let Some(event) = key_press(event) else {
+        return InputAction::Ignore;
+    };
+
     match event.code {
         KeyCode::Char(c) => {
             if event.modifiers.contains(KeyModifiers::CONTROL) {
-                match c {
+                // Control chords are case-insensitive. The kitty keyboard
+                // protocol may report `Ctrl+Shift+C` as either `'c'` or `'C'`
+                // with CONTROL depending on which enhancement flags are on,
+                // and both are the same key to the user.
+                match c.to_ascii_lowercase() {
                     'c' => InputAction::Interrupt,
                     'a' => InputAction::MoveToStart,
                     'e' => InputAction::MoveToEnd,
@@ -61,6 +82,12 @@ pub fn key_event_to_action(event: KeyEvent) -> InputAction {
                     'w' => InputAction::DeleteWord,
                     _ => InputAction::Ignore,
                 }
+            } else if c.is_control() {
+                // Under CSI-u a control character can arrive as `Char` where
+                // the legacy encoding delivered a named key: `Ctrl+J` is
+                // `Char('\n')` either way. A single-line buffer must never take
+                // one — it would break the one-row input invariant.
+                InputAction::Ignore
             } else {
                 InputAction::InsertChar(c)
             }
@@ -311,6 +338,87 @@ mod tests {
 
     fn ctrl_action(c: char) -> InputAction {
         key_event_to_action(KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL))
+    }
+
+    fn kind_action(code: KeyCode, kind: KeyEventKind) -> InputAction {
+        key_event_to_action(KeyEvent::new_with_kind(code, KeyModifiers::NONE, kind))
+    }
+
+    /// A key release is not a keypress. Windows always reports releases, and
+    /// the kitty keyboard protocol reports them when `REPORT_EVENT_TYPES` is
+    /// pushed; without this filter every character is typed twice.
+    #[test]
+    fn key_release_is_not_a_keypress() {
+        assert_eq!(
+            kind_action(KeyCode::Char('a'), KeyEventKind::Press),
+            InputAction::InsertChar('a')
+        );
+        assert_eq!(
+            kind_action(KeyCode::Char('a'), KeyEventKind::Release),
+            InputAction::Ignore
+        );
+        // Autorepeat is a real keypress and must still insert.
+        assert_eq!(
+            kind_action(KeyCode::Char('a'), KeyEventKind::Repeat),
+            InputAction::InsertChar('a')
+        );
+        assert_eq!(
+            kind_action(KeyCode::Enter, KeyEventKind::Release),
+            InputAction::Ignore
+        );
+    }
+
+    #[test]
+    fn key_press_filters_releases() {
+        let release = KeyEvent::new_with_kind(
+            KeyCode::Char('x'),
+            KeyModifiers::NONE,
+            KeyEventKind::Release,
+        );
+        assert!(key_press(release).is_none());
+        assert!(key_press(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE)).is_some());
+    }
+
+    /// Control chords are case-insensitive. Depending on which kitty keyboard
+    /// enhancement flags are active, `Ctrl+Shift+C` is reported as either
+    /// `'c'` or `'C'` with CONTROL; both mean the same key.
+    #[test]
+    fn control_chords_ignore_letter_case() {
+        assert_eq!(ctrl_action('C'), InputAction::Interrupt);
+        assert_eq!(ctrl_action('A'), InputAction::MoveToStart);
+        assert_eq!(ctrl_action('E'), InputAction::MoveToEnd);
+        assert_eq!(ctrl_action('K'), InputAction::KillToEnd);
+        assert_eq!(ctrl_action('U'), InputAction::KillToStart);
+        assert_eq!(ctrl_action('W'), InputAction::DeleteWord);
+    }
+
+    /// Disambiguation is the point of the protocol: keys that used to be the
+    /// same bytes become distinct, and each has to land on its own action.
+    #[test]
+    fn disambiguated_keys_stay_distinct() {
+        // Esc alone still interrupts…
+        assert_eq!(action(KeyCode::Esc), InputAction::Interrupt);
+        // …but `Ctrl+[` is no longer Esc, and must not interrupt.
+        assert_eq!(ctrl_action('['), InputAction::Ignore);
+
+        // Tab still completes; `Ctrl+I` is a different key.
+        assert_eq!(action(KeyCode::Tab), InputAction::TabComplete);
+        assert_eq!(ctrl_action('i'), InputAction::Ignore);
+
+        // Enter still submits; `Ctrl+M` is a different key.
+        assert_eq!(action(KeyCode::Enter), InputAction::Submit);
+        assert_eq!(ctrl_action('m'), InputAction::Ignore);
+    }
+
+    /// A control character must never reach the single-line buffer, whichever
+    /// encoding delivered it.
+    #[test]
+    fn control_characters_are_never_inserted() {
+        assert_eq!(action(KeyCode::Char('\n')), InputAction::Ignore);
+        assert_eq!(action(KeyCode::Char('\r')), InputAction::Ignore);
+        assert_eq!(action(KeyCode::Char('\u{1b}')), InputAction::Ignore);
+        // Ordinary text is unaffected.
+        assert_eq!(action(KeyCode::Char('a')), InputAction::InsertChar('a'));
     }
 
     #[test]
