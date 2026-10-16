@@ -46,6 +46,13 @@ pub struct TeamMemoryEntry {
     /// Whether this entry has been locally deleted.
     /// Deleted entries are excluded from sync propagation.
     pub tombstoned: bool,
+    /// Monotonic version, bumped on every local write.
+    ///
+    /// Carried so a caller can pin the version it expects to replace
+    /// (`if_version` semantics); see [`crate::service`]. Defaults to `0` for
+    /// entries written before the field existed.
+    #[serde(default)]
+    pub version: u64,
 }
 
 /// Result of a sync operation.
@@ -249,6 +256,7 @@ impl TeamMemorySyncService {
                 checksum,
                 updated_at: now,
                 tombstoned: false, // Upsert un-tombstones
+                version: existing.version + 1,
                 ..existing
             }
         } else {
@@ -259,6 +267,7 @@ impl TeamMemorySyncService {
                 created_at: now,
                 updated_at: now,
                 tombstoned: false,
+                version: 1,
             }
         };
 
@@ -353,6 +362,7 @@ impl TeamMemorySyncService {
                         created_at: *updated_at,
                         updated_at: *updated_at,
                         tombstoned: false,
+                        version: 0,
                     });
                 }
                 Some(local) => {
@@ -365,6 +375,7 @@ impl TeamMemorySyncService {
                                 created_at: local.created_at,
                                 updated_at: *updated_at,
                                 tombstoned: false,
+                                version: 0,
                             });
                         }
                     }
@@ -568,6 +579,7 @@ mod tests {
             created_at: Utc::now(),
             updated_at: Utc::now(),
             tombstoned: false,
+            version: 0,
         }];
 
         let count = svc.apply_remote(remote_entries).unwrap();
@@ -590,6 +602,7 @@ mod tests {
             created_at: older,
             updated_at: older,
             tombstoned: false,
+            version: 0,
         }];
 
         let count = svc.apply_remote(remote_entries).unwrap();
@@ -713,6 +726,7 @@ mod tests {
                 created_at: Utc::now(),
                 updated_at: Utc::now(),
                 tombstoned: false,
+                version: 0,
             })
             .await;
 
@@ -732,6 +746,7 @@ mod tests {
             created_at: Utc::now(),
             updated_at: Utc::now(),
             tombstoned: false,
+            version: 0,
         }];
 
         transport.send_delta(&entries).await.unwrap();

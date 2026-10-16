@@ -145,6 +145,7 @@ mod tests {
             created_at: Utc::now(),
             updated_at: Utc::now(),
             tombstoned: false,
+            version: 0,
         }];
 
         transport.send_delta(&entries).await.unwrap();
@@ -161,6 +162,7 @@ mod tests {
             created_at: Utc::now(),
             updated_at: Utc::now(),
             tombstoned: false,
+            version: 0,
         };
 
         Mock::given(method("POST"))

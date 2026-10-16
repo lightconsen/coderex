@@ -114,6 +114,13 @@ pub struct MemoryEntry {
     pub updated_at: DateTime<Utc>,
     /// How many times this memory has been accessed.
     pub access_count: u64,
+    /// Monotonic version, bumped on every write.
+    ///
+    /// A caller may pin the version it expects to replace (`if_version`
+    /// semantics); see [`crate::service`]. Defaults to `0` for entries written
+    /// before the field existed, so old files still load.
+    #[serde(default)]
+    pub version: u64,
 }
 
 /// Long-term memory stored under `<base_path>/`.
@@ -297,6 +304,7 @@ impl LongTermStore {
                     key: key.or(existing.key),
                     updated_at: now,
                     access_count: existing.access_count,
+                    version: existing.version + 1,
                     ..existing
                 }
             } else {
@@ -307,6 +315,7 @@ impl LongTermStore {
                     created_at: now,
                     updated_at: now,
                     access_count: 0,
+                    version: 1,
                 }
             }
         } else {
@@ -317,6 +326,7 @@ impl LongTermStore {
                 created_at: now,
                 updated_at: now,
                 access_count: 0,
+                version: 1,
             }
         };
 

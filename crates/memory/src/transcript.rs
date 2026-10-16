@@ -1,15 +1,39 @@
 //! JSONL transcript store — append-only session transcripts.
+//!
+//! A transcript is `<base_path>/<session_id>.jsonl`, one [`TranscriptEntry`]
+//! per line. An ordinary line is a bare [`Message`] — the format has not
+//! changed — while compaction boundaries and session headers carry a `"type"`
+//! tag. See [`crate::entry`] for the entry model and why it is not larger.
+//!
+//! # The session-id sanitization rule
+//!
+//! The session id becomes the transcript's file name, so it is the one part of
+//! the path that comes from outside. [`sanitize_session_id`] is the rule, and
+//! every method here applies it before it touches the filesystem:
+//!
+//! > A session id must be 1 to [`MAX_SESSION_ID_LEN`] characters long and every
+//! > character must be an ASCII letter, digit, `-`, or `_`. Anything else —
+//! > empty, a path separator, a `.` or `..`, a control character, a character
+//! > outside ASCII — is refused.
+//!
+//! A UUID, which is what [`coderex_core::state::SessionState`] generates,
+//! satisfies this as-is. The rule is a refusal, not a rewrite: an id that does
+//! not satisfy it is reported rather than mangled into one that does, because
+//! two ids that sanitize to the same name would be the same transcript.
 
 use chrono::{DateTime, Utc};
-use coderex_core::types::Message;
+use coderex_core::types::{Message, Role};
 use flate2::Compression;
 use flate2::write::GzEncoder;
-use regex::Regex;
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
-use std::sync::LazyLock;
 use thiserror::Error;
+
+use crate::entry::TranscriptEntry;
+
+/// Longest a session id may be.
+pub const MAX_SESSION_ID_LEN: usize = 128;
 
 /// Errors from transcript operations.
 #[derive(Debug, Error)]
@@ -20,16 +44,52 @@ pub enum TranscriptError {
     /// A JSON parsing error occurred.
     #[error("JSON parse error: {0}")]
     Json(#[from] serde_json::Error),
+    /// A session id cannot be a transcript file name.
+    #[error("'{0}' is not a usable session id")]
+    InvalidSessionId(String),
 }
 
-/// Regex pattern to skip the first system prompt during replay.
-static SKIP_FIRST_PROMPT_PATTERN: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r#""role"\s*:\s*"System""#).expect("invalid skip regex"));
+impl TranscriptError {
+    /// The same failure as an [`std::io::Error`].
+    ///
+    /// The archive, backup, restore and prune methods report in `io::Result`
+    /// because they are file operations; a bad session id reaches them through
+    /// this rather than being unwrapped.
+    fn into_io(self) -> std::io::Error {
+        match self {
+            Self::Io(e) => e,
+            other => std::io::Error::new(std::io::ErrorKind::InvalidInput, other.to_string()),
+        }
+    }
+}
+
+/// The session-id sanitization rule: check, and return the id unchanged.
+///
+/// See the module docs for the rule in full. This refuses an id that cannot be
+/// a single file name; it does not rewrite one.
+///
+/// # Errors
+///
+/// [`TranscriptError::InvalidSessionId`] when the id cannot be a file name.
+pub fn sanitize_session_id(session_id: &str) -> Result<(), TranscriptError> {
+    let refuse = || TranscriptError::InvalidSessionId(session_id.to_string());
+
+    if session_id.is_empty() || session_id.len() > MAX_SESSION_ID_LEN {
+        return Err(refuse());
+    }
+    if !session_id
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
+        return Err(refuse());
+    }
+    Ok(())
+}
 
 /// Append-only JSONL transcript store.
 ///
 /// Stored at `<base_path>/<session_id>.jsonl`.
-/// Each line is a JSON-serialized `Message`.
+/// Each line is a JSON-serialized [`TranscriptEntry`].
 #[derive(Debug)]
 pub struct TranscriptStore {
     base_path: PathBuf,
@@ -42,35 +102,46 @@ impl TranscriptStore {
         Self { base_path }
     }
 
-    /// Get the file path for a session.
-    fn session_path(&self, session_id: &str) -> PathBuf {
-        self.base_path.join(format!("{session_id}.jsonl"))
+    /// Get the file path for a session, applying the session-id rule.
+    fn session_path(&self, session_id: &str) -> Result<PathBuf, TranscriptError> {
+        sanitize_session_id(session_id)?;
+        Ok(self.base_path.join(format!("{session_id}.jsonl")))
     }
 
     /// Append a message to a session's transcript.
     pub fn append(&self, session_id: &str, message: &Message) -> Result<(), TranscriptError> {
-        let path = self.session_path(session_id);
+        self.append_entry(session_id, &TranscriptEntry::message(message.clone()))
+    }
+
+    /// Append a transcript entry to a session's transcript.
+    pub fn append_entry(
+        &self,
+        session_id: &str,
+        entry: &TranscriptEntry,
+    ) -> Result<(), TranscriptError> {
+        let path = self.session_path(session_id)?;
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
         let mut file = OpenOptions::new().create(true).append(true).open(&path)?;
-        let line = serde_json::to_string(message)?;
+        let line = serde_json::to_string(entry)?;
         writeln!(file, "{line}")?;
         file.sync_all()?;
         Ok(())
     }
 
-    /// Read all messages from a session's transcript.
+    /// Read every entry from a session's transcript.
     ///
-    /// Returns an empty vec if the file does not exist.
-    pub fn read_all(&self, session_id: &str) -> Result<Vec<Message>, TranscriptError> {
-        let path = self.session_path(session_id);
+    /// Returns an empty vec if the file does not exist. Corrupted lines are
+    /// skipped with a warning rather than failing the read.
+    pub fn read_entries(&self, session_id: &str) -> Result<Vec<TranscriptEntry>, TranscriptError> {
+        let path = self.session_path(session_id)?;
         if !path.exists() {
             return Ok(Vec::new());
         }
         let file = std::fs::File::open(&path)?;
         let reader = BufReader::new(file);
-        let mut messages = Vec::new();
+        let mut entries = Vec::new();
         let mut line_no: usize = 0;
         for line in reader.lines() {
             line_no += 1;
@@ -78,8 +149,13 @@ impl TranscriptStore {
             if line.is_empty() {
                 continue;
             }
-            match serde_json::from_str::<Message>(&line) {
-                Ok(msg) => messages.push(msg),
+            match serde_json::from_str::<TranscriptEntry>(&line) {
+                // A message is classified, so a boundary written as a plain
+                // system message reads as a boundary here.
+                Ok(TranscriptEntry::Message(message)) => {
+                    entries.push(TranscriptEntry::from_message(message));
+                }
+                Ok(entry) => entries.push(entry),
                 Err(e) => {
                     tracing::warn!(
                         "skipping corrupted transcript line {} in {:?}: {}",
@@ -90,7 +166,20 @@ impl TranscriptStore {
                 }
             }
         }
-        Ok(messages)
+        Ok(entries)
+    }
+
+    /// Read all messages from a session's transcript.
+    ///
+    /// Returns an empty vec if the file does not exist. A session header is not
+    /// a message and is not returned; a compaction boundary comes back as the
+    /// system message the engine uses for it.
+    pub fn read_all(&self, session_id: &str) -> Result<Vec<Message>, TranscriptError> {
+        Ok(self
+            .read_entries(session_id)?
+            .iter()
+            .filter_map(TranscriptEntry::to_message)
+            .collect())
     }
 
     /// Read all messages, skipping the first system prompt.
@@ -101,51 +190,33 @@ impl TranscriptStore {
         &self,
         session_id: &str,
     ) -> Result<Vec<Message>, TranscriptError> {
-        let path = self.session_path(session_id);
-        if !path.exists() {
-            return Ok(Vec::new());
-        }
-        let file = std::fs::File::open(&path)?;
-        let reader = BufReader::new(file);
-        let mut messages = Vec::new();
         let mut skipped = false;
-        let mut line_no: usize = 0;
-        for line in reader.lines() {
-            line_no += 1;
-            let line = line?;
-            if line.is_empty() {
+        let mut messages = Vec::new();
+        for entry in self.read_entries(session_id)? {
+            let Some(message) = entry.to_message() else {
                 continue;
-            }
-            if !skipped && SKIP_FIRST_PROMPT_PATTERN.is_match(&line) {
+            };
+            if !skipped && matches!(message.role, Role::System) {
                 skipped = true;
                 continue;
             }
-            match serde_json::from_str::<Message>(&line) {
-                Ok(msg) => messages.push(msg),
-                Err(e) => {
-                    tracing::warn!(
-                        "skipping corrupted transcript line {} in {:?}: {}",
-                        line_no,
-                        path,
-                        e
-                    );
-                }
-            }
+            messages.push(message);
         }
         Ok(messages)
     }
 
     /// Write a compact boundary marker to the transcript.
     ///
-    /// Appends a special marker message indicating where compact occurred.
+    /// Appends a [`TranscriptEntry::CompactBoundary`] naming where context was
+    /// compacted.
     pub fn write_compact_boundary(&self, session_id: &str) -> Result<(), TranscriptError> {
-        let boundary_msg = Message::system(
+        let entry = TranscriptEntry::compact_boundary(
             "<coderex_compact_boundary>\n\
             Context was compacted at this point.\n\
             Earlier conversation history has been removed.\n\
             </coderex_compact_boundary>",
         );
-        self.append(session_id, &boundary_msg)
+        self.append_entry(session_id, &entry)
     }
 
     /// Rewrite the transcript, keeping only messages from a given index onward.
@@ -156,7 +227,7 @@ impl TranscriptStore {
         session_id: &str,
         keep_from_index: usize,
     ) -> Result<(), TranscriptError> {
-        let path = self.session_path(session_id);
+        let path = self.session_path(session_id)?;
         if !path.exists() {
             return Ok(());
         }
@@ -184,8 +255,14 @@ impl TranscriptStore {
     /// Rewrite the transcript with a new set of messages (full replace).
     ///
     /// Uses a temp file + atomic rename for crash safety.
+    ///
+    /// Every line written is a bare message, exactly as before — a compaction
+    /// boundary that is a system message in `messages` goes back out as the
+    /// same system message. The typed form is opt-in through
+    /// [`Self::append_entry`]; [`Self::read_entries`] classifies on the way in,
+    /// so a boundary is a boundary either way.
     pub fn rewrite(&self, session_id: &str, messages: &[Message]) -> Result<(), TranscriptError> {
-        let path = self.session_path(session_id);
+        let path = self.session_path(session_id)?;
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
@@ -224,7 +301,9 @@ impl TranscriptStore {
 
     /// Get the file modification time for a session.
     pub fn session_modified_at(&self, session_id: &str) -> std::io::Result<Option<DateTime<Utc>>> {
-        let path = self.session_path(session_id);
+        let path = self
+            .session_path(session_id)
+            .map_err(TranscriptError::into_io)?;
         if !path.exists() {
             return Ok(None);
         }
@@ -243,7 +322,9 @@ impl TranscriptStore {
         session_id: &str,
         archive_dir: &Path,
     ) -> std::io::Result<PathBuf> {
-        let source = self.session_path(session_id);
+        let source = self
+            .session_path(session_id)
+            .map_err(TranscriptError::into_io)?;
         if !source.exists() {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::NotFound,
@@ -302,7 +383,9 @@ impl TranscriptStore {
             if self.archive_session(id, &archive_dir).is_ok() {
                 archived += 1;
                 // Delete original
-                let path = self.session_path(id);
+                let Ok(path) = self.session_path(id) else {
+                    continue;
+                };
                 if std::fs::remove_file(&path).is_ok() {
                     deleted += 1;
                 }
@@ -321,7 +404,9 @@ impl TranscriptStore {
     ///
     /// Writes `<session_path>.bak`.
     pub fn backup(&self, session_id: &str) -> std::io::Result<PathBuf> {
-        let source = self.session_path(session_id);
+        let source = self
+            .session_path(session_id)
+            .map_err(TranscriptError::into_io)?;
         if !source.exists() {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::NotFound,
@@ -338,7 +423,9 @@ impl TranscriptStore {
     /// Reads `<session_path>.bak` and replaces the current transcript.
     /// Returns `None` if no backup exists.
     pub fn restore(&self, session_id: &str) -> std::io::Result<Option<PathBuf>> {
-        let source = self.session_path(session_id);
+        let source = self
+            .session_path(session_id)
+            .map_err(TranscriptError::into_io)?;
         let backup_path = source.with_extension("jsonl.bak");
         if !backup_path.exists() {
             return Ok(None);
@@ -362,7 +449,7 @@ impl TranscriptStore {
     ) -> Result<(), TranscriptError> {
         use aes_gcm::aead::{Aead, AeadCore};
         use rand_core::OsRng;
-        let path = self.encrypted_session_path(session_id);
+        let path = self.encrypted_session_path(session_id)?;
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
@@ -392,7 +479,7 @@ impl TranscriptStore {
         cipher: &aes_gcm::Aes256Gcm,
     ) -> Result<Vec<Message>, TranscriptError> {
         use aes_gcm::aead::Aead;
-        let path = self.encrypted_session_path(session_id);
+        let path = self.encrypted_session_path(session_id)?;
         if !path.exists() {
             return Ok(Vec::new());
         }
@@ -431,8 +518,9 @@ impl TranscriptStore {
 
     /// Get the file path for an encrypted session.
     #[cfg(feature = "encryption")]
-    fn encrypted_session_path(&self, session_id: &str) -> PathBuf {
-        self.base_path.join(format!("{session_id}.jsonl.enc"))
+    fn encrypted_session_path(&self, session_id: &str) -> Result<PathBuf, TranscriptError> {
+        sanitize_session_id(session_id)?;
+        Ok(self.base_path.join(format!("{session_id}.jsonl.enc")))
     }
 }
 
@@ -599,7 +687,7 @@ mod tests {
     #[test]
     fn read_all_skips_corrupted_lines() {
         let (store, _tmp) = temp_store();
-        let path = store.session_path("session_corrupt");
+        let path = store.session_path("session_corrupt").unwrap();
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         let mut file = std::fs::File::create(&path).unwrap();
         writeln!(
@@ -626,7 +714,7 @@ mod tests {
     #[test]
     fn truncate_before_skips_corrupted_lines() {
         let (store, _tmp) = temp_store();
-        let path = store.session_path("session_truncate_corrupt");
+        let path = store.session_path("session_truncate_corrupt").unwrap();
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         let mut file = std::fs::File::create(&path).unwrap();
         writeln!(
@@ -688,7 +776,7 @@ mod tests {
         assert!(backup_path.to_string_lossy().ends_with(".jsonl.bak"));
 
         // Corrupt the original
-        let orig_path = store.session_path("sess_bak");
+        let orig_path = store.session_path("sess_bak").unwrap();
         std::fs::write(&orig_path, "corrupted\n").unwrap();
 
         let restored = store.restore("sess_bak").unwrap().unwrap();
@@ -807,5 +895,138 @@ mod tests {
 
         let enc_path = tmp.path().join("ext_check.jsonl.enc");
         assert!(enc_path.exists());
+    }
+
+    // ─── The session-id rule ───────────────────────────────────────────────
+
+    #[test]
+    fn a_uuid_session_id_is_accepted() {
+        let id = uuid::Uuid::new_v4().to_string();
+        assert!(sanitize_session_id(&id).is_ok());
+        assert!(sanitize_session_id("sess_1").is_ok());
+        assert!(sanitize_session_id("ABC-def_123").is_ok());
+    }
+
+    #[test]
+    fn a_session_id_that_is_not_a_file_name_is_refused() {
+        let hostile = [
+            "",           // empty
+            "..",         // parent directory
+            ".",          // current directory
+            "a/b",        // path separator
+            "a\\b",       // other path separator
+            "../escape",  // traversal
+            "with space", // whitespace
+            "nul\0byte",  // control character
+            "new\nline",  // newline
+            "café",       // non-ASCII
+            "dots.jsonl", // would change the extension
+            "semi;colon", // shell metacharacter
+        ];
+        for id in hostile {
+            assert!(
+                sanitize_session_id(id).is_err(),
+                "{id:?} should be refused as a session id"
+            );
+        }
+    }
+
+    #[test]
+    fn an_over_long_session_id_is_refused() {
+        let long = "a".repeat(MAX_SESSION_ID_LEN);
+        assert!(sanitize_session_id(&long).is_ok());
+        let too_long = "a".repeat(MAX_SESSION_ID_LEN + 1);
+        assert!(sanitize_session_id(&too_long).is_err());
+    }
+
+    #[test]
+    fn a_hostile_session_id_never_touches_the_filesystem() {
+        let (store, tmp) = temp_store();
+        let escape = tmp.path().join("escape.jsonl");
+
+        // Every method that takes a session id must refuse, not write.
+        assert!(store.append("../escape", &Message::user("x")).is_err());
+        assert!(store.read_all("../escape").is_err());
+        assert!(store.read_all_skip_first_prompt("../escape").is_err());
+        assert!(store.read_entries("../escape").is_err());
+        assert!(store.rewrite("../escape", &[Message::user("x")]).is_err());
+        assert!(store.write_compact_boundary("../escape").is_err());
+        assert!(store.truncate_before("../escape", 0).is_err());
+        assert!(store.session_modified_at("../escape").is_err());
+        assert!(store.backup("../escape").is_err());
+        assert!(store.restore("../escape").is_err());
+        assert!(store.archive_session("../escape", tmp.path()).is_err());
+
+        assert!(!escape.exists(), "a refused id must not create a file");
+    }
+
+    // ─── Entry model ───────────────────────────────────────────────────────
+
+    #[test]
+    fn a_boundary_written_by_the_store_reads_back_as_a_boundary_entry() {
+        let (store, _tmp) = temp_store();
+        store
+            .append("sess_entries", &Message::user("hello"))
+            .unwrap();
+        store.write_compact_boundary("sess_entries").unwrap();
+
+        let entries = store.read_entries("sess_entries").unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].kind(), crate::entry::EntryKind::UserText);
+        assert_eq!(entries[1].kind(), crate::entry::EntryKind::CompactBoundary);
+
+        // And read_all still hands back the message a message-only reader
+        // expects.
+        let messages = store.read_all("sess_entries").unwrap();
+        assert_eq!(messages.len(), 2);
+        assert!(matches!(
+            messages[1].role,
+            coderex_core::types::Role::System
+        ));
+    }
+
+    #[test]
+    fn a_bare_boundary_line_is_classified_on_read() {
+        let (store, _tmp) = temp_store();
+        let path = store.session_path("sess_bare_boundary").unwrap();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        // What the engine writes today: a plain system message.
+        std::fs::write(
+            &path,
+            format!(
+                "{}\n",
+                serde_json::to_string(&Message::system(
+                    "<coderex_compact_boundary>\nremoved\n</coderex_compact_boundary>"
+                ))
+                .unwrap()
+            ),
+        )
+        .unwrap();
+
+        let entries = store.read_entries("sess_bare_boundary").unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].kind(), crate::entry::EntryKind::CompactBoundary);
+    }
+
+    #[test]
+    fn a_session_header_is_not_returned_as_a_message() {
+        let (store, _tmp) = temp_store();
+        store
+            .append_entry(
+                "sess_header",
+                &crate::entry::TranscriptEntry::session_meta("sess_header", "/tmp/p", None),
+            )
+            .unwrap();
+        store
+            .append("sess_header", &Message::user("hello"))
+            .unwrap();
+
+        let entries = store.read_entries("sess_header").unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].kind(), crate::entry::EntryKind::SessionMeta);
+
+        // The header is metadata; a message reader sees only the message.
+        let messages = store.read_all("sess_header").unwrap();
+        assert_eq!(messages.len(), 1);
     }
 }
