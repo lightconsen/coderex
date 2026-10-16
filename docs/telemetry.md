@@ -21,12 +21,14 @@ Privacy-first telemetry collection, local storage, and batch upload. Stores even
 ### Key Types (uploader.rs)
 
 - **`TelemetryConfig`** — Endpoint, optional explicit crash endpoint, API key, batch size (default 100), interval (default 300s), enabled flag, sample rate (default 1.0), optional pinned root certificate PEM for TLS pinning.
-- **`TelemetryUploader`** — reqwest client + own DB connection + config + circuit breaker. Opens a fresh SQLite connection per upload batch for safe concurrent access.
-- **`CircuitBreaker`** — Three-state breaker (Closed/Open/HalfOpen). Opens after 5 consecutive failures, cools down for 60s, then transitions to HalfOpen.
+- **`TelemetryUploader`** — reqwest client + own DB connection + config + circuit breaker + rate limiter. Opens a fresh SQLite connection per upload batch for safe concurrent access.
+- **`CircuitBreaker`** — Three-state breaker (Closed/Open/HalfOpen). Opens after 5 consecutive failures, cools down for 60s, then transitions to HalfOpen. Handles *failures*.
+- **`RateLimiter`** — Sliding-window limiter for *rejections*: at most 10 upload attempts per 60s, and after the endpoint answers 429/403 uploads are suppressed for 300s. `upload_pending` surfaces those statuses as `TelemetryError::Rejected` so the loop can back off instead of retrying into the limit.
 
 ### Key Types (scrubber.rs)
 
-- **`Scrubber`** — Regex-based PII sanitizer. Replaces emails, IPs, home paths, and API keys with `<EMAIL>`, `<IP>`, `<USER>`, `<API_KEY>` tokens. Applied to `Error` and `ApiCall` events before insertion.
+- **`Scrubber`** — Regex-based PII sanitizer. Replaces emails, IPs, home paths, and credential shapes with `<EMAIL>`, `<IP>`, `<USER>`, `<API_KEY>`, `<AUTH_TOKEN>`, `<JWT>`, `<PRIVATE_KEY>` tokens. Applied to `Error.message`, `ApiCall.provider/model`, and `ToolUsed.tool_name` before insertion.
+- **`EXCLUDED_FIELDS`** — Field names (`api_key`, `authorization`, `password`, `secret`, `token`, `cookie`, `set-cookie`, `apikey`) that `Scrubber::scrub_json` **removes** from a payload entirely, recursively, as a second layer at upload time.
 
 ### Key Types (crash.rs)
 
@@ -74,24 +76,41 @@ Privacy-first telemetry collection, local storage, and batch upload. Stores even
 - **Size-based retention** via `TelemetryStore::prune_to_size()`.
 - **Explicit crash endpoint** override (`TelemetryConfig.crash_endpoint`) or derived from events endpoint.
 - **DB size queries** via `PRAGMA page_count * page_size`.
-- **PII scrubbing** via `Scrubber` (emails, IPs, paths, API keys) applied to `Error` and `ApiCall` events.
+- **PII scrubbing** via `Scrubber` (emails, IPs, paths, API keys, bearer tokens, JWTs, PEM private keys) applied to `Error`, `ApiCall`, and `ToolUsed` events, plus an `EXCLUDED_FIELDS` exclusion set applied recursively to payloads at upload time.
 - **Worker panic recovery** with `catch_unwind`, fresh DB connection per respawn, 3-attempt limit, 10s cooldown.
 - **Certificate pinning** via `TelemetryConfig.pinned_cert_pem` + `add_root_certificate()`.
-- **User consent gate** on first run, persisted to `settings.json`.
+- **Opt-in consent gate**: telemetry is off until the user consents. `Settings::defaults()` leaves `telemetry_enabled` as `None` ("undecided"), so the first-run prompt in `StartupOrchestrator::phase_load_settings` is actually reachable; an undecided value is treated as *disabled*. The choice is persisted to `settings.json`.
+- **Rate limiting / suppression**: `RateLimiter` caps uploads at 10/minute and suppresses them for 300s after an HTTP 429/403.
 - **Settings.json integration** via `TelemetrySubConfig` nested struct (schema v3).
+
+### Channels
+
+CodeRex has one channel: a first-party HTTP JSON uploader (`uploader.rs`). Claude
+has three (first-party OTel Logs, user-configured OTel, Datadog — first-party
+only). The extra channels are deliberately **not** copied (⚪): each requires a
+heavy SDK dependency (OpenTelemetry / Datadog), which is out of scope for this
+work, and their wire formats are not the CodeRex event schema. The single
+first-party channel is the only one with a real consumer here.
 
 ### What Is Stubbed/Partial
 
-None — all previously stubbed items are now implemented.
+- **Model-field redaction**: Claude applies a dedicated model-field regex plus an
+  exclusion set. CodeRex routes `provider`/`model` through the shared pattern set
+  and adds the `EXCLUDED_FIELDS` exclusion set, but does **not** add a model-name
+  allowlist — model ids are not PII and an allowlist would only reduce telemetry
+  usefulness. Deliberate ⚪.
+- **Enterprise/HIPAA allowlisting**: no stricter allowlist mode is implemented;
+  the same scrubber runs for all users.
 
 ### Tests
 
-- 4 tests in `store.rs` (insert, batch, mark uploaded, crash roundtrip).
-- 6 tests in `uploader.rs` (config defaults, crash endpoint explicit/derived, circuit breaker, compression).
-- 1 test in `crash.rs` (serialization).
-- 5 tests in `scrubber.rs` (email, IPv4, home path, API key, event scrubbing).
+- 5 tests in `store.rs` (insert, batch, mark uploaded, crash roundtrip, size retention).
+- 15 tests in `uploader.rs` (config defaults, crash endpoint explicit/derived, circuit breaker, gzip encoding/header, rate limiter window/suppression, rejection statuses).
+- 2 tests in `crash.rs` (serialization, ingest scrubbing).
+- 13 tests in `scrubber.rs` (email, IPv4, home path, API key, GitHub/AWS/bearer/JWT/private-key, event scrubbing, exclusion set, nested JSON scrubbing).
 - Tests use tempfile/NamedTempFile for SQLite.
 
 ## Gaps for Production
 
-None — all identified production gaps are implemented.
+None. The items under "What Is Stubbed/Partial" are deliberate ⚪ product-form
+differences, not gaps.

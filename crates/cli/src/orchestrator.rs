@@ -504,11 +504,21 @@ impl StartupOrchestrator {
         // Find project config in CWD or ancestors
         let project_path = Self::find_project_config(&self.ctx.cwd);
 
-        let config_service = ConfigService::new(user_path.clone(), project_path.clone());
+        // The managed-settings file carrier (enterprise). Defaults to
+        // <config_dir>/managed_settings.json; deployments can point it at an
+        // admin-controlled location via the env var.
+        let managed_path = std::env::var("CODEREX_MANAGED_SETTINGS_PATH")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|_| config_dir.join("managed_settings.json"));
+
+        let config_service = ConfigService::new(user_path.clone(), project_path.clone())
+            .with_managed_settings_path(managed_path);
         let mut settings = config_service.resolve()?;
 
-        // First-run consent gate: if no user config exists and telemetry_enabled
-        // is not explicitly set, prompt the user interactively.
+        // First-run consent gate. Telemetry is opt-in: `telemetry_enabled` is
+        // `None` until the user decides (the built-in defaults no longer force
+        // it on), so this gate is reachable. It fires on first run — no user
+        // settings file yet and no decision recorded anywhere.
         if !user_path.exists() && settings.telemetry_enabled.is_none() {
             if let Some(choice) = Self::prompt_telemetry_consent() {
                 settings.telemetry_enabled = Some(choice);
@@ -552,8 +562,9 @@ impl StartupOrchestrator {
             println!("{}", diff.render());
         }
 
-        // Initialize telemetry subsystem with resolved settings
-        let telemetry_enabled = settings.telemetry_enabled.unwrap_or(true);
+        // Initialize telemetry subsystem with resolved settings.
+        // Undecided (`None`) means no consent was recorded — stay off.
+        let telemetry_enabled = settings.telemetry_enabled.unwrap_or(false);
         if telemetry_enabled {
             if let Some((handle, _uploader)) = Self::init_telemetry(&settings) {
                 self.ctx.telemetry_handle = Some(handle);
@@ -1097,6 +1108,8 @@ impl StartupOrchestrator {
         repl.with_json_schema(self.ctx.json_schema.clone());
         let budget = self.ctx.settings.as_ref().and_then(|s| s.max_budget_usd);
         repl.with_max_budget_usd(budget);
+        let hooks = self.ctx.settings.as_ref().and_then(|s| s.hooks.clone());
+        repl.with_hooks(hooks);
         repl.with_max_turns(self.ctx.max_turns);
         repl.with_replay_user_messages(self.ctx.replay_user_messages);
         repl.with_include_partial_messages(self.ctx.include_partial_messages);

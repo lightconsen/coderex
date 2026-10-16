@@ -35,7 +35,47 @@ pub enum ConfigError {
         /// The unrecognized field name.
         field: String,
     },
+    /// A settings file exceeded the maximum allowed size and was skipped.
+    #[error("settings file {path:?} is {size} bytes, exceeding the {limit} byte limit")]
+    TooLarge {
+        /// Path to the oversized file.
+        path: PathBuf,
+        /// Size of the file in bytes.
+        size: u64,
+        /// The configured maximum size in bytes.
+        limit: u64,
+    },
 }
+
+/// Maximum size of a single settings file (2 MiB).
+///
+/// A settings file is loaded on every startup and parsed eagerly; an
+/// unbounded file is a cheap way to make the CLI hang or exhaust memory.
+/// Files larger than this are skipped whole (see [`load_settings_file`]).
+pub const MAX_SETTINGS_FILE_BYTES: u64 = 2 * 1024 * 1024;
+
+/// The set of keys a settings file may contain.
+const KNOWN_SETTINGS_FIELDS: [&str; 9] = [
+    "config_version",
+    "model",
+    "permission_mode",
+    "max_budget_usd",
+    "telemetry_enabled",
+    "telemetry",
+    "hooks",
+    "mcp_servers",
+    "api_key",
+];
+
+/// Permission modes accepted in settings, most restrictive first.
+const VALID_PERMISSION_MODES: [&str; 6] = [
+    "default",
+    "accept-edits",
+    "bypass-permissions",
+    "dont-ask",
+    "plan",
+    "auto",
+];
 
 /// A single diff entry showing what changed and where.
 #[derive(Debug, Clone)]
@@ -132,6 +172,12 @@ pub struct Settings {
 
 impl Settings {
     /// Built-in default settings.
+    ///
+    /// `telemetry_enabled` is deliberately left `None` ("undecided"). Telemetry
+    /// is opt-in: a `None` value means the user has not consented, and callers
+    /// must treat it as disabled. Setting a `Some(true)` default here would make
+    /// the first-run consent gate unreachable and enable telemetry without ever
+    /// asking (see `StartupOrchestrator::phase_load_settings`).
     #[must_use]
     pub fn defaults() -> Self {
         Self {
@@ -139,7 +185,7 @@ impl Settings {
             model: Some("claude-sonnet-4-6".into()),
             permission_mode: Some("default".into()),
             max_budget_usd: None,
-            telemetry_enabled: Some(true),
+            telemetry_enabled: None,
             telemetry: None,
             hooks: None,
             mcp_servers: None,
@@ -166,18 +212,10 @@ impl Settings {
             }
         }
         if let Some(ref mode) = self.permission_mode {
-            let valid_modes = [
-                "default",
-                "accept-edits",
-                "bypass-permissions",
-                "dont-ask",
-                "plan",
-                "auto",
-            ];
-            if !valid_modes.contains(&mode.as_str()) {
+            if !VALID_PERMISSION_MODES.contains(&mode.as_str()) {
                 return Err(ConfigError::Validation {
                     field: "permission_mode".to_string(),
-                    message: format!("must be one of: {}", valid_modes.join(", ")),
+                    message: format!("must be one of: {}", VALID_PERMISSION_MODES.join(", ")),
                 });
             }
         }
@@ -221,6 +259,11 @@ impl Settings {
     /// Merge another Settings into this one.
     ///
     /// Values from `other` override `self` when they are `Some`.
+    ///
+    /// Every key is winner-take-all: the higher-priority layer replaces the
+    /// whole value rather than merging into it (the `telemetry` sub-config is
+    /// replaced wholesale, not field-by-field). This is why there is no separate
+    /// "winner-only under merge" key table — the property holds for all keys.
     #[must_use]
     pub fn merge(&self, other: &Self) -> Self {
         Self {
@@ -353,9 +396,11 @@ impl RuntimeOverrides {
 
 /// Service for loading and merging settings from all sources.
 #[derive(Debug, Clone)]
+#[allow(clippy::struct_field_names)] // `*_config_path` is the clearest naming here
 pub struct ConfigService {
     user_config_path: PathBuf,
     project_config_path: Option<PathBuf>,
+    managed_config_path: Option<PathBuf>,
 }
 
 impl ConfigService {
@@ -365,7 +410,53 @@ impl ConfigService {
         Self {
             user_config_path,
             project_config_path,
+            managed_config_path: None,
         }
+    }
+
+    /// Attach a managed-settings file (the "file" enterprise carrier).
+    ///
+    /// The file is a [`crate::dirs::ManagedSettings`] document — a `settings`
+    /// object plus a SHA-256 `checksum` — and is merged at the highest
+    /// priority. When absent, no managed file source is consulted.
+    #[must_use]
+    pub fn with_managed_settings_path(mut self, path: PathBuf) -> Self {
+        self.managed_config_path = Some(path);
+        self
+    }
+
+    /// Load managed settings from the configured file carrier.
+    ///
+    /// Returns `Ok(None)` if no managed path is configured or the file is
+    /// missing. A checksum mismatch is treated as absent (fail closed) so a
+    /// tampered managed file cannot relax policy.
+    pub fn load_managed_config(&self) -> Result<Option<Settings>, ConfigError> {
+        let Some(path) = &self.managed_config_path else {
+            return Ok(None);
+        };
+        if !path.exists() {
+            return Ok(None);
+        }
+        enforce_size_cap(path)?;
+        let content = std::fs::read_to_string(path)?;
+        let managed: crate::dirs::ManagedSettings =
+            serde_json::from_str(&content).map_err(|source| ConfigError::Json {
+                path: path.clone(),
+                source,
+            })?;
+        if !managed.verify_checksum() {
+            tracing::warn!(
+                "managed settings at {path:?} failed checksum verification — ignoring (fail closed)"
+            );
+            return Ok(None);
+        }
+        check_unknown_fields(&managed.settings, "managed")?;
+        let settings: Settings =
+            serde_json::from_value(managed.settings).map_err(|source| ConfigError::Json {
+                path: path.clone(),
+                source,
+            })?;
+        Ok(Some(finalize_settings(settings, "managed")?))
     }
 
     /// Load user config from `~/.coderex/settings.json`.
@@ -387,8 +478,9 @@ impl ConfigService {
 
     /// Resolve the final merged settings, migrate if needed, and validate.
     ///
-    /// Merge order: built-in defaults → user config → project config.
-    /// Runtime overrides are applied separately via `RuntimeOverrides::apply`.
+    /// Merge order: built-in defaults → user config → project config → managed
+    /// config. Runtime overrides are applied separately via
+    /// `RuntimeOverrides::apply`.
     pub fn resolve(&self) -> Result<Settings, ConfigError> {
         let defaults = Settings::defaults();
 
@@ -404,7 +496,13 @@ impl ConfigService {
             .unwrap_or(None)
             .unwrap_or_default();
 
-        let mut merged = defaults.merge(&user).merge(&project);
+        let managed = self
+            .load_managed_config()
+            .inspect_err(|e| tracing::debug!("managed config not loaded: {e}"))
+            .unwrap_or(None)
+            .unwrap_or_default();
+
+        let mut merged = defaults.merge(&user).merge(&project).merge(&managed);
 
         // Migrate schema if needed
         migrate_settings(&mut merged, "resolved");
@@ -442,46 +540,105 @@ fn enforce_permission_source_policy(settings: &mut Settings, source: &str) {
     }
 }
 
+/// Enforce which settings sources may turn telemetry on.
+///
+/// Telemetry is opt-in. Repository-controlled files (project / local settings)
+/// are committed to the repository, so they must never be able to enable
+/// telemetry for a user who has not consented — they may only *disable* it.
+/// An attempt to enable it is dropped, so the value falls back to the next
+/// more permissive layer (user / flag / managed). This is the same
+/// "repository-controlled files must not relax privacy" reasoning as
+/// [`enforce_permission_source_policy`].
+fn enforce_telemetry_source_policy(settings: &mut Settings, source: &str) {
+    let repo_controlled = matches!(source, "project" | "local");
+    if repo_controlled && settings.telemetry_enabled == Some(true) {
+        tracing::warn!(
+            "settings telemetry_enabled=true ignored — only user/flag/managed settings may enable telemetry ({source} settings are repository-controllable)"
+        );
+        settings.telemetry_enabled = None;
+    }
+}
+
+/// Reject a settings file that exceeds [`MAX_SETTINGS_FILE_BYTES`].
+///
+/// The whole file is skipped rather than truncated: a partially-read settings
+/// file is worse than none, because the reader cannot tell which keys were cut.
+fn enforce_size_cap(path: &Path) -> Result<(), ConfigError> {
+    let size = std::fs::metadata(path)?.len();
+    if size > MAX_SETTINGS_FILE_BYTES {
+        tracing::warn!(
+            "settings file {path:?} is {size} bytes (limit {MAX_SETTINGS_FILE_BYTES}) — skipping the whole file"
+        );
+        return Err(ConfigError::TooLarge {
+            path: path.to_path_buf(),
+            size,
+            limit: MAX_SETTINGS_FILE_BYTES,
+        });
+    }
+    Ok(())
+}
+
+/// Reject a parsed settings object that carries a key we do not understand.
+fn check_unknown_fields(value: &serde_json::Value, source: &str) -> Result<(), ConfigError> {
+    if let Some(obj) = value.as_object() {
+        for key in obj.keys() {
+            if !KNOWN_SETTINGS_FIELDS.contains(&key.as_str()) {
+                tracing::warn!("unknown config field in {source} settings: {key}");
+                return Err(ConfigError::UnknownField { field: key.clone() });
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Migrate, validate, and apply source policies to a freshly-parsed settings value.
+///
+/// An unrecognized `permission_mode` is dropped (a *restrictive re-read*) rather
+/// than rejecting the whole file: the rest of the file still applies, and the
+/// effective mode falls back to the next layer — ultimately the built-in
+/// `"default"`, the most restrictive mode. Every other invalid value rejects
+/// the whole file.
+fn finalize_settings(mut settings: Settings, source: &str) -> Result<Settings, ConfigError> {
+    migrate_settings(&mut settings, source);
+
+    if let Some(mode) = settings.permission_mode.as_deref() {
+        if !VALID_PERMISSION_MODES.contains(&mode) {
+            tracing::warn!(
+                "invalid permission_mode '{mode}' in {source} settings — ignoring it (falling back to a more restrictive mode)"
+            );
+            settings.permission_mode = None;
+        }
+    }
+
+    settings.validate()?;
+    enforce_permission_source_policy(&mut settings, source);
+    enforce_telemetry_source_policy(&mut settings, source);
+    Ok(settings)
+}
+
 /// Load and deserialize a settings file, migrating and validating.
+///
+/// Any error (oversized file, unknown field, invalid JSON, failed validation)
+/// rejects the *whole* file: callers see `Err` and fall back to the next layer.
+/// A settings file is never partially applied.
 fn load_settings_file(path: &Path, source: &str) -> Result<Option<Settings>, ConfigError> {
     if !path.exists() {
         return Ok(None);
     }
+    enforce_size_cap(path)?;
     let content = std::fs::read_to_string(path)?;
 
     // Check for unknown fields by parsing as generic JSON first
     if let Ok(value) = serde_json::from_str::<serde_json::Value>(&content) {
-        if let Some(obj) = value.as_object() {
-            let known_fields = [
-                "config_version",
-                "model",
-                "permission_mode",
-                "max_budget_usd",
-                "telemetry_enabled",
-                "telemetry",
-                "hooks",
-                "mcp_servers",
-                "api_key",
-            ];
-            for key in obj.keys() {
-                if !known_fields.contains(&key.as_str()) {
-                    tracing::warn!("unknown config field in {path:?}: {key}");
-                    return Err(ConfigError::UnknownField { field: key.clone() });
-                }
-            }
-        }
+        check_unknown_fields(&value, source)?;
     }
 
-    let mut settings: Settings =
+    let settings: Settings =
         serde_json::from_str(&content).map_err(|source| ConfigError::Json {
             path: path.to_path_buf(),
             source,
         })?;
-
-    // Migrate and validate
-    migrate_settings(&mut settings, source);
-    settings.validate()?;
-    enforce_permission_source_policy(&mut settings, source);
+    let settings = finalize_settings(settings, source)?;
 
     // Write back migrated config
     if let Ok(migrated) = serde_json::to_string_pretty(&settings) {
@@ -825,5 +982,230 @@ mod tests {
     fn resolve_api_key_passthrough() {
         let key = resolve_api_key("my-raw-key");
         assert_eq!(key, "my-raw-key");
+    }
+
+    // ── Invalid values: whole-file skip vs. restrictive re-read ──────────
+
+    /// An unrecognized `permission_mode` is dropped (restrictive re-read)
+    /// instead of rejecting the whole file — the other keys still apply.
+    #[test]
+    fn invalid_permission_mode_is_dropped_not_whole_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let user_path = temp.path().join("user.json");
+        std::fs::write(
+            &user_path,
+            r#"{"permission_mode":"god-mode","model":"custom-model"}"#,
+        )
+        .unwrap();
+        let service = ConfigService::new(user_path, None);
+        let resolved = service.resolve().unwrap();
+        // The invalid mode falls back to the most restrictive default...
+        assert_eq!(resolved.permission_mode.as_deref(), Some("default"));
+        // ...and the rest of the file still applies.
+        assert_eq!(resolved.model, Some("custom-model".into()));
+    }
+
+    /// A different invalid value still rejects the whole file.
+    #[test]
+    fn invalid_model_still_rejects_the_whole_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let user_path = temp.path().join("user.json");
+        std::fs::write(
+            &user_path,
+            r#"{"model":"","permission_mode":"plan","max_budget_usd":7.0}"#,
+        )
+        .unwrap();
+        let service = ConfigService::new(user_path, None);
+        let resolved = service.resolve().unwrap();
+        // Whole file dropped: neither the valid mode nor the budget survive.
+        assert_eq!(resolved.permission_mode.as_deref(), Some("default"));
+        assert_eq!(resolved.max_budget_usd, None);
+    }
+
+    // ── Telemetry consent / source policy ────────────────────────────────
+
+    /// The default must leave telemetry *undecided*: a `Some(true)` default
+    /// made the first-run consent gate (`is_none()`) unreachable and turned
+    /// telemetry on without ever asking.
+    #[test]
+    fn defaults_leave_telemetry_undecided() {
+        assert!(Settings::defaults().telemetry_enabled.is_none());
+        let service = ConfigService::new(PathBuf::from("/nonexistent/settings.json"), None);
+        assert!(service.resolve().unwrap().telemetry_enabled.is_none());
+    }
+
+    /// A repository-committed project file must not be able to switch
+    /// telemetry on for someone who never consented.
+    #[test]
+    fn project_settings_cannot_enable_telemetry() {
+        let temp = tempfile::tempdir().unwrap();
+        let project_path = temp.path().join("project.json");
+        std::fs::write(&project_path, r#"{"telemetry_enabled":true}"#).unwrap();
+        let service = ConfigService::new(temp.path().join("user.json"), Some(project_path));
+        assert_eq!(service.resolve().unwrap().telemetry_enabled, None);
+    }
+
+    /// The same file may still turn telemetry *off*.
+    #[test]
+    fn project_settings_can_disable_telemetry() {
+        let temp = tempfile::tempdir().unwrap();
+        let user_path = temp.path().join("user.json");
+        std::fs::write(&user_path, r#"{"telemetry_enabled":true}"#).unwrap();
+        let project_path = temp.path().join("project.json");
+        std::fs::write(&project_path, r#"{"telemetry_enabled":false}"#).unwrap();
+        let service = ConfigService::new(user_path, Some(project_path));
+        assert_eq!(service.resolve().unwrap().telemetry_enabled, Some(false));
+    }
+
+    /// The user's own settings may enable telemetry.
+    #[test]
+    fn user_settings_can_enable_telemetry() {
+        let temp = tempfile::tempdir().unwrap();
+        let user_path = temp.path().join("user.json");
+        std::fs::write(&user_path, r#"{"telemetry_enabled":true}"#).unwrap();
+        let service = ConfigService::new(user_path, None);
+        assert_eq!(service.resolve().unwrap().telemetry_enabled, Some(true));
+    }
+
+    // ── Size cap ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn oversized_settings_file_is_skipped_whole() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("user.json");
+        let padding = "a".repeat(usize::try_from(MAX_SETTINGS_FILE_BYTES).unwrap() + 1);
+        std::fs::write(
+            &path,
+            format!(r#"{{"model":"custom-model","api_key":"{padding}"}}"#),
+        )
+        .unwrap();
+
+        assert!(matches!(
+            load_settings_file(&path, "user"),
+            Err(ConfigError::TooLarge { .. })
+        ));
+
+        // The whole file is dropped, so even the valid `model` does not apply.
+        let service = ConfigService::new(path, None);
+        assert_eq!(
+            service.resolve().unwrap().model,
+            Some("claude-sonnet-4-6".into())
+        );
+    }
+
+    #[test]
+    fn settings_file_at_the_size_limit_is_accepted() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("user.json");
+        // Build a valid file whose byte length is exactly the cap.
+        let prefix = r#"{"api_key":""}"#;
+        let padding = "a".repeat(usize::try_from(MAX_SETTINGS_FILE_BYTES).unwrap() - prefix.len());
+        std::fs::write(&path, format!(r#"{{"api_key":"{padding}"}}"#)).unwrap();
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().len(),
+            MAX_SETTINGS_FILE_BYTES
+        );
+        assert!(load_settings_file(&path, "user").is_ok());
+    }
+
+    // ── Merge semantics (WINNER_ONLY_UNDER_MERGE) ────────────────────────
+
+    /// Every key is winner-take-all: a higher layer replaces the whole value
+    /// instead of deep-merging into it, so no separate "winner-only" table is
+    /// needed.
+    #[test]
+    fn merge_replaces_whole_value_never_deep_merges() {
+        let user = Settings {
+            telemetry: Some(TelemetrySubConfig {
+                endpoint: Some("https://user.example".into()),
+                batch_size: Some(5),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let project = Settings {
+            telemetry: Some(TelemetrySubConfig {
+                endpoint: Some("https://project.example".into()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let merged = user.merge(&project);
+        let telemetry = merged.telemetry.unwrap();
+        assert_eq!(
+            telemetry.endpoint.as_deref(),
+            Some("https://project.example")
+        );
+        // The loser's batch_size does NOT survive — this is whole-value replacement.
+        assert_eq!(telemetry.batch_size, None);
+    }
+
+    // ── Managed file carrier ─────────────────────────────────────────────
+
+    fn write_managed(path: &Path, settings: serde_json::Value) {
+        let managed = crate::dirs::ManagedSettings::new(settings);
+        std::fs::write(path, serde_json::to_string(&managed).unwrap()).unwrap();
+    }
+
+    #[test]
+    fn managed_settings_file_is_applied_last() {
+        let temp = tempfile::tempdir().unwrap();
+        let user_path = temp.path().join("user.json");
+        std::fs::write(&user_path, r#"{"model":"user-model"}"#).unwrap();
+        let managed_path = temp.path().join("managed_settings.json");
+        write_managed(
+            &managed_path,
+            serde_json::json!({ "model": "managed-model" }),
+        );
+
+        let service = ConfigService::new(user_path, None).with_managed_settings_path(managed_path);
+        assert_eq!(
+            service.resolve().unwrap().model,
+            Some("managed-model".into())
+        );
+    }
+
+    #[test]
+    fn managed_settings_checksum_mismatch_is_ignored() {
+        let temp = tempfile::tempdir().unwrap();
+        let managed_path = temp.path().join("managed_settings.json");
+        let managed = crate::dirs::ManagedSettings::new(serde_json::json!({
+            "model": "managed-model"
+        }));
+        let mut tampered = serde_json::to_value(&managed).unwrap();
+        tampered["settings"]["model"] = serde_json::json!("tampered-model");
+        std::fs::write(&managed_path, serde_json::to_string(&tampered).unwrap()).unwrap();
+
+        let service = ConfigService::new(temp.path().join("user.json"), None)
+            .with_managed_settings_path(managed_path);
+        // Fail closed: the tampered value never applies.
+        assert_eq!(
+            service.resolve().unwrap().model,
+            Some("claude-sonnet-4-6".into())
+        );
+    }
+
+    /// Managed settings are administrator-controlled, not repository-controlled,
+    /// so they may enable telemetry (unlike project settings).
+    #[test]
+    fn managed_settings_may_enable_telemetry() {
+        let temp = tempfile::tempdir().unwrap();
+        let managed_path = temp.path().join("managed_settings.json");
+        write_managed(
+            &managed_path,
+            serde_json::json!({ "telemetry_enabled": true }),
+        );
+
+        let service = ConfigService::new(temp.path().join("user.json"), None)
+            .with_managed_settings_path(managed_path);
+        assert_eq!(service.resolve().unwrap().telemetry_enabled, Some(true));
+    }
+
+    #[test]
+    fn no_managed_path_means_no_managed_source() {
+        let temp = tempfile::tempdir().unwrap();
+        let service = ConfigService::new(temp.path().join("user.json"), None);
+        assert!(service.load_managed_config().unwrap().is_none());
     }
 }

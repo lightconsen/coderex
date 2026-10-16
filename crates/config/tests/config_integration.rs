@@ -139,7 +139,8 @@ fn config_priority_merge_order_is_correct() {
     assert_eq!(merged.model, Some("user-model".into()));
     assert_eq!(merged.max_budget_usd, Some(5.0));
     assert_eq!(merged.permission_mode, Some("dont-ask".into()));
-    assert_eq!(merged.telemetry_enabled, Some(true)); // from defaults
+    // Undecided by default — telemetry is opt-in (see Settings::defaults).
+    assert_eq!(merged.telemetry_enabled, None);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -587,7 +588,7 @@ fn runtime_overrides_partial_apply() {
 
     assert_eq!(result.model, Some("override-model".into()));
     assert_eq!(result.permission_mode, Some("default".into())); // unchanged
-    assert_eq!(result.telemetry_enabled, Some(true)); // unchanged
+    assert_eq!(result.telemetry_enabled, None); // undecided — opt-in
 }
 
 #[test]

@@ -1,9 +1,11 @@
 //! Telemetry uploader — batch-upload events and crash reports to a remote endpoint.
 
-use crate::{TelemetryError, TelemetryStore};
+use crate::{Scrubber, TelemetryError, TelemetryStore};
+use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::sync::Mutex;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// Configuration for telemetry upload.
 #[derive(Debug, Clone)]
@@ -119,6 +121,91 @@ impl CircuitBreaker {
     }
 }
 
+/// Sliding-window rate limiter with a post-rejection suppression period.
+///
+/// The circuit breaker handles *failures* (5 in a row → open for 60s). This is
+/// the complementary policy for *rejections*: a polite client sends at most
+/// [`RateLimiter::MAX_PER_WINDOW`] uploads per [`RateLimiter::WINDOW`], and
+/// after the endpoint answers with 429/403 it stops entirely for
+/// [`RateLimiter::SUPPRESSION`] rather than retrying into the limit.
+#[derive(Debug)]
+struct RateLimiter {
+    /// Timestamps of recent upload attempts, oldest first.
+    window: Mutex<VecDeque<Instant>>,
+    /// If set, uploads are suppressed until this instant.
+    suppressed_until: Mutex<Option<Instant>>,
+    max_per_window: usize,
+    window_len: Duration,
+    suppression: Duration,
+}
+
+impl RateLimiter {
+    /// Maximum upload attempts allowed per window.
+    const MAX_PER_WINDOW: usize = 10;
+    /// Length of the sliding window.
+    const WINDOW: Duration = Duration::from_secs(60);
+    /// How long to stay quiet after the endpoint rejects an upload.
+    const SUPPRESSION: Duration = Duration::from_secs(300);
+
+    const fn new() -> Self {
+        Self::with_limits(Self::MAX_PER_WINDOW, Self::WINDOW, Self::SUPPRESSION)
+    }
+
+    /// Construct a limiter with explicit limits (used by tests).
+    const fn with_limits(
+        max_per_window: usize,
+        window_len: Duration,
+        suppression: Duration,
+    ) -> Self {
+        Self {
+            window: Mutex::new(VecDeque::new()),
+            suppressed_until: Mutex::new(None),
+            max_per_window,
+            window_len,
+            suppression,
+        }
+    }
+
+    /// Whether an upload may proceed right now.
+    fn allow(&self) -> bool {
+        let now = Instant::now();
+
+        if let Ok(suppressed) = self.suppressed_until.lock() {
+            if let Some(until) = *suppressed {
+                if now < until {
+                    return false;
+                }
+            }
+        }
+
+        let Ok(mut window) = self.window.lock() else {
+            return true;
+        };
+        while let Some(front) = window.front() {
+            if now.duration_since(*front) >= self.window_len {
+                window.pop_front();
+            } else {
+                break;
+            }
+        }
+        window.len() < self.max_per_window
+    }
+
+    /// Record that an upload attempt is being made.
+    fn record(&self) {
+        if let Ok(mut window) = self.window.lock() {
+            window.push_back(Instant::now());
+        }
+    }
+
+    /// Enter the suppression period after the endpoint rejected an upload.
+    fn on_rejection(&self) {
+        if let Ok(mut suppressed) = self.suppressed_until.lock() {
+            *suppressed = Some(Instant::now() + self.suppression);
+        }
+    }
+}
+
 /// Background uploader that periodically sends pending telemetry.
 #[derive(Debug)]
 pub struct TelemetryUploader {
@@ -126,6 +213,8 @@ pub struct TelemetryUploader {
     config: TelemetryConfig,
     client: reqwest::Client,
     circuit: CircuitBreaker,
+    rate: RateLimiter,
+    scrubber: Scrubber,
 }
 
 impl Clone for TelemetryUploader {
@@ -135,6 +224,8 @@ impl Clone for TelemetryUploader {
             config: self.config.clone(),
             client: self.client.clone(),
             circuit: CircuitBreaker::new(),
+            rate: RateLimiter::new(),
+            scrubber: self.scrubber.clone(),
         }
     }
 }
@@ -163,6 +254,8 @@ impl TelemetryUploader {
             config,
             client,
             circuit: CircuitBreaker::new(),
+            rate: RateLimiter::new(),
+            scrubber: Scrubber::new(),
         }
     }
 
@@ -193,8 +286,23 @@ impl TelemetryUploader {
                 continue;
             }
 
+            if !self.rate.allow() {
+                tracing::debug!("telemetry upload rate limited or suppressed — skipping");
+                continue;
+            }
+            self.rate.record();
+
             match self.upload_pending().await {
                 Ok(_) => self.circuit.on_success(),
+                Err(TelemetryError::Rejected { status }) => {
+                    // The endpoint told us to back off. Suppress uploads for the
+                    // suppression window instead of retrying into the limit.
+                    tracing::debug!(
+                        "telemetry upload rejected (HTTP {status}) — suppressing uploads for {}s",
+                        RateLimiter::SUPPRESSION.as_secs()
+                    );
+                    self.rate.on_rejection();
+                }
                 Err(e) => {
                     tracing::debug!("telemetry upload failed (will retry): {e}");
                     self.circuit.on_failure();
@@ -215,9 +323,15 @@ impl TelemetryUploader {
         let ids: Vec<i64> = events.iter().map(|e| e.id).collect();
         let payload = serde_json::json!({
             "events": events.iter().map(|e| {
+                let mut event_payload =
+                    serde_json::from_str::<serde_json::Value>(&e.payload).unwrap_or(serde_json::Value::Null);
+                // Defence in depth: drop excluded fields and re-scrub strings on
+                // the way out, so a payload that reached the store unscrubbed
+                // still cannot carry a secret off the machine.
+                self.scrubber.scrub_json(&mut event_payload);
                 serde_json::json!({
                     "type": e.event_type,
-                    "payload": serde_json::from_str::<serde_json::Value>(&e.payload).unwrap_or(serde_json::Value::Null),
+                    "payload": event_payload,
                     "timestamp": e.created_at,
                 })
             }).collect::<Vec<_>>(),
@@ -240,6 +354,10 @@ impl TelemetryUploader {
                 if response.status().is_success() {
                     store.mark_uploaded(&ids)?;
                     tracing::debug!("uploaded {} telemetry events", ids.len());
+                } else if is_rejection(response.status()) {
+                    return Err(TelemetryError::Rejected {
+                        status: response.status().as_u16(),
+                    });
                 } else {
                     return Err(TelemetryError::Upload(format!(
                         "HTTP {}",
@@ -295,6 +413,10 @@ impl TelemetryUploader {
                 if response.status().is_success() {
                     store.mark_crashes_uploaded(&ids)?;
                     tracing::debug!("uploaded {} crash reports", ids.len());
+                } else if is_rejection(response.status()) {
+                    return Err(TelemetryError::Rejected {
+                        status: response.status().as_u16(),
+                    });
                 } else {
                     return Err(TelemetryError::Upload(format!(
                         "HTTP {} (crashes)",
@@ -309,6 +431,11 @@ impl TelemetryUploader {
 
         Ok(())
     }
+}
+
+/// Whether an HTTP status is an explicit "back off" signal from the endpoint.
+fn is_rejection(status: reqwest::StatusCode) -> bool {
+    status == reqwest::StatusCode::TOO_MANY_REQUESTS || status == reqwest::StatusCode::FORBIDDEN
 }
 
 /// Compress a JSON value into a gzip-encoded byte vector.
@@ -471,5 +598,79 @@ mod tests {
             .expect("body must be valid gzip when flagged as such");
         let round_trip: serde_json::Value = serde_json::from_slice(&decoded).unwrap();
         assert_eq!(round_trip, val);
+    }
+
+    // ── Rate limiting / suppression ──────────────────────────────────────
+
+    #[test]
+    fn rate_limiter_allows_fresh_upload() {
+        let limiter = RateLimiter::new();
+        assert!(limiter.allow());
+    }
+
+    #[test]
+    fn rate_limiter_blocks_after_max_in_window() {
+        // Use explicit limits so this pins the *behavior* independently of the
+        // production constants (which `rate_limiter_policy_matches_reference`
+        // pins separately).
+        let limiter =
+            RateLimiter::with_limits(3, Duration::from_secs(60), Duration::from_secs(300));
+        for i in 0..3 {
+            assert!(limiter.allow(), "attempt {i} under the cap must be allowed");
+            limiter.record();
+        }
+        assert!(
+            !limiter.allow(),
+            "the 4th attempt in the window must be refused"
+        );
+    }
+
+    #[test]
+    fn rate_limiter_suppresses_after_rejection() {
+        let limiter = RateLimiter::new();
+        assert!(limiter.allow());
+        limiter.on_rejection();
+        assert!(
+            !limiter.allow(),
+            "a rejection must suppress further uploads immediately"
+        );
+    }
+
+    /// The suppression window must actually expire rather than being permanent.
+    #[test]
+    fn rate_limiter_suppression_expires() {
+        let limiter =
+            RateLimiter::with_limits(10, Duration::from_secs(60), Duration::from_millis(20));
+        limiter.on_rejection();
+        assert!(!limiter.allow());
+        std::thread::sleep(Duration::from_millis(40));
+        assert!(limiter.allow(), "uploads resume once the suppression ends");
+    }
+
+    /// The window must slide: attempts older than the window no longer count.
+    #[test]
+    fn rate_limiter_window_slides() {
+        let limiter =
+            RateLimiter::with_limits(2, Duration::from_millis(20), Duration::from_secs(300));
+        limiter.record();
+        limiter.record();
+        assert!(!limiter.allow());
+        std::thread::sleep(Duration::from_millis(40));
+        assert!(limiter.allow(), "old attempts fall out of the window");
+    }
+
+    #[test]
+    fn rate_limiter_policy_matches_reference() {
+        assert_eq!(RateLimiter::MAX_PER_WINDOW, 10);
+        assert_eq!(RateLimiter::WINDOW, Duration::from_secs(60));
+        assert_eq!(RateLimiter::SUPPRESSION, Duration::from_secs(300));
+    }
+
+    #[test]
+    fn only_back_off_statuses_are_rejections() {
+        assert!(is_rejection(reqwest::StatusCode::TOO_MANY_REQUESTS));
+        assert!(is_rejection(reqwest::StatusCode::FORBIDDEN));
+        assert!(!is_rejection(reqwest::StatusCode::INTERNAL_SERVER_ERROR));
+        assert!(!is_rejection(reqwest::StatusCode::BAD_REQUEST));
     }
 }

@@ -272,4 +272,13 @@ pub enum TelemetryError {
     /// HTTP upload error.
     #[error("upload error: {0}")]
     Upload(String),
+    /// The endpoint explicitly rejected the upload (HTTP 429 or 403).
+    ///
+    /// Distinguished from a generic transport failure so the uploader can back
+    /// off politely instead of retrying into a rate limit.
+    #[error("upload rejected by server: HTTP {status}")]
+    Rejected {
+        /// The HTTP status code returned by the endpoint.
+        status: u16,
+    },
 }
