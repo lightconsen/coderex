@@ -1,6 +1,6 @@
 //! Telemetry uploader — batch-upload events and crash reports to a remote endpoint.
 
-use crate::{Scrubber, TelemetryError, TelemetryStore};
+use crate::{PendingCrash, PendingEvent, Scrubber, TelemetryError, TelemetryStore};
 use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -206,6 +206,36 @@ impl RateLimiter {
     }
 }
 
+/// Environment variable that turns on strict (confidentiality) redaction.
+///
+/// Present with any value other than `0`/`false`/`no`/empty enables the mode,
+/// mirroring `CODEREX_DISABLE_ADOPT`.
+pub const HIPAA_ENV: &str = "CODEREX_HIPAA";
+
+/// Whether strict (confidentiality) redaction is requested for this process.
+///
+/// This is CodeRex's port of the reference's `hipaa` trigger. The reference
+/// reads both an environment variable and a settings lookup; CodeRex's settings
+/// layer is not reachable from this crate, so the environment variable is the
+/// whole trigger. See `docs/telemetry.md`.
+#[must_use]
+pub fn hipaa_enabled() -> bool {
+    hipaa_enabled_with(std::env::var(HIPAA_ENV).ok().as_deref())
+}
+
+/// Pure helper behind [`hipaa_enabled`]; testable without touching the process
+/// environment.
+#[must_use]
+pub fn hipaa_enabled_with(value: Option<&str>) -> bool {
+    value.is_some_and(|raw| {
+        let trimmed = raw.trim();
+        !(trimmed.is_empty()
+            || trimmed.eq_ignore_ascii_case("0")
+            || trimmed.eq_ignore_ascii_case("false")
+            || trimmed.eq_ignore_ascii_case("no"))
+    })
+}
+
 /// Background uploader that periodically sends pending telemetry.
 #[derive(Debug)]
 pub struct TelemetryUploader {
@@ -215,6 +245,8 @@ pub struct TelemetryUploader {
     circuit: CircuitBreaker,
     rate: RateLimiter,
     scrubber: Scrubber,
+    /// Resolved once at construction from [`hipaa_enabled`].
+    strict: bool,
 }
 
 impl Clone for TelemetryUploader {
@@ -226,6 +258,7 @@ impl Clone for TelemetryUploader {
             circuit: CircuitBreaker::new(),
             rate: RateLimiter::new(),
             scrubber: self.scrubber.clone(),
+            strict: self.strict,
         }
     }
 }
@@ -256,6 +289,7 @@ impl TelemetryUploader {
             circuit: CircuitBreaker::new(),
             rate: RateLimiter::new(),
             scrubber: Scrubber::new(),
+            strict: hipaa_enabled(),
         }
     }
 
@@ -322,19 +356,10 @@ impl TelemetryUploader {
 
         let ids: Vec<i64> = events.iter().map(|e| e.id).collect();
         let payload = serde_json::json!({
-            "events": events.iter().map(|e| {
-                let mut event_payload =
-                    serde_json::from_str::<serde_json::Value>(&e.payload).unwrap_or(serde_json::Value::Null);
-                // Defence in depth: drop excluded fields and re-scrub strings on
-                // the way out, so a payload that reached the store unscrubbed
-                // still cannot carry a secret off the machine.
-                self.scrubber.scrub_json(&mut event_payload);
-                serde_json::json!({
-                    "type": e.event_type,
-                    "payload": event_payload,
-                    "timestamp": e.created_at,
-                })
-            }).collect::<Vec<_>>(),
+            "events": events
+                .iter()
+                .map(|e| build_event_payload(&self.scrubber, e, self.strict))
+                .collect::<Vec<_>>(),
         });
 
         let body = encode_json(&payload)?;
@@ -386,13 +411,10 @@ impl TelemetryUploader {
 
         let ids: Vec<i64> = crashes.iter().map(|c| c.id).collect();
         let payload = serde_json::json!({
-            "crashes": crashes.iter().map(|c| {
-                serde_json::json!({
-                    "panic_info": c.panic_info,
-                    "backtrace": c.backtrace,
-                    "timestamp": c.created_at,
-                })
-            }).collect::<Vec<_>>(),
+            "crashes": crashes
+                .iter()
+                .map(|c| build_crash_payload(c, self.strict))
+                .collect::<Vec<_>>(),
         });
 
         let body = encode_json(&payload)?;
@@ -436,6 +458,43 @@ impl TelemetryUploader {
 /// Whether an HTTP status is an explicit "back off" signal from the endpoint.
 fn is_rejection(status: reqwest::StatusCode) -> bool {
     status == reqwest::StatusCode::TOO_MANY_REQUESTS || status == reqwest::StatusCode::FORBIDDEN
+}
+
+/// Build the wire payload for one pending event.
+///
+/// The stored payload is re-scrubbed on the way out (defence in depth: a
+/// payload that reached the store unscrubbed still cannot carry a secret off
+/// the machine). Under strict mode it must also validate against the field
+/// allowlist — if it cannot, it is sent marked unredacted rather than dropped.
+fn build_event_payload(
+    scrubber: &Scrubber,
+    event: &PendingEvent,
+    strict: bool,
+) -> serde_json::Value {
+    let mut event_payload = serde_json::from_str::<serde_json::Value>(&event.payload)
+        .unwrap_or(serde_json::Value::Null);
+    scrubber.scrub_json(&mut event_payload);
+    if strict {
+        crate::scrubber::mark_unredacted_if_unallowlisted(&mut event_payload);
+    }
+    serde_json::json!({
+        "type": event.event_type,
+        "payload": event_payload,
+        "timestamp": event.created_at,
+    })
+}
+
+/// Build the wire payload for one pending crash report.
+fn build_crash_payload(crash: &PendingCrash, strict: bool) -> serde_json::Value {
+    let mut payload = serde_json::json!({
+        "panic_info": crash.panic_info,
+        "backtrace": crash.backtrace,
+        "timestamp": crash.created_at,
+    });
+    if strict {
+        crate::scrubber::mark_unredacted_if_unallowlisted(&mut payload);
+    }
+    payload
 }
 
 /// Compress a JSON value into a gzip-encoded byte vector.
@@ -672,5 +731,79 @@ mod tests {
         assert!(is_rejection(reqwest::StatusCode::FORBIDDEN));
         assert!(!is_rejection(reqwest::StatusCode::INTERNAL_SERVER_ERROR));
         assert!(!is_rejection(reqwest::StatusCode::BAD_REQUEST));
+    }
+
+    // ── Strict (HIPAA) trigger and payload marking ───────────────────────
+
+    #[test]
+    fn hipaa_env_values_parse() {
+        assert!(hipaa_enabled_with(Some("1")));
+        assert!(hipaa_enabled_with(Some("true")));
+        assert!(hipaa_enabled_with(Some("YES")));
+        assert!(!hipaa_enabled_with(Some("0")));
+        assert!(!hipaa_enabled_with(Some("false")));
+        assert!(!hipaa_enabled_with(Some("no")));
+        assert!(!hipaa_enabled_with(Some("")));
+        assert!(!hipaa_enabled_with(None));
+    }
+
+    #[test]
+    fn hipaa_env_name_matches_the_documented_trigger() {
+        assert_eq!(HIPAA_ENV, "CODEREX_HIPAA");
+    }
+
+    fn pending_event_with(payload: serde_json::Value) -> crate::PendingEvent {
+        crate::PendingEvent {
+            id: 1,
+            event_type: "error".into(),
+            payload: payload.to_string(),
+            created_at: "2026-01-01T00:00:00Z".into(),
+        }
+    }
+
+    /// A payload built from allowlisted fields is sent unmarked, even in strict
+    /// mode.
+    #[test]
+    fn strict_mode_sends_allowlisted_event_unmarked() {
+        let scrubber = Scrubber::new();
+        let event = pending_event_with(serde_json::json!({
+            "type": "error",
+            "error_type": "io",
+            "message": "boom",
+            "timestamp": 1
+        }));
+        let built = build_event_payload(&scrubber, &event, true);
+        let inner = &built["payload"];
+        assert!(inner.get("redaction_status").is_none());
+    }
+
+    /// A payload the allowlist cannot validate is sent *marked* unredacted —
+    /// the marker is in the payload, not a log line.
+    #[test]
+    fn strict_mode_marks_unallowlisted_event_unredacted() {
+        let scrubber = Scrubber::new();
+        let event = pending_event_with(serde_json::json!({
+            "type": "error",
+            "message": "boom",
+            "conversation_snippet": "unexpected field"
+        }));
+        let built = build_event_payload(&scrubber, &event, true);
+        assert_eq!(
+            built["payload"]["redaction_status"],
+            serde_json::json!("unredacted")
+        );
+    }
+
+    /// Outside strict mode nothing is marked, even for an unknown field.
+    #[test]
+    fn non_strict_mode_does_not_mark() {
+        let scrubber = Scrubber::new();
+        let event = pending_event_with(serde_json::json!({
+            "type": "error",
+            "message": "boom",
+            "conversation_snippet": "unexpected field"
+        }));
+        let built = build_event_payload(&scrubber, &event, false);
+        assert!(built["payload"].get("redaction_status").is_none());
     }
 }

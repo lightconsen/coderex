@@ -23,7 +23,9 @@ mod uploader;
 pub use crash::{CrashReport, CrashReporter};
 pub use scrubber::Scrubber;
 pub use store::{PendingCrash, PendingEvent, TelemetryEvent, TelemetryStore};
-pub use uploader::{TelemetryConfig, TelemetryUploader};
+pub use uploader::{
+    HIPAA_ENV, TelemetryConfig, TelemetryUploader, hipaa_enabled, hipaa_enabled_with,
+};
 
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};

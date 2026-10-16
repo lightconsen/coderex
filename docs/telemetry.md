@@ -29,6 +29,51 @@ Privacy-first telemetry collection, local storage, and batch upload. Stores even
 
 - **`Scrubber`** — Regex-based PII sanitizer. Replaces emails, IPs, home paths, and credential shapes with `<EMAIL>`, `<IP>`, `<USER>`, `<API_KEY>`, `<AUTH_TOKEN>`, `<JWT>`, `<PRIVATE_KEY>` tokens. Applied to `Error.message`, `ApiCall.provider/model`, and `ToolUsed.tool_name` before insertion.
 - **`EXCLUDED_FIELDS`** — Field names (`api_key`, `authorization`, `password`, `secret`, `token`, `cookie`, `set-cookie`, `apikey`) that `Scrubber::scrub_json` **removes** from a payload entirely, recursively, as a second layer at upload time.
+- **Model-name redaction** (`is_model_key`, `redact_model_fields`, `CONFIDENTIAL_MODEL`) — a dedicated model-field key regex plus an exclusion set, run recursively on every payload by `Scrubber::scrub_json` (see below).
+- **Strict mode** (`strictly_allowlisted`, `mark_unredacted_if_unallowlisted`, `STRICT_ALLOWED_FIELDS`) — validates a payload against a field allowlist and marks anything it cannot validate (see below).
+
+### Model-name redaction
+
+A JSON object key is a **model field** when either:
+
+- it is one of the always-model keys `chain_entry`, `fallbackFrom`, `shortName`; or
+- it is **not** `repository_model` (the explicit exclusion) **and** matches the model-key regex
+  `^(?:model|model_id|[A-Za-z0-9_]*_models?|[A-Za-z0-9_]*[a-z0-9]Models?)$`
+  — i.e. `model`, `model_id`, `*_model`, `*_models`, `*Model`, `*Models`.
+
+The exclusion is applied before the regex because `repository_model` matches the regex
+(`repository` + `_model`); it names a repository relationship, not a model, and is left verbatim.
+
+A model field's value is replaced with the constant `"confidential"`. Two kinds of value are
+**not** replaced:
+
+- the placeholders `inherit`, `default`, `none`, `unknown`, `nonconforming` — they name no model,
+  so keeping them is honest; and
+- nothing else: a concrete model id **and** an unavailable value (empty string, or a non-string)
+  both become `"confidential"`.
+
+**The confidentiality rule.** The reference substitutes `"confidential"` only for models on a
+"needs confidentiality" list (and for unavailable models). CodeRex has one first-party channel and
+no cloud model catalogue, so it cannot know which names are sensitive. It therefore treats **every
+concrete model name as confidential** and redacts all of them, keeping only the non-identifying
+placeholders. This is stricter than the reference's default and is the honest choice for a client
+that cannot enumerate the sensitive set.
+
+### Strict mode (confidentiality trigger)
+
+Strict mode is turned on by the environment variable **`CODEREX_HIPAA`** — present with any value
+other than `0`/`false`/`no`/empty (`hipaa_enabled`). It mirrors the reference's `hipaa`
+setting/lookup trigger. The reference also carries a settings key; CodeRex's settings layer is not
+reachable from this crate, so the environment variable is the whole trigger.
+
+When on, a payload must validate against `STRICT_ALLOWED_FIELDS` — the union of the event and crash
+schema fields (`type`, `session_id`, `tool_name`, `success`, `duration_ms`, `provider`, `model`,
+`tokens_in`, `tokens_out`, `error_type`, `message`, `timestamp`, `panic_info`, `backtrace`). The
+check is recursive: every key at every level must be known. A payload that **does not** validate is
+still sent, but is marked with `"redaction_status": "unredacted"` **inside the payload itself** —
+so the mark travels in the stored/uploaded event, not a log line. The payload is not silently
+dropped (that would lose telemetry) and not silently sent unmarked (that would claim a validation
+that did not happen).
 
 ### Key Types (crash.rs)
 
@@ -53,7 +98,7 @@ Privacy-first telemetry collection, local storage, and batch upload. Stores even
 
 ### Public API Surface
 
-- `TelemetryHandle`, `TelemetryEvent`, `TelemetryStore`, `TelemetryUploader`, `TelemetryConfig`, `CrashReporter`, `CrashReport`, `PendingEvent`, `PendingCrash`, `Scrubber`.
+- `TelemetryHandle`, `TelemetryEvent`, `TelemetryStore`, `TelemetryUploader`, `TelemetryConfig`, `CrashReporter`, `CrashReport`, `PendingEvent`, `PendingCrash`, `Scrubber`, `HIPAA_ENV`, `hipaa_enabled`.
 
 ## Current Status
 
@@ -77,6 +122,8 @@ Privacy-first telemetry collection, local storage, and batch upload. Stores even
 - **Explicit crash endpoint** override (`TelemetryConfig.crash_endpoint`) or derived from events endpoint.
 - **DB size queries** via `PRAGMA page_count * page_size`.
 - **PII scrubbing** via `Scrubber` (emails, IPs, paths, API keys, bearer tokens, JWTs, PEM private keys) applied to `Error`, `ApiCall`, and `ToolUsed` events, plus an `EXCLUDED_FIELDS` exclusion set applied recursively to payloads at upload time.
+- **Model-name redaction**: the model-field key regex (including `*_models` / `*Models`), the always-model keys (`chain_entry`, `fallbackFrom`, `shortName`), the `repository_model` exclusion, the never-replaced placeholder set, and the `"confidential"` constant. Applied recursively to every uploaded payload by `Scrubber::scrub_json`.
+- **Strict (confidentiality) mode**: `CODEREX_HIPAA` turns on a recursive field-allowlist check; a payload that fails it is uploaded marked `"redaction_status": "unredacted"` in the payload itself.
 - **Worker panic recovery** with `catch_unwind`, fresh DB connection per respawn, 3-attempt limit, 10s cooldown.
 - **Certificate pinning** via `TelemetryConfig.pinned_cert_pem` + `add_root_certificate()`.
 - **Opt-in consent gate**: telemetry is off until the user consents. `Settings::defaults()` leaves `telemetry_enabled` as `None` ("undecided"), so the first-run prompt in `StartupOrchestrator::phase_load_settings` is actually reachable; an undecided value is treated as *disabled*. The choice is persisted to `settings.json`.
@@ -94,23 +141,20 @@ first-party channel is the only one with a real consumer here.
 
 ### What Is Stubbed/Partial
 
-- **Model-field redaction**: Claude applies a dedicated model-field regex plus an
-  exclusion set. CodeRex routes `provider`/`model` through the shared pattern set
-  and adds the `EXCLUDED_FIELDS` exclusion set, but does **not** add a model-name
-  allowlist — model ids are not PII and an allowlist would only reduce telemetry
-  usefulness. Deliberate ⚪.
-- **Enterprise/HIPAA allowlisting**: no stricter allowlist mode is implemented;
-  the same scrubber runs for all users.
+None. Model-field redaction and the strict (confidentiality) mode are both
+implemented; the only deliberate difference from the reference is that the
+strict trigger is the `CODEREX_HIPAA` environment variable rather than an
+environment variable *and* a settings key (the settings layer is not reachable
+from the telemetry crate).
 
 ### Tests
 
 - 5 tests in `store.rs` (insert, batch, mark uploaded, crash roundtrip, size retention).
-- 15 tests in `uploader.rs` (config defaults, crash endpoint explicit/derived, circuit breaker, gzip encoding/header, rate limiter window/suppression, rejection statuses).
+- 20 tests in `uploader.rs` (config defaults, crash endpoint explicit/derived, circuit breaker, gzip encoding/header, rate limiter window/suppression, rejection statuses, HIPAA trigger parsing, strict-mode payload marking).
 - 2 tests in `crash.rs` (serialization, ingest scrubbing).
-- 13 tests in `scrubber.rs` (email, IPv4, home path, API key, GitHub/AWS/bearer/JWT/private-key, event scrubbing, exclusion set, nested JSON scrubbing).
+- 22 tests in `scrubber.rs` (email, IPv4, home path, API key, GitHub/AWS/bearer/JWT/private-key, event scrubbing, exclusion set, nested JSON scrubbing, model-key regex, model redaction, placeholder preservation, `repository_model` exclusion, strict allowlist/marker).
 - Tests use tempfile/NamedTempFile for SQLite.
 
 ## Gaps for Production
 
-None. The items under "What Is Stubbed/Partial" are deliberate ⚪ product-form
-differences, not gaps.
+None.
