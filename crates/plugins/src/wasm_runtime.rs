@@ -15,6 +15,43 @@
 
 use crate::runtime::{PluginCommandInfo, PluginSkillInfo};
 
+/// Fuel granted to each plugin call.
+///
+/// Fuel is charged per WebAssembly instruction, so this bounds total guest
+/// execution: a plugin that loops forever (or otherwise runs away) traps with
+/// "all fuel consumed by WebAssembly" instead of pinning the host thread. The
+/// budget is deliberately generous — it is a runaway guard, not a performance
+/// budget.
+#[cfg(feature = "wasm-runtime")]
+const PLUGIN_FUEL: u64 = 100_000_000;
+
+/// Maximum guest linear memory, in bytes.
+///
+/// Enforced by a `StoreLimits` resource limiter on both instantiation (the
+/// module's declared minimum memory) and every `memory.grow` at runtime, so a
+/// plugin cannot allocate without bound.
+#[cfg(feature = "wasm-runtime")]
+const PLUGIN_MAX_MEMORY_BYTES: usize = 64 * 1024 * 1024;
+
+/// Build the sandboxed engine shared by every plugin instance.
+///
+/// Plugins are untrusted code, so the engine is configured with:
+/// - fuel metering, so runaway execution is interrupted instead of hanging;
+/// - the threads proposal disabled, so a module cannot create a shared memory
+///   (which wasmtime's store limiter deliberately does not bound) or use
+///   atomics.
+///
+/// No WASI (or any other host interface) is linked: instances are created with
+/// an empty import set, so a module that imports anything at all fails to
+/// instantiate. The plugin ABI is self-contained and needs no imports.
+#[cfg(feature = "wasm-runtime")]
+fn sandboxed_engine() -> Result<wasmtime::Engine, String> {
+    let mut config = wasmtime::Config::new();
+    config.consume_fuel(true);
+    config.wasm_threads(false);
+    wasmtime::Engine::new(&config).map_err(|e| format!("failed to build WASM engine: {e}"))
+}
+
 /// A loaded WASM plugin instance.
 ///
 /// When the `wasm-runtime` feature is enabled, this compiles and instantiates
@@ -59,7 +96,7 @@ impl std::fmt::Debug for PluginWasmInstance {
 impl PluginWasmInstance {
     /// Load a WASM module from the given path.
     pub fn new(wasm_path: &std::path::Path) -> Result<Self, String> {
-        let engine = wasmtime::Engine::default();
+        let engine = sandboxed_engine()?;
         let module = wasmtime::Module::from_file(&engine, wasm_path)
             .map_err(|e| format!("failed to load WASM module '{}': {e}", wasm_path.display()))?;
         Ok(Self {
@@ -69,6 +106,22 @@ impl PluginWasmInstance {
             commands: Vec::new(),
             skills: Vec::new(),
         })
+    }
+
+    /// Create a fresh, resource-limited `Store` for a single plugin call.
+    ///
+    /// Every call gets its own store, so the fuel budget and memory ceiling are
+    /// reset per call rather than accumulating across calls.
+    fn new_store(&self) -> Result<wasmtime::Store<wasmtime::StoreLimits>, String> {
+        let limits = wasmtime::StoreLimitsBuilder::new()
+            .memory_size(PLUGIN_MAX_MEMORY_BYTES)
+            .build();
+        let mut store = wasmtime::Store::new(&self.engine, limits);
+        store.limiter(|limits| limits);
+        store
+            .set_fuel(PLUGIN_FUEL)
+            .map_err(|e| format!("failed to set WASM fuel: {e}"))?;
+        Ok(store)
     }
 
     /// Check if initialized.
@@ -161,7 +214,7 @@ impl PluginWasmInstance {
         params_json: Option<&str>,
     ) -> Result<serde_json::Value, String> {
         tokio::task::block_in_place(|| {
-            let mut store = wasmtime::Store::new(&self.engine, ());
+            let mut store = self.new_store()?;
             let instance = wasmtime::Instance::new(&mut store, &self.module, &[])
                 .map_err(|e| format!("failed to instantiate WASM module: {e}"))?;
 
@@ -182,7 +235,7 @@ impl PluginWasmInstance {
                 let (ptr, len) = write_to_memory(&memory, &mut store, &alloc, json)?;
                 let r = func
                     .call(&mut store, (ptr, len))
-                    .map_err(|e| format!("WASM call '{method}' failed: {e}"))?;
+                    .map_err(|e| format!("WASM call '{method}' failed: {e:#}"))?;
                 let _ = dealloc.call(&mut store, (ptr, len));
                 r
             } else {
@@ -210,7 +263,7 @@ impl PluginWasmInstance {
         s2: &str,
     ) -> Result<serde_json::Value, String> {
         tokio::task::block_in_place(|| {
-            let mut store = wasmtime::Store::new(&self.engine, ());
+            let mut store = self.new_store()?;
             let instance = wasmtime::Instance::new(&mut store, &self.module, &[])
                 .map_err(|e| format!("failed to instantiate WASM module: {e}"))?;
 
@@ -232,7 +285,7 @@ impl PluginWasmInstance {
 
             let result_ptr = func
                 .call(&mut store, (p1, l1, p2, l2))
-                .map_err(|e| format!("WASM call '{method}' failed: {e}"))?;
+                .map_err(|e| format!("WASM call '{method}' failed: {e:#}"))?;
 
             let _ = dealloc.call(&mut store, (p1, l1));
             let _ = dealloc.call(&mut store, (p2, l2));
@@ -308,7 +361,7 @@ impl PluginWasmInstance {
 #[cfg(feature = "wasm-runtime")]
 fn write_to_memory(
     memory: &wasmtime::Memory,
-    store: &mut wasmtime::Store<()>,
+    store: &mut wasmtime::Store<wasmtime::StoreLimits>,
     alloc: &wasmtime::TypedFunc<i32, i32>,
     data: &str,
 ) -> Result<(i32, i32), String> {
@@ -328,7 +381,7 @@ fn write_to_memory(
 #[cfg(feature = "wasm-runtime")]
 fn read_cstring(
     memory: &wasmtime::Memory,
-    store: &wasmtime::Store<()>,
+    store: &wasmtime::Store<wasmtime::StoreLimits>,
     ptr: i32,
 ) -> Result<String, String> {
     if ptr == 0 {
@@ -363,6 +416,171 @@ mod tests {
         assert!(
             err.contains("not enabled") || err.contains("failed to load"),
             "unexpected error: {err}"
+        );
+    }
+}
+
+/// Sandbox tests. These only exist when the WASM runtime is compiled in; run
+/// them with `cargo test -p coderex-plugins --features wasm-runtime`.
+///
+/// Each test writes a small WAT module to a temp file and asserts the sandbox
+/// stops behaviour a hostile plugin would use to take the host down.
+#[cfg(all(test, feature = "wasm-runtime"))]
+mod sandbox_tests {
+    use super::*;
+    use std::path::{Path, PathBuf};
+
+    /// Write a WAT module to a temp dir and return its path.
+    fn write_module(dir: &Path, name: &str, wat: &str) -> PathBuf {
+        let path = dir.join(name);
+        std::fs::write(&path, wat).expect("failed to write WAT module");
+        path
+    }
+
+    /// A plugin that spins forever must be stopped by the fuel budget rather
+    /// than hanging the calling thread.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn runaway_loop_is_stopped_by_fuel() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_module(
+            dir.path(),
+            "spin.wasm",
+            r#"(module
+                 (memory (export "memory") 1)
+                 (func (export "alloc") (param i32) (result i32)
+                   i32.const 1024)
+                 (func (export "dealloc") (param i32 i32))
+                 (func (export "coderex_initialize") (param i32 i32) (result i32)
+                   (loop $spin
+                     br $spin)
+                   i32.const 0))"#,
+        );
+
+        let mut instance = PluginWasmInstance::new(&path).unwrap();
+        let err = instance
+            .initialize()
+            .await
+            .expect_err("a module that loops forever must not complete");
+        assert!(
+            err.contains("fuel"),
+            "expected an out-of-fuel trap, got: {err}"
+        );
+    }
+
+    /// A plugin that grows its memory past the ceiling must be refused. The
+    /// module returns a valid pointer only if the growth succeeded, so a
+    /// missing limit would surface as a successful call.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn over_limit_memory_growth_is_denied() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_module(
+            dir.path(),
+            "grow.wasm",
+            r#"(module
+                 (memory (export "memory") 1)
+                 (data (i32.const 16) "\"ok\"\00")
+                 (func (export "alloc") (param i32) (result i32)
+                   i32.const 1024)
+                 (func (export "dealloc") (param i32 i32))
+                 (func (export "coderex_initialize") (param i32 i32) (result i32)
+                   ;; ask for 2000 more pages (128 MiB), above the 64 MiB ceiling
+                   i32.const 2000
+                   memory.grow
+                   i32.const 0
+                   i32.ge_s
+                   (if (result i32)
+                     (then i32.const 16)
+                     (else i32.const 0))))"#,
+        );
+
+        let mut instance = PluginWasmInstance::new(&path).unwrap();
+        let err = instance
+            .initialize()
+            .await
+            .expect_err("memory growth past the ceiling must be denied");
+        assert!(
+            err.contains("null pointer"),
+            "expected the growth to be denied, got: {err}"
+        );
+    }
+
+    /// A module whose *declared* memory already exceeds the ceiling must fail
+    /// to instantiate at all.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn over_limit_initial_memory_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_module(
+            dir.path(),
+            "big.wasm",
+            r#"(module
+                 (memory (export "memory") 2000)
+                 (data (i32.const 16) "\"ok\"\00")
+                 (func (export "alloc") (param i32) (result i32)
+                   i32.const 1024)
+                 (func (export "dealloc") (param i32 i32))
+                 (func (export "coderex_initialize") (param i32 i32) (result i32)
+                   i32.const 16))"#,
+        );
+
+        let mut instance = PluginWasmInstance::new(&path).unwrap();
+        let err = instance
+            .initialize()
+            .await
+            .expect_err("a module declaring 128 MiB must not instantiate");
+        assert!(
+            err.contains("memory"),
+            "expected an instantiation memory-limit error, got: {err}"
+        );
+    }
+
+    /// The threads proposal is off, so a module using a shared memory (which
+    /// wasmtime's store limiter does not bound) is rejected at load time.
+    #[test]
+    fn shared_memory_module_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_module(
+            dir.path(),
+            "shared.wasm",
+            r#"(module
+                 (memory (export "memory") 1 1 shared)
+                 (func (export "alloc") (param i32) (result i32)
+                   i32.const 0))"#,
+        );
+
+        assert!(
+            PluginWasmInstance::new(&path).is_err(),
+            "a module using shared memory must not load"
+        );
+    }
+
+    /// No host interface is linked, so a module importing WASI cannot be
+    /// instantiated. This is a regression guard for the "no WASI" property,
+    /// not a fix: it holds regardless of the limits above.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn wasi_importing_module_cannot_instantiate() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_module(
+            dir.path(),
+            "wasi.wasm",
+            r#"(module
+                 (import "wasi_snapshot_preview1" "fd_write"
+                   (func (param i32 i32 i32 i32) (result i32)))
+                 (memory (export "memory") 1)
+                 (func (export "alloc") (param i32) (result i32)
+                   i32.const 1024)
+                 (func (export "dealloc") (param i32 i32))
+                 (func (export "coderex_initialize") (param i32 i32) (result i32)
+                   i32.const 0))"#,
+        );
+
+        let mut instance = PluginWasmInstance::new(&path).unwrap();
+        let err = instance
+            .initialize()
+            .await
+            .expect_err("a module importing WASI must not instantiate");
+        assert!(
+            err.contains("instantiate"),
+            "expected an unresolved-import error, got: {err}"
         );
     }
 }
