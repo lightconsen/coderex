@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use coderex_agents::{
-    AgentManager, AgentResult, AgentStatus, AgentType, ForkedContext, SpawnOptions, TeammateEvent,
+    AgentError, AgentManager, AgentResult, AgentStatus, AgentType, SpawnOptions, TeammateEvent,
     Thoroughness,
 };
 
@@ -178,29 +178,22 @@ async fn agent_background_spawn_returns_immediately() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-//  6.5 SendMessage — send a message to a running agent
+//  6.5 SendMessage — a registered (not running) agent cannot receive messages
 // ═══════════════════════════════════════════════════════════════════════════
 
 #[tokio::test]
-async fn agent_send_message_to_running_agent_succeeds() {
+async fn agent_send_message_to_registered_agent_fails() {
     let mut mgr = test_manager();
 
-    // Use resume_agent to create a Running agent (no task spawned)
-    let context = ForkedContext::new("sess_007".into(), "/tmp".into(), 5);
-    mgr.resume_agent(
-        "running_agent_1",
-        AgentType::GeneralPurpose,
-        SpawnOptions::default(),
-        context,
-    )
-    .await
-    .unwrap();
+    // Registration only records the id. It starts no task, so there is no
+    // receiver and the message must be refused rather than silently dropped.
+    mgr.register_agent("external_agent_1").unwrap();
+    assert!(mgr.is_registered("external_agent_1"));
 
-    // Now the agent is Running, send_message should succeed
     let result = mgr
-        .send_message("running_agent_1", "please also check tests")
+        .send_message("external_agent_1", "please also check tests")
         .await;
-    assert!(result.is_ok());
+    assert!(matches!(result, Err(AgentError::NotFound(_))));
 }
 
 #[tokio::test]
@@ -525,14 +518,14 @@ async fn agent_get_agent_by_id() {
 }
 
 #[tokio::test]
-async fn agent_env_variables_inherited_in_context() {
+async fn agent_extra_env_is_refused() {
     let mut mgr = test_manager();
     let tmp = tempfile::tempdir().unwrap();
 
     let mut env = HashMap::new();
     env.insert("AGENT_VAR".into(), "agent_value".into());
 
-    let instance = mgr
+    let result = mgr
         .spawn_agent(
             AgentType::GeneralPurpose,
             "test",
@@ -544,9 +537,10 @@ async fn agent_env_variables_inherited_in_context() {
             tmp.path().to_str().unwrap(),
             0,
         )
-        .await
-        .unwrap();
+        .await;
 
-    let ctx = instance.context.as_ref().unwrap();
-    assert_eq!(ctx.env_snapshot.get("AGENT_VAR").unwrap(), "agent_value");
+    // Sub-agents run in the parent process, so there is no child environment
+    // to inject into; the spawn is refused instead of silently dropping the
+    // variables the caller asked for.
+    assert!(matches!(result, Err(AgentError::Configuration(_))));
 }

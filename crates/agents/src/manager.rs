@@ -1,7 +1,7 @@
 //! AgentManager — spawn, manage, and communicate with sub-agents.
 //!
 //! Phase 10.3 + 10.5: Provides agent spawning with context inheritance,
-//! tool whitelisting, messaging, resume support, and teammate events.
+//! tool whitelisting, messaging, worktree isolation, and teammate events.
 
 use coderex_core::api_client::ApiClient;
 use coderex_core::confirmation_bus::ConfirmationBus;
@@ -20,9 +20,10 @@ use coderex_core::task::{TaskHandle, TaskKind, TaskManager};
 use coderex_core::tool_executor::ToolExecutor;
 use coderex_core::types::{AgentLifecycleEvent, EngineEvent, ModelId};
 use coderex_core::wire_adapter::engine_event_to_wire;
+use coderex_core::worktree::{WorktreeConfig, WorktreeManager};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 use thiserror::Error;
@@ -115,11 +116,18 @@ pub struct SpawnOptions {
     pub model_override: Option<String>,
     /// Tool whitelist — only these tools are available.
     pub allowed_tools: Option<Vec<String>>,
-    /// Isolation mode.
+    /// Isolation mode. The only supported value is `"worktree"`, which runs
+    /// the agent in its own git worktree so it cannot modify the caller's
+    /// checkout. Any other non-`None` value is refused at spawn time rather
+    /// than silently ignored.
     pub isolation: Option<String>,
     /// Working directory for the agent.
     pub cwd: Option<PathBuf>,
-    /// Environment variables to inject.
+    /// Environment variables to inject into the agent.
+    ///
+    /// Sub-agents run in the parent process, so there is no child environment
+    /// to inject into. A non-empty map is refused at spawn time rather than
+    /// silently dropped; see [`AgentManager::spawn_agent`].
     pub extra_env: HashMap<String, String>,
     /// Whether the agent may write files (false = read-only tools).
     pub writable: bool,
@@ -267,6 +275,13 @@ pub struct AgentInstance {
     pub prompt: String,
     /// Background task handle for the running agent.
     pub task_join_handle: Option<tokio::task::JoinHandle<()>>,
+    /// Directory the agent's engine actually runs in. This is the isolation
+    /// worktree when one was created, otherwise the caller's cwd (or the
+    /// `cwd` override). It is the value passed to the engine as its working
+    /// directory.
+    pub working_directory: PathBuf,
+    /// Git worktree created for this agent, when isolation was requested.
+    pub worktree_path: Option<PathBuf>,
 }
 
 impl AgentInstance {
@@ -274,6 +289,7 @@ impl AgentInstance {
     #[must_use]
     pub fn new(agent_type: AgentType, options: SpawnOptions, task_handle: TaskHandle) -> Self {
         let model = options.model_override.clone();
+        let working_directory = options.cwd.clone().unwrap_or_else(|| PathBuf::from("."));
         let (status_tx, status_rx) = watch::channel(AgentStatus::Starting);
         Self {
             agent_type,
@@ -287,6 +303,8 @@ impl AgentInstance {
             model,
             prompt: String::new(),
             task_join_handle: None,
+            working_directory,
+            worktree_path: None,
         }
     }
 
@@ -334,7 +352,7 @@ type ToolExecutorFactory =
 /// Handles:
 /// - Spawning agents with context fork and tool whitelist
 /// - Tracking agent state and messaging
-/// - Resuming existing agents
+/// - Registering externally managed agents (no execution is resumed)
 /// - Broadcasting teammate events
 /// - Running forked agents and background features via AI
 pub struct AgentManager {
@@ -344,8 +362,8 @@ pub struct AgentManager {
     agents: HashMap<String, AgentInstance>,
     /// Callback for teammate events.
     event_callback: Option<TeammateEventCallback>,
-    /// Resumed agents (from a previous session).
-    resumed_agents: Vec<String>,
+    /// Agent ids registered as managed outside this manager.
+    registered_agents: Vec<String>,
     /// API client for forked/background AI execution.
     api_client: Option<Box<dyn ApiClient>>,
     /// Default model inherited from the parent session.
@@ -371,7 +389,7 @@ impl std::fmt::Debug for AgentManager {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("AgentManager")
             .field("agents", &self.agents.len())
-            .field("resumed_agents", &self.resumed_agents)
+            .field("registered_agents", &self.registered_agents)
             .finish_non_exhaustive()
     }
 }
@@ -385,7 +403,7 @@ impl AgentManager {
             task_manager,
             agents: HashMap::new(),
             event_callback: None,
-            resumed_agents: Vec::new(),
+            registered_agents: Vec::new(),
             api_client: None,
             model: ModelId::sonnet(),
             event_tx: None,
@@ -557,6 +575,12 @@ impl AgentManager {
         cwd: &str,
         message_count: usize,
     ) -> Result<&AgentInstance, AgentError> {
+        // Refuse spawn options this manager cannot honor before doing any
+        // work. An accepted-but-ignored isolation request is the dangerous
+        // case: the caller believes the agent is confined to its own worktree
+        // when it is in fact free to edit the caller's checkout.
+        validate_spawn_options(&options)?;
+
         // Build forked context
         let context = ForkedContext::new(
             parent_session_id.to_string(),
@@ -582,16 +606,31 @@ impl AgentManager {
         // Set up message channel
         let (msg_tx, mut msg_rx) = mpsc::unbounded_channel::<AgentMessage>();
 
+        // Resolve where the agent actually runs. A `worktree` isolation
+        // request creates a real git worktree and runs the agent there; the
+        // caller's checkout is never the agent's working directory in that
+        // case. A failed worktree creation is a hard error, never a silent
+        // fallback to the caller's checkout.
+        let base_directory = options.cwd.clone().unwrap_or_else(|| PathBuf::from(cwd));
+        let worktree_path = if options.isolation.is_some() {
+            Some(create_isolation_worktree(&base_directory, &task_id)?)
+        } else {
+            None
+        };
+        let working_directory = worktree_path
+            .clone()
+            .unwrap_or_else(|| base_directory.clone());
+
         // Create output file path. Keep agent artifacts out of the project
         // unless the caller explicitly chose a working directory override.
-        let output_file = options.cwd.as_ref().map_or_else(
-            || {
-                std::env::temp_dir()
-                    .join("coderex-agents")
-                    .join(format!("agent-{task_id}-output.txt"))
-            },
-            |d| d.join(format!("agent-{task_id}-output.txt")),
-        );
+        // When isolation created a worktree (itself a checkout) the artifacts
+        // go to the temp directory so they do not pollute that checkout.
+        let output_file = match (&worktree_path, &options.cwd) {
+            (None, Some(dir)) => dir.join(format!("agent-{task_id}-output.txt")),
+            _ => std::env::temp_dir()
+                .join("coderex-agents")
+                .join(format!("agent-{task_id}-output.txt")),
+        };
 
         if let Some(parent) = output_file.parent() {
             tokio::fs::create_dir_all(parent).await.map_err(|error| {
@@ -631,11 +670,12 @@ impl AgentManager {
         instance.context = Some(context);
         instance.message_tx = Some(msg_tx);
         instance.output_file = Some(output_file.clone());
+        instance.working_directory = working_directory.clone();
+        instance.worktree_path = worktree_path.clone();
         let _ = instance.status_tx.send(AgentStatus::Running);
         instance.prompt = system_prompt.clone();
 
         let agent_id = task_id.clone();
-        let working_directory = options.cwd.clone().unwrap_or_else(|| PathBuf::from(cwd));
         let permission_mode = self
             .permission_checker
             .as_ref()
@@ -849,57 +889,40 @@ impl AgentManager {
             .count()
     }
 
-    // ─── Resume Support (10.5) ─────────────────────────────────────────
+    // ─── Registered (externally managed) agents ─────────────────────────
 
-    /// Resume an existing agent from a previous session.
+    /// Register an agent id that is managed outside this manager.
     ///
-    /// Restores the agent's context and state from serialized data.
-    pub async fn resume_agent(
-        &mut self,
-        agent_id: &str,
-        agent_type: AgentType,
-        options: SpawnOptions,
-        context: ForkedContext,
-    ) -> Result<&AgentInstance, AgentError> {
-        // Check if agent already exists
-        if self.agents.contains_key(agent_id) {
+    /// This does **not** resume execution, and it cannot: CodeRex does not
+    /// persist a sub-agent's transcript, so there is no prior conversation or
+    /// task to resume from. The previous name for this method
+    /// (`resume_agent`) promised a resume it never performed — it created an
+    /// instance marked [`AgentStatus::Running`] whose message channel had no
+    /// receiver, so `send_message` reported success while nothing ever
+    /// received the message.
+    ///
+    /// The id is recorded only so callers can ask
+    /// [`AgentManager::is_registered`]. No [`AgentInstance`] is created, so
+    /// `send_message`, `get_agent`, and `wait_for_completion` treat the id as
+    /// unknown rather than as a running agent.
+    pub fn register_agent(&mut self, agent_id: &str) -> Result<(), AgentError> {
+        if self.is_registered(agent_id) {
             return Err(AgentError::SpawnFailed(format!(
-                "agent {agent_id} already exists"
+                "agent {agent_id} is already registered"
             )));
         }
 
-        // Re-create task handle
-        let kind = TaskKind::LocalAgent {
-            agent_type: agent_type_name(&agent_type),
-            pid: None,
-        };
+        self.registered_agents.push(agent_id.to_string());
 
-        let task_manager = self.task_manager.lock().await;
-        // Use the specific ID for resumed agents
-        let task_handle = TaskHandle::new(agent_id.to_string(), kind);
-        drop(task_manager);
+        tracing::info!("agent registered (no execution attached): agent_id={agent_id}");
 
-        let (msg_tx, _msg_rx) = mpsc::unbounded_channel::<AgentMessage>();
-
-        let mut instance = AgentInstance::new(agent_type, options, task_handle);
-        instance.context = Some(context);
-        instance.message_tx = Some(msg_tx);
-        let _ = instance.status_tx.send(AgentStatus::Running);
-
-        self.agents.insert(agent_id.to_string(), instance);
-        self.resumed_agents.push(agent_id.to_string());
-
-        tracing::info!("agent resumed: agent_id={agent_id}");
-
-        self.agents
-            .get(agent_id)
-            .ok_or_else(|| AgentError::SpawnFailed("resume failed".into()))
+        Ok(())
     }
 
-    /// Check if an agent was resumed from a previous session.
+    /// Check whether an agent id was registered via [`AgentManager::register_agent`].
     #[must_use]
-    pub fn is_resumed(&self, agent_id: &str) -> bool {
-        self.resumed_agents.iter().any(|id| id == agent_id)
+    pub fn is_registered(&self, agent_id: &str) -> bool {
+        self.registered_agents.iter().any(|id| id == agent_id)
     }
 
     // ─── Forked / Background Agent Execution ─────────────────────────────────
@@ -948,6 +971,72 @@ impl AgentManager {
             .await
             .map_err(|e| AgentError::SpawnFailed(e.to_string()))
     }
+}
+
+/// The only `SpawnOptions::isolation` value this manager can honor.
+const ISOLATION_WORKTREE: &str = "worktree";
+
+/// Reject spawn options this manager cannot honor.
+///
+/// Both checks guard against the same failure mode: a request that is
+/// accepted and then silently ignored. A caller that asked for worktree
+/// isolation believes the agent cannot touch their checkout; a caller that
+/// asked for environment variables believes the agent has them. Running the
+/// agent anyway, without either, is worse than refusing to spawn it.
+fn validate_spawn_options(options: &SpawnOptions) -> Result<(), AgentError> {
+    if let Some(ref mode) = options.isolation {
+        if !mode.eq_ignore_ascii_case(ISOLATION_WORKTREE) {
+            return Err(AgentError::Configuration(format!(
+                "unsupported isolation mode {mode:?}: this build can only isolate an agent in a \
+                 git worktree (isolation = \"worktree\"); refusing the spawn instead of running \
+                 it without the isolation the caller asked for"
+            )));
+        }
+    }
+
+    if !options.extra_env.is_empty() {
+        let mut keys: Vec<&str> = options.extra_env.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        return Err(AgentError::Configuration(format!(
+            "extra_env is not supported for sub-agents (requested keys: {keys:?}); sub-agents run \
+             in the parent process, so there is no child environment to inject into, and setting \
+             process-wide variables would leak into the parent and other agents; refusing the \
+             spawn instead of ignoring the request"
+        )));
+    }
+
+    Ok(())
+}
+
+/// Create a git worktree for an isolated agent and return its path.
+///
+/// The worktree is created from `repo` on a branch named after the agent, so
+/// two concurrently isolated agents never collide on a branch name. A failure
+/// here is a hard error: an agent that asked for isolation must never fall
+/// back to running in the caller's checkout.
+///
+/// The worktree is left in place after the agent finishes — it holds the
+/// agent's work, which is the point of isolating it — so callers that want it
+/// removed should do so explicitly.
+fn create_isolation_worktree(repo: &Path, agent_id: &str) -> Result<PathBuf, AgentError> {
+    let config = WorktreeConfig {
+        base_dir: repo.join(".coderex").join("worktrees"),
+        branch_prefix: "coderex".to_string(),
+        auto_cleanup: true,
+    };
+    let mut manager = WorktreeManager::new(config);
+    let branch = format!("coderex-agent-{agent_id}");
+    let repo_path = repo.to_path_buf();
+
+    manager
+        .create_worktree(&repo_path, Some(&branch))
+        .map(|result| result.path)
+        .map_err(|error| {
+            AgentError::SpawnFailed(format!(
+                "could not create an isolation worktree for agent {agent_id} from {}: {error}",
+                repo.display()
+            ))
+        })
 }
 
 /// Derive a system prompt from an agent type and user prompt.
@@ -1569,42 +1658,160 @@ mod tests {
         assert_eq!(mgr.list_agents()[0].status(), AgentStatus::Stopped);
     }
 
-    #[tokio::test]
-    async fn resume_agent() {
+    #[test]
+    fn register_agent_tracks_without_running() {
         let mut mgr = make_manager();
-        let context = ForkedContext::new("sess_parent".into(), "/tmp".into(), 10);
+        mgr.register_agent("external_1").unwrap();
 
-        mgr.resume_agent(
-            "resumed_1",
-            AgentType::Plan,
-            SpawnOptions::default(),
-            context,
-        )
-        .await
-        .unwrap();
+        assert!(mgr.is_registered("external_1"));
+        // Registration starts nothing: there is no task and no instance, so
+        // the agent is not counted as running and cannot be fetched.
+        assert_eq!(mgr.running_count(), 0);
+        assert!(mgr.get_agent("external_1").is_none());
+    }
 
-        assert!(mgr.is_resumed("resumed_1"));
-        assert_eq!(mgr.running_count(), 1);
+    #[test]
+    fn register_duplicate_agent_errors() {
+        let mut mgr = make_manager();
+        mgr.register_agent("dup_1").unwrap();
+
+        let result = mgr.register_agent("dup_1");
+        assert!(matches!(result, Err(AgentError::SpawnFailed(_))));
     }
 
     #[tokio::test]
-    async fn resume_existing_agent_errors() {
+    async fn send_message_to_registered_agent_errors() {
         let mut mgr = make_manager();
-        let context = ForkedContext::new("sess_parent".into(), "/tmp".into(), 10);
+        mgr.register_agent("external_1").unwrap();
 
-        mgr.resume_agent(
-            "dup_1",
-            AgentType::Plan,
-            SpawnOptions::default(),
-            context.clone(),
-        )
-        .await
-        .unwrap();
+        // A registered agent has no receiver; the message must be refused
+        // rather than silently dropped.
+        let result = mgr.send_message("external_1", "hello").await;
+        assert!(matches!(result, Err(AgentError::NotFound(_))));
+    }
+
+    /// Create a git repository with one commit so `git worktree add` can run.
+    fn init_git_repo(dir: &std::path::Path) {
+        let run = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .args(args)
+                .current_dir(dir)
+                .env("GIT_AUTHOR_NAME", "test")
+                .env("GIT_AUTHOR_EMAIL", "test@example.com")
+                .env("GIT_COMMITTER_NAME", "test")
+                .env("GIT_COMMITTER_EMAIL", "test@example.com")
+                .status()
+                .unwrap();
+            assert!(status.success(), "git {args:?} failed");
+        };
+        run(&["init", "-q"]);
+        std::fs::write(dir.join("README.md"), "hello\n").unwrap();
+        run(&["add", "README.md"]);
+        run(&["commit", "-q", "-m", "init"]);
+    }
+
+    #[tokio::test]
+    async fn isolation_worktree_runs_agent_in_worktree() {
+        let repo = tempfile::tempdir().unwrap();
+        init_git_repo(repo.path());
+
+        let mut mgr = make_manager();
+        let instance = mgr
+            .spawn_agent(
+                AgentType::GeneralPurpose,
+                "do work",
+                SpawnOptions {
+                    isolation: Some("worktree".into()),
+                    ..Default::default()
+                },
+                "sess_iso",
+                repo.path().to_str().unwrap(),
+                0,
+            )
+            .await
+            .unwrap();
+
+        let worktree = instance
+            .worktree_path
+            .clone()
+            .expect("isolation must create a worktree");
+        assert!(worktree.is_dir(), "worktree {} missing", worktree.display());
+        assert_ne!(worktree.as_path(), repo.path());
+        // The engine's working directory is the worktree, not the checkout.
+        assert_eq!(instance.working_directory, worktree);
+        // The worktree is a real checkout of the repo.
+        assert!(worktree.join("README.md").is_file());
+        // The agent's artifacts do not land in the caller's checkout.
+        let output = instance.output_file.clone().unwrap();
+        assert!(!output.starts_with(repo.path()));
+    }
+
+    #[tokio::test]
+    async fn isolation_unknown_mode_is_refused() {
+        let mut mgr = make_manager();
+        let result = mgr
+            .spawn_agent(
+                AgentType::GeneralPurpose,
+                "do work",
+                SpawnOptions {
+                    isolation: Some("container".into()),
+                    ..Default::default()
+                },
+                "sess_iso",
+                "/tmp",
+                0,
+            )
+            .await;
+
+        assert!(matches!(result, Err(AgentError::Configuration(_))));
+        assert!(mgr.list_agents().is_empty());
+    }
+
+    #[tokio::test]
+    async fn isolation_worktree_without_git_repo_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut mgr = make_manager();
+        let result = mgr
+            .spawn_agent(
+                AgentType::GeneralPurpose,
+                "do work",
+                SpawnOptions {
+                    isolation: Some("worktree".into()),
+                    ..Default::default()
+                },
+                "sess_iso",
+                dir.path().to_str().unwrap(),
+                0,
+            )
+            .await;
+
+        // No silent fallback to the caller's directory when isolation fails.
+        assert!(matches!(result, Err(AgentError::SpawnFailed(_))));
+        assert!(mgr.list_agents().is_empty());
+    }
+
+    #[tokio::test]
+    async fn extra_env_is_refused() {
+        let mut mgr = make_manager();
+        let mut env = HashMap::new();
+        env.insert("SECRET".to_string(), "value".to_string());
 
         let result = mgr
-            .resume_agent("dup_1", AgentType::Plan, SpawnOptions::default(), context)
+            .spawn_agent(
+                AgentType::GeneralPurpose,
+                "do work",
+                SpawnOptions {
+                    extra_env: env,
+                    ..Default::default()
+                },
+                "sess_env",
+                "/tmp",
+                0,
+            )
             .await;
-        assert!(matches!(result, Err(AgentError::SpawnFailed(_))));
+
+        assert!(matches!(result, Err(AgentError::Configuration(_))));
+        assert!(mgr.list_agents().is_empty());
     }
 
     #[tokio::test]
