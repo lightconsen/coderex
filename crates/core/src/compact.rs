@@ -1,7 +1,16 @@
 //! Compact strategies for reducing context window size.
 //!
+//! Every strategy here is **client-side**: it rewrites the message list in
+//! this process, before the request is sent. CodeRex has no server-side
+//! context management, so nothing in this module corresponds to the reference
+//! implementation's `clear_tool_uses_20250919` context-management instruction,
+//! where the request tells the *server* to drop old tool results and the local
+//! transcript is left untouched. Do not read these functions as a wrapper over
+//! that mechanism — they are the whole of CodeRex's compaction, and the model
+//! sees whatever this code leaves behind.
+//!
 //! Four strategies are available, ranging from light to aggressive:
-//! - **Micro**: Replace early tool results with short summaries
+//! - **Micro**: Truncate early tool results to their head and tail
 //! - **Auto**: Micro + remove pure-text assistant messages
 //! - **Reactive**: Auto + truncate older conversation turns
 //! - **Snip**: Truncate history at a boundary point, preserving essential context
@@ -61,7 +70,10 @@ fn total_token_estimate(messages: &[Message]) -> usize {
 
 // ─── Micro Compact ──────────────────────────────────────────────────────────
 
-/// Parameters for cache-friendly micro compact.
+/// Parameters for micro compact.
+///
+/// `head_tokens` and `tail_tokens` split the truncation budget between the two
+/// ends of a result (see [`truncate_tool_output`]); only the middle is elided.
 #[derive(Debug, Clone, Copy)]
 pub struct MicroCompactParams {
     /// Keep the last N tool-result messages verbatim.
@@ -85,11 +97,14 @@ impl Default for MicroCompactParams {
     }
 }
 
-/// Tools whose results are safe to truncate in micro compact.
+/// Tools whose results micro compact may truncate.
 ///
-/// Read/search/shell results are re-derivable (re-run the command, re-read
-/// the file); mutating or remote tools outside this list keep their output
-/// verbatim.
+/// Only re-derivable results are listed: re-running the command or re-reading
+/// the file reconstructs them, so eliding the middle loses nothing that cannot
+/// be recovered. Mutating tools (`edit`, `write`, `apply_patch`, …) are
+/// deliberately absent — their output records a change that cannot be replayed,
+/// and for a diff the elided middle is where the remaining hunks live. A tool
+/// that is not listed here keeps its output verbatim.
 const MICRO_COMPACT_TOOLS: &[&str] = &[
     "read",
     "shell",
@@ -101,9 +116,6 @@ const MICRO_COMPACT_TOOLS: &[&str] = &[
     "web_search",
     "webfetch",
     "web_fetch",
-    "edit",
-    "write",
-    "apply_patch",
 ];
 
 fn is_micro_compactable(name: &str) -> bool {
@@ -117,7 +129,12 @@ fn is_micro_compactable(name: &str) -> bool {
 /// `min_result_tokens` have their output truncated (head + tail kept,
 /// middle elided). The message identity — role, `tool_call_id`,
 /// `is_error` — is preserved so provider-side tool_use/tool_result
-/// pairing and any prompt cache over the structure survive compaction.
+/// pairing survives compaction.
+///
+/// This edits the transcript itself, so it invalidates any prompt cache over
+/// the truncated prefix: only the `keep_recent` results the model most recently
+/// saw are left byte-for-byte identical, and everything before the first
+/// truncated result is a cache miss on the next request.
 #[must_use]
 pub fn micro_compact(messages: &[Message], params: MicroCompactParams) -> CompactResult {
     let tokens_before = total_token_estimate(messages);
@@ -196,17 +213,31 @@ pub fn micro_compact(messages: &[Message], params: MicroCompactParams) -> Compac
 /// with the result (tail is signal); the middle is where redundancy lives.
 /// The 2:1 head:tail split reflects that tool outputs are more
 /// path/command-heavy up front than plain prose.
+///
+/// Both ends are always kept, which is what makes this safe for the results
+/// that matter most: a `cargo test` failure ends with the failing assertion,
+/// and a diff ends with its last hunk, so neither is reduced to a bare head.
 #[must_use]
 pub fn truncate_tool_output(output: &str, head_tokens: usize, tail_tokens: usize) -> String {
     if PromptCompiler::estimate_tokens(output) <= head_tokens + tail_tokens {
         return output.to_string();
     }
-    let head_chars = head_tokens * 4;
-    let tail_chars = tail_tokens * 4;
     let chars: Vec<char> = output.chars().collect();
+    // The budgets below are char-denominated (≈ tokens × 4) but the check
+    // above counts *bytes*, so multi-byte output can clear the token budget
+    // while still holding fewer chars than `head + tail`. Clamp both ends to
+    // the string and never let them overlap: an overlap duplicates the text
+    // and returns something longer than the input, the opposite of what a
+    // compact pass is for. When the budgets cover the whole string there is
+    // nothing in the middle to elide, so the output passes through untouched.
+    let head_chars = (head_tokens * 4).min(chars.len());
+    let tail_chars = (tail_tokens * 4).min(chars.len() - head_chars);
+    if head_chars + tail_chars >= chars.len() {
+        return output.to_string();
+    }
     let elided_tokens = PromptCompiler::estimate_tokens(output) - head_tokens - tail_tokens;
-    let head_part: String = chars[..head_chars.min(chars.len())].iter().collect();
-    let tail_start = chars.len().saturating_sub(tail_chars);
+    let head_part: String = chars[..head_chars].iter().collect();
+    let tail_start = chars.len() - tail_chars;
     let tail_part: String = chars[tail_start..].iter().collect();
     format!("{head_part}\n[... ~{elided_tokens} tokens elided ...]\n{tail_part}")
 }
@@ -936,6 +967,34 @@ mod tests {
     }
 
     #[test]
+    fn micro_compact_leaves_mutating_tool_results_verbatim() {
+        // A mutating tool's output records a change that cannot be replayed,
+        // and a large one is usually a diff whose elided middle is where the
+        // remaining hunks live. Unlike a re-derivable read/shell result, it
+        // must never be truncated.
+        for name in ["edit", "write", "apply_patch"] {
+            let mut messages = Vec::new();
+            messages.extend(make_tool_exchange("tc_1", name, &"d".repeat(40_000)));
+            messages.extend(make_tool_exchange("tc_2", "read", "recent"));
+
+            let result = micro_compact(
+                &messages,
+                MicroCompactParams {
+                    keep_recent: 1,
+                    ..Default::default()
+                },
+            );
+
+            assert_eq!(result.tokens_removed, 0, "{name} result was truncated");
+            if let MessageContent::ToolResult(tr) = &result.messages[1].content {
+                assert_eq!(tr.output, "d".repeat(40_000), "{name} output changed");
+            } else {
+                panic!("expected tool result for {name}");
+            }
+        }
+    }
+
+    #[test]
     fn micro_compact_leaves_small_results_intact() {
         let mut messages = Vec::new();
         messages.extend(make_tool_exchange("tc_1", "read", "tiny output"));
@@ -1008,6 +1067,24 @@ mod tests {
 
         assert!(truncated.contains("tokens elided"));
         assert!(truncated.chars().count() < output.chars().count());
+    }
+
+    #[test]
+    fn truncate_tool_output_never_grows_multibyte_output() {
+        // 3 000 CJK chars is 9 000 bytes, so the byte-based token estimate
+        // (9 000 / 4 = 2 250) clears the 1 500-token budget, while the char
+        // count (3 000) sits below the 4 000 + 2 000 char head+tail budget.
+        // Slicing by those budgets made the head and tail overlap, so the
+        // "truncated" output came back longer than the input.
+        let output = "汉".repeat(3_000);
+        let truncated = truncate_tool_output(&output, 1_000, 500);
+
+        assert!(
+            truncated.chars().count() <= output.chars().count(),
+            "truncation grew the output: {} chars from {}",
+            truncated.chars().count(),
+            output.chars().count()
+        );
     }
 
     #[test]
