@@ -544,6 +544,10 @@ pub struct ReplLoop {
     dream_shutdown_tx: Option<tokio::sync::oneshot::Sender<()>>,
     /// Team memory sync service for cross-repo memory sharing.
     team_memory_service: Option<Arc<TeamMemorySyncService>>,
+    /// Whether the memory tools may write. Cleared by
+    /// `--no-session-persistence`, which arrives after the tools are
+    /// registered, so the tools read it at call time.
+    memory_writable: Arc<std::sync::atomic::AtomicBool>,
     /// Config watcher for hot-reloading settings.
     #[cfg(feature = "hot-reload")]
     config_changed_rx: Option<tokio::sync::watch::Receiver<()>>,
@@ -551,6 +555,9 @@ pub struct ReplLoop {
     command_history: CommandHistory,
     /// Macro registry for user-defined command sequences.
     macro_registry: MacroRegistry,
+    /// Lifecycle hooks from settings, installed on the engine by
+    /// [`apply_cli_config`](Self::apply_cli_config).
+    hooks_settings: Option<serde_json::Value>,
     /// Pending destructive command awaiting confirmation.
     pending_destructive_cmd: Option<(String, Vec<String>)>,
     /// Plugin manager for dynamic plugin commands and tools.
@@ -721,8 +728,10 @@ impl ReplLoop {
             auto_dream: None,
             dream_shutdown_tx: None,
             team_memory_service: None,
+            memory_writable: Arc::new(std::sync::atomic::AtomicBool::new(true)),
             command_history: CommandHistory::new(1000),
             macro_registry: MacroRegistry::new(),
+            hooks_settings: None,
             pending_destructive_cmd: None,
             plugin_manager: None,
             _primary_tool_executor: None,
@@ -810,6 +819,17 @@ impl ReplLoop {
             "default".to_string(),
             memory_base.join("team"),
         ));
+        // The model-facing memory family. A write to a shared store is decided
+        // by the model rather than assumed safe, and the service refuses such a
+        // write outright when no classifier is installed.
+        let memory_service = Arc::new(coderex_memory::service::MemoryService::new(
+            Arc::clone(&long_term_store),
+            Arc::clone(&team_memory_service),
+        )
+        .with_classifier(Arc::new(
+            crate::memory_tools::ModelMemoryClassifier::new(api_client.clone_box()),
+        )));
+        let memory_writable = Arc::new(std::sync::atomic::AtomicBool::new(true));
 
         let engine = QueryEngine::new(
             api_client.clone_box(),
@@ -880,6 +900,19 @@ impl ReplLoop {
             .with_root(coderex_workflow::default_root())
             .with_project_dir(std::path::Path::new(&cwd).join(".coderex/workflows")),
         ));
+        // Rule exemptions are deliberately NOT installed here.
+        //
+        // `Agent` and `Workflow` declare that they ignore whole-tool allow
+        // rules, and installing that makes the fallback "ask" — so every
+        // delegation would prompt, in every mode, even though the subagent's
+        // own tool calls are gated by this same checker anyway. The prompt
+        // would be redundant. `coderex_tools::install_rule_exemptions` exists
+        // for a session that wants that policy; this one does not.
+        for tool in
+            crate::memory_tools::memory_tools(Arc::clone(&memory_service), &memory_writable)
+        {
+            registry.register(tool);
+        }
         let registry = Arc::new(registry);
         let inner_executor = Arc::new(ToolsExecutor::new(ExecutionConfig::default()));
         let mut dispatcher = RegistryToolDispatcher::new(
@@ -953,8 +986,10 @@ impl ReplLoop {
             auto_dream: Some(auto_dream),
             dream_shutdown_tx: None,
             team_memory_service: Some(team_memory_service),
+            memory_writable,
             command_history: CommandHistory::new(1000),
             macro_registry: MacroRegistry::new(),
+            hooks_settings: None,
             pending_destructive_cmd: None,
             plugin_manager: None,
             _primary_tool_executor: Some(primary_executor),
@@ -1117,6 +1152,15 @@ impl ReplLoop {
         self.permission_mode = mode;
     }
 
+    /// Lifecycle hooks from settings, installed by `apply_cli_config`.
+    ///
+    /// The `hooks` block was parsed into settings and then dropped: the engine
+    /// kept its no-op executor, so a configured hook never ran. This is the
+    /// value that gets loaded onto the engine.
+    pub fn with_hooks(&mut self, hooks: Option<serde_json::Value>) {
+        self.hooks_settings = hooks;
+    }
+
     pub fn with_no_persistence(&mut self, no_persist: bool) {
         self.no_persistence = no_persist;
     }
@@ -1230,6 +1274,10 @@ impl ReplLoop {
             self.long_term_store = None;
             self.auto_dream = None;
             self.team_memory_service = None;
+            // The memory tools hold their own handle to the stores, so
+            // dropping the fields above does not stop them writing.
+            self.memory_writable
+                .store(false, std::sync::atomic::Ordering::Relaxed);
             tracing::info!("Session persistence disabled — memory stores cleared");
         }
 
@@ -1315,6 +1363,25 @@ impl ReplLoop {
         // 14. Debug file — log that it would be configured
         if let Some(ref debug_path) = self.debug_file {
             tracing::info!("Debug output file configured: {debug_path:?}");
+        }
+
+        // 15. Lifecycle hooks
+        //
+        // The hooks crate was complete and never installed: the engine kept the
+        // no-op executor it is built with, so a `hooks` block in settings.json
+        // was parsed, validated, and then did nothing whatsoever. This is the
+        // call that makes a configured event actually fire.
+        //
+        // These hooks come from settings, which a repository can write, so they
+        // are loaded in the `Core` tier — a managed policy hook runs ahead of
+        // them regardless of the priority they give themselves.
+        if let Some(ref hooks) = self.hooks_settings {
+            if let Some(ref mut engine) = self.engine {
+                match coderex_hooks::HookRegistry::from_settings_json(hooks) {
+                    Ok(registry) => engine.set_hooks(registry.into_executor()),
+                    Err(e) => tracing::warn!("hooks in settings were not loaded: {e}"),
+                }
+            }
         }
     }
 
@@ -1908,6 +1975,12 @@ impl ReplLoop {
                 Some(event) = ct_rx.recv() => {
                     match event {
                         Event::Key(key) => {
+                            // Windows always reports key releases, and the
+                            // disambiguated protocol can too; acting on them
+                            // types every character twice.
+                            let Some(key) = coderex_ui::input::key_press(key) else {
+                                continue;
+                            };
                             if key.code == KeyCode::Char('c')
                                 && key.modifiers.contains(KeyModifiers::CONTROL)
                             {
@@ -5104,6 +5177,69 @@ mod tests {
         }
     }
 
+    /// Counts the turn's own requests, so a test can tell "the turn ran" from
+    /// "only the side queries around it ran".
+    ///
+    /// A headless turn goes through `submit_streaming`, and this stream is
+    /// empty, so the turn produces no text at all — the answer string is not a
+    /// usable signal. The count is.
+    #[derive(Clone)]
+    struct CountingApi {
+        turn_requests: Arc<std::sync::Mutex<usize>>,
+    }
+
+    impl CountingApi {
+        fn new() -> Self {
+            Self {
+                turn_requests: Arc::new(std::sync::Mutex::new(0)),
+            }
+        }
+
+        fn turn_requests(&self) -> usize {
+            *self.turn_requests.lock().unwrap()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ApiClient for CountingApi {
+        fn clone_box(&self) -> Box<dyn ApiClient> {
+            Box::new(self.clone())
+        }
+
+        async fn create_message(
+            &self,
+            _system: &str,
+            _messages: &[serde_json::Value],
+            _model: &ModelId,
+            _max_tokens: u32,
+            _tools: &[ToolInfo],
+        ) -> Result<ApiResponse, ApiError> {
+            Ok(ApiResponse {
+                content: "Side query answer".into(),
+                tool_calls: Vec::new(),
+                usage: UsageSummary {
+                    input_tokens: 1,
+                    output_tokens: 1,
+                    cache_read_tokens: 0,
+                    cache_creation_tokens: 0,
+                },
+                stop_reason: "end_turn".into(),
+            })
+        }
+
+        async fn create_message_streaming(
+            &self,
+            _system: &str,
+            _messages: &[serde_json::Value],
+            _model: &ModelId,
+            _max_tokens: u32,
+            _tools: &[ToolInfo],
+        ) -> std::pin::Pin<Box<dyn futures::Stream<Item = StreamEvent> + Send + 'static>> {
+            *self.turn_requests.lock().unwrap() += 1;
+            Box::pin(futures::stream::empty())
+        }
+    }
+
     #[test]
     fn parse_empty_returns_none() {
         assert!(parse_input("").is_none());
@@ -5354,6 +5490,99 @@ mod tests {
 
         phase.reset();
         assert!(phase.status_label().is_none());
+    }
+
+    /// A `hooks` block in settings used to be parsed, validated, and then
+    /// dropped: the engine kept the no-op executor it is constructed with, so a
+    /// configured hook never ran. This pins the install, not the registry —
+    /// `coderex-hooks` has its own tests for loading.
+    #[tokio::test]
+    async fn hooks_from_settings_run_before_the_turn() {
+        let temp = tempfile::tempdir().unwrap();
+        let marker = temp.path().join("hook-ran");
+        let hooks = serde_json::json!([{
+            "event": "UserPromptSubmit",
+            "command": format!("touch {} && echo '{{}}'", marker.display()),
+        }]);
+
+        let api = CountingApi::new();
+        let mut repl = ReplLoop::with_engine(
+            Box::new(api.clone()),
+            temp.path().to_string_lossy().into_owned(),
+            ModelId::sonnet(),
+        );
+        repl.with_hooks(Some(hooks));
+        repl.apply_cli_config();
+
+        repl.run_headless("Hello").await.unwrap();
+
+        assert!(
+            marker.exists(),
+            "the configured hook never ran — settings hooks are not installed on the engine"
+        );
+        assert_eq!(
+            api.turn_requests(),
+            1,
+            "a hook that answered 'continue' should not have stopped the turn"
+        );
+    }
+
+    /// A hook that cannot answer is a failure, and on a gating event a failure
+    /// denies: the turn must not reach the model. Without the install this test
+    /// would pass for the wrong reason, which is why it counts requests rather
+    /// than asserting on an answer the empty stream never produces.
+    #[tokio::test]
+    async fn a_hook_that_cannot_answer_stops_the_turn() {
+        let temp = tempfile::tempdir().unwrap();
+        let hooks = serde_json::json!([{
+            "event": "UserPromptSubmit",
+            "command": "exit 3",
+        }]);
+
+        let api = CountingApi::new();
+        let mut repl = ReplLoop::with_engine(
+            Box::new(api.clone()),
+            temp.path().to_string_lossy().into_owned(),
+            ModelId::sonnet(),
+        );
+        repl.with_hooks(Some(hooks));
+        repl.apply_cli_config();
+
+        repl.run_headless("Hello").await.unwrap();
+
+        assert_eq!(
+            api.turn_requests(),
+            0,
+            "a hook that failed was treated as 'continue' and the turn ran anyway"
+        );
+    }
+
+    /// The hook is told which prompt it is gating. It used to be handed
+    /// `custom_system_prompt`, which is almost always empty.
+    #[tokio::test]
+    async fn the_prompt_hook_is_given_the_prompt() {
+        let temp = tempfile::tempdir().unwrap();
+        let seen = temp.path().join("seen.json");
+        let hooks = serde_json::json!([{
+            "event": "UserPromptSubmit",
+            "command": format!("cat > {}; echo '{{}}'", seen.display()),
+        }]);
+
+        let mut repl = ReplLoop::with_engine(
+            Box::new(CountingApi::new()),
+            temp.path().to_string_lossy().into_owned(),
+            ModelId::sonnet(),
+        );
+        repl.with_hooks(Some(hooks));
+        repl.apply_cli_config();
+
+        repl.run_headless("Hello there").await.unwrap();
+
+        let input = std::fs::read_to_string(&seen).expect("the hook wrote its input");
+        assert!(
+            input.contains("Hello there"),
+            "the hook was not told the prompt it is gating: {input}"
+        );
     }
 
     #[test]

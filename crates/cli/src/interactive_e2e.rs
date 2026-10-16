@@ -333,6 +333,20 @@ fn strip_ansi(text: &str) -> String {
     out
 }
 
+/// Drop every whitespace character, so a needle can be compared against a
+/// rendering whose spaces are not all there.
+///
+/// Ratatui repaints only the cells that changed, and the cells it skips reach
+/// the byte stream as cursor moves rather than as spaces. `strip_ansi` then
+/// removes those moves, so whether a given space survives into the raw stream
+/// depends on the previous frame, not on what was displayed — a needle written
+/// without spaces matched or missed on the luck of the diff. Squeezing both
+/// sides makes the wait say what it means: these words were written to the
+/// terminal at some point.
+fn squeeze_whitespace(text: &str) -> String {
+    text.chars().filter(|c| !c.is_whitespace()).collect()
+}
+
 fn sibling_binary(name: &str) -> Result<PathBuf> {
     let current = std::env::current_exe().context("failed to locate current executable")?;
     let dir = current
@@ -627,9 +641,10 @@ impl PtySession {
 
     fn wait_for_raw_text(&self, needle: &str, timeout: Duration) -> Result<String> {
         let deadline = Instant::now() + timeout;
+        let needle = squeeze_whitespace(needle);
         loop {
             let raw = strip_ansi(&self.raw_text());
-            if raw.contains(needle) {
+            if squeeze_whitespace(&raw).contains(&needle) {
                 return Ok(raw);
             }
             if Instant::now() >= deadline {

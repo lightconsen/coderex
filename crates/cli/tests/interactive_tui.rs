@@ -33,6 +33,21 @@ fn strip_ansi(text: &str) -> String {
     out
 }
 
+/// Drop every whitespace character, so a needle can be compared against a
+/// rendering whose spaces are not all there.
+///
+/// Ratatui repaints only the cells that changed, and the cells it skips reach
+/// the byte stream as cursor moves rather than as spaces. `strip_ansi` then
+/// removes those moves, so whether a given space survives into the raw stream
+/// depends on the previous frame, not on what was displayed. A needle written
+/// without spaces ("Error:tool'Bash'denied") therefore matched or missed on the
+/// luck of the diff — which is what made these waits flaky. Squeezing both
+/// sides makes the assertion say what it means: these words were written to the
+/// terminal at some point.
+fn squeeze_whitespace(text: &str) -> String {
+    text.chars().filter(|c| !c.is_whitespace()).collect()
+}
+
 fn find_free_port() -> u16 {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind free port");
     listener.local_addr().expect("local addr").port()
@@ -286,9 +301,10 @@ impl PtySession {
 
     fn wait_for_raw_text(&self, needle: &str, timeout: Duration) -> String {
         let deadline = Instant::now() + timeout;
+        let needle = squeeze_whitespace(needle);
         loop {
             let raw = strip_ansi(&self.raw_text());
-            if raw.contains(needle) {
+            if squeeze_whitespace(&raw).contains(&needle) {
                 return raw;
             }
             if Instant::now() >= deadline {
@@ -513,9 +529,10 @@ fn assert_raw_contains_any(session: &PtySession, needles: &[&str], context: &str
 
 fn assert_raw_absent(session: &PtySession, needles: &[&str]) {
     let raw = strip_ansi(&session.raw_text());
+    let squeezed = squeeze_whitespace(&raw);
     for needle in needles {
         assert!(
-            !raw.contains(needle),
+            !squeezed.contains(&squeeze_whitespace(needle)),
             "raw output unexpectedly contained {needle:?}\n--- raw ---\n{raw}"
         );
     }
