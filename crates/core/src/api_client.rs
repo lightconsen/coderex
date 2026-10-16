@@ -19,6 +19,20 @@ pub enum ApiError {
     /// HTTP request failed.
     #[error("HTTP error: {0}")]
     Http(String),
+    /// The request never completed: no connection, or no answer in time.
+    ///
+    /// Separate from [`Self::Http`] because whether to try again is a question
+    /// about *how* it failed, and that is not something the message text can
+    /// be trusted to answer — the retry decision used to be
+    /// `message.contains("timeout") || message.contains("connect")`, so a
+    /// rewording in the HTTP client would have quietly stopped retrying.
+    #[error("transport error ({kind}): {message}")]
+    Transport {
+        /// What kind of failure it was.
+        kind: TransportError,
+        /// The underlying message, for a person.
+        message: String,
+    },
     /// Authentication failed or missing API key.
     #[error("authentication error: {0}")]
     Auth(String),
@@ -50,6 +64,10 @@ impl Clone for ApiError {
     fn clone(&self) -> Self {
         match self {
             Self::Http(msg) => Self::Http(msg.clone()),
+            Self::Transport { kind, message } => Self::Transport {
+                kind: *kind,
+                message: message.clone(),
+            },
             Self::Auth(msg) => Self::Auth(msg.clone()),
             Self::Response { status, message } => Self::Response {
                 status: *status,
@@ -68,9 +86,41 @@ impl Clone for ApiError {
     }
 }
 
+/// How a request failed at the transport level.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TransportError {
+    /// The far side did not answer in time.
+    Timeout,
+    /// The connection could not be established — or was dropped.
+    Connect,
+    /// Something else went wrong getting the request out or the answer back.
+    Other,
+}
+
+impl std::fmt::Display for TransportError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Timeout => f.write_str("timeout"),
+            Self::Connect => f.write_str("connect"),
+            Self::Other => f.write_str("other"),
+        }
+    }
+}
+
 impl From<reqwest::Error> for ApiError {
     fn from(e: reqwest::Error) -> Self {
-        Self::Http(e.to_string())
+        // Asked of the error itself rather than read out of its message.
+        let kind = if e.is_timeout() {
+            TransportError::Timeout
+        } else if e.is_connect() || e.is_request() {
+            TransportError::Connect
+        } else {
+            TransportError::Other
+        };
+        Self::Transport {
+            kind,
+            message: e.to_string(),
+        }
     }
 }
 
@@ -1343,7 +1393,11 @@ fn parse_sse_message(message: &str, state: &mut SseParserState) -> Vec<StreamEve
 #[must_use]
 pub fn is_retryable(error: &ApiError) -> bool {
     match error {
-        ApiError::Http(msg) => msg.contains("timeout") || msg.contains("connect"),
+        ApiError::Transport { kind, .. } => {
+            matches!(kind, TransportError::Timeout | TransportError::Connect)
+        }
+        // A message we built ourselves, not a transport failure.
+        ApiError::Http(_) => false,
         ApiError::Response { status, .. } => *status >= 500 || *status == 429,
         ApiError::AccessPolicy(_) => false,
         _ => false,
@@ -1493,6 +1547,52 @@ mod tests {
     async fn config_custom_timeout() {
         let config = ApiConfig::new("test_key".into()).with_timeout(60);
         assert_eq!(config.request_timeout_secs, 60);
+    }
+
+    /// The retry decision comes from how the request failed, not from what the
+    /// failure says. It used to be `message.contains("timeout") ||
+    /// message.contains("connect")` — so a rewording in the HTTP client, or a
+    /// message that happened to contain "connect" for another reason, changed
+    /// whether the client retried.
+    #[test]
+    fn is_retryable_reads_the_kind_not_the_message() {
+        let transport = |kind, message: &str| ApiError::Transport {
+            kind,
+            message: message.to_string(),
+        };
+
+        assert!(is_retryable(&transport(
+            TransportError::Timeout,
+            "something entirely different"
+        )));
+        assert!(is_retryable(&transport(TransportError::Connect, "")));
+
+        // A message that mentions the words is not a timeout.
+        assert!(!is_retryable(&transport(
+            TransportError::Other,
+            "timed out while connecting"
+        )));
+        // And one that is a failure of ours is not retryable either.
+        assert!(!is_retryable(&ApiError::Http(
+            "timeout while connecting".to_string()
+        )));
+    }
+
+    #[test]
+    fn a_request_error_carries_its_kind() {
+        // The conversion is what fills the kind in; a `reqwest::Error` cannot
+        // be built here, so this pins the mapping the classification relies on.
+        for (kind, retryable) in [
+            (TransportError::Timeout, true),
+            (TransportError::Connect, true),
+            (TransportError::Other, false),
+        ] {
+            let error = ApiError::Transport {
+                kind,
+                message: String::new(),
+            };
+            assert_eq!(is_retryable(&error), retryable, "{kind}");
+        }
     }
 
     #[test]

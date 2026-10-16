@@ -279,7 +279,13 @@ pub fn classify_api_error(provider: &str, err: ApiError) -> ProviderError {
             _ => ProviderErrorKind::Unknown,
         },
         ApiError::RetryExhausted { .. } => ProviderErrorKind::Unavailable,
-        ApiError::Http(_) => ProviderErrorKind::Retryable,
+        // The transport already said how it failed; the kind carries it.
+        ApiError::Transport { kind, .. } => match kind {
+            crate::api_client::TransportError::Timeout
+            | crate::api_client::TransportError::Connect => ProviderErrorKind::Retryable,
+            crate::api_client::TransportError::Other => ProviderErrorKind::Unknown,
+        },
+        ApiError::Http(_) => ProviderErrorKind::Unknown,
         ApiError::InvalidModel(_) => ProviderErrorKind::InvalidRequest,
     };
 

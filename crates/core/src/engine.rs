@@ -736,6 +736,77 @@ impl TurnRuntime {
     }
 }
 
+/// Why a turn could not get a response from the model.
+///
+/// The turn loop used to tell these apart by reading the message —
+/// `Err(e) if e.starts_with("The AI service is temporarily unavailable")` —
+/// which meant the two halves of the engine were joined by a sentence: change
+/// the wording where it is produced and the loop quietly stops recognising it,
+/// reporting a provider outage as a plain error instead.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TurnError {
+    /// The provider could not be reached, after retrying. The same request may
+    /// work later, and the session is intact.
+    ApiUnavailable {
+        /// What to show a person.
+        message: String,
+    },
+    /// Anything else: a bad request, a refusal, a bug here.
+    Fatal {
+        /// What to show a person.
+        message: String,
+    },
+}
+
+impl TurnError {
+    /// The message a person sees.
+    #[must_use]
+    pub fn message(&self) -> &str {
+        match self {
+            Self::ApiUnavailable { message } | Self::Fatal { message } => message,
+        }
+    }
+
+    /// The reason this turn ended.
+    #[must_use]
+    pub fn terminal_reason(&self) -> TerminalReason {
+        match self {
+            Self::ApiUnavailable { message } => TerminalReason::ApiUnavailable {
+                message: message.clone(),
+            },
+            Self::Fatal { message } => TerminalReason::Error(message.clone()),
+        }
+    }
+
+    /// The same error as a plain message.
+    #[must_use]
+    pub fn into_message(self) -> String {
+        match self {
+            Self::ApiUnavailable { message } | Self::Fatal { message } => message,
+        }
+    }
+}
+
+impl From<String> for TurnError {
+    /// A message that is not a provider outage — a tool that could not run, a
+    /// hook that failed — is the engine's own trouble.
+    fn from(message: String) -> Self {
+        Self::Fatal { message }
+    }
+}
+
+impl From<TurnError> for String {
+    fn from(error: TurnError) -> Self {
+        error.into_message()
+    }
+}
+
+impl std::fmt::Display for TurnError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.message())
+    }
+}
+
 /// Every transition a turn made, for the test that checks the graph against
 /// what the engine actually does.
 #[cfg(test)]
@@ -1441,16 +1512,16 @@ impl QueryEngine {
                         turn_number += 1;
                     }
                 }
-                Err(e) if e.starts_with("The AI service is temporarily unavailable") => {
-                    let reason = TerminalReason::ApiUnavailable { message: e };
+                // The error says which kind it is; the loop does not read the
+                // message to find out.
+                Err(error) => {
+                    let reason = error.terminal_reason();
                     turn.terminate(reason.clone());
                     self.current_turn = turn_number;
-                    return Ok(reason);
-                }
-                Err(e) => {
-                    turn.terminate(TerminalReason::Error(e.clone()));
-                    self.current_turn = turn_number;
-                    return Err(e);
+                    return match error {
+                        TurnError::ApiUnavailable { .. } => Ok(reason),
+                        TurnError::Fatal { message } => Err(message),
+                    };
                 }
             }
 
@@ -1549,16 +1620,16 @@ impl QueryEngine {
                         turn_number += 1;
                     }
                 }
-                Err(e) if e.starts_with("The AI service is temporarily unavailable") => {
-                    let reason = TerminalReason::ApiUnavailable { message: e };
+                // The error says which kind it is; the loop does not read the
+                // message to find out.
+                Err(error) => {
+                    let reason = error.terminal_reason();
                     turn.terminate(reason.clone());
                     self.current_turn = turn_number;
-                    return Ok(reason);
-                }
-                Err(e) => {
-                    turn.terminate(TerminalReason::Error(e.clone()));
-                    self.current_turn = turn_number;
-                    return Err(e);
+                    return match error {
+                        TurnError::ApiUnavailable { .. } => Ok(reason),
+                        TurnError::Fatal { message } => Err(message),
+                    };
                 }
             }
 
@@ -1578,7 +1649,7 @@ impl QueryEngine {
         turn: &mut TurnRuntime,
         options: &SubmitOptions,
         turn_number: u32,
-    ) -> Result<TerminalReason, String> {
+    ) -> Result<TerminalReason, TurnError> {
         let _start = Instant::now();
 
         // Phase 1: Initialize → BuildContext
@@ -1780,7 +1851,7 @@ impl QueryEngine {
         turn: &mut TurnRuntime,
         options: &SubmitOptions,
         turn_number: u32,
-    ) -> Result<TerminalReason, String> {
+    ) -> Result<TerminalReason, TurnError> {
         let _start = Instant::now();
 
         // Phase 1: Initialize → BuildContext
@@ -2430,7 +2501,7 @@ impl QueryEngine {
         &mut self,
         turn: &TurnRuntime,
         options: &SubmitOptions,
-    ) -> Result<ApiResponse, String> {
+    ) -> Result<ApiResponse, TurnError> {
         let system = turn
             .messages
             .iter()
@@ -2457,15 +2528,28 @@ impl QueryEngine {
                 attempts,
                 last_error_message: _,
             }) => {
-                let msg = format!(
+                let message = format!(
                     "The AI service is temporarily unavailable after {attempts} attempts. Please try again later."
                 );
                 let _ = self.event_tx.send(EngineEvent::Notification {
-                    message: msg.clone(),
+                    message: message.clone(),
                 });
-                return Err(msg);
+                return Err(TurnError::ApiUnavailable { message });
             }
-            Err(e) => return Err(e.to_string()),
+            Err(e) => {
+                // A transport failure that ran out of retries is the same
+                // question — try later — and is classified by kind rather than
+                // by reading the message.
+                return Err(if crate::api_client::is_retryable(&e) {
+                    TurnError::ApiUnavailable {
+                        message: e.to_string(),
+                    }
+                } else {
+                    TurnError::Fatal {
+                        message: e.to_string(),
+                    }
+                });
+            }
         };
 
         // Cache successful response for graceful degradation
@@ -2487,7 +2571,7 @@ impl QueryEngine {
         &mut self,
         turn: &mut TurnRuntime,
         options: &SubmitOptions,
-    ) -> Result<StreamedResponse, String> {
+    ) -> Result<StreamedResponse, TurnError> {
         use futures::StreamExt;
         use std::collections::HashSet;
 
@@ -3653,6 +3737,176 @@ mod tests {
         assert!(matches!(
             QueryEngine::reason_for("end_turn"),
             TerminalReason::Completed
+        ));
+    }
+
+    /// A provider outage ends the turn as `ApiUnavailable`, whatever the
+    /// message says. The turn loop used to decide by reading the message —
+    /// `e.starts_with("The AI service is temporarily unavailable")` — so the
+    /// two halves of the engine were joined by a sentence.
+    #[tokio::test]
+    async fn an_unreachable_provider_is_reported_as_temporarily_unavailable() {
+        /// Fails every request the way no network does.
+        struct UnreachableMock;
+
+        #[async_trait::async_trait]
+        impl ApiClient for UnreachableMock {
+            fn clone_box(&self) -> Box<dyn ApiClient> {
+                Box::new(UnreachableMock)
+            }
+
+            async fn create_message(
+                &self,
+                _system: &str,
+                _messages: &[serde_json::Value],
+                _model: &ModelId,
+                _max_tokens: u32,
+                _tools: &[crate::tool_executor::ToolInfo],
+            ) -> Result<ApiResponse, crate::api_client::ApiError> {
+                Err(crate::api_client::ApiError::Transport {
+                    kind: crate::api_client::TransportError::Connect,
+                    // Deliberately not the sentence the loop used to look for.
+                    message: "the far side is not answering".to_string(),
+                })
+            }
+
+            async fn create_message_streaming(
+                &self,
+                system: &str,
+                messages: &[serde_json::Value],
+                model: &ModelId,
+                max_tokens: u32,
+                tools: &[crate::tool_executor::ToolInfo],
+            ) -> std::pin::Pin<
+                Box<dyn futures::Stream<Item = crate::api_client::StreamEvent> + Send + 'static>,
+            > {
+                match self
+                    .create_message(system, messages, model, max_tokens, tools)
+                    .await
+                {
+                    Ok(response) => Box::pin(futures::stream::iter(vec![
+                        crate::api_client::StreamEvent::TextDelta(response.content),
+                        crate::api_client::StreamEvent::StreamEnd,
+                    ])),
+                    Err(error) => Box::pin(futures::stream::iter(vec![
+                        crate::api_client::StreamEvent::Error(error),
+                    ])),
+                }
+            }
+        }
+
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let session = SessionState::new(std::path::PathBuf::from("/tmp/test"));
+        let checker = PermissionChecker::new(PermissionMode::BypassPermissions);
+        let mut engine = QueryEngine::new(
+            Box::new(UnreachableMock),
+            ModelId::sonnet(),
+            session,
+            PermissionEngine::new(checker),
+            tx,
+        );
+
+        let reason = engine
+            .submit("say something".into(), SubmitOptions::default())
+            .await
+            .unwrap();
+
+        assert!(
+            matches!(reason, TerminalReason::ApiUnavailable { .. }),
+            "an unreachable provider came back as {reason:?}"
+        );
+    }
+
+    /// And a failure that is ours is not dressed up as a provider outage.
+    #[tokio::test]
+    async fn a_bad_request_is_not_reported_as_a_provider_outage() {
+        struct RejectingMock;
+
+        #[async_trait::async_trait]
+        impl ApiClient for RejectingMock {
+            fn clone_box(&self) -> Box<dyn ApiClient> {
+                Box::new(RejectingMock)
+            }
+
+            async fn create_message(
+                &self,
+                _system: &str,
+                _messages: &[serde_json::Value],
+                _model: &ModelId,
+                _max_tokens: u32,
+                _tools: &[crate::tool_executor::ToolInfo],
+            ) -> Result<ApiResponse, crate::api_client::ApiError> {
+                Err(crate::api_client::ApiError::Response {
+                    status: 400,
+                    message: "messages: field required".to_string(),
+                })
+            }
+
+            async fn create_message_streaming(
+                &self,
+                system: &str,
+                messages: &[serde_json::Value],
+                model: &ModelId,
+                max_tokens: u32,
+                tools: &[crate::tool_executor::ToolInfo],
+            ) -> std::pin::Pin<
+                Box<dyn futures::Stream<Item = crate::api_client::StreamEvent> + Send + 'static>,
+            > {
+                match self
+                    .create_message(system, messages, model, max_tokens, tools)
+                    .await
+                {
+                    Ok(response) => Box::pin(futures::stream::iter(vec![
+                        crate::api_client::StreamEvent::TextDelta(response.content),
+                        crate::api_client::StreamEvent::StreamEnd,
+                    ])),
+                    Err(error) => Box::pin(futures::stream::iter(vec![
+                        crate::api_client::StreamEvent::Error(error),
+                    ])),
+                }
+            }
+        }
+
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let session = SessionState::new(std::path::PathBuf::from("/tmp/test"));
+        let checker = PermissionChecker::new(PermissionMode::BypassPermissions);
+        let mut engine = QueryEngine::new(
+            Box::new(RejectingMock),
+            ModelId::sonnet(),
+            session,
+            PermissionEngine::new(checker),
+            tx,
+        );
+
+        let outcome = engine
+            .submit("say something".into(), SubmitOptions::default())
+            .await;
+
+        assert!(
+            outcome.is_err(),
+            "a bad request was reported as recoverable: {outcome:?}"
+        );
+    }
+
+    #[test]
+    fn a_turn_error_says_which_kind_it_is() {
+        let unavailable = TurnError::ApiUnavailable {
+            message: "later".into(),
+        };
+        assert!(matches!(
+            unavailable.terminal_reason(),
+            TerminalReason::ApiUnavailable { .. }
+        ));
+        assert_eq!(unavailable.message(), "later");
+
+        let fatal = TurnError::Fatal {
+            message: "our bug".into(),
+        };
+        assert!(matches!(fatal.terminal_reason(), TerminalReason::Error(_)));
+        // A plain message from the engine's own layers is fatal.
+        assert!(matches!(
+            TurnError::from("tool failed".to_string()),
+            TurnError::Fatal { .. }
         ));
     }
 
