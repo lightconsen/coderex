@@ -8,8 +8,9 @@ Implements the tool trait system, registers built-in tools, and provides executi
 
 ### Key Types
 
-- **`Tool` trait** (`tool.rs:74`) — Core abstraction: `descriptor()` returns metadata, `execute()` runs the tool. All tools implement this via `async_trait`.
-- **`ToolDescriptor`** (`tool.rs:48`) — Metadata: name, tier (Baseline/FeatureGated/DynamicMcp/Internal), input/output JSON schemas, approval requirement, read-only flag, concurrency safety, interrupt behavior.
+- **`Tool` trait** (`tool.rs`) — Core abstraction: `descriptor()` returns metadata, `capabilities()` returns what the tool declares about itself, `execute()` runs the tool. All tools implement this via `async_trait`.
+- **`ToolDescriptor`** (`tool.rs`) — Metadata: name, tier (Baseline/FeatureGated/DynamicMcp/Internal), input/output JSON schemas, approval requirement, read-only flag, concurrency safety, interrupt behavior.
+- **`ToolCapabilities`** (`tool.rs`) — What a tool declares that has no home in `ToolDescriptor`: `max_result_size_chars`, `rule_content_field`, `backgrounding`, `ignores_whole_tool_allow_rule`, `suppresses_always_allow_rule`. Reached through the defaulted `Tool::capabilities()` method rather than four more `ToolDescriptor` fields, because `ToolDescriptor` is built with a struct literal at 100+ sites across the workspace, several in crates `coderex-tools` does not own. Every default is the pre-existing behaviour, so a tool that declares nothing is unchanged.
 - **`ToolContext`** (`tool.rs:84`) — Runtime context: `execution_context` (Normal, AsyncAgent, CoordinatorMode, InProcessTeam, PlanMode, ReplOnly, HeadlessSdk, RemoteBridge), `cwd`, and `extra` shared state map (`Arc<HashMap<String, SharedState>>`).
 - **`ToolInput`** (`tool.rs:37`) — `call_id`, `name`, JSON `arguments`.
 - **`ToolOutput`** (`context.rs:66`) — `output: String` and `is_display: bool`.
@@ -73,6 +74,22 @@ Registered with `ToolTier::FeatureGated` and `is_enabled: false`. Return a "feat
 | ListPeers | Peer discovery |
 | Tungsten | Tungsten integration |
 
+### The result-size ladder
+
+Seven tiers, mirroring the reference's `maxResultSizeChars`. A tool declares one; the executor no longer applies one size to every tool alike. `1`/`0` is the reference's spelling of "no cap" and maps to `Unlimited`, which **only `Read` declares** — and only because Read bounds its own output (`MAX_DISPLAY_CHARS`) before returning it.
+
+| Tier | Characters | Declared by |
+|------|-----------|-------------|
+| `Unlimited` (`1`/`0`) | — | `Read` |
+| `Tiny` | 10 000 | `TaskOutput` (matches its own `MAX_OUTPUT_CHARS`) |
+| `Small` | 20 000 | — |
+| `Medium` | 50 000 | — |
+| `Large` | 100 000 | — |
+| `XLarge` | 300 000 | — |
+| `Huge` | 1 048 576 | the default — every tool that declares nothing, i.e. all of them but the two above |
+
+`Bash` and `PowerShell` cut themselves at 50 000 bytes (`MAX_OUTPUT_BYTES`) and so belong in `Medium`, but those two files are owned elsewhere; until their owner declares it they keep the `Huge` default and their internal cut, which is the pre-existing behaviour either way.
+
 ### Architecture Patterns
 
 - **Trait-based plugin system** — All tools implement `Tool` with `async_trait`. The trait is object-safe and tools are stored as `Arc<dyn Tool>`.
@@ -85,7 +102,10 @@ Registered with `ToolTier::FeatureGated` and `is_enabled: false`. Return a "feat
   - `"rate_limiter"` → `Arc<RateLimiter>` (for web tools)
   - `"web_fetch_cache"` → `Arc<WebFetchCache>` (for `WebFetchTool` URL cache)
 - **Concurrency serialization** — `ToolExecutor` maintains per-tool-name `Arc<Mutex<()>>` locks. Tools marked `is_concurrency_safe: false` are serialized; safe tools run in parallel up to `max_concurrent`.
-- **Output truncation** — `ExecutionConfig.max_output_bytes` (default 1MB) enforced by `ToolExecutor`. Outputs beyond the limit are truncated with `"\n... [truncated]"`.
+- **Output truncation** — each tool's own `MaxResultSizeChars` tier is the cap, applied by `ToolExecutor`; `ExecutionConfig.max_result_size_chars` (default 1 048 576) is an operator *ceiling* that can only lower it. Outputs beyond the limit are truncated with `"\n... [truncated]"`, counted in **characters** so the cut always lands on a character boundary.
+- **Rule content fields** — a deny rule is judged against the value the tool names in `rule_content_field` (`Read` declares `file_path`); a tool that declares nothing falls back to the known path fields, then to anything path-shaped, because for a deny rule the safe direction to be wrong in is "matched".
+- **Backgrounding** — `backgrounding` is `None` / `SelfManaged` / `Detach`. A tool that does not declare one has `run_in_background` removed from the schema the model is shown, rather than advertising a flag it ignores.
+- **Rule exemptions** — `install_rule_exemptions(&mut PermissionChecker, &ToolRegistry)` copies each tool's declared exemptions into the checker. A tool with `ignores_whole_tool_allow_rule` is not approved by a whole-tool allow rule and is never auto-approved; `suppresses_always_allow_rule` withholds the session-wide option from the confirmation prompt. Both narrow *allow* rules only — a deny rule is evaluated first and still wins. **The CLI session does not install them**: `Agent` and `Workflow` declare both flags, and installing them makes the fallback "ask", so every delegation would prompt in every mode — even though a subagent's own tool calls are gated by that same checker, which makes the prompt redundant. The mechanism is wired and tested for a session that wants the stricter policy; `coderex-cli` is not one.
 - **Timeout enforcement** — All tool executions wrapped in `tokio::time::timeout` using `ExecutionConfig.default_timeout` (default 60s).
 - **Batch execution** — `execute_many()` chunks calls into batches of `max_concurrent` and runs each batch concurrently.
 - **Result caching** — `ToolExecutor` caches successful results from read-only tools in an LRU cache (`moka`, default 1000 entries, 5-minute TTL). `Read` tool cache entries are invalidated when the underlying file's mtime changes.

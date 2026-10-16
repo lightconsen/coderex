@@ -158,6 +158,43 @@ pub struct PermissionRule {
     pub description: String,
 }
 
+/// Per-tool exemptions from whole-tool allow rules.
+///
+/// A whole-tool allow rule names a tool and gives no path patterns: it says
+/// "this tool, anywhere, is fine". For most tools that is the point. For a
+/// *runner* — a tool that executes other work on the model's behalf — it is a
+/// way to approve once and get anything, so the tool itself refuses the
+/// shortcut.
+///
+/// These narrow **allow** rules only. A deny rule is evaluated before any
+/// allow rule and is unaffected: a tool carrying either flag is still denied
+/// by a deny rule.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolRuleExemptions {
+    /// A whole-tool allow rule does not approve this tool. Such a tool is
+    /// never auto-approved: it needs an explicit decision per call.
+    #[serde(default)]
+    pub ignores_whole_tool_allow_rule: bool,
+    /// The "always allow" choice is not offered for this tool, so an approval
+    /// cannot be turned into a session-wide one.
+    #[serde(default)]
+    pub suppresses_always_allow_rule: bool,
+}
+
+impl ToolRuleExemptions {
+    /// No exemptions — the state of every tool that declares none.
+    pub const NONE: Self = Self {
+        ignores_whole_tool_allow_rule: false,
+        suppresses_always_allow_rule: false,
+    };
+
+    /// Whether this tool carries no exemptions at all.
+    #[must_use]
+    pub const fn is_empty(self) -> bool {
+        !self.ignores_whole_tool_allow_rule && !self.suppresses_always_allow_rule
+    }
+}
+
 /// Action a rule takes.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub enum PermissionAction {
@@ -201,6 +238,12 @@ pub struct PermissionChecker {
     session_approvals: HashMap<String, bool>,
     /// Tools known to be dangerous (always require approval).
     dangerous_tools: Vec<String>,
+    /// Per-tool rule exemptions, keyed by lowercased tool name.
+    ///
+    /// The checker cannot see tools, so whoever owns both a registry and a
+    /// checker has to introduce them; until then a tool's declared exemptions
+    /// are inert.
+    tool_exemptions: HashMap<String, ToolRuleExemptions>,
 }
 
 impl PermissionChecker {
@@ -219,7 +262,29 @@ impl PermissionChecker {
                 "multi_edit".into(),
                 "notebook_edit".into(),
             ],
+            tool_exemptions: HashMap::new(),
         }
+    }
+
+    /// Declare a tool's exemptions from whole-tool allow rules.
+    ///
+    /// Passing [`ToolRuleExemptions::NONE`] clears any earlier declaration.
+    pub fn set_tool_exemptions(&mut self, tool_name: &str, exemptions: ToolRuleExemptions) {
+        let key = tool_name.to_lowercase();
+        if exemptions.is_empty() {
+            self.tool_exemptions.remove(&key);
+        } else {
+            self.tool_exemptions.insert(key, exemptions);
+        }
+    }
+
+    /// A tool's declared exemptions, or [`ToolRuleExemptions::NONE`].
+    #[must_use]
+    pub fn tool_exemptions(&self, tool_name: &str) -> ToolRuleExemptions {
+        self.tool_exemptions
+            .get(&tool_name.to_lowercase())
+            .copied()
+            .unwrap_or(ToolRuleExemptions::NONE)
     }
 
     /// Set the permission mode.
@@ -309,8 +374,11 @@ impl PermissionChecker {
 
         // Rule matching: most specific (tool+path) wins, then tool-only, then default
         let path_str = path.map(|p| p.to_string_lossy().to_string());
+        let exemptions = self.tool_exemptions(tool_name);
 
-        // Check for explicit deny rules first (deny takes priority)
+        // Check for explicit deny rules first (deny takes priority). Nothing
+        // below — including a tool's own exemptions — can turn a deny into an
+        // allow, which is why this loop runs before any of them.
         for rule in &self.rules {
             if rule.action == PermissionAction::Deny
                 && Self::rule_matches(rule, tool_name, path_str.as_deref())
@@ -327,6 +395,12 @@ impl PermissionChecker {
                 && Self::rule_matches(rule, tool_name, path_str.as_deref())
             {
                 if rule.path_matchers.is_empty() {
+                    // A whole-tool allow. A runner that refuses the shortcut
+                    // does not get it, and the next rule — or the default
+                    // below — decides instead.
+                    if exemptions.ignores_whole_tool_allow_rule {
+                        continue;
+                    }
                     return PermissionResult::Allow;
                 }
                 return PermissionResult::AllowForPath {
@@ -355,6 +429,18 @@ impl PermissionChecker {
         // `Auto` takes this same path. The checker has no auto behaviour of its
         // own — see `PermissionMode::Auto`; anything "auto" about the mode comes
         // from the classifier hook the CLI registers ahead of the checker.
+        //
+        // A tool that refuses whole-tool allow rules is not auto-approved
+        // either: refusing the shortcut is only meaningful if the fallback is
+        // "ask" rather than "allow". Otherwise the flag would be a no-op for
+        // any tool that was not already dangerous.
+        if exemptions.ignores_whole_tool_allow_rule {
+            return PermissionResult::Ask {
+                reason: format!(
+                    "tool '{tool_name}' is not covered by whole-tool allow rules and requires approval"
+                ),
+            };
+        }
         if self.is_dangerous_tool(tool_name) {
             PermissionResult::Ask {
                 reason: format!("tool '{tool_name}' requires approval (dangerous operation)"),
@@ -695,6 +781,118 @@ mod tests {
             checker.check("read", Some(Path::new("/etc/passwd"))),
             PermissionResult::Deny { .. }
         ));
+    }
+
+    /// A whole-tool allow rule normally approves the tool outright.
+    fn whole_tool_allow(tool: &str) -> PermissionRule {
+        PermissionRule {
+            tool_name: tool.into(),
+            action: PermissionAction::Allow,
+            paths: Vec::new(),
+            description: String::new(),
+        }
+    }
+
+    /// A runner refuses the blanket allow: it is not approvable wholesale,
+    /// because one approval would cover anything it goes on to run.
+    #[test]
+    fn a_tool_that_ignores_whole_tool_allow_rules_is_not_approved_by_one() {
+        let mut checker = PermissionChecker::new(PermissionMode::Default);
+        checker.add_rule(whole_tool_allow("agent")).unwrap();
+
+        // Without the flag the blanket allow stands.
+        assert!(matches!(
+            checker.check("agent", None),
+            PermissionResult::Allow
+        ));
+
+        checker.set_tool_exemptions(
+            "agent",
+            ToolRuleExemptions {
+                ignores_whole_tool_allow_rule: true,
+                ..ToolRuleExemptions::NONE
+            },
+        );
+        assert!(
+            matches!(checker.check("agent", None), PermissionResult::Ask { .. }),
+            "a blanket allow approved a tool that refuses blanket allows"
+        );
+    }
+
+    /// Deny keeps winning. The exemptions narrow allow rules only.
+    #[test]
+    fn an_exempt_tool_cannot_escape_a_deny() {
+        let mut checker = PermissionChecker::new(PermissionMode::Default);
+        checker.add_rule(whole_tool_allow("agent")).unwrap();
+        checker
+            .add_rule(PermissionRule {
+                tool_name: "agent".into(),
+                action: PermissionAction::Deny,
+                paths: Vec::new(),
+                description: "no sub-agents here".into(),
+            })
+            .unwrap();
+        checker.set_tool_exemptions(
+            "agent",
+            ToolRuleExemptions {
+                ignores_whole_tool_allow_rule: true,
+                suppresses_always_allow_rule: true,
+            },
+        );
+
+        match checker.check("agent", None) {
+            PermissionResult::Deny { reason } => assert!(reason.contains("sub-agents"), "{reason}"),
+            other => panic!("deny must win over exemptions, got {other:?}"),
+        }
+    }
+
+    /// A path-scoped allow is not a blanket allow: it still applies, because
+    /// the flag is about approving a tool *anywhere*.
+    #[test]
+    fn an_exempt_tool_is_still_covered_by_a_path_scoped_allow() {
+        let mut checker = PermissionChecker::new(PermissionMode::Default);
+        checker
+            .add_rule(PermissionRule {
+                tool_name: "agent".into(),
+                action: PermissionAction::Allow,
+                paths: vec!["/tmp/**".into()],
+                description: String::new(),
+            })
+            .unwrap();
+        checker.set_tool_exemptions(
+            "agent",
+            ToolRuleExemptions {
+                ignores_whole_tool_allow_rule: true,
+                ..ToolRuleExemptions::NONE
+            },
+        );
+
+        assert!(matches!(
+            checker.check("agent", Some(Path::new("/tmp/work"))),
+            PermissionResult::AllowForPath { .. }
+        ));
+    }
+
+    #[test]
+    fn exemptions_are_cleared_by_declaring_none() {
+        let mut checker = PermissionChecker::new(PermissionMode::Default);
+        checker.set_tool_exemptions(
+            "agent",
+            ToolRuleExemptions {
+                ignores_whole_tool_allow_rule: true,
+                ..ToolRuleExemptions::NONE
+            },
+        );
+        assert!(
+            checker
+                .tool_exemptions("Agent")
+                .ignores_whole_tool_allow_rule
+        );
+
+        checker.set_tool_exemptions("agent", ToolRuleExemptions::NONE);
+        assert_eq!(checker.tool_exemptions("agent"), ToolRuleExemptions::NONE);
+        // A tool that declares nothing is unaffected, by name or by case.
+        assert_eq!(checker.tool_exemptions("bash"), ToolRuleExemptions::NONE);
     }
 
     #[test]

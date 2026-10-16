@@ -30,11 +30,12 @@ pub use cron_scheduler::{CRON_SCHEDULER_KEY, CronJob, CronScheduler};
 pub use dispatcher::RegistryToolDispatcher;
 pub use executor::{ExecutionConfig, ToolExecutor};
 pub use rate_limiter::{RATE_LIMITER_KEY, RateLimitConfig, RateLimiter};
-pub use registry::{ToolDenyRule, ToolNotFoundError, ToolRegistry};
+pub use registry::{ToolDenyRule, ToolNotFoundError, ToolRegistry, install_rule_exemptions};
 pub use sandbox_policy::{default_sandbox_config, is_path_allowed};
 pub use task_store::{TASK_STORE_KEY, TaskRecord, TaskStatus, TaskStore};
 pub use todo_store::{TODO_STORE_KEY, TodoItem, TodoStatus, TodoStore};
 pub use tool::{
-    ElicitRequest, InterruptBehavior, Tool, ToolContext, ToolDescriptor, ToolInput, ToolTier,
+    Backgrounding, ElicitRequest, InterruptBehavior, MaxResultSizeChars, RuleContentField, Tool,
+    ToolCapabilities, ToolContext, ToolDescriptor, ToolInput, ToolTier,
 };
 pub use tool_cache::{ToolCache, ToolCacheConfig};

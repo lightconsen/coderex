@@ -2,7 +2,9 @@
 
 use crate::context::{ToolError, ToolOutput};
 use crate::task_store::TASK_STORE_KEY;
-use crate::tool::{Tool, ToolContext, ToolDescriptor, ToolInput, ToolTier};
+use crate::tool::{
+    MaxResultSizeChars, Tool, ToolCapabilities, ToolContext, ToolDescriptor, ToolInput, ToolTier,
+};
 use async_trait::async_trait;
 use std::sync::Arc;
 
@@ -38,6 +40,15 @@ impl Tool for TaskOutputTool {
             is_read_only: true,
             is_concurrency_safe: true,
             interrupt_behavior: crate::tool::InterruptBehavior::RunToCompletion,
+        }
+    }
+
+    fn capabilities(&self) -> ToolCapabilities {
+        ToolCapabilities {
+            // The tool already cuts itself at MAX_OUTPUT_CHARS; declaring the
+            // matching tier makes the descriptor say what the tool does.
+            max_result_size_chars: MaxResultSizeChars::Tiny,
+            ..ToolCapabilities::default()
         }
     }
 

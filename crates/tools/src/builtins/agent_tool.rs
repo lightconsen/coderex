@@ -1,7 +1,9 @@
 //! Agent tool — spawn a sub-agent via AgentManager.
 
 use crate::context::{ToolError, ToolOutput};
-use crate::tool::{Tool, ToolContext, ToolDescriptor, ToolInput, ToolTier};
+use crate::tool::{
+    Backgrounding, Tool, ToolCapabilities, ToolContext, ToolDescriptor, ToolInput, ToolTier,
+};
 use async_trait::async_trait;
 use std::sync::Arc;
 
@@ -86,6 +88,21 @@ impl Tool for AgentTool {
             is_read_only: false,
             is_concurrency_safe: false,
             interrupt_behavior: crate::tool::InterruptBehavior::RunToCompletion,
+        }
+    }
+
+    fn capabilities(&self) -> ToolCapabilities {
+        ToolCapabilities {
+            // `run_in_background` is read below and really does return early
+            // with an agent handle, so the schema's promise is kept.
+            backgrounding: Backgrounding::SelfManaged,
+            // A runner: allowing "Agent" wholesale would let the model spawn a
+            // sub-agent that does anything, with no further question asked.
+            // Both exemption flags are set, as they are for the other runner
+            // tool (Workflow), and neither narrows a deny rule.
+            ignores_whole_tool_allow_rule: true,
+            suppresses_always_allow_rule: true,
+            ..ToolCapabilities::default()
         }
     }
 

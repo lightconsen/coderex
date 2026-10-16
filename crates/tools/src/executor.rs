@@ -1,7 +1,7 @@
 //! Tool executor — dispatches tool calls with concurrency control and timeout.
 
 use crate::context::{ToolError, ToolOutput};
-use crate::tool::{Tool, ToolContext, ToolDescriptor, ToolInput};
+use crate::tool::{Tool, ToolCapabilities, ToolContext, ToolDescriptor, ToolInput};
 use crate::tool_cache::{ToolCache, ToolCacheConfig};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -18,8 +18,13 @@ pub struct ExecutionConfig {
     pub max_concurrent: usize,
     /// Whether to enforce sandbox restrictions for tool execution.
     pub sandbox_enabled: bool,
-    /// Maximum output size in bytes before truncation.
-    pub max_output_bytes: usize,
+    /// Operator ceiling on output size, in characters.
+    ///
+    /// A tool's own tier ([`ToolCapabilities::max_result_size_chars`]) decides
+    /// its cap; this only ever lowers it, so a tool that declares less is not
+    /// silently given more. `Read` declares "no cap", and no cap means no cap —
+    /// it is not lowered by this ceiling either.
+    pub max_result_size_chars: usize,
     /// Cache configuration for tool results.
     pub cache_config: ToolCacheConfig,
 }
@@ -30,7 +35,9 @@ impl Default for ExecutionConfig {
             default_timeout: Duration::from_secs(60),
             max_concurrent: 4,
             sandbox_enabled: true,
-            max_output_bytes: 1_048_576, // 1 MB
+            // The widest finite tier, so a tool that declares nothing keeps
+            // exactly the flat cap it had before the ladder existed.
+            max_result_size_chars: 1_048_576,
             cache_config: ToolCacheConfig::default(),
         }
     }
@@ -136,8 +143,8 @@ impl ToolExecutor {
             if desc.is_read_only {
                 if let Some(ref cache) = self.cache {
                     if let Some(cached) = cache.get(&desc.name, &input.arguments).await {
-                        all_results[idx] =
-                            Some(Ok(truncate_output(cached, self.config.max_output_bytes)));
+                        let cap = output_cap(&self.config, tool.capabilities());
+                        all_results[idx] = Some(Ok(truncate_output(cached, cap)));
                         continue;
                     }
                 }
@@ -199,13 +206,30 @@ impl ToolExecutor {
     }
 }
 
-/// Truncate tool output if it exceeds `max_output_bytes`.
-fn truncate_output(mut output: ToolOutput, max_output_bytes: usize) -> ToolOutput {
-    if output.output.len() > max_output_bytes {
-        let mut truncated = output.output;
-        truncated.truncate(max_output_bytes);
-        truncated.push_str("\n... [truncated]");
-        output.output = truncated;
+/// The number of characters this tool may return, if any.
+///
+/// The tool's declared tier is the cap; the operator ceiling can only lower
+/// it, never raise it. `None` means no cap at all.
+fn output_cap(config: &ExecutionConfig, caps: ToolCapabilities) -> Option<usize> {
+    caps.max_result_size_chars
+        .chars()
+        .map(|tier| tier.min(config.max_result_size_chars))
+}
+
+/// Truncate tool output to at most `cap` characters.
+///
+/// Counted in characters, not bytes. `String::truncate` takes a byte index and
+/// panics when the cut lands inside a multi-byte character, which a byte-sized
+/// cap hits as soon as the output is not ASCII; cutting on a character
+/// boundary cannot. It also means the cap means the same thing for CJK output
+/// as for English.
+fn truncate_output(mut output: ToolOutput, cap: Option<usize>) -> ToolOutput {
+    let Some(cap) = cap else {
+        return output;
+    };
+    if let Some((byte_index, _)) = output.output.char_indices().nth(cap) {
+        output.output.truncate(byte_index);
+        output.output.push_str("\n... [truncated]");
     }
     output
 }
@@ -222,11 +246,15 @@ async fn run_tool_call(
     config: &ExecutionConfig,
     cache: Option<&ToolCache>,
 ) -> Result<ToolOutput, ToolError> {
+    // The cap is the tool's own declaration, read once: the executor no longer
+    // guesses a size for every tool alike.
+    let cap = output_cap(config, tool.capabilities());
+
     // Try cache for read-only tools
     if desc.is_read_only {
         if let Some(cache) = cache {
             if let Some(cached) = cache.get(&desc.name, &input.arguments).await {
-                return Ok(truncate_output(cached, config.max_output_bytes));
+                return Ok(truncate_output(cached, cap));
             }
         }
     }
@@ -237,7 +265,7 @@ async fn run_tool_call(
             timeout: config.default_timeout,
         })?;
 
-    let result = result.map(|output| truncate_output(output, config.max_output_bytes));
+    let result = result.map(|output| truncate_output(output, cap));
 
     // Cache successful read-only results
     if desc.is_read_only {
@@ -442,5 +470,156 @@ mod tests {
             1,
             "execute_single let two calls to the same non-safe tool overlap"
         );
+    }
+
+    /// Returns whatever it is told to, so a cap can be observed on the way out.
+    struct CappedTool {
+        caps: ToolCapabilities,
+        output: String,
+    }
+
+    #[async_trait::async_trait]
+    impl Tool for CappedTool {
+        fn descriptor(&self) -> ToolDescriptor {
+            ToolDescriptor {
+                name: "capped".into(),
+                tier: crate::tool::ToolTier::Baseline,
+                input_schema: serde_json::json!({}),
+                output_schema: serde_json::json!({}),
+                requires_approval: false,
+                is_enabled: true,
+                is_read_only: false,
+                is_concurrency_safe: true,
+                interrupt_behavior: crate::tool::InterruptBehavior::RunToCompletion,
+            }
+        }
+
+        fn capabilities(&self) -> ToolCapabilities {
+            self.caps
+        }
+
+        async fn execute(
+            &self,
+            _input: ToolInput,
+            _ctx: ToolContext<'_>,
+        ) -> Result<ToolOutput, ToolError> {
+            Ok(ToolOutput {
+                output: self.output.clone(),
+                is_display: false,
+            })
+        }
+    }
+
+    fn capped(caps: ToolCapabilities, output: String) -> CappedTool {
+        CappedTool { caps, output }
+    }
+
+    fn medium_caps() -> ToolCapabilities {
+        ToolCapabilities {
+            max_result_size_chars: crate::tool::MaxResultSizeChars::Medium,
+            ..ToolCapabilities::default()
+        }
+    }
+
+    /// A tool's own tier is the cap — the executor no longer applies one size
+    /// to every tool alike.
+    #[tokio::test]
+    async fn a_tool_that_declares_a_smaller_tier_is_cut_to_it() {
+        let executor = ToolExecutor::new(ExecutionConfig::default());
+        let tool = capped(medium_caps(), "x".repeat(60_000));
+
+        let out = executor
+            .execute_single(&tool, test_input(""), test_ctx())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            out.output.chars().count(),
+            50_000 + "\n... [truncated]".len()
+        );
+        assert!(out.output.ends_with("\n... [truncated]"));
+    }
+
+    /// The default tier is the old flat cap, so the 45 tools that declare
+    /// nothing are unchanged.
+    #[tokio::test]
+    async fn a_tool_that_declares_nothing_keeps_the_old_flat_cap() {
+        let executor = ToolExecutor::new(ExecutionConfig::default());
+        let tool = capped(ToolCapabilities::default(), "x".repeat(1_048_577));
+
+        let out = executor
+            .execute_single(&tool, test_input(""), test_ctx())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            out.output.chars().count(),
+            1_048_576 + "\n... [truncated]".len()
+        );
+    }
+
+    /// `1`/`0` in the reference means "no cap", and no cap means untouched.
+    #[tokio::test]
+    async fn an_unlimited_tool_is_not_truncated() {
+        let executor = ToolExecutor::new(ExecutionConfig::default());
+        let tool = capped(
+            ToolCapabilities {
+                max_result_size_chars: crate::tool::MaxResultSizeChars::Unlimited,
+                ..ToolCapabilities::default()
+            },
+            "x".repeat(2_000_000),
+        );
+
+        let out = executor
+            .execute_single(&tool, test_input(""), test_ctx())
+            .await
+            .unwrap();
+
+        assert_eq!(out.output.chars().count(), 2_000_000);
+        assert!(!out.output.contains("truncated"));
+    }
+
+    /// The cap counts characters. A byte-index cut inside a multi-byte
+    /// character panics; this output is three bytes per character, so a byte
+    /// cap would land mid-character and a naive `String::truncate` would blow
+    /// up here.
+    #[tokio::test]
+    async fn multibyte_output_is_cut_on_a_character_boundary() {
+        let executor = ToolExecutor::new(ExecutionConfig::default());
+        let tool = capped(
+            ToolCapabilities {
+                max_result_size_chars: crate::tool::MaxResultSizeChars::Tiny,
+                ..ToolCapabilities::default()
+            },
+            "漢".repeat(10_001),
+        );
+
+        let out = executor
+            .execute_single(&tool, test_input(""), test_ctx())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            out.output.chars().count(),
+            10_000 + "\n... [truncated]".len()
+        );
+        assert!(out.output.starts_with("漢"));
+    }
+
+    /// The operator ceiling can lower a tool's declared tier, never raise it.
+    #[tokio::test]
+    async fn the_operator_ceiling_lowers_a_declared_tier() {
+        let executor = ToolExecutor::new(ExecutionConfig {
+            max_result_size_chars: 100,
+            ..ExecutionConfig::default()
+        });
+        let tool = capped(medium_caps(), "x".repeat(1_000));
+
+        let out = executor
+            .execute_single(&tool, test_input(""), test_ctx())
+            .await
+            .unwrap();
+
+        assert_eq!(out.output.chars().count(), 100 + "\n... [truncated]".len());
     }
 }

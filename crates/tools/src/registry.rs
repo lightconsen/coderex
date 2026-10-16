@@ -356,14 +356,64 @@ impl ToolRegistry {
     }
 }
 
+/// Introduce every tool's declared rule exemptions to a permission checker.
+///
+/// The checker lives in `coderex-core` and cannot see tools, so a session that
+/// owns both has to make the introduction; without this call a tool's declared
+/// `ignores_whole_tool_allow_rule` / `suppresses_always_allow_rule` are inert.
+/// Only tools that declare something are registered.
+pub fn install_rule_exemptions(
+    checker: &mut coderex_core::permissions::PermissionChecker,
+    registry: &ToolRegistry,
+) {
+    for (name, tool) in registry.list_tools() {
+        let exemptions = tool.capabilities().rule_exemptions();
+        if !exemptions.is_empty() {
+            checker.set_tool_exemptions(&name, exemptions);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::builtins::{EchoTool, NoOpTool};
+    use crate::builtins::{AgentTool, EchoTool, NoOpTool};
     use crate::tool::{BoxedTool, InterruptBehavior};
 
     fn make_tool(tool: impl Tool + 'static) -> BoxedTool {
         Arc::new(tool)
+    }
+
+    /// A tool's declaration is inert until someone introduces it to the
+    /// checker — this is that introduction, and the runner's refusal survives
+    /// the trip.
+    #[test]
+    fn declared_exemptions_reach_the_permission_checker() {
+        let mut registry = ToolRegistry::new();
+        registry.register(make_tool(AgentTool::new()));
+        registry.register(make_tool(EchoTool));
+
+        let mut checker = coderex_core::permissions::PermissionChecker::new(
+            coderex_core::permissions::PermissionMode::Default,
+        );
+        install_rule_exemptions(&mut checker, &registry);
+
+        assert!(
+            checker
+                .tool_exemptions("Agent")
+                .ignores_whole_tool_allow_rule,
+            "the Agent runner's declaration did not reach the checker"
+        );
+        assert!(
+            checker
+                .tool_exemptions("Agent")
+                .suppresses_always_allow_rule
+        );
+        // A tool that declares nothing stays undeclared.
+        assert_eq!(
+            checker.tool_exemptions("echo"),
+            coderex_core::permissions::ToolRuleExemptions::NONE
+        );
     }
 
     #[test]

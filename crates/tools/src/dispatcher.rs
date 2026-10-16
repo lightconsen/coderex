@@ -15,7 +15,9 @@ use crate::rate_limiter::{RATE_LIMITER_KEY, RateLimiter};
 use crate::registry::ToolRegistry;
 use crate::sandbox_policy;
 use crate::task_store::{TASK_STORE_KEY, TaskStore};
-use crate::tool::{SharedState, ToolContext, ToolInput};
+use crate::tool::{
+    Backgrounding, RuleContentField, SharedState, ToolCapabilities, ToolContext, ToolInput,
+};
 use coderex_core::tool_executor::{ToolDispatchOutcome, ToolExecutor as CoreToolExecutor};
 use coderex_core::types::ToolResult;
 use serde_json::Value;
@@ -175,15 +177,21 @@ impl CoreToolExecutor for RegistryToolDispatcher {
             .all_descriptors()
             .into_iter()
             .filter(|d| d.is_enabled && available.contains(&d.name))
-            .map(|d| coderex_core::tool_executor::ToolInfo {
-                name: d.name.clone(),
-                description: d
-                    .input_schema
-                    .get("description")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or(&d.name)
-                    .to_string(),
-                input_schema: d.input_schema,
+            .map(|d| {
+                let caps = self
+                    .registry
+                    .get_tool_arc(&d.name)
+                    .map_or_else(ToolCapabilities::default, |tool| tool.capabilities());
+                coderex_core::tool_executor::ToolInfo {
+                    name: d.name.clone(),
+                    description: d
+                        .input_schema
+                        .get("description")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or(&d.name)
+                        .to_string(),
+                    input_schema: advertised_schema(d.input_schema, caps),
+                }
             })
             .collect()
     }
@@ -209,9 +217,11 @@ impl CoreToolExecutor for RegistryToolDispatcher {
 
         // Deny rules are checked here, with the call's own arguments: a rule
         // written against a path can only be judged against the path this call
-        // is about to touch. Until this existed, `deny_rules` were consulted
-        // nowhere but the registry's own tests.
-        let paths = path_arguments(input);
+        // is about to touch. The tool says which argument carries that value;
+        // one that says nothing is read the old way. Until this existed,
+        // `deny_rules` were consulted nowhere but the registry's own tests.
+        let caps = tool.capabilities();
+        let paths = rule_content_arguments(caps.rule_content_field, input);
         if let Some(reason) = self.registry.denial_for(tool_name, &paths, self.context) {
             return ToolDispatchOutcome {
                 result: ToolResult {
@@ -342,7 +352,85 @@ impl CoreToolExecutor for RegistryToolDispatcher {
     }
 }
 
-/// The paths a tool call is about to touch.
+/// The schema the model is shown, with promises the tool does not keep removed.
+///
+/// A tool that advertises `run_in_background` but declares no backgrounding
+/// behaviour would silently ignore the flag, and a tool the model is told
+/// something false about is worse than one that says nothing: the model spends
+/// a turn discovering the truth. Until such a tool honours the flag, the
+/// argument is not offered. A tool that declares [`Backgrounding::SelfManaged`]
+/// or [`Backgrounding::Detach`] keeps it.
+#[must_use]
+fn advertised_schema(mut schema: Value, caps: ToolCapabilities) -> Value {
+    if caps.backgrounding != Backgrounding::None {
+        return schema;
+    }
+    let advertised = schema
+        .get_mut("properties")
+        .and_then(Value::as_object_mut)
+        .is_some_and(|properties| properties.remove("run_in_background").is_some());
+    if !advertised {
+        return schema;
+    }
+    if let Some(required) = schema.get_mut("required").and_then(Value::as_array_mut) {
+        required.retain(|entry| entry.as_str() != Some("run_in_background"));
+    }
+    schema
+}
+
+/// The values a permission rule should be judged against for this call.
+///
+/// A tool that declares its own [`RuleContentField`] is read from exactly that
+/// argument and nothing else, so a rule cannot be tripped by an unrelated
+/// value that happens to sit in the same call. A tool that declares nothing
+/// keeps the old behaviour: the known path fields, then anything path-shaped,
+/// because for a deny rule the safe direction to be wrong in is "matched".
+#[must_use]
+pub fn rule_content_arguments(
+    field: Option<RuleContentField>,
+    input: &Value,
+) -> Vec<std::path::PathBuf> {
+    match field {
+        Some(RuleContentField::Scalar(name)) => scalar_argument(input, name).into_iter().collect(),
+        Some(RuleContentField::List(name)) => list_argument(input, name),
+        None => path_arguments(input),
+    }
+}
+
+/// One string argument, if it is a non-empty string.
+fn scalar_argument(input: &Value, field: &str) -> Option<std::path::PathBuf> {
+    let Value::Object(map) = input else {
+        return None;
+    };
+    match map.get(field) {
+        Some(Value::String(value)) if !value.is_empty() => Some(std::path::PathBuf::from(value)),
+        _ => None,
+    }
+}
+
+/// A list argument: strings, or objects carrying a `path`.
+fn list_argument(input: &Value, field: &str) -> Vec<std::path::PathBuf> {
+    let mut paths = Vec::new();
+    let Value::Object(map) = input else {
+        return paths;
+    };
+    if let Some(Value::Array(values)) = map.get(field) {
+        for value in values {
+            match value {
+                Value::String(path) => paths.push(std::path::PathBuf::from(path)),
+                Value::Object(entry) => {
+                    if let Some(Value::String(path)) = entry.get("path") {
+                        paths.push(std::path::PathBuf::from(path));
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    paths
+}
+
+/// The paths a tool call is about to touch, for a tool that declares none.
 ///
 /// A deny rule written against a path needs the path, and only the tool knows
 /// which argument carries it — so the ones that do are named here. Anything
@@ -368,28 +456,12 @@ pub fn path_arguments(input: &Value) -> Vec<std::path::PathBuf> {
 
     // The field the tool actually uses, when it is one we know.
     for field in PATH_FIELDS {
-        if let Some(Value::String(value)) = map.get(field) {
-            if !value.is_empty() {
-                paths.push(std::path::PathBuf::from(value));
-            }
-        }
+        paths.extend(scalar_argument(input, field));
     }
 
     // Lists of files (Write's `files`, SendFile's `file_paths`).
     for field in ["files", "file_paths", "paths"] {
-        if let Some(Value::Array(values)) = map.get(field) {
-            for value in values {
-                match value {
-                    Value::String(path) => paths.push(std::path::PathBuf::from(path)),
-                    Value::Object(entry) => {
-                        if let Some(Value::String(path)) = entry.get("path") {
-                            paths.push(std::path::PathBuf::from(path));
-                        }
-                    }
-                    _ => {}
-                }
-            }
-        }
+        paths.extend(list_argument(input, field));
     }
 
     // Nothing known: a rule is more useful over-matching than under-matching,
@@ -603,5 +675,195 @@ mod tests {
         assert!(outcome.result.is_error);
         assert!(outcome.result.output.contains("no_such_tool"));
         assert!(outcome.result.output.contains("not found"));
+    }
+
+    /// A tool that names its own rule content is read from exactly that
+    /// argument — no other value in the same call can trip a rule.
+    #[test]
+    fn a_declared_field_is_the_only_thing_a_rule_sees() {
+        let input = serde_json::json!({
+            "file_path": "/etc/passwd",
+            "content": "/etc/shadow",
+        });
+
+        assert_eq!(
+            rule_content_arguments(Some(RuleContentField::Scalar("file_path")), &input),
+            vec![std::path::PathBuf::from("/etc/passwd")]
+        );
+        // Declared as something this call does not carry: nothing is offered,
+        // and in particular the path-shaped `file_path` is not.
+        assert!(
+            rule_content_arguments(Some(RuleContentField::Scalar("command")), &input).is_empty()
+        );
+
+        // Undeclared, the heuristic reaches a path-shaped value even when the
+        // tool's own field is not one it knows — the over-matching this
+        // declaration exists to stop.
+        let opaque = serde_json::json!({"blob": "/etc/shadow"});
+        assert_eq!(
+            path_arguments(&opaque),
+            vec![std::path::PathBuf::from("/etc/shadow")]
+        );
+        assert!(
+            rule_content_arguments(Some(RuleContentField::Scalar("command")), &opaque).is_empty()
+        );
+    }
+
+    #[test]
+    fn a_declared_list_field_is_read_as_a_list() {
+        let input = serde_json::json!({"files": ["a.txt", {"path": "b.txt"}, 7]});
+        assert_eq!(
+            rule_content_arguments(Some(RuleContentField::List("files")), &input),
+            vec![
+                std::path::PathBuf::from("a.txt"),
+                std::path::PathBuf::from("b.txt")
+            ]
+        );
+    }
+
+    #[test]
+    fn an_undeclared_tool_keeps_the_path_heuristic() {
+        let input = serde_json::json!({"where": "/etc/shadow"});
+        assert_eq!(rule_content_arguments(None, &input), path_arguments(&input));
+    }
+
+    /// The tool that declares the field is the one a deny rule is judged
+    /// against: `Echo`-shaped input where the declared field is the only one
+    /// that matters.
+    struct DeclaredPathTool;
+
+    #[async_trait::async_trait]
+    impl crate::tool::Tool for DeclaredPathTool {
+        fn descriptor(&self) -> crate::tool::ToolDescriptor {
+            crate::tool::ToolDescriptor {
+                name: "declared".into(),
+                tier: crate::tool::ToolTier::Baseline,
+                input_schema: serde_json::json!({}),
+                output_schema: serde_json::json!({}),
+                requires_approval: false,
+                is_enabled: true,
+                is_read_only: false,
+                is_concurrency_safe: true,
+                interrupt_behavior: crate::tool::InterruptBehavior::RunToCompletion,
+            }
+        }
+
+        fn capabilities(&self) -> ToolCapabilities {
+            ToolCapabilities {
+                rule_content_field: Some(RuleContentField::Scalar("command")),
+                ..ToolCapabilities::default()
+            }
+        }
+
+        async fn execute(
+            &self,
+            _input: ToolInput,
+            _ctx: ToolContext<'_>,
+        ) -> Result<crate::context::ToolOutput, crate::context::ToolError> {
+            Ok(crate::context::ToolOutput {
+                output: "ran".into(),
+                is_display: false,
+            })
+        }
+    }
+
+    /// A shell-shaped tool that declares `command` as its rule content is
+    /// stopped by a rule over that value — the case the hardcoded field list
+    /// could not express.
+    #[tokio::test]
+    async fn a_declared_command_field_drives_the_deny_check() {
+        let mut registry = ToolRegistry::new();
+        registry.register(Arc::new(DeclaredPathTool));
+        registry.add_deny_rule(ToolDenyRule::for_paths(vec!["/etc/shadow".into()]));
+        let registry = Arc::new(registry);
+
+        let executor = Arc::new(InnerExecutor::new(ExecutionConfig::default()));
+        let dispatcher = RegistryToolDispatcher::new(
+            registry,
+            executor,
+            ExecutionContext::Normal,
+            PathBuf::from("/tmp"),
+        );
+
+        let denied = dispatcher
+            .execute(
+                "id-1",
+                "declared",
+                &serde_json::json!({"command": "/etc/shadow"}),
+            )
+            .await;
+        assert!(denied.result.is_error, "{:?}", denied.result);
+        assert!(
+            denied.result.output.contains("/etc/shadow"),
+            "{}",
+            denied.result.output
+        );
+
+        let allowed = dispatcher
+            .execute(
+                "id-2",
+                "declared",
+                &serde_json::json!({"command": "/tmp/ok"}),
+            )
+            .await;
+        assert!(!allowed.result.is_error, "{:?}", allowed.result);
+
+        // The declared field is the *only* one judged: a denied path sitting in
+        // some other argument of a tool that named `command` is not its rule
+        // content, and must not stop the call.
+        let unrelated = dispatcher
+            .execute(
+                "id-3",
+                "declared",
+                &serde_json::json!({"command": "/tmp/ok", "cwd": "/etc/shadow"}),
+            )
+            .await;
+        assert!(!unrelated.result.is_error, "{:?}", unrelated.result);
+    }
+
+    /// A tool that never reads `run_in_background` must not be advertised as
+    /// taking it: the model would spend a turn finding out.
+    #[tokio::test]
+    async fn a_tool_that_ignores_run_in_background_does_not_advertise_it() {
+        let mut registry = ToolRegistry::new();
+        registry.register(Arc::new(crate::builtins::BashTool::new()));
+        registry.register(Arc::new(crate::builtins::AgentTool::new()));
+        let registry = Arc::new(registry);
+
+        let executor = Arc::new(InnerExecutor::new(ExecutionConfig::default()));
+        let dispatcher = RegistryToolDispatcher::new(
+            registry,
+            executor,
+            ExecutionContext::Normal,
+            PathBuf::from("/tmp"),
+        );
+
+        let tools = dispatcher.list_tools();
+        let schema_of = |name: &str| {
+            tools
+                .iter()
+                .find(|t| t.name == name)
+                .map(|t| t.input_schema.clone())
+                .unwrap_or_else(|| panic!("{name} was not listed"))
+        };
+
+        // Bash advertises the argument and does not read it, so it is gone.
+        assert!(
+            schema_of("Bash")
+                .get("properties")
+                .unwrap()
+                .get("run_in_background")
+                .is_none(),
+            "Bash still advertises a flag it ignores"
+        );
+        // Agent reads it and really does background, so it keeps it.
+        assert!(
+            schema_of("Agent")
+                .get("properties")
+                .unwrap()
+                .get("run_in_background")
+                .is_some(),
+            "Agent honours run_in_background and must keep advertising it"
+        );
     }
 }

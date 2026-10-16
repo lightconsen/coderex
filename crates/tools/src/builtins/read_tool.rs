@@ -3,7 +3,10 @@
 use std::path::PathBuf;
 
 use crate::context::{ToolError, ToolOutput};
-use crate::tool::{Tool, ToolContext, ToolDescriptor, ToolInput, ToolTier};
+use crate::tool::{
+    MaxResultSizeChars, RuleContentField, Tool, ToolCapabilities, ToolContext, ToolDescriptor,
+    ToolInput, ToolTier,
+};
 use async_trait::async_trait;
 use serde_json::Value;
 
@@ -46,6 +49,19 @@ impl Tool for ReadTool {
             is_read_only: true,
             is_concurrency_safe: true,
             interrupt_behavior: crate::tool::InterruptBehavior::RunToCompletion,
+        }
+    }
+
+    fn capabilities(&self) -> ToolCapabilities {
+        ToolCapabilities {
+            // Read is the one tool that declares "no cap": it bounds its own
+            // output (MAX_DISPLAY_CHARS) before returning, so a cap here would
+            // only ever cut a string the tool already decided to hand over.
+            max_result_size_chars: MaxResultSizeChars::Unlimited,
+            // The argument a path rule is about, named by the tool rather than
+            // guessed from the shape of the call.
+            rule_content_field: Some(RuleContentField::Scalar("file_path")),
+            ..ToolCapabilities::default()
         }
     }
 

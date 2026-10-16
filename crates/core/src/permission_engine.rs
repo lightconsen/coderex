@@ -286,6 +286,16 @@ impl PermissionEngine {
         };
 
         // Phase 3: Confirmation bus (if configured and result needs user input)
+        //
+        // A tool that suppresses the "always allow" choice is offered the
+        // one-shot approval only. This is the only place the flag can take
+        // effect: the prompt's session option lives here.
+        let suppresses_always_allow = {
+            let checker = self.checker.lock().unwrap();
+            checker
+                .tool_exemptions(tool_name)
+                .suppresses_always_allow_rule
+        };
         let result = match result {
             PermissionResult::Ask { ref reason }
             | PermissionResult::AskForSession { ref reason } => {
@@ -296,10 +306,12 @@ impl PermissionEngine {
                         arguments: request.arguments.clone(),
                         path: request.path.clone(),
                         reason: reason.clone(),
-                        allow_session: matches!(
-                            result,
-                            PermissionResult::Ask { .. } | PermissionResult::AskForSession { .. }
-                        ),
+                        allow_session: !suppresses_always_allow
+                            && matches!(
+                                result,
+                                PermissionResult::Ask { .. }
+                                    | PermissionResult::AskForSession { .. }
+                            ),
                         context: request.context.clone(),
                     };
 
@@ -1049,6 +1061,60 @@ mod tests {
 
         let result = handle.await.unwrap();
         assert!(matches!(result, PermissionResult::Allow));
+    }
+
+    /// Ask the bus for one request and hand back whether it offered the
+    /// session-wide approval.
+    async fn session_option_offered_for(
+        tool: &str,
+        exemptions: crate::permissions::ToolRuleExemptions,
+    ) -> bool {
+        use crate::confirmation_bus::{ConfirmationBus, ConfirmationResponse};
+
+        let bus = ConfirmationBus::new(10);
+        let mut checker = PermissionChecker::new(PermissionMode::Default);
+        checker.set_tool_exemptions(tool, exemptions);
+        let mut engine = PermissionEngine::new(checker);
+        engine.set_confirmation_bus(bus.clone());
+
+        let bus_clone = bus.clone();
+        let owned = tool.to_string();
+        let handle = tokio::spawn(async move {
+            let (_request, result) = engine
+                .evaluate(&owned, "{}".into(), None, HashMap::new())
+                .await
+                .unwrap();
+            result
+        });
+
+        let req = bus_clone.next_request().await.unwrap();
+        let offered = req.allow_session;
+        bus_clone
+            .respond(&req.id, ConfirmationResponse::Approved)
+            .await;
+        let _ = handle.await.unwrap();
+        offered
+    }
+
+    /// The session-wide option is the default; a tool that suppresses it is
+    /// offered the one-shot approval only.
+    #[tokio::test]
+    async fn suppresses_always_allow_rule_withholds_the_session_option() {
+        assert!(
+            session_option_offered_for("bash", crate::permissions::ToolRuleExemptions::NONE).await,
+            "an ordinary tool must still offer the session option"
+        );
+        assert!(
+            !session_option_offered_for(
+                "bash",
+                crate::permissions::ToolRuleExemptions {
+                    ignores_whole_tool_allow_rule: true,
+                    suppresses_always_allow_rule: true,
+                },
+            )
+            .await,
+            "the session option was offered for a tool that suppresses it"
+        );
     }
 
     #[tokio::test]

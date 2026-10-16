@@ -32,6 +32,169 @@ pub enum ToolTier {
     Internal,
 }
 
+/// A graded per-tool cap on how many characters of output a tool may return.
+///
+/// A tool declares its own tier instead of the executor guessing, so a tool
+/// that legitimately returns a lot and one that never should are
+/// distinguishable. Seven tiers, matching the reference's `maxResultSizeChars`
+/// ladder.
+///
+/// [`MaxResultSizeChars::Unlimited`] is the reference's `1`/`0` sentinel: no
+/// cap at all. Exactly one tool declares it — `Read` — and only because Read
+/// bounds its own output before returning it.
+///
+/// The ladder tops out at [`MaxResultSizeChars::Huge`]; a tool that needs more
+/// than that declares `Unlimited`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum MaxResultSizeChars {
+    /// No cap (the reference's `1`/`0`). Read only.
+    Unlimited,
+    /// 10 000 characters.
+    Tiny,
+    /// 20 000 characters.
+    Small,
+    /// 50 000 characters.
+    Medium,
+    /// 100 000 characters.
+    Large,
+    /// 300 000 characters.
+    XLarge,
+    /// 1 048 576 characters — the widest finite tier, and the flat cap every
+    /// tool had before the ladder existed.
+    #[default]
+    Huge,
+}
+
+impl MaxResultSizeChars {
+    /// The cap in characters, or `None` for `Unlimited`.
+    #[must_use]
+    pub const fn chars(self) -> Option<usize> {
+        match self {
+            Self::Unlimited => None,
+            Self::Tiny => Some(10_000),
+            Self::Small => Some(20_000),
+            Self::Medium => Some(50_000),
+            Self::Large => Some(100_000),
+            Self::XLarge => Some(300_000),
+            Self::Huge => Some(1_048_576),
+        }
+    }
+
+    /// The tier for a raw character count.
+    ///
+    /// `0` and `1` are the reference's spellings of "no cap", so they map to
+    /// [`MaxResultSizeChars::Unlimited`]; anything else snaps to the nearest
+    /// tier at or above it.
+    #[must_use]
+    pub const fn from_chars(chars: usize) -> Self {
+        match chars {
+            0 | 1 => Self::Unlimited,
+            2..=10_000 => Self::Tiny,
+            10_001..=20_000 => Self::Small,
+            20_001..=50_000 => Self::Medium,
+            50_001..=100_000 => Self::Large,
+            100_001..=300_000 => Self::XLarge,
+            _ => Self::Huge,
+        }
+    }
+
+    /// How the reference spells this tier: the character count, or `1` for
+    /// `Unlimited`.
+    #[must_use]
+    pub const fn declared(self) -> usize {
+        match self.chars() {
+            Some(chars) => chars,
+            None => 1,
+        }
+    }
+}
+
+/// The argument a permission rule should read a tool's content from.
+///
+/// A deny rule written against a path can only be judged against the value the
+/// call is about to touch, and only the tool knows which argument carries it:
+/// Bash's content is its `command`, Read's is its `file_path`, SendFile's is
+/// its `files` list.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RuleContentField {
+    /// A single string argument (Bash: `command`, Read: `file_path`).
+    Scalar(&'static str),
+    /// A list of strings, or of objects carrying a `path` (SendFile: `files`).
+    List(&'static str),
+}
+
+impl RuleContentField {
+    /// The JSON argument name.
+    #[must_use]
+    pub const fn field(self) -> &'static str {
+        match self {
+            Self::Scalar(field) | Self::List(field) => field,
+        }
+    }
+}
+
+/// How a tool that can outlive its own call behaves.
+///
+/// Three states: a tool either always completes inside its call (`None`),
+/// manages the backgrounding itself and answers with a handle (`SelfManaged`,
+/// the reference's `"self"`), or detaches from the turn and reports later
+/// (`Detach`, the reference's `"detach"`).
+///
+/// The state is also a promise about the input schema: a tool that advertises
+/// a `run_in_background` argument must declare something other than `None`,
+/// and the dispatcher stops advertising the argument for a tool that does not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Backgrounding {
+    /// The tool always completes inside its call.
+    #[default]
+    None,
+    /// The tool backgrounds itself and returns a handle the caller can poll.
+    SelfManaged,
+    /// The tool detaches from the turn; its result arrives later.
+    Detach,
+}
+
+/// Everything a tool declares about itself that has no home in
+/// [`ToolDescriptor`].
+///
+/// This is a defaulted method on [`Tool`] rather than four more
+/// `ToolDescriptor` fields because `ToolDescriptor` is built with a struct
+/// literal at well over a hundred sites across the workspace, several of them
+/// in crates this one does not own; a new required field would break every one
+/// of them. Every default below is the behaviour tools had before the concept
+/// existed, so a tool that declares nothing is unchanged.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ToolCapabilities {
+    /// This tool's output cap.
+    pub max_result_size_chars: MaxResultSizeChars,
+    /// The argument a permission rule reads this tool's content from.
+    ///
+    /// `None` means "no declaration", and the caller falls back to looking for
+    /// anything path-shaped.
+    pub rule_content_field: Option<RuleContentField>,
+    /// Whether this tool backgrounds work of its own accord.
+    pub backgrounding: Backgrounding,
+    /// Whether a whole-tool allow rule (one naming this tool with no path
+    /// patterns) must not auto-approve it.
+    ///
+    /// Such a tool needs an explicit decision per call. This narrows *allow*
+    /// rules only: a deny rule is evaluated first and still wins.
+    pub ignores_whole_tool_allow_rule: bool,
+    /// Whether the "always allow" choice must not be offered for this tool.
+    pub suppresses_always_allow_rule: bool,
+}
+
+impl ToolCapabilities {
+    /// This tool's rule exemptions, as the permission checker spells them.
+    #[must_use]
+    pub const fn rule_exemptions(self) -> coderex_core::permissions::ToolRuleExemptions {
+        coderex_core::permissions::ToolRuleExemptions {
+            ignores_whole_tool_allow_rule: self.ignores_whole_tool_allow_rule,
+            suppresses_always_allow_rule: self.suppresses_always_allow_rule,
+        }
+    }
+}
+
 /// Input to a tool execution call.
 #[derive(Debug, Clone)]
 pub struct ToolInput {
@@ -74,6 +237,16 @@ pub struct ToolDescriptor {
 pub trait Tool: Send + Sync {
     /// Returns the tool's descriptor with metadata and capabilities.
     fn descriptor(&self) -> ToolDescriptor;
+
+    /// What this tool declares about its own output cap, rule content field,
+    /// backgrounding, and rule exemptions.
+    ///
+    /// See [`ToolCapabilities`]. The default is what every tool did before the
+    /// concept existed: the 1 MiB cap, no declared content field, no
+    /// backgrounding, no rule exemptions.
+    fn capabilities(&self) -> ToolCapabilities {
+        ToolCapabilities::default()
+    }
 
     /// Execute the tool with the given input and execution context.
     async fn execute(

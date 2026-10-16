@@ -7,6 +7,55 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
+/// Environment variable that turns the `mcp__<server>__<tool>` prefix off.
+///
+/// Set it to anything other than `0`/`false` (an empty value counts as "set")
+/// to address MCP tools by their raw server-side name. Mirrors the reference
+/// SDK's `CLAUDE_AGENT_SDK_MCP_NO_PREFIX`.
+pub const MCP_NO_PREFIX_ENV: &str = "CLAUDE_AGENT_SDK_MCP_NO_PREFIX";
+
+thread_local! {
+    /// Per-thread override of the env var, so a test can exercise no-prefix
+    /// mode without racing every other test in the process through a global.
+    static PREFIX_OVERRIDE: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// Whether the `mcp__<server>__<tool>` prefix is in force.
+///
+/// Prefixing is the default because it is load-bearing: two servers may expose
+/// the same raw tool name, and the prefix is what keeps them apart. Turning it
+/// off is opt-in, and the cost of a collision is paid in
+/// [`McpToolRegistry::register`], not silently.
+#[must_use]
+pub fn mcp_prefix_enabled() -> bool {
+    if let Some(forced) = PREFIX_OVERRIDE.with(std::cell::Cell::get) {
+        return forced;
+    }
+    // Unset means prefixed: the reference's spelling of "no prefix" is the
+    // variable being present, and anything but an explicit off counts as
+    // present.
+    std::env::var(MCP_NO_PREFIX_ENV).map_or(true, |value| !no_prefix_value_is_set(&value))
+}
+
+/// Whether a value of [`MCP_NO_PREFIX_ENV`] asks for no prefix.
+fn no_prefix_value_is_set(value: &str) -> bool {
+    !matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "0" | "false" | "no"
+    )
+}
+
+/// Force the prefix on or off for this thread. Used by tests; production reads
+/// the environment.
+pub fn set_mcp_prefix_enabled(enabled: bool) {
+    PREFIX_OVERRIDE.with(|cell| cell.set(Some(enabled)));
+}
+
+/// Drop any thread-local override, returning to the environment.
+pub fn clear_mcp_prefix_override() {
+    PREFIX_OVERRIDE.with(|cell| cell.set(None));
+}
+
 /// Information about a discovered MCP tool.
 #[derive(Debug, Clone)]
 pub struct McpToolInfo {
@@ -21,14 +70,41 @@ pub struct McpToolInfo {
 }
 
 impl McpToolInfo {
-    /// Public, collision-free name used by the model and permission rules.
+    /// Public name used by the model and permission rules.
     ///
-    /// The raw `name` remains unchanged because it is what the MCP server
-    /// expects in `tools/call`.
+    /// Normally the collision-free `mcp__<server>__<tool>`; the raw name when
+    /// the prefix is switched off.
+    ///
+    /// The raw `name` field remains unchanged either way, because it is what
+    /// the MCP server expects in `tools/call`.
     #[must_use]
     pub fn qualified_name(&self) -> String {
+        if mcp_prefix_enabled() {
+            self.prefixed_name()
+        } else {
+            self.name.clone()
+        }
+    }
+
+    /// The server-qualified name, whatever the prefix switch says.
+    ///
+    /// This is the unambiguous spelling, and the one to use when a raw name
+    /// turns out not to be unique.
+    #[must_use]
+    pub fn prefixed_name(&self) -> String {
         format!("mcp__{}__{}", self.server, self.name)
     }
+}
+
+/// A tool whose raw name is not unique, in no-prefix mode.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct McpToolNameConflict {
+    /// The raw name two servers both expose.
+    pub name: String,
+    /// The server that already holds the name.
+    pub held_by: String,
+    /// The server whose tool was refused registration.
+    pub refused: String,
 }
 
 /// Proxy for calling an MCP tool on a remote server.
@@ -98,6 +174,7 @@ impl McpToolProxy {
 #[derive(Debug, Default)]
 pub struct McpToolRegistry {
     tools: HashMap<String, McpToolInfo>,
+    conflicts: Vec<McpToolNameConflict>,
 }
 
 impl McpToolRegistry {
@@ -106,12 +183,45 @@ impl McpToolRegistry {
     pub fn new() -> Self {
         Self {
             tools: HashMap::new(),
+            conflicts: Vec::new(),
         }
     }
 
-    /// Register a discovered tool under its server-qualified public name.
+    /// Register a discovered tool under its public name.
+    ///
+    /// Registering the same server's tool again replaces it, which is what a
+    /// reconnect needs. In no-prefix mode two *different* servers can offer the
+    /// same raw name, and then the name can only address one of them: rather
+    /// than let the second registration quietly take over the name — and route
+    /// calls to the wrong server — the newcomer is refused and recorded in
+    /// [`Self::conflicts`]. Turn the prefix back on to reach it.
     pub fn register(&mut self, info: McpToolInfo) {
-        self.tools.insert(info.qualified_name(), info);
+        let public = info.qualified_name();
+        if let Some(existing) = self.tools.get(&public) {
+            if existing.server != info.server {
+                tracing::warn!(
+                    tool = %public,
+                    held_by = %existing.server,
+                    refused = %info.server,
+                    "MCP tool name is not unique without the server prefix; \
+                     the later registration was refused"
+                );
+                self.conflicts.push(McpToolNameConflict {
+                    name: info.name,
+                    held_by: existing.server.clone(),
+                    refused: info.server,
+                });
+                return;
+            }
+        }
+        self.tools.insert(public, info);
+    }
+
+    /// Names that could not be registered because no-prefix mode left them
+    /// ambiguous. Empty in the default, prefixed mode.
+    #[must_use]
+    pub fn conflicts(&self) -> &[McpToolNameConflict] {
+        &self.conflicts
     }
 
     /// Look up a tool by name.
@@ -228,6 +338,79 @@ mod tests {
         assert_eq!(proxy.server, "server1");
         assert_eq!(proxy.tool, "tool1");
         assert!(proxy.channel.is_none());
+    }
+
+    /// The switch exists and defaults to the prefixed name.
+    #[test]
+    fn the_prefix_is_on_unless_the_environment_says_otherwise() {
+        assert!(mcp_prefix_enabled());
+        assert_eq!(sample_tool().qualified_name(), "mcp__filesystem__read_file");
+        assert_eq!(sample_tool().prefixed_name(), "mcp__filesystem__read_file");
+
+        set_mcp_prefix_enabled(false);
+        assert!(!mcp_prefix_enabled());
+        assert_eq!(sample_tool().qualified_name(), "read_file");
+        // The unambiguous spelling is still available.
+        assert_eq!(sample_tool().prefixed_name(), "mcp__filesystem__read_file");
+
+        clear_mcp_prefix_override();
+        assert!(mcp_prefix_enabled());
+    }
+
+    #[test]
+    fn the_no_prefix_env_value_only_yields_to_an_explicit_off() {
+        assert!(no_prefix_value_is_set("1"));
+        assert!(no_prefix_value_is_set("true"));
+        assert!(no_prefix_value_is_set(""));
+        assert!(no_prefix_value_is_set("yes"));
+        assert!(!no_prefix_value_is_set("0"));
+        assert!(!no_prefix_value_is_set("false"));
+        assert!(!no_prefix_value_is_set("FALSE"));
+    }
+
+    /// Without the prefix, two servers offering the same raw name cannot both
+    /// be addressed by it. The later one is refused rather than silently
+    /// taking the name over, which would send its calls to the other server.
+    #[test]
+    fn a_raw_name_two_servers_share_is_refused_rather_than_routed_wrongly() {
+        set_mcp_prefix_enabled(false);
+        let mut reg = McpToolRegistry::new();
+        reg.register(sample_tool());
+        reg.register(McpToolInfo {
+            server: "other".into(),
+            ..sample_tool()
+        });
+
+        assert_eq!(reg.len(), 1, "the ambiguous tool was registered anyway");
+        assert_eq!(
+            reg.get("read_file").map(|info| info.server.as_str()),
+            Some("filesystem"),
+            "the name must keep addressing the server that already held it"
+        );
+        assert_eq!(
+            reg.conflicts(),
+            [McpToolNameConflict {
+                name: "read_file".into(),
+                held_by: "filesystem".into(),
+                refused: "other".into(),
+            }]
+        );
+
+        clear_mcp_prefix_override();
+    }
+
+    /// In the default mode the same two tools coexist, and nothing is refused.
+    #[test]
+    fn the_prefix_keeps_same_named_tools_apart_without_conflict() {
+        let mut reg = McpToolRegistry::new();
+        reg.register(sample_tool());
+        reg.register(McpToolInfo {
+            server: "other".into(),
+            ..sample_tool()
+        });
+
+        assert_eq!(reg.len(), 2);
+        assert!(reg.conflicts().is_empty());
     }
 
     #[test]

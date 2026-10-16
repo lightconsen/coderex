@@ -12,14 +12,21 @@ Model Context Protocol (MCP) support — enables CodeRex to act as an MCP client
 - **`McpServer`** (`server.rs`) — Server descriptor with full lifecycle: spawn, health check (immutable), reconnect (max 3), stop. Tracks 5 statuses: Stopped, Starting, Running, Unhealthy, Errored.
 - **`JsonRpcChannel`** (`channel.rs`) — JSON-RPC 2.0 stdio transport: `initialize()` (protocol 2024-11-05 + `initialized` notification), `send_request()`, `send_notification()`, `read_response()`, `list_tools()`, `list_resources()`.
 - **`McpToolProxy`** (`proxy.rs`) — Tool call forwarding: `call(args)` sends `tools/call` over shared channel.
-- **`McpToolRegistry`** (`proxy.rs`) — HashMap-based tool registry with `McpToolInfo` (name, description, input_schema, server).
+- **`McpToolRegistry`** (`proxy.rs`) — HashMap-based tool registry with `McpToolInfo` (name, description, input_schema, server). Public names are `mcp__<server>__<tool>`, or the raw name when `CLAUDE_AGENT_SDK_MCP_NO_PREFIX` is set (see *Tool naming* below).
+- **`McpToolNameConflict`** (`proxy.rs`) — a raw name two servers both expose while the prefix is off. The later registration is refused and recorded via `McpToolRegistry::conflicts()`, because the name can only address one of them.
 - **`McpResource`** / **`McpResourceContent`** / **`McpResourceRegistry`** (`resources.rs`) — Resource listing and access with MIME-type filtering.
 - **`McpConfig`** / **`McpServerConfig`** (`config.rs`) — Configuration loading from `.mcp.json` or settings.json, with file persistence.
 - **`McpOAuthState`** / **`OAuthManager`** (`oauth.rs`) — token bookkeeping for MCP servers: access_token, refresh_token, expires_at, scopes. Expiry checking via `chrono`, persistence to `~/.coderex/mcp_tokens.json`, and a real `grant_type=refresh_token` exchange (`OAuthManager::refresh`) against the server's token endpoint. Near-expiry detection (5 min buffer) drives `OAuthManager::refresh_if_needed`, which `McpManager::start_all` calls before connecting to a remote server. This module cannot *obtain* a token — it can only keep one alive.
 - **`McpAuthTool`** (`crates/tools/src/builtins/mcp_auth_tool.rs`) — the interactive half: authorization-code flow with PKCE (S256), a callback listener on `localhost:8765`, and a manual completion path (`code` + `code_verifier`) for when no browser can be opened. It is the only thing that can sign in, and it needs a browser and a user to approve.
 - **`ElicitationRequest`** / **`ElicitationManager`** (`elicitation.rs`) — User prompt forwarding from MCP servers with pending/response lifecycle.
 - **`McpResultAdapter`** (`result_adapter.rs`) — Converts MCP `tools/call` response JSON (text, image, resource content) into `ToolResult`.
-- **`McpToolExecutor`** / **`CompositeToolExecutor`** (`tool_executor.rs`) — Implements `ToolExecutor` trait for MCP tool dispatch. Composite tries primary executor first, falls back to MCP.
+- **`McpTool`** (`crates/mcp/src/tool.rs`) — a discovered MCP tool as an ordinary `Tool`, registered in the shared `ToolRegistry` under its public name, so it goes through the same dispatcher, timeout, output limit and concurrency rules as a built-in. The separate `McpToolExecutor`/`CompositeToolExecutor` were removed.
+
+### Tool naming
+
+Public names are `mcp__<server>__<tool>`, which is load-bearing: two servers may expose the same raw tool name, and the prefix is what keeps them apart. Setting `CLAUDE_AGENT_SDK_MCP_NO_PREFIX` (to anything but `0`/`false`) addresses tools by their raw server-side name instead — the raw name is what the server expects in `tools/call` either way.
+
+Without the prefix a shared raw name cannot address both servers, so the second registration is **refused** rather than allowed to take the name over (which would route its calls to the other server). The refusal is reported by `McpToolRegistry::conflicts()` and logged; turn the prefix back on to reach that tool. `McpToolInfo::prefixed_name()` always gives the unambiguous spelling.
 
 ### Hooked Into CLI
 
@@ -71,6 +78,10 @@ Model Context Protocol (MCP) support — enables CodeRex to act as an MCP client
 
 - **MCP tool schema in prompts**: Discovered MCP tools are registered but not yet formatted into the system prompt sent to the LLM. The engine needs to serialize `McpToolInfo` into the tool definitions section of prompts.
 - **Resource read via cache**: The cache infrastructure exists but `resources/read` is not yet called through it. A full `read_resource(uri)` method that checks cache, falls back to server, and stores result is needed for complete integration.
+
+### IDE tool whitelist
+
+The reference allows two IDE tools (`mcp__ide__executeCode`, `mcp__ide__getDiagnostics`) to be used without a prompt. CodeRex has no IDE product to allowlist for: the only `ide` surfaces are the `--ide` CLI flag, which is accepted and explicitly does nothing ("this build has no IDE integration"), and the `/ide` status command, which reports "Not connected" and defers to a REPL that never connects. There is no `ide` MCP server, so there is no tool to whitelist — adding one would be building a policy for a product that does not exist.
 
 ## Remaining Considerations
 

@@ -8,6 +8,9 @@ use std::sync::Arc;
 
 macro_rules! feature_gated_tool {
     ($name:ident, $tool_name:expr) => {
+        feature_gated_tool!($name, $tool_name, crate::tool::ToolCapabilities::default());
+    };
+    ($name:ident, $tool_name:expr, $caps:expr) => {
         #[derive(Debug)]
         pub struct $name;
 
@@ -35,6 +38,10 @@ macro_rules! feature_gated_tool {
                 }
             }
 
+            fn capabilities(&self) -> crate::tool::ToolCapabilities {
+                $caps
+            }
+
             async fn execute(&self, _input: ToolInput, _ctx: ToolContext<'_>) -> Result<ToolOutput, ToolError> {
                 Ok(ToolOutput {
                     output: format!("tool '{}' is feature-gated and not enabled", $tool_name),
@@ -49,7 +56,19 @@ feature_gated_tool!(WebBrowserTool, "WebBrowser");
 feature_gated_tool!(TerminalCaptureTool, "TerminalCapture");
 feature_gated_tool!(CtxInspectTool, "CtxInspect");
 feature_gated_tool!(MonitorTool, "Monitor");
-feature_gated_tool!(WorkflowToolTool, "WorkflowTool");
+// A runner, like `Agent`: it orchestrates sub-agents, so allowing the tool
+// wholesale would hand the model everything those agents can reach. Declared
+// here so the flag is already in place when the tool itself is implemented;
+// today it is registered disabled and answers "feature-gated".
+feature_gated_tool!(
+    WorkflowToolTool,
+    "WorkflowTool",
+    crate::tool::ToolCapabilities {
+        ignores_whole_tool_allow_rule: true,
+        suppresses_always_allow_rule: true,
+        ..crate::tool::ToolCapabilities::default()
+    }
+);
 feature_gated_tool!(SnipToolTool, "SnipTool");
 feature_gated_tool!(VerifyPlanExecutionTool, "VerifyPlanExecution");
 feature_gated_tool!(SuggestBackgroundPRTool, "SuggestBackgroundPR");
