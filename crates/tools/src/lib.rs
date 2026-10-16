@@ -25,6 +25,7 @@ pub use builtins::{
     WebFetchTool, WebSearchTool, WriteTool, default_token_path, persist_token_at,
     register_builtin_tools,
 };
+pub use coderex_core::permissions::ToolRuleExemptions;
 pub use context::{ExecutionContext, ToolError, ToolOutput};
 pub use cron_scheduler::{CRON_SCHEDULER_KEY, CronJob, CronScheduler};
 pub use dispatcher::RegistryToolDispatcher;

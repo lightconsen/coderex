@@ -18,7 +18,7 @@ use std::sync::Arc;
 
 use coderex_tools::{
     InterruptBehavior, Tool, ToolContext, ToolDescriptor, ToolError, ToolInput, ToolOutput,
-    ToolTier,
+    ToolRuleExemptions, ToolTier,
 };
 
 use crate::db::{CURRENT_USER, Write as DbWrite};
@@ -141,6 +141,29 @@ fn actions_of(family: Family) -> &'static [&'static str] {
         Family::Data => &DATA_ACTIONS,
         Family::Comments => &COMMENTS_ACTIONS,
         Family::Check => &CHECK_ACTIONS,
+    }
+}
+
+/// Whether an action changes something.
+///
+/// A whole-tool allow rule says "this tool, anywhere, is fine". For a reader of
+/// a published page that is a reasonable thing to write; for the same tool's
+/// publishing, deleting, uploading and database writes it is a single approval
+/// that covers all of them, so those actions refuse the shortcut — the
+/// reference's `ignoresWholeToolAllowRule` — and do not offer to be allowed for
+/// the rest of the session either. Reads and `verify` are ordinary.
+///
+/// `verify` is read-only (`ArtifactCheck` reports on a page, it does not touch
+/// it), so it is not in the set.
+#[must_use]
+fn is_mutating(family: Family, action: &str) -> bool {
+    match family {
+        Family::Artifact => {
+            matches!(action, "publish" | "delete" | "upload_asset" | "delete_asset")
+        }
+        Family::Data => matches!(action, "set" | "update" | "delete" | "str_replace" | "batch"),
+        Family::Comments => matches!(action, "add" | "reply" | "resolve"),
+        Family::Check => false,
     }
 }
 
@@ -788,6 +811,21 @@ impl Tool for ArtifactTool {
             // document someone may be reading; neither may overlap itself.
             is_concurrency_safe: read_only,
             interrupt_behavior: InterruptBehavior::RunToCompletion,
+        }
+    }
+
+    /// The flags are per action, not per tool — see [`is_mutating`]. The action
+    /// is resolved first, so a legacy spelling (`write_db`, `preview`) answers
+    /// for the action it now names.
+    fn rule_exemptions_for(&self, input: &Value) -> ToolRuleExemptions {
+        let resolved = resolve_action(self.name, &action_of(input));
+        if is_mutating(resolved.family, &resolved.action) {
+            ToolRuleExemptions {
+                ignores_whole_tool_allow_rule: true,
+                suppresses_always_allow_rule: true,
+            }
+        } else {
+            ToolRuleExemptions::NONE
         }
     }
 
@@ -1535,6 +1573,139 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(error.contains("teleport"), "{error}");
+    }
+
+    /// The mutating actions refuse a whole-tool allow rule; the reads honour
+    /// it. This split is why the flags are answered per call rather than
+    /// declared once for the tool.
+    #[test]
+    fn mutating_actions_carry_the_rule_exemptions_and_reads_do_not() {
+        let (service, _dir) = tools();
+        let exemptions = |name: &'static str, action: &str| {
+            page_tool(&service, name).rule_exemptions_for(&json!({ "action": action }))
+        };
+
+        let cases: [(&'static str, &[&str], &[&str]); 4] = [
+            (
+                ARTIFACT_TOOL,
+                &["publish", "delete", "upload_asset", "delete_asset"],
+                &[
+                    "list",
+                    "read",
+                    "version",
+                    "list_files",
+                    "read_file",
+                    "list_assets",
+                    "read_asset",
+                ],
+            ),
+            (
+                DATA_TOOL,
+                &["set", "update", "delete", "str_replace", "batch"],
+                &["get", "list", "query"],
+            ),
+            (
+                COMMENTS_TOOL,
+                &["add", "reply", "resolve"],
+                &["comments", "read", "list"],
+            ),
+            (CHECK_TOOL, &[], &["verify"]),
+        ];
+
+        for (tool_name, mutating, reads) in cases {
+            for action in mutating {
+                let declared = exemptions(tool_name, action);
+                assert!(
+                    declared.ignores_whole_tool_allow_rule,
+                    "{tool_name}/{action} must refuse a whole-tool allow rule"
+                );
+                assert!(
+                    declared.suppresses_always_allow_rule,
+                    "{tool_name}/{action} must not offer a session-wide allow"
+                );
+            }
+            for action in reads {
+                assert_eq!(
+                    exemptions(tool_name, action),
+                    ToolRuleExemptions::NONE,
+                    "{tool_name}/{action} is an ordinary action"
+                );
+            }
+        }
+
+        // The page tool's default action is `publish`, and publishing mutates.
+        assert!(
+            page_tool(&service, ARTIFACT_TOOL)
+                .rule_exemptions_for(&json!({}))
+                .ignores_whole_tool_allow_rule,
+            "a publish with no action named must refuse the shortcut"
+        );
+    }
+
+    /// A legacy action answers for the action it now names, wherever it was
+    /// addressed: `write_db` writes, `read_db` and `verify` do not.
+    #[test]
+    fn legacy_spellings_answer_for_the_action_they_now_name() {
+        let (service, _dir) = tools();
+        let page = page_tool(&service, ARTIFACT_TOOL);
+        let data = page_tool(&service, DATA_TOOL);
+
+        for tool in [&page, &data] {
+            assert!(
+                tool.rule_exemptions_for(&json!({ "action": "write_db" }))
+                    .ignores_whole_tool_allow_rule
+            );
+            assert_eq!(
+                tool.rule_exemptions_for(&json!({ "action": "read_db" })),
+                ToolRuleExemptions::NONE
+            );
+        }
+        assert_eq!(
+            page.rule_exemptions_for(&json!({ "action": "verify" })),
+            ToolRuleExemptions::NONE
+        );
+        assert_eq!(
+            page.rule_exemptions_for(&json!({ "action": "preview" })),
+            ToolRuleExemptions::NONE
+        );
+    }
+
+    /// The registry is what the engine asks, so the family's answer has to
+    /// survive the trip through it — and a name nothing declares stays nothing.
+    #[test]
+    fn the_registry_answers_the_familys_exemptions_per_action() {
+        let (service, _dir) = tools();
+        let mut registry = coderex_tools::ToolRegistry::new();
+        for tool in ArtifactTools::new(Arc::clone(&service)).all() {
+            registry.register(tool);
+        }
+
+        assert!(
+            registry
+                .rule_exemptions_for(ARTIFACT_TOOL, &json!({ "action": "publish" }))
+                .ignores_whole_tool_allow_rule
+        );
+        assert_eq!(
+            registry.rule_exemptions_for(ARTIFACT_TOOL, &json!({ "action": "read" })),
+            ToolRuleExemptions::NONE
+        );
+        assert!(
+            registry
+                .rule_exemptions_for(DATA_TOOL, &json!({ "action": "set" }))
+                .ignores_whole_tool_allow_rule
+        );
+        assert_eq!(
+            registry.rule_exemptions_for(COMMENTS_TOOL, &json!({ "action": "comments" })),
+            ToolRuleExemptions::NONE
+        );
+        assert_eq!(
+            registry.rule_exemptions_for(CHECK_TOOL, &json!({ "action": "verify" })),
+            ToolRuleExemptions::NONE
+        );
+        assert_eq!(
+            registry.rule_exemptions_for("NotATool", &json!({ "action": "publish" })),
+            ToolRuleExemptions::NONE
+        );
     }
 
     #[test]

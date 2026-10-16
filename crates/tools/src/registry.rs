@@ -3,7 +3,9 @@
 
 use crate::context::ExecutionContext;
 use crate::tool::{BoxedTool, InterruptBehavior, Tool, ToolDescriptor, ToolTier};
+use coderex_core::permissions::ToolRuleExemptions;
 use parking_lot::RwLock;
+use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -354,66 +356,228 @@ impl ToolRegistry {
             .map(|t| t.descriptor().interrupt_behavior)
             .unwrap_or(InterruptBehavior::RunToCompletion)
     }
+
+    /// What a named tool's rule exemptions are for this call.
+    ///
+    /// The flags are a property of the call, not only of the tool — the
+    /// artifact tool refuses a whole-tool allow rule for its mutating actions
+    /// and honours it for its reads — so the tool is asked with the call's own
+    /// arguments. An unknown tool declares nothing.
+    #[must_use]
+    pub fn rule_exemptions_for(&self, tool_name: &str, input: &Value) -> ToolRuleExemptions {
+        self.get_tool_arc(tool_name)
+            .map_or(ToolRuleExemptions::NONE, |tool| {
+                tool.rule_exemptions_for(input)
+            })
+    }
 }
 
-/// Introduce every tool's declared rule exemptions to a permission checker.
+/// Install a registry-backed rule-exemption resolver on a permission engine.
 ///
-/// The checker lives in `coderex-core` and cannot see tools, so a session that
-/// owns both has to make the introduction; without this call a tool's declared
+/// The checker lives in `coderex-core` and cannot see tools, and the flags are
+/// a property of the *call* rather than the tool, so copying a tool's constant
+/// answer into a table is not enough: the engine has to be able to ask, per
+/// call, what this input makes of the tool. Without this call a tool's declared
 /// `ignores_whole_tool_allow_rule` / `suppresses_always_allow_rule` are inert.
-/// Only tools that declare something are registered.
 pub fn install_rule_exemptions(
-    checker: &mut coderex_core::permissions::PermissionChecker,
-    registry: &ToolRegistry,
+    engine: &mut coderex_core::permission_engine::PermissionEngine,
+    registry: &Arc<ToolRegistry>,
 ) {
-    for (name, tool) in registry.list_tools() {
-        let exemptions = tool.capabilities().rule_exemptions();
-        if !exemptions.is_empty() {
-            checker.set_tool_exemptions(&name, exemptions);
-        }
-    }
+    let registry = Arc::clone(registry);
+    engine.set_rule_exemptions_resolver(Box::new(move |tool_name, input| {
+        registry.rule_exemptions_for(tool_name, input)
+    }));
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::builtins::{AgentTool, EchoTool, NoOpTool};
-    use crate::tool::{BoxedTool, InterruptBehavior};
+    use crate::builtins::{EchoTool, NoOpTool};
+    use crate::context::{ToolError, ToolOutput};
+    use crate::tool::{BoxedTool, InterruptBehavior, ToolContext, ToolInput};
+    use async_trait::async_trait;
+    use coderex_core::permission_engine::PermissionEngine;
+    use coderex_core::permissions::{
+        PermissionAction, PermissionChecker, PermissionMode, PermissionResult, PermissionRule,
+    };
+    use std::collections::HashMap;
 
     fn make_tool(tool: impl Tool + 'static) -> BoxedTool {
         Arc::new(tool)
     }
 
-    /// A tool's declaration is inert until someone introduces it to the
-    /// checker — this is that introduction, and the runner's refusal survives
-    /// the trip.
+    /// A tool whose answer depends on the call, the way the artifact tool's
+    /// does: it refuses a whole-tool allow rule for its writes and honours it
+    /// for its reads.
+    ///
+    /// It is named `Write` because that is a name the checker already treats as
+    /// dangerous, so the ordinary default a refused rule falls through to is
+    /// observable from outside.
+    #[derive(Debug)]
+    struct SplitExemptionsTool;
+
+    #[async_trait]
+    impl Tool for SplitExemptionsTool {
+        fn descriptor(&self) -> ToolDescriptor {
+            ToolDescriptor {
+                name: "Write".into(),
+                tier: ToolTier::Baseline,
+                input_schema: serde_json::json!({ "type": "object" }),
+                output_schema: serde_json::json!({ "type": "object" }),
+                requires_approval: false,
+                is_enabled: true,
+                is_read_only: false,
+                is_concurrency_safe: false,
+                interrupt_behavior: InterruptBehavior::RunToCompletion,
+            }
+        }
+
+        fn rule_exemptions_for(&self, input: &Value) -> ToolRuleExemptions {
+            if input.get("action").and_then(Value::as_str) == Some("publish") {
+                ToolRuleExemptions {
+                    ignores_whole_tool_allow_rule: true,
+                    ..ToolRuleExemptions::NONE
+                }
+            } else {
+                ToolRuleExemptions::NONE
+            }
+        }
+
+        async fn execute(
+            &self,
+            _input: ToolInput,
+            _ctx: ToolContext<'_>,
+        ) -> Result<ToolOutput, ToolError> {
+            Ok(ToolOutput {
+                output: String::new(),
+                is_display: false,
+            })
+        }
+    }
+
+    fn whole_tool_allow(tool: &str) -> PermissionRule {
+        PermissionRule {
+            tool_name: tool.into(),
+            action: PermissionAction::Allow,
+            paths: Vec::new(),
+            description: String::new(),
+        }
+    }
+
+    /// The registry answers for the call it is given, and says nothing about a
+    /// tool it does not have.
     #[test]
-    fn declared_exemptions_reach_the_permission_checker() {
+    fn rule_exemptions_are_answered_per_call() {
         let mut registry = ToolRegistry::new();
-        registry.register(make_tool(AgentTool::new()));
-        registry.register(make_tool(EchoTool));
-
-        let mut checker = coderex_core::permissions::PermissionChecker::new(
-            coderex_core::permissions::PermissionMode::Default,
-        );
-        install_rule_exemptions(&mut checker, &registry);
+        registry.register(make_tool(SplitExemptionsTool));
 
         assert!(
-            checker
-                .tool_exemptions("Agent")
-                .ignores_whole_tool_allow_rule,
-            "the Agent runner's declaration did not reach the checker"
+            registry
+                .rule_exemptions_for("Write", &serde_json::json!({ "action": "publish" }))
+                .ignores_whole_tool_allow_rule
         );
-        assert!(
-            checker
-                .tool_exemptions("Agent")
-                .suppresses_always_allow_rule
-        );
-        // A tool that declares nothing stays undeclared.
         assert_eq!(
-            checker.tool_exemptions("echo"),
-            coderex_core::permissions::ToolRuleExemptions::NONE
+            registry.rule_exemptions_for("Write", &serde_json::json!({ "action": "read" })),
+            ToolRuleExemptions::NONE
         );
+        assert_eq!(
+            registry.rule_exemptions_for("Write", &serde_json::json!({})),
+            ToolRuleExemptions::NONE
+        );
+        assert_eq!(
+            registry.rule_exemptions_for("unknown", &serde_json::json!({ "action": "publish" })),
+            ToolRuleExemptions::NONE
+        );
+    }
+
+    /// A tool's declaration is inert until a session introduces the registry to
+    /// the engine. This is that introduction, and the split survives the trip:
+    /// the read is approved by the whole-tool allow rule, the publish is not.
+    #[tokio::test]
+    async fn installed_exemptions_reach_the_engine_per_call() {
+        let mut registry = ToolRegistry::new();
+        registry.register(make_tool(SplitExemptionsTool));
+        registry.register(make_tool(EchoTool));
+        let registry = Arc::new(registry);
+
+        let mut checker = PermissionChecker::new(PermissionMode::Default);
+        checker.add_rule(whole_tool_allow("Write")).unwrap();
+        let mut engine = PermissionEngine::new(checker);
+        install_rule_exemptions(&mut engine, &registry);
+
+        // The read carries no exemption, so the whole-tool allow rule stands.
+        let (_request, result) = engine
+            .evaluate(
+                "Write",
+                serde_json::json!({ "action": "read" }).to_string(),
+                None,
+                HashMap::new(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            matches!(result, PermissionResult::Allow),
+            "the whole-tool allow rule must stand for a read: {result:?}"
+        );
+
+        // The publish refuses the rule, so the decision falls through to the
+        // ordinary dangerous default.
+        let (_request, result) = engine
+            .evaluate(
+                "Write",
+                serde_json::json!({ "action": "publish" }).to_string(),
+                None,
+                HashMap::new(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            matches!(result, PermissionResult::Ask { .. }),
+            "a refused allow rule must not approve the call: {result:?}"
+        );
+
+        // A tool that declares nothing is untouched by the resolver.
+        let (_request, result) = engine
+            .evaluate("Echo", "{}".into(), None, HashMap::new())
+            .await
+            .unwrap();
+        assert!(matches!(result, PermissionResult::Allow));
+    }
+
+    /// Deny is evaluated before any allow rule and is not something a tool's
+    /// exemptions can lift: the exempt publish is still denied.
+    #[tokio::test]
+    async fn a_deny_rule_beats_the_exemption() {
+        let mut registry = ToolRegistry::new();
+        registry.register(make_tool(SplitExemptionsTool));
+        let registry = Arc::new(registry);
+
+        let mut checker = PermissionChecker::new(PermissionMode::Default);
+        checker.add_rule(whole_tool_allow("Write")).unwrap();
+        checker
+            .add_rule(PermissionRule {
+                tool_name: "Write".into(),
+                action: PermissionAction::Deny,
+                paths: Vec::new(),
+                description: "no writes here".into(),
+            })
+            .unwrap();
+        let mut engine = PermissionEngine::new(checker);
+        install_rule_exemptions(&mut engine, &registry);
+
+        let (_request, result) = engine
+            .evaluate(
+                "Write",
+                serde_json::json!({ "action": "publish" }).to_string(),
+                None,
+                HashMap::new(),
+            )
+            .await
+            .unwrap();
+        match result {
+            PermissionResult::Deny { reason } => assert!(reason.contains("no writes here"), "{reason}"),
+            other => panic!("deny must win over the exemption, got {other:?}"),
+        }
     }
 
     #[test]

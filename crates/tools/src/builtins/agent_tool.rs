@@ -96,12 +96,12 @@ impl Tool for AgentTool {
             // `run_in_background` is read below and really does return early
             // with an agent handle, so the schema's promise is kept.
             backgrounding: Backgrounding::SelfManaged,
-            // A runner: allowing "Agent" wholesale would let the model spawn a
-            // sub-agent that does anything, with no further question asked.
-            // Both exemption flags are set, as they are for the other runner
-            // tool (Workflow), and neither narrows a deny rule.
-            ignores_whole_tool_allow_rule: true,
-            suppresses_always_allow_rule: true,
+            // No rule exemptions. Delegation is not a "runner" in the sense the
+            // reference means (that is a CI self-hosted runner, which re-runs a
+            // session somewhere else): this tool self-allows in the ordinary
+            // modes, and the sub-agent's own tool calls are gated by the same
+            // checker anyway. Declaring them here would refuse a whole-tool
+            // allow rule the user wrote on purpose, for no security gain.
             ..ToolCapabilities::default()
         }
     }
@@ -285,6 +285,23 @@ mod tests {
         assert!(
             result.is_err(),
             "a background agent that was never started must not report an output file"
+        );
+    }
+
+    /// Delegation carries no rule exemptions. It is not the reference's
+    /// "runner" (a CI self-hosted runner), and a session that installs the
+    /// exemptions into its engine would otherwise ask about every delegation,
+    /// because the fallback for a refused rule is the ordinary default.
+    #[test]
+    fn agent_declares_no_rule_exemptions() {
+        let tool = AgentTool::new();
+        assert_eq!(
+            tool.capabilities().rule_exemptions(),
+            coderex_core::permissions::ToolRuleExemptions::NONE
+        );
+        assert_eq!(
+            tool.rule_exemptions_for(&serde_json::json!({ "prompt": "do something" })),
+            coderex_core::permissions::ToolRuleExemptions::NONE
         );
     }
 

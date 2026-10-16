@@ -2,7 +2,7 @@
 //! pending request persistence, and orphaned recovery.
 
 use crate::confirmation_bus::{ConfirmationBus, ConfirmationRequest, ConfirmationResponse};
-use crate::permissions::{PermissionChecker, PermissionResult};
+use crate::permissions::{PermissionChecker, PermissionResult, ToolRuleExemptions};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -10,6 +10,18 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use thiserror::Error;
+
+/// Answers a tool's rule exemptions for one specific call.
+///
+/// The flags are per-*input*, not per-tool: the artifact tool refuses a
+/// whole-tool allow rule for its mutating actions and honours it for its
+/// reads. So the engine asks this with the call's own arguments; the tool and
+/// the registry that know the tool's shape answer.
+///
+/// `coderex-tools` installs a registry-backed one through
+/// `install_rule_exemptions`.
+pub type RuleExemptionsResolver =
+    dyn Fn(&str, &serde_json::Value) -> ToolRuleExemptions + Send + Sync;
 
 /// Errors from the permission request system.
 #[derive(Debug, Error)]
@@ -155,6 +167,11 @@ pub struct PermissionEngine {
     request_counter: u64,
     /// Optional confirmation bus for async user approval.
     confirmation_bus: Option<ConfirmationBus>,
+    /// Optional per-call resolver for tool rule exemptions.
+    ///
+    /// Without one the checker's static table is used, which is all a caller
+    /// that only knows a tool name can answer.
+    rule_exemptions: Option<Box<RuleExemptionsResolver>>,
 }
 
 impl PermissionEngine {
@@ -167,6 +184,28 @@ impl PermissionEngine {
             pending: PendingPermissionStore::new(None),
             request_counter: 0,
             confirmation_bus: None,
+            rule_exemptions: None,
+        }
+    }
+
+    /// Install a resolver that answers a tool's rule exemptions per call.
+    ///
+    /// The flags are per-input — see [`RuleExemptionsResolver`] — so the engine
+    /// asks the resolver with the call's own arguments. While one is installed
+    /// it replaces the checker's static table; without one the engine falls
+    /// back to that table, which is the behaviour of every session that has not
+    /// installed a resolver.
+    pub fn set_rule_exemptions_resolver(&mut self, resolver: Box<RuleExemptionsResolver>) {
+        self.rule_exemptions = Some(resolver);
+    }
+
+    /// The exemptions that apply to one call.
+    ///
+    /// Falls back to the checker's static table when no resolver is installed.
+    fn exemptions_for(&self, tool_name: &str, arguments: &serde_json::Value) -> ToolRuleExemptions {
+        match self.rule_exemptions.as_ref() {
+            Some(resolve) => resolve(tool_name, arguments),
+            None => self.checker.lock().unwrap().tool_exemptions(tool_name),
         }
     }
 
@@ -236,10 +275,19 @@ impl PermissionEngine {
         }
 
         // Phase 2: Permission checker
+        //
+        // The tool's rule exemptions are a property of this call, not only of
+        // the tool, so they are resolved from the call's own arguments. They
+        // are resolved once and reused below: the same answer decides whether a
+        // whole-tool allow rule is honoured and whether the session-wide
+        // approval is offered or written.
+        let arguments: serde_json::Value = serde_json::from_str(&request.arguments)
+            .unwrap_or(serde_json::Value::Null);
+        let exemptions = self.exemptions_for(tool_name, &arguments);
         let result = {
             let checker = self.checker.lock().unwrap();
             let path_ref = request.path.as_deref();
-            checker.check(tool_name, path_ref)
+            checker.check_with_exemptions(tool_name, path_ref, Some(exemptions))
         };
 
         // Phase 2.5: shell security analysis
@@ -288,14 +336,8 @@ impl PermissionEngine {
         // Phase 3: Confirmation bus (if configured and result needs user input)
         //
         // A tool that suppresses the "always allow" choice is offered the
-        // one-shot approval only. This is the only place the flag can take
-        // effect: the prompt's session option lives here.
-        let suppresses_always_allow = {
-            let checker = self.checker.lock().unwrap();
-            checker
-                .tool_exemptions(tool_name)
-                .suppresses_always_allow_rule
-        };
+        // one-shot approval only.
+        let suppresses_always_allow = exemptions.suppresses_always_allow_rule;
         let result = match result {
             PermissionResult::Ask { ref reason }
             | PermissionResult::AskForSession { ref reason } => {
@@ -328,8 +370,12 @@ impl PermissionEngine {
                     match response {
                         Some(ConfirmationResponse::Approved) => PermissionResult::Allow,
                         Some(ConfirmationResponse::ApproveSession) => {
-                            // Record session approval
-                            {
+                            // The flag's second job: a suppressed tool does not
+                            // get its approval written as a session-wide one.
+                            // The prompt never offers it, so this only bites a
+                            // caller that asks for it anyway — and it approves
+                            // this call either way, it just does not remember.
+                            if !suppresses_always_allow {
                                 let mut checker = self.checker.lock().unwrap();
                                 checker.record_session_approval(tool_name.to_string(), true);
                             }
@@ -357,11 +403,25 @@ impl PermissionEngine {
     ) -> Result<(), PermissionRequestError> {
         // Record session approval if applicable
         if response == PermissionResponse::ApproveSession {
-            // Find the request to get the tool name
-            if let Some(req) = self.pending.pending().iter().find(|r| r.id == request_id) {
-                let tool = req.tool_name.clone();
-                let mut checker = self.checker.lock().unwrap();
-                checker.record_session_approval(tool, true);
+            // Find the request to get the tool name and the call it was for:
+            // a tool that suppresses the session-wide allow is not given one,
+            // however the answer arrived.
+            let found = self
+                .pending
+                .pending()
+                .iter()
+                .find(|r| r.id == request_id)
+                .map(|req| {
+                    (
+                        req.tool_name.clone(),
+                        serde_json::from_str(&req.arguments).unwrap_or(serde_json::Value::Null),
+                    )
+                });
+            if let Some((tool, arguments)) = found {
+                if !self.exemptions_for(&tool, &arguments).suppresses_always_allow_rule {
+                    let mut checker = self.checker.lock().unwrap();
+                    checker.record_session_approval(tool, true);
+                }
             }
         }
 
@@ -1094,6 +1154,193 @@ mod tests {
             .await;
         let _ = handle.await.unwrap();
         offered
+    }
+
+    /// A call whose exemptions come from a resolver: run it through the bus,
+    /// answer it, and hand back what the prompt offered, the verdict, and what
+    /// a fresh check of the same tool says afterwards — the last one shows
+    /// whether the answer was written down as a session-wide approval.
+    async fn one_bus_call(
+        tool: &str,
+        arguments: serde_json::Value,
+        exemptions: crate::permissions::ToolRuleExemptions,
+        resolver: Option<Box<RuleExemptionsResolver>>,
+        response: ConfirmationResponse,
+    ) -> (bool, PermissionResult, PermissionResult) {
+        use crate::confirmation_bus::ConfirmationBus;
+
+        let bus = ConfirmationBus::new(10);
+        let mut checker = PermissionChecker::new(PermissionMode::Default);
+        checker.set_tool_exemptions(tool, exemptions);
+        let mut engine = PermissionEngine::new(checker);
+        engine.set_confirmation_bus(bus.clone());
+        if let Some(resolver) = resolver {
+            engine.set_rule_exemptions_resolver(resolver);
+        }
+
+        let reply_bus = bus.clone();
+        let answer = async move {
+            let request = reply_bus.next_request().await.unwrap();
+            let offered = request.allow_session;
+            reply_bus.respond(&request.id, response).await;
+            offered
+        };
+        let (evaluated, offered) = tokio::join!(
+            engine.evaluate(tool, arguments.to_string(), None, HashMap::new()),
+            answer
+        );
+        let verdict = evaluated.unwrap().1;
+        let written = engine.checker().lock().unwrap().check(tool, None);
+        (offered, verdict, written)
+    }
+
+    /// The flags are answered per call, not per tool: the same tool honours a
+    /// whole-tool allow rule for a read and refuses it for a publish, and the
+    /// refusal falls through to the ordinary default rather than to a prompt
+    /// invented for the exemption.
+    #[tokio::test]
+    async fn a_resolver_answers_rule_exemptions_for_each_call() {
+        let mut checker = PermissionChecker::new(PermissionMode::Default);
+        checker
+            .add_rule(crate::permissions::PermissionRule {
+                tool_name: "Write".into(),
+                action: crate::permissions::PermissionAction::Allow,
+                paths: Vec::new(),
+                description: String::new(),
+            })
+            .unwrap();
+        let mut engine = PermissionEngine::new(checker);
+        engine.set_rule_exemptions_resolver(Box::new(|_tool, input| {
+            if input.get("action").and_then(serde_json::Value::as_str) == Some("publish") {
+                ToolRuleExemptions {
+                    ignores_whole_tool_allow_rule: true,
+                    ..ToolRuleExemptions::NONE
+                }
+            } else {
+                ToolRuleExemptions::NONE
+            }
+        }));
+
+        let (_request, result) = engine
+            .evaluate(
+                "Write",
+                serde_json::json!({ "action": "read" }).to_string(),
+                None,
+                HashMap::new(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            matches!(result, PermissionResult::Allow),
+            "a read carries no exemption, so the whole-tool allow rule must stand: {result:?}"
+        );
+
+        let (_request, result) = engine
+            .evaluate(
+                "Write",
+                serde_json::json!({ "action": "publish" }).to_string(),
+                None,
+                HashMap::new(),
+            )
+            .await
+            .unwrap();
+        match result {
+            PermissionResult::Ask { reason } => {
+                assert!(
+                    reason.contains("dangerous operation"),
+                    "a refused allow rule falls to the ordinary default: {reason}"
+                );
+                assert!(
+                    !reason.contains("not covered by whole-tool allow rules"),
+                    "the exemption is not a prompt of its own: {reason}"
+                );
+            }
+            other => panic!("a refused allow rule must not approve the call, got {other:?}"),
+        }
+    }
+
+    /// Suppression is answered per call too, and it reaches the prompt: the
+    /// same tool is offered the session-wide option for a read and not for a
+    /// publish.
+    #[tokio::test]
+    async fn a_resolver_can_withhold_the_session_option_for_one_kind_of_call() {
+        let resolver = || -> Box<RuleExemptionsResolver> {
+            Box::new(|_tool, input| {
+                if input.get("action").and_then(serde_json::Value::as_str) == Some("publish") {
+                    ToolRuleExemptions {
+                        suppresses_always_allow_rule: true,
+                        ..ToolRuleExemptions::NONE
+                    }
+                } else {
+                    ToolRuleExemptions::NONE
+                }
+            })
+        };
+
+        let (offered, _verdict, _written) = one_bus_call(
+            "write",
+            serde_json::json!({ "action": "read" }),
+            ToolRuleExemptions::NONE,
+            Some(resolver()),
+            ConfirmationResponse::Approved,
+        )
+        .await;
+        assert!(offered, "an ordinary call must still offer the session option");
+
+        let (offered, _verdict, _written) = one_bus_call(
+            "write",
+            serde_json::json!({ "action": "publish" }),
+            ToolRuleExemptions::NONE,
+            Some(resolver()),
+            ConfirmationResponse::Approved,
+        )
+        .await;
+        assert!(
+            !offered,
+            "a suppressing call offered the session-wide option"
+        );
+    }
+
+    /// The suppression's other job: a suppressed tool is not given the
+    /// session-wide approval even when the answer asks for it. This call is
+    /// still approved; the next one asks again.
+    #[tokio::test]
+    async fn a_suppressing_tool_gets_no_session_wide_approval_written() {
+        let suppressing = ToolRuleExemptions {
+            ignores_whole_tool_allow_rule: true,
+            suppresses_always_allow_rule: true,
+        };
+        let (offered, verdict, written) = one_bus_call(
+            "write",
+            serde_json::json!({}),
+            suppressing,
+            None,
+            ConfirmationResponse::ApproveSession,
+        )
+        .await;
+        assert!(!offered);
+        assert!(matches!(verdict, PermissionResult::Allow));
+        assert!(
+            matches!(written, PermissionResult::Ask { .. }),
+            "the session-wide approval was written for a tool that suppresses it: {written:?}"
+        );
+
+        // The control: an ordinary tool's session approval is written, which is
+        // what makes the check above mean something.
+        let (offered, verdict, written) = one_bus_call(
+            "write",
+            serde_json::json!({}),
+            ToolRuleExemptions::NONE,
+            None,
+            ConfirmationResponse::ApproveSession,
+        )
+        .await;
+        assert!(offered);
+        assert!(matches!(verdict, PermissionResult::Allow));
+        assert!(
+            matches!(written, PermissionResult::Allow),
+            "an ordinary tool's session approval must still be written: {written:?}"
+        );
     }
 
     /// The session-wide option is the default; a tool that suppresses it is

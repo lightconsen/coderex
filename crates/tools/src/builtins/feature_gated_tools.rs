@@ -56,19 +56,12 @@ feature_gated_tool!(WebBrowserTool, "WebBrowser");
 feature_gated_tool!(TerminalCaptureTool, "TerminalCapture");
 feature_gated_tool!(CtxInspectTool, "CtxInspect");
 feature_gated_tool!(MonitorTool, "Monitor");
-// A runner, like `Agent`: it orchestrates sub-agents, so allowing the tool
-// wholesale would hand the model everything those agents can reach. Declared
-// here so the flag is already in place when the tool itself is implemented;
-// today it is registered disabled and answers "feature-gated".
-feature_gated_tool!(
-    WorkflowToolTool,
-    "WorkflowTool",
-    crate::tool::ToolCapabilities {
-        ignores_whole_tool_allow_rule: true,
-        suppresses_always_allow_rule: true,
-        ..crate::tool::ToolCapabilities::default()
-    }
-);
+// No rule exemptions. The reference's carriers are its CI runner tools, the
+// artifact family (per action) and its browser tool — delegation, which is what
+// this and `Agent` do, is not among them. Declaring them here would refuse a
+// whole-tool allow rule the user wrote on purpose, and the workflow's own tool
+// calls are gated by this same checker anyway.
+feature_gated_tool!(WorkflowToolTool, "WorkflowTool");
 feature_gated_tool!(SnipToolTool, "SnipTool");
 feature_gated_tool!(VerifyPlanExecutionTool, "VerifyPlanExecution");
 feature_gated_tool!(SuggestBackgroundPRTool, "SuggestBackgroundPR");
@@ -141,5 +134,15 @@ mod tests {
         register_feature_gated_tools(&mut reg);
         let tools = reg.list_tools();
         assert_eq!(tools.len(), 13);
+    }
+
+    /// The workflow stub orchestrates sub-agents; that is delegation, not one
+    /// of the reference's exemption carriers, so it declares nothing.
+    #[test]
+    fn workflow_declares_no_rule_exemptions() {
+        assert_eq!(
+            WorkflowToolTool.capabilities().rule_exemptions(),
+            coderex_core::permissions::ToolRuleExemptions::NONE
+        );
     }
 }

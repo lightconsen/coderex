@@ -2,6 +2,7 @@
 
 use crate::context::{ExecutionContext, ToolError, ToolOutput};
 use async_trait::async_trait;
+use coderex_core::permissions::ToolRuleExemptions;
 use serde_json::Value;
 use std::collections::HashMap;
 use std::fmt;
@@ -177,18 +178,26 @@ pub struct ToolCapabilities {
     /// Whether a whole-tool allow rule (one naming this tool with no path
     /// patterns) must not auto-approve it.
     ///
-    /// Such a tool needs an explicit decision per call. This narrows *allow*
-    /// rules only: a deny rule is evaluated first and still wins.
+    /// The rule is not honoured and the decision continues down the ordinary
+    /// path; it is not "always ask", and it narrows *allow* rules only — a deny
+    /// rule is evaluated first and still wins.
+    ///
+    /// This is the tool's constant answer. A tool whose answer depends on the
+    /// call overrides [`Tool::rule_exemptions_for`] instead.
     pub ignores_whole_tool_allow_rule: bool,
-    /// Whether the "always allow" choice must not be offered for this tool.
+    /// Whether the "always allow" choice must not be offered for this tool, and
+    /// an approval must not be written as a session-wide one.
+    ///
+    /// As above, the constant answer; a per-call answer comes from
+    /// [`Tool::rule_exemptions_for`].
     pub suppresses_always_allow_rule: bool,
 }
 
 impl ToolCapabilities {
     /// This tool's rule exemptions, as the permission checker spells them.
     #[must_use]
-    pub const fn rule_exemptions(self) -> coderex_core::permissions::ToolRuleExemptions {
-        coderex_core::permissions::ToolRuleExemptions {
+    pub const fn rule_exemptions(self) -> ToolRuleExemptions {
+        ToolRuleExemptions {
             ignores_whole_tool_allow_rule: self.ignores_whole_tool_allow_rule,
             suppresses_always_allow_rule: self.suppresses_always_allow_rule,
         }
@@ -246,6 +255,19 @@ pub trait Tool: Send + Sync {
     /// backgrounding, no rule exemptions.
     fn capabilities(&self) -> ToolCapabilities {
         ToolCapabilities::default()
+    }
+
+    /// What this tool's rule exemptions are for one specific call.
+    ///
+    /// [`ToolCapabilities`] answers per tool, but the flags it carries are a
+    /// property of the *call*: the artifact tool declares exempt actions
+    /// (`publish`, `set`, `reply`, …) and ordinary ones (`read`, `list`,
+    /// `verify`), so what it refuses depends on what the call is asking for.
+    /// A tool with such a split overrides this; the default is its constant
+    /// answer, and a tool that declares nothing keeps returning
+    /// [`ToolRuleExemptions::NONE`].
+    fn rule_exemptions_for(&self, _input: &Value) -> ToolRuleExemptions {
+        self.capabilities().rule_exemptions()
     }
 
     /// Execute the tool with the given input and execution context.

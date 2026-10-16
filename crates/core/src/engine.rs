@@ -1435,6 +1435,16 @@ impl QueryEngine {
         self.permission_engine.checker()
     }
 
+    /// The permission engine, to install the per-call pieces a session owns.
+    ///
+    /// A rule exemption is a property of a *call* — the same Artifact tool
+    /// refuses a whole-tool allow rule for a publish and honours it for a read
+    /// — and the engine is where the call's arguments are, so the resolver has
+    /// to be installed here rather than copied into the checker's table.
+    pub fn permission_engine_mut(&mut self) -> &mut PermissionEngine {
+        &mut self.permission_engine
+    }
+
     /// Configure the confirmation bus used for interactive permission prompts.
     pub fn set_confirmation_bus(&mut self, bus: ConfirmationBus) {
         self.permission_engine.set_confirmation_bus(bus);

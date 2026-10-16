@@ -169,10 +169,22 @@ pub struct PermissionRule {
 /// These narrow **allow** rules only. A deny rule is evaluated before any
 /// allow rule and is unaffected: a tool carrying either flag is still denied
 /// by a deny rule.
+///
+/// Both flags are a property of the *call*, not only of the tool: the artifact
+/// tool refuses the shortcut for its mutating actions and honours it for its
+/// reads. Whoever resolves them therefore answers per input — a tool answers
+/// `rule_exemptions_for(input)` in `coderex-tools`, and a session hands the
+/// engine a resolver that consults the registry (see
+/// [`PermissionEngine::set_rule_exemptions_resolver`](crate::permission_engine::PermissionEngine::set_rule_exemptions_resolver)).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ToolRuleExemptions {
-    /// A whole-tool allow rule does not approve this tool. Such a tool is
-    /// never auto-approved: it needs an explicit decision per call.
+    /// A whole-tool allow rule does not approve this tool — the rule is not
+    /// honoured and the decision continues down the ordinary path.
+    ///
+    /// Only that: it neutralises a rule that matched. A tool carrying it that
+    /// no rule matched still gets the ordinary mode default, so the flag is not
+    /// "always prompt" (a mode that bypasses checks still allows) and being a
+    /// no-op when there is nothing to refuse is intended.
     #[serde(default)]
     pub ignores_whole_tool_allow_rule: bool,
     /// The "always allow" choice is not offered for this tool, so an approval
@@ -342,8 +354,29 @@ impl PermissionChecker {
     /// Check if a tool operation is allowed.
     ///
     /// Evaluates in order: mode → session cache → rules → dangerous tool defaults.
+    ///
+    /// A tool's rule exemptions are taken from this checker's static table —
+    /// see [`Self::check_with_exemptions`] for a caller that can answer them
+    /// per call.
     #[must_use]
     pub fn check(&self, tool_name: &str, path: Option<&Path>) -> PermissionResult {
+        self.check_with_exemptions(tool_name, path, None)
+    }
+
+    /// Check a call whose rule exemptions are already known.
+    ///
+    /// The flags are a property of the *call* — the artifact tool refuses
+    /// whole-tool allow rules for its mutating actions only — so a caller that
+    /// has the call's arguments (the permission engine) resolves them and
+    /// passes them here. `None` means "use this checker's static table", which
+    /// is what a caller with only a tool name can do.
+    #[must_use]
+    pub fn check_with_exemptions(
+        &self,
+        tool_name: &str,
+        path: Option<&Path>,
+        exemptions: Option<ToolRuleExemptions>,
+    ) -> PermissionResult {
         // Mode-level shortcuts
         if self.mode.bypasses_all() {
             return PermissionResult::Allow;
@@ -374,7 +407,7 @@ impl PermissionChecker {
 
         // Rule matching: most specific (tool+path) wins, then tool-only, then default
         let path_str = path.map(|p| p.to_string_lossy().to_string());
-        let exemptions = self.tool_exemptions(tool_name);
+        let exemptions = exemptions.unwrap_or_else(|| self.tool_exemptions(tool_name));
 
         // Check for explicit deny rules first (deny takes priority). Nothing
         // below — including a tool's own exemptions — can turn a deny into an
@@ -430,17 +463,12 @@ impl PermissionChecker {
         // own — see `PermissionMode::Auto`; anything "auto" about the mode comes
         // from the classifier hook the CLI registers ahead of the checker.
         //
-        // A tool that refuses whole-tool allow rules is not auto-approved
-        // either: refusing the shortcut is only meaningful if the fallback is
-        // "ask" rather than "allow". Otherwise the flag would be a no-op for
-        // any tool that was not already dangerous.
-        if exemptions.ignores_whole_tool_allow_rule {
-            return PermissionResult::Ask {
-                reason: format!(
-                    "tool '{tool_name}' is not covered by whole-tool allow rules and requires approval"
-                ),
-            };
-        }
+        // A tool's exemptions are not consulted here. Their only job is to
+        // refuse a whole-tool allow rule that matched (above); a tool that
+        // carries them and finds no such rule reaches this ordinary default
+        // like any other tool. Asking here instead would make the flag mean
+        // "never auto-approved", which is not what it is — being a no-op when
+        // no rule matched is the intended design.
         if self.is_dangerous_tool(tool_name) {
             PermissionResult::Ask {
                 reason: format!("tool '{tool_name}' requires approval (dangerous operation)"),
@@ -793,30 +821,156 @@ mod tests {
         }
     }
 
-    /// A runner refuses the blanket allow: it is not approvable wholesale,
-    /// because one approval would cover anything it goes on to run.
+    /// A tool refuses the blanket allow: the rule is not honoured and the
+    /// decision continues down the ordinary path — here, to the ask rule that
+    /// sits behind it.
     #[test]
     fn a_tool_that_ignores_whole_tool_allow_rules_is_not_approved_by_one() {
         let mut checker = PermissionChecker::new(PermissionMode::Default);
-        checker.add_rule(whole_tool_allow("agent")).unwrap();
+        checker.add_rule(whole_tool_allow("artifact")).unwrap();
+        checker
+            .add_rule(PermissionRule {
+                tool_name: "artifact".into(),
+                action: PermissionAction::Ask,
+                paths: Vec::new(),
+                description: "artifact needs a look".into(),
+            })
+            .unwrap();
 
         // Without the flag the blanket allow stands.
         assert!(matches!(
-            checker.check("agent", None),
+            checker.check("artifact", None),
             PermissionResult::Allow
         ));
 
         checker.set_tool_exemptions(
-            "agent",
+            "artifact",
             ToolRuleExemptions {
                 ignores_whole_tool_allow_rule: true,
                 ..ToolRuleExemptions::NONE
             },
         );
         assert!(
-            matches!(checker.check("agent", None), PermissionResult::Ask { .. }),
+            matches!(checker.check("artifact", None), PermissionResult::Ask { .. }),
             "a blanket allow approved a tool that refuses blanket allows"
         );
+    }
+
+    /// The flag's only job is to neutralise an allow rule. A tool that carries
+    /// it and finds no whole-tool allow rule to refuse gets exactly the default
+    /// an ordinary tool gets — for a safe tool, "allow".
+    ///
+    /// This is the pin on the branch that used to sit at the mode default and
+    /// answer `Ask` for any exempt tool. That branch made the flag "never
+    /// auto-approved", which the reference does not do: there, `bypassPermissions`
+    /// and the ordinary default are reached before — and regardless of — the flag.
+    #[test]
+    fn an_exempt_tool_with_no_matching_allow_rule_gets_the_ordinary_mode_default() {
+        let mut checker = PermissionChecker::new(PermissionMode::Default);
+        checker.set_tool_exemptions(
+            "artifact",
+            ToolRuleExemptions {
+                ignores_whole_tool_allow_rule: true,
+                ..ToolRuleExemptions::NONE
+            },
+        );
+
+        assert!(
+            matches!(checker.check("artifact", None), PermissionResult::Allow),
+            "an exempt tool nothing refused must still get the ordinary default: {:?}",
+            checker.check("artifact", None)
+        );
+
+        // A dangerous tool keeps the ordinary dangerous default, with the
+        // ordinary reason rather than one invented for the exemption.
+        checker.set_tool_exemptions(
+            "bash",
+            ToolRuleExemptions {
+                ignores_whole_tool_allow_rule: true,
+                ..ToolRuleExemptions::NONE
+            },
+        );
+        match checker.check("bash", None) {
+            PermissionResult::Ask { reason } => {
+                assert!(reason.contains("dangerous operation"), "{reason}");
+            }
+            other => panic!("expected the ordinary approval question, got {other:?}"),
+        }
+    }
+
+    /// The mode bypass runs before the rules and before the exemptions, so an
+    /// exempt tool is still approved wholesale in `bypassPermissions`. The
+    /// exemption is not a floor under the mode.
+    #[test]
+    fn mode_bypass_is_checked_before_exemptions() {
+        let mut checker = PermissionChecker::new(PermissionMode::BypassPermissions);
+        checker.set_tool_exemptions(
+            "artifact",
+            ToolRuleExemptions {
+                ignores_whole_tool_allow_rule: true,
+                suppresses_always_allow_rule: true,
+            },
+        );
+        assert!(matches!(
+            checker.check("artifact", None),
+            PermissionResult::Allow
+        ));
+    }
+
+    /// A caller holding the call's arguments answers the flags itself, and what
+    /// it passes wins over the static table — which is how a per-input answer
+    /// reaches the checker.
+    ///
+    /// The observable difference is which rules a call reaches: a refused
+    /// allow rule falls through to the ask rule behind it. (Without that second
+    /// rule both answers end at the same default, since "artifact" is not a
+    /// dangerous name and the ordinary default is "allow".)
+    #[test]
+    fn exemptions_resolved_for_a_call_override_the_static_table() {
+        let exemptions = ToolRuleExemptions {
+            ignores_whole_tool_allow_rule: true,
+            ..ToolRuleExemptions::NONE
+        };
+        let mut checker = PermissionChecker::new(PermissionMode::Default);
+        checker.add_rule(whole_tool_allow("artifact")).unwrap();
+        checker
+            .add_rule(PermissionRule {
+                tool_name: "artifact".into(),
+                action: PermissionAction::Ask,
+                paths: Vec::new(),
+                description: "artifact needs a look".into(),
+            })
+            .unwrap();
+
+        // This call is a read: it carries nothing, so the whole-tool allow stands.
+        assert!(matches!(
+            checker.check_with_exemptions("artifact", None, Some(ToolRuleExemptions::NONE)),
+            PermissionResult::Allow
+        ));
+        // This call is a publish: it refuses the allow, so the ask behind it decides.
+        match checker.check_with_exemptions("artifact", None, Some(exemptions)) {
+            PermissionResult::Ask { reason } => assert!(reason.contains("needs a look"), "{reason}"),
+            other => panic!("a refused allow rule must not approve the call, got {other:?}"),
+        }
+
+        // Nothing resolved for it: the static table is used, and it declares
+        // nothing — which is the pre-resolution behaviour.
+        assert!(matches!(
+            checker.check("artifact", None),
+            PermissionResult::Allow
+        ));
+
+        // Now declare it statically: the plain check refuses the rule, and the
+        // per-call answer overrides that back to "nothing to refuse".
+        checker.set_tool_exemptions("artifact", exemptions);
+        assert!(matches!(
+            checker.check("artifact", None),
+            PermissionResult::Ask { .. }
+        ));
+        assert!(matches!(
+            checker.check_with_exemptions("artifact", None, Some(ToolRuleExemptions::NONE)),
+            PermissionResult::Allow
+        ));
     }
 
     /// Deny keeps winning. The exemptions narrow allow rules only.
