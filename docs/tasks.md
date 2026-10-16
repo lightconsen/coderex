@@ -585,26 +585,31 @@
 
 ### 10.2 TaskManager (crate: `core`)
 - [x] 定义 `TaskManager` 结构体
-- [x] 实现 `create_task(kind, command) -> TaskHandle`
+- [x] 实现 `create_task(kind, command) -> TaskHandle`（另加 `create_task_at(kind, owner, now_ms)` 用于确定性时间戳与归属）
 - [x] 实现 `list_tasks()`, `get_task(id)`, `update_task(id, state)`
 - [x] 实现 `stop_task(id)`, `get_task_output(id)`
 - [x] 实现 foreground/background 任务切换
+- [x] 实现 **adopt**：新会话启动时重新接管上一会话遗留的后台任务（`adopt_persisted`），含 `CLOCK_SKEW_ALLOWANCE_MS` 时钟偏差容忍；**foreign**（归属其他会话）与 **stale**（超过 `STALE_TASK_AGE_MS` 未更新）的记录一律不接管，终态任务与 `MainSession` 也不接管
 - **测试**：
   - task CRUD 操作正确的单元测试
   - 后台任务输出可查询的集成测试
   - 前后台切换的集成测试
+  - adopt：接管本会话近期任务、拒绝 foreign/stale/未来时间戳越界/终态/MainSession、容忍小范围时钟偏差、不覆盖在管任务、序列化往返保留归属与时间戳（`crates/core/src/task.rs`）
 - **依赖**：10.1
+- **说明**：CodeRex 的 `TaskKind` 是 shell/agent/dream/teammate/main-session 五类，**没有** cron 与 workflow 两类（定时任务由 `CronCreate` 系列工具负责，不归 `TaskManager`）；adopt 只覆盖真正存在的后台类型（见 `TaskKind::is_adoptable`），不为了凑齐四类而造枚举。
 
 ### 10.3 Agent 类型与 AgentManager (crate: `agents`)
 - [x] 定义 `AgentType` 枚举（GeneralPurpose, Explore, Plan, Verification, ClaudeCodeGuide, StatuslineSetup, Custom）
 - [x] 定义 `AgentManager` 结构体
 - [x] 实现 `spawn_agent(type, prompt, options) -> TaskHandle`
 - [x] 实现 fork 继承上下文
+- [x] 实现**缓存感知 fork**：`ForkedContext` 携带父会话的对话前缀（`conversation_prefix` / `fork_point`）与 `CacheSafeParams`（model / system prompt / 工具集），`fork_messages()` 逐字节复用父前缀（而非重算）并在 fork 点后追加子任务，`prefix_fingerprint()` 做漂移检测，`is_cache_safe()` 判定参数是否仍命中父前缀缓存；`SpawnOptions.parent_prefix` / `parent_cache_safe_params` 供调用方注入（CodeRex 消息无稳定 uuid，fork 点用下标而非 id）
 - [x] 实现自定义工具白名单
 - [x] 实现 `SendMessage` 到指定 agent
 - **测试**：
   - agent spawn 后独立运行的集成测试
   - fork 上下文继承正确的集成测试
+  - fork 逐字节复用父前缀、无前缀则全新、指纹随前缀变化、缓存安全判定需参数一致、spawn 记录父前缀（`crates/agents/src/manager.rs`）
   - SendMessage 消息送达的集成测试
 - **依赖**：10.2, 6.2, 4.1
 

@@ -65,7 +65,7 @@ Sub-agent system for spawning autonomous worker agents, dream agents (background
 
 #### Core Types
 
-- **`AgentManager`** — Central manager: spawns, tracks, messages, resumes agents. Holds `Arc<Mutex<TaskManager>>`, active instances, custom agent defs, event broadcast, and tool executor factory.
+- **`AgentManager`** — Central manager: spawns, tracks, messages, and registers agents. Holds `Arc<Mutex<TaskManager>>`, active instances, custom agent defs, event broadcast, and tool executor factory.
 - **`AgentInstance`** — Running agent handle with `task_handle`, `status`, `context`, `message_tx`, `output_file`, `model`, `prompt`, `completion_notify`.
 - **`AgentStatus`** — Lifecycle states: `Starting`, `Running`, `Completed`, `Failed`, `Stopped`.
 - **`AgentResult`** — Completion result: `output`, `status`, `token_usage`.
@@ -85,13 +85,16 @@ Sub-agent system for spawning autonomous worker agents, dream agents (background
   - `output_schema` — JSON schema for output validation
   - `retry_policy` — retry on failure
   - `sandbox` — sandbox config override
+  - `parent_prefix` — parent conversation messages the fork reuses verbatim (empty = fresh prefix)
+  - `parent_cache_safe_params` — `CacheSafeParams` that must match the parent for the prefix to be cache-safe
 
 - **`RetryPolicy`** — Retry configuration: `max_retries`, `on_failure` (`Retry` or `EscalateToParent`), `escalation_prompt`.
 - **`FailureAction`** — What to do when retries exhausted.
 
 #### Context & Messaging
 
-- **`ForkedContext`** — Context inherited from parent: `parent_session_id`, `cwd`, `recent_message_count`, `allowed_tools`, `env_snapshot`. Builder pattern with `with_tools()` and `with_env()`.
+- **`ForkedContext`** — Context inherited from parent: `parent_session_id`, `cwd`, `recent_message_count`, `allowed_tools`, `env_snapshot`, plus the cache-aware fork fields `conversation_prefix`, `fork_point` and `cache_safe_params`. Builder pattern with `with_tools()`, `with_env()`, `with_conversation_prefix()` and `with_cache_safe_params()`.
+- **`CacheSafeParams`** — The request components that must match the parent for a fork to hit the provider's prefix cache: `model`, `system_prompt`, `tool_names`.
 - **`AgentMessage`** — Parent-to-agent message: `agent_id`, `content`, `message_id`.
 
 #### Events & Observability
@@ -110,6 +113,7 @@ Sub-agent system for spawning autonomous worker agents, dream agents (background
 - **Real `QueryEngine` execution** — Spawned agents run a full `QueryEngine` from `coderex-core` with tool whitelisting and read-only enforcement.
 - **Channel-based messaging** — Parent and child agents communicate via `mpsc::UnboundedChannel`; messages are drained and appended to the prompt before each engine submission.
 - **Context forking** — Parent snapshots its state (session ID, cwd, tool list, env vars) for the child to work from.
+- **Cache-aware forking** — When the caller supplies `parent_prefix`, the fork reuses the parent's conversation messages *verbatim* (cloned, not re-derived, so the bytes match what the parent sent) and appends its own task after `fork_point`. `prefix_fingerprint()` gives a stable hash of the prefix for drift detection, and `is_cache_safe()` reports whether a given model/system-prompt/tool set would still hit the parent's prefix cache. A fork with no prefix starts a fresh one. CodeRex messages carry no stable uuid, so the fork point is an index, not an id.
 - **Tool executor factory** — Since `coderex-agents` cannot depend on `coderex-tools`, the caller provides a factory closure that creates concrete `ToolExecutor` implementations.
 - **Retry with escalation** — Failed agents retry up to `max_retries` times with error context and optional escalation prompt appended to the prompt.
 - **Schema validation** — Agent outputs validated against JSON schema via `StructuredOutputValidator` with automatic retry on validation failure.
@@ -120,7 +124,7 @@ Sub-agent system for spawning autonomous worker agents, dream agents (background
 - **Sandbox override** — Per-agent `SandboxConfig` injected into the tool executor factory.
 - **Token tracking** — `QueryEngine.total_usage()` captured after each attempt, persisted to companion `.meta.json` file alongside the output file.
 - **Custom agent definitions** — Users define agents in `~/.coderex/agents/{name}.json`; resolved by name in `AgentType::Custom`.
-- **Resume support** — Agents from previous sessions can be resumed with `resume_agent()`, restoring their context and state.
+- **Registered (externally managed) agents** — `register_agent()` records an agent id managed outside the manager. It does **not** resume execution and cannot: CodeRex does not persist a sub-agent transcript, so there is nothing to resume. `send_message`/`get_agent` treat a registered id as unknown rather than as a running agent (the old `resume_agent()` created a fake instance whose channel had no receiver).
 
 ## Current Status
 
@@ -130,11 +134,11 @@ All features are implemented. No known stubs.
 
 - **Agent type definitions** — All 7 built-in types plus custom agents.
 - **Custom agent loading** — Scans `~/.coderex/agents/*.json` on manager creation; merged options override spawn defaults.
-- **AgentManager** — Full lifecycle: spawn, send_message, complete, stop, list, running_count, resume.
+- **AgentManager** — Full lifecycle: spawn, send_message, complete, stop, list, running_count, register.
 - **Real engine execution** — `spawn_agent()` creates a `tokio::spawn` task running `run_agent_task()` with a full `QueryEngine`.
 - **`execute_via_agent()`** — Short-lived agent execution for command-style tasks.
 - **`spawn_dream_agent()`** — Read-only background analysis agent with Read/Glob/Grep whitelist.
-- **Context forking** — `ForkedContext` with session ID, cwd, message count, tool whitelist, and environment snapshot.
+- **Context forking** — `ForkedContext` with session ID, cwd, message count, tool whitelist, environment snapshot, and — for cache-aware forks — the parent conversation prefix, fork point and cache-safe params.
 - **Messaging** — `send_message()` via `mpsc::UnboundedChannel`; messages drained and appended to prompt before each engine submission.
 - **Resource limits** — `max_tokens`, `max_duration_seconds`, `max_turns` enforced per attempt.
 - **Retry policy** — Configurable retries with escalation prompt and error context.
@@ -144,7 +148,8 @@ All features are implemented. No known stubs.
 - **Token usage tracking** — Captured from `QueryEngine.total_usage()`, persisted to `.meta.json`, returned by `wait_for_completion()`.
 - **Observability** — Broadcast channel, NDJSON log files, parent event bus integration.
 - **Teammate events** — `TaskCompleted` and `Idle` events emitted with callback support.
-- **Resume support** — `resume_agent()` restores agents from previous sessions.
+- **Registered agents** — `register_agent()` tracks an externally managed id; no execution is attached (see the pattern note above).
+- **Cache-aware forking** — `ForkedContext` reuses the parent's conversation prefix verbatim (`fork_messages()`, `prefix_fingerprint()`, `is_cache_safe()`), so a fork can hit the provider's prefix cache instead of paying for a fresh prefix.
 - **Forked/background delegation** — `run_forked_agent()` and `run_background_feature()` via `coderex-core` orchestrator.
 - **Custom agent resolution** — `AgentType::Custom` resolves named custom agents from loaded definitions, merging allowed_tools, model, max_tokens, and output_schema.
 

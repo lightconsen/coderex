@@ -10,7 +10,7 @@ use coderex_core::engine::{
     QueryEngine, StructuredOutputValidator, SubmitOptions, ValidationResult,
 };
 use coderex_core::orchestrator::{
-    BackgroundFeatureRequest, QueryResult, run_background_feature, run_forked_agent,
+    run_background_feature, run_forked_agent, BackgroundFeatureRequest, QueryResult,
 };
 use coderex_core::permission_engine::PermissionEngine;
 use coderex_core::permissions::{PermissionChecker, PermissionMode};
@@ -27,7 +27,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 use thiserror::Error;
-use tokio::sync::{Mutex, broadcast, mpsc, watch};
+use tokio::sync::{broadcast, mpsc, watch, Mutex};
 
 use crate::types::AgentType;
 
@@ -143,6 +143,15 @@ pub struct SpawnOptions {
     pub retry_policy: Option<RetryPolicy>,
     /// Sandbox configuration override (None = use default sandbox).
     pub sandbox: Option<coderex_core::sandbox::SandboxConfig>,
+    /// Parent conversation messages the fork should reuse verbatim so the
+    /// provider's prefix cache is hit instead of a fresh prefix being paid
+    /// for. Empty means "start a fresh prefix".
+    #[serde(default)]
+    pub parent_prefix: Vec<serde_json::Value>,
+    /// Parent request params that must match for `parent_prefix` to be
+    /// cache-safe. See [`CacheSafeParams`].
+    #[serde(default)]
+    pub parent_cache_safe_params: Option<CacheSafeParams>,
 }
 
 impl Default for SpawnOptions {
@@ -161,13 +170,60 @@ impl Default for SpawnOptions {
             output_schema: None,
             retry_policy: None,
             sandbox: None,
+            parent_prefix: Vec::new(),
+            parent_cache_safe_params: None,
         }
     }
 }
 
 // ─── Context Fork ───────────────────────────────────────────────────────────
 
+/// Request parameters that must be identical between the parent request and a
+/// forked request for the provider's prompt-prefix cache to be reusable.
+///
+/// Providers cache on an exact byte prefix: the cacheable region starts at the
+/// system prompt and covers the leading messages, and it is only hit when the
+/// system prompt, the tool set and the model match what the parent sent. A
+/// fork that reuses the parent's conversation prefix but changes any of these
+/// pays full price for the prefix it thought it was reusing. Capturing them
+/// together lets a caller check cache safety before spending the tokens.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CacheSafeParams {
+    /// Model id the parent request used.
+    pub model: String,
+    /// System prompt the parent request sent, verbatim.
+    pub system_prompt: String,
+    /// Tool names the parent request advertised, in order.
+    pub tool_names: Vec<String>,
+}
+
+impl CacheSafeParams {
+    /// Create cache-safe params from the parent request's components.
+    #[must_use]
+    pub fn new(
+        model: impl Into<String>,
+        system_prompt: impl Into<String>,
+        tool_names: Vec<String>,
+    ) -> Self {
+        Self {
+            model: model.into(),
+            system_prompt: system_prompt.into(),
+            tool_names,
+        }
+    }
+}
+
 /// Context inherited from the parent session when forking a sub-agent.
+///
+/// The fork is *cache-aware*: it carries the parent's conversation prefix
+/// verbatim so the forked request reuses the provider's cached prefix instead
+/// of starting a fresh one. `fork_point` records where the fork diverges —
+/// everything up to and including that index is the parent's, and the
+/// sub-agent's own task is appended after it.
+///
+/// CodeRex messages carry no stable uuid, so the fork point is an index into
+/// the prefix rather than an id; `prefix_fingerprint` gives the same
+/// drift-detection a uuid would, by hashing the exact bytes of the prefix.
 #[derive(Debug, Clone, Serialize)]
 pub struct ForkedContext {
     /// Parent session ID.
@@ -180,6 +236,13 @@ pub struct ForkedContext {
     pub allowed_tools: Vec<String>,
     /// Environment snapshot (opt-in keys only).
     pub env_snapshot: HashMap<String, String>,
+    /// Parent conversation messages reused verbatim by the fork.
+    pub conversation_prefix: Vec<serde_json::Value>,
+    /// Index one past the last parent message included in the prefix — the
+    /// point at which the fork's own messages begin.
+    pub fork_point: usize,
+    /// Params that must match the parent for the prefix to be cache-safe.
+    pub cache_safe_params: Option<CacheSafeParams>,
 }
 
 impl ForkedContext {
@@ -192,19 +255,93 @@ impl ForkedContext {
             recent_message_count: message_count,
             allowed_tools: Vec::new(),
             env_snapshot: HashMap::new(),
+            conversation_prefix: Vec::new(),
+            fork_point: 0,
+            cache_safe_params: None,
         }
     }
 
     /// Set the tool whitelist for the forked agent.
+    #[must_use]
     pub fn with_tools(mut self, tools: Vec<String>) -> Self {
         self.allowed_tools = tools;
         self
     }
 
     /// Add environment variables to the snapshot.
+    #[must_use]
     pub fn with_env(mut self, vars: HashMap<String, String>) -> Self {
         self.env_snapshot = vars;
         self
+    }
+
+    /// Reuse the parent's conversation prefix, forking after the last message.
+    #[must_use]
+    pub fn with_conversation_prefix(mut self, prefix: Vec<serde_json::Value>) -> Self {
+        self.fork_point = prefix.len();
+        self.conversation_prefix = prefix;
+        self
+    }
+
+    /// Record the params that must match the parent for a cache hit.
+    #[must_use]
+    pub fn with_cache_safe_params(mut self, params: CacheSafeParams) -> Self {
+        self.cache_safe_params = Some(params);
+        self
+    }
+
+    /// Whether this fork actually reuses a parent prefix.
+    #[must_use]
+    pub fn reuses_parent_prefix(&self) -> bool {
+        !self.conversation_prefix.is_empty()
+    }
+
+    /// Build the message list for a forked request: the parent's prefix,
+    /// byte-for-byte, followed by the sub-agent's task.
+    ///
+    /// The prefix is cloned rather than re-derived, so it serializes to the
+    /// same bytes the parent sent and the provider's prefix cache applies.
+    #[must_use]
+    pub fn fork_messages(&self, task: &str) -> Vec<serde_json::Value> {
+        let mut messages = self.conversation_prefix.clone();
+        messages.push(serde_json::json!({
+            "role": "user",
+            "content": task,
+        }));
+        messages
+    }
+
+    /// A stable fingerprint of the exact prefix bytes.
+    ///
+    /// Two forks with the same fingerprint will present the same cacheable
+    /// prefix; a change in any message changes it. This is the CodeRex
+    /// stand-in for a fork-point uuid.
+    #[must_use]
+    pub fn prefix_fingerprint(&self) -> String {
+        // FNV-1a over the serialized prefix. A stable, dependency-free hash is
+        // enough: this is drift detection, not a security boundary.
+        let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+        if let Ok(bytes) = serde_json::to_vec(&self.conversation_prefix) {
+            for byte in bytes {
+                hash ^= u64::from(byte);
+                hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+            }
+        }
+        format!("{hash:016x}")
+    }
+
+    /// Whether a request with these components would actually hit the
+    /// parent's prefix cache.
+    ///
+    /// Returns `false` when no cache-safe params were recorded, or when the
+    /// model, system prompt or tool set differ from the parent's.
+    #[must_use]
+    pub fn is_cache_safe(&self, model: &str, system_prompt: &str, tool_names: &[String]) -> bool {
+        self.cache_safe_params.as_ref().is_some_and(|params| {
+            params.model == model
+                && params.system_prompt == system_prompt
+                && params.tool_names == tool_names
+        })
     }
 }
 
@@ -581,14 +718,20 @@ impl AgentManager {
         // when it is in fact free to edit the caller's checkout.
         validate_spawn_options(&options)?;
 
-        // Build forked context
-        let context = ForkedContext::new(
+        // Build forked context. When the caller supplies the parent's
+        // conversation prefix, the fork reuses it verbatim (cache-aware fork);
+        // otherwise the fork starts a fresh prefix.
+        let mut context = ForkedContext::new(
             parent_session_id.to_string(),
             cwd.to_string(),
             message_count,
         )
         .with_tools(options.allowed_tools.clone().unwrap_or_default())
-        .with_env(options.extra_env.clone());
+        .with_env(options.extra_env.clone())
+        .with_conversation_prefix(options.parent_prefix.clone());
+        if let Some(params) = options.parent_cache_safe_params.clone() {
+            context = context.with_cache_safe_params(params);
+        }
 
         // Create task handle for tracking
         let kind = TaskKind::LocalAgent {
@@ -1880,6 +2023,108 @@ mod tests {
         assert_eq!(ctx.cwd, "/src");
         assert_eq!(ctx.recent_message_count, 42);
         assert_eq!(ctx.allowed_tools, vec!["Read", "Bash"]);
+    }
+
+    fn parent_prefix() -> Vec<serde_json::Value> {
+        vec![
+            serde_json::json!({"role": "user", "content": "first question"}),
+            serde_json::json!({"role": "assistant", "content": "first answer"}),
+            serde_json::json!({"role": "user", "content": "second question"}),
+        ]
+    }
+
+    #[test]
+    fn forked_context_reuses_parent_prefix_verbatim() {
+        let prefix = parent_prefix();
+        let ctx = ForkedContext::new("parent".into(), "/src".into(), 3)
+            .with_conversation_prefix(prefix.clone());
+
+        assert!(ctx.reuses_parent_prefix());
+        assert_eq!(ctx.fork_point, 3);
+
+        let messages = ctx.fork_messages("do the sub-task");
+        // The parent prefix is reused byte-for-byte (a fresh prefix would not
+        // hit the provider's cache), and the task follows the fork point.
+        assert_eq!(messages.len(), 4);
+        assert_eq!(&messages[..3], prefix.as_slice());
+        assert_eq!(messages[3]["role"], "user");
+        assert_eq!(messages[3]["content"], "do the sub-task");
+    }
+
+    #[test]
+    fn fork_without_prefix_starts_fresh() {
+        let ctx = ForkedContext::new("parent".into(), "/src".into(), 0);
+        assert!(!ctx.reuses_parent_prefix());
+        assert_eq!(ctx.fork_point, 0);
+
+        let messages = ctx.fork_messages("task");
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0]["content"], "task");
+    }
+
+    #[test]
+    fn forked_context_prefix_fingerprint_detects_drift() {
+        let base = ForkedContext::new("parent".into(), "/src".into(), 3)
+            .with_conversation_prefix(parent_prefix());
+
+        let mut changed_prefix = parent_prefix();
+        changed_prefix[1]["content"] = serde_json::json!("a different answer");
+        let changed = ForkedContext::new("parent".into(), "/src".into(), 3)
+            .with_conversation_prefix(changed_prefix);
+
+        let same = ForkedContext::new("parent".into(), "/src".into(), 3)
+            .with_conversation_prefix(parent_prefix());
+
+        assert_eq!(base.prefix_fingerprint(), same.prefix_fingerprint());
+        assert_ne!(base.prefix_fingerprint(), changed.prefix_fingerprint());
+    }
+
+    #[test]
+    fn forked_context_cache_safety_requires_matching_params() {
+        let tools = vec!["Read".to_string(), "Grep".to_string()];
+        let params = CacheSafeParams::new("claude-sonnet-4-6", "you are helpful", tools.clone());
+        let ctx = ForkedContext::new("parent".into(), "/src".into(), 1)
+            .with_conversation_prefix(parent_prefix())
+            .with_cache_safe_params(params);
+
+        assert!(ctx.is_cache_safe("claude-sonnet-4-6", "you are helpful", &tools));
+        // A different system prompt or tool set breaks the cache.
+        assert!(!ctx.is_cache_safe("claude-sonnet-4-6", "you are a sub-agent", &tools));
+        assert!(!ctx.is_cache_safe("claude-opus-4-1", "you are helpful", &tools));
+        assert!(!ctx.is_cache_safe("claude-sonnet-4-6", "you are helpful", &["Read".into()]));
+
+        // Without recorded params there is nothing to be cache-safe against.
+        let bare = ForkedContext::new("parent".into(), "/src".into(), 1);
+        assert!(!bare.is_cache_safe("claude-sonnet-4-6", "you are helpful", &tools));
+    }
+
+    #[tokio::test]
+    async fn spawn_agent_records_parent_prefix() {
+        let mut mgr = make_manager();
+        let prefix = parent_prefix();
+        let options = SpawnOptions {
+            parent_prefix: prefix.clone(),
+            parent_cache_safe_params: Some(CacheSafeParams::new("m", "sys", vec!["Read".into()])),
+            ..Default::default()
+        };
+
+        let instance = mgr
+            .spawn_agent(
+                AgentType::GeneralPurpose,
+                "sub-task",
+                options,
+                "sess_1",
+                "/tmp",
+                prefix.len(),
+            )
+            .await
+            .unwrap();
+
+        let ctx = instance.context.as_ref().unwrap();
+        assert!(ctx.reuses_parent_prefix());
+        assert_eq!(ctx.conversation_prefix, prefix);
+        assert_eq!(ctx.fork_point, prefix.len());
+        assert_eq!(ctx.fork_messages("sub-task").len(), prefix.len() + 1);
     }
 
     #[test]
