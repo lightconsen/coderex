@@ -166,12 +166,27 @@ fn run_agent_with_env(
     timeout: Duration,
     envs: &[(&str, String)],
 ) -> AgentOutput {
+    // A config home of its own, seeded with a decision already recorded.
+    //
+    // Without this the benchmark reads the developer's settings — so a
+    // `permission_mode` of `plan`, say, denies every tool the benchmark is
+    // exercising and the run times out instead of failing on its assertion.
+    // An unseeded one is worse: the CLI asks for telemetry consent on stdin
+    // before doing anything, and the prompt goes to that question.
+    let config_home = tempfile::tempdir().expect("config home");
+    std::fs::write(
+        config_home.path().join("settings.json"),
+        r#"{"config_version": 3, "telemetry_enabled": false}"#,
+    )
+    .expect("seed config home");
+
     let mut cmd = Command::new(cargo_bin("coderex"));
     cmd.arg("-p")
         .arg("--no-session-persistence")
         .args(extra_args)
         .current_dir(cwd)
         .env("CODEREX_LOG", "off")
+        .env("CLAUDE_CONFIG_DIR", config_home.path())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());

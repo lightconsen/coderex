@@ -438,6 +438,12 @@ struct PtySession {
     parser: Arc<Mutex<vt100::Parser>>,
     raw: Arc<Mutex<Vec<u8>>>,
     reader_thread: Option<thread::JoinHandle<()>>,
+    /// The config home this session was given, held so it outlives it.
+    ///
+    /// Otherwise the CLI reads the developer's own settings — and the first-run
+    /// consent gate *writes* them — so a test would inherit whatever permission
+    /// mode the person running it happens to have configured.
+    config_home: PathBuf,
 }
 
 impl PtySession {
@@ -477,6 +483,16 @@ impl PtySession {
         }
         cmd.cwd(cwd);
         cmd.env("CODEREX_LOG", "off");
+        // A config home of its own, seeded with a decision already recorded:
+        // an untouched one makes the CLI ask for telemetry consent on stdin
+        // before it draws anything, and there is no one to answer.
+        let config_home = unique_config_home()?;
+        std::fs::write(
+            config_home.join("settings.json"),
+            r#"{"config_version": 3, "telemetry_enabled": false}"#,
+        )
+        .context("seed config home")?;
+        cmd.env("CLAUDE_CONFIG_DIR", &config_home);
         for (key, value) in extra_envs {
             cmd.env(key, value);
         }
@@ -523,6 +539,7 @@ impl PtySession {
             parser,
             raw,
             reader_thread: Some(reader_thread),
+            config_home,
         })
     }
 
@@ -705,7 +722,26 @@ impl Drop for PtySession {
         if let Some(handle) = self.reader_thread.take() {
             let _ = handle.join();
         }
+        // The session's own config home, not the developer's.
+        let _ = std::fs::remove_dir_all(&self.config_home);
     }
+}
+
+/// A fresh directory to use as `CLAUDE_CONFIG_DIR` for one session.
+///
+/// Built from `std` rather than `tempfile`, which is a dev-dependency this
+/// module (part of the library) cannot use.
+fn unique_config_home() -> Result<PathBuf> {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static COUNTER: AtomicU32 = AtomicU32::new(0);
+
+    let path = std::env::temp_dir().join(format!(
+        "coderex-e2e-config-{}-{}",
+        std::process::id(),
+        COUNTER.fetch_add(1, Ordering::Relaxed)
+    ));
+    std::fs::create_dir_all(&path).context("create config home")?;
+    Ok(path)
 }
 
 struct ScreenRegions {

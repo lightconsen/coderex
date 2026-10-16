@@ -123,6 +123,13 @@ struct PtySession {
     parser: Arc<Mutex<vt100::Parser>>,
     raw: Arc<Mutex<Vec<u8>>>,
     reader_thread: Option<thread::JoinHandle<()>>,
+    /// The config home this session was given, held so it outlives it.
+    ///
+    /// Without this the CLI reads the developer's own settings — and the
+    /// first-run consent gate *writes* them — so a test would inherit whatever
+    /// permission mode the person running it happens to have configured, and a
+    /// test run could change it.
+    _config_home: tempfile::TempDir,
 }
 
 impl PtySession {
@@ -167,6 +174,21 @@ impl PtySession {
         }
         cmd.cwd(cwd);
         cmd.env("CODEREX_LOG", "off");
+        // A config home of its own: the CLI looks here for settings, and the
+        // first-run consent gate writes here. Pointing it at the developer's
+        // real `~/.coderex` would make every test depend on their settings —
+        // and let a test run change them.
+        //
+        // It is seeded with a decision already recorded, because an untouched
+        // config home makes the CLI ask for telemetry consent on stdin before
+        // it draws anything, and a test has no one to answer.
+        let config_home = tempfile::tempdir().expect("config home");
+        std::fs::write(
+            config_home.path().join("settings.json"),
+            r#"{"config_version": 3, "telemetry_enabled": false}"#,
+        )
+        .expect("seed config home");
+        cmd.env("CLAUDE_CONFIG_DIR", config_home.path());
         for (key, value) in extra_envs {
             cmd.env(key, value);
         }
@@ -208,6 +230,7 @@ impl PtySession {
             parser,
             raw,
             reader_thread: Some(reader_thread),
+            _config_home: config_home,
         }
     }
 
