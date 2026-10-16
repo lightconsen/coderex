@@ -5,13 +5,12 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "In-process broadcast event bus — session event fan-out, permission tracking, elicitation"
+description = "Line-delimited JSON wire protocol (stream-json), plus permission/elicitation session state"
 
 [lints]
 workspace = true
 
 [dependencies]
-coderex-core = { path = "../core" }
 coderex-config = { path = "../config" }
 
 serde.workspace = true

@@ -4,7 +4,7 @@
 
 Daemon server mode — provides WebSocket sessions and structured I/O for headless/SDK consumers. Enables CodeRex to run as a background service that external tools can connect to.
 
-This crate is the **external protocol**: out-of-process clients (IDEs, web/mobile, scripts) connect here. It is distinct from the in-process event bus in `coderex-events` (`docs/events.md`), which never opens a socket.
+This crate is the **external protocol**: out-of-process clients (IDEs, web/mobile, scripts) connect here. It is distinct from `coderex-events` (`docs/events.md`), which is the **line-delimited stream protocol** on stdout (`--output-format stream-json`) plus session bookkeeping — there is no in-process event bus in either crate.
 
 ## Design
 

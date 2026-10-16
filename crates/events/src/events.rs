@@ -1,198 +1,15 @@
-//! In-process event stream, permission tracking, and elicitation.
+//! Permission tracking and elicitation state.
+//!
+//! A session accumulates permission requests and elicitation prompts that need
+//! bookkeeping: who is pending, what was resolved, and when a request has
+//! timed out. That bookkeeping is independent of how the session reports its
+//! events — the reporting path is the line-delimited wire protocol in
+//! [`crate::protocol`], not a bus.
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::{Mutex, broadcast};
-
-use coderex_core::types::{EngineEvent, ToolCall, ToolResult};
-
-// ── Events ──────────────────────────────────────────────────────────────
-
-/// Events carried on the in-process session event bus.
-///
-/// This enum captures every significant event that occurs during a CodeRex
-/// session so that in-process subscribers (the CLI's own components, test
-/// rigs) can observe and react to the assistant's behaviour. It is not a wire
-/// format for out-of-process clients; see the crate docs for where the
-/// external protocol lives.
-///
-/// # Event lifecycle
-///
-/// A typical turn looks like this:
-///
-/// 1. One or more [`BusEvent::TextDelta`] events as the model streams its
-///    response.
-/// 2. Zero or more [`BusEvent::ToolCallStart`] / [`BusEvent::ToolCallEnd`]
-///    pairs when the model decides to invoke tools.
-/// 3. A [`BusEvent::CompactBoundary`] whenever the context window is
-///    compacted.
-/// 4. [`BusEvent::PermissionRequest`] when a dangerous tool is invoked;
-///    followed by [`BusEvent::PermissionResolved`] once the user (or a
-///    policy) responds.
-/// 5. [`BusEvent::ElicitationRequest`] when the model needs clarification;
-///    followed by [`BusEvent::ElicitationResolved`] once the user answers.
-/// 6. [`BusEvent::SessionEnd`] when the session terminates.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[non_exhaustive]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub enum BusEvent {
-    /// A text delta from the assistant.
-    TextDelta(String),
-    /// A tool call started.
-    ToolCallStart {
-        /// The tool call that was initiated.
-        tool_call: ToolCall,
-    },
-    /// A tool call ended.
-    ToolCallEnd {
-        /// The result of the tool call.
-        result: ToolResult,
-    },
-    /// A compact boundary was inserted.
-    CompactBoundary,
-    /// A permission request.
-    PermissionRequest {
-        /// The unique request identifier.
-        id: String,
-        /// The tool name requesting permission.
-        tool: String,
-        /// The arguments passed to the tool.
-        args: serde_json::Value,
-    },
-    /// A permission request was resolved.
-    PermissionResolved {
-        /// The unique request identifier.
-        id: String,
-        /// Whether it was allowed.
-        allowed: bool,
-    },
-    /// An elicitation request.
-    ElicitationRequest {
-        /// The unique request identifier.
-        id: String,
-        /// The elicitation message.
-        message: String,
-    },
-    /// An elicitation was responded to.
-    ElicitationResolved {
-        /// The unique request identifier.
-        id: String,
-    },
-    /// Session ended.
-    SessionEnd,
-    /// Engine event from the core.
-    Engine(EngineEvent),
-}
-
-// ── Event Stream ────────────────────────────────────────────────────────
-
-/// In-process broadcast event bus for session events.
-///
-/// Uses a `tokio::sync::broadcast` channel with capacity 4096.  If a
-/// subscriber is slow, events are dropped for that subscriber and a
-/// warning is logged via [`BusSubscriber::lag()`].
-#[derive(Debug, Clone)]
-pub struct EventBus {
-    /// The broadcast sender.
-    tx: broadcast::Sender<BusEvent>,
-}
-
-impl EventBus {
-    /// Create a new event stream.
-    #[must_use]
-    pub fn new() -> Self {
-        let (tx, _) = broadcast::channel(4096);
-        Self { tx }
-    }
-
-    /// Emit an event to all listeners.
-    pub fn emit(&self, event: BusEvent) {
-        if self.tx.receiver_count() == 0 {
-            return;
-        }
-        if let Err(e) = self.tx.send(event) {
-            tracing::debug!("event broadcast failed (no receivers): {e}");
-        }
-    }
-
-    /// Subscribe to the event stream with backpressure tracking.
-    ///
-    /// The returned [`BusSubscriber`] wraps the raw broadcast receiver and
-    /// counts how many events were dropped because the subscriber was slow.
-    #[must_use]
-    pub fn subscribe(&self) -> BusSubscriber {
-        BusSubscriber::new(self.tx.subscribe())
-    }
-
-    /// Count of active subscribers.
-    #[must_use]
-    pub fn subscriber_count(&self) -> usize {
-        self.tx.receiver_count()
-    }
-}
-
-impl Default for EventBus {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-// ── Backpressure ────────────────────────────────────────────────────────
-
-/// A subscriber wrapper that tracks lag (dropped events).
-///
-/// If a subscriber falls behind the broadcast buffer, `tokio::sync::broadcast`
-/// silently drops events for that subscriber.  [`BusSubscriber`] counts
-/// those drops and exposes them via [`lag()`](Self::lag).  Callers can
-/// disconnect slow subscribers when lag exceeds a threshold.
-#[derive(Debug)]
-pub struct BusSubscriber {
-    inner: broadcast::Receiver<BusEvent>,
-    lag: std::sync::atomic::AtomicUsize,
-}
-
-impl BusSubscriber {
-    fn new(inner: broadcast::Receiver<BusEvent>) -> Self {
-        Self {
-            inner,
-            lag: std::sync::atomic::AtomicUsize::new(0),
-        }
-    }
-
-    /// Receive the next event, accounting for lag.
-    ///
-    /// Returns `Ok(event)` on success, or `Err(RecvError)` if the
-    /// broadcast channel is closed.
-    pub async fn recv(&mut self) -> Result<BusEvent, broadcast::error::RecvError> {
-        match self.inner.recv().await {
-            Ok(event) => Ok(event),
-            Err(e) => Err(e),
-        }
-    }
-
-    /// Try to receive an event without awaiting.
-    pub fn try_recv(&mut self) -> Result<BusEvent, broadcast::error::TryRecvError> {
-        match self.inner.try_recv() {
-            Ok(event) => Ok(event),
-            Err(broadcast::error::TryRecvError::Lagged(n)) => {
-                self.lag
-                    .fetch_add(n as usize, std::sync::atomic::Ordering::Relaxed);
-                tracing::warn!(
-                    "event subscriber lagged by {n} events; consider disconnecting slow consumer"
-                );
-                Err(broadcast::error::TryRecvError::Lagged(n))
-            }
-            Err(e) => Err(e),
-        }
-    }
-
-    /// Number of events this subscriber has missed due to lag.
-    #[must_use]
-    pub fn lag(&self) -> usize {
-        self.lag.load(std::sync::atomic::Ordering::Relaxed)
-    }
-}
+use tokio::sync::Mutex;
 
 // ── Permission Tracking ─────────────────────────────────────────────────
 
@@ -552,45 +369,44 @@ impl ElicitationTracker {
     }
 }
 
-// ── EventSession ──────────────────────────────────────────────────────────
+// ── SessionState ─────────────────────────────────────────────────────────
 
-/// A session-scoped handle combining the event bus, permission tracking, and
-/// elicitation state.
+/// Permission and elicitation state for one session.
 ///
-/// # Example
-///
-/// ```rust,no_run
-/// use coderex_events::{EventSession, BusEvent};
-///
-/// let session = EventSession::new("sess-1".into());
-/// let mut sub = session.subscribe_events();
-/// session.emit(BusEvent::TextDelta("hello".into()));
-/// ```
+/// Earlier this type also carried an in-process event bus; that bus has been
+/// deleted (see the crate docs). What remains is genuine session bookkeeping:
+/// the two trackers, timeout auto-resolution, and persistence.
 #[derive(Debug)]
-pub struct EventSession {
+pub struct SessionState {
     /// Session ID.
     pub id: String,
-    /// Event broadcast channel.
-    pub events: Arc<EventBus>,
     /// Permission request tracker.
     pub permissions: Arc<Mutex<PermissionTracker>>,
     /// Elicitation tracker.
     pub elicitations: Arc<Mutex<ElicitationTracker>>,
 }
 
-impl EventSession {
-    /// Create a new event session.
+/// The requests a timeout sweep auto-resolved, by id.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ResolvedTimeouts {
+    /// Permission requests that were auto-denied.
+    pub permissions: Vec<String>,
+    /// Elicitation requests that were auto-denied.
+    pub elicitations: Vec<String>,
+}
+
+impl SessionState {
+    /// Create empty session state.
     #[must_use]
     pub fn new(id: String) -> Self {
         Self {
             id,
-            events: Arc::new(EventBus::new()),
             permissions: Arc::new(Mutex::new(PermissionTracker::new())),
             elicitations: Arc::new(Mutex::new(ElicitationTracker::new())),
         }
     }
 
-    /// Create a session, optionally hydrating from a persisted store.
+    /// Create state, hydrating from a persisted store if one exists.
     ///
     /// If a store file exists at `.coderex/sdk_sessions/{id}.json`, the
     /// permission and elicitation trackers are restored from it.
@@ -607,34 +423,21 @@ impl EventSession {
         session
     }
 
-    /// Emit an event.
-    pub fn emit(&self, event: BusEvent) {
-        self.events.emit(event);
-    }
-
-    /// Subscribe to events with lag tracking.
-    #[must_use]
-    pub fn subscribe_events(&self) -> BusSubscriber {
-        self.events.subscribe()
-    }
-
-    /// Scan pending permissions and elicitations and auto-resolve any
-    /// that have exceeded their timeout.
+    /// Scan pending permissions and elicitations and auto-resolve any that
+    /// have exceeded their timeout.
     ///
-    /// Emits `PermissionResolved` / `ElicitationResolved` events for each
-    /// expired item.
-    pub async fn check_timeouts(&self) {
+    /// Returns the ids it resolved so the caller can report them on whatever
+    /// channel it owns — this type no longer emits anything itself.
+    pub async fn check_timeouts(&self) -> ResolvedTimeouts {
+        let mut resolved = ResolvedTimeouts::default();
+
         let expired_perms: Vec<String> = {
             let tracker = self.permissions.lock().await;
             tracker.expired().iter().map(|p| p.id.clone()).collect()
         };
         for id in expired_perms {
-            let resolved = {
-                let mut tracker = self.permissions.lock().await;
-                tracker.resolve_timeout(&id)
-            };
-            if resolved {
-                self.emit(BusEvent::PermissionResolved { id, allowed: false });
+            if self.permissions.lock().await.resolve_timeout(&id) {
+                resolved.permissions.push(id);
             }
         }
 
@@ -643,20 +446,18 @@ impl EventSession {
             tracker.expired().iter().map(|e| e.id.clone()).collect()
         };
         for id in expired_elics {
-            let resolved = {
-                let mut tracker = self.elicitations.lock().await;
-                tracker.resolve_timeout(&id)
-            };
-            if resolved {
-                self.emit(BusEvent::ElicitationResolved { id });
+            if self.elicitations.lock().await.resolve_timeout(&id) {
+                resolved.elicitations.push(id);
             }
         }
+
+        resolved
     }
 
     /// Spawn a background task that calls [`check_timeouts`](Self::check_timeouts)
     /// every 5 seconds.
     ///
-    /// Returns a `JoinHandle` that runs until the session is dropped.
+    /// Returns a `JoinHandle` that runs until the state is dropped.
     /// If called outside a Tokio runtime, the function returns `None`.
     pub fn spawn_timeout_checker(&self) -> Option<tokio::task::JoinHandle<()>> {
         let session = self.clone();
@@ -666,7 +467,7 @@ impl EventSession {
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
                 interval.tick().await;
-                session.check_timeouts().await;
+                let _ = session.check_timeouts().await;
             }
         }))
     }
@@ -680,11 +481,10 @@ impl EventSession {
     }
 }
 
-impl Clone for EventSession {
+impl Clone for SessionState {
     fn clone(&self) -> Self {
         Self {
             id: self.id.clone(),
-            events: Arc::clone(&self.events),
             permissions: Arc::clone(&self.permissions),
             elicitations: Arc::clone(&self.elicitations),
         }
@@ -694,25 +494,6 @@ impl Clone for EventSession {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn event_stream_broadcast() {
-        let stream = EventBus::new();
-        let mut rx = stream.subscribe();
-        stream.emit(BusEvent::SessionEnd);
-        let event = rx.try_recv().unwrap();
-        assert!(matches!(event, BusEvent::SessionEnd));
-    }
-
-    #[test]
-    fn event_stream_multiple_subscribers() {
-        let stream = EventBus::new();
-        let mut rx1 = stream.subscribe();
-        let mut rx2 = stream.subscribe();
-        stream.emit(BusEvent::TextDelta("hello".to_string()));
-        assert!(matches!(rx1.try_recv(), Ok(BusEvent::TextDelta(ref s)) if s == "hello"));
-        assert!(matches!(rx2.try_recv(), Ok(BusEvent::TextDelta(ref s)) if s == "hello"));
-    }
 
     #[test]
     fn permission_tracker_lifecycle() {
@@ -766,12 +547,28 @@ mod tests {
         assert!(!tracker.resolve("nope", false, None));
     }
 
-    #[test]
-    fn event_session_emits_events() {
-        let session = EventSession::new("s1".to_string());
-        let mut rx = session.subscribe_events();
-        session.emit(BusEvent::CompactBoundary);
-        assert!(matches!(rx.try_recv(), Ok(BusEvent::CompactBoundary)));
+    #[tokio::test]
+    async fn session_state_timeout_sweep_reports_ids() {
+        let session = SessionState::new("s1".to_string());
+        let perm_id = session
+            .permissions
+            .lock()
+            .await
+            .create("Read".into(), serde_json::json!({}), None, 1)
+            .unwrap();
+        session.elicitations.lock().await.create("Confirm?".into(), 1);
+
+        // Nothing has timed out yet.
+        assert_eq!(session.check_timeouts().await, ResolvedTimeouts::default());
+
+        std::thread::sleep(std::time::Duration::from_secs(2));
+        let resolved = session.check_timeouts().await;
+        assert_eq!(resolved.permissions, vec![perm_id]);
+        assert_eq!(resolved.elicitations.len(), 1);
+
+        // Resolved ids move out of the pending set.
+        assert_eq!(session.permissions.lock().await.pending_count(), 0);
+        assert_eq!(session.elicitations.lock().await.pending_count(), 0);
     }
 
     #[test]
@@ -872,20 +669,5 @@ mod tests {
         assert!(tracker.resolve_timeout(&id));
         let perm = tracker.get(&id).unwrap();
         assert_eq!(perm.status, PermissionStatus::TimedOut);
-    }
-
-    #[test]
-    fn subscriber_lag_tracked_on_try_recv() {
-        let stream = EventBus::new();
-        let mut sub = stream.subscribe();
-
-        // Fill the broadcast buffer beyond capacity to trigger lag
-        for i in 0..5000 {
-            stream.emit(BusEvent::TextDelta(format!("msg-{i}")));
-        }
-
-        // try_recv should report lag
-        let _ = sub.try_recv();
-        assert!(sub.lag() > 0);
     }
 }
