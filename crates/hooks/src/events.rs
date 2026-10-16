@@ -97,6 +97,25 @@ impl HookEvent {
 }
 
 impl HookEvent {
+    /// Whether the firing site reads a `stop` decision on this event as a gate.
+    ///
+    /// On `PreToolUse` a `stop` denies the tool; on `UserPromptSubmit` it
+    /// refuses the prompt. Those are the only events where the caller consults
+    /// [`HookFireResult::stop`](coderex_core::hook_executor::HookFireResult::stop),
+    /// so they are the only events where a hook that *cannot answer* has a
+    /// fail-closed response available (deny). Elsewhere a failed hook can only
+    /// be recorded, not turned into a denial.
+    ///
+    /// Keep this in sync with the firing sites: a new caller that gates on
+    /// `stop` must add its event here, or a failed hook there will read as an
+    /// allow.
+    #[must_use]
+    pub const fn is_gating(self) -> bool {
+        matches!(self, Self::PreToolUse | Self::UserPromptSubmit)
+    }
+}
+
+impl HookEvent {
     /// Whether CodeRex fires this event anywhere.
     ///
     /// The firing sites, so this list can be checked against the code:
@@ -234,6 +253,23 @@ pub enum HookError {
     /// Hook execution failed (non-zero exit).
     #[error("hook exited with code {0}")]
     ExecutionFailed(i32),
+    /// The hook's input could not be delivered to it.
+    ///
+    /// The hook ran — or started to — without its input, so its answer cannot
+    /// be trusted. Fail closed: see the `HookFireResult` contract.
+    #[error("hook input could not be delivered: {0}")]
+    InputNotDelivered(String),
+    /// The hook produced no output, so it gave no answer.
+    ///
+    /// An empty stdout is not "continue": a hook that cannot answer is a failed
+    /// hook, and a failed hook must not be read as an allow. Hooks that want to
+    /// continue without a decision must say so explicitly with `{}` or
+    /// `{"action":"continue"}`.
+    #[error("hook produced no output (expected a JSON result on stdout)")]
+    NoOutput,
+    /// The hook's output could not be parsed as a hook result.
+    #[error("hook output could not be parsed: {0}")]
+    UnparseableOutput(String),
 }
 
 #[cfg(test)]
@@ -267,6 +303,26 @@ mod tests {
                 "TurnEnd",
             ]
         );
+    }
+
+    /// Only the events whose firing site reads `stop` as a gate may report as
+    /// gating. A failed hook on a non-gating event has nowhere to deny.
+    #[test]
+    fn only_the_gating_events_report_as_gating() {
+        let gating: Vec<&str> = HookEvent::iter()
+            .filter(|event| event.is_gating())
+            .map(HookEvent::as_str)
+            .collect();
+        assert_eq!(gating, vec!["PreToolUse", "UserPromptSubmit"]);
+    }
+
+    /// A gating event must also be one CodeRex actually fires — otherwise the
+    /// gate is a promise about a hook that can never run.
+    #[test]
+    fn every_gating_event_is_triggered() {
+        for event in HookEvent::iter().filter(|e| e.is_gating()) {
+            assert!(event.is_triggered(), "{event:?} gates but never fires");
+        }
     }
 
     #[test]

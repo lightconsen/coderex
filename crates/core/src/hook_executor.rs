@@ -7,14 +7,39 @@
 use std::collections::HashMap;
 
 /// Result of firing a single hook event.
+///
+/// # Fail-closed contract
+///
+/// Hooks gate work: a `PreToolUse` hook can deny a tool, a `UserPromptSubmit`
+/// hook can refuse a prompt. That gate is only trustworthy if the hook actually
+/// answered. A hook that could not be fed its input, whose result could not be
+/// retrieved, or which could not answer at all must not be read as "Continue" —
+/// that turns a broken hook into a silent allow.
+///
+/// So when any matching hook fails, [`failed`](Self::failed) is set, the reason
+/// is appended to [`errors`](Self::errors), and — on the events where the
+/// firing site reads [`stop`](Self::stop) as a gate (`PreToolUse`,
+/// `UserPromptSubmit`) — `stop` is set too, so the caller denies. Callers that
+/// want to distinguish "the hook said stop" from "the hook could not answer"
+/// should read `failed`; callers that only want the gate should read `stop`.
 #[derive(Debug, Clone, Default)]
 pub struct HookFireResult {
     /// Whether the hook requested to stop the operation.
+    ///
+    /// Also set when a hook failed on a gating event (fail-closed): a gate we
+    /// could not get an answer for is treated as denied. See the type-level
+    /// docs.
     pub stop: bool,
     /// Optional replacement for the user input.
     pub updated_input: Option<String>,
     /// Errors encountered during hook execution (empty on success).
     pub errors: Vec<String>,
+    /// Whether at least one matching hook failed and produced no usable answer.
+    ///
+    /// Failure means the hook could not be run, could not be given its input,
+    /// produced output that could not be parsed, or timed out. When `failed` is
+    /// set on a gating event, [`stop`](Self::stop) is set as well.
+    pub failed: bool,
 }
 
 /// Abstract hook executor — implemented by `coderex-hooks::HookRegistry`.
@@ -25,6 +50,9 @@ pub trait HookExecutor: Send + Sync {
     /// `event_name` is the string name of the event (e.g. "UserPromptSubmit").
     /// `input` is the current input string (user prompt, tool name, etc.).
     /// `context` is additional context (session_id, tool args, etc.).
+    ///
+    /// Implementations must fail closed: if a hook cannot answer, the returned
+    /// [`HookFireResult`] must not read as an allow. See [`HookFireResult`].
     async fn fire_hook(
         &self,
         event_name: &str,
@@ -46,5 +74,22 @@ impl HookExecutor for NoOpHookExecutor {
         _context: &HashMap<String, String>,
     ) -> HookFireResult {
         HookFireResult::default()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The no-op executor is not a failed hook — it simply has nothing to say.
+    /// Conflating the two would make every hook-less session look broken.
+    #[tokio::test]
+    async fn noop_executor_is_not_a_failure() {
+        let result = NoOpHookExecutor
+            .fire_hook("PreToolUse", "Bash", &HashMap::new())
+            .await;
+        assert!(!result.failed);
+        assert!(!result.stop);
+        assert!(result.errors.is_empty());
     }
 }

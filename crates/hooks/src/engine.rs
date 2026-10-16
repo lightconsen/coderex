@@ -12,12 +12,77 @@ use coderex_core::hook_executor::{HookExecutor, HookFireResult};
 
 // ─── Hook Configuration ─────────────────────────────────────────────────────
 
+/// Which trust tier a hook belongs to.
+///
+/// Hooks are matched in tier order — managed first, then plugin, then core —
+/// and only priority breaks ties *within* a tier. The tier is a security
+/// property, not cosmetics: the chain order decides which hook gets to speak
+/// first, and a later tier cannot pre-empt an earlier one.
+///
+/// A hook's tier is assigned by the code that loads it, from *where the
+/// settings came from* — never from a field a repository can write. A
+/// repository-controlled `settings.json` can therefore never promote one of its
+/// hooks into the `Managed` tier.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HookTier {
+    /// Managed policy hooks — highest trust, run first. Loaded only from an
+    /// administrator-controlled source.
+    Managed,
+    /// Plugin-provided hooks.
+    Plugin,
+    /// Built-in and user/project settings hooks — the default tier.
+    #[default]
+    Core,
+}
+
+/// What kind of action a hook takes when it fires.
+///
+/// CodeRex implements [`HookType::Command`] (a subprocess). The other kinds are
+/// recognised so that a configuration naming one is reported rather than
+/// silently treated as a command; see [`HookRegistry::load_from_settings`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HookType {
+    /// Run a shell command (the only kind CodeRex executes).
+    #[default]
+    Command,
+    /// Call an HTTP endpoint. Recognised but not implemented.
+    Http,
+    /// Ask a model. Recognised but not implemented.
+    Prompt,
+    /// Call an MCP tool. Recognised but not implemented.
+    McpTool,
+    /// Run an agent. Recognised but not implemented.
+    Agent,
+}
+
+impl HookType {
+    /// The wire name used in settings, matching Claude's `type` values.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Command => "command",
+            Self::Http => "http",
+            Self::Prompt => "prompt",
+            Self::McpTool => "mcp_tool",
+            Self::Agent => "agent",
+        }
+    }
+}
+
 /// Configuration for a single hook.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HookConfig {
     /// Event(s) this hook responds to.
     pub event: String,
-    /// Command to execute.
+    /// What kind of action this hook takes.
+    ///
+    /// Serialized as `type`, matching Claude's discriminator. Absent means
+    /// [`HookType::Command`].
+    #[serde(rename = "type", default)]
+    pub kind: HookType,
+    /// Command to execute (required for [`HookType::Command`]).
     pub command: String,
     /// Optional environment variables to inject.
     #[serde(default)]
@@ -46,6 +111,12 @@ pub struct HookConfig {
     /// Maximum output file size (MB) for the hook subprocess (None = unlimited).
     #[serde(default)]
     pub max_file_size_mb: Option<u64>,
+    /// Trust tier — assigned by the loader, never read from settings.
+    ///
+    /// `#[serde(skip)]` is deliberate: a settings file that writes `tier` must
+    /// not be able to promote its own hook into a higher-trust tier.
+    #[serde(skip, default)]
+    pub tier: HookTier,
 }
 
 const fn default_timeout() -> u64 {
@@ -92,13 +163,42 @@ pub struct HookSettings {
     pub hooks: Vec<RawHookConfig>,
 }
 
+/// The two shapes the hook settings arrive in.
+///
+/// `Settings.hooks` in `coderex-config` holds the bare array — the value under
+/// the `hooks` key of `settings.json` — while a whole settings object is
+/// `{"hooks": [...]}`. The install API accepts either so the caller does not
+/// have to know which it has.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+enum HookSettingsValue {
+    /// `{"hooks": [...]}` — a whole settings object.
+    Wrapped(HookSettings),
+    /// `[...]` — the bare array, as `Settings.hooks` holds it.
+    Bare(Vec<RawHookConfig>),
+}
+
+impl HookSettingsValue {
+    /// The hook list, whichever shape it came in.
+    fn into_hooks(self) -> Vec<RawHookConfig> {
+        match self {
+            Self::Wrapped(settings) => settings.hooks,
+            Self::Bare(hooks) => hooks,
+        }
+    }
+}
+
 /// Raw hook config as it appears in settings.json (more flexible field types).
 #[derive(Debug, Clone, Deserialize)]
 pub struct RawHookConfig {
     /// Event name or pattern.
     pub event: String,
-    /// Command to run.
-    pub command: String,
+    /// Hook kind (`type` in settings). Absent means `command`.
+    #[serde(rename = "type", default)]
+    pub kind: HookType,
+    /// Command to run (required for the `command` kind).
+    #[serde(default)]
+    pub command: Option<String>,
     /// Environment variables to inject.
     #[serde(default)]
     pub env: Option<HashMap<String, String>>,
@@ -173,31 +273,105 @@ impl HookRegistry {
         Self { hooks: Vec::new() }
     }
 
-    /// Load hooks from settings.json value.
-    pub fn load_from_settings(value: &serde_json::Value) -> Result<Self, HookError> {
+    /// Load hooks from a settings.json value, assigning every hook the given
+    /// trust tier.
+    ///
+    /// A hook whose `type` is a kind CodeRex does not execute is **skipped with
+    /// a loud warning**, not silently run as a command and not silently
+    /// dropped: only `command` hooks run. A `command` hook with no `command`
+    /// field is a configuration error and fails the load.
+    pub fn load_from_settings_with_tier(
+        value: &serde_json::Value,
+        tier: HookTier,
+    ) -> Result<Self, HookError> {
         if value.is_null() {
             return Ok(Self::new());
         }
-        let settings: HookSettings = serde_json::from_value(value.clone())?;
-        let hooks: Vec<HookConfig> = settings
-            .hooks
-            .into_iter()
-            .map(|raw| HookConfig {
-                event: raw.event,
-                command: raw.command,
-                env: raw.env.unwrap_or_default(),
-                cwd: raw.cwd,
-                internal: raw.internal.unwrap_or(false),
-                timeout_ms: raw.timeout_ms.unwrap_or_else(default_timeout),
-                priority: raw.priority.unwrap_or(0),
-                dry_run: raw.dry_run.unwrap_or(false),
-                max_cpu_seconds: raw.max_cpu_seconds,
-                max_memory_mb: raw.max_memory_mb,
-                max_file_size_mb: raw.max_file_size_mb,
-            })
-            .collect();
+        // Accept both `{"hooks": [...]}` and the bare `[...]` that
+        // `Settings.hooks` holds.
+        let raw_hooks = serde_json::from_value::<HookSettingsValue>(value.clone())?.into_hooks();
+        let mut hooks = Vec::with_capacity(raw_hooks.len());
+        for raw in raw_hooks {
+            match raw.kind {
+                HookType::Command => {
+                    let Some(command) = raw.command else {
+                        return Err(HookError::InvalidCommand(format!(
+                            "hook for event '{}' is type 'command' but has no 'command' field",
+                            raw.event
+                        )));
+                    };
+                    hooks.push(HookConfig {
+                        event: raw.event,
+                        kind: HookType::Command,
+                        command,
+                        env: raw.env.unwrap_or_default(),
+                        cwd: raw.cwd,
+                        internal: raw.internal.unwrap_or(false),
+                        timeout_ms: raw.timeout_ms.unwrap_or_else(default_timeout),
+                        priority: raw.priority.unwrap_or(0),
+                        dry_run: raw.dry_run.unwrap_or(false),
+                        max_cpu_seconds: raw.max_cpu_seconds,
+                        max_memory_mb: raw.max_memory_mb,
+                        max_file_size_mb: raw.max_file_size_mb,
+                        tier,
+                    });
+                }
+                unsupported => tracing::warn!(
+                    hook_type = unsupported.as_str(),
+                    event = %raw.event,
+                    "hook configured with a type CodeRex does not execute — skipping it; \
+                     only 'command' hooks run"
+                ),
+            }
+        }
         Self::warn_about_inert_hooks(&hooks);
         Ok(Self { hooks })
+    }
+
+    /// Load hooks from a settings.json value.
+    ///
+    /// Every hook is assigned [`HookTier::Core`]; use
+    /// [`load_from_settings_with_tier`](Self::load_from_settings_with_tier) to
+    /// load from a managed or plugin source.
+    pub fn load_from_settings(value: &serde_json::Value) -> Result<Self, HookError> {
+        Self::load_from_settings_with_tier(value, HookTier::Core)
+    }
+
+    /// Install API: build a registry from the `hooks` value of `Settings`.
+    ///
+    /// This is the one-line entry point for the CLI. `Settings.hooks` is the raw
+    /// JSON value; pass it through here, then
+    /// [`into_executor`](Self::into_executor):
+    ///
+    /// ```ignore
+    /// let registry = HookRegistry::from_settings_json(
+    ///     settings.hooks.as_ref().unwrap_or(&serde_json::Value::Null),
+    /// )?;
+    /// engine.set_hooks(registry.into_executor());
+    /// ```
+    ///
+    /// Every hook is assigned [`HookTier::Core`]. Hooks from an
+    /// administrator-controlled source must use
+    /// [`from_settings_json_with_tier`](Self::from_settings_json_with_tier) so
+    /// they can run ahead of repository-controlled hooks.
+    pub fn from_settings_json(value: &serde_json::Value) -> Result<Self, HookError> {
+        Self::load_from_settings_with_tier(value, HookTier::Core)
+    }
+
+    /// Install API: like [`from_settings_json`](Self::from_settings_json), but
+    /// for a managed or plugin source.
+    pub fn from_settings_json_with_tier(
+        value: &serde_json::Value,
+        tier: HookTier,
+    ) -> Result<Self, HookError> {
+        Self::load_from_settings_with_tier(value, tier)
+    }
+
+    /// Install API: turn the registry into the boxed executor the engine takes,
+    /// so `engine.set_hooks(registry.into_executor())` is one line.
+    #[must_use]
+    pub fn into_executor(self) -> Box<dyn HookExecutor + Send + Sync> {
+        Box::new(self)
     }
 
     /// Report hooks whose event nothing ever fires.
@@ -226,32 +400,40 @@ impl HookRegistry {
         }
     }
 
-    /// Register a hook configuration.
+    /// Register a hook configuration, in the tier the config carries.
     pub fn register(&mut self, config: HookConfig) {
         self.hooks.push(config);
     }
 
-    /// Find hooks matching the given event, sorted by priority (highest first).
-    #[must_use]
-    pub fn matches_for_event(&self, event: &HookEvent) -> Vec<&HookConfig> {
-        let event_name = event.as_str();
-        let mut hooks: Vec<_> = self
-            .hooks
-            .iter()
-            .filter(|h| h.event == event_name || h.event == "*")
-            .collect();
-        hooks.sort_by_key(|h| std::cmp::Reverse(h.priority));
-        hooks
+    /// Register a hook configuration in an explicit tier, overriding the tier
+    /// the config carries.
+    pub fn register_in_tier(&mut self, tier: HookTier, mut config: HookConfig) {
+        config.tier = tier;
+        self.hooks.push(config);
     }
 
-    /// Find hooks matching the given event name string, sorted by priority (highest first).
+    /// Find hooks matching the given event, in chain order.
+    ///
+    /// Chain order is tier first — managed, then plugin, then core — and
+    /// priority (highest first) only within a tier. Insertion order breaks
+    /// remaining ties. Tier order is a security property: a managed hook runs
+    /// ahead of a repository-controlled one no matter what priority the
+    /// repository gives itself.
+    #[must_use]
+    pub fn matches_for_event(&self, event: &HookEvent) -> Vec<&HookConfig> {
+        self.matches_for_event_name(event.as_str())
+    }
+
+    /// Find hooks matching the given event name string, in chain order.
     fn matches_for_event_name(&self, event_name: &str) -> Vec<&HookConfig> {
         let mut hooks: Vec<_> = self
             .hooks
             .iter()
             .filter(|h| h.event == event_name || h.event == "*")
             .collect();
-        hooks.sort_by_key(|h| std::cmp::Reverse(h.priority));
+        // Stable sort: tier ascending, then priority descending. Equal keys
+        // keep registration order.
+        hooks.sort_by_key(|h| (h.tier, std::cmp::Reverse(h.priority)));
         hooks
     }
 
@@ -336,6 +518,13 @@ impl HookExecutor for HookRegistry {
         // Execute matching hooks for this event
         let results = self.execute_sync_for_event(event_name, &hook_input).await;
 
+        // Whether a failure here can deny. Only the events whose firing site
+        // reads `stop` as a gate can (see `HookEvent::is_gating`); an unknown
+        // event name fires nowhere, so it cannot.
+        let gating = event_name
+            .parse::<HookEvent>()
+            .is_ok_and(HookEvent::is_gating);
+
         let mut combined = HookFireResult::default();
         for exec_result in results.into_iter() {
             match exec_result {
@@ -348,9 +537,15 @@ impl HookExecutor for HookRegistry {
                     }
                 }
                 Err(e) => {
+                    // Fail closed: a hook that could not answer is not an
+                    // allow. Record the failure, and on a gating event deny.
+                    combined.failed = true;
                     combined.errors.push(format!("{e}"));
                 }
             }
+        }
+        if combined.failed && gating {
+            combined.stop = true;
         }
         combined
     }
@@ -420,6 +615,12 @@ async fn execute_hook_with_timeout(
 }
 
 /// Execute a single hook subprocess.
+///
+/// Every way the hook can fail to produce an answer is an `Err`: an
+/// undeliverable input, a non-zero exit, an empty stdout, or output that is not
+/// a hook result. Only a hook that answered is `Ok`. This is the fail-closed
+/// core — [`HookRegistry::fire_hook`] turns the `Err` into a deny on the events
+/// that gate.
 async fn execute_hook(
     hook: &HookConfig,
     input: &HookInput,
@@ -443,13 +644,21 @@ async fn execute_hook(
         .spawn()
         .map_err(|e| HookError::SpawnFailed(e.to_string()))?;
 
-    // Write input to stdin (ignore broken pipe — hook may not read stdin)
+    // Deliver the input. See `classify_input_write`: a hook that closes stdin
+    // without reading it has declined its input (benign); any other write error
+    // means the input genuinely did not arrive (fail closed).
     if let Some(mut stdin) = child.stdin.take() {
-        if let Err(e) = stdin.write_all(input_json.as_bytes()).await {
-            if e.kind() != std::io::ErrorKind::BrokenPipe {
-                return Err(HookError::SpawnFailed(e.to_string()));
+        let write = stdin.write_all(input_json.as_bytes()).await;
+        if let Err(e) = &write {
+            if e.kind() == std::io::ErrorKind::BrokenPipe {
+                tracing::debug!(
+                    hook_command = hook.command,
+                    event = input.event,
+                    "hook closed stdin without reading its input"
+                );
             }
         }
+        classify_input_write(write)?;
     }
 
     // Collect stdout and stderr
@@ -462,11 +671,19 @@ async fn execute_hook(
     let stderr = String::from_utf8_lossy(&output.stderr).to_string();
     let exit_code = output.status.code().unwrap_or(-1);
 
-    let hook_result = if exit_code == 0 && !stdout.trim().is_empty() {
-        parse_hook_output(&stdout).unwrap_or_else(|_| default_continue_result())
-    } else {
-        default_continue_result()
-    };
+    // A hook that did not exit cleanly did not answer.
+    if exit_code != 0 {
+        return Err(HookError::ExecutionFailed(exit_code));
+    }
+    // Neither did one that printed nothing.
+    if stdout.trim().is_empty() {
+        return Err(HookError::NoOutput);
+    }
+    // Nor one whose output is not a hook result. `{}` and
+    // `{"action":"continue"}` are how a hook says "continue"; unparseable
+    // output is not a silent continue.
+    let hook_result =
+        parse_hook_output(&stdout).map_err(|e| HookError::UnparseableOutput(e.to_string()))?;
 
     Ok(HookExecutionResult {
         hook_result,
@@ -474,6 +691,26 @@ async fn execute_hook(
         stderr,
         exit_code,
     })
+}
+
+/// Classify the result of writing a hook's input to its stdin.
+///
+/// A **broken pipe** is not a delivery failure. It means the hook closed stdin
+/// without reading it — the hook declined the input, which a hook that does not
+/// look at stdin legitimately does. Treating it as failure would break every
+/// such hook, and it is racy: whether the write lands before the hook exits
+/// depends on scheduling, so the same hook would pass or fail run to run. A
+/// hook that *needed* the input and died instead shows up as a non-zero exit or
+/// no output, which fail on their own.
+///
+/// Any other write error means the input did not arrive, so the hook's answer
+/// cannot be trusted: fail closed.
+fn classify_input_write(result: std::io::Result<()>) -> Result<(), HookError> {
+    match result {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => Ok(()),
+        Err(e) => Err(HookError::InputNotDelivered(e.to_string())),
+    }
 }
 
 /// Parse a HookResult from a hook's stdout (single JSON line).
@@ -531,18 +768,6 @@ pub fn parse_hook_output_line(line: &str) -> Result<HookResult, HookError> {
         watch_paths,
         permission_decision,
     })
-}
-
-/// Default HookResult: Continue, no suppression.
-const fn default_continue_result() -> HookResult {
-    HookResult {
-        action: HookAction::Continue,
-        suppress_output: false,
-        updated_input: None,
-        additional_context: None,
-        watch_paths: Vec::new(),
-        permission_decision: None,
-    }
 }
 
 /// Build the environment map for a hook subprocess.
@@ -618,6 +843,8 @@ mod tests {
         let mut registry = HookRegistry::new();
         registry.register(HookConfig {
             event: "SessionStart".to_string(),
+            kind: HookType::Command,
+            tier: HookTier::Core,
             command: "echo hello".to_string(),
             env: HashMap::new(),
             cwd: None,
@@ -640,6 +867,8 @@ mod tests {
         let mut registry = HookRegistry::new();
         registry.register(HookConfig {
             event: "*".to_string(),
+            kind: HookType::Command,
+            tier: HookTier::Core,
             command: "echo all".to_string(),
             env: HashMap::new(),
             cwd: None,
@@ -673,6 +902,18 @@ mod tests {
         let registry = HookRegistry::load_from_settings(&value).unwrap();
         let matches = registry.matches_for_event(&HookEvent::PreToolUse);
         assert_eq!(matches.len(), 1);
+    }
+
+    /// `Settings.hooks` is the bare array under the `hooks` key, not a wrapped
+    /// object. The install API must accept that shape, or the one-line wiring
+    /// does not work.
+    #[test]
+    fn load_from_settings_accepts_a_bare_hooks_array() {
+        let value = serde_json::json!([
+            { "event": "PreToolUse", "command": "echo pre" }
+        ]);
+        let registry = HookRegistry::from_settings_json(&value).unwrap();
+        assert_eq!(registry.matches_for_event(&HookEvent::PreToolUse).len(), 1);
     }
 
     #[test]
@@ -753,6 +994,8 @@ mod tests {
         let mut registry = HookRegistry::new();
         registry.register(HookConfig {
             event: "PreToolUse".to_string(),
+            kind: HookType::Command,
+            tier: HookTier::Core,
             command: "echo".to_string(),
             env: HashMap::new(),
             cwd: None,
@@ -766,6 +1009,8 @@ mod tests {
         });
         registry.register(HookConfig {
             event: "*".to_string(),
+            kind: HookType::Command,
+            tier: HookTier::Core,
             command: "echo all".to_string(),
             env: HashMap::new(),
             cwd: None,
@@ -794,6 +1039,8 @@ mod tests {
     fn build_hook_env_includes_metadata() {
         let hook = HookConfig {
             event: "SessionStart".to_string(),
+            kind: HookType::Command,
+            tier: HookTier::Core,
             command: "echo".to_string(),
             env: [("MY_VAR".to_string(), "my_val".to_string())]
                 .into_iter()
@@ -842,10 +1089,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn execute_hook_returns_continue_for_simple_command() {
+    async fn execute_hook_returns_continue_for_answering_command() {
         let hook = HookConfig {
             event: "SessionStart".to_string(),
-            command: "echo hello".to_string(),
+            kind: HookType::Command,
+            tier: HookTier::Core,
+            command: r#"echo '{"action":"continue"}'"#.to_string(),
             env: HashMap::new(),
             cwd: None,
             internal: false,
@@ -867,10 +1116,41 @@ mod tests {
         assert_eq!(result.exit_code, 0);
     }
 
+    /// A hook that prints something that is not a hook result has not answered,
+    /// so the run is an error rather than a silent Continue.
+    #[tokio::test]
+    async fn execute_hook_rejects_unparseable_output() {
+        let hook = HookConfig {
+            event: "SessionStart".to_string(),
+            kind: HookType::Command,
+            tier: HookTier::Core,
+            command: "echo hello".to_string(),
+            env: HashMap::new(),
+            cwd: None,
+            internal: false,
+            timeout_ms: 5000,
+            priority: 0,
+            dry_run: false,
+            max_cpu_seconds: None,
+            max_memory_mb: None,
+            max_file_size_mb: None,
+        };
+        let input = HookInput {
+            event: "SessionStart".to_string(),
+            session_id: None,
+            input: None,
+            context: None,
+        };
+        let result = execute_hook_with_timeout(&hook, &input).await;
+        assert!(matches!(result, Err(HookError::UnparseableOutput(_))));
+    }
+
     #[tokio::test]
     async fn execute_hook_timeout_kills_process() {
         let hook = HookConfig {
             event: "Stop".to_string(),
+            kind: HookType::Command,
+            tier: HookTier::Core,
             command: "sleep 10".to_string(),
             env: HashMap::new(),
             cwd: None,
@@ -896,6 +1176,8 @@ mod tests {
     fn sandbox_prefix_none_when_no_limits() {
         let hook = HookConfig {
             event: "Test".to_string(),
+            kind: HookType::Command,
+            tier: HookTier::Core,
             command: "echo test".to_string(),
             env: HashMap::new(),
             cwd: None,
@@ -914,6 +1196,8 @@ mod tests {
     fn sandbox_prefix_with_limits() {
         let hook = HookConfig {
             event: "Test".to_string(),
+            kind: HookType::Command,
+            tier: HookTier::Core,
             command: "echo test".to_string(),
             env: HashMap::new(),
             cwd: None,
@@ -929,5 +1213,224 @@ mod tests {
         assert!(prefix.contains("ulimit -t 10"));
         assert!(prefix.contains("ulimit -v 262144")); // 256 * 1024
         assert!(prefix.contains("ulimit -f 51200")); // 50 * 1024
+    }
+
+    // ─── Chain order: managed → plugin → core ───────────────────────────────
+
+    fn tiered(event: &str, command: &str, tier: HookTier, priority: u32) -> HookConfig {
+        HookConfig {
+            event: event.to_string(),
+            kind: HookType::Command,
+            command: command.to_string(),
+            env: HashMap::new(),
+            cwd: None,
+            internal: false,
+            timeout_ms: 5000,
+            priority,
+            dry_run: false,
+            max_cpu_seconds: None,
+            max_memory_mb: None,
+            max_file_size_mb: None,
+            tier,
+        }
+    }
+
+    /// Tier decides order before priority: a repository-controlled core hook
+    /// with the highest priority still runs after a managed hook.
+    #[test]
+    fn chain_order_is_tier_then_priority() {
+        let mut registry = HookRegistry::new();
+        registry.register(tiered("PreToolUse", "core", HookTier::Core, 100));
+        registry.register(tiered("PreToolUse", "plugin", HookTier::Plugin, 0));
+        registry.register(tiered("PreToolUse", "managed", HookTier::Managed, 0));
+        registry.register(tiered("PreToolUse", "core-low", HookTier::Core, 1));
+
+        let commands: Vec<&str> = registry
+            .matches_for_event(&HookEvent::PreToolUse)
+            .iter()
+            .map(|h| h.command.as_str())
+            .collect();
+        assert_eq!(commands, vec!["managed", "plugin", "core", "core-low"]);
+    }
+
+    /// Within a tier, higher priority still wins, and equal keys keep
+    /// registration order.
+    #[test]
+    fn priority_breaks_ties_within_a_tier() {
+        let mut registry = HookRegistry::new();
+        registry.register(tiered("PreToolUse", "a", HookTier::Core, 0));
+        registry.register(tiered("PreToolUse", "b", HookTier::Core, 5));
+        registry.register(tiered("PreToolUse", "c", HookTier::Core, 5));
+
+        let commands: Vec<&str> = registry
+            .matches_for_event(&HookEvent::PreToolUse)
+            .iter()
+            .map(|h| h.command.as_str())
+            .collect();
+        assert_eq!(commands, vec!["b", "c", "a"]);
+    }
+
+    /// The tier is a security property: a settings file that writes `tier`
+    /// must not be able to promote its hook.
+    #[test]
+    fn settings_cannot_set_the_tier() {
+        let value = serde_json::json!({
+            "hooks": [
+                { "event": "PreToolUse", "command": "echo hi", "tier": "managed" }
+            ]
+        });
+        let registry = HookRegistry::load_from_settings_with_tier(&value, HookTier::Core).unwrap();
+        let matches = registry.matches_for_event(&HookEvent::PreToolUse);
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].tier, HookTier::Core);
+    }
+
+    #[test]
+    fn register_in_tier_overrides_the_config_tier() {
+        let mut registry = HookRegistry::new();
+        registry.register_in_tier(
+            HookTier::Managed,
+            tiered("PreToolUse", "echo hi", HookTier::Core, 0),
+        );
+        assert_eq!(
+            registry.matches_for_event(&HookEvent::PreToolUse)[0].tier,
+            HookTier::Managed
+        );
+    }
+
+    // ─── Hook kind (`type`) ─────────────────────────────────────────────────
+
+    #[test]
+    fn hook_type_defaults_to_command() {
+        let value = serde_json::json!({
+            "hooks": [{ "event": "PreToolUse", "command": "echo hi" }]
+        });
+        let registry = HookRegistry::load_from_settings(&value).unwrap();
+        assert_eq!(
+            registry.matches_for_event(&HookEvent::PreToolUse)[0].kind,
+            HookType::Command
+        );
+    }
+
+    /// A kind CodeRex does not execute is skipped, not run as a command and not
+    /// silently accepted — the other hooks in the same settings still load.
+    #[test]
+    fn unsupported_hook_type_is_skipped_not_run() {
+        let value = serde_json::json!({
+            "hooks": [
+                { "event": "PreToolUse", "type": "http", "url": "https://example.test" },
+                { "event": "PreToolUse", "type": "prompt", "prompt": "is this ok?" },
+                { "event": "PreToolUse", "command": "echo hi" }
+            ]
+        });
+        let registry = HookRegistry::load_from_settings(&value).unwrap();
+        let matches = registry.matches_for_event(&HookEvent::PreToolUse);
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].command, "echo hi");
+    }
+
+    #[test]
+    fn unknown_hook_type_is_a_config_error() {
+        let value = serde_json::json!({
+            "hooks": [{ "event": "PreToolUse", "type": "telepathy", "command": "echo hi" }]
+        });
+        assert!(HookRegistry::load_from_settings(&value).is_err());
+    }
+
+    #[test]
+    fn command_type_without_a_command_is_a_config_error() {
+        let value = serde_json::json!({
+            "hooks": [{ "event": "PreToolUse", "type": "command" }]
+        });
+        assert!(matches!(
+            HookRegistry::load_from_settings(&value),
+            Err(HookError::InvalidCommand(_))
+        ));
+    }
+
+    // ─── Fail-closed contract ───────────────────────────────────────────────
+
+    /// A hook that cannot answer must not read as an allow. On a gating event
+    /// the failure is surfaced as `stop` so the existing call sites deny.
+    #[tokio::test]
+    async fn failed_hook_denies_on_a_gating_event() {
+        let mut registry = HookRegistry::new();
+        registry.register(tiered("PreToolUse", "exit 1", HookTier::Core, 0));
+
+        let result = registry
+            .fire_hook("PreToolUse", "Bash", &HashMap::new())
+            .await;
+        assert!(result.failed, "a broken hook is a failure");
+        assert!(result.stop, "a failure on a gating event must deny");
+        assert!(!result.errors.is_empty());
+    }
+
+    /// On an event whose firing site does not read `stop`, a failure can only
+    /// be recorded — there is nowhere to deny.
+    #[tokio::test]
+    async fn failed_hook_is_recorded_but_cannot_deny_off_gate() {
+        let mut registry = HookRegistry::new();
+        registry.register(tiered("PostToolUse", "exit 1", HookTier::Core, 0));
+
+        let result = registry
+            .fire_hook("PostToolUse", "Bash", &HashMap::new())
+            .await;
+        assert!(result.failed);
+        assert!(!result.stop);
+        assert!(!result.errors.is_empty());
+    }
+
+    /// An answering hook is not a failure, even when it decides to stop.
+    #[tokio::test]
+    async fn answering_stop_hook_is_not_a_failure() {
+        let mut registry = HookRegistry::new();
+        registry.register(tiered(
+            "PreToolUse",
+            r#"echo '{"action":"stop"}'"#,
+            HookTier::Core,
+            0,
+        ));
+
+        let result = registry
+            .fire_hook("PreToolUse", "Bash", &HashMap::new())
+            .await;
+        assert!(result.stop);
+        assert!(!result.failed);
+    }
+
+    /// A hook that closes stdin without reading it declined its input — that is
+    /// not a delivery failure, and must not fail the hook. Any other write
+    /// error is a delivery failure and must.
+    #[test]
+    fn input_write_classification() {
+        use std::io::{Error, ErrorKind};
+
+        assert!(classify_input_write(Ok(())).is_ok());
+        assert!(
+            classify_input_write(Err(Error::from(ErrorKind::BrokenPipe))).is_ok(),
+            "a hook that ignores stdin must not be treated as failed"
+        );
+        assert!(matches!(
+            classify_input_write(Err(Error::from(ErrorKind::PermissionDenied))),
+            Err(HookError::InputNotDelivered(_))
+        ));
+    }
+
+    /// `into_executor` is the one-line install path the CLI needs.
+    #[tokio::test]
+    async fn into_executor_installs_a_working_registry() {
+        let mut registry = HookRegistry::new();
+        registry.register(tiered(
+            "PreToolUse",
+            r#"echo '{"action":"stop"}'"#,
+            HookTier::Core,
+            0,
+        ));
+        let executor = registry.into_executor();
+        let result = executor
+            .fire_hook("PreToolUse", "Bash", &HashMap::new())
+            .await;
+        assert!(result.stop);
+        assert!(!result.failed);
     }
 }

@@ -10,13 +10,14 @@ use std::collections::HashMap;
 
 use coderex_core::hook_executor::HookExecutor;
 use coderex_hooks::events::HookEvent;
-use coderex_hooks::{HookAction, HookConfig, HookInput, HookRegistry};
+use coderex_hooks::{HookAction, HookConfig, HookInput, HookRegistry, HookTier, HookType};
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
 fn config(event: &str, command: &str) -> HookConfig {
     HookConfig {
         event: event.to_string(),
+        kind: HookType::Command,
         command: command.to_string(),
         env: HashMap::new(),
         cwd: None,
@@ -27,12 +28,14 @@ fn config(event: &str, command: &str) -> HookConfig {
         max_cpu_seconds: None,
         max_memory_mb: None,
         max_file_size_mb: None,
+        tier: HookTier::Core,
     }
 }
 
 fn config_with_env(event: &str, command: &str, env: HashMap<String, String>) -> HookConfig {
     HookConfig {
         event: event.to_string(),
+        kind: HookType::Command,
         command: command.to_string(),
         env,
         cwd: None,
@@ -43,6 +46,7 @@ fn config_with_env(event: &str, command: &str, env: HashMap<String, String>) -> 
         max_cpu_seconds: None,
         max_memory_mb: None,
         max_file_size_mb: None,
+        tier: HookTier::Core,
     }
 }
 
@@ -77,10 +81,12 @@ async fn hook_sessionstart_fires_and_returns_continue() {
 #[tokio::test]
 async fn hook_sessionstart_receives_input_on_stdin() {
     let mut registry = HookRegistry::new();
-    // Read stdin and echo back the event name we received using python3 or python
+    // Read stdin and echo back the first bytes we received, as JSON, using
+    // python3 or python. `json.dumps` escapes the input so the echoed value is
+    // still valid JSON.
     registry.register(config(
         "SessionStart",
-        r#"python3 -c "import sys; line=sys.stdin.read(); print('{\"action\":\"continue\", \"additional_context\": \"' + line[:20] + '\"}')" 2>/dev/null || python -c "import sys; line=sys.stdin.read(); print('{\"action\":\"continue\", \"additional_context\": \"' + line[:20] + '\"}')""#,
+        r#"python3 -c "import sys,json; print(json.dumps({'action':'continue','additional_context':sys.stdin.read()[:20]}))" 2>/dev/null || python -c "import sys,json; print(json.dumps({'action':'continue','additional_context':sys.stdin.read()[:20]}))""#,
     ));
 
     let results = registry
@@ -89,7 +95,11 @@ async fn hook_sessionstart_receives_input_on_stdin() {
     let result = results[0].as_ref().unwrap();
     assert!(matches!(result.hook_result.action, HookAction::Continue));
     // The hook should have received the JSON input on stdin (starts with {"event":)
-    assert!(result.stdout.contains("continue"));
+    let echoed = result.hook_result.additional_context.clone().unwrap();
+    assert!(
+        echoed.contains("event"),
+        "hook did not receive its input on stdin: {echoed:?}"
+    );
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -513,27 +523,45 @@ async fn hook_permission_decision_parsed_from_output() {
 }
 
 #[tokio::test]
-async fn hook_nonzero_exit_continues_by_default() {
+async fn hook_nonzero_exit_is_a_failure() {
     let mut registry = HookRegistry::new();
     registry.register(config("SessionStart", "exit 1"));
 
     let results = registry
         .execute_sync(&HookEvent::SessionStart, &input("SessionStart"))
         .await;
-    let result = results[0].as_ref().unwrap();
-    // Non-zero exit with no stdout should default to Continue
-    assert!(matches!(result.hook_result.action, HookAction::Continue));
-    assert_eq!(result.exit_code, 1);
+    // A hook that exits non-zero did not answer; it is not a silent Continue.
+    assert!(matches!(
+        results[0],
+        Err(coderex_hooks::HookError::ExecutionFailed(1))
+    ));
 }
 
 #[tokio::test]
-async fn hook_empty_stdout_continues_by_default() {
+async fn hook_empty_stdout_is_a_failure() {
     let mut registry = HookRegistry::new();
-    registry.register(config("SessionStart", "echo -n"));
+    // `true` exits 0 and prints nothing — a hook that gave no answer.
+    registry.register(config("SessionStart", "true"));
 
     let results = registry
         .execute_sync(&HookEvent::SessionStart, &input("SessionStart"))
         .await;
-    let result = results[0].as_ref().unwrap();
-    assert!(matches!(result.hook_result.action, HookAction::Continue));
+    assert!(matches!(
+        results[0],
+        Err(coderex_hooks::HookError::NoOutput)
+    ));
+}
+
+#[tokio::test]
+async fn hook_unparseable_stdout_is_a_failure() {
+    let mut registry = HookRegistry::new();
+    registry.register(config("SessionStart", "echo not-json"));
+
+    let results = registry
+        .execute_sync(&HookEvent::SessionStart, &input("SessionStart"))
+        .await;
+    assert!(matches!(
+        results[0],
+        Err(coderex_hooks::HookError::UnparseableOutput(_))
+    ));
 }

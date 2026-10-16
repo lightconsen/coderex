@@ -1,76 +1,197 @@
-# hooks Module Inspection
+# hooks Module
 
 ## Goal
 
-Lifecycle hook system with 22 events. Allows external scripts or built-in handlers to intercept and modify behavior at key points: user prompt submission, tool use, compaction, turn end, etc.
+Lifecycle hook system. Hooks are external scripts that intercept and modify
+behaviour at key points — before a tool runs, before a prompt is submitted,
+around compaction, at the end of a turn. A hook reads a JSON input on stdin and
+prints a JSON result on stdout; a `PreToolUse` hook can deny a tool, a
+`UserPromptSubmit` hook can refuse a prompt.
 
-## Design
+## Key Types
 
-### Key Types
+- **`HookRegistry`** (`engine.rs`) — holds hook definitions and matches them to
+  events. Implements `HookExecutor`, so it can be installed on the engine.
+- **`HookConfig`** (`engine.rs`) — one hook: `event`, `type`, `command`, `env`,
+  `cwd`, `timeout_ms`, `priority`, `dry_run`, the `ulimit` limits, and `tier`.
+- **`HookTier`** (`engine.rs`) — `Managed` / `Plugin` / `Core`. Decides chain
+  order; see below.
+- **`HookType`** (`engine.rs`) — the `type` discriminator: `Command`, `Http`,
+  `Prompt`, `McpTool`, `Agent`. Only `Command` executes.
+- **`HookMatcher`** (`engine.rs`) — matches events by name.
+- **`HookInput`** (`engine.rs`) — the JSON written to a hook's stdin.
+- **`HookResult`** / **`HookAction`** / **`HookPermissionDecision`**
+  (`events.rs`) — what a hook answered.
+- **`HookExecutionResult`** (`engine.rs`) — a parsed result plus stdout, stderr,
+  exit code.
+- **`HookError`** (`events.rs`) — typed failure: `Timeout`, `SpawnFailed`,
+  `InputNotDelivered`, `NoOutput`, `UnparseableOutput`, `ExecutionFailed`,
+  `InvalidCommand`, `JsonError`.
+- **`HookFireResult`** (`crates/core/src/hook_executor.rs`) — the aggregate a
+  firing site reads: `stop`, `updated_input`, `errors`, and `failed`.
 
-- **`HookRegistry`** (`engine.rs`) — Stores hook definitions with matchers. Supports priority-based ordering.
-- **`HookMatcher`** (`engine.rs`) — Matches events by name, tool, path patterns.
-- **`HookConfig`** (`engine.rs`) — Hook execution configuration: event, command, env, cwd, timeout_ms, priority, dry_run, max_cpu_seconds, max_memory_mb, max_file_size_mb.
-- **`HookInput`** (`engine.rs`) — Context passed to hook: event name, tool name, arguments.
-- **`HookResult`** (`events.rs`) — Success/stop/error with optional message.
-- **`HookPermissionDecision`** (`events.rs`) — Allow/deny/ask from hook.
-- **`HookExecutionResult`** (`engine.rs`) — Parsed result + stdout, stderr, exit_code from subprocess.
-- **`HookError`** (`events.rs`) — Typed error enum: Timeout, SpawnFailed, JsonError, ExecutionFailed, etc.
-- **`HookFireResult`** (`hook_executor.rs`) — Aggregated result from fire_hook: stop, updated_input, errors.
-- **`StopHookContext`** / **`StopHookDecision`** (`stop_hook.rs`) — Compact/recovery decision logic.
+## Installing hooks (one line)
 
-### Hook Events (22 total)
+`Settings.hooks` is raw JSON that nothing used to load. The install path is:
 
-| Event | When Fired |
-|-------|-----------|
-| `UserPromptSubmit` | Before sending user message to API |
-| `PreToolUse` | Before executing a tool |
-| `PostToolUse` | After successful tool execution |
-| `PostToolUseFail` | After failed/denied tool execution |
-| `PreCompact` | Before context compaction |
-| `PostCompact` | After context compaction |
-| `TurnEnd` | At end of each turn |
-| + 15 more | Various lifecycle points |
+```rust
+let registry = coderex_hooks::HookRegistry::from_settings_json(
+    settings.hooks.as_ref().unwrap_or(&serde_json::Value::Null),
+)?;
+engine.set_hooks(registry.into_executor());
+```
 
-### Architecture Patterns
+`from_settings_json` accepts either the bare array that `Settings.hooks` holds
+(`[{ "event": ..., "command": ... }]`) or a whole settings object
+(`{"hooks": [...]}`), so the caller does not have to know which it has.
 
-- **Registry with pattern matching** — Hooks can match by event name or wildcard (`*`).
-- **Priority ordering** — Hooks sorted by `priority` field (higher runs first) before execution.
-- **Sync and async execution** — `execute_sync` (sequential) and `execute_async` (spawned tasks) modes.
-- **Stop propagation** — A hook returning `stop: true` halts the current operation.
-- **Subprocess execution** — External scripts run via `sh -c` with JSON input on stdin, JSON result on stdout.
-- **Timeout enforcement** — Each hook wrapped in `tokio::time::timeout` with configurable `timeout_ms` (default 5000ms).
-- **Dry-run mode** — `dry_run: bool` on `HookConfig` executes hooks but suppresses `stop` actions for safe testing.
-- **Structured logging** — Every hook execution logged via `tracing::info!`/`tracing::warn!` with fields: `hook_command`, `event`, `duration_ms`, `exit_code`, `stop`, `error`.
-- **Error aggregation** — `HookFireResult.errors` collects errors from all matching hooks; callers log via `tracing::warn!`.
-- **Resource sandboxing** — Hooks can apply `ulimit` constraints: CPU seconds (`-t`), memory (`-v`), and file size (`-f`) limits injected into the shell command prefix.
+`from_settings_json` assigns every hook the `Core` tier. Hooks from an
+administrator-controlled source must use `from_settings_json_with_tier(value,
+HookTier::Managed)` so they can run ahead of repository-controlled hooks.
 
-## Current Status
+**Status:** this API exists and is tested, but the CLI does not yet call it —
+`crates/cli/src/repl.rs` still constructs the engine with the default
+`NoOpHookExecutor`. Until that one line is wired, hooks are inert in the
+production binary no matter how they are configured.
 
-### What Works
+## Chain order: managed → plugin → core
 
-- Hook registry with pattern-based matching (exact name + wildcard).
-- 22 event types defined and implemented.
-- External script hooks — subprocess execution via `sh -c` with JSON stdin/stdout.
-- Hook timeout — configurable `timeout_ms` (default 5000ms) via `tokio::time::timeout`.
-- Hook priority ordering — higher-priority hooks execute first.
-- Dry-run mode — `dry_run: bool` on `HookConfig` suppresses stop actions.
-- Structured debug logging — `tracing` spans with duration, exit code, error details.
-- Error propagation — `HookFireResult.errors` collects errors; all call sites log failures.
-- Hook sandboxing — resource limits via `ulimit`: CPU time (`max_cpu_seconds`), memory (`max_memory_mb`), file size (`max_file_size_mb`).
-- Stop hook evaluation for compact/recovery decisions.
-- `NoOpHookExecutor` for when hooks are disabled.
-- Hook result propagation (stop, allow, deny, updated_input).
-- 24 tests covering registry, matching, parsing, execution, timeout, and sandbox.
+Hooks for an event run in **tier order** — `Managed`, then `Plugin`, then
+`Core` — and `priority` (highest first) only breaks ties *within* a tier.
+Registration order breaks the remaining ties.
 
-### What Is Stubbed/Partial
+The tier is assigned by the loader from **where the settings came from**, never
+from a field in the settings file: `HookConfig.tier` is `#[serde(skip)]`, and a
+settings file that writes `"tier": "managed"` has that field ignored. This is a
+security property, not cosmetics. Hooks come from repository-controllable
+settings, and the chain order decides which hook gets to speak first; if a
+repository could set its own tier, it could promote itself ahead of the managed
+policy that is supposed to constrain it.
 
-*None remaining.*
+## Hook kinds (`type`)
 
-## Gaps for Production
+Claude has five kinds — `command`, `prompt`, `mcp_tool`, `http`, `agent`.
+CodeRex has one working kind and four recognised-but-unimplemented ones:
 
-*None remaining.*
+| `type` | Status |
+|--------|--------|
+| `command` | **Implemented.** Runs `sh -c <command>` with the input JSON on stdin. |
+| `http` | Recognised, **skipped with a warning**. Would need `reqwest` in this crate's `Cargo.toml`. |
+| `prompt` | Recognised, **skipped with a warning**. Needs a model/API client, which does not belong in this crate. |
+| `mcp_tool` | Recognised, **skipped with a warning**. Needs the MCP server registry, which lives in another crate. |
+| `agent` | Recognised, **skipped with a warning**. Same reason as `prompt`. |
 
-## Remaining Considerations
+A hook whose `type` is one of the four unimplemented kinds is **not** run as a
+command and **not** silently dropped — the loader logs a `warn!` naming the type
+and the event, and the other hooks in the same settings still load. An
+unrecognised `type` string (a typo) is a hard config error. A `command` hook
+with no `command` field is a hard config error. A hook with no `type` at all
+defaults to `command`, so existing settings keep working.
 
-- **No hook marketplace/examples**: Users write hooks from scratch. Future enhancement: create a `hooks/` directory with curated examples and a template generator.
+## Fail-closed contract
+
+Hooks gate work, so a gate that could not be answered must not read as an
+allow. A hook is a **failure** — and does not read as "continue" — when any of
+these is true:
+
+- **The input could not be delivered.** A stdin write that fails for any reason
+  other than a broken pipe means the hook ran without its input, so its answer
+  cannot be trusted. A *broken pipe* is deliberately **not** a failure: it means
+  the hook closed stdin without reading it — it declined the input, which a hook
+  that does not look at stdin legitimately does, and the outcome is racy with
+  scheduling. A hook that needed the input and died instead fails on its own,
+  via a non-zero exit or empty output.
+- **The result could not be retrieved.** Non-zero exit, empty stdout, or stdout
+  that is not a hook result. A hook that wants to continue must say so
+  explicitly — `{}` or `{"action":"continue"}`. Silence is not consent.
+- **The hook could not answer.** A timeout, or a spawn failure.
+
+On a **gating event** — `PreToolUse` (a `stop` denies the tool) and
+`UserPromptSubmit` (a `stop` refuses the prompt) — a failure sets both
+`HookFireResult.failed` and `HookFireResult.stop`, so the existing firing sites
+deny. `HookEvent::is_gating()` is the single source of truth for which events
+these are, and a test keeps it in sync with the firing sites. On any other
+event there is nowhere to deny, so the failure is only recorded in `errors`.
+
+`failed` distinguishes "the hook said stop" from "the hook could not answer".
+Callers that only gate read `stop`; callers that want to tell the two apart read
+`failed`.
+
+Note this is **stricter than Claude's default**. Claude's `onFailure` defaults
+to `continue` for `command` hooks; CodeRex chooses fail-closed because the
+checklist asks for it. A PreToolUse hook that exits non-zero, prints nothing, or
+prints non-JSON will deny the tool rather than silently allowing it.
+
+## What actually fires
+
+`HookEvent` has **22 names**, but a name is not a promise. `HookEvent::is_triggered()`
+is the single source of truth, and a test pins it.
+
+**Fired (10):** `PreToolUse`, `PostToolUse`, `PostToolUseFailure`,
+`UserPromptSubmit`, `PermissionRequest`, `PermissionDenied`, `PreCompact`,
+`PostCompact`, `Stop`, `TurnEnd`.
+
+**Reserved, never fired (12):** `SessionStart`, `Setup`, `SubagentStart`,
+`Notification`, `CwdChanged`, `FileChanged`, `WorktreeCreate`, `SubagentStop`,
+`TaskCompleted`, `TeammateIdle`, `Elicitation`, `ElicitationResult`.
+
+A hook configured on a reserved event matches nothing and runs never. That is
+indistinguishable from a working hook until someone notices it did not run, so
+the load path warns about each one (`warn_about_inert_hooks`). An unknown event
+name is warned about too. Event names come from `HookEvent::as_str`, which for
+the events core fires returns core's `hook_events` constants, so the firing side
+and the matching side cannot drift.
+
+## Execution model
+
+- **Subprocess.** A `command` hook runs via `sh -c` with the `HookInput` JSON on
+  stdin and a `HookResult` JSON on stdout.
+- **Timeout.** Each hook is wrapped in `tokio::time::timeout` with
+  `timeout_ms` (default 5000).
+- **Sync / async.** `execute_sync` runs hooks in chain order, sequentially;
+  `execute_async` spawns them as tasks. `fire_hook` uses the sequential path so
+  tier/priority order is meaningful.
+- **Sandboxing.** Optional `ulimit` limits on CPU time (`max_cpu_seconds`),
+  address space (`max_memory_mb`), and file size (`max_file_size_mb`), injected
+  into the shell command prefix.
+- **Dry-run.** `dry_run: true` executes the hook but suppresses its `stop`
+  action — useful for testing a hook without letting it block work.
+- **Logging.** Every execution logs `hook_command`, `event`, `duration_ms`,
+  `exit_code`, and `error` via `tracing`.
+
+## Worker isolation — a deliberate ⚪ difference
+
+Claude runs plugin function-hooks in dedicated `worker_threads` with a
+bidirectional protocol (26 message types plus `SharedArrayBuffer` timestamps).
+CodeRex does not, and should not copy this:
+
+- Claude's function-hooks are **in-process** JavaScript modules; a worker thread
+  is how Claude isolates them from the host. CodeRex hooks are already a
+  **separate OS process** (`sh -c`), which is stronger isolation than a worker
+  thread — a worker shares the address space, a subprocess does not.
+- The bidirectional protocol exists in Claude to support streaming, `next`
+  middleware, and pulling results back from a worker that shares memory. CodeRex
+  hooks are one-way request/response by design; there is nothing to stream.
+- CodeRex has no in-process JS hook modules to isolate, so a worker would be a
+  second, weaker copy of isolation the subprocess boundary already provides.
+
+A bidirectional protocol here would add a lot of surface and buy nothing. The
+one-way stdin/stdout contract plus `ulimit` limits is the right shape for this
+codebase.
+
+## Current status
+
+**Works:** registry and matching; chain order (tier then priority); the install
+API; `command` hooks with stdin/stdout; timeout; sandbox limits; dry-run;
+fail-closed failure classification and the deny-on-gate behaviour; inert-event
+and unsupported-type warnings; structured logging.
+
+**Not wired:** the CLI still uses `NoOpHookExecutor`. `set_hooks` has no
+production caller yet — wiring `from_settings_json` + `into_executor` into
+`repl.rs` is the remaining step, and it belongs to the CLI, not this crate.
+
+**Not implemented:** the `http`, `prompt`, `mcp_tool`, and `agent` hook kinds
+(recognised, skipped, warned). Claude's `onFailure` knob (`continue` / `block`),
+`args`/exec form, `if` filters, `once`, `async`/`asyncRewake`, `statusMessage`,
+and per-event output schemas are also absent — the `command` hook protocol here
+is the minimal one, and the fail-closed policy is fixed rather than configurable.

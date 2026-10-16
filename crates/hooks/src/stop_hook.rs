@@ -74,15 +74,26 @@ pub async fn execute_stop_hook(registry: &HookRegistry, ctx: &StopHookContext) -
     // Execute Stop hooks
     let results = registry.execute_async(&HookEvent::Stop, &input).await;
 
-    // If any hook returns Stop, terminate
-    for exec_result in results.iter().flatten() {
-        if matches!(exec_result.hook_result.action, HookAction::Stop) {
-            let reason = exec_result
-                .hook_result
-                .additional_context
-                .clone()
-                .unwrap_or_else(|| "stop hook requested termination".to_string());
-            return StopHookDecision::Terminate { reason };
+    for exec_result in &results {
+        match exec_result {
+            // A hook that returns Stop, terminates.
+            Ok(exec_result) if matches!(exec_result.hook_result.action, HookAction::Stop) => {
+                let reason = exec_result
+                    .hook_result
+                    .additional_context
+                    .clone()
+                    .unwrap_or_else(|| "stop hook requested termination".to_string());
+                return StopHookDecision::Terminate { reason };
+            }
+            Ok(_) => {}
+            // Fail closed: a Stop hook that cannot answer must not be read as
+            // "continue" — that would let a broken hook wave through the
+            // compact/retry it was meant to gate.
+            Err(e) => {
+                return StopHookDecision::Terminate {
+                    reason: format!("stop hook could not answer: {e}"),
+                };
+            }
         }
     }
 
@@ -118,6 +129,45 @@ mod tests {
         assert!(!should_proceed_with_compact(&decision));
         if let StopHookDecision::Terminate { reason } = decision {
             assert!(reason.contains("recovery retry limit reached"));
+        } else {
+            panic!("expected Terminate");
+        }
+    }
+
+    /// A Stop hook that cannot answer must terminate, not silently continue.
+    #[tokio::test]
+    async fn failing_stop_hook_terminates() {
+        use crate::engine::{HookConfig, HookTier, HookType};
+        use std::collections::HashMap;
+
+        let mut registry = HookRegistry::new();
+        registry.register(HookConfig {
+            event: "Stop".to_string(),
+            kind: HookType::Command,
+            command: "exit 1".to_string(),
+            env: HashMap::new(),
+            cwd: None,
+            internal: false,
+            timeout_ms: 5000,
+            priority: 0,
+            dry_run: false,
+            max_cpu_seconds: None,
+            max_memory_mb: None,
+            max_file_size_mb: None,
+            tier: HookTier::Core,
+        });
+        let ctx = StopHookContext {
+            recovery_count: 1,
+            max_recovery_retries: 3,
+            estimated_tokens: 150_000,
+            compact_strategy: "Auto".to_string(),
+            stop_reason: "end_turn".to_string(),
+        };
+
+        let decision = execute_stop_hook(&registry, &ctx).await;
+        assert!(!should_proceed_with_compact(&decision));
+        if let StopHookDecision::Terminate { reason } = decision {
+            assert!(reason.contains("could not answer"));
         } else {
             panic!("expected Terminate");
         }
