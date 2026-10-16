@@ -178,8 +178,29 @@ impl JsonRpcChannel {
             return Ok(());
         }
 
+        // A server named by a path that lands in the working directory is a
+        // checkout deciding what the client launches; refuse it rather than
+        // run it.
+        let cwd = std::env::current_dir().unwrap_or_default();
+        if coderex_core::sandbox::resolves_inside_cwd(&self.command, &cwd) {
+            return Err(format!(
+                "refusing to spawn '{}': it resolves inside the working directory {}",
+                self.command,
+                cwd.display()
+            ));
+        }
+
         let mut cmd = Command::new(&self.command);
         cmd.args(&self.args);
+        // The server is not a provider client, so it does not inherit this
+        // session's credentials. Its own configured environment is layered on
+        // afterwards and always wins, so a server that genuinely needs a
+        // variable gets it by naming it in its configuration.
+        for key in coderex_core::sandbox::credential_scrub_keys() {
+            if !self.env.contains_key(&key) {
+                cmd.env_remove(&key);
+            }
+        }
         cmd.envs(&self.env);
         cmd.stdin(Stdio::piped());
         cmd.stdout(Stdio::piped());
@@ -597,5 +618,105 @@ mod tests {
         let err = response.error.unwrap();
         assert_eq!(err.code, -32601);
         assert_eq!(err.message, "Method not found");
+    }
+
+    /// Read one line of the spawned child's stdout.
+    #[cfg(unix)]
+    async fn read_child_line(channel: &mut JsonRpcChannel) -> String {
+        use tokio::io::AsyncBufReadExt as _;
+        let mut line = String::new();
+        channel
+            .stdout
+            .as_mut()
+            .expect("stdout")
+            .read_line(&mut line)
+            .await
+            .expect("read child stdout");
+        line.trim_end().to_string()
+    }
+
+    /// An MCP server is not a provider client: it must not inherit the
+    /// session's credentials.
+    #[cfg(unix)]
+    #[tokio::test]
+    #[allow(unsafe_code)]
+    async fn spawn_does_not_hand_over_provider_credentials() {
+        let key = "ANTHROPIC_AUTH_TOKEN";
+        let previous = std::env::var_os(key);
+        // SAFETY: edition 2024 marks `set_var` unsafe because another thread
+        // could read the environment concurrently. This test names a variable
+        // no other test in this crate reads.
+        unsafe { std::env::set_var(key, "coderex-test-secret") };
+
+        let mut channel = JsonRpcChannel::new(
+            "sh",
+            vec![
+                "-c".to_string(),
+                "printf '%s\\n' \"${ANTHROPIC_AUTH_TOKEN:-STRIPPED}\"".to_string(),
+            ],
+            HashMap::new(),
+        );
+        let spawned = channel.spawn().await;
+        let seen = match &spawned {
+            Ok(()) => read_child_line(&mut channel).await,
+            Err(e) => e.clone(),
+        };
+        let _ = channel.terminate().await;
+
+        match previous {
+            Some(v) => unsafe { std::env::set_var(key, v) },
+            None => unsafe { std::env::remove_var(key) },
+        }
+
+        spawned.expect("spawn");
+        assert_eq!(seen, "STRIPPED", "credential reached the MCP server");
+    }
+
+    /// The server's own configured environment still arrives — including a
+    /// credential it explicitly asked for.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn spawn_passes_the_configured_environment() {
+        let mut env = HashMap::new();
+        env.insert("CODREX_MCP_PLAIN".to_string(), "from-config".to_string());
+        env.insert(
+            "ANTHROPIC_AUTH_TOKEN".to_string(),
+            "from-config".to_string(),
+        );
+
+        let mut channel = JsonRpcChannel::new(
+            "sh",
+            vec![
+                "-c".to_string(),
+                "printf '%s %s\\n' \"$CODREX_MCP_PLAIN\" \"$ANTHROPIC_AUTH_TOKEN\"".to_string(),
+            ],
+            env,
+        );
+        channel.spawn().await.expect("spawn");
+        let seen = read_child_line(&mut channel).await;
+        let _ = channel.terminate().await;
+
+        assert_eq!(seen, "from-config from-config");
+    }
+
+    /// A server command that would come out of the working directory is
+    /// refused instead of run.
+    #[tokio::test]
+    async fn spawn_refuses_a_command_inside_the_working_directory() {
+        let cwd = std::env::current_dir().unwrap();
+        let name = format!("coderex_planted_mcp_{}", std::process::id());
+        let planted = cwd.join(&name);
+        std::fs::write(&planted, b"#!/bin/sh\nexit 0\n").unwrap();
+
+        let mut channel = JsonRpcChannel::new(format!("./{name}"), vec![], HashMap::new());
+        let result = channel.spawn().await;
+
+        let _ = std::fs::remove_file(&planted);
+
+        let error = result.expect_err("a program inside the cwd must be refused");
+        assert!(
+            error.contains("resolves inside the working directory"),
+            "unexpected error: {error}"
+        );
     }
 }

@@ -61,19 +61,33 @@ impl Tool for PowerShellTool {
             .unwrap_or(DEFAULT_TIMEOUT_SECS as i64)
             .clamp(1, MAX_TIMEOUT_SECS as i64) as u64;
 
-        let result = tokio::time::timeout(
-            Duration::from_secs(timeout_secs),
-            Command::new("pwsh")
-                .arg("-Command")
-                .arg(&command)
-                .current_dir(ctx.cwd)
-                .output(),
-        )
-        .await
-        .map_err(|_| ToolError::Timeout {
-            timeout: Duration::from_secs(timeout_secs),
-        })?
-        .map_err(ToolError::Io)?;
+        // Refuse a `pwsh` that would come out of the working directory: a
+        // checkout that ships one would otherwise choose what "run PowerShell"
+        // means.
+        if coderex_core::sandbox::resolves_inside_cwd("pwsh", ctx.cwd) {
+            return Err(ToolError::Io(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                format!(
+                    "refusing to execute 'pwsh': it resolves inside the working directory {}",
+                    ctx.cwd.display()
+                ),
+            )));
+        }
+
+        let mut cmd = Command::new("pwsh");
+        cmd.arg("-Command").arg(&command).current_dir(ctx.cwd);
+        // The shell is not a provider client, so it is given no way to read
+        // this session's credentials out of the environment it inherits.
+        for key in coderex_core::sandbox::credential_scrub_keys() {
+            cmd.env_remove(key);
+        }
+
+        let result = tokio::time::timeout(Duration::from_secs(timeout_secs), cmd.output())
+            .await
+            .map_err(|_| ToolError::Timeout {
+                timeout: Duration::from_secs(timeout_secs),
+            })?
+            .map_err(ToolError::Io)?;
 
         let exit_code = result.status.code().unwrap_or(-1);
         let mut stdout = String::from_utf8_lossy(&result.stdout).to_string();

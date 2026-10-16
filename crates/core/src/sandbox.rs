@@ -11,7 +11,9 @@
 //!
 //! ## macOS
 //! Generates a `sandbox-exec(1)` profile and spawns the process through
-//! `/usr/bin/sandbox-exec -f <profile>` with read/write path restrictions.
+//! `/usr/bin/sandbox-exec -f <profile>`. Reads are confined to the configured
+//! read paths plus a fixed set of system roots the shell and its loader need,
+//! and writes to the configured write paths.
 //!
 //! ## Windows
 //! Creates a Win32 Job Object with memory/process limits and assigns the
@@ -19,6 +21,19 @@
 //!
 //! ## Unsupported platforms
 //! Falls back to a no-op sandbox that logs warnings but does not restrict.
+//!
+//! ## What is enforced, per platform
+//! Only macOS confines the filesystem (see [`filesystem_isolation`]). Linux
+//! applies a seccomp syscall allowlist and rlimits but no path-based
+//! confinement, and says so on every sandbox it creates; Windows limits
+//! resources, not paths. The in-process path checks in the `Edit` and `Write`
+//! tools are not kernel-enforced and do not change this.
+//!
+//! ## Child environment
+//! Separately from any platform sandbox, children are spawned without this
+//! session's provider credentials — see [`credential_scrub_keys`] — and a
+//! program that would be executed out of the working directory is refused —
+//! see [`resolves_inside_cwd`].
 
 #![allow(unsafe_code)]
 
@@ -66,6 +81,187 @@ pub struct SandboxConfig {
     pub max_cpu_seconds: Option<u64>,
     /// Network access allowed.
     pub allow_network: bool,
+}
+
+// ─── Child-process hardening ────────────────────────────────────────────────
+
+/// Environment variables whose exact names carry this session's provider
+/// credentials, and are therefore never handed to a child process.
+const CREDENTIAL_KEYS: &[&str] = &[
+    "ANTHROPIC_API_KEY",
+    "ANTHROPIC_AUTH_TOKEN",
+    "ANTHROPIC_OAUTH_TOKEN",
+];
+
+/// Name prefixes whose variables are this session's identity and telemetry
+/// configuration rather than the child's own business.
+///
+/// `CLAUDE_` covers `CLAUDE_CODE_OAUTH_TOKEN` and the `CLAUDE_CODE_*` switches;
+/// `OTEL_` covers exporter endpoints and the `Authorization` headers some of
+/// them carry.
+const CREDENTIAL_PREFIXES: &[&str] = &["CLAUDE_", "OTEL_"];
+
+/// Whether a single variable name is one this process keeps to itself.
+///
+/// The rule is "strip when the child does not need it": a tool or MCP server
+/// spawned by this session is not itself a provider client, so it is given the
+/// variables it names and not the session's credentials. A child that *is* a
+/// provider client — one launched with an explicitly configured environment —
+/// gets back whatever its own configuration names, because an explicit
+/// environment entry always beats a removal.
+#[must_use]
+pub fn is_credential_key(key: &str) -> bool {
+    CREDENTIAL_KEYS.contains(&key) || CREDENTIAL_PREFIXES.iter().any(|p| key.starts_with(p))
+}
+
+/// Pick out the credential-bearing names from a set of environment keys.
+///
+/// Split from [`credential_scrub_keys`] so the classification can be tested
+/// against a fixed input instead of whatever the test process happens to be
+/// running with.
+#[must_use]
+pub fn credential_scrub_keys_from<I, K>(keys: I) -> Vec<String>
+where
+    I: IntoIterator<Item = K>,
+    K: AsRef<str>,
+{
+    keys.into_iter()
+        .map(|k| k.as_ref().to_string())
+        .filter(|k| is_credential_key(k))
+        .collect()
+}
+
+/// The credential-bearing variables present in *this* process's environment.
+///
+/// Callers remove each of these from the child's inherited environment. Names
+/// the child's own configuration sets are exempted by the caller, which re-adds
+/// them afterwards.
+#[must_use]
+pub fn credential_scrub_keys() -> Vec<String> {
+    credential_scrub_keys_from(std::env::vars().map(|(key, _)| key))
+}
+
+/// Resolve `program` the way the loader would, searching `PATH` in order and
+/// resolving relative entries against `cwd`.
+///
+/// Returns the first candidate that exists, which is the one `execvp(3)` would
+/// pick, or `None` when nothing in the search path matches.
+#[must_use]
+pub fn resolve_program(program: &str, cwd: &std::path::Path) -> Option<PathBuf> {
+    program_candidates(program, cwd)
+        .into_iter()
+        .find(|p| p.is_file())
+}
+
+/// Whether `program` would be executed from inside the working directory.
+///
+/// A checkout can carry a binary that shadows a system tool (`./sh`) or a
+/// `PATH` entry pointing back at the workspace, and either one turns "run the
+/// shell" into "run whatever the repository shipped". A program that resolves
+/// inside `cwd` is refused rather than run.
+#[must_use]
+pub fn resolves_inside_cwd(program: &str, cwd: &std::path::Path) -> bool {
+    let cwd = canonicalize_lenient(cwd);
+    // Everything is inside the filesystem root, so the check has nothing to
+    // say there; refusing every program would be the wrong reading.
+    if cwd.parent().is_none() {
+        return false;
+    }
+    resolve_program(program, cwd.as_path())
+        .is_some_and(|resolved| canonicalize_lenient(&resolved).starts_with(&cwd))
+}
+
+/// The candidates `execvp(3)` would try, in order.
+fn program_candidates(program: &str, cwd: &std::path::Path) -> Vec<PathBuf> {
+    if program.contains('/') || program.contains(std::path::MAIN_SEPARATOR) {
+        let path = std::path::Path::new(program);
+        return vec![if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            cwd.join(path)
+        }];
+    }
+
+    let Some(path_var) = std::env::var_os("PATH") else {
+        // With no `PATH`, `execvp` falls back to a built-in default that never
+        // names the working directory.
+        return Vec::new();
+    };
+
+    std::env::split_paths(&path_var)
+        .map(|dir| {
+            let base = if dir.as_os_str().is_empty() {
+                // An empty entry means the current directory.
+                cwd.to_path_buf()
+            } else if dir.is_absolute() {
+                dir
+            } else {
+                cwd.join(dir)
+            };
+            base.join(program)
+        })
+        .collect()
+}
+
+fn canonicalize_lenient(path: &std::path::Path) -> PathBuf {
+    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
+// ─── Isolation report ───────────────────────────────────────────────────────
+
+/// What a sandbox backend actually enforces, as opposed to what it is asked to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FilesystemIsolation {
+    /// The kernel confines reads and writes to the configured paths.
+    Kernel,
+    /// No path-based confinement: the process may read and write anywhere its
+    /// user could. Callers must not describe this as filesystem isolation.
+    None,
+}
+
+// Report the filesystem confinement actually in force, per platform:
+//
+// - macOS: `Kernel` — `sandbox-exec` applies a Seatbelt profile that restricts
+//   reads to the configured paths plus the system roots, and writes to the
+//   configured paths.
+// - Linux: `None` — the sandbox is a seccomp syscall allowlist plus rlimits.
+//   There is no path-based confinement, and bubblewrap, which would provide it,
+//   is only detected (see `bubblewrap_available`) and not yet wired into the
+//   spawn path.
+// - Windows: `None` — the Job Object limits memory, CPU and UI access, not file
+//   paths.
+
+/// Report the filesystem confinement in force on this platform.
+#[must_use]
+#[cfg(target_os = "macos")]
+pub const fn filesystem_isolation() -> FilesystemIsolation {
+    FilesystemIsolation::Kernel
+}
+
+/// Report the filesystem confinement in force on this platform.
+#[must_use]
+#[cfg(not(target_os = "macos"))]
+pub const fn filesystem_isolation() -> FilesystemIsolation {
+    FilesystemIsolation::None
+}
+
+/// Whether `bwrap` is on `PATH`.
+///
+/// Detection only: the Linux spawn path does not use it yet, so this says what
+/// is *available*, not what is in force. [`filesystem_isolation`] is the
+/// authority on the latter.
+#[must_use]
+#[cfg(target_os = "linux")]
+pub fn bubblewrap_available() -> bool {
+    std::env::var_os("PATH")
+        .is_some_and(|path| std::env::split_paths(&path).any(|dir| dir.join("bwrap").is_file()))
+}
+
+/// Whether `bwrap` is on `PATH` — always false outside Linux.
+#[must_use]
+#[cfg(not(target_os = "linux"))]
+pub const fn bubblewrap_available() -> bool {
+    false
 }
 
 // ─── Public Handle ──────────────────────────────────────────────────────────
@@ -390,6 +586,24 @@ mod linux_impl {
 
     impl LinuxSandbox {
         pub fn create(config: SandboxConfig) -> Result<Self, SandboxError> {
+            // Say plainly what this sandbox is. The seccomp filter and the
+            // rlimits are real, but they are a syscall allowlist and a budget,
+            // not path-based confinement — a wrapped process can still read
+            // and write anything its user could. Saying so beats letting the
+            // caller assume a filesystem sandbox it does not have.
+            if super::bubblewrap_available() {
+                tracing::warn!(
+                    "sandbox: filesystem isolation is NOT enforced on Linux — bubblewrap is \
+                     installed but not wired into the spawn path; seccomp syscall filtering and \
+                     rlimits are the only restrictions in force"
+                );
+            } else {
+                tracing::warn!(
+                    "sandbox: filesystem isolation is NOT enforced on Linux — bubblewrap (bwrap) \
+                     is not installed; seccomp syscall filtering and rlimits are the only \
+                     restrictions in force"
+                );
+            }
             Ok(Self { config })
         }
 
@@ -652,9 +866,13 @@ mod macos_impl {
             profile.push_str("(allow signal (target same-sandbox))\n");
             profile.push_str("(allow sysctl-read)\n\n");
 
-            // Broad read access — the sandbox restricts writes, network,
-            // and arbitrary execution, not reading.
-            profile.push_str("(allow file-read*)\n");
+            // Reading file *contents* is confined below. Two allowances keep
+            // that confinement from being fatal to every process: the root
+            // directory itself, which the loader reads before anything else,
+            // and metadata everywhere, so `stat` on a path still answers
+            // without disclosing what is in the file.
+            profile.push_str("(allow file-read-metadata)\n");
+            profile.push_str("(allow file-read* (literal \"/\"))\n");
             profile.push_str("(allow process-fork)\n");
             profile.push_str("(allow process-exec-interpreter)\n\n");
 
@@ -671,10 +889,31 @@ mod macos_impl {
             }
             profile.push('\n');
 
+            // System roots the shell, its loader and the tools it runs need in
+            // order to start at all. Everything outside these and the paths
+            // below is unreadable; a child cannot read a file just because it
+            // can name it. `/private/var/select/sh` is where the system's `sh`
+            // looks up which shell to hand off to.
+            let system_read_paths = [
+                "/usr",
+                "/bin",
+                "/sbin",
+                "/System",
+                "/Library",
+                "/private/etc",
+                "/private/var/db",
+                "/private/var/select",
+                "/dev",
+            ];
+            profile.push_str("(allow file-read*\n");
+            for path in &system_read_paths {
+                let _ = writeln!(profile, "  (subpath \"{path}\")");
+            }
             for path in &self.config.allowed_read_paths {
                 let p = path.to_string_lossy();
-                let _ = writeln!(profile, "(allow file-read* (subpath \"{p}\"))");
+                let _ = writeln!(profile, "  (subpath \"{p}\")");
             }
+            profile.push_str(")\n\n");
 
             for path in &self.config.allowed_write_paths {
                 let p = path.to_string_lossy();
@@ -686,9 +925,14 @@ mod macos_impl {
                 let _ = writeln!(profile, "(allow file-read* file-write* (subpath \"{d}\"))");
             }
 
+            // `subpath` rather than `literal`: a configured exec path is
+            // normally a directory such as `/usr/bin`, and `literal` on a
+            // directory matches the directory itself and nothing inside it —
+            // which silently allowed no program at all. `subpath` also matches
+            // the path itself, so it is correct for a single binary too.
             for path in &self.config.allowed_exec_paths {
                 let p = path.to_string_lossy();
-                let _ = writeln!(profile, "(allow process-exec (literal \"{p}\"))");
+                let _ = writeln!(profile, "(allow process-exec (subpath \"{p}\"))");
             }
 
             if self.config.allow_network {
@@ -1007,6 +1251,193 @@ mod tests {
         let handle = SandboxHandle::create(config).unwrap();
         let mut cmd = std::process::Command::new("echo");
         handle.prepare(&mut cmd).unwrap(); // no-op on macOS
+    }
+
+    // ─── Credential scrubbing ───────────────────────────────────────────────
+
+    #[test]
+    fn provider_credentials_are_credential_keys() {
+        assert!(is_credential_key("ANTHROPIC_AUTH_TOKEN"));
+        assert!(is_credential_key("ANTHROPIC_API_KEY"));
+        assert!(is_credential_key("ANTHROPIC_OAUTH_TOKEN"));
+        assert!(is_credential_key("CLAUDE_CODE_OAUTH_TOKEN"));
+    }
+
+    #[test]
+    fn claude_and_otel_prefixes_are_credential_keys() {
+        assert!(is_credential_key("CLAUDE_CODE_USE_BEDROCK"));
+        assert!(is_credential_key("OTEL_EXPORTER_OTLP_HEADERS"));
+    }
+
+    #[test]
+    fn ordinary_variables_are_not_credential_keys() {
+        for key in ["PATH", "HOME", "TERM", "GITHUB_TOKEN", "OPENAI_API_KEY"] {
+            assert!(!is_credential_key(key), "{key} should survive scrubbing");
+        }
+    }
+
+    #[test]
+    fn scrub_selection_keeps_only_credential_names() {
+        let selected = credential_scrub_keys_from([
+            "PATH",
+            "ANTHROPIC_AUTH_TOKEN",
+            "CLAUDE_CODE_OAUTH_TOKEN",
+            "OTEL_TRACES_EXPORTER",
+            "HOME",
+        ]);
+        assert_eq!(
+            selected,
+            vec![
+                "ANTHROPIC_AUTH_TOKEN".to_string(),
+                "CLAUDE_CODE_OAUTH_TOKEN".to_string(),
+                "OTEL_TRACES_EXPORTER".to_string(),
+            ]
+        );
+    }
+
+    // ─── safeSpawn ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn program_in_cwd_is_refused() {
+        let dir = std::env::temp_dir().join(format!("coderex_spawn_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let planted = dir.join("coderex_shadow_prog");
+        std::fs::write(&planted, b"#!/bin/sh\n").unwrap();
+
+        // Named by path, relative to the working directory.
+        assert!(resolves_inside_cwd("./coderex_shadow_prog", &dir));
+        // Named absolutely, inside the working directory.
+        assert!(resolves_inside_cwd(planted.to_str().unwrap(), &dir));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn system_program_is_not_refused() {
+        // `sh` lives in /bin, not in the working directory.
+        let dir = std::env::temp_dir();
+        assert!(!resolves_inside_cwd("sh", &dir));
+    }
+
+    #[test]
+    fn unresolvable_program_is_not_refused() {
+        // Nothing to refuse when nothing matches; the spawn reports its own
+        // failure rather than this check guessing.
+        assert!(!resolves_inside_cwd(
+            "coderex_no_such_program_zzz",
+            &std::env::temp_dir()
+        ));
+    }
+
+    #[test]
+    fn path_search_prefers_the_first_match_like_execvp() {
+        // A directory that shadows `sh` must not be reported when the real
+        // shell is found earlier in PATH — the loader would not run it either.
+        let resolved = resolve_program("sh", &std::env::temp_dir()).unwrap();
+        assert!(!resolved.starts_with(std::env::temp_dir()));
+    }
+
+    // ─── macOS read confinement (runtime) ───────────────────────────────────
+
+    /// Run `script` under a generated profile and return
+    /// `(stdout, stderr, success)`.
+    #[cfg(target_os = "macos")]
+    fn run_sandboxed(config: SandboxConfig, script: &str) -> (String, String, bool) {
+        let handle = SandboxHandle::create(config).unwrap();
+        let (wrapper, args) = handle.sandboxed_program().unwrap();
+        let output = std::process::Command::new(wrapper)
+            .args(&args)
+            .arg("sh")
+            .arg("-c")
+            .arg(script)
+            .output()
+            .unwrap();
+        (
+            String::from_utf8_lossy(&output.stdout).to_string(),
+            String::from_utf8_lossy(&output.stderr).to_string(),
+            output.status.success(),
+        )
+    }
+
+    /// Reads are confined to the configured paths. Without the fix the profile
+    /// allowed `file-read*` unconditionally, so the secret was readable.
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn macos_sandbox_denies_read_outside_allowed_path() {
+        // /private/tmp is the canonical form on macOS; the profile matches on
+        // the resolved path.
+        let root = PathBuf::from(format!("/private/tmp/coderex_read_{}", std::process::id()));
+        let allowed = root.join("allowed");
+        let secret = root.join("secret");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&allowed).unwrap();
+        std::fs::create_dir_all(&secret).unwrap();
+        std::fs::write(allowed.join("f.txt"), "ALLOWED\n").unwrap();
+        std::fs::write(secret.join("f.txt"), "SECRET\n").unwrap();
+
+        let config = SandboxConfig {
+            allowed_read_paths: vec![allowed.clone()],
+            allowed_write_paths: vec![allowed.clone()],
+            allowed_exec_paths: vec![PathBuf::from("/bin"), PathBuf::from("/usr/bin")],
+            ..SandboxConfig::default()
+        };
+
+        let (out, err, _) = run_sandboxed(
+            config,
+            &format!(
+                "cat {}/f.txt; cat {}/f.txt",
+                allowed.display(),
+                secret.display()
+            ),
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+
+        assert!(out.contains("ALLOWED"), "allowed read failed: {out} {err}");
+        assert!(
+            !out.contains("SECRET"),
+            "a file outside the allowed read paths was readable: {out}"
+        );
+    }
+
+    /// `ls` is a separate binary rather than a shell builtin, so running it
+    /// proves the profile's `process-exec` rules name the directory and not
+    /// just the directory entry.
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn macos_sandbox_allows_executing_a_tool_from_an_allowed_path() {
+        let dir = PathBuf::from(format!("/private/tmp/coderex_exec_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let config = SandboxConfig {
+            allowed_read_paths: vec![dir.clone()],
+            allowed_write_paths: vec![dir.clone()],
+            allowed_exec_paths: vec![PathBuf::from("/bin"), PathBuf::from("/usr/bin")],
+            ..SandboxConfig::default()
+        };
+
+        let (out, err, ok) = run_sandboxed(config, &format!("ls {}", dir.display()));
+
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert!(ok, "ls should run inside the sandbox: {err}");
+    }
+
+    // ─── Isolation report ───────────────────────────────────────────────────
+
+    #[test]
+    fn isolation_report_matches_the_platform() {
+        #[cfg(target_os = "macos")]
+        assert_eq!(filesystem_isolation(), FilesystemIsolation::Kernel);
+        #[cfg(not(target_os = "macos"))]
+        assert_eq!(filesystem_isolation(), FilesystemIsolation::None);
+    }
+
+    #[test]
+    #[cfg(not(target_os = "linux"))]
+    fn bubblewrap_is_not_reported_on_non_linux() {
+        assert!(!bubblewrap_available());
     }
 
     #[test]

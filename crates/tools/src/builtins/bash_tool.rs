@@ -15,6 +15,25 @@ use async_trait::async_trait;
 use coderex_core::shell_security::BashAst;
 use tokio::process::Command;
 
+/// Refuse to run a program that would come out of the working directory.
+///
+/// A checkout can carry a binary named after a system tool (`./sh`) or a
+/// `PATH` entry that points back at the workspace. Either one turns "run the
+/// shell" into "run whatever the repository shipped", so a program that
+/// resolves inside the working directory is refused rather than run.
+fn guard_program_origin(program: &str, cwd: &std::path::Path) -> Result<(), ToolError> {
+    if coderex_core::sandbox::resolves_inside_cwd(program, cwd) {
+        return Err(ToolError::Io(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!(
+                "refusing to execute '{program}': it resolves inside the working directory {}",
+                cwd.display()
+            ),
+        )));
+    }
+    Ok(())
+}
+
 /// Build a `tokio::process::Command` for the given shell command,
 /// applying sandbox wrapping if a [`SandboxConfig`] is present in
 /// `ctx.extra`.
@@ -46,6 +65,10 @@ fn build_sandboxed_command(
                     "sandbox: no wrapper program available",
                 ))
             })?;
+            // Both the wrapper and the shell are resolved through `PATH`, so
+            // both are checked.
+            guard_program_origin(wrapper, ctx.cwd)?;
+            guard_program_origin("sh", ctx.cwd)?;
             let mut cmd = Command::new(wrapper);
             for arg in prefix_args {
                 cmd.arg(arg);
@@ -66,6 +89,7 @@ fn build_sandboxed_command(
                         format!("sandbox: {e}"),
                     ))
                 })?;
+            guard_program_origin("sh", ctx.cwd)?;
             let mut std_cmd = std::process::Command::new("sh");
             std_cmd.arg("-c").arg(command);
             std_cmd.current_dir(ctx.cwd);
@@ -80,6 +104,7 @@ fn build_sandboxed_command(
     }
 
     // No sandbox (or unsupported platform with sandbox config)
+    guard_program_origin("sh", ctx.cwd)?;
     let mut cmd = Command::new("sh");
     cmd.arg("-c").arg(command);
     cmd.current_dir(ctx.cwd);
@@ -192,6 +217,12 @@ impl Tool for BashTool {
         };
 
         let (mut cmd, _sandbox_handle) = build_sandboxed_command(&ctx, &command)?;
+
+        // The shell is not a provider client, so it is given no way to read
+        // this session's credentials out of the environment it inherits.
+        for key in coderex_core::sandbox::credential_scrub_keys() {
+            cmd.env_remove(key);
+        }
 
         let result = tokio::time::timeout(Duration::from_secs(timeout_secs), cmd.output())
             .await
@@ -368,5 +399,88 @@ mod tests {
             "output was: {}",
             output.output
         );
+    }
+
+    /// A shell that can still read `PATH` and `HOME` but not the session's
+    /// credentials. The variable is set in this process for the duration of
+    /// the call; nothing else in the crate reads it.
+    #[tokio::test]
+    #[allow(unsafe_code)]
+    async fn child_does_not_inherit_provider_credentials() {
+        const KEYS: [&str; 3] = [
+            "ANTHROPIC_AUTH_TOKEN",
+            "ANTHROPIC_API_KEY",
+            "CLAUDE_CODE_OAUTH_TOKEN",
+        ];
+        let previous: Vec<_> = KEYS.iter().map(|k| (*k, std::env::var_os(k))).collect();
+        for key in KEYS {
+            // SAFETY: edition 2024 marks `set_var` unsafe because another
+            // thread could read the environment concurrently. The only keys
+            // touched are the three above, which no other test reads.
+            unsafe { std::env::set_var(key, "coderex-test-secret") };
+        }
+
+        let output = BashTool::new()
+            .execute(
+                bash_input("printf %s \"${ANTHROPIC_AUTH_TOKEN:-STRIPPED} ${CLAUDE_CODE_OAUTH_TOKEN:-STRIPPED}\""),
+                test_ctx(Path::new("/tmp")),
+            )
+            .await
+            .unwrap();
+
+        for (key, value) in previous {
+            match value {
+                Some(v) => unsafe { std::env::set_var(key, v) },
+                None => unsafe { std::env::remove_var(key) },
+            }
+        }
+
+        assert!(
+            output.output.contains("STRIPPED STRIPPED"),
+            "credentials reached the child: {}",
+            output.output
+        );
+        assert!(!output.output.contains("coderex-test-secret"));
+    }
+
+    /// Stripping credentials must not become clearing the environment.
+    #[tokio::test]
+    async fn child_keeps_ordinary_environment() {
+        let output = BashTool::new()
+            .execute(
+                bash_input("printf %s \"${HOME:+HAS_HOME}${PATH:+HAS_PATH}\""),
+                test_ctx(Path::new("/tmp")),
+            )
+            .await
+            .unwrap();
+        assert!(
+            output.output.contains("HAS_HOMEHAS_PATH"),
+            "ordinary variables were stripped too: {}",
+            output.output
+        );
+    }
+
+    #[test]
+    fn program_resolving_inside_cwd_is_refused() {
+        let dir = std::env::temp_dir().join(format!("coderex_bash_guard_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let planted = dir.join("coderex_planted_tool");
+        std::fs::write(&planted, b"#!/bin/sh\necho planted\n").unwrap();
+
+        let error = guard_program_origin("./coderex_planted_tool", &dir).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("resolves inside the working directory"),
+            "unexpected error: {error}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn system_shell_is_not_refused() {
+        // The ordinary case: `sh` comes from the system, not the workspace.
+        guard_program_origin("sh", Path::new("/tmp")).unwrap();
     }
 }
