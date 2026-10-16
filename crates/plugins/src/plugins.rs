@@ -597,6 +597,36 @@ pub enum PluginSource {
         /// Branch, tag, or full commit SHA to check out.
         rev: Option<String>,
     },
+    /// A subdirectory of a git repository, cloned and then narrowed to `path`.
+    ///
+    /// The reference's `git-subdir` source. The clone, transport validation and
+    /// commit pinning are the git path's; the only addition is that the plugin
+    /// directory is a named subdirectory rather than the repository root, and
+    /// that name may not escape the clone.
+    GitSubdir {
+        /// Clone URL.
+        url: String,
+        /// Directory inside the repository that holds `plugin.json`.
+        path: String,
+        /// Branch or tag to check out (the reference's `ref`).
+        rev: Option<String>,
+        /// Full commit SHA to check out and pin to.
+        sha: Option<String>,
+    },
+    /// A GitHub repository in `owner/repo` shorthand.
+    ///
+    /// The reference's `github` source. Resolved to
+    /// `https://github.com/<owner>/<repo>.git` and installed by the git path, so
+    /// the transport validation, `GIT_TERMINAL_PROMPT=0` and commit pinning all
+    /// apply unchanged.
+    Github {
+        /// Repository in `owner/repo` form.
+        repo: String,
+        /// Branch or tag to check out (the reference's `ref`).
+        rev: Option<String>,
+        /// Full commit SHA to check out and pin to.
+        sha: Option<String>,
+    },
     /// A `plugin.tar.gz` (or `.tgz`) fetched over HTTPS.
     Archive {
         /// Archive URL.
@@ -604,6 +634,87 @@ pub enum PluginSource {
         /// Expected SHA-256 of the archive, if the caller pinned one.
         sha256: Option<String>,
     },
+    /// A source kind the reference defines but CodeRex does not implement.
+    ///
+    /// Recognised so the refusal is explicit rather than a fall-through to "a
+    /// marketplace listing that could not be downloaded": `install_plugin`
+    /// routes a listing whose url is not a marketplace URL straight here, so a
+    /// third-party listing must not be able to name a source that executes.
+    Unsupported {
+        /// The recognised scheme (`npm`, `command`).
+        kind: String,
+    },
+}
+
+/// The `owner/repo` shorthand in a spec string becomes a git clone URL.
+fn github_clone_url(repo: &str) -> Result<String, String> {
+    let mut parts = repo.split('/');
+    let (Some(owner), Some(name), None) = (parts.next(), parts.next(), parts.next()) else {
+        return Err(format!("github source '{repo}' is not in owner/repo form"));
+    };
+    for segment in [owner, name] {
+        if segment.is_empty()
+            || segment == "."
+            || segment == ".."
+            || !segment
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+        {
+            return Err(format!("github source '{repo}' is not in owner/repo form"));
+        }
+    }
+    Ok(format!("https://github.com/{owner}/{name}.git"))
+}
+
+/// Split an optional `@rev` suffix off a spec's payload.
+///
+/// The *last* `@` wins so that a scp-like clone URL (`git@host:path`), which has
+/// its own `@`, keeps its owner.
+fn split_rev(spec: &str) -> (&str, Option<&str>) {
+    match spec.rsplit_once('@') {
+        Some((head, rev)) if !rev.is_empty() => (head, Some(rev)),
+        _ => (spec, None),
+    }
+}
+
+/// A revision that reads as a full commit SHA is a `sha`; anything else is a
+/// branch or tag (`ref`).
+fn classify_rev(rev: Option<&str>) -> (Option<String>, Option<String>) {
+    match rev {
+        Some(r) if is_full_commit_sha(r) => (None, Some(r.to_string())),
+        Some(r) => (Some(r.to_string()), None),
+        None => (None, None),
+    }
+}
+
+/// Which revision to check out: an explicit commit wins over a branch or tag.
+///
+/// A `sha` that is not a full commit SHA is refused here rather than passed to
+/// `git` as if it were a branch name — a caller that asked for a commit and
+/// silently got a branch tip is the failure this avoids.
+fn checkout_rev<'a>(rev: Option<&'a str>, sha: Option<&'a str>) -> Result<Option<&'a str>, String> {
+    if let Some(sha) = sha {
+        if !is_full_commit_sha(sha) {
+            return Err(format!(
+                "'{sha}' is not a full 40-character commit SHA, so it cannot be a source's sha"
+            ));
+        }
+    }
+    Ok(sha.or(rev))
+}
+
+/// Why an [`PluginSource::Unsupported`] kind is not implemented.
+#[must_use]
+pub fn unsupported_source_reason(kind: &str) -> String {
+    match kind {
+        // The reference's own message for this branch, quoted so the gap is
+        // attributed rather than invented.
+        "npm" => "NPM marketplace sources not yet implemented".to_string(),
+        "command" => "a command source runs a command named by a marketplace entry; CodeRex \
+                      has no sandbox for that and no consent step, so it is not implemented"
+            .to_string(),
+        other => format!("source kind '{other}' is not implemented"),
+    }
 }
 
 impl PluginSource {
@@ -613,8 +724,44 @@ impl PluginSource {
     /// remote is cloned; an HTTPS URL ending in `.tar.gz`/`.tgz` is downloaded.
     /// Anything else is treated as a marketplace listing name, which is what
     /// `coderex plugin install <name>` has always meant.
+    ///
+    /// The reference's structured sources that a string cannot express by shape
+    /// alone get a `scheme:` prefix: `github:owner/repo[@rev]` and
+    /// `git-subdir:<url>#<path>[@rev]`. The schemes CodeRex deliberately does not
+    /// implement (`npm:`, `command:`) are recognised so they refuse out loud
+    /// instead of being mistaken for a marketplace plugin by that name.
     #[must_use]
     pub fn detect(spec: &str) -> Self {
+        if let Some(rest) = spec.strip_prefix("github:") {
+            let (repo, rev) = split_rev(rest);
+            let (rev, sha) = classify_rev(rev);
+            return Self::Github {
+                repo: repo.to_string(),
+                rev,
+                sha,
+            };
+        }
+        if let Some(rest) = spec.strip_prefix("git-subdir:") {
+            let (url, tail) = rest.split_once('#').unwrap_or((rest, ""));
+            let (path, rev) = split_rev(tail);
+            let (rev, sha) = classify_rev(rev);
+            return Self::GitSubdir {
+                url: url.to_string(),
+                path: path.to_string(),
+                rev,
+                sha,
+            };
+        }
+        for scheme in ["npm", "command"] {
+            if spec
+                .strip_prefix(scheme)
+                .is_some_and(|rest| rest.starts_with(':'))
+            {
+                return Self::Unsupported {
+                    kind: scheme.to_string(),
+                };
+            }
+        }
         if std::path::Path::new(spec).is_dir() {
             return Self::LocalDir(PathBuf::from(spec));
         }
@@ -1707,10 +1854,25 @@ impl PluginManager {
             PluginSource::Git { url, rev } => {
                 self.install_git(url, rev.as_deref(), install_dir).await
             }
+            PluginSource::Github { repo, rev, sha } => {
+                let url = github_clone_url(repo)?;
+                let rev = checkout_rev(rev.as_deref(), sha.as_deref())?;
+                self.install_git(&url, rev, install_dir).await
+            }
+            PluginSource::GitSubdir {
+                url,
+                path,
+                rev,
+                sha,
+            } => {
+                self.install_git_subdir(url, path, rev.as_deref(), sha.as_deref(), install_dir)
+                    .await
+            }
             PluginSource::Archive { url, sha256 } => {
                 self.install_archive(url, sha256.as_deref(), install_dir)
                     .await
             }
+            PluginSource::Unsupported { kind } => Err(unsupported_source_reason(kind)),
         }
     }
 
@@ -1800,6 +1962,122 @@ impl PluginManager {
             },
         )
         .await
+    }
+
+    /// Install a plugin from a subdirectory of a git repository.
+    ///
+    /// The repository is cloned with the git path's rules (transport validation,
+    /// no credential prompt, no inherited `GIT_DIR`), the resolved commit is what
+    /// the install is pinned to, and `path` is then resolved *inside* the clone:
+    /// an absolute path, a `..` that climbs out, or a symlink that leaves the
+    /// checkout is refused before anything is read or copied.
+    pub async fn install_git_subdir(
+        &self,
+        url: &str,
+        path: &str,
+        rev: Option<&str>,
+        sha: Option<&str>,
+        install_dir: &Path,
+    ) -> Result<PathBuf, String> {
+        validate_git_url(url)?;
+        let rev = checkout_rev(rev, sha)?;
+
+        let clone_dir = Self::staging_dir(install_dir, &format!("{url}#{path}"));
+        let _ = std::fs::remove_dir_all(&clone_dir);
+        std::fs::create_dir_all(install_dir)
+            .map_err(|e| format!("failed to create {}: {e}", install_dir.display()))?;
+
+        let commit = match Self::clone_git(url, rev, &clone_dir).await {
+            Ok(commit) => commit,
+            Err(e) => {
+                let _ = std::fs::remove_dir_all(&clone_dir);
+                return Err(e);
+            }
+        };
+
+        let subdir = match Self::resolve_subdir(&clone_dir, path) {
+            Ok(subdir) => subdir,
+            Err(e) => {
+                let _ = std::fs::remove_dir_all(&clone_dir);
+                return Err(e);
+            }
+        };
+
+        let manifest = match Self::read_manifest_dir(&subdir) {
+            Ok(manifest) => manifest,
+            Err(e) => {
+                let _ = std::fs::remove_dir_all(&clone_dir);
+                return Err(e);
+            }
+        };
+        if let Err(e) = self.check_install_compatible(&manifest) {
+            let _ = std::fs::remove_dir_all(&clone_dir);
+            return Err(e);
+        }
+
+        // The subdirectory is copied into its own staging directory, so
+        // `finalize_install` sees exactly the same shape a git install produces
+        // and the clone can be thrown away even if the move fails.
+        let staged = Self::staging_dir(install_dir, &manifest.name);
+        let _ = std::fs::remove_dir_all(&staged);
+        if let Err(e) = copy_dir_recursive(&subdir, &staged) {
+            let _ = std::fs::remove_dir_all(&staged);
+            let _ = std::fs::remove_dir_all(&clone_dir);
+            return Err(e);
+        }
+        let _ = std::fs::remove_dir_all(&clone_dir);
+
+        self.warn_unverifiable_source(&manifest.name, "git subdirectory");
+        self.finalize_install(
+            &manifest.name,
+            &staged,
+            install_dir,
+            &manifest,
+            false,
+            PluginPin {
+                sha256: None,
+                git_commit: Some(commit),
+            },
+        )
+        .await
+    }
+
+    /// Resolve a `git-subdir` path against a clone, refusing anything that
+    /// leaves it.
+    ///
+    /// The name is checked twice: syntactically, so `..` and absolute paths are
+    /// rejected for the reason they are dangerous, and afterwards by
+    /// canonicalising, so a symlink pointing out of the checkout is caught too.
+    fn resolve_subdir(clone_root: &Path, path: &str) -> Result<PathBuf, String> {
+        if path.trim().is_empty() {
+            return Err("git-subdir source has an empty path".to_string());
+        }
+        for component in Path::new(path).components() {
+            match component {
+                std::path::Component::ParentDir => {
+                    return Err(format!(
+                        "refusing git-subdir path '{path}': it climbs out of the repository"
+                    ));
+                }
+                std::path::Component::RootDir | std::path::Component::Prefix(_) => {
+                    return Err(format!("refusing git-subdir path '{path}': it is absolute"));
+                }
+                _ => {}
+            }
+        }
+
+        let root = clone_root
+            .canonicalize()
+            .map_err(|e| format!("failed to resolve {}: {e}", clone_root.display()))?;
+        let resolved = clone_root.join(path).canonicalize().map_err(|_| {
+            format!("git-subdir path '{path}' is not a directory in the repository")
+        })?;
+        if !resolved.starts_with(&root) || !resolved.is_dir() {
+            return Err(format!(
+                "refusing git-subdir path '{path}': it does not resolve inside the repository"
+            ));
+        }
+        Ok(resolved)
     }
 
     /// Clone a repository into `dest` and report the commit that landed there.
@@ -3792,6 +4070,390 @@ done
                 .join(".install-https___example.invalid_does_not_exist_git")
                 .exists()
         );
+    }
+
+    // ── github / git-subdir / unsupported sources ────────────────────────
+
+    #[test]
+    fn structured_source_specs_are_detected() {
+        assert_eq!(
+            PluginSource::detect("github:acme/plugin"),
+            PluginSource::Github {
+                repo: "acme/plugin".into(),
+                rev: None,
+                sha: None,
+            }
+        );
+        // A branch or tag is a `rev`; a full commit is a `sha`.
+        assert_eq!(
+            PluginSource::detect("github:acme/plugin@main"),
+            PluginSource::Github {
+                repo: "acme/plugin".into(),
+                rev: Some("main".into()),
+                sha: None,
+            }
+        );
+        let commit = "a".repeat(40);
+        assert_eq!(
+            PluginSource::detect(&format!("github:acme/plugin@{commit}")),
+            PluginSource::Github {
+                repo: "acme/plugin".into(),
+                rev: None,
+                sha: Some(commit),
+            }
+        );
+
+        assert_eq!(
+            PluginSource::detect("git-subdir:https://github.com/acme/mono.git#plugins/foo@v1"),
+            PluginSource::GitSubdir {
+                url: "https://github.com/acme/mono.git".into(),
+                path: "plugins/foo".into(),
+                rev: Some("v1".into()),
+                sha: None,
+            }
+        );
+        // The `@` belongs to the scp-like clone URL, not to a revision.
+        assert_eq!(
+            PluginSource::detect("git-subdir:git@github.com:acme/mono.git#plugins/foo"),
+            PluginSource::GitSubdir {
+                url: "git@github.com:acme/mono.git".into(),
+                path: "plugins/foo".into(),
+                rev: None,
+                sha: None,
+            }
+        );
+
+        // The two kinds the reference defines but CodeRex does not implement are
+        // recognised, so they are never mistaken for a plugin name.
+        assert_eq!(
+            PluginSource::detect("npm:@acme/plugin"),
+            PluginSource::Unsupported { kind: "npm".into() }
+        );
+        assert_eq!(
+            PluginSource::detect("command:print-the-path"),
+            PluginSource::Unsupported {
+                kind: "command".into()
+            }
+        );
+        // A bare word is still a marketplace listing, not a command.
+        assert!(matches!(
+            PluginSource::detect("command"),
+            PluginSource::Marketplace { .. }
+        ));
+    }
+
+    #[test]
+    fn github_shorthand_becomes_a_clone_url_and_the_rest_is_refused() {
+        assert_eq!(
+            github_clone_url("acme/plugin").unwrap(),
+            "https://github.com/acme/plugin.git"
+        );
+        assert_eq!(
+            github_clone_url("acme/my.plugin-2_x").unwrap(),
+            "https://github.com/acme/my.plugin-2_x.git"
+        );
+        for bad in [
+            "plugin",
+            "acme/plugin/extra",
+            "/plugin",
+            "acme/",
+            "../evil",
+            "acme/../evil",
+            "acme/pl ug in",
+        ] {
+            assert!(github_clone_url(bad).is_err(), "{bad} should be refused");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_github_source_that_is_not_owner_repo_is_refused() {
+        let install_dir = tempfile::tempdir().unwrap();
+        let mgr = PluginManager::new();
+        let err = mgr
+            .install_from_source(
+                &PluginSource::Github {
+                    repo: "just-a-name".into(),
+                    rev: None,
+                    sha: None,
+                },
+                install_dir.path(),
+            )
+            .await
+            .unwrap_err();
+        assert!(err.contains("owner/repo form"), "{err}");
+    }
+
+    /// A caller that asked for a commit must get that commit or an error, never
+    /// a branch that happens to share the name.
+    #[tokio::test]
+    async fn a_source_sha_that_is_not_a_commit_is_refused() {
+        let install_dir = tempfile::tempdir().unwrap();
+        let mgr = PluginManager::new();
+        let err = mgr
+            .install_from_source(
+                &PluginSource::GitSubdir {
+                    url: "file:///nonexistent/plugin-repo".into(),
+                    path: "plugins/foo".into(),
+                    rev: None,
+                    sha: Some("v1".into()),
+                },
+                install_dir.path(),
+            )
+            .await
+            .unwrap_err();
+        assert!(err.contains("40-character commit SHA"), "{err}");
+
+        let err = mgr
+            .install_from_source(
+                &PluginSource::Github {
+                    repo: "acme/plugin".into(),
+                    rev: Some("main".into()),
+                    sha: Some("main".into()),
+                },
+                install_dir.path(),
+            )
+            .await
+            .unwrap_err();
+        assert!(err.contains("40-character commit SHA"), "{err}");
+    }
+
+    /// A repository whose plugin lives in a subdirectory, so the root itself is
+    /// not a valid plugin.
+    async fn fixture_repo_with_subdir(
+        subdir: &str,
+        name: &str,
+    ) -> Option<(tempfile::TempDir, String)> {
+        if run_git(&["--version"]).await.is_err() {
+            return None;
+        }
+        let repo = tempfile::tempdir().unwrap();
+        let path = repo.path().to_string_lossy().to_string();
+
+        run_in_repo(&path, &["init", "-q"]).await.ok()?;
+        std::fs::write(repo.path().join("README.md"), "not a plugin").unwrap();
+        let plugin_dir = repo.path().join(subdir);
+        std::fs::create_dir_all(&plugin_dir).unwrap();
+        write_local_plugin(&plugin_dir, name);
+        run_in_repo(&path, &["add", "-A"]).await.ok()?;
+        run_in_repo(&path, &["commit", "-q", "-m", "plugin"])
+            .await
+            .ok()?;
+        let commit = run_in_repo(&path, &["rev-parse", "HEAD"])
+            .await
+            .ok()?
+            .trim()
+            .to_string();
+        Some((repo, commit))
+    }
+
+    #[tokio::test]
+    async fn installing_from_a_git_subdirectory_installs_that_subdirectory() {
+        let Some((repo, commit)) = fixture_repo_with_subdir("plugins/inner", "sub-plugin").await
+        else {
+            eprintln!("skipping: git is not available");
+            return;
+        };
+        let install_dir = tempfile::tempdir().unwrap();
+        let mgr = PluginManager::new();
+
+        let installed = mgr
+            .install_from_source(
+                &PluginSource::GitSubdir {
+                    url: format!("file://{}", repo.path().display()),
+                    path: "plugins/inner".into(),
+                    rev: None,
+                    sha: None,
+                },
+                install_dir.path(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(installed, install_dir.path().join("sub-plugin"));
+        assert!(installed.join("plugin.json").exists());
+        // Exactly the subdirectory was installed: the repository's own files did
+        // not come along, and the checkout is still a snapshot.
+        assert!(!installed.join("README.md").exists());
+        assert!(!installed.join(".git").exists());
+        // The clone and the staging directory are both gone.
+        assert!(!install_dir.path().join(".install-sub-plugin").exists());
+        let leftovers: Vec<_> = std::fs::read_dir(install_dir.path())
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .filter(|n| n.starts_with(".install-"))
+            .collect();
+        assert!(leftovers.is_empty(), "staging left behind: {leftovers:?}");
+
+        // The pin is the commit the clone resolved to, exactly as a git install.
+        let pins = PluginPinStore::load(&install_dir.path().join(PIN_FILE_NAME)).unwrap();
+        assert_eq!(
+            pins.get("sub-plugin").unwrap().git_commit.as_deref(),
+            Some(commit.as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn a_git_subdir_path_that_escapes_the_clone_is_refused() {
+        let Some((repo, _)) = fixture_repo_with_subdir("plugins/inner", "sub-plugin").await else {
+            eprintln!("skipping: git is not available");
+            return;
+        };
+        let install_dir = tempfile::tempdir().unwrap();
+        let mgr = PluginManager::new();
+        let url = format!("file://{}", repo.path().display());
+
+        for path in ["..", "../..", "/etc", "plugins/../../etc"] {
+            let err = mgr
+                .install_from_source(
+                    &PluginSource::GitSubdir {
+                        url: url.clone(),
+                        path: path.into(),
+                        rev: None,
+                        sha: None,
+                    },
+                    install_dir.path(),
+                )
+                .await
+                .unwrap_err();
+            assert!(
+                err.contains("climbs out") || err.contains("absolute"),
+                "{path}: {err}"
+            );
+        }
+
+        // Nothing was installed, and no staging directory was left behind for
+        // the next attempt to trip over.
+        assert!(mgr.list_plugins().is_empty());
+        let leftovers: Vec<_> = std::fs::read_dir(install_dir.path())
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .collect();
+        assert!(leftovers.is_empty(), "staging left behind: {leftovers:?}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_git_subdir_symlink_that_leaves_the_clone_is_refused() {
+        let Some((repo, _)) = fixture_repo_with_subdir("plugins/inner", "sub-plugin").await else {
+            eprintln!("skipping: git is not available");
+            return;
+        };
+        // A committed symlink pointing outside the checkout: the path itself is
+        // innocent, so only the canonicalised check catches it.
+        let escape_target = repo.path().parent().unwrap().to_path_buf();
+        std::os::unix::fs::symlink(&escape_target, repo.path().join("escape")).unwrap();
+        let path = repo.path().to_string_lossy().to_string();
+        run_in_repo(&path, &["add", "-A"]).await.unwrap();
+        run_in_repo(&path, &["commit", "-q", "-m", "symlink"])
+            .await
+            .unwrap();
+
+        let install_dir = tempfile::tempdir().unwrap();
+        let mgr = PluginManager::new();
+        let err = mgr
+            .install_from_source(
+                &PluginSource::GitSubdir {
+                    url: format!("file://{}", repo.path().display()),
+                    path: "escape".into(),
+                    rev: None,
+                    sha: None,
+                },
+                install_dir.path(),
+            )
+            .await
+            .unwrap_err();
+        assert!(err.contains("does not resolve inside"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn a_git_subdir_path_that_does_not_exist_is_refused() {
+        let Some((repo, _)) = fixture_repo_with_subdir("plugins/inner", "sub-plugin").await else {
+            eprintln!("skipping: git is not available");
+            return;
+        };
+        let install_dir = tempfile::tempdir().unwrap();
+        let mgr = PluginManager::new();
+        let err = mgr
+            .install_from_source(
+                &PluginSource::GitSubdir {
+                    url: format!("file://{}", repo.path().display()),
+                    path: "plugins/missing".into(),
+                    rev: None,
+                    sha: None,
+                },
+                install_dir.path(),
+            )
+            .await
+            .unwrap_err();
+        assert!(err.contains("not a directory in the repository"), "{err}");
+
+        // An empty path is a spec that cannot be resolved, not a root install.
+        let err = mgr
+            .install_from_source(
+                &PluginSource::GitSubdir {
+                    url: format!("file://{}", repo.path().display()),
+                    path: String::new(),
+                    rev: None,
+                    sha: None,
+                },
+                install_dir.path(),
+            )
+            .await
+            .unwrap_err();
+        assert!(err.contains("empty path"), "{err}");
+    }
+
+    /// The `command` source runs a command named by a marketplace entry. CodeRex
+    /// has no sandbox for that, so the kind is refused and nothing runs.
+    #[tokio::test]
+    async fn a_command_source_is_refused_and_never_executed() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("pwned");
+        let install_dir = tempfile::tempdir().unwrap();
+        let mgr = PluginManager::new();
+
+        let source = PluginSource::detect(&format!("command:touch {}", marker.display()));
+        assert!(
+            matches!(source, PluginSource::Unsupported { .. }),
+            "a command spec must not become an installable source"
+        );
+        let err = mgr
+            .install_from_source(&source, install_dir.path())
+            .await
+            .unwrap_err();
+        assert!(err.contains("sandbox"), "{err}");
+        assert!(!marker.exists(), "the command was executed");
+    }
+
+    #[tokio::test]
+    async fn the_npm_source_reports_the_reference_gap() {
+        let install_dir = tempfile::tempdir().unwrap();
+        let mgr = PluginManager::new();
+        let err = mgr
+            .install_from_source(
+                &PluginSource::detect("npm:@acme/plugin"),
+                install_dir.path(),
+            )
+            .await
+            .unwrap_err();
+        // The reference's own message, so the gap is attributed, not invented.
+        assert!(
+            err.contains("NPM marketplace sources not yet implemented"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn a_branch_rev_is_overridden_by_an_explicit_commit() {
+        let commit = "c".repeat(40);
+        assert_eq!(
+            checkout_rev(Some("main"), Some(&commit)).unwrap(),
+            Some(commit.as_str())
+        );
+        assert_eq!(checkout_rev(Some("main"), None).unwrap(), Some("main"));
+        assert_eq!(checkout_rev(None, None).unwrap(), None);
     }
 
     // ── pinning ──────────────────────────────────────────────────────────

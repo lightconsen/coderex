@@ -13,7 +13,7 @@ Manages plugin lifecycle (discovery, loading, execution, unloading), marketplace
 - **`PluginManifest`** — Deserialized from `plugin.json`. Identity/metadata (`name`, `displayName`, `version`, `description`, `author`, `homepage`, `repository`, `license`, `keywords`, `defaultEnabled`, `metadata`, `$schema`), CodeRex execution fields (`min_version`, `commands`, `skills`, `dependencies`, `signature`, `runtime`, `entrypoint`, `env`), `userConfig`, and the Claude component fields CodeRex accepts without acting on. See the field table below.
 - **`PluginAuthor`** — `{name, email?}`; parses from either an object (Claude's shape) or a bare string.
 - **`UserConfigField`** — One `userConfig` entry: `type`, `title`, `description`, `required`, `default`, `sensitive`, `multiple`, plus `options`/`min`/`max` accepted but not enforced.
-- **`PluginSource`** — Install source: `Marketplace { name }`, `LocalDir(path)`, `Git { url, rev }`, `Archive { url, sha256 }`; `PluginSource::detect()` classifies a CLI argument.
+- **`PluginSource`** — Install source: `Marketplace { name }`, `LocalDir(path)`, `Git { url, rev }`, `Github { repo, rev, sha }`, `GitSubdir { url, path, rev, sha }`, `Archive { url, sha256 }`, and `Unsupported { kind }`; `PluginSource::detect()` classifies a CLI argument.
 - **`PluginPin` / `PluginPinStore`** — Trust-on-first-use record of what was installed (archive SHA-256, git commit), read from `.coderex-pins.json` in the install directory.
 - **`RuntimeType`** — Enum: `Process` (default), `Wasm`. Declares how the plugin executes.
 - **`MarketplacePlugin`** — Marketplace listing with download URL.
@@ -70,7 +70,7 @@ Manages plugin lifecycle (discovery, loading, execution, unloading), marketplace
 ### Public API Surface
 
 - `PluginManager`, `PluginHandle`, `PluginState`, `PluginManifest`, `PluginAuthor`, `UserConfigField`, `RuntimeType`, `MarketplacePlugin`, `MarketplaceConnection`, `MarketplaceError`, `ReconciliationReport`, `MarketplaceReconciler`.
-- `PluginSource`, `PluginPin`, `PluginPinStore`, `PIN_FILE_NAME`, `sha256_hex`, `substitute_user_config`, `PLUGIN_OPTION_ENV_PREFIX`, `PLUGIN_PUBLIC_KEY_ENV`, `SignatureCheck`.
+- `PluginSource`, `PluginPin`, `PluginPinStore`, `PIN_FILE_NAME`, `sha256_hex`, `substitute_user_config`, `PLUGIN_OPTION_ENV_PREFIX`, `PLUGIN_PUBLIC_KEY_ENV`, `SignatureCheck`, `unsupported_source_reason`.
 - `PluginProcess`, `PluginCommandInfo`, `PluginSkillInfo`.
 - `PluginCommandBridge`.
 - `PluginToolExecutor`.
@@ -146,30 +146,69 @@ A manifest declares options, and `spawn_plugin` turns them into the child's envi
 
 ## Install Sources
 
-`PluginSource` has four kinds, and `PluginSource::detect()` classifies a CLI argument into one of them (an existing directory → `LocalDir`; a git remote → `Git`; an HTTPS `.tar.gz`/`.tgz` → `Archive`; anything else → a marketplace listing name, which is what `coderex plugin install <name>` has always meant). `install_plugin` routes a listing whose url is not a marketplace URL to `install_from_source`, so `coderex plugin install ./my-plugin` and `coderex plugin install https://github.com/acme/plugin.git` work without the CLI changing its argument shape.
+`PluginSource` has seven kinds, and `PluginSource::detect()` classifies a CLI argument into one of them (a `github:`/`git-subdir:` prefix → that kind; an existing directory → `LocalDir`; a git remote → `Git`; an HTTPS `.tar.gz`/`.tgz` → `Archive`; anything else → a marketplace listing name, which is what `coderex plugin install <name>` has always meant). `install_plugin` routes a listing whose url is not a marketplace URL to `install_from_source`, so `coderex plugin install ./my-plugin` and `coderex plugin install https://github.com/acme/plugin.git` work without the CLI changing its argument shape.
 
 | Kind | Behaviour |
 |---|---|
 | `Marketplace { name }` | The original path: HTTPS listing → download endpoint → extract → validate → atomic rename. |
 | `LocalDir(path)` | Reads `plugin.json`, copies the directory into a staging directory, then renames it into place. The source is copied, not moved or linked, so it stays a working copy. |
 | `Git { url, rev }` | Shallow clone (`--depth 1`, `--branch <rev>`); a full commit SHA as `rev` clones the history and checks it out. `.git` is dropped afterwards so the install is a snapshot, not a nested repository. The resolved commit is the plugin's pin. |
+| `Github { repo, rev, sha }` | `owner/repo` is expanded to `https://github.com/<owner>/<repo>.git` and installed by the git path, so transport validation, `GIT_TERMINAL_PROMPT=0` and commit pinning all apply unchanged. `repo` must be exactly `owner/repo` — anything with extra segments, a leading `/`, or a `..` segment is refused before a URL is built. |
+| `GitSubdir { url, path, rev, sha }` | Clone, then install the named subdirectory as the plugin. `path` is resolved *inside* the clone: an absolute path or a `..` component is refused syntactically, and the joined path is then canonicalised and must still be under the clone root, so a committed symlink pointing outside the checkout is refused too (a committed symlink is the case the syntactic check alone misses). The clone's resolved commit is the pin, exactly as a plain git install. |
 | `Archive { url, sha256 }` | HTTPS only. Signature-checked like a marketplace archive, and the archive's SHA-256 is recorded as a pin. |
+| `Unsupported { kind }` | A source the reference defines but CodeRex does not implement. Recognised so the refusal is explicit (see "npm and command" below). |
 
 Git transports that run commands are refused before `git` is spawned: `ext::` and any other `<name>::` transport is rejected, and only `https://`, `ssh://`, `git://`, `file://` and `user@host:path` are accepted. Credential prompts are disabled (`GIT_TERMINAL_PROMPT=0`) so an unauthenticated clone fails with a message instead of hanging, and `GIT_DIR`/`GIT_WORK_TREE`/`GIT_INDEX_FILE` are not inherited from the caller.
 
+A `rev` and a `sha` are both the same knob to `git`, but they are not interchangeable to a caller: `sha` must be a full 40-character commit (anything else is refused, so a caller who asked for a commit never silently gets a branch tip of the same name), and when both are present the `sha` wins. Which one a spec string carries is decided by content — a 40-hex revision is a `sha`, anything else is a `rev`.
+
+### Source spec strings
+
+The reference's source union is structured JSON, but CodeRex's CLI takes one string. The two kinds a shape cannot express by inspection get a `scheme:` prefix; both accept an optional `@<rev>` suffix:
+
+| Spec string | Detected as |
+|---|---|
+| `github:owner/repo` | `Github { repo: "owner/repo", .. }` |
+| `github:owner/repo@main` | `Github { .., rev: Some("main") }` |
+| `github:owner/repo@<40-hex>` | `Github { .., sha: Some(..) }` |
+| `git-subdir:<clone-url>#<path>` | `GitSubdir { url, path, .. }` |
+| `git-subdir:<clone-url>#<path>@v1` | `GitSubdir { .., rev: Some("v1") }` |
+| `npm:<package>` | `Unsupported { kind: "npm" }` |
+| `command:<command>` | `Unsupported { kind: "command" }` |
+
+For `git-subdir` the split is on the *first* `#` and then the *last* `@` after it, so a scp-like clone URL (`git@github.com:acme/mono.git#plugins/foo`) keeps its own `@` as part of the owner. A path containing `@` is not expressible; use the structured variant.
+
 ### Which of Claude's source kinds do not apply
 
-Claude's marketplace entry union has eight-ish kinds. CodeRex implements four of the shapes and deliberately not the rest:
+Claude's marketplace entry union has eight-ish kinds. CodeRex implements five of the shapes and deliberately not the rest:
 
 | Claude kind | CodeRex | Why |
 |---|---|---|
 | local path | ✅ `LocalDir` | Local-first tool; this is the primary source. |
-| `url`, `github`, `git-subdir` | ✅ `Git` (one kind) | All three are "clone a git remote at a ref"; `rev` covers the ref, and `detect()` recognises GitHub/GitLab/Codeberg/Bitbucket URLs. Subdirectory extraction (`git-subdir`'s sparse checkout) is not implemented — the repository root must hold `plugin.json`. |
+| `github` | ✅ `Github` | `owner/repo` shorthand plus an optional ref; resolved to a clone URL and handed to the git path. |
+| `git-subdir` | ✅ `GitSubdir` | A clone narrowed to a named subdirectory, with the git path's transport validation and commit pinning carried over. |
+| `url` | ✅ via `Git`/`Archive` | Not a separate kind: `{url, ref?, sha?}` is a clone (covered by `Git`) or, when the URL is an archive, a download (covered by `Archive`). `detect()` already picks between them from the URL itself, so adding a third spelling of the same two kinds would only be a way to get the same thing wrong twice. |
 | `archive` | ✅ `Archive` | Straightforward and gives the SHA-256 pin a home. |
-| `npm` | ❌ | Needs a Node toolchain and registry resolution; CodeRex plugins are not npm packages. Claude itself still throws "NPM marketplace sources not yet implemented". |
-| `command` | ❌ | Runs an arbitrary command to print a directory path. CodeRex refuses to execute a command as part of resolving a source; a local path or a git URL says the same thing without the execution. |
-| `unsupported` | ❌ | Claude's placeholder variant; nothing to implement. |
-| `settings` | ❌ | Claude-internal (plugins defined inside settings); CodeRex's settings have no plugin table to read. |
+| `npm` | ⚪ not implemented | Needs a Node toolchain and registry resolution; CodeRex plugins are not npm packages, and there is no npm registry client anywhere in the workspace. The reference is in the same state — its own source throws `Error("NPM marketplace sources not yet implemented")` (`plugin.md:200`) — so this is recorded as a gap, not built. The spec string `npm:` is still recognised and refused with that same message, so it is never mistaken for a plugin by that name. |
+| `command` | ⚪ not implemented | **Decided against on purpose.** See below. |
+| `settings` | ⚪ not implemented | The reference's `settings` is a *marketplace* that lives inside settings. CodeRex registers marketplaces through `add_marketplace` (a base URL plus endpoint paths); its settings file has no plugin or marketplace table, so there is nothing to read and no local shape for the kind to take. Claude-internal, and local-first CodeRex has no equivalent container. |
+| `unsupported` | ⚪ | Claude's placeholder variant; nothing to implement. |
+
+### Why `command` is not implemented
+
+The reference's `command` source runs a command and reads the absolute plugin directory path it prints. The command comes from a marketplace entry — that is, its text is chosen by a third party — and installing a plugin is not a consent step for arbitrary execution.
+
+None of the guards this crate already has apply here:
+
+- Transport validation (`validate_git_url`) governs `git` transports; it says nothing about a shell command.
+- `GIT_TERMINAL_PROMPT=0` stops a prompt, not a command.
+- `timeout` bounds *how long* a command runs, not *what* it may do — `rm -rf ~` finishes well inside any timeout.
+- `mode: ["copy", "link"]` decides how the reported directory is installed, which happens *after* the command has already run.
+- `validate_plugin_name` protects the install destination, not the machine.
+
+There is no sandbox in this crate for running an arbitrary command, and the trigger is not necessarily a user typing it: `install_plugin` routes any listing whose `url` is not a marketplace URL to `install_from_source`, so a marketplace listing with `"url": "command:..."` would reach the resolver. `PluginSource::detect()` therefore maps `command:` to `Unsupported { kind: "command" }`, and `install_from_source` refuses it — the spec is recognised, named, and never executed. A local path or a git URL expresses "the plugin is over there" without the execution, so nothing is lost.
+
+The decision is enforced by a test that asserts a `command:` spec does not become an installable source *and* that the command's side effect never happened.
 
 ## Pinning (Trust on First Use)
 
@@ -240,21 +279,21 @@ During REPL construction:
 - **WASM feature flag prep**: `process-runtime` (default) and `wasm-runtime` Cargo features.
 - **Full manifest field table** with `deny_unknown_fields`, `PluginAuthor` accepting a string or an object, and a load-time warning for fields CodeRex accepts but does not implement.
 - **`userConfig` injection**: `CODEREX_PLUGIN_OPTION_<KEY>` in the child's environment and `${user_config.KEY}` substitution in `env` and `entrypoint`; sensitive options refuse a plaintext default and refuse an unresolved `keyring://` reference; a required option with no value stops the spawn.
-- **Install sources**: marketplace listing, local directory, git URL, HTTPS archive — with `PluginSource::detect()` classifying a CLI argument.
+- **Install sources**: marketplace listing, local directory, git URL, GitHub `owner/repo` shorthand, a git subdirectory, and HTTPS archive — with `PluginSource::detect()` classifying a CLI argument, and the unimplemented `npm`/`command` kinds recognised and refused rather than silently reinterpreted.
 - **Pinning**: trust-on-first-use SHA-256 for archives and commit pinning for git, recorded in `.coderex-pins.json`.
 
 ### Known Gaps
 
 - No keychain access in this crate, so sensitive options are host-supplied or environment-supplied; nothing prompts the user or writes answers back to settings (see "userConfig Injection").
 - `options`/`min`/`max`/`type` in `userConfig` are parsed and ignored: no validation.
-- No subdirectory extraction for git sources (`git-subdir`): the repository root must hold `plugin.json`.
 - Pin files are created by the first install; a user cannot pre-seed a pin before installing.
 - WASM plugins get no `userConfig` (no process environment).
+- `npm` and `command` sources are not implemented (see above for why, and for the reference citation on `npm`).
 - `crates/cli/src/orchestrator.rs` still parses `plugin.json` itself in `phase_init_plugins` and ignores a parse error silently; the library's `discover()` warns, but the CLI's own loop has not been changed here.
 
 ### Tests
 
-- 58 tests in `plugins.rs` (manager ops, load/unload, marketplace, discovery, reconciler, URL validation, version checks, signature verification, dependency resolution, error recovery, custom endpoints, the manifest field table, `userConfig` resolution and injection end-to-end, source detection and git URL validation, directory/git installs, SHA-256 vectors and pin enforcement).
-- 16+ tests in `skills.rs` (parsing, loader, plugin/MCP skills, repo dir, conflict resolution, precedence, quoted strings).
-- 6 tests in `runtime.rs` (spawn, initialize, terminate, invalid command).
-- Tests use `tempfile` for filesystem operations. The git install test creates a throwaway repository inside a `tempfile::tempdir()` and pins every git command with `-C`, so it never touches the project's own repository.
+- 70 tests in `plugins.rs` (manager ops, load/unload, marketplace, discovery, reconciler, URL validation, version checks, signature verification, dependency resolution, error recovery, custom endpoints, the manifest field table, `userConfig` resolution and injection end-to-end, source detection and git URL validation, directory/git/git-subdir installs, structured source specs, the `npm`/`command` refusals, SHA-256 vectors and pin enforcement).
+- 14 tests in `skills.rs` (parsing, loader, plugin/MCP skills, repo dir, conflict resolution, precedence, quoted strings).
+- 7 tests in `runtime.rs` (spawn, initialize, terminate, invalid command), plus 1 in `wasm_runtime.rs`.
+- Tests use `tempfile` for filesystem operations. The git and git-subdir install tests create a throwaway repository inside a `tempfile::tempdir()` and pin every git command with `-C`, so they never touch the project's own repository. The subdirectory tests use `file://` clone URLs, so they need no network.
