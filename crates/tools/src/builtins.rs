@@ -192,6 +192,47 @@ impl Tool for NoOpTool {
     }
 }
 
+/// Whether this platform's shell is PowerShell.
+///
+/// There is one shell role with two platform spellings, and the platform picks
+/// which: on Windows it is PowerShell, everywhere else Bash. The reference says
+/// so in its own words — the REPL's `!` mode calls the Bash tool and "PowerShell
+/// 平台走 PowerShellTool", the headless path uses `/bin/sh -c` and "Windows 用
+/// `pwsh -NoProfile -Command`" (`subsystems/bash.md` §3.12) — and the same
+/// pairing runs through its sandbox layer, which wraps "the Bash tool / the
+/// PowerShell tool", and its permission classes, `["Bash","PowerShell"]`.
+#[must_use]
+pub const fn platform_shell_is_powershell() -> bool {
+    cfg!(windows)
+}
+
+/// The name of the shell tool this platform runs commands with.
+#[must_use]
+pub const fn platform_shell_tool() -> &'static str {
+    if platform_shell_is_powershell() {
+        "PowerShell"
+    } else {
+        "Bash"
+    }
+}
+
+/// Register the one shell tool this platform runs commands with.
+///
+/// Registering both, as this used to, advertised a shell the platform does not
+/// use — the model could call `PowerShell` on a machine with no `pwsh`, and it
+/// reached a tool that has no sandbox path wired. The non-native tool still
+/// exists and still compiles; it is simply not offered where it is not the
+/// shell.
+pub fn register_shell_tool(reg: &mut crate::registry::ToolRegistry) {
+    use std::sync::Arc;
+
+    if platform_shell_is_powershell() {
+        reg.register(Arc::new(PowerShellTool));
+    } else {
+        reg.register(Arc::new(BashTool::new()));
+    }
+}
+
 /// Register all baseline built-in tools into the given registry.
 pub fn register_builtin_tools(reg: &mut crate::registry::ToolRegistry) {
     use std::sync::Arc;
@@ -199,8 +240,7 @@ pub fn register_builtin_tools(reg: &mut crate::registry::ToolRegistry) {
     reg.register(Arc::new(WriteTool));
     reg.register(Arc::new(EditTool));
     reg.register(Arc::new(NotebookEditTool));
-    reg.register(Arc::new(BashTool::new()));
-    reg.register(Arc::new(PowerShellTool));
+    register_shell_tool(reg);
     reg.register(Arc::new(SleepTool));
     reg.register(Arc::new(GlobTool));
     reg.register(Arc::new(GrepTool));
@@ -527,5 +567,62 @@ mod tests {
             )
             .await;
         assert!(result.is_err(), "ReadTool should error on missing file");
+    }
+
+    // ─── The platform's shell ────────────────────────────────────────────
+
+    /// One shell role, two platform spellings.
+    #[test]
+    fn the_platform_shell_is_named_for_the_platform() {
+        let expected = if cfg!(windows) { "PowerShell" } else { "Bash" };
+        assert_eq!(platform_shell_tool(), expected);
+        assert_eq!(platform_shell_is_powershell(), cfg!(windows));
+    }
+
+    /// The advertised tool list carries the platform's shell and not the other
+    /// one: a `PowerShell` tool on a machine that has no `pwsh` is an
+    /// invitation to a spawn failure, and it reaches a shell with no sandbox
+    /// wired.
+    #[test]
+    fn only_the_platforms_shell_tool_is_registered() {
+        let mut registry = crate::registry::ToolRegistry::new();
+        register_builtin_tools(&mut registry);
+        let names: Vec<String> = registry
+            .list_tools()
+            .into_iter()
+            .map(|(name, _tool)| name)
+            .collect();
+
+        assert!(
+            names.iter().any(|name| name == platform_shell_tool()),
+            "the platform's shell tool is missing from {names:?}"
+        );
+        let other = if platform_shell_is_powershell() {
+            "Bash"
+        } else {
+            "PowerShell"
+        };
+        assert!(
+            !names.iter().any(|name| name == other),
+            "the other platform's shell tool is advertised too: {names:?}"
+        );
+    }
+
+    /// Registering the shell the platform does not use is still possible — the
+    /// tool exists and compiles — but it is not something the default registry
+    /// does.
+    #[test]
+    fn the_unused_shell_tool_still_exists() {
+        let mut registry = crate::registry::ToolRegistry::new();
+        registry.register(std::sync::Arc::new(PowerShellTool));
+        registry.register(std::sync::Arc::new(BashTool::new()));
+
+        let names: Vec<String> = registry
+            .list_tools()
+            .into_iter()
+            .map(|(name, _tool)| name)
+            .collect();
+        assert!(names.iter().any(|name| name == "PowerShell"));
+        assert!(names.iter().any(|name| name == "Bash"));
     }
 }

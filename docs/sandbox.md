@@ -14,7 +14,7 @@ says so at runtime rather than letting the caller assume otherwise.
 | Per-tool default policy (which paths, which limits) | `crates/tools/src/sandbox_policy.rs` |
 | Policy injected into `ToolContext.extra["sandbox_config"]` | `RegistryToolDispatcher` in `crates/tools/src/dispatcher.rs` |
 | `Bash` applies the sandbox | `build_sandboxed_command`, `crates/tools/src/builtins/bash_tool.rs:43` |
-| `PowerShell` applies the sandbox | `crates/tools/src/builtins/powershell_tool.rs` |
+| `PowerShell` **does not** — it never reads `sandbox_config`, and it is registered only on Windows | `crates/tools/src/builtins/powershell_tool.rs` |
 | MCP servers spawn outside it | `JsonRpcChannel::spawn`, `crates/mcp/src/channel.rs:176` |
 
 Sandboxing is on by default (`ExecutionConfig::sandbox_enabled = true`, the
@@ -96,6 +96,14 @@ fall back to the syscall filter.
 Creates a Job Object with per-job user time and memory limits and assigns the
 child to it, plus UI restrictions (no desktop, no clipboard, no global atoms).
 This limits resources and UI reach; it does not restrict file paths or network.
+
+**In practice this is not applied to anything.** `SandboxHandle::post_spawn` —
+the only way a Job Object reaches a child — has no production caller, and
+`bash_tool` has no Windows branch. On Windows the shell tool is `PowerShell`
+(see `docs/tools.md`, "The platform's shell"), which does not read the sandbox
+config at all, so a Windows shell command runs with neither a Job Object nor any
+confinement. The reference confines it (`srt-win`); CodeRex does not, and says so
+here rather than implying otherwise.
 
 ### Other platforms
 

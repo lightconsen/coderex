@@ -31,7 +31,7 @@ Implements the tool trait system, registers built-in tools, and provides executi
 | Tool | Category | Status |
 |------|----------|--------|
 | Read, Write, Edit, Glob, Grep, NotebookEdit | File I/O | Functional |
-| Bash, PowerShell | Shell execution | Functional (sandbox + allowlist + metacharacter rejection) |
+| Bash, PowerShell | Shell execution | Functional (sandbox + allowlist + metacharacter rejection). **One of the two is registered, chosen by platform**: PowerShell on Windows, Bash everywhere else — see below. |
 | WebSearch, WebFetch | Web | Functional (rate limiting, domain whitelist, redirect validation) |
 | Skill | Skill loading | Functional (reads `.md` files) |
 | Brief | Session summary | Functional |
@@ -114,6 +114,26 @@ Seven tiers, mirroring the reference's `maxResultSizeChars`. A tool declares one
 - **Timeout enforcement** — All tool executions wrapped in `tokio::time::timeout` using `ExecutionConfig.default_timeout` (default 60s).
 - **Batch execution** — `execute_many()` chunks calls into batches of `max_concurrent` and runs each batch concurrently.
 - **Result caching** — `ToolExecutor` caches successful results from read-only tools in an LRU cache (`moka`, default 1000 entries, 5-minute TTL). `Read` tool cache entries are invalidated when the underlying file's mtime changes.
+
+## The platform's shell
+
+There is one shell role with two platform spellings, and the platform picks
+which: `platform_shell_is_powershell()` is `cfg!(windows)`, and
+`register_builtin_tools` registers that one. The reference does the same — its
+REPL `!` mode calls the Bash tool and "PowerShell 平台走 PowerShellTool", its
+headless path uses `/bin/sh -c` and "Windows 用 `pwsh -NoProfile -Command`"
+(`subsystems/bash.md` §3.12), its sandbox layer wraps "the Bash tool / the
+PowerShell tool", and its permission classes are `["Bash","PowerShell"]`.
+
+Registering both, as this did, advertised a shell the platform does not use: on
+a machine with no `pwsh` the model could call `PowerShell` and get a spawn
+failure — and it reached a tool with no sandbox path wired, because the sandbox
+wrapper was attached to Bash only. The non-native tool still exists and still
+compiles (`the_unused_shell_tool_still_exists`); it is simply not offered where
+it is not the shell.
+
+`sandbox_policy::default_sandbox_config` keeps its entry for both names, because
+on Windows the `PowerShell` entry is the live one.
 
 ## Current Status
 

@@ -23,7 +23,8 @@ pub use builtins::{
     SkillTool, SleepTool, StructuredOutputTool, SyntheticOutputTool, TaskCreateTool, TaskGetTool,
     TaskListTool, TaskOutputTool, TaskStopTool, TaskUpdateTool, TodoWriteTool, ToolSearchTool,
     WebFetchTool, WebSearchTool, WriteTool, default_token_path, persist_token_at,
-    register_builtin_tools,
+    platform_shell_is_powershell, platform_shell_tool, register_builtin_tools,
+    register_shell_tool,
 };
 pub use coderex_core::permissions::ToolRuleExemptions;
 pub use context::{ExecutionContext, ToolError, ToolOutput};
