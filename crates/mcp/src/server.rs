@@ -81,6 +81,8 @@ pub struct McpServer {
     pub max_reconnects: usize,
     /// JSON-RPC stdio channel (present when running).
     channel: Option<Arc<Mutex<JsonRpcChannel>>>,
+    /// Answers requests this server makes of the client, when one was set.
+    inbound_handler: Option<Arc<dyn crate::channel::InboundRequestHandler>>,
 }
 
 impl McpServer {
@@ -104,6 +106,7 @@ impl McpServer {
             reconnect_count: 0,
             max_reconnects: 3,
             channel: None,
+            inbound_handler: None,
         }
     }
 
@@ -127,24 +130,40 @@ impl McpServer {
             reconnect_count: 0,
             max_reconnects: 3,
             channel: None,
+            inbound_handler: None,
         }
     }
 
     /// Build a fresh channel using this server's transport configuration.
     fn create_channel(&self) -> Result<JsonRpcChannel, String> {
-        match self.transport {
-            McpTransport::Stdio => Ok(JsonRpcChannel::new(
-                self.command.clone(),
-                self.args.clone(),
-                self.env.clone(),
-            )),
+        // The handler belongs to the server rather than to a channel: `spawn`
+        // builds the channel it will use, so one set on the pre-spawn handle
+        // would be dropped on the floor.
+        let mut channel = match self.transport {
+            McpTransport::Stdio => {
+                JsonRpcChannel::new(self.command.clone(), self.args.clone(), self.env.clone())
+            }
             McpTransport::Sse | McpTransport::Http => {
                 let url = self.url.as_deref().ok_or_else(|| {
                     format!("remote MCP server '{}' has no URL configured", self.name)
                 })?;
-                JsonRpcChannel::new_http(url, self.headers.clone())
+                JsonRpcChannel::new_http(url, self.headers.clone())?
             }
+        };
+        if let Some(ref handler) = self.inbound_handler {
+            channel.set_inbound_handler(Arc::clone(handler));
         }
+        Ok(channel)
+    }
+
+    /// Answer requests this server makes of the client.
+    ///
+    /// A server that asks — `elicitation/create` is the common one — waits for
+    /// the answer, so a client that cannot answer must say so. Without a
+    /// handler every such request is refused with a JSON-RPC error rather than
+    /// ignored.
+    pub fn set_inbound_handler(&mut self, handler: Arc<dyn crate::channel::InboundRequestHandler>) {
+        self.inbound_handler = Some(handler);
     }
 
     /// Spawn the server process and initialize JSON-RPC channel.

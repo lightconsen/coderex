@@ -37,6 +37,9 @@ pub struct JsonRpcResponse {
     pub error: Option<JsonRpcError>,
 }
 
+/// JSON-RPC's "no such method" error code.
+pub const METHOD_NOT_FOUND: i64 = -32601;
+
 /// A JSON-RPC error.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JsonRpcError {
@@ -47,6 +50,36 @@ pub struct JsonRpcError {
     /// Optional extra data.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub data: Option<Value>,
+}
+
+/// A JSON-RPC request *from* the server, which the client has to answer.
+///
+/// The protocol runs both ways: the server asks the client to do things —
+/// `elicitation/create` is one — and waits for the answer. These used to be
+/// parsed as responses and dropped when their id matched nothing the client
+/// had sent, so the server waited until its own timeout for an answer that was
+/// never coming.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct JsonRpcServerRequest {
+    /// JSON-RPC version.
+    pub jsonrpc: String,
+    /// The server's request ID, which the answer must carry back.
+    pub id: u64,
+    /// Method name.
+    pub method: String,
+    /// Parameters.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub params: Option<Value>,
+}
+
+/// Answers requests the server makes of the client.
+///
+/// Synchronous on purpose: a handler that can answer immediately is the only
+/// kind this transport can honour, and one that cannot answer must say so
+/// rather than leave the server waiting.
+pub trait InboundRequestHandler: Send + Sync + std::fmt::Debug {
+    /// Answer one request, or say why it cannot be answered.
+    fn handle(&self, method: &str, params: Option<&Value>) -> Result<Value, JsonRpcError>;
 }
 
 /// A JSON-RPC notification (no ID, no response expected).
@@ -62,7 +95,6 @@ pub struct JsonRpcNotification {
 }
 
 /// A channel for JSON-RPC communication over stdio with a subprocess.
-#[derive(Debug)]
 pub struct JsonRpcChannel {
     /// The child process (stdio transport only).
     process: Option<Child>,
@@ -82,6 +114,19 @@ pub struct JsonRpcChannel {
     env: HashMap<String, String>,
     /// Whether the channel is initialized.
     initialized: bool,
+    /// Answers requests the server makes of the client, when one was supplied.
+    handler: Option<std::sync::Arc<dyn InboundRequestHandler>>,
+}
+
+impl std::fmt::Debug for JsonRpcChannel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("JsonRpcChannel")
+            .field("command", &self.command)
+            .field("initialized", &self.initialized)
+            .field("has_handler", &self.handler.is_some())
+            .field("http", &self.http.is_some())
+            .finish_non_exhaustive()
+    }
 }
 
 impl JsonRpcChannel {
@@ -102,6 +147,7 @@ impl JsonRpcChannel {
             args,
             env,
             initialized: false,
+            handler: None,
         }
     }
 
@@ -117,7 +163,13 @@ impl JsonRpcChannel {
             args: Vec::new(),
             env: HashMap::new(),
             initialized: false,
+            handler: None,
         })
+    }
+
+    /// Answer requests the server makes of the client.
+    pub fn set_inbound_handler(&mut self, handler: std::sync::Arc<dyn InboundRequestHandler>) {
+        self.handler = Some(handler);
     }
 
     /// Spawn the subprocess and capture stdio handles.
@@ -261,26 +313,70 @@ impl JsonRpcChannel {
 
     /// Read a response from stdout matching the given ID.
     async fn read_response(&mut self, expected_id: u64) -> Result<Value, String> {
-        let stdout = self.stdout.as_mut().ok_or("stdout not available")?;
         let mut line = String::new();
 
         loop {
             line.clear();
-            let bytes_read = stdout
-                .read_line(&mut line)
-                .await
-                .map_err(|e| format!("failed to read from stdout: {e}"))?;
+            // The borrow of `stdout` ends with the read, so answering a server
+            // request can take the channel again to write.
+            let bytes_read = {
+                let stdout = self.stdout.as_mut().ok_or("stdout not available")?;
+                stdout
+                    .read_line(&mut line)
+                    .await
+                    .map_err(|e| format!("failed to read from stdout: {e}"))?
+            };
 
             if bytes_read == 0 {
                 return Err("stdout closed before response".to_string());
             }
 
-            let trimmed = line.trim();
+            let trimmed = line.trim().to_string();
+            let trimmed = trimmed.as_str();
             if trimmed.is_empty() {
                 continue;
             }
 
-            let response: JsonRpcResponse = serde_json::from_str(trimmed)
+            // Told apart by shape, not by trying to read every line as a
+            // response: the protocol runs both ways, and a request from the
+            // server has a method and an id but no result.
+            let value: Value = serde_json::from_str(trimmed)
+                .map_err(|e| format!("failed to parse JSON-RPC message: {e}, raw: {trimmed}"))?;
+            let has_method = value.get("method").is_some();
+            let has_id = value.get("id").is_some();
+
+            match (has_method, has_id) {
+                // The server asking us to do something. It is waiting for an
+                // answer, so one is always sent — an error if nothing here can
+                // answer it.
+                (true, true) => {
+                    let request: JsonRpcServerRequest = serde_json::from_value(value)
+                        .map_err(|e| format!("failed to parse a server request: {e}"))?;
+                    self.answer_server_request(&request).await?;
+                    continue;
+                }
+                // A notification: no answer is expected.
+                (true, false) => {
+                    tracing::debug!(
+                        server = %self.command,
+                        message = %trimmed,
+                        "ignoring a notification from the server"
+                    );
+                    continue;
+                }
+                (false, true) => {}
+                // Neither shape: say so rather than read past it.
+                (false, false) => {
+                    tracing::warn!(
+                        server = %self.command,
+                        message = %trimmed,
+                        "a message from the server is neither a response nor a request"
+                    );
+                    continue;
+                }
+            }
+
+            let response: JsonRpcResponse = serde_json::from_value(value)
                 .map_err(|e| format!("failed to parse JSON-RPC response: {e}, raw: {trimmed}"))?;
 
             if response.id == expected_id {
@@ -292,8 +388,67 @@ impl JsonRpcChannel {
                 }
                 return Ok(response.result.unwrap_or(Value::Null));
             }
-            // If ID doesn't match, it might be a notification — continue reading
+
+            // An answer to a request that is no longer being waited for — a
+            // retry, or one that timed out. Read past it, but not silently.
+            tracing::debug!(
+                server = %self.command,
+                id = response.id,
+                expected = expected_id,
+                "a response arrived for a request nothing is waiting on"
+            );
         }
+    }
+
+    /// Answer a request the server made.
+    async fn answer_server_request(
+        &mut self,
+        request: &JsonRpcServerRequest,
+    ) -> Result<(), String> {
+        let answer = match &self.handler {
+            Some(handler) => handler.handle(&request.method, request.params.as_ref()),
+            None => Err(JsonRpcError {
+                code: METHOD_NOT_FOUND,
+                message: format!(
+                    "this client has no handler for '{}'; nothing here can answer it",
+                    request.method
+                ),
+                data: None,
+            }),
+        };
+
+        let response = match answer {
+            Ok(result) => JsonRpcResponse {
+                jsonrpc: "2.0".to_string(),
+                id: request.id,
+                result: Some(result),
+                error: None,
+            },
+            Err(error) => JsonRpcResponse {
+                jsonrpc: "2.0".to_string(),
+                id: request.id,
+                result: None,
+                error: Some(error),
+            },
+        };
+
+        self.write_response(&response).await
+    }
+
+    /// Write a response to a request the server made.
+    async fn write_response(&mut self, response: &JsonRpcResponse) -> Result<(), String> {
+        let stdin = self.stdin.as_mut().ok_or("stdin not available")?;
+        let line = serde_json::to_string(response)
+            .map_err(|e| format!("failed to serialize response: {e}"))?;
+        stdin
+            .write_all(format!("{line}\n").as_bytes())
+            .await
+            .map_err(|e| format!("failed to write to stdin: {e}"))?;
+        stdin
+            .flush()
+            .await
+            .map_err(|e| format!("failed to flush stdin: {e}"))?;
+        Ok(())
     }
 
     /// Check if the channel is alive by attempting to read from stdout.

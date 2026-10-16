@@ -231,6 +231,166 @@ async fn tool_discovery_manager_discovers_and_registers() {
     mgr.stop_all().await;
 }
 
+/// A server that asks the client a question.
+///
+/// The protocol runs both ways: `elicitation/create` is the server asking the
+/// client to ask the person. The client used to parse every line as a response
+/// and drop anything whose id it had not sent, so the request vanished and the
+/// server waited for an answer that never came.
+const ASKING_SERVER: &str = r#"#!/usr/bin/env python3
+import json
+import os
+import sys
+
+def send(obj):
+    print(json.dumps(obj), flush=True)
+
+def log(obj):
+    # What the client answered, for the test to read.
+    path = os.environ.get("CODEREX_MOCK_ANSWER_LOG")
+    if path:
+        with open(path, "a") as handle:
+            handle.write(json.dumps(obj) + "\n")
+
+# The request the server owes an answer to, while it waits for the client.
+waiting = {}
+
+for line in sys.stdin:
+    line = line.strip()
+    if not line:
+        continue
+    req = json.loads(line)
+    method = req.get("method", "")
+    req_id = req.get("id")
+
+    if method == "initialize":
+        send({"jsonrpc": "2.0", "id": req_id, "result": {
+            "protocolVersion": "2024-11-05",
+            "capabilities": {"tools": {}, "elicitation": {}},
+            "serverInfo": {"name": "asking-mcp", "version": "1.0"}}})
+    elif method == "tools/list":
+        # Ask the client something first, and remember what we owe an answer.
+        waiting[9001] = req_id
+        send({"jsonrpc": "2.0", "id": 9001, "method": "elicitation/create",
+              "params": {"message": "which environment?"}})
+    elif req_id in waiting:
+        # The client's answer to the question: whatever it was, the request
+        # that was waiting on it can now be answered.
+        log({"received": req, "waiting_for": waiting[req_id]})
+        send({"jsonrpc": "2.0", "id": waiting.pop(req_id), "result": {"tools": []}})
+    elif method == "ping":
+        send({"jsonrpc": "2.0", "id": req_id, "result": {}})
+"#;
+
+fn asking_server_path() -> PathBuf {
+    let id = MOCK_ID.fetch_add(1, Ordering::SeqCst);
+    let path = std::env::temp_dir().join(format!("coderex_asking_mcp_{id}.py"));
+    std::fs::write(&path, ASKING_SERVER).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(&path).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&path, perms).unwrap();
+    }
+    path
+}
+
+/// A handler that answers everything, recording what it was asked.
+#[derive(Debug)]
+struct RecordingHandler {
+    asked: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+}
+
+impl coderex_mcp::channel::InboundRequestHandler for RecordingHandler {
+    fn handle(
+        &self,
+        method: &str,
+        _params: Option<&serde_json::Value>,
+    ) -> Result<serde_json::Value, coderex_mcp::channel::JsonRpcError> {
+        self.asked.lock().unwrap().push(method.to_string());
+        Ok(serde_json::json!({"action": "accept", "content": {"environment": "test"}}))
+    }
+}
+
+#[tokio::test]
+async fn a_request_from_the_server_is_answered() {
+    let script = asking_server_path();
+    let mut server = McpServer::new("asking", script.to_str().unwrap(), vec![], HashMap::new());
+
+    let asked = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    server.set_inbound_handler(std::sync::Arc::new(RecordingHandler {
+        asked: std::sync::Arc::clone(&asked),
+    }));
+
+    server.spawn().await.unwrap();
+
+    // The server asks mid-request; the client answers, and the request that
+    // was in flight still completes.
+    let tools = server.discover_tools().await.unwrap();
+    assert!(tools.get("tools").is_some(), "{tools}");
+
+    let asked = asked.lock().unwrap().clone();
+    assert!(
+        asked.iter().any(|method| method == "elicitation/create"),
+        "the client never answered the server's request: {asked:?}"
+    );
+
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn a_request_from_the_server_with_no_handler_is_refused_not_ignored() {
+    let script = asking_server_path();
+    let log = std::env::temp_dir().join(format!(
+        "coderex_mock_answers_{}.jsonl",
+        MOCK_ID.fetch_add(1, Ordering::SeqCst)
+    ));
+    let _ = std::fs::remove_file(&log);
+
+    let mut env = HashMap::new();
+    env.insert(
+        "CODEREX_MOCK_ANSWER_LOG".to_string(),
+        log.to_string_lossy().into_owned(),
+    );
+    let mut server = McpServer::new("asking", script.to_str().unwrap(), vec![], env);
+    server.spawn().await.unwrap();
+
+    // No handler was set: the client must still answer — the server is waiting
+    // — and it must answer with a refusal, not with a success that says the
+    // question was answered by nobody.
+    let tools = server.discover_tools().await;
+    assert!(
+        tools.is_ok(),
+        "the server never got an answer, so the request never completed: {tools:?}"
+    );
+
+    let logged = std::fs::read_to_string(&log).unwrap_or_default();
+    assert!(!logged.is_empty(), "the server never received an answer");
+    let answer: serde_json::Value = serde_json::from_str(
+        logged
+            .lines()
+            .next()
+            .and_then(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .and_then(|entry| entry.get("received").cloned())
+            .map(|received| received.to_string())
+            .unwrap_or_default()
+            .as_str(),
+    )
+    .expect("the answer was logged as JSON");
+    assert_eq!(
+        answer
+            .get("error")
+            .and_then(|error| error.get("code"))
+            .and_then(serde_json::Value::as_i64),
+        Some(-32601),
+        "a request nothing can answer should be refused, not answered with nothing: {answer}"
+    );
+
+    let _ = std::fs::remove_file(&log);
+    server.stop().await;
+}
+
 #[tokio::test]
 async fn tool_discovery_proxy_call() {
     let script = mock_server_path();
