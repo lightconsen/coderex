@@ -71,22 +71,62 @@ policy that is supposed to constrain it.
 ## Hook kinds (`type`)
 
 Claude has five kinds — `command`, `prompt`, `mcp_tool`, `http`, `agent`.
-CodeRex has one working kind and four recognised-but-unimplemented ones:
+CodeRex has two working kinds and three recognised-but-unimplemented ones:
 
 | `type` | Status |
 |--------|--------|
 | `command` | **Implemented.** Runs `sh -c <command>` with the input JSON on stdin. |
-| `http` | Recognised, **skipped with a warning**. Would need `reqwest` in this crate's `Cargo.toml`. |
+| `http` | **Implemented.** POSTs the input JSON to `url`; the response body is the answer. See below. |
 | `prompt` | Recognised, **skipped with a warning**. Needs a model/API client, which does not belong in this crate. |
 | `mcp_tool` | Recognised, **skipped with a warning**. Needs the MCP server registry, which lives in another crate. |
 | `agent` | Recognised, **skipped with a warning**. Same reason as `prompt`. |
 
-A hook whose `type` is one of the four unimplemented kinds is **not** run as a
+A hook whose `type` is one of the three unimplemented kinds is **not** run as a
 command and **not** silently dropped — the loader logs a `warn!` naming the type
 and the event, and the other hooks in the same settings still load. An
 unrecognised `type` string (a typo) is a hard config error. A `command` hook
 with no `command` field is a hard config error. A hook with no `type` at all
 defaults to `command`, so existing settings keep working.
+
+### `http` hooks
+
+```json
+{
+  "event": "PreToolUse",
+  "type": "http",
+  "url": "https://policy.example.test/hooks/tool-use",
+  "headers": { "authorization": "Bearer ${HOOK_TOKEN}" },
+  "allowedEnvVars": ["HOOK_TOKEN"],
+  "blockPrivateHosts": true
+}
+```
+
+The request body is the same JSON a `command` hook receives on stdin, and the
+response body is parsed exactly the way `command` stdout is: `{}` or
+`{"action":"continue"}` continues, `{"action":"stop"}` stops. The failure rules
+are the command hook's rules one for one — a request that does not complete, a
+status that is not 2xx, an empty body, and a body that is not a hook result are
+all failures, and a failure denies on a gating event.
+
+Three properties are deliberate, because the body is the conversation:
+
+- **The URL must be absolute `http`/`https`.** A relative path or a
+  `file:`-style scheme is refused at load: the destination has to be named
+  outright.
+- **A redirect is a failure.** `3xx` is not followed — following one would send
+  the conversation to a host the configuration never named.
+- **A header may only read a granted variable.** `$NAME` and `${NAME}` are
+  interpolated from the environment, but only for names in `allowedEnvVars`; a
+  configuration that references anything else is refused at load, so a hook
+  cannot read out a variable simply by naming it. A variable that is named but
+  unset is a failure at call time, not an empty substitution.
+
+`blockPrivateHosts` is off by default, because a local hook endpoint is an
+ordinary thing to want. On, it refuses an endpoint whose host resolves to
+localhost or a private range. Both of those live in
+`coderex_core::hook_security` — `UrlValidator`, `SsrfGuard`, `EnvInterpolator`
+and `env_var_references` — which existed for this purpose and had no caller
+until now.
 
 ## Fail-closed contract
 
@@ -186,12 +226,8 @@ API; `command` hooks with stdin/stdout; timeout; sandbox limits; dry-run;
 fail-closed failure classification and the deny-on-gate behaviour; inert-event
 and unsupported-type warnings; structured logging.
 
-**Not wired:** the CLI still uses `NoOpHookExecutor`. `set_hooks` has no
-production caller yet — wiring `from_settings_json` + `into_executor` into
-`repl.rs` is the remaining step, and it belongs to the CLI, not this crate.
-
-**Not implemented:** the `http`, `prompt`, `mcp_tool`, and `agent` hook kinds
+**Not implemented:** the `prompt`, `mcp_tool`, and `agent` hook kinds
 (recognised, skipped, warned). Claude's `onFailure` knob (`continue` / `block`),
 `args`/exec form, `if` filters, `once`, `async`/`asyncRewake`, `statusMessage`,
-and per-event output schemas are also absent — the `command` hook protocol here
-is the minimal one, and the fail-closed policy is fixed rather than configurable.
+and per-event output schemas are also absent — the hook protocol here is the
+minimal one, and the fail-closed policy is fixed rather than configurable.

@@ -6,7 +6,7 @@ pub mod engine;
 pub mod events;
 pub mod stop_hook;
 
-pub use engine::{HookConfig, HookInput, HookMatcher, HookRegistry, HookTier, HookType};
+pub use engine::{HookConfig, HookInput, HookMatcher, HookRegistry, HookTier, HookType, HttpHook};
 pub use events::{
     HookAction, HookError, HookEvent, HookPermissionDecision, HookResult, UnknownHookEvent,
 };

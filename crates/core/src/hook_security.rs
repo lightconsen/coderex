@@ -390,6 +390,74 @@ impl EnvInterpolator {
     }
 }
 
+/// The environment variable names a string refers to.
+///
+/// [`EnvInterpolator`] reads whatever a configuration names, so a hook that
+/// interpolates `$ANTHROPIC_API_KEY` into a header sends it wherever the hook
+/// points. This is what lets a caller bound that: collect the names, compare
+/// them against an allowlist, and refuse a configuration that reaches for
+/// something it was not granted.
+///
+/// Recognises both spellings the interpolator does — `$NAME` and `${NAME}` —
+/// and ignores a `$` that is not followed by a name.
+#[must_use]
+pub fn env_var_references(input: &str) -> Vec<String> {
+    let mut names = Vec::new();
+    let mut chars = input.chars().peekable();
+
+    while let Some(ch) = chars.next() {
+        if ch != '$' {
+            continue;
+        }
+        let name = if chars.peek() == Some(&'{') {
+            chars.next();
+            let mut name = String::new();
+            while let Some(c) = chars.next() {
+                if c == '}' {
+                    break;
+                }
+                // A default (`${VAR:-x}`) is not part of the name.
+                if c == ':' && chars.peek() == Some(&'-') {
+                    chars.next();
+                    for rest in chars.by_ref() {
+                        if rest == '}' {
+                            break;
+                        }
+                    }
+                    break;
+                }
+                name.push(c);
+            }
+            name
+        } else {
+            let mut name = String::new();
+            // A name starts with a letter or an underscore, the way an
+            // environment variable does. `$5` is a positional parameter, not a
+            // variable this could ever be granted, and reading it as one would
+            // refuse a configuration over a shell idiom.
+            while let Some(&c) = chars.peek() {
+                let acceptable = if name.is_empty() {
+                    c.is_ascii_alphabetic() || c == '_'
+                } else {
+                    c.is_ascii_alphanumeric() || c == '_'
+                };
+                if !acceptable {
+                    break;
+                }
+                name.push(c);
+                chars.next();
+            }
+            name
+        };
+
+        if !name.is_empty() && !names.contains(&name) {
+            names.push(name);
+        }
+    }
+
+    names
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -537,5 +605,44 @@ mod tests {
             EnvInterpolator::interpolate("no variables here").unwrap(),
             "no variables here"
         );
+    }
+
+    #[test]
+    fn references_finds_both_spellings() {
+        assert_eq!(
+            env_var_references("Bearer $TOKEN"),
+            vec!["TOKEN".to_string()]
+        );
+        assert_eq!(
+            env_var_references("Bearer ${TOKEN}"),
+            vec!["TOKEN".to_string()]
+        );
+        assert_eq!(
+            env_var_references("$A-${b_2}"),
+            vec!["A".to_string(), "b_2".to_string()]
+        );
+    }
+
+    /// A `${VAR:-default}` reference is a reference to `VAR`, not to `default`.
+    #[test]
+    fn references_ignores_the_default_of_a_reference() {
+        assert_eq!(
+            env_var_references("${REGION:-us-east-1}"),
+            vec!["REGION".to_string()]
+        );
+    }
+
+    #[test]
+    fn references_reports_a_name_once() {
+        assert_eq!(
+            env_var_references("$TOKEN ${TOKEN}"),
+            vec!["TOKEN".to_string()]
+        );
+    }
+
+    #[test]
+    fn references_ignores_a_bare_dollar() {
+        assert!(env_var_references("cost is $5 and $ alone").is_empty());
+        assert!(env_var_references("no variables").is_empty());
     }
 }

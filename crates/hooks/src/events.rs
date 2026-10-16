@@ -270,6 +270,18 @@ pub enum HookError {
     /// The hook's output could not be parsed as a hook result.
     #[error("hook output could not be parsed: {0}")]
     UnparseableOutput(String),
+    /// Invalid configuration for an `http` hook.
+    #[error("invalid http hook: {0}")]
+    InvalidHttpHook(String),
+    /// The hook's HTTP request did not complete.
+    #[error("hook request failed: {0}")]
+    RequestFailed(String),
+    /// The hook's endpoint answered with a status that is not a success.
+    ///
+    /// A redirect counts here: the body is the conversation, so following one
+    /// would send it to a destination the configuration did not name.
+    #[error("hook endpoint answered {0}")]
+    HttpStatus(u16),
 }
 
 #[cfg(test)]

@@ -19,6 +19,7 @@ fn config(event: &str, command: &str) -> HookConfig {
         event: event.to_string(),
         kind: HookType::Command,
         command: command.to_string(),
+        http: None,
         env: HashMap::new(),
         cwd: None,
         internal: false,
@@ -37,6 +38,7 @@ fn config_with_env(event: &str, command: &str, env: HashMap<String, String>) -> 
         event: event.to_string(),
         kind: HookType::Command,
         command: command.to_string(),
+        http: None,
         env,
         cwd: None,
         internal: false,
@@ -564,4 +566,266 @@ async fn hook_unparseable_stdout_is_a_failure() {
         results[0],
         Err(coderex_hooks::HookError::UnparseableOutput(_))
     ));
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  http hooks — the input is POSTed, the response body is the answer
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// A one-request HTTP endpoint.
+///
+/// Serves exactly one request, hands the raw request text to the test, and
+/// answers with a fixed status and body.
+struct TestEndpoint {
+    port: u16,
+    received: std::sync::mpsc::Receiver<String>,
+}
+
+impl TestEndpoint {
+    fn start(status: &str, body: &str) -> Self {
+        use std::io::{Read, Write};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind test endpoint");
+        let port = listener.local_addr().expect("local addr").port();
+        let (tx, received) = std::sync::mpsc::channel();
+        let response = format!(
+            "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+
+        std::thread::spawn(move || {
+            let Ok((mut stream, _)) = listener.accept() else {
+                return;
+            };
+            let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(5)));
+
+            let mut raw = Vec::new();
+            let mut chunk = [0_u8; 1024];
+            // Reading stops on the read timeout once the body is in, so a
+            // request without a Content-Length still gets collected whole.
+            while let Ok(n) = stream.read(&mut chunk) {
+                if n == 0 {
+                    break;
+                }
+                raw.extend_from_slice(&chunk[..n]);
+                let Some(head) = find_header_end(&raw) else {
+                    continue;
+                };
+                let headers = String::from_utf8_lossy(&raw[..head]).to_string();
+                if raw.len() >= head + 4 + content_length(&headers) {
+                    break;
+                }
+            }
+
+            let _ = tx.send(String::from_utf8_lossy(&raw).to_string());
+            let _ = stream.write_all(response.as_bytes());
+            let _ = stream.flush();
+        });
+
+        Self { port, received }
+    }
+
+    fn url(&self, path: &str) -> String {
+        format!("http://127.0.0.1:{}{path}", self.port)
+    }
+
+    /// The request the hook sent, waiting for it to arrive.
+    fn request(&self) -> String {
+        self.received
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("the hook should have sent a request")
+    }
+}
+
+fn find_header_end(raw: &[u8]) -> Option<usize> {
+    raw.windows(4).position(|w| w == b"\r\n\r\n")
+}
+
+fn content_length(headers: &str) -> usize {
+    headers
+        .lines()
+        .find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            name.eq_ignore_ascii_case("content-length")
+                .then(|| value.trim().parse().ok())?
+        })
+        .unwrap_or(0)
+}
+
+fn http_config(event: &str, url: &str) -> HookConfig {
+    http_config_with(event, url, HashMap::new(), Vec::new())
+}
+
+fn http_config_with(
+    event: &str,
+    url: &str,
+    headers: HashMap<String, String>,
+    allowed_env_vars: Vec<String>,
+) -> HookConfig {
+    HookConfig {
+        event: event.to_string(),
+        kind: HookType::Http,
+        command: String::new(),
+        http: Some(coderex_hooks::HttpHook {
+            url: url.to_string(),
+            headers,
+            allowed_env_vars,
+            block_private_hosts: false,
+        }),
+        env: HashMap::new(),
+        cwd: None,
+        internal: false,
+        timeout_ms: 5000,
+        priority: 0,
+        dry_run: false,
+        max_cpu_seconds: None,
+        max_memory_mb: None,
+        max_file_size_mb: None,
+        tier: HookTier::Core,
+    }
+}
+
+#[tokio::test]
+async fn an_http_hook_posts_its_input_and_continues() {
+    let endpoint = TestEndpoint::start("200 OK", r#"{"action":"continue"}"#);
+    let mut registry = HookRegistry::new();
+    registry.register(http_config("PreToolUse", &endpoint.url("/hook")));
+
+    let result = registry
+        .fire_hook("PreToolUse", "Bash", &HashMap::new())
+        .await;
+
+    assert!(!result.stop, "a continue answer must not stop the tool");
+    assert!(result.errors.is_empty(), "{:?}", result.errors);
+
+    let request = endpoint.request();
+    assert!(request.starts_with("POST /hook"), "{request}");
+    assert!(
+        request.contains("PreToolUse"),
+        "the hook input was not posted: {request}"
+    );
+}
+
+#[tokio::test]
+async fn an_http_hook_that_answers_stop_stops_a_gating_event() {
+    let endpoint = TestEndpoint::start("200 OK", r#"{"action":"stop"}"#);
+    let mut registry = HookRegistry::new();
+    registry.register(http_config("PreToolUse", &endpoint.url("/hook")));
+
+    let result = registry
+        .fire_hook("PreToolUse", "Bash", &HashMap::new())
+        .await;
+
+    assert!(result.stop, "an endpoint that said stop was ignored");
+    assert!(
+        !endpoint.request().is_empty(),
+        "the hook never reached the endpoint, so this test proves nothing about the answer"
+    );
+}
+
+/// A status that is not a success is a hook that did not answer, and a gating
+/// event denies on that.
+#[tokio::test]
+async fn an_http_hook_endpoint_that_fails_denies() {
+    let endpoint = TestEndpoint::start("500 Internal Server Error", "boom");
+    let mut registry = HookRegistry::new();
+    registry.register(http_config("PreToolUse", &endpoint.url("/hook")));
+
+    let result = registry
+        .fire_hook("PreToolUse", "Bash", &HashMap::new())
+        .await;
+
+    assert!(result.stop, "a 500 was read as an allow");
+    assert!(!result.errors.is_empty());
+    assert!(
+        !endpoint.request().is_empty(),
+        "the hook never reached the endpoint, so this test proves nothing about the answer"
+    );
+}
+
+#[tokio::test]
+async fn an_http_hook_that_says_nothing_denies() {
+    let endpoint = TestEndpoint::start("200 OK", "");
+    let mut registry = HookRegistry::new();
+    registry.register(http_config("PreToolUse", &endpoint.url("/hook")));
+
+    let result = registry
+        .fire_hook("PreToolUse", "Bash", &HashMap::new())
+        .await;
+
+    assert!(result.stop, "an empty body was read as an allow");
+    assert!(
+        !endpoint.request().is_empty(),
+        "the hook never reached the endpoint, so this test proves nothing about the answer"
+    );
+}
+
+#[tokio::test]
+async fn an_http_hook_that_answers_nonsense_denies() {
+    let endpoint = TestEndpoint::start("200 OK", "not json at all");
+    let mut registry = HookRegistry::new();
+    registry.register(http_config("PreToolUse", &endpoint.url("/hook")));
+
+    let result = registry
+        .fire_hook("PreToolUse", "Bash", &HashMap::new())
+        .await;
+
+    assert!(result.stop, "unparseable body was read as an allow");
+    assert!(
+        !endpoint.request().is_empty(),
+        "the hook never reached the endpoint, so this test proves nothing about the answer"
+    );
+}
+
+/// A redirect is a second destination the configuration did not name, and the
+/// body is the conversation — so it is a failure, not something to follow.
+#[tokio::test]
+async fn an_http_hook_redirect_is_a_failure() {
+    let endpoint = TestEndpoint::start(
+        "302 Found",
+        "",
+    );
+    let mut registry = HookRegistry::new();
+    // The endpoint answers 302; if the client followed redirects it would look
+    // for a Location target and hang instead of failing.
+    registry.register(http_config("PreToolUse", &endpoint.url("/hook")));
+
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        registry.fire_hook("PreToolUse", "Bash", &HashMap::new()),
+    )
+    .await
+    .expect("the hook should fail rather than follow the redirect");
+
+    assert!(result.stop);
+    let _ = endpoint.request();
+}
+
+#[tokio::test]
+async fn an_http_hook_sends_a_header_it_was_granted() {
+    let endpoint = TestEndpoint::start("200 OK", r#"{"action":"continue"}"#);
+    let mut registry = HookRegistry::new();
+    let mut headers = HashMap::new();
+    headers.insert(
+        "authorization".to_string(),
+        "Bearer ${PATH}".to_string(),
+    );
+    registry.register(http_config_with(
+        "PreToolUse",
+        &endpoint.url("/hook"),
+        headers,
+        vec!["PATH".to_string()],
+    ));
+
+    let result = registry
+        .fire_hook("PreToolUse", "Bash", &HashMap::new())
+        .await;
+    assert!(!result.stop, "{:?}", result.errors);
+
+    let request = endpoint.request();
+    let path = std::env::var("PATH").unwrap_or_default();
+    assert!(
+        request.contains(&format!("authorization: Bearer {path}")),
+        "the granted variable was not interpolated: {request}"
+    );
 }

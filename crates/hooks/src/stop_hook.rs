@@ -145,6 +145,7 @@ mod tests {
             event: "Stop".to_string(),
             kind: HookType::Command,
             command: "exit 1".to_string(),
+            http: None,
             env: HashMap::new(),
             cwd: None,
             internal: false,

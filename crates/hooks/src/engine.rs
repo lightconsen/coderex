@@ -71,6 +71,64 @@ impl HookType {
     }
 }
 
+/// The target of an `http` hook.
+///
+/// The hook input is POSTed to [`url`](Self::url), and the response body is
+/// read as the hook's answer — the same JSON a `command` hook prints on stdout.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HttpHook {
+    /// Where the hook input is POSTed.
+    ///
+    /// Only an absolute `http`/`https` URL: the body is the conversation, so
+    /// the destination has to be named outright rather than resolved through a
+    /// relative path or a scheme that points at a local file.
+    pub url: String,
+    /// Extra request headers.
+    ///
+    /// A value may reference an environment variable as `$NAME` or `${NAME}`,
+    /// but only a name [`allowed_env_vars`](Self::allowed_env_vars) grants.
+    #[serde(default)]
+    pub headers: HashMap<String, String>,
+    /// The environment variables a header value may reference.
+    ///
+    /// A configuration that references anything else is refused at load, so a
+    /// hook cannot read out a variable simply by naming it.
+    #[serde(default)]
+    pub allowed_env_vars: Vec<String>,
+    /// Refuse an endpoint whose host resolves to localhost or a private range.
+    ///
+    /// Off by default: a local hook endpoint is an ordinary thing to want. On,
+    /// it stops a configuration from reaching a cloud metadata service or an
+    /// internal host through the hook's request.
+    #[serde(default)]
+    pub block_private_hosts: bool,
+}
+
+impl HttpHook {
+    /// Check the URL and the header references.
+    ///
+    /// # Errors
+    ///
+    /// Returns the reason the hook cannot be used as configured.
+    pub fn validate(&self) -> Result<(), HookError> {
+        coderex_core::hook_security::UrlValidator::new()
+            .validate(&self.url)
+            .map_err(|e| HookError::InvalidHttpHook(e.to_string()))?;
+
+        for (header, value) in &self.headers {
+            for name in coderex_core::hook_security::env_var_references(value) {
+                if !self.allowed_env_vars.contains(&name) {
+                    return Err(HookError::InvalidHttpHook(format!(
+                        "header '{header}' references ${name}, which is not in allowedEnvVars"
+                    )));
+                }
+            }
+        }
+
+        Ok(())
+    }
+}
+
 /// Configuration for a single hook.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HookConfig {
@@ -83,7 +141,14 @@ pub struct HookConfig {
     #[serde(rename = "type", default)]
     pub kind: HookType,
     /// Command to execute (required for [`HookType::Command`]).
+    ///
+    /// Empty for an [`HookType::Http`] hook — the loader fills in exactly one
+    /// of the two targets per kind. [`label`](Self::label) is what a log line
+    /// should use.
     pub command: String,
+    /// Where an `http` hook sends its input (required for [`HookType::Http`]).
+    #[serde(default)]
+    pub http: Option<HttpHook>,
     /// Optional environment variables to inject.
     #[serde(default)]
     pub env: HashMap<String, String>,
@@ -121,6 +186,21 @@ pub struct HookConfig {
 
 const fn default_timeout() -> u64 {
     5000
+}
+
+impl HookConfig {
+    /// What this hook should be called in a log line.
+    ///
+    /// A hook names itself by its command or, for an `http` hook, by the URL it
+    /// posts to — `command` is empty for the latter, and a log line reading
+    /// `hook_command=""` says nothing about which hook ran.
+    #[must_use]
+    pub fn label(&self) -> &str {
+        match self.http.as_ref() {
+            Some(http) => &http.url,
+            None => &self.command,
+        }
+    }
 }
 
 /// Build a shell command wrapper that applies resource limits via `ulimit`.
@@ -199,6 +279,18 @@ pub struct RawHookConfig {
     /// Command to run (required for the `command` kind).
     #[serde(default)]
     pub command: Option<String>,
+    /// Where to POST the hook input (required for the `http` kind).
+    #[serde(default)]
+    pub url: Option<String>,
+    /// Extra request headers for an `http` hook.
+    #[serde(default)]
+    pub headers: Option<HashMap<String, String>>,
+    /// The environment variables a header value may reference.
+    #[serde(rename = "allowedEnvVars", default)]
+    pub allowed_env_vars: Option<Vec<String>>,
+    /// Refuse an `http` endpoint on localhost or a private range.
+    #[serde(default)]
+    pub block_private_hosts: Option<bool>,
     /// Environment variables to inject.
     #[serde(default)]
     pub env: Option<HashMap<String, String>>,
@@ -304,6 +396,38 @@ impl HookRegistry {
                         event: raw.event,
                         kind: HookType::Command,
                         command,
+                        http: None,
+                        env: raw.env.unwrap_or_default(),
+                        cwd: raw.cwd,
+                        internal: raw.internal.unwrap_or(false),
+                        timeout_ms: raw.timeout_ms.unwrap_or_else(default_timeout),
+                        priority: raw.priority.unwrap_or(0),
+                        dry_run: raw.dry_run.unwrap_or(false),
+                        max_cpu_seconds: raw.max_cpu_seconds,
+                        max_memory_mb: raw.max_memory_mb,
+                        max_file_size_mb: raw.max_file_size_mb,
+                        tier,
+                    });
+                }
+                HookType::Http => {
+                    let Some(url) = raw.url else {
+                        return Err(HookError::InvalidHttpHook(format!(
+                            "hook for event '{}' is type 'http' but has no 'url' field",
+                            raw.event
+                        )));
+                    };
+                    let http = HttpHook {
+                        url,
+                        headers: raw.headers.unwrap_or_default(),
+                        allowed_env_vars: raw.allowed_env_vars.unwrap_or_default(),
+                        block_private_hosts: raw.block_private_hosts.unwrap_or(false),
+                    };
+                    http.validate()?;
+                    hooks.push(HookConfig {
+                        event: raw.event,
+                        kind: HookType::Http,
+                        command: String::new(),
+                        http: Some(http),
                         env: raw.env.unwrap_or_default(),
                         cwd: raw.cwd,
                         internal: raw.internal.unwrap_or(false),
@@ -320,7 +444,7 @@ impl HookRegistry {
                     hook_type = unsupported.as_str(),
                     event = %raw.event,
                     "hook configured with a type CodeRex does not execute — skipping it; \
-                     only 'command' hooks run"
+                     'command' and 'http' hooks run"
                 ),
             }
         }
@@ -562,26 +686,35 @@ async fn execute_hook_with_timeout(
 
     if hook.dry_run {
         tracing::info!(
-            hook_command = hook.command,
+            hook = hook.label(),
             event = input.event,
             "Hook would execute (dry-run)"
         );
     }
 
     let timeout_ms = hook.timeout_ms;
-    let result = tokio::time::timeout(
-        std::time::Duration::from_millis(timeout_ms),
-        execute_hook(hook, input),
-    )
-    .await
-    .map_or(Err(HookError::Timeout(timeout_ms)), |r| r);
+    let execution = async {
+        match hook.kind {
+            HookType::Command => execute_hook(hook, input).await,
+            HookType::Http => execute_http_hook(hook, input).await,
+            // The loader refuses these, so this is only reachable for a
+            // `HookConfig` built by hand.
+            other => Err(HookError::InvalidCommand(format!(
+                "hook type '{}' is not executable",
+                other.as_str()
+            ))),
+        }
+    };
+    let result = tokio::time::timeout(std::time::Duration::from_millis(timeout_ms), execution)
+        .await
+        .map_or(Err(HookError::Timeout(timeout_ms)), |r| r);
 
     let elapsed = start.elapsed();
 
     match &result {
         Ok(exec_result) => {
             tracing::info!(
-                hook_command = hook.command,
+                hook = hook.label(),
                 event = input.event,
                 duration_ms = elapsed.as_millis(),
                 exit_code = exec_result.exit_code,
@@ -591,7 +724,7 @@ async fn execute_hook_with_timeout(
         }
         Err(e) => {
             tracing::warn!(
-                hook_command = hook.command,
+                hook = hook.label(),
                 event = input.event,
                 duration_ms = elapsed.as_millis(),
                 error = ?e,
@@ -652,7 +785,7 @@ async fn execute_hook(
         if let Err(e) = &write {
             if e.kind() == std::io::ErrorKind::BrokenPipe {
                 tracing::debug!(
-                    hook_command = hook.command,
+                    hook = hook.label(),
                     event = input.event,
                     "hook closed stdin without reading its input"
                 );
@@ -690,6 +823,70 @@ async fn execute_hook(
         stdout,
         stderr,
         exit_code,
+    })
+}
+
+/// POST a hook's input to its endpoint and read the answer from the body.
+///
+/// The failure rules are the command hook's rules, one for one: a request that
+/// does not complete, a status that is not a success, an empty body, and a body
+/// that is not a hook result are all failures, and a failure is what a gating
+/// event denies on.
+async fn execute_http_hook(
+    hook: &HookConfig,
+    input: &HookInput,
+) -> Result<HookExecutionResult, HookError> {
+    let Some(http) = hook.http.as_ref() else {
+        return Err(HookError::InvalidHttpHook(
+            "no url configured for an http hook".to_string(),
+        ));
+    };
+
+    if http.block_private_hosts {
+        coderex_core::hook_security::SsrfGuard::guard(&http.url)
+            .map_err(|e| HookError::InvalidHttpHook(e.to_string()))?;
+    }
+
+    let client = reqwest::Client::builder()
+        // The body is the conversation. A redirect would hand it to a
+        // destination the configuration did not name, so a 3xx is a failure
+        // rather than something to follow.
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .map_err(|e| HookError::RequestFailed(e.to_string()))?;
+
+    let mut request = client.post(&http.url).json(input);
+    for (name, value) in &http.headers {
+        let value = coderex_core::hook_security::EnvInterpolator::interpolate(value)
+            .map_err(|e| HookError::RequestFailed(format!("header '{name}': {e}")))?;
+        request = request.header(name, value);
+    }
+
+    let response = request
+        .send()
+        .await
+        .map_err(|e| HookError::RequestFailed(e.to_string()))?;
+
+    let status = response.status();
+    if !status.is_success() {
+        return Err(HookError::HttpStatus(status.as_u16()));
+    }
+
+    let body = response
+        .text()
+        .await
+        .map_err(|e| HookError::RequestFailed(e.to_string()))?;
+    if body.trim().is_empty() {
+        return Err(HookError::NoOutput);
+    }
+    let hook_result =
+        parse_hook_output(&body).map_err(|e| HookError::UnparseableOutput(e.to_string()))?;
+
+    Ok(HookExecutionResult {
+        hook_result,
+        stdout: body,
+        stderr: String::new(),
+        exit_code: 0,
     })
 }
 
@@ -831,11 +1028,9 @@ mod tests {
     #[test]
     fn hook_registry_starts_empty() {
         let registry = HookRegistry::new();
-        assert!(
-            registry
-                .matches_for_event(&HookEvent::SessionStart)
-                .is_empty()
-        );
+        assert!(registry
+            .matches_for_event(&HookEvent::SessionStart)
+            .is_empty());
     }
 
     #[test]
@@ -846,6 +1041,7 @@ mod tests {
             kind: HookType::Command,
             tier: HookTier::Core,
             command: "echo hello".to_string(),
+            http: None,
             env: HashMap::new(),
             cwd: None,
             internal: false,
@@ -870,6 +1066,7 @@ mod tests {
             kind: HookType::Command,
             tier: HookTier::Core,
             command: "echo all".to_string(),
+            http: None,
             env: HashMap::new(),
             cwd: None,
             internal: false,
@@ -919,11 +1116,9 @@ mod tests {
     #[test]
     fn load_from_settings_null_returns_empty() {
         let registry = HookRegistry::load_from_settings(&serde_json::Value::Null).unwrap();
-        assert!(
-            registry
-                .matches_for_event(&HookEvent::SessionStart)
-                .is_empty()
-        );
+        assert!(registry
+            .matches_for_event(&HookEvent::SessionStart)
+            .is_empty());
     }
 
     #[test]
@@ -997,6 +1192,7 @@ mod tests {
             kind: HookType::Command,
             tier: HookTier::Core,
             command: "echo".to_string(),
+            http: None,
             env: HashMap::new(),
             cwd: None,
             internal: false,
@@ -1012,6 +1208,7 @@ mod tests {
             kind: HookType::Command,
             tier: HookTier::Core,
             command: "echo all".to_string(),
+            http: None,
             env: HashMap::new(),
             cwd: None,
             internal: false,
@@ -1042,6 +1239,7 @@ mod tests {
             kind: HookType::Command,
             tier: HookTier::Core,
             command: "echo".to_string(),
+            http: None,
             env: [("MY_VAR".to_string(), "my_val".to_string())]
                 .into_iter()
                 .collect(),
@@ -1095,6 +1293,7 @@ mod tests {
             kind: HookType::Command,
             tier: HookTier::Core,
             command: r#"echo '{"action":"continue"}'"#.to_string(),
+            http: None,
             env: HashMap::new(),
             cwd: None,
             internal: false,
@@ -1125,6 +1324,7 @@ mod tests {
             kind: HookType::Command,
             tier: HookTier::Core,
             command: "echo hello".to_string(),
+            http: None,
             env: HashMap::new(),
             cwd: None,
             internal: false,
@@ -1152,6 +1352,7 @@ mod tests {
             kind: HookType::Command,
             tier: HookTier::Core,
             command: "sleep 10".to_string(),
+            http: None,
             env: HashMap::new(),
             cwd: None,
             internal: false,
@@ -1179,6 +1380,7 @@ mod tests {
             kind: HookType::Command,
             tier: HookTier::Core,
             command: "echo test".to_string(),
+            http: None,
             env: HashMap::new(),
             cwd: None,
             internal: false,
@@ -1199,6 +1401,7 @@ mod tests {
             kind: HookType::Command,
             tier: HookTier::Core,
             command: "echo test".to_string(),
+            http: None,
             env: HashMap::new(),
             cwd: None,
             internal: false,
@@ -1222,6 +1425,7 @@ mod tests {
             event: event.to_string(),
             kind: HookType::Command,
             command: command.to_string(),
+            http: None,
             env: HashMap::new(),
             cwd: None,
             internal: false,
@@ -1318,8 +1522,9 @@ mod tests {
     fn unsupported_hook_type_is_skipped_not_run() {
         let value = serde_json::json!({
             "hooks": [
-                { "event": "PreToolUse", "type": "http", "url": "https://example.test" },
                 { "event": "PreToolUse", "type": "prompt", "prompt": "is this ok?" },
+                { "event": "PreToolUse", "type": "mcp_tool", "server": "s", "tool": "t" },
+                { "event": "PreToolUse", "type": "agent", "prompt": "verify" },
                 { "event": "PreToolUse", "command": "echo hi" }
             ]
         });
@@ -1327,6 +1532,76 @@ mod tests {
         let matches = registry.matches_for_event(&HookEvent::PreToolUse);
         assert_eq!(matches.len(), 1);
         assert_eq!(matches[0].command, "echo hi");
+    }
+
+    /// An `http` hook loads, and names itself by its URL.
+    #[test]
+    fn an_http_hook_loads_and_labels_itself_by_url() {
+        let value = serde_json::json!({
+            "hooks": [{ "event": "PreToolUse", "type": "http", "url": "https://example.test/hook" }]
+        });
+        let registry = HookRegistry::load_from_settings(&value).unwrap();
+        let matches = registry.matches_for_event(&HookEvent::PreToolUse);
+
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].kind, HookType::Http);
+        assert_eq!(matches[0].label(), "https://example.test/hook");
+    }
+
+    #[test]
+    fn http_hook_without_a_url_is_a_config_error() {
+        let value = serde_json::json!({
+            "hooks": [{ "event": "PreToolUse", "type": "http" }]
+        });
+        assert!(HookRegistry::load_from_settings(&value).is_err());
+    }
+
+    /// The body is the conversation, so the destination has to be absolute and
+    /// speak http(s) — not a relative path, and not a scheme that reads a file.
+    #[test]
+    fn http_hook_url_must_be_absolute_http() {
+        for url in [
+            "/hook",
+            "example.test/hook",
+            "file:///etc/hosts",
+            "ftp://example.test/hook",
+        ] {
+            let value = serde_json::json!({
+                "hooks": [{ "event": "PreToolUse", "type": "http", "url": url }]
+            });
+            assert!(
+                HookRegistry::load_from_settings(&value).is_err(),
+                "{url} should not be accepted as a hook endpoint"
+            );
+        }
+    }
+
+    /// A header may only read a variable the configuration granted it.
+    #[test]
+    fn http_hook_header_cannot_reference_an_ungranted_variable() {
+        let refused = serde_json::json!({
+            "hooks": [{
+                "event": "PreToolUse",
+                "type": "http",
+                "url": "https://example.test/hook",
+                "headers": { "authorization": "Bearer $ANTHROPIC_API_KEY" }
+            }]
+        });
+        assert!(
+            HookRegistry::load_from_settings(&refused).is_err(),
+            "a header read a variable that allowedEnvVars did not grant"
+        );
+
+        let granted = serde_json::json!({
+            "hooks": [{
+                "event": "PreToolUse",
+                "type": "http",
+                "url": "https://example.test/hook",
+                "headers": { "authorization": "Bearer $HOOK_TOKEN" },
+                "allowedEnvVars": ["HOOK_TOKEN"]
+            }]
+        });
+        assert!(HookRegistry::load_from_settings(&granted).is_ok());
     }
 
     #[test]
