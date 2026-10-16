@@ -44,7 +44,6 @@ coderex-plugins = { path = "../plugins" }
 coderex-bridge = { path = "../bridge" }
 coderex-server = { path = "../server" }
 coderex-ui = { path = "../ui" }
-coderex-events = { path = "../events" }
 coderex-config = { path = "../config" }
 notify = { version = "7", optional = true }
 coderex-telemetry = { path = "../telemetry" }
