@@ -499,6 +499,45 @@ async fn a_disconnect_stops_the_query_that_was_running() {
     );
 }
 
+/// The session store must not hold the key that opened the session: the file
+/// gets backed up and synced, and a working credential for this daemon in it
+/// is a leak that outlives the process.
+#[tokio::test]
+async fn the_session_store_never_holds_the_key() {
+    let db = std::env::temp_dir().join(format!("coderex_store_{}.db", std::process::id()));
+    let _ = std::fs::remove_file(&db);
+
+    let config = ServerConfig {
+        valid_keys: vec!["the-actual-key".into()],
+        idle_timeout: Duration::from_secs(3600),
+        max_sessions: 10,
+        rate_limit_per_minute: 100,
+        health_port: None,
+        persist_path: Some(db.clone()),
+        allow_anonymous: false,
+    };
+    let addr = start_server(config).await;
+    let mut ws = ws_connect(addr).await;
+    let _sid = ws_auth(&mut ws, "the-actual-key").await;
+    ws.close(None).await.unwrap();
+
+    // The write happens on the connection's thread; give it a moment.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let bytes = std::fs::read(&db).expect("the store was written");
+    let text = String::from_utf8_lossy(&bytes);
+    assert!(
+        !text.contains("the-actual-key"),
+        "the key that opened the session is in the store file"
+    );
+    assert!(
+        text.contains("sess_"),
+        "the session was not persisted at all"
+    );
+
+    let _ = std::fs::remove_file(&db);
+}
+
 #[tokio::test]
 async fn a_query_without_an_engine_is_refused_rather_than_echoed() {
     let config = ServerConfig {

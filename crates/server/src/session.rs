@@ -345,10 +345,13 @@ impl DaemonServer {
         };
         self.sessions.insert(id.clone(), session);
 
-        // Persist to SQLite if configured
+        // Persist to SQLite if configured. What reaches the file is a
+        // fingerprint of the key, not the key: the row only has to say which
+        // key opened the session.
         if let Some(ref mut store) = self.store {
             let sess = self.sessions.get(&id).unwrap();
-            let ps = crate::persistence::persist_session(sess);
+            let fingerprint = store.fingerprint(&sess.auth_token);
+            let ps = crate::persistence::persist_session(sess, fingerprint);
             if let Err(e) = store.save(&ps) {
                 warn!("Failed to persist session {id}: {e}");
             }
