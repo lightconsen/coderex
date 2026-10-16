@@ -201,6 +201,63 @@ fn permission_request_args(arguments: &str) -> serde_json::Value {
     serde_json::from_str(arguments).unwrap_or_else(|_| serde_json::Value::String(arguments.into()))
 }
 
+/// Translate one engine event into a frame of the line-delimited protocol.
+///
+/// `None` for events that are this process's own business — a permission dialog
+/// the host cannot answer, an elevation request — rather than something a
+/// consumer outside the process acts on. The protocol is what a host reads to
+/// follow the conversation, not a mirror of everything the UI does.
+fn protocol_frame(
+    event: &EngineEvent,
+    session_id: &str,
+) -> Option<coderex_events::ProtocolMessage> {
+    use coderex_events::{protocol, AssistantFrame, MessageBody, ProtocolMessage, SystemFrame, UserFrame};
+
+    Some(match event {
+        // One frame per delta, as the reference streams them.
+        EngineEvent::TextDelta(text) => ProtocolMessage::StreamEvent(protocol::StreamEventFrame {
+            event: serde_json::json!({
+                "type": "content_block_delta",
+                "delta": { "type": "text_delta", "text": text },
+            }),
+            parent_tool_use_id: None,
+            session_id: session_id.to_string(),
+        }),
+        EngineEvent::ToolCallStart { id, name, summary } => {
+            ProtocolMessage::Assistant(AssistantFrame {
+                message: MessageBody::assistant(vec![protocol::tool_use_block(
+                    id,
+                    name,
+                    serde_json::json!({ "summary": summary }),
+                )]),
+                parent_tool_use_id: None,
+                session_id: session_id.to_string(),
+            })
+        }
+        EngineEvent::ToolCallEnd { id, result } => ProtocolMessage::User(UserFrame {
+            // The tool result is a user-side message in the protocol: it is
+            // what the model is sent back, and the host needs to see it there.
+            message: MessageBody::user(vec![protocol::tool_result_block(id, &result.output)]),
+            parent_tool_use_id: None,
+            session_id: session_id.to_string(),
+        }),
+        EngineEvent::CompactBoundary => ProtocolMessage::System(SystemFrame {
+            subtype: "compact_boundary".to_string(),
+            session_id: session_id.to_string(),
+            data: serde_json::Map::new(),
+        }),
+        EngineEvent::Notification { message } => ProtocolMessage::System(SystemFrame {
+            subtype: "informational".to_string(),
+            session_id: session_id.to_string(),
+            data: serde_json::Map::from_iter([(
+                "message".to_string(),
+                serde_json::Value::String(message.clone()),
+            )]),
+        }),
+        _ => return None,
+    })
+}
+
 fn sync_permission_overlay(
     ui_state: &mut coderex_ui::state::UiState,
     tool: &str,
@@ -558,6 +615,13 @@ pub struct ReplLoop {
     /// Lifecycle hooks from settings, installed on the engine by
     /// [`apply_cli_config`](Self::apply_cli_config).
     hooks_settings: Option<serde_json::Value>,
+    /// Where the line-delimited protocol goes, when `--output-format
+    /// stream-json` was asked for.
+    ///
+    /// One writer, one consumer outside the process — not a bus. The writer is
+    /// boxed rather than pinned to `Stdout` so a test can read back what a turn
+    /// emitted.
+    protocol_sink: Option<coderex_events::MessageSink<Box<dyn std::io::Write + Send>>>,
     /// Pending destructive command awaiting confirmation.
     pending_destructive_cmd: Option<(String, Vec<String>)>,
     /// Plugin manager for dynamic plugin commands and tools.
@@ -732,6 +796,7 @@ impl ReplLoop {
             command_history: CommandHistory::new(1000),
             macro_registry: MacroRegistry::new(),
             hooks_settings: None,
+            protocol_sink: None,
             pending_destructive_cmd: None,
             plugin_manager: None,
             _primary_tool_executor: None,
@@ -900,20 +965,17 @@ impl ReplLoop {
             .with_root(coderex_workflow::default_root())
             .with_project_dir(std::path::Path::new(&cwd).join(".coderex/workflows")),
         ));
-        // Rule exemptions are deliberately NOT installed here.
-        //
-        // `Agent` and `Workflow` declare that they ignore whole-tool allow
-        // rules, and installing that makes the fallback "ask" — so every
-        // delegation would prompt, in every mode, even though the subagent's
-        // own tool calls are gated by this same checker anyway. The prompt
-        // would be redundant. `coderex_tools::install_rule_exemptions` exists
-        // for a session that wants that policy; this one does not.
         for tool in
             crate::memory_tools::memory_tools(Arc::clone(&memory_service), &memory_writable)
         {
             registry.register(tool);
         }
+        // A tool's declared exemptions are a property of the *call*, not the
+        // tool — the Artifact family refuses a whole-tool allow rule for a
+        // publish and honours it for a read — so the engine asks the registry
+        // per call rather than being handed a table up front.
         let registry = Arc::new(registry);
+        coderex_tools::install_rule_exemptions(engine.permission_engine_mut(), &registry);
         let inner_executor = Arc::new(ToolsExecutor::new(ExecutionConfig::default()));
         let mut dispatcher = RegistryToolDispatcher::new(
             registry,
@@ -990,6 +1052,7 @@ impl ReplLoop {
             command_history: CommandHistory::new(1000),
             macro_registry: MacroRegistry::new(),
             hooks_settings: None,
+            protocol_sink: None,
             pending_destructive_cmd: None,
             plugin_manager: None,
             _primary_tool_executor: Some(primary_executor),
@@ -1159,6 +1222,18 @@ impl ReplLoop {
     /// value that gets loaded onto the engine.
     pub fn with_hooks(&mut self, hooks: Option<serde_json::Value>) {
         self.hooks_settings = hooks;
+    }
+
+    /// Emit the line-delimited protocol on stdout as the turn runs.
+    ///
+    /// This is the `stream-json` output format: one JSON object per line, for a
+    /// host outside the process to read. There is no in-process subscriber to
+    /// hand it to, and there is not meant to be one.
+    pub fn with_protocol_sink(
+        &mut self,
+        sink: Option<coderex_events::MessageSink<Box<dyn std::io::Write + Send>>>,
+    ) {
+        self.protocol_sink = sink;
     }
 
     pub fn with_no_persistence(&mut self, no_persist: bool) {
@@ -1553,6 +1628,42 @@ impl ReplLoop {
         Ok((messages, snapshot))
     }
 
+    /// Report background work the previous session left behind, and settle it.
+    ///
+    /// The reference re-attaches to a job because its jobs are separate
+    /// processes with recorded PIDs. CodeRex's run inside this one, so there is
+    /// nothing to re-attach to; the honest half is to say what was interrupted
+    /// instead of dropping it silently.
+    fn adopt_background_jobs(&self, ui_state: &mut coderex_ui::state::UiState) {
+        let session_id = self
+            .current_session_id()
+            .unwrap_or_else(|| "unknown".to_string());
+        let store = coderex_core::JobStore::new(&self.cwd);
+        let adopted = match coderex_core::adopt_for_session(
+            &store,
+            coderex_core::task::now_ms(),
+            &session_id,
+        ) {
+            Ok(adopted) => adopted,
+            Err(error) => {
+                tracing::warn!("could not read the background job records: {error}");
+                return;
+            }
+        };
+
+        for notification in &adopted.notifications {
+            ui_state
+                .messages
+                .push(coderex_ui::message_list::Message {
+                    role: coderex_ui::message_list::MessageRole::System,
+                    content: notification.text.clone().into(),
+                    tool_name: None,
+                    streaming: false,
+                    folded: false,
+                });
+        }
+    }
+
     fn persist_interactive_snapshot(&self, ui_state: &coderex_ui::state::UiState) {
         if self.no_persistence {
             return;
@@ -1847,6 +1958,16 @@ impl ReplLoop {
                 folded: false,
             });
         }
+
+        // Adopt what the last session left behind.
+        //
+        // A background task runs in this process, so a record that still claims
+        // to be running belongs to a process that is gone: this session cannot
+        // re-attach to it and says so, in the conversation, rather than leaving
+        // a task that looks live and never finishes. A cleanly-exited session
+        // is not aged out, and a record written by another session is left
+        // alone.
+        self.adopt_background_jobs(&mut ui_state);
 
         // Crossterm event channel — read in a blocking thread
         let (ct_tx, mut ct_rx) = tokio::sync::mpsc::unbounded_channel::<crossterm::event::Event>();
@@ -3455,18 +3576,49 @@ impl ReplLoop {
         let mut output = String::new();
         self.drain_events(&mut output);
 
+        // The protocol stream, if this run was asked for one. Taken out of
+        // `self` so the turn can hold it across the loop below without
+        // borrowing the whole REPL.
+        let mut protocol = self.protocol_sink.take();
+        let session_id = self.current_session_id().unwrap_or_default();
+        let turn_started = std::time::Instant::now();
+        // Watched in the loop rather than drained at the end, so the host sees
+        // the turn as it happens instead of all at once when it is over.
+        let mut live_events = self.event_rx.take();
+
         let options = self.build_submit_options();
         let mut engine = self.engine.take().unwrap();
         let prompt_owned = prompt.to_string();
-        let (engine_tx, engine_rx) = tokio::sync::oneshot::channel();
+        // A channel rather than a one-shot: the wait for it happens inside
+        // `select!`, and a one-shot receiver is consumed by its own future —
+        // so a poll that loses to another branch drops the receiver and
+        // cancels the handoff, leaving the engine stranded. `recv()` on a
+        // channel borrows instead, so losing a poll costs nothing.
+        let (engine_tx, mut engine_rx) =
+            tokio::sync::mpsc::channel::<(QueryEngine, Result<TerminalReason, String>)>(1);
         tokio::spawn(async move {
             let result = engine.submit_streaming(prompt_owned, options).await;
-            let _ = engine_tx.send((engine, result));
+            let _ = engine_tx.send((engine, result)).await;
         });
-
-        let mut engine_rx = Some(engine_rx);
         let (engine, result) = loop {
             tokio::select! {
+                Some(event) = async {
+                    match live_events.as_mut() {
+                        Some(rx) => rx.recv().await,
+                        None => std::future::pending().await,
+                    }
+                }, if live_events.is_some() => {
+                    if let Some(sink) = protocol.as_mut() {
+                        if let Some(frame) = protocol_frame(&event, &session_id) {
+                            if let Err(error) = sink.emit(&frame) {
+                                tracing::warn!("could not write a protocol frame: {error}");
+                            }
+                        }
+                    }
+                    if let EngineEvent::TextDelta(delta) = &event {
+                        output.push_str(delta);
+                    }
+                }
                 Some(request) = elicit_rx.recv() => {
                     for (i, q) in request.questions.iter().enumerate() {
                         if let Some(text) = q.get("question").and_then(|v| v.as_str()) {
@@ -3491,15 +3643,54 @@ impl ReplLoop {
                     let answers = serde_json::json!({ "answer": answer });
                     let _ = request.response_tx.send(answers);
                 }
-                Ok((engine, result)) = async { engine_rx.take().unwrap().await }, if engine_rx.is_some() => {
-                    break (engine, result);
-                }
-            }
+                received = engine_rx.recv() => {
+                    match received {
+                        Some(handoff) => break handoff,
+                        // The task is gone and took the engine with it. Say so
+                        // rather than waiting for a handoff that cannot come.
+                        None => {
+                            return "the query task ended without returning its engine".to_string();
+                        }
+                    }
+                }            }
         };
 
         self.engine = Some(engine);
+        self.event_rx = live_events;
 
         self.drain_events(&mut output);
+
+        // One result frame closes the turn: `emit_turn_complete` consumes the
+        // turn guard, so a turn cannot report itself finished twice.
+        if let Some(mut sink) = protocol {
+            let turn = sink.begin_turn();
+            let frame = match &result {
+                Ok(_) => coderex_events::ResultFrame::success(
+                    session_id.clone(),
+                    output.trim(),
+                    u64::try_from(turn_started.elapsed().as_millis()).unwrap_or(u64::MAX),
+                    1,
+                ),
+                Err(error) => {
+                    let mut frame = coderex_events::ResultFrame::error(
+                        session_id.clone(),
+                        coderex_events::protocol::result_subtype::ERROR_DURING_EXECUTION,
+                        u64::try_from(turn_started.elapsed().as_millis()).unwrap_or(u64::MAX),
+                        1,
+                    );
+                    // The reason goes in the detail field, not the discriminant.
+                    frame.data.insert(
+                        "error".to_string(),
+                        serde_json::Value::String(format!("{error}")),
+                    );
+                    frame
+                }
+            };
+            if let Err(error) = turn.emit_turn_complete(frame) {
+                tracing::warn!("could not close the protocol turn: {error}");
+            }
+            self.protocol_sink = Some(sink);
+        }
 
         // Trigger background features on successful turn
         if result.is_ok() {
@@ -5582,6 +5773,133 @@ mod tests {
         assert!(
             input.contains("Hello there"),
             "the hook was not told the prompt it is gating: {input}"
+        );
+    }
+
+    /// The protocol is what a host outside the process reads, so the mapping
+    /// from engine events has to be exactly one frame per thing it cares
+    /// about — and nothing for this process's own dialogs.
+    #[test]
+    fn engine_events_map_to_the_protocol_frames_a_host_reads() {
+        use coderex_events::ProtocolMessage;
+
+        let delta = protocol_frame(&EngineEvent::TextDelta("hello".into()), "s1");
+        let Some(ProtocolMessage::StreamEvent(frame)) = delta else {
+            panic!("a text delta should be a stream_event frame");
+        };
+        assert_eq!(frame.session_id, "s1");
+        assert_eq!(frame.event["delta"]["text"], "hello");
+
+        let start = protocol_frame(
+            &EngineEvent::ToolCallStart {
+                id: "call_1".into(),
+                name: "Read".into(),
+                summary: "Reading src/lib.rs".into(),
+            },
+            "s1",
+        );
+        let Some(ProtocolMessage::Assistant(frame)) = start else {
+            panic!("a tool call start should be an assistant frame");
+        };
+        assert_eq!(frame.message.content[0]["type"], "tool_use");
+        assert_eq!(frame.message.content[0]["name"], "Read");
+
+        let end = protocol_frame(
+            &EngineEvent::ToolCallEnd {
+                id: "call_1".into(),
+                result: ToolResult {
+                    tool_call_id: "call_1".into(),
+                    output: "file contents".into(),
+                    is_error: false,
+                },
+            },
+            "s1",
+        );
+        let Some(ProtocolMessage::User(frame)) = end else {
+            panic!("a tool result is a user-side message in the protocol");
+        };
+        assert_eq!(frame.message.content[0]["type"], "tool_result");
+
+        let boundary = protocol_frame(&EngineEvent::CompactBoundary, "s1");
+        let Some(ProtocolMessage::System(frame)) = boundary else {
+            panic!("a compact boundary should be a system frame");
+        };
+        assert_eq!(frame.subtype, "compact_boundary");
+    }
+
+    /// A shared buffer the sink can write into while the test holds the other
+    /// end, so a turn's stream can be read back.
+    #[derive(Clone, Default)]
+    struct SharedBuffer(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for SharedBuffer {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl SharedBuffer {
+        fn lines(&self) -> Vec<String> {
+            let bytes = self.0.lock().unwrap().clone();
+            String::from_utf8_lossy(&bytes)
+                .lines()
+                .map(ToString::to_string)
+                .collect()
+        }
+    }
+
+    /// The whole point of the format: a host reads one JSON object per line,
+    /// and gets exactly one `result` telling it the turn is over.
+    #[tokio::test]
+    async fn a_headless_turn_writes_one_line_per_frame_and_one_result() {
+        let temp = tempfile::tempdir().unwrap();
+        let buffer = SharedBuffer::default();
+        let mut repl = ReplLoop::with_engine(
+            Box::new(CountingApi::new()),
+            temp.path().to_string_lossy().into_owned(),
+            ModelId::sonnet(),
+        );
+        repl.with_protocol_sink(Some(coderex_events::MessageSink::new(
+            Box::new(buffer.clone()) as Box<dyn std::io::Write + Send>
+        )));
+
+        repl.run_headless("Hello").await.unwrap();
+
+        let lines = buffer.lines();
+        assert!(!lines.is_empty(), "the turn wrote nothing to the stream");
+
+        let mut results = 0;
+        for line in &lines {
+            let parsed: serde_json::Value = serde_json::from_str(line)
+                .unwrap_or_else(|e| panic!("every line must be one JSON object, got {line:?}: {e}"));
+            if parsed["type"] == "result" {
+                results += 1;
+                assert!(parsed["subtype"].is_string(), "a result carries a subtype");
+            }
+        }
+        assert_eq!(results, 1, "a turn must close with exactly one result");
+    }
+
+    /// A dialog this process asks a person is not something a host can act on,
+    /// so it is not in the stream.
+    #[test]
+    fn process_local_events_are_not_protocol_frames() {
+        assert!(protocol_frame(&EngineEvent::SessionEnd, "s1").is_none());
+        assert!(
+            protocol_frame(
+                &EngineEvent::PermissionRequest {
+                    id: "p1".into(),
+                    tool: "Bash".into(),
+                    args: serde_json::json!({}),
+                },
+                "s1",
+            )
+            .is_none()
         );
     }
 

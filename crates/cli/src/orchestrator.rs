@@ -522,8 +522,13 @@ impl StartupOrchestrator {
         if !user_path.exists() && settings.telemetry_enabled.is_none() {
             if let Some(choice) = Self::prompt_telemetry_consent() {
                 settings.telemetry_enabled = Some(choice);
-                // Persist the choice to settings.json
-                let _ = Self::write_user_settings(&user_path, &settings);
+                // Persist the decision on its own. Writing the resolved
+                // settings back would copy everything that went into resolving
+                // them — including whatever a project's `.coderex/settings.json`
+                // contributed, which the repository controls — into the
+                // person's permanent settings as a side effect of answering a
+                // question about telemetry.
+                let _ = Self::write_telemetry_consent(&user_path, choice);
             }
         }
 
@@ -656,15 +661,24 @@ impl StartupOrchestrator {
         Some(choice)
     }
 
-    /// Write user settings to disk, preserving other fields.
-    fn write_user_settings(
+    /// Record the telemetry decision, and nothing else.
+    ///
+    /// The consent gate runs before any settings file exists, so this is what
+    /// creates one. It writes the one field it is answering for: a resolved
+    /// `Settings` snapshot would carry in defaults and project values the
+    /// person never chose.
+    fn write_telemetry_consent(
         path: &std::path::Path,
-        settings: &Settings,
+        enabled: bool,
     ) -> Result<(), std::io::Error> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let json = serde_json::to_string_pretty(settings).unwrap_or_default();
+        let document = serde_json::json!({
+            "config_version": coderex_config::settings::CURRENT_SCHEMA_VERSION,
+            "telemetry_enabled": enabled,
+        });
+        let json = serde_json::to_string_pretty(&document).unwrap_or_default();
         std::fs::write(path, json)
     }
 
@@ -1211,7 +1225,22 @@ impl StartupOrchestrator {
 
         final_prompt.push_str(&user_prompt);
 
+        // `stream-json` is a protocol, not a formatted answer: the turn is
+        // written to stdout as it happens, one JSON object per line, and the
+        // host reads that instead of a printed string. So the sink goes on the
+        // loop before the turn starts, and nothing is echoed after it.
+        let streaming_protocol = self.ctx.output_format == "stream-json";
+        if streaming_protocol {
+            repl.with_protocol_sink(Some(coderex_events::MessageSink::new(
+                Box::new(std::io::stdout()) as Box<dyn std::io::Write + Send>
+            )));
+        }
+
         let result = repl.run_headless(&final_prompt).await?;
+
+        if streaming_protocol {
+            return Ok(());
+        }
 
         // Apply output formatting
         let formatted = self.format_headless_output(&result);
@@ -1234,6 +1263,17 @@ impl StartupOrchestrator {
                 "model": self.ctx.model.as_ref().map(|m| m.0.clone()),
             });
             return json_obj.to_string();
+        }
+
+        if self.ctx.output_format == "stream-json" {
+            // The protocol has already been written by the time this runs; the
+            // caller returns before reaching here. Reaching it would mean the
+            // sink was never installed, and printing the answer as text on top
+            // of a half-written stream would corrupt it.
+            tracing::warn!(
+                "stream-json was requested but no protocol sink was installed; no output was written"
+            );
+            return String::new();
         }
 
         output
