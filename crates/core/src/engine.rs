@@ -382,6 +382,75 @@ pub enum TurnState {
 }
 
 impl TurnState {
+    /// The name of this state, for logs.
+    #[must_use]
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            Self::Initialize => "initialize",
+            Self::BuildContext => "build_context",
+            Self::RunPreSubmitHooks => "run_pre_submit_hooks",
+            Self::StartRequest => "start_request",
+            Self::StreamAssistant => "stream_assistant",
+            Self::ExecuteTools => "execute_tools",
+            Self::AwaitPermission => "await_permission",
+            Self::AwaitElicitation => "await_elicitation",
+            Self::ApplyToolResults => "apply_tool_results",
+            Self::EvaluateContinuation => "evaluate_continuation",
+            Self::CompactRecovery => "compact_recovery",
+            Self::StopHooks => "stop_hooks",
+            Self::Finalize => "finalize",
+            Self::Terminated => "terminated",
+        }
+    }
+
+    /// Whether this state may be followed by `next`.
+    ///
+    /// The graph is what a turn actually does:
+    ///
+    /// ```text
+    /// Initialize → BuildContext → RunPreSubmitHooks → StartRequest → StreamAssistant
+    /// StreamAssistant → ExecuteTools → ApplyToolResults → EvaluateContinuation
+    /// StreamAssistant → EvaluateContinuation            (no tools to run)
+    /// EvaluateContinuation → CompactRecovery → StartRequest   (context too large)
+    /// EvaluateContinuation → StopHooks → Finalize → Terminated
+    /// ExecuteTools → AwaitPermission ─┐                 (a decision is needed)
+    /// StartRequest → AwaitElicitation ┘→ back where they came from
+    /// ```
+    ///
+    /// Any state may be terminated, and any state may be re-entered from
+    /// `Initialize` for a new turn.
+    #[must_use]
+    pub const fn can_transition_to(self, next: Self) -> bool {
+        // A turn can always end, and a new turn always starts the same way.
+        if matches!(next, Self::Terminated) || matches!(self, Self::Initialize) {
+            return matches!(next, Self::Terminated | Self::BuildContext);
+        }
+        match self {
+            Self::Initialize => unreachable!(),
+            Self::BuildContext => matches!(next, Self::RunPreSubmitHooks),
+            Self::RunPreSubmitHooks => matches!(next, Self::StartRequest),
+            Self::StartRequest => matches!(next, Self::StreamAssistant | Self::AwaitElicitation),
+            Self::StreamAssistant => matches!(
+                next,
+                Self::ExecuteTools | Self::EvaluateContinuation | Self::AwaitElicitation
+            ),
+            // A permission decision is answered and the tools run.
+            Self::AwaitPermission => matches!(next, Self::ExecuteTools | Self::ApplyToolResults),
+            Self::AwaitElicitation => matches!(next, Self::StreamAssistant | Self::StartRequest),
+            Self::ExecuteTools => matches!(next, Self::ApplyToolResults | Self::AwaitPermission),
+            Self::ApplyToolResults => matches!(next, Self::EvaluateContinuation),
+            // The stop hooks run on the way out, from the last decision point.
+            Self::EvaluateContinuation => {
+                matches!(next, Self::CompactRecovery | Self::StopHooks)
+            }
+            Self::CompactRecovery => matches!(next, Self::StartRequest | Self::Finalize),
+            Self::StopHooks => matches!(next, Self::Finalize),
+            Self::Finalize => matches!(next, Self::Terminated),
+            // Terminating an ended turn is a no-op, not a mistake.
+            Self::Terminated => matches!(next, Self::Terminated),
+        }
+    }
+
     /// Returns true if this state waits for user input.
     #[must_use]
     pub const fn is_user_waiting(&self) -> bool {
@@ -636,8 +705,27 @@ impl TurnRuntime {
         self.budget.reset_turn();
     }
 
-    /// Transition to a new state.
-    pub const fn transition_to(&mut self, new_state: TurnState) {
+    /// Transition to a new state, reporting a move the graph does not allow.
+    ///
+    /// The state is a diagnostic — what the engine is doing, for the UI and for
+    /// whoever reads a log — and this used to be a bare assignment, so any
+    /// state could follow any other and the value meant nothing. The legal
+    /// moves are in [`TurnState::can_transition_to`].
+    ///
+    /// An illegal move is reported rather than refused: refusing would turn a
+    /// bookkeeping mistake into a failed turn, and the work is not what is
+    /// wrong.
+    pub fn transition_to(&mut self, new_state: TurnState) {
+        #[cfg(test)]
+        record_transition(self.state, new_state);
+
+        if !self.state.can_transition_to(new_state) {
+            tracing::warn!(
+                from = self.state.as_str(),
+                to = new_state.as_str(),
+                "the turn moved between states the graph does not allow"
+            );
+        }
         self.state = new_state;
     }
 
@@ -646,6 +734,24 @@ impl TurnRuntime {
         self.state = TurnState::Terminated;
         self.terminal_reason = Some(reason);
     }
+}
+
+/// Every transition a turn made, for the test that checks the graph against
+/// what the engine actually does.
+#[cfg(test)]
+thread_local! {
+    static RECORDED_TRANSITIONS: std::cell::RefCell<Vec<(TurnState, TurnState)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+#[cfg(test)]
+fn record_transition(from: TurnState, to: TurnState) {
+    RECORDED_TRANSITIONS.with(|recorded| recorded.borrow_mut().push((from, to)));
+}
+
+#[cfg(test)]
+fn take_recorded_transitions() -> Vec<(TurnState, TurnState)> {
+    RECORDED_TRANSITIONS.with(|recorded| std::mem::take(&mut *recorded.borrow_mut()))
 }
 
 /// What one streamed request produced.
@@ -3548,6 +3654,292 @@ mod tests {
             QueryEngine::reason_for("end_turn"),
             TerminalReason::Completed
         ));
+    }
+
+    /// The transition graph describes what a turn does: every step of a real
+    /// turn is a legal move.
+    #[test]
+    fn the_legal_transitions_are_the_ones_a_turn_makes() {
+        use TurnState as S;
+
+        // The happy path, in order, twice round the tool loop.
+        let path = [
+            S::Initialize,
+            S::BuildContext,
+            S::RunPreSubmitHooks,
+            S::StartRequest,
+            S::StreamAssistant,
+            S::ExecuteTools,
+            S::ApplyToolResults,
+            S::EvaluateContinuation,
+            S::CompactRecovery,
+            S::StartRequest,
+            S::StreamAssistant,
+            S::EvaluateContinuation,
+            S::StopHooks,
+            S::Finalize,
+            S::Terminated,
+        ];
+        for pair in path.windows(2) {
+            assert!(
+                pair[0].can_transition_to(pair[1]),
+                "{} → {} is not allowed",
+                pair[0].as_str(),
+                pair[1].as_str()
+            );
+        }
+
+        // Waiting for a decision is a detour, not a dead end.
+        assert!(S::ExecuteTools.can_transition_to(S::AwaitPermission));
+        assert!(S::AwaitPermission.can_transition_to(S::ExecuteTools));
+        assert!(S::StartRequest.can_transition_to(S::AwaitElicitation));
+        assert!(S::AwaitElicitation.can_transition_to(S::StreamAssistant));
+
+        // A turn can always end.
+        for state in [
+            S::BuildContext,
+            S::StartRequest,
+            S::StreamAssistant,
+            S::ExecuteTools,
+            S::AwaitPermission,
+            S::AwaitElicitation,
+            S::ApplyToolResults,
+            S::EvaluateContinuation,
+            S::CompactRecovery,
+            S::StopHooks,
+            S::Finalize,
+        ] {
+            assert!(
+                state.can_transition_to(S::Terminated),
+                "{} cannot end",
+                state.as_str()
+            );
+        }
+    }
+
+    /// The graph is checked against a turn that really ran, not against a path
+    /// written by hand to match it.
+    #[tokio::test]
+    async fn a_real_turn_only_makes_legal_moves() {
+        struct ToolThenText {
+            calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        }
+
+        #[async_trait::async_trait]
+        impl ApiClient for ToolThenText {
+            fn clone_box(&self) -> Box<dyn ApiClient> {
+                Box::new(Self {
+                    calls: std::sync::Arc::clone(&self.calls),
+                })
+            }
+
+            async fn create_message(
+                &self,
+                _system: &str,
+                _messages: &[serde_json::Value],
+                _model: &ModelId,
+                _max_tokens: u32,
+                _tools: &[crate::tool_executor::ToolInfo],
+            ) -> Result<ApiResponse, crate::api_client::ApiError> {
+                let call = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(ApiResponse {
+                    content: if call == 0 {
+                        String::new()
+                    } else {
+                        "done".into()
+                    },
+                    tool_calls: if call == 0 {
+                        vec![crate::types::ToolCall {
+                            id: "tc_1".into(),
+                            name: "bash".into(),
+                            input: serde_json::json!({"command": "true"}),
+                        }]
+                    } else {
+                        Vec::new()
+                    },
+                    usage: UsageSummary {
+                        input_tokens: 10,
+                        output_tokens: 5,
+                        cache_read_tokens: 0,
+                        cache_creation_tokens: 0,
+                    },
+                    stop_reason: if call == 0 { "tool_use" } else { "end_turn" }.into(),
+                })
+            }
+
+            async fn create_message_streaming(
+                &self,
+                system: &str,
+                messages: &[serde_json::Value],
+                model: &ModelId,
+                max_tokens: u32,
+                tools: &[crate::tool_executor::ToolInfo],
+            ) -> std::pin::Pin<
+                Box<dyn futures::Stream<Item = crate::api_client::StreamEvent> + Send + 'static>,
+            > {
+                let response = self
+                    .create_message(system, messages, model, max_tokens, tools)
+                    .await
+                    .expect("the mock answers");
+                let mut events = vec![crate::api_client::StreamEvent::StopReason(
+                    response.stop_reason.clone(),
+                )];
+                for call in &response.tool_calls {
+                    events.insert(
+                        0,
+                        crate::api_client::StreamEvent::ToolCallBlockStart {
+                            id: call.id.clone(),
+                            name: call.name.clone(),
+                        },
+                    );
+                    events.insert(
+                        1,
+                        crate::api_client::StreamEvent::ToolCallBlockEnd {
+                            id: call.id.clone(),
+                            input: call.input.clone(),
+                        },
+                    );
+                }
+                events.push(crate::api_client::StreamEvent::StreamEnd);
+                Box::pin(futures::stream::iter(events))
+            }
+        }
+
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let session = SessionState::new(std::path::PathBuf::from("/tmp/test"));
+        let checker = PermissionChecker::new(PermissionMode::BypassPermissions);
+        let mut engine = QueryEngine::new(
+            Box::new(ToolThenText {
+                calls: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            }),
+            ModelId::sonnet(),
+            session,
+            PermissionEngine::new(checker),
+            tx,
+        );
+
+        let _ = take_recorded_transitions();
+        engine
+            .submit_streaming("run something".into(), SubmitOptions::default())
+            .await
+            .unwrap();
+
+        let recorded = take_recorded_transitions();
+        assert!(recorded.len() > 5, "the turn barely moved: {recorded:?}");
+        for (from, to) in &recorded {
+            assert!(
+                from.can_transition_to(*to),
+                "a real turn went {} → {}, which the graph refuses",
+                from.as_str(),
+                to.as_str()
+            );
+        }
+    }
+
+    /// The exact graph, state by state.
+    ///
+    /// Written as the whole set rather than a few `assert!(!...)` lines: a
+    /// spot check passes whether the graph is right or merely missing an
+    /// entry, which is how `evaluate_continuation → stop_hooks` went unnoticed
+    /// until a real turn was recorded.
+    #[test]
+    fn the_legal_moves_are_exactly_these() {
+        use TurnState as S;
+
+        let expected: &[(S, &[S])] = &[
+            (S::Initialize, &[S::BuildContext, S::Terminated]),
+            (S::BuildContext, &[S::RunPreSubmitHooks, S::Terminated]),
+            (S::RunPreSubmitHooks, &[S::StartRequest, S::Terminated]),
+            (
+                S::StartRequest,
+                &[S::StreamAssistant, S::AwaitElicitation, S::Terminated],
+            ),
+            (
+                S::StreamAssistant,
+                &[
+                    S::ExecuteTools,
+                    S::EvaluateContinuation,
+                    S::AwaitElicitation,
+                    S::Terminated,
+                ],
+            ),
+            (
+                S::ExecuteTools,
+                &[S::ApplyToolResults, S::AwaitPermission, S::Terminated],
+            ),
+            (
+                S::AwaitPermission,
+                &[S::ExecuteTools, S::ApplyToolResults, S::Terminated],
+            ),
+            (
+                S::AwaitElicitation,
+                &[S::StreamAssistant, S::StartRequest, S::Terminated],
+            ),
+            (
+                S::ApplyToolResults,
+                &[S::EvaluateContinuation, S::Terminated],
+            ),
+            (
+                S::EvaluateContinuation,
+                &[S::CompactRecovery, S::StopHooks, S::Terminated],
+            ),
+            (
+                S::CompactRecovery,
+                &[S::StartRequest, S::Finalize, S::Terminated],
+            ),
+            (S::StopHooks, &[S::Finalize, S::Terminated]),
+            (S::Finalize, &[S::Terminated]),
+            (S::Terminated, &[S::Terminated]),
+        ];
+
+        let all = [
+            S::Initialize,
+            S::BuildContext,
+            S::RunPreSubmitHooks,
+            S::StartRequest,
+            S::StreamAssistant,
+            S::ExecuteTools,
+            S::AwaitPermission,
+            S::AwaitElicitation,
+            S::ApplyToolResults,
+            S::EvaluateContinuation,
+            S::CompactRecovery,
+            S::StopHooks,
+            S::Finalize,
+            S::Terminated,
+        ];
+
+        for (from, allowed) in expected {
+            for to in all {
+                assert_eq!(
+                    from.can_transition_to(to),
+                    allowed.contains(&to),
+                    "{} → {} should be {}",
+                    from.as_str(),
+                    to.as_str(),
+                    if allowed.contains(&to) {
+                        "allowed"
+                    } else {
+                        "refused"
+                    }
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn an_illegal_transition_is_reported_and_does_not_stop_the_turn() {
+        let budget = TokenBudget::with_defaults();
+        let mut turn = TurnRuntime::new(budget);
+
+        // Nothing legitimate goes straight from a fresh turn to the end.
+        assert!(!turn.state.can_transition_to(TurnState::Finalize));
+        turn.transition_to(TurnState::Finalize);
+
+        // It moved, and the turn is not poisoned by the report.
+        assert!(matches!(turn.state, TurnState::Finalize));
+        turn.transition_to(TurnState::Terminated);
+        assert!(matches!(turn.state, TurnState::Terminated));
     }
 
     /// `interrupt()` sets the flag the turn loop reads, not only the event.
