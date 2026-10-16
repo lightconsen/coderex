@@ -50,25 +50,46 @@ listing is readable. Neither discloses file contents.
 `SandboxConfig` have no effect on a macOS child. Only the command's own timeout
 bounds it.
 
-### Linux — seccomp + rlimits
+### Linux — bubblewrap, seccomp + rlimits
 
-`prepare()` installs a `pre_exec` closure that applies `RLIMIT_NOFILE`,
-`RLIMIT_AS` and `RLIMIT_CPU`, then installs a seccomp-BPF filter with a default
-action of kill and an explicit allowlist of syscalls. The audit token and the
-syscall numbers come from the current architecture (`seccomp_arch`), so an
-aarch64 host does not get the x86_64 table.
+Two mechanisms, and which one is in force depends on whether bubblewrap is
+installed.
 
-`allow_network` **is** honoured: the network syscalls are a separate table that is
+**With `bwrap` on `PATH`** (and not switched off — see below), the command is
+wrapped in a mount namespace: the root is bound read-only, `/proc`, `/dev` and
+`/tmp` are fresh mounts, only the configured paths are re-bound writable, and the
+child starts in the working directory the policy names. `--unshare-net` is added
+when `allow_network` is false, which confines the network more strongly than a
+syscall filter can. In this mode the seccomp allowlist is **not** installed: the
+wrapper would inherit it, and mounting, unsharing and pivoting a root are exactly
+the syscalls an allowlist for a shell refuses. `filesystem_isolation()` reports
+`Kernel`, and the arguments are built by `bubblewrap_args` — a pure function, so
+the policy they encode is compiled and tested on every platform, not only on the
+one that runs it.
+
+`CODEREX_BWRAP=0` switches the wrapper off. Anything but an explicit negative
+(`0`, `false`, `no`) leaves it on, because a sandbox that disables itself over an
+unexpected value is worse than one that says what it wants.
+
+**Without `bwrap`**, `prepare()` installs a `pre_exec` closure that applies
+`RLIMIT_NOFILE`, `RLIMIT_AS` and `RLIMIT_CPU`, then installs a seccomp-BPF filter
+with a default action of kill and an explicit allowlist of syscalls. The audit
+token and the syscall numbers come from the current architecture
+(`seccomp_arch`), so an aarch64 host does not get the x86_64 table.
+`allow_network` **is** honoured there: the network syscalls are a separate table
 concatenated only when the flag is set, and a test asserts the two tables do not
-overlap.
-
-**There is no path-based isolation on Linux.** seccomp filters syscalls, not
-paths, so a wrapped process can still read and write anything its user could.
-bubblewrap would provide path confinement; it is *detected*
-(`bubblewrap_available`) but **not wired into the spawn path**. Every Linux
-sandbox therefore logs a warning stating that filesystem isolation is not
-enforced, and `filesystem_isolation()` reports `None`. Nothing silently claims
+overlap. In this mode `filesystem_isolation()` reports `None` — seccomp filters
+syscalls, not paths, so a wrapped process can still read and write anything its
+user could — and the sandbox logs a warning saying so. Nothing silently claims
 otherwise.
+
+**Unverified at runtime:** the wrapper's flags were written on macOS, where
+`bwrap` does not exist. The argument construction is unit-tested here and the
+Linux-gated code is reviewed but **cannot be compiled or run on this machine**
+(`ring`'s build script needs a cross C compiler, and no Linux toolchain is
+installed). If a flag is wrong on a real Linux host, every sandboxed command
+fails loudly rather than silently running unconfined — set `CODEREX_BWRAP=0` to
+fall back to the syscall filter.
 
 ### Windows — Job Objects
 
@@ -161,7 +182,9 @@ does not go through the tool layer is not bound by them either.
 
 ## Not enforced, and not claimed
 
-- Linux filesystem confinement (no bubblewrap integration).
+- Linux filesystem confinement **when `bwrap` is absent or switched off** — it is
+  enforced when bubblewrap is installed, and `filesystem_isolation()` reports
+  which of the two is the case.
 - Any filesystem confinement on Windows or unsupported platforms.
 - rlimits on macOS.
 - Network confinement on Windows.

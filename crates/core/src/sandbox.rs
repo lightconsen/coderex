@@ -224,32 +224,40 @@ pub enum FilesystemIsolation {
 // - macOS: `Kernel` — `sandbox-exec` applies a Seatbelt profile that restricts
 //   reads to the configured paths plus the system roots, and writes to the
 //   configured paths.
-// - Linux: `None` — the sandbox is a seccomp syscall allowlist plus rlimits.
-//   There is no path-based confinement, and bubblewrap, which would provide it,
-//   is only detected (see `bubblewrap_available`) and not yet wired into the
-//   spawn path.
+// - Linux: `Kernel` when bubblewrap is installed and not switched off — the
+//   command runs in a mount namespace with a read-only root and only the
+//   configured paths writable. `None` otherwise, where the sandbox is a seccomp
+//   syscall allowlist plus rlimits and a wrapped process can still read and
+//   write anything its user could.
 // - Windows: `None` — the Job Object limits memory, CPU and UI access, not file
 //   paths.
 
 /// Report the filesystem confinement in force on this platform.
+///
+/// On Linux this is a runtime answer, not a compile-time one: it depends on
+/// whether bubblewrap is installed and not switched off.
 #[must_use]
-#[cfg(target_os = "macos")]
-pub const fn filesystem_isolation() -> FilesystemIsolation {
-    FilesystemIsolation::Kernel
-}
-
-/// Report the filesystem confinement in force on this platform.
-#[must_use]
-#[cfg(not(target_os = "macos"))]
-pub const fn filesystem_isolation() -> FilesystemIsolation {
-    FilesystemIsolation::None
+#[allow(clippy::missing_const_for_fn)] // the Linux body reads the environment
+pub fn filesystem_isolation() -> FilesystemIsolation {
+    #[cfg(target_os = "macos")]
+    {
+        FilesystemIsolation::Kernel
+    }
+    #[cfg(target_os = "linux")]
+    {
+        if bubblewrap_in_force() {
+            FilesystemIsolation::Kernel
+        } else {
+            FilesystemIsolation::None
+        }
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        FilesystemIsolation::None
+    }
 }
 
 /// Whether `bwrap` is on `PATH`.
-///
-/// Detection only: the Linux spawn path does not use it yet, so this says what
-/// is *available*, not what is in force. [`filesystem_isolation`] is the
-/// authority on the latter.
 #[must_use]
 #[cfg(target_os = "linux")]
 pub fn bubblewrap_available() -> bool {
@@ -262,6 +270,125 @@ pub fn bubblewrap_available() -> bool {
 #[cfg(not(target_os = "linux"))]
 pub const fn bubblewrap_available() -> bool {
     false
+}
+
+/// Whether the environment switched the wrapper off.
+///
+/// Pure, so the rule can be read and tested without touching a process-wide
+/// variable: anything but an explicit negative leaves it on.
+///
+/// Only the Linux implementation of [`bubblewrap_in_force`] reads it, and that
+/// implementation is compiled out elsewhere — the rule is still worth having
+/// one definition of, and one test.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn bubblewrap_disabled_by_env(value: Option<&str>) -> bool {
+    matches!(value, Some("0" | "false" | "no"))
+}
+
+/// Whether `bwrap` is on `PATH` and has not been switched off.
+#[must_use]
+#[cfg(target_os = "linux")]
+pub fn bubblewrap_in_force() -> bool {
+    bubblewrap_available() && !bubblewrap_disabled_by_env(std::env::var(BWRAP_ENV).ok().as_deref())
+}
+
+/// Whether `bwrap` is in force — always false outside Linux.
+#[must_use]
+#[cfg(not(target_os = "linux"))]
+pub const fn bubblewrap_in_force() -> bool {
+    false
+}
+
+/// The environment variable that switches the bubblewrap wrapper off.
+pub const BWRAP_ENV: &str = "CODEREX_BWRAP";
+
+/// The `bwrap` invocation for a config, when the wrapper is in force.
+///
+/// Cross-platform, so the shape is compiled and tested everywhere rather than
+/// only on the platform that runs it. `None` means the command is not wrapped:
+/// either this is not Linux, or bubblewrap is missing or switched off.
+///
+/// The working directory comes from
+/// [`additional_working_dirs`](SandboxConfig::additional_working_dirs), which
+/// the session's policy fills with the workspace first — a rebuilt root needs
+/// an explicit place to start, and without one the child starts at `/`.
+#[must_use]
+pub fn bubblewrap_program(config: &SandboxConfig) -> Option<(&'static str, Vec<String>)> {
+    if !bubblewrap_in_force() {
+        return None;
+    }
+    let cwd = config
+        .additional_working_dirs
+        .first()
+        .cloned()
+        .unwrap_or_else(|| PathBuf::from("/"));
+
+    Some(("bwrap", bubblewrap_args(config, &cwd)))
+}
+
+/// The `bwrap` arguments that confine a command to the configured paths.
+///
+/// Pure, so the policy can be read and tested on any platform — the wrapper is
+/// Linux-only, but *which* mounts it creates is a decision worth pinning
+/// everywhere.
+///
+/// Order is the whole trick. `bwrap` applies its arguments in sequence, so the
+/// read-only root is bound first and every path that is allowed to change is
+/// re-bound after it; a bind that came before `--ro-bind / /` would be undone
+/// by it. `cwd` is passed explicitly rather than inherited, because the child
+/// starts in a namespace whose root was just rebuilt.
+///
+/// The caller appends the command to run; this returns options only.
+#[must_use]
+pub fn bubblewrap_args(config: &SandboxConfig, cwd: &std::path::Path) -> Vec<String> {
+    let mut args: Vec<String> = vec![
+        // Nothing of ours should outlive us in the namespace.
+        "--die-with-parent".into(),
+        "--unshare-pid".into(),
+        "--unshare-ipc".into(),
+        "--unshare-uts".into(),
+    ];
+
+    // A network namespace, which is a stronger boundary than the seccomp
+    // syscall table and the one thing bubblewrap can express that it cannot.
+    if !config.allow_network {
+        args.push("--unshare-net".into());
+    }
+
+    // The root is read-only: every read path the config names is already inside
+    // it, so this is what makes the *write* set the only thing that can change.
+    args.push("--ro-bind".into());
+    args.push("/".into());
+    args.push("/".into());
+
+    // Fresh /proc and /dev: the root bind made both read-only, and a shell that
+    // cannot write to /dev/null or see itself in /proc is not usable.
+    args.push("--proc".into());
+    args.push("/proc".into());
+    args.push("--dev".into());
+    args.push("/dev".into());
+    args.push("--tmpfs".into());
+    args.push("/tmp".into());
+
+    // The writable set, after the read-only root.
+    let mut writable = config.allowed_write_paths.clone();
+    writable.extend(config.additional_working_dirs.iter().cloned());
+    let mut seen: Vec<PathBuf> = Vec::new();
+    for path in writable {
+        if seen.contains(&path) {
+            continue;
+        }
+        seen.push(path.clone());
+        let path = path.to_string_lossy().to_string();
+        args.push("--bind".into());
+        args.push(path.clone());
+        args.push(path);
+    }
+
+    args.push("--chdir".into());
+    args.push(cwd.to_string_lossy().to_string());
+
+    args
 }
 
 // ─── Public Handle ──────────────────────────────────────────────────────────
@@ -373,6 +500,8 @@ impl PlatformSandbox {
     fn sandboxed_program(&self) -> Option<(&str, Vec<String>)> {
         match self {
             Self::MacOs(s) => Some(s.exec_command()),
+            #[cfg(target_os = "linux")]
+            Self::Linux(s) => s.exec_command(),
             _ => None,
         }
     }
@@ -582,20 +711,35 @@ mod linux_impl {
     /// Linux sandbox using seccomp + rlimit.
     pub struct LinuxSandbox {
         config: SandboxConfig,
+        /// Whether commands are wrapped in `bubblewrap`.
+        ///
+        /// Decided once, at creation: both the warning and whether the syscall
+        /// filter may be installed depend on it.
+        use_bwrap: bool,
     }
 
     impl LinuxSandbox {
         pub fn create(config: SandboxConfig) -> Result<Self, SandboxError> {
-            // Say plainly what this sandbox is. The seccomp filter and the
-            // rlimits are real, but they are a syscall allowlist and a budget,
-            // not path-based confinement — a wrapped process can still read
-            // and write anything its user could. Saying so beats letting the
-            // caller assume a filesystem sandbox it does not have.
-            if super::bubblewrap_available() {
+            let use_bwrap = super::bubblewrap_in_force();
+
+            // Say plainly what this sandbox is, in each of the three cases,
+            // because they confine very different things.
+            if use_bwrap {
+                tracing::info!(
+                    "sandbox: filesystem isolation is enforced by bubblewrap — the root is \
+                     read-only, the configured paths are writable, and network access is {}",
+                    if config.allow_network {
+                        "allowed"
+                    } else {
+                        "denied by a network namespace"
+                    }
+                );
+            } else if super::bubblewrap_available() {
                 tracing::warn!(
                     "sandbox: filesystem isolation is NOT enforced on Linux — bubblewrap is \
-                     installed but not wired into the spawn path; seccomp syscall filtering and \
-                     rlimits are the only restrictions in force"
+                     installed but switched off by {}; seccomp syscall filtering and rlimits are \
+                     the only restrictions in force",
+                    super::BWRAP_ENV
                 );
             } else {
                 tracing::warn!(
@@ -604,14 +748,24 @@ mod linux_impl {
                      restrictions in force"
                 );
             }
-            Ok(Self { config })
+
+            Ok(Self { config, use_bwrap })
         }
 
         pub fn prepare(&self, cmd: &mut Command) -> Result<(), SandboxError> {
             let config = self.config.clone();
+            let use_bwrap = self.use_bwrap;
             let apply = move || -> Result<(), std::io::Error> {
                 Self::apply_rlimits(&config)?;
-                Self::apply_seccomp(config.allow_network)?;
+                // The syscall allowlist is not installed when bubblewrap wraps
+                // the command: the filter would be inherited by the wrapper
+                // itself, and mounting, unsharing and pivoting a root are
+                // exactly the syscalls an allowlist for a shell refuses. What
+                // the filter buys when it is in force — no network syscalls —
+                // bubblewrap provides with a network namespace instead.
+                if !use_bwrap {
+                    Self::apply_seccomp(config.allow_network)?;
+                }
                 Ok(())
             };
             // SAFETY: pre_exec runs in the child process before exec().
@@ -621,6 +775,14 @@ mod linux_impl {
             Ok(())
         }
 
+        /// The `bwrap` invocation that confines a command, when it is in force.
+        pub fn exec_command(&self) -> Option<(&'static str, Vec<String>)> {
+            if !self.use_bwrap {
+                return None;
+            }
+            super::bubblewrap_program(&self.config)
+        }
+
         pub fn post_spawn(&self, _child: &std::process::Child) -> Result<(), SandboxError> {
             Ok(())
         }
@@ -628,7 +790,7 @@ mod linux_impl {
         // ─── rlimits ─────────────────────────────────────────────────────────
 
         fn apply_rlimits(config: &SandboxConfig) -> Result<(), std::io::Error> {
-            use libc::{RLIMIT_AS, RLIMIT_CPU, RLIMIT_NOFILE, prlimit, rlimit64};
+            use libc::{prlimit, rlimit64, RLIMIT_AS, RLIMIT_CPU, RLIMIT_NOFILE};
 
             if let Some(max_files) = config.max_open_files {
                 let rl = rlimit64 {
@@ -972,13 +1134,13 @@ mod windows_impl {
     use std::ptr;
     use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
     use windows_sys::Win32::System::JobObjects::{
-        AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_ACTIVE_PROCESS,
+        AssignProcessToJobObject, CreateJobObjectW, JobObjectBasicUIRestrictions,
+        JobObjectExtendedLimitInformation, SetInformationJobObject,
+        JOBOBJECT_BASIC_LIMIT_INFORMATION, JOBOBJECT_BASIC_UI_RESTRICTIONS,
+        JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JOB_OBJECT_LIMIT_ACTIVE_PROCESS,
         JOB_OBJECT_LIMIT_JOB_MEMORY, JOB_OBJECT_LIMIT_JOB_TIME, JOB_OBJECT_UI_EXIT_WINDOWS,
         JOB_OBJECT_UI_GLOBAL_ATOMS, JOB_OBJECT_UI_HANDLES, JOB_OBJECT_UI_NO_DESKTOP,
         JOB_OBJECT_UI_READCLIPBOARD, JOB_OBJECT_UI_WRITECLIPBOARD,
-        JOBOBJECT_BASIC_LIMIT_INFORMATION, JOBOBJECT_BASIC_UI_RESTRICTIONS,
-        JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectBasicUIRestrictions,
-        JobObjectExtendedLimitInformation, SetInformationJobObject,
     };
 
     /// Windows sandbox using Job Objects.
@@ -1417,7 +1579,7 @@ mod tests {
             ..SandboxConfig::default()
         };
 
-        let (out, err, ok) = run_sandboxed(config, &format!("ls {}", dir.display()));
+        let (_out, err, ok) = run_sandboxed(config, &format!("ls {}", dir.display()));
 
         let _ = std::fs::remove_dir_all(&dir);
 
@@ -1430,8 +1592,146 @@ mod tests {
     fn isolation_report_matches_the_platform() {
         #[cfg(target_os = "macos")]
         assert_eq!(filesystem_isolation(), FilesystemIsolation::Kernel);
-        #[cfg(not(target_os = "macos"))]
+        // On Linux the answer depends on bubblewrap, so the report is pinned to
+        // what is actually in force rather than to the platform.
+        #[cfg(target_os = "linux")]
+        assert_eq!(
+            filesystem_isolation(),
+            if bubblewrap_in_force() {
+                FilesystemIsolation::Kernel
+            } else {
+                FilesystemIsolation::None
+            }
+        );
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
         assert_eq!(filesystem_isolation(), FilesystemIsolation::None);
+    }
+
+    // ─── bubblewrap policy ──────────────────────────────────────────────────
+    //
+    // The wrapper itself is Linux-only, but the arguments it is given are a
+    // policy decision, and these run everywhere.
+
+    fn bubblewrap_config() -> SandboxConfig {
+        SandboxConfig {
+            allowed_read_paths: vec![PathBuf::from("/work/project")],
+            allowed_write_paths: vec![PathBuf::from("/work/project")],
+            allowed_exec_paths: vec![PathBuf::from("/usr/bin")],
+            additional_working_dirs: vec![PathBuf::from("/work/project")],
+            max_open_files: None,
+            max_memory_bytes: None,
+            max_cpu_seconds: None,
+            allow_network: false,
+        }
+    }
+
+    /// The read-only root has to come first: `bwrap` applies its arguments in
+    /// order, so a writable bind emitted before it would be undone.
+    #[test]
+    fn bubblewrap_binds_the_root_read_only_before_anything_writable() {
+        let args = bubblewrap_args(&bubblewrap_config(), std::path::Path::new("/work/project"));
+
+        let root = args
+            .windows(3)
+            .position(|w| w == ["--ro-bind", "/", "/"])
+            .expect("the root should be bound read-only");
+        let writable = args
+            .windows(3)
+            .position(|w| w[0] == "--bind" && w[1] == "/work/project")
+            .expect("the workspace should be writable");
+
+        assert!(
+            root < writable,
+            "the writable bind would be undone: {args:?}"
+        );
+    }
+
+    #[test]
+    fn bubblewrap_makes_each_writable_path_writable_once() {
+        let mut config = bubblewrap_config();
+        // The policy lists the workspace in both fields; a second identical
+        // bind is noise, not a second permission.
+        config
+            .additional_working_dirs
+            .push(std::path::PathBuf::from("/work/build"));
+
+        let args = bubblewrap_args(&config, std::path::Path::new("/work/project"));
+
+        let binds: Vec<&String> = args
+            .windows(3)
+            .filter(|w| w[0] == "--bind")
+            .map(|w| &w[1])
+            .collect();
+        assert_eq!(binds, vec!["/work/project", "/work/build"]);
+    }
+
+    /// Network is a namespace question, not a syscall question, here.
+    #[test]
+    fn bubblewrap_denies_network_by_namespace_only_when_asked() {
+        let denied = bubblewrap_args(&bubblewrap_config(), std::path::Path::new("/"));
+        assert!(denied.iter().any(|a| a == "--unshare-net"));
+
+        let mut allowed_config = bubblewrap_config();
+        allowed_config.allow_network = true;
+        let allowed = bubblewrap_args(&allowed_config, std::path::Path::new("/"));
+        assert!(
+            !allowed.iter().any(|a| a == "--unshare-net"),
+            "a command that may use the network was put in a network namespace"
+        );
+    }
+
+    /// Nothing is wrapped unless the wrapper is actually available: off Linux,
+    /// and on a Linux host without `bwrap`, the caller falls back to the
+    /// syscall filter rather than spawning a program that is not there.
+    #[test]
+    fn no_wrapper_is_offered_when_bubblewrap_is_not_in_force() {
+        if bubblewrap_in_force() {
+            // A Linux host with bwrap in force; the argument tests above cover
+            // what it gets.
+            return;
+        }
+        assert!(bubblewrap_program(&bubblewrap_config()).is_none());
+    }
+
+    #[test]
+    fn bubblewrap_starts_in_the_working_directory() {
+        let args = bubblewrap_args(&bubblewrap_config(), std::path::Path::new("/work/project"));
+
+        let chdir = args
+            .iter()
+            .position(|a| a == "--chdir")
+            .expect("a rebuilt root needs an explicit working directory");
+        assert_eq!(args[chdir + 1], "/work/project");
+    }
+
+    /// The child needs a writable `/dev` and a `/proc` of its own; the
+    /// read-only root bind gives it neither.
+    #[test]
+    fn bubblewrap_provides_fresh_dev_and_proc() {
+        let args = bubblewrap_args(&bubblewrap_config(), std::path::Path::new("/"));
+
+        for flag in ["--proc", "--dev", "--tmpfs", "--die-with-parent"] {
+            assert!(args.iter().any(|a| a == flag), "{flag} missing: {args:?}");
+        }
+    }
+
+    /// Anything but an explicit negative leaves the wrapper on: a sandbox that
+    /// switches itself off because a variable was set to something unexpected
+    /// is worse than one that says what it wants.
+    #[test]
+    fn bubblewrap_is_switched_off_only_by_an_explicit_negative() {
+        for off in ["0", "false", "no"] {
+            assert!(
+                bubblewrap_disabled_by_env(Some(off)),
+                "{off} should switch the wrapper off"
+            );
+        }
+        for on in [None, Some("1"), Some("true"), Some("yes"), Some("")] {
+            assert!(
+                !bubblewrap_disabled_by_env(on),
+                "{on:?} should leave the wrapper on"
+            );
+        }
     }
 
     #[test]

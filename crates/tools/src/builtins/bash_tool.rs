@@ -89,9 +89,21 @@ fn build_sandboxed_command(
                         format!("sandbox: {e}"),
                     ))
                 })?;
+
+            // With bubblewrap in force the command runs under it; the wrapper
+            // is resolved through `PATH` like the shell, so both are checked.
+            let (program, prefix_args) = match handle.sandboxed_program() {
+                Some((wrapper, args)) => {
+                    guard_program_origin(wrapper, ctx.cwd)?;
+                    (wrapper.to_string(), args)
+                }
+                None => (String::from("sh"), Vec::new()),
+            };
             guard_program_origin("sh", ctx.cwd)?;
-            let mut std_cmd = std::process::Command::new("sh");
-            std_cmd.arg("-c").arg(command);
+
+            let mut std_cmd = std::process::Command::new(&program);
+            std_cmd.args(&prefix_args);
+            std_cmd.arg("sh").arg("-c").arg(command);
             std_cmd.current_dir(ctx.cwd);
             handle.prepare(&mut std_cmd).map_err(|e| {
                 ToolError::Io(std::io::Error::new(
