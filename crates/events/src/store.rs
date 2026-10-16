@@ -14,7 +14,7 @@ pub enum StoreError {
     Serialization(#[from] serde_json::Error),
 }
 
-/// On-disk JSON store for a single SDK session.
+/// On-disk JSON store for a single session's tracker state.
 #[derive(Debug)]
 pub struct SessionStore {
     path: PathBuf,

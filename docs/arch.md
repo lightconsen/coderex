@@ -17,7 +17,7 @@
 | `server` | WebSocket daemon server, session auth, idle cleanup |
 | `hooks` | Hook event system (22 events), sync/async execution, timeout |
 | `config` | Settings merge (defaults->user->project), feature flags, enterprise |
-| `sdk` | Structured I/O event stream for programmatic consumers |
+| `events` | In-process broadcast event bus (session event fan-out; external I/O is `server`) |
 
 Commands (user-facing slash commands) are separate from Tools (LLM-facing function calls).
 

@@ -80,7 +80,7 @@ CodeRex is organized as a Rust workspace with 16 crates:
 | `server` | WebSocket daemon, session auth, idle cleanup |
 | `hooks` | Hook event system (22+ events), sync/async execution |
 | `config` | Settings loading/merging, feature flags, enterprise |
-| `sdk` | Structured I/O event stream for headless consumers |
+| `events` | In-process broadcast event bus for a session (not the external protocol) |
 | `telemetry` | Crash reporting and usage analytics |
 | `test-utils` | Test rigs, snapshot helpers, wire client |
 

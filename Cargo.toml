@@ -14,7 +14,7 @@ members = [
     "crates/bridge",
     "crates/server",
     "crates/ui",
-    "crates/sdk",
+    "crates/events",
     "crates/config",
     "crates/telemetry",
     "crates/cli",

@@ -21,6 +21,7 @@ use coderex_core::query_profiles::{ModelProfile, PromptProfile, QueryKind, Query
 use coderex_core::state::SessionState;
 use coderex_core::types::ModelId;
 use coderex_core::types::{EngineEvent, Message, ToolCall};
+use coderex_events::{BusEvent, EventSession};
 use coderex_memory::{
     DreamCheckResult, ai_workflow,
     auto_dream::{AutoDream, DreamConfig},
@@ -28,7 +29,6 @@ use coderex_memory::{
     session_memory::SessionMemoryStore,
     team_memory::TeamMemorySyncService,
 };
-use coderex_sdk::{SdkEvent, SdkSession};
 use coderex_tools::{
     AgentTool, ChromeClient, CronScheduler, ExecutionConfig, ExecutionContext, RateLimiter,
     RegistryToolDispatcher, TaskStore, ToolExecutor as ToolsExecutor, ToolRegistry,
@@ -583,10 +583,10 @@ pub struct ReplLoop {
     confirmation_bus: Option<ConfirmationBus>,
     /// Receiver for cron job fire events.
     cron_rx: Option<tokio::sync::mpsc::UnboundedReceiver<(String, String)>>,
-    /// SDK session for headless/structured event consumers.
-    sdk_session: Option<Arc<SdkSession>>,
-    /// Background timeout checker for the SDK session.
-    _sdk_timeout_handle: Option<tokio::task::JoinHandle<()>>,
+    /// Event session carrying the engine event stream for in-process consumers.
+    event_session: Option<Arc<EventSession>>,
+    /// Background timeout checker for the event session.
+    _event_timeout_handle: Option<tokio::task::JoinHandle<()>>,
     /// Teleport manager for session sharing and directory switching.
     teleport_manager: Option<coderex_bridge::teleport::TeleportManager>,
     /// Skip permission prompts (--dangerously-skip-permissions).
@@ -740,8 +740,8 @@ impl ReplLoop {
             pending_elicitation: None,
             confirmation_bus: None,
             cron_rx: None,
-            sdk_session: None,
-            _sdk_timeout_handle: None,
+            event_session: None,
+            _event_timeout_handle: None,
             teleport_manager: Some(coderex_bridge::teleport::TeleportManager::new()),
             #[cfg(feature = "hot-reload")]
             config_changed_rx: None,
@@ -932,9 +932,9 @@ impl ReplLoop {
         // Start cron background runner
         let cron_rx = cron_scheduler.spawn_runner();
 
-        // Create SDK session and start its timeout checker
-        let sdk_session = Arc::new(SdkSession::new(session_id.to_string()));
-        let sdk_timeout_handle = sdk_session.spawn_timeout_checker();
+        // Create event session and start its timeout checker
+        let event_session = Arc::new(EventSession::new(session_id.to_string()));
+        let event_timeout_handle = event_session.spawn_timeout_checker();
 
         let orchestrator = coderex_core::orchestrator::Orchestrator::new(api_client.clone_box());
         let (bg_tx, bg_rx) = mpsc::unbounded_channel::<BackgroundTaskResult>();
@@ -976,8 +976,8 @@ impl ReplLoop {
             pending_elicitation: None,
             confirmation_bus: Some(confirmation_bus),
             cron_rx: Some(cron_rx),
-            sdk_session: Some(sdk_session),
-            _sdk_timeout_handle: sdk_timeout_handle,
+            event_session: Some(event_session),
+            _event_timeout_handle: event_timeout_handle,
             teleport_manager: Some(coderex_bridge::teleport::TeleportManager::new()),
             #[cfg(feature = "hot-reload")]
             config_changed_rx,
@@ -1599,10 +1599,10 @@ impl ReplLoop {
         Ok(message)
     }
 
-    /// Forward an engine event into the SDK session's broadcast stream.
+    /// Forward an engine event into the event session's broadcast stream.
     fn forward_engine_event(&self, event: &EngineEvent) {
-        if let Some(ref session) = self.sdk_session {
-            session.emit(SdkEvent::Engine(event.clone()));
+        if let Some(ref session) = self.event_session {
+            session.emit(BusEvent::Engine(event.clone()));
         }
     }
 
@@ -2731,13 +2731,13 @@ impl ReplLoop {
     }
 
     /// Drain pending events from the event channel, append text deltas to output,
-    /// and forward all events into the SDK session.
+    /// and forward all events into the event session.
     fn drain_events(&mut self, output: &mut String) {
-        let sdk = self.sdk_session.clone();
+        let event_session = self.event_session.clone();
         if let Some(ref mut rx) = self.event_rx {
             while let Ok(event) = rx.try_recv() {
-                if let Some(ref session) = sdk {
-                    session.emit(SdkEvent::Engine(event.clone()));
+                if let Some(ref session) = event_session {
+                    session.emit(BusEvent::Engine(event.clone()));
                 }
                 if let EngineEvent::TextDelta(delta) = event {
                     output.push_str(&delta);

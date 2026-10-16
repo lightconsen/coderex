@@ -1,4 +1,4 @@
-//! SDK structured event stream, permission tracking, and elicitation.
+//! In-process event stream, permission tracking, and elicitation.
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -9,32 +9,34 @@ use coderex_core::types::{EngineEvent, ToolCall, ToolResult};
 
 // ── Events ──────────────────────────────────────────────────────────────
 
-/// Events emitted by the SDK.
+/// Events carried on the in-process session event bus.
 ///
 /// This enum captures every significant event that occurs during a CodeRex
-/// session so that headless consumers (servers, scripts, test rigs) can
-/// observe and react to the assistant's behaviour.
+/// session so that in-process subscribers (the CLI's own components, test
+/// rigs) can observe and react to the assistant's behaviour. It is not a wire
+/// format for out-of-process clients; see the crate docs for where the
+/// external protocol lives.
 ///
 /// # Event lifecycle
 ///
 /// A typical turn looks like this:
 ///
-/// 1. One or more [`SdkEvent::TextDelta`] events as the model streams its
+/// 1. One or more [`BusEvent::TextDelta`] events as the model streams its
 ///    response.
-/// 2. Zero or more [`SdkEvent::ToolCallStart`] / [`SdkEvent::ToolCallEnd`]
+/// 2. Zero or more [`BusEvent::ToolCallStart`] / [`BusEvent::ToolCallEnd`]
 ///    pairs when the model decides to invoke tools.
-/// 3. A [`SdkEvent::CompactBoundary`] whenever the context window is
+/// 3. A [`BusEvent::CompactBoundary`] whenever the context window is
 ///    compacted.
-/// 4. [`SdkEvent::PermissionRequest`] when a dangerous tool is invoked;
-///    followed by [`SdkEvent::PermissionResolved`] once the user (or a
+/// 4. [`BusEvent::PermissionRequest`] when a dangerous tool is invoked;
+///    followed by [`BusEvent::PermissionResolved`] once the user (or a
 ///    policy) responds.
-/// 5. [`SdkEvent::ElicitationRequest`] when the model needs clarification;
-///    followed by [`SdkEvent::ElicitationResolved`] once the user answers.
-/// 6. [`SdkEvent::SessionEnd`] when the session terminates.
+/// 5. [`BusEvent::ElicitationRequest`] when the model needs clarification;
+///    followed by [`BusEvent::ElicitationResolved`] once the user answers.
+/// 6. [`BusEvent::SessionEnd`] when the session terminates.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[non_exhaustive]
 #[serde(tag = "type", rename_all = "snake_case")]
-pub enum SdkEvent {
+pub enum BusEvent {
     /// A text delta from the assistant.
     TextDelta(String),
     /// A tool call started.
@@ -85,18 +87,18 @@ pub enum SdkEvent {
 
 // ── Event Stream ────────────────────────────────────────────────────────
 
-/// Broadcast event stream for SDK consumers.
+/// In-process broadcast event bus for session events.
 ///
 /// Uses a `tokio::sync::broadcast` channel with capacity 4096.  If a
 /// subscriber is slow, events are dropped for that subscriber and a
-/// warning is logged via [`SdkSubscriber::lag()`].
+/// warning is logged via [`BusSubscriber::lag()`].
 #[derive(Debug, Clone)]
-pub struct SdkEventStream {
+pub struct EventBus {
     /// The broadcast sender.
-    tx: broadcast::Sender<SdkEvent>,
+    tx: broadcast::Sender<BusEvent>,
 }
 
-impl SdkEventStream {
+impl EventBus {
     /// Create a new event stream.
     #[must_use]
     pub fn new() -> Self {
@@ -105,22 +107,22 @@ impl SdkEventStream {
     }
 
     /// Emit an event to all listeners.
-    pub fn emit(&self, event: SdkEvent) {
+    pub fn emit(&self, event: BusEvent) {
         if self.tx.receiver_count() == 0 {
             return;
         }
         if let Err(e) = self.tx.send(event) {
-            tracing::debug!("sdk event broadcast failed (no receivers): {e}");
+            tracing::debug!("event broadcast failed (no receivers): {e}");
         }
     }
 
     /// Subscribe to the event stream with backpressure tracking.
     ///
-    /// The returned [`SdkSubscriber`] wraps the raw broadcast receiver and
+    /// The returned [`BusSubscriber`] wraps the raw broadcast receiver and
     /// counts how many events were dropped because the subscriber was slow.
     #[must_use]
-    pub fn subscribe(&self) -> SdkSubscriber {
-        SdkSubscriber::new(self.tx.subscribe())
+    pub fn subscribe(&self) -> BusSubscriber {
+        BusSubscriber::new(self.tx.subscribe())
     }
 
     /// Count of active subscribers.
@@ -130,7 +132,7 @@ impl SdkEventStream {
     }
 }
 
-impl Default for SdkEventStream {
+impl Default for EventBus {
     fn default() -> Self {
         Self::new()
     }
@@ -141,17 +143,17 @@ impl Default for SdkEventStream {
 /// A subscriber wrapper that tracks lag (dropped events).
 ///
 /// If a subscriber falls behind the broadcast buffer, `tokio::sync::broadcast`
-/// silently drops events for that subscriber.  [`SdkSubscriber`] counts
+/// silently drops events for that subscriber.  [`BusSubscriber`] counts
 /// those drops and exposes them via [`lag()`](Self::lag).  Callers can
 /// disconnect slow subscribers when lag exceeds a threshold.
 #[derive(Debug)]
-pub struct SdkSubscriber {
-    inner: broadcast::Receiver<SdkEvent>,
+pub struct BusSubscriber {
+    inner: broadcast::Receiver<BusEvent>,
     lag: std::sync::atomic::AtomicUsize,
 }
 
-impl SdkSubscriber {
-    fn new(inner: broadcast::Receiver<SdkEvent>) -> Self {
+impl BusSubscriber {
+    fn new(inner: broadcast::Receiver<BusEvent>) -> Self {
         Self {
             inner,
             lag: std::sync::atomic::AtomicUsize::new(0),
@@ -162,7 +164,7 @@ impl SdkSubscriber {
     ///
     /// Returns `Ok(event)` on success, or `Err(RecvError)` if the
     /// broadcast channel is closed.
-    pub async fn recv(&mut self) -> Result<SdkEvent, broadcast::error::RecvError> {
+    pub async fn recv(&mut self) -> Result<BusEvent, broadcast::error::RecvError> {
         match self.inner.recv().await {
             Ok(event) => Ok(event),
             Err(e) => Err(e),
@@ -170,14 +172,14 @@ impl SdkSubscriber {
     }
 
     /// Try to receive an event without awaiting.
-    pub fn try_recv(&mut self) -> Result<SdkEvent, broadcast::error::TryRecvError> {
+    pub fn try_recv(&mut self) -> Result<BusEvent, broadcast::error::TryRecvError> {
         match self.inner.try_recv() {
             Ok(event) => Ok(event),
             Err(broadcast::error::TryRecvError::Lagged(n)) => {
                 self.lag
                     .fetch_add(n as usize, std::sync::atomic::Ordering::Relaxed);
                 tracing::warn!(
-                    "sdk subscriber lagged by {n} events; consider disconnecting slow consumer"
+                    "event subscriber lagged by {n} events; consider disconnecting slow consumer"
                 );
                 Err(broadcast::error::TryRecvError::Lagged(n))
             }
@@ -550,38 +552,39 @@ impl ElicitationTracker {
     }
 }
 
-// ── SdkSession ──────────────────────────────────────────────────────────
+// ── EventSession ──────────────────────────────────────────────────────────
 
-/// Unified SDK session combining event stream, permission tracking, and elicitation.
+/// A session-scoped handle combining the event bus, permission tracking, and
+/// elicitation state.
 ///
 /// # Example
 ///
 /// ```rust,no_run
-/// use coderex_sdk::{SdkSession, SdkEvent};
+/// use coderex_events::{EventSession, BusEvent};
 ///
-/// let session = SdkSession::new("sess-1".into());
+/// let session = EventSession::new("sess-1".into());
 /// let mut sub = session.subscribe_events();
-/// session.emit(SdkEvent::TextDelta("hello".into()));
+/// session.emit(BusEvent::TextDelta("hello".into()));
 /// ```
 #[derive(Debug)]
-pub struct SdkSession {
+pub struct EventSession {
     /// Session ID.
     pub id: String,
     /// Event broadcast channel.
-    pub events: Arc<SdkEventStream>,
+    pub events: Arc<EventBus>,
     /// Permission request tracker.
     pub permissions: Arc<Mutex<PermissionTracker>>,
     /// Elicitation tracker.
     pub elicitations: Arc<Mutex<ElicitationTracker>>,
 }
 
-impl SdkSession {
-    /// Create a new SDK session.
+impl EventSession {
+    /// Create a new event session.
     #[must_use]
     pub fn new(id: String) -> Self {
         Self {
             id,
-            events: Arc::new(SdkEventStream::new()),
+            events: Arc::new(EventBus::new()),
             permissions: Arc::new(Mutex::new(PermissionTracker::new())),
             elicitations: Arc::new(Mutex::new(ElicitationTracker::new())),
         }
@@ -605,13 +608,13 @@ impl SdkSession {
     }
 
     /// Emit an event.
-    pub fn emit(&self, event: SdkEvent) {
+    pub fn emit(&self, event: BusEvent) {
         self.events.emit(event);
     }
 
     /// Subscribe to events with lag tracking.
     #[must_use]
-    pub fn subscribe_events(&self) -> SdkSubscriber {
+    pub fn subscribe_events(&self) -> BusSubscriber {
         self.events.subscribe()
     }
 
@@ -631,7 +634,7 @@ impl SdkSession {
                 tracker.resolve_timeout(&id)
             };
             if resolved {
-                self.emit(SdkEvent::PermissionResolved { id, allowed: false });
+                self.emit(BusEvent::PermissionResolved { id, allowed: false });
             }
         }
 
@@ -645,7 +648,7 @@ impl SdkSession {
                 tracker.resolve_timeout(&id)
             };
             if resolved {
-                self.emit(SdkEvent::ElicitationResolved { id });
+                self.emit(BusEvent::ElicitationResolved { id });
             }
         }
     }
@@ -677,7 +680,7 @@ impl SdkSession {
     }
 }
 
-impl Clone for SdkSession {
+impl Clone for EventSession {
     fn clone(&self) -> Self {
         Self {
             id: self.id.clone(),
@@ -694,21 +697,21 @@ mod tests {
 
     #[test]
     fn event_stream_broadcast() {
-        let stream = SdkEventStream::new();
+        let stream = EventBus::new();
         let mut rx = stream.subscribe();
-        stream.emit(SdkEvent::SessionEnd);
+        stream.emit(BusEvent::SessionEnd);
         let event = rx.try_recv().unwrap();
-        assert!(matches!(event, SdkEvent::SessionEnd));
+        assert!(matches!(event, BusEvent::SessionEnd));
     }
 
     #[test]
     fn event_stream_multiple_subscribers() {
-        let stream = SdkEventStream::new();
+        let stream = EventBus::new();
         let mut rx1 = stream.subscribe();
         let mut rx2 = stream.subscribe();
-        stream.emit(SdkEvent::TextDelta("hello".to_string()));
-        assert!(matches!(rx1.try_recv(), Ok(SdkEvent::TextDelta(ref s)) if s == "hello"));
-        assert!(matches!(rx2.try_recv(), Ok(SdkEvent::TextDelta(ref s)) if s == "hello"));
+        stream.emit(BusEvent::TextDelta("hello".to_string()));
+        assert!(matches!(rx1.try_recv(), Ok(BusEvent::TextDelta(ref s)) if s == "hello"));
+        assert!(matches!(rx2.try_recv(), Ok(BusEvent::TextDelta(ref s)) if s == "hello"));
     }
 
     #[test]
@@ -764,11 +767,11 @@ mod tests {
     }
 
     #[test]
-    fn sdk_session_emits_events() {
-        let session = SdkSession::new("s1".to_string());
+    fn event_session_emits_events() {
+        let session = EventSession::new("s1".to_string());
         let mut rx = session.subscribe_events();
-        session.emit(SdkEvent::CompactBoundary);
-        assert!(matches!(rx.try_recv(), Ok(SdkEvent::CompactBoundary)));
+        session.emit(BusEvent::CompactBoundary);
+        assert!(matches!(rx.try_recv(), Ok(BusEvent::CompactBoundary)));
     }
 
     #[test]
@@ -873,12 +876,12 @@ mod tests {
 
     #[test]
     fn subscriber_lag_tracked_on_try_recv() {
-        let stream = SdkEventStream::new();
+        let stream = EventBus::new();
         let mut sub = stream.subscribe();
 
         // Fill the broadcast buffer beyond capacity to trigger lag
         for i in 0..5000 {
-            stream.emit(SdkEvent::TextDelta(format!("msg-{i}")));
+            stream.emit(BusEvent::TextDelta(format!("msg-{i}")));
         }
 
         // try_recv should report lag
