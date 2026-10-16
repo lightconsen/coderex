@@ -4,7 +4,6 @@
 
 pub mod export;
 pub mod input;
-pub mod keybindings;
 pub mod message_list;
 pub mod notification_center;
 pub mod overlay;

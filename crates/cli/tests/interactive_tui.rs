@@ -922,14 +922,47 @@ fn provider_failure_recovers_to_usable_prompt() {
     assert!(screen.contains("System Status"));
 }
 
+/// The redraw after a resize still draws the banner and the prompt.
+///
+/// This used to assert `screen.contains("CodeRex v") || raw_text().contains("❯")`
+/// — and `raw_text()` is everything the terminal has ever received, so the
+/// right-hand side was true no matter what the TUI did after the resize. The
+/// assertion is now about what is *on the screen* afterwards, which is the
+/// thing a resize can break.
 #[test]
 fn resize_keeps_tui_alive() {
     let dir = setup_project_dir();
     let mut session = session_without_engine(dir.path());
     session.wait_for_text("CodeRex v", SCREEN_TIMEOUT);
+
     session.resize(16, 70);
-    let screen = session.wait_for_any_text(&["CodeRex v", "❯"], SCREEN_TIMEOUT);
-    assert!(screen.contains("CodeRex v") || session.raw_text().contains("❯"));
+    let after_shrink = session.wait_for_text("CodeRex v", SCREEN_TIMEOUT);
+    assert!(
+        after_shrink.contains("❯"),
+        "the prompt is missing after shrinking:\n{after_shrink}"
+    );
+
+    // Typing at the new size requires a redraw at the new size: the prompt
+    // assertions above could be satisfied by a screen left over from before
+    // the resize.
+    session.send_text("typed-after-resize");
+    let typed = session.wait_for_text("typed-after-resize", SCREEN_TIMEOUT);
+    assert!(typed.contains("❯"), "{typed}");
+    for _ in 0.."typed-after-resize".len() {
+        session.send_bytes(b"\x7f");
+    }
+
+    session.resize(40, 120);
+    let after_grow = session.wait_for_text("CodeRex v", SCREEN_TIMEOUT);
+    assert!(
+        after_grow.contains("❯"),
+        "the prompt is missing after growing:\n{after_grow}"
+    );
+
+    // And it still takes input.
+    session.send_line("/status");
+    let screen = session.wait_for_text("System Status", SCREEN_TIMEOUT);
+    assert!(screen.contains("System Status"), "{screen}");
 }
 
 #[test]
