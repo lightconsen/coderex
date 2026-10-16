@@ -1263,27 +1263,15 @@ impl ReplLoop {
         }
 
         // 5. Worktree mode
+        //
+        // This used to record the *current* directory as the active worktree,
+        // with the current branch — so `--worktree` told the session it was
+        // isolated while it went on working in the person's own checkout. It
+        // creates one now, and the session is pointed at it. A failure is
+        // reported rather than papered over: silently working in the checkout
+        // is the thing the flag exists to prevent.
         if self.worktree {
-            if let Some(ref mut engine) = self.engine {
-                let mut session = engine.session().clone();
-                if let Ok(base) = std::env::current_dir() {
-                    let branch = std::process::Command::new("git")
-                        .args(["rev-parse", "--abbrev-ref", "HEAD"])
-                        .current_dir(&base)
-                        .output();
-                    let branch_str = branch
-                        .ok()
-                        .and_then(|o| String::from_utf8(o.stdout).ok())
-                        .map(|s| s.trim().to_string())
-                        .unwrap_or_else(|| "unknown".into());
-                    session.active_worktree = Some(coderex_core::state::WorktreeState {
-                        path: base.clone(),
-                        base: branch_str,
-                        has_changes: false,
-                    });
-                    engine.set_session(session);
-                }
-            }
+            self.enter_worktree_mode();
         }
 
         // 6. Resume or fork an existing transcript into the current engine session
@@ -1325,45 +1313,115 @@ impl ReplLoop {
             }
         }
 
-        // 9. PR context
-        if let Some(ref pr_url) = self.from_pr {
-            self.session_effects
-                .extra_context
-                .push(format!("Loading context from PR: {pr_url}"));
-        }
-
-        // 10. Agent context
-        if let Some(ref agent) = self.agent {
-            self.session_effects
-                .extra_context
-                .push(format!("Active agent: {agent}"));
-        }
-
-        // 11. IDE context
-        if let Some(ref ide) = self.ide {
-            self.session_effects
-                .extra_context
-                .push(format!("IDE mode: {ide}"));
-        }
-
-        // 12. Beta features
-        if !self.betas.is_empty() {
-            self.session_effects
-                .extra_context
-                .push(format!("Enabled beta features: {}", self.betas.join(", ")));
-        }
-
-        // 13. Tmux context
-        if self.tmux_enabled {
-            self.session_effects
-                .extra_context
-                .push("Tmux integration enabled".into());
-        }
+        // 9–13. The flags with nothing behind them.
+        //
+        // Each of these used to push a sentence into the model's context
+        // saying the thing was on — "Enabled beta features: x", "IDE mode:
+        // y", "Active agent: z" — while none of it was true: the values were
+        // stored and never read again. Telling the model it has an IDE, a
+        // selected agent, or a beta turned on is worse than ignoring the flag,
+        // because the model then behaves as if it did.
+        self.warn_about_unimplemented_flags();
 
         // 14. Debug file — log that it would be configured
         if let Some(ref debug_path) = self.debug_file {
             tracing::info!("Debug output file configured: {debug_path:?}");
         }
+    }
+
+    /// Say plainly which flags this build accepts but does not act on.
+    ///
+    /// They are still accepted so a script written against the full CLI does
+    /// not fail on an unknown argument, but a person reading the output should
+    /// not have to guess whether `--ide` did anything.
+    fn warn_about_unimplemented_flags(&self) {
+        let mut unimplemented = Vec::new();
+        if self.from_pr.is_some() {
+            unimplemented.push("--from-pr");
+        }
+        if self.agent.is_some() {
+            unimplemented.push("--agent");
+        }
+        if self.ide.is_some() {
+            unimplemented.push("--ide");
+        }
+        if !self.betas.is_empty() {
+            unimplemented.push("--betas");
+        }
+        if self.tmux_enabled {
+            unimplemented.push("--tmux");
+        }
+
+        if unimplemented.is_empty() {
+            return;
+        }
+        tracing::warn!(
+            flags = %unimplemented.join(", "),
+            "these flags were accepted but this build does not act on them"
+        );
+    }
+
+    /// Create a worktree and move the session into it.
+    fn enter_worktree_mode(&mut self) {
+        let Ok(base) = std::env::current_dir() else {
+            return;
+        };
+        self.enter_worktree_mode_for(&base);
+    }
+
+    /// The same, for a named repository.
+    ///
+    /// Split out because the flag works from the process's working directory,
+    /// which a test cannot change.
+    fn enter_worktree_mode_for(&mut self, base: &std::path::Path) {
+        use coderex_core::worktree::{WorktreeConfig, WorktreeManager};
+
+        let base = base.to_path_buf();
+
+        let config = WorktreeConfig {
+            base_dir: base.join(".coderex").join("worktrees"),
+            ..WorktreeConfig::default()
+        };
+        let mut manager = WorktreeManager::new(config);
+        let created = match manager.create_worktree(&base, None) {
+            Ok(created) => created,
+            Err(error) => {
+                // The alternative is pretending, which is what this used to do.
+                tracing::error!(
+                    "could not create a worktree for --worktree: {error} — refusing to run \
+                     isolated-mode work in the checkout instead"
+                );
+                eprintln!(
+                    "could not create a worktree: {error}\n\
+                     --worktree isolates the session in its own checkout; without one the \
+                     session would edit this checkout, so it has stopped."
+                );
+                self.running = false;
+                return;
+            }
+        };
+
+        if let Some(ref mut engine) = self.engine {
+            let mut session = engine.session().clone();
+            session.active_worktree = Some(coderex_core::state::WorktreeState {
+                path: created.path.clone(),
+                base: created.branch.clone(),
+                has_changes: false,
+            });
+            engine.set_session(session);
+        }
+
+        // The tools have to run there too, or the session is isolated in name
+        // only.
+        if let Some(ref dispatcher) = self.dispatcher {
+            dispatcher.set_cwd(created.path.clone());
+        }
+        self.cwd = created.path.to_string_lossy().to_string();
+        tracing::info!(
+            worktree = %created.path.display(),
+            branch = %created.branch,
+            "--worktree: the session runs in a worktree of its own"
+        );
     }
 
     /// List directory contents as a simple string.
@@ -5389,6 +5447,71 @@ mod tests {
         }
         assert!(saw_started, "missing sub-agent start event");
         assert!(saw_completed, "missing sub-agent completion event");
+    }
+
+    /// `--worktree` creates a worktree and moves the session into it. It used
+    /// to record the *current* directory as the active worktree, so the flag
+    /// told the session it was isolated while it went on editing the person's
+    /// own checkout.
+    #[tokio::test]
+    async fn worktree_mode_creates_a_worktree_and_runs_there() {
+        let repo = tempfile::tempdir().unwrap();
+        for args in [
+            vec!["init", "--quiet"],
+            vec!["commit", "--quiet", "--allow-empty", "-m", "init"],
+        ] {
+            let status = std::process::Command::new("git")
+                .args(&args)
+                .current_dir(repo.path())
+                .env("GIT_AUTHOR_NAME", "test")
+                .env("GIT_AUTHOR_EMAIL", "test@example.com")
+                .env("GIT_COMMITTER_NAME", "test")
+                .env("GIT_COMMITTER_EMAIL", "test@example.com")
+                .output()
+                .expect("git");
+            assert!(status.status.success(), "{args:?} failed");
+        }
+
+        let api = ReadThenAnswerApi {
+            call: Arc::new(std::sync::Mutex::new(0)),
+            expected_contents: "unused",
+        };
+        let mut repl = ReplLoop::with_engine(
+            Box::new(api),
+            repo.path().to_string_lossy().into_owned(),
+            ModelId::sonnet(),
+        );
+        repl.with_worktree(true);
+
+        // The worktree is created relative to the process's working directory,
+        // which the test cannot change, so the check is on what the session
+        // was pointed at rather than on the path itself.
+        let before = repl.dispatcher.as_ref().unwrap().cwd();
+        repl.enter_worktree_mode_for(&repo.path().to_path_buf());
+
+        let session = repl.engine.as_ref().unwrap().session().clone();
+        let active = session
+            .active_worktree
+            .expect("--worktree recorded no worktree");
+        assert_ne!(
+            active.path, before,
+            "the session was pointed at the original checkout"
+        );
+        assert!(
+            active.path.is_dir(),
+            "the recorded worktree is not a directory: {}",
+            active.path.display()
+        );
+        assert!(
+            active.path.join(".git").exists(),
+            "the recorded path is not a worktree: {}",
+            active.path.display()
+        );
+        assert_eq!(
+            repl.dispatcher.as_ref().unwrap().cwd(),
+            active.path,
+            "the tools still run in the original checkout"
+        );
     }
 
     #[tokio::test]

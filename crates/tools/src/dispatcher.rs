@@ -31,7 +31,13 @@ pub struct RegistryToolDispatcher {
     registry: Arc<ToolRegistry>,
     executor: Arc<InnerExecutor>,
     context: ExecutionContext,
-    cwd: PathBuf,
+    /// The working directory tools run in.
+    ///
+    /// Behind a shared lock rather than a plain field so a session that is
+    /// moved into a worktree takes its tools with it — and shared rather than
+    /// copied so a dispatcher clone (the agent manager holds one) sees the same
+    /// move.
+    cwd: Arc<parking_lot::RwLock<PathBuf>>,
     sandbox_enabled: bool,
     /// Whether this session's feature flags are on, which decides whether a
     /// gated tool is offered at all. Off until a session says otherwise: a
@@ -60,6 +66,20 @@ impl RegistryToolDispatcher {
         self.feature_flags_enabled = enabled;
     }
 
+    /// Move the working directory tools run in.
+    ///
+    /// Used when the session is given a checkout of its own — a worktree — so
+    /// the tools work where the session says it is.
+    pub fn set_cwd(&self, cwd: PathBuf) {
+        *self.cwd.write() = cwd;
+    }
+
+    /// The working directory tools run in.
+    #[must_use]
+    pub fn cwd(&self) -> PathBuf {
+        self.cwd.read().clone()
+    }
+
     /// The registry this dispatcher resolves tools from.
     ///
     /// Lets callers add tools discovered after construction (MCP servers).
@@ -82,7 +102,7 @@ impl RegistryToolDispatcher {
             registry,
             executor,
             context,
-            cwd,
+            cwd: Arc::new(parking_lot::RwLock::new(cwd)),
             sandbox_enabled,
             feature_flags_enabled: false,
             sandbox_override: None,
@@ -191,7 +211,7 @@ impl CoreToolExecutor for RegistryToolDispatcher {
         // written against a path can only be judged against the path this call
         // is about to touch. Until this existed, `deny_rules` were consulted
         // nowhere but the registry's own tests.
-        let paths = path_arguments(tool_name, input);
+        let paths = path_arguments(input);
         if let Some(reason) = self.registry.denial_for(tool_name, &paths, self.context) {
             return ToolDispatchOutcome {
                 result: ToolResult {
@@ -202,7 +222,10 @@ impl CoreToolExecutor for RegistryToolDispatcher {
             };
         }
 
-        let mut ctx = ToolContext::new(self.context, &self.cwd);
+        // Read once rather than holding the lock across the call: the guard is
+        // not `Send`, and this runs inside spawned tasks.
+        let cwd = self.cwd.read().clone();
+        let mut ctx = ToolContext::new(self.context, &cwd);
 
         // Inject elicitation channel if available
         if let Ok(guard) = self.elicit_tx.lock() {
@@ -219,7 +242,7 @@ impl CoreToolExecutor for RegistryToolDispatcher {
             let config = self
                 .sandbox_override
                 .clone()
-                .or_else(|| sandbox_policy::default_sandbox_config(tool_name, &self.cwd));
+                .or_else(|| sandbox_policy::default_sandbox_config(tool_name, &cwd));
             if let Some(config) = config {
                 extra.insert(
                     "sandbox_config".to_string(),
@@ -326,7 +349,7 @@ impl CoreToolExecutor for RegistryToolDispatcher {
 /// else is scanned for values that look like paths, because for a deny rule
 /// the safe direction to be wrong in is "matched".
 #[must_use]
-pub fn path_arguments(tool_name: &str, input: &Value) -> Vec<std::path::PathBuf> {
+pub fn path_arguments(input: &Value) -> Vec<std::path::PathBuf> {
     const PATH_FIELDS: [&str; 8] = [
         "file_path",
         "notebook_path",
@@ -444,15 +467,15 @@ mod tests {
     #[test]
     fn path_arguments_are_read_from_the_field_the_tool_uses() {
         assert_eq!(
-            path_arguments("Read", &serde_json::json!({"file_path": "/etc/passwd"})),
+            path_arguments(&serde_json::json!({"file_path": "/etc/passwd"})),
             vec![std::path::PathBuf::from("/etc/passwd")]
         );
         assert_eq!(
-            path_arguments("Edit", &serde_json::json!({"file_path": "src/lib.rs"})),
+            path_arguments(&serde_json::json!({"file_path": "src/lib.rs"})),
             vec![std::path::PathBuf::from("src/lib.rs")]
         );
         assert_eq!(
-            path_arguments("Write", &serde_json::json!({"files": ["a.txt", "b.txt"]})),
+            path_arguments(&serde_json::json!({"files": ["a.txt", "b.txt"]})),
             vec![
                 std::path::PathBuf::from("a.txt"),
                 std::path::PathBuf::from("b.txt")
@@ -464,18 +487,16 @@ mod tests {
     /// path field is not known still offers anything that looks like a path.
     #[test]
     fn an_unknown_tool_still_offers_what_looks_like_a_path() {
-        let found = path_arguments(
-            "SomethingNew",
-            &serde_json::json!({"where": "/etc/shadow", "name": "not-a-path"}),
-        );
+        let found =
+            path_arguments(&serde_json::json!({"where": "/etc/shadow", "name": "not-a-path"}));
         assert_eq!(found, vec![std::path::PathBuf::from("/etc/shadow")]);
     }
 
     #[test]
     fn arguments_with_no_paths_offer_nothing() {
-        assert!(path_arguments("echo", &serde_json::json!({"message": "hello"})).is_empty());
-        assert!(path_arguments("echo", &serde_json::json!({})).is_empty());
-        assert!(path_arguments("echo", &serde_json::json!("not an object")).is_empty());
+        assert!(path_arguments(&serde_json::json!({"message": "hello"})).is_empty());
+        assert!(path_arguments(&serde_json::json!({})).is_empty());
+        assert!(path_arguments(&serde_json::json!("not an object")).is_empty());
     }
 
     /// The check has to happen at dispatch, with the call's own arguments: a

@@ -57,11 +57,12 @@ pub struct Cli {
     #[arg(short = 'p', long)]
     pub print: bool,
 
-    /// Concise output (minimal formatting).
+    /// Trim surrounding whitespace from headless output, and say nothing
+    /// else: this build does not reformat the answer.
     #[arg(long)]
     pub brief: bool,
 
-    /// Minimal output (no decorations, aliases --brief).
+    /// The same as --brief; kept because scripts pass it.
     #[arg(long)]
     pub bare: bool,
 
@@ -93,7 +94,8 @@ pub struct Cli {
     #[arg(long, value_name = "ID")]
     pub fork_session: Option<String>,
 
-    /// Load context from a PR URL.
+    /// Accepted, but this build does not fetch the PR — the flag is recorded
+    /// and nothing else happens.
     #[arg(long, value_name = "URL")]
     pub from_pr: Option<String>,
 
@@ -169,7 +171,8 @@ pub struct Cli {
     #[arg(long, value_name = "LEVEL")]
     pub effort: Option<String>,
 
-    /// Enable beta features.
+    /// Accepted, but this build sends no beta headers — the flag is recorded
+    /// and nothing else happens.
     #[arg(long)]
     pub betas: Vec<String>,
 
@@ -181,15 +184,18 @@ pub struct Cli {
     #[arg(long)]
     pub no_chrome: bool,
 
-    /// Enable tmux integration.
+    /// Accepted, but this build has no tmux integration — the flag is
+    /// recorded and nothing else happens.
     #[arg(long)]
     pub tmux: bool,
 
-    /// Use a specific agent.
+    /// Accepted, but this build does not switch agents — the flag is
+    /// recorded and nothing else happens.
     #[arg(long, value_name = "AGENT")]
     pub agent: Option<String>,
 
-    /// IDE integration mode (vscode, jetbrains, etc).
+    /// Accepted, but this build has no IDE integration — the flag is
+    /// recorded and nothing else happens.
     #[arg(long, value_name = "IDE")]
     pub ide: Option<String>,
 
