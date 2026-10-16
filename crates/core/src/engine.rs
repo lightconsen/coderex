@@ -428,7 +428,10 @@ impl TurnState {
         match self {
             Self::Initialize => unreachable!(),
             Self::BuildContext => matches!(next, Self::RunPreSubmitHooks),
-            Self::RunPreSubmitHooks => matches!(next, Self::StartRequest),
+            // RunPreSubmitHooks → CompactRecovery is the cache-TTL pass: it
+            // runs before the request, while the token line has not been
+            // crossed.
+            Self::RunPreSubmitHooks => matches!(next, Self::StartRequest | Self::CompactRecovery),
             Self::StartRequest => matches!(next, Self::StreamAssistant | Self::AwaitElicitation),
             Self::StreamAssistant => matches!(
                 next,
@@ -495,6 +498,10 @@ pub enum TerminalReason {
         /// Human-readable explanation.
         message: String,
     },
+    /// The provider paused the turn (`pause_turn`/`compaction`) and asked for
+    /// the same request again. Not an end: the loop re-sends with the same
+    /// context, and this is the signal that says so.
+    Resume,
 }
 
 impl std::fmt::Display for TerminalReason {
@@ -519,6 +526,7 @@ impl std::fmt::Display for TerminalReason {
             Self::ApiUnavailable { message } => {
                 write!(f, "api unavailable: {message}")
             }
+            Self::Resume => write!(f, "resumed"),
         }
     }
 }
@@ -852,6 +860,234 @@ fn stop_reason_eq(stop_reason: &str, expected: &str) -> bool {
     }
 }
 
+/// Combine text delivered before a retry with the text the retry produced.
+///
+/// A stream cannot be resumed at a byte offset, so a retry re-requests the
+/// turn from the beginning and the model regenerates the opening it already
+/// produced. The two texts therefore share a prefix, and taking the longer one
+/// keeps the reader from being shown the same sentence twice. When the retry
+/// instead picks up past where the first attempt stopped — or diverges — both
+/// are kept, so nothing already delivered is lost. The result never shrinks,
+/// which is what lets the caller emit only the growth.
+#[must_use]
+fn merge_stream_text(delivered: &str, retried: &str) -> String {
+    if retried.starts_with(delivered) {
+        retried.to_string()
+    } else if delivered.starts_with(retried) {
+        delivered.to_string()
+    } else {
+        let mut merged = String::with_capacity(delivered.len() + retried.len());
+        merged.push_str(delivered);
+        merged.push_str(retried);
+        merged
+    }
+}
+
+/// What a provider's stop reason asks the turn loop to do next.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StopDisposition {
+    /// The model wants tools run before it can go on.
+    RunTools,
+    /// The provider paused the turn and expects the same request again: it
+    /// ran out of a server-side budget (`pause_turn`) or compacted its own
+    /// context (`compaction`). Neither is the end of the turn — treating them
+    /// as one silently truncates the answer.
+    Resume,
+    /// The turn is over, whether the model finished or was cut short.
+    Stop,
+}
+
+/// Read a provider's stop reason for what it asks the loop to do.
+///
+/// Anthropic spells the paused cases `pause_turn` and `compaction`; OpenAI
+/// compatible providers spell a tool call `tool_calls`. Anything not named
+/// here — `end_turn`, `max_tokens`, `length`, `refusal`, `stop`, and whatever
+/// a provider invents next — ends the turn, which is the safe default: an
+/// unknown reason must not make the loop re-request forever.
+#[must_use]
+pub fn classify_stop_reason(stop_reason: &str) -> StopDisposition {
+    match stop_reason {
+        "tool_use" | "tool_calls" => StopDisposition::RunTools,
+        "pause_turn" | "compaction" => StopDisposition::Resume,
+        _ => StopDisposition::Stop,
+    }
+}
+
+// ─── Compaction outcome ─────────────────────────────────────────────────────
+
+/// What asked for compaction to be considered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompactTrigger {
+    /// The context crossed the token line.
+    TokenThreshold,
+    /// The prompt cache went cold while the session sat idle.
+    CacheTtl,
+}
+
+/// What became of the LLM summary step.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SummaryOutcome {
+    /// The model wrote the summary.
+    Summarized,
+    /// The model was not asked — this trigger does not use a summary.
+    NotRequested,
+    /// There was too little conversation between the preserved head and tail
+    /// to be worth a call.
+    RangeTooSmall {
+        /// Messages available.
+        messages: usize,
+    },
+    /// The summary call failed.
+    Failed {
+        /// The failure.
+        error: String,
+    },
+    /// The summary came back empty.
+    Empty,
+}
+
+/// What compaction did, or why it did not happen.
+///
+/// The engine used to answer this only in `tracing::warn!` strings — a caller
+/// cannot act on a log line and a test cannot assert one. Every path through
+/// `run_compact_recovery` now returns one of these instead.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CompactOutcome {
+    /// Compaction ran and removed tokens.
+    Compacted {
+        /// Which strategy ran.
+        strategy: CompactStrategy,
+        /// What triggered it.
+        trigger: CompactTrigger,
+        /// Estimated tokens removed.
+        tokens_removed: usize,
+        /// Messages left after compaction.
+        messages_remaining: usize,
+        /// What became of the summary step.
+        summary: SummaryOutcome,
+    },
+    /// The check ran but this trigger stood down: the context is not in the
+    /// band this trigger acts on, and the other path owns it.
+    ///
+    /// The cache-TTL pass is the one that defers — once the token line has
+    /// been crossed, compacting for the threshold is the right response and
+    /// doing both would compact twice for one reason.
+    DeferredToThresholdPath {
+        /// Estimated tokens at the time.
+        estimated_tokens: usize,
+    },
+    /// The recovery retry budget is spent.
+    SkippedRecoveryBudget {
+        /// Recovery attempts already made.
+        recovery_count: u32,
+        /// The limit.
+        max: u32,
+    },
+    /// Auto-compaction is paused after consecutive failures.
+    CircuitBreakerOpen {
+        /// Consecutive failures so far.
+        consecutive_failures: u32,
+        /// The limit.
+        max: u32,
+    },
+    /// The Stop hook ended the turn instead of compacting.
+    StopHookTerminated {
+        /// The hook's reason.
+        reason: String,
+    },
+    /// Compaction ran but removed nothing — the context is irrecoverable by
+    /// this strategy, and the circuit breaker counts it.
+    NoProgress {
+        /// Tokens before.
+        tokens_before: usize,
+        /// Tokens after.
+        tokens_after: usize,
+        /// What became of the summary step.
+        summary: SummaryOutcome,
+    },
+}
+
+impl CompactOutcome {
+    /// Whether this outcome ends the turn.
+    #[must_use]
+    pub const fn is_failure(&self) -> bool {
+        matches!(
+            self,
+            Self::CircuitBreakerOpen { .. } | Self::StopHookTerminated { .. }
+        )
+    }
+
+    /// The message to terminate the turn with, when this outcome is a failure.
+    #[must_use]
+    pub fn failure_message(&self) -> Option<String> {
+        match self {
+            Self::CircuitBreakerOpen {
+                consecutive_failures,
+                max,
+            } => Some(format!(
+                "CompactRecovery: {consecutive_failures}/{max} consecutive compact failures — \
+                 stopping auto-retry. Use /compact manually or start a new session."
+            )),
+            Self::StopHookTerminated { reason } => Some(reason.clone()),
+            _ => None,
+        }
+    }
+}
+
+/// How many provider-paused turns the loop will resume before it gives up.
+///
+/// A provider that answers `pause_turn` forever must not spin the loop
+/// forever; past this many consecutive resumes the pause is reported as the
+/// end of the run.
+pub const MAX_PROVIDER_RESUMES: u32 = 8;
+
+/// What the outer turn loop does after a turn returns a reason.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum LoopStep {
+    /// Run another turn.
+    Continue,
+    /// Stop the run, reporting this reason.
+    Break(TerminalReason),
+}
+
+/// Decide whether the loop runs another turn after `reason`.
+///
+/// `last_message_is_tool_result` is the old rule for `Completed`: a turn that
+/// ended on a tool result is not finished, the model has not seen the result
+/// yet. `resumes` is how many consecutive provider-paused turns have already
+/// run, which bounds the `Resume` case.
+fn next_loop_step(
+    reason: &TerminalReason,
+    last_message_is_tool_result: bool,
+    resumes: u32,
+) -> LoopStep {
+    if matches!(reason, TerminalReason::Resume) {
+        // A paused turn continues with the same context. The bound keeps a
+        // provider that never stops pausing from looping forever.
+        return if resumes >= MAX_PROVIDER_RESUMES {
+            LoopStep::Break(TerminalReason::Completed)
+        } else {
+            LoopStep::Continue
+        };
+    }
+
+    if matches!(
+        reason,
+        TerminalReason::Completed
+            | TerminalReason::TokenLimitStop
+            | TerminalReason::LoopDetected { .. }
+            | TerminalReason::ApiUnavailable { .. }
+    ) {
+        if matches!(reason, TerminalReason::Completed) && last_message_is_tool_result {
+            LoopStep::Continue
+        } else {
+            LoopStep::Break(reason.clone())
+        }
+    } else {
+        LoopStep::Continue
+    }
+}
+
 // ─── Interrupts ─────────────────────────────────────────────────────────────
 
 /// A way to stop the turn an engine is running, from outside it.
@@ -947,6 +1183,9 @@ pub struct QueryEngine {
     /// Optional compaction backend (the local/remote dual-track seam).
     /// Absent → the built-in local LLM summary path is used.
     compaction_backend: Option<Arc<dyn crate::compaction_backend::CompactionBackend>>,
+    /// When the last provider request started, for the prompt-cache TTL
+    /// trigger: every request refreshes the cache, so the clock starts there.
+    last_request_at: Option<Instant>,
 }
 
 /// A denied tool call that should be summarized in the next turn.
@@ -1042,6 +1281,7 @@ impl QueryEngine {
             coordinator: None,
             session_memory: None,
             compaction_backend: None,
+            last_request_at: None,
         }
     }
 
@@ -1450,6 +1690,7 @@ impl QueryEngine {
         turn.agent_id = options.agent_id.clone();
         let mut turn_number = self.current_turn + 1;
         let mut last_reason = TerminalReason::Completed;
+        let mut provider_resumes: u32 = 0;
 
         // Add user message
         self.session.messages.push(Message::user(prompt.clone()));
@@ -1488,28 +1729,23 @@ impl QueryEngine {
                         let _ = coordinator.advance(&summary);
                     }
 
-                    if matches!(
-                        reason,
-                        TerminalReason::Completed
-                            | TerminalReason::TokenLimitStop
-                            | TerminalReason::LoopDetected { .. }
-                            | TerminalReason::ApiUnavailable { .. }
-                    ) {
-                        // If the last message is a tool result, the model needs another turn
-                        if matches!(reason, TerminalReason::Completed)
-                            && self
-                                .session
-                                .messages
-                                .last()
-                                .map(|m| matches!(m.role, crate::types::Role::Tool))
-                                .unwrap_or(false)
-                        {
+                    let last_is_tool_result = self
+                        .session
+                        .messages
+                        .last()
+                        .map(|m| matches!(m.role, crate::types::Role::Tool))
+                        .unwrap_or(false);
+                    match next_loop_step(&reason, last_is_tool_result, provider_resumes) {
+                        LoopStep::Continue => {
+                            if matches!(reason, TerminalReason::Resume) {
+                                provider_resumes += 1;
+                            }
                             turn_number += 1;
-                        } else {
+                        }
+                        LoopStep::Break(reason) => {
+                            last_reason = reason;
                             break;
                         }
-                    } else {
-                        turn_number += 1;
                     }
                 }
                 // The error says which kind it is; the loop does not read the
@@ -1556,6 +1792,7 @@ impl QueryEngine {
         turn.agent_id = options.agent_id.clone();
         let mut turn_number = self.current_turn + 1;
         let mut last_reason = TerminalReason::Completed;
+        let mut provider_resumes: u32 = 0;
 
         // Add user message
         self.session.messages.push(Message::user(prompt.clone()));
@@ -1596,28 +1833,23 @@ impl QueryEngine {
                         let _ = coordinator.advance(&summary);
                     }
 
-                    if matches!(
-                        reason,
-                        TerminalReason::Completed
-                            | TerminalReason::TokenLimitStop
-                            | TerminalReason::LoopDetected { .. }
-                            | TerminalReason::ApiUnavailable { .. }
-                    ) {
-                        // If the last message is a tool result, the model needs another turn
-                        if matches!(reason, TerminalReason::Completed)
-                            && self
-                                .session
-                                .messages
-                                .last()
-                                .map(|m| matches!(m.role, crate::types::Role::Tool))
-                                .unwrap_or(false)
-                        {
+                    let last_is_tool_result = self
+                        .session
+                        .messages
+                        .last()
+                        .map(|m| matches!(m.role, crate::types::Role::Tool))
+                        .unwrap_or(false);
+                    match next_loop_step(&reason, last_is_tool_result, provider_resumes) {
+                        LoopStep::Continue => {
+                            if matches!(reason, TerminalReason::Resume) {
+                                provider_resumes += 1;
+                            }
                             turn_number += 1;
-                        } else {
+                        }
+                        LoopStep::Break(reason) => {
+                            last_reason = reason;
                             break;
                         }
-                    } else {
-                        turn_number += 1;
                     }
                 }
                 // The error says which kind it is; the loop does not read the
@@ -1660,17 +1892,24 @@ impl QueryEngine {
         turn.transition_to(TurnState::RunPreSubmitHooks);
 
         // Fire UserPromptSubmit hook
-        let user_prompt = options
-            .custom_system_prompt
-            .as_deref()
-            .unwrap_or_else(|| options.append_system_prompt.as_deref().unwrap_or(""));
+        let user_prompt = self.submitted_prompt();
         let ctx = std::collections::HashMap::new();
         let hook_result = self
-            .fire_hook(hook_events::USER_PROMPT_SUBMIT, user_prompt, &ctx)
+            .fire_hook(hook_events::USER_PROMPT_SUBMIT, &user_prompt, &ctx)
             .await;
         if hook_result.stop {
             turn.terminate(TerminalReason::Completed);
             return Ok(TerminalReason::Completed);
+        }
+
+        // The prompt cache may have gone cold while this session sat idle:
+        // the cheapest moment to compact is just before a request that is
+        // going to miss the cache anyway.
+        if let Some(outcome) = self
+            .maybe_compact_on_cache_ttl(turn, options, turn_number)
+            .await
+        {
+            tracing::debug!("cache-TTL compaction: {outcome:?}");
         }
 
         // Phase 3: RunPreSubmitHooks → StartRequest
@@ -1727,9 +1966,17 @@ impl QueryEngine {
                 // Try compact recovery before giving up
                 if turn.recovery_count < self.compact_config.max_recovery_retries {
                     turn.transition_to(TurnState::CompactRecovery);
-                    if let Err(e) = self.run_compact_recovery(turn, options, turn_number).await {
-                        turn.terminate(TerminalReason::Error(e.clone()));
-                        return Ok(TerminalReason::Error(e));
+                    let outcome = self
+                        .run_compact_recovery(
+                            turn,
+                            options,
+                            turn_number,
+                            CompactTrigger::TokenThreshold,
+                        )
+                        .await;
+                    if let Some(reason) = outcome.failure_message() {
+                        turn.terminate(TerminalReason::Error(reason.clone()));
+                        return Ok(TerminalReason::Error(reason));
                     }
                     // Retry the request with compacted context
                     turn.transition_to(TurnState::StartRequest);
@@ -1802,11 +2049,19 @@ impl QueryEngine {
             // Try compact recovery before giving up
             if turn.recovery_count < self.compact_config.max_recovery_retries {
                 turn.transition_to(TurnState::CompactRecovery);
-                if let Err(e) = self.run_compact_recovery(turn, options, turn_number).await {
-                    turn.terminate(TerminalReason::Error(e.clone()));
+                let outcome = self
+                    .run_compact_recovery(
+                        turn,
+                        options,
+                        turn_number,
+                        CompactTrigger::TokenThreshold,
+                    )
+                    .await;
+                if let Some(reason) = outcome.failure_message() {
+                    turn.terminate(TerminalReason::Error(reason.clone()));
                     self.cost_tracker
                         .end_turn(turn_number, &api_response.usage, &self.model);
-                    return Ok(TerminalReason::Error(e));
+                    return Ok(TerminalReason::Error(reason));
                 }
                 // After compact, tool results are still pending — the caller
                 // will start the next turn with the compacted context
@@ -1862,17 +2117,24 @@ impl QueryEngine {
         turn.transition_to(TurnState::RunPreSubmitHooks);
 
         // Fire UserPromptSubmit hook
-        let user_prompt = options
-            .custom_system_prompt
-            .as_deref()
-            .unwrap_or_else(|| options.append_system_prompt.as_deref().unwrap_or(""));
+        let user_prompt = self.submitted_prompt();
         let ctx = std::collections::HashMap::new();
         let hook_result = self
-            .fire_hook(hook_events::USER_PROMPT_SUBMIT, user_prompt, &ctx)
+            .fire_hook(hook_events::USER_PROMPT_SUBMIT, &user_prompt, &ctx)
             .await;
         if hook_result.stop {
             turn.terminate(TerminalReason::Completed);
             return Ok(TerminalReason::Completed);
+        }
+
+        // The prompt cache may have gone cold while this session sat idle:
+        // the cheapest moment to compact is just before a request that is
+        // going to miss the cache anyway.
+        if let Some(outcome) = self
+            .maybe_compact_on_cache_ttl(turn, options, turn_number)
+            .await
+        {
+            tracing::debug!("cache-TTL compaction: {outcome:?}");
         }
 
         // Phase 3: RunPreSubmitHooks → StartRequest → StreamAssistant
@@ -1945,9 +2207,17 @@ impl QueryEngine {
             if !turn.budget.should_continue() {
                 if turn.recovery_count < self.compact_config.max_recovery_retries {
                     turn.transition_to(TurnState::CompactRecovery);
-                    if let Err(e) = self.run_compact_recovery(turn, options, turn_number).await {
-                        turn.terminate(TerminalReason::Error(e.clone()));
-                        return Ok(TerminalReason::Error(e));
+                    let outcome = self
+                        .run_compact_recovery(
+                            turn,
+                            options,
+                            turn_number,
+                            CompactTrigger::TokenThreshold,
+                        )
+                        .await;
+                    if let Some(reason) = outcome.failure_message() {
+                        turn.terminate(TerminalReason::Error(reason.clone()));
+                        return Ok(TerminalReason::Error(reason));
                     }
                     turn.transition_to(TurnState::StartRequest);
                     let retried = self.send_request_streaming(turn, options).await?;
@@ -2003,10 +2273,18 @@ impl QueryEngine {
         if !turn.budget.should_continue() {
             if turn.recovery_count < self.compact_config.max_recovery_retries {
                 turn.transition_to(TurnState::CompactRecovery);
-                if let Err(e) = self.run_compact_recovery(turn, options, turn_number).await {
-                    turn.terminate(TerminalReason::Error(e.clone()));
+                let outcome = self
+                    .run_compact_recovery(
+                        turn,
+                        options,
+                        turn_number,
+                        CompactTrigger::TokenThreshold,
+                    )
+                    .await;
+                if let Some(reason) = outcome.failure_message() {
+                    turn.terminate(TerminalReason::Error(reason.clone()));
                     self.cost_tracker.end_turn(turn_number, &usage, &self.model);
-                    return Ok(TerminalReason::Error(e));
+                    return Ok(TerminalReason::Error(reason));
                 }
             } else {
                 turn.terminate(TerminalReason::BudgetExhausted);
@@ -2044,14 +2322,29 @@ impl QueryEngine {
         turn.transition_to(TurnState::Finalize);
         self.cost_tracker.end_turn(turn_number, usage, &self.model);
         let _ = self.fire_turn_end_hook(turn_number, stop_reason).await;
+
+        // A provider-paused turn is not an empty turn. The model answered and
+        // the provider asked for the same request again; recording that as a
+        // tool-call-free turn would let the loop detector call a legitimate
+        // pause a repetition and end the run after three of them.
+        if matches!(classify_stop_reason(stop_reason), StopDisposition::Resume) {
+            return None;
+        }
+
         self.record_and_check_loop(pending_for_loop)
     }
 
     /// The reason a closed turn reports, given how the model stopped.
+    ///
+    /// A paused turn reports [`TerminalReason::Resume`] rather than
+    /// `Completed`: both are "not an error", but only one of them tells the
+    /// loop to send the request again.
     #[must_use]
     fn reason_for(stop_reason: &str) -> TerminalReason {
         if stop_reason_eq(stop_reason, "max_tokens") {
             TerminalReason::TokenLimitStop
+        } else if matches!(classify_stop_reason(stop_reason), StopDisposition::Resume) {
+            TerminalReason::Resume
         } else {
             TerminalReason::Completed
         }
@@ -2088,6 +2381,27 @@ impl QueryEngine {
     }
 
     /// Build the prompt context from session state.
+    /// The prompt this turn is answering.
+    ///
+    /// `execute_turn` takes no prompt parameter — the prompt is the last user
+    /// message on the session — and the `UserPromptSubmit` hook used to be
+    /// handed `custom_system_prompt` instead. That is almost always empty, so a
+    /// hook that inspects the prompt it is supposedly being told about saw
+    /// nothing at all.
+    fn submitted_prompt(&self) -> String {
+        self.session
+            .messages
+            .iter()
+            .rev()
+            .find_map(|message| match (&message.role, &message.content) {
+                (crate::types::Role::User, crate::types::MessageContent::Text(text)) => {
+                    Some(text.clone())
+                }
+                _ => None,
+            })
+            .unwrap_or_default()
+    }
+
     fn build_context(&mut self, turn: &mut TurnRuntime, options: &SubmitOptions) {
         // Assemble context using PromptCompiler
         let available_tools = self.tools.list_tools();
@@ -2214,24 +2528,35 @@ impl QueryEngine {
     }
 
     /// Run compact recovery when context is too large.
+    ///
+    /// Returns a named [`CompactOutcome`] for every path, including the ones
+    /// that do nothing: "why compaction did not happen" is a question a caller
+    /// and a test both need answered, and a log line answers it for neither.
     #[allow(clippy::unused_async)]
     async fn run_compact_recovery(
         &self,
         turn: &mut TurnRuntime,
         _options: &SubmitOptions,
         _turn_number: u32,
-    ) -> Result<(), String> {
+        trigger: CompactTrigger,
+    ) -> CompactOutcome {
         // Estimate current token count
         let estimated_tokens = PromptCompiler::estimate_message_tokens(&turn.messages);
 
-        // Select compact strategy
+        // The strategy follows the trigger. A cold cache is a moment to tidy
+        // up cheaply, not a reason to rewrite history: it takes the lightest
+        // pass and never calls the summarizer. Crossing the token line takes
+        // the strategy the thresholds name.
         let stop_reason = "end_turn"; // default — would come from last API response
-        let strategy = compact::select_compact_strategy(
-            stop_reason,
-            estimated_tokens,
-            &self.model,
-            &self.compact_config,
-        );
+        let strategy = match trigger {
+            CompactTrigger::CacheTtl => CompactStrategy::Micro,
+            CompactTrigger::TokenThreshold => compact::select_compact_strategy(
+                stop_reason,
+                estimated_tokens,
+                &self.model,
+                &self.compact_config,
+            ),
+        };
 
         // Execute Stop hook with dead loop protection
         let hook_ctx = StopHookContext {
@@ -2246,7 +2571,7 @@ impl QueryEngine {
         match decision {
             StopHookDecision::Terminate { reason } => {
                 tracing::warn!("Stop hook: {}", reason);
-                return Err(reason);
+                return CompactOutcome::StopHookTerminated { reason };
             }
             StopHookDecision::Continue { .. } => {
                 tracing::info!(
@@ -2262,6 +2587,7 @@ impl QueryEngine {
         let mut ctx = std::collections::HashMap::new();
         ctx.insert("strategy".to_string(), format!("{strategy:?}"));
         ctx.insert("estimated_tokens".to_string(), estimated_tokens.to_string());
+        ctx.insert("trigger".to_string(), format!("{trigger:?}"));
         let pre_compact_result = self
             .fire_hook(hook_events::PRE_COMPACT, "compact_recovery", &ctx)
             .await;
@@ -2272,17 +2598,20 @@ impl QueryEngine {
         // Circuit breaker: stop auto-compacting against an irrecoverable
         // context (e.g., context_window exceeded by a single message).
         if turn.compact_failures >= self.compact_config.max_consecutive_failures {
-            return Err(format!(
-                "CompactRecovery: {} consecutive compact failures — stopping auto-retry. \
-                 Use /compact manually or start a new session.",
-                turn.compact_failures
-            ));
+            return CompactOutcome::CircuitBreakerOpen {
+                consecutive_failures: turn.compact_failures,
+                max: self.compact_config.max_consecutive_failures,
+            };
         }
 
         // ── LLM summary compaction (preferred path) ──
         // Preserve head (first user message) and tail (recent turns) verbatim;
         // LLM-summarize the interval in between. Falls back to rule-based
         // strategies on any failure.
+        //
+        // The TTL trigger skips this: a summary is a model call, and a
+        // proactive tidy-up is not worth one — and the lightest rule-based
+        // pass is the whole point of compacting while the cache is cold.
         let tokens_before = estimated_tokens;
         let split = compact::summary_split(&turn.messages, 3);
         let summary_input = compact::build_summary_input(
@@ -2291,69 +2620,83 @@ impl QueryEngine {
             self.compact_config.summary_input_max_tokens,
         );
 
-        if summary_input.len() >= 2 {
-            // PTL resilience: if the summary request fails (e.g., the input
-            // itself is too long), retry once with half the input budget —
-            // `build_summary_input` re-caps by dropping the oldest messages.
-            let mut summary_result = self
-                .summarize_for_compaction(
-                    &summary_input.join("\n\n"),
-                    self.compact_config.summary_output_max_tokens,
-                )
-                .await;
-            if summary_result.is_err() {
-                tracing::warn!("CompactRecovery: summary failed — retrying with half input budget");
-                let halved = compact::build_summary_input(
-                    &turn.messages,
-                    &split,
-                    self.compact_config.summary_input_max_tokens / 2,
-                );
-                if halved.len() >= 2 {
-                    summary_result = self
-                        .summarize_for_compaction(
-                            &halved.join("\n\n"),
-                            self.compact_config.summary_output_max_tokens,
-                        )
-                        .await;
-                }
-            }
-            match summary_result {
-                Ok(summary_text) if !summary_text.trim().is_empty() => {
-                    // Refresh the persistent session memory from the same
-                    // summarized interval and merge it into the summary.
-                    // Box::pin breaks the future-size cycle through the
-                    // nested background-feature call chain.
-                    let summary_text =
-                        Box::pin(self.refresh_session_memory(&summary_text, &summary_input)).await;
-                    let mut result = compact::assemble_summary_result(
+        let mut summary_failure: Option<SummaryOutcome> = None;
+        if trigger == CompactTrigger::TokenThreshold {
+            if summary_input.len() >= 2 {
+                // PTL resilience: if the summary request fails (e.g., the input
+                // itself is too long), retry once with half the input budget —
+                // `build_summary_input` re-caps by dropping the oldest messages.
+                let mut summary_result = self
+                    .summarize_for_compaction(
+                        &summary_input.join("\n\n"),
+                        self.compact_config.summary_output_max_tokens,
+                    )
+                    .await;
+                if summary_result.is_err() {
+                    tracing::warn!(
+                        "CompactRecovery: summary failed — retrying with half input budget"
+                    );
+                    let halved = compact::build_summary_input(
                         &turn.messages,
                         &split,
-                        &summary_text,
-                        tokens_before,
-                        0,
+                        self.compact_config.summary_input_max_tokens / 2,
                     );
-                    // Post-compact restore: breadcrumb the file paths whose
-                    // contents were compacted away so the agent can re-read.
-                    let restored_paths =
-                        compact::extract_recent_file_paths(&turn.messages, &split, 5);
-                    if let Some(restore_msg) = compact::file_restore_message(&restored_paths) {
-                        result.messages.push(restore_msg);
+                    if halved.len() >= 2 {
+                        summary_result = self
+                            .summarize_for_compaction(
+                                &halved.join("\n\n"),
+                                self.compact_config.summary_output_max_tokens,
+                            )
+                            .await;
                     }
-                    turn.compact_failures = 0;
-                    self.finish_compaction(turn, result).await;
-                    return Ok(());
                 }
-                Ok(_) => {
-                    tracing::warn!("CompactRecovery: LLM summary empty — falling back to rules");
+                match summary_result {
+                    Ok(summary_text) if !summary_text.trim().is_empty() => {
+                        // Refresh the persistent session memory from the same
+                        // summarized interval and merge it into the summary.
+                        // Box::pin breaks the future-size cycle through the
+                        // nested background-feature call chain.
+                        let summary_text =
+                            Box::pin(self.refresh_session_memory(&summary_text, &summary_input))
+                                .await;
+                        let mut result = compact::assemble_summary_result(
+                            &turn.messages,
+                            &split,
+                            &summary_text,
+                            tokens_before,
+                            0,
+                        );
+                        // Post-compact restore: breadcrumb the file paths whose
+                        // contents were compacted away so the agent can re-read.
+                        let restored_paths =
+                            compact::extract_recent_file_paths(&turn.messages, &split, 5);
+                        if let Some(restore_msg) = compact::file_restore_message(&restored_paths) {
+                            result.messages.push(restore_msg);
+                        }
+                        turn.compact_failures = 0;
+                        return self
+                            .finish_compaction(turn, result, trigger, SummaryOutcome::Summarized)
+                            .await;
+                    }
+                    Ok(_) => {
+                        summary_failure = Some(SummaryOutcome::Empty);
+                        tracing::warn!(
+                            "CompactRecovery: LLM summary empty — falling back to rules"
+                        );
+                    }
+                    Err(e) => {
+                        summary_failure = Some(SummaryOutcome::Failed { error: e.clone() });
+                        tracing::warn!(
+                            "CompactRecovery: LLM summary failed ({e}) — falling back to rules"
+                        );
+                    }
                 }
-                Err(e) => {
-                    tracing::warn!(
-                        "CompactRecovery: LLM summary failed ({e}) — falling back to rules"
-                    );
-                }
+            } else {
+                tracing::debug!("CompactRecovery: summarize range too small — rule-based path");
+                summary_failure = Some(SummaryOutcome::RangeTooSmall {
+                    messages: summary_input.len(),
+                });
             }
-        } else {
-            tracing::debug!("CompactRecovery: summarize range too small — rule-based path");
         }
 
         // ── Rule-based fallback (existing strategies) ──
@@ -2368,8 +2711,8 @@ impl QueryEngine {
             }
         };
 
-        self.finish_compaction(turn, result).await;
-        Ok(())
+        let summary = summary_failure.unwrap_or(SummaryOutcome::NotRequested);
+        self.finish_compaction(turn, result, trigger, summary).await
     }
 
     /// Shared tail of every compaction path: tokens bookkeeping, boundary
@@ -2379,17 +2722,28 @@ impl QueryEngine {
     /// fails to shrink the context counts as a failure and resets on progress,
     /// so `run_compact_recovery` stops retrying once the context is
     /// irrecoverable.
-    async fn finish_compaction(&self, turn: &mut TurnRuntime, mut result: CompactResult) {
+    ///
+    /// Only a threshold-triggered compaction spends a recovery retry. A
+    /// cache-TTL pass is maintenance, and charging it to the recovery budget
+    /// would let tidying up starve a real recovery later.
+    async fn finish_compaction(
+        &self,
+        turn: &mut TurnRuntime,
+        mut result: CompactResult,
+        trigger: CompactTrigger,
+        summary: SummaryOutcome,
+    ) -> CompactOutcome {
         // Recompute tokens removed from the actual post-compaction messages.
         let tokens_after = PromptCompiler::estimate_message_tokens(&result.messages);
         let tokens_before = PromptCompiler::estimate_message_tokens(&turn.messages);
         result.tokens_removed = tokens_before.saturating_sub(tokens_after);
 
         // Circuit breaker accounting: no progress counts as a failure.
-        if tokens_after >= tokens_before {
-            turn.compact_failures = turn.compact_failures.saturating_add(1);
-        } else {
+        let made_progress = tokens_after < tokens_before;
+        if made_progress {
             turn.compact_failures = 0;
+        } else {
+            turn.compact_failures = turn.compact_failures.saturating_add(1);
         }
 
         // Check if compact boundary was inserted
@@ -2401,12 +2755,23 @@ impl QueryEngine {
 
         // Update turn messages with compacted messages
         let messages_remaining = result.messages.len();
+        let strategy = result.strategy;
         turn.messages = result.messages;
 
         // Persist compact to transcript file on disk
         if let Some(ref base_path) = self.transcript_path {
             let session_id_str = self.session.session_id.to_string();
             let transcript_file = base_path.join(format!("{session_id_str}.jsonl"));
+
+            // Back up first: compaction overwrites the transcript, and the
+            // messages it drops are gone from the live file with no undo.
+            match Self::write_transcript_backup(&transcript_file) {
+                Ok(Some(path)) => {
+                    tracing::info!("PreCompact: transcript backed up to {}", path.display());
+                }
+                Ok(None) => { /* nothing on disk yet — nothing to lose */ }
+                Err(e) => tracing::warn!("PreCompact: could not back up transcript: {e}"),
+            }
 
             // Write compacted messages to transcript
             if let Err(e) = Self::write_transcript_replacement(&transcript_file, &turn.messages) {
@@ -2421,8 +2786,10 @@ impl QueryEngine {
             }
         }
 
-        // Increment recovery count
-        turn.recovery_count += 1;
+        // Increment recovery count (threshold-triggered compaction only).
+        if trigger == CompactTrigger::TokenThreshold {
+            turn.recovery_count += 1;
+        }
 
         // Fire PostCompact hook
         let mut ctx = std::collections::HashMap::new();
@@ -2434,7 +2801,9 @@ impl QueryEngine {
             "messages_remaining".to_string(),
             messages_remaining.to_string(),
         );
-        ctx.insert("strategy".to_string(), format!("{:?}", result.strategy));
+        ctx.insert("strategy".to_string(), format!("{strategy:?}"));
+        ctx.insert("trigger".to_string(), format!("{trigger:?}"));
+        ctx.insert("summary".to_string(), format!("{summary:?}"));
         let post_compact_result = self
             .fire_hook(hook_events::POST_COMPACT, "compact_complete", &ctx)
             .await;
@@ -2442,11 +2811,113 @@ impl QueryEngine {
             tracing::warn!("PostCompact hook errors: {:?}", post_compact_result.errors);
         }
 
+        let outcome = if made_progress {
+            CompactOutcome::Compacted {
+                strategy,
+                trigger,
+                tokens_removed: result.tokens_removed,
+                messages_remaining,
+                summary,
+            }
+        } else {
+            CompactOutcome::NoProgress {
+                tokens_before,
+                tokens_after,
+                summary,
+            }
+        };
         tracing::debug!(
-            "CompactRecovery: {} tokens removed, {} messages remaining",
+            "CompactRecovery: {outcome:?} ({} tokens removed, {} messages remaining)",
             result.tokens_removed,
             turn.messages.len(),
         );
+        outcome
+    }
+
+    /// Copy the transcript aside before compaction overwrites it.
+    ///
+    /// Returns the path written, or `None` when there is no transcript on disk
+    /// yet. The name is timestamped so a second compaction does not overwrite
+    /// the first backup with an already-compacted transcript — the point of a
+    /// backup is to keep what the *first* one had.
+    fn write_transcript_backup(path: &PathBuf) -> std::io::Result<Option<PathBuf>> {
+        if !path.exists() {
+            return Ok(None);
+        }
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("transcript.jsonl");
+        let backup_path = path.with_file_name(format!("{name}.backup.{stamp}"));
+        std::fs::copy(path, &backup_path)?;
+        Ok(Some(backup_path))
+    }
+
+    /// Whether the prompt cache has gone cold since the last request.
+    fn cache_ttl_elapsed(&self) -> bool {
+        let Some(last) = self.last_request_at else {
+            return false;
+        };
+        compact::should_compact_on_cache_ttl(
+            last.elapsed(),
+            std::time::Duration::from_secs(self.compact_config.cache_ttl_secs),
+            std::time::Duration::from_secs(self.compact_config.cache_ttl_early_exit_secs),
+        )
+    }
+
+    /// Compact proactively when the prompt cache has gone cold.
+    ///
+    /// Every request refreshes the cache, so a session that sat idle past the
+    /// TTL pays a cache miss on its next request whatever happens — which is
+    /// the cheapest moment to rewrite the context. This runs *before* the
+    /// request, and only while the context is below the token line: at or
+    /// above it the threshold path owns compaction, and running both would
+    /// compact twice for one reason.
+    ///
+    /// The reference implementation schedules this on a timer. The engine has
+    /// no background task, so the check happens at the turn boundary: a
+    /// session that never sends another request never compacts. That is the
+    /// honest limit of doing this inside the turn loop.
+    ///
+    /// On the compacting path the turn is left in `CompactRecovery` — the
+    /// caller's next move to `StartRequest` is the one the graph already
+    /// allows from there.
+    async fn maybe_compact_on_cache_ttl(
+        &self,
+        turn: &mut TurnRuntime,
+        options: &SubmitOptions,
+        turn_number: u32,
+    ) -> Option<CompactOutcome> {
+        if !self.cache_ttl_elapsed() {
+            return None;
+        }
+
+        let estimated_tokens = PromptCompiler::estimate_message_tokens(&turn.messages);
+        let thresholds = compact::CompactThresholds::resolve(&self.model, &self.compact_config);
+        if matches!(
+            thresholds.level(estimated_tokens),
+            compact::ContextLevel::Compact | compact::ContextLevel::Blocked
+        ) {
+            return Some(CompactOutcome::DeferredToThresholdPath { estimated_tokens });
+        }
+
+        if turn.recovery_count >= self.compact_config.max_recovery_retries {
+            return Some(CompactOutcome::SkippedRecoveryBudget {
+                recovery_count: turn.recovery_count,
+                max: self.compact_config.max_recovery_retries,
+            });
+        }
+
+        turn.transition_to(TurnState::CompactRecovery);
+        let outcome = self
+            .run_compact_recovery(turn, options, turn_number, CompactTrigger::CacheTtl)
+            .await;
+        // The caller moves on to StartRequest; the graph allows it from here.
+        Some(outcome)
     }
 
     /// Write a full replacement to the transcript file with the given messages.
@@ -2519,6 +2990,9 @@ impl QueryEngine {
         let request_client = self
             .api_client
             .with_request_context(self.build_request_context(self.current_turn, options));
+        // Mark the request time: a successful response refreshes the provider's
+        // prompt cache, and the TTL trigger measures idleness from here.
+        self.last_request_at = Some(Instant::now());
         let response = match request_client
             .create_message(&system, &messages, &self.model, 4096, &tools)
             .await
@@ -2593,6 +3067,15 @@ impl QueryEngine {
         let messages = Self::provider_messages(&turn.messages);
         let tools = self.tools.list_tools();
 
+        // Text survives a retry. A stream cannot be resumed at an offset —
+        // the retry re-requests the turn — but what the first attempt already
+        // delivered is kept and merged with what the retry produces, so an
+        // interruption costs the reader nothing that had already arrived.
+        // `emitted_len` is how much of the merged text the UI has seen; only
+        // the growth past it is sent again.
+        let mut carried_text = String::new();
+        let mut emitted_len = 0usize;
+
         let mut attempt: u32 = 0;
         loop {
             attempt += 1;
@@ -2602,8 +3085,12 @@ impl QueryEngine {
             let mut stream = request_client
                 .create_message_streaming(&system, &messages, &self.model, 4096, &tools)
                 .await;
+            self.last_request_at = Some(Instant::now());
 
-            // Per-attempt state: discarded entirely on retry.
+            // Per-attempt state. Text is merged into `carried_text` as it
+            // arrives; tool calls are the attempt's own — a retry re-asks the
+            // model, and executing a call twice because two attempts both
+            // proposed it would double its side effects.
             let mut assembler = StreamingToolCallAssembler::new();
             let mut usage = UsageSummary {
                 input_tokens: 0,
@@ -2611,7 +3098,7 @@ impl QueryEngine {
                 cache_read_tokens: 0,
                 cache_creation_tokens: 0,
             };
-            let mut text_so_far = String::new();
+            let mut attempt_text = String::new();
             let mut early_results: Vec<ToolResult> = Vec::new();
             let mut deferred_calls: Vec<ToolCall> = Vec::new();
             let mut stream_failed = false;
@@ -2627,8 +3114,13 @@ impl QueryEngine {
                 }
                 match event.clone() {
                     StreamEvent::TextDelta(ref text) => {
-                        text_so_far.push_str(text);
-                        let _ = self.event_tx.send(EngineEvent::TextDelta(text.clone()));
+                        attempt_text.push_str(text);
+                        carried_text = merge_stream_text(&carried_text, &attempt_text);
+                        if carried_text.len() > emitted_len {
+                            let new_text = carried_text[emitted_len..].to_string();
+                            emitted_len = carried_text.len();
+                            let _ = self.event_tx.send(EngineEvent::TextDelta(new_text));
+                        }
                     }
                     StreamEvent::ToolCallBlockStart { .. } => {}
                     StreamEvent::ToolCallBlockEnd { .. } => {
@@ -2649,12 +3141,12 @@ impl QueryEngine {
                     StreamEvent::Error(ref e) => {
                         if attempt < MAX_STREAM_ATTEMPTS && crate::api_client::is_retryable(e) {
                             tracing::warn!(
-                                "streaming network error on attempt {attempt} ({} bytes received): {e} — retrying from scratch",
-                                text_so_far.len()
+                                "streaming network error on attempt {attempt} ({} bytes received): {e} — re-requesting",
+                                carried_text.len()
                             );
                             let _ = self.event_tx.send(EngineEvent::StreamInterrupted {
                                 reason: "error".into(),
-                                partial_len: text_so_far.len(),
+                                partial_len: carried_text.len(),
                                 will_retry: true,
                             });
                             tokio::time::sleep(std::time::Duration::from_millis(
@@ -2662,11 +3154,13 @@ impl QueryEngine {
                             ))
                             .await;
                             retry_requested = true;
-                            break; // discard everything; outer loop re-requests
+                            // Text carries into the retry; the attempt's tool
+                            // calls do not (see the note above the loop).
+                            break;
                         }
                         tracing::warn!(
                             "streaming network error ({} bytes received so far): {e}",
-                            text_so_far.len()
+                            carried_text.len()
                         );
                         stream_failed = true;
                         // Fail-open: stop consuming the stream but return
@@ -2720,7 +3214,7 @@ impl QueryEngine {
             }
 
             if stream_failed
-                && text_so_far.is_empty()
+                && carried_text.is_empty()
                 && early_results.is_empty()
                 && deferred_calls.is_empty()
             {
@@ -2747,14 +3241,14 @@ impl QueryEngine {
             if self.interrupt.is_interrupted() {
                 let _ = self.event_tx.send(EngineEvent::StreamInterrupted {
                     reason: "user".into(),
-                    partial_len: text_so_far.len(),
+                    partial_len: carried_text.len(),
                     will_retry: false,
                 });
                 // Whatever arrived before the interrupt is kept: a partial
                 // answer is what the person asked to stop at, and throwing it
                 // away would lose the tokens they already paid for.
                 return Ok(StreamedResponse {
-                    content: text_so_far,
+                    content: carried_text,
                     tool_calls: deferred_calls,
                     early_results,
                     usage,
@@ -2765,7 +3259,7 @@ impl QueryEngine {
             if stream_failed {
                 let _ = self.event_tx.send(EngineEvent::StreamInterrupted {
                     reason: "error".into(),
-                    partial_len: text_so_far.len(),
+                    partial_len: carried_text.len(),
                     will_retry: false,
                 });
             } else if matches!(stop_reason.as_deref(), Some("max_tokens") | Some("length")) {
@@ -2773,13 +3267,13 @@ impl QueryEngine {
                 // not retryable (re-requesting would loop and double cost).
                 let _ = self.event_tx.send(EngineEvent::StreamInterrupted {
                     reason: stop_reason.clone().unwrap_or_default(),
-                    partial_len: text_so_far.len(),
+                    partial_len: carried_text.len(),
                     will_retry: false,
                 });
             }
 
             return Ok(StreamedResponse {
-                content: text_so_far,
+                content: carried_text,
                 tool_calls: deferred_calls,
                 early_results,
                 usage,
@@ -3765,6 +4259,7 @@ mod tests {
             ) -> Result<ApiResponse, crate::api_client::ApiError> {
                 Err(crate::api_client::ApiError::Transport {
                     kind: crate::api_client::TransportError::Connect,
+                    class: crate::api_client::ErrorClass::Connection,
                     // Deliberately not the sentence the loop used to look for.
                     message: "the far side is not answering".to_string(),
                 })
@@ -4103,7 +4598,10 @@ mod tests {
         let expected: &[(S, &[S])] = &[
             (S::Initialize, &[S::BuildContext, S::Terminated]),
             (S::BuildContext, &[S::RunPreSubmitHooks, S::Terminated]),
-            (S::RunPreSubmitHooks, &[S::StartRequest, S::Terminated]),
+            (
+                S::RunPreSubmitHooks,
+                &[S::StartRequest, S::CompactRecovery, S::Terminated],
+            ),
             (
                 S::StartRequest,
                 &[S::StreamAssistant, S::AwaitElicitation, S::Terminated],
@@ -5255,8 +5753,8 @@ mod tests {
     #[tokio::test]
     async fn elicitation_heuristic_triggers_in_execute_turn() {
         use std::sync::{
-            Arc,
             atomic::{AtomicUsize, Ordering},
+            Arc,
         };
 
         struct StatefulMock {
@@ -5472,5 +5970,617 @@ mod tests {
         let lines: Vec<&str> = content.lines().collect();
         assert_eq!(lines.len(), 2);
         assert!(lines[1].contains("coderex_compact_boundary"));
+    }
+
+    // ─── Provider stop reasons ─────────────────────────────────────────────
+
+    /// A stop reason is read for what it asks the loop to do.
+    #[test]
+    fn a_stop_reason_says_what_the_loop_does_next() {
+        assert_eq!(classify_stop_reason("tool_use"), StopDisposition::RunTools);
+        assert_eq!(
+            classify_stop_reason("tool_calls"),
+            StopDisposition::RunTools
+        );
+        assert_eq!(classify_stop_reason("pause_turn"), StopDisposition::Resume);
+        assert_eq!(classify_stop_reason("compaction"), StopDisposition::Resume);
+
+        // Anything not named is the end of the turn — including a reason a
+        // provider invents next, which must not make the loop re-request.
+        for ending in ["end_turn", "max_tokens", "length", "refusal", "stop", ""] {
+            assert_eq!(
+                classify_stop_reason(ending),
+                StopDisposition::Stop,
+                "{ending:?}"
+            );
+        }
+    }
+
+    /// A paused turn is reported as one to resume, not as a finished answer.
+    /// `reason_for` used to special-case only `max_tokens`; every other reason
+    /// became `Completed`, so a `pause_turn` ended the run mid-answer.
+    #[test]
+    fn a_paused_turn_is_not_reported_as_finished() {
+        for paused in ["pause_turn", "compaction"] {
+            assert!(
+                matches!(QueryEngine::reason_for(paused), TerminalReason::Resume),
+                "{paused} should resume"
+            );
+        }
+        for finished in ["end_turn", "refusal", "stop", ""] {
+            assert!(
+                matches!(QueryEngine::reason_for(finished), TerminalReason::Completed),
+                "{finished} should finish"
+            );
+        }
+        assert!(matches!(
+            QueryEngine::reason_for("max_tokens"),
+            TerminalReason::TokenLimitStop
+        ));
+    }
+
+    /// A resumed turn runs again, but a provider that only ever pauses cannot
+    /// spin the loop forever.
+    #[test]
+    fn a_paused_turn_runs_again_until_the_bound() {
+        assert!(matches!(
+            next_loop_step(&TerminalReason::Resume, false, 0),
+            LoopStep::Continue
+        ));
+        assert!(matches!(
+            next_loop_step(&TerminalReason::Resume, false, MAX_PROVIDER_RESUMES - 1),
+            LoopStep::Continue
+        ));
+        assert!(matches!(
+            next_loop_step(&TerminalReason::Resume, false, MAX_PROVIDER_RESUMES),
+            LoopStep::Break(TerminalReason::Completed)
+        ));
+
+        // The older rule still holds: a turn that ended on a tool result is
+        // not finished, the model has not seen the result yet.
+        assert!(matches!(
+            next_loop_step(&TerminalReason::Completed, true, 0),
+            LoopStep::Continue
+        ));
+        assert!(matches!(
+            next_loop_step(&TerminalReason::Completed, false, 0),
+            LoopStep::Break(TerminalReason::Completed)
+        ));
+    }
+
+    /// Answers with the next stop reason from a fixed list, one per request,
+    /// and counts the requests.
+    struct StopReasonSequenceMock {
+        reasons: Vec<String>,
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl StopReasonSequenceMock {
+        fn next_reason(&self) -> String {
+            let n = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.reasons
+                .get(n)
+                .or_else(|| self.reasons.last())
+                .cloned()
+                .unwrap_or_else(|| "end_turn".to_string())
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ApiClient for StopReasonSequenceMock {
+        fn clone_box(&self) -> Box<dyn ApiClient> {
+            Box::new(Self {
+                reasons: self.reasons.clone(),
+                calls: Arc::clone(&self.calls),
+            })
+        }
+
+        async fn create_message(
+            &self,
+            _system: &str,
+            _messages: &[serde_json::Value],
+            _model: &ModelId,
+            _max_tokens: u32,
+            _tools: &[crate::tool_executor::ToolInfo],
+        ) -> Result<ApiResponse, crate::api_client::ApiError> {
+            let n = self.calls.load(std::sync::atomic::Ordering::SeqCst);
+            Ok(ApiResponse {
+                content: format!("answer {n}"),
+                tool_calls: Vec::new(),
+                usage: UsageSummary {
+                    input_tokens: 10,
+                    output_tokens: 5,
+                    cache_read_tokens: 0,
+                    cache_creation_tokens: 0,
+                },
+                stop_reason: self.next_reason(),
+            })
+        }
+
+        async fn create_message_streaming(
+            &self,
+            system: &str,
+            messages: &[serde_json::Value],
+            model: &ModelId,
+            max_tokens: u32,
+            tools: &[crate::tool_executor::ToolInfo],
+        ) -> std::pin::Pin<
+            Box<dyn futures::Stream<Item = crate::api_client::StreamEvent> + Send + 'static>,
+        > {
+            let response = self
+                .create_message(system, messages, model, max_tokens, tools)
+                .await
+                .expect("the sequence mock answers");
+            Box::pin(futures::stream::iter(vec![
+                crate::api_client::StreamEvent::TextDelta(response.content),
+                crate::api_client::StreamEvent::StopReason(response.stop_reason),
+                crate::api_client::StreamEvent::StreamEnd,
+            ]))
+        }
+    }
+
+    fn sequence_engine(reasons: &[&str]) -> (QueryEngine, Arc<std::sync::atomic::AtomicUsize>) {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let session = SessionState::new(std::path::PathBuf::from("/tmp/test"));
+        let checker = PermissionChecker::new(PermissionMode::BypassPermissions);
+        let engine = QueryEngine::new(
+            Box::new(StopReasonSequenceMock {
+                reasons: reasons.iter().map(|r| (*r).to_string()).collect(),
+                calls: Arc::clone(&calls),
+            }),
+            ModelId::sonnet(),
+            session,
+            PermissionEngine::new(checker),
+            tx,
+        );
+        (engine, calls)
+    }
+
+    /// A `pause_turn` is a pause, not an ending: the request is sent again and
+    /// the run reports the reason that really ended it.
+    #[tokio::test]
+    async fn a_paused_turn_is_resumed_rather_than_reported_as_an_answer() {
+        let (mut engine, calls) = sequence_engine(&["pause_turn", "end_turn"]);
+        let reason = engine
+            .submit("go".into(), SubmitOptions::default())
+            .await
+            .unwrap();
+        assert!(matches!(reason, TerminalReason::Completed), "{reason:?}");
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "the paused turn should have been requested again"
+        );
+    }
+
+    /// The streaming path resumes a paused turn too.
+    #[tokio::test]
+    async fn a_paused_turn_is_resumed_on_the_streaming_path() {
+        let (mut engine, calls) = sequence_engine(&["compaction", "end_turn"]);
+        let reason = engine
+            .submit_streaming("go".into(), SubmitOptions::default())
+            .await
+            .unwrap();
+        assert!(matches!(reason, TerminalReason::Completed), "{reason:?}");
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    /// A provider that only ever pauses stops at the bound rather than
+    /// spinning.
+    #[tokio::test]
+    async fn a_provider_that_only_pauses_does_not_loop_forever() {
+        let (mut engine, calls) = sequence_engine(&["pause_turn"]);
+        let reason = engine
+            .submit("go".into(), SubmitOptions::default())
+            .await
+            .unwrap();
+        assert!(matches!(reason, TerminalReason::Completed), "{reason:?}");
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            MAX_PROVIDER_RESUMES as usize + 1
+        );
+    }
+
+    // ─── Mid-stream interruption recovery ──────────────────────────────────
+
+    /// Merge keeps a prefix from being delivered twice and never loses text.
+    #[test]
+    fn a_retry_that_repeats_the_opening_does_not_repeat_it_to_the_reader() {
+        assert_eq!(
+            merge_stream_text("The answer is ", "The answer is 42."),
+            "The answer is 42."
+        );
+        assert_eq!(merge_stream_text("abc", "ab"), "abc");
+        assert_eq!(merge_stream_text("", "abc"), "abc");
+        // A retry that picks up past the cut, or diverges, keeps both — text
+        // already delivered is never dropped.
+        assert_eq!(merge_stream_text("abc", "def"), "abcdef");
+    }
+
+    /// A stream that dies mid-answer is re-requested, and what it already
+    /// delivered reaches the reader once. The old recovery re-requested from
+    /// scratch and threw the partial text away.
+    #[tokio::test]
+    async fn a_stream_that_dies_mid_answer_keeps_what_it_delivered() {
+        struct InterruptedStreamMock {
+            attempts: Arc<std::sync::atomic::AtomicUsize>,
+        }
+
+        #[async_trait::async_trait]
+        impl ApiClient for InterruptedStreamMock {
+            fn clone_box(&self) -> Box<dyn ApiClient> {
+                Box::new(Self {
+                    attempts: Arc::clone(&self.attempts),
+                })
+            }
+
+            async fn create_message(
+                &self,
+                _system: &str,
+                _messages: &[serde_json::Value],
+                _model: &ModelId,
+                _max_tokens: u32,
+                _tools: &[crate::tool_executor::ToolInfo],
+            ) -> Result<ApiResponse, crate::api_client::ApiError> {
+                Ok(ApiResponse {
+                    content: "fallback".into(),
+                    tool_calls: Vec::new(),
+                    usage: UsageSummary {
+                        input_tokens: 1,
+                        output_tokens: 1,
+                        cache_read_tokens: 0,
+                        cache_creation_tokens: 0,
+                    },
+                    stop_reason: "end_turn".into(),
+                })
+            }
+
+            async fn create_message_streaming(
+                &self,
+                _system: &str,
+                _messages: &[serde_json::Value],
+                _model: &ModelId,
+                _max_tokens: u32,
+                _tools: &[crate::tool_executor::ToolInfo],
+            ) -> std::pin::Pin<
+                Box<dyn futures::Stream<Item = crate::api_client::StreamEvent> + Send + 'static>,
+            > {
+                let n = self
+                    .attempts
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if n == 0 {
+                    // The connection dies with the answer half-delivered.
+                    Box::pin(futures::stream::iter(vec![
+                        StreamEvent::TextDelta("The answer is ".into()),
+                        StreamEvent::Error(crate::api_client::ApiError::Transport {
+                            kind: crate::api_client::TransportError::Other,
+                            class: crate::api_client::ErrorClass::Stream,
+                            message: "connection reset mid-body".into(),
+                        }),
+                    ]))
+                } else {
+                    Box::pin(futures::stream::iter(vec![
+                        StreamEvent::TextDelta("The answer is 42.".into()),
+                        StreamEvent::StopReason("end_turn".into()),
+                        StreamEvent::StreamEnd,
+                    ]))
+                }
+            }
+        }
+
+        let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let session = SessionState::new(std::path::PathBuf::from("/tmp/test"));
+        let checker = PermissionChecker::new(PermissionMode::BypassPermissions);
+        let mut engine = QueryEngine::new(
+            Box::new(InterruptedStreamMock {
+                attempts: Arc::clone(&attempts),
+            }),
+            ModelId::sonnet(),
+            session,
+            PermissionEngine::new(checker),
+            tx,
+        );
+
+        let reason = engine
+            .submit_streaming("go".into(), SubmitOptions::default())
+            .await
+            .unwrap();
+        assert!(matches!(reason, TerminalReason::Completed), "{reason:?}");
+        assert_eq!(
+            attempts.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "the cut stream should have been re-requested"
+        );
+
+        let mut delivered = String::new();
+        let mut interrupts: Vec<(bool, usize)> = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            match event {
+                EngineEvent::TextDelta(text) => delivered.push_str(&text),
+                EngineEvent::StreamInterrupted {
+                    will_retry,
+                    partial_len,
+                    ..
+                } => interrupts.push((will_retry, partial_len)),
+                _ => {}
+            }
+        }
+
+        assert_eq!(
+            delivered, "The answer is 42.",
+            "the reader should see the answer once, not twice"
+        );
+        assert_eq!(
+            interrupts,
+            vec![(true, "The answer is ".len())],
+            "the interruption should be reported as one that will retry"
+        );
+    }
+
+    // ─── Compaction outcomes ───────────────────────────────────────────────
+
+    /// Why compaction did not happen is returned, not only logged.
+    #[tokio::test]
+    async fn compaction_says_why_it_did_not_happen() {
+        let (engine, _rx, _session) = make_test_engine();
+        let mut turn = TurnRuntime::new(TokenBudget::with_defaults());
+        turn.messages = vec![Message::user("hello")];
+        turn.compact_failures = engine.compact_config.max_consecutive_failures;
+
+        let outcome = engine
+            .run_compact_recovery(
+                &mut turn,
+                &SubmitOptions::default(),
+                1,
+                CompactTrigger::TokenThreshold,
+            )
+            .await;
+
+        assert!(
+            matches!(outcome, CompactOutcome::CircuitBreakerOpen { .. }),
+            "{outcome:?}"
+        );
+        assert!(outcome.is_failure());
+        assert!(outcome.failure_message().is_some());
+    }
+
+    /// Only the outcomes that end the turn carry a message.
+    #[test]
+    fn only_a_fatal_compaction_outcome_ends_the_turn() {
+        let compacted = CompactOutcome::Compacted {
+            strategy: CompactStrategy::Micro,
+            trigger: CompactTrigger::TokenThreshold,
+            tokens_removed: 10,
+            messages_remaining: 2,
+            summary: SummaryOutcome::Summarized,
+        };
+        assert!(!compacted.is_failure());
+        assert!(compacted.failure_message().is_none());
+
+        let deferred = CompactOutcome::DeferredToThresholdPath {
+            estimated_tokens: 200_000,
+        };
+        assert!(!deferred.is_failure());
+        assert!(deferred.failure_message().is_none());
+
+        let stopped = CompactOutcome::StopHookTerminated {
+            reason: "stop".into(),
+        };
+        assert!(stopped.is_failure());
+        assert_eq!(stopped.failure_message().as_deref(), Some("stop"));
+    }
+
+    // ─── Pre-compaction backup ─────────────────────────────────────────────
+
+    /// The transcript is copied aside before compaction overwrites it, and a
+    /// second compaction does not overwrite the first backup.
+    #[test]
+    fn a_backup_keeps_what_compaction_is_about_to_discard() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("session.jsonl");
+        QueryEngine::write_transcript_replacement(&path, &[Message::user("the history")]).unwrap();
+
+        let first = QueryEngine::write_transcript_backup(&path)
+            .unwrap()
+            .expect("a backup");
+        assert!(first.exists());
+        assert_eq!(
+            std::fs::read_to_string(&first).unwrap(),
+            std::fs::read_to_string(&path).unwrap()
+        );
+
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        QueryEngine::write_transcript_replacement(&path, &[Message::user("compacted")]).unwrap();
+        let second = QueryEngine::write_transcript_backup(&path)
+            .unwrap()
+            .expect("a second backup");
+
+        assert_ne!(first, second, "the first backup must survive a second");
+        assert!(std::fs::read_to_string(&first)
+            .unwrap()
+            .contains("the history"));
+    }
+
+    /// There is nothing to back up before the first write.
+    #[test]
+    fn there_is_nothing_to_back_up_before_the_first_write() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("session.jsonl");
+        assert!(QueryEngine::write_transcript_backup(&path)
+            .unwrap()
+            .is_none());
+    }
+
+    /// Compacting a session with a transcript on disk leaves a backup holding
+    /// the pre-compaction history.
+    #[tokio::test]
+    async fn compaction_backs_up_the_transcript_before_overwriting_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut engine, _rx, session) = make_test_engine();
+        engine.set_transcript_path(tmp.path().to_path_buf());
+
+        let transcript = tmp.path().join(format!("{}.jsonl", session.session_id));
+        QueryEngine::write_transcript_replacement(&transcript, &[Message::user("the history")])
+            .unwrap();
+
+        let mut turn = TurnRuntime::new(TokenBudget::with_defaults());
+        turn.messages = vec![Message::user("a much longer history than this")];
+
+        let outcome = engine
+            .finish_compaction(
+                &mut turn,
+                CompactResult {
+                    strategy: CompactStrategy::Micro,
+                    messages: vec![Message::user("short")],
+                    tokens_removed: 0,
+                    boundary_inserted: false,
+                    boundary_index: None,
+                },
+                CompactTrigger::TokenThreshold,
+                SummaryOutcome::Summarized,
+            )
+            .await;
+
+        assert!(
+            matches!(outcome, CompactOutcome::Compacted { .. }),
+            "{outcome:?}"
+        );
+        assert!(
+            std::fs::read_to_string(&transcript)
+                .unwrap()
+                .contains("short"),
+            "the live transcript should hold the compacted messages"
+        );
+
+        let backups: Vec<PathBuf> = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|e| e.path())
+            .filter(|p| p.to_string_lossy().contains(".backup."))
+            .collect();
+        assert_eq!(backups.len(), 1, "one backup, got {backups:?}");
+        assert!(
+            std::fs::read_to_string(&backups[0])
+                .unwrap()
+                .contains("the history"),
+            "the backup should hold the pre-compaction transcript"
+        );
+    }
+
+    // ─── Cache-TTL compaction ──────────────────────────────────────────────
+
+    /// A cold cache is not by itself a reason to compact a small context:
+    /// nothing has gone wrong, and the pass is skipped without a model call.
+    #[tokio::test]
+    async fn a_warm_cache_is_not_a_reason_to_compact() {
+        let (mut engine, _rx, _session) = make_test_engine();
+        let mut turn = TurnRuntime::new(TokenBudget::with_defaults());
+        turn.messages = vec![Message::user("hello")];
+
+        // Never sent a request — no TTL to have elapsed.
+        assert!(engine
+            .maybe_compact_on_cache_ttl(&mut turn, &SubmitOptions::default(), 1)
+            .await
+            .is_none());
+
+        // A request a moment ago leaves the cache warm.
+        engine.last_request_at = Some(Instant::now());
+        assert!(engine
+            .maybe_compact_on_cache_ttl(&mut turn, &SubmitOptions::default(), 1)
+            .await
+            .is_none());
+    }
+
+    /// Once the token line is crossed the threshold path owns compaction, and
+    /// the TTL pass stands down rather than compacting twice for one reason.
+    #[tokio::test]
+    async fn the_cache_ttl_pass_stands_down_at_the_token_line() {
+        let (mut engine, _rx, _session) = make_test_engine();
+        let mut turn = TurnRuntime::new(TokenBudget::with_defaults());
+
+        // A context past the compaction line for this model.
+        let auto = compact::CompactThresholds::resolve(&engine.model, &engine.compact_config).auto;
+        turn.messages = vec![Message::user("x".repeat(auto * 4 + 4_000))];
+        assert!(
+            PromptCompiler::estimate_message_tokens(&turn.messages) >= auto,
+            "the fixture must cross the compaction line"
+        );
+
+        // The cache went cold while the session sat idle.
+        engine.last_request_at = Some(
+            Instant::now()
+                - std::time::Duration::from_secs(engine.compact_config.cache_ttl_secs + 1),
+        );
+
+        let outcome = engine
+            .maybe_compact_on_cache_ttl(&mut turn, &SubmitOptions::default(), 1)
+            .await;
+        assert!(
+            matches!(
+                outcome,
+                Some(CompactOutcome::DeferredToThresholdPath { .. })
+            ),
+            "{outcome:?}"
+        );
+    }
+
+    /// A cold cache below the token line compacts, and the pass is charged to
+    /// nobody's recovery budget — tidying up must not starve a real recovery.
+    #[tokio::test]
+    async fn a_cold_cache_below_the_token_line_compacts_without_spending_a_retry() {
+        let (mut engine, _rx, _session) = make_test_engine();
+        let mut turn = TurnRuntime::new(TokenBudget::with_defaults());
+        turn.messages = vec![Message::user("hello")];
+        turn.recovery_count = 0;
+
+        engine.last_request_at = Some(
+            Instant::now()
+                - std::time::Duration::from_secs(engine.compact_config.cache_ttl_secs + 1),
+        );
+
+        let outcome = engine
+            .maybe_compact_on_cache_ttl(&mut turn, &SubmitOptions::default(), 1)
+            .await;
+
+        assert!(outcome.is_some(), "a cold cache should be acted on");
+        assert_eq!(
+            turn.recovery_count, 0,
+            "a maintenance pass must not spend a recovery retry"
+        );
+    }
+
+    /// The turn loop reaches the TTL pass: a cold cache is compacted before
+    /// the request goes out, and the turn still completes.
+    #[tokio::test]
+    async fn the_turn_loop_compacts_a_cold_cache_before_the_request() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut engine, _rx, session) = make_test_engine();
+        engine.set_transcript_path(tmp.path().to_path_buf());
+        let transcript = tmp.path().join(format!("{}.jsonl", session.session_id));
+        QueryEngine::write_transcript_replacement(&transcript, &[Message::user("earlier history")])
+            .unwrap();
+
+        engine.last_request_at = Some(
+            Instant::now()
+                - std::time::Duration::from_secs(engine.compact_config.cache_ttl_secs + 1),
+        );
+
+        let reason = engine
+            .submit("go".into(), SubmitOptions::default())
+            .await
+            .unwrap();
+        assert!(matches!(reason, TerminalReason::Completed), "{reason:?}");
+
+        // The pass ran: the transcript was rewritten, and a backup of what it
+        // held before is on disk.
+        let backups: Vec<PathBuf> = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|e| e.path())
+            .filter(|p| p.to_string_lossy().contains(".backup."))
+            .collect();
+        assert_eq!(backups.len(), 1, "the cold cache should have compacted");
     }
 }

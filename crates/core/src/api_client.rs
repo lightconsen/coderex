@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::pin::Pin;
 use thiserror::Error;
-use tokio::time::{Duration, sleep};
+use tokio::time::{sleep, Duration};
 use uuid::Uuid;
 
 /// Errors from API operations.
@@ -28,8 +28,13 @@ pub enum ApiError {
     /// rewording in the HTTP client would have quietly stopped retrying.
     #[error("transport error ({kind}): {message}")]
     Transport {
-        /// What kind of failure it was.
+        /// What kind of failure it was, coarsely.
         kind: TransportError,
+        /// The triage class, from the facts of the failure (see
+        /// [`classify_transport_facts`]). Finer than `kind` because the retry
+        /// decision needs to tell a cut-off stream from a certificate the
+        /// server will reject again.
+        class: ErrorClass,
         /// The underlying message, for a person.
         message: String,
     },
@@ -64,8 +69,13 @@ impl Clone for ApiError {
     fn clone(&self) -> Self {
         match self {
             Self::Http(msg) => Self::Http(msg.clone()),
-            Self::Transport { kind, message } => Self::Transport {
+            Self::Transport {
+                kind,
+                class,
+                message,
+            } => Self::Transport {
                 kind: *kind,
+                class: *class,
                 message: message.clone(),
             },
             Self::Auth(msg) => Self::Auth(msg.clone()),
@@ -87,6 +97,10 @@ impl Clone for ApiError {
 }
 
 /// How a request failed at the transport level.
+///
+/// Coarse on purpose. Other subsystems read this bucket to answer one
+/// question — did it time out, did it fail to connect, or something else —
+/// and the finer answer lives on [`ApiError::Transport::class`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TransportError {
     /// The far side did not answer in time.
@@ -107,18 +121,265 @@ impl std::fmt::Display for TransportError {
     }
 }
 
+// ─── Provider error triage ──────────────────────────────────────────────────
+
+/// The class a provider failure falls into.
+///
+/// This is the table the retry decision reads. Every class is settled by a
+/// *fact* about the failure — a predicate the HTTP client offers about itself
+/// (`is_timeout`, `is_body`, `is_connect`, …), an HTTP status, or the
+/// [`std::io::ErrorKind`] at the bottom of the source chain — never by
+/// matching the error's wording. That property is the point: the previous
+/// retry rule read the message, so a rewording in the HTTP client silently
+/// changed whether a request was retried.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ErrorClass {
+    /// TLS handshake or certificate failure. Sending the same request again
+    /// fails the same way.
+    Ssl,
+    /// The host name could not be resolved. Worth another try — resolution
+    /// failures are as often a blip as a bad name.
+    Dns,
+    /// The connection was refused, reset, or dropped.
+    Connection,
+    /// The far side did not answer in time.
+    Timeout,
+    /// The response body was cut off part-way through the stream.
+    Stream,
+    /// A response arrived but could not be decoded. The bytes are what they
+    /// are, so re-asking does not help.
+    Decode,
+    /// The provider asked us to slow down (HTTP 429).
+    RateLimit,
+    /// The provider failed on its side (HTTP 5xx).
+    Server,
+    /// Credentials were missing or rejected (HTTP 401/403).
+    Auth,
+    /// The request was refused by the provider's access policy.
+    AccessPolicy,
+    /// The request itself was wrong (bad model, bad shape, other 4xx).
+    InvalidRequest,
+    /// Not classified.
+    Unknown,
+}
+
+impl std::fmt::Display for ErrorClass {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let name = match self {
+            Self::Ssl => "ssl",
+            Self::Dns => "dns",
+            Self::Connection => "connection",
+            Self::Timeout => "timeout",
+            Self::Stream => "stream",
+            Self::Decode => "decode",
+            Self::RateLimit => "rate limit",
+            Self::Server => "server",
+            Self::Auth => "auth",
+            Self::AccessPolicy => "access policy",
+            Self::InvalidRequest => "invalid request",
+            Self::Unknown => "unknown",
+        };
+        f.write_str(name)
+    }
+}
+
+impl ErrorClass {
+    /// The coarse [`TransportError`] bucket this class belongs to.
+    ///
+    /// Only meaningful for the classes a transport failure produces; the
+    /// others fall to `Other`.
+    #[must_use]
+    pub const fn transport_kind(self) -> TransportError {
+        match self {
+            Self::Timeout => TransportError::Timeout,
+            // Both are connection-stage failures, and both are worth another
+            // try, which is what the coarse bucket says.
+            Self::Dns | Self::Connection => TransportError::Connect,
+            // A certificate the server will reject again, a body that will
+            // not decode, an unclassified failure: none of them are "connect".
+            Self::Ssl | Self::Stream | Self::Decode | Self::Unknown => TransportError::Other,
+            Self::RateLimit
+            | Self::Server
+            | Self::Auth
+            | Self::AccessPolicy
+            | Self::InvalidRequest => TransportError::Other,
+        }
+    }
+}
+
+/// What to do about a classified failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RetryAction {
+    /// Try again after a backoff.
+    Retry,
+    /// Try again, but back off further: the provider has told us to slow down,
+    /// and retrying a rate limit at the old pace is how a soft limit becomes
+    /// a hard one.
+    RetryAfterRateLimit,
+    /// Do not try again. The same request will fail the same way.
+    Fail,
+}
+
+/// A classified failure and the decision it implies.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ErrorTriage {
+    /// What kind of failure it was.
+    pub class: ErrorClass,
+    /// Whether and how to try again.
+    pub action: RetryAction,
+}
+
+impl ErrorTriage {
+    /// Whether this failure should be retried.
+    #[must_use]
+    pub const fn is_retry(&self) -> bool {
+        !matches!(self.action, RetryAction::Fail)
+    }
+}
+
+/// The structured facts a transport failure is classified from.
+///
+/// `reqwest::Error` answers these about itself; nothing here is read out of
+/// an error message. `io_kind` is the one fact the HTTP client does not
+/// expose directly — the [`std::io::Error`] underneath a connect failure
+/// still carries a kind, and that is how a TLS/certificate failure is told
+/// from a name that would not resolve without matching on text.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TransportFacts {
+    /// The request timed out.
+    pub timeout: bool,
+    /// The response body failed mid-stream.
+    pub body: bool,
+    /// The response body could not be decoded.
+    pub decode: bool,
+    /// The connection could not be established.
+    pub connect: bool,
+    /// The request itself failed.
+    pub request: bool,
+    /// The kind of the `io::Error` at the bottom of the source chain, if any.
+    pub io_kind: Option<std::io::ErrorKind>,
+}
+
+/// Classify a transport failure from its facts.
+///
+/// The order matters: a timeout is a timeout whatever else is also true, and
+/// a body that failed after a response arrived is a stream failure rather
+/// than a connect failure.
+#[must_use]
+pub fn classify_transport_facts(facts: TransportFacts) -> ErrorClass {
+    if facts.timeout {
+        return ErrorClass::Timeout;
+    }
+    if facts.decode {
+        return ErrorClass::Decode;
+    }
+    if facts.body {
+        return ErrorClass::Stream;
+    }
+    if facts.connect || facts.request {
+        return match facts.io_kind {
+            // A handshake or certificate failure surfaces as a data-validity
+            // error, not as a plain connection refusal.
+            Some(std::io::ErrorKind::InvalidData | std::io::ErrorKind::UnexpectedEof) => {
+                ErrorClass::Ssl
+            }
+            // Name resolution failed.
+            Some(std::io::ErrorKind::NotFound) => ErrorClass::Dns,
+            _ => ErrorClass::Connection,
+        };
+    }
+    ErrorClass::Unknown
+}
+
+/// The kind of the `std::io::Error` at the bottom of an error's source chain.
+fn io_error_kind(error: &(dyn std::error::Error + 'static)) -> Option<std::io::ErrorKind> {
+    let mut source = error.source();
+    while let Some(err) = source {
+        if let Some(io) = err.downcast_ref::<std::io::Error>() {
+            return Some(io.kind());
+        }
+        source = err.source();
+    }
+    None
+}
+
+/// Classify an [`ApiError`].
+#[must_use]
+pub fn classify_error(error: &ApiError) -> ErrorClass {
+    match error {
+        // The class was settled when the error was built, from the facts the
+        // HTTP client reported about itself.
+        ApiError::Transport { class, .. } => *class,
+        ApiError::Auth(_) => ErrorClass::Auth,
+        ApiError::AccessPolicy(_) => ErrorClass::AccessPolicy,
+        ApiError::Response { status, .. } => match status {
+            401 | 403 => ErrorClass::Auth,
+            429 => ErrorClass::RateLimit,
+            500..=599 => ErrorClass::Server,
+            _ => ErrorClass::InvalidRequest,
+        },
+        ApiError::InvalidModel(_) => ErrorClass::InvalidRequest,
+        // A failure we built ourselves, or one whose cause is a retry loop
+        // that already ran out: neither is a classification of the provider.
+        ApiError::Http(_) | ApiError::RetryExhausted { .. } => ErrorClass::Unknown,
+    }
+}
+
+/// The triage decision for a failure: its class, and whether to try again.
+#[must_use]
+pub fn triage(error: &ApiError) -> ErrorTriage {
+    let class = classify_error(error);
+    let action = match class {
+        ErrorClass::Timeout
+        | ErrorClass::Dns
+        | ErrorClass::Connection
+        | ErrorClass::Stream
+        | ErrorClass::Server => RetryAction::Retry,
+        ErrorClass::RateLimit => RetryAction::RetryAfterRateLimit,
+        ErrorClass::Ssl
+        | ErrorClass::Decode
+        | ErrorClass::Auth
+        | ErrorClass::AccessPolicy
+        | ErrorClass::InvalidRequest
+        | ErrorClass::Unknown => RetryAction::Fail,
+    };
+    ErrorTriage { class, action }
+}
+
+/// The floor for the backoff after a rate limit.
+///
+/// The provider has said to slow down; the exponential schedule alone would
+/// come back too soon.
+pub const RATE_LIMIT_BACKOFF_FLOOR: Duration = Duration::from_secs(5);
+
+/// The delay before the next attempt, from the classification.
+///
+/// `attempt` is 1 for the first retry. The exponential schedule is unchanged
+/// from before — only a rate limit's floor is new.
+#[must_use]
+pub fn retry_backoff_for(attempt: u32, base: Duration, triage: &ErrorTriage) -> Duration {
+    let shift = attempt.saturating_sub(1).min(16);
+    let exponential = base.saturating_mul(1u32 << shift);
+    match triage.action {
+        RetryAction::RetryAfterRateLimit => exponential.max(RATE_LIMIT_BACKOFF_FLOOR),
+        RetryAction::Retry | RetryAction::Fail => exponential,
+    }
+}
+
 impl From<reqwest::Error> for ApiError {
     fn from(e: reqwest::Error) -> Self {
         // Asked of the error itself rather than read out of its message.
-        let kind = if e.is_timeout() {
-            TransportError::Timeout
-        } else if e.is_connect() || e.is_request() {
-            TransportError::Connect
-        } else {
-            TransportError::Other
-        };
+        let class = classify_transport_facts(TransportFacts {
+            timeout: e.is_timeout(),
+            body: e.is_body(),
+            decode: e.is_decode(),
+            connect: e.is_connect(),
+            request: e.is_request(),
+            io_kind: io_error_kind(&e),
+        });
         Self::Transport {
-            kind,
+            kind: class.transport_kind(),
+            class,
             message: e.to_string(),
         }
     }
@@ -471,7 +732,7 @@ impl AnthropicApiClient {
         body: &[u8],
         request_id: &str,
     ) -> reqwest::RequestBuilder {
-        use crate::providers::cloud::{AuthStyle, AwsCredentials, sign_v4, signing_service};
+        use crate::providers::cloud::{sign_v4, signing_service, AuthStyle, AwsCredentials};
 
         let Some(cloud) = &self.config.cloud else {
             return if self.is_anthropic_api() {
@@ -712,13 +973,23 @@ impl AnthropicApiClient {
         F: Fn() -> Fut,
         Fut: std::future::Future<Output = Result<T, ApiError>>,
     {
-        let mut last_error = None;
+        let mut last_error: Option<ApiError> = None;
         for attempt in 0..=self.config.max_retries {
             if attempt > 0 {
-                let backoff = self.config.retry_backoff * 2_u32.pow(attempt - 1);
+                // The backoff follows the classification: a rate limit backs
+                // off further than a dropped connection.
+                let previous = last_error.as_ref().map_or(
+                    ErrorTriage {
+                        class: ErrorClass::Unknown,
+                        action: RetryAction::Retry,
+                    },
+                    |e| triage(e),
+                );
+                let backoff = retry_backoff_for(attempt, self.config.retry_backoff, &previous);
                 tracing::debug!(
-                    "API retry {attempt}/{}, backing off {backoff:?}",
-                    self.config.max_retries
+                    "API retry {attempt}/{} after {} — backing off {backoff:?}",
+                    self.config.max_retries,
+                    previous.class
                 );
                 sleep(backoff).await;
             }
@@ -737,7 +1008,7 @@ impl AnthropicApiClient {
 
         Err(ApiError::RetryExhausted {
             attempts: self.config.max_retries + 1,
-            last_error_message: last_error.unwrap().to_string(),
+            last_error_message: last_error.map_or_else(|| "unknown".into(), |e| e.to_string()),
         })
     }
 }
@@ -1388,20 +1659,15 @@ fn parse_sse_message(message: &str, state: &mut SseParserState) -> Vec<StreamEve
         _ => Vec::new(),
     }
 }
-/// Classify an error as retryable (transient): timeouts, connection failures,
-/// server errors and rate limits. Auth/policy and other 4xx errors are not.
+/// Classify an error as retryable (transient): timeouts, name-resolution and
+/// connection failures, cut-off streams, server errors and rate limits.
+/// Auth/policy, TLS, decode and other 4xx errors are not.
+///
+/// This is the triage table's decision — there is one place that decides, so
+/// the retry rule and the backoff rule cannot drift apart.
 #[must_use]
 pub fn is_retryable(error: &ApiError) -> bool {
-    match error {
-        ApiError::Transport { kind, .. } => {
-            matches!(kind, TransportError::Timeout | TransportError::Connect)
-        }
-        // A message we built ourselves, not a transport failure.
-        ApiError::Http(_) => false,
-        ApiError::Response { status, .. } => *status >= 500 || *status == 429,
-        ApiError::AccessPolicy(_) => false,
-        _ => false,
-    }
+    triage(error).is_retry()
 }
 
 fn parse_custom_headers(raw: &str) -> BTreeMap<String, String> {
@@ -1556,20 +1822,21 @@ mod tests {
     /// whether the client retried.
     #[test]
     fn is_retryable_reads_the_kind_not_the_message() {
-        let transport = |kind, message: &str| ApiError::Transport {
-            kind,
+        let transport = |class: ErrorClass, message: &str| ApiError::Transport {
+            kind: class.transport_kind(),
+            class,
             message: message.to_string(),
         };
 
         assert!(is_retryable(&transport(
-            TransportError::Timeout,
+            ErrorClass::Timeout,
             "something entirely different"
         )));
-        assert!(is_retryable(&transport(TransportError::Connect, "")));
+        assert!(is_retryable(&transport(ErrorClass::Connection, "")));
 
         // A message that mentions the words is not a timeout.
         assert!(!is_retryable(&transport(
-            TransportError::Other,
+            ErrorClass::Unknown,
             "timed out while connecting"
         )));
         // And one that is a failure of ours is not retryable either.
@@ -1587,12 +1854,230 @@ mod tests {
             (TransportError::Connect, true),
             (TransportError::Other, false),
         ] {
+            let class = match kind {
+                TransportError::Timeout => ErrorClass::Timeout,
+                TransportError::Connect => ErrorClass::Connection,
+                TransportError::Other => ErrorClass::Unknown,
+            };
             let error = ApiError::Transport {
                 kind,
+                class,
                 message: String::new(),
             };
             assert_eq!(is_retryable(&error), retryable, "{kind}");
         }
+    }
+
+    // ─── Triage table ───────────────────────────────────────────────────────
+
+    /// The triage table, one row per class. A permanent failure that is
+    /// retried is the defect this table exists to prevent, so the failing
+    /// rows matter as much as the retrying ones.
+    #[test]
+    fn triage_classifies_every_class_by_fact() {
+        let transport = |class: ErrorClass| ApiError::Transport {
+            kind: class.transport_kind(),
+            class,
+            message: String::new(),
+        };
+
+        let cases = [
+            (
+                transport(ErrorClass::Ssl),
+                ErrorClass::Ssl,
+                RetryAction::Fail,
+            ),
+            (
+                transport(ErrorClass::Dns),
+                ErrorClass::Dns,
+                RetryAction::Retry,
+            ),
+            (
+                transport(ErrorClass::Connection),
+                ErrorClass::Connection,
+                RetryAction::Retry,
+            ),
+            (
+                transport(ErrorClass::Timeout),
+                ErrorClass::Timeout,
+                RetryAction::Retry,
+            ),
+            (
+                transport(ErrorClass::Stream),
+                ErrorClass::Stream,
+                RetryAction::Retry,
+            ),
+            (
+                transport(ErrorClass::Decode),
+                ErrorClass::Decode,
+                RetryAction::Fail,
+            ),
+            (
+                ApiError::Response {
+                    status: 429,
+                    message: String::new(),
+                },
+                ErrorClass::RateLimit,
+                RetryAction::RetryAfterRateLimit,
+            ),
+            (
+                ApiError::Response {
+                    status: 503,
+                    message: String::new(),
+                },
+                ErrorClass::Server,
+                RetryAction::Retry,
+            ),
+            (
+                ApiError::Auth(String::new()),
+                ErrorClass::Auth,
+                RetryAction::Fail,
+            ),
+            (
+                ApiError::AccessPolicy(String::new()),
+                ErrorClass::AccessPolicy,
+                RetryAction::Fail,
+            ),
+            (
+                ApiError::Response {
+                    status: 400,
+                    message: String::new(),
+                },
+                ErrorClass::InvalidRequest,
+                RetryAction::Fail,
+            ),
+            (
+                ApiError::InvalidModel(String::new()),
+                ErrorClass::InvalidRequest,
+                RetryAction::Fail,
+            ),
+            (
+                ApiError::Http(String::new()),
+                ErrorClass::Unknown,
+                RetryAction::Fail,
+            ),
+        ];
+
+        for (error, class, action) in cases {
+            let decision = triage(&error);
+            assert_eq!(decision.class, class, "{error}");
+            assert_eq!(decision.action, action, "{error}");
+            assert_eq!(decision.is_retry(), !matches!(action, RetryAction::Fail));
+        }
+    }
+
+    /// A TLS/certificate failure and a name that will not resolve are both
+    /// "connect" failures to the HTTP client; the triage tells them apart by
+    /// the `io::ErrorKind` underneath, not by the message.
+    #[test]
+    fn transport_facts_tell_tls_and_dns_from_a_refused_connection() {
+        let connect = |io_kind| TransportFacts {
+            connect: true,
+            io_kind,
+            ..TransportFacts::default()
+        };
+
+        assert_eq!(
+            classify_transport_facts(connect(Some(std::io::ErrorKind::InvalidData))),
+            ErrorClass::Ssl
+        );
+        assert_eq!(
+            classify_transport_facts(connect(Some(std::io::ErrorKind::NotFound))),
+            ErrorClass::Dns
+        );
+        assert_eq!(
+            classify_transport_facts(connect(Some(std::io::ErrorKind::ConnectionRefused))),
+            ErrorClass::Connection
+        );
+        assert_eq!(
+            classify_transport_facts(connect(None)),
+            ErrorClass::Connection
+        );
+
+        // A timeout is a timeout whatever else is also true.
+        assert_eq!(
+            classify_transport_facts(TransportFacts {
+                timeout: true,
+                connect: true,
+                io_kind: Some(std::io::ErrorKind::InvalidData),
+                ..TransportFacts::default()
+            }),
+            ErrorClass::Timeout
+        );
+
+        // A body that failed after a response arrived is a stream failure,
+        // not a connect failure.
+        assert_eq!(
+            classify_transport_facts(TransportFacts {
+                body: true,
+                ..TransportFacts::default()
+            }),
+            ErrorClass::Stream
+        );
+        assert_eq!(
+            classify_transport_facts(TransportFacts {
+                decode: true,
+                ..TransportFacts::default()
+            }),
+            ErrorClass::Decode
+        );
+        assert_eq!(
+            classify_transport_facts(TransportFacts::default()),
+            ErrorClass::Unknown
+        );
+    }
+
+    /// A permanent failure must not be retried, and the class must not be
+    /// recoverable by wording the message differently.
+    #[test]
+    fn a_permanent_failure_is_not_retried_however_it_is_worded() {
+        for message in ["timeout", "connection reset", "please retry", "429"] {
+            let ssl = ApiError::Transport {
+                kind: TransportError::Other,
+                class: ErrorClass::Ssl,
+                message: message.to_string(),
+            };
+            assert!(!is_retryable(&ssl), "ssl must not be retried: {message}");
+
+            let auth = ApiError::Auth(message.to_string());
+            assert!(!is_retryable(&auth), "auth must not be retried: {message}");
+        }
+    }
+
+    /// A rate limit backs off further than a dropped connection, and the
+    /// schedule is still exponential.
+    #[test]
+    fn backoff_follows_the_classification() {
+        let base = Duration::from_secs(1);
+        let connection = triage(&ApiError::Transport {
+            kind: TransportError::Connect,
+            class: ErrorClass::Connection,
+            message: String::new(),
+        });
+        let rate_limit = triage(&ApiError::Response {
+            status: 429,
+            message: String::new(),
+        });
+
+        assert_eq!(retry_backoff_for(1, base, &connection), base);
+        assert_eq!(
+            retry_backoff_for(2, base, &connection),
+            Duration::from_secs(2)
+        );
+        assert_eq!(
+            retry_backoff_for(3, base, &connection),
+            Duration::from_secs(4)
+        );
+
+        // The rate-limit floor wins over a short exponential backoff.
+        assert_eq!(
+            retry_backoff_for(1, base, &rate_limit),
+            RATE_LIMIT_BACKOFF_FLOOR
+        );
+        assert_eq!(
+            retry_backoff_for(4, base, &rate_limit),
+            Duration::from_secs(8)
+        );
     }
 
     #[test]

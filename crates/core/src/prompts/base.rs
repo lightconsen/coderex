@@ -93,6 +93,17 @@ pub struct CompactConfig {
     /// Whether compaction refreshes and injects session memory
     /// (requires a session-memory backend attached to the engine).
     pub session_memory_enabled: bool,
+    /// How long the provider's prompt cache is kept, in seconds.
+    ///
+    /// Anthropic's default cache is 5 minutes. Every request refreshes it, so
+    /// an idle gap longer than this means the next request pays a cache miss
+    /// whatever happens — which is the cheapest moment to compact.
+    pub cache_ttl_secs: u64,
+    /// How long before the cache TTL expires the proactive compaction fires.
+    ///
+    /// The reference implementation wakes at 90% of the TTL and exits 30s
+    /// early, which for a 5-minute cache are the same instant.
+    pub cache_ttl_early_exit_secs: u64,
 }
 
 impl Default for CompactConfig {
@@ -113,6 +124,8 @@ impl Default for CompactConfig {
             micro_head_tokens: 1_000,
             micro_tail_tokens: 500,
             session_memory_enabled: true,
+            cache_ttl_secs: 300,
+            cache_ttl_early_exit_secs: 30,
         }
     }
 }

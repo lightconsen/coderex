@@ -577,6 +577,50 @@ pub fn select_compact_strategy(
     }
 }
 
+// ─── Cache TTL trigger ──────────────────────────────────────────────────────
+
+/// How long after the last request the prompt cache counts as cold.
+///
+/// The reference implementation wakes at 90% of the TTL and exits 30 seconds
+/// early; for a 5-minute cache both rules name the same instant. Taking the
+/// earlier of the two keeps that true for other TTLs too.
+///
+/// A TTL shorter than the early-exit window falls back to the 90% rule: an
+/// early exit that has already passed would otherwise make every request
+/// count as a cold cache.
+#[must_use]
+pub fn cache_ttl_wake_after(
+    ttl: std::time::Duration,
+    early_exit: std::time::Duration,
+) -> std::time::Duration {
+    let ninety_percent = ttl * 9 / 10;
+    match ttl.checked_sub(early_exit) {
+        Some(early) if !early.is_zero() => {
+            if ninety_percent < early {
+                ninety_percent
+            } else {
+                early
+            }
+        }
+        _ => ninety_percent,
+    }
+}
+
+/// Whether an idle gap has reached the point where the cache is nearly cold.
+///
+/// This is a *timing* trigger, not a size one: it says "compacting now costs
+/// nothing extra", not "the context is too big". It is deliberately
+/// independent of [`CompactThresholds`] so the two triggers can be reasoned
+/// about separately.
+#[must_use]
+pub fn should_compact_on_cache_ttl(
+    idle: std::time::Duration,
+    ttl: std::time::Duration,
+    early_exit: std::time::Duration,
+) -> bool {
+    !ttl.is_zero() && idle >= cache_ttl_wake_after(ttl, early_exit)
+}
+
 // ─── LLM Summary Compaction ─────────────────────────────────────────────────
 
 /// The interval of messages that an LLM summary compaction replaces.
@@ -1481,5 +1525,63 @@ mod tests {
         assert!(text.contains("- a.rs"));
         assert!(text.contains("- b.md"));
         assert!(text.contains("Re-read"));
+    }
+
+    // ─── Cache TTL trigger ─────────────────────────────────────────────────
+
+    /// The wake point is 90% of the TTL, or 30s early — whichever comes first.
+    /// For the 5-minute default both rules name the same instant.
+    #[test]
+    fn the_cache_ttl_wake_point_is_the_earlier_of_the_two_rules() {
+        use std::time::Duration;
+        assert_eq!(
+            cache_ttl_wake_after(Duration::from_secs(300), Duration::from_secs(30)),
+            Duration::from_secs(270)
+        );
+        // A long TTL: 90% is earlier than TTL − 30s, so 90% wins.
+        assert_eq!(
+            cache_ttl_wake_after(Duration::from_secs(3600), Duration::from_secs(30)),
+            Duration::from_secs(3240)
+        );
+        // A TTL shorter than the early exit falls back to 90% rather than
+        // waking at zero, which would call every request cold.
+        assert_eq!(
+            cache_ttl_wake_after(Duration::from_secs(10), Duration::from_secs(30)),
+            Duration::from_secs(9)
+        );
+        assert_eq!(
+            cache_ttl_wake_after(Duration::ZERO, Duration::from_secs(30)),
+            Duration::ZERO
+        );
+    }
+
+    /// The trigger fires at the wake point and not before, and a zero TTL
+    /// means "no cache" rather than "always cold".
+    #[test]
+    fn the_cache_ttl_trigger_fires_at_the_wake_point() {
+        use std::time::Duration;
+        let ttl = Duration::from_secs(300);
+        let early = Duration::from_secs(30);
+
+        assert!(!should_compact_on_cache_ttl(
+            Duration::from_secs(269),
+            ttl,
+            early
+        ));
+        assert!(should_compact_on_cache_ttl(
+            Duration::from_secs(270),
+            ttl,
+            early
+        ));
+        assert!(should_compact_on_cache_ttl(
+            Duration::from_secs(3600),
+            ttl,
+            early
+        ));
+        assert!(!should_compact_on_cache_ttl(
+            Duration::from_secs(3600),
+            Duration::ZERO,
+            early
+        ));
     }
 }
