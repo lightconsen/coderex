@@ -589,14 +589,13 @@
 - [x] 实现 `list_tasks()`, `get_task(id)`, `update_task(id, state)`
 - [x] 实现 `stop_task(id)`, `get_task_output(id)`
 - [x] 实现 foreground/background 任务切换
-- [x] 实现 **adopt**：新会话启动时重新接管上一会话遗留的后台任务（`adopt_persisted`），含 `CLOCK_SKEW_ALLOWANCE_MS` 时钟偏差容忍；**foreign**（归属其他会话）与 **stale**（超过 `STALE_TASK_AGE_MS` 未更新）的记录一律不接管，终态任务与 `MainSession` 也不接管
 - **测试**：
   - task CRUD 操作正确的单元测试
   - 后台任务输出可查询的集成测试
   - 前后台切换的集成测试
-  - adopt：接管本会话近期任务、拒绝 foreign/stale/未来时间戳越界/终态/MainSession、容忍小范围时钟偏差、不覆盖在管任务、序列化往返保留归属与时间戳（`crates/core/src/task.rs`）
+  - 序列化往返保留归属与时间戳（`crates/core/src/task.rs`）
 - **依赖**：10.1
-- **说明**：CodeRex 的 `TaskKind` 是 shell/agent/dream/teammate/main-session 五类，**没有** cron 与 workflow 两类（定时任务由 `CronCreate` 系列工具负责，不归 `TaskManager`）；adopt 只覆盖真正存在的后台类型（见 `TaskKind::is_adoptable`），不为了凑齐四类而造枚举。
+- **说明**：`TaskManager` 是**进程内**任务的生命周期管理器：它的 `TaskHandle` 随进程消失，所以这里**没有** adopt 路径。持久化与 adopt 属于 `JobRecord`（见 10.6），阈值只有一套。`TaskKind` 是 shell/agent/dream/teammate/main-session 五类，与 `JobKind`（agent/shell/workflow/cron）是两个不同的问题域：前者是"正在跑什么"，后者是"磁盘上记了什么"。
 
 ### 10.3 Agent 类型与 AgentManager (crate: `agents`)
 - [x] 定义 `AgentType` 枚举（GeneralPurpose, Explore, Plan, Verification, ClaudeCodeGuide, StatuslineSetup, Custom）
@@ -633,6 +632,27 @@
   - teammate idle 事件触发的集成测试
   - task completed 广播送达的集成测试
 - **依赖**：10.3
+
+### 10.6 后台作业记录与 adopt (crate: `core`)
+- [x] `crates/core/src/job_record.rs`：`JobKind { Agent, Shell, Workflow, Cron }`、`JobState { Running, Interrupted, Done, Failed }`、`JobRecord { id, kind, description, cwd, session_id, pid, started_at_ms, updated_at_ms, state }`
+- [x] `JobStore`：每个作业一个 JSON 文件，路径 `<cwd>/.coderex/jobs/<id>.json`；**原子写**（同目录临时文件 + `rename`）；`write` / `load` / `list` / `remove` / `prune_done`；id 只允许 `[A-Za-z0-9_-]`，杜绝 `../` 逃逸
+- [x] **纯函数** `adopt(records, now_ms, session_id) -> AdoptOutcome`，五个桶 `resumable` / `interrupted` / `stale` / `foreign` / `terminal`，分类是全函数（每条记录恰好落一个桶）
+  - `STALE_THRESHOLD_MS = 120_000`：超过即 stale
+  - `CLOCK_SKEW_ALLOWANCE_MS = 60_000`：**非对称**上界，仅放宽"未来"方向；标称时间戳比本地时钟超前不超过 60s 仍可信，落后不受此容忍影响
+  - **foreign**：`session_id` 非空且不等于当前会话 → 不接管；**terminal**：`Done`/`Failed` 先于年龄判定，因此**豁免老化**（对应参照物"干净退出的会话不参与老化"）
+  - **resumable 只有 cron**：`JobKind::is_resumable()` 仅 `Cron` 为真；agent/shell/workflow 是**进程内 tokio 任务**，记录只可能是 `interrupted`，不做假的重连
+- [x] `JobStore::mark_interrupted(&outcome, now_ms)`：把 `interrupted` 里仍标 `Running` 的记录改写为 `Interrupted`（首个接管它的会话负责改写；已 `Interrupted` 的不重复报），返回每条一次 `TaskNotification` —— **宁可报告，绝不留 phantom running**
+- [x] `AdoptOutcome::notifications()`：`interrupted` 桶的纯函数视图，无存储时（如无头）也能报告
+- [x] 总入口 `adopt_for_session(store, now_ms, session_id) -> Result<StartupAdopt, JobStoreError>`；`adopt_and_reconcile` 是不看开关的纯核心
+- [x] 开关 `CODEREX_DISABLE_ADOPT`（对应参照物 `CLAUDE_DISABLE_ADOPT`）：非空且非 `0`/`false`/`no` 即整体停用。参照物**没有 adopt 时的同意弹窗**——它沿用此前已授予的同意并**披露**而非询问——所以这里是开关而不是对话框
+- **测试**：
+  - 可收养性矩阵（fresh / foreign / stale / 未来时间戳在 skew 内 / 超出 skew / 终态豁免老化 / 已 Interrupted）单元测试，含两个边界（阈值恰等、skew 恰等）（`crates/core/src/job_record.rs`）
+  - 存储往返：write → load → list → remove → prune_done；原子写不留临时文件；并发写/读不产生解码失败；损坏文件被跳过而不是让 adopt 整体失败；非法 id 被拒（`crates/core/tests/job_record_integration.rs`）
+  - **interrupted 记录被上报而不是丢掉**：写入一条 `Running` 记录 → `adopt_and_reconcile` → 得到一条 notification，且磁盘上该记录变为 `Interrupted`（不再是 `Running`）
+  - 变异验证：去掉 skew 上界 → `future_timestamp_within_skew_is_trusted` 必须失败；去掉 foreign 判定 → `foreign_record_is_not_adopted` 必须失败
+- **依赖**：10.2
+- **说明（为什么不需要 roster 索引）**：参照物在每作业 `state.json` 旁另存 `roster.json` 索引，是因为它的守护进程要在每次重启时扫描一棵大小未知的作业树。CodeRex 的作业目录由一个会话写入、只装少量文件，`list()` 直接读目录即可；再加一份索引等于引入第二个事实来源，会与它索引的文件互相矛盾。故**不设索引**。
+- **说明（cron 的真相）**：持久化 cron 定义**已经存在**——`CronScheduler`（`crates/tools/src/cron_scheduler.rs`）把 `durable` 作业写入 `~/.coderex/scheduled_tasks.json`，`repl.rs:941` 会话启动时 `load()`，随后 `spawn_runner()` 在同一个 scheduler 上重新调度。也就是说参照物 `adoptCron` 想做的事（按存储去重后重排）在这里由 `CronScheduler` 自己完成，**adopt 不去重排、也不会重复登记**：它把 cron 记录归入 `resumable` 仅供披露。`CronCreate` 目前不写 `JobRecord`，所以实践中该桶通常为空——如实成陈述，不假造生产者。
 
 ---
 

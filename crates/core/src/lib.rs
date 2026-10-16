@@ -20,6 +20,7 @@ pub mod fuzzy_matcher;
 pub mod hook_events;
 pub mod hook_executor;
 pub mod hook_security;
+pub mod job_record;
 pub mod loop_detector;
 pub mod markdown;
 pub mod model_router;
@@ -87,6 +88,12 @@ pub use elicitation::{
 };
 
 pub use task::{TaskError, TaskHandle, TaskKind, TaskManager, TaskState};
+
+pub use job_record::{
+    AdoptOutcome, DISABLE_ADOPT_ENV, JobKind, JobRecord, JobState, JobStore, JobStoreError,
+    StartupAdopt, TaskNotification, adopt, adopt_and_reconcile, adopt_disabled, adopt_disabled_with,
+    adopt_for_session,
+};
 
 pub use worktree::{
     WorktreeConfig, WorktreeError, WorktreeManager, WorktreeResult, enter_worktree, exit_worktree,

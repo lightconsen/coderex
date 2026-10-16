@@ -2,6 +2,11 @@
 //!
 //! Phase 10.1–10.2: Defines `TaskKind`, `TaskState`, `TaskHandle`, and `TaskManager`
 //! for managing local shell commands, sub-agents, and other background tasks.
+//!
+//! Everything here is **in-process**: a [`TaskHandle`] lives only as long as
+//! the process that owns it. Durability across restarts, and the adoptability
+//! rules that decide what a starting session may pick up, live in
+//! [`crate::job_record`] — a single adopt path with a single set of thresholds.
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -10,29 +15,13 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 
-// ─── Adopt tolerances ───────────────────────────────────────────────────────
-
-/// Tolerance applied to persisted task timestamps when adopting them at
-/// session start.
-///
-/// A record whose last update is stamped up to this far *ahead* of the local
-/// clock is trusted (treated as "now") instead of being rejected as corrupt:
-/// the process that wrote it may simply have had a clock a little ahead. The
-/// same allowance bounds how recently a record may have been touched before
-/// this session treats it as still owned by a live session rather than as
-/// something to adopt.
-pub const CLOCK_SKEW_ALLOWANCE_MS: i64 = 60_000;
-
-/// A persisted background task whose last update is older than this is
-/// **stale**: it is assumed to have died with the session that owned it, and
-/// is not adopted.
-pub const STALE_TASK_AGE_MS: i64 = 30 * 60_000;
+// ─── Time ───────────────────────────────────────────────────────────────────
 
 /// Current wall-clock time in milliseconds since the Unix epoch.
 ///
 /// Returns `0` if the clock is set before the epoch, which is only reachable
-/// on a badly misconfigured machine; callers that adopt persisted tasks
-/// already reject implausible timestamps.
+/// on a badly misconfigured machine; the durability logic in
+/// [`crate::job_record`] rejects implausible timestamps.
 #[must_use]
 pub fn now_ms() -> i64 {
     SystemTime::now()
@@ -73,26 +62,6 @@ pub enum TaskKind {
 }
 
 impl TaskKind {
-    /// Whether a task of this kind can be re-attached ("adopted") by a later
-    /// session.
-    ///
-    /// CodeRex tracks five kinds, not Claude's four (cron/shell/agent/workflow):
-    /// there is no cron kind — scheduling is owned by the `CronCreate` family
-    /// of tools, not by `TaskManager` — and no workflow kind. The background
-    /// kinds that genuinely exist here are shell, agent, dream and in-process
-    /// teammate; the interactive main session is never a background task and
-    /// so is never adopted.
-    #[must_use]
-    pub const fn is_adoptable(&self) -> bool {
-        match self {
-            Self::LocalShell { .. }
-            | Self::LocalAgent { .. }
-            | Self::Dream { .. }
-            | Self::InProcessTeammate { .. } => true,
-            Self::MainSession => false,
-        }
-    }
-
     /// A short stable label for this kind, used in logs and persisted records.
     #[must_use]
     pub const fn label(&self) -> &'static str {
@@ -161,11 +130,11 @@ pub enum TaskError {
 ///
 /// Provides access to task state, output, and lifecycle control.
 ///
-/// A handle is also the unit of persistence: a session that wants its
-/// background tasks to survive a restart writes handles out, and a later
-/// session re-attaches them with [`TaskManager::adopt_persisted`]. The
-/// timestamps and `owner_session_id` exist so that re-attachment can tell a
-/// live task of ours from a stale record or another session's task.
+/// The timestamps and `owner_session_id` record *who* owned the work and
+/// *when*, for observability and for [`crate::job_record`], which is the
+/// durable counterpart of this in-process type: a task handle lives only as
+/// long as the process that owns it, so nothing here is ever re-attached after
+/// a restart.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TaskHandle {
     /// Unique task identifier.
@@ -224,13 +193,6 @@ impl TaskHandle {
         self.created_at_ms = now_ms;
         self.updated_at_ms = now_ms;
         self
-    }
-
-    /// Whether this record could be re-attached by a session: the kind is
-    /// adoptable and the task has not reached a terminal state.
-    #[must_use]
-    pub const fn is_adoptable(&self) -> bool {
-        self.kind.is_adoptable() && !self.is_terminal()
     }
 
     /// Mark the task as started.
@@ -519,72 +481,6 @@ impl TaskManager {
             .filter(|h| h.state == TaskState::Running)
             .count()
     }
-
-    // ─── Adopt (re-attach after a session restart) ──────────────────────
-
-    /// Re-attach background tasks that a previous session left behind.
-    ///
-    /// A persisted [`TaskHandle`] is adopted when **all** of the following
-    /// hold:
-    ///
-    /// 1. its id is not already tracked here (adopt never clobbers a live
-    ///    task);
-    /// 2. its [`TaskKind`] is adoptable and it is not terminal — there is
-    ///    nothing to re-attach to a finished task;
-    /// 3. it is not **foreign**: either it records no owner, or the owner is
-    ///    `session_id`. A task owned by a different session belongs to a
-    ///    session that may still be live, and adopting it would double-drive
-    ///    the same work;
-    /// 4. it is not **stale**: its last update is no more than
-    ///    [`STALE_TASK_AGE_MS`] old;
-    /// 5. its timestamp is not implausibly far in the future — no more than
-    ///    [`CLOCK_SKEW_ALLOWANCE_MS`] ahead of `now_ms`. A record stamped
-    ///    within that allowance (or slightly behind) is trusted despite clock
-    ///    differences between the two processes.
-    ///
-    /// Adopted handles are inserted with their persisted state and timestamp
-    /// intact. The returned vector lists the adopted ids in input order.
-    ///
-    /// `session_id` is the identity this session adopts tasks *for*: a fresh
-    /// session that wants to pick up its own previous run passes that run's
-    /// persisted session id; a brand-new session passes its own id and adopts
-    /// only tasks it owns.
-    pub fn adopt_persisted(
-        &mut self,
-        persisted: &[TaskHandle],
-        session_id: &str,
-        now_ms: i64,
-    ) -> Vec<String> {
-        let mut adopted = Vec::new();
-
-        for handle in persisted {
-            if self.tasks.contains_key(&handle.id) {
-                continue;
-            }
-            if !handle.is_adoptable() {
-                continue;
-            }
-            if let Some(owner) = handle.owner_session_id.as_deref() {
-                if owner != session_id {
-                    continue;
-                }
-            }
-
-            let ahead = handle.updated_at_ms.saturating_sub(now_ms);
-            if ahead > CLOCK_SKEW_ALLOWANCE_MS {
-                continue;
-            }
-            let age = now_ms.saturating_sub(handle.updated_at_ms);
-            if age > STALE_TASK_AGE_MS {
-                continue;
-            }
-
-            self.tasks.insert(handle.id.clone(), handle.clone());
-            adopted.push(handle.id.clone());
-        }
-
-        adopted
-    }
 }
 
 #[cfg(test)]
@@ -850,207 +746,10 @@ mod tests {
         assert_eq!(TaskState::Stopped.to_string(), "stopped");
     }
 
-    // ─── Adopt tests ────────────────────────────────────────────────────────
-
-    /// Build a persisted handle the way a previous session would have left it.
-    fn persisted(
-        id: &str,
-        kind: TaskKind,
-        owner: Option<&str>,
-        state: TaskState,
-        updated_at_ms: i64,
-    ) -> TaskHandle {
-        let mut handle = TaskHandle::new(id.to_string(), kind)
-            .with_owner(owner.map(str::to_string), updated_at_ms);
-        handle.state = state;
-        handle.updated_at_ms = updated_at_ms;
-        handle
-    }
+    // ─── Persistence fields ─────────────────────────────────────────────────
 
     #[test]
-    fn adopt_reattaches_recent_owned_task() {
-        let now = 1_000_000_000_000;
-        let mut mgr = TaskManager::new();
-        let records = vec![persisted(
-            "task_7",
-            TaskKind::LocalShell {
-                command: "cargo build".into(),
-            },
-            Some("sess_prev"),
-            TaskState::Running,
-            now - 5_000,
-        )];
-
-        let adopted = mgr.adopt_persisted(&records, "sess_prev", now);
-        assert_eq!(adopted, vec!["task_7".to_string()]);
-
-        let handle = mgr.get_task("task_7").unwrap();
-        assert_eq!(handle.state, TaskState::Running);
-        assert_eq!(handle.owner_session_id.as_deref(), Some("sess_prev"));
-        assert_eq!(mgr.running_count(), 1);
-    }
-
-    #[test]
-    fn adopt_rejects_foreign_task() {
-        let now = 1_000_000_000_000;
-        let mut mgr = TaskManager::new();
-        let records = vec![persisted(
-            "task_other",
-            TaskKind::LocalAgent {
-                agent_type: "explore".into(),
-                pid: None,
-            },
-            Some("sess_other"),
-            TaskState::Running,
-            now - 5_000,
-        )];
-
-        let adopted = mgr.adopt_persisted(&records, "sess_mine", now);
-        assert!(adopted.is_empty());
-        assert!(mgr.get_task("task_other").is_none());
-    }
-
-    #[test]
-    fn adopt_rejects_stale_task() {
-        let now = 1_000_000_000_000;
-        let mut mgr = TaskManager::new();
-        let records = vec![persisted(
-            "task_old",
-            TaskKind::Dream {
-                description: "nightly analysis".into(),
-            },
-            Some("sess_prev"),
-            TaskState::Running,
-            now - (STALE_TASK_AGE_MS + 1),
-        )];
-
-        let adopted = mgr.adopt_persisted(&records, "sess_prev", now);
-        assert!(adopted.is_empty(), "a stale record must not be adopted");
-    }
-
-    #[test]
-    fn adopt_tolerates_small_clock_skew() {
-        let now = 1_000_000_000_000;
-        let mut mgr = TaskManager::new();
-        // The writer's clock was a little ahead of ours.
-        let records = vec![persisted(
-            "task_skewed",
-            TaskKind::LocalShell {
-                command: "sleep 1".into(),
-            },
-            Some("sess_prev"),
-            TaskState::Running,
-            now + (CLOCK_SKEW_ALLOWANCE_MS / 2),
-        )];
-
-        let adopted = mgr.adopt_persisted(&records, "sess_prev", now);
-        assert_eq!(adopted, vec!["task_skewed".to_string()]);
-    }
-
-    #[test]
-    fn adopt_rejects_implausible_future_timestamp() {
-        let now = 1_000_000_000_000;
-        let mut mgr = TaskManager::new();
-        let records = vec![persisted(
-            "task_future",
-            TaskKind::LocalShell {
-                command: "echo hi".into(),
-            },
-            Some("sess_prev"),
-            TaskState::Running,
-            now + CLOCK_SKEW_ALLOWANCE_MS + 1,
-        )];
-
-        let adopted = mgr.adopt_persisted(&records, "sess_prev", now);
-        assert!(
-            adopted.is_empty(),
-            "a timestamp beyond the skew allowance is not trusted"
-        );
-    }
-
-    #[test]
-    fn adopt_rejects_terminal_and_main_session() {
-        let now = 1_000_000_000_000;
-        let mut mgr = TaskManager::new();
-        let records = vec![
-            persisted(
-                "task_done",
-                TaskKind::LocalShell {
-                    command: "true".into(),
-                },
-                Some("sess_prev"),
-                TaskState::Completed,
-                now - 1_000,
-            ),
-            persisted(
-                "task_main",
-                TaskKind::MainSession,
-                Some("sess_prev"),
-                TaskState::Running,
-                now - 1_000,
-            ),
-        ];
-
-        let adopted = mgr.adopt_persisted(&records, "sess_prev", now);
-        assert!(adopted.is_empty());
-    }
-
-    #[test]
-    fn adopt_does_not_clobber_live_task() {
-        let now = 1_000_000_000_000;
-        let mut mgr = TaskManager::new();
-        mgr.create_task_at(TaskKind::MainSession, Some("sess_prev"), now);
-        let live_id = mgr.list_tasks(None)[0].id.clone();
-        mgr.mark_running(&live_id).unwrap();
-
-        let records = vec![persisted(
-            &live_id,
-            TaskKind::LocalShell {
-                command: "other".into(),
-            },
-            Some("sess_prev"),
-            TaskState::Running,
-            now,
-        )];
-
-        let adopted = mgr.adopt_persisted(&records, "sess_prev", now);
-        assert!(adopted.is_empty());
-        // The live task is untouched.
-        assert!(matches!(
-            mgr.get_task(&live_id).unwrap().kind,
-            TaskKind::MainSession
-        ));
-    }
-
-    #[test]
-    fn adopt_accepts_ownerless_legacy_record() {
-        let now = 1_000_000_000_000;
-        let mut mgr = TaskManager::new();
-        let records = vec![persisted(
-            "task_legacy",
-            TaskKind::InProcessTeammate {
-                name: "scribe".into(),
-            },
-            None,
-            TaskState::Pending,
-            now - 1_000,
-        )];
-
-        let adopted = mgr.adopt_persisted(&records, "sess_any", now);
-        assert_eq!(adopted, vec!["task_legacy".to_string()]);
-    }
-
-    #[test]
-    fn task_kind_adoptability_and_labels() {
-        assert!(TaskKind::LocalShell {
-            command: String::new()
-        }
-        .is_adoptable());
-        assert!(TaskKind::Dream {
-            description: String::new()
-        }
-        .is_adoptable());
-        assert!(!TaskKind::MainSession.is_adoptable());
+    fn task_kind_labels() {
         assert_eq!(TaskKind::MainSession.label(), "main_session");
         assert_eq!(
             TaskKind::LocalAgent {
@@ -1060,10 +759,16 @@ mod tests {
             .label(),
             "agent"
         );
+        assert_eq!(TaskKind::Dream { description: String::new() }.label(), "dream");
+        assert_eq!(TaskKind::LocalShell { command: String::new() }.label(), "shell");
+        assert_eq!(
+            TaskKind::InProcessTeammate { name: String::new() }.label(),
+            "teammate"
+        );
     }
 
     #[test]
-    fn handle_serialization_roundtrip_preserves_adopt_fields() {
+    fn handle_serialization_roundtrip_preserves_owner_and_timestamps() {
         let now = 1_000_000_000_000;
         let handle = TaskHandle::new(
             "task_1".into(),

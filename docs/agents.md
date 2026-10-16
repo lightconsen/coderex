@@ -153,6 +153,79 @@ All features are implemented. No known stubs.
 - **Forked/background delegation** — `run_forked_agent()` and `run_background_feature()` via `coderex-core` orchestrator.
 - **Custom agent resolution** — `AgentType::Custom` resolves named custom agents from loaded definitions, merging allowed_tools, model, max_tokens, and output_schema.
 
+## Background Job Records and Adoption (`coderex-core::job_record`)
+
+Background agents (and background shell commands and workflow runs) are
+**in-process `tokio` tasks**. When the process exits, the work is gone. There is
+no worker process outliving its supervisor, so there is nothing to re-attach:
+adoption here does not fake re-attachment. What it does is make the *record* of
+that work durable, and make sure the next session reports what it finds.
+
+**The record.** `JobStore` writes one JSON file per job under
+`<cwd>/.coderex/jobs/<id>.json`, atomically (a sibling temp file renamed over
+the target, so concurrent readers never see a partial record). A `JobRecord`
+carries `id`, `kind` (`Agent` / `Shell` / `Workflow` / `Cron`), `description`,
+`cwd`, `session_id`, `pid`, `started_at_ms`, `updated_at_ms` and `state`
+(`Running` / `Interrupted` / `Done` / `Failed`).
+
+**No roster index.** The reference keeps a `roster.json` index beside its
+per-job `state.json` files because its daemon rescans a job tree of unknown
+size on every restart. CodeRex's job directory is written by one session and
+holds a handful of files, so `JobStore::list()` just reads the directory. A
+second copy of the same facts is a second thing that can be wrong.
+
+**The classifier.** `adopt(records, now_ms, session_id) -> AdoptOutcome` is a
+pure function — no IO, no clock, no environment. Every record lands in exactly
+one bucket:
+
+| Bucket | Rule |
+|---|---|
+| `foreign` | `session_id` is set and differs from the adopting session |
+| `terminal` | state is `Done`/`Failed` — checked **before** ageing, so a cleanly-exited job is never "stale" |
+| `stale` | last update more than `STALE_THRESHOLD_MS` (120 s) old, **or** more than `CLOCK_SKEW_ALLOWANCE_MS` (60 s) ahead of local time |
+| `resumable` | the kind is genuinely re-attachable — currently `Cron` only |
+| `interrupted` | everything else: work that was alive when written and cannot be re-attached |
+
+The clock-skew bound is deliberately **asymmetric**: it only ever relaxes the
+future direction (a writer whose clock ran ahead, or an NTP step), it never
+makes an old record fresh.
+
+**Interrupted work is reported, not dropped.** `JobStore::mark_interrupted()`
+rewrites every `interrupted` record still claiming `Running` to `Interrupted`
+and returns one `TaskNotification` per transition, so a crashed background
+agent is surfaced into the conversation once — never left as a phantom
+`running`, and never re-reported on every subsequent start.
+
+**Cron is already durable.** `CronScheduler` (`crates/tools`) persists
+`durable` definitions to `~/.coderex/scheduled_tasks.json` and reloads them at
+session start (`repl.rs` calls `load()` then `spawn_runner()`), which is what
+the reference's cron adoption does — dedupe against the session store and
+re-schedule. Adoption therefore classifies cron records as `resumable` for
+disclosure but does not re-register them, and there is no second cron store.
+
+**Kill switch.** `CODEREX_DISABLE_ADOPT` (non-empty, not `0`/`false`/`no`)
+makes `adopt_for_session()` a no-op. As in the reference, there is **no
+adopt-time consent prompt** — consent is carried, and adoption *discloses*
+rather than asks — so this is a switch, not a dialog.
+
+**Session entry point.** One call, from the session setup in `repl.rs` (next to
+the existing `TaskStore` / `CronScheduler` wiring):
+
+```rust
+let store = coderex_core::JobStore::new(&cwd);
+let adopted = coderex_core::adopt_for_session(&store, coderex_core::task::now_ms(), &session_id)
+    .unwrap_or_default();
+for n in &adopted.notifications {
+    ui_state.messages.push(Message {
+        role: MessageRole::System,
+        content: n.text.clone().into(),
+        tool_name: None,
+        streaming: false,
+        folded: false,
+    });
+}
+```
+
 ## API Quick Reference
 
 ### Spawning an Agent
