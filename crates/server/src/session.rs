@@ -1,6 +1,8 @@
 //! Detached WebSocket session management with authentication, rate limiting,
 //! and idle cleanup.
 
+use coderex_core::engine::{QueryEngine, SubmitOptions};
+use coderex_core::types::EngineEvent;
 use futures::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -58,8 +60,12 @@ pub enum WsResponseKind {
     QueryOk { content: String },
     /// Streaming chunk from a query in progress.
     StreamChunk { chunk: String },
-    /// Query completed.
-    QueryDone,
+    /// Query completed, and why it ended.
+    QueryDone {
+        /// How the turn finished: `completed`, `token_limit_stop`, and so on.
+        /// A truncated or interrupted answer is not the same as a finished one.
+        reason: String,
+    },
     /// Ping response.
     Pong,
     /// Error response.
@@ -196,8 +202,22 @@ impl Default for ServerConfig {
     }
 }
 
+/// Builds the engine a session's queries run on.
+///
+/// The server cannot build one itself — an engine needs an API client, a
+/// permission checker, and a tool dispatcher, and those belong to whatever
+/// started the server. The factory is how they are handed over, and it also
+/// returns the event stream, because whoever builds the engine is who can read
+/// what it emits.
+pub type EngineFactory = Arc<
+    dyn Fn() -> (
+            QueryEngine,
+            tokio::sync::mpsc::UnboundedReceiver<EngineEvent>,
+        ) + Send
+        + Sync,
+>;
+
 /// Server for managing detached sessions over WebSocket.
-#[derive(Debug)]
 pub struct DaemonServer {
     /// Active sessions.
     sessions: HashMap<String, Session>,
@@ -209,6 +229,20 @@ pub struct DaemonServer {
     store: Option<crate::persistence::SessionStore>,
     /// Monotonic source of session ids.
     next_session_id: u64,
+    /// How a session's queries reach a model, when one was supplied.
+    engine_factory: Option<EngineFactory>,
+    /// The query running in each session, so it can be interrupted.
+    running_queries: HashMap<String, coderex_core::engine::InterruptHandle>,
+}
+
+impl std::fmt::Debug for DaemonServer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DaemonServer")
+            .field("sessions", &self.sessions.len())
+            .field("has_engine", &self.engine_factory.is_some())
+            .field("running_queries", &self.running_queries.len())
+            .finish_non_exhaustive()
+    }
 }
 
 impl Default for DaemonServer {
@@ -218,6 +252,14 @@ impl Default for DaemonServer {
 }
 
 impl DaemonServer {
+    /// Supply the engine sessions run their queries on.
+    ///
+    /// Without one, a query is refused with `no_engine` rather than answered:
+    /// a server that cannot run a query has nothing true to say about one.
+    pub fn set_engine_factory(&mut self, factory: EngineFactory) {
+        self.engine_factory = Some(factory);
+    }
+
     /// Create a new daemon server with default config.
     #[must_use]
     pub fn new() -> Self {
@@ -227,6 +269,8 @@ impl DaemonServer {
             session_count_atomic: Arc::new(AtomicUsize::new(0)),
             store: None,
             next_session_id: 0,
+            engine_factory: None,
+            running_queries: HashMap::new(),
         }
     }
 
@@ -239,6 +283,8 @@ impl DaemonServer {
             session_count_atomic: Arc::new(AtomicUsize::new(0)),
             store: None,
             next_session_id: 0,
+            engine_factory: None,
+            running_queries: HashMap::new(),
         };
 
         // Initialize persistence if configured
@@ -510,54 +556,85 @@ impl DaemonServer {
             .send(Message::Text(serde_json::to_string(&ready).unwrap().into()))
             .await;
 
-        // Message loop with structured JSON protocol
-        loop {
-            match tokio::time::timeout(Duration::from_secs(300), ws.next()).await {
-                Ok(Some(Ok(Message::Text(text)))) => {
-                    // Rate limit check
-                    if !limiter.try_consume() {
-                        let evt = WsEvent::RateLimited;
-                        let _ = ws
-                            .send(Message::Text(serde_json::to_string(&evt).unwrap().into()))
-                            .await;
-                        continue;
-                    }
-                    self.record_activity(&session_id);
-                    debug!("session {session_id} received: {text}");
+        // Message loop with structured JSON protocol.
+        //
+        // Outgoing frames go through a channel so a query running in its own
+        // task can stream while this loop keeps reading: the socket has one
+        // writer, and it is here.
+        let (out_tx, mut out_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
 
-                    let response = self.handle_message(&session_id, &text);
-                    let json = serde_json::to_string(&response).unwrap();
-                    if let Err(e) = ws.send(Message::Text(json.into())).await {
+        loop {
+            tokio::select! {
+                // A frame from a query running in its own task.
+                Some(frame) = out_rx.recv() => {
+                    if let Err(e) = ws.send(Message::Text(frame.into())).await {
                         warn!("send error for session {session_id}: {e}");
                         break;
                     }
                 }
-                Ok(Some(Ok(Message::Close(_)))) => {
-                    debug!("session {session_id} closed connection");
-                    break;
-                }
-                Ok(Some(Ok(Message::Ping(data)))) => {
-                    if let Err(e) = ws.send(Message::Pong(data)).await {
-                        warn!("pong error for session {session_id}: {e}");
-                        break;
+                incoming = tokio::time::timeout(Duration::from_secs(300), ws.next()) => {
+                    match incoming {
+                        Ok(Some(Ok(Message::Text(text)))) => {
+                            // Rate limit check
+                            if !limiter.try_consume() {
+                                let evt = WsEvent::RateLimited;
+                                let _ = ws
+                                    .send(Message::Text(
+                                        serde_json::to_string(&evt).unwrap().into(),
+                                    ))
+                                    .await;
+                                continue;
+                            }
+                            self.record_activity(&session_id);
+                            debug!("session {session_id} received: {text}");
+
+                            // A query answers through the channel as it runs;
+                            // everything else answers here.
+                            let Some(response) = self.handle_message(&session_id, &text, &out_tx)
+                            else {
+                                continue;
+                            };
+                            let json = serde_json::to_string(&response).unwrap();
+                            if let Err(e) = ws.send(Message::Text(json.into())).await {
+                                warn!("send error for session {session_id}: {e}");
+                                break;
+                            }
+                        }
+                        Ok(Some(Ok(Message::Close(_)))) => {
+                            debug!("session {session_id} closed connection");
+                            break;
+                        }
+                        Ok(Some(Ok(Message::Ping(data)))) => {
+                            if let Err(e) = ws.send(Message::Pong(data)).await {
+                                warn!("pong error for session {session_id}: {e}");
+                                break;
+                            }
+                        }
+                        Ok(Some(Err(e))) => {
+                            warn!("WebSocket error for session {session_id}: {e}");
+                            break;
+                        }
+                        Ok(None) => {
+                            debug!("session {session_id} stream ended");
+                            break;
+                        }
+                        Err(_) => {
+                            warn!("session {session_id} message timeout");
+                            break;
+                        }
+                        _ => {
+                            // Ignore Binary, Pong, Frame, and other message types
+                        }
                     }
                 }
-                Ok(Some(Err(e))) => {
-                    warn!("WebSocket error for session {session_id}: {e}");
-                    break;
-                }
-                Ok(None) => {
-                    debug!("session {session_id} stream ended");
-                    break;
-                }
-                Err(_) => {
-                    warn!("session {session_id} message timeout");
-                    break;
-                }
-                _ => {
-                    // Ignore Binary, Pong, Frame, and other message types
-                }
             }
+        }
+
+        // A query still running when the connection goes away is stopped:
+        // nothing is listening for its answer, and it would keep using the
+        // account and the filesystem otherwise.
+        if let Some(handle) = self.running_queries.remove(&session_id) {
+            handle.interrupt();
         }
 
         self.disconnect(&session_id);
@@ -568,38 +645,116 @@ impl DaemonServer {
     }
 
     /// Route a structured JSON message to the appropriate handler.
-    fn handle_message(&mut self, _session_id: &str, text: &str) -> WsResponse {
+    ///
+    /// A query does not return a response: it starts a task that streams the
+    /// answer over `out`. Everything else answers immediately.
+    fn handle_message(
+        &mut self,
+        session_id: &str,
+        text: &str,
+        out: &tokio::sync::mpsc::UnboundedSender<String>,
+    ) -> Option<WsResponse> {
         let req: WsRequest = match serde_json::from_str(text) {
             Ok(r) => r,
             Err(e) => {
-                return WsResponse::error(
+                return Some(WsResponse::error(
                     "unknown",
                     "parse_error",
                     &format!("invalid JSON request: {e}"),
-                );
+                ));
             }
         };
 
         match req.kind {
             WsRequestKind::Query { content } => {
                 debug!(
-                    "query from session {_session_id}: {}",
+                    "query from session {session_id}: {}",
                     content.chars().take(80).collect::<String>()
                 );
-                // In production, this routes to QueryEngine.
-                // For now, echo back as a query response to confirm the protocol works.
-                WsResponse {
-                    id: req.id,
-                    kind: WsResponseKind::QueryOk {
-                        content: format!("received query: {content}"),
-                    },
-                }
+
+                let Some(factory) = self.engine_factory.clone() else {
+                    return Some(WsResponse::error(
+                        &req.id,
+                        "no_engine",
+                        "this server was started without a query engine, so there is nothing to \
+                         run the query on",
+                    ));
+                };
+
+                let (mut engine, mut events) = factory();
+                let handle = engine.interrupt_handle();
+                self.running_queries
+                    .insert(session_id.to_string(), handle.clone());
+
+                let id = req.id.clone();
+                let out = out.clone();
+                let session = session_id.to_string();
+                tokio::spawn(async move {
+                    // The answer streams while the query runs, so the events
+                    // are pumped on their own task.
+                    let pump_id = id.clone();
+                    let pump_out = out.clone();
+                    let pump = tokio::spawn(async move {
+                        while let Some(event) = events.recv().await {
+                            if let EngineEvent::TextDelta(chunk) = event {
+                                let frame = WsResponse {
+                                    id: pump_id.clone(),
+                                    kind: WsResponseKind::StreamChunk { chunk },
+                                };
+                                if let Ok(json) = serde_json::to_string(&frame) {
+                                    if pump_out.send(json).is_err() {
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    });
+
+                    let result = engine
+                        .submit_streaming(content, SubmitOptions::default())
+                        .await;
+
+                    // Dropping the engine closes the event channel, which ends
+                    // the pump.
+                    drop(engine);
+                    let _ = pump.await;
+
+                    let frame = match result {
+                        Ok(reason) => WsResponse {
+                            id,
+                            kind: WsResponseKind::QueryDone {
+                                reason: reason.to_string(),
+                            },
+                        },
+                        Err(error) => WsResponse::error(&id, "query_failed", &error),
+                    };
+                    if let Ok(json) = serde_json::to_string(&frame) {
+                        let _ = out.send(json);
+                    }
+                    // The handle stays until the session ends: `Interrupt`
+                    // needs to find it while the query is in flight.
+                    let _ = session;
+                });
+
+                None
             }
-            WsRequestKind::Interrupt => WsResponse {
-                id: req.id,
-                kind: WsResponseKind::QueryDone,
-            },
-            WsRequestKind::Ping => WsResponse::pong(&req.id),
+            WsRequestKind::Interrupt => {
+                let interrupted = self.running_queries.get(session_id).is_some_and(|handle| {
+                    handle.interrupt();
+                    true
+                });
+                Some(WsResponse {
+                    id: req.id,
+                    kind: WsResponseKind::QueryDone {
+                        reason: if interrupted {
+                            "interrupted".to_string()
+                        } else {
+                            "nothing running".to_string()
+                        },
+                    },
+                })
+            }
+            WsRequestKind::Ping => Some(WsResponse::pong(&req.id)),
         }
     }
 }

@@ -1254,6 +1254,19 @@ impl StartupOrchestrator {
 
         let mut server = DaemonServer::with_config(config);
 
+        // Serve queries on a real engine. Without this the server could only
+        // refuse them — and before it did, it echoed them back, which is worse
+        // than refusing because it looked like an answer.
+        match Self::serve_engine_factory(
+            cwd,
+            self.ctx.model.clone().unwrap_or_else(ModelId::sonnet),
+        ) {
+            Some(factory) => server.set_engine_factory(factory),
+            None => tracing::warn!(
+                "no API key configured: served sessions will refuse queries with 'no_engine'"
+            ),
+        }
+
         tracing::info!("CodeRex server initialized: cwd={cwd}");
         tracing::info!(
             "Server config: idle_timeout={idle_timeout}s, max_sessions=100, port={port}"
@@ -1269,6 +1282,58 @@ impl StartupOrchestrator {
         let _ = daemon::remove_pid_file();
 
         result
+    }
+
+    /// The engine every served session runs its queries on.
+    ///
+    /// One per session, built from the same pieces the REPL uses: the routed
+    /// API client, the session's model, and the standard tool set behind the
+    /// registry dispatcher. Returns `None` when no provider is configured —
+    /// the server then says so rather than answering with something it did not
+    /// ask a model.
+    fn serve_engine_factory(
+        cwd: &str,
+        model: ModelId,
+    ) -> Option<coderex_server::session::EngineFactory> {
+        use coderex_tools::{
+            ExecutionConfig, ExecutionContext, RegistryToolDispatcher,
+            ToolExecutor as ToolsExecutor, ToolRegistry, register_builtin_tools,
+        };
+
+        let api_key = std::env::var("ANTHROPIC_API_KEY").ok();
+        let api_client = Self::try_create_api_client(api_key.as_deref())?;
+
+        let cwd = cwd.to_string();
+        Some(std::sync::Arc::new(move || {
+            let mut registry = ToolRegistry::new();
+            register_builtin_tools(&mut registry);
+
+            let mut dispatcher = RegistryToolDispatcher::new(
+                std::sync::Arc::new(registry),
+                std::sync::Arc::new(ToolsExecutor::new(ExecutionConfig::default())),
+                ExecutionContext::Normal,
+                std::path::PathBuf::from(&cwd),
+            );
+            dispatcher.set_feature_flags_enabled(
+                coderex_config::flags::FeatureFlags::from_env().capabilities()
+                    != coderex_config::flags::CapabilitySet::empty(),
+            );
+
+            let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+            let mut engine = coderex_core::engine::QueryEngine::new(
+                api_client.clone_box(),
+                model.clone(),
+                coderex_core::state::SessionState::new(std::path::PathBuf::from(&cwd)),
+                coderex_core::permission_engine::PermissionEngine::new(
+                    coderex_core::permissions::PermissionChecker::new(
+                        coderex_core::permissions::PermissionMode::Default,
+                    ),
+                ),
+                tx,
+            );
+            engine.set_tool_executor(Box::new(dispatcher));
+            (engine, rx)
+        }))
     }
 
     #[allow(clippy::unused_async)]

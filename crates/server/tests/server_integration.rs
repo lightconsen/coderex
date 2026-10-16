@@ -8,6 +8,59 @@ use std::net::SocketAddr;
 use std::time::Duration;
 
 use coderex_server::{DaemonServer, ServerConfig, WsEvent};
+
+/// A model that answers with fixed text, so the server's query path is
+/// exercised without a provider.
+struct ScriptedModel(&'static str);
+
+#[async_trait::async_trait]
+impl coderex_core::api_client::ApiClient for ScriptedModel {
+    fn clone_box(&self) -> Box<dyn coderex_core::api_client::ApiClient> {
+        Box::new(ScriptedModel(self.0))
+    }
+
+    async fn create_message(
+        &self,
+        _system: &str,
+        _messages: &[serde_json::Value],
+        _model: &coderex_core::types::ModelId,
+        _max_tokens: u32,
+        _tools: &[coderex_core::tool_executor::ToolInfo],
+    ) -> Result<coderex_core::api_client::ApiResponse, coderex_core::api_client::ApiError> {
+        Ok(coderex_core::api_client::ApiResponse {
+            content: self.0.to_string(),
+            tool_calls: Vec::new(),
+            usage: coderex_core::types::UsageSummary {
+                input_tokens: 5,
+                output_tokens: 5,
+                cache_read_tokens: 0,
+                cache_creation_tokens: 0,
+            },
+            stop_reason: "end_turn".into(),
+        })
+    }
+
+    async fn create_message_streaming(
+        &self,
+        system: &str,
+        messages: &[serde_json::Value],
+        model: &coderex_core::types::ModelId,
+        max_tokens: u32,
+        tools: &[coderex_core::tool_executor::ToolInfo],
+    ) -> std::pin::Pin<
+        Box<dyn futures::Stream<Item = coderex_core::api_client::StreamEvent> + Send + 'static>,
+    > {
+        let response = self
+            .create_message(system, messages, model, max_tokens, tools)
+            .await
+            .expect("the scripted model answers");
+        Box::pin(futures::stream::iter(vec![
+            coderex_core::api_client::StreamEvent::TextDelta(response.content),
+            coderex_core::api_client::StreamEvent::StopReason(response.stop_reason),
+            coderex_core::api_client::StreamEvent::StreamEnd,
+        ]))
+    }
+}
 use futures::{SinkExt, StreamExt};
 use tokio_tungstenite::tungstenite::Message;
 
@@ -17,9 +70,168 @@ use tokio_tungstenite::tungstenite::Message;
 
 /// Start a DaemonServer on a free port and return the bound address.
 async fn start_server(config: ServerConfig) -> SocketAddr {
+    start_server_with(config, None).await
+}
+
+/// Start a server whose engine factories record the handle they handed out.
+async fn start_server_recording_handles(
+    config: ServerConfig,
+    answer: &'static str,
+    delay: Duration,
+) -> (
+    SocketAddr,
+    std::sync::Arc<std::sync::Mutex<Vec<coderex_core::engine::InterruptHandle>>>,
+) {
+    let handles = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let recorder = std::sync::Arc::clone(&handles);
+
+    let addr = start_server_with_factory(
+        config,
+        std::sync::Arc::new(move || {
+            let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+            let mut engine = coderex_core::engine::QueryEngine::new(
+                Box::new(SlowScriptedModel { answer, delay }),
+                coderex_core::types::ModelId::sonnet(),
+                coderex_core::state::SessionState::new(std::path::PathBuf::from("/tmp")),
+                coderex_core::permission_engine::PermissionEngine::new(
+                    coderex_core::permissions::PermissionChecker::new(
+                        coderex_core::permissions::PermissionMode::BypassPermissions,
+                    ),
+                ),
+                tx,
+            );
+            engine.set_tool_executor(Box::new(coderex_core::tool_executor::NoOpToolExecutor));
+            if let Ok(mut recorded) = recorder.lock() {
+                recorded.push(engine.interrupt_handle());
+            }
+            (engine, rx)
+        }),
+    )
+    .await;
+
+    (addr, handles)
+}
+
+/// A model that answers slowly, so a query is still running when the socket
+/// goes away.
+struct SlowScriptedModel {
+    answer: &'static str,
+    delay: Duration,
+}
+
+#[async_trait::async_trait]
+impl coderex_core::api_client::ApiClient for SlowScriptedModel {
+    fn clone_box(&self) -> Box<dyn coderex_core::api_client::ApiClient> {
+        Box::new(SlowScriptedModel {
+            answer: self.answer,
+            delay: self.delay,
+        })
+    }
+
+    async fn create_message(
+        &self,
+        _system: &str,
+        _messages: &[serde_json::Value],
+        _model: &coderex_core::types::ModelId,
+        _max_tokens: u32,
+        _tools: &[coderex_core::tool_executor::ToolInfo],
+    ) -> Result<coderex_core::api_client::ApiResponse, coderex_core::api_client::ApiError> {
+        Ok(coderex_core::api_client::ApiResponse {
+            content: self.answer.to_string(),
+            tool_calls: Vec::new(),
+            usage: coderex_core::types::UsageSummary {
+                input_tokens: 5,
+                output_tokens: 5,
+                cache_read_tokens: 0,
+                cache_creation_tokens: 0,
+            },
+            stop_reason: "end_turn".into(),
+        })
+    }
+
+    async fn create_message_streaming(
+        &self,
+        system: &str,
+        messages: &[serde_json::Value],
+        model: &coderex_core::types::ModelId,
+        max_tokens: u32,
+        tools: &[coderex_core::tool_executor::ToolInfo],
+    ) -> std::pin::Pin<
+        Box<dyn futures::Stream<Item = coderex_core::api_client::StreamEvent> + Send + 'static>,
+    > {
+        let response = self
+            .create_message(system, messages, model, max_tokens, tools)
+            .await
+            .expect("the slow model answers");
+        let delay = self.delay;
+        Box::pin(futures::stream::unfold(0, move |step| {
+            let answer = response.content.clone();
+            async move {
+                match step {
+                    0 => Some((
+                        coderex_core::api_client::StreamEvent::TextDelta(answer),
+                        step + 1,
+                    )),
+                    1 => {
+                        // The answer takes a while, which is the window the
+                        // disconnect has to land in.
+                        tokio::time::sleep(delay).await;
+                        Some((
+                            coderex_core::api_client::StreamEvent::StopReason("end_turn".into()),
+                            step + 1,
+                        ))
+                    }
+                    2 => Some((coderex_core::api_client::StreamEvent::StreamEnd, step + 1)),
+                    _ => None,
+                }
+            }
+        }))
+    }
+}
+
+/// Start a server with an engine factory, returning the address.
+async fn start_server_with_factory(
+    config: ServerConfig,
+    factory: coderex_server::session::EngineFactory,
+) -> SocketAddr {
+    start_on_free_port(config, Some(factory)).await
+}
+
+/// Start a server, optionally with an engine whose model answers `answer`.
+async fn start_server_with(config: ServerConfig, answer: Option<&'static str>) -> SocketAddr {
+    let factory = answer.map(|answer| {
+        std::sync::Arc::new(move || {
+            let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+            let mut engine = coderex_core::engine::QueryEngine::new(
+                Box::new(ScriptedModel(answer)),
+                coderex_core::types::ModelId::sonnet(),
+                coderex_core::state::SessionState::new(std::path::PathBuf::from("/tmp")),
+                coderex_core::permission_engine::PermissionEngine::new(
+                    coderex_core::permissions::PermissionChecker::new(
+                        coderex_core::permissions::PermissionMode::BypassPermissions,
+                    ),
+                ),
+                tx,
+            );
+            engine.set_tool_executor(Box::new(coderex_core::tool_executor::NoOpToolExecutor));
+            (engine, rx)
+        }) as coderex_server::session::EngineFactory
+    });
+
+    start_on_free_port(config, factory).await
+}
+
+/// Start a server on the first free port in the test range.
+async fn start_on_free_port(
+    config: ServerConfig,
+    factory: Option<coderex_server::session::EngineFactory>,
+) -> SocketAddr {
     for port in 19000..20000 {
         let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
         let mut server = DaemonServer::with_config(config.clone());
+        if let Some(factory) = factory.clone() {
+            server.set_engine_factory(factory);
+        }
         let handle = tokio::spawn(async move {
             let _ = server.run(addr).await;
         });
@@ -199,7 +411,7 @@ async fn structured_io_query_request_response() {
         persist_path: None,
         allow_anonymous: false,
     };
-    let addr = start_server(config).await;
+    let addr = start_server_with(config, Some("the scripted answer")).await;
     let mut ws = ws_connect(addr).await;
     let _sid = ws_auth(&mut ws, "key").await;
 
@@ -210,11 +422,115 @@ async fn structured_io_query_request_response() {
     });
     ws_send_json(&mut ws, &req).await;
 
-    let resp_text = ws_recv_text(&mut ws).await;
-    let resp: serde_json::Value = serde_json::from_str(&resp_text).unwrap();
-    assert_eq!(resp.get("id").unwrap(), "req_1");
-    assert_eq!(resp.get("type").unwrap(), "query_ok");
-    assert!(resp.get("content").is_some());
+    // The answer arrives as streamed chunks — the query ran — and then the
+    // query ends. A server with no engine refuses instead (see
+    // `a_query_without_an_engine_is_refused_rather_than_echoed`).
+    let mut answer = String::new();
+    loop {
+        let text = ws_recv_text(&mut ws).await;
+        let frame: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(frame.get("id").unwrap(), "req_1");
+        match frame.get("type").unwrap().as_str().unwrap() {
+            "stream_chunk" => {
+                answer.push_str(frame.get("chunk").unwrap().as_str().unwrap());
+            }
+            "query_done" => {
+                assert_eq!(frame.get("reason").unwrap(), "completed");
+                break;
+            }
+            other => panic!("unexpected frame: {other}"),
+        }
+    }
+
+    assert_eq!(answer, "the scripted answer", "the streamed answer");
+}
+
+/// A query still running when the connection goes away is stopped: nothing is
+/// listening for its answer, and it would keep using the account otherwise.
+#[tokio::test]
+async fn a_disconnect_stops_the_query_that_was_running() {
+    let config = ServerConfig {
+        valid_keys: vec!["key".into()],
+        idle_timeout: Duration::from_secs(3600),
+        max_sessions: 10,
+        rate_limit_per_minute: 100,
+        health_port: None,
+        persist_path: None,
+        allow_anonymous: false,
+    };
+    let (addr, handles) =
+        start_server_recording_handles(config, "a slow answer", Duration::from_secs(30)).await;
+
+    let mut ws = ws_connect(addr).await;
+    let _sid = ws_auth(&mut ws, "key").await;
+    ws_send_json(
+        &mut ws,
+        &serde_json::json!({"id": "q1", "type": "query", "content": "say something"}),
+    )
+    .await;
+
+    // Wait for the query to start, then leave.
+    let mut waited = 0;
+    while handles.lock().map(|held| held.is_empty()).unwrap_or(true) && waited < 100 {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        waited += 1;
+    }
+    let handle = handles
+        .lock()
+        .unwrap()
+        .first()
+        .cloned()
+        .expect("the engine factory ran");
+    assert!(
+        !handle.is_interrupted(),
+        "interrupted before the disconnect"
+    );
+
+    ws.close(None).await.unwrap();
+
+    let mut waited = 0;
+    while !handle.is_interrupted() && waited < 100 {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        waited += 1;
+    }
+    assert!(
+        handle.is_interrupted(),
+        "the query kept running after the client left"
+    );
+}
+
+#[tokio::test]
+async fn a_query_without_an_engine_is_refused_rather_than_echoed() {
+    let config = ServerConfig {
+        valid_keys: vec!["key".into()],
+        idle_timeout: Duration::from_secs(3600),
+        max_sessions: 10,
+        rate_limit_per_minute: 100,
+        health_port: None,
+        persist_path: None,
+        allow_anonymous: false,
+    };
+    let addr = start_server(config).await;
+    let mut ws = ws_connect(addr).await;
+    let _sid = ws_auth(&mut ws, "key").await;
+
+    ws_send_json(
+        &mut ws,
+        &serde_json::json!({"id": "q1", "type": "query", "content": "hello"}),
+    )
+    .await;
+
+    let text = ws_recv_text(&mut ws).await;
+    let frame: serde_json::Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(frame.get("type").unwrap(), "error");
+    assert_eq!(frame.get("code").unwrap(), "no_engine");
+    assert!(
+        frame
+            .get("message")
+            .and_then(|m| m.as_str())
+            .is_some_and(|m| m.contains("query engine")),
+        "{frame}"
+    );
 }
 
 #[tokio::test]
@@ -488,14 +804,14 @@ async fn full_websocket_lifecycle_auth_query_disconnect() {
         persist_path: None,
         allow_anonymous: false,
     };
-    let addr = start_server(config).await;
+    let addr = start_server_with(config, Some("lifecycle answer")).await;
     let mut ws = ws_connect(addr).await;
 
     // Auth
     let session_id = ws_auth(&mut ws, "key").await;
     assert!(session_id.starts_with("sess_"));
 
-    // Send query
+    // Send query: the answer streams, then the query ends.
     let req = serde_json::json!({
         "id": "q1",
         "type": "query",
@@ -503,9 +819,17 @@ async fn full_websocket_lifecycle_auth_query_disconnect() {
     });
     ws_send_json(&mut ws, &req).await;
 
-    let resp_text = ws_recv_text(&mut ws).await;
-    let resp: serde_json::Value = serde_json::from_str(&resp_text).unwrap();
-    assert_eq!(resp.get("type").unwrap(), "query_ok");
+    let mut answer = String::new();
+    loop {
+        let text = ws_recv_text(&mut ws).await;
+        let frame: serde_json::Value = serde_json::from_str(&text).unwrap();
+        match frame.get("type").unwrap().as_str().unwrap() {
+            "stream_chunk" => answer.push_str(frame.get("chunk").unwrap().as_str().unwrap()),
+            "query_done" => break,
+            other => panic!("unexpected frame: {other}"),
+        }
+    }
+    assert_eq!(answer, "lifecycle answer");
 
     // Send ping
     let req = serde_json::json!({"id": "p1", "type": "ping"});
