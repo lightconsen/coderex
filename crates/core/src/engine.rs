@@ -648,6 +648,33 @@ impl TurnRuntime {
     }
 }
 
+/// What one streamed request produced.
+///
+/// The stop reason is part of it: the blocking path has always had it on the
+/// response, and the streaming path used to drop it — which is why a truncated
+/// answer looked like a finished turn.
+#[derive(Debug, Clone)]
+struct StreamedResponse {
+    content: String,
+    tool_calls: Vec<ToolCall>,
+    early_results: Vec<ToolResult>,
+    usage: UsageSummary,
+    stop_reason: String,
+}
+
+/// Whether a provider's stop reason means "the answer was cut off".
+///
+/// Providers spell it two ways: `max_tokens` is Anthropic's, `length` is
+/// OpenAI's. Reading only one of them means a truncated answer from the other
+/// provider is reported as a finished turn.
+#[must_use]
+fn stop_reason_eq(stop_reason: &str, expected: &str) -> bool {
+    match expected {
+        "max_tokens" => stop_reason == "max_tokens" || stop_reason == "length",
+        other => stop_reason == other,
+    }
+}
+
 // ─── Interrupts ─────────────────────────────────────────────────────────────
 
 /// A way to stop the turn an engine is running, from outside it.
@@ -850,6 +877,8 @@ impl QueryEngine {
         self.api_client = client;
     }
 
+    /// Replace the elicitation handler — how the engine asks the person a
+    /// question mid-turn.
     pub fn set_elicitation_handler(&mut self, handler: Box<dyn ElicitationHandler + Send + Sync>) {
         self.elicitation_handler = handler;
     }
@@ -1541,48 +1570,38 @@ impl QueryEngine {
                         return Ok(TerminalReason::BudgetExhausted);
                     }
 
-                    self.run_stop_hooks(turn, turn_number, &api_response.stop_reason)
-                        .await;
-                    turn.transition_to(TurnState::Finalize);
-                    self.cost_tracker
-                        .end_turn(turn_number, &api_response.usage, &self.model);
-                    let _ = self
-                        .fire_turn_end_hook(turn_number, &api_response.stop_reason)
-                        .await;
-
-                    if api_response.stop_reason == "max_tokens" {
-                        if let Some(reason) = self.record_and_check_loop(&[]) {
-                            return Ok(reason);
-                        }
-                        return Ok(TerminalReason::TokenLimitStop);
-                    }
-                    if let Some(reason) = self.record_and_check_loop(&[]) {
+                    if let Some(reason) = self
+                        .close_turn(
+                            turn,
+                            turn_number,
+                            &api_response.stop_reason,
+                            &api_response.usage,
+                            &[],
+                        )
+                        .await
+                    {
                         return Ok(reason);
                     }
-                    return Ok(TerminalReason::Completed);
+                    return Ok(Self::reason_for(&api_response.stop_reason));
                 }
 
                 turn.terminate(TerminalReason::BudgetExhausted);
                 return Ok(TerminalReason::BudgetExhausted);
             }
 
-            turn.transition_to(TurnState::Finalize);
-            self.cost_tracker
-                .end_turn(turn_number, &api_response.usage, &self.model);
-            let _ = self
-                .fire_turn_end_hook(turn_number, &api_response.stop_reason)
-                .await;
-
-            if api_response.stop_reason == "max_tokens" {
-                if let Some(reason) = self.record_and_check_loop(&[]) {
-                    return Ok(reason);
-                }
-                return Ok(TerminalReason::TokenLimitStop);
-            }
-            if let Some(reason) = self.record_and_check_loop(&[]) {
+            if let Some(reason) = self
+                .close_turn(
+                    turn,
+                    turn_number,
+                    &api_response.stop_reason,
+                    &api_response.usage,
+                    &[],
+                )
+                .await
+            {
                 return Ok(reason);
             }
-            return Ok(TerminalReason::Completed);
+            return Ok(Self::reason_for(&api_response.stop_reason));
         }
 
         // Phase 5: Execute tools
@@ -1684,8 +1703,13 @@ impl QueryEngine {
         turn.transition_to(TurnState::StreamAssistant);
 
         // Streaming request
-        let (mut content, mut tool_calls, mut early_results, mut usage) =
-            self.send_request_streaming(turn, options).await?;
+        let StreamedResponse {
+            mut content,
+            mut tool_calls,
+            mut early_results,
+            mut usage,
+            mut stop_reason,
+        } = self.send_request_streaming(turn, options).await?;
 
         // Record budget and cost
         turn.budget.record_tokens(&usage);
@@ -1710,15 +1734,15 @@ impl QueryEngine {
                     turn.messages.push(user_msg.clone());
                     self.session.messages.push(user_msg);
                     // Re-send request with clarified context
-                    let (new_content, new_tool_calls, new_early_results, new_usage) =
-                        self.send_request_streaming(turn, options).await?;
-                    turn.budget.record_tokens(&new_usage);
-                    self.cost_tracker.record_usage(&new_usage, &self.model);
-                    self.last_usage = Some(new_usage);
-                    content = new_content;
-                    tool_calls = new_tool_calls;
-                    early_results = new_early_results;
-                    usage = new_usage;
+                    let answered = self.send_request_streaming(turn, options).await?;
+                    turn.budget.record_tokens(&answered.usage);
+                    self.cost_tracker.record_usage(&answered.usage, &self.model);
+                    self.last_usage = Some(answered.usage);
+                    content = answered.content;
+                    tool_calls = answered.tool_calls;
+                    early_results = answered.early_results;
+                    usage = answered.usage;
+                    stop_reason = answered.stop_reason;
                     self.push_visible_assistant_message(turn, content.clone());
                 }
             }
@@ -1749,37 +1773,37 @@ impl QueryEngine {
                         return Ok(TerminalReason::Error(e));
                     }
                     turn.transition_to(TurnState::StartRequest);
-                    let (content, _tool_calls, _early_results, usage) =
-                        self.send_request_streaming(turn, options).await?;
-                    turn.budget.record_tokens(&usage);
-                    self.cost_tracker.record_usage(&usage, &self.model);
-                    self.last_usage = Some(usage);
-                    self.push_visible_assistant_message(turn, content);
+                    let retried = self.send_request_streaming(turn, options).await?;
+                    turn.budget.record_tokens(&retried.usage);
+                    self.cost_tracker.record_usage(&retried.usage, &self.model);
+                    self.last_usage = Some(retried.usage);
+                    self.push_visible_assistant_message(turn, retried.content);
+                    let usage = retried.usage;
 
                     if !turn.budget.should_continue() {
                         turn.terminate(TerminalReason::BudgetExhausted);
                         return Ok(TerminalReason::BudgetExhausted);
                     }
 
-                    self.run_stop_hooks(turn, turn_number, "end_turn").await;
-                    turn.transition_to(TurnState::Finalize);
-                    self.cost_tracker.end_turn(turn_number, &usage, &self.model);
-                    let _ = self.fire_turn_end_hook(turn_number, "end_turn").await;
-                    if let Some(reason) = self.record_and_check_loop(&[]) {
+                    let stop_reason = retried.stop_reason.clone();
+                    if let Some(reason) = self
+                        .close_turn(turn, turn_number, &stop_reason, &usage, &[])
+                        .await
+                    {
                         return Ok(reason);
                     }
-                    return Ok(TerminalReason::Completed);
+                    return Ok(Self::reason_for(&stop_reason));
                 }
                 turn.terminate(TerminalReason::BudgetExhausted);
                 return Ok(TerminalReason::BudgetExhausted);
             }
-            turn.transition_to(TurnState::Finalize);
-            self.cost_tracker.end_turn(turn_number, &usage, &self.model);
-            let _ = self.fire_turn_end_hook(turn_number, "end_turn").await;
-            if let Some(reason) = self.record_and_check_loop(&[]) {
+            if let Some(reason) = self
+                .close_turn(turn, turn_number, &stop_reason, &usage, &[])
+                .await
+            {
                 return Ok(reason);
             }
-            return Ok(TerminalReason::Completed);
+            return Ok(Self::reason_for(&stop_reason));
         }
 
         // Phase 5: Execute tools
@@ -1822,6 +1846,38 @@ impl QueryEngine {
             return Ok(reason);
         }
         Ok(TerminalReason::Completed)
+    }
+
+    /// Close a turn: stop hooks, finalize, cost, turn-end hook, loop check.
+    ///
+    /// Both turn paths end here, and they had drifted apart: the streaming one
+    /// passed a hardcoded `"end_turn"` as the reason and never reported a
+    /// truncated answer as [`TerminalReason::TokenLimitStop`], so a response
+    /// the model ran out of room for looked exactly like a finished turn.
+    /// Returns a reason when the loop detector has had enough.
+    async fn close_turn(
+        &mut self,
+        turn: &mut TurnRuntime,
+        turn_number: u32,
+        stop_reason: &str,
+        usage: &UsageSummary,
+        pending_for_loop: &[PendingToolCall],
+    ) -> Option<TerminalReason> {
+        self.run_stop_hooks(turn, turn_number, stop_reason).await;
+        turn.transition_to(TurnState::Finalize);
+        self.cost_tracker.end_turn(turn_number, usage, &self.model);
+        let _ = self.fire_turn_end_hook(turn_number, stop_reason).await;
+        self.record_and_check_loop(pending_for_loop)
+    }
+
+    /// The reason a closed turn reports, given how the model stopped.
+    #[must_use]
+    fn reason_for(stop_reason: &str) -> TerminalReason {
+        if stop_reason_eq(stop_reason, "max_tokens") {
+            TerminalReason::TokenLimitStop
+        } else {
+            TerminalReason::Completed
+        }
     }
 
     /// Validate structured output if a schema is configured.
@@ -2325,7 +2381,7 @@ impl QueryEngine {
         &mut self,
         turn: &mut TurnRuntime,
         options: &SubmitOptions,
-    ) -> Result<(String, Vec<ToolCall>, Vec<ToolResult>, UsageSummary), String> {
+    ) -> Result<StreamedResponse, String> {
         use futures::StreamExt;
         use std::collections::HashSet;
 
@@ -2482,7 +2538,16 @@ impl QueryEngine {
                     "streaming request yielded no usable events; retrying same turn non-streaming"
                 );
                 if let Ok(resp) = self.send_request(turn, options).await {
-                    return Ok((resp.content, resp.tool_calls, Vec::new(), resp.usage));
+                    // The fallback keeps the response's own stop reason: a
+                    // truncated answer is still truncated when it arrives this
+                    // way.
+                    return Ok(StreamedResponse {
+                        content: resp.content,
+                        tool_calls: resp.tool_calls,
+                        early_results: Vec::new(),
+                        usage: resp.usage,
+                        stop_reason: resp.stop_reason,
+                    });
                 }
             }
 
@@ -2498,7 +2563,13 @@ impl QueryEngine {
                 // Whatever arrived before the interrupt is kept: a partial
                 // answer is what the person asked to stop at, and throwing it
                 // away would lose the tokens they already paid for.
-                return Ok((text_so_far, deferred_calls, early_results, usage));
+                return Ok(StreamedResponse {
+                    content: text_so_far,
+                    tool_calls: deferred_calls,
+                    early_results,
+                    usage,
+                    stop_reason: stop_reason.unwrap_or_else(|| "interrupted".to_string()),
+                });
             }
 
             if stream_failed {
@@ -2517,7 +2588,13 @@ impl QueryEngine {
                 });
             }
 
-            return Ok((text_so_far, deferred_calls, early_results, usage));
+            return Ok(StreamedResponse {
+                content: text_so_far,
+                tool_calls: deferred_calls,
+                early_results,
+                usage,
+                stop_reason: stop_reason.unwrap_or_else(|| "end_turn".to_string()),
+            });
         }
     }
 
@@ -3360,6 +3437,117 @@ mod tests {
                 crate::api_client::StreamEvent::StreamEnd,
             ]))
         }
+    }
+
+    /// A truncated answer ends the turn as `TokenLimitStop` — on both paths.
+    /// The streaming path lost this: it passed a hardcoded `"end_turn"` as the
+    /// stop reason and never checked for truncation, so a response the model
+    /// ran out of room for looked exactly like a finished turn.
+    #[tokio::test]
+    async fn a_truncated_answer_stops_the_turn_on_the_streaming_path() {
+        /// Answers, and says it ran out of room.
+        struct TruncatingMock;
+
+        #[async_trait::async_trait]
+        impl ApiClient for TruncatingMock {
+            fn clone_box(&self) -> Box<dyn ApiClient> {
+                Box::new(TruncatingMock)
+            }
+
+            async fn create_message(
+                &self,
+                _system: &str,
+                _messages: &[serde_json::Value],
+                _model: &ModelId,
+                _max_tokens: u32,
+                _tools: &[crate::tool_executor::ToolInfo],
+            ) -> Result<ApiResponse, crate::api_client::ApiError> {
+                Ok(ApiResponse {
+                    content: "a half-finished ans".into(),
+                    tool_calls: Vec::new(),
+                    usage: UsageSummary {
+                        input_tokens: 10,
+                        output_tokens: 5,
+                        cache_read_tokens: 0,
+                        cache_creation_tokens: 0,
+                    },
+                    stop_reason: "max_tokens".into(),
+                })
+            }
+
+            async fn create_message_streaming(
+                &self,
+                system: &str,
+                messages: &[serde_json::Value],
+                model: &ModelId,
+                max_tokens: u32,
+                tools: &[crate::tool_executor::ToolInfo],
+            ) -> std::pin::Pin<
+                Box<dyn futures::Stream<Item = crate::api_client::StreamEvent> + Send + 'static>,
+            > {
+                let response = self
+                    .create_message(system, messages, model, max_tokens, tools)
+                    .await
+                    .expect("the mock answers");
+                Box::pin(futures::stream::iter(vec![
+                    crate::api_client::StreamEvent::TextDelta(response.content),
+                    crate::api_client::StreamEvent::StopReason(response.stop_reason),
+                    crate::api_client::StreamEvent::StreamEnd,
+                ]))
+            }
+        }
+
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let session = SessionState::new(std::path::PathBuf::from("/tmp/test"));
+        let checker = PermissionChecker::new(PermissionMode::BypassPermissions);
+        let mut engine = QueryEngine::new(
+            Box::new(TruncatingMock),
+            ModelId::sonnet(),
+            session,
+            PermissionEngine::new(checker),
+            tx,
+        );
+
+        let streamed = engine
+            .submit_streaming("write something long".into(), SubmitOptions::default())
+            .await
+            .unwrap();
+        assert!(
+            matches!(streamed, TerminalReason::TokenLimitStop),
+            "streaming reported {streamed:?}"
+        );
+
+        // And the blocking path agrees, which is the property that was lost.
+        let blocked = engine
+            .submit("write something long".into(), SubmitOptions::default())
+            .await
+            .unwrap();
+        assert!(
+            matches!(blocked, TerminalReason::TokenLimitStop),
+            "blocking reported {blocked:?}"
+        );
+    }
+
+    /// Providers spell "cut off" two ways; both count.
+    #[test]
+    fn a_cut_off_answer_is_recognised_whichever_way_it_is_spelled() {
+        assert!(stop_reason_eq("max_tokens", "max_tokens"));
+        assert!(stop_reason_eq("length", "max_tokens"));
+        assert!(!stop_reason_eq("end_turn", "max_tokens"));
+        assert!(!stop_reason_eq("", "max_tokens"));
+
+        assert!(matches!(
+            QueryEngine::reason_for("max_tokens"),
+            TerminalReason::TokenLimitStop
+        ));
+        assert!(matches!(
+            QueryEngine::reason_for("length"),
+            TerminalReason::TokenLimitStop
+        ));
+        assert!(matches!(
+            QueryEngine::reason_for("end_turn"),
+            TerminalReason::Completed
+        ));
     }
 
     /// `interrupt()` sets the flag the turn loop reads, not only the event.
