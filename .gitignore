@@ -15,3 +15,6 @@ export_env.*.sh
 # Local configuration and generated docs
 .coderex/
 .claude/settings.json
+
+# Agent and session worktrees
+.claude/worktrees/

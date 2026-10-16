@@ -4130,6 +4130,13 @@ impl ReplLoop {
         Ok(())
     }
 
+    /// Run one command line outside the TUI.
+    ///
+    /// Unlike the interactive path, this does not stop to confirm a command
+    /// marked `destructive`: there is nobody to ask. An interactive session
+    /// asks first (the `Confirm` overlay before running the command); a
+    /// headless run carries out what it was told to, which is what running it
+    /// without a person present means.
     async fn execute_command(
         &mut self,
         line: &str,

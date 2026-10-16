@@ -588,6 +588,140 @@ pub fn register_all_commands(registry: &mut CommandRegistry) {
 mod tests {
     use super::*;
 
+    /// A command's argument spec is enforced before its handler runs: the
+    /// declaration existed and `execute` consulted it, and nothing asserted
+    /// that the seam works.
+    #[test]
+    fn a_command_with_too_few_arguments_is_refused_before_it_runs() {
+        let mut registry = CommandRegistry::new();
+        registry.register(
+            SlashCommand::local(
+                "needs-two",
+                "needs two arguments",
+                false,
+                false,
+                false,
+                Arc::new(|_ctx: &CommandContext, args: &[String]| {
+                    CommandResult::success(format!("ran with {} args", args.len()))
+                }),
+            )
+            .with_args(CommandArgs::AtLeast(2)),
+        );
+
+        let too_few = registry.execute("needs-two", &make_ctx(), &["one".into()]);
+        assert!(too_few.output.contains("at least 2"), "{}", too_few.output);
+        assert!(
+            !too_few.output.contains("ran with"),
+            "the handler ran anyway: {}",
+            too_few.output
+        );
+
+        let enough = registry.execute("needs-two", &make_ctx(), &["one".into(), "two".into()]);
+        assert!(enough.output.contains("ran with 2"), "{}", enough.output);
+    }
+
+    #[test]
+    fn a_command_with_too_many_arguments_is_refused() {
+        let mut registry = CommandRegistry::new();
+        registry.register(
+            SlashCommand::local(
+                "takes-one",
+                "takes one argument",
+                false,
+                false,
+                false,
+                Arc::new(|_ctx: &CommandContext, _args: &[String]| CommandResult::success("ran")),
+            )
+            .with_args(CommandArgs::AtMost(1)),
+        );
+
+        let too_many = registry.execute("takes-one", &make_ctx(), &["a".into(), "b".into()]);
+        assert!(too_many.output.contains("at most 1"), "{}", too_many.output);
+        assert!(!too_many.output.contains("ran"), "{}", too_many.output);
+    }
+
+    #[test]
+    fn a_command_with_the_wrong_count_is_refused() {
+        let mut registry = CommandRegistry::new();
+        registry.register(
+            SlashCommand::local(
+                "takes-exactly-two",
+                "takes exactly two",
+                false,
+                false,
+                false,
+                Arc::new(|_ctx: &CommandContext, _args: &[String]| CommandResult::success("ran")),
+            )
+            .with_args(CommandArgs::Exactly(2)),
+        );
+
+        for args in [vec![], vec!["a".into()], vec!["a".into(), "b".into(), "c".into()]] {
+            let result = registry.execute("takes-exactly-two", &make_ctx(), &args);
+            assert!(
+                result.output.contains("exactly 2"),
+                "{args:?} gave {}",
+                result.output
+            );
+        }
+
+        let right = registry.execute(
+            "takes-exactly-two",
+            &make_ctx(),
+            &["a".into(), "b".into()],
+        );
+        assert!(right.output.contains("ran"), "{}", right.output);
+    }
+
+    /// `CommandArgs::None` — the default — accepts anything, so a command that
+    /// says nothing about its arguments is not accidentally constrained.
+    #[test]
+    fn a_command_that_says_nothing_about_its_arguments_accepts_them() {
+        let mut registry = CommandRegistry::new();
+        registry.register(SlashCommand::local(
+            "anything",
+            "takes anything",
+            false,
+            false,
+            false,
+            Arc::new(|_ctx: &CommandContext, args: &[String]| {
+                CommandResult::success(format!("ran with {} args", args.len()))
+            }),
+        ));
+
+        let result = registry.execute("anything", &make_ctx(), &["a".into(), "b".into(), "c".into()]);
+        assert!(result.output.contains("ran with 3"), "{}", result.output);
+    }
+
+    /// A command marked destructive says so on the command itself, which is
+    /// what the REPL asks before running it. The flag has to survive the
+    /// registry, or the prompt never happens.
+    #[test]
+    fn a_destructive_command_carries_the_flag_the_repl_asks_about() {
+        let mut registry = CommandRegistry::new();
+        registry.register(
+            SlashCommand::local(
+                "wipe",
+                "wipes something",
+                false,
+                false,
+                false,
+                Arc::new(|_ctx: &CommandContext, _args: &[String]| CommandResult::success("done")),
+            )
+            .with_destructive(),
+        );
+        registry.register(SlashCommand::local(
+            "harmless",
+            "does nothing much",
+            false,
+            false,
+            false,
+            Arc::new(|_ctx: &CommandContext, _args: &[String]| CommandResult::success("done")),
+        ));
+
+        assert!(registry.find("wipe").unwrap().destructive);
+        assert!(!registry.find("harmless").unwrap().destructive);
+    }
+
     fn make_ctx() -> CommandContext {
         CommandContext::new(
             "/src".into(),
