@@ -150,7 +150,7 @@ impl TokenBucket {
 }
 
 /// A connected WebSocket session.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Session {
     /// The unique session identifier.
     pub id: String,
@@ -217,116 +217,37 @@ pub type EngineFactory = Arc<
         + Sync,
 >;
 
-/// Server for managing detached sessions over WebSocket.
-pub struct DaemonServer {
+/// The state every connection shares.
+///
+/// Behind a synchronous lock on purpose: it is only ever held for the short
+/// bookkeeping a message needs, never across an `await`, and a guard that is
+/// not `Send` makes the compiler enforce that in the tasks that serve
+/// connections.
+#[derive(Debug, Default)]
+struct Shared {
     /// Active sessions.
     sessions: HashMap<String, Session>,
-    /// Server configuration.
-    config: ServerConfig,
-    /// Thread-safe session count for the health endpoint.
-    session_count_atomic: Arc<AtomicUsize>,
     /// Optional SQLite session store for persistence.
     store: Option<crate::persistence::SessionStore>,
     /// Monotonic source of session ids.
     next_session_id: u64,
-    /// How a session's queries reach a model, when one was supplied.
-    engine_factory: Option<EngineFactory>,
-    /// The query running in each session, so it can be interrupted.
-    running_queries: HashMap<String, coderex_core::engine::InterruptHandle>,
 }
 
-impl std::fmt::Debug for DaemonServer {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("DaemonServer")
-            .field("sessions", &self.sessions.len())
-            .field("has_engine", &self.engine_factory.is_some())
-            .field("running_queries", &self.running_queries.len())
-            .finish_non_exhaustive()
-    }
-}
-
-impl Default for DaemonServer {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl DaemonServer {
-    /// Supply the engine sessions run their queries on.
-    ///
-    /// Without one, a query is refused with `no_engine` rather than answered:
-    /// a server that cannot run a query has nothing true to say about one.
-    pub fn set_engine_factory(&mut self, factory: EngineFactory) {
-        self.engine_factory = Some(factory);
-    }
-
-    /// Create a new daemon server with default config.
-    #[must_use]
-    pub fn new() -> Self {
-        Self {
-            sessions: HashMap::new(),
-            config: ServerConfig::default(),
-            session_count_atomic: Arc::new(AtomicUsize::new(0)),
-            store: None,
-            next_session_id: 0,
-            engine_factory: None,
-            running_queries: HashMap::new(),
-        }
-    }
-
-    /// Create a new daemon server with the given config.
-    #[must_use]
-    pub fn with_config(config: ServerConfig) -> Self {
-        let mut server = Self {
-            sessions: HashMap::new(),
-            config: config.clone(),
-            session_count_atomic: Arc::new(AtomicUsize::new(0)),
-            store: None,
-            next_session_id: 0,
-            engine_factory: None,
-            running_queries: HashMap::new(),
-        };
-
-        // Initialize persistence if configured
-        if let Some(ref path) = config.persist_path {
-            match crate::persistence::SessionStore::open(path) {
-                Ok(store) => {
-                    server.store = Some(store);
-                    // Restore previous sessions
-                    if let Ok(psessions) = server.store.as_ref().unwrap().load_all() {
-                        for ps in &psessions {
-                            let restored = crate::persistence::restore_session(ps);
-                            server.sessions.insert(restored.id.clone(), restored);
-                        }
-                        if !psessions.is_empty() {
-                            info!("Restored {} sessions from database", psessions.len());
-                        }
-                    }
-                }
-                Err(e) => {
-                    warn!("Failed to open session store at {:?}: {}", path, e);
-                }
-            }
-        }
-
-        server.sync_session_count();
-        server
-    }
-
-    /// Authenticate a new session with the given token.
-    pub fn authenticate(&mut self, token: &str) -> Result<String, String> {
-        if self.config.valid_keys.is_empty() {
-            if !self.config.allow_anonymous {
+impl Shared {
+    /// Open a session for a token that is allowed to have one.
+    fn authenticate(&mut self, token: &str, config: &ServerConfig) -> Result<String, String> {
+        if config.valid_keys.is_empty() {
+            if !config.allow_anonymous {
                 return Err(
                     "server has no API keys configured; set one, or enable anonymous \
                      access explicitly for local development"
                         .to_string(),
                 );
             }
-        } else if !self.config.valid_keys.iter().any(|k| k == token) {
+        } else if !config.valid_keys.iter().any(|k| k == token) {
             return Err("invalid API key".to_string());
         }
-        if self.sessions.len() >= self.config.max_sessions {
+        if self.sessions.len() >= config.max_sessions {
             return Err("max sessions reached".to_string());
         }
 
@@ -349,20 +270,21 @@ impl DaemonServer {
         // fingerprint of the key, not the key: the row only has to say which
         // key opened the session.
         if let Some(ref mut store) = self.store {
-            let sess = self.sessions.get(&id).unwrap();
-            let fingerprint = store.fingerprint(&sess.auth_token);
-            let ps = crate::persistence::persist_session(sess, fingerprint);
+            let session = self.sessions.get(&id).expect("just inserted");
+            let fingerprint = store.fingerprint(&session.auth_token);
+            let ps = crate::persistence::persist_session(session, fingerprint);
             if let Err(e) = store.save(&ps) {
                 warn!("Failed to persist session {id}: {e}");
             }
         }
 
-        self.sync_session_count();
         Ok(id)
     }
+}
 
-    /// Record activity for a session (resets idle timer).
-    pub fn record_activity(&mut self, session_id: &str) -> bool {
+impl Shared {
+    /// Note that a session was used, so idle cleanup leaves it alone.
+    fn record_activity(&mut self, session_id: &str) -> bool {
         if let Some(session) = self.sessions.get_mut(session_id) {
             session.last_activity = Instant::now();
             true
@@ -371,10 +293,9 @@ impl DaemonServer {
         }
     }
 
-    /// Remove idle sessions that have exceeded the timeout.
-    pub fn cleanup_idle(&mut self) -> Vec<String> {
+    /// Drop the sessions that have been idle past the timeout.
+    fn cleanup_idle(&mut self, timeout: Duration) -> Vec<String> {
         let now = Instant::now();
-        let timeout = self.config.idle_timeout;
         let mut removed = Vec::new();
 
         self.sessions.retain(|id, session| {
@@ -385,96 +306,60 @@ impl DaemonServer {
                 true
             }
         });
-        self.sync_session_count();
         removed
     }
 
-    /// List all active sessions.
-    #[must_use]
-    pub fn list_sessions(&self) -> Vec<&Session> {
-        self.sessions.values().collect()
-    }
-
-    /// Get a session by ID.
-    #[must_use]
-    pub fn get_session(&self, session_id: &str) -> Option<&Session> {
-        self.sessions.get(session_id)
-    }
-
-    /// Disconnect a session.
-    pub fn disconnect(&mut self, session_id: &str) -> bool {
+    /// End a session, in memory and in the store.
+    fn disconnect(&mut self, session_id: &str) -> bool {
         let removed = self.sessions.remove(session_id).is_some();
         if removed {
-            // Remove from persistence layer
             if let Some(ref mut store) = self.store {
                 if let Err(e) = store.remove(session_id) {
                     warn!("Failed to remove session {session_id} from store: {e}");
                 }
             }
+        }
+        removed
+    }
+}
+
+/// One WebSocket connection, with what it shares and what it owns.
+struct Connection {
+    config: ServerConfig,
+    shared: Arc<parking_lot::Mutex<Shared>>,
+    session_count_atomic: Arc<AtomicUsize>,
+    engine_factory: Option<EngineFactory>,
+}
+
+impl Connection {
+    fn authenticate(&self, token: &str) -> Result<String, String> {
+        let id = self.shared.lock().authenticate(token, &self.config)?;
+        self.sync_session_count();
+        Ok(id)
+    }
+
+    fn record_activity(&self, session_id: &str) -> bool {
+        self.shared.lock().record_activity(session_id)
+    }
+
+    fn disconnect(&self, session_id: &str) -> bool {
+        let removed = self.shared.lock().disconnect(session_id);
+        if removed {
             self.sync_session_count();
         }
         removed
     }
 
-    /// Number of active sessions.
-    #[must_use]
-    pub fn session_count(&self) -> usize {
-        self.session_count_atomic.load(Ordering::Relaxed)
+    fn session_count(&self) -> usize {
+        self.shared.lock().sessions.len()
     }
 
-    /// Update the atomic session counter (called after sessions change).
     fn sync_session_count(&self) {
         self.session_count_atomic
-            .store(self.sessions.len(), Ordering::Relaxed);
+            .store(self.shared.lock().sessions.len(), Ordering::Relaxed);
     }
 
-    /// Start the WebSocket server and accept connections.
-    ///
-    /// Binds a TCP listener on the given address, upgrades connections to
-    /// WebSocket, authenticates clients, and routes messages.
-    /// If `config.health_port` is set, spawns a lightweight HTTP server
-    /// on that port serving a `/health` endpoint.
-    pub async fn run(&mut self, addr: SocketAddr) -> Result<(), String> {
-        let listener = TcpListener::bind(addr)
-            .await
-            .map_err(|e| format!("failed to bind TCP listener: {e}"))?;
-
-        info!("WebSocket server listening on ws://{addr}");
-
-        // Spawn health endpoint if configured
-        if let Some(health_port) = self.config.health_port {
-            let counter = Arc::clone(&self.session_count_atomic);
-            tokio::spawn(async move {
-                run_health_server(health_port, counter).await;
-            });
-        }
-
-        let mut cleanup_interval = tokio::time::interval(Duration::from_secs(60));
-
-        loop {
-            tokio::select! {
-                accept_result = listener.accept() => {
-                    match accept_result {
-                        Ok((stream, peer)) => {
-                            debug!("new TCP connection from {peer}");
-                            self.handle_connection(stream).await;
-                        }
-                        Err(e) => {
-                            warn!("accept error: {e}");
-                        }
-                    }
-                }
-                _ = cleanup_interval.tick() => {
-                    let removed = self.cleanup_idle();
-                    if !removed.is_empty() {
-                        info!("cleaned up {} idle sessions: {:?}", removed.len(), removed);
-                    }
-                }
-            }
-        }
-    }
-
-    async fn handle_connection(&mut self, stream: TcpStream) {
+    async fn serve(&self, stream: TcpStream) {
         let ws_result = tokio_tungstenite::accept_async(stream).await;
         let mut ws = match ws_result {
             Ok(ws) => ws,
@@ -565,6 +450,11 @@ impl DaemonServer {
         // task can stream while this loop keeps reading: the socket has one
         // writer, and it is here.
         let (out_tx, mut out_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        // The queries this connection has running, so Ctrl+C and a disconnect
+        // can reach them. A session belongs to one connection, so this is
+        // per-connection state rather than shared.
+        let mut running_queries: HashMap<String, coderex_core::engine::InterruptHandle> =
+            HashMap::new();
 
         loop {
             tokio::select! {
@@ -593,7 +483,8 @@ impl DaemonServer {
 
                             // A query answers through the channel as it runs;
                             // everything else answers here.
-                            let Some(response) = self.handle_message(&session_id, &text, &out_tx)
+                            let Some(response) =
+                                self.handle_message(&session_id, &text, &out_tx, &mut running_queries)
                             else {
                                 continue;
                             };
@@ -636,7 +527,7 @@ impl DaemonServer {
         // A query still running when the connection goes away is stopped:
         // nothing is listening for its answer, and it would keep using the
         // account and the filesystem otherwise.
-        if let Some(handle) = self.running_queries.remove(&session_id) {
+        if let Some(handle) = running_queries.remove(&session_id) {
             handle.interrupt();
         }
 
@@ -652,10 +543,11 @@ impl DaemonServer {
     /// A query does not return a response: it starts a task that streams the
     /// answer over `out`. Everything else answers immediately.
     fn handle_message(
-        &mut self,
+        &self,
         session_id: &str,
         text: &str,
         out: &tokio::sync::mpsc::UnboundedSender<String>,
+        running_queries: &mut HashMap<String, coderex_core::engine::InterruptHandle>,
     ) -> Option<WsResponse> {
         let req: WsRequest = match serde_json::from_str(text) {
             Ok(r) => r,
@@ -686,8 +578,7 @@ impl DaemonServer {
 
                 let (mut engine, mut events) = factory();
                 let handle = engine.interrupt_handle();
-                self.running_queries
-                    .insert(session_id.to_string(), handle.clone());
+                running_queries.insert(session_id.to_string(), handle.clone());
 
                 let id = req.id.clone();
                 let out = out.clone();
@@ -742,7 +633,7 @@ impl DaemonServer {
                 None
             }
             WsRequestKind::Interrupt => {
-                let interrupted = self.running_queries.get(session_id).is_some_and(|handle| {
+                let interrupted = running_queries.get(session_id).is_some_and(|handle| {
                     handle.interrupt();
                     true
                 });
@@ -758,6 +649,204 @@ impl DaemonServer {
                 })
             }
             WsRequestKind::Ping => Some(WsResponse::pong(&req.id)),
+        }
+    }
+}
+/// Server for managing detached sessions over WebSocket.
+pub struct DaemonServer {
+    /// Server configuration.
+    config: ServerConfig,
+    /// Session bookkeeping, shared with the task serving each connection.
+    shared: Arc<parking_lot::Mutex<Shared>>,
+    /// Thread-safe session count for the health endpoint.
+    session_count_atomic: Arc<AtomicUsize>,
+    /// How a session's queries reach a model, when one was supplied.
+    engine_factory: Option<EngineFactory>,
+}
+
+impl std::fmt::Debug for DaemonServer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DaemonServer")
+            .field("sessions", &self.shared.lock().sessions.len())
+            .field("has_engine", &self.engine_factory.is_some())
+            .finish_non_exhaustive()
+    }
+}
+
+impl Default for DaemonServer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl DaemonServer {
+    /// Supply the engine sessions run their queries on.
+    ///
+    /// Without one, a query is refused with `no_engine` rather than answered:
+    /// a server that cannot run a query has nothing true to say about one.
+    pub fn set_engine_factory(&mut self, factory: EngineFactory) {
+        self.engine_factory = Some(factory);
+    }
+
+    /// Create a new daemon server with default config.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            config: ServerConfig::default(),
+            shared: Arc::new(parking_lot::Mutex::new(Shared::default())),
+            session_count_atomic: Arc::new(AtomicUsize::new(0)),
+            engine_factory: None,
+        }
+    }
+
+    /// Create a new daemon server with the given config.
+    #[must_use]
+    pub fn with_config(config: ServerConfig) -> Self {
+        let mut server = Self {
+            config: config.clone(),
+            shared: Arc::new(parking_lot::Mutex::new(Shared::default())),
+            session_count_atomic: Arc::new(AtomicUsize::new(0)),
+            engine_factory: None,
+        };
+
+        // Initialize persistence if configured
+        if let Some(ref path) = config.persist_path {
+            match crate::persistence::SessionStore::open(path) {
+                Ok(store) => {
+                    // Restore previous sessions
+                    let restored = store.load_all().unwrap_or_default();
+                    let mut shared = server.shared.lock();
+                    for ps in &restored {
+                        let session = crate::persistence::restore_session(ps);
+                        shared.sessions.insert(session.id.clone(), session);
+                    }
+                    if !restored.is_empty() {
+                        info!("Restored {} sessions from database", restored.len());
+                    }
+                    shared.store = Some(store);
+                }
+                Err(e) => {
+                    warn!("Failed to open session store at {:?}: {}", path, e);
+                }
+            }
+        }
+
+        server.sync_session_count();
+        server
+    }
+
+    /// Authenticate a new session with the given token.
+    pub fn authenticate(&mut self, token: &str) -> Result<String, String> {
+        let id = self.shared.lock().authenticate(token, &self.config)?;
+        self.sync_session_count();
+        Ok(id)
+    }
+
+    /// Record activity for a session (resets idle timer).
+    pub fn record_activity(&mut self, session_id: &str) -> bool {
+        self.shared.lock().record_activity(session_id)
+    }
+
+    /// Remove idle sessions that have exceeded the timeout.
+    pub fn cleanup_idle(&mut self) -> Vec<String> {
+        let removed = self.shared.lock().cleanup_idle(self.config.idle_timeout);
+        self.sync_session_count();
+        removed
+    }
+
+    /// List all active sessions.
+    #[must_use]
+    /// The active sessions, as copies.
+    ///
+    /// Copies rather than references: the bookkeeping is behind a lock now, and
+    /// a reference out of it would outlive the guard.
+    pub fn list_sessions(&self) -> Vec<Session> {
+        self.shared.lock().sessions.values().cloned().collect()
+    }
+
+    /// Get a session by ID.
+    #[must_use]
+    pub fn get_session(&self, session_id: &str) -> Option<Session> {
+        self.shared.lock().sessions.get(session_id).cloned()
+    }
+
+    /// Disconnect a session.
+    pub fn disconnect(&mut self, session_id: &str) -> bool {
+        let removed = self.shared.lock().disconnect(session_id);
+        if removed {
+            self.sync_session_count();
+        }
+        removed
+    }
+
+    /// Number of active sessions.
+    #[must_use]
+    pub fn session_count(&self) -> usize {
+        self.session_count_atomic.load(Ordering::Relaxed)
+    }
+
+    /// Update the atomic session counter (called after sessions change).
+    fn sync_session_count(&self) {
+        self.session_count_atomic
+            .store(self.shared.lock().sessions.len(), Ordering::Relaxed);
+    }
+
+    /// Start the WebSocket server and accept connections.
+    ///
+    /// Binds a TCP listener on the given address, upgrades connections to
+    /// WebSocket, authenticates clients, and routes messages.
+    /// If `config.health_port` is set, spawns a lightweight HTTP server
+    /// on that port serving a `/health` endpoint.
+    pub async fn run(&mut self, addr: SocketAddr) -> Result<(), String> {
+        let listener = TcpListener::bind(addr)
+            .await
+            .map_err(|e| format!("failed to bind TCP listener: {e}"))?;
+
+        info!("WebSocket server listening on ws://{addr}");
+
+        // Spawn health endpoint if configured
+        if let Some(health_port) = self.config.health_port {
+            let counter = Arc::clone(&self.session_count_atomic);
+            tokio::spawn(async move {
+                run_health_server(health_port, counter).await;
+            });
+        }
+
+        let mut cleanup_interval = tokio::time::interval(Duration::from_secs(60));
+
+        loop {
+            tokio::select! {
+                accept_result = listener.accept() => {
+                    match accept_result {
+                        Ok((stream, peer)) => {
+                            debug!("new TCP connection from {peer}");
+                            // Served in its own task. Awaiting the connection
+                            // here meant one client held the accept loop for as
+                            // long as it stayed connected: no second client
+                            // could connect, and the idle sweep above never
+                            // ran.
+                            let connection = Connection {
+                                config: self.config.clone(),
+                                shared: Arc::clone(&self.shared),
+                                session_count_atomic: Arc::clone(&self.session_count_atomic),
+                                engine_factory: self.engine_factory.clone(),
+                            };
+                            tokio::spawn(async move {
+                                connection.serve(stream).await;
+                            });
+                        }
+                        Err(e) => {
+                            warn!("accept error: {e}");
+                        }
+                    }
+                }
+                _ = cleanup_interval.tick() => {
+                    let removed = self.cleanup_idle();
+                    if !removed.is_empty() {
+                        info!("cleaned up {} idle sessions: {:?}", removed.len(), removed);
+                    }
+                }
+            }
         }
     }
 }

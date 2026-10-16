@@ -538,6 +538,39 @@ async fn the_session_store_never_holds_the_key() {
     let _ = std::fs::remove_file(&db);
 }
 
+/// One connection must not hold the accept loop. It used to: the loop awaited
+/// the whole connection, so a client that connected and stayed quiet kept
+/// every other client out — and kept the idle sweep from running.
+#[tokio::test]
+async fn a_quiet_connection_does_not_block_the_next_one() {
+    let config = ServerConfig {
+        valid_keys: vec!["key".into()],
+        idle_timeout: Duration::from_secs(3600),
+        max_sessions: 10,
+        rate_limit_per_minute: 100,
+        health_port: None,
+        persist_path: None,
+        allow_anonymous: false,
+    };
+    let addr = start_server(config).await;
+
+    // A connection that authenticates and then just sits there.
+    let mut quiet = ws_connect(addr).await;
+    let _sid = ws_auth(&mut quiet, "key").await;
+
+    // A second client must still be served.
+    let mut second = tokio::time::timeout(Duration::from_secs(5), ws_connect(addr))
+        .await
+        .expect("a second client could not connect while the first was idle");
+    let answer = tokio::time::timeout(Duration::from_secs(5), ws_auth(&mut second, "key"))
+        .await
+        .expect("a second client could not authenticate");
+    assert!(answer.starts_with("sess_"));
+
+    quiet.close(None).await.ok();
+    second.close(None).await.ok();
+}
+
 #[tokio::test]
 async fn a_query_without_an_engine_is_refused_rather_than_echoed() {
     let config = ServerConfig {
