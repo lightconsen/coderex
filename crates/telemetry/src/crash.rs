@@ -80,6 +80,12 @@ impl CrashReporter {
     ) -> Result<usize, crate::TelemetryError> {
         self.enforce_size_limit();
 
+        // The same scrubber the event path uses, applied here too: a panic
+        // message is `format!("{info}")` of whatever the panic carried, and a
+        // backtrace is a list of paths. Both leave the machine — the store is
+        // uploaded from — so both are scrubbed before they are stored.
+        let scrubber = crate::Scrubber::new();
+
         let mut count = 0;
         let entries = match std::fs::read_dir(&self.pending_dir) {
             Ok(entries) => entries,
@@ -95,8 +101,15 @@ impl CrashReporter {
             match std::fs::read_to_string(&path) {
                 Ok(content) => {
                     if let Ok(report) = serde_json::from_str::<CrashReport>(&content) {
-                        let backtrace = report.backtrace.as_deref();
-                        if store.insert_crash(&report.panic_info, backtrace).is_ok() {
+                        let panic_info = scrubber.scrub(&report.panic_info);
+                        let backtrace = report
+                            .backtrace
+                            .as_deref()
+                            .map(|backtrace| scrubber.scrub(backtrace));
+                        if store
+                            .insert_crash(&panic_info, backtrace.as_deref())
+                            .is_ok()
+                        {
                             let _ = std::fs::remove_file(&path);
                             count += 1;
                         }
@@ -168,6 +181,46 @@ impl CrashReporter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A crash message and its backtrace leave the machine, so they go through
+    /// the same scrubber the event path uses. They used to be stored — and
+    /// uploaded — exactly as the panic produced them.
+    #[test]
+    fn an_ingested_crash_is_scrubbed() {
+        let dir = std::env::temp_dir().join(format!("coderex_crash_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let reporter = CrashReporter::new(dir.clone());
+        let report = CrashReport {
+            panic_info: "failed for user@example.com from 10.0.0.7 at /Users/somebody/project"
+                .into(),
+            backtrace: Some("at /home/somebody/project/src/main.rs:12".to_string()),
+            timestamp: chrono::Utc::now(),
+        };
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("crash_1.json"),
+            serde_json::to_string(&report).unwrap(),
+        )
+        .unwrap();
+
+        let db = dir.join("telemetry.db");
+        let store = crate::TelemetryStore::open(&db).unwrap();
+        assert_eq!(reporter.ingest_pending(&store).unwrap(), 1);
+
+        let crashes = store.pending_crashes(10).unwrap();
+        assert_eq!(crashes.len(), 1);
+        let stored = format!(
+            "{}\n{}",
+            crashes[0].panic_info,
+            crashes[0].backtrace.clone().unwrap_or_default()
+        );
+        assert!(!stored.contains("user@example.com"), "{stored}");
+        assert!(!stored.contains("10.0.0.7"), "{stored}");
+        assert!(!stored.contains("somebody"), "{stored}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn crash_report_serialization() {
