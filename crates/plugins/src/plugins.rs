@@ -6,7 +6,7 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::Mutex as TokioMutex;
@@ -81,18 +81,167 @@ impl std::fmt::Display for RuntimeType {
     }
 }
 
-/// A plugin manifest — parsed from plugin.json.
+/// A plugin author, as declared in `plugin.json`.
+///
+/// Claude's manifest writes this as an object (`{"name": ..., "email": ...}`)
+/// and CodeRex manifests in the wild write it as a bare string. Both parse:
+/// an object used to fail the whole manifest, which took the plugin with it.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct PluginAuthor {
+    /// Author name.
+    pub name: String,
+    /// Author contact address.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub email: Option<String>,
+}
+
+impl From<&str> for PluginAuthor {
+    fn from(name: &str) -> Self {
+        Self {
+            name: name.to_string(),
+            email: None,
+        }
+    }
+}
+
+impl From<String> for PluginAuthor {
+    fn from(name: String) -> Self {
+        Self { name, email: None }
+    }
+}
+
+impl std::fmt::Display for PluginAuthor {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.name)
+    }
+}
+
+impl<'de> Deserialize<'de> for PluginAuthor {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Repr {
+            /// `"author": "name"`.
+            Name(String),
+            /// `"author": {"name": ..., "email": ...}`.
+            Full {
+                name: String,
+                #[serde(default)]
+                email: Option<String>,
+            },
+        }
+
+        Ok(match Repr::deserialize(deserializer)? {
+            Repr::Name(name) => Self { name, email: None },
+            Repr::Full { name, email } => Self { name, email },
+        })
+    }
+}
+
+/// One entry of a manifest's `userConfig` block.
+///
+/// The keys of the map are the option names, which become
+/// `CODEREX_PLUGIN_OPTION_<KEY>` environment variables in the plugin process.
+/// Claude's schema also allows `options`, `min` and `max`; they are accepted
+/// so a Claude-shaped manifest parses, but CodeRex does not enforce them.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UserConfigField {
+    /// Declared value type: `string`, `number`, `boolean`, `directory` or `file`.
+    #[serde(rename = "type", default, skip_serializing_if = "Option::is_none")]
+    pub value_type: Option<String>,
+    /// Human-readable label.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    /// Human-readable explanation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// Whether the plugin needs this option to run.
+    #[serde(default)]
+    pub required: bool,
+    /// Default value. Refused for `sensitive` options: a secret written into
+    /// `plugin.json` is a secret in a file that gets committed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default: Option<Value>,
+    /// Whether the value is a secret.
+    #[serde(default)]
+    pub sensitive: bool,
+    /// Whether several values may be supplied.
+    #[serde(default)]
+    pub multiple: bool,
+    /// Allowed values for a `string` option (accepted, not enforced).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub options: Option<Value>,
+    /// Minimum for a `number` option (accepted, not enforced).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min: Option<Value>,
+    /// Maximum for a `number` option (accepted, not enforced).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max: Option<Value>,
+}
+
+/// Environment variable prefix for plugin options: `<PREFIX><KEY>`.
+pub const PLUGIN_OPTION_ENV_PREFIX: &str = "CODEREX_PLUGIN_OPTION_";
+
+/// A plugin manifest — parsed from plugin.json.
+///
+/// Unknown fields are a hard parse error (`deny_unknown_fields`): a field a
+/// plugin author invents, or misspells, is reported by name instead of being
+/// silently dropped on the floor. Fields that belong to Claude's documented
+/// manifest but that CodeRex does not act on yet are declared here anyway and
+/// reported by [`PluginManifest::unimplemented_fields`], which is logged when
+/// the plugin is loaded.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PluginManifest {
+    /// JSON schema URL (`$schema`), as written by the plugin scaffolding.
+    #[serde(rename = "$schema", default, skip_serializing_if = "Option::is_none")]
+    pub schema: Option<String>,
     /// Plugin name.
     pub name: String,
+    /// Human-readable name, for display.
+    #[serde(
+        rename = "displayName",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub display_name: Option<String>,
     /// Plugin version.
+    #[serde(default)]
     pub version: String,
     /// Plugin description.
+    #[serde(default)]
     pub description: String,
-    /// Plugin author.
-    pub author: String,
+    /// Plugin author — a string or an object.
+    #[serde(default)]
+    pub author: PluginAuthor,
+    /// Project homepage.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub homepage: Option<String>,
+    /// Source repository.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repository: Option<String>,
+    /// License identifier.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub license: Option<String>,
+    /// Search keywords.
+    #[serde(default)]
+    pub keywords: Vec<String>,
+    /// Whether the plugin is enabled without being asked for.
+    #[serde(
+        rename = "defaultEnabled",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub default_enabled: Option<bool>,
+    /// Free-form metadata.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<Value>,
     /// Minimum CodeRex version required.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub min_version: Option<String>,
     /// Commands this plugin provides.
     #[serde(default)]
@@ -104,17 +253,272 @@ pub struct PluginManifest {
     #[serde(default)]
     pub dependencies: Vec<String>,
     /// Ed25519 signature of the plugin archive (hex-encoded).
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub signature: Option<String>,
     /// Runtime type: "process" (default) or "wasm".
     #[serde(default)]
     pub runtime: RuntimeType,
     /// Entrypoint command for process plugins (e.g., "bin/plugin", "node index.js").
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub entrypoint: Option<String>,
     /// Environment variables for the plugin process.
     #[serde(default)]
     pub env: HashMap<String, String>,
+    /// Options the user configures, injected as `CODEREX_PLUGIN_OPTION_<KEY>`.
+    #[serde(rename = "userConfig", default)]
+    pub user_config: HashMap<String, UserConfigField>,
+
+    // ── Accepted, not implemented ────────────────────────────────────────
+    // Declared so a Claude-shaped manifest parses and so the fields are named
+    // in the warning `unimplemented_fields()` produces, rather than vanishing.
+    /// Hook matchers (CodeRex hooks come from settings, not from plugins).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hooks: Option<Value>,
+    /// Agent definitions shipped by the plugin.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agents: Option<Value>,
+    /// Output styles shipped by the plugin.
+    #[serde(
+        rename = "outputStyles",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub output_styles: Option<Value>,
+    /// Themes shipped by the plugin.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub themes: Option<Value>,
+    /// Workflows shipped by the plugin.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workflows: Option<Value>,
+    /// Background monitor scripts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub monitors: Option<Value>,
+    /// MCP servers the plugin starts.
+    #[serde(
+        rename = "mcpServers",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub mcp_servers: Option<Value>,
+    /// LSP servers the plugin starts.
+    #[serde(
+        rename = "lspServers",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub lsp_servers: Option<Value>,
+    /// Channels the plugin serves.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub channels: Option<Value>,
+    /// Binaries to fetch, with their SHA-256 pins.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub binaries: Option<Value>,
+    /// Type declarations for the plugin's authoring surface.
+    #[serde(rename = "types", default, skip_serializing_if = "Option::is_none")]
+    pub types: Option<Value>,
+    /// Settings merged into the user's settings while the plugin is enabled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub settings: Option<Value>,
+    /// Experimental features (`themes`, `outputStyles`, `evals`, ...).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub experimental: Option<Value>,
+}
+
+impl PluginManifest {
+    /// Fields this manifest declares that CodeRex accepts but does not act on.
+    ///
+    /// These are the documented Claude manifest components with no CodeRex
+    /// counterpart yet. They parse (so the plugin still loads) but they have no
+    /// effect, which the caller reports rather than leaving the author to guess.
+    #[must_use]
+    pub fn unimplemented_fields(&self) -> Vec<&'static str> {
+        let mut fields = Vec::new();
+        let mut note = |present: bool, name: &'static str| {
+            if present {
+                fields.push(name);
+            }
+        };
+        note(self.hooks.is_some(), "hooks");
+        note(self.agents.is_some(), "agents");
+        note(self.output_styles.is_some(), "outputStyles");
+        note(self.themes.is_some(), "themes");
+        note(self.workflows.is_some(), "workflows");
+        note(self.monitors.is_some(), "monitors");
+        note(self.mcp_servers.is_some(), "mcpServers");
+        note(self.lsp_servers.is_some(), "lspServers");
+        note(self.channels.is_some(), "channels");
+        note(self.binaries.is_some(), "binaries");
+        note(self.types.is_some(), "types");
+        note(self.settings.is_some(), "settings");
+        note(self.experimental.is_some(), "experimental");
+        fields
+    }
+
+    /// Log the declared-but-unimplemented fields, if any.
+    pub fn warn_unimplemented_fields(&self) {
+        let fields = self.unimplemented_fields();
+        if !fields.is_empty() {
+            tracing::warn!(
+                plugin = %self.name,
+                fields = ?fields,
+                "plugin.json declares fields CodeRex does not implement; they have no effect"
+            );
+        }
+    }
+
+    /// Resolve the values of the manifest's `userConfig` options.
+    ///
+    /// Resolution order for each declared option:
+    /// 1. `provided` — a value the host has already resolved (from its own
+    ///    configuration, or from the OS keychain: CodeRex's `keyring://`
+    ///    convention lives in `coderex-config`).
+    /// 2. `lookup` — normally CodeRex's own environment, for
+    ///    `CODEREX_PLUGIN_OPTION_<KEY>`.
+    /// 3. The manifest's `default`, which a `sensitive` option may not have.
+    ///
+    /// Errors are deliberate and loud, because every one of them is a way for a
+    /// secret to end up somewhere it should not: an option name that cannot be
+    /// an environment variable, a plaintext default for a sensitive option, an
+    /// unresolved `keyring://` reference, or a required option with no value.
+    pub fn resolve_options<F>(
+        &self,
+        provided: &HashMap<String, String>,
+        lookup: F,
+    ) -> Result<HashMap<String, String>, String>
+    where
+        F: Fn(&str) -> Option<String>,
+    {
+        let mut values = HashMap::new();
+
+        for (key, field) in &self.user_config {
+            if !is_valid_option_key(key) {
+                return Err(format!(
+                    "userConfig option '{key}' is not a usable environment variable name \
+                     (letters, digits and underscore, not starting with a digit)"
+                ));
+            }
+
+            if field.sensitive && field.default.is_some() {
+                return Err(format!(
+                    "userConfig option '{key}' is sensitive but has a plaintext default in \
+                     plugin.json; a secret belongs in the keychain or the environment, not in \
+                     the manifest"
+                ));
+            }
+
+            let env_key = format!("{PLUGIN_OPTION_ENV_PREFIX}{key}");
+            let resolved = non_empty(provided.get(key).cloned())
+                .or_else(|| non_empty(lookup(&env_key)))
+                .or_else(|| {
+                    field
+                        .default
+                        .as_ref()
+                        .and_then(value_to_env_string)
+                        .and_then(|v| non_empty(Some(v)))
+                });
+
+            let Some(value) = resolved else {
+                if field.required {
+                    return Err(format!(
+                        "userConfig option '{key}' is required but no value was supplied \
+                         (set {env_key} or configure the plugin)"
+                    ));
+                }
+                tracing::debug!(
+                    plugin = %self.name,
+                    option = %key,
+                    "optional userConfig option not supplied; not injecting it"
+                );
+                continue;
+            };
+
+            if field.sensitive && value.starts_with("keyring://") {
+                return Err(format!(
+                    "userConfig option '{key}' is sensitive and its value is still the \
+                     keyring reference '{value}'; resolve it before handing it to a plugin \
+                     (keychain access lives in coderex-config, behind its `keyring` feature)"
+                ));
+            }
+
+            values.insert(key.clone(), value);
+        }
+
+        Ok(values)
+    }
+
+    /// Build the environment a plugin process is spawned with.
+    ///
+    /// The manifest's static `env` is carried over, with `${user_config.KEY}`
+    /// substitution applied, and one `CODEREX_PLUGIN_OPTION_<KEY>` variable is
+    /// added per resolved option. Sensitive values travel the same way, which
+    /// is Claude's design too — they are in the child's environment, visible to
+    /// the plugin and to the process table of the same user.
+    #[must_use]
+    pub fn build_env(&self, values: &HashMap<String, String>) -> HashMap<String, String> {
+        let mut env: HashMap<String, String> = self
+            .env
+            .iter()
+            .map(|(k, v)| (k.clone(), substitute_user_config(v, values)))
+            .collect();
+
+        for (key, value) in values {
+            env.insert(format!("{PLUGIN_OPTION_ENV_PREFIX}{key}"), value.clone());
+        }
+
+        for (key, value) in &env {
+            if value.contains("${user_config.") {
+                tracing::warn!(
+                    plugin = %self.name,
+                    variable = %key,
+                    "environment variable still contains an unresolved \
+                     ${{user_config.KEY}} placeholder"
+                );
+            }
+        }
+
+        env
+    }
+}
+
+/// Whether an option name can be turned into an environment variable safely.
+fn is_valid_option_key(key: &str) -> bool {
+    let mut chars = key.chars();
+    match chars.next() {
+        Some(c) if c.is_ascii_alphabetic() || c == '_' => {}
+        _ => return false,
+    }
+    chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// Treat an empty or blank value as "not supplied".
+fn non_empty(value: Option<String>) -> Option<String> {
+    value.filter(|v| !v.trim().is_empty())
+}
+
+/// Render a JSON default as an environment variable value.
+///
+/// Scalars stringify; a default that is an object or an array has no
+/// environment-variable form and is not injected.
+fn value_to_env_string(value: &Value) -> Option<String> {
+    match value {
+        Value::String(s) => Some(s.clone()),
+        Value::Number(n) => Some(n.to_string()),
+        Value::Bool(b) => Some(b.to_string()),
+        Value::Null | Value::Array(_) | Value::Object(_) => None,
+    }
+}
+
+/// Substitute `${user_config.KEY}` references with resolved option values.
+///
+/// Unknown keys are left as they were written, so a manifest author can see
+/// what did not resolve rather than getting an empty string.
+#[must_use]
+pub fn substitute_user_config(text: &str, values: &HashMap<String, String>) -> String {
+    let mut out = text.to_string();
+    for (key, value) in values {
+        out = out.replace(&format!("${{user_config.{key}}}"), value);
+    }
+    out
 }
 
 /// Environment variable carrying the plugin signing key.
@@ -171,6 +575,441 @@ pub struct MarketplaceConnection {
     pub download_endpoint: String,
 }
 
+/// Where a plugin is installed from.
+///
+/// CodeRex is local-first, so the source kinds that earn their place are the
+/// ones that work without a package registry behind them: a directory on this
+/// machine, a git repository, and a plain HTTPS archive. Marketplace listings
+/// stay where they were, behind [`PluginManager::install_plugin`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PluginSource {
+    /// A listing fetched from a registered marketplace over HTTPS.
+    Marketplace {
+        /// Listing name.
+        name: String,
+    },
+    /// A directory on this machine holding a `plugin.json`.
+    LocalDir(PathBuf),
+    /// A git repository, cloned shallowly.
+    Git {
+        /// Clone URL.
+        url: String,
+        /// Branch, tag, or full commit SHA to check out.
+        rev: Option<String>,
+    },
+    /// A `plugin.tar.gz` (or `.tgz`) fetched over HTTPS.
+    Archive {
+        /// Archive URL.
+        url: String,
+        /// Expected SHA-256 of the archive, if the caller pinned one.
+        sha256: Option<String>,
+    },
+}
+
+impl PluginSource {
+    /// Classify a source argument.
+    ///
+    /// An existing directory is a local source; something that looks like a git
+    /// remote is cloned; an HTTPS URL ending in `.tar.gz`/`.tgz` is downloaded.
+    /// Anything else is treated as a marketplace listing name, which is what
+    /// `coderex plugin install <name>` has always meant.
+    #[must_use]
+    pub fn detect(spec: &str) -> Self {
+        if std::path::Path::new(spec).is_dir() {
+            return Self::LocalDir(PathBuf::from(spec));
+        }
+        if looks_like_git_url(spec) {
+            return Self::Git {
+                url: spec.to_string(),
+                rev: None,
+            };
+        }
+        if spec.starts_with("https://")
+            && (ends_with_ignore_case(spec, ".tar.gz") || ends_with_ignore_case(spec, ".tgz"))
+        {
+            return Self::Archive {
+                url: spec.to_string(),
+                sha256: None,
+            };
+        }
+        Self::Marketplace {
+            name: spec.to_string(),
+        }
+    }
+
+    /// Whether this source needs a marketplace connection.
+    #[must_use]
+    pub const fn is_marketplace(&self) -> bool {
+        matches!(self, Self::Marketplace { .. })
+    }
+}
+
+/// Whether a string looks like a git remote rather than a plugin name.
+fn looks_like_git_url(spec: &str) -> bool {
+    const GIT_SCHEMES: [&str; 5] = ["https://", "ssh://", "git://", "git+https://", "file://"];
+    if GIT_SCHEMES.iter().any(|s| spec.starts_with(s)) {
+        let lowered = spec.to_ascii_lowercase();
+        // Only the well-known forges are guessed at without a `.git` suffix;
+        // anything else needs the suffix to be recognised.
+        return ends_with_ignore_case(spec, ".git")
+            || lowered.contains("github.com/")
+            || lowered.contains("gitlab.com/")
+            || lowered.contains("codeberg.org/")
+            || lowered.contains("bitbucket.org/");
+    }
+    is_scp_like_git_url(spec)
+}
+
+/// Whether `text` ends with `suffix`, ignoring ASCII case.
+fn ends_with_ignore_case(text: &str, suffix: &str) -> bool {
+    text.get(text.len().saturating_sub(suffix.len())..)
+        .is_some_and(|tail| tail.eq_ignore_ascii_case(suffix))
+}
+
+/// Whether a string uses git's `user@host:path` shorthand.
+fn is_scp_like_git_url(spec: &str) -> bool {
+    let Some((user_host, path)) = spec.split_once(':') else {
+        return false;
+    };
+    !path.is_empty()
+        && !user_host.is_empty()
+        && user_host.contains('@')
+        && !user_host.contains('/')
+        && !user_host.contains(' ')
+}
+
+/// Refuse git transports that run commands.
+///
+/// `git clone ext::sh -c '...'` runs an arbitrary command, so the transport is
+/// checked before `git` is ever spawned. Only transports that fetch from a
+/// remote (or from a local path) are allowed.
+fn validate_git_url(url: &str) -> Result<(), String> {
+    // `ext::` (and friends) hand the "URL" to a shell. The transport prefix is
+    // whatever precedes the first `::`, so a plain `https://` URL is unaffected.
+    if let Some((transport, _)) = url.split_once("::") {
+        let named_transport = !transport.is_empty()
+            && transport
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '+' || c == '-');
+        if named_transport {
+            return Err(format!(
+                "refusing git URL '{url}': the {transport}:: transport can run arbitrary \
+                 commands"
+            ));
+        }
+    }
+    let allowed = url.starts_with("https://")
+        || url.starts_with("ssh://")
+        || url.starts_with("git://")
+        || url.starts_with("git+https://")
+        || url.starts_with("file://")
+        || is_scp_like_git_url(url);
+    if !allowed {
+        return Err(format!(
+            "refusing git URL '{url}': expected https://, ssh://, git://, file:// or \
+             user@host:path"
+        ));
+    }
+    Ok(())
+}
+
+/// A recorded pin for an installed plugin.
+///
+/// Trust-on-first-use: the first install records what it got, and later
+/// installs of the same plugin have to match it.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PluginPin {
+    /// SHA-256 of the installed archive, when the plugin came from one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sha256: Option<String>,
+    /// Commit the plugin was cloned at, when it came from git.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub git_commit: Option<String>,
+}
+
+impl PluginPin {
+    /// Whether this pin records anything.
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.sha256.is_none() && self.git_commit.is_none()
+    }
+
+    /// Compare a candidate pin against this one.
+    ///
+    /// Only the fields recorded here are checked, so a plugin pinned by commit
+    /// is not silently re-checked against a hash it never had.
+    pub fn check(&self, candidate: &Self) -> Result<(), String> {
+        if let Some(expected) = &self.sha256 {
+            match &candidate.sha256 {
+                Some(actual) if actual == expected => {}
+                Some(actual) => {
+                    return Err(format!(
+                        "plugin archive does not match its pinned SHA-256 (pinned {expected}, \
+                         got {actual})"
+                    ));
+                }
+                None => return Err("plugin no longer comes from an archive to hash".into()),
+            }
+        }
+        if let Some(expected) = &self.git_commit {
+            match &candidate.git_commit {
+                Some(actual) if actual == expected => {}
+                Some(actual) => {
+                    return Err(format!(
+                        "plugin does not match its pinned commit (pinned {expected}, got {actual})"
+                    ));
+                }
+                None => return Err("plugin no longer comes from a git checkout".into()),
+            }
+        }
+        Ok(())
+    }
+}
+
+/// The on-disk record of pinned plugin contents.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct PluginPinStore {
+    /// Plugin name to pin.
+    #[serde(default)]
+    pub plugins: HashMap<String, PluginPin>,
+}
+
+impl PluginPinStore {
+    /// Read the pin file, if it exists.
+    ///
+    /// A pin file that cannot be parsed is an error rather than an empty store:
+    /// silently forgetting the pins would turn the next install into a fresh
+    /// first use.
+    pub fn load(path: &std::path::Path) -> Result<Self, String> {
+        if !path.exists() {
+            return Ok(Self::default());
+        }
+        let content = std::fs::read_to_string(path)
+            .map_err(|e| format!("failed to read pin file {}: {e}", path.display()))?;
+        serde_json::from_str(&content)
+            .map_err(|e| format!("failed to parse pin file {}: {e}", path.display()))
+    }
+
+    /// Write the pin file.
+    pub fn save(&self, path: &std::path::Path) -> Result<(), String> {
+        let json = serde_json::to_string_pretty(self)
+            .map_err(|e| format!("failed to serialize pin file: {e}"))?;
+        std::fs::write(path, json)
+            .map_err(|e| format!("failed to write pin file {}: {e}", path.display()))
+    }
+
+    /// The pin recorded for a plugin, if any.
+    #[must_use]
+    pub fn get(&self, name: &str) -> Option<&PluginPin> {
+        self.plugins.get(name)
+    }
+}
+
+/// The pin file name inside an install directory.
+pub const PIN_FILE_NAME: &str = ".coderex-pins.json";
+
+/// SHA-256, hex-encoded.
+///
+/// The workspace has `sha2`, but this crate cannot take a dependency on it
+/// without touching `Cargo.toml` and `Cargo.lock`, which are shared. The
+/// function is the published algorithm verbatim and is checked against the
+/// NIST vectors in the tests; it is used for integrity pinning only, never as a
+/// signature. Swap it for `sha2` the moment this crate may add dependencies.
+#[must_use]
+// The working variables carry the names the specification gives them.
+#[allow(clippy::many_single_char_names)]
+pub fn sha256_hex(data: &[u8]) -> String {
+    const K: [u32; 64] = [
+        0x428a_2f98,
+        0x7137_4491,
+        0xb5c0_fbcf,
+        0xe9b5_dba5,
+        0x3956_c25b,
+        0x59f1_11f1,
+        0x923f_82a4,
+        0xab1c_5ed5,
+        0xd807_aa98,
+        0x1283_5b01,
+        0x2431_85be,
+        0x550c_7dc3,
+        0x72be_5d74,
+        0x80de_b1fe,
+        0x9bdc_06a7,
+        0xc19b_f174,
+        0xe49b_69c1,
+        0xefbe_4786,
+        0x0fc1_9dc6,
+        0x240c_a1cc,
+        0x2de9_2c6f,
+        0x4a74_84aa,
+        0x5cb0_a9dc,
+        0x76f9_88da,
+        0x983e_5152,
+        0xa831_c66d,
+        0xb003_27c8,
+        0xbf59_7fc7,
+        0xc6e0_0bf3,
+        0xd5a7_9147,
+        0x06ca_6351,
+        0x1429_2967,
+        0x27b7_0a85,
+        0x2e1b_2138,
+        0x4d2c_6dfc,
+        0x5338_0d13,
+        0x650a_7354,
+        0x766a_0abb,
+        0x81c2_c92e,
+        0x9272_2c85,
+        0xa2bf_e8a1,
+        0xa81a_664b,
+        0xc24b_8b70,
+        0xc76c_51a3,
+        0xd192_e819,
+        0xd699_0624,
+        0xf40e_3585,
+        0x106a_a070,
+        0x19a4_c116,
+        0x1e37_6c08,
+        0x2748_774c,
+        0x34b0_bcb5,
+        0x391c_0cb3,
+        0x4ed8_aa4a,
+        0x5b9c_ca4f,
+        0x682e_6ff3,
+        0x748f_82ee,
+        0x78a5_636f,
+        0x84c8_7814,
+        0x8cc7_0208,
+        0x90be_fffa,
+        0xa450_6ceb,
+        0xbef9_a3f7,
+        0xc671_78f2,
+    ];
+
+    let mut state: [u32; 8] = [
+        0x6a09_e667,
+        0xbb67_ae85,
+        0x3c6e_f372,
+        0xa54f_f53a,
+        0x510e_527f,
+        0x9b05_688c,
+        0x1f83_d9ab,
+        0x5be0_cd19,
+    ];
+
+    let mut message = data.to_vec();
+    let bit_len = (data.len() as u64).wrapping_mul(8);
+    message.push(0x80);
+    while message.len() % 64 != 56 {
+        message.push(0);
+    }
+    message.extend_from_slice(&bit_len.to_be_bytes());
+
+    for chunk in message.chunks_exact(64) {
+        let mut w = [0u32; 64];
+        for (i, word) in chunk.chunks_exact(4).enumerate() {
+            w[i] = u32::from_be_bytes([word[0], word[1], word[2], word[3]]);
+        }
+        for i in 16..64 {
+            let s0 = w[i - 15].rotate_right(7) ^ w[i - 15].rotate_right(18) ^ (w[i - 15] >> 3);
+            let s1 = w[i - 2].rotate_right(17) ^ w[i - 2].rotate_right(19) ^ (w[i - 2] >> 10);
+            w[i] = w[i - 16]
+                .wrapping_add(s0)
+                .wrapping_add(w[i - 7])
+                .wrapping_add(s1);
+        }
+
+        let [mut a, mut b, mut c, mut d, mut e, mut f, mut g, mut h] = state;
+        for i in 0..64 {
+            let s1 = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
+            let ch = (e & f) ^ ((!e) & g);
+            let t1 = h
+                .wrapping_add(s1)
+                .wrapping_add(ch)
+                .wrapping_add(K[i])
+                .wrapping_add(w[i]);
+            let s0 = a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22);
+            let maj = (a & b) ^ (a & c) ^ (b & c);
+            let t2 = s0.wrapping_add(maj);
+
+            h = g;
+            g = f;
+            f = e;
+            e = d.wrapping_add(t1);
+            d = c;
+            c = b;
+            b = a;
+            a = t1.wrapping_add(t2);
+        }
+
+        for (slot, value) in state.iter_mut().zip([a, b, c, d, e, f, g, h]) {
+            *slot = slot.wrapping_add(value);
+        }
+    }
+
+    let mut bytes = [0u8; 32];
+    for (i, word) in state.iter().enumerate() {
+        bytes[i * 4..i * 4 + 4].copy_from_slice(&word.to_be_bytes());
+    }
+    hex::encode(bytes)
+}
+
+/// Whether a revision is a full commit SHA rather than a branch or tag name.
+fn is_full_commit_sha(rev: &str) -> bool {
+    rev.len() == 40 && rev.chars().all(|c| c.is_ascii_hexdigit())
+}
+
+/// Run a git command and return its standard output.
+///
+/// Credential prompts are turned off: a plugin install that cannot authenticate
+/// fails with a message instead of hanging on a prompt nobody sees.
+async fn run_git(args: &[&str]) -> Result<String, String> {
+    let output = tokio::process::Command::new("git")
+        .args(args)
+        .env("GIT_TERMINAL_PROMPT", "0")
+        // Never inherit a repository selection from the caller: an install must
+        // operate on the URL it was given, not on whatever repo the process
+        // happens to be pointed at.
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_INDEX_FILE")
+        .output()
+        .await
+        .map_err(|e| format!("failed to run git: {e} (is git installed?)"))?;
+
+    if !output.status.success() {
+        return Err(format!(
+            "git {} failed: {}",
+            args.first().copied().unwrap_or(""),
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+
+    Ok(String::from_utf8_lossy(&output.stdout).to_string())
+}
+
+/// Copy a directory tree, skipping anything that is not a regular file or
+/// directory.
+fn copy_dir_recursive(from: &std::path::Path, to: &std::path::Path) -> Result<(), String> {
+    std::fs::create_dir_all(to).map_err(|e| format!("failed to create {}: {e}", to.display()))?;
+    let entries =
+        std::fs::read_dir(from).map_err(|e| format!("failed to read {}: {e}", from.display()))?;
+    for entry in entries.flatten() {
+        let source = entry.path();
+        let target = to.join(entry.file_name());
+        let file_type = entry
+            .file_type()
+            .map_err(|e| format!("failed to stat {}: {e}", source.display()))?;
+        if file_type.is_dir() {
+            copy_dir_recursive(&source, &target)?;
+        } else if file_type.is_file() {
+            std::fs::copy(&source, &target)
+                .map_err(|e| format!("failed to copy {}: {e}", source.display()))?;
+        }
+    }
+    Ok(())
+}
+
 use crate::runtime::PluginProcess;
 use crate::wasm_runtime::PluginWasmInstance;
 
@@ -197,6 +1036,8 @@ pub struct PluginManager {
     install_locks: DashMap<String, Arc<TokioMutex<()>>>,
     /// Optional Ed25519 public key for signature verification (hex-encoded 32 bytes).
     public_key: Option<String>,
+    /// `userConfig` values the host has resolved, per plugin.
+    plugin_options: DashMap<String, HashMap<String, String>>,
 }
 
 impl Default for PluginManager {
@@ -220,12 +1061,34 @@ impl PluginManager {
             app_version: env!("CARGO_PKG_VERSION").to_string(),
             install_locks: DashMap::new(),
             public_key: None,
+            plugin_options: DashMap::new(),
         }
     }
 
     /// Set the application version for compatibility checks.
     pub fn set_app_version(&mut self, version: impl Into<String>) {
         self.app_version = version.into();
+    }
+
+    /// Supply a value for one of a plugin's `userConfig` options.
+    ///
+    /// The host resolves these — from its own configuration, or from the OS
+    /// keychain, which is why a `sensitive` value arriving here as an
+    /// unresolved `keyring://` reference is refused rather than injected.
+    pub fn set_plugin_option(&self, plugin: &str, key: &str, value: impl Into<String>) {
+        self.plugin_options
+            .entry(plugin.to_string())
+            .or_default()
+            .insert(key.to_string(), value.into());
+    }
+
+    /// The `userConfig` values supplied for a plugin.
+    #[must_use]
+    pub fn plugin_options(&self, plugin: &str) -> HashMap<String, String> {
+        self.plugin_options
+            .get(plugin)
+            .map(|e| e.value().clone())
+            .unwrap_or_default()
     }
 
     /// Set the marketplace domain allowlist.
@@ -249,10 +1112,20 @@ impl PluginManager {
                 for entry in entries.flatten() {
                     let manifest_path = entry.path().join("plugin.json");
                     if manifest_path.exists() {
-                        if let Ok(content) = std::fs::read_to_string(&manifest_path) {
-                            if let Ok(manifest) = serde_json::from_str::<PluginManifest>(&content) {
-                                found.push(manifest);
-                            }
+                        // A manifest that does not parse is reported, not
+                        // skipped in silence: the plugin simply not appearing
+                        // is the hardest failure for an author to diagnose.
+                        match std::fs::read_to_string(&manifest_path)
+                            .map_err(|e| e.to_string())
+                            .and_then(|content| {
+                                serde_json::from_str::<PluginManifest>(&content)
+                                    .map_err(|e| e.to_string())
+                            }) {
+                            Ok(manifest) => found.push(manifest),
+                            Err(e) => tracing::warn!(
+                                manifest = %manifest_path.display(),
+                                "ignoring plugin: {e}"
+                            ),
                         }
                     }
                 }
@@ -266,6 +1139,8 @@ impl PluginManager {
     /// Skips loading if the plugin's `min_version` is incompatible.
     /// For process-runtime plugins, spawns the subprocess asynchronously.
     pub fn load_plugin(&self, manifest: PluginManifest, path: PathBuf) {
+        manifest.warn_unimplemented_fields();
+
         if !self.is_version_compatible(manifest.min_version.as_deref()) {
             tracing::warn!(
                 plugin = %manifest.name,
@@ -372,6 +1247,13 @@ impl PluginManager {
         };
 
         if manifest.runtime == RuntimeType::Wasm {
+            if !manifest.user_config.is_empty() {
+                tracing::warn!(
+                    plugin = %name,
+                    "userConfig is not injected into WASM plugins; the declared options have \
+                     no effect"
+                );
+            }
             let wasm_file = manifest.entrypoint.as_deref().unwrap_or("plugin.wasm");
             let wasm_path = handle.path.join(wasm_file);
 
@@ -418,8 +1300,20 @@ impl PluginManager {
             ));
         }
 
+        // Resolve userConfig, then build the environment and the entrypoint
+        // from it. A required option with no value, or a sensitive option
+        // configured in a way we will not accept, stops the spawn: a plugin
+        // that silently runs without the secret it asked for is worse than one
+        // that does not run at all.
+        let provided = self.plugin_options(name);
+        let option_values = manifest
+            .resolve_options(&provided, |key| std::env::var(key).ok())
+            .map_err(|e| format!("plugin '{name}' userConfig: {e}"))?;
+        let env = manifest.build_env(&option_values);
+
         // Determine entrypoint
         let entrypoint = manifest.entrypoint.as_deref().unwrap_or("bin/plugin");
+        let entrypoint = substitute_user_config(entrypoint, &option_values);
 
         // Split entrypoint into command and args (supports "node index.js")
         let parts: Vec<&str> = entrypoint.split_whitespace().collect();
@@ -430,7 +1324,7 @@ impl PluginManager {
         let cmd = parts[0].to_string();
         let args: Vec<String> = parts[1..].iter().map(|s| s.to_string()).collect();
 
-        let mut process = PluginProcess::new(cmd, args, manifest.env, handle.path.clone());
+        let mut process = PluginProcess::new(cmd, args, env, handle.path.clone());
 
         process.spawn().await?;
         process.initialize().await?;
@@ -717,15 +1611,457 @@ impl PluginManager {
 
     /// Validate that an extracted plugin directory contains a valid `plugin.json`.
     fn validate_extracted_plugin(dir: &std::path::Path) -> Result<PluginManifest, String> {
+        Self::read_manifest_dir(dir)
+    }
+
+    /// A staging directory for a source, next to the final location so the
+    /// final move is a rename on the same filesystem.
+    fn staging_dir(install_dir: &Path, tag: &str) -> PathBuf {
+        let safe: String = tag
+            .chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                    c
+                } else {
+                    '_'
+                }
+            })
+            .take(64)
+            .collect();
+        install_dir.join(format!(".install-{safe}"))
+    }
+
+    /// Read and parse the `plugin.json` of a plugin directory.
+    fn read_manifest_dir(dir: &Path) -> Result<PluginManifest, String> {
         let manifest_path = dir.join("plugin.json");
         if !manifest_path.exists() {
-            return Err("extracted plugin missing plugin.json".into());
+            return Err(format!(
+                "plugin directory {} has no plugin.json",
+                dir.display()
+            ));
         }
         let content = std::fs::read_to_string(&manifest_path)
             .map_err(|e| format!("failed to read plugin.json: {e}"))?;
-        let manifest: PluginManifest = serde_json::from_str(&content)
-            .map_err(|e| format!("failed to parse plugin.json: {e}"))?;
-        Ok(manifest)
+        serde_json::from_str(&content).map_err(|e| format!("failed to parse plugin.json: {e}"))
+    }
+
+    /// Refuse a plugin name that would escape the install directory.
+    ///
+    /// The name comes from the plugin's own manifest, so an archive must not be
+    /// able to name itself `../../etc` and have the install write there.
+    fn validate_plugin_name(name: &str) -> Result<(), String> {
+        if name.trim().is_empty() {
+            return Err("plugin.json has an empty name".into());
+        }
+        if name.contains('/') || name.contains('\\') || name.contains('\0') || name == "." {
+            return Err(format!(
+                "plugin name '{name}' is not usable as a directory name"
+            ));
+        }
+        Ok(())
+    }
+
+    /// Refuse an install whose `min_version` the running CodeRex does not meet.
+    fn check_install_compatible(&self, manifest: &PluginManifest) -> Result<(), String> {
+        if self.is_version_compatible(manifest.min_version.as_deref()) {
+            return Ok(());
+        }
+        Err(format!(
+            "plugin '{}' requires CodeRex >= {} (current: {})",
+            manifest.name,
+            manifest.min_version.as_deref().unwrap_or("unknown"),
+            self.app_version
+        ))
+    }
+
+    /// Note that a configured signing key cannot apply to this kind of source.
+    fn warn_unverifiable_source(&self, name: &str, kind: &str) {
+        if self.public_key.is_some() {
+            tracing::warn!(
+                plugin = %name,
+                source = kind,
+                "a signing key is configured, but a {kind} source has no archive signature \
+                 to check against it; this plugin is installed unverified"
+            );
+        }
+    }
+
+    /// Install a plugin from any supported source.
+    ///
+    /// A marketplace listing is not handled here: it carries a version and a
+    /// download URL, so it goes through [`Self::install_plugin`]. Every other
+    /// source stages into a temporary directory under `install_dir` and is
+    /// moved into place with a single rename, so a failed install never leaves
+    /// a half-written plugin behind.
+    pub async fn install_from_source(
+        &self,
+        source: &PluginSource,
+        install_dir: &Path,
+    ) -> Result<PathBuf, String> {
+        match source {
+            PluginSource::Marketplace { name } => Err(format!(
+                "'{name}' is a marketplace listing; install it with install_plugin, which \
+                 carries the listing's version and download URL"
+            )),
+            PluginSource::LocalDir(dir) => self.install_local_dir(dir, install_dir).await,
+            PluginSource::Git { url, rev } => {
+                self.install_git(url, rev.as_deref(), install_dir).await
+            }
+            PluginSource::Archive { url, sha256 } => {
+                self.install_archive(url, sha256.as_deref(), install_dir)
+                    .await
+            }
+        }
+    }
+
+    /// Install a plugin from a directory on this machine.
+    ///
+    /// The directory is copied, not moved or linked, so the source keeps
+    /// working as a working copy. A directory has no archive and no commit, so
+    /// there is nothing to pin: what protects it is that it is a path the user
+    /// chose.
+    pub async fn install_local_dir(
+        &self,
+        src: &Path,
+        install_dir: &Path,
+    ) -> Result<PathBuf, String> {
+        let manifest = Self::read_manifest_dir(src)?;
+        self.check_install_compatible(&manifest)?;
+
+        let staged = Self::staging_dir(install_dir, &manifest.name);
+        let _ = std::fs::remove_dir_all(&staged);
+        std::fs::create_dir_all(install_dir)
+            .map_err(|e| format!("failed to create {}: {e}", install_dir.display()))?;
+        if let Err(e) = copy_dir_recursive(src, &staged) {
+            let _ = std::fs::remove_dir_all(&staged);
+            return Err(e);
+        }
+
+        self.warn_unverifiable_source(&manifest.name, "directory");
+        self.finalize_install(
+            &manifest.name,
+            &staged,
+            install_dir,
+            &manifest,
+            false,
+            PluginPin::default(),
+        )
+        .await
+    }
+
+    /// Install a plugin from a git repository.
+    ///
+    /// The clone is shallow unless `rev` is a full commit SHA, and the resolved
+    /// commit becomes the plugin's pin: the next install of the same plugin has
+    /// to come from that commit.
+    pub async fn install_git(
+        &self,
+        url: &str,
+        rev: Option<&str>,
+        install_dir: &Path,
+    ) -> Result<PathBuf, String> {
+        validate_git_url(url)?;
+
+        let staged = Self::staging_dir(install_dir, url);
+        let _ = std::fs::remove_dir_all(&staged);
+        std::fs::create_dir_all(install_dir)
+            .map_err(|e| format!("failed to create {}: {e}", install_dir.display()))?;
+
+        let commit = match Self::clone_git(url, rev, &staged).await {
+            Ok(commit) => commit,
+            Err(e) => {
+                let _ = std::fs::remove_dir_all(&staged);
+                return Err(e);
+            }
+        };
+
+        let manifest = match Self::read_manifest_dir(&staged) {
+            Ok(manifest) => manifest,
+            Err(e) => {
+                let _ = std::fs::remove_dir_all(&staged);
+                return Err(e);
+            }
+        };
+        if let Err(e) = self.check_install_compatible(&manifest) {
+            let _ = std::fs::remove_dir_all(&staged);
+            return Err(e);
+        }
+
+        self.warn_unverifiable_source(&manifest.name, "git");
+        self.finalize_install(
+            &manifest.name,
+            &staged,
+            install_dir,
+            &manifest,
+            false,
+            PluginPin {
+                sha256: None,
+                git_commit: Some(commit),
+            },
+        )
+        .await
+    }
+
+    /// Clone a repository into `dest` and report the commit that landed there.
+    async fn clone_git(url: &str, rev: Option<&str>, dest: &Path) -> Result<String, String> {
+        let dest_arg = dest.to_string_lossy().to_string();
+        let commit_rev = rev.filter(|r| is_full_commit_sha(r));
+
+        let mut args: Vec<String> = vec!["clone".into()];
+        if commit_rev.is_some() {
+            // `--branch` takes a ref, not a SHA, so pinning to a commit means
+            // taking the history and checking it out.
+            args.push("--no-checkout".into());
+        } else {
+            args.push("--depth".into());
+            args.push("1".into());
+            if let Some(rev) = rev {
+                args.push("--branch".into());
+                args.push(rev.to_string());
+            }
+        }
+        args.push("--".into());
+        args.push(url.to_string());
+        args.push(dest_arg.clone());
+
+        let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+        run_git(&refs).await?;
+
+        if let Some(sha) = commit_rev {
+            run_git(&["-C", dest_arg.as_str(), "checkout", "--detach", sha]).await?;
+        }
+
+        let commit = run_git(&["-C", dest_arg.as_str(), "rev-parse", "HEAD"])
+            .await?
+            .trim()
+            .to_string();
+
+        if let Some(sha) = commit_rev {
+            if !commit.eq_ignore_ascii_case(sha) {
+                return Err(format!(
+                    "git checkout is at {commit}, not the requested commit {sha}"
+                ));
+            }
+        }
+
+        // The checkout is a snapshot now. Dropping `.git` keeps the installed
+        // plugin from looking like a repository to the project around it.
+        let _ = std::fs::remove_dir_all(dest.join(".git"));
+
+        Ok(commit)
+    }
+
+    /// Install a plugin from an HTTPS archive.
+    ///
+    /// The archive is verified against the configured signing key exactly as a
+    /// marketplace archive is, and its SHA-256 is recorded as a pin.
+    pub async fn install_archive(
+        &self,
+        url: &str,
+        sha256: Option<&str>,
+        install_dir: &Path,
+    ) -> Result<PathBuf, String> {
+        if !url.starts_with("https://") {
+            return Err(format!(
+                "refusing to install plugin from non-HTTPS URL '{url}'"
+            ));
+        }
+
+        let staged = Self::staging_dir(install_dir, url);
+        let _ = std::fs::remove_dir_all(&staged);
+        std::fs::create_dir_all(&staged).map_err(|e| format!("failed to create temp dir: {e}"))?;
+
+        let client = Client::builder()
+            .timeout(std::time::Duration::from_secs(30))
+            .build()
+            .unwrap_or_default();
+
+        let bytes = match client.get(url).send().await {
+            Ok(response) if response.status().is_success() => match response.bytes().await {
+                Ok(bytes) => bytes.to_vec(),
+                Err(e) => {
+                    let _ = std::fs::remove_dir_all(&staged);
+                    return Err(format!("failed to read plugin archive: {e}"));
+                }
+            },
+            Ok(response) => {
+                let _ = std::fs::remove_dir_all(&staged);
+                return Err(format!("download failed: HTTP {}", response.status()));
+            }
+            Err(e) => {
+                let _ = std::fs::remove_dir_all(&staged);
+                return Err(format!("failed to download plugin archive: {e}"));
+            }
+        };
+
+        let digest = sha256_hex(&bytes);
+        if let Some(expected) = sha256 {
+            if !expected.eq_ignore_ascii_case(&digest) {
+                let _ = std::fs::remove_dir_all(&staged);
+                return Err(format!(
+                    "plugin archive does not match the requested SHA-256 (expected {expected}, \
+                     got {digest})"
+                ));
+            }
+        }
+
+        if let Err(e) = Self::extract_archive(&bytes, &staged) {
+            let _ = std::fs::remove_dir_all(&staged);
+            return Err(e);
+        }
+
+        let manifest = match Self::read_manifest_dir(&staged) {
+            Ok(manifest) => manifest,
+            Err(e) => {
+                let _ = std::fs::remove_dir_all(&staged);
+                return Err(e);
+            }
+        };
+        if let Err(e) = self.check_install_compatible(&manifest) {
+            let _ = std::fs::remove_dir_all(&staged);
+            return Err(e);
+        }
+
+        let verified = match self.verify_signature(&bytes, manifest.signature.as_deref()) {
+            Ok(check) => matches!(check, SignatureCheck::Verified),
+            Err(e) => {
+                let _ = std::fs::remove_dir_all(&staged);
+                return Err(e);
+            }
+        };
+        if !verified {
+            tracing::warn!(
+                plugin = %manifest.name,
+                "installing unsigned plugin: no signing key is configured, so nothing about \
+                 this archive has been checked"
+            );
+        }
+
+        self.finalize_install(
+            &manifest.name,
+            &staged,
+            install_dir,
+            &manifest,
+            verified,
+            PluginPin {
+                sha256: Some(digest),
+                git_commit: None,
+            },
+        )
+        .await
+    }
+
+    /// Take the install lock, enforce the pin, move the staged plugin into
+    /// place, and record what was installed.
+    async fn finalize_install(
+        &self,
+        name: &str,
+        staged: &Path,
+        install_dir: &Path,
+        manifest: &PluginManifest,
+        verified: bool,
+        pin: PluginPin,
+    ) -> Result<PathBuf, String> {
+        let lock = {
+            let arc = self
+                .install_locks
+                .entry(name.to_string())
+                .or_insert_with(|| Arc::new(TokioMutex::new(())))
+                .clone();
+            arc
+        };
+        let _guard = lock.lock().await;
+
+        if let Err(e) = Self::validate_plugin_name(name) {
+            let _ = std::fs::remove_dir_all(staged);
+            return Err(e);
+        }
+
+        let target_dir = install_dir.join(name);
+        if target_dir.exists() {
+            let _ = std::fs::remove_dir_all(staged);
+            return Err(format!(
+                "plugin '{name}' is already installed at {}",
+                target_dir.display()
+            ));
+        }
+
+        // Trust on first use: the first install records what it got, and later
+        // installs have to match it.
+        let store = match Self::check_pin(install_dir, name, &pin) {
+            Ok(store) => store,
+            Err(e) => {
+                let _ = std::fs::remove_dir_all(staged);
+                self.set_plugin_state(name, PluginState::Error(e.clone()));
+                return Err(e);
+            }
+        };
+
+        if let Err(e) = std::fs::rename(staged, &target_dir) {
+            let _ = std::fs::remove_dir_all(staged);
+            return Err(format!("failed to finalize plugin install: {e}"));
+        }
+
+        Self::record_pin(install_dir, store, name, &pin);
+        manifest.warn_unimplemented_fields();
+
+        let handle = PluginHandle {
+            name: name.to_string(),
+            version: manifest.version.clone(),
+            state: PluginState::Active,
+            path: target_dir.clone(),
+            commands: manifest.commands.clone(),
+            skills: manifest.skills.clone(),
+            retry_count: 0,
+            max_retries: 3,
+            verified,
+            last_retry_at: None,
+        };
+        self.plugins.insert(name.to_string(), handle);
+
+        tracing::info!(
+            plugin = %name,
+            version = %manifest.version,
+            path = %target_dir.display(),
+            "installed plugin"
+        );
+        self.mark_needs_refresh();
+
+        Ok(target_dir)
+    }
+
+    /// Load the pin store and check a candidate pin against it.
+    fn check_pin(
+        install_dir: &Path,
+        name: &str,
+        pin: &PluginPin,
+    ) -> Result<PluginPinStore, String> {
+        let store = PluginPinStore::load(&install_dir.join(PIN_FILE_NAME))?;
+        if let Some(existing) = store.get(name) {
+            existing.check(pin)?;
+        }
+        Ok(store)
+    }
+
+    /// Record a pin and write the store back.
+    ///
+    /// A pin that cannot be written does not fail the install — the plugin is
+    /// already in place and correct — but it is said out loud, because the
+    /// protection it would have given is now missing.
+    fn record_pin(install_dir: &Path, mut store: PluginPinStore, name: &str, pin: &PluginPin) {
+        if pin.is_empty() || store.get(name) == Some(pin) {
+            return;
+        }
+        store.plugins.insert(name.to_string(), pin.clone());
+        let path = install_dir.join(PIN_FILE_NAME);
+        match store.save(&path) {
+            Ok(()) => tracing::info!(plugin = %name, "pinned plugin contents for future installs"),
+            Err(e) => tracing::warn!(
+                plugin = %name,
+                "installed, but the pin could not be written to {}: {e}",
+                path.display()
+            ),
+        }
     }
 
     /// Install a plugin from the marketplace.
@@ -738,6 +2074,16 @@ impl PluginManager {
         plugin: &MarketplacePlugin,
         install_dir: &PathBuf,
     ) -> Result<PathBuf, String> {
+        // `coderex plugin install <source>` passes its argument through both
+        // the name and the url. When that argument names a directory, a git
+        // remote or an archive, install from there rather than looking it up in
+        // a marketplace. A real listing's url never looks like either.
+        let detected = PluginSource::detect(&plugin.url);
+        if !detected.is_marketplace() {
+            return self.install_from_source(&detected, install_dir).await;
+        }
+
+        Self::validate_plugin_name(&plugin.name)?;
         let target_dir = install_dir.join(&plugin.name);
 
         // Acquire install lock for this plugin name
@@ -883,6 +2229,22 @@ impl PluginManager {
             );
         }
 
+        // Pin the archive's contents before anything is moved into place, so a
+        // marketplace that serves different bytes the second time is refused
+        // rather than installed.
+        let pin = PluginPin {
+            sha256: Some(sha256_hex(&bytes)),
+            git_commit: None,
+        };
+        let store = match Self::check_pin(install_dir, &plugin.name, &pin) {
+            Ok(store) => store,
+            Err(e) => {
+                let _ = std::fs::remove_dir_all(&temp_dir);
+                self.set_plugin_state(&plugin.name, PluginState::Error(e.clone()));
+                return Err(e);
+            }
+        };
+
         // Atomically rename temp dir to final location
         if let Err(e) = std::fs::rename(&temp_dir, &target_dir) {
             let _ = std::fs::remove_dir_all(&temp_dir);
@@ -892,6 +2254,8 @@ impl PluginManager {
             );
             return Err(format!("failed to finalize plugin install: {e}"));
         }
+
+        Self::record_pin(install_dir, store, &plugin.name, &pin);
 
         // Clean up the archive file if it was left in the target dir
         let archive_path = target_dir.join("plugin.tar.gz");
@@ -1398,9 +2762,7 @@ mod tests {
             skills: vec!["skill1".into()],
             dependencies: Vec::new(),
             signature: None,
-            runtime: RuntimeType::Process,
-            entrypoint: None,
-            env: HashMap::new(),
+            ..Default::default()
         };
         mgr.load_plugin(manifest, PathBuf::from("/plugins/test"));
         assert_eq!(mgr.len(), 1);
@@ -1420,15 +2782,13 @@ mod tests {
             name: "temp".into(),
             version: "1.0.0".into(),
             description: String::new(),
-            author: String::new(),
+            author: String::new().into(),
             min_version: None,
             commands: vec![],
             skills: vec![],
             dependencies: Vec::new(),
             signature: None,
-            runtime: RuntimeType::Process,
-            entrypoint: None,
-            env: HashMap::new(),
+            ..Default::default()
         };
         mgr.load_plugin(manifest, PathBuf::from("/tmp"));
         assert!(mgr.unload_plugin("temp"));
@@ -1458,29 +2818,25 @@ mod tests {
             name: "a".into(),
             version: "1".into(),
             description: String::new(),
-            author: String::new(),
+            author: String::new().into(),
             min_version: None,
             commands: vec!["cmd1".into()],
             skills: vec!["sk1".into()],
             dependencies: Vec::new(),
             signature: None,
-            runtime: RuntimeType::Process,
-            entrypoint: None,
-            env: HashMap::new(),
+            ..Default::default()
         };
         let m2 = PluginManifest {
             name: "b".into(),
             version: "1".into(),
             description: String::new(),
-            author: String::new(),
+            author: String::new().into(),
             min_version: None,
             commands: vec!["cmd2".into()],
             skills: vec!["sk2".into()],
             dependencies: Vec::new(),
             signature: None,
-            runtime: RuntimeType::Process,
-            entrypoint: None,
-            env: HashMap::new(),
+            ..Default::default()
         };
         mgr.load_plugin(m1, PathBuf::new());
         mgr.load_plugin(m2, PathBuf::new());
@@ -1505,15 +2861,13 @@ mod tests {
             name: "test-plugin".into(),
             version: "0.1.0".into(),
             description: String::new(),
-            author: String::new(),
+            author: String::new().into(),
             min_version: None,
             commands: vec![],
             skills: vec![],
             dependencies: Vec::new(),
             signature: None,
-            runtime: RuntimeType::Process,
-            entrypoint: None,
-            env: HashMap::new(),
+            ..Default::default()
         };
         std::fs::write(
             plugin_dir.join("plugin.json"),
@@ -1657,15 +3011,13 @@ mod tests {
             name: "old-plugin".into(),
             version: "1.0.0".into(),
             description: String::new(),
-            author: String::new(),
+            author: String::new().into(),
             min_version: Some("99.0.0".into()),
             commands: vec![],
             skills: vec![],
             dependencies: Vec::new(),
             signature: None,
-            runtime: RuntimeType::Process,
-            entrypoint: None,
-            env: HashMap::new(),
+            ..Default::default()
         };
         mgr.load_plugin(manifest, PathBuf::from("/tmp/old"));
         let plugin = mgr.get_plugin("old-plugin").unwrap();
@@ -1741,7 +3093,7 @@ mod tests {
             name: "base".into(),
             version: "1".into(),
             description: String::new(),
-            author: String::new(),
+            author: String::new().into(),
             min_version: None,
             commands: vec![],
             skills: vec![],
@@ -1753,7 +3105,7 @@ mod tests {
             name: "derived".into(),
             version: "1".into(),
             description: String::new(),
-            author: String::new(),
+            author: String::new().into(),
             min_version: None,
             commands: vec![],
             skills: vec![],
@@ -1793,7 +3145,7 @@ mod tests {
             name: "a".into(),
             version: "1".into(),
             description: String::new(),
-            author: String::new(),
+            author: String::new().into(),
             min_version: None,
             commands: vec![],
             skills: vec![],
@@ -1805,7 +3157,7 @@ mod tests {
             name: "b".into(),
             version: "1".into(),
             description: String::new(),
-            author: String::new(),
+            author: String::new().into(),
             min_version: None,
             commands: vec![],
             skills: vec![],
@@ -1842,15 +3194,13 @@ mod tests {
             name: "broken".into(),
             version: "1".into(),
             description: String::new(),
-            author: String::new(),
+            author: String::new().into(),
             min_version: None,
             commands: Vec::new(),
             skills: Vec::new(),
             dependencies: Vec::new(),
             signature: None,
-            runtime: RuntimeType::Process,
-            entrypoint: None,
-            env: HashMap::new(),
+            ..Default::default()
         };
         mgr.load_plugin(manifest, std::path::PathBuf::from("/nonexistent/broken"));
         mgr.set_plugin_state("broken", PluginState::Error("broke".into()));
@@ -1885,7 +3235,7 @@ mod tests {
             name: "broken".into(),
             version: "1.0.0".into(),
             description: String::new(),
-            author: String::new(),
+            author: String::new().into(),
             min_version: None,
             commands: vec![],
             skills: vec![],
@@ -1921,5 +3271,606 @@ mod tests {
         let conn = mgr.marketplaces.get("custom").unwrap();
         assert_eq!(conn.list_endpoint, "/v2/plugins");
         assert_eq!(conn.download_endpoint, "/v2/plugins/{name}/dl");
+    }
+
+    // ── plugin.json field table ──────────────────────────────────────────
+
+    /// A manifest shaped like Claude's parses, including the fields CodeRex
+    /// does not act on yet.
+    #[test]
+    fn a_claude_shaped_manifest_parses() {
+        let manifest: PluginManifest = serde_json::from_str(
+            r#"{
+                "$schema": "https://example.com/plugin.schema.json",
+                "name": "shaped",
+                "displayName": "Shaped Plugin",
+                "version": "1.2.3",
+                "description": "d",
+                "author": {"name": "Someone", "email": "someone@example.com"},
+                "homepage": "https://example.com",
+                "repository": "https://github.com/example/shaped",
+                "license": "MIT",
+                "keywords": ["a", "b"],
+                "defaultEnabled": true,
+                "userConfig": {
+                    "API_KEY": {"type": "string", "title": "API key", "sensitive": true},
+                    "REGION": {"type": "string", "default": "eu"}
+                },
+                "experimental": {"themes": true},
+                "mcpServers": {"browser": {"command": "node"}}
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(manifest.display_name.as_deref(), Some("Shaped Plugin"));
+        assert_eq!(manifest.author.name, "Someone");
+        assert_eq!(
+            manifest.author.email.as_deref(),
+            Some("someone@example.com")
+        );
+        assert_eq!(manifest.keywords, vec!["a", "b"]);
+        assert_eq!(manifest.default_enabled, Some(true));
+        assert!(manifest.user_config["API_KEY"].sensitive);
+        assert_eq!(
+            manifest.unimplemented_fields(),
+            vec!["mcpServers", "experimental"],
+            "fields with no CodeRex behaviour must be named, not dropped"
+        );
+    }
+
+    /// The published Claude sample writes `author` as an object. A bare string
+    /// is what CodeRex manifests use. Both have to parse: an object used to
+    /// fail the whole manifest, which took the plugin with it, in silence.
+    #[test]
+    fn an_author_object_does_not_take_the_plugin_with_it() {
+        let object: PluginManifest =
+            serde_json::from_str(r#"{"name":"n","author":{"name":"A"}}"#).unwrap();
+        assert_eq!(object.author.name, "A");
+
+        let string: PluginManifest = serde_json::from_str(r#"{"name":"n","author":"B"}"#).unwrap();
+        assert_eq!(string.author.to_string(), "B");
+    }
+
+    /// A misspelled field is reported by name instead of being dropped.
+    #[test]
+    fn an_unknown_manifest_field_is_an_error_not_a_silent_drop() {
+        let err = serde_json::from_str::<PluginManifest>(
+            r#"{"name":"n","displayname":"typo","userconfig":{}}"#,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("displayname"), "{err}");
+    }
+
+    // ── userConfig injection ─────────────────────────────────────────────
+
+    fn manifest_with_options() -> PluginManifest {
+        serde_json::from_str(
+            r#"{
+                "name": "configured",
+                "entrypoint": "bin/plugin --region ${user_config.REGION}",
+                "env": {"ENDPOINT": "https://${user_config.REGION}.example.com"},
+                "userConfig": {
+                    "TOKEN": {"type": "string", "required": true},
+                    "REGION": {"type": "string", "default": "eu"}
+                }
+            }"#,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn user_config_becomes_plugin_option_variables() {
+        let manifest = manifest_with_options();
+        let values = manifest
+            .resolve_options(&HashMap::new(), |key| {
+                (key == "CODEREX_PLUGIN_OPTION_TOKEN").then(|| "from-env".to_string())
+            })
+            .unwrap();
+
+        assert_eq!(values["TOKEN"], "from-env");
+        assert_eq!(values["REGION"], "eu");
+
+        let env = manifest.build_env(&values);
+        assert_eq!(env["CODEREX_PLUGIN_OPTION_TOKEN"], "from-env");
+        assert_eq!(env["CODEREX_PLUGIN_OPTION_REGION"], "eu");
+        assert_eq!(env["ENDPOINT"], "https://eu.example.com");
+    }
+
+    #[test]
+    fn user_config_substitution_fills_the_entrypoint() {
+        let manifest = manifest_with_options();
+        let values = manifest
+            .resolve_options(&HashMap::new(), |key| {
+                (key == "CODEREX_PLUGIN_OPTION_TOKEN").then(|| "value".to_string())
+            })
+            .unwrap();
+        let entrypoint =
+            substitute_user_config(manifest.entrypoint.as_deref().unwrap_or_default(), &values);
+        assert_eq!(entrypoint, "bin/plugin --region eu");
+    }
+
+    #[test]
+    fn a_value_supplied_by_the_host_beats_the_environment() {
+        let manifest = manifest_with_options();
+        let provided = HashMap::from([("TOKEN".to_string(), "from-host".to_string())]);
+        let values = manifest
+            .resolve_options(&provided, |_| Some("from-env".into()))
+            .unwrap();
+        assert_eq!(values["TOKEN"], "from-host");
+    }
+
+    #[test]
+    fn a_sensitive_option_may_not_have_a_plaintext_default() {
+        let manifest: PluginManifest = serde_json::from_str(
+            r#"{"name":"n","userConfig":{"API_KEY":{"sensitive":true,"default":"hunter2"}}}"#,
+        )
+        .unwrap();
+        let err = manifest
+            .resolve_options(&HashMap::new(), |_| None)
+            .unwrap_err();
+        assert!(err.contains("plaintext default"), "{err}");
+    }
+
+    #[test]
+    fn an_unresolved_keyring_reference_is_refused() {
+        let manifest: PluginManifest =
+            serde_json::from_str(r#"{"name":"n","userConfig":{"API_KEY":{"sensitive":true}}}"#)
+                .unwrap();
+        let provided =
+            HashMap::from([("API_KEY".to_string(), "keyring://coderex/api".to_string())]);
+        let err = manifest.resolve_options(&provided, |_| None).unwrap_err();
+        assert!(err.contains("keyring://coderex/api"), "{err}");
+    }
+
+    #[test]
+    fn a_required_option_with_no_value_stops_the_plugin() {
+        let manifest = manifest_with_options();
+        let err = manifest
+            .resolve_options(&HashMap::new(), |_| None)
+            .unwrap_err();
+        assert!(err.contains("required"), "{err}");
+        assert!(err.contains("CODEREX_PLUGIN_OPTION_TOKEN"), "{err}");
+    }
+
+    #[test]
+    fn an_optional_option_with_no_value_is_simply_absent() {
+        let manifest: PluginManifest =
+            serde_json::from_str(r#"{"name":"n","userConfig":{"REGION":{"type":"string"}}}"#)
+                .unwrap();
+        let values = manifest.resolve_options(&HashMap::new(), |_| None).unwrap();
+        assert!(values.is_empty());
+        assert!(manifest.build_env(&values).is_empty());
+    }
+
+    #[test]
+    fn an_option_name_that_cannot_be_an_environment_variable_is_refused() {
+        let manifest: PluginManifest =
+            serde_json::from_str(r#"{"name":"n","userConfig":{"bad-key":{}}}"#).unwrap();
+        let err = manifest
+            .resolve_options(&HashMap::new(), |_| None)
+            .unwrap_err();
+        assert!(err.contains("bad-key"), "{err}");
+    }
+
+    /// The environment really reaches the child process: a plugin script that
+    /// dumps its environment and answers JSON-RPC.
+    #[tokio::test]
+    async fn user_config_reaches_the_plugin_process() {
+        let dir = tempfile::tempdir().unwrap();
+        let dumped = dir.path().join("env.txt");
+        let script = dir.path().join("plugin.sh");
+        std::fs::write(
+            &script,
+            format!(
+                r#"#!/bin/sh
+env > {dumped}
+while IFS= read -r line; do
+  id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
+  printf '{{"jsonrpc":"2.0","id":%s,"result":[]}}\n' "$id"
+done
+"#,
+                dumped = dumped.display()
+            ),
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        let manifest_json = format!(
+            r#"{{"name":"env-plugin","entrypoint":"{}","userConfig":{{"TOKEN":{{"required":true}}}}}}"#,
+            script.display()
+        );
+        std::fs::write(dir.path().join("plugin.json"), &manifest_json).unwrap();
+        let manifest: PluginManifest = serde_json::from_str(&manifest_json).unwrap();
+
+        let mgr = PluginManager::new();
+        mgr.set_plugin_option("env-plugin", "TOKEN", "s3cret");
+        mgr.load_plugin(manifest, dir.path().to_path_buf());
+
+        tokio::time::timeout(
+            std::time::Duration::from_secs(20),
+            mgr.spawn_plugin("env-plugin"),
+        )
+        .await
+        .expect("spawning the plugin timed out")
+        .expect("plugin should spawn");
+
+        let environment = std::fs::read_to_string(&dumped).unwrap();
+        assert!(
+            environment.contains("CODEREX_PLUGIN_OPTION_TOKEN=s3cret"),
+            "the option never reached the child: {environment}"
+        );
+    }
+
+    // ── marketplace sources ──────────────────────────────────────────────
+
+    #[test]
+    fn source_detection_picks_the_right_kind() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(matches!(
+            PluginSource::detect(&dir.path().to_string_lossy()),
+            PluginSource::LocalDir(_)
+        ));
+        for git in [
+            "https://github.com/acme/plugin.git",
+            "https://github.com/acme/plugin",
+            "git@github.com:acme/plugin.git",
+            "ssh://git@example.com/acme/plugin.git",
+        ] {
+            assert!(
+                matches!(PluginSource::detect(git), PluginSource::Git { .. }),
+                "{git} should be a git source"
+            );
+        }
+        assert!(matches!(
+            PluginSource::detect("https://example.com/plugin.tar.gz"),
+            PluginSource::Archive { .. }
+        ));
+        assert_eq!(
+            PluginSource::detect("some-plugin"),
+            PluginSource::Marketplace {
+                name: "some-plugin".into()
+            }
+        );
+    }
+
+    #[test]
+    fn a_git_transport_that_runs_commands_is_refused() {
+        let err = validate_git_url("ext::sh -c 'touch /tmp/pwned'").unwrap_err();
+        // The transport is what has to be named: falling through to the scheme
+        // allowlist would also reject it, but for the wrong reason.
+        assert!(err.contains("ext:: transport"), "{err}");
+        assert!(validate_git_url("https://github.com/acme/plugin.git").is_ok());
+        assert!(validate_git_url("git@github.com:acme/plugin.git").is_ok());
+        assert!(validate_git_url("http://example.com/plugin.git").is_err());
+    }
+
+    #[tokio::test]
+    async fn a_non_https_archive_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = PluginManager::new();
+        let err = mgr
+            .install_archive("http://example.com/plugin.tar.gz", None, dir.path())
+            .await
+            .unwrap_err();
+        assert!(err.contains("non-HTTPS"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn a_marketplace_listing_is_not_installed_as_a_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = PluginManager::new();
+        let err = mgr
+            .install_from_source(
+                &PluginSource::Marketplace {
+                    name: "thing".into(),
+                },
+                dir.path(),
+            )
+            .await
+            .unwrap_err();
+        assert!(err.contains("marketplace listing"), "{err}");
+    }
+
+    // ── installing from a directory ──────────────────────────────────────
+
+    fn write_local_plugin(dir: &Path, name: &str) {
+        std::fs::write(
+            dir.join("plugin.json"),
+            format!(r#"{{"name":"{name}","version":"1.0.0"}}"#),
+        )
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn installing_from_a_local_directory_copies_it_into_place() {
+        let source = tempfile::tempdir().unwrap();
+        write_local_plugin(source.path(), "local-plugin");
+        let install_dir = tempfile::tempdir().unwrap();
+
+        let mgr = PluginManager::new();
+        let installed = mgr
+            .install_from_source(
+                &PluginSource::LocalDir(source.path().to_path_buf()),
+                install_dir.path(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(installed, install_dir.path().join("local-plugin"));
+        assert!(installed.join("plugin.json").exists());
+        // The source directory is left alone: it is someone's working copy.
+        assert!(source.path().join("plugin.json").exists());
+        assert!(mgr.needs_refresh());
+        let handle = mgr.get_plugin("local-plugin").unwrap();
+        assert_eq!(handle.state, PluginState::Active);
+        // A directory has no archive to sign, so nothing was verified.
+        assert!(!handle.verified);
+        // Nothing is left staged behind.
+        assert!(!install_dir.path().join(".install-local-plugin").exists());
+    }
+
+    #[tokio::test]
+    async fn a_second_install_of_the_same_plugin_is_refused() {
+        let source = tempfile::tempdir().unwrap();
+        write_local_plugin(source.path(), "local-plugin");
+        let install_dir = tempfile::tempdir().unwrap();
+
+        let mgr = PluginManager::new();
+        let source = PluginSource::LocalDir(source.path().to_path_buf());
+        mgr.install_from_source(&source, install_dir.path())
+            .await
+            .unwrap();
+        let err = mgr
+            .install_from_source(&source, install_dir.path())
+            .await
+            .unwrap_err();
+        assert!(err.contains("already installed"), "{err}");
+    }
+
+    /// What `coderex plugin install <source>` does: the argument is passed
+    /// through as both the name and the url of a listing, and a listing whose
+    /// url names a directory installs from that directory.
+    #[tokio::test]
+    async fn the_cli_install_path_reaches_the_new_sources() {
+        let source = tempfile::tempdir().unwrap();
+        write_local_plugin(source.path(), "from-cli");
+        let install_dir = tempfile::tempdir().unwrap();
+        let argument = source.path().to_string_lossy().to_string();
+
+        let mgr = PluginManager::new();
+        let listing = MarketplacePlugin {
+            name: argument.clone(),
+            version: "latest".into(),
+            url: argument,
+            description: String::new(),
+        };
+
+        let installed = mgr
+            .install_plugin(&listing, &install_dir.path().to_path_buf())
+            .await
+            .unwrap();
+
+        assert_eq!(installed, install_dir.path().join("from-cli"));
+        assert!(installed.join("plugin.json").exists());
+    }
+
+    #[tokio::test]
+    async fn installing_a_directory_without_a_manifest_fails() {
+        let source = tempfile::tempdir().unwrap();
+        let install_dir = tempfile::tempdir().unwrap();
+        let mgr = PluginManager::new();
+        let err = mgr
+            .install_from_source(
+                &PluginSource::LocalDir(source.path().to_path_buf()),
+                install_dir.path(),
+            )
+            .await
+            .unwrap_err();
+        assert!(err.contains("no plugin.json"), "{err}");
+    }
+
+    /// The name comes from the plugin's own manifest, so it must not be able to
+    /// point the install at a directory outside the install root.
+    #[tokio::test]
+    async fn a_plugin_name_that_escapes_the_install_directory_is_refused() {
+        let source = tempfile::tempdir().unwrap();
+        write_local_plugin(source.path(), "../../escaped");
+        let install_dir = tempfile::tempdir().unwrap();
+        let inside = install_dir.path().join("plugins");
+        std::fs::create_dir_all(&inside).unwrap();
+
+        let mgr = PluginManager::new();
+        let err = mgr
+            .install_from_source(
+                &PluginSource::LocalDir(source.path().to_path_buf()),
+                &inside,
+            )
+            .await
+            .unwrap_err();
+
+        assert!(err.contains("directory name"), "{err}");
+        assert!(!install_dir.path().join("escaped").exists());
+    }
+
+    // ── installing from git ──────────────────────────────────────────────
+
+    /// Create a throwaway repository in a temporary directory and return its
+    /// path and HEAD commit.
+    ///
+    /// The repository is made inside `tempfile::tempdir()`, and every command
+    /// is pinned with `-C`, so nothing here touches the project's own repo.
+    async fn run_in_repo(path: &str, args: &[&str]) -> Result<String, String> {
+        let mut full: Vec<&str> = vec![
+            "-C",
+            path,
+            "-c",
+            "user.name=coderex",
+            "-c",
+            "user.email=coderex@example.invalid",
+        ];
+        full.extend_from_slice(args);
+        run_git(&full).await
+    }
+
+    async fn fixture_repo(name: &str) -> Option<(tempfile::TempDir, String)> {
+        if run_git(&["--version"]).await.is_err() {
+            return None;
+        }
+        let repo = tempfile::tempdir().unwrap();
+        let path = repo.path().to_string_lossy().to_string();
+
+        run_in_repo(&path, &["init", "-q"]).await.ok()?;
+        write_local_plugin(repo.path(), name);
+        run_in_repo(&path, &["add", "-A"]).await.ok()?;
+        run_in_repo(&path, &["commit", "-q", "-m", "plugin"])
+            .await
+            .ok()?;
+        let commit = run_in_repo(&path, &["rev-parse", "HEAD"])
+            .await
+            .ok()?
+            .trim()
+            .to_string();
+        Some((repo, commit))
+    }
+
+    #[tokio::test]
+    async fn installing_from_git_clones_the_repo_and_pins_the_commit() {
+        let Some((repo, commit)) = fixture_repo("git-plugin").await else {
+            eprintln!("skipping: git is not available");
+            return;
+        };
+        let install_dir = tempfile::tempdir().unwrap();
+        let mgr = PluginManager::new();
+
+        let installed = mgr
+            .install_from_source(
+                &PluginSource::Git {
+                    url: format!("file://{}", repo.path().display()),
+                    rev: None,
+                },
+                install_dir.path(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(installed, install_dir.path().join("git-plugin"));
+        assert!(installed.join("plugin.json").exists());
+        // The checkout is a snapshot, not a nested repository.
+        assert!(!installed.join(".git").exists());
+
+        let pins = PluginPinStore::load(&install_dir.path().join(PIN_FILE_NAME)).unwrap();
+        assert_eq!(
+            pins.get("git-plugin").unwrap().git_commit.as_deref(),
+            Some(commit.as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn a_git_install_that_cannot_clone_reports_why() {
+        let install_dir = tempfile::tempdir().unwrap();
+        let mgr = PluginManager::new();
+        let err = mgr
+            .install_from_source(
+                &PluginSource::Git {
+                    url: "https://example.invalid/does/not/exist.git".into(),
+                    rev: None,
+                },
+                install_dir.path(),
+            )
+            .await
+            .unwrap_err();
+        assert!(err.contains("git"), "{err}");
+        // Nothing is left behind for the next attempt to trip over.
+        assert!(
+            !install_dir
+                .path()
+                .join(".install-https___example.invalid_does_not_exist_git")
+                .exists()
+        );
+    }
+
+    // ── pinning ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn sha256_matches_the_published_vectors() {
+        assert_eq!(
+            sha256_hex(b""),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+        assert_eq!(
+            sha256_hex(b"abc"),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+        assert_eq!(
+            sha256_hex(b"abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq"),
+            "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1"
+        );
+        assert_eq!(
+            sha256_hex(&vec![b'a'; 1_000_000]),
+            "cdc76e5c9914fb9281a1c7e284d73e67f1809a48a497200e046d39ccc7112cd0"
+        );
+    }
+
+    #[test]
+    fn a_pin_records_the_first_install_and_refuses_a_different_one() {
+        let install_dir = tempfile::tempdir().unwrap();
+        let first = PluginPin {
+            sha256: Some("aa".repeat(32)),
+            git_commit: None,
+        };
+
+        // Trust on first use: nothing is recorded, so nothing is refused.
+        let store = PluginManager::check_pin(install_dir.path(), "pinned", &first).unwrap();
+        assert!(store.get("pinned").is_none());
+        PluginManager::record_pin(install_dir.path(), store, "pinned", &first);
+
+        let on_disk = PluginPinStore::load(&install_dir.path().join(PIN_FILE_NAME)).unwrap();
+        assert_eq!(on_disk.get("pinned"), Some(&first));
+
+        // The same contents install again.
+        assert!(PluginManager::check_pin(install_dir.path(), "pinned", &first).is_ok());
+
+        // Different contents do not.
+        let swapped = PluginPin {
+            sha256: Some("bb".repeat(32)),
+            git_commit: None,
+        };
+        let err = PluginManager::check_pin(install_dir.path(), "pinned", &swapped).unwrap_err();
+        assert!(err.contains("pinned SHA-256"), "{err}");
+    }
+
+    #[test]
+    fn a_pin_file_that_cannot_be_read_is_an_error() {
+        let install_dir = tempfile::tempdir().unwrap();
+        std::fs::write(install_dir.path().join(PIN_FILE_NAME), "not json").unwrap();
+        let pin = PluginPin {
+            sha256: Some("aa".repeat(32)),
+            git_commit: None,
+        };
+        // Forgetting the pins would turn the next install into a fresh first
+        // use, which is exactly what the pin is for.
+        assert!(PluginManager::check_pin(install_dir.path(), "pinned", &pin).is_err());
+    }
+
+    #[test]
+    fn a_commit_pin_is_not_checked_against_an_archive_hash() {
+        let commit_pin = PluginPin {
+            sha256: None,
+            git_commit: Some("a".repeat(40)),
+        };
+        let archive = PluginPin {
+            sha256: Some("b".repeat(64)),
+            git_commit: None,
+        };
+        // The pinned fields are the ones that are checked, so a plugin pinned
+        // by commit is not failed for lacking a hash it never had.
+        assert!(commit_pin.check(&archive).is_err());
+        assert!(archive.check(&archive).is_ok());
+        assert!(PluginPin::default().check(&archive).is_ok());
     }
 }
