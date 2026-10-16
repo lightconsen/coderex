@@ -21,6 +21,16 @@
 //! `write_relay_unapproved`, and a message telling the caller to retry so the
 //! confirmation card is shown again.
 //!
+//! # Where this is enforced
+//!
+//! The binding is not a check the caller may skip: it is the relay endpoint.
+//! A relayed call arrives as a `relay_call` message on the bridge's own
+//! transport protocol (see [`crate::orchestrator::Bridge::handle_transport_message`]);
+//! the endpoint applies [`forwardable_headers`] to the headers the call
+//! carries, so the allowlist is the policy that decides what the gate even
+//! sees, and then spends a confirmation or refuses. A refusal comes back as
+//! [`RelayDecision::Refuse`] carrying the gateway's status, code, and message.
+//!
 //! # What is CodeRex's own here
 //!
 //! The reference binds an artifact *share*: its snapshot holds `mode`,
@@ -29,11 +39,11 @@
 //! arguments. The binding rules, the wire format, and the refusal are the same;
 //! the payload is what this codebase actually approves.
 
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine as _;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 /// Header naming the call awaiting a decision.
 pub const TOOL_USE_ID_HEADER: &str = "x-ccr-relay-tool-use-id";
@@ -88,11 +98,12 @@ impl ApprovedIntent {
 
     /// Decode a snapshot from its base64url JSON form.
     pub fn decode(encoded: &str) -> Result<Self, RelayDenial> {
-        let bytes = URL_SAFE_NO_PAD
-            .decode(encoded.trim())
-            .map_err(|e| RelayDenial::InvalidIntent {
-                reason: format!("not base64url: {e}"),
-            })?;
+        let bytes =
+            URL_SAFE_NO_PAD
+                .decode(encoded.trim())
+                .map_err(|e| RelayDenial::InvalidIntent {
+                    reason: format!("not base64url: {e}"),
+                })?;
         serde_json::from_slice(&bytes).map_err(|e| RelayDenial::InvalidIntent {
             reason: format!("not an approved intent: {e}"),
         })
@@ -142,6 +153,16 @@ impl RelayDenial {
     #[must_use]
     pub const fn message(&self) -> &'static str {
         UNAPPROVED_MESSAGE
+    }
+
+    /// The refusal as it is sent back over the relay.
+    #[must_use]
+    pub fn refusal(&self) -> RelayDecision {
+        RelayDecision::Refuse {
+            status: self.status(),
+            code: self.error_code().to_string(),
+            message: self.message().to_string(),
+        }
     }
 }
 
@@ -218,6 +239,47 @@ impl RelayApprovalGate {
     }
 }
 
+/// The call a `relay_call` message carries, minus the headers.
+///
+/// This is the body of a relayed tool call as it crosses the wire; the paired
+/// approval headers travel beside it, in the message's metadata.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RelayCallBody {
+    /// Session the call belongs to.
+    pub session_id: String,
+    /// Tool the call runs.
+    pub tool: String,
+    /// Arguments, as the tool receives them.
+    pub args: String,
+}
+
+/// What the relay did with a relayed call.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "outcome", rename_all = "snake_case")]
+pub enum RelayDecision {
+    /// The call matched an unspent confirmation and may run.
+    Forward {
+        /// Session the call belongs to.
+        session_id: String,
+        /// Tool the call runs.
+        tool: String,
+        /// Arguments, as the tool receives them.
+        args: String,
+        /// The headers the relay forwards: everything the policy refused is
+        /// already gone, so nothing downstream can be fooled by it.
+        headers: BTreeMap<String, String>,
+    },
+    /// The call was refused, in the gateway's own refusal shape.
+    Refuse {
+        /// HTTP status the refusal is reported with.
+        status: u16,
+        /// Error code the refusal is reported with.
+        code: String,
+        /// Message the caller is shown.
+        message: String,
+    },
+}
+
 /// Whether a relay may forward this header.
 ///
 /// A relayed request arrives from a cloud session, so a header it names is not
@@ -241,10 +303,25 @@ pub fn is_forwardable_header(name: &str) -> bool {
         };
         head.eq_ignore_ascii_case(prefix)
             && !rest.is_empty()
-            && rest
-                .chars()
-                .all(|c| c.is_ascii_alphanumeric() || c == '-')
+            && rest.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
     })
+}
+
+/// Apply the forwarding policy to a set of headers.
+///
+/// The survivors come back with lowercase names, ready to be looked up by
+/// [`RelayApprovalGate::authorize_headers`]. A header the policy refuses is
+/// dropped rather than rejected: a relayed request arrives through a gateway,
+/// and a header it names is not a reason to trust it.
+#[must_use]
+pub fn forwardable_headers(
+    headers: impl IntoIterator<Item = (String, String)>,
+) -> BTreeMap<String, String> {
+    headers
+        .into_iter()
+        .filter(|(name, _)| is_forwardable_header(name))
+        .map(|(name, value)| (name.to_ascii_lowercase(), value))
+        .collect()
 }
 
 fn hex(bytes: &[u8]) -> String {
@@ -284,7 +361,10 @@ mod tests {
     fn intent_is_base64url_json_on_the_wire() {
         let encoded = intent().encode();
         assert!(!encoded.contains('='), "padding should be stripped");
-        assert!(!encoded.contains('+') && !encoded.contains('/'), "{encoded}");
+        assert!(
+            !encoded.contains('+') && !encoded.contains('/'),
+            "{encoded}"
+        );
 
         let json: serde_json::Value =
             serde_json::from_slice(&URL_SAFE_NO_PAD.decode(&encoded).unwrap()).unwrap();
@@ -418,6 +498,56 @@ mod tests {
         assert_eq!(denied.status(), 403);
         assert_eq!(denied.error_code(), "write_relay_unapproved");
         assert!(denied.message().contains("confirmation card"));
+    }
+
+    #[test]
+    fn the_forwarding_policy_drops_everything_it_does_not_own() {
+        let forwarded = forwardable_headers([
+            ("Authorization".to_string(), "Bearer secret".to_string()),
+            ("X-Ccr-Relay-Tool-Use-Id".to_string(), "perm_0".to_string()),
+            ("X-CCR-RELAY-APPROVED-INTENT".to_string(), "abc".to_string()),
+            ("X-Frame-Ancestors".to_string(), "none".to_string()),
+            ("Accept".to_string(), "application/json".to_string()),
+            ("Cookie".to_string(), "session=1".to_string()),
+            ("X-Api-Key".to_string(), "k".to_string()),
+        ]);
+
+        assert_eq!(forwarded.len(), 4, "{forwarded:?}");
+        assert!(!forwarded.contains_key("authorization"), "{forwarded:?}");
+        assert!(!forwarded.contains_key("cookie"), "{forwarded:?}");
+        assert!(!forwarded.contains_key("x-api-key"), "{forwarded:?}");
+        // Names arrive lowercased, the form the gate looks them up by.
+        assert_eq!(
+            forwarded.get(TOOL_USE_ID_HEADER).map(String::as_str),
+            Some("perm_0")
+        );
+        assert_eq!(
+            forwarded.get(APPROVED_INTENT_HEADER).map(String::as_str),
+            Some("abc")
+        );
+    }
+
+    #[test]
+    fn a_refusal_carries_the_gateway_shape() {
+        let refusal = RelayDenial::Unapproved {
+            tool_use_id: "perm_0".into(),
+        }
+        .refusal();
+
+        match refusal {
+            RelayDecision::Refuse {
+                status,
+                code,
+                message,
+            } => {
+                assert_eq!(status, 403);
+                assert_eq!(code, "write_relay_unapproved");
+                assert!(message.contains("confirmation card"));
+            }
+            other @ RelayDecision::Forward { .. } => {
+                panic!("expected a refusal, got {other:?}")
+            }
+        }
     }
 
     #[test]

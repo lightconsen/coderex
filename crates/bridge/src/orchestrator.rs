@@ -4,15 +4,36 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
 use crate::archive::{BridgeArchiveWriter, BridgeCleanupManager, UsageStats};
+use crate::epoch::{StaleEpoch, WriteFence};
 use crate::heartbeat::{
-    HeartbeatConfig, HeartbeatLoop, HeartbeatStatus, SessionRecoveryState, WsReconnector,
+    HeartbeatConfig, HeartbeatLoop, HeartbeatStatus, SequenceCursor, SessionRecoveryState,
+    WsReconnector,
 };
 use crate::permission::{BridgePermissionRouter, PermissionResponse};
 use crate::poller::{BridgeWorkPoller, SpawnMode, WorkAssignment};
-use crate::relay::{ApprovedIntent, RelayApprovalGate, RelayDenial};
+use crate::relay::{ApprovedIntent, RelayApprovalGate, RelayCallBody, RelayDecision, RelayDenial};
 use crate::spawner::{BridgeSessionSpawner, SpawnConfig, SpawnResult};
 use crate::state::{BridgeSessionState, BridgeSessionStateMachine};
-use crate::transport::Transport;
+use crate::transport::{Transport, TransportMessage};
+
+/// Message type the gateway sends for a relayed tool call.
+pub const RELAY_CALL_TYPE: &str = "relay_call";
+/// Message type the worker answers a relayed call with.
+pub const RELAY_RESULT_TYPE: &str = "relay_result";
+/// Message type a worker sends to report a session's state.
+pub const SESSION_WRITE_TYPE: &str = "session_write";
+/// Message type the worker answers a write-back with.
+pub const SESSION_WRITE_RESULT_TYPE: &str = "session_write_result";
+/// Message type the gateway sends when the downstream stream has ended.
+pub const STREAM_END_TYPE: &str = "stream_end";
+/// Message type a worker sends to resume a stream from a sequence number.
+pub const RESUME_TYPE: &str = "resume";
+/// Metadata key carrying a frame's downstream sequence number.
+pub const SEQUENCE_NUM_KEY: &str = "sequence_num";
+/// Metadata key carrying the epoch of the worker making a write.
+pub const WORKER_EPOCH_KEY: &str = "worker_epoch";
+/// Metadata key carrying the resume point in the event-stream spelling.
+pub const LAST_EVENT_ID_KEY: &str = "last-event-id";
 
 /// Configuration for the bridge system.
 #[derive(Debug, Clone)]
@@ -104,6 +125,14 @@ pub struct Bridge {
     permission_router: BridgePermissionRouter,
     /// Confirmations the person has given, for relayed calls to match against.
     relay_approvals: RelayApprovalGate,
+    /// Highest downstream sequence number that reached this worker.
+    cursor: SequenceCursor,
+    /// Per-session write fences, so a replaced worker cannot write back over
+    /// its successor.
+    write_fences: std::collections::HashMap<String, WriteFence>,
+    /// The state each session's worker last reported, by the worker that owns
+    /// the session now.
+    worker_reports: std::collections::HashMap<String, String>,
     /// Archive writer for session snapshots.
     archive_writer: BridgeArchiveWriter,
     /// Cleanup manager for resource teardown.
@@ -156,6 +185,9 @@ impl Bridge {
             spawner,
             permission_router: BridgePermissionRouter::new(),
             relay_approvals: RelayApprovalGate::new(),
+            cursor: SequenceCursor::new(),
+            write_fences: std::collections::HashMap::new(),
+            worker_reports: std::collections::HashMap::new(),
             archive_writer,
             cleanup_manager: BridgeCleanupManager::new(
                 config.worktree_base.clone(),
@@ -250,6 +282,10 @@ impl Bridge {
     /// confirmation; anything else is refused as the gateway refuses it — 403
     /// with [`crate::relay::UNAPPROVED_ERROR_CODE`]. `header` looks a header up
     /// by lowercase name.
+    ///
+    /// [`Self::handle_relay_call`] is the caller that matters: it is where a
+    /// `relay_call` frame on the transport protocol lands, after the headers
+    /// have been through the forwarding policy.
     pub fn authorize_relay_call(
         &mut self,
         header: impl Fn(&str) -> Option<String>,
@@ -266,6 +302,234 @@ impl Bridge {
     #[must_use]
     pub fn outstanding_relay_approvals(&self) -> usize {
         self.relay_approvals.outstanding()
+    }
+
+    /// ─── The relay endpoint ───
+    ///
+    /// Handle a relayed tool call from the cloud session's gateway.
+    ///
+    /// This is the production call site for the approval chain: `headers` is
+    /// the metadata a [`RELAY_CALL_TYPE`] message carried, and the forwarding
+    /// policy runs first, so a header the relay does not own never reaches the
+    /// gate. What survives is what the gate judges, and a call that matches no
+    /// unspent confirmation comes back as the gateway's own refusal.
+    pub fn handle_relay_call(
+        &mut self,
+        call: RelayCallBody,
+        headers: impl IntoIterator<Item = (String, String)>,
+    ) -> RelayDecision {
+        let forwarded = crate::relay::forwardable_headers(headers);
+        match self.authorize_relay_call(|name| forwarded.get(name).cloned()) {
+            Ok(()) => RelayDecision::Forward {
+                session_id: call.session_id,
+                tool: call.tool,
+                args: call.args,
+                headers: forwarded,
+            },
+            Err(denial) => denial.refusal(),
+        }
+    }
+
+    /// Record a session state a worker reported, if that worker still owns the
+    /// session.
+    ///
+    /// The write is fenced by `epoch`: a worker whose epoch has been superseded
+    /// cannot write back over the worker that replaced it.
+    pub fn apply_session_write(
+        &mut self,
+        session_id: &str,
+        epoch: u64,
+        state: &str,
+    ) -> Result<(), StaleEpoch> {
+        self.write_fences
+            .entry(session_id.to_string())
+            .or_default()
+            .admit(epoch)?;
+        self.worker_reports
+            .insert(session_id.to_string(), state.to_string());
+        Ok(())
+    }
+
+    /// The state the session's current worker last reported.
+    #[must_use]
+    pub fn worker_state(&self, session_id: &str) -> Option<&str> {
+        self.worker_reports.get(session_id).map(String::as_str)
+    }
+
+    /// The highest downstream sequence number that reached this worker.
+    #[must_use]
+    pub const fn last_delivered_sequence(&self) -> Option<u64> {
+        self.cursor.last_delivered()
+    }
+
+    /// Note a frame's sequence number, so a reconnect can resume past it.
+    fn note_sequence(&mut self, message: &TransportMessage) {
+        if let Some(seq) = message
+            .metadata
+            .get(SEQUENCE_NUM_KEY)
+            .and_then(|s| s.parse::<u64>().ok())
+        {
+            self.cursor.deliver(seq);
+        }
+    }
+
+    /// The frame a reconnect sends to ask for the gap rather than the whole
+    /// stream.
+    ///
+    /// Both spellings of the same point: `from_sequence_num` for the bridge's
+    /// own protocol, and `Last-Event-ID` for an event stream that only knows
+    /// that one.
+    #[must_use]
+    pub fn resume_request(&self) -> TransportMessage {
+        let mut metadata = std::collections::HashMap::new();
+        if let Some(last_event_id) = self.cursor.last_event_id() {
+            metadata.insert(LAST_EVENT_ID_KEY.to_string(), last_event_id);
+        }
+        TransportMessage {
+            r#type: RESUME_TYPE.to_string(),
+            correlation_id: None,
+            payload: serde_json::json!({ "from_sequence_num": self.cursor.resume_from() })
+                .to_string(),
+            metadata,
+        }
+    }
+
+    /// Route one inbound frame to the handler for its type.
+    ///
+    /// Returns the frame to send back, if the message expects one.
+    pub fn handle_transport_message(
+        &mut self,
+        message: TransportMessage,
+    ) -> Option<TransportMessage> {
+        match message.r#type.as_str() {
+            RELAY_CALL_TYPE => {
+                let body: RelayCallBody = match serde_json::from_str(&message.payload) {
+                    Ok(body) => body,
+                    Err(e) => {
+                        return Some(transport_error(&message, &format!("relay_call body: {e}")));
+                    }
+                };
+                let decision = self.handle_relay_call(body, message.metadata.clone());
+                Some(transport_reply(
+                    &message,
+                    RELAY_RESULT_TYPE,
+                    serde_json::to_string(&decision).unwrap_or_default(),
+                ))
+            }
+            SESSION_WRITE_TYPE => {
+                #[derive(Deserialize)]
+                struct Write {
+                    session_id: String,
+                    state: String,
+                }
+                let Some(epoch) = message
+                    .metadata
+                    .get(WORKER_EPOCH_KEY)
+                    .and_then(|e| e.parse::<u64>().ok())
+                else {
+                    return Some(transport_error(
+                        &message,
+                        "session_write is missing its worker_epoch",
+                    ));
+                };
+                let write: Write = match serde_json::from_str(&message.payload) {
+                    Ok(write) => write,
+                    Err(e) => {
+                        return Some(transport_error(
+                            &message,
+                            &format!("session_write body: {e}"),
+                        ));
+                    }
+                };
+                let payload = match self.apply_session_write(&write.session_id, epoch, &write.state)
+                {
+                    Ok(()) => serde_json::json!({
+                        "accepted": true,
+                        "session_id": write.session_id,
+                        "worker_epoch": epoch,
+                    }),
+                    Err(stale) => serde_json::json!({
+                        "accepted": false,
+                        "reason": stale.to_string(),
+                        "current_epoch": stale.current,
+                    }),
+                };
+                Some(transport_reply(
+                    &message,
+                    SESSION_WRITE_RESULT_TYPE,
+                    payload.to_string(),
+                ))
+            }
+            "heartbeat" => {
+                if let Some(heartbeat) = self.heartbeat_loop.as_ref().map(|h| h.heartbeat()) {
+                    if let Ok(mut beat) = heartbeat.lock() {
+                        beat.record_success();
+                    }
+                }
+                Some(transport_reply(&message, "heartbeat_ack", "{}".into()))
+            }
+            other => Some(transport_error(
+                &message,
+                &format!("unknown message type: {other}"),
+            )),
+        }
+    }
+
+    /// Serve inbound frames until the transport ends.
+    ///
+    /// This is the loop the relay endpoint lives on: every frame is sequenced,
+    /// a `stream_end` makes the worker come back asking to resume rather than
+    /// reconnecting blind, and everything else is routed by type.
+    pub async fn serve_transport(&mut self) -> Result<(), String> {
+        self.running = true;
+        while self.running {
+            let received = {
+                let transport = self.transport.as_mut().ok_or("no transport configured")?;
+                transport.receive().await
+            };
+            let message = match received {
+                Ok(message) => message,
+                // The stream ended; a gateway that wants the worker back says
+                // so with `stream_end` instead.
+                Err(_) => break,
+            };
+            self.note_sequence(&message);
+
+            if message.r#type == STREAM_END_TYPE {
+                self.reconnect_with_resume().await?;
+                continue;
+            }
+
+            if let Some(reply) = self.handle_transport_message(message) {
+                let transport = self.transport.as_mut().ok_or("no transport configured")?;
+                if transport.send(reply).await.is_err() {
+                    break;
+                }
+            }
+        }
+        self.running = false;
+        Ok(())
+    }
+
+    /// Reconnect after the downstream ended, and ask to resume the stream from
+    /// the last sequence number that reached this worker.
+    pub async fn reconnect_with_resume(&mut self) -> Result<(), String> {
+        self.emit(BridgeEvent::TransportReconnecting {
+            attempt: self.reconnector.attempt_count() + 1,
+        });
+
+        if let Some(delay) = self.reconnector.next_delay() {
+            tokio::time::sleep(delay).await;
+        }
+
+        let resume = self.resume_request();
+        let transport = self.transport.as_mut().ok_or("no transport configured")?;
+        transport.connect().await.map_err(|e| e.to_string())?;
+        transport.send(resume).await.map_err(|e| e.to_string())?;
+
+        self.reconnector.reset();
+        self.emit(BridgeEvent::TransportReconnected);
+        Ok(())
     }
 
     /// Get the heartbeat status.
@@ -510,11 +774,12 @@ impl Bridge {
 
     /// ─── Recovery state for a session ───
 
+    /// Snapshot a session for recovery, including where its stream had got to.
     #[must_use]
     pub fn create_recovery_state(&self, session_id: &str) -> Option<SessionRecoveryState> {
         self.sessions.get(session_id).map(|session| {
-            SessionRecoveryState::new(
-                session_id.to_string(),
+            self.recovery_state_for(
+                session_id,
                 session.state_machine.current.label().to_string(),
             )
         })
@@ -527,13 +792,39 @@ impl Bridge {
             .iter()
             .filter(|(_, s)| !s.state_machine.is_terminal())
             .map(|(id, session)| {
-                SessionRecoveryState::new(
-                    id.clone(),
-                    session.state_machine.current.label().to_string(),
-                )
+                self.recovery_state_for(id, session.state_machine.current.label().to_string())
             })
             .collect()
     }
+
+    /// A recovery snapshot with the downstream offset attached, so a session
+    /// that comes back knows where to resume rather than only where it was.
+    fn recovery_state_for(&self, session_id: &str, last_state: String) -> SessionRecoveryState {
+        let mut state = SessionRecoveryState::new(session_id.to_string(), last_state);
+        if let Some(seq) = self.cursor.last_delivered() {
+            state.record_sequence(seq);
+        }
+        state
+    }
+}
+
+/// Build the frame that answers `request`.
+fn transport_reply(request: &TransportMessage, r#type: &str, payload: String) -> TransportMessage {
+    TransportMessage {
+        r#type: r#type.to_string(),
+        correlation_id: request.correlation_id.clone(),
+        payload,
+        metadata: std::collections::HashMap::new(),
+    }
+}
+
+/// Build the frame that reports a message the worker could not read.
+fn transport_error(request: &TransportMessage, reason: &str) -> TransportMessage {
+    transport_reply(
+        request,
+        "error",
+        serde_json::json!({ "error": reason }).to_string(),
+    )
 }
 
 impl Default for BridgeConfig {
@@ -599,20 +890,23 @@ mod tests {
             Err(RelayDenial::Unapproved { .. })
         ));
 
-        assert!(bridge.respond_to_permission(
-            &request_id,
-            PermissionResponse::Allow { always: false }
-        ));
+        assert!(
+            bridge.respond_to_permission(&request_id, PermissionResponse::Allow { always: false })
+        );
         assert_eq!(bridge.outstanding_relay_approvals(), 1);
-        assert!(bridge
-            .authorize_relay_call(relay_headers(&request_id, &intent))
-            .is_ok());
+        assert!(
+            bridge
+                .authorize_relay_call(relay_headers(&request_id, &intent))
+                .is_ok()
+        );
 
         // The confirmation authorised that one call.
         assert_eq!(bridge.outstanding_relay_approvals(), 0);
-        assert!(bridge
-            .authorize_relay_call(relay_headers(&request_id, &intent))
-            .is_err());
+        assert!(
+            bridge
+                .authorize_relay_call(relay_headers(&request_id, &intent))
+                .is_err()
+        );
     }
 
     #[test]
@@ -630,10 +924,9 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let mut bridge = test_bridge(tmp.path());
         let request_id = bridge.request_permission("sess_1", "Bash", r#"{"command":"ls"}"#);
-        assert!(bridge.respond_to_permission(
-            &request_id,
-            PermissionResponse::Allow { always: false }
-        ));
+        assert!(
+            bridge.respond_to_permission(&request_id, PermissionResponse::Allow { always: false })
+        );
 
         let other = ApprovedIntent::for_call("sess_1", "Bash", r#"{"command":"rm -rf /"}"#);
         assert!(matches!(
@@ -648,10 +941,9 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let mut bridge = test_bridge(tmp.path());
         let request_id = bridge.request_permission("sess_1", "Bash", "ls");
-        assert!(bridge.respond_to_permission(
-            &request_id,
-            PermissionResponse::Allow { always: false }
-        ));
+        assert!(
+            bridge.respond_to_permission(&request_id, PermissionResponse::Allow { always: false })
+        );
 
         assert!(bridge.withdraw_relay_approval(&request_id));
         let intent = ApprovedIntent::for_call("sess_1", "Bash", "ls");

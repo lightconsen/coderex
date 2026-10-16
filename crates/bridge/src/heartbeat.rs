@@ -289,6 +289,64 @@ impl WsReconnector {
     }
 }
 
+/// A cursor over the sequence numbers of the downstream stream.
+///
+/// Reconnecting with backoff alone re-establishes the connection but not the
+/// stream: whatever the gateway sent while the worker was away is simply gone.
+/// The cursor is the other half of the insurance — the worker remembers the
+/// highest sequence number that reached it, and asks to resume one past it.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SequenceCursor {
+    last_delivered: Option<u64>,
+}
+
+impl SequenceCursor {
+    /// Create a cursor that has seen nothing.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            last_delivered: None,
+        }
+    }
+
+    /// Record that sequence number `seq` reached the worker.
+    ///
+    /// A frame that arrives out of order never rewinds the cursor: the point
+    /// is the furthest point the stream has reached.
+    pub fn deliver(&mut self, seq: u64) {
+        let ahead = match self.last_delivered {
+            None => true,
+            Some(last) => seq > last,
+        };
+        if ahead {
+            self.last_delivered = Some(seq);
+        }
+    }
+
+    /// The highest sequence number that reached the worker.
+    #[must_use]
+    pub const fn last_delivered(&self) -> Option<u64> {
+        self.last_delivered
+    }
+
+    /// The sequence number a reconnect should ask for.
+    ///
+    /// One past the last frame that arrived; from the beginning if none did.
+    #[must_use]
+    pub fn resume_from(&self) -> u64 {
+        self.last_delivered.map_or(1, |last| last + 1)
+    }
+
+    /// The `Last-Event-ID` a reconnect presents, when anything has arrived.
+    ///
+    /// The same point expressed the way an event stream expects it, so a
+    /// gateway that understands one form or the other can serve the resume.
+    #[must_use]
+    pub fn last_event_id(&self) -> Option<String> {
+        self.last_delivered.map(|last| last.to_string())
+    }
+}
+
 /// State recovery snapshot for reconnecting sessions.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionRecoveryState {
@@ -300,6 +358,12 @@ pub struct SessionRecoveryState {
     pub pending_tool_calls: Vec<String>,
     /// Timestamp of the recovery snapshot.
     pub snapshot_time: String,
+    /// Highest downstream sequence number delivered before the snapshot.
+    ///
+    /// Defaulted on deserialisation so snapshots written before the stream
+    /// carried a cursor still load.
+    #[serde(default)]
+    pub last_sequence_num: Option<u64>,
 }
 
 impl SessionRecoveryState {
@@ -311,6 +375,7 @@ impl SessionRecoveryState {
             last_state,
             pending_tool_calls: Vec::new(),
             snapshot_time: chrono::Utc::now().to_rfc3339(),
+            last_sequence_num: None,
         }
     }
 
@@ -323,6 +388,29 @@ impl SessionRecoveryState {
     #[must_use]
     pub fn has_pending_tools(&self) -> bool {
         !self.pending_tool_calls.is_empty()
+    }
+
+    /// Record the last downstream sequence number the session had seen.
+    pub fn record_sequence(&mut self, seq: u64) {
+        let ahead = match self.last_sequence_num {
+            None => true,
+            Some(last) => seq > last,
+        };
+        if ahead {
+            self.last_sequence_num = Some(seq);
+        }
+    }
+
+    /// The sequence number this session's reconnect should ask for.
+    #[must_use]
+    pub fn resume_from(&self) -> u64 {
+        self.last_sequence_num.map_or(1, |last| last + 1)
+    }
+
+    /// The `Last-Event-ID` this session's reconnect should present.
+    #[must_use]
+    pub fn last_event_id(&self) -> Option<String> {
+        self.last_sequence_num.map(|last| last.to_string())
     }
 }
 
@@ -446,6 +534,59 @@ mod tests {
         recovery.add_pending_tool("tc2".into());
         assert!(recovery.has_pending_tools());
         assert_eq!(recovery.pending_tool_calls.len(), 2);
+    }
+
+    #[test]
+    fn a_cursor_starts_at_the_beginning_of_the_stream() {
+        let cursor = SequenceCursor::new();
+        assert_eq!(cursor.last_delivered(), None);
+        assert_eq!(cursor.resume_from(), 1);
+        assert_eq!(cursor.last_event_id(), None);
+    }
+
+    #[test]
+    fn a_cursor_resumes_one_past_the_last_frame() {
+        let mut cursor = SequenceCursor::new();
+        for seq in [1, 2, 3] {
+            cursor.deliver(seq);
+        }
+        assert_eq!(cursor.last_delivered(), Some(3));
+        assert_eq!(cursor.resume_from(), 4);
+        assert_eq!(cursor.last_event_id().as_deref(), Some("3"));
+    }
+
+    #[test]
+    fn a_cursor_never_rewinds_on_an_out_of_order_frame() {
+        let mut cursor = SequenceCursor::new();
+        cursor.deliver(9);
+        cursor.deliver(4);
+        assert_eq!(cursor.last_delivered(), Some(9));
+        assert_eq!(cursor.resume_from(), 10);
+    }
+
+    #[test]
+    fn a_recovery_snapshot_carries_the_stream_offset() {
+        let mut recovery = SessionRecoveryState::new("s1".into(), "running".into());
+        assert_eq!(recovery.resume_from(), 1);
+
+        recovery.record_sequence(12);
+        recovery.record_sequence(11); // out of order, ignored
+        assert_eq!(recovery.last_sequence_num, Some(12));
+        assert_eq!(recovery.resume_from(), 13);
+        assert_eq!(recovery.last_event_id().as_deref(), Some("12"));
+    }
+
+    #[test]
+    fn an_older_snapshot_without_an_offset_still_loads() {
+        let json = r#"{
+            "session_id": "s1",
+            "last_state": "running",
+            "pending_tool_calls": [],
+            "snapshot_time": "2026-01-01T00:00:00Z"
+        }"#;
+        let recovery: SessionRecoveryState = serde_json::from_str(json).unwrap();
+        assert_eq!(recovery.last_sequence_num, None);
+        assert_eq!(recovery.resume_from(), 1);
     }
 
     #[test]

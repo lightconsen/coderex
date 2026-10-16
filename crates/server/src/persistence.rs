@@ -192,6 +192,9 @@ pub fn restore_session(ps: &PersistedSession) -> super::Session {
         // A restored session carries the fingerprint, not the key: the key is
         // not on disk to carry, and nothing reads this back.
         auth_token: ps.token_fingerprint.clone(),
+        // The role is not persisted, and a restored session gets the narrower
+        // surface: coming back from the store must not widen what it may run.
+        role: super::SessionRole::default(),
         created_at: now,
         last_activity: now,
         authenticated: true,
@@ -260,6 +263,7 @@ mod tests {
         let sess = super::super::Session {
             id: "sess_rt".to_string(),
             auth_token: "secret-key".to_string(),
+            role: super::super::SessionRole::default(),
             created_at: Instant::now(),
             last_activity: Instant::now(),
             authenticated: true,

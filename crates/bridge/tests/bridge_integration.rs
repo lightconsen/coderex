@@ -5,16 +5,22 @@
 //! 12.1 environment registration, 12.2 work assignment, 12.3 permission forwarding,
 //! 12.4 worktree spawn, 12.5 disconnect recovery
 
+use std::collections::HashMap;
 use std::path::PathBuf;
+use std::time::Duration;
 
 use coderex_bridge::archive::UsageStats;
 use coderex_bridge::heartbeat::{HeartbeatConfig, HeartbeatStatus, WsReconnector};
 use coderex_bridge::orchestrator::{Bridge, BridgeConfig, BridgeEvent, ManagedSession};
 use coderex_bridge::permission::{BridgePermissionRouter, PermissionResponse};
 use coderex_bridge::poller::{BridgeWorkPoller, SpawnMode, WorkAssignment};
+use coderex_bridge::relay::{
+    APPROVED_INTENT_HEADER, ApprovedIntent, RelayDecision, TOOL_USE_ID_HEADER,
+};
 use coderex_bridge::spawner::{BridgeSessionSpawner, SpawnConfig};
 use coderex_bridge::state::{BridgeSessionState, BridgeSessionStateMachine};
-use coderex_bridge::transport::InProcessTransport;
+use coderex_bridge::transport::{InProcessTransport, Transport, TransportMessage};
+use coderex_bridge::ws_transport::{WebSocketTransport, WsTransportConfig};
 
 // ═══════════════════════════════════════════════════════════════════════════
 //  Helpers
@@ -608,6 +614,320 @@ async fn disconnect_recovery_full_lifecycle_with_recovery() {
     };
     bridge.complete_session("s1", usage).await.unwrap();
     assert!(!bridge.has_session("s1"));
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  12.6 Relay endpoint — the approval chain on the live protocol
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Send a frame over an in-process transport and read the reply to it.
+async fn transport_round_trip(
+    transport: &mut InProcessTransport,
+    frame: &TransportMessage,
+) -> TransportMessage {
+    transport.send(frame.clone()).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(5), transport.receive())
+        .await
+        .expect("round trip timed out")
+        .expect("transport ended")
+}
+
+/// Build the `relay_call` frame the gateway sends for a tool call.
+fn relay_frame(
+    session_id: &str,
+    tool: &str,
+    args: &str,
+    headers: &[(&str, &str)],
+) -> TransportMessage {
+    TransportMessage {
+        r#type: "relay_call".into(),
+        correlation_id: Some("call_1".into()),
+        payload: serde_json::json!({
+            "session_id": session_id,
+            "tool": tool,
+            "args": args,
+        })
+        .to_string(),
+        metadata: headers
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+            .collect(),
+    }
+}
+
+/// Send a frame over a real WebSocket and read the reply to it.
+async fn ws_round_trip(
+    ws: &mut tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>,
+    frame: &TransportMessage,
+) -> TransportMessage {
+    use futures_util::{SinkExt, StreamExt};
+    use tokio_tungstenite::tungstenite::Message;
+
+    ws.send(Message::Text(serde_json::to_string(frame).unwrap().into()))
+        .await
+        .unwrap();
+    loop {
+        let next = tokio::time::timeout(Duration::from_secs(5), ws.next())
+            .await
+            .expect("relay round trip timed out")
+            .expect("websocket ended")
+            .expect("websocket error");
+        if let Message::Text(text) = next {
+            return serde_json::from_str(&text).expect("reply is a transport message");
+        }
+    }
+}
+
+/// The whole point of the relay endpoint: a call the person confirmed is
+/// forwarded once, a replay of the same pair is refused, and the header
+/// allowlist decides what the gate even sees — all over the wire.
+#[tokio::test]
+async fn a_relayed_call_is_authorized_over_the_websocket_protocol() {
+    use tokio::net::TcpListener;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let args = r#"{"command":"ls"}"#;
+
+    // The gateway side of the relay: a real WebSocket peer.
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let gateway = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        tokio_tungstenite::accept_async(stream).await.unwrap()
+    });
+
+    let url = format!("ws://{addr}");
+    let mut transport = WebSocketTransport::new(WsTransportConfig::new(url.clone()));
+    transport
+        .connect_ws(WsTransportConfig::new(url))
+        .await
+        .unwrap();
+
+    let mut bridge = Bridge::new(test_config(tmp.path()), Box::new(transport));
+    let request_id = bridge.request_permission("sess_1", "Bash", args);
+    assert!(bridge.respond_to_permission(&request_id, PermissionResponse::Allow { always: false }));
+
+    let serving = tokio::spawn(async move { bridge.serve_transport().await });
+    let mut ws = gateway.await.unwrap();
+
+    let intent = ApprovedIntent::for_call("sess_1", "Bash", args);
+    let encoded = intent.encode();
+    let approved = relay_frame(
+        "sess_1",
+        "Bash",
+        args,
+        &[
+            (TOOL_USE_ID_HEADER, request_id.as_str()),
+            (APPROVED_INTENT_HEADER, encoded.as_str()),
+            // A header the relay does not own: it must not cross the boundary.
+            ("authorization", "Bearer smuggled"),
+        ],
+    );
+
+    let reply = ws_round_trip(&mut ws, &approved).await;
+    assert_eq!(reply.r#type, "relay_result");
+    let decision: RelayDecision = serde_json::from_str(&reply.payload).unwrap();
+    match decision {
+        RelayDecision::Forward { headers, .. } => {
+            assert!(headers.contains_key(TOOL_USE_ID_HEADER), "{headers:?}");
+            assert!(
+                !headers.contains_key("authorization"),
+                "the forwarding policy let a foreign header through: {headers:?}"
+            );
+        }
+        other => panic!("the confirmed call should have been forwarded, got {other:?}"),
+    }
+
+    // One confirmation authorises one call.
+    let replay = ws_round_trip(&mut ws, &approved).await;
+    let decision: RelayDecision = serde_json::from_str(&replay.payload).unwrap();
+    match decision {
+        RelayDecision::Refuse { status, code, .. } => {
+            assert_eq!(status, 403);
+            assert_eq!(code, "write_relay_unapproved");
+        }
+        other => panic!("a replayed header pair must be refused, got {other:?}"),
+    }
+
+    // A call whose pair headers were smuggled under names the relay does not
+    // forward arrives with no binding at all, and is refused like any other.
+    let smuggled = relay_frame(
+        "sess_1",
+        "Bash",
+        args,
+        &[
+            ("x-pair-id", request_id.as_str()),
+            ("x-pair-intent", encoded.as_str()),
+        ],
+    );
+    let reply = ws_round_trip(&mut ws, &smuggled).await;
+    let decision: RelayDecision = serde_json::from_str(&reply.payload).unwrap();
+    assert!(
+        matches!(decision, RelayDecision::Refuse { status: 403, .. }),
+        "{decision:?}"
+    );
+
+    serving.abort();
+}
+
+#[tokio::test]
+async fn a_relayed_call_is_refused_when_the_person_denied_it() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (bridge_transport, mut gateway) =
+        InProcessTransport::create_pair("bridge".into(), "gateway".into());
+    gateway.connect().await.unwrap();
+    let mut bridge = Bridge::new(test_config(tmp.path()), Box::new(bridge_transport));
+    bridge.connect().await.unwrap();
+    let request_id = bridge.request_permission("sess_1", "Bash", "ls");
+    assert!(bridge.respond_to_permission(&request_id, PermissionResponse::Deny));
+
+    let serving = tokio::spawn(async move { bridge.serve_transport().await });
+
+    let intent = ApprovedIntent::for_call("sess_1", "Bash", "ls");
+    let encoded = intent.encode();
+    let frame = relay_frame(
+        "sess_1",
+        "Bash",
+        "ls",
+        &[
+            (TOOL_USE_ID_HEADER, request_id.as_str()),
+            (APPROVED_INTENT_HEADER, encoded.as_str()),
+        ],
+    );
+
+    let reply = transport_round_trip(&mut gateway, &frame).await;
+    let decision: RelayDecision = serde_json::from_str(&reply.payload).unwrap();
+    match decision {
+        RelayDecision::Refuse { status, code, .. } => {
+            assert_eq!(status, 403);
+            assert_eq!(code, "write_relay_unapproved");
+        }
+        other => panic!("a denied call must not be forwarded, got {other:?}"),
+    }
+
+    serving.abort();
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  12.7 Worker epoch write fence
+// ═══════════════════════════════════════════════════════════════════════════
+
+fn session_write_frame(epoch: u64, state: &str) -> TransportMessage {
+    TransportMessage {
+        r#type: "session_write".into(),
+        correlation_id: Some(format!("w{epoch}")),
+        payload: serde_json::json!({ "session_id": "s1", "state": state }).to_string(),
+        metadata: HashMap::from([("worker_epoch".to_string(), epoch.to_string())]),
+    }
+}
+
+/// A worker that has been replaced must not be able to write back over the
+/// worker that replaced it.
+#[tokio::test]
+async fn a_stale_worker_epoch_cannot_write_back() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (bridge_transport, mut gateway) =
+        InProcessTransport::create_pair("bridge".into(), "gateway".into());
+    gateway.connect().await.unwrap();
+    let mut bridge = Bridge::new(test_config(tmp.path()), Box::new(bridge_transport));
+    bridge.connect().await.unwrap();
+
+    let serving = tokio::spawn(async move { bridge.serve_transport().await });
+
+    // The replacement worker takes the session.
+    let reply = transport_round_trip(&mut gateway, &session_write_frame(2, "running")).await;
+    assert_eq!(reply.r#type, "session_write_result");
+    let payload: serde_json::Value = serde_json::from_str(&reply.payload).unwrap();
+    assert_eq!(payload["accepted"], true, "{payload}");
+
+    // The worker it replaced is still finishing its last request.
+    let reply = transport_round_trip(&mut gateway, &session_write_frame(1, "archiving")).await;
+    let payload: serde_json::Value = serde_json::from_str(&reply.payload).unwrap();
+    assert_eq!(payload["accepted"], false, "{payload}");
+    assert_eq!(payload["current_epoch"], 2, "{payload}");
+    assert!(
+        payload["reason"].as_str().unwrap().contains("stale"),
+        "{payload}"
+    );
+
+    serving.abort();
+}
+
+#[tokio::test]
+async fn a_write_without_an_epoch_is_refused() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (bridge_transport, mut gateway) =
+        InProcessTransport::create_pair("bridge".into(), "gateway".into());
+    gateway.connect().await.unwrap();
+    let mut bridge = Bridge::new(test_config(tmp.path()), Box::new(bridge_transport));
+    bridge.connect().await.unwrap();
+
+    let serving = tokio::spawn(async move { bridge.serve_transport().await });
+
+    let frame = TransportMessage {
+        r#type: "session_write".into(),
+        correlation_id: Some("w0".into()),
+        payload: serde_json::json!({ "session_id": "s1", "state": "running" }).to_string(),
+        metadata: HashMap::new(),
+    };
+    let reply = transport_round_trip(&mut gateway, &frame).await;
+    assert_eq!(reply.r#type, "error");
+    assert!(reply.payload.contains("worker_epoch"), "{}", reply.payload);
+
+    serving.abort();
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  12.8 Stream resume — the sequence cursor on reconnect
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// A reconnect asks for the gap, not the whole stream: the worker comes back
+/// with the sequence number it got to, in both spellings.
+#[tokio::test]
+async fn a_reconnect_resumes_from_the_last_delivered_sequence() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (bridge_transport, mut gateway) =
+        InProcessTransport::create_pair("bridge".into(), "gateway".into());
+    gateway.connect().await.unwrap();
+    let mut bridge = Bridge::new(test_config(tmp.path()), Box::new(bridge_transport));
+    bridge.connect().await.unwrap();
+
+    let serving = tokio::spawn(async move { bridge.serve_transport().await });
+
+    for seq in 1..=3u64 {
+        let beat = TransportMessage {
+            r#type: "heartbeat".into(),
+            correlation_id: Some(format!("h{seq}")),
+            payload: "{}".into(),
+            metadata: HashMap::from([("sequence_num".to_string(), seq.to_string())]),
+        };
+        let reply = transport_round_trip(&mut gateway, &beat).await;
+        assert_eq!(reply.r#type, "heartbeat_ack");
+    }
+
+    // The gateway says the downstream ended.
+    let end = TransportMessage {
+        r#type: "stream_end".into(),
+        correlation_id: None,
+        payload: "{}".into(),
+        metadata: HashMap::new(),
+    };
+    gateway.send(end).await.unwrap();
+
+    let resume = tokio::time::timeout(Duration::from_secs(10), gateway.receive())
+        .await
+        .expect("the worker should have reconnected")
+        .expect("transport ended");
+
+    assert_eq!(resume.r#type, "resume");
+    let payload: serde_json::Value = serde_json::from_str(&resume.payload).unwrap();
+    assert_eq!(payload["from_sequence_num"], 4);
+    assert_eq!(
+        resume.metadata.get("last-event-id").map(String::as_str),
+        Some("3")
+    );
+
+    serving.abort();
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

@@ -14,6 +14,6 @@ pub use control_plane::{
 pub use filter::{CommandFilter, SafetyLevel};
 pub use persistence::{PersistedSession, SessionStore};
 pub use session::{
-    DaemonServer, ServerConfig, Session, WsEvent, WsRequest, WsRequestKind, WsResponse,
-    WsResponseKind,
+    DaemonServer, ServerConfig, Session, SessionRole, WsEvent, WsRequest, WsRequestKind,
+    WsResponse, WsResponseKind,
 };

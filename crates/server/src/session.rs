@@ -1,6 +1,7 @@
 //! Detached WebSocket session management with authentication, rate limiting,
 //! and idle cleanup.
 
+use coderex_commands::registry::{CommandRegistry, register_all_commands};
 use coderex_core::engine::{QueryEngine, SubmitOptions};
 use coderex_core::types::EngineEvent;
 use futures::{SinkExt, StreamExt};
@@ -13,6 +14,8 @@ use std::time::{Duration, Instant};
 use tokio::net::{TcpListener, TcpStream};
 use tokio_tungstenite::tungstenite::Message;
 use tracing::{debug, info, warn};
+
+use crate::filter::{CommandFilter, SafetyLevel};
 
 /// ─── Structured JSON Protocol Types ──────────────────────────────────────
 
@@ -38,6 +41,16 @@ pub enum WsRequestKind {
     Interrupt,
     /// Ping to keep the connection alive.
     Ping,
+    /// Resolve a command the session wants to run.
+    ///
+    /// `line` is what the client typed: a slash command when it starts with
+    /// `/`, a shell command otherwise. The server answers whether the
+    /// session's role may run it at all — a command outside the role's
+    /// whitelist never resolves.
+    Command {
+        /// The command line, as typed.
+        line: String,
+    },
 }
 
 /// Server → Client response message.
@@ -68,6 +81,13 @@ pub enum WsResponseKind {
     },
     /// Ping response.
     Pong,
+    /// The command resolved, and may run.
+    CommandResolved {
+        /// The command, as it was resolved.
+        command: String,
+        /// What the command does.
+        description: String,
+    },
     /// Error response.
     Error { code: String, message: String },
 }
@@ -149,6 +169,40 @@ impl TokenBucket {
     }
 }
 
+/// What kind of client opened a session.
+///
+/// The role decides which commands the session may resolve: a remote client
+/// gets the read-only surface, a bridge session gets the limited-write one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionRole {
+    /// A client reaching the daemon over the network.
+    #[default]
+    Remote,
+    /// A bridge session, which may also write inside its working directory.
+    Bridge,
+}
+
+impl SessionRole {
+    /// The command-safety level this role resolves commands at.
+    #[must_use]
+    pub const fn safety_level(self) -> SafetyLevel {
+        match self {
+            Self::Remote => SafetyLevel::Remote,
+            Self::Bridge => SafetyLevel::Bridge,
+        }
+    }
+
+    /// The role's name, for messages.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Remote => "remote",
+            Self::Bridge => "bridge",
+        }
+    }
+}
+
 /// A connected WebSocket session.
 #[derive(Debug, Clone)]
 pub struct Session {
@@ -156,6 +210,8 @@ pub struct Session {
     pub id: String,
     /// The API key or token used for authentication.
     pub auth_token: String,
+    /// What kind of client opened the session.
+    pub role: SessionRole,
     /// When the session was created.
     pub created_at: Instant,
     /// Last activity timestamp.
@@ -235,7 +291,12 @@ struct Shared {
 
 impl Shared {
     /// Open a session for a token that is allowed to have one.
-    fn authenticate(&mut self, token: &str, config: &ServerConfig) -> Result<String, String> {
+    fn authenticate(
+        &mut self,
+        token: &str,
+        role: SessionRole,
+        config: &ServerConfig,
+    ) -> Result<String, String> {
         if config.valid_keys.is_empty() {
             if !config.allow_anonymous {
                 return Err(
@@ -260,6 +321,7 @@ impl Shared {
         let session = Session {
             id: id.clone(),
             auth_token: token.to_string(),
+            role,
             created_at: now,
             last_activity: now,
             authenticated: true,
@@ -329,13 +391,78 @@ struct Connection {
     shared: Arc<parking_lot::Mutex<Shared>>,
     session_count_atomic: Arc<AtomicUsize>,
     engine_factory: Option<EngineFactory>,
+    /// Every slash command this build knows about, for resolving what a
+    /// remote or bridge session may run.
+    commands: Arc<CommandRegistry>,
 }
 
 impl Connection {
-    fn authenticate(&self, token: &str) -> Result<String, String> {
-        let id = self.shared.lock().authenticate(token, &self.config)?;
+    fn authenticate(&self, token: &str, role: SessionRole) -> Result<String, String> {
+        let id = self.shared.lock().authenticate(token, role, &self.config)?;
         self.sync_session_count();
         Ok(id)
+    }
+
+    /// The role the session opened with, or the default when it is unknown.
+    fn session_role(&self, session_id: &str) -> SessionRole {
+        self.shared
+            .lock()
+            .sessions
+            .get(session_id)
+            .map_or(SessionRole::default(), |session| session.role)
+    }
+
+    /// Resolve a command a remote or bridge session asked for.
+    ///
+    /// This is where the whitelists are enforced. A slash command has to be in
+    /// the registry's availability matrix for the session's role; anything
+    /// else is a shell command and has to pass the role's safety filter. A
+    /// command that does not is never resolved, and the caller is told so.
+    fn resolve_command(
+        &self,
+        role: SessionRole,
+        line: &str,
+    ) -> Result<(String, String), (String, String)> {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            return Err(("empty_command".to_string(), "nothing to run".to_string()));
+        }
+        let level = role.safety_level();
+
+        if let Some(rest) = trimmed.strip_prefix('/') {
+            let name = rest.split_whitespace().next().unwrap_or("");
+            let available = self.commands.available_commands(
+                true,
+                level == SafetyLevel::Remote,
+                level == SafetyLevel::Bridge,
+            );
+            return match available.iter().find(|command| command.name == name) {
+                Some(command) => Ok((command.name.to_string(), command.description.to_string())),
+                None => Err((
+                    "command_not_allowed".to_string(),
+                    format!("/{name} is not available to a {} session", role.name()),
+                )),
+            };
+        }
+
+        let allowed = match level {
+            SafetyLevel::Remote => CommandFilter::is_remote_safe(trimmed),
+            SafetyLevel::Bridge => CommandFilter::is_bridge_safe(trimmed),
+        };
+        if allowed {
+            Ok((
+                trimmed.to_string(),
+                "allowed by the command whitelist".to_string(),
+            ))
+        } else {
+            Err((
+                "command_not_allowed".to_string(),
+                format!(
+                    "`{trimmed}` is not on the {} command whitelist",
+                    role.name()
+                ),
+            ))
+        }
     }
 
     fn record_activity(&self, session_id: &str) -> bool {
@@ -400,17 +527,21 @@ impl Connection {
             }
         };
 
-        // Parse auth JSON: {"token":"..."}
-        let token = match serde_json::from_str::<serde_json::Value>(&auth_msg) {
-            Ok(v) => v
-                .get("token")
-                .and_then(|t| t.as_str())
-                .unwrap_or("")
-                .to_string(),
-            Err(_) => auth_msg.to_string(), // fallback: raw token
+        // Parse auth JSON: {"token":"...", "role":"bridge"}
+        let (token, role) = match serde_json::from_str::<serde_json::Value>(&auth_msg) {
+            Ok(v) => (
+                v.get("token")
+                    .and_then(|t| t.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+                v.get("role")
+                    .and_then(|r| serde_json::from_value::<SessionRole>(r.clone()).ok())
+                    .unwrap_or_default(),
+            ),
+            Err(_) => (auth_msg.to_string(), SessionRole::default()), // fallback: raw token
         };
 
-        let session_id = match self.authenticate(&token) {
+        let session_id = match self.authenticate(&token, role) {
             Ok(id) => id,
             Err(e) => {
                 warn!("authentication failed: {e}");
@@ -649,6 +780,19 @@ impl Connection {
                 })
             }
             WsRequestKind::Ping => Some(WsResponse::pong(&req.id)),
+            WsRequestKind::Command { line } => {
+                let role = self.session_role(session_id);
+                match self.resolve_command(role, &line) {
+                    Ok((command, description)) => Some(WsResponse {
+                        id: req.id,
+                        kind: WsResponseKind::CommandResolved {
+                            command,
+                            description,
+                        },
+                    }),
+                    Err((code, message)) => Some(WsResponse::error(&req.id, &code, &message)),
+                }
+            }
         }
     }
 }
@@ -736,8 +880,15 @@ impl DaemonServer {
     }
 
     /// Authenticate a new session with the given token.
+    ///
+    /// The session gets the default role; [`Self::authenticate_as`] names one.
     pub fn authenticate(&mut self, token: &str) -> Result<String, String> {
-        let id = self.shared.lock().authenticate(token, &self.config)?;
+        self.authenticate_as(token, SessionRole::default())
+    }
+
+    /// Authenticate a new session with the given token and role.
+    pub fn authenticate_as(&mut self, token: &str, role: SessionRole) -> Result<String, String> {
+        let id = self.shared.lock().authenticate(token, role, &self.config)?;
         self.sync_session_count();
         Ok(id)
     }
@@ -814,6 +965,14 @@ impl DaemonServer {
 
         let mut cleanup_interval = tokio::time::interval(Duration::from_secs(60));
 
+        // Built once: the registry is the availability matrix a session's
+        // command resolution is checked against.
+        let commands = Arc::new({
+            let mut registry = CommandRegistry::new();
+            register_all_commands(&mut registry);
+            registry
+        });
+
         loop {
             tokio::select! {
                 accept_result = listener.accept() => {
@@ -830,6 +989,7 @@ impl DaemonServer {
                                 shared: Arc::clone(&self.shared),
                                 session_count_atomic: Arc::clone(&self.session_count_atomic),
                                 engine_factory: self.engine_factory.clone(),
+                                commands: Arc::clone(&commands),
                             };
                             tokio::spawn(async move {
                                 connection.serve(stream).await;
@@ -917,6 +1077,8 @@ async fn handle_health_request(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use coderex_commands::CommandContext;
+    use coderex_commands::registry::{CommandResult, SlashCommand};
 
     fn server_with_keys() -> DaemonServer {
         DaemonServer::with_config(ServerConfig {
@@ -1163,5 +1325,168 @@ mod tests {
         let req: WsRequest = serde_json::from_str(json).unwrap();
         assert_eq!(req.id, "r2");
         assert!(matches!(req.kind, WsRequestKind::Ping));
+    }
+
+    fn test_connection() -> Connection {
+        let mut registry = CommandRegistry::new();
+        register_all_commands(&mut registry);
+        // No production command is non-interactive *and* remote-forbidden, so
+        // without this one the role filter would be untestable: every command
+        // the non-interactive filter lets through is also remote-safe, and a
+        // test would pass whether or not the role was consulted at all.
+        registry.register(SlashCommand::local(
+            "bridge-only",
+            "a command a remote session may not have",
+            true,
+            false,
+            true,
+            Arc::new(|_ctx: &CommandContext, _args: &[String]| CommandResult::success("ok")),
+        ));
+        Connection {
+            config: ServerConfig::default(),
+            shared: Arc::new(parking_lot::Mutex::new(Shared::default())),
+            session_count_atomic: Arc::new(AtomicUsize::new(0)),
+            engine_factory: None,
+            commands: Arc::new(registry),
+        }
+    }
+
+    #[test]
+    fn a_remote_session_resolves_only_read_only_shell_commands() {
+        let connection = test_connection();
+
+        assert!(
+            connection
+                .resolve_command(SessionRole::Remote, "ls -la")
+                .is_ok()
+        );
+        assert!(
+            connection
+                .resolve_command(SessionRole::Remote, "git status")
+                .is_ok()
+        );
+
+        for refused in ["rm -rf /", "sudo ls", "curl http://evil", "mkdir x"] {
+            let denied = connection.resolve_command(SessionRole::Remote, refused);
+            assert_eq!(
+                denied.unwrap_err().0,
+                "command_not_allowed",
+                "{refused} should not resolve for a remote session"
+            );
+        }
+    }
+
+    #[test]
+    fn a_bridge_session_may_write_but_not_destroy() {
+        let connection = test_connection();
+
+        assert!(
+            connection
+                .resolve_command(SessionRole::Bridge, "mkdir x")
+                .is_ok()
+        );
+        assert!(
+            connection
+                .resolve_command(SessionRole::Bridge, "cargo build")
+                .is_ok()
+        );
+        assert!(
+            connection
+                .resolve_command(SessionRole::Bridge, "rm -rf /")
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn a_slash_command_must_be_available_to_the_role() {
+        let connection = test_connection();
+
+        // `/clear` is flagged remote-safe and bridge-safe, so both roles see it.
+        let (command, _) = connection
+            .resolve_command(SessionRole::Remote, "/clear")
+            .expect("/clear should resolve for a remote session");
+        assert_eq!(command, "clear");
+        assert!(
+            connection
+                .resolve_command(SessionRole::Bridge, "/clear")
+                .is_ok()
+        );
+
+        // `/heapdump` is non-interactive-safe in no sense, so neither role sees
+        // it — this is the non-interactive filter, not the role filter.
+        for role in [SessionRole::Remote, SessionRole::Bridge] {
+            assert_eq!(
+                connection.resolve_command(role, "/heapdump").unwrap_err().0,
+                "command_not_allowed"
+            );
+        }
+
+        // Non-interactive but not remote-safe: the role filter, on its own.
+        assert_eq!(
+            connection
+                .resolve_command(SessionRole::Remote, "/bridge-only")
+                .unwrap_err()
+                .0,
+            "command_not_allowed",
+            "a remote session got a command that is not remote-safe"
+        );
+        assert!(
+            connection
+                .resolve_command(SessionRole::Bridge, "/bridge-only")
+                .is_ok()
+        );
+
+        // Remote-safe but not bridge-safe: the other direction.
+        assert!(
+            connection
+                .resolve_command(SessionRole::Remote, "/bridge-kick")
+                .is_ok()
+        );
+        assert_eq!(
+            connection
+                .resolve_command(SessionRole::Bridge, "/bridge-kick")
+                .unwrap_err()
+                .0,
+            "command_not_allowed",
+            "a bridge session got a command that is not bridge-safe"
+        );
+    }
+
+    #[test]
+    fn an_empty_command_resolves_to_nothing() {
+        let connection = test_connection();
+        assert_eq!(
+            connection
+                .resolve_command(SessionRole::Remote, "   ")
+                .unwrap_err()
+                .0,
+            "empty_command"
+        );
+    }
+
+    #[test]
+    fn the_auth_message_may_name_a_role() {
+        let json = r#"{"token":"k","role":"bridge"}"#;
+        let value: serde_json::Value = serde_json::from_str(json).unwrap();
+        let role = value
+            .get("role")
+            .and_then(|r| serde_json::from_value::<SessionRole>(r.clone()).ok())
+            .unwrap_or_default();
+        assert_eq!(role, SessionRole::Bridge);
+        assert_eq!(role.safety_level(), crate::filter::SafetyLevel::Bridge);
+    }
+
+    #[test]
+    fn a_session_without_a_role_is_remote() {
+        let mut server = server_with_keys();
+        let id = server.authenticate("key1").unwrap();
+        assert_eq!(server.get_session(&id).unwrap().role, SessionRole::Remote);
+    }
+
+    #[test]
+    fn a_session_can_open_as_a_bridge() {
+        let mut server = server_with_keys();
+        let id = server.authenticate_as("key1", SessionRole::Bridge).unwrap();
+        assert_eq!(server.get_session(&id).unwrap().role, SessionRole::Bridge);
     }
 }

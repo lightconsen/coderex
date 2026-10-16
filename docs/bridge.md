@@ -65,14 +65,16 @@ Remote session orchestration for connecting to remote CodeRex instances or manag
 |------|--------|---------------|
 | `transport.rs` | Transport trait + InProcessTransport | Message transport abstraction, bidirectional channels |
 | `ws_transport.rs` | WebSocketTransport + BridgeTokenStore | TLS WebSocket client, token-based auth, credential persistence |
-| `heartbeat.rs` | Heartbeat, HeartbeatLoop, WsReconnector | Connection health monitoring, exponential backoff reconnect |
+| `heartbeat.rs` | Heartbeat, HeartbeatLoop, WsReconnector, SequenceCursor | Connection health monitoring, exponential backoff reconnect, downstream resume point |
+| `epoch.rs` | WriteFence, StaleEpoch | Monotonic worker-epoch write fence |
+| `relay.rs` | RelayApprovalGate, RelayCallBody, RelayDecision, `forwardable_headers` | Relayed-call approval binding, header forwarding policy, gateway refusal shape |
 | `state.rs` | BridgeSessionStateMachine | 11-state session lifecycle with validated transitions |
 | `permission.rs` | BridgePermissionRouter | Session-scoped Allow/Deny permission routing |
 | `poller.rs` | BridgeWorkPoller, SpawnMode | Control plane registration, capacity-aware assignment queue |
 | `spawner.rs` | BridgeSessionSpawner | Session creation: worktree, single-dir, same-dir, SSH remote |
 | `archive.rs` | BridgeArchiveWriter, BridgeCleanupManager | Versioned transcript archival, resource teardown |
 | `delta_sync.rs` | StateDelta, LamportTimestamp, ConcurrentStateTracker | Hash-based state diffing, Lamport conflict resolution |
-| `orchestrator.rs` | Bridge, BridgeConfig, BridgeEvent | Central orchestrator owning all modules, event bus |
+| `orchestrator.rs` | Bridge, BridgeConfig, BridgeEvent | Central orchestrator owning all modules, event bus, relay endpoint, transport serve loop |
 
 ## Key Types
 
@@ -165,6 +167,12 @@ Terminal states: `Completed`, `Failed`. All transitions validated with error typ
 | `complete_session()` | Drive state to Archiving → CleaningUp, archive, cleanup |
 | `fail_session()` | Mark state Failed, free capacity |
 | `request_permission()` / `respond_to_permission()` | Permission routing with event emission |
+| `handle_relay_call()` | The relay endpoint: forwarding policy, then the approval gate |
+| `handle_transport_message()` | Route one inbound frame by type |
+| `serve_transport()` | The live receive loop; sequences, routes, answers |
+| `reconnect_with_resume()` | Reconnect after `stream_end` and ask for the gap |
+| `apply_session_write()` | Epoch-fenced write-back from a worker |
+| `resume_request()` | The `resume` frame for the last delivered sequence |
 | `subscribe()` | Get `broadcast::Receiver<BridgeEvent>` |
 | `heartbeat_status()` / `active_sessions()` / `all_recovery_states()` | Observability |
 | `connection_id()` / `is_running()` / `pending_assignment_count()` / `pending_permission_count()` | Status queries |
@@ -172,6 +180,109 @@ Terminal states: `Completed`, `Failed`. All transitions validated with error typ
 **`BridgeConfig`** — `{ env_id, max_concurrent, control_plane_url, repo_root, worktree_base, session_base, archive_base, heartbeat }`.
 
 **`BridgeEvent`** — 9 broadcastable variants: `SessionSpawned`, `SessionCompleted`, `SessionFailed`, `PermissionRequested`, `PermissionResolved`, `TransportReconnecting`, `TransportReconnected`, `HeartbeatChanged`, `SessionArchived`. Event bus uses `tokio::sync::broadcast` with 256-slot channel.
+
+## The relay endpoint
+
+A cloud session does not reach this machine directly; its requests arrive
+through a gateway. Holding a permission grant is not enough at that boundary —
+the gateway has to know a call is *the one the person just confirmed*, not a
+call injected into a session that already holds a grant. The bridge is where
+those requests land, so the bridge is where the approval chain is enforced.
+
+A relayed call is a `relay_call` message on the transport protocol (the same
+`TransportMessage` JSON the WebSocket transport speaks):
+
+```json
+{
+  "type": "relay_call",
+  "correlation_id": "call_1",
+  "payload": "{\"session_id\":\"sess_1\",\"tool\":\"Bash\",\"args\":\"{\\\"command\\\":\\\"ls\\\"}\"}",
+  "metadata": {
+    "x-ccr-relay-tool-use-id": "perm_0",
+    "x-ccr-relay-approved-intent": "<base64url JSON snapshot>"
+  }
+}
+```
+
+`Bridge::handle_transport_message` routes it to `Bridge::handle_relay_call`,
+which runs the two halves of the contract in order:
+
+1. **Forwarding policy first.** `forwardable_headers` keeps only the header
+   families the relay defines (`x-frame-*`, `x-ccr-relay-*`) plus `accept` and
+   `if-match`, lowercasing what survives. Everything else — `authorization`,
+   `cookie`, `x-api-key`, anything the caller invented — is dropped before the
+   gate sees it. The allowlist is policy, not data: a pair header smuggled
+   under a name the relay does not own arrives as *no header at all*.
+2. **The gate.** The surviving headers go through
+   `RelayApprovalGate::authorize_headers`, which requires both
+   `x-ccr-relay-tool-use-id` and `x-ccr-relay-approved-intent`, decodes the
+   snapshot, and matches it against a confirmation the person gave. A
+   confirmation authorises **one** call: it is spent on success, so a replay of
+   the same pair is refused.
+
+The answer is a `relay_result` frame carrying a `RelayDecision`:
+
+```json
+{"outcome": "forward", "session_id": "sess_1", "tool": "Bash", "args": "...", "headers": {...}}
+{"outcome": "refuse",  "status": 403, "code": "write_relay_unapproved", "message": "..."}
+```
+
+A refusal is the gateway's own shape — `403` with error code
+`write_relay_unapproved` and a message telling the caller to retry so the
+confirmation card is shown again.
+
+Approvals come from `Bridge::respond_to_permission`: when the person allows a
+permission request, the request becomes the confirmation a relayed call for
+that call has to present. `withdraw_relay_approval` drops one whose request was
+cancelled.
+
+## Worker epoch write fence
+
+More than one worker can serve the same session across a restart, a reconnect,
+or a hand-over: the gateway starts a replacement while the old worker is still
+finishing its last request. `epoch::WriteFence` remembers the newest
+`worker_epoch` it has admitted for a session and refuses anything older.
+
+A worker reports state with a `session_write` frame:
+
+```json
+{"type": "session_write", "payload": "{\"session_id\":\"s1\",\"state\":\"running\"}", "metadata": {"worker_epoch": "2"}}
+```
+
+`Bridge::apply_session_write` admits the write only if `epoch >=` the fence's
+current epoch; a stale worker gets `{"accepted": false, "reason": "...", "current_epoch": 2}`
+and the session's state is left with the worker that actually owns it.
+
+## Stream resume
+
+Reconnecting with exponential backoff re-establishes the connection but not the
+stream: whatever the gateway sent while the worker was away is gone.
+`heartbeat::SequenceCursor` is the other half of the insurance. Every inbound
+frame's `sequence_num` metadata advances the cursor, and a reconnect sends a
+`resume` frame asking for the gap rather than the whole stream:
+
+```json
+{"type": "resume", "payload": "{\"from_sequence_num\": 4}", "metadata": {"last-event-id": "3"}}
+```
+
+Both spellings of the same point: `from_sequence_num` for the bridge's own
+protocol, and `Last-Event-ID` for an event stream that only knows that one.
+
+`SessionRecoveryState` now carries `last_sequence_num`, so a recovery snapshot
+says not only where a session was but where its stream had got to.
+
+## Transport serve loop
+
+`Bridge::serve_transport` is the loop the relay endpoint lives on. It receives
+frames, sequences them, routes each by type, and answers:
+
+| Inbound `type` | Answer | What happens |
+|----------------|--------|--------------|
+| `relay_call` | `relay_result` | Forwarding policy, then the approval gate |
+| `session_write` | `session_write_result` | Epoch-fenced write-back |
+| `heartbeat` | `heartbeat_ack` | Records a successful beat |
+| `stream_end` | — | Reconnect via `reconnect_with_resume` and send `resume` |
+| anything else | `error` | Unknown message type |
 
 ## Data Flow
 
@@ -226,23 +337,66 @@ Control Plane                      Bridge                          Remote/Local
 - **Event bus** — `tokio::sync::broadcast` channel (256 slots) for real-time event streaming to observers.
 - **Control plane HTTP API** — Raw HTTP/1.1 server in `coderex-server` serving register, assignments, claim, capacity, and list endpoints.
 
+## Deliberately not built
+
+- **An HTTP relay endpoint.** The reference exposes the relay over HTTP with
+  the paired headers as real request headers, and this workspace has no HTTP
+  framework (no `hyper`/`axum`/`warp`). Rather than add one, the relay contract
+  was hung on the transport protocol the bridge already speaks. The binding
+  rules, the wire format, and the refusal are unchanged; only the carrier is
+  different.
+- **A relay endpoint on the `coderex-server` WebSocket protocol.** The server's
+  WebSocket surface is a local SDK/daemon surface with its own API-key auth; it
+  is not gateway-mediated, so there is nothing there for a relayed call to
+  arrive through. The relay lives in `coderex-bridge`, which is the component a
+  gateway forwards to. The two crates are siblings with no dependency edge
+  between them, so the endpoint could not be put on the server without either
+  adding one or duplicating the gate.
+- **Actually executing a resolved command server-side.** The server enforces
+  which commands a remote/bridge session may resolve; it does not run them.
+  Execution belongs to the session's tool executor, which the daemon does not
+  own, and giving the daemon shell execution would be a new attack surface
+  rather than a port of an existing behaviour.
+- **Server-sent-events framing for the downstream.** The resume point is
+  carried as a sequence number plus `Last-Event-ID`; there is no SSE encoder in
+  this workspace and the transport is WebSocket, so the two spellings of the
+  resume point are what the gateway is given.
+- **A production driver for `Bridge::serve_transport`.** The loop is the live
+  request path — every relayed call, fenced write-back, and resume goes through
+  it — but nothing in the workspace constructs a `Bridge` to run it. `coderex
+  serve` starts `DaemonServer`; the CLI uses `coderex_bridge::transport` and
+  `TeleportManager` but never `Bridge`. So today the only caller is the
+  integration test, which drives a real `tokio-tungstenite` connection through
+  the loop. Wiring the loop into the CLI is a change to `crates/cli`, outside
+  this workstream's ownership; the endpoint itself is complete and tested
+  against the real protocol, and would come up unchanged the moment a `Bridge`
+  is run.
+
 ## Test Summary
 
 | Module | Test Count | Coverage |
 |--------|-----------|----------|
-| `transport` | 10 | InProcessTransport bidirectional messaging, timeouts, connection ID |
+| `transport` | 12 | InProcessTransport bidirectional messaging, timeouts, connection ID |
 | `ws_transport` | 7 | WebSocket connect, auth, token store CRUD, JSON roundtrip |
-| `heartbeat` | 12 | Healthy→Degraded→Lost transitions, backoff, recovery state, loop |
+| `heartbeat` | 19 | Healthy→Degraded→Lost transitions, backoff, recovery state, loop, sequence cursor |
+| `epoch` | 4 | Worker epoch write fence: newer epoch takes it, stale epoch refused |
+| `relay` | 13 | Approval binding, one-time consumption, forwarding policy, refusal shape |
 | `state` | 14 | All 11 state transitions, terminal guards, failure, history |
 | `permission` | 6 | Create/respond/query/prune, Allow/Deny, session scoping |
 | `poller` | 7 | Capacity limits, assignment queue, register, URL config |
-| `spawner` | 5 | Worktree create/remove, single session, SSH variant, non-existent cleanup |
+| `spawner` | 12 | Worktree create/remove, single session, SSH variant, non-existent cleanup |
+| `teleport` | 9 | Snapshot/restore, manifest, conflict handling |
 | `archive` | 9 | Versioning, list/load, metadata, process tracking, cleanup report |
-| `delta_sync` | 22 | Diff/apply, revision hash, JSON roundtrip, Lamport timestamps, conflict tracker, delta merge |
-| `orchestrator` | 13 | Connect/disconnect, spawn/complete lifecycle, permissions, events, recovery |
-| `control_plane` (server) | 16 | All 5 HTTP endpoints, state management, claim conflicts, 404 routing |
+| `delta_sync` | 21 | Diff/apply, revision hash, JSON roundtrip, Lamport timestamps, conflict tracker, delta merge |
+| `orchestrator` | 17 | Connect/disconnect, spawn/complete lifecycle, permissions, events, recovery, relay endpoint, write fence, resume |
+| `bridge_integration` (tests/) | 33 | Live relay call over WebSocket, refusal, stale epoch, resume cursor, end-to-end flows |
+| `control_plane` (server) | 15 | All 5 HTTP endpoints, state management, claim conflicts, 404 routing |
+| `filter` (server) | 7 | Remote/bridge shell whitelists, dangerous-command rejection |
+| `persistence` (server) | 6 | Session store roundtrip, salted fingerprints, legacy-token migration |
+| `session` (server) | 25 | Auth, roles, command resolution, rate limiting, idle cleanup, protocol |
+| `server_integration` (server, tests/) | 24 | Full WS lifecycle, auth, roles, command whitelist over the protocol |
 
-**Total: 109 bridge tests + 41 server tests = 150 tests pass.**
+**Total: 150 bridge unit + 33 bridge integration + 53 server unit + 24 server integration = 260 tests pass.**
 
 ## Dependencies
 

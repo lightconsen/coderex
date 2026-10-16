@@ -312,7 +312,10 @@ mod tests {
         assert_eq!(expand_tilde("/tmp/key").unwrap(), PathBuf::from("/tmp/key"));
         assert_eq!(expand_tilde("key").unwrap(), PathBuf::from("key"));
         // Only a bare `~` or `~/…` is expanded; `~user` is a path of its own.
-        assert_eq!(expand_tilde("~user/key").unwrap(), PathBuf::from("~user/key"));
+        assert_eq!(
+            expand_tilde("~user/key").unwrap(),
+            PathBuf::from("~user/key")
+        );
         assert_eq!(expand_tilde("~").unwrap(), home::home_dir().unwrap());
     }
 

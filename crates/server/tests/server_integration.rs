@@ -862,6 +862,128 @@ async fn session_listing_count_atomic() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
+//  13.5 Command resolution — the whitelists on the live path
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Authenticate with an explicit session role.
+async fn ws_auth_as(
+    ws: &mut tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>,
+    token: &str,
+    role: &str,
+) -> String {
+    ws_send_json(ws, &serde_json::json!({"token": token, "role": role})).await;
+    let text = ws_recv_text(ws).await;
+    let parsed: serde_json::Value = serde_json::from_str(&text).unwrap();
+    let session_id = parsed
+        .get("session_id")
+        .and_then(|v| v.as_str())
+        .unwrap()
+        .to_string();
+    let ready = ws_recv_text(ws).await;
+    let ready: serde_json::Value = serde_json::from_str(&ready).unwrap();
+    assert_eq!(ready["event"], "session_ready");
+    session_id
+}
+
+async fn resolve_command(
+    ws: &mut tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>,
+    id: &str,
+    line: &str,
+) -> serde_json::Value {
+    ws_send_json(
+        ws,
+        &serde_json::json!({"id": id, "type": "command", "line": line}),
+    )
+    .await;
+    serde_json::from_str(&ws_recv_text(ws).await).unwrap()
+}
+
+fn command_test_config() -> ServerConfig {
+    ServerConfig {
+        valid_keys: vec!["key".into()],
+        idle_timeout: Duration::from_secs(3600),
+        max_sessions: 10,
+        rate_limit_per_minute: 100,
+        health_port: None,
+        persist_path: None,
+        allow_anonymous: false,
+    }
+}
+
+/// A remote session cannot resolve a command off the whitelist, and the
+/// refusal comes back over the same protocol the request arrived on.
+#[tokio::test]
+async fn a_remote_session_resolves_only_whitelisted_commands() {
+    let addr = start_server(command_test_config()).await;
+    let mut ws = ws_connect(addr).await;
+    ws_auth(&mut ws, "key").await;
+
+    let resolved = resolve_command(&mut ws, "c1", "ls -la").await;
+    assert_eq!(resolved["type"], "command_resolved", "{resolved}");
+    assert_eq!(resolved["command"], "ls -la");
+
+    let refused = resolve_command(&mut ws, "c2", "rm -rf /").await;
+    assert_eq!(refused["type"], "error", "{refused}");
+    assert_eq!(refused["code"], "command_not_allowed");
+}
+
+#[tokio::test]
+async fn a_remote_session_cannot_resolve_a_command_that_writes() {
+    let addr = start_server(command_test_config()).await;
+    let mut ws = ws_connect(addr).await;
+    ws_auth(&mut ws, "key").await;
+
+    let refused = resolve_command(&mut ws, "c1", "mkdir scratch").await;
+    assert_eq!(refused["code"], "command_not_allowed", "{refused}");
+}
+
+#[tokio::test]
+async fn a_bridge_session_gets_the_wider_whitelist() {
+    let addr = start_server(command_test_config()).await;
+    let mut ws = ws_connect(addr).await;
+    ws_auth_as(&mut ws, "key", "bridge").await;
+
+    // Writes are allowed inside a bridge session's working directory.
+    let resolved = resolve_command(&mut ws, "c1", "mkdir scratch").await;
+    assert_eq!(resolved["type"], "command_resolved", "{resolved}");
+
+    // Destruction is not, at either level.
+    let refused = resolve_command(&mut ws, "c2", "rm -rf /").await;
+    assert_eq!(refused["code"], "command_not_allowed", "{refused}");
+}
+
+/// Slash commands are gated by the registry's availability matrix, not by the
+/// shell-command whitelist.
+#[tokio::test]
+async fn slash_commands_are_gated_by_availability() {
+    let addr = start_server(command_test_config()).await;
+
+    // A remote session sees the commands flagged remote-safe.
+    let mut remote = ws_connect(addr).await;
+    ws_auth_as(&mut remote, "key", "remote").await;
+
+    let resolved = resolve_command(&mut remote, "c1", "/clear").await;
+    assert_eq!(resolved["type"], "command_resolved", "{resolved}");
+    assert_eq!(resolved["command"], "clear");
+
+    // `/bridge-kick` is remote-safe, so a remote session still gets it.
+    let kick = resolve_command(&mut remote, "c2", "/bridge-kick").await;
+    assert_eq!(kick["type"], "command_resolved", "{kick}");
+
+    // `/heapdump` is not non-interactive-safe, so nobody gets it.
+    let refused = resolve_command(&mut remote, "c3", "/heapdump").await;
+    assert_eq!(refused["code"], "command_not_allowed", "{refused}");
+
+    // A bridge session does not: the same command is not bridge-safe. This is
+    // the role filter, not the non-interactive one — `/bridge-kick` passes the
+    // latter for every role.
+    let mut bridge = ws_connect(addr).await;
+    ws_auth_as(&mut bridge, "key", "bridge").await;
+    let refused = resolve_command(&mut bridge, "c4", "/bridge-kick").await;
+    assert_eq!(refused["code"], "command_not_allowed", "{refused}");
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
 //  Cross-cutting: Full WebSocket lifecycle
 // ═══════════════════════════════════════════════════════════════════════════
 

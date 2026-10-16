@@ -4,6 +4,7 @@
 
 pub mod archive;
 pub mod delta_sync;
+pub mod epoch;
 pub mod heartbeat;
 pub mod orchestrator;
 pub mod permission;

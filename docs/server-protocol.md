@@ -9,6 +9,24 @@ CodeRex daemon server communicates over WebSocket using a structured JSON protoc
 3. Server responds with `{"session_id": "sess_N"}` or `{"error": "..."}`.
 4. After authentication, server sends an `event: "session_ready"` message.
 
+### Session role
+
+The authentication message may name the role the session opens as:
+
+```json
+{"token": "your-api-key", "role": "bridge"}
+```
+
+| Role | Command surface |
+|------|-----------------|
+| `remote` (default) | read-only shell commands only |
+| `bridge` | read-only plus limited filesystem writes |
+
+The role decides what `command` requests (below) can resolve to. It is a
+statement by the client, not a credential: it narrows what the session may do,
+never widens it, so a client that asks for `remote` gets no less than it
+would have anyway.
+
 ## Client → Server Requests
 
 Every request has an `id` (string) for correlation and a `type` field:
@@ -28,6 +46,22 @@ Every request has an `id` (string) for correlation and a `type` field:
 {"id": "req_3", "type": "ping"}
 ```
 
+### Command
+```json
+{"id": "req_4", "type": "command", "line": "ls -la"}
+```
+
+`line` is what the client typed. A line starting with `/` is a slash command
+and is resolved against the command registry's availability matrix for the
+session's role; anything else is a shell command and is resolved against the
+role's command whitelist (read-only for `remote`, read-only plus limited
+writes for `bridge`). A command that is not on the role's whitelist does not
+resolve: the server answers `command_not_allowed` and the caller has nothing
+to run.
+
+The server enforces the whitelist; it does not run the command. Execution
+belongs to the session's own tool executor, which the daemon does not own.
+
 ## Server → Client Responses
 
 Every response echoes the request `id` and includes a `type` field:
@@ -45,6 +79,11 @@ Every response echoes the request `id` and includes a `type` field:
 ### Pong
 ```json
 {"id": "req_3", "type": "pong"}
+```
+
+### Command Resolved
+```json
+{"id": "req_4", "type": "command_resolved", "command": "ls -la", "description": "allowed by the command whitelist"}
 ```
 
 ### Error
@@ -86,6 +125,10 @@ Events are unsolicited messages (not correlated to a request):
 | `auth_timeout` | Authentication message timed out |
 | `invalid_token` | API key not recognized |
 | `max_sessions` | Server at capacity |
+| `no_engine` | Query sent to a server started without an engine |
+| `query_failed` | The engine could not finish the query |
+| `empty_command` | A `command` request with nothing in `line` |
+| `command_not_allowed` | The command is not on the session role's whitelist |
 
 ## Health Endpoint
 
@@ -105,15 +148,29 @@ Response:
 ```typescript
 interface WsRequest {
   id: string;
-  type: "query" | "interrupt" | "ping";
+  type: "query" | "interrupt" | "ping" | "command";
   content?: string;
+  line?: string;
+}
+
+interface WsAuth {
+  token: string;
+  role?: "remote" | "bridge";
 }
 
 interface WsResponse {
   id: string;
-  type: "query_ok" | "query_done" | "pong" | "error" | "stream_chunk";
+  type:
+    | "query_ok"
+    | "query_done"
+    | "pong"
+    | "command_resolved"
+    | "error"
+    | "stream_chunk";
   content?: string;
   chunk?: string;
+  command?: string;
+  description?: string;
   code?: string;
   message?: string;
 }
