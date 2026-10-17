@@ -9,7 +9,7 @@ Implements the tool trait system, registers built-in tools, and provides executi
 ### Key Types
 
 - **`Tool` trait** (`tool.rs`) — Core abstraction: `descriptor()` returns metadata, `capabilities()` returns what the tool declares about itself, `execute()` runs the tool. All tools implement this via `async_trait`.
-- **`ToolDescriptor`** (`tool.rs`) — Metadata: name, tier (Baseline/FeatureGated/DynamicMcp/Internal), input/output JSON schemas, approval requirement, read-only flag, concurrency safety, interrupt behavior.
+- **`ToolDescriptor`** (`tool.rs`) — Metadata: name, tier (Baseline/FeatureGated/DynamicMcp), input/output JSON schemas, approval requirement, read-only flag, concurrency safety, interrupt behavior.
 - **`ToolCapabilities`** (`tool.rs`) — What a tool declares that has no home in `ToolDescriptor`: `max_result_size_chars`, `rule_content_field`, `backgrounding`, `ignores_whole_tool_allow_rule`, `suppresses_always_allow_rule`. Reached through the defaulted `Tool::capabilities()` method rather than four more `ToolDescriptor` fields, because `ToolDescriptor` is built with a struct literal at 100+ sites across the workspace, several in crates `coderex-tools` does not own. Every default is the pre-existing behaviour, so a tool that declares nothing is unchanged.
 - **`ToolContext`** (`tool.rs:84`) — Runtime context: `execution_context` (Normal, AsyncAgent, CoordinatorMode, InProcessTeam, PlanMode, ReplOnly, HeadlessSdk, RemoteBridge), `cwd`, and `extra` shared state map (`Arc<HashMap<String, SharedState>>`).
 - **`ToolInput`** (`tool.rs:37`) — `call_id`, `name`, JSON `arguments`.
@@ -93,7 +93,7 @@ Seven tiers, mirroring the reference's `maxResultSizeChars`. A tool declares one
 ### Architecture Patterns
 
 - **Trait-based plugin system** — All tools implement `Tool` with `async_trait`. The trait is object-safe and tools are stored as `Arc<dyn Tool>`.
-- **Tier-based gating** — Tools classified by `ToolTier`: `Baseline` (always available), `FeatureGated` (disabled by default), `DynamicMcp` (discovered at runtime), `Internal` (debugging).
+- **Tier-based gating** — Tools classified by `ToolTier`: `Baseline` (always available), `FeatureGated` (disabled by default), `DynamicMcp` (discovered at runtime).
 - **Concurrent registry** — `DashMap<String, Arc<dyn Tool>>` for thread-safe tool lookup. Supports deny rules (`deny_list`) and tier filtering.
 - **Shared state injection** — `RegistryToolDispatcher` injects shared services into `ToolContext.extra` before execution:
   - `"sandbox_config"` → `SandboxConfig` (per-tool policy from `sandbox_policy.rs`)

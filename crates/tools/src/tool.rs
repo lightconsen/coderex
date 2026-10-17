@@ -29,8 +29,6 @@ pub enum ToolTier {
     FeatureGated,
     /// Dynamically discovered via MCP.
     DynamicMcp,
-    /// Internal/debugging tools.
-    Internal,
 }
 
 /// A graded per-tool cap on how many characters of output a tool may return.

@@ -126,7 +126,7 @@ impl ToolRegistry {
     pub fn register(&mut self, tool: BoxedTool) {
         let descriptor = tool.descriptor();
         match descriptor.tier {
-            ToolTier::Baseline | ToolTier::Internal => {
+            ToolTier::Baseline => {
                 self.baseline.insert(descriptor.name, tool);
             }
             ToolTier::FeatureGated => {
