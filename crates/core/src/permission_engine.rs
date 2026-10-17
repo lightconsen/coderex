@@ -174,6 +174,19 @@ pub struct PermissionEngine {
     rule_exemptions: Option<Box<RuleExemptionsResolver>>,
 }
 
+/// The denial to report when nobody answered.
+///
+/// `None` from the bus means the confirmation channel closed before a decision
+/// arrived — not that the person refused. Inventing "denied by user" there
+/// makes a vanished UI indistinguishable from a real refusal.
+fn unanswered_ask(tool_name: &str) -> PermissionResult {
+    PermissionResult::Deny {
+        reason: format!(
+            "tool '{tool_name}' needs approval, but the confirmation channel closed before an answer arrived"
+        ),
+    }
+}
+
 impl PermissionEngine {
     /// Create a new permission engine with the given checker.
     #[must_use]
@@ -381,9 +394,15 @@ impl PermissionEngine {
                             }
                             PermissionResult::Allow
                         }
-                        Some(ConfirmationResponse::Denied) | None => PermissionResult::Deny {
+                        Some(ConfirmationResponse::Denied) => PermissionResult::Deny {
                             reason: format!("tool '{}' denied by user", tool_name),
                         },
+                        // A closed channel is not a decision. The elevation
+                        // path already tells these apart (`abandon_pending_elevation`);
+                        // this is the ordinary Ask path catching up, so a
+                        // transcript or a headless caller is not told a person
+                        // said no when nobody was asked.
+                        None => unanswered_ask(tool_name),
                     }
                 } else {
                     result
@@ -1092,6 +1111,19 @@ mod tests {
             .await
             .unwrap();
         assert!(result.is_none());
+    }
+
+    /// A missing answer is not a decision. The arm is defensive — the engine
+    /// holds a bus clone, so today the channel cannot close mid-request — but
+    /// the wording must not invent a refusal if it ever becomes reachable.
+    #[test]
+    fn an_unanswered_ask_is_not_reported_as_a_user_denial() {
+        let result = unanswered_ask("bash");
+        let PermissionResult::Deny { reason } = result else {
+            panic!("an unanswered ask closes the operation");
+        };
+        assert!(reason.contains("closed"), "{reason}");
+        assert!(!reason.contains("by user"), "a person was not asked: {reason}");
     }
 
     #[tokio::test]
