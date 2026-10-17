@@ -3427,7 +3427,7 @@ impl QueryEngine {
                     .await;
                 if !fail_result.errors.is_empty() {
                     tracing::warn!(
-                        "PostToolUseFail hook errors for {}: {:?}",
+                        "PostToolUseFailure hook errors for {}: {:?}",
                         call.name,
                         fail_result.errors
                     );
@@ -3459,7 +3459,7 @@ impl QueryEngine {
                     .await;
                 if !fail_result.errors.is_empty() {
                     tracing::warn!(
-                        "PostToolUseFail hook errors for {}: {:?}",
+                        "PostToolUseFailure hook errors for {}: {:?}",
                         call.name,
                         fail_result.errors
                     );

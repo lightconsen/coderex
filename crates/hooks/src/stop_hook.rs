@@ -155,6 +155,7 @@ mod tests {
             timeout_ms: 5000,
             priority: 0,
             dry_run: false,
+            stream: false,
             max_cpu_seconds: None,
             max_memory_mb: None,
             max_file_size_mb: None,

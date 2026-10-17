@@ -1233,7 +1233,11 @@ mod windows_impl {
                     limit_flags |= JOB_OBJECT_LIMIT_JOB_TIME;
                 }
 
-                if limit_flags != 0 {
+                // Memory is a flag on the extended structure rather than one
+                // that was set above, so a memory-only configuration must
+                // enter here too; otherwise it silently applies no limit.
+                let has_limits = limit_flags != 0 || self.config.max_memory_bytes.is_some();
+                if has_limits {
                     basic.LimitFlags = limit_flags;
                     let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
                     info.BasicLimitInformation = basic;

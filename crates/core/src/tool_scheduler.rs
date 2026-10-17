@@ -185,7 +185,7 @@ pub async fn run_tool_calls(
                     .await;
                 if !fail_result.errors.is_empty() {
                     tracing::warn!(
-                        "PostToolUseFail hook errors for {}: {:?}",
+                        "PostToolUseFailure hook errors for {}: {:?}",
                         call.name,
                         fail_result.errors
                     );
@@ -226,7 +226,7 @@ pub async fn run_tool_calls(
                     .await;
                 if !fail_result.errors.is_empty() {
                     tracing::warn!(
-                        "PostToolUseFail hook errors for {}: {:?}",
+                        "PostToolUseFailure hook errors for {}: {:?}",
                         call.name,
                         fail_result.errors
                     );

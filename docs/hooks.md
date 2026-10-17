@@ -15,7 +15,7 @@ prints a JSON result on stdout; a `PreToolUse` hook can deny a tool, a
   also carries the injected [`HookActionRunner`], if the session supplied one.
 - **`HookConfig`** (`engine.rs`) — one hook: `event`, `type`, `command`,
   `http`, `prompt`, `model`, `mcp`, `env`, `cwd`, `timeout_ms`, `priority`,
-  `dry_run`, the `ulimit` limits, and `tier`.
+  `dry_run`, `stream`, the resource limits, and `tier`.
 - **`HookTier`** (`engine.rs`) — `Managed` / `Plugin` / `Core`. Decides chain
   order; see below.
 - **`HookType`** (`engine.rs`) — the `type` discriminator: `Command`, `Http`,
@@ -30,11 +30,14 @@ prints a JSON result on stdout; a `PreToolUse` hook can deny a tool, a
 - **`HookResult`** / **`HookAction`** / **`HookPermissionDecision`**
   (`events.rs`) — what a hook answered.
 - **`HookExecutionResult`** (`engine.rs`) — a parsed result plus stdout, stderr,
-  exit code.
+  exit code, and the progress events the hook emitted before its answer.
 - **`HookError`** (`events.rs`) — typed failure: `Timeout`, `SpawnFailed`,
-  `InputNotDelivered`, `NoOutput`, `UnparseableOutput`, `ExecutionFailed`,
-  `InvalidCommand`, `JsonError`, `InvalidPromptHook`, `InvalidMcpToolHook`,
-  `InterpolationFailed`, `MissingActionRunner`.
+  `InputNotDelivered`, `NoOutput`, `UnparseableOutput`, `OutputTooLarge`,
+  `ExecutionFailed`, `InvalidCommand`, `JsonError`, `InvalidPromptHook`,
+  `InvalidMcpToolHook`, `InterpolationFailed`, `MissingActionRunner`.
+- **`HookRequestHandler`** / **`HookHostRequest`** / **`HookStreamEvent`**
+  (`stream.rs`) — the bidirectional protocol: a `stream: true` hook may ask the
+  host a question while it runs, and may report progress before its answer.
 - **`HookFireResult`** (`crates/core/src/hook_executor.rs`) — the aggregate a
   firing site reads: `stop`, `updated_input`, `errors`, and `failed`.
 
@@ -253,47 +256,72 @@ and the matching side cannot drift.
 ## Execution model
 
 - **Subprocess.** A `command` hook runs via `sh -c` with the `HookInput` JSON on
-  stdin and a `HookResult` JSON on stdout.
+  stdin and a `HookResult` JSON on stdout. Unless the hook sets `stream: true`,
+  stdin is closed after the input, so a hook that reads stdin to EOF (for
+  example `sys.stdin.read()`) sees that EOF.
 - **Timeout.** Each hook is wrapped in `tokio::time::timeout` with
-  `timeout_ms` (default 5000).
+  `timeout_ms` (default 5000). A timed-out hook is killed (`kill_on_drop`);
+  with `stream: true` a best-effort `{"type":"cancel"}` is written first.
 - **Sync / async.** `execute_sync` runs hooks in chain order, sequentially;
   `execute_async` spawns them as tasks. `fire_hook` uses the sequential path so
   tier/priority order is meaningful.
-- **Sandboxing.** Optional `ulimit` limits on CPU time (`max_cpu_seconds`),
-  address space (`max_memory_mb`), and file size (`max_file_size_mb`), injected
-  into the shell command prefix.
+- **Resource limits.** `max_cpu_seconds` (`RLIMIT_CPU`) and
+  `max_file_size_mb` (`RLIMIT_FSIZE`) are installed in `pre_exec`, before the
+  hook program runs, so `ulimit -f unlimited` inside the hook cannot raise
+  them. `max_memory_mb` (`RLIMIT_AS`) is Linux-only: macOS rejects that limit,
+  and OS-sandbox memory confinement there is a separate, not-yet-applied layer.
+  Windows uses a Job Object through `coderex_core::sandbox`.
+- **Streaming protocol.** With `stream: true`, stdout is line-delimited JSON.
+  A line without a control `type` is the answer (the historical contract,
+  unchanged). Before it a hook may emit `{"type":"log",...}`,
+  `{"type":"event",...}`, and `{"type":"request","id":N,"method":...}`. The
+  host answers the request on stdin with `{"type":"response","id":N,...}` —
+  through the session's `HookRequestHandler`, or with `-32601` when none is
+  installed. The first line on stdin is always the `HookInput`.
+- **Output bounds.** One stdout line is capped at 1 MiB and the whole output at
+  4 MiB; stderr is drained completely but only the first 1 MiB is kept. A hook
+  cannot exhaust the host's memory through a pipe.
 - **Dry-run.** `dry_run: true` executes the hook but suppresses its `stop`
   action — useful for testing a hook without letting it block work.
 - **Logging.** Every execution logs `hook_command`, `event`, `duration_ms`,
-  `exit_code`, and `error` via `tracing`.
+  `exit_code`, and `error` via `tracing`; protocol `log` and `event` lines are
+  logged as they arrive.
 
-## Worker isolation — a deliberate ⚪ difference
+## Worker isolation
 
 Claude runs plugin function-hooks in dedicated `worker_threads` with a
 bidirectional protocol (26 message types plus `SharedArrayBuffer` timestamps).
-CodeRex does not, and should not copy this:
+CodeRex does not copy the thread: its hooks are already a **separate OS
+process**, which is stronger isolation than a worker thread — a worker shares
+the address space, a subprocess does not. The two capabilities that protocol
+provides are implemented in process-appropriate form instead:
 
-- Claude's function-hooks are **in-process** JavaScript modules; a worker thread
-  is how Claude isolates them from the host. CodeRex hooks are already a
-  **separate OS process** (`sh -c`), which is stronger isolation than a worker
-  thread — a worker shares the address space, a subprocess does not.
-- The bidirectional protocol exists in Claude to support streaming, `next`
-  middleware, and pulling results back from a worker that shares memory. CodeRex
-  hooks are one-way request/response by design; there is nothing to stream.
-- CodeRex has no in-process JS hook modules to isolate, so a worker would be a
-  second, weaker copy of isolation the subprocess boundary already provides.
+- **Kernel-enforced limits.** CPU, file size and (on Linux) address space are
+  set in `pre_exec`, so they are part of the child's credentials before exec and
+  cannot be raised by the hook itself. Windows uses a Job Object. This replaces
+  the old `ulimit` shell prefix, which a hook could undo.
+- **Bidirectional streaming.** A `stream: true` hook can emit progress events,
+  log lines, and requests; the host answers requests on stdin and may send a
+  best-effort `cancel`. The protocol is line-delimited JSON, so any language can
+  speak it. Output is read incrementally with line and total-size caps and
+  stderr is drained concurrently, so a hook cannot deadlock the host on a full
+  pipe or exhaust its memory.
 
-A bidirectional protocol here would add a lot of surface and buy nothing. The
-one-way stdin/stdout contract plus `ulimit` limits is the right shape for this
-codebase.
+**Not applied:** OS-level filesystem and network confinement (bubblewrap on
+Linux, `sandbox-exec` on macOS, AppContainer on Windows). `coderex_core::sandbox`
+already provides those primitives for shell tools; extending them to hooks is a
+recorded policy decision, not an accidental gap. Until it is applied, a hook can
+read and write whatever the session process can.
 
 ## Current status
 
 **Works:** registry and matching; chain order (tier then priority); the install
 API; all five hook kinds — `command` (stdin/stdout), `http` (POST), `prompt`
 and `agent` (one model query through an injected runner), and `mcp_tool` (one
-MCP call through the same runner); timeout; sandbox limits for `command`
-subprocesses; dry-run; fail-closed failure classification and the
+MCP call through the same runner); timeout with process kill; kernel-enforced
+CPU/file-size/address-space limits for `command` subprocesses; the
+`stream: true` protocol (events, logs, host-answered requests, best-effort
+cancel, bounded output); dry-run; fail-closed failure classification and the
 deny-on-gate behaviour; inert-event warnings; structured logging.
 
 **Not implemented:** Claude's `onFailure` knob (`continue` / `block`),
@@ -302,6 +330,6 @@ deny-on-gate behaviour; inert-event warnings; structured logging.
 minimal one, and the fail-closed policy is fixed rather than configurable. The
 four settings fields among those that a configuration can write are accepted
 and inert, with a load-time warning (see above). The action kinds also have no
-`cwd`/`env`/`ulimit` application: those are subprocess knobs, and no subprocess
-runs. `agent` is the same one-shot call as `prompt` with different defaults and
+`cwd`/`env`/resource-limit application: those are subprocess knobs, and no
+subprocess runs. `agent` is the same one-shot call as `prompt` with different defaults and
 a verifier framing rather than a multi-turn tool loop.

@@ -67,9 +67,9 @@ impl HookEvent {
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
-            // The seven events core actually fires are named by core's
-            // `hook_events` constants, so the firing side and the matching
-            // side cannot drift apart.
+            // The events core fires are named by core's `hook_events`
+            // constants, so the firing side and the matching side cannot
+            // drift apart.
             Self::PreToolUse => coderex_core::hook_events::PRE_TOOL_USE,
             Self::PostToolUse => coderex_core::hook_events::POST_TOOL_USE,
             Self::PostToolUseFailure => coderex_core::hook_events::POST_TOOL_USE_FAILURE,
@@ -270,6 +270,13 @@ pub enum HookError {
     /// The hook's output could not be parsed as a hook result.
     #[error("hook output could not be parsed: {0}")]
     UnparseableOutput(String),
+    /// The hook produced more output than the streaming protocol accepts.
+    ///
+    /// The limit exists so a hook cannot exhaust the host's memory: a pipe
+    /// gives the writer backpressure, but only if the reader bounds what it
+    /// keeps.
+    #[error("hook output exceeded the {0}-byte limit")]
+    OutputTooLarge(usize),
     /// Invalid configuration for an `http` hook.
     #[error("invalid http hook: {0}")]
     InvalidHttpHook(String),
@@ -397,8 +404,11 @@ mod tests {
             HookEvent::PostToolUse,
             HookEvent::PostToolUseFailure,
             HookEvent::UserPromptSubmit,
+            HookEvent::PermissionRequest,
+            HookEvent::PermissionDenied,
             HookEvent::PreCompact,
             HookEvent::PostCompact,
+            HookEvent::Stop,
             HookEvent::TurnEnd,
         ];
         let expected = [
@@ -406,8 +416,11 @@ mod tests {
             core_events::POST_TOOL_USE,
             core_events::POST_TOOL_USE_FAILURE,
             core_events::USER_PROMPT_SUBMIT,
+            core_events::PERMISSION_REQUEST,
+            core_events::PERMISSION_DENIED,
             core_events::PRE_COMPACT,
             core_events::POST_COMPACT,
+            core_events::STOP,
             core_events::TURN_END,
         ];
         for (event, name) in fired.iter().zip(expected) {

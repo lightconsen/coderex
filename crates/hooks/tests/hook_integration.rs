@@ -10,7 +10,10 @@ use std::collections::HashMap;
 
 use coderex_core::hook_executor::HookExecutor;
 use coderex_hooks::events::HookEvent;
-use coderex_hooks::{HookAction, HookConfig, HookInput, HookRegistry, HookTier, HookType};
+use coderex_hooks::{
+    HookAction, HookConfig, HookInput, HookRegistry, HookRequestError, HookRequestHandler,
+    HookStreamEvent, HookTier, HookType,
+};
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
@@ -29,6 +32,7 @@ fn config(event: &str, command: &str) -> HookConfig {
         timeout_ms: 5000,
         priority: 0,
         dry_run: false,
+        stream: false,
         max_cpu_seconds: None,
         max_memory_mb: None,
         max_file_size_mb: None,
@@ -51,6 +55,7 @@ fn config_with_env(event: &str, command: &str, env: HashMap<String, String>) -> 
         timeout_ms: 5000,
         priority: 0,
         dry_run: false,
+        stream: false,
         max_cpu_seconds: None,
         max_memory_mb: None,
         max_file_size_mb: None,
@@ -68,11 +73,14 @@ fn input(event: &str) -> HookInput {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-//  5.1 SessionStart — hook fires when session begins
+//  5.1 SessionStart — the registry runs a configured hook
+//
+// SessionStart is a reserved name: the engine never fires it. These tests
+// exercise `execute_sync` on the registry, not a firing site.
 // ═══════════════════════════════════════════════════════════════════════════
 
 #[tokio::test]
-async fn hook_sessionstart_fires_and_returns_continue() {
+async fn hook_sessionstart_runs_through_the_registry() {
     let mut registry = HookRegistry::new();
     registry.register(config("SessionStart", r#"echo '{"action":"continue"}'"#));
 
@@ -285,11 +293,14 @@ async fn hook_postcompact_fires_after_compaction() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-//  5.9 CwdChanged — hook fires when working directory changes
+//  5.9 CwdChanged — the registry runs a configured hook
+//
+// CwdChanged is a reserved name: the engine never fires it. This test
+// exercises `execute_sync` on the registry, not a firing site.
 // ═══════════════════════════════════════════════════════════════════════════
 
 #[tokio::test]
-async fn hook_cwdchanged_fires_on_directory_change() {
+async fn hook_cwdchanged_runs_through_the_registry() {
     let mut registry = HookRegistry::new();
     registry.register(config(
         "CwdChanged",
@@ -470,6 +481,7 @@ async fn hook_dry_run_suppresses_stop_action() {
     let mut registry = HookRegistry::new();
     registry.register(HookConfig {
         dry_run: true,
+        stream: false,
         ..config("PreToolUse", r#"echo '{"action":"stop"}'"#)
     });
 
@@ -687,6 +699,7 @@ fn http_config_with(
         timeout_ms: 5000,
         priority: 0,
         dry_run: false,
+        stream: false,
         max_cpu_seconds: None,
         max_memory_mb: None,
         max_file_size_mb: None,
@@ -993,4 +1006,117 @@ async fn an_unresolvable_mcp_tool_input_denies_on_a_gate() {
 
     assert!(result.stop, "an unresolvable argument must deny the tool");
     assert!(runner.mcp_calls().is_empty(), "the tool must not be called");
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  Streaming protocol — events, logs, and host-answered requests
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// A registry with one `stream: true` command hook.
+fn streaming_registry(command: &str) -> HookRegistry {
+    let hooks = serde_json::json!([{
+        "event": "PreToolUse",
+        "command": command,
+        "stream": true,
+        "timeout_ms": 5000,
+    }]);
+    HookRegistry::from_settings_json(&hooks).unwrap()
+}
+
+/// A path unique to this test process.
+fn scratch_path(name: &str) -> std::path::PathBuf {
+    std::env::temp_dir().join(format!("coderex-{name}-{}.tmp", std::process::id()))
+}
+
+#[tokio::test]
+async fn a_streaming_hook_reports_events_before_its_answer() {
+    let registry = streaming_registry(
+        r#"echo '{"type":"event","event":"step","data":{"n":1}}'
+           echo '{"type":"log","message":"working"}'
+           echo '{"action":"continue"}'"#,
+    );
+
+    let results = registry
+        .execute_sync(&HookEvent::PreToolUse, &input("PreToolUse"))
+        .await;
+    let result = results[0].as_ref().unwrap();
+
+    assert_eq!(
+        result.events,
+        vec![HookStreamEvent {
+            event: "step".into(),
+            data: Some(serde_json::json!({"n": 1})),
+        }]
+    );
+    assert!(matches!(result.hook_result.action, HookAction::Continue));
+}
+
+#[derive(Debug)]
+struct AnsweringHandler;
+
+impl HookRequestHandler for AnsweringHandler {
+    fn handle(
+        &self,
+        method: &str,
+        _params: Option<&serde_json::Value>,
+    ) -> Result<serde_json::Value, HookRequestError> {
+        assert_eq!(method, "context");
+        Ok(serde_json::json!({"answer": 42}))
+    }
+}
+
+/// The hook asks a question, waits on stdin, and records the answer it got.
+///
+/// The first line of stdin is the `HookInput`, exactly as in the one-way
+/// contract; host messages (here the response) follow it.
+fn asking_command(path: &std::path::Path) -> String {
+    r#"IFS= read -r initial_input
+       printf '%s\n' '{"type":"request","id":7,"method":"context","params":{}}'
+       IFS= read -r answer
+       printf '%s' "$answer" > __ANSWER_PATH__
+       printf '%s\n' '{"action":"continue"}'"#
+        .replace("__ANSWER_PATH__", &path.display().to_string())
+}
+
+#[tokio::test]
+async fn a_streaming_hook_gets_an_answer_to_its_request() {
+    let answer_path = scratch_path("hook-answer");
+    let _ = std::fs::remove_file(&answer_path);
+    let mut registry = streaming_registry(&asking_command(&answer_path));
+    registry.set_request_handler(std::sync::Arc::new(AnsweringHandler));
+
+    let results = registry
+        .execute_sync(&HookEvent::PreToolUse, &input("PreToolUse"))
+        .await;
+    let result = results[0].as_ref().unwrap();
+    assert!(matches!(result.hook_result.action, HookAction::Continue));
+
+    let answer = std::fs::read_to_string(&answer_path).unwrap();
+    let _ = std::fs::remove_file(&answer_path);
+    let answer: serde_json::Value = serde_json::from_str(&answer).unwrap();
+
+    assert_eq!(answer["type"], "response");
+    assert_eq!(answer["id"], 7);
+    assert_eq!(answer["result"]["answer"], 42);
+}
+
+#[tokio::test]
+async fn a_streaming_hook_with_no_handler_is_refused_not_left_waiting() {
+    let answer_path = scratch_path("hook-refusal");
+    let _ = std::fs::remove_file(&answer_path);
+    let registry = streaming_registry(&asking_command(&answer_path));
+
+    let results = registry
+        .execute_sync(&HookEvent::PreToolUse, &input("PreToolUse"))
+        .await;
+    let result = results[0].as_ref().unwrap();
+    assert!(matches!(result.hook_result.action, HookAction::Continue));
+
+    let answer = std::fs::read_to_string(&answer_path).unwrap();
+    let _ = std::fs::remove_file(&answer_path);
+    let answer: serde_json::Value = serde_json::from_str(&answer).unwrap();
+
+    assert_eq!(answer["type"], "response");
+    assert_eq!(answer["id"], 7);
+    assert_eq!(answer["error"]["code"], -32601);
 }

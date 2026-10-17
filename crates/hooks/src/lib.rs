@@ -5,7 +5,9 @@
 pub mod action;
 pub mod engine;
 pub mod events;
+mod sandbox;
 pub mod stop_hook;
+mod stream;
 
 pub use action::{
     AGENT_DEFAULT_MODEL, AGENT_DEFAULT_TIMEOUT_MS, ActionPrompt, HookActionRunner, McpToolHook,
@@ -17,4 +19,7 @@ pub use events::{
 };
 pub use stop_hook::{
     StopHookContext, StopHookDecision, execute_stop_hook, should_proceed_with_compact,
+};
+pub use stream::{
+    HookHostRequest, HookRequestError, HookRequestHandler, HookStreamEvent, METHOD_NOT_FOUND,
 };

@@ -5,15 +5,28 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
-use tokio::io::AsyncWriteExt;
-use tokio::process::Command;
+use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::process::{ChildStderr, ChildStdin, Command};
 
 use crate::action::{
     AGENT_DEFAULT_MODEL, AGENT_DEFAULT_TIMEOUT_MS, ActionPrompt, HookActionRunner, McpToolHook,
     PROMPT_DEFAULT_TIMEOUT_MS, interpolate_tool_input, parse_answer, substitute_arguments,
 };
 use crate::events::{HookAction, HookError, HookEvent, HookResult};
+use crate::stream::{HookMessage, HookRequestHandler, HookStreamEvent};
+use crate::{sandbox, stream};
 use coderex_core::hook_executor::{HookExecutor, HookFireResult};
+
+/// The largest single stdout line the streaming protocol accepts.
+const MAX_HOOK_LINE_BYTES: usize = 1024 * 1024;
+/// The largest amount of stdout the host will hold for one hook.
+const MAX_HOOK_OUTPUT_BYTES: usize = 4 * 1024 * 1024;
+/// The largest number of progress events kept for one hook.
+const MAX_HOOK_EVENTS: usize = 1024;
+/// The largest amount of stderr kept; the rest is drained and discarded.
+const MAX_HOOK_STDERR_BYTES: usize = 1024 * 1024;
+/// How long before the hard timeout the cancel message is sent.
+const CANCEL_LEAD_MS: u64 = 50;
 
 // ─── Hook Configuration ─────────────────────────────────────────────────────
 
@@ -191,6 +204,14 @@ pub struct HookConfig {
     /// If true, execute but ignore stop decisions (for testing).
     #[serde(default)]
     pub dry_run: bool,
+    /// Whether this hook speaks the bidirectional streaming protocol.
+    ///
+    /// `false` (the default) is the historical one-way contract: the host
+    /// writes the input and **closes stdin**, so a hook that reads stdin to
+    /// EOF sees the end. `true` keeps stdin open for `response` and `cancel`
+    /// messages; a hook that emits `request` needs it.
+    #[serde(default)]
+    pub stream: bool,
     /// Maximum CPU seconds for the hook subprocess (None = unlimited).
     #[serde(default)]
     pub max_cpu_seconds: Option<u64>,
@@ -231,36 +252,6 @@ impl HookConfig {
             return &mcp.tool;
         }
         self.prompt.as_deref().unwrap_or_default()
-    }
-}
-
-/// Build a shell command wrapper that applies resource limits via `ulimit`.
-///
-/// Returns `None` if no limits are configured.
-fn sandbox_prefix(config: &HookConfig) -> Option<String> {
-    let mut parts = Vec::new();
-
-    // RLIMIT_CPU: max CPU time in seconds (-t)
-    if let Some(cpu_secs) = config.max_cpu_seconds {
-        parts.push(format!("ulimit -t {cpu_secs}"));
-    }
-
-    // RLIMIT_FSIZE: max file size in KB (-f), convert MB → KB
-    if let Some(size_mb) = config.max_file_size_mb {
-        let size_kb = size_mb * 1024;
-        parts.push(format!("ulimit -f {size_kb}"));
-    }
-
-    // RLIMIT_AS (virtual memory): max in KB (-v), convert MB → KB
-    if let Some(mem_mb) = config.max_memory_mb {
-        let mem_kb = mem_mb * 1024;
-        parts.push(format!("ulimit -v {mem_kb}"));
-    }
-
-    if parts.is_empty() {
-        None
-    } else {
-        Some(parts.join("; "))
     }
 }
 
@@ -367,6 +358,9 @@ pub struct RawHookConfig {
     /// Dry-run mode.
     #[serde(default)]
     pub dry_run: Option<bool>,
+    /// Whether this hook speaks the bidirectional streaming protocol.
+    #[serde(default)]
+    pub stream: Option<bool>,
     /// Max CPU seconds.
     #[serde(default)]
     pub max_cpu_seconds: Option<u64>,
@@ -398,6 +392,7 @@ fn from_raw(raw: &RawHookConfig, timeout_ms: u64) -> HookConfig {
         timeout_ms,
         priority: raw.priority.unwrap_or(0),
         dry_run: raw.dry_run.unwrap_or(false),
+        stream: raw.stream.unwrap_or(false),
         max_cpu_seconds: raw.max_cpu_seconds,
         max_memory_mb: raw.max_memory_mb,
         max_file_size_mb: raw.max_file_size_mb,
@@ -442,12 +437,14 @@ fn warn_about_unimplemented_fields(raw: &RawHookConfig) {
 pub struct HookExecutionResult {
     /// Parsed hook result from stdout.
     pub hook_result: HookResult,
-    /// Standard output from the hook subprocess.
+    /// Standard output from the hook subprocess (the protocol lines it wrote).
     pub stdout: String,
     /// Standard error from the hook subprocess.
     pub stderr: String,
     /// Exit code from the hook subprocess.
     pub exit_code: i32,
+    /// Progress events the hook emitted before its answer, in order.
+    pub events: Vec<HookStreamEvent>,
 }
 
 // ─── Hook Input (serialized to stdin) ───────────────────────────────────────
@@ -473,6 +470,9 @@ pub struct HookRegistry {
     /// Supplied by the session that owns a model client or the MCP registry;
     /// see [`HookActionRunner`].
     action_runner: Option<Arc<dyn HookActionRunner>>,
+    /// Supplied by the session when it can answer a hook's inbound request;
+    /// without one the request is refused with `-32601`.
+    request_handler: Option<Arc<dyn HookRequestHandler>>,
 }
 
 impl std::fmt::Debug for HookRegistry {
@@ -480,6 +480,7 @@ impl std::fmt::Debug for HookRegistry {
         f.debug_struct("HookRegistry")
             .field("hooks", &self.hooks)
             .field("action_runner", &self.action_runner.is_some())
+            .field("request_handler", &self.request_handler.is_some())
             .finish()
     }
 }
@@ -495,6 +496,7 @@ impl HookRegistry {
         Self {
             hooks: Vec::new(),
             action_runner: None,
+            request_handler: None,
         }
     }
 
@@ -513,6 +515,22 @@ impl HookRegistry {
     /// an allow.
     pub fn set_action_runner(&mut self, runner: Arc<dyn HookActionRunner>) {
         self.action_runner = Some(runner);
+    }
+
+    /// Install the handler for requests a hook makes while it runs.
+    ///
+    /// The streaming protocol lets a `command` hook ask the host a question
+    /// (`{"type":"request",...}`) and wait for an answer on stdin. Without a
+    /// handler every such request is refused with `-32601`, which is an
+    /// answer — the hook is never left waiting.
+    pub fn set_request_handler(&mut self, handler: Arc<dyn HookRequestHandler>) {
+        self.request_handler = Some(handler);
+    }
+
+    /// The installed request handler, if any.
+    #[must_use]
+    pub fn request_handler(&self) -> Option<Arc<dyn HookRequestHandler>> {
+        self.request_handler.clone()
     }
 
     /// The runner installed on this registry, if any.
@@ -643,6 +661,7 @@ impl HookRegistry {
         Ok(Self {
             hooks,
             action_runner: None,
+            request_handler: None,
         })
     }
 
@@ -764,8 +783,13 @@ impl HookRegistry {
         let matching = self.matches_for_event_name(event_name);
         let mut results = Vec::new();
         for hook in matching {
-            let result =
-                execute_hook_with_timeout(hook, input, self.action_runner.as_deref()).await;
+            let result = execute_hook_with_timeout(
+                hook,
+                input,
+                self.action_runner.as_deref(),
+                self.request_handler.as_deref(),
+            )
+            .await;
             results.push(result);
         }
         results
@@ -780,8 +804,13 @@ impl HookRegistry {
         let matching = self.matches_for_event(event);
         let mut results = Vec::new();
         for hook in matching {
-            let result =
-                execute_hook_with_timeout(hook, input, self.action_runner.as_deref()).await;
+            let result = execute_hook_with_timeout(
+                hook,
+                input,
+                self.action_runner.as_deref(),
+                self.request_handler.as_deref(),
+            )
+            .await;
             results.push(result);
         }
         results
@@ -799,8 +828,10 @@ impl HookRegistry {
             let hook = hook.clone();
             let input = input.clone();
             let runner = self.action_runner.clone();
+            let requests = self.request_handler.clone();
             let handle = tokio::spawn(async move {
-                execute_hook_with_timeout(&hook, &input, runner.as_deref()).await
+                execute_hook_with_timeout(&hook, &input, runner.as_deref(), requests.as_deref())
+                    .await
             });
             handles.push(handle);
         }
@@ -880,6 +911,7 @@ async fn execute_hook_with_timeout(
     hook: &HookConfig,
     input: &HookInput,
     action_runner: Option<&dyn HookActionRunner>,
+    request_handler: Option<&dyn HookRequestHandler>,
 ) -> Result<HookExecutionResult, HookError> {
     let start = std::time::Instant::now();
 
@@ -892,9 +924,14 @@ async fn execute_hook_with_timeout(
     }
 
     let timeout_ms = hook.timeout_ms;
+    // Leave a sliver of the timeout for the cancel message: writing it and
+    // then killing is a best-effort courtesy, and it can only happen before
+    // the hard timeout does.
+    let stream_deadline = tokio::time::Instant::now()
+        + std::time::Duration::from_millis(timeout_ms.saturating_sub(CANCEL_LEAD_MS).max(1));
     let execution = async {
         match hook.kind {
-            HookType::Command => execute_hook(hook, input).await,
+            HookType::Command => execute_hook(hook, input, request_handler, stream_deadline).await,
             HookType::Http => execute_http_hook(hook, input).await,
             HookType::Prompt => execute_prompt_hook(hook, input, action_runner, false).await,
             HookType::Agent => execute_prompt_hook(hook, input, action_runner, true).await,
@@ -953,31 +990,64 @@ async fn execute_hook_with_timeout(
 async fn execute_hook(
     hook: &HookConfig,
     input: &HookInput,
+    request_handler: Option<&dyn HookRequestHandler>,
+    deadline: tokio::time::Instant,
 ) -> Result<HookExecutionResult, HookError> {
     let input_json = serde_json::to_string(input)?;
     let env = build_hook_env(hook, input);
 
-    // Wrap command with sandbox limits if configured.
-    let shell_cmd = match sandbox_prefix(hook) {
-        Some(prefix) => format!("{prefix}; {command}", command = hook.command),
-        None => hook.command.clone(),
-    };
-
-    let mut child = Command::new("sh")
+    let mut command = Command::new("sh");
+    command
         .arg("-c")
-        .arg(&shell_cmd)
+        .arg(&hook.command)
         .envs(&env)
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
+        // A timeout (or any dropped execution) must not leave the hook
+        // running; the timeout future is dropped, not awaited.
+        .kill_on_drop(true);
+
+    // Limits are installed before exec, so the hook cannot raise them.
+    sandbox::apply_resource_limits(&mut command, hook);
+
+    #[cfg(target_os = "windows")]
+    let job = sandbox::prepare_windows_limits(hook);
+
+    let mut child = command
         .spawn()
         .map_err(|e| HookError::SpawnFailed(e.to_string()))?;
+
+    #[cfg(target_os = "windows")]
+    if let Some(job) = &job {
+        sandbox::assign_windows_limits(job, &child);
+    }
+
+    let mut stdin = child.stdin.take();
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| HookError::SpawnFailed("hook stdout was not piped".to_string()))?;
+    // Draining stderr concurrently is not optional: a hook that fills the
+    // stderr pipe blocks forever if nobody reads it while stdout is read.
+    let stderr_task = tokio::spawn(read_stderr(child.stderr.take()));
 
     // Deliver the input. See `classify_input_write`: a hook that closes stdin
     // without reading it has declined its input (benign); any other write error
     // means the input genuinely did not arrive (fail closed).
-    if let Some(mut stdin) = child.stdin.take() {
-        let write = stdin.write_all(input_json.as_bytes()).await;
+    if let Some(pipe) = stdin.as_mut() {
+        let write: std::io::Result<()> = async {
+            pipe.write_all(input_json.as_bytes()).await?;
+            // In streaming mode the input is the first *line* of a
+            // line-delimited protocol, so it needs a terminator before any
+            // response can follow. The one-way contract keeps the exact
+            // bytes it always had.
+            if hook.stream {
+                pipe.write_all(b"\n").await?;
+            }
+            Ok(())
+        }
+        .await;
         if let Err(e) = &write {
             if e.kind() == std::io::ErrorKind::BrokenPipe {
                 tracing::debug!(
@@ -990,36 +1060,199 @@ async fn execute_hook(
         classify_input_write(write)?;
     }
 
-    // Collect stdout and stderr
-    let output = child
-        .wait_with_output()
-        .await
-        .map_err(|e| HookError::SpawnFailed(e.to_string()))?;
+    // The one-way contract ends stdin after the input: a hook that reads
+    // stdin to EOF (`sys.stdin.read()`) must see that EOF. Only a hook that
+    // declared `stream: true` is kept open for responses and cancel.
+    if !hook.stream {
+        stdin = None;
+    }
 
-    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-    let exit_code = output.status.code().unwrap_or(-1);
+    let mut reader = BufReader::new(stdout);
+    let mut captured = String::new();
+    let mut events = Vec::new();
+    let mut total_bytes = 0usize;
+    let mut hook_result: Option<HookResult> = None;
 
-    // A hook that did not exit cleanly did not answer.
+    loop {
+        // Read incrementally: a hook may ask a question mid-stream and wait
+        // for the answer, so buffering the whole body would deadlock.
+        let read = tokio::select! {
+            read = stream::read_line_capped(&mut reader, MAX_HOOK_LINE_BYTES) => read,
+            () = tokio::time::sleep_until(deadline) => {
+                cancel_hook(&mut stdin).await;
+                let _ = child.kill().await;
+                let _ = child.wait().await;
+                return Err(HookError::Timeout(hook.timeout_ms));
+            }
+        };
+
+        let Some(line) = read.map_err(|error| map_line_error(&error))? else {
+            break;
+        };
+
+        total_bytes = total_bytes.saturating_add(line.len());
+        if total_bytes > MAX_HOOK_OUTPUT_BYTES {
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+            return Err(HookError::OutputTooLarge(MAX_HOOK_OUTPUT_BYTES));
+        }
+
+        let line = String::from_utf8_lossy(&line);
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+
+        // Lines after the answer are drained (so the hook is not blocked on a
+        // full stdout pipe) but not interpreted: the first answer wins.
+        if hook_result.is_some() {
+            continue;
+        }
+
+        captured.push_str(trimmed);
+        captured.push('\n');
+
+        match stream::parse_message(trimmed) {
+            Err(error) => {
+                let _ = child.kill().await;
+                let _ = child.wait().await;
+                return Err(HookError::UnparseableOutput(error));
+            }
+            Ok(None) => {}
+            Ok(Some(HookMessage::Event(event))) => {
+                if events.len() < MAX_HOOK_EVENTS {
+                    tracing::debug!(
+                        hook = hook.label(),
+                        event = %event.event,
+                        "hook event"
+                    );
+                    events.push(event);
+                }
+            }
+            Ok(Some(HookMessage::Log(message))) => {
+                tracing::info!(hook = hook.label(), "hook log: {message}");
+            }
+            Ok(Some(HookMessage::Request(request))) => {
+                let answer = stream::response_line(&request, request_handler);
+                write_answer(&mut stdin, &request, &answer).await?;
+            }
+            Ok(Some(HookMessage::Result)) => {
+                // `{}` and `{"action":"continue"}` are how a hook says
+                // "continue"; unparseable output is not a silent continue.
+                hook_result = Some(
+                    parse_hook_output_line(trimmed)
+                        .map_err(|e| HookError::UnparseableOutput(e.to_string()))?,
+                );
+            }
+        }
+    }
+
+    // stdout closed, but the process may still be running. Wait for it under
+    // the same deadline: a hook that prints its answer and then hangs is a
+    // failed hook, exactly as it was when the whole output was buffered.
+    let status = if let Ok(status) = tokio::time::timeout_at(deadline, child.wait()).await {
+        status.map_err(|e| HookError::SpawnFailed(e.to_string()))?
+    } else {
+        cancel_hook(&mut stdin).await;
+        let _ = child.kill().await;
+        let _ = child.wait().await;
+        return Err(HookError::Timeout(hook.timeout_ms));
+    };
+
+    let stderr = stderr_task.await.unwrap_or_default();
+    let exit_code = status.code().unwrap_or(-1);
+
+    // A hook that did not exit cleanly did not answer, even if it printed a
+    // result first: the exit status is part of the answer.
     if exit_code != 0 {
         return Err(HookError::ExecutionFailed(exit_code));
     }
-    // Neither did one that printed nothing.
-    if stdout.trim().is_empty() {
-        return Err(HookError::NoOutput);
-    }
-    // Nor one whose output is not a hook result. `{}` and
-    // `{"action":"continue"}` are how a hook says "continue"; unparseable
-    // output is not a silent continue.
-    let hook_result =
-        parse_hook_output(&stdout).map_err(|e| HookError::UnparseableOutput(e.to_string()))?;
+
+    let hook_result = hook_result.ok_or(HookError::NoOutput)?;
 
     Ok(HookExecutionResult {
         hook_result,
-        stdout,
+        stdout: captured,
         stderr,
         exit_code,
+        events,
     })
+}
+
+/// Send one answer to a hook that asked a question.
+async fn write_answer(
+    stdin: &mut Option<ChildStdin>,
+    request: &crate::stream::HookHostRequest,
+    answer: &str,
+) -> Result<(), HookError> {
+    let Some(pipe) = stdin.as_mut() else {
+        return Err(HookError::InputNotDelivered(format!(
+            "the hook asked '{}' but did not declare `stream: true`, so its stdin is closed \
+             and the answer cannot be delivered",
+            request.method
+        )));
+    };
+
+    let mut payload = answer.to_string();
+    payload.push('\n');
+    pipe.write_all(payload.as_bytes()).await.map_err(|error| {
+        HookError::InputNotDelivered(format!(
+            "the answer to '{}' could not be delivered: {error}",
+            request.method
+        ))
+    })?;
+    pipe.flush().await.map_err(|error| {
+        HookError::InputNotDelivered(format!(
+            "the answer to '{}' could not be flushed: {error}",
+            request.method
+        ))
+    })
+}
+
+/// Ask a hook that has run past its deadline to stop, best effort.
+async fn cancel_hook(stdin: &mut Option<ChildStdin>) {
+    if let Some(pipe) = stdin.as_mut() {
+        let _ = pipe.write_all(stream::CANCEL_LINE.as_bytes()).await;
+        let _ = pipe.write_all(b"\n").await;
+        let _ = pipe.flush().await;
+    }
+}
+
+/// Read stderr to the end, keeping at most [`MAX_HOOK_STDERR_BYTES`].
+///
+/// The rest is still drained: refusing to read would fill the pipe and block
+/// the hook.
+async fn read_stderr(stderr: Option<ChildStderr>) -> String {
+    let Some(stderr) = stderr else {
+        return String::new();
+    };
+
+    let mut reader = BufReader::new(stderr);
+    let mut kept = Vec::new();
+    let mut chunk = [0_u8; 8192];
+
+    loop {
+        match reader.read(&mut chunk).await {
+            Ok(0) | Err(_) => break,
+            Ok(count) => {
+                let room = MAX_HOOK_STDERR_BYTES.saturating_sub(kept.len());
+                if room > 0 {
+                    kept.extend_from_slice(&chunk[..count.min(room)]);
+                }
+            }
+        }
+    }
+
+    String::from_utf8_lossy(&kept).into_owned()
+}
+
+/// Map a stdout read failure onto the hook's error type.
+fn map_line_error(error: &std::io::Error) -> HookError {
+    if error.kind() == std::io::ErrorKind::InvalidData {
+        HookError::OutputTooLarge(MAX_HOOK_LINE_BYTES)
+    } else {
+        HookError::SpawnFailed(format!("failed to read hook stdout: {error}"))
+    }
 }
 
 /// POST a hook's input to its endpoint and read the answer from the body.
@@ -1083,6 +1316,7 @@ async fn execute_http_hook(
         stdout: body,
         stderr: String::new(),
         exit_code: 0,
+        events: Vec::new(),
     })
 }
 
@@ -1125,6 +1359,7 @@ async fn execute_prompt_hook(
         stdout: answer,
         stderr: String::new(),
         exit_code: 0,
+        events: Vec::new(),
     })
 }
 
@@ -1157,6 +1392,7 @@ async fn execute_mcp_tool_hook(
         stdout: answer,
         stderr: String::new(),
         exit_code: 0,
+        events: Vec::new(),
     })
 }
 
@@ -1323,6 +1559,7 @@ mod tests {
             timeout_ms: 5000,
             priority: 0,
             dry_run: false,
+            stream: false,
             max_cpu_seconds: None,
             max_memory_mb: None,
             max_file_size_mb: None,
@@ -1351,6 +1588,7 @@ mod tests {
             timeout_ms: 5000,
             priority: 0,
             dry_run: false,
+            stream: false,
             max_cpu_seconds: None,
             max_memory_mb: None,
             max_file_size_mb: None,
@@ -1482,6 +1720,7 @@ mod tests {
             timeout_ms: 5000,
             priority: 0,
             dry_run: false,
+            stream: false,
             max_cpu_seconds: None,
             max_memory_mb: None,
             max_file_size_mb: None,
@@ -1501,6 +1740,7 @@ mod tests {
             timeout_ms: 5000,
             priority: 0,
             dry_run: false,
+            stream: false,
             max_cpu_seconds: None,
             max_memory_mb: None,
             max_file_size_mb: None,
@@ -1537,6 +1777,7 @@ mod tests {
             timeout_ms: 5000,
             priority: 0,
             dry_run: false,
+            stream: false,
             max_cpu_seconds: None,
             max_memory_mb: None,
             max_file_size_mb: None,
@@ -1592,6 +1833,7 @@ mod tests {
             timeout_ms: 5000,
             priority: 0,
             dry_run: false,
+            stream: false,
             max_cpu_seconds: None,
             max_memory_mb: None,
             max_file_size_mb: None,
@@ -1602,7 +1844,7 @@ mod tests {
             input: None,
             context: None,
         };
-        let result = execute_hook_with_timeout(&hook, &input, None)
+        let result = execute_hook_with_timeout(&hook, &input, None, None)
             .await
             .unwrap();
         assert!(matches!(result.hook_result.action, HookAction::Continue));
@@ -1628,6 +1870,7 @@ mod tests {
             timeout_ms: 5000,
             priority: 0,
             dry_run: false,
+            stream: false,
             max_cpu_seconds: None,
             max_memory_mb: None,
             max_file_size_mb: None,
@@ -1638,7 +1881,7 @@ mod tests {
             input: None,
             context: None,
         };
-        let result = execute_hook_with_timeout(&hook, &input, None).await;
+        let result = execute_hook_with_timeout(&hook, &input, None, None).await;
         assert!(matches!(result, Err(HookError::UnparseableOutput(_))));
     }
 
@@ -1659,6 +1902,7 @@ mod tests {
             timeout_ms: 50,
             priority: 0,
             dry_run: false,
+            stream: false,
             max_cpu_seconds: None,
             max_memory_mb: None,
             max_file_size_mb: None,
@@ -1669,17 +1913,27 @@ mod tests {
             input: None,
             context: None,
         };
-        let result = execute_hook_with_timeout(&hook, &input, None).await;
+        let result = execute_hook_with_timeout(&hook, &input, None, None).await;
         assert!(matches!(result, Err(HookError::Timeout(50))));
     }
 
-    #[test]
-    fn sandbox_prefix_none_when_no_limits() {
+    /// The old shell prefix could be undone by the hook itself. The limits are
+    /// installed before exec now, so `ulimit -f unlimited` inside the hook
+    /// cannot raise them and the write still fails.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_hook_cannot_raise_its_own_limits() {
+        let target =
+            std::env::temp_dir().join(format!("coderex-hook-limit-engine-{}", std::process::id()));
         let hook = HookConfig {
             event: "Test".to_string(),
             kind: HookType::Command,
             tier: HookTier::Core,
-            command: "echo test".to_string(),
+            command: format!(
+                "ulimit -f unlimited 2>/dev/null || true; \
+                 head -c 2097152 /dev/zero > {}; echo '{{}}'",
+                target.display()
+            ),
             http: None,
             prompt: None,
             model: None,
@@ -1687,41 +1941,76 @@ mod tests {
             env: HashMap::new(),
             cwd: None,
             internal: false,
-            timeout_ms: 5000,
+            timeout_ms: 10_000,
             priority: 0,
             dry_run: false,
+            stream: false,
             max_cpu_seconds: None,
+            max_memory_mb: None,
+            max_file_size_mb: Some(1),
+        };
+        let input = HookInput {
+            event: "Test".to_string(),
+            session_id: None,
+            input: None,
+            context: None,
+        };
+
+        let result = execute_hook_with_timeout(&hook, &input, None, None).await;
+        let written = std::fs::metadata(&target).map_or(0, |meta| meta.len());
+        let _ = std::fs::remove_file(&target);
+
+        assert!(
+            result.is_ok(),
+            "the hook's own answer should still be delivered: {result:?}"
+        );
+        assert!(
+            written <= 1024 * 1024,
+            "the hook raised its own file-size limit and wrote {written} bytes"
+        );
+    }
+
+    /// `RLIMIT_CPU` is enforced by the kernel, not by the hook: a busy loop is
+    /// stopped after the configured second even though the hook never checks
+    /// anything.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_hook_that_burns_cpu_past_its_limit_is_stopped() {
+        let hook = HookConfig {
+            event: "Test".to_string(),
+            kind: HookType::Command,
+            tier: HookTier::Core,
+            command: "while :; do :; done".to_string(),
+            http: None,
+            prompt: None,
+            model: None,
+            mcp: None,
+            env: HashMap::new(),
+            cwd: None,
+            internal: false,
+            timeout_ms: 10_000,
+            priority: 0,
+            dry_run: false,
+            stream: false,
+            max_cpu_seconds: Some(1),
             max_memory_mb: None,
             max_file_size_mb: None,
         };
-        assert!(sandbox_prefix(&hook).is_none());
-    }
-
-    #[test]
-    fn sandbox_prefix_with_limits() {
-        let hook = HookConfig {
+        let input = HookInput {
             event: "Test".to_string(),
-            kind: HookType::Command,
-            tier: HookTier::Core,
-            command: "echo test".to_string(),
-            http: None,
-            prompt: None,
-            model: None,
-            mcp: None,
-            env: HashMap::new(),
-            cwd: None,
-            internal: false,
-            timeout_ms: 5000,
-            priority: 0,
-            dry_run: false,
-            max_cpu_seconds: Some(10),
-            max_memory_mb: Some(256),
-            max_file_size_mb: Some(50),
+            session_id: None,
+            input: None,
+            context: None,
         };
-        let prefix = sandbox_prefix(&hook).unwrap();
-        assert!(prefix.contains("ulimit -t 10"));
-        assert!(prefix.contains("ulimit -v 262144")); // 256 * 1024
-        assert!(prefix.contains("ulimit -f 51200")); // 50 * 1024
+
+        let result = execute_hook_with_timeout(&hook, &input, None, None).await;
+        assert!(
+            matches!(
+                result,
+                Err(HookError::ExecutionFailed(_) | HookError::Timeout(_))
+            ),
+            "the CPU limit did not stop the hook: {result:?}"
+        );
     }
 
     // ─── Chain order: managed → plugin → core ───────────────────────────────
@@ -1741,6 +2030,7 @@ mod tests {
             timeout_ms: 5000,
             priority,
             dry_run: false,
+            stream: false,
             max_cpu_seconds: None,
             max_memory_mb: None,
             max_file_size_mb: None,
@@ -1998,7 +2288,7 @@ mod tests {
             r#"{"action":"continue","additional_context":"looks fine"}"#,
         );
         let hook = prompt_config(HookType::Prompt, "is this ok?");
-        let result = execute_hook_with_timeout(&hook, &action_input(), as_runner(&runner))
+        let result = execute_hook_with_timeout(&hook, &action_input(), as_runner(&runner), None)
             .await
             .unwrap();
 
@@ -2027,7 +2317,7 @@ mod tests {
             .unwrap()
             .matches_for_event(&HookEvent::PreToolUse)[0]
             .clone();
-        let result = execute_hook_with_timeout(&hook, &action_input(), as_runner(&runner))
+        let result = execute_hook_with_timeout(&hook, &action_input(), as_runner(&runner), None)
             .await
             .unwrap();
 
@@ -2060,7 +2350,7 @@ mod tests {
     async fn a_prompt_hook_sees_the_hook_input_as_arguments() {
         let runner = crate::action::FakeRunner::answering("{}");
         let hook = prompt_config(HookType::Prompt, "gate this: $ARGUMENTS");
-        execute_hook_with_timeout(&hook, &action_input(), as_runner(&runner))
+        execute_hook_with_timeout(&hook, &action_input(), as_runner(&runner), None)
             .await
             .unwrap();
 
@@ -2082,7 +2372,7 @@ mod tests {
             "path": "${tool_input.file_path}",
             "recursive": false
         }));
-        let result = execute_hook_with_timeout(&hook, &action_input(), as_runner(&runner))
+        let result = execute_hook_with_timeout(&hook, &action_input(), as_runner(&runner), None)
             .await
             .unwrap();
 
@@ -2103,7 +2393,8 @@ mod tests {
     async fn an_unresolvable_tool_input_reference_fails_the_hook() {
         let runner = crate::action::FakeRunner::answering("{}");
         let hook = mcp_config(serde_json::json!({ "path": "${tool_input.nope}" }));
-        let result = execute_hook_with_timeout(&hook, &action_input(), as_runner(&runner)).await;
+        let result =
+            execute_hook_with_timeout(&hook, &action_input(), as_runner(&runner), None).await;
 
         assert!(
             matches!(result, Err(HookError::InterpolationFailed(_))),
@@ -2186,7 +2477,7 @@ mod tests {
             let runner = crate::action::FakeRunner::answering(answer);
             let hook = prompt_config(HookType::Prompt, "ask");
             let result =
-                execute_hook_with_timeout(&hook, &action_input(), as_runner(&runner)).await;
+                execute_hook_with_timeout(&hook, &action_input(), as_runner(&runner), None).await;
             assert!(result.is_err(), "{answer:?} should not read as an answer");
         }
     }
