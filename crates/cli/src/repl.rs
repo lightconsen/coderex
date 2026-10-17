@@ -2134,34 +2134,15 @@ impl ReplLoop {
                                     continue;
                                 }
                                 if thinking {
-                                    // Tell the engine to stop before letting
-                                    // go of its result: the turn is abandoned
-                                    // *and* ended.
-                                    if let Some(handle) = self.running_query.take() {
-                                        handle.interrupt();
-                                    }
-                                    thinking = false;
-                                    phase.reset();
-                                    query_done_rx = None;
-                                    elicit_rx = None;
-                                    tui_elicit_rx = None;
-                                    self.pending_elicitation = None;
-                                    clear_permission_overlay(&mut ui_state);
-                                    if let Some(last) = ui_state
-                                        .messages
-                                        .messages
-                                        .iter_mut()
-                                        .rev()
-                                        .find(|msg| msg.role == MessageRole::Assistant && msg.streaming)
-                                    {
-                                        last.streaming = false;
-                                        let mut msg = last.content.to_string();
-                                        msg.push_str(" (interrupted)");
-                                        last.content = msg.into();
-                                    }
-                                    if let Some(ref dispatcher) = self.dispatcher {
-                                        dispatcher.set_elicit_tx(None);
-                                    }
+                                    self.stop_running_query(
+                                        &mut ui_state,
+                                        &mut thinking,
+                                        &mut phase,
+                                        &mut query_done_rx,
+                                        &mut elicit_rx,
+                                        &mut tui_elicit_rx,
+                                        " (interrupted)",
+                                    );
                                     pending_confirmation = None;
                                     continue;
                                 }
@@ -2310,6 +2291,24 @@ impl ReplLoop {
                             }
 
                             if !self.vim_mode_enabled && key.code == KeyCode::Esc {
+                                // Esc means "stop the run" whether or not Vim
+                                // mode is on. Only the Vim path used to reach
+                                // the interrupt, so in the default mode Esc did
+                                // nothing while the model was answering — the
+                                // one moment a person most wants it to.
+                                if thinking {
+                                    self.stop_running_query(
+                                        &mut ui_state,
+                                        &mut thinking,
+                                        &mut phase,
+                                        &mut query_done_rx,
+                                        &mut elicit_rx,
+                                        &mut tui_elicit_rx,
+                                        " (interrupted)",
+                                    );
+                                    pending_confirmation = None;
+                                    continue;
+                                }
                                 if ui_state.overlays.is_active() {
                                     ui_state.overlays.clear();
                                 }
@@ -2335,32 +2334,16 @@ impl ReplLoop {
                                 }
                                 VimAction::Escape => {
                                     if thinking {
-                                        if let Some(handle) = self.running_query.take() {
-                                            handle.interrupt();
-                                        }
-                                        thinking = false;
-                                        phase.reset();
-                                        query_done_rx = None;
-                                        elicit_rx = None;
-                                        tui_elicit_rx = None;
-                                        self.pending_elicitation = None;
+                                        self.stop_running_query(
+                                            &mut ui_state,
+                                            &mut thinking,
+                                            &mut phase,
+                                            &mut query_done_rx,
+                                            &mut elicit_rx,
+                                            &mut tui_elicit_rx,
+                                            " (cancelled)",
+                                        );
                                         pending_confirmation = None;
-                                        clear_permission_overlay(&mut ui_state);
-                                        if let Some(last) = ui_state
-                                            .messages
-                                            .messages
-                                            .iter_mut()
-                                            .rev()
-                                            .find(|msg| msg.role == MessageRole::Assistant && msg.streaming)
-                                        {
-                                            last.streaming = false;
-                                            let mut msg = last.content.to_string();
-                                            msg.push_str(" (cancelled)");
-                                            last.content = msg.into();
-                                        }
-                                        if let Some(ref dispatcher) = self.dispatcher {
-                                            dispatcher.set_elicit_tx(None);
-                                        }
                                     } else if vim.mode == VimMode::Normal {
                                         ui_state.overlays.clear();
                                         ui_state.active_view = ViewMode::MainRepl;
@@ -4196,6 +4179,56 @@ impl ReplLoop {
         self.persist_interactive_snapshot(ui_state);
     }
 
+    /// Stop the running query, and close the TUI's side of it.
+    ///
+    /// Ctrl+C and Esc mean the same thing here — end the turn — and the two
+    /// sequences had already drifted into near-duplicates that differed only in
+    /// the word appended to the streaming message. Esc in the *default*
+    /// (non-Vim) mode never reached either of them, so "Esc stops the run" was
+    /// only true with Vim mode on.
+    fn stop_running_query(
+        &mut self,
+        ui_state: &mut coderex_ui::state::UiState,
+        thinking: &mut bool,
+        phase: &mut InteractivePhase,
+        query_done_rx: &mut Option<
+            tokio::sync::oneshot::Receiver<(QueryEngine, Result<TerminalReason, String>)>,
+        >,
+        elicit_rx: &mut Option<tokio::sync::mpsc::Receiver<coderex_tools::ElicitRequest>>,
+        tui_elicit_rx: &mut Option<tokio::sync::mpsc::Receiver<TuiElicitationRequest>>,
+        marker: &str,
+    ) {
+        // Tell the engine to stop before letting go of its result: the turn is
+        // abandoned *and* ended.
+        if let Some(handle) = self.running_query.take() {
+            handle.interrupt();
+        }
+        *thinking = false;
+        phase.reset();
+        *query_done_rx = None;
+        *elicit_rx = None;
+        *tui_elicit_rx = None;
+        self.pending_elicitation = None;
+        clear_permission_overlay(ui_state);
+        if let Some(last) = ui_state
+            .messages
+            .messages
+            .iter_mut()
+            .rev()
+            .find(|msg| {
+                msg.role == coderex_ui::message_list::MessageRole::Assistant && msg.streaming
+            })
+        {
+            last.streaming = false;
+            let mut msg = last.content.to_string();
+            msg.push_str(marker);
+            last.content = msg.into();
+        }
+        if let Some(ref dispatcher) = self.dispatcher {
+            dispatcher.set_elicit_tx(None);
+        }
+    }
+
     /// Execute a single command through the registry and display the result in the TUI.
     async fn execute_and_display_command(
         &mut self,
@@ -5986,6 +6019,54 @@ mod tests {
             )
             .is_none()
         );
+    }
+
+    /// Every way a person can say "stop" runs the same sequence: interrupt the
+    /// engine, drop the TUI's side of the turn, and say on the message that it
+    /// was cut short.
+    #[tokio::test]
+    async fn stopping_a_running_query_asks_the_engine_and_closes_the_ui() {
+        let mut repl = ReplLoop::new("/tmp".into(), ModelId::sonnet());
+        let handle = coderex_core::engine::InterruptHandle::default();
+        repl.running_query = Some(handle.clone());
+
+        let mut ui_state = coderex_ui::state::UiState::new();
+        ui_state
+            .messages
+            .push(coderex_ui::message_list::Message {
+                role: coderex_ui::message_list::MessageRole::Assistant,
+                content: "answering…".into(),
+                tool_name: None,
+                streaming: true,
+                folded: false,
+            });
+        let mut thinking = true;
+        let mut phase = InteractivePhase::Thinking;
+        let mut query_done = None;
+        let mut elicit = None;
+        let mut tui_elicit = None;
+
+        repl.stop_running_query(
+            &mut ui_state,
+            &mut thinking,
+            &mut phase,
+            &mut query_done,
+            &mut elicit,
+            &mut tui_elicit,
+            " (interrupted)",
+        );
+
+        assert!(handle.is_interrupted(), "the engine was never told to stop");
+        assert!(!thinking, "the UI still thinks a query is running");
+        assert!(repl.running_query.is_none());
+        assert!(matches!(phase, InteractivePhase::Idle));
+        let last = ui_state.messages.messages.last().unwrap();
+        assert!(
+            last.content.contains("(interrupted)"),
+            "the message does not say it was cut short: {}",
+            last.content
+        );
+        assert!(!last.streaming);
     }
 
     #[test]
