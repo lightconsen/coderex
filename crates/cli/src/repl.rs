@@ -20,7 +20,7 @@ use coderex_core::prompts;
 use coderex_core::query_profiles::{ModelProfile, PromptProfile, QueryKind, QueryRequest};
 use coderex_core::state::SessionState;
 use coderex_core::types::ModelId;
-use coderex_core::types::{EngineEvent, Message, ToolCall};
+use coderex_core::types::{AgentLifecycleEvent, EngineEvent, Message, ToolCall};
 use coderex_memory::{
     DreamCheckResult, ai_workflow,
     auto_dream::{AutoDream, DreamConfig},
@@ -144,6 +144,53 @@ fn push_activity_row(ui_state: &mut coderex_ui::state::UiState, label: &str) {
         streaming: false,
         folded: false,
     });
+}
+
+/// How a sub-agent's lifecycle reads in the UI.
+///
+/// The engine emits these, and nothing consumed them — the TUI's event match
+/// ended at `_ => {}`, so delegating to a sub-agent looked like a silent pause
+/// in the transcript. The agent's own text is deliberately not shown: the Agent
+/// tool's result already carries it, and replaying a sub-agent's stream under
+/// the main conversation would duplicate it with the wrong author.
+fn agent_event_label(agent_id: &str, event: &AgentLifecycleEvent) -> Option<String> {
+    let short: String = agent_id.chars().take(8).collect();
+    Some(match event {
+        AgentLifecycleEvent::Started => format!("Sub-agent {short} started"),
+        AgentLifecycleEvent::ToolCall { name, .. } => format!("Sub-agent {short}: {name}"),
+        AgentLifecycleEvent::Completed { .. } => format!("Sub-agent {short} finished"),
+        AgentLifecycleEvent::Idle { reason } => format!("Sub-agent {short} idle ({reason})"),
+        AgentLifecycleEvent::Failed { .. } => format!("Sub-agent {short} failed"),
+        AgentLifecycleEvent::TextDelta(_) => return None,
+    })
+}
+
+/// Put a sub-agent's lifecycle on screen: an activity row, and a notification
+/// for the transitions a person would want to notice.
+fn apply_agent_event(
+    ui_state: &mut coderex_ui::state::UiState,
+    agent_id: &str,
+    event: &AgentLifecycleEvent,
+) {
+    let Some(label) = agent_event_label(agent_id, event) else {
+        return;
+    };
+    push_activity_row(ui_state, &label);
+    match event {
+        AgentLifecycleEvent::Started => ui_state.notifications.info(label),
+        AgentLifecycleEvent::Completed { summary } if !summary.trim().is_empty() => {
+            ui_state
+                .notifications
+                .success(format!("{label}: {}", summary.trim()));
+        }
+        AgentLifecycleEvent::Completed { .. } => ui_state.notifications.success(label),
+        AgentLifecycleEvent::Failed { error } => {
+            ui_state.notifications.err(format!("{label}: {error}"));
+        }
+        // A tool call or an idle note is activity, not something to interrupt for.
+        AgentLifecycleEvent::ToolCall { .. } | AgentLifecycleEvent::Idle { .. } => {}
+        AgentLifecycleEvent::TextDelta(_) => {}
+    }
 }
 
 fn set_plan_step(ui_state: &mut coderex_ui::state::UiState, label: &str) {
@@ -2644,6 +2691,10 @@ impl ReplLoop {
                                 true,
                             );
                             ui_state.notifications.warn(label);
+                            self.persist_interactive_snapshot(&ui_state);
+                        }
+                        EngineEvent::AgentEvent { agent_id, event } => {
+                            apply_agent_event(&mut ui_state, &agent_id, &event);
                             self.persist_interactive_snapshot(&ui_state);
                         }
                         EngineEvent::PermissionExplanation { tool, explanation } => {
@@ -6075,6 +6126,68 @@ mod tests {
             permission_activity_label("Running cargo test -p coderex-cli..."),
             "Waiting for permission: Running cargo test -p coderex-cli..."
         );
+    }
+
+    /// Every sub-agent lifecycle event that means something to a person shows
+    /// up on screen; the agent's own text does not, because the Agent tool's
+    /// result already carries it.
+    #[test]
+    fn sub_agent_events_reach_the_activity_log() {
+        let mut ui_state = coderex_ui::state::UiState::new();
+
+        apply_agent_event(
+            &mut ui_state,
+            "agent-1234-uuid",
+            &AgentLifecycleEvent::Started,
+        );
+        assert_eq!(
+            ui_state.activity_log.last().map(String::as_str),
+            Some("Sub-agent agent-12 started")
+        );
+        assert!(ui_state
+            .notifications
+            .latest()
+            .is_some_and(|note| note.message.contains("started")));
+
+        apply_agent_event(
+            &mut ui_state,
+            "agent-1234-uuid",
+            &AgentLifecycleEvent::Completed {
+                summary: "did the thing".into(),
+            },
+        );
+        assert!(
+            ui_state
+                .notifications
+                .latest()
+                .is_some_and(|note| note.message.contains("did the thing")),
+            "the completion summary should reach the notification"
+        );
+
+        apply_agent_event(
+            &mut ui_state,
+            "agent-1234-uuid",
+            &AgentLifecycleEvent::Failed {
+                error: "it broke".into(),
+            },
+        );
+        let latest = ui_state.notifications.latest().unwrap();
+        assert!(latest.message.contains("it broke"), "{}", latest.message);
+        assert_eq!(
+            latest.kind,
+            coderex_ui::notification_center::NotificationKind::Error
+        );
+
+        // Text belongs to the Agent tool's result, not the main transcript.
+        let rows = ui_state.activity_log.len();
+        let notes = ui_state.notifications.active().len();
+        apply_agent_event(
+            &mut ui_state,
+            "agent-1234-uuid",
+            &AgentLifecycleEvent::TextDelta("streaming".into()),
+        );
+        assert_eq!(ui_state.activity_log.len(), rows);
+        assert_eq!(ui_state.notifications.active().len(), notes);
     }
 
     #[tokio::test]

@@ -1075,6 +1075,19 @@ fn reported_skills_tools_sequence_stays_usable() {
     );
 }
 
+/// A delegated sub-agent used to look like a silent pause: the manager emitted
+/// its lifecycle events and the TUI's event match fell through to `_ => {}`.
+#[test]
+fn delegating_shows_the_sub_agent_in_the_transcript() {
+    let dir = setup_project_dir();
+    let (_server, mut session) = session_with_static_server(dir.path());
+    session.wait_for_text("CodeRex v", SCREEN_TIMEOUT);
+
+    session.send_line("delegate a simple agent");
+    session.wait_for_text("Sub-agent", SCREEN_TIMEOUT);
+    session.wait_for_text("Completed in", SCREEN_TIMEOUT);
+}
+
 #[test]
 fn mixed_prompt_tool_sequence_matrix_stays_usable() {
     let dir = setup_project_dir();
