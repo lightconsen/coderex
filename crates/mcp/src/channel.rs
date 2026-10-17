@@ -272,7 +272,9 @@ impl JsonRpcChannel {
         };
 
         if let Some(ref http) = self.http {
-            return http.send_request(&request).await;
+            // A remote server can ask the client things too; the handler is
+            // the same one the stdio read loop uses.
+            return http.send_request(&request, self.handler.as_deref()).await;
         }
 
         self.write_request(&request).await?;

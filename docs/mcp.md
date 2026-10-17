@@ -61,6 +61,7 @@ Without the prefix a shared raw name cannot address both servers, so the second 
 - Token refresh: `OAuthManager::refresh` posts `grant_type=refresh_token` to the server's token endpoint and stores the result, including a rotated refresh token. `OAuthManager::refresh_if_needed` is called by `McpManager::start_all` for every remote server, and the resulting token is sent as `Authorization: Bearer`.
 - Interactive sign-in: `McpAuth` performs authorization-code + PKCE (S256), with a `localhost:8765` callback listener and a manual `code` + `code_verifier` path when the browser cannot be opened.
 - Elicitation: `ElicitationManager` for pending requests and responses.
+- Server-initiated requests: messages from the server are told apart by shape (method+id is a request, method alone a notification, id alone a response). They are answered on both transports — the stdio read loop directly, and the HTTP/SSE response stream incrementally, with the answer sent as a separate POST so a server holding its response open cannot deadlock the client. With no handler the answer is a JSON-RPC `-32601` refusal rather than silence.
 - Config loading: `.mcp.json` file parsing + settings.json integration, save/load roundtrip.
 - Result adapter: `McpResultAdapter` converts MCP content (text, image, resource) to `ToolResult`.
 - Tool executor: `McpToolExecutor` implements `ToolExecutor` trait; `CompositeToolExecutor` provides fallback dispatch.
