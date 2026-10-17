@@ -5194,7 +5194,7 @@ impl ReplLoop {
 
 /// Get the current git branch for the statusline.
 fn current_git_branch(cwd: &str) -> String {
-    std::process::Command::new("git")
+    coderex_core::git_hardening::git_command()
         .args(["branch", "--show-current"])
         .current_dir(cwd)
         .output()
@@ -6076,7 +6076,7 @@ mod tests {
             vec!["init", "--quiet"],
             vec!["commit", "--quiet", "--allow-empty", "-m", "init"],
         ] {
-            let status = std::process::Command::new("git")
+            let status = coderex_core::git_hardening::git_command()
                 .args(&args)
                 .current_dir(repo.path())
                 .env("GIT_AUTHOR_NAME", "test")

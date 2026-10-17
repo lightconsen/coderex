@@ -20,6 +20,7 @@ pub mod fuzzy_matcher;
 pub mod hook_events;
 pub mod hook_executor;
 pub mod hook_security;
+pub mod git_hardening;
 pub mod job_record;
 pub mod loop_detector;
 pub mod markdown;

@@ -142,6 +142,31 @@ only.
 Two protections are applied by the spawning code itself, independently of any
 platform sandbox.
 
+### Git configuration
+
+A repository can carry configuration that makes `git` **execute programs**:
+`core.fsmonitor` fires a hook on `git status`, `core.attributesFile` can name
+filters that run on diff, `init.templateDir` can land hooks in a clone,
+`core.alternateRefsCommand` and the `gpg.*.program` keys are commands by
+definition, and `protocol.*.allow` can re-enable transports that execute. None of
+it appears in a command line.
+
+Every `git` process CodeRex spawns on its own behalf therefore gets a fixed
+config table injected through `GIT_CONFIG_COUNT` / `GIT_CONFIG_KEY_<n>` /
+`GIT_CONFIG_VALUE_<n>` — the reference's mechanism, key for key
+(`crates/core/src/git_hardening.rs`). Injecting through the environment rather
+than rewriting argv is what makes it apply to anything the child spawns as well.
+`protocol.file.allow=user` is kept as the one deliberate exception: local paths
+are needed for submodules.
+
+A test builds a repository whose `core.fsmonitor` writes a marker and runs
+`git status` twice: unhardened, the hook runs (so the hazard is real); through
+`git_command()`, it does not. That control is what makes the test mean something.
+
+**Not covered:** the user's own `git` inside the Bash tool is governed by the
+sandbox, not by this table. The reference injects it into the shell it runs; this
+port applies it to CodeRex's internal invocations.
+
 ### Credential stripping
 
 A `Bash` shell, a `PowerShell` shell and an MCP server are all spawned **without

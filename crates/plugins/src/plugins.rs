@@ -1111,7 +1111,7 @@ fn is_full_commit_sha(rev: &str) -> bool {
 /// Credential prompts are turned off: a plugin install that cannot authenticate
 /// fails with a message instead of hanging on a prompt nobody sees.
 async fn run_git(args: &[&str]) -> Result<String, String> {
-    let output = tokio::process::Command::new("git")
+    let output = tokio::process::Command::from(coderex_core::git_hardening::git_command())
         .args(args)
         .env("GIT_TERMINAL_PROMPT", "0")
         // Never inherit a repository selection from the caller: an install must

@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 /// Run a git command in the given directory.
 fn run_git(dir: &std::path::Path, args: &[&str]) -> Result<String, String> {
-    let output = std::process::Command::new("git")
+    let output = coderex_core::git_hardening::git_command()
         .args(args)
         .current_dir(dir)
         .output()
@@ -294,18 +294,34 @@ mod tests {
 
     fn init_git_repo(path: &std::path::Path) {
         std::fs::create_dir_all(path).ok();
-        std::process::Command::new("git")
+        coderex_core::git_hardening::git_command()
             .args(["init", "--quiet"])
             .current_dir(path)
             .output()
             .expect("git init failed");
+        // The commands under test commit as the repository's user, and this
+        // repository is ours — so it carries its own identity instead of
+        // borrowing whatever the machine happens to have configured. Without
+        // this, a machine with no global identity fails the tests, and the
+        // assertions measure the environment rather than the command.
+        for (key, value) in [
+            ("user.name", "CodeRex Test"),
+            ("user.email", "test@coderex.invalid"),
+        ] {
+            let configured = coderex_core::git_hardening::git_command()
+                .args(["config", key, value])
+                .current_dir(path)
+                .output()
+                .expect("git config failed");
+            assert!(configured.status.success(), "could not set {key}");
+        }
         std::fs::write(path.join("README"), "root").unwrap();
-        std::process::Command::new("git")
+        coderex_core::git_hardening::git_command()
             .args(["add", "README"])
             .current_dir(path)
             .output()
             .expect("git add failed");
-        std::process::Command::new("git")
+        coderex_core::git_hardening::git_command()
             .args(["commit", "--quiet", "-m", "init"])
             .env("GIT_AUTHOR_NAME", "test")
             .env("GIT_AUTHOR_EMAIL", "test@test.com")
@@ -317,12 +333,12 @@ mod tests {
     }
 
     fn commit_all(path: &std::path::Path, message: &str) {
-        std::process::Command::new("git")
+        coderex_core::git_hardening::git_command()
             .args(["add", "-A"])
             .current_dir(path)
             .output()
             .expect("git add failed");
-        std::process::Command::new("git")
+        coderex_core::git_hardening::git_command()
             .args(["commit", "--quiet", "-m", message])
             .env("GIT_AUTHOR_NAME", "test")
             .env("GIT_AUTHOR_EMAIL", "test@test.com")

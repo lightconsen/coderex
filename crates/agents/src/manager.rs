@@ -1836,7 +1836,7 @@ mod tests {
     /// Create a git repository with one commit so `git worktree add` can run.
     fn init_git_repo(dir: &std::path::Path) {
         let run = |args: &[&str]| {
-            let status = std::process::Command::new("git")
+            let status = coderex_core::git_hardening::git_command()
                 .args(args)
                 .current_dir(dir)
                 .env("GIT_AUTHOR_NAME", "test")

@@ -365,7 +365,7 @@ impl PromptCompiler {
         let mut out = String::new();
 
         // Git branch
-        if let Ok(output) = std::process::Command::new("git")
+        if let Ok(output) = crate::git_hardening::git_command()
             .args(["branch", "--show-current"])
             .current_dir(cwd)
             .output()
@@ -379,7 +379,7 @@ impl PromptCompiler {
         }
 
         // Git status (short)
-        if let Ok(output) = std::process::Command::new("git")
+        if let Ok(output) = crate::git_hardening::git_command()
             .args(["status", "--short"])
             .current_dir(cwd)
             .output()

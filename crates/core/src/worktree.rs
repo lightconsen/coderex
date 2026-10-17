@@ -111,7 +111,7 @@ impl WorktreeManager {
         }
 
         // Run git worktree add
-        let output = std::process::Command::new("git")
+        let output = crate::git_hardening::git_command()
             .args([
                 "-C",
                 cwd.to_str().unwrap_or("."),
@@ -177,7 +177,7 @@ impl WorktreeManager {
         }
 
         // Prune the worktree
-        let output = std::process::Command::new("git")
+        let output = crate::git_hardening::git_command()
             .args(["worktree", "prune"])
             .output()
             .map_err(|e| WorktreeError::GitCommand(e.to_string()))?;
@@ -189,7 +189,7 @@ impl WorktreeManager {
 
         // Delete the branch
         if let Some(branch) = self.worktrees.iter().find(|w| w.path == *path) {
-            let _ = std::process::Command::new("git")
+            let _ = crate::git_hardening::git_command()
                 .args(["branch", "-D", &branch.branch])
                 .output();
         }
@@ -225,7 +225,7 @@ impl WorktreeManager {
 
     /// Check if a worktree path has uncommitted changes.
     fn has_uncommitted_changes(&self, path: &PathBuf) -> Result<bool, WorktreeError> {
-        let output = std::process::Command::new("git")
+        let output = crate::git_hardening::git_command()
             .args(["-C", path.to_str().unwrap_or("."), "status", "--porcelain"])
             .output()
             .map_err(|e| WorktreeError::GitCommand(e.to_string()))?;
@@ -236,7 +236,7 @@ impl WorktreeManager {
 
     /// Get the current branch name for a git repo.
     fn current_branch(&self, cwd: &PathBuf) -> Result<String, WorktreeError> {
-        let output = std::process::Command::new("git")
+        let output = crate::git_hardening::git_command()
             .args([
                 "-C",
                 cwd.to_str().unwrap_or("."),

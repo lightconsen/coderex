@@ -96,7 +96,7 @@ impl BridgeSessionSpawner {
         let worktree_path = self.worktree_base.join(&config.session_id);
 
         if !worktree_path.exists() {
-            let output = std::process::Command::new("git")
+            let output = coderex_core::git_hardening::git_command()
                 .args(["worktree", "add", worktree_path.to_str().unwrap(), branch])
                 .current_dir(&self.repo_root)
                 .output()
@@ -130,7 +130,7 @@ impl BridgeSessionSpawner {
     pub fn cleanup_worktree(&self, session_id: &str) -> Result<(), String> {
         let worktree_path = self.worktree_base.join(session_id);
         if worktree_path.exists() {
-            std::process::Command::new("git")
+            coderex_core::git_hardening::git_command()
                 .args(["worktree", "remove", worktree_path.to_str().unwrap()])
                 .current_dir(&self.repo_root)
                 .output()
@@ -329,18 +329,18 @@ mod tests {
     }
 
     fn init_git_repo(path: &Path) {
-        std::process::Command::new("git")
+        coderex_core::git_hardening::git_command()
             .args(["init", "--quiet"])
             .current_dir(path)
             .output()
             .expect("git init failed");
         std::fs::write(path.join("README"), "root").unwrap();
-        std::process::Command::new("git")
+        coderex_core::git_hardening::git_command()
             .args(["add", "README"])
             .current_dir(path)
             .output()
             .expect("git add failed");
-        std::process::Command::new("git")
+        coderex_core::git_hardening::git_command()
             .args(["commit", "--quiet", "-m", "init"])
             .env("GIT_AUTHOR_NAME", "test")
             .env("GIT_AUTHOR_EMAIL", "test@test.com")

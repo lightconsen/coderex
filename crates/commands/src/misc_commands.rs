@@ -193,7 +193,7 @@ pub fn register(registry: &mut CommandRegistry) {
             // Ask git whether this is a repository before asking for a diff.
             // Reporting an empty diff for a directory git cannot read would
             // say "nothing changed" about a place where nothing is known.
-            let inside = std::process::Command::new("git")
+            let inside = coderex_core::git_hardening::git_command()
                 .args(["rev-parse", "--is-inside-work-tree"])
                 .current_dir(dir)
                 .output();
@@ -218,7 +218,7 @@ pub fn register(registry: &mut CommandRegistry) {
             if cached {
                 cmd_args.push("--cached");
             }
-            match std::process::Command::new("git")
+            match coderex_core::git_hardening::git_command()
                 .args(&cmd_args)
                 .current_dir(dir)
                 .output()
@@ -582,7 +582,7 @@ mod tests {
     fn diff_in_git_repo() {
         let tmp = tempfile::tempdir().unwrap();
         // Init a git repo
-        std::process::Command::new("git")
+        coderex_core::git_hardening::git_command()
             .args(["init", "--quiet"])
             .current_dir(tmp.path())
             .output()
