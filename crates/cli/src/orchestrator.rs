@@ -883,7 +883,12 @@ impl StartupOrchestrator {
 
         tracing::info!("plugins initialized: {loaded} loaded, {spawned} spawned");
 
-        self.ctx.plugin_manager = Some(Arc::new(manager));
+        let manager = Arc::new(manager);
+        // Error-state plugins are retried while the session runs. The loop
+        // holds a Weak reference and exits when the manager is dropped; the
+        // handle is detached deliberately.
+        let _retry_loop = manager.spawn_retry_loop(std::time::Duration::from_secs(1));
+        self.ctx.plugin_manager = Some(manager);
         Ok(())
     }
 

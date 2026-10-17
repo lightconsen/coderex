@@ -2569,6 +2569,35 @@ impl PluginManager {
         }
     }
 
+    /// Spawn the background loop that drives [`Self::retry_failed_plugins`].
+    ///
+    /// The loop holds a `Weak` reference, so it does not keep the manager
+    /// alive: when the session drops its last `Arc`, the next tick cannot
+    /// upgrade and the task exits. The caller may detach the returned handle;
+    /// it is exposed so a test can abort the loop.
+    ///
+    /// `interval` is how often the backoff is *checked*, not the backoff
+    /// itself — [`Self::retry_failed_plugins`] decides whether enough time has
+    /// passed for a particular plugin.
+    #[must_use]
+    pub fn spawn_retry_loop(
+        self: &Arc<Self>,
+        interval: std::time::Duration,
+    ) -> tokio::task::JoinHandle<()> {
+        let manager = Arc::downgrade(self);
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(interval);
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                ticker.tick().await;
+                let Some(manager) = manager.upgrade() else {
+                    break;
+                };
+                manager.retry_failed_plugins();
+            }
+        })
+    }
+
     /// Retry loading plugins that are in the `Error` state.
     ///
     /// Uses exponential backoff: waits `2^retry_count` seconds before retrying.
@@ -3533,6 +3562,53 @@ mod tests {
         // Should still be error because manifest path doesn't exist,
         // but retry_count should have incremented
         assert_eq!(plugin.retry_count, 1);
+    }
+
+    /// The retry path is driven by a background loop, not by a caller
+    /// remembering to invoke it. An Error-state plugin whose manifest is now
+    /// readable must come back without anyone calling `retry_failed_plugins`
+    /// directly.
+    #[tokio::test]
+    async fn the_retry_loop_recovers_an_error_state_plugin() {
+        let dir = tempfile::tempdir().unwrap();
+        let plugin_dir = dir.path().join("recovering");
+        std::fs::create_dir_all(&plugin_dir).unwrap();
+
+        let manifest = PluginManifest {
+            name: "recovering".into(),
+            version: "1.0.0".into(),
+            commands: vec!["hello".into()],
+            skills: Vec::new(),
+            author: String::new().into(),
+            ..Default::default()
+        };
+        std::fs::write(
+            plugin_dir.join("plugin.json"),
+            serde_json::to_string(&manifest).unwrap(),
+        )
+        .unwrap();
+
+        let mgr = Arc::new(PluginManager::new());
+        mgr.load_plugin(manifest, plugin_dir);
+        mgr.set_plugin_state("recovering", PluginState::Error("manual".into()));
+
+        let loop_handle = mgr.spawn_retry_loop(std::time::Duration::from_millis(10));
+
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if matches!(
+                    mgr.get_plugin("recovering").map(|plugin| plugin.state),
+                    Some(PluginState::Active)
+                ) {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the retry loop never recovered the plugin");
+
+        loop_handle.abort();
     }
 
     #[test]
