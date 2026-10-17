@@ -7,8 +7,7 @@
 use assert_cmd::cargo::cargo_bin;
 use serde::Deserialize;
 use std::collections::BTreeSet;
-use std::io::{BufReader, Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child as ProcessChild, Command, Stdio};
 use std::thread;
@@ -63,30 +62,20 @@ struct ForbiddenContent {
     text: String,
 }
 
-fn find_free_port() -> u16 {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind free port");
-    listener.local_addr().expect("local addr").port()
-}
-
-fn wait_for_server(port: u16) {
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while Instant::now() < deadline {
-        if TcpStream::connect(format!("127.0.0.1:{port}")).is_ok() {
-            return;
-        }
-        thread::sleep(Duration::from_millis(100));
-    }
-    panic!("static test server did not start on port {port}");
-}
-
 struct StaticServer {
     child: ProcessChild,
     port: u16,
 }
 
 impl StaticServer {
+    /// Start the server on an OS-assigned port and read the port it announced.
+    ///
+    /// Picking a "free" port and then spawning on it is a TOCTOU race: under a
+    /// parallel workspace run another test can take the port in between, and
+    /// the server then exits while the harness waits ten seconds and panics.
+    /// `--port 0` lets the server bind first and tell us what it got; stderr is
+    /// kept open and drained because the server logs every request.
     fn start() -> Self {
-        let port = find_free_port();
         let responses_path =
             Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/responses.json");
         assert!(
@@ -95,19 +84,41 @@ impl StaticServer {
             responses_path.display()
         );
 
-        let child = Command::new(cargo_bin("static-anthropic-server"))
+        let mut child = Command::new(cargo_bin("static-anthropic-server"))
             .args([
                 "--port",
-                &port.to_string(),
+                "0",
                 "--responses",
                 responses_path.to_str().expect("utf8 responses path"),
             ])
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stderr(Stdio::piped())
             .spawn()
             .expect("spawn static-anthropic-server");
 
-        wait_for_server(port);
+        let stderr = child.stderr.take().expect("server stderr");
+        let (tx, rx) = std::sync::mpsc::channel();
+        thread::spawn(move || {
+            let mut announced = false;
+            for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+                if !announced {
+                    if let Some(address) = line.split("listening on ").nth(1) {
+                        let _ = tx.send(address.trim().to_string());
+                        announced = true;
+                    }
+                }
+            }
+        });
+
+        let address = rx
+            .recv_timeout(Duration::from_secs(30))
+            .expect("static test server did not announce its address");
+        let port = address
+            .rsplit(':')
+            .next()
+            .and_then(|port| port.parse::<u16>().ok())
+            .unwrap_or_else(|| panic!("unexpected server address {address}"));
+
         Self { child, port }
     }
 

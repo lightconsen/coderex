@@ -555,7 +555,10 @@ struct WorkflowAgentRunner {
 
 #[async_trait::async_trait]
 impl coderex_workflow::AgentRunner for WorkflowAgentRunner {
-    async fn run(&self, request: coderex_workflow::AgentRequest) -> Result<Option<String>, String> {
+    async fn run(
+        &self,
+        request: coderex_workflow::AgentRequest,
+    ) -> Result<coderex_workflow::AgentOutput, String> {
         use coderex_agents::manager::SpawnOptions;
         use coderex_agents::types::{AgentType, Thoroughness};
 
@@ -605,7 +608,10 @@ impl coderex_workflow::AgentRunner for WorkflowAgentRunner {
             .await
             .map_err(|error| format!("the agent did not finish: {error}"))?;
 
-        Ok(Some(result.output))
+        Ok(coderex_workflow::AgentOutput {
+            text: Some(result.output),
+            tokens: result.token_usage.unwrap_or(0),
+        })
     }
 }
 
@@ -618,6 +624,13 @@ pub struct ReplLoop {
     cwd: String,
     /// Whether the loop should continue.
     running: bool,
+    /// A setup failure that must stop the session before it runs.
+    ///
+    /// `--worktree` is the current producer: if the isolated checkout cannot
+    /// be created, running the prompt in the original checkout is exactly the
+    /// silent fallback the flag exists to prevent. Headless mode consults this
+    /// instead of relying on `running`, which only the interactive loop reads.
+    setup_error: Option<String>,
     /// Prompt history.
     history: Vec<String>,
     /// QueryEngine for processing user queries (14.1 wired).
@@ -824,6 +837,7 @@ impl ReplLoop {
             model,
             cwd,
             running: true,
+            setup_error: None,
             history: Vec::new(),
             engine: None,
             event_rx: None,
@@ -1080,6 +1094,7 @@ impl ReplLoop {
             model,
             cwd,
             running: true,
+            setup_error: None,
             history: Vec::new(),
             engine: Some(engine),
             event_rx: Some(event_rx),
@@ -1400,7 +1415,16 @@ impl ReplLoop {
             // dropping the fields above does not stop them writing.
             self.memory_writable
                 .store(false, std::sync::atomic::Ordering::Relaxed);
+            if let Some(ref mut engine) = self.engine {
+                engine.clear_transcript_path();
+            }
             tracing::info!("Session persistence disabled — memory stores cleared");
+        } else if let Some(ref mut engine) = self.engine {
+            // Compaction backs the transcript up before overwriting it, but
+            // only when it knows where transcripts live. The CLI persists them
+            // here; without this the engine's backup path stayed `None` and
+            // the pre-compaction backup never ran.
+            engine.set_transcript_path(crate::session_resume::transcript_dir(&self.cwd));
         }
 
         // 3. Chrome integration
@@ -1558,10 +1582,13 @@ impl ReplLoop {
     }
 
     /// Create a worktree and move the session into it.
+    ///
+    /// The base is the session's configured directory (`--directory` or the
+    /// process cwd), not `std::env::current_dir()`: the two differ whenever a
+    /// caller configured the session explicitly, and using the process cwd
+    /// created the worktree from the wrong repository.
     fn enter_worktree_mode(&mut self) {
-        let Ok(base) = std::env::current_dir() else {
-            return;
-        };
+        let base = std::path::PathBuf::from(&self.cwd);
         self.enter_worktree_mode_for(&base);
     }
 
@@ -1587,11 +1614,16 @@ impl ReplLoop {
                     "could not create a worktree for --worktree: {error} — refusing to run \
                      isolated-mode work in the checkout instead"
                 );
-                eprintln!(
+                let message = format!(
                     "could not create a worktree: {error}\n\
                      --worktree isolates the session in its own checkout; without one the \
                      session would edit this checkout, so it has stopped."
                 );
+                eprintln!("{message}");
+                // Headless mode does not read `running`; `run_headless` checks
+                // this instead, so a failed `--worktree` cannot fall back to
+                // the original checkout in `-p` mode.
+                self.setup_error = Some(message);
                 self.running = false;
                 return;
             }
@@ -1604,6 +1636,10 @@ impl ReplLoop {
                 base: created.branch.clone(),
                 has_changes: false,
             });
+            // The engine builds the model's prompt context from `session.cwd`,
+            // so leaving it at the original checkout would tell the model to
+            // work there while the tools ran in the worktree.
+            session.cwd = created.path.clone();
             engine.set_session(session);
         }
 
@@ -2936,6 +2972,10 @@ impl ReplLoop {
 
     /// Run a single query in non-interactive (headless) mode.
     pub async fn run_headless(&mut self, prompt: &str) -> Result<String> {
+        if let Some(error) = self.setup_error.as_deref() {
+            return Err(anyhow::anyhow!("{error}"));
+        }
+
         if prompt.starts_with('/') {
             // Slash commands go through the same dispatch the interactive
             // non-TUI path uses. That dispatch owns the built-ins which change
@@ -3715,8 +3755,14 @@ impl ReplLoop {
         // One result frame closes the turn: `emit_turn_complete` consumes the
         // turn guard, so a turn cannot report itself finished twice.
         if let Some(mut sink) = protocol {
-            let turn = sink.begin_turn();
+            let turn = sink.begin_turn(session_id.clone());
             let frame = match &result {
+                Ok(TerminalReason::MaxTurnsReached) => coderex_events::ResultFrame::error(
+                    session_id.clone(),
+                    coderex_events::protocol::result_subtype::ERROR_MAX_TURNS,
+                    u64::try_from(turn_started.elapsed().as_millis()).unwrap_or(u64::MAX),
+                    1,
+                ),
                 Ok(_) => coderex_events::ResultFrame::success(
                     session_id.clone(),
                     output.trim(),
@@ -4390,7 +4436,10 @@ impl ReplLoop {
                 continue;
             }
             let parts: Vec<&str> = segment.split_whitespace().collect();
-            let cmd_name = parts[0];
+            // Every segment but the first still carries its slash: the whole
+            // line was trimmed once, not per segment, so `/version | /env`
+            // splits into "/version" and "/env".
+            let cmd_name = parts[0].trim_start_matches('/');
             let args: Vec<String> = parts[1..].iter().map(|s| s.to_string()).collect();
 
             self.command_history.append(cmd_name, &args);
@@ -6293,11 +6342,11 @@ mod tests {
         );
         repl.with_worktree(true);
 
-        // The worktree is created relative to the process's working directory,
-        // which the test cannot change, so the check is on what the session
-        // was pointed at rather than on the path itself.
+        // The base comes from the session's cwd, not the process's: this is
+        // the `--directory /repo --worktree` case, and the test process is not
+        // in the repo.
         let before = repl.dispatcher.as_ref().unwrap().cwd();
-        repl.enter_worktree_mode_for(&repo.path().to_path_buf());
+        repl.enter_worktree_mode();
 
         let session = repl.engine.as_ref().unwrap().session().clone();
         let active = session
@@ -6321,6 +6370,73 @@ mod tests {
             repl.dispatcher.as_ref().unwrap().cwd(),
             active.path,
             "the tools still run in the original checkout"
+        );
+        assert_eq!(
+            session.cwd, active.path,
+            "the engine still tells the model to work in the original checkout"
+        );
+        assert_eq!(
+            repl.cwd,
+            active.path.to_string_lossy(),
+            "the loop's cwd was not moved"
+        );
+    }
+
+    /// Compaction's transcript backup needs a directory. The CLI was already
+    /// writing transcripts under `<cwd>/.coderex/transcripts`, but the engine
+    /// never learned that path, so `--no-session-persistence` was not the only
+    /// reason the backup could be skipped.
+    #[tokio::test]
+    async fn apply_cli_config_gives_the_engine_the_transcript_directory() {
+        let temp = tempfile::tempdir().unwrap();
+        let cwd = temp.path().to_string_lossy().into_owned();
+        let api = ReadThenAnswerApi {
+            call: Arc::new(std::sync::Mutex::new(0)),
+            expected_contents: "unused",
+        };
+        let mut repl = ReplLoop::with_engine(Box::new(api), cwd.clone(), ModelId::sonnet());
+
+        repl.apply_cli_config();
+        let expected = crate::session_resume::transcript_dir(&cwd);
+        assert_eq!(
+            repl.engine.as_ref().unwrap().transcript_path(),
+            Some(expected.as_path()),
+            "the engine was not told where transcripts live"
+        );
+
+        repl.with_no_persistence(true);
+        repl.apply_cli_config();
+        assert!(
+            repl.engine.as_ref().unwrap().transcript_path().is_none(),
+            "--no-session-persistence must also disable the engine's backup"
+        );
+    }
+
+    /// A failed `--worktree` must stop a headless run, not fall back to the
+    /// checkout. The interactive loop reads `running`; `run_headless` reads
+    /// `setup_error`, which is the only thing that reached this path.
+    #[tokio::test]
+    async fn a_failed_worktree_stops_a_headless_run() {
+        let not_a_repo = tempfile::tempdir().unwrap();
+        let api = ReadThenAnswerApi {
+            call: Arc::new(std::sync::Mutex::new(0)),
+            expected_contents: "unused",
+        };
+        let mut repl = ReplLoop::with_engine(
+            Box::new(api),
+            not_a_repo.path().to_string_lossy().into_owned(),
+            ModelId::sonnet(),
+        );
+        repl.with_worktree(true);
+        repl.enter_worktree_mode();
+
+        let error = repl
+            .run_headless("hello")
+            .await
+            .expect_err("a failed worktree did not stop the headless run");
+        assert!(
+            error.to_string().contains("could not create a worktree"),
+            "unexpected error: {error}"
         );
     }
 

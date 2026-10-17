@@ -151,7 +151,7 @@ pub struct Cli {
     #[arg(long, value_name = "FORMAT", default_value = "text")]
     pub input_format: String,
 
-    /// Output format for non-interactive mode (text, json, markdown).
+    /// Output format for non-interactive mode (text, json, markdown, stream-json).
     #[arg(long, value_name = "FORMAT", default_value = "text")]
     pub output_format: String,
 

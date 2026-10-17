@@ -1984,9 +1984,10 @@ mod seccomp_arch_tests {
         );
     }
 
-    /// The filter's default action is to kill, so a network syscall reaches the
-    /// network only if it is explicitly listed. Listing one in both tables
-    /// would make `allow_network: false` meaningless.
+    /// The filter's default action is `SECCOMP_RET_ERRNO` with `EPERM` (not
+    /// kill), so a network syscall reaches the network only if it is explicitly
+    /// listed. Listing one in both tables would make `allow_network: false`
+    /// meaningless.
     #[test]
     fn network_syscalls_are_separate_from_the_base_allowlist() {
         let base: std::collections::HashSet<_> = seccomp_arch::ALLOWED.iter().collect();

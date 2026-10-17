@@ -13,28 +13,41 @@ pub fn pid_file_path() -> PathBuf {
 
 /// Write the current process PID to the PID file.
 pub fn write_pid_file() -> std::io::Result<()> {
-    let path = pid_file_path();
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let pid = std::process::id();
-    std::fs::write(&path, pid.to_string())
+    write_pid_file_at(&pid_file_path())
 }
 
 /// Remove the PID file.
 pub fn remove_pid_file() -> std::io::Result<()> {
-    let path = pid_file_path();
-    if path.exists() {
-        std::fs::remove_file(&path)?;
-    }
-    Ok(())
+    remove_pid_file_at(&pid_file_path())
 }
 
 /// Read the PID from the PID file, if it exists.
 #[must_use]
 pub fn read_pid() -> Option<u32> {
-    let path = pid_file_path();
-    let content = std::fs::read_to_string(&path).ok()?;
+    read_pid_at(&pid_file_path())
+}
+
+/// Write the current process PID to `path`.
+///
+/// Split out so the tests can use a directory of their own: the tests used to
+/// share the developer's real `~/.coderex/daemon.pid`, and running in parallel
+/// meant one test deleting the file another was reading.
+fn write_pid_file_at(path: &std::path::Path) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(path, std::process::id().to_string())
+}
+
+fn remove_pid_file_at(path: &std::path::Path) -> std::io::Result<()> {
+    if path.exists() {
+        std::fs::remove_file(path)?;
+    }
+    Ok(())
+}
+
+fn read_pid_at(path: &std::path::Path) -> Option<u32> {
+    let content = std::fs::read_to_string(path).ok()?;
     content.trim().parse::<u32>().ok()
 }
 
@@ -117,24 +130,27 @@ mod tests {
 
     #[test]
     fn write_and_read_pid_roundtrip() {
-        let _ = remove_pid_file();
-        write_pid_file().unwrap();
-        let pid = read_pid();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("daemon.pid");
+        write_pid_file_at(&path).unwrap();
+        let pid = read_pid_at(&path);
         assert!(pid.is_some());
         assert_eq!(pid.unwrap(), std::process::id());
-        remove_pid_file().unwrap();
+        remove_pid_file_at(&path).unwrap();
     }
 
     #[test]
     fn read_pid_returns_none_when_missing() {
-        let _ = remove_pid_file();
-        assert!(read_pid().is_none());
+        let dir = tempfile::tempdir().unwrap();
+        assert!(read_pid_at(&dir.path().join("daemon.pid")).is_none());
     }
 
     #[test]
     fn remove_pid_file_is_idempotent() {
-        remove_pid_file().unwrap();
-        remove_pid_file().unwrap(); // No error on second call
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("daemon.pid");
+        remove_pid_file_at(&path).unwrap();
+        remove_pid_file_at(&path).unwrap(); // No error on second call
     }
 
     #[test]

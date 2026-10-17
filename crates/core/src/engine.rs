@@ -1325,6 +1325,17 @@ impl QueryEngine {
         self.transcript_path = Some(path);
     }
 
+    /// Stop persisting compaction results.
+    pub fn clear_transcript_path(&mut self) {
+        self.transcript_path = None;
+    }
+
+    /// The transcript directory compaction uses, if one is configured.
+    #[must_use]
+    pub fn transcript_path(&self) -> Option<&std::path::Path> {
+        self.transcript_path.as_deref()
+    }
+
     /// Attach a persistent session-memory backend.
     ///
     /// When set (and `CompactConfig::session_memory_enabled`), compaction

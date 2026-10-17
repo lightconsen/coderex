@@ -26,6 +26,7 @@ pub mod tool;
 pub use journal::{CallOptions, Entry, Journal, RestoreState, key_for};
 pub use meta::{Meta, MetaError, Phase, read};
 pub use runtime::{
-    AgentRequest, AgentRunner, Limits, Outcome, Progress, WorkflowError, new_run_id, run_script,
+    AgentOutput, AgentRequest, AgentRunner, Limits, Outcome, Progress, WorkflowError, new_run_id,
+    run_script,
 };
 pub use tool::{ENABLE_FLAG, WORKFLOW_TOOL, WorkflowTool, default_root};

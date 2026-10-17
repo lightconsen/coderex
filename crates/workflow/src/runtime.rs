@@ -87,12 +87,52 @@ impl AgentRequest {
     }
 }
 
+/// What an agent produced: its text (if any) and the output tokens it spent.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AgentOutput {
+    /// The agent's text, or `None` when it produced nothing — skipped, or it
+    /// gave up — which the script sees as `null`.
+    pub text: Option<String>,
+    /// Output tokens the agent consumed, for the run's token budget.
+    pub tokens: u64,
+}
+
+impl AgentOutput {
+    /// An answer with no token accounting.
+    #[must_use]
+    pub fn text(text: impl Into<String>) -> Self {
+        Self {
+            text: Some(text.into()),
+            tokens: 0,
+        }
+    }
+
+    /// An answer and the tokens it spent.
+    #[must_use]
+    pub fn with_tokens(text: impl Into<String>, tokens: u64) -> Self {
+        Self {
+            text: Some(text.into()),
+            tokens,
+        }
+    }
+
+    /// No answer.
+    #[must_use]
+    pub fn empty() -> Self {
+        Self {
+            text: None,
+            tokens: 0,
+        }
+    }
+}
+
 /// What runs the agents a workflow asks for.
 #[async_trait::async_trait]
 pub trait AgentRunner: Send + Sync {
-    /// Run one agent. `Ok(None)` means it produced nothing — skipped, or it
-    /// gave up — which the script sees as `null`.
-    async fn run(&self, request: AgentRequest) -> Result<Option<String>, String>;
+    /// Run one agent. `text: None` means it produced nothing — skipped, or it
+    /// gave up — which the script sees as `null`. `tokens` feeds the run's
+    /// budget.
+    async fn run(&self, request: AgentRequest) -> Result<AgentOutput, String>;
 }
 
 /// What happened while a workflow ran.
@@ -203,6 +243,7 @@ pub async fn run_script(
         keys: Vec::new(),
         last_key: ROOT_KEY.to_string(),
         agent_count: 0,
+        tokens_used: 0,
         pending: Vec::new(),
     };
 
@@ -242,6 +283,8 @@ struct State {
     keys: Vec<String>,
     last_key: String,
     agent_count: usize,
+    /// Output tokens spent by agents that actually ran.
+    tokens_used: u64,
     pending: Vec<(String, AgentRequest)>,
 }
 
@@ -259,6 +302,7 @@ fn drive(
     context
         .eval(Source::from_bytes(&prelude))
         .map_err(|e| WorkflowError::Failed(format!("the runtime prelude failed: {e}")))?;
+    set_budget_globals(&mut context, state)?;
 
     // The arguments the script sees, and the calls it can make.
     let args_value = json_to_js(&mut context, args);
@@ -309,6 +353,9 @@ fn drive(
             };
             resolve_agent(&mut context, &id, value)?;
         }
+        // The next round's `budget.remaining()` must see what this round
+        // spent.
+        set_budget_globals(&mut context, state)?;
     }
     context.run_jobs();
 
@@ -367,6 +414,19 @@ async fn run_agents(
     let mut results = Vec::with_capacity(pending.len());
     let mut to_run = Vec::new();
 
+    // Do not start a round with the budget already spent. The check after the
+    // round catches the last batch; this one refuses the next.
+    if state
+        .limits
+        .token_budget
+        .is_some_and(|budget| state.tokens_used >= budget)
+    {
+        return Err(WorkflowError::Limit(format!(
+            "the workflow reached its token budget of {} output tokens",
+            state.limits.token_budget.unwrap_or_default()
+        )));
+    }
+
     for (id, request) in pending {
         state.agent_count += 1;
         if state.agent_count > state.limits.max_agents {
@@ -403,25 +463,23 @@ async fn run_agents(
 
     let runner = Arc::clone(&state.runner);
     let limit = state.limits.max_concurrent;
-    let jounal_entries: Vec<(
-        String,
-        String,
-        Option<String>,
-        Result<Option<String>, String>,
-    )> = stream::iter(to_run.into_iter().map(|(id, key, request)| {
-        let runner = Arc::clone(&runner);
-        async move {
-            let outcome = runner.run(request).await;
-            (id, key, None, outcome)
-        }
-    }))
-    .buffer_unordered(limit)
-    .collect::<Vec<_>>()
-    .await;
+    let jounal_entries: Vec<(String, String, Option<String>, Result<AgentOutput, String>)> =
+        stream::iter(to_run.into_iter().map(|(id, key, request)| {
+            let runner = Arc::clone(&runner);
+            async move {
+                let outcome = runner.run(request).await;
+                (id, key, None, outcome)
+            }
+        }))
+        .buffer_unordered(limit)
+        .collect::<Vec<_>>()
+        .await;
 
     for (id, key, _, outcome) in jounal_entries {
         match outcome {
-            Ok(value) => {
+            Ok(output) => {
+                state.tokens_used = state.tokens_used.saturating_add(output.tokens);
+                let value = output.text;
                 if value.is_none() {
                     state.progress.agents_empty += 1;
                 }
@@ -451,6 +509,15 @@ async fn run_agents(
                 state.progress.agents_empty += 1;
                 results.push((id, None));
             }
+        }
+    }
+
+    if let Some(budget) = state.limits.token_budget {
+        if state.tokens_used > budget {
+            return Err(WorkflowError::Limit(format!(
+                "the workflow used {} output tokens, past its budget of {budget}",
+                state.tokens_used
+            )));
         }
     }
 
@@ -634,6 +701,32 @@ fn budget_remaining(
     context.eval(Source::from_bytes("globalThis.__budget_remaining"))
 }
 
+/// Publish the run's token budget to the script.
+///
+/// The prelude initialises the globals to "no budget"; the host replaces them
+/// with the real figures before the body runs and after every round, so
+/// `budget.total()` and `budget.remaining()` report the budget actually in
+/// force instead of a constant.
+fn set_budget_globals(context: &mut Context, state: &State) -> Result<(), WorkflowError> {
+    let total = state
+        .limits
+        .token_budget
+        .map_or_else(|| "null".to_string(), |budget| budget.to_string());
+    let remaining = state.limits.token_budget.map_or_else(
+        || "Infinity".to_string(),
+        |budget| budget.saturating_sub(state.tokens_used).to_string(),
+    );
+    let script = format!(
+        "globalThis.__budget_total = {total}; globalThis.__budget_remaining = {remaining};"
+    );
+    context.eval(Source::from_bytes(&script)).map_err(|error| {
+        WorkflowError::Failed(format!(
+            "could not set the workflow budget globals: {error}"
+        ))
+    })?;
+    Ok(())
+}
+
 /// Call one of the realm's helpers with the arguments a script passed.
 fn call_helper(context: &mut Context, name: &str, args: &[JsValue]) -> JsResult<JsValue> {
     let helper = context.global_object().get(JsString::from(name), context)?;
@@ -809,11 +902,13 @@ mod tests {
 
     #[async_trait::async_trait]
     impl AgentRunner for FakeRunner {
-        async fn run(&self, request: AgentRequest) -> Result<Option<String>, String> {
+        async fn run(&self, request: AgentRequest) -> Result<AgentOutput, String> {
             let prompt = request.prompt.clone();
             self.calls.lock().unwrap().push(request);
             let answer = self.answer.lock().unwrap().clone();
-            Ok(answer.or_else(|| Some(format!("answered {prompt}"))))
+            Ok(AgentOutput::text(
+                answer.unwrap_or_else(|| format!("answered {prompt}")),
+            ))
         }
     }
 
@@ -822,14 +917,93 @@ mod tests {
     }
 
     async fn run_with(body: &str, runner: Arc<dyn AgentRunner>) -> Result<Outcome, WorkflowError> {
+        run_with_limits(body, runner, Limits::default()).await
+    }
+
+    async fn run_with_limits(
+        body: &str,
+        runner: Arc<dyn AgentRunner>,
+        limits: Limits,
+    ) -> Result<Outcome, WorkflowError> {
         run_script(
             &script(body),
             None,
             runner,
             std::env::temp_dir().join(new_run_id()),
-            Limits::default(),
+            limits,
         )
         .await
+    }
+
+    /// The budget the host configured is what the script sees, rather than
+    /// the prelude's `null` / `Infinity` placeholders.
+    #[tokio::test]
+    async fn the_budget_globals_report_the_configured_budget() {
+        let outcome = run_with_limits(
+            "return [budget.total(), budget.remaining()]",
+            Arc::new(FakeRunner::answering("unused")),
+            Limits {
+                token_budget: Some(10),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(outcome.result, Some(serde_json::json!([10, 10])));
+    }
+
+    /// The budget is a ceiling, not advice: a run that spends past it stops
+    /// with a limit error instead of continuing.
+    #[tokio::test]
+    async fn a_run_stops_when_it_spends_its_token_budget() {
+        struct Spending;
+
+        #[async_trait::async_trait]
+        impl AgentRunner for Spending {
+            async fn run(&self, _request: AgentRequest) -> Result<AgentOutput, String> {
+                Ok(AgentOutput::with_tokens("ok", 100))
+            }
+        }
+
+        let error = run_with_limits(
+            "await agent('one')\nawait agent('two')\nreturn 'done'",
+            Arc::new(Spending),
+            Limits {
+                token_budget: Some(150),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(error, WorkflowError::Limit(_)), "{error}");
+    }
+
+    /// `budget.remaining()` reflects what earlier agents spent.
+    #[tokio::test]
+    async fn the_remaining_budget_shrinks_after_agents_run() {
+        struct Spending;
+
+        #[async_trait::async_trait]
+        impl AgentRunner for Spending {
+            async fn run(&self, _request: AgentRequest) -> Result<AgentOutput, String> {
+                Ok(AgentOutput::with_tokens("ok", 40))
+            }
+        }
+
+        let outcome = run_with_limits(
+            "await agent('one')\nreturn budget.remaining()",
+            Arc::new(Spending),
+            Limits {
+                token_budget: Some(100),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(outcome.result, Some(serde_json::json!(60)));
     }
 
     #[tokio::test]
@@ -1083,7 +1257,7 @@ mod tests {
 
         #[async_trait::async_trait]
         impl AgentRunner for FailingRunner {
-            async fn run(&self, _request: AgentRequest) -> Result<Option<String>, String> {
+            async fn run(&self, _request: AgentRequest) -> Result<AgentOutput, String> {
                 Err("the model refused".to_string())
             }
         }

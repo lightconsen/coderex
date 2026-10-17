@@ -341,9 +341,22 @@ impl<W: Write> MessageSink<W> {
     /// frame as soon as the producer emits it, not when an internal buffer
     /// fills.
     ///
-    /// `result` frames should normally go through [`Turn::emit_turn_complete`]
-    /// instead, which enforces one per turn.
+    /// A `result` frame is refused here: it is the turn's one and only closing
+    /// signal, and [`Turn::emit_turn_complete`] is the only path that writes
+    /// it. Without the refusal a caller could put two results in one turn by
+    /// bypassing the guard.
     pub fn emit(&mut self, message: &ProtocolMessage) -> io::Result<()> {
+        if message.is_result() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "result frames must go through Turn::emit_turn_complete",
+            ));
+        }
+        self.write(message)
+    }
+
+    /// Write a frame without the public guard. Only [`Turn`] calls this.
+    fn write(&mut self, message: &ProtocolMessage) -> io::Result<()> {
         self.writer.write_all(message.to_line().as_bytes())?;
         self.writer.flush()
     }
@@ -352,10 +365,13 @@ impl<W: Write> MessageSink<W> {
     ///
     /// The returned [`Turn`] is the only sanctioned way to emit the turn's
     /// `result`, and it consumes itself when doing so — so a turn cannot
-    /// produce two.
-    pub const fn begin_turn(&mut self) -> Turn<'_, W> {
+    /// produce two. Dropping it without a result writes an error result rather
+    /// than leaving the turn with none.
+    pub fn begin_turn(&mut self, session_id: impl Into<String>) -> Turn<'_, W> {
         Turn {
             sink: self,
+            session_id: session_id.into(),
+            started: std::time::Instant::now(),
             completed: false,
         }
     }
@@ -373,11 +389,14 @@ impl<W: Write> MessageSink<W> {
 
 /// A turn in progress.
 ///
-/// Dropping a `Turn` without completing it logs a warning: the reference
-/// always emits a `result`, even for a failed turn.
+/// Dropping a `Turn` without completing it writes an error `result` rather
+/// than leaving the turn open: the reference always emits a `result`, even for
+/// a failed turn.
 #[derive(Debug)]
 pub struct Turn<'a, W: Write> {
     sink: &'a mut MessageSink<W>,
+    session_id: String,
+    started: std::time::Instant,
     completed: bool,
 }
 
@@ -399,7 +418,7 @@ impl<W: Write> Turn<'_, W> {
     /// Consumes the turn, so it cannot be called twice.
     pub fn emit_turn_complete(mut self, result: ResultFrame) -> Result<(), TurnError> {
         self.sink
-            .emit(&ProtocolMessage::Result(result))
+            .write(&ProtocolMessage::Result(result))
             .map_err(TurnError::Io)?;
         self.completed = true;
         Ok(())
@@ -414,9 +433,23 @@ impl<W: Write> Turn<'_, W> {
 
 impl<W: Write> Drop for Turn<'_, W> {
     fn drop(&mut self) {
-        if !self.completed {
+        if self.completed {
+            return;
+        }
+
+        let frame = ResultFrame::error(
+            self.session_id.clone(),
+            result_subtype::ERROR_DURING_EXECUTION,
+            u64::try_from(self.started.elapsed().as_millis()).unwrap_or(u64::MAX),
+            1,
+        );
+        if self
+            .sink
+            .write(&ProtocolMessage::Result(frame))
+            .is_err()
+        {
             tracing::warn!(
-                "turn ended without a result frame; the protocol requires exactly one per turn"
+                "turn ended without a result and the fallback result could not be written"
             );
         }
     }
@@ -588,7 +621,7 @@ mod tests {
     fn a_turn_emits_exactly_one_result() {
         let mut sink = MessageSink::new(Vec::new());
         {
-            let mut turn = sink.begin_turn();
+            let mut turn = sink.begin_turn("s1");
             turn.emit(&assistant_line("s1", "hi")).unwrap();
             // A result may not sneak in through the ordinary emit path.
             let stray = ProtocolMessage::Result(ResultFrame::success("s1", "nope", 0, 1));
@@ -608,6 +641,39 @@ mod tests {
             })
             .count();
         assert_eq!(results, 1, "a turn must end with exactly one result frame");
+    }
+
+    /// The sink itself refuses a result, so a caller cannot bypass the turn
+    /// guard by writing a second one directly.
+    #[test]
+    fn the_sink_refuses_a_result_that_did_not_come_from_a_turn() {
+        let mut sink = MessageSink::new(Vec::new());
+        let stray = ProtocolMessage::Result(ResultFrame::success("s1", "nope", 0, 1));
+        let error = sink.emit(&stray).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    /// A turn dropped without its result still closes the stream with an error
+    /// result; zero results would leave a host waiting forever.
+    #[test]
+    fn dropping_a_turn_writes_an_error_result() {
+        let mut sink = MessageSink::new(Vec::new());
+        {
+            let mut turn = sink.begin_turn("s1");
+            turn.emit(&assistant_line("s1", "partial")).unwrap();
+            // Dropped without emit_turn_complete.
+        }
+
+        let out = String::from_utf8(sink.into_inner()).unwrap();
+        let results: Vec<Value> = out
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .filter(|value: &Value| value["type"] == "result")
+            .collect();
+        assert_eq!(results.len(), 1, "a dropped turn must still close itself");
+        assert_eq!(results[0]["subtype"], "error_during_execution");
+        assert_eq!(results[0]["is_error"], true);
+        assert_eq!(results[0]["session_id"], "s1");
     }
 
     #[test]

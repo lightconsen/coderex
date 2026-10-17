@@ -76,7 +76,7 @@ A turn emits **exactly one** `result` frame, including when the turn failed
 (the reference's own schema says to treat `result` as the end of the turn).
 This is enforced by construction rather than by convention:
 
-- `MessageSink::begin_turn()` returns a `Turn` guard.
+- `MessageSink::begin_turn(session_id)` returns a `Turn` guard.
 - `Turn::emit_turn_complete(self, ResultFrame)` consumes the guard, so it
   cannot run twice.
 - `Turn::emit(&ProtocolMessage::Result(..))` is **refused** — the only
@@ -114,9 +114,10 @@ would hand it `stdout` (`StdoutSink` is the alias for that case).
   termination reasons pass through.
 - **The transcript mirror is not implemented here.** The protocol is the
   reporting path; nothing in this crate writes a transcript.
-- **No consumer inside this repository.** The CLI does not yet construct a
-  `MessageSink` — see the wiring note below. The crate compiles and is tested
-  in isolation; it has no dependents.
+- **The CLI is the consumer.** `--output-format stream-json` constructs a
+  `MessageSink` in `orchestrator.rs` and the headless turn loop in `repl.rs`
+  writes frames to it as engine events arrive; see *How the CLI emits the
+  stream* below.
 
 ## Design
 
@@ -136,7 +137,10 @@ would hand it `stdout` (`StdoutSink` is the alias for that case).
 
 - **One producer → one serialized output.** No fan-out, no registry.
 - **Ownership as enforcement.** The `Turn` guard makes "exactly one result"
-  structural.
+  structural: `Turn::emit` refuses a `result`, `emit_turn_complete` consumes
+  the guard, `MessageSink::emit` refuses a `result` from outside a turn, and
+  dropping a turn without one writes an `error_during_execution` result, so a
+  host is never left waiting for zero.
 - **Untyped passthrough at the edges.** Fields the reference does not fix are
   preserved as JSON rather than dropped or re-modelled.
 - **Interior mutability** via `Arc<Mutex<..>>` for session trackers; **JSON
@@ -159,36 +163,25 @@ would hand it `stdout` (`StdoutSink` is the alias for that case).
   that no longer exists. `check_timeouts()` now *returns* the ids it resolved
   instead of emitting bus events.
 
-## Wiring the CLI (`--output-format stream-json`)
+## How the CLI emits the stream (`--output-format stream-json`)
 
-`--output-format` today accepts `text` (default) and `json`; `json` prints one
-final blob from `crates/cli/src/orchestrator.rs`
-(`format_headless_output`, ~line 1231). `stream-json` is not handled at all
-today — it falls through to raw text. The change is:
+`--output-format` accepts `text` (default), `json`, `markdown`, and
+`stream-json`. For `stream-json`, `run_headless_with_prompt` in
+`crates/cli/src/orchestrator.rs` constructs
+`MessageSink::new(std::io::stdout())` and hands it to the `ReplLoop`
+(`with_protocol_sink`) before the turn starts. The headless turn loop in
+`repl.rs` then:
 
-1. **Construct the sink in `run_headless_with_prompt`**
-   (`crates/cli/src/orchestrator.rs:1154`), right after the `ReplLoop` is built
-   and before `repl.run_headless(...)`:
-   `MessageSink::new(std::io::stdout())` when `ctx.output_format ==
-   "stream-json"`, and hand it to the `ReplLoop`.
-2. **The emitter has to live where `event_rx` is drained.** `ReplLoop` owns the
-   engine event stream: the channel is created at
-   `crates/cli/src/repl.rs:800` (`mpsc::unbounded_channel::<EngineEvent>()`),
-   stored in the `event_rx` field (`repl.rs:522`), and read in `drain_events`
-   (`repl.rs:2792`) and the TUI match loop (`repl.rs:2456`). One turn is one
-   `run_headless` call (`repl.rs:2765`). So the `ReplLoop` needs an
-   `Option<MessageSink<Stdout>>` field (set via a `with_protocol_sink`-style
-   setter) and must map `EngineEvent` → `ProtocolMessage` where it already
-   matches on engine events: `TextDelta` → `stream_event` (and/or an
-   `assistant` frame), `ToolCallStart`/`ToolCallEnd` → an `assistant` `tool_use`
-   block and the `user` `tool_result` frame, `CompactBoundary` → a `system`
-   frame with `subtype: "compact_boundary"`, and `SessionEnd` → the turn's
-   `result`. That translation is the only genuinely new code; constructing the
-   sink and calling `begin_turn` / `emit_turn_complete` is small.
-3. `format_headless_output` should skip its `json`/text formatting when
-   `stream-json` is selected — the protocol frames are written to stdout as they
-   happen, and `run_headless`'s returned string becomes `result.result` in the
-   final `result` frame rather than something to `println!`.
+- maps engine events to protocol frames as they arrive (`protocol_frame`), so
+  the host sees the turn live rather than in one blob at the end;
+- opens the turn with `sink.begin_turn(session_id)`;
+- closes it with `emit_turn_complete`: `success` for a completed turn,
+  `error_max_turns` when the engine stopped at the turn limit, and
+  `error_during_execution` (with the reason in `data.error`) for a failed
+  query.
 
-`repl.rs` is not edited by this change; the above is the exact shape of the
-wiring it needs.
+`format_headless_output` is skipped for `stream-json`; the final `result`
+frame is the answer, one JSON object per line. The CLI test
+`stream_json_writes_one_frame_per_line` drives the real `coderex` binary
+against the static mock provider and parses every line as JSON, asserting
+exactly one `result` frame.

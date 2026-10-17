@@ -28,6 +28,9 @@ pub const ENABLE_FLAG: &str = "workflow_scripts";
 /// The environment variable that overrides the concurrency gate.
 pub const MAX_CONCURRENT_ENV: &str = "CODEREX_WORKFLOW_MAX_CONCURRENT_AGENTS";
 
+/// Environment variable holding the run's output-token budget.
+pub const TOKEN_BUDGET_ENV: &str = "CODEREX_WORKFLOW_TOKEN_BUDGET";
+
 /// Longest a run's result is reported at, in characters.
 pub const MAX_RESULT_CHARS: usize = 16_000;
 
@@ -108,6 +111,11 @@ impl WorkflowTool {
         if let Ok(value) = std::env::var(MAX_CONCURRENT_ENV) {
             if let Ok(parsed) = value.parse::<usize>() {
                 limits.max_concurrent = parsed.clamp(1, 64);
+            }
+        }
+        if let Ok(value) = std::env::var(TOKEN_BUDGET_ENV) {
+            if let Ok(parsed) = value.parse::<u64>() {
+                limits.token_budget = Some(parsed);
             }
         }
         limits
@@ -388,7 +396,7 @@ fn execution(message: &str) -> ToolError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::runtime::AgentRequest;
+    use crate::runtime::{AgentOutput, AgentRequest};
     use std::sync::Mutex;
 
     #[derive(Default)]
@@ -398,9 +406,9 @@ mod tests {
 
     #[async_trait::async_trait]
     impl AgentRunner for CountingRunner {
-        async fn run(&self, request: AgentRequest) -> Result<Option<String>, String> {
+        async fn run(&self, request: AgentRequest) -> Result<AgentOutput, String> {
             *self.calls.lock().unwrap() += 1;
-            Ok(Some(format!("handled {}", request.prompt)))
+            Ok(AgentOutput::text(format!("handled {}", request.prompt)))
         }
     }
 

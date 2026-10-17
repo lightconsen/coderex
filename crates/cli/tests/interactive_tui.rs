@@ -590,6 +590,23 @@ fn startup_renders_prompt_and_default_regions() {
     assert!(!session.raw_text().contains("[DEBUG] args.print"));
 }
 
+/// A piped command's later segments arrive with their slash still on; the
+/// TUI used to ask the registry for `"/env"` and print `Unknown command`.
+#[test]
+fn piped_commands_work_in_the_tui() {
+    let dir = setup_project_dir();
+    let mut session = session_without_engine(dir.path());
+    session.wait_for_text("CodeRex v", SCREEN_TIMEOUT);
+    session.send_line("/version | /env");
+    // The env listing is longer than the screen, so look for a variable the
+    // harness itself set rather than the header (which scrolls off).
+    let screen = session.wait_for_text("CARGO_BIN_EXE_static-anthropic-server", SCREEN_TIMEOUT);
+    assert!(
+        !screen.contains("Unknown command"),
+        "the later piped segment was not recognised:\n{screen}"
+    );
+}
+
 #[test]
 fn help_command_renders_in_tui() {
     let dir = setup_project_dir();
@@ -993,11 +1010,22 @@ fn resize_keeps_tui_alive() {
     }
 
     session.resize(40, 120);
-    let after_grow = session.wait_for_text("CodeRex v", SCREEN_TIMEOUT);
+    // Force a redraw at the new size instead of waiting for one that may only
+    // update the cells ratatui thinks changed. Typing is the same thing the
+    // shrink half does, and it makes the wait deterministic under load.
+    session.send_text("grown");
+    let after_grow = session.wait_for_text("grown", SCREEN_TIMEOUT);
+    assert!(
+        after_grow.contains("CodeRex v"),
+        "the banner is missing after growing:\n{after_grow}"
+    );
     assert!(
         after_grow.contains("❯"),
         "the prompt is missing after growing:\n{after_grow}"
     );
+    for _ in 0.."grown".len() {
+        session.send_bytes(b"\x7f");
+    }
 
     // And it still takes input.
     session.send_line("/status");

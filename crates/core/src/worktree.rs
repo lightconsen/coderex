@@ -88,7 +88,9 @@ impl WorktreeManager {
     /// Stashes uncommitted changes, creates a new branch, and sets up
     /// a worktree in a subdirectory.
     ///
-    /// Falls back to the original directory if worktree creation fails.
+    /// Returns an error if the worktree cannot be created. It does **not**
+    /// fall back to the original directory: a caller that asked for isolation
+    /// and silently got the checkout is the failure this avoids.
     pub fn create_worktree(
         &mut self,
         cwd: &PathBuf,

@@ -44,7 +44,7 @@
 //! };
 //!
 //! let mut sink = MessageSink::new(Vec::new());
-//! let mut turn = sink.begin_turn();
+//! let mut turn = sink.begin_turn("session-1");
 //! turn.emit(&ProtocolMessage::Assistant(AssistantFrame {
 //!     message: MessageBody::assistant(vec![text_block("hello")]),
 //!     parent_tool_use_id: None,
