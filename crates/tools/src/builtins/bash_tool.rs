@@ -83,6 +83,17 @@ impl BashTool {
 
 #[async_trait]
 impl Tool for BashTool {
+    /// The command is this tool's rule content, as it is in the reference
+    /// (`Bash=command`). Declaring the field means a deny rule is judged
+    /// against the command line the call is about to run — including a command
+    /// with no slash in it, which the path-shaped fallback would not offer.
+    fn capabilities(&self) -> crate::tool::ToolCapabilities {
+        crate::tool::ToolCapabilities {
+            rule_content_field: Some(crate::tool::RuleContentField::Scalar("command")),
+            ..crate::tool::ToolCapabilities::default()
+        }
+    }
+
     fn descriptor(&self) -> ToolDescriptor {
         ToolDescriptor {
             name: "Bash".into(),

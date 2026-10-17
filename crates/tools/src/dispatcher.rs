@@ -571,6 +571,59 @@ mod tests {
         assert!(path_arguments(&serde_json::json!("not an object")).is_empty());
     }
 
+    /// A Bash call is judged against its command line, because that is what
+    /// the tool declares its rule content to be. This command has no slash in
+    /// it, so the path-shaped fallback would have offered nothing to the rule —
+    /// which is what makes this a regression test for the declaration rather
+    /// than for the dispatch check.
+    #[tokio::test]
+    async fn a_bash_command_without_a_slash_is_still_judged() {
+        let mut registry = ToolRegistry::new();
+        registry.register(Arc::new(crate::builtins::BashTool::new()));
+        registry.add_deny_rule(ToolDenyRule::for_paths(vec!["*rm -rf*".into()]));
+        let registry = Arc::new(registry);
+
+        let executor = Arc::new(InnerExecutor::new(ExecutionConfig::default()));
+        let dispatcher = RegistryToolDispatcher::new(
+            registry,
+            executor,
+            ExecutionContext::Normal,
+            PathBuf::from("/tmp"),
+        );
+
+        let denied = dispatcher
+            .execute("id-1", "Bash", &serde_json::json!({"command": "rm -rf build"}))
+            .await;
+        assert!(denied.result.is_error, "{:?}", denied.result);
+        assert!(
+            denied.result.output.contains("denied"),
+            "the refusal should say so: {}",
+            denied.result.output
+        );
+    }
+
+    /// The control for the test above: a command the rule does not match runs.
+    #[tokio::test]
+    async fn a_bash_command_the_rule_does_not_match_runs() {
+        let mut registry = ToolRegistry::new();
+        registry.register(Arc::new(crate::builtins::BashTool::new()));
+        registry.add_deny_rule(ToolDenyRule::for_paths(vec!["*rm -rf*".into()]));
+        let registry = Arc::new(registry);
+
+        let executor = Arc::new(InnerExecutor::new(ExecutionConfig::default()));
+        let dispatcher = RegistryToolDispatcher::new(
+            registry,
+            executor,
+            ExecutionContext::Normal,
+            PathBuf::from("/tmp"),
+        );
+
+        let allowed = dispatcher
+            .execute("id-1", "Bash", &serde_json::json!({"command": "echo hello"}))
+            .await;
+        assert!(!allowed.result.is_error, "{:?}", allowed.result);
+    }
+
     /// The check has to happen at dispatch, with the call's own arguments: a
     /// rule written against a path is only meaningful against the path this
     /// call is about to touch.
