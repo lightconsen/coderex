@@ -10,6 +10,7 @@ mod executor;
 mod rate_limiter;
 mod registry;
 mod sandbox_policy;
+mod sandbox_shell;
 mod task_store;
 mod todo_store;
 mod tool;

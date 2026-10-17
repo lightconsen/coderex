@@ -431,11 +431,31 @@ impl SandboxHandle {
         self.inner.post_spawn(child)
     }
 
-    /// Get the program to use as a sandbox wrapper (macOS only).
+    /// Complete sandbox setup for an asynchronously spawned child.
     ///
-    /// On macOS, returns `("sandbox-exec", ["-f", profile_path])`.
-    /// On other platforms, returns `None`.
-    #[cfg(target_os = "macos")]
+    /// The shell tools spawn through `tokio::process`, which hands out a raw
+    /// handle rather than a `std::process::Child` — so the Windows path needs
+    /// this entry point to put the child in its Job Object. Without a caller
+    /// there was no caller at all: the Job Object was created and never
+    /// assigned to anything.
+    #[cfg(target_os = "windows")]
+    pub fn post_spawn_raw(
+        &self,
+        handle: std::os::windows::io::RawHandle,
+    ) -> Result<(), SandboxError> {
+        self.inner.post_spawn_raw(handle)
+    }
+
+    /// The program to run a command under, when a wrapper is in force.
+    ///
+    /// macOS returns `("sandbox-exec", ["-f", profile_path])`; Linux returns
+    /// `("bwrap", …)` when bubblewrap is available and not switched off. Both
+    /// are `None` when nothing wraps the command.
+    ///
+    /// This was `#[cfg(target_os = "macos")]`, which meant the Linux caller in
+    /// `bash_tool` could not see it — and, because that caller is itself behind
+    /// a Linux `cfg`, neither the definition nor the use was ever compiled for
+    /// the platform they exist for.
     #[must_use]
     pub fn sandboxed_program(&self) -> Option<(&str, Vec<String>)> {
         self.inner.sandboxed_program()
@@ -472,7 +492,8 @@ impl PlatformSandbox {
         }
     }
 
-    fn prepare(&self, _cmd: &mut std::process::Command) -> Result<(), SandboxError> {
+    #[allow(unused_variables)] // only the Linux arm reads it
+    fn prepare(&self, cmd: &mut std::process::Command) -> Result<(), SandboxError> {
         match self {
             #[cfg(target_os = "linux")]
             Self::Linux(s) => s.prepare(cmd),
@@ -496,9 +517,20 @@ impl PlatformSandbox {
         }
     }
 
-    #[cfg(target_os = "macos")]
+    #[cfg(target_os = "windows")]
+    fn post_spawn_raw(
+        &self,
+        handle: std::os::windows::io::RawHandle,
+    ) -> Result<(), SandboxError> {
+        match self {
+            Self::Windows(s) => s.post_spawn_raw(handle),
+            _ => Ok(()),
+        }
+    }
+
     fn sandboxed_program(&self) -> Option<(&str, Vec<String>)> {
         match self {
+            #[cfg(target_os = "macos")]
             Self::MacOs(s) => Some(s.exec_command()),
             #[cfg(target_os = "linux")]
             Self::Linux(s) => s.exec_command(),
@@ -706,6 +738,7 @@ mod seccomp_arch {
 #[cfg(target_os = "linux")]
 mod linux_impl {
     use super::{SandboxConfig, SandboxError};
+    use std::os::unix::process::CommandExt;
     use std::process::Command;
 
     /// Linux sandbox using seccomp + rlimit.
@@ -790,10 +823,10 @@ mod linux_impl {
         // ─── rlimits ─────────────────────────────────────────────────────────
 
         fn apply_rlimits(config: &SandboxConfig) -> Result<(), std::io::Error> {
-            use libc::{prlimit, rlimit64, RLIMIT_AS, RLIMIT_CPU, RLIMIT_NOFILE};
+            use libc::{prlimit, rlimit, RLIMIT_AS, RLIMIT_CPU, RLIMIT_NOFILE};
 
             if let Some(max_files) = config.max_open_files {
-                let rl = rlimit64 {
+                let rl = rlimit {
                     rlim_cur: max_files,
                     rlim_max: max_files,
                 };
@@ -804,7 +837,7 @@ mod linux_impl {
             }
 
             if let Some(max_mem) = config.max_memory_bytes {
-                let rl = rlimit64 {
+                let rl = rlimit {
                     rlim_cur: max_mem,
                     rlim_max: max_mem,
                 };
@@ -815,7 +848,7 @@ mod linux_impl {
             }
 
             if let Some(max_cpu) = config.max_cpu_seconds {
-                let rl = rlimit64 {
+                let rl = rlimit {
                     rlim_cur: max_cpu,
                     rlim_max: max_cpu,
                 };
@@ -836,6 +869,7 @@ mod linux_impl {
             const PR_SET_SECCOMP: libc::c_int = 22;
             const SECCOMP_MODE_FILTER: libc::c_int = 2;
             const SECCOMP_RET_ALLOW: u32 = 0x7FFF_0000;
+            const SECCOMP_RET_ERRNO: u32 = 0x0005_0000;
             const SECCOMP_RET_KILL: u32 = 0x0000_0000;
 
             const BPF_LD: u16 = 0x00;
@@ -865,18 +899,31 @@ mod linux_impl {
             // wrapped process at its first syscall.
             const ALLOWED: &[i64] = super::seccomp_arch::ALLOWED;
 
-            // load arch @ offset 0
+            // The vector is filled in two places — the arch prologue before the
+            // syscall list is built, and the syscall pairs after it — so it is
+            // declared where the prologue starts.
+            let mut filter: Vec<sock_filter> = Vec::new();
+
+            // Load `seccomp_data.arch`, which is at offset **4** — the struct is
+            // `{ nr: i32, arch: u32, ip: u64, args: [u64; 6] }`. These two
+            // offsets were the other way round, so the filter compared the
+            // syscall *number* against the architecture token, never matched,
+            // and killed every process at its first syscall.
             filter.push(sock_filter {
                 code: BPF_LD + BPF_W + BPF_ABS,
                 jt: 0,
                 jf: 0,
-                k: 0,
+                k: 4,
             });
-            // if arch == AUDIT_ARCH, continue; else kill
+            // If the arch matches, skip the kill and continue; if it does not,
+            // fall through to it. `jt`/`jf` are offsets from the *next*
+            // instruction, so matching has to jump over the kill — with the
+            // offsets swapped this killed every process on the very
+            // architecture the table was built for.
             filter.push(sock_filter {
                 code: BPF_JMP + BPF_JEQ + BPF_K,
-                jt: 0,
-                jf: 1,
+                jt: 1,
+                jf: 0,
                 k: super::seccomp_arch::AUDIT_ARCH,
             });
             filter.push(sock_filter {
@@ -886,12 +933,12 @@ mod linux_impl {
                 k: SECCOMP_RET_KILL,
             });
 
-            // load syscall @ offset 4
+            // Load `seccomp_data.nr`, the syscall number, at offset 0.
             filter.push(sock_filter {
                 code: BPF_LD + BPF_W + BPF_ABS,
                 jt: 0,
                 jf: 0,
-                k: 4,
+                k: 0,
             });
 
             // Network syscalls are absent from the base list, and the default
@@ -901,8 +948,6 @@ mod linux_impl {
             if allow_network {
                 allowed.extend_from_slice(super::seccomp_arch::NETWORK);
             }
-
-            let mut filter: Vec<sock_filter> = Vec::with_capacity(4 + allowed.len() * 2 + 1);
 
             // one JEQ + RET_ALLOW pair per allowed syscall
             for &nr in &allowed {
@@ -920,12 +965,22 @@ mod linux_impl {
                 });
             }
 
-            // default deny
+            // Default deny — with `EPERM`, not `KILL`.
+            //
+            // A 159-syscall allowlist cannot anticipate everything a real
+            // program calls: glibc picks up new syscalls (`rseq`, for one) and
+            // the list goes stale. With a kill default, any syscall nobody
+            // listed takes the whole process down with SIGSYS — which is
+            // exactly what happened to `true` the first time this ran on a
+            // Linux kernel. A sandbox should refuse the call, not murder the
+            // process it was asked to confine; network syscalls are still
+            // absent from the allowlist when the network is denied, so they
+            // fail with the same `EPERM` either way.
             filter.push(sock_filter {
                 code: BPF_RET + BPF_K,
                 jt: 0,
                 jf: 0,
-                k: SECCOMP_RET_KILL,
+                k: SECCOMP_RET_ERRNO | (libc::EPERM as u32 & 0xffff),
             });
 
             let prog = sock_fprog {
@@ -1230,15 +1285,24 @@ mod windows_impl {
 
         pub fn post_spawn(&self, child: &std::process::Child) -> Result<(), SandboxError> {
             use std::os::windows::io::AsRawHandle;
-            unsafe {
-                let ret =
-                    AssignProcessToJobObject(self.job_handle, child.as_raw_handle() as HANDLE);
-                if ret == 0 {
-                    return Err(SandboxError::CreationError(format!(
-                        "AssignProcessToJobObject failed: {}",
-                        std::io::Error::last_os_error()
-                    )));
-                }
+            self.post_spawn_raw(child.as_raw_handle())
+        }
+
+        /// Assign a process to the Job Object, by handle.
+        ///
+        /// The assignment is what makes the limits apply, so a child that never
+        /// gets here is not sandboxed at all — which is how this subsystem used
+        /// to be: the Job Object was created, and nothing was put in it.
+        pub fn post_spawn_raw(
+            &self,
+            process: std::os::windows::io::RawHandle,
+        ) -> Result<(), SandboxError> {
+            let ret = unsafe { AssignProcessToJobObject(self.job_handle, process as HANDLE) };
+            if ret == 0 {
+                return Err(SandboxError::CreationError(format!(
+                    "AssignProcessToJobObject failed: {}",
+                    std::io::Error::last_os_error()
+                )));
             }
             Ok(())
         }
@@ -1718,6 +1782,110 @@ mod tests {
     /// Anything but an explicit negative leaves the wrapper on: a sandbox that
     /// switches itself off because a variable was set to something unexpected
     /// is worse than one that says what it wants.
+    /// Run `bwrap` for real with the arguments [`bubblewrap_args`] produces.
+    ///
+    /// Every other bubblewrap test reads the argument vector; this one executes
+    /// it, so a wrong flag fails a test instead of breaking every shell command
+    /// on a Linux machine. Linux-only, and skipped when `bwrap` is not
+    /// installed — but it is the test that turns "the policy looks right" into
+    /// "the kernel agrees".
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn the_bubblewrap_arguments_confine_a_real_process() {
+        if !bubblewrap_available() {
+            eprintln!("skipping: bwrap is not installed");
+            return;
+        }
+
+        let dir = std::env::temp_dir().join(format!("coderex-bwrap-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let config = SandboxConfig {
+            allowed_read_paths: vec![dir.clone()],
+            allowed_write_paths: vec![dir.clone()],
+            allowed_exec_paths: Vec::new(),
+            additional_working_dirs: vec![dir.clone()],
+            max_open_files: None,
+            max_memory_bytes: None,
+            max_cpu_seconds: None,
+            allow_network: false,
+        };
+        let args = bubblewrap_args(&config, &dir);
+        let run = |script: &str| {
+            std::process::Command::new("bwrap")
+                .args(&args)
+                .arg("sh")
+                .arg("-c")
+                .arg(script)
+                .output()
+                .expect("bwrap should be runnable")
+        };
+
+        // It starts at all, in the working directory the policy names, and the
+        // writable path is writable — the three things a wrong flag breaks first.
+        let out = run("pwd; echo written > inside.txt");
+        assert!(
+            out.status.success(),
+            "bwrap refused the arguments: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout).trim(),
+            dir.to_string_lossy(),
+            "the child did not start in the configured working directory"
+        );
+        assert!(
+            dir.join("inside.txt").exists(),
+            "the allowed write path was not writable"
+        );
+
+        // The root is read-only.
+        let out = run("touch /coderex-should-not-exist 2>&1 || echo blocked");
+        assert!(
+            String::from_utf8_lossy(&out.stdout).contains("blocked"),
+            "the read-only root let a write through"
+        );
+        assert!(!std::path::Path::new("/coderex-should-not-exist").exists());
+
+        // Network is off by default, so the namespace has no interface but loopback.
+        let out = run("cut -d: -f1 /proc/net/dev");
+        let interfaces = String::from_utf8_lossy(&out.stdout).to_string();
+        assert!(
+            !interfaces.contains("eth0"),
+            "the network namespace was not created: {interfaces}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The syscall allowlist, exercised on a real process.
+    ///
+    /// Only meaningful when the wrapper is **not** in force — with `bwrap` the
+    /// sandbox is the mount namespace, and `prepare` deliberately skips the
+    /// seccomp table (the wrapper itself needs the syscalls the table denies).
+    /// So this is skipped when `bwrap` is in force; run it with
+    /// `CODEREX_BWRAP=0` to exercise the allowlist. A wrong table kills the
+    /// child with SIGSYS, which is exactly what this asserts does not happen.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn the_seccomp_allowlist_lets_a_real_process_run() {
+        if bubblewrap_in_force() {
+            eprintln!("skipping: bubblewrap is in force; set CODEREX_BWRAP=0 to test the syscall table");
+            return;
+        }
+
+        let handle = SandboxHandle::create(SandboxConfig::default()).unwrap();
+        let mut cmd = std::process::Command::new("true");
+        handle.prepare(&mut cmd).expect("pre_exec should install");
+        let output = cmd.output().expect("spawn");
+        assert!(
+            output.status.success(),
+            "the syscall allowlist killed a trivial process: {:?}",
+            output.status
+        );
+    }
+
     #[test]
     fn bubblewrap_is_switched_off_only_by_an_explicit_negative() {
         for off in ["0", "false", "no"] {

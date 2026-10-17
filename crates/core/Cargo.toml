@@ -15,6 +15,11 @@ default = []
 test-utils = ["dep:wiremock"]
 
 [dependencies]
+# The Linux sandbox reaches libc directly (seccomp, prlimit). It was declared in
+# the workspace and never listed here, so `coderex-core` did not build on Linux
+# at all — the sandbox code was reviewed but never compiled on the platform it
+# exists for.
+libc.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

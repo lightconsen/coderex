@@ -13,8 +13,9 @@ says so at runtime rather than letting the caller assume otherwise.
 | Platform backends (Seatbelt / seccomp / Job Objects) | `crates/core/src/sandbox.rs` |
 | Per-tool default policy (which paths, which limits) | `crates/tools/src/sandbox_policy.rs` |
 | Policy injected into `ToolContext.extra["sandbox_config"]` | `RegistryToolDispatcher` in `crates/tools/src/dispatcher.rs` |
-| `Bash` applies the sandbox | `build_sandboxed_command`, `crates/tools/src/builtins/bash_tool.rs:43` |
-| `PowerShell` **does not** — it never reads `sandbox_config`, and it is registered only on Windows | `crates/tools/src/builtins/powershell_tool.rs` |
+| **Shell wrapping lives in one place** — both shell tools use it | `sandboxed_shell` / `finish_spawn`, `crates/tools/src/sandbox_shell.rs` |
+| `Bash` applies the sandbox | `crates/tools/src/builtins/bash_tool.rs` |
+| `PowerShell` applies the sandbox too | `crates/tools/src/builtins/powershell_tool.rs` |
 | MCP servers spawn outside it | `JsonRpcChannel::spawn`, `crates/mcp/src/channel.rs:176` |
 
 Sandboxing is on by default (`ExecutionConfig::sandbox_enabled = true`, the
@@ -73,7 +74,13 @@ unexpected value is worse than one that says what it wants.
 
 **Without `bwrap`**, `prepare()` installs a `pre_exec` closure that applies
 `RLIMIT_NOFILE`, `RLIMIT_AS` and `RLIMIT_CPU`, then installs a seccomp-BPF filter
-with a default action of kill and an explicit allowlist of syscalls. The audit
+with an explicit allowlist of syscalls and a default action of **`EPERM`**. The
+default used to be `KILL`, which turned every syscall nobody had listed into
+`SIGSYS` — and, because the filter read `seccomp_data.arch` and `.nr` at each
+other's offsets, it never matched the architecture and killed every process at
+its first syscall. A sandbox should refuse a call, not murder the process it was
+asked to confine; network syscalls are still absent from the allowlist when the
+network is denied, so they fail with `EPERM` either way. The audit
 token and the syscall numbers come from the current architecture
 (`seccomp_arch`), so an aarch64 host does not get the x86_64 table.
 `allow_network` **is** honoured there: the network syscalls are a separate table
@@ -83,13 +90,24 @@ syscalls, not paths, so a wrapped process can still read and write anything its
 user could — and the sandbox logs a warning saying so. Nothing silently claims
 otherwise.
 
-**Unverified at runtime:** the wrapper's flags were written on macOS, where
-`bwrap` does not exist. The argument construction is unit-tested here and the
-Linux-gated code is reviewed but **cannot be compiled or run on this machine**
-(`ring`'s build script needs a cross C compiler, and no Linux toolchain is
-installed). If a flag is wrong on a real Linux host, every sandboxed command
-fails loudly rather than silently running unconfined — set `CODEREX_BWRAP=0` to
-fall back to the syscall filter.
+**Verified on Linux, in a container.** The whole workspace is compiled and its
+core and tools suites run on a Linux kernel (Debian, `bwrap` 0.12) in both modes
+— wrapper on, and `CODEREX_BWRAP=0` for the syscall path. Three tests exist so it
+stays that way: `the_bubblewrap_arguments_confine_a_real_process` runs `bwrap`
+with the arguments this module produces and asserts the root is read-only, the
+configured path writable, the child starts where it was told to, and the network
+namespace has no interface but loopback; `sandboxed_echo_works_on_linux` and
+`sandboxed_echo_works_without_bubblewrap` drive the Bash tool's own spawn path
+through each mode.
+
+That verification is what found the defects this file used to describe as
+"reviewed only": `coderex-core` did not compile on Linux at all (`libc` was
+declared in the workspace and never listed in the crate), `sandboxed_program`
+was gated to macOS so the Linux caller could not see it, the seccomp filter read
+the architecture and syscall numbers from each other's offsets, and the shell
+fallback ran `sh sh -c …`. None of that was visible from macOS, which is the
+point: a platform `cfg` that is never compiled on its platform is a comment, not
+code.
 
 ### Windows — Job Objects
 
@@ -97,13 +115,22 @@ Creates a Job Object with per-job user time and memory limits and assigns the
 child to it, plus UI restrictions (no desktop, no clipboard, no global atoms).
 This limits resources and UI reach; it does not restrict file paths or network.
 
-**In practice this is not applied to anything.** `SandboxHandle::post_spawn` —
-the only way a Job Object reaches a child — has no production caller, and
-`bash_tool` has no Windows branch. On Windows the shell tool is `PowerShell`
-(see `docs/tools.md`, "The platform's shell"), which does not read the sandbox
-config at all, so a Windows shell command runs with neither a Job Object nor any
-confinement. The reference confines it (`srt-win`); CodeRex does not, and says so
-here rather than implying otherwise.
+The assignment happens **after spawn**, through `SandboxHandle::post_spawn_raw`
+(the shell tools spawn asynchronously and only have a raw handle) — on Windows
+the shell tool is `PowerShell`, and it now reads the policy the dispatcher hands
+over. A child that exits before it can be placed in its Job Object is logged as
+having run without the limits, rather than being counted as sandboxed.
+
+**This is still not filesystem isolation.** A Job Object limits CPU, memory and
+UI reach; it does not restrict paths or the network. The reference has `srt-win`
+for that, and CodeRex has nothing — so on Windows a shell command can still read
+and write anything its user can. What changed is that it is now *bounded and
+labelled*, not that it is confined.
+
+**Unverified on Windows.** There is no Windows toolchain on the machine this was
+written on, so this path has not been compiled or run; the calling code is
+cross-platform and compiled, but the Job Object assignment itself is reviewed
+only.
 
 ### Other platforms
 

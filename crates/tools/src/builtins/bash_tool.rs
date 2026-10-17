@@ -15,112 +15,17 @@ use async_trait::async_trait;
 use coderex_core::shell_security::BashAst;
 use tokio::process::Command;
 
-/// Refuse to run a program that would come out of the working directory.
-///
-/// A checkout can carry a binary named after a system tool (`./sh`) or a
-/// `PATH` entry that points back at the workspace. Either one turns "run the
-/// shell" into "run whatever the repository shipped", so a program that
-/// resolves inside the working directory is refused rather than run.
-fn guard_program_origin(program: &str, cwd: &std::path::Path) -> Result<(), ToolError> {
-    if coderex_core::sandbox::resolves_inside_cwd(program, cwd) {
-        return Err(ToolError::Io(std::io::Error::new(
-            std::io::ErrorKind::PermissionDenied,
-            format!(
-                "refusing to execute '{program}': it resolves inside the working directory {}",
-                cwd.display()
-            ),
-        )));
-    }
-    Ok(())
-}
 
-/// Build a `tokio::process::Command` for the given shell command,
-/// applying sandbox wrapping if a [`SandboxConfig`] is present in
-/// `ctx.extra`.
+/// Build the shell command under the session's sandbox policy.
 ///
-/// Returns the command plus an optional `SandboxHandle` that must be
-/// kept alive until the command finishes (macOS profile cleanup).
+/// The platform logic lives in [`crate::sandbox_shell`], shared with the
+/// PowerShell tool: the sandbox is a property of *the shell tool*, and having it
+/// inside this one is how the other shell ended up unconfined.
 fn build_sandboxed_command(
     ctx: &ToolContext<'_>,
     command: &str,
 ) -> Result<(Command, Option<coderex_core::sandbox::SandboxHandle>), ToolError> {
-    let sandbox_config = ctx
-        .extra
-        .get("sandbox_config")
-        .and_then(|v| v.downcast_ref::<coderex_core::sandbox::SandboxConfig>());
-
-    #[cfg(target_os = "macos")]
-    {
-        if let Some(config) = sandbox_config {
-            let handle =
-                coderex_core::sandbox::SandboxHandle::create(config.clone()).map_err(|e| {
-                    ToolError::Io(std::io::Error::new(
-                        std::io::ErrorKind::Other,
-                        format!("sandbox: {e}"),
-                    ))
-                })?;
-            let (wrapper, prefix_args) = handle.sandboxed_program().ok_or_else(|| {
-                ToolError::Io(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    "sandbox: no wrapper program available",
-                ))
-            })?;
-            // Both the wrapper and the shell are resolved through `PATH`, so
-            // both are checked.
-            guard_program_origin(wrapper, ctx.cwd)?;
-            guard_program_origin("sh", ctx.cwd)?;
-            let mut cmd = Command::new(wrapper);
-            for arg in prefix_args {
-                cmd.arg(arg);
-            }
-            cmd.arg("sh").arg("-c").arg(command);
-            cmd.current_dir(ctx.cwd);
-            return Ok((cmd, Some(handle)));
-        }
-    }
-
-    #[cfg(target_os = "linux")]
-    {
-        if let Some(config) = sandbox_config {
-            let handle =
-                coderex_core::sandbox::SandboxHandle::create(config.clone()).map_err(|e| {
-                    ToolError::Io(std::io::Error::new(
-                        std::io::ErrorKind::Other,
-                        format!("sandbox: {e}"),
-                    ))
-                })?;
-
-            // With bubblewrap in force the command runs under it; the wrapper
-            // is resolved through `PATH` like the shell, so both are checked.
-            let (program, prefix_args) = match handle.sandboxed_program() {
-                Some((wrapper, args)) => {
-                    guard_program_origin(wrapper, ctx.cwd)?;
-                    (wrapper.to_string(), args)
-                }
-                None => (String::from("sh"), Vec::new()),
-            };
-            guard_program_origin("sh", ctx.cwd)?;
-
-            let mut std_cmd = std::process::Command::new(&program);
-            std_cmd.args(&prefix_args);
-            std_cmd.arg("sh").arg("-c").arg(command);
-            std_cmd.current_dir(ctx.cwd);
-            handle.prepare(&mut std_cmd).map_err(|e| {
-                ToolError::Io(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    format!("sandbox: {e}"),
-                ))
-            })?;
-            return Ok((Command::from(std_cmd), Some(handle)));
-        }
-    }
-
-    // No sandbox (or unsupported platform with sandbox config)
-    guard_program_origin("sh", ctx.cwd)?;
-    let mut cmd = Command::new("sh");
-    cmd.arg("-c").arg(command);
-    cmd.current_dir(ctx.cwd);
-    Ok((cmd, None))
+    crate::sandbox_shell::sandboxed_shell(ctx, "sh", &["-c", command])
 }
 
 /// Default timeout in seconds.
@@ -228,7 +133,7 @@ impl Tool for BashTool {
             None
         };
 
-        let (mut cmd, _sandbox_handle) = build_sandboxed_command(&ctx, &command)?;
+        let (mut cmd, sandbox_handle) = build_sandboxed_command(&ctx, &command)?;
 
         // The shell is not a provider client, so it is given no way to read
         // this session's credentials out of the environment it inherits.
@@ -236,12 +141,24 @@ impl Tool for BashTool {
             cmd.env_remove(key);
         }
 
-        let result = tokio::time::timeout(Duration::from_secs(timeout_secs), cmd.output())
-            .await
-            .map_err(|_| ToolError::Timeout {
-                timeout: Duration::from_secs(timeout_secs),
-            })?
-            .map_err(ToolError::Io)?;
+        // Spawned rather than `output()`ed because Windows has to place the
+        // child in its Job Object *after* it exists. The handle stays alive
+        // until the child has finished, which is what keeps a macOS profile and
+        // a Job Object alive for its lifetime.
+        let result = tokio::time::timeout(Duration::from_secs(timeout_secs), async {
+            // `spawn()` inherits the parent's stdio; `output()` used to supply
+            // a null stdin and piped stdout/stderr, so ask for the same here.
+            cmd.stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped());
+            let child = cmd.spawn().map_err(ToolError::Io)?;
+            crate::sandbox_shell::finish_spawn(sandbox_handle.as_ref(), &child)?;
+            child.wait_with_output().await.map_err(ToolError::Io)
+        })
+        .await
+        .map_err(|_| ToolError::Timeout {
+            timeout: Duration::from_secs(timeout_secs),
+        })??;
 
         let exit_code = result.status.code().unwrap_or(-1);
         let mut stdout = String::from_utf8_lossy(&result.stdout).to_string();
@@ -413,6 +330,115 @@ mod tests {
         );
     }
 
+    /// The Linux counterpart of `sandboxed_echo_works`: the Bash tool's own
+    /// spawn path, under the wrapper its policy produces.
+    ///
+    /// The macOS test above runs `sandbox-exec`; this one is what proves the
+    /// Linux branch — `bwrap` for a mount namespace, `prepare` for rlimits —
+    /// actually spawns a command. Skipped when bubblewrap is not in force,
+    /// because without it the branch deliberately falls back to the syscall
+    /// filter.
+    #[tokio::test]
+    #[cfg(target_os = "linux")]
+    async fn sandboxed_echo_works_on_linux() {
+        use std::collections::HashMap;
+        use std::path::PathBuf;
+
+        if !coderex_core::sandbox::bubblewrap_in_force() {
+            eprintln!("skipping: bubblewrap is not in force");
+            return;
+        }
+
+        let dir = std::env::temp_dir().join(format!("coderex-bash-sandbox-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let dir_buf = PathBuf::from(&dir);
+
+        let mut extra = HashMap::new();
+        extra.insert(
+            "sandbox_config".to_string(),
+            Box::new(coderex_core::sandbox::SandboxConfig {
+                allowed_read_paths: vec![dir_buf.clone()],
+                allowed_write_paths: vec![dir_buf.clone()],
+                additional_working_dirs: vec![dir_buf],
+                allow_network: false,
+                ..Default::default()
+            }) as crate::tool::SharedState,
+        );
+        let ctx = ToolContext::new(ExecutionContext::Normal, &dir).with_extra(extra);
+
+        let output = BashTool::new()
+            .execute(bash_input("echo sandboxed; echo written > inside.txt"), ctx)
+            .await
+            .unwrap();
+
+        assert!(
+            output.output.contains("sandboxed"),
+            "output was: {}",
+            output.output
+        );
+        assert!(
+            output.output.contains("Exit code: 0"),
+            "output was: {}",
+            output.output
+        );
+        assert!(
+            dir.join("inside.txt").exists(),
+            "the sandboxed command could not write to the allowed path"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The fallback a Linux machine without `bwrap` takes: `prepare` installs
+    /// rlimits and the syscall table instead of a mount namespace.
+    ///
+    /// This is the path that used to take every command down with SIGSYS — the
+    /// filter compared the syscall number with the architecture token, so it
+    /// never matched and killed the process at its first syscall.
+    #[tokio::test]
+    #[cfg(target_os = "linux")]
+    async fn sandboxed_echo_works_without_bubblewrap() {
+        use std::collections::HashMap;
+        use std::path::PathBuf;
+
+        if coderex_core::sandbox::bubblewrap_in_force() {
+            eprintln!("skipping: bubblewrap is in force; set CODEREX_BWRAP=0 for the syscall path");
+            return;
+        }
+
+        let dir = std::env::temp_dir().join(format!("coderex-bash-seccomp-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let dir_buf = PathBuf::from(&dir);
+
+        let mut extra = HashMap::new();
+        extra.insert(
+            "sandbox_config".to_string(),
+            Box::new(coderex_core::sandbox::SandboxConfig {
+                allowed_read_paths: vec![dir_buf.clone()],
+                allowed_write_paths: vec![dir_buf.clone()],
+                additional_working_dirs: vec![dir_buf],
+                allow_network: false,
+                ..Default::default()
+            }) as crate::tool::SharedState,
+        );
+        let ctx = ToolContext::new(ExecutionContext::Normal, &dir).with_extra(extra);
+
+        let output = BashTool::new()
+            .execute(bash_input("echo fallback"), ctx)
+            .await
+            .unwrap();
+
+        assert!(
+            output.output.contains("fallback"),
+            "the syscall table broke a trivial command: {}",
+            output.output
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// A shell that can still read `PATH` and `HOME` but not the session's
     /// credentials. The variable is set in this process for the duration of
     /// the call; nothing else in the crate reads it.
@@ -479,7 +505,7 @@ mod tests {
         let planted = dir.join("coderex_planted_tool");
         std::fs::write(&planted, b"#!/bin/sh\necho planted\n").unwrap();
 
-        let error = guard_program_origin("./coderex_planted_tool", &dir).unwrap_err();
+        let error = crate::sandbox_shell::guard_program_origin("./coderex_planted_tool", &dir).unwrap_err();
         assert!(
             error
                 .to_string()
@@ -493,6 +519,6 @@ mod tests {
     #[test]
     fn system_shell_is_not_refused() {
         // The ordinary case: `sh` comes from the system, not the workspace.
-        guard_program_origin("sh", Path::new("/tmp")).unwrap();
+        crate::sandbox_shell::guard_program_origin("sh", Path::new("/tmp")).unwrap();
     }
 }

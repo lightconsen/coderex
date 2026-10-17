@@ -5,7 +5,6 @@ use std::time::Duration;
 use crate::context::{ToolError, ToolOutput};
 use crate::tool::{Tool, ToolContext, ToolDescriptor, ToolInput, ToolTier};
 use async_trait::async_trait;
-use tokio::process::Command;
 
 /// Default timeout in seconds.
 const DEFAULT_TIMEOUT_SECS: u64 = 60;
@@ -61,33 +60,38 @@ impl Tool for PowerShellTool {
             .unwrap_or(DEFAULT_TIMEOUT_SECS as i64)
             .clamp(1, MAX_TIMEOUT_SECS as i64) as u64;
 
-        // Refuse a `pwsh` that would come out of the working directory: a
-        // checkout that ships one would otherwise choose what "run PowerShell"
-        // means.
-        if coderex_core::sandbox::resolves_inside_cwd("pwsh", ctx.cwd) {
-            return Err(ToolError::Io(std::io::Error::new(
-                std::io::ErrorKind::PermissionDenied,
-                format!(
-                    "refusing to execute 'pwsh': it resolves inside the working directory {}",
-                    ctx.cwd.display()
-                ),
-            )));
-        }
+        // Build under the session's sandbox policy, exactly as the Bash tool
+        // does. This used to spawn `pwsh` directly and never look at
+        // `ctx.extra["sandbox_config"]` — so on Windows, where this *is* the
+        // shell tool, a command ran with no Job Object and no confinement at
+        // all, while the dispatcher had handed over a policy that nothing read.
+        //
+        // The helper also refuses a `pwsh` that resolves inside the working
+        // directory: a checkout that ships one would otherwise choose what
+        // "run PowerShell" means.
+        let (mut cmd, sandbox_handle) =
+            crate::sandbox_shell::sandboxed_shell(&ctx, "pwsh", &["-Command", &command])?;
 
-        let mut cmd = Command::new("pwsh");
-        cmd.arg("-Command").arg(&command).current_dir(ctx.cwd);
         // The shell is not a provider client, so it is given no way to read
         // this session's credentials out of the environment it inherits.
         for key in coderex_core::sandbox::credential_scrub_keys() {
             cmd.env_remove(key);
         }
 
-        let result = tokio::time::timeout(Duration::from_secs(timeout_secs), cmd.output())
-            .await
-            .map_err(|_| ToolError::Timeout {
-                timeout: Duration::from_secs(timeout_secs),
-            })?
-            .map_err(ToolError::Io)?;
+        // Spawned rather than `output()`ed because Windows has to place the
+        // child in its Job Object after it exists.
+        let result = tokio::time::timeout(Duration::from_secs(timeout_secs), async {
+            cmd.stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped());
+            let child = cmd.spawn().map_err(ToolError::Io)?;
+            crate::sandbox_shell::finish_spawn(sandbox_handle.as_ref(), &child)?;
+            child.wait_with_output().await.map_err(ToolError::Io)
+        })
+        .await
+        .map_err(|_| ToolError::Timeout {
+            timeout: Duration::from_secs(timeout_secs),
+        })??;
 
         let exit_code = result.status.code().unwrap_or(-1);
         let mut stdout = String::from_utf8_lossy(&result.stdout).to_string();
