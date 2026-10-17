@@ -63,7 +63,14 @@ pub fn register(registry: &mut CommandRegistry) {
                 let text = format!("Message(s): {}", args.join(", "));
                 match copy_to_clipboard(&text) {
                     Ok(()) => CommandResult::success(format!("Copied message(s) {} to clipboard.", args.join(", "))),
-                    Err(e) => CommandResult::error(format!("Clipboard failed: {e}")),
+                    // Say which messages were not copied. A bare failure makes
+                    // the command indistinguishable from one that copied
+                    // nothing, on a machine with no clipboard tool.
+                    Err(e) => CommandResult::error(format!(
+                        "Clipboard failed: {e}\nMessage(s) {} were not copied.\n\
+                         Ensure pbcopy (macOS), clip (Windows), or xclip (Linux) is available.",
+                        args.join(", ")
+                    )),
                 }
             }
         }),
