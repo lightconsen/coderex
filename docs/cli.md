@@ -59,7 +59,7 @@ main() → parse_args() → StartupOrchestrator::run()
 | `--dangerously-skip-permissions` | | Skip all permission prompts (sets `BypassPermissions` mode) |
 | `--allowed-tools TOOLS` | | Comma-separated list of allowed tools (restricts tool executor) |
 | `--model MODEL` | `-m` | Model to use (e.g., `claude-sonnet-4-6`, `claude-opus-4-6`) |
-| `--fallback-model MODEL` | | Retry once with this model after a model-unavailable error. Headless only; interactive mode rejects the flag at startup rather than ignoring it |
+| `--fallback-model MODEL` | | Retry the same request once with this model when the primary is unavailable; if that succeeds the session continues on the fallback. Works in interactive and headless mode; other errors never trigger it |
 | `--system-prompt PROMPT` | | Custom system prompt (replaces default), in headless and interactive mode |
 | `--append-system-prompt` | | Append to the default system prompt instead of replacing it, in headless and interactive mode |
 | `--file FILE` | `-f` | Include a file in context (can be repeated) |
@@ -163,6 +163,13 @@ A comma-separated list applied on top of `CODEREX_FEATURE_FLAGS`:
   `terminal_panel`, `kairos`, `team_collaboration`, `auto_dream`.
 - An unknown name is a startup error listing the unknown names and the known
   set; it is never dropped silently.
+- Some names are accepted for configuration compatibility but have no effect in
+  this build: `streaming_tool_execution`, `tool_use_summaries`, `fast_mode`,
+  `coordinator_mode`, `history_snip`, `agent_triggers`, `bridge_mode`,
+  `daemon`, `buddy`, `web_browser_tool`, `context_collapse`, `terminal_panel`,
+  `kairos`, `team_collaboration`, and `auto_dream`. Enabling any of them logs
+  a warning at startup instead of implying behavior. `workflow_scripts`,
+  `voice_mode`, and the six command-availability flags do have consumers.
 
 ### `--from-pr URL`
 

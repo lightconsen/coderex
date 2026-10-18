@@ -70,8 +70,10 @@ registry, which is what the CLI uses.
 in `coderex-config`: core, managed, and plugin), so `crates/cli/src/repl.rs`
 loads managed hooks as `HookTier::Managed` and user/project hooks as
 `HookTier::Core` in `apply_cli_config`. Managed hooks are not also installed as
-Core. There is no plugin-manifest hook producer yet, so the `Plugin` tier is
-structurally present but has no source. A session that wants the `prompt`,
+Core. Active plugins are the source for the `Plugin` tier: each manifest's
+`hooks` value is normalized and merged by `PluginManager::plugin_hooks()`, and
+the orchestrator installs the result as `HookLayers.plugin` before the REPL
+loads the tiers. A session that wants the `prompt`,
 `agent`, and `mcp_tool` kinds must additionally call `set_action_runner` before
 `into_executor` (see the kinds section); without it those three kinds fail when
 they fire, which is a denial on a gating event.

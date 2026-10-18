@@ -42,7 +42,7 @@ Implements the `/` slash command system that users type in the REPL. Provides a 
 - **Closure-based handlers** — Each command is an `Arc<dyn Fn>` with shared `CommandContext`.
 - **Availability matrix** — Commands filtered by `supports_non_interactive`, `remote_safe`, `bridge_safe` for different execution contexts.
 - **Agent backend flag** — Commands can opt into sub-agent execution via `with_agent_backend()`.
-- **Argument validation** — `CommandArgs` enum validated pre-dispatch; `CommandArgs::None` accepts any count, while `AtLeast(n)`, `AtMost(n)`, `Exactly(n)` enforce constraints.
+- **Argument validation** — `CommandArgs` enum validated pre-dispatch; `CommandArgs::None` accepts any count, while `AtLeast(n)`, `AtMost(n)`, `Exactly(n)` enforce constraints. Production declarers: `/btw` and `/add-dir` require at least one argument, `/rename` at least one word (titles may contain spaces), and `/model`, `/theme` and `/resume` accept at most one. `/history` keeps form-specific checks because `search` takes a multiword query.
 - **Destructive confirmation** — Commands marked `.with_destructive()` trigger a `Confirm` overlay in TUI mode (y/n), skipped in headless mode.
 - **Command piping** — Input split on `|` operator; segments executed sequentially with output of each passed as `pipe_input` to the next via `CommandContext`.
 - **Macro expansion** — Command names resolved against `MacroRegistry` before registry dispatch; macro sequences expanded and executed in order.
@@ -89,7 +89,4 @@ These return an error message when the feature is not enabled. The flag names ar
 - **`/macro` is a REPL built-in, not a registry command.** It mutates the session's
   `MacroRegistry` and can therefore run in the TUI and headless paths, but remote/bridge
   sessions (which dispatch through the registry) do not see it.
-- **`CommandArgs` validation has no production declarers.** The enum and the pre-dispatch
-  check are live, but no shipped command calls `.with_args(...)`; `/btw` and `/history` do
-  ad-hoc checks instead.
 - **Remote/bridge availability filtering is only used by the server.** The local TUI does not consult the availability matrix.

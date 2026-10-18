@@ -306,7 +306,7 @@ The manifest is parsed with `deny_unknown_fields`: a field that is not in the ta
 | `$schema`, `name`, `displayName`, `version`, `description`, `homepage`, `repository`, `license`, `keywords`, `defaultEnabled`, `metadata` | ✅ parsed | Identity and metadata. `author` accepts a string or `{name, email}`; an object used to fail the whole manifest. |
 | `min_version`, `commands`, `skills`, `dependencies`, `signature`, `runtime`, `entrypoint`, `env` | ✅ acted on | CodeRex execution fields (pre-existing). |
 | `userConfig` | ✅ implemented | See "userConfig injection". |
-| `hooks` | 🟡 accepted, not implemented | CodeRex hooks come from settings, not from plugin manifests. |
+| `hooks` | ✅ implemented | Active plugins contribute their hooks to the `Plugin` tier. The value may be a bare array or `{"hooks":[...]}`; `PluginManager::plugin_hooks()` merges them in plugin-name order and logs malformed values. |
 | `agents`, `outputStyles`, `themes`, `workflows`, `monitors` | 🟡 accepted, not implemented | No CodeRex counterpart yet. |
 | `mcpServers`, `lspServers`, `channels` | 🟡 accepted, not implemented | CodeRex's MCP servers are configured in settings; plugins cannot start their own. |
 | `binaries`, `types`, `settings`, `experimental` | 🟡 accepted, not implemented | `binaries` carries per-binary SHA-256 pins in Claude; CodeRex pins archives and commits instead (see "Pinning"). |
