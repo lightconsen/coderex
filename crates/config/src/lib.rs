@@ -5,6 +5,7 @@
 pub mod dirs;
 pub mod experiments;
 pub mod flags;
+pub mod managed;
 pub mod secret_store;
 pub mod settings;
 
@@ -16,6 +17,9 @@ pub mod remote_settings;
 pub mod trusted_device;
 
 pub use flags::{CapabilitySet, FeatureFlags, FlagRegistry, percentage_rollout};
+pub use managed::{
+    DEFAULT_MACOS_MANAGED_PLIST_DOMAIN, WINDOWS_MANAGED_REGISTRY_KEY, default_managed_plist_path,
+};
 #[cfg(feature = "enterprise")]
 pub use org_policy::{OrgPolicy, OrgPolicyError, OrgPolicyStore};
 #[cfg(feature = "enterprise")]

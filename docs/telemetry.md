@@ -21,7 +21,8 @@ Privacy-first telemetry collection, local storage, and batch upload. Stores even
 ### Key Types (uploader.rs)
 
 - **`TelemetryConfig`** — Endpoint, optional explicit crash endpoint, API key, batch size (default 100), interval (default 300s), enabled flag, sample rate (default 1.0), optional pinned root certificate PEM for TLS pinning.
-- **`TelemetryUploader`** — reqwest client + own DB connection + config + circuit breaker + rate limiter. Opens a fresh SQLite connection per upload batch for safe concurrent access.
+- **`TelemetryUploader`** — reqwest client + own DB connection + config + circuit breaker + rate limiter + optional `TelemetryChannels`. Opens a fresh SQLite connection per upload batch for safe concurrent access.
+- **`ChannelConfig` / `TelemetryChannels`** (`channels.rs`) — Optional OTLP/HTTP JSON logs and Datadog Logs export channels. `ChannelConfig::from_env` reads the `CODEREX_OTLP_*` / `CODEREX_DATADOG_*` variables; `TelemetryUploader::with_channels` accepts an explicit configuration. See [Channels](#channels).
 - **`CircuitBreaker`** — Three-state breaker (Closed/Open/HalfOpen). Opens after 5 consecutive failures, cools down for 60s, then transitions to HalfOpen. Handles *failures*.
 - **`RateLimiter`** — Sliding-window limiter for *rejections*: at most 10 upload attempts per 60s, and after the endpoint answers 429/403 uploads are suppressed for 300s. `upload_pending` surfaces those statuses as `TelemetryError::Rejected` so the loop can back off instead of retrying into the limit.
 
@@ -218,7 +219,7 @@ The keys are selected by the marker: `structured` and `symbolized` payloads cont
 
 ### Public API Surface
 
-- `TelemetryHandle`, `TelemetryEvent`, `TelemetryStore`, `TelemetryUploader`, `TelemetryConfig`, `CrashReporter`, `CrashReport`, `PendingEvent`, `PendingCrash`, `Scrubber`, `HIPAA_ENV`, `hipaa_enabled`, `CRASH_VERBOSE_ENV`, `crash_verbose`, `crash_verbose_with`, `PanicTemplate`, `PanicClassification`, `classify_panic_message`, `BacktraceSymbols`, `symbolize_backtrace`, `symbolize_backtrace_limited`, `MAX_BACKTRACE_FRAMES`, `DEFAULT_PENDING_MAX_AGE_SECS`, `DEFAULT_CRASH_RETENTION_DAYS`, `preview_crash_payload`, `preview_crash_payload_with`.
+- `TelemetryHandle`, `TelemetryEvent`, `TelemetryStore`, `TelemetryUploader`, `TelemetryConfig`, `CrashReporter`, `CrashReport`, `PendingEvent`, `PendingCrash`, `Scrubber`, `HIPAA_ENV`, `hipaa_enabled`, `CRASH_VERBOSE_ENV`, `crash_verbose`, `crash_verbose_with`, `PanicTemplate`, `PanicClassification`, `classify_panic_message`, `BacktraceSymbols`, `symbolize_backtrace`, `symbolize_backtrace_limited`, `MAX_BACKTRACE_FRAMES`, `DEFAULT_PENDING_MAX_AGE_SECS`, `DEFAULT_CRASH_RETENTION_DAYS`, `preview_crash_payload`, `preview_crash_payload_with`, `ChannelConfig`, `TelemetryChannels`, `OTLP_ENDPOINT_ENV`, `OTLP_HEADERS_ENV`, `DATADOG_API_KEY_ENV`, `DD_API_KEY_ENV`, `DATADOG_SITE_ENV`, `DATADOG_ENDPOINT_ENV`, `DEFAULT_DATADOG_SITE`.
 
 ## Current Status
 
@@ -249,16 +250,77 @@ The keys are selected by the marker: `structured` and `symbolized` payloads cont
 - **Certificate pinning** via `TelemetryConfig.pinned_cert_pem` + `add_root_certificate()`.
 - **Opt-in consent gate**: telemetry is off until the user consents. `Settings::defaults()` leaves `telemetry_enabled` as `None` ("undecided"), so the first-run prompt in `StartupOrchestrator::phase_load_settings` is actually reachable; an undecided value is treated as *disabled*. The choice is persisted to `settings.json`.
 - **Rate limiting / suppression**: `RateLimiter` caps uploads at 10/minute and suppresses them for 300s after an HTTP 429/403.
-- **Settings.json integration** via `TelemetrySubConfig` nested struct (schema v3).
+- **Settings.json integration** via `TelemetrySubConfig` nested struct (schema v3), including the optional OTLP/Datadog channel fields.
+- **OTLP/HTTP JSON logs channel** (`channels.rs`): endpoint derivation (base URL or full `/v1/logs`), extra headers, resource/scope metadata, per-event log records with severity, attributes and nanosecond timestamps.
+- **Datadog Logs channel** (`channels.rs`): site-derived or explicit intake URL, `DD-API-KEY` auth, per-event log entries with `ddsource`/`service`/`ddtags`/`status`, millisecond timestamps, and no hostname.
+- **Channel consent gate**: channels are built only for an enabled uploader; `upload_pending()` is a no-op when disabled and `send_events()` refuses to send when its own switch is off.
 
 ### Channels
 
-CodeRex has one channel: a first-party HTTP JSON uploader (`uploader.rs`). Claude
-has three (first-party OTel Logs, user-configured OTel, Datadog — first-party
-only). The extra channels are deliberately **not** copied (⚪): each requires a
-heavy SDK dependency (OpenTelemetry / Datadog), which is out of scope for this
-work, and their wire formats are not the CodeRex event schema. The single
-first-party channel is the only one with a real consumer here.
+Events are always uploaded to the first-party HTTP JSON endpoint
+(`uploader.rs`). Two optional additional channels can carry the same events:
+
+1. **OTLP/HTTP JSON logs** (`channels.rs`) — plain `POST <endpoint>/v1/logs`
+   with an `ExportLogsServiceRequest` body. No OpenTelemetry SDK is used; the
+   request is built directly with `serde_json` + `reqwest`.
+2. **Datadog Logs intake** (`channels.rs`) — `POST` to
+   `https://http-intake.logs.<site>/api/v2/logs` with the standard
+   `DD-API-KEY` header and a JSON array of log entries.
+
+Both consume the *same* scrubbed event payload as the first-party uploader
+(`Scrubber::scrub_json` runs again on the way out). Only usage events are sent;
+crash reports stay on the first-party channel.
+
+#### Consent
+
+Channels are wired to the existing telemetry opt-in:
+
+- `TelemetryUploader::new` builds a channel set only when
+  `TelemetryConfig::enabled` is true.
+- `upload_pending()` returns early when disabled — no first-party request, no
+  channel request, and no row marked uploaded.
+- `TelemetryChannels::send_events()` independently refuses to send when its
+  own `ChannelConfig::enabled` is false.
+
+`TelemetryHandle::new` still constructs the uploader only when the CLI passes an
+enabled configuration, which happens only after `settings.telemetry_enabled` is
+`Some(true)`. An undecided (`None`) or false value means nothing is sent.
+
+#### Configuration
+
+Channels are configured from the environment when the uploader is constructed:
+
+| Variable | Meaning |
+|---|---|
+| `CODEREX_OTLP_ENDPOINT` | OTLP/HTTP base URL (e.g. `http://localhost:4318`); `/v1/logs` is appended unless already present. |
+| `CODEREX_OTLP_HEADERS` | Optional comma-separated `key=value` request headers (for collector auth). |
+| `CODEREX_DATADOG_API_KEY` | Datadog API key. Falls back to `DD_API_KEY`. |
+| `CODEREX_DATADOG_SITE` | Datadog site; default `datadoghq.com` (also accepts an `http-intake.logs.*` host). |
+| `CODEREX_DATADOG_ENDPOINT` | Full intake URL, overriding the site-derived endpoint. |
+
+`settings.json` can carry the same values under `telemetry` (`otlp_endpoint`,
+`otlp_headers`, `datadog_api_key`, `datadog_site`, `datadog_endpoint`); a caller
+that holds those values can pass them explicitly with
+`TelemetryUploader::with_channels(ChannelConfig)`. The API key is never rendered
+in `Debug` output.
+
+#### Wire mapping
+
+Every `PendingEvent` becomes one OTLP log record / one Datadog log entry:
+
+| Event field | OTLP | Datadog |
+|---|---|---|
+| `created_at` | `timeUnixNano` / `observedTimeUnixNano` (string) | `timestamp` (milliseconds) |
+| `event_type` | `body.stringValue` and the `event.type` attribute | `ddtags` (`event_type:…`) |
+| payload fields | one `KeyValue` attribute each (strings, booleans, numbers); objects/arrays become JSON text | inside `message`, the scrubbed payload JSON |
+| `error` event | severity 17 / `ERROR` | `status: "error"` |
+| other events | severity 9 / `INFO` | `status: "info"` |
+| — | resource `service.name = coderex`, SDK name/language | `ddsource`/`service = coderex` |
+
+No hostname is sent to Datadog. Channel delivery is best-effort: the
+first-party upload runs and marks the rows first, and a channel failure is
+logged rather than retried into a duplicate first-party upload. When one
+channel fails, the other is still attempted.
 
 ### What Is Stubbed/Partial
 
@@ -271,12 +333,17 @@ from the telemetry crate).
 ### Tests
 
 - 8 tests in `store.rs` (insert, batch, mark uploaded, crash roundtrip, structured-record roundtrip, old-schema migration, crash retention, size retention).
-- 34 tests in `uploader.rs` (config defaults, crash endpoint explicit/derived, circuit breaker, gzip encoding/header, rate limiter window/suppression, rejection statuses, HIPAA trigger parsing, strict-mode payload marking, structured/symbolized/pattern crash payloads, unknown-message length/hash only, no absolute paths, preview API, HIPAA precedence, legacy rows, tampered-row field validation).
+- 36 tests in `uploader.rs` (config defaults, crash endpoint explicit/derived, circuit breaker, gzip encoding/header, rate limiter window/suppression, rejection statuses, HIPAA trigger parsing, strict-mode payload marking, structured/symbolized/pattern crash payloads, unknown-message length/hash only, no absolute paths, preview API, HIPAA precedence, legacy rows, tampered-row field validation, disabled uploader sends nothing and keeps rows pending, enabled uploader fans events out to channels).
+- 16 tests in `channels.rs` (OTLP endpoint derivation, Datadog site/explicit endpoint/API-key requirements, env parsing, redacted `Debug`, disabled-set construction, OTLP log-record mapping and scrubbing, Datadog entry mapping and scrubbing, and mock-server delivery to both channels including partial failure).
 - 22 tests in `crash.rs` (taxonomy for every known template, safe-field parsing, unknown length/hash, symbolization/top-N/path rejection, default structured+symbolized ingestion, verbose raw local copy, strict-over-verbose precedence, legacy raw-file handling, `CODEREX_CRASH_VERBOSE` parsing, `0600` mode, TTL prune, serialization).
 - 49 tests in `scrubber.rs` (email, IPv4, home path, API key, GitHub/AWS/Slack/bearer/JWT/private-key, Luhn card/SSN/IBAN, event scrubbing, exclusion set, nested JSON scrubbing, model-key regex, model redaction, placeholder preservation, `repository_model` exclusion, strict allowlist/marker, high-entropy true positives, and path/symbol/URL/prose/numeric false positives).
 - Tests use tempfile/NamedTempFile for SQLite.
 
-M1 verification: `cargo test -p coderex-telemetry --offline` → **113 passed / 0 failed**.
+M1 verification: `cargo test -p coderex-telemetry --offline` → **131 passed / 0 failed**;
+`cargo test -p coderex-config --offline` → **90 unit + 40 integration passed / 0 failed**
+(including the macOS plist carrier). `cargo test -p coderex-cli --offline -- --test-threads=1`
+→ all test binaries passed (the two PATH-sensitive tests flake only when run in
+parallel).
 
 ## Gaps for Production
 

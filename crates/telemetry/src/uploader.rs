@@ -1,6 +1,9 @@
 //! Telemetry uploader — batch-upload events and crash reports to a remote endpoint.
 
-use crate::{PendingCrash, PendingEvent, Scrubber, TelemetryError, TelemetryStore};
+use crate::{
+    ChannelConfig, PendingCrash, PendingEvent, Scrubber, TelemetryChannels, TelemetryError,
+    TelemetryStore,
+};
 use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::Mutex;
@@ -245,6 +248,9 @@ pub struct TelemetryUploader {
     circuit: CircuitBreaker,
     rate: RateLimiter,
     scrubber: Scrubber,
+    /// Optional OTLP / Datadog export channels. `None` when telemetry is
+    /// disabled or no channel is configured.
+    channels: Option<TelemetryChannels>,
     /// Resolved once at construction from [`hipaa_enabled`].
     strict: bool,
     /// Resolved once at construction from [`crate::crash_verbose`]. Ignored
@@ -261,6 +267,7 @@ impl Clone for TelemetryUploader {
             circuit: CircuitBreaker::new(),
             rate: RateLimiter::new(),
             scrubber: self.scrubber.clone(),
+            channels: self.channels.clone(),
             strict: self.strict,
             verbose: self.verbose,
         }
@@ -286,6 +293,15 @@ impl TelemetryUploader {
 
         let client = builder.build().unwrap_or_default();
 
+        // Export channels are configured from the environment and only exist
+        // when the user's telemetry opt-in is on. A disabled uploader never
+        // constructs them.
+        let channels = if config.enabled {
+            TelemetryChannels::new(ChannelConfig::from_env())
+        } else {
+            None
+        };
+
         Self {
             db_path,
             config,
@@ -293,9 +309,25 @@ impl TelemetryUploader {
             circuit: CircuitBreaker::new(),
             rate: RateLimiter::new(),
             scrubber: Scrubber::new(),
+            channels,
             strict: hipaa_enabled(),
             verbose: crate::crash_verbose(),
         }
+    }
+
+    /// Replace the environment-derived export channel configuration.
+    ///
+    /// Used by embedders that carry channel settings in their own
+    /// configuration and by tests that must not depend on the environment.
+    /// Channels remain disabled when the uploader itself is disabled.
+    #[must_use]
+    pub fn with_channels(mut self, config: ChannelConfig) -> Self {
+        self.channels = if self.config.enabled {
+            TelemetryChannels::new(config)
+        } else {
+            None
+        };
+        self
     }
 
     /// Override the resolved modes in tests without touching the environment.
@@ -369,7 +401,14 @@ impl TelemetryUploader {
     }
 
     /// Upload a single batch of pending events.
+    ///
+    /// When telemetry is disabled this is a no-op: no first-party request and
+    /// no export channel request is made, and no row is marked uploaded.
     pub async fn upload_pending(&self) -> Result<(), TelemetryError> {
+        if !self.config.enabled {
+            return Ok(());
+        }
+
         let store = self.open_store()?;
 
         let events = store.pending_events(self.config.batch_size)?;
@@ -415,6 +454,16 @@ impl TelemetryUploader {
             }
             Err(e) => {
                 return Err(TelemetryError::Upload(format!("request failed: {e}")));
+            }
+        }
+
+        // Fan the same scrubbed events out to the optional export channels.
+        // Channel delivery is best-effort: the first-party upload already
+        // succeeded and the rows are marked, so a channel outage is logged
+        // rather than retried into a duplicate first-party upload.
+        if let Some(channels) = &self.channels {
+            if let Err(e) = channels.send_events(&events).await {
+                tracing::warn!("telemetry export channel delivery failed: {e}");
             }
         }
 
@@ -682,6 +731,105 @@ fn encode_json(value: &serde_json::Value) -> Result<EncodedBody, TelemetryError>
 #[cfg(test)]
 mod tests {
     use super::*;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    fn pending_session_store() -> (tempfile::NamedTempFile, TelemetryStore) {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let store = TelemetryStore::open(file.path()).unwrap();
+        store
+            .insert(&crate::TelemetryEvent::SessionStart {
+                session_id: "channel-test".into(),
+                timestamp: chrono::Utc::now(),
+            })
+            .unwrap();
+        (file, store)
+    }
+
+    #[tokio::test]
+    async fn disabled_uploader_sends_nothing_and_keeps_rows_pending() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+
+        let (file, store) = pending_session_store();
+        drop(store);
+
+        let uploader = TelemetryUploader::new(
+            file.path().to_path_buf(),
+            TelemetryConfig {
+                endpoint: format!("{}/events", server.uri()),
+                enabled: false,
+                ..Default::default()
+            },
+        )
+        .with_channels(ChannelConfig {
+            otlp_endpoint: Some(server.uri()),
+            datadog_api_key: Some("dd-key".into()),
+            datadog_endpoint: Some(format!("{}/api/v2/logs", server.uri())),
+            ..Default::default()
+        });
+
+        uploader.upload_pending().await.unwrap();
+        assert!(
+            server.received_requests().await.unwrap().is_empty(),
+            "a disabled uploader must not contact the first-party endpoint or any channel"
+        );
+
+        let store = TelemetryStore::open(file.path()).unwrap();
+        assert_eq!(
+            store.pending_count().unwrap(),
+            1,
+            "a disabled uploader must not mark the row uploaded"
+        );
+    }
+
+    #[tokio::test]
+    async fn enabled_uploader_fans_events_out_to_channels() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/events"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/logs"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+
+        let (file, store) = pending_session_store();
+        drop(store);
+
+        let uploader = TelemetryUploader::new(
+            file.path().to_path_buf(),
+            TelemetryConfig {
+                endpoint: format!("{}/events", server.uri()),
+                ..Default::default()
+            },
+        )
+        .with_channels(ChannelConfig {
+            otlp_endpoint: Some(server.uri()),
+            ..Default::default()
+        });
+
+        uploader.upload_pending().await.unwrap();
+
+        let paths: Vec<String> = server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .map(|request| request.url.path().to_string())
+            .collect();
+        assert!(paths.iter().any(|p| p == "/events"), "{paths:?}");
+        assert!(paths.iter().any(|p| p == "/v1/logs"), "{paths:?}");
+
+        let store = TelemetryStore::open(file.path()).unwrap();
+        assert_eq!(store.pending_count().unwrap(), 0);
+    }
 
     #[test]
     fn telemetry_config_defaults() {
