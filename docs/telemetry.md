@@ -27,7 +27,8 @@ Privacy-first telemetry collection, local storage, and batch upload. Stores even
 
 ### Key Types (scrubber.rs)
 
-- **`Scrubber`** — Regex-based PII sanitizer. Replaces emails, IPs, home paths, and credential shapes with `<EMAIL>`, `<IP>`, `<USER>`, `<API_KEY>`, `<AUTH_TOKEN>`, `<JWT>`, `<PRIVATE_KEY>` tokens. Applied to `Error.message`, `ApiCall.provider/model`, and `ToolUsed.tool_name` before insertion.
+- **`Scrubber`** — Regex-based PII sanitizer. Replaces emails, IPs, home paths, labelled credential shapes, and long high-entropy tokens with `<EMAIL>`, `<IP>`, `<USER>`, `<API_KEY>`, `<AUTH_TOKEN>`, `<JWT>`, `<PRIVATE_KEY>`, `<SECRET>` tokens. Applied to `Error.message`, `ApiCall.provider/model`, and `ToolUsed.tool_name` before insertion, and recursively to every uploaded payload.
+- **High-entropy detector** (`is_high_entropy_token`, `scrub_high_entropy_tokens`, placeholder `<SECRET>`) — redacts standalone base64url/hex/mixed-alphanumeric runs of 32+ characters. It is deliberately conservative: paths, URLs, Rust symbols, backtrace frames and ordinary identifiers are left alone (see the exact rules below).
 - **`EXCLUDED_FIELDS`** — Field names (`api_key`, `authorization`, `password`, `secret`, `token`, `cookie`, `set-cookie`, `apikey`) that `Scrubber::scrub_json` **removes** from a payload entirely, recursively, as a second layer at upload time.
 - **Model-name redaction** (`is_model_key`, `redact_model_fields`, `CONFIDENTIAL_MODEL`) — a dedicated model-field key regex plus an exclusion set, run recursively on every payload by `Scrubber::scrub_json` (see below).
 - **Strict mode** (`strictly_allowlisted`, `mark_unredacted_if_unallowlisted`, `STRICT_ALLOWED_FIELDS`) — validates a payload against a field allowlist and marks anything it cannot validate (see below).
@@ -68,17 +69,64 @@ reachable from this crate, so the environment variable is the whole trigger.
 
 When on, a payload must validate against `STRICT_ALLOWED_FIELDS` — the union of the event and crash
 schema fields (`type`, `session_id`, `tool_name`, `success`, `duration_ms`, `provider`, `model`,
-`tokens_in`, `tokens_out`, `error_type`, `message`, `timestamp`, `panic_info`, `backtrace`). The
-check is recursive: every key at every level must be known. A payload that **does not** validate is
-still sent, but is marked with `"redaction_status": "unredacted"` **inside the payload itself** —
-so the mark travels in the stored/uploaded event, not a log line. The payload is not silently
-dropped (that would lose telemetry) and not silently sent unmarked (that would claim a validation
-that did not happen).
+`tokens_in`, `tokens_out`, `error_type`, `message`, `timestamp`, `panic_info`, `backtrace`,
+`redaction_status`). The check is recursive: every key at every level must be known. A payload that
+**does not** validate is still sent, but is marked with `"redaction_status": "unredacted"` **inside
+the payload itself** — so the mark travels in the stored/uploaded event, not a log line. The payload
+is not silently dropped (that would lose telemetry) and not silently sent unmarked (that would claim
+a validation that did not happen). `redaction_status` is itself allowlisted so an explicit mark (for
+example the crash "structured" mark) is never overwritten with "unredacted".
+
+### What the scrubber removes — and what it does not
+
+The scrubber is **pattern-based**. It removes shapes, not meaning. Concretely, it replaces:
+
+- email addresses (`<EMAIL>`), IPv4/IPv6 addresses (`<IP>`);
+- `/home/<name>` and `/Users/<name>` path segments (`<USER>`) — the rest of the path is kept;
+- PEM private-key headers, bearer values, JWTs, GitHub/AWS/Slack tokens, and labelled
+  `sk-` / `api_key` / `token` / `secret` values (`<PRIVATE_KEY>`, `<AUTH_TOKEN>`, `<JWT>`,
+  `<API_KEY>`);
+- standalone high-entropy runs of **32 or more** characters drawn from
+  `[A-Za-z0-9_+=-]` (`<SECRET>`). A run qualifies when it is all-hex of that length, or when it
+  mixes uppercase, lowercase and digits with Shannon entropy of at least 3.0 bits/character.
+
+It does **not** remove:
+
+- ordinary prose or conversation text (a sentence accidentally embedded in a panic message stays
+  readable unless it contains one of the patterns above);
+- file paths, source locations (`file.rs:12`), or Rust symbols (`module::function`,
+  `Type::method`, mangled `_ZN…`/`_R…` names);
+- URLs — `/`, `.`, `:` split candidate runs, and a run adjacent to `/`, `\`, `.`, `@`, `~` or `::`
+  is treated as part of a structured value and left alone;
+- `snake_case`, `kebab-case`, `CamelCase`, or `CONSTANT` identifiers, and short/low-entropy runs.
+
+Consequently, outside strict mode a panic message containing conversation text is **not** safe: the
+scrubber cannot tell it apart from prose. Strict mode exists precisely so crash reports do not rely
+on this detector for free-form text.
 
 ### Key Types (crash.rs)
 
-- **`CrashReport`** — Serializable crash data.
-- **`CrashReporter`** — Panic hook + pending directory ingestion with disk-space enforcement.
+- **`CrashReport`** — Serializable crash data: `panic_info`, optional `backtrace`, timestamp, plus panic metadata (`panic_location`, `thread_name`, `panic_type`; defaulted on deserialization for older pending files).
+- **`CrashReporter`** — Panic hook + pending directory ingestion with disk-space enforcement. `strict` is resolved from `CODEREX_HIPAA` at construction (overridable with `with_strict` for tests).
+
+### Crash reports under strict mode
+
+A panic message is `format!("{info}")` of whatever the panicking code carried — potentially
+conversation text. Pattern scrubbing cannot make that safe, so strict mode does not send it:
+
+- **Panic hook:** in strict mode the pending file never contains the free-form payload or
+  backtrace. It records only panic type (`&str`/`String`/`unknown`), thread name, and source
+  location.
+- **Ingestion:** `ingest_pending` stores a `[strict-crash-summary]` string with
+  `type=…; thread=…; location=…; message=omitted; backtrace=omitted`, and stores no backtrace.
+  A legacy pending file with raw text is reduced to its `panicked at <file:line:column>:`
+  location; the message is never stored.
+- **Upload:** `build_crash_payload` emits the summary with `"redaction_status": "structured"`
+  **as a payload field** and `"backtrace": null`. Free-form stored text from a pre-strict row is
+  summarized at this step too, so it cannot leave unmarked.
+
+Outside strict mode the current diagnostics are kept (panic text and backtrace), and both the
+pattern set and the new high-entropy detector run at ingestion and again at upload.
 
 ### Architecture Patterns
 
@@ -91,7 +139,7 @@ that did not happen).
 - **Circuit breaker**: Prevents hammering a failing endpoint with exponential backoff via Open/HalfOpen states.
 - **Event sampling**: Deterministic hash-based sampling on the serialized event JSON. Same event always yields the same decision.
 - **Own-connection uploader**: `TelemetryUploader` opens a fresh `TelemetryStore` connection per batch instead of sharing the worker's connection, avoiding Sync issues.
-- **PII scrubbing**: `Scrubber` regex-sanitizes `Error` and `ApiCall` events before insertion.
+- **PII scrubbing**: `Scrubber` regex-sanitizes `Error` and `ApiCall` events before insertion, including high-entropy secret tokens (`<SECRET>`).
 - **Worker panic recovery**: `spawn_worker_with_recovery()` uses `catch_unwind` + fresh connection respawn (max 3 attempts, 10s cooldown).
 - **Certificate pinning**: Optional `pinned_cert_pem` in `TelemetryConfig` adds a custom root certificate to the reqwest client.
 - **Settings.json integration**: `TelemetrySubConfig` nested struct (schema v3) loads user overrides from `~/.coderex/settings.json`.
@@ -121,7 +169,8 @@ that did not happen).
 - **Size-based retention** via `TelemetryStore::prune_to_size()`.
 - **Explicit crash endpoint** override (`TelemetryConfig.crash_endpoint`) or derived from events endpoint.
 - **DB size queries** via `PRAGMA page_count * page_size`.
-- **PII scrubbing** via `Scrubber` (emails, IPs, paths, API keys, bearer tokens, JWTs, PEM private keys) applied to `Error`, `ApiCall`, and `ToolUsed` events, plus an `EXCLUDED_FIELDS` exclusion set applied recursively to payloads at upload time.
+- **PII scrubbing** via `Scrubber` (emails, IPs, home paths, API keys, bearer tokens, JWTs, PEM private keys, and 32+ character high-entropy tokens as `<SECRET>`) applied to `Error`, `ApiCall`, and `ToolUsed` events, plus an `EXCLUDED_FIELDS` exclusion set applied recursively to payloads at upload time. Detection is pattern-based and deliberately conservative: paths, URLs, symbols and ordinary prose are not touched.
+- **Crash-report strict mode**: under `CODEREX_HIPAA`, free-form `panic_info` and the backtrace are replaced by a marked structured summary at the hook, at ingestion, and at upload; the marker (`"redaction_status": "structured"`) is a payload field. Non-strict crash reports keep diagnostics and run the high-entropy detector.
 - **Model-name redaction**: the model-field key regex (including `*_models` / `*Models`), the always-model keys (`chain_entry`, `fallbackFrom`, `shortName`), the `repository_model` exclusion, the never-replaced placeholder set, and the `"confidential"` constant. Applied recursively to every uploaded payload by `Scrubber::scrub_json`.
 - **Strict (confidentiality) mode**: `CODEREX_HIPAA` turns on a recursive field-allowlist check; a payload that fails it is uploaded marked `"redaction_status": "unredacted"` in the payload itself.
 - **Worker panic recovery** with `catch_unwind`, fresh DB connection per respawn, 3-attempt limit, 10s cooldown.
@@ -150,9 +199,9 @@ from the telemetry crate).
 ### Tests
 
 - 5 tests in `store.rs` (insert, batch, mark uploaded, crash roundtrip, size retention).
-- 20 tests in `uploader.rs` (config defaults, crash endpoint explicit/derived, circuit breaker, gzip encoding/header, rate limiter window/suppression, rejection statuses, HIPAA trigger parsing, strict-mode payload marking).
-- 2 tests in `crash.rs` (serialization, ingest scrubbing).
-- 22 tests in `scrubber.rs` (email, IPv4, home path, API key, GitHub/AWS/bearer/JWT/private-key, event scrubbing, exclusion set, nested JSON scrubbing, model-key regex, model redaction, placeholder preservation, `repository_model` exclusion, strict allowlist/marker).
+- 23 tests in `uploader.rs` (config defaults, crash endpoint explicit/derived, circuit breaker, gzip encoding/header, rate limiter window/suppression, rejection statuses, HIPAA trigger parsing, strict-mode payload marking, strict/non-strict crash payloads).
+- 6 tests in `crash.rs` (serialization, ingest scrubbing, strict structured summary with conversation/email/token exclusion, legacy raw-file handling, non-strict token redaction, backtrace path/symbol survival).
+- 29 tests in `scrubber.rs` (email, IPv4, home path, API key, GitHub/AWS/bearer/JWT/private-key, event scrubbing, exclusion set, nested JSON scrubbing, model-key regex, model redaction, placeholder preservation, `repository_model` exclusion, strict allowlist/marker, high-entropy true positives and path/symbol/URL/prose false positives).
 - Tests use tempfile/NamedTempFile for SQLite.
 
 ## Gaps for Production
