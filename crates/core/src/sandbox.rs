@@ -58,6 +58,14 @@ pub enum SandboxError {
     /// Failed to create the sandbox environment.
     #[error("failed to create sandbox: {0}")]
     CreationError(String),
+    /// The platform cannot provide the isolation the policy asks for.
+    ///
+    /// On Windows this means the AppContainer runtime is missing, the
+    /// process-token call was refused, or the sandbox was asked for a
+    /// capability this backend does not implement. Callers must treat it as a
+    /// refusal, not as permission to run unconfined.
+    #[error("sandbox isolation unavailable: {0}")]
+    IsolationUnavailable(String),
 }
 
 // ─── Configuration ──────────────────────────────────────────────────────────
@@ -229,15 +237,20 @@ pub enum FilesystemIsolation {
 //   configured paths writable. `None` otherwise, where the sandbox is a seccomp
 //   syscall allowlist plus rlimits and a wrapped process can still read and
 //   write anything its user could.
-// - Windows: `None` — the Job Object limits memory, CPU and UI access, not file
-//   paths.
+// - Windows: `Kernel` when the AppContainer runtime is present — the child runs
+//   under a container SID and path access is governed by DACLs. `None` on an
+//   installation where the AppContainer APIs are unavailable; sandbox creation
+//   then fails rather than degrading.
+//
+// The Windows answer is a runtime answer for the same reason as Linux's: it
+// depends on APIs the installed Windows version may not export.
 
 /// Report the filesystem confinement in force on this platform.
 ///
-/// On Linux this is a runtime answer, not a compile-time one: it depends on
-/// whether bubblewrap is installed and not switched off.
+/// On Linux and Windows this is a runtime answer, not a compile-time one: it
+/// depends on whether bubblewrap is installed / the AppContainer APIs exist.
 #[must_use]
-#[allow(clippy::missing_const_for_fn)] // the Linux body reads the environment
+#[allow(clippy::missing_const_for_fn)] // the Linux and Windows bodies read the environment
 pub fn filesystem_isolation() -> FilesystemIsolation {
     #[cfg(target_os = "macos")]
     {
@@ -251,7 +264,15 @@ pub fn filesystem_isolation() -> FilesystemIsolation {
             FilesystemIsolation::None
         }
     }
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    #[cfg(target_os = "windows")]
+    {
+        if crate::sandbox_windows::app_container_available() {
+            FilesystemIsolation::Kernel
+        } else {
+            FilesystemIsolation::None
+        }
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
     {
         FilesystemIsolation::None
     }
@@ -404,10 +425,25 @@ impl SandboxHandle {
     ///
     /// On Linux: stores config for `pre_exec` application.
     /// On macOS: generates a sandbox-exec profile.
-    /// On Windows: creates a Job Object with limits.
+    /// On Windows: creates an AppContainer profile and its ACLs, plus a Job
+    /// Object with limits. Fails with [`SandboxError::IsolationUnavailable`] if
+    /// the AppContainer runtime is missing — it does *not* fall back to
+    /// limits-only, because that would be a boundary the caller did not get.
     /// On unsupported platforms: returns a warning but proceeds.
     pub fn create(config: SandboxConfig) -> Result<Self, SandboxError> {
         let inner = PlatformSandbox::create(config)?;
+        Ok(Self { inner })
+    }
+
+    /// Create a sandbox that applies resource limits but no path isolation.
+    ///
+    /// Only Windows needs this, for callers (the hooks engine) that create
+    /// their own child and cannot run the post-spawn AppContainer token
+    /// attach. It must never be used where the caller believes the child is
+    /// confined: on Windows this handle does not confine paths or network.
+    /// Other platforms create their normal backend.
+    pub fn create_limits_only(config: SandboxConfig) -> Result<Self, SandboxError> {
+        let inner = PlatformSandbox::create_limits_only(config)?;
         Ok(Self { inner })
     }
 
@@ -417,7 +453,10 @@ impl SandboxHandle {
     ///   seccomp filters in the child process before `execve`.
     /// - **macOS**: no-op. Use [`SandboxHandle::sandboxed_program`] to get the
     ///   wrapper command.
-    /// - **Windows**: no-op. Use [`SandboxHandle::post_spawn`] after spawning.
+    /// - **Windows**: starts the child suspended (`CREATE_SUSPENDED`) when a
+    ///   security container is active. [`SandboxHandle::post_spawn`] must then
+    ///   attach the AppContainer token and resume it; a child whose post-spawn
+    ///   step is never run stays suspended.
     /// - **Unsupported**: no-op.
     pub fn prepare(&self, cmd: &mut std::process::Command) -> Result<(), SandboxError> {
         self.inner.prepare(cmd)
@@ -425,7 +464,9 @@ impl SandboxHandle {
 
     /// Complete sandbox setup after the child process has spawned.
     ///
-    /// - **Windows**: assigns the child process to the Job Object.
+    /// - **Windows**: attaches the AppContainer token to the suspended child,
+    ///   assigns it to the Job Object, and resumes it. Any failure terminates
+    ///   the child.
     /// - **Other platforms**: no-op.
     pub fn post_spawn(&self, child: &std::process::Child) -> Result<(), SandboxError> {
         self.inner.post_spawn(child)
@@ -434,10 +475,10 @@ impl SandboxHandle {
     /// Complete sandbox setup for an asynchronously spawned child.
     ///
     /// The shell tools spawn through `tokio::process`, which hands out a raw
-    /// handle rather than a `std::process::Child` — so the Windows path needs
-    /// this entry point to put the child in its Job Object. Without a caller
-    /// there was no caller at all: the Job Object was created and never
-    /// assigned to anything.
+    /// handle rather than a `std::process::Child`. On Windows this attaches the
+    /// AppContainer token to the suspended child, assigns the Job Object, and
+    /// resumes it. Without a caller there was no caller at all: the Job Object
+    /// was created and never assigned to anything.
     #[cfg(target_os = "windows")]
     pub fn post_spawn_raw(
         &self,
@@ -469,8 +510,10 @@ enum PlatformSandbox {
     Linux(LinuxSandbox),
     #[cfg(target_os = "macos")]
     MacOs(MacOsSandbox),
+    // Boxed to keep the enum small: the Windows handle owns the policy, the
+    // Job Object and the AppContainer state.
     #[cfg(target_os = "windows")]
-    Windows(WindowsSandbox),
+    Windows(Box<WindowsSandbox>),
     Unsupported,
 }
 
@@ -483,12 +526,30 @@ impl PlatformSandbox {
         return MacOsSandbox::create(config).map(Self::MacOs);
 
         #[cfg(target_os = "windows")]
-        return WindowsSandbox::create(config).map(Self::Windows);
+        return WindowsSandbox::create(config)
+            .map(Box::new)
+            .map(Self::Windows);
 
         #[allow(unreachable_code)]
         {
             tracing::warn!("Sandbox not supported on this platform; proceeding without isolation");
             Ok(Self::Unsupported)
+        }
+    }
+
+    /// Create a handle for resource limits only.
+    ///
+    /// On Windows this deliberately skips the AppContainer; other platforms
+    /// have no separate "limits only" mode and create their normal backend.
+    fn create_limits_only(config: SandboxConfig) -> Result<Self, SandboxError> {
+        #[cfg(target_os = "windows")]
+        return WindowsSandbox::create_limits_only(config)
+            .map(Box::new)
+            .map(Self::Windows);
+
+        #[allow(unreachable_code)]
+        {
+            Self::create(config)
         }
     }
 
@@ -500,7 +561,7 @@ impl PlatformSandbox {
             #[cfg(target_os = "macos")]
             Self::MacOs(_) => Ok(()),
             #[cfg(target_os = "windows")]
-            Self::Windows(_) => Ok(()),
+            Self::Windows(s) => s.prepare(cmd),
             Self::Unsupported => Ok(()),
         }
     }
@@ -518,10 +579,7 @@ impl PlatformSandbox {
     }
 
     #[cfg(target_os = "windows")]
-    fn post_spawn_raw(
-        &self,
-        handle: std::os::windows::io::RawHandle,
-    ) -> Result<(), SandboxError> {
+    fn post_spawn_raw(&self, handle: std::os::windows::io::RawHandle) -> Result<(), SandboxError> {
         match self {
             Self::Windows(s) => s.post_spawn_raw(handle),
             _ => Ok(()),
@@ -1179,48 +1237,110 @@ mod macos_impl {
 #[cfg(target_os = "macos")]
 use macos_impl::MacOsSandbox;
 
-// ─── Windows: Job Objects ───────────────────────────────────────────────────
+// ─── Windows: AppContainer + Job Objects ────────────────────────────────────
 
 #[cfg(target_os = "windows")]
 mod windows_impl {
     use super::{SandboxConfig, SandboxError};
+    use crate::sandbox_windows::{app_container_available, AppContainer};
     use std::ffi::OsStr;
     use std::os::windows::ffi::OsStrExt;
+    use std::os::windows::io::RawHandle;
+    use std::os::windows::process::CommandExt;
     use std::ptr;
     use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
     use windows_sys::Win32::System::JobObjects::{
         AssignProcessToJobObject, CreateJobObjectW, JobObjectBasicUIRestrictions,
         JobObjectExtendedLimitInformation, SetInformationJobObject,
         JOBOBJECT_BASIC_LIMIT_INFORMATION, JOBOBJECT_BASIC_UI_RESTRICTIONS,
-        JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JOB_OBJECT_LIMIT_ACTIVE_PROCESS,
-        JOB_OBJECT_LIMIT_JOB_MEMORY, JOB_OBJECT_LIMIT_JOB_TIME, JOB_OBJECT_UI_EXIT_WINDOWS,
-        JOB_OBJECT_UI_GLOBAL_ATOMS, JOB_OBJECT_UI_HANDLES, JOB_OBJECT_UI_NO_DESKTOP,
-        JOB_OBJECT_UI_READCLIPBOARD, JOB_OBJECT_UI_WRITECLIPBOARD,
+        JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JOB_OBJECT_LIMIT_JOB_MEMORY,
+        JOB_OBJECT_LIMIT_JOB_TIME, JOB_OBJECT_UILIMIT_DESKTOP, JOB_OBJECT_UILIMIT_EXITWINDOWS,
+        JOB_OBJECT_UILIMIT_GLOBALATOMS, JOB_OBJECT_UILIMIT_HANDLES,
+        JOB_OBJECT_UILIMIT_READCLIPBOARD, JOB_OBJECT_UILIMIT_WRITECLIPBOARD,
     };
+    use windows_sys::Win32::System::Threading::{TerminateProcess, CREATE_SUSPENDED};
 
-    /// Windows sandbox using Job Objects.
+    /// Windows sandbox: an AppContainer for paths/network plus a Job Object for
+    /// resource and UI limits.
+    ///
+    /// The AppContainer is optional only for the `limits_only` constructor,
+    /// which exists for hook processes: the hooks engine creates its own child
+    /// and cannot run the post-spawn token attach. A handle built by the normal
+    /// [`Self::create`] always has a container; if one cannot be made, creation
+    /// fails rather than silently degrading to limits-only.
     pub struct WindowsSandbox {
         job_handle: HANDLE,
         config: SandboxConfig,
+        container: Option<AppContainer>,
     }
 
+    // SAFETY: `job_handle` is a kernel handle with no thread affinity, and
+    // `AppContainer` is `Send + Sync` (its SID is immutable). Moving the
+    // sandbox between threads does not alias anything.
+    unsafe impl Send for WindowsSandbox {}
+    // SAFETY: the Win32 calls used through `&self` (`post_spawn_raw`) take the
+    // handle by value and are safe to call from any thread.
+    unsafe impl Sync for WindowsSandbox {}
+
     impl WindowsSandbox {
+        /// Create a fully confined child: AppContainer plus Job Object.
         pub fn create(config: SandboxConfig) -> Result<Self, SandboxError> {
+            if !app_container_available() {
+                return Err(SandboxError::IsolationUnavailable(
+                    "AppContainer APIs are unavailable on this Windows installation; \
+                     refusing to run under resource limits alone"
+                        .into(),
+                ));
+            }
+            let container = AppContainer::create(&config)?;
+            Self::with_container(config, Some(container))
+        }
+
+        /// Create a handle that applies only the Job Object limits.
+        ///
+        /// There is deliberately no AppContainer here: a caller that cannot
+        /// perform the post-spawn token attach must not be given a handle that
+        /// pretends to confine paths. It exists for hooks, which still fail
+        /// closed when they need a security boundary (see `hooks::sandbox`).
+        pub fn create_limits_only(config: SandboxConfig) -> Result<Self, SandboxError> {
+            Self::with_container(config, None)
+        }
+
+        fn with_container(
+            config: SandboxConfig,
+            container: Option<AppContainer>,
+        ) -> Result<Self, SandboxError> {
             let job_name_wide: Vec<u16> = OsStr::new("CodeRexSandboxJob")
                 .encode_wide()
                 .chain(Some(0))
                 .collect();
             let job_handle = unsafe { CreateJobObjectW(ptr::null_mut(), job_name_wide.as_ptr()) };
-            if job_handle == 0 {
+            if job_handle.is_null() {
                 return Err(SandboxError::CreationError(format!(
                     "CreateJobObject failed: {}",
                     std::io::Error::last_os_error()
                 )));
             }
 
-            let mut sandbox = Self { job_handle, config };
-            sandbox.apply_limits()?;
+            let mut sandbox = Self {
+                job_handle,
+                config,
+                container,
+            };
+            if let Err(error) = sandbox.apply_limits() {
+                unsafe { CloseHandle(job_handle) };
+                return Err(error);
+            }
             Ok(sandbox)
+        }
+
+        /// Ask `std::process::Command` to stop the child before its first
+        /// instruction, so the AppContainer token can be attached.
+        pub fn prepare(&self, cmd: &mut std::process::Command) -> Result<(), SandboxError> {
+            if self.container.is_some() {
+                cmd.creation_flags(CREATE_SUSPENDED);
+            }
+            Ok(())
         }
 
         fn apply_limits(&mut self) -> Result<(), SandboxError> {
@@ -1229,7 +1349,9 @@ mod windows_impl {
                 let mut limit_flags: u32 = 0;
 
                 if let Some(max_cpu) = self.config.max_cpu_seconds {
-                    basic.PerJobUserTimeLimit.QuadPart = (max_cpu * 10_000_000) as i64;
+                    // 100-nanosecond ticks; windows-sys exposes the field as a
+                    // plain `i64` rather than a `LARGE_INTEGER`.
+                    basic.PerJobUserTimeLimit = (max_cpu * 10_000_000) as i64;
                     limit_flags |= JOB_OBJECT_LIMIT_JOB_TIME;
                 }
 
@@ -1262,12 +1384,12 @@ mod windows_impl {
                 }
 
                 let mut ui: JOBOBJECT_BASIC_UI_RESTRICTIONS = std::mem::zeroed();
-                ui.UIRestrictionsClass = JOB_OBJECT_UI_NO_DESKTOP
-                    | JOB_OBJECT_UI_EXIT_WINDOWS
-                    | JOB_OBJECT_UI_GLOBAL_ATOMS
-                    | JOB_OBJECT_UI_HANDLES
-                    | JOB_OBJECT_UI_READCLIPBOARD
-                    | JOB_OBJECT_UI_WRITECLIPBOARD;
+                ui.UIRestrictionsClass = JOB_OBJECT_UILIMIT_DESKTOP
+                    | JOB_OBJECT_UILIMIT_EXITWINDOWS
+                    | JOB_OBJECT_UILIMIT_GLOBALATOMS
+                    | JOB_OBJECT_UILIMIT_HANDLES
+                    | JOB_OBJECT_UILIMIT_READCLIPBOARD
+                    | JOB_OBJECT_UILIMIT_WRITECLIPBOARD;
 
                 let ret = SetInformationJobObject(
                     self.job_handle,
@@ -1292,29 +1414,72 @@ mod windows_impl {
             self.post_spawn_raw(child.as_raw_handle())
         }
 
-        /// Assign a process to the Job Object, by handle.
+        /// Attach the AppContainer token to a still-suspended child.
         ///
-        /// The assignment is what makes the limits apply, so a child that never
-        /// gets here is not sandboxed at all — which is how this subsystem used
-        /// to be: the Job Object was created, and nothing was put in it.
-        pub fn post_spawn_raw(
-            &self,
-            process: std::os::windows::io::RawHandle,
-        ) -> Result<(), SandboxError> {
-            let ret = unsafe { AssignProcessToJobObject(self.job_handle, process as HANDLE) };
+        /// A failure terminates the child: it was created suspended precisely
+        /// so it could not run outside the container, and reporting the error
+        /// while letting it run would defeat that.
+        fn attach_container(&self, handle: HANDLE) -> Result<(), SandboxError> {
+            let Some(container) = &self.container else {
+                return Ok(());
+            };
+            if let Err(error) = container.restrict_suspended(handle) {
+                unsafe { TerminateProcess(handle, 1) };
+                return Err(error);
+            }
+            Ok(())
+        }
+
+        /// Resume a child whose token was replaced by [`Self::attach_container`].
+        fn resume_child(&self, handle: HANDLE) -> Result<(), SandboxError> {
+            let Some(container) = &self.container else {
+                return Ok(());
+            };
+            if let Err(error) = container.resume(handle) {
+                unsafe { TerminateProcess(handle, 1) };
+                return Err(error);
+            }
+            Ok(())
+        }
+
+        /// Finish setting up a spawned child: attach the AppContainer token,
+        /// assign the Job Object, then resume.
+        ///
+        /// The child was created suspended by [`Self::prepare`]. Any failure
+        /// before the resume terminates it — a child that ran even briefly
+        /// outside the container would defeat the confinement, so this path is
+        /// fail-closed. The job assignment stays after the token attach because
+        /// once the token is replaced there is no need to touch the process as
+        /// the user again.
+        pub fn post_spawn_raw(&self, process: RawHandle) -> Result<(), SandboxError> {
+            let handle = process as HANDLE;
+
+            self.attach_container(handle)?;
+
+            let ret = unsafe { AssignProcessToJobObject(self.job_handle, handle) };
             if ret == 0 {
-                return Err(SandboxError::CreationError(format!(
+                let error = SandboxError::CreationError(format!(
                     "AssignProcessToJobObject failed: {}",
                     std::io::Error::last_os_error()
-                )));
+                ));
+                // A process still suspended never ran, so terminating it is
+                // simply a refusal. A limits-only process is already running;
+                // killing it would change the caller's semantics and the
+                // caller reports the error either way.
+                if self.container.is_some() {
+                    unsafe { TerminateProcess(handle, 1) };
+                }
+                return Err(error);
             }
+
+            self.resume_child(handle)?;
             Ok(())
         }
     }
 
     impl Drop for WindowsSandbox {
         fn drop(&mut self) {
-            if self.job_handle != 0 {
+            if !self.job_handle.is_null() {
                 unsafe { CloseHandle(self.job_handle) };
             }
         }
@@ -1937,21 +2102,66 @@ mod tests {
         handle.prepare(&mut cmd).unwrap();
     }
 
+    /// The path the shell tools use: create suspended, attach the AppContainer
+    /// token, assign the Job Object, resume.
+    ///
+    /// Runs on a Windows CI host. The container may write in the granted
+    /// directory and must not write in an ungranted sibling.
     #[test]
     #[cfg(target_os = "windows")]
-    fn windows_sandbox_creates_job_object() {
+    fn windows_sandbox_confines_a_suspended_child() {
+        if !crate::sandbox_windows::app_container_available() {
+            // The backend refuses to run unconfined; that refusal is the
+            // contract, so assert it rather than skipping silently.
+            assert!(matches!(
+                SandboxHandle::create(SandboxConfig::default()),
+                Err(SandboxError::IsolationUnavailable(_))
+            ));
+            assert!(SandboxHandle::create_limits_only(SandboxConfig::default()).is_ok());
+            return;
+        }
+
+        let base = std::env::var_os("LOCALAPPDATA")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(std::env::temp_dir);
+        let root = base.join(format!("coderex-sandbox-{}", std::process::id()));
+        let allowed = root.join("allowed");
+        let denied = root.join("denied");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&allowed).unwrap();
+        std::fs::create_dir_all(&denied).unwrap();
+
         let config = SandboxConfig {
+            allowed_read_paths: vec![allowed.clone()],
+            allowed_write_paths: vec![allowed.clone()],
+            additional_working_dirs: vec![allowed.clone()],
             max_memory_bytes: Some(512 * 1024 * 1024),
             max_cpu_seconds: Some(30),
             ..SandboxConfig::default()
         };
         let handle = SandboxHandle::create(config).unwrap();
-        let mut cmd = std::process::Command::new("cmd");
-        cmd.arg("/c").arg("echo hello");
-        handle.prepare(&mut cmd).unwrap(); // no-op on Windows
+
+        let inside = allowed.join("inside.txt");
+        let outside = denied.join("outside.txt");
+        let script = format!(
+            "echo inside> \"{}\" & echo outside> \"{}\"",
+            inside.display(),
+            outside.display()
+        );
+        let mut cmd = std::process::Command::new("cmd.exe");
+        cmd.arg("/C")
+            .arg(script)
+            .current_dir(&allowed)
+            .stdin(std::process::Stdio::null());
+        handle.prepare(&mut cmd).unwrap();
         let child = cmd.spawn().unwrap();
         handle.post_spawn(&child).unwrap();
         let _ = child.wait_with_output();
+
+        assert!(inside.exists(), "the granted workspace was not writable");
+        assert!(!outside.exists(), "a path outside the policy was writable");
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
 

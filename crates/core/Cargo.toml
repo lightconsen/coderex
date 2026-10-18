@@ -52,6 +52,21 @@ toml.workspace = true
 wiremock = { workspace = true, optional = true }
 crossterm = { workspace = true, optional = true }
 
+# The Windows sandbox needs Win32 directly: AppContainer profiles, DACL
+# editing, process attributes and Job Objects. Declaring it only in the code
+# left `coderex-core` unable to build for Windows at all.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Security_Isolation",
+    "Win32_Storage_FileSystem",
+    "Win32_System_JobObjects",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Threading",
+] }
+
 [dev-dependencies]
 mockall.workspace = true
 proptest.workspace = true

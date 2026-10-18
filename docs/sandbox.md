@@ -2,16 +2,20 @@
 
 This document describes the guarantees the sandbox makes today, per platform, and
 draws the line between what the kernel enforces and what is only an in-process
-check. The short version: **macOS and Linux-with-bubblewrap confine the
-filesystem; Windows and Linux without bubblewrap do not.** Where they do not,
-the sandbox is a syscall allowlist, a resource budget, or nothing at all — and
-it says so at runtime rather than letting the caller assume otherwise.
+check. The short version: **macOS, Windows (AppContainer), and
+Linux-with-bubblewrap confine the filesystem; Linux without bubblewrap does
+not.** Where they do not, the sandbox is a syscall allowlist, a resource
+budget, or nothing at all — and it says so at runtime rather than letting the
+caller assume otherwise. On Windows, confinement requires the AppContainer
+APIs; when they are missing, creating a confined sandbox fails rather than
+silently degrading.
 
 ## Where it is wired
 
 | Piece | Location |
 |---|---|
 | Platform backends (Seatbelt / seccomp / Job Objects) | `crates/core/src/sandbox.rs` |
+| Windows AppContainer, ACL policy, and raw `STARTUPINFOEX` spawn | `crates/core/src/sandbox_windows.rs` |
 | Per-tool default policy (which paths, which limits) | `crates/tools/src/sandbox_policy.rs` |
 | Policy injected into `ToolContext.extra["sandbox_config"]` | `RegistryToolDispatcher` in `crates/tools/src/dispatcher.rs` |
 | **Shell wrapping lives in one place** — both shell tools use it | `sandboxed_shell` / `finish_spawn`, `crates/tools/src/sandbox_shell.rs` |
@@ -111,28 +115,105 @@ fallback ran `sh sh -c …`. None of that was visible from macOS, which is the
 point: a platform `cfg` that is never compiled on its platform is a comment, not
 code.
 
-### Windows — Job Objects
+### Windows — AppContainer + Job Objects
 
-Creates a Job Object with per-job user time and memory limits and assigns the
-child to it, plus UI restrictions (no desktop, no clipboard, no global atoms).
-This limits resources and UI reach; it does not restrict file paths or network.
+Two layers, both applied to a shell child:
 
-The assignment happens **after spawn**, through `SandboxHandle::post_spawn_raw`
-(the shell tools spawn asynchronously and only have a raw handle) — on Windows
-the shell tool is `PowerShell`, and it now reads the policy the dispatcher hands
-over. A child that exits before it can be placed in its Job Object is logged as
-having run without the limits, rather than being counted as sandboxed.
+1. **AppContainer** — the real security boundary. A profile with a stable name
+   (`CodeRex.Sandbox`, or `CodeRex.Sandbox.Network` when the policy allows the
+   network) gives the child a container SID instead of the user's SID. The SID
+   is granted read/execute on the configured read and execute paths and
+   read/write on the configured write paths, the working directories and the
+   temp directory. No capability is placed in the token unless
+   `allow_network` is set, so without the `internetClient` capability the
+   container has **no network access**.
+2. **Job Object** — CPU time and memory limits, plus UI restrictions (no
+   desktop, no clipboard, no global atoms).
 
-**This is still not filesystem isolation.** A Job Object limits CPU, memory and
-UI reach; it does not restrict paths or the network. The reference has `srt-win`
-for that, and CodeRex has nothing — so on Windows a shell command can still read
-and write anything its user can. What changed is that it is now *bounded and
-labelled*, not that it is confined.
+#### Granting paths
 
-**Unverified on Windows.** There is no Windows toolchain on the machine this was
-written on, so this path has not been compiled or run; the calling code is
-cross-platform and compiled, but the Job Object assignment itself is reviewed
-only.
+ACLs are merged into each path's existing DACL with `SetEntriesInAclW` and
+written with `SetNamedSecurityInfoW`; the existing ACEs are left in place. The
+container SID gets:
+
+| Path | Access |
+|---|---|
+| Configured read paths, execute paths, and every `PATH` directory | read + execute |
+| System roots (`%SystemRoot%`, `System32`, `SysWOW64`, `Program Files*`, WindowsApps) | read + execute, best-effort |
+| Configured write paths, additional working dirs | read + write |
+| `%TEMP%` | read + write, not recursive |
+| Ancestors of every granted path | traverse only, not inheritable |
+
+Ancestor traverse is required because an AppContainer token has no
+`SeChangeNotifyPrivilege` and therefore cannot bypass traverse checking.
+Traverse is not read or list access. It is deliberately not inheritable, so
+granting it on `C:\Users\me` does not widen access to everything below.
+
+Directories get inheritable ACEs for new files. Pre-existing files do not
+inherit retroactively, so each recursively granted root is walked once per
+process to apply the ACE to the tree already there (symlinks are skipped,
+following a link could grant a path the policy never named; the walk stops
+after 200,000 entries and logs that descendants now rely on inheritance). The
+walk and each profile SID are stable across commands, and grants are cached per
+profile, so the cost is paid once per profile per process, not on every shell
+invocation.
+
+Changing a DACL requires `WRITE_DAC` on the object. The user normally has it
+for their own workspace and `%TEMP%`; system roots are marked best-effort
+because Windows system directories normally already grant
+`ALL APPLICATION PACKAGES`, and a user cannot rewrite their ACLs. A failure is
+logged and the path simply stays unreachable to the container (fail closed).
+
+#### Creating the process
+
+The documented mechanism is `CreateProcessW` with `STARTUPINFOEX` carrying
+`PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES`; that primitive lives in
+`crates/core/src/sandbox_windows.rs`. Stable Rust cannot pass a process
+attribute list through `std::process::Command` (`spawn_with_attributes` is
+unstable, and tokio's equivalent needs `tokio_unstable`), so the shell tools use
+an equivalent post-spawn path:
+
+1. `prepare` sets `CREATE_SUSPENDED`.
+2. `post_spawn_raw` creates an AppContainer token with the
+   `CreateAppContainerToken` export from `kernelbase.dll`, replaces the
+   suspended child's primary token through
+   `NtSetInformationProcess(ProcessAccessToken)`, assigns the Job Object, and
+   resumes with `NtResumeProcess`.
+3. Any failure terminates the suspended child and returns an error. A command
+   is never reported as sandboxed after running outside the container.
+
+`CreateAppContainerToken` is not in the public SDK. It has been stable since
+Windows 8 and is the call Chromium used for the same purpose, but it is
+undocumented, so availability is checked at runtime and the sandbox refuses to
+start if it is missing.
+
+#### Windows limitations, stated plainly
+
+- Confinement requires AppContainer support. When the profile or token APIs are
+  absent, `SandboxHandle::create` returns `IsolationUnavailable` and shell
+  tools fail rather than run unconfined. `filesystem_isolation()` reports
+  `None` in that case.
+- The ACL grant only helps where the process can change the DACL. A workspace
+  owned by another user may be unreadable to the container even though it is in
+  the policy.
+- Command hooks do **not** get AppContainer confinement: the hook engine owns
+  its spawn and has no post-spawn attach step, so a handle given to it uses
+  `create_limits_only` (Job Object only). Gating hooks fail closed instead of
+  claiming confinement. See `docs/hooks.md`.
+- The MCP server and the WASM compiler helper still spawn through their own
+  paths; only the Job Object applies to them.
+
+**Verification status.** The pure policy functions (ACL plan, capability set,
+command-line quoting) are compiled and unit-tested on macOS. The Win32 code and
+its integration in `sandbox.rs` were type-checked for
+`x86_64-pc-windows-gnu` with `cargo check` in an isolated scratch crate — the
+workspace's own cross-check stops in `ring`'s build script because no mingw C
+compiler is installed. The code has **not been linked or run on Windows**. Two
+Windows-gated tests are ready for a Windows CI host: one exercises the
+documented `STARTUPINFOEX` spawn, the other the suspended-token attach used by
+the shell tools; both check that a granted directory is writable and an
+ungranted sibling is not. Until they run, the Win32 path is reviewed and
+type-checked, not verified.
 
 ### Other platforms
 
@@ -163,9 +244,11 @@ process-wide. Additional paths are absolute or the load is refused; unknown
 sandbox keys are load errors. See `docs/hooks.md` for the settings shape.
 
 Enforcement matches the platform table above. On macOS the hook is wrapped in
-`sandbox-exec`; on Linux with `bwrap` it is wrapped in bubblewrap. Where there
-is no filesystem isolation — Windows, or Linux without `bwrap` — a gating hook
-(`PreToolUse`, `UserPromptSubmit`) fails closed with
+`sandbox-exec`; on Linux with `bwrap` it is wrapped in bubblewrap. On Windows
+the hook engine creates its own child and has no AppContainer post-spawn attach
+step, so hooks are not confined there even though shell tools are. Where there
+is no hook filesystem isolation — Windows, or Linux without `bwrap` — a gating
+hook (`PreToolUse`, `UserPromptSubmit`) fails closed with
 `HookError::SandboxUnavailable` rather than running unconfined, and a
 non-gating hook logs a warning and runs with resource limits only. An explicit
 opt-out is not a failure.
@@ -237,10 +320,11 @@ credential carrier.
 
 ### `allow_network`, per platform
 
-Honoured on macOS (`(allow network*)` vs `(deny network*)`) and on Linux (the
+Honoured on macOS (`(allow network*)` vs `(deny network*)`), on Linux (the
 network syscalls are a separate seccomp table, concatenated only when the flag is
-set). Not honoured on Windows: a Job Object does not filter network access, and
-nothing else does there either. `NoOpSandbox` honours nothing.
+set), and on Windows (the AppContainer token gets the `internetClient`
+capability only when the flag is set; a container without it cannot open
+outbound connections). `NoOpSandbox` honours nothing.
 
 ### Refusing to execute out of the working directory (`safeSpawn`)
 
@@ -282,9 +366,11 @@ does not go through the tool layer is not bound by them either.
 - Linux filesystem confinement **when `bwrap` is absent or switched off** — it is
   enforced when bubblewrap is installed, and `filesystem_isolation()` reports
   which of the two is the case.
-- Any filesystem confinement on Windows or unsupported platforms.
+- Filesystem confinement on Windows when the AppContainer APIs are unavailable —
+  creation fails and `filesystem_isolation()` reports `None`; it does not fall
+  back to limits-only.
+- Filesystem or network confinement on unsupported platforms.
 - rlimits on macOS.
-- Network confinement on Windows.
 - cgroup memory control. The reference uses a cgroup v1 memory controller for
   tool and MCP children; this is Linux-only and is **not implemented** here. It
   is deferred rather than written blind: there is no way to exercise it from
@@ -292,9 +378,11 @@ does not go through the tool layer is not bound by them either.
   than a control.
 - Path checks for processes that do not go through the tool layer.
 - Filesystem or network confinement for a `command` hook on Windows, or on
-  Linux without `bwrap`. There, a gating hook is denied rather than run
-  unconfined; a non-gating one runs with a warning. `CODEREX_HOOK_SANDBOX=0`
-  and the per-hook `sandbox.enabled: false` opt out deliberately.
+  Linux without `bwrap`. On Windows the hook engine has no AppContainer
+  post-spawn attach step; the hook still gets the Job Object's resource limits.
+  There, a gating hook is denied rather than run unconfined; a non-gating one
+  runs with a warning. `CODEREX_HOOK_SANDBOX=0` and the per-hook
+  `sandbox.enabled: false` opt out deliberately.
 
 ## Verifying the macOS guarantees
 
@@ -319,3 +407,12 @@ covered by Linux-gated tests that cannot run on macOS.
 
 Linux behaviour (seccomp allowlist, `allow_network`, rlimits) is covered by
 Linux-gated tests that cannot run on macOS.
+
+Windows behaviour is covered by Windows-gated tests, none of which has run yet:
+`sandbox_windows::tests::spawn_in_container_confines_a_real_process` (the
+documented `STARTUPINFOEX` spawn) and
+`sandbox::tests::windows_sandbox_confines_a_suspended_child` (the token-attach
+path the shell tools use). Both write inside a granted directory and assert an
+ungranted sibling stays unwritable, and both assert the fail-closed path when
+the AppContainer APIs are missing. The pure ACL/capability/quoting policy is
+tested on macOS.

@@ -273,10 +273,13 @@ and the matching side cannot drift.
   `max_file_size_mb` (`RLIMIT_FSIZE`) are installed in `pre_exec`, before the
   hook program runs, so `ulimit -f unlimited` inside the hook cannot raise
   them. `max_memory_mb` (`RLIMIT_AS`) is Linux-only: macOS rejects that limit.
-  Windows uses a Job Object through `coderex_core::sandbox`.
+  Windows uses a Job Object through `coderex_core::sandbox` (limits only; see
+  the platform table below).
 - **OS sandbox.** A `command` hook is additionally confined with the same
   primitives the shell tools use: `sandbox-exec` on macOS, `bubblewrap` on
-  Linux. See the next section.
+  Linux. Windows shell tools use an AppContainer, but the hook spawn path cannot
+  attach it, so Windows hooks remain unconfined and fail closed on a gate. See
+  the next section.
 - **Streaming protocol.** With `stream: true`, stdout is line-delimited JSON.
   A line without a control `type` is the answer (the historical contract,
   unchanged). Before it a hook may emit `{"type":"log",...}`,
@@ -295,10 +298,17 @@ and the matching side cannot drift.
 
 ## OS sandbox for command hooks
 
-Every `command` hook runs inside the platform sandbox, in addition to its
-resource limits. The layer is `coderex_core::sandbox` — the same
+On macOS and Linux, every `command` hook runs inside the platform sandbox, in
+addition to its resource limits. The layer is `coderex_core::sandbox` — the same
 `SandboxHandle`, Seatbelt profile, and bubblewrap argument builder the Bash and
 PowerShell tools use — so there is one policy implementation, not two.
+
+Windows is the exception. Shell tools get AppContainer confinement by creating
+the child suspended and attaching the token after spawn; the hook engine owns
+its spawn and has no such step. It is given a limits-only handle whose
+`prepare` does not suspend anything, and confinement is reported as
+unavailable rather than claimed. See [When the platform cannot
+confine](#when-the-platform-cannot-confine).
 
 ### Default policy
 
@@ -355,9 +365,9 @@ with `CODEREX_BWRAP`, only an explicit negative switches it off.
 
 ### When the platform cannot confine
 
-The sandbox is not pretended. If the wrapper cannot be created — Windows has
-no path/network isolation, Linux has no `bwrap`, macOS has no `sandbox-exec` —
-then:
+The sandbox is not pretended. If the wrapper cannot be created — the Windows
+hook spawn path cannot attach the AppContainer token, Linux has no `bwrap`,
+macOS has no `sandbox-exec` — then:
 
 - On a **gating event** (`PreToolUse`, `UserPromptSubmit`) the hook fails with
   `HookError::SandboxUnavailable`, which is a failure and therefore a deny. A
@@ -376,7 +386,7 @@ run hooks on a platform without confinement.
 | macOS | **Kernel** — Seatbelt read/write paths | **Kernel** — `deny network*` | CPU/file-size; no `RLIMIT_AS` |
 | Linux with `bwrap` | **Kernel** — read-only root, writable policy paths | **Kernel** — network namespace | CPU/file-size/address space |
 | Linux without `bwrap` | **None** — gating hooks fail closed | None (no wrapper) | CPU/file-size/address space |
-| Windows | **None** — Job Objects limit resources/UI only; gating hooks fail closed | None | Job Object CPU/memory |
+| Windows | **None for hooks** — the AppContainer token cannot be attached on this spawn path; gating hooks fail closed | None | Job Object CPU/memory |
 | Other | **None** — gating hooks fail closed | None | — |
 
 The streaming protocol is unaffected: stdin/stdout/stderr are inherited
@@ -406,9 +416,12 @@ provides are implemented in process-appropriate form instead:
 
 **OS confinement is applied** to `command` hooks: `sandbox-exec` on macOS and
 bubblewrap on Linux, reusing `coderex_core::sandbox` (see
-[OS sandbox for command hooks](#os-sandbox-for-command-hooks)). Windows has no
-filesystem isolation in the primitive CodeRex uses; there, a gating hook fails
-closed rather than running unconfined, and a non-gating hook warns. An explicit
+[OS sandbox for command hooks](#os-sandbox-for-command-hooks)). Windows shell
+tools get AppContainer confinement, but the hook engine spawns its own child
+and has no post-spawn token-attach step; a handle built for a hook is
+limits-only (`create_limits_only`), never a suspended child. A gating hook
+therefore fails closed rather than running unconfined, and a non-gating hook
+warns while still getting the Job Object's CPU/memory limits. An explicit
 per-hook or environment opt-out is available.
 
 ## Current status

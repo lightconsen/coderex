@@ -9,7 +9,8 @@
 //!
 //! Both shell tools now build their command here, so the platform logic exists
 //! once: a Seatbelt profile on macOS, a mount namespace on Linux, and on Windows
-//! a Job Object assigned after the child has spawned.
+//! an AppContainer token attached to a suspended child plus a Job Object
+//! assigned after it has spawned.
 
 use crate::context::ToolError;
 use crate::tool::ToolContext;
@@ -47,8 +48,8 @@ pub fn guard_program_origin(program: &str, cwd: &std::path::Path) -> Result<(), 
 /// Build a shell invocation under the configured sandbox, if there is one.
 ///
 /// Returns the command and the handle that must stay alive until it finishes
-/// (macOS profile cleanup, Windows Job Object). With no policy configured the
-/// shell runs unwrapped, exactly as it did before.
+/// (macOS profile cleanup, Windows AppContainer and Job Object). With no policy
+/// configured the shell runs unwrapped, exactly as it did before.
 ///
 /// # Errors
 ///
@@ -90,8 +91,10 @@ pub fn sandboxed_shell(
     guard_program_origin(shell, ctx.cwd)?;
     std_cmd.args(shell_args).current_dir(ctx.cwd);
 
-    // rlimits on Linux, a no-op elsewhere. On Linux with `bwrap` this installs
-    // the rlimits and deliberately skips the syscall table (see `sandbox.rs`).
+    // rlimits on Linux; on Windows this sets `CREATE_SUSPENDED` so
+    // `finish_spawn` can attach the AppContainer token; no-op on macOS. On
+    // Linux with `bwrap` this installs the rlimits and deliberately skips the
+    // syscall table (see `sandbox.rs`).
     handle.prepare(&mut std_cmd).map_err(|error| {
         ToolError::Io(std::io::Error::new(
             std::io::ErrorKind::Other,
@@ -104,13 +107,16 @@ pub fn sandboxed_shell(
 
 /// Finish sandbox setup for a child that has just spawned.
 ///
-/// On Windows the child is created first and then placed in its Job Object,
-/// which is the only moment that operation is possible; elsewhere there is
-/// nothing left to do. Callers must hold the handle until the child exits.
+/// On Windows the child was created suspended by `prepare`. This attaches the
+/// AppContainer token, assigns the Job Object, and resumes it; any failure
+/// terminates the child, so a command is never reported as sandboxed after
+/// running outside the container. Elsewhere there is nothing left to do.
+/// Callers must hold the handle until the child exits.
 ///
 /// # Errors
 ///
-/// Returns an error when the child could not be assigned to its Job Object.
+/// Returns an error when the container token could not be attached or the
+/// child could not be assigned to its Job Object.
 pub fn finish_spawn(
     handle: Option<&SandboxHandle>,
     child: &tokio::process::Child,
@@ -125,13 +131,14 @@ pub fn finish_spawn(
                         format!("sandbox: {error}"),
                     ))
                 })?,
-                // A command that finished before it could be placed in the Job
-                // Object ran without its limits. Nothing can be done about it
-                // after the fact — but it should not be silently treated as
-                // sandboxed either.
+                // The child was created suspended specifically so this path
+                // could attach the container token. Losing the handle means it
+                // cannot be confined, and it must not be reported as if it
+                // were.
                 None => tracing::warn!(
-                    "the child exited before it could be placed in its Job Object; \
-                     this command ran without the sandbox's resource limits"
+                    "the child's process handle was unavailable before the AppContainer \
+                     token and Job Object could be attached; this command may have run \
+                     without filesystem, network, or resource limits"
                 ),
             }
         }
