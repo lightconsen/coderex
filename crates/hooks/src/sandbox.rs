@@ -38,9 +38,13 @@
 //! - **Linux** — `bwrap`: the root is read-only, policy paths are the only
 //!   writable mounts, and `--unshare-net` denies the network. Without `bwrap`
 //!   there is no path confinement, so a gating hook fails closed.
-//! - **Windows** — Job Objects limit CPU and memory only; there is no
-//!   filesystem or network isolation, so a gating hook fails closed unless it
-//!   opts out.
+//! - **Windows** — shell tools get AppContainer confinement, but the hook
+//!   engine spawns its own child and has no post-spawn step, so it cannot
+//!   attach the AppContainer token. Hook confinement is therefore reported as
+//!   unavailable: a gating hook fails closed unless it opts out, and a
+//!   non-gating one runs with the Job Object resource limits and a warning.
+//!   (An AppContainer child is created suspended; running hooks under it
+//!   without the attach step would leave every hook suspended forever.)
 
 use crate::engine::HookConfig;
 use crate::events::HookError;
@@ -167,13 +171,23 @@ fn confinement_availability() -> Result<(), String> {
             Err("bubblewrap (bwrap) is not installed".to_string())
         }
     }
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    #[cfg(target_os = "windows")]
     {
+        // The Windows backend can build an AppContainer, but only by suspending
+        // the child, attaching the token after spawn, and resuming. The hook
+        // engine owns its spawn and never calls that post-spawn step, so it
+        // must not be told the hook is confined. Saying so is better than
+        // handing back a Job Object and calling it confinement.
         Err(
-            "this platform has no filesystem isolation (Windows Job Objects limit \
-             resources and UI reach, not paths or network)"
+            "Windows hook confinement cannot be attached in this build: the hook spawn \
+             path has no AppContainer post-spawn step (Windows shell tools do use \
+             AppContainer confinement)"
                 .to_string(),
         )
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+    {
+        Err("this platform has no filesystem isolation".to_string())
     }
 }
 
@@ -533,6 +547,11 @@ fn apply_unix_limits(command: &mut Command, config: &HookConfig) {
 
 /// Build the Job Object that limits a hook on Windows, if any limit is set.
 ///
+/// This deliberately uses `create_limits_only`: a full sandbox would create an
+/// AppContainer and `prepare` would suspend the child, but the hook engine has
+/// no post-spawn attach/resume step. Limits are all this handle is allowed to
+/// claim.
+///
 /// Returns `None` when nothing is configured or the job cannot be created (a
 /// warning is logged in the latter case): a missing hardening layer should not
 /// make every hook unrunnable. The caller keeps the handle alive until the
@@ -546,18 +565,20 @@ pub(crate) fn prepare_windows_limits(
     }
 
     let sandbox =
-        coderex_core::sandbox::SandboxHandle::create(coderex_core::sandbox::SandboxConfig {
-            allowed_read_paths: Vec::new(),
-            allowed_write_paths: Vec::new(),
-            allowed_exec_paths: Vec::new(),
-            additional_working_dirs: Vec::new(),
-            max_open_files: None,
-            max_memory_bytes: config
-                .max_memory_mb
-                .map(|mb| mb.saturating_mul(1024 * 1024)),
-            max_cpu_seconds: config.max_cpu_seconds,
-            allow_network: true,
-        });
+        coderex_core::sandbox::SandboxHandle::create_limits_only(
+            coderex_core::sandbox::SandboxConfig {
+                allowed_read_paths: Vec::new(),
+                allowed_write_paths: Vec::new(),
+                allowed_exec_paths: Vec::new(),
+                additional_working_dirs: Vec::new(),
+                max_open_files: None,
+                max_memory_bytes: config
+                    .max_memory_mb
+                    .map(|mb| mb.saturating_mul(1024 * 1024)),
+                max_cpu_seconds: config.max_cpu_seconds,
+                allow_network: true,
+            },
+        );
 
     match sandbox {
         Ok(sandbox) => Some(sandbox),
@@ -569,6 +590,11 @@ pub(crate) fn prepare_windows_limits(
 }
 
 /// Put a spawned hook into its Job Object.
+///
+/// The handle was built with `create_limits_only`, so the child was never
+/// suspended and there is nothing to resume. The `post_spawn_raw` call is the
+/// same entry point the shell tools use; with no AppContainer in the handle it
+/// assigns the job and returns.
 #[cfg(target_os = "windows")]
 pub(crate) fn assign_windows_limits(
     sandbox: &coderex_core::sandbox::SandboxHandle,
@@ -1034,8 +1060,9 @@ mod policy_tests {
         );
     }
 
-    /// Windows Job Objects limit resources, not paths. A gating hook therefore
-    /// fails closed unless it opts out; off a gate it runs with a warning.
+    /// The hook spawn path cannot attach the Windows AppContainer token, so a
+    /// gating hook fails closed unless it opts out; off a gate it runs with the
+    /// Job Object's resource limits and a warning.
     #[cfg(target_os = "windows")]
     #[tokio::test]
     async fn windows_hooks_fail_closed_only_on_a_gate() {

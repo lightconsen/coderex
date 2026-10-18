@@ -1,0 +1,1315 @@
+//! Windows filesystem and network isolation for sandboxed subprocesses.
+//!
+//! The Windows backend used to be a Job Object and nothing else: it bounded
+//! CPU, memory and UI reach, but a child could still read and write anything
+//! its user could and use the network. This module adds a real security
+//! boundary on top:
+//!
+//! 1. A per-user **AppContainer profile** is created (or an existing one is
+//!    derived) and its SID is the identity the child runs under. An
+//!    AppContainer token contains the container SID instead of the user's SID,
+//!    so ordinary user files are unreadable unless the container SID was
+//!    granted access.
+//! 2. The container SID is granted read/execute on the configured read and
+//!    execute paths and read/write on the configured write paths with
+//!    [`SetEntriesInAclW`] + [`SetNamedSecurityInfoW`]. System roots are granted
+//!    best-effort; they normally already include `ALL APPLICATION PACKAGES`.
+//! 3. No capabilities are placed in the token unless `allow_network` is set.
+//!    Without the `internetClient` capability an AppContainer has no network
+//!    access, which is how this backend denies the network.
+//!
+//! ## Two ways to create the process
+//!
+//! The documented Windows way to start a process in an AppContainer is a
+//! `STARTUPINFOEX` carrying `PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES` and
+//! `CreateProcessW(..., EXTENDED_STARTUPINFO_PRESENT, ...)`. That is what
+//! [`AppContainer::spawn`] does.
+//!
+//! Rust's stable `std::process::Command` cannot pass a process attribute list,
+//! and the workspace builds on stable Rust. The shell tools therefore create
+//! the child with `CREATE_SUSPENDED`, then [`AppContainer::restrict_suspended`]
+//! replaces its primary token with an AppContainer token before the first
+//! thread runs, and [`AppContainer::resume`] lets it go. The token is created
+//! with the undocumented-but-long-standing `CreateAppContainerToken` export
+//! from `kernelbase.dll`; the call is resolved dynamically and the sandbox
+//! reports itself unavailable when it is missing. This is the same mechanism
+//! Chromium used to attach a LowBox token to a suspended process.
+//!
+//! Both paths share the profile, SID, capability and ACL policy in this module.
+//!
+//! ## What is pure and what is Windows-only
+//!
+//! [`acl_plan`], [`capability_names`], [`quote_windows_arg`] and
+//! [`build_command_line`] are deliberately platform-independent: they encode
+//! the policy and are unit-tested on macOS and Linux as well. Every Win32 call
+//! is behind `cfg(windows)`.
+//!
+//! ## Verification status
+//!
+//! The Win32 code has **not been compiled or run** on the machine this was
+//! written on (macOS, no Windows toolchain). Only the pure policy functions
+//! have been executed, by the unit tests below. The Windows-gated tests that
+//! spawn a real process exist so a Windows CI host can verify the guarantees;
+//! until they run, the AppContainer path is reviewed-only.
+
+#![allow(unsafe_code)]
+#![cfg_attr(not(target_os = "windows"), allow(dead_code))]
+
+use crate::sandbox::SandboxConfig;
+use std::path::PathBuf;
+
+/// The capability a container needs in order to reach the network.
+///
+/// It is deliberately absent by default: an AppContainer without it cannot
+/// open outbound connections.
+pub(crate) const INTERNET_CLIENT_CAPABILITY: &str = "internetClient";
+
+/// What an ACL grant allows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum AclAccess {
+    /// Traverse a directory in the path to something else.
+    ///
+    /// An AppContainer token does not carry `SeChangeNotifyPrivilege`, so it
+    /// cannot bypass traverse checking: every ancestor of an allowed path has
+    /// to grant `FILE_TRAVERSE` explicitly. This is not read or list access.
+    Traverse,
+    /// Read and execute (for a directory: list and traverse). No writes.
+    ReadExecute,
+    /// Read, execute and write.
+    Modify,
+}
+
+impl AclAccess {
+    /// Strength order used when two policy sources name the same path.
+    const fn rank(self) -> u8 {
+        match self {
+            Self::Traverse => 0,
+            Self::ReadExecute => 1,
+            Self::Modify => 2,
+        }
+    }
+
+    /// Whether this grant may be inherited by descendants.
+    ///
+    /// Traverse is deliberately not inheritable: it exists only to reach the
+    /// granted path, not to widen access to everything below an ancestor.
+    const fn inheritable(self) -> bool {
+        !matches!(self, Self::Traverse)
+    }
+}
+
+/// One path the container SID is granted access to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct AclGrant {
+    /// The path to change the DACL of.
+    pub(crate) path: PathBuf,
+    /// The access to grant.
+    pub(crate) access: AclAccess,
+    /// Whether the grant must also be applied to existing descendants.
+    ///
+    /// Inheritable ACEs cover files created *after* the grant. A workspace
+    /// already full of files needs the walk or the container cannot read them.
+    pub(crate) recursive: bool,
+    /// Whether failure to change this path's DACL is survivable.
+    ///
+    /// System and `PATH` roots are best-effort: Windows system directories
+    /// normally grant `ALL APPLICATION PACKAGES`, and a user may not be able
+    /// to rewrite their DACL at all. The configured policy paths are required.
+    pub(crate) best_effort: bool,
+}
+
+/// Build the ACL grants that confine a container.
+///
+/// Pure, so the policy can be read and tested on any host. The Win32 layer
+/// supplies the platform's system roots and `PATH` directories; the test
+/// supplies fixed ones.
+///
+/// Ordering is fixed (system roots, `PATH`, execute, read, write, working
+/// directories, temp) and duplicates are merged so the same path receives at
+/// most one ACE and the strongest access wins.
+#[must_use]
+pub(crate) fn acl_plan(
+    config: &SandboxConfig,
+    system_roots: &[PathBuf],
+    search_paths: &[PathBuf],
+    temp_dir: &std::path::Path,
+) -> Vec<AclGrant> {
+    let mut grants: Vec<AclGrant> = Vec::new();
+
+    for path in system_roots {
+        push_path(&mut grants, path, AclAccess::ReadExecute, false, true);
+    }
+    for path in search_paths {
+        push_path(&mut grants, path, AclAccess::ReadExecute, false, true);
+    }
+    for path in &config.allowed_exec_paths {
+        push_path(&mut grants, path, AclAccess::ReadExecute, true, false);
+    }
+    for path in &config.allowed_read_paths {
+        push_path(&mut grants, path, AclAccess::ReadExecute, true, false);
+    }
+    for path in &config.allowed_write_paths {
+        push_path(&mut grants, path, AclAccess::Modify, true, false);
+    }
+    for path in &config.additional_working_dirs {
+        push_path(&mut grants, path, AclAccess::Modify, true, false);
+    }
+    // A shell needs somewhere to write temporary files even when the caller
+    // did not name the temp directory in the policy. This grant is *not*
+    // recursive: the user's temp tree can be large, and pre-existing files
+    // there are not something the sandbox has to read. Children created after
+    // the grant inherit it.
+    push_path(&mut grants, temp_dir, AclAccess::Modify, false, false);
+
+    grants
+}
+
+/// Add a path and the traverse rights its ancestors need.
+fn push_path(
+    grants: &mut Vec<AclGrant>,
+    path: &std::path::Path,
+    access: AclAccess,
+    recursive: bool,
+    best_effort: bool,
+) {
+    push_grant(grants, path.to_path_buf(), access, recursive, best_effort);
+    for ancestor in path.ancestors().skip(1) {
+        // A relative path's last ancestor is the empty path; there is nothing
+        // to grant there.
+        if ancestor.as_os_str().is_empty() {
+            continue;
+        }
+        push_grant(
+            grants,
+            ancestor.to_path_buf(),
+            AclAccess::Traverse,
+            false,
+            best_effort,
+        );
+    }
+}
+
+/// Merge a grant into the plan, keeping one entry per path.
+fn push_grant(
+    grants: &mut Vec<AclGrant>,
+    path: PathBuf,
+    access: AclAccess,
+    recursive: bool,
+    best_effort: bool,
+) {
+    if let Some(existing) = grants.iter_mut().find(|grant| grant.path == path) {
+        if access.rank() > existing.access.rank() {
+            existing.access = access;
+        }
+        existing.recursive |= recursive && access.inheritable();
+        // If any source requires the path, the merge is required.
+        existing.best_effort &= best_effort;
+        return;
+    }
+    grants.push(AclGrant {
+        path,
+        access,
+        recursive,
+        best_effort,
+    });
+}
+
+/// The capabilities an AppContainer token is given.
+///
+/// Pure: the only capability this backend ever grants is `internetClient`, and
+/// only when the policy allows the network. Anything else would silently widen
+/// the boundary.
+#[must_use]
+pub(crate) fn capability_names(config: &SandboxConfig) -> Vec<&'static str> {
+    if config.allow_network {
+        vec![INTERNET_CLIENT_CAPABILITY]
+    } else {
+        Vec::new()
+    }
+}
+
+/// Quote one argument for the Windows command line.
+///
+/// `CreateProcessW` parses its command line itself; an argument containing a
+/// space, tab or quote has to be wrapped in quotes and its backslashes/quotes
+/// escaped the way `CommandLineToArgvW` expects.
+#[must_use]
+pub(crate) fn quote_windows_arg(arg: &str) -> String {
+    let needs_quotes = arg.is_empty() || arg.contains([' ', '\t', '"']);
+    if !needs_quotes {
+        return arg.to_string();
+    }
+
+    let mut quoted = String::with_capacity(arg.len() + 2);
+    quoted.push('"');
+    let mut backslashes = 0usize;
+    for ch in arg.chars() {
+        match ch {
+            '\\' => backslashes += 1,
+            '"' => {
+                // Backslashes before a quote are doubled, then the quote is
+                // escaped.
+                quoted.extend(std::iter::repeat_n('\\', backslashes * 2 + 1));
+                quoted.push('"');
+                backslashes = 0;
+            }
+            _ => {
+                quoted.extend(std::iter::repeat_n('\\', backslashes));
+                backslashes = 0;
+                quoted.push(ch);
+            }
+        }
+    }
+    // Backslashes immediately before the closing quote are doubled.
+    quoted.extend(std::iter::repeat_n('\\', backslashes * 2));
+    quoted.push('"');
+    quoted
+}
+
+/// Build the `lpCommandLine` for [`CreateProcessW`] from a program and
+/// arguments.
+#[must_use]
+pub(crate) fn build_command_line(program: &str, args: &[String]) -> String {
+    let mut line = quote_windows_arg(program);
+    for arg in args {
+        line.push(' ');
+        line.push_str(&quote_windows_arg(arg));
+    }
+    line
+}
+
+// ─── Win32 implementation ───────────────────────────────────────────────────
+
+#[cfg(target_os = "windows")]
+mod imp {
+    use super::{acl_plan, capability_names, AclAccess};
+    use crate::sandbox::{SandboxConfig, SandboxError};
+    use std::ffi::{c_void, OsStr, OsString};
+    use std::os::windows::ffi::OsStrExt;
+    use std::path::{Path, PathBuf};
+    use std::ptr;
+    use std::sync::{Mutex, OnceLock};
+
+    use windows_sys::Win32::Foundation::{
+        CloseHandle, LocalFree, ERROR_ALREADY_EXISTS, HANDLE, HLOCAL, WAIT_OBJECT_0,
+    };
+    use windows_sys::Win32::Security::Authorization::{
+        GetNamedSecurityInfoW, SetEntriesInAclW, SetNamedSecurityInfoW, EXPLICIT_ACCESS_W,
+        GRANT_ACCESS, NO_MULTIPLE_TRUSTEE, SE_FILE_OBJECT, TRUSTEE_IS_SID, TRUSTEE_IS_UNKNOWN,
+        TRUSTEE_W,
+    };
+    use windows_sys::Win32::Security::Isolation::{
+        CreateAppContainerProfile, DeriveAppContainerSidFromAppContainerName,
+    };
+    use windows_sys::Win32::Security::{
+        CreateWellKnownSid, FreeSid, WinCapabilityInternetClientSid, ACL, PSECURITY_DESCRIPTOR,
+        PSID, SECURITY_CAPABILITIES, SECURITY_MAX_SID_SIZE, SID_AND_ATTRIBUTES,
+    };
+    use windows_sys::Win32::Security::{TOKEN_DUPLICATE, TOKEN_QUERY};
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_GENERIC_EXECUTE, FILE_GENERIC_READ, FILE_GENERIC_WRITE,
+    };
+    use windows_sys::Win32::System::LibraryLoader::{
+        GetModuleHandleW, GetProcAddress, LoadLibraryW,
+    };
+    use windows_sys::Win32::System::Threading::{
+        CreateProcessW, DeleteProcThreadAttributeList, GetCurrentProcess, GetExitCodeProcess,
+        InitializeProcThreadAttributeList, OpenProcessToken, UpdateProcThreadAttribute,
+        WaitForSingleObject, CREATE_UNICODE_ENVIRONMENT, EXTENDED_STARTUPINFO_PRESENT,
+        LPPROC_THREAD_ATTRIBUTE_LIST, PROCESS_INFORMATION,
+        PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES, STARTUPINFOEXW,
+    };
+
+    /// `SE_GROUP_ENABLED`; windows-sys keeps it behind another feature.
+    const SE_GROUP_ENABLED: u32 = 0x4;
+    /// `ProcessAccessToken` information class for `NtSetInformationProcess`.
+    const PROCESS_ACCESS_TOKEN_CLASS: u32 = 9;
+    /// `OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE`.
+    const INHERIT_ALL: u32 = 0x1 | 0x2;
+    /// Stop walking a large tree after this many entries rather than spending
+    /// unbounded time rewriting DACLs.
+    const MAX_ACL_WALK_ENTRIES: usize = 200_000;
+
+    // NtDll entry points that windows-sys does not bind.
+    //
+    // SAFETY: these are ordinary Win32/NT ABI declarations; the calls below
+    // pass valid process handles and correctly sized structures.
+    unsafe extern "system" {
+        fn NtSetInformationProcess(
+            ProcessHandle: HANDLE,
+            ProcessInformationClass: u32,
+            ProcessInformation: *const c_void,
+            ProcessInformationLength: u32,
+        ) -> i32;
+        fn NtResumeProcess(ProcessHandle: HANDLE) -> i32;
+    }
+
+    /// The structure `NtSetInformationProcess(ProcessAccessToken)` expects.
+    #[repr(C)]
+    struct ProcessAccessToken {
+        token: HANDLE,
+        thread: HANDLE,
+    }
+
+    /// `CreateAppContainerToken` as exported by `kernelbase.dll`.
+    ///
+    /// The signature is not in the public SDK but has been stable since Windows
+    /// 8 and is the one Chromium uses.
+    type CreateAppContainerTokenFn = unsafe extern "system" fn(
+        base_token: HANDLE,
+        security_capabilities: *const SECURITY_CAPABILITIES,
+        token: *mut HANDLE,
+    ) -> i32;
+
+    /// The function-pointer shape `GetProcAddress` returns.
+    type RawProc = unsafe extern "system" fn() -> isize;
+
+    /// Track whether the AppContainer runtime is present, once per process.
+    static AVAILABLE: OnceLock<bool> = OnceLock::new();
+
+    /// Roots whose DACLs have already been updated by this process, keyed by
+    /// profile name, path, access and whether the tree was walked.
+    ///
+    /// The profile SIDs are stable, so re-granting on every command would only
+    /// rewrite identical ACEs. New files inherit the directory ACE, so the
+    /// walk is needed once per root per profile per process. The profile name is
+    /// part of the key because the network and no-network profiles have
+    /// different SIDs.
+    type GrantedRoot = (&'static str, PathBuf, AclAccess, bool);
+    static GRANTED_ROOTS: OnceLock<Mutex<Vec<GrantedRoot>>> = OnceLock::new();
+
+    /// Whether this Windows installation can create and attach AppContainers.
+    ///
+    /// Both the profile API (`userenv!CreateAppContainerProfile`) and the token
+    /// API (`kernelbase!CreateAppContainerToken`) have to be present. The
+    /// answer is cached; it cannot change within a process.
+    #[must_use]
+    pub(crate) fn app_container_available() -> bool {
+        *AVAILABLE.get_or_init(|| {
+            let userenv = load_module("userenv.dll");
+            let kernelbase = load_module("kernelbase.dll");
+            if userenv.is_null() || kernelbase.is_null() {
+                return false;
+            }
+            let profile =
+                unsafe { GetProcAddress(userenv, c"CreateAppContainerProfile".as_ptr().cast()) };
+            let token =
+                unsafe { GetProcAddress(kernelbase, c"CreateAppContainerToken".as_ptr().cast()) };
+            profile.is_some() && token.is_some()
+        })
+    }
+
+    fn load_module(name: &str) -> windows_sys::Win32::Foundation::HMODULE {
+        let wide = wide(name);
+        let handle = unsafe { GetModuleHandleW(wide.as_ptr()) };
+        if handle.is_null() {
+            unsafe { LoadLibraryW(wide.as_ptr()) }
+        } else {
+            handle
+        }
+    }
+
+    fn create_app_container_token_fn() -> Option<CreateAppContainerTokenFn> {
+        let kernelbase = load_module("kernelbase.dll");
+        if kernelbase.is_null() {
+            return None;
+        }
+        let proc =
+            unsafe { GetProcAddress(kernelbase, c"CreateAppContainerToken".as_ptr().cast())? };
+        // SAFETY: the export has the documented-for-Chromium signature above;
+        // it is only ever called with matching arguments.
+        Some(unsafe { std::mem::transmute::<RawProc, CreateAppContainerTokenFn>(proc) })
+    }
+
+    /// A live AppContainer profile and its SID.
+    pub(crate) struct AppContainer {
+        /// The stable profile name. The two profiles (network and no network)
+        /// have different SIDs, so ACL grants have to be keyed by this and not
+        /// just by path.
+        profile: &'static str,
+        sid: PSID,
+        capabilities: CapabilitySids,
+    }
+
+    // SAFETY: the SID is allocated by the OS and only read/owned by this
+    // handle; moving the handle between threads does not create aliasing.
+    unsafe impl Send for AppContainer {}
+    // SAFETY: as above; the ACL/profile APIs are called with a stable SID.
+    unsafe impl Sync for AppContainer {}
+
+    /// Capability SIDs, kept in buffers whose addresses do not move.
+    struct CapabilitySids {
+        // The `SID_AND_ATTRIBUTES` entries point into these allocations, so
+        // each buffer is boxed to keep its address stable if the outer `Vec`
+        // reallocates. That matters more than the extra indirection; the
+        // buffers also have to outlive the entries even though the field is
+        // not read directly.
+        #[allow(dead_code, clippy::vec_box)]
+        buffers: Vec<Box<[u8; SECURITY_MAX_SID_SIZE as usize]>>,
+        attributes: Vec<SID_AND_ATTRIBUTES>,
+    }
+
+    impl CapabilitySids {
+        fn from_names(names: &[&str]) -> Result<Self, SandboxError> {
+            let mut buffers = Vec::new();
+            let mut attributes = Vec::new();
+            for name in names {
+                if *name != super::INTERNET_CLIENT_CAPABILITY {
+                    return Err(SandboxError::IsolationUnavailable(format!(
+                        "unsupported AppContainer capability '{name}'"
+                    )));
+                }
+                let mut buffer: Box<[u8; SECURITY_MAX_SID_SIZE as usize]> =
+                    Box::new([0; SECURITY_MAX_SID_SIZE as usize]);
+                let mut size = SECURITY_MAX_SID_SIZE;
+                let ok = unsafe {
+                    CreateWellKnownSid(
+                        WinCapabilityInternetClientSid,
+                        ptr::null_mut(),
+                        buffer.as_mut_ptr().cast(),
+                        &mut size,
+                    )
+                };
+                if ok == 0 {
+                    return Err(last_error("CreateWellKnownSid"));
+                }
+                let sid = buffer.as_mut_ptr().cast::<c_void>();
+                buffers.push(buffer);
+                attributes.push(SID_AND_ATTRIBUTES {
+                    Sid: sid,
+                    Attributes: SE_GROUP_ENABLED,
+                });
+            }
+            Ok(Self {
+                buffers,
+                attributes,
+            })
+        }
+
+        fn as_ptr(&self) -> *const SID_AND_ATTRIBUTES {
+            if self.attributes.is_empty() {
+                ptr::null()
+            } else {
+                self.attributes.as_ptr()
+            }
+        }
+
+        fn len(&self) -> u32 {
+            u32::try_from(self.attributes.len()).unwrap_or(0)
+        }
+    }
+
+    impl AppContainer {
+        /// Create or derive the stable profile and grant the policy paths.
+        ///
+        /// The profile name is stable across processes on purpose: the SID in
+        /// DACLs has to stay the same, or every command would add another ACE
+        /// to every file. Two profiles exist because the capability set is
+        /// fixed when the profile is created: one without capabilities (the
+        /// default) and one with `internetClient` when the network is allowed.
+        pub(crate) fn create(config: &SandboxConfig) -> Result<Self, SandboxError> {
+            if !app_container_available() {
+                return Err(SandboxError::IsolationUnavailable(
+                    "AppContainer APIs are not available on this Windows installation".into(),
+                ));
+            }
+
+            let names = capability_names(config);
+            let capabilities = CapabilitySids::from_names(&names)?;
+            let profile = if config.allow_network {
+                "CodeRex.Sandbox.Network"
+            } else {
+                "CodeRex.Sandbox"
+            };
+            let profile_wide = wide(profile);
+            let display_wide = wide("CodeRex sandbox");
+            let description_wide =
+                wide("Filesystem and network isolation for CodeRex subprocesses");
+
+            let mut sid: PSID = ptr::null_mut();
+            // SAFETY: every pointer is a live, NUL-terminated UTF-16 string and
+            // `sid` is a valid out pointer. A zero-length capability list is
+            // passed as null.
+            let hr = unsafe {
+                CreateAppContainerProfile(
+                    profile_wide.as_ptr(),
+                    display_wide.as_ptr(),
+                    description_wide.as_ptr(),
+                    capabilities.as_ptr(),
+                    capabilities.len(),
+                    &mut sid,
+                )
+            };
+            if hr < 0 {
+                // HRESULT_FROM_WIN32(ERROR_ALREADY_EXISTS): the profile from an
+                // earlier CodeRex process is reused, which is exactly what the
+                // stable DACL design needs.
+                if (hr as u32 & 0xffff_0000) == 0x8007_0000
+                    && (hr as u32 & 0xffff) == ERROR_ALREADY_EXISTS
+                {
+                    let hr = unsafe {
+                        DeriveAppContainerSidFromAppContainerName(profile_wide.as_ptr(), &mut sid)
+                    };
+                    if hr < 0 {
+                        return Err(SandboxError::CreationError(format!(
+                            "DeriveAppContainerSidFromAppContainerName failed: 0x{hr:08X}"
+                        )));
+                    }
+                } else {
+                    return Err(SandboxError::CreationError(format!(
+                        "CreateAppContainerProfile failed: 0x{hr:08X}"
+                    )));
+                }
+            }
+            if sid.is_null() {
+                return Err(SandboxError::CreationError(
+                    "AppContainer profile returned a null SID".into(),
+                ));
+            }
+
+            let container = Self {
+                profile,
+                sid,
+                capabilities,
+            };
+            container.apply_acl_plan(config);
+            Ok(container)
+        }
+
+        /// The security capabilities to put in a token or a process attribute.
+        fn security_capabilities(&self) -> SECURITY_CAPABILITIES {
+            SECURITY_CAPABILITIES {
+                AppContainerSid: self.sid,
+                Capabilities: self.capabilities.as_ptr().cast_mut(),
+                CapabilityCount: self.capabilities.len(),
+                Reserved: 0,
+            }
+        }
+
+        /// Grant the container SID access to the policy paths.
+        ///
+        /// Failures are logged rather than returned: a DACL that cannot be
+        /// changed makes a path unreadable to the container, which fails
+        /// closed, and failing every shell command because one file in a large
+        /// workspace is owned by someone else would be worse than a warning.
+        fn apply_acl_plan(&self, config: &SandboxConfig) {
+            let system_roots = system_roots();
+            let search_paths = search_path_dirs();
+            let temp_dir = std::env::temp_dir();
+            let plan = acl_plan(config, &system_roots, &search_paths, &temp_dir);
+
+            let applied = GRANTED_ROOTS.get_or_init(|| Mutex::new(Vec::new()));
+            let mut applied = applied
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+            for grant in &plan {
+                // Keyed by profile: the two stable profiles have different
+                // SIDs, so a path granted to one must still be granted to the
+                // other. `recursive` is part of the key too: a path first seen
+                // as the non-recursive temp root may later be named explicitly
+                // as a policy write path, and must then get the walk.
+                let key = (
+                    self.profile,
+                    grant.path.clone(),
+                    grant.access,
+                    grant.recursive,
+                );
+                if applied.contains(&key) {
+                    continue;
+                }
+                if !grant.path.exists() {
+                    // Do not cache: the path may be created later in this
+                    // process, and then it should get its grant.
+                    tracing::debug!(
+                        path = %grant.path.display(),
+                        "sandbox: skipping ACL grant for a path that does not exist"
+                    );
+                    continue;
+                }
+
+                if let Err(error) = set_grant(&grant.path, self.sid, grant.access) {
+                    if grant.best_effort {
+                        tracing::debug!(
+                            path = %grant.path.display(),
+                            %error,
+                            "sandbox: best-effort ACL grant failed; the path may still be \
+                             reachable through ALL APPLICATION PACKAGES"
+                        );
+                    } else {
+                        tracing::warn!(
+                            path = %grant.path.display(),
+                            %error,
+                            "sandbox: could not grant the AppContainer access to a policy path"
+                        );
+                    }
+                } else {
+                    tracing::debug!(
+                        path = %grant.path.display(),
+                        access = ?grant.access,
+                        "sandbox: granted the AppContainer access"
+                    );
+                }
+
+                if grant.recursive {
+                    walk_and_grant(&grant.path, self.sid, grant.access);
+                }
+                applied.push(key);
+            }
+        }
+
+        /// Replace the primary token of a suspended child with an AppContainer
+        /// token, without resuming it.
+        ///
+        /// The caller must have created the process with `CREATE_SUSPENDED`;
+        /// Windows only permits a primary-token replacement while the initial
+        /// thread has not run.
+        pub(crate) fn restrict_suspended(&self, process: HANDLE) -> Result<(), SandboxError> {
+            let create_token = create_app_container_token_fn().ok_or_else(|| {
+                SandboxError::IsolationUnavailable(
+                    "CreateAppContainerToken is not exported by this Windows installation".into(),
+                )
+            })?;
+
+            let mut base_token: HANDLE = ptr::null_mut();
+            let ok = unsafe {
+                OpenProcessToken(
+                    GetCurrentProcess(),
+                    TOKEN_DUPLICATE | TOKEN_QUERY,
+                    &mut base_token,
+                )
+            };
+            if ok == 0 {
+                return Err(last_error("OpenProcessToken"));
+            }
+
+            let capabilities = self.security_capabilities();
+            let mut token: HANDLE = ptr::null_mut();
+            // SAFETY: the base token is valid and `capabilities` (including the
+            // SID and capability buffers) outlives the call.
+            let hr = unsafe { create_token(base_token, &capabilities, &mut token) };
+            unsafe { CloseHandle(base_token) };
+            // `CreateAppContainerToken` returns an HRESULT: zero is success.
+            if hr < 0 {
+                return Err(SandboxError::CreationError(format!(
+                    "CreateAppContainerToken failed: 0x{hr:08X}"
+                )));
+            }
+
+            let access = ProcessAccessToken {
+                token,
+                thread: ptr::null_mut(),
+            };
+            // SAFETY: `access` is the structure the information class expects
+            // and `process` is the suspended child's handle.
+            let status = unsafe {
+                NtSetInformationProcess(
+                    process,
+                    PROCESS_ACCESS_TOKEN_CLASS,
+                    (&raw const access).cast(),
+                    std::mem::size_of_val(&access) as u32,
+                )
+            };
+            unsafe { CloseHandle(token) };
+            if status < 0 {
+                return Err(nt_error(
+                    "NtSetInformationProcess(ProcessAccessToken)",
+                    status,
+                ));
+            }
+            Ok(())
+        }
+
+        /// Resume a child suspended by `CREATE_SUSPENDED`.
+        pub(crate) fn resume(&self, process: HANDLE) -> Result<(), SandboxError> {
+            // SAFETY: `process` is a live process handle owned by the caller.
+            let status = unsafe { NtResumeProcess(process) };
+            if status < 0 {
+                return Err(nt_error("NtResumeProcess", status));
+            }
+            Ok(())
+        }
+
+        /// Spawn a process inside the container through the documented
+        /// `STARTUPINFOEX` + `PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES`
+        /// path.
+        ///
+        /// This is the primitive for callers that can create a process
+        /// themselves. `std::process::Command` cannot pass a process attribute
+        /// list on stable Rust, which is why the shell tools use
+        /// [`Self::restrict_suspended`] instead.
+        ///
+        /// The environment is inherited from this process.
+        #[allow(dead_code)] // the documented path is exercised by the Windows tests
+        pub(crate) fn spawn(
+            &self,
+            program: &Path,
+            args: &[OsString],
+            cwd: Option<&Path>,
+        ) -> Result<ContainedChild, SandboxError> {
+            let program_string = program.to_string_lossy();
+            let arg_strings: Vec<String> = args
+                .iter()
+                .map(|arg| arg.to_string_lossy().into_owned())
+                .collect();
+            let mut command_line = super::build_command_line(&program_string, &arg_strings)
+                .encode_utf16()
+                .chain(Some(0))
+                .collect::<Vec<u16>>();
+            let program_wide = wide_os(program.as_os_str());
+            let cwd_wide = cwd.map(|dir| wide_os(dir.as_os_str()));
+
+            // Size the attribute list, then allocate and initialize it.
+            let mut size = 0usize;
+            unsafe {
+                InitializeProcThreadAttributeList(ptr::null_mut(), 1, 0, &mut size);
+            }
+            if size == 0 {
+                return Err(last_error("InitializeProcThreadAttributeList(size)"));
+            }
+            let mut buffer = vec![0u8; size];
+            let list: LPPROC_THREAD_ATTRIBUTE_LIST = buffer.as_mut_ptr().cast();
+            let ok = unsafe { InitializeProcThreadAttributeList(list, 1, 0, &mut size) };
+            if ok == 0 {
+                return Err(last_error("InitializeProcThreadAttributeList"));
+            }
+
+            let capabilities = self.security_capabilities();
+            // SAFETY: `capabilities` points at live SIDs for the duration of
+            // the two calls, and the attribute size is its own.
+            let ok = unsafe {
+                UpdateProcThreadAttribute(
+                    list,
+                    0,
+                    PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES as usize,
+                    (&raw const capabilities).cast(),
+                    std::mem::size_of_val(&capabilities),
+                    ptr::null_mut(),
+                    ptr::null(),
+                )
+            };
+            if ok == 0 {
+                unsafe { DeleteProcThreadAttributeList(list) };
+                return Err(last_error("UpdateProcThreadAttribute"));
+            }
+
+            let mut startup: STARTUPINFOEXW = unsafe { std::mem::zeroed() };
+            startup.StartupInfo.cb = std::mem::size_of::<STARTUPINFOEXW>() as u32;
+            startup.lpAttributeList = list;
+
+            let mut process_info: PROCESS_INFORMATION = unsafe { std::mem::zeroed() };
+            // SAFETY: all pointers are live for the duration of the call; the
+            // command line is mutable because CreateProcessW may modify it.
+            let ok = unsafe {
+                CreateProcessW(
+                    program_wide.as_ptr(),
+                    command_line.as_mut_ptr(),
+                    ptr::null(),
+                    ptr::null(),
+                    1,
+                    EXTENDED_STARTUPINFO_PRESENT | CREATE_UNICODE_ENVIRONMENT,
+                    ptr::null(),
+                    cwd_wide.as_ref().map_or(ptr::null(), |wide| wide.as_ptr()),
+                    &startup.StartupInfo,
+                    &mut process_info,
+                )
+            };
+            unsafe { DeleteProcThreadAttributeList(list) };
+            if ok == 0 {
+                return Err(last_error("CreateProcessW"));
+            }
+
+            Ok(ContainedChild {
+                process: process_info.hProcess,
+                thread: process_info.hThread,
+            })
+        }
+
+        /// The profile SID, for tests and diagnostics.
+        #[must_use]
+        #[allow(dead_code)] // used by the Windows integration tests
+        pub(crate) fn sid(&self) -> PSID {
+            self.sid
+        }
+    }
+
+    impl Drop for AppContainer {
+        fn drop(&mut self) {
+            if !self.sid.is_null() {
+                // SAFETY: the SID came from CreateAppContainerProfile or
+                // DeriveAppContainerSidFromAppContainerName and is freed once.
+                unsafe { FreeSid(self.sid) };
+            }
+        }
+    }
+
+    /// A process started by [`AppContainer::spawn`].
+    pub(crate) struct ContainedChild {
+        process: HANDLE,
+        thread: HANDLE,
+    }
+
+    impl ContainedChild {
+        /// Wait for the process to exit and return its exit code.
+        pub(crate) fn wait(&self) -> Result<u32, SandboxError> {
+            // SAFETY: `process` is a live handle owned by this value.
+            let wait = unsafe { WaitForSingleObject(self.process, u32::MAX) };
+            if wait != WAIT_OBJECT_0 {
+                return Err(last_error("WaitForSingleObject"));
+            }
+            let mut code = 0u32;
+            // SAFETY: `code` is a valid out pointer.
+            let ok = unsafe { GetExitCodeProcess(self.process, &mut code) };
+            if ok == 0 {
+                return Err(last_error("GetExitCodeProcess"));
+            }
+            Ok(code)
+        }
+    }
+
+    impl Drop for ContainedChild {
+        fn drop(&mut self) {
+            // SAFETY: both handles were returned by CreateProcessW and are
+            // closed exactly once.
+            unsafe {
+                if !self.thread.is_null() {
+                    CloseHandle(self.thread);
+                }
+                if !self.process.is_null() {
+                    CloseHandle(self.process);
+                }
+            }
+        }
+    }
+
+    /// Apply one ACE to one path.
+    fn set_grant(path: &Path, sid: PSID, access: AclAccess) -> Result<(), SandboxError> {
+        let wide_path = wide_os(path.as_os_str());
+        let mut old_dacl: *mut ACL = ptr::null_mut();
+        let mut descriptor: PSECURITY_DESCRIPTOR = ptr::null_mut();
+        // SAFETY: the path is NUL-terminated and every out pointer is valid.
+        let err = unsafe {
+            GetNamedSecurityInfoW(
+                wide_path.as_ptr(),
+                SE_FILE_OBJECT,
+                windows_sys::Win32::Security::DACL_SECURITY_INFORMATION,
+                ptr::null_mut(),
+                ptr::null_mut(),
+                &mut old_dacl,
+                ptr::null_mut(),
+                &mut descriptor,
+            )
+        };
+        if err != windows_sys::Win32::Foundation::ERROR_SUCCESS {
+            return Err(win32_error("GetNamedSecurityInfoW", err));
+        }
+        // A null DACL grants everyone, the container included. Replacing it
+        // with a single ACE could lock the owner out, so leave it alone.
+        if old_dacl.is_null() {
+            unsafe { LocalFree(descriptor as HLOCAL) };
+            return Ok(());
+        }
+
+        let permissions = match access {
+            // FILE_TRAVERSE | FILE_READ_ATTRIBUTES: reach the object without
+            // listing or reading it.
+            AclAccess::Traverse => 0x0000_0020 | 0x0000_0080,
+            AclAccess::ReadExecute => FILE_GENERIC_READ | FILE_GENERIC_EXECUTE,
+            AclAccess::Modify => {
+                FILE_GENERIC_READ | FILE_GENERIC_EXECUTE | FILE_GENERIC_WRITE | 0x0001_0000
+                // DELETE
+            }
+        };
+
+        let mut entry: EXPLICIT_ACCESS_W = unsafe { std::mem::zeroed() };
+        entry.grfAccessPermissions = permissions;
+        entry.grfAccessMode = GRANT_ACCESS;
+        entry.grfInheritance = if access.inheritable() { INHERIT_ALL } else { 0 };
+        entry.Trustee = TRUSTEE_W {
+            pMultipleTrustee: ptr::null_mut(),
+            MultipleTrusteeOperation: NO_MULTIPLE_TRUSTEE,
+            TrusteeForm: TRUSTEE_IS_SID,
+            TrusteeType: TRUSTEE_IS_UNKNOWN,
+            ptstrName: sid.cast::<u16>(),
+        };
+
+        let mut new_dacl: *mut ACL = ptr::null_mut();
+        // SAFETY: `entry` is initialized, `old_dacl` lives in `descriptor`,
+        // and `new_dacl` is a valid out pointer.
+        let err = unsafe { SetEntriesInAclW(1, &entry, old_dacl, &mut new_dacl) };
+        if err != windows_sys::Win32::Foundation::ERROR_SUCCESS {
+            unsafe { LocalFree(descriptor as HLOCAL) };
+            return Err(win32_error("SetEntriesInAclW", err));
+        }
+
+        // SAFETY: both ACLs are live and correctly sized for the calls.
+        let err = unsafe {
+            SetNamedSecurityInfoW(
+                wide_path.as_ptr().cast_mut(),
+                SE_FILE_OBJECT,
+                windows_sys::Win32::Security::DACL_SECURITY_INFORMATION,
+                ptr::null_mut(),
+                ptr::null_mut(),
+                new_dacl,
+                ptr::null_mut(),
+            )
+        };
+        unsafe {
+            LocalFree(new_dacl as HLOCAL);
+            LocalFree(descriptor as HLOCAL);
+        }
+        if err != windows_sys::Win32::Foundation::ERROR_SUCCESS {
+            return Err(win32_error("SetNamedSecurityInfoW", err));
+        }
+        Ok(())
+    }
+
+    /// Grant access to an existing tree.
+    ///
+    /// Inheritable ACEs only cover objects created after the grant, so the
+    /// workspace as it stands has to be walked. Symlinks are skipped: their
+    /// target may be outside the policy paths, and following it would grant
+    /// access the policy did not name.
+    fn walk_and_grant(root: &Path, sid: PSID, access: AclAccess) {
+        let mut seen = 0usize;
+        for entry in walkdir::WalkDir::new(root).follow_links(false).into_iter() {
+            let Ok(entry) = entry else {
+                continue;
+            };
+            if entry.path() == root {
+                continue;
+            }
+            seen += 1;
+            if seen > MAX_ACL_WALK_ENTRIES {
+                tracing::warn!(
+                    path = %root.display(),
+                    limit = MAX_ACL_WALK_ENTRIES,
+                    "sandbox: stopping the ACL walk; descendants past this point rely on \
+                     inherited ACEs"
+                );
+                return;
+            }
+            if entry.file_type().is_symlink() {
+                continue;
+            }
+            if let Err(error) = set_grant(entry.path(), sid, access) {
+                tracing::debug!(
+                    path = %entry.path().display(),
+                    %error,
+                    "sandbox: could not grant the AppContainer access to a descendant"
+                );
+            }
+        }
+    }
+
+    /// The system roots a shell and its loader need.
+    fn system_roots() -> Vec<PathBuf> {
+        let mut roots = Vec::new();
+        let system_root = std::env::var_os("SystemRoot")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(r"C:\Windows"));
+        roots.push(system_root.clone());
+        roots.push(system_root.join("System32"));
+        roots.push(system_root.join("SysWOW64"));
+        for variable in ["ProgramFiles", "ProgramFiles(x86)", "ProgramW6432"] {
+            if let Some(value) = std::env::var_os(variable) {
+                roots.push(PathBuf::from(value));
+            }
+        }
+        if let Some(local) = std::env::var_os("LOCALAPPDATA") {
+            roots.push(PathBuf::from(local).join("Microsoft").join("WindowsApps"));
+        }
+        dedup(roots)
+    }
+
+    /// The directories on `PATH`, which hold the shell and its toolchain.
+    fn search_path_dirs() -> Vec<PathBuf> {
+        let Some(path) = std::env::var_os("PATH") else {
+            return Vec::new();
+        };
+        dedup(
+            path.to_string_lossy()
+                .split(';')
+                .filter(|entry| !entry.trim().is_empty())
+                .map(PathBuf::from)
+                .collect(),
+        )
+    }
+
+    fn dedup(paths: Vec<PathBuf>) -> Vec<PathBuf> {
+        let mut unique = Vec::with_capacity(paths.len());
+        for path in paths {
+            if !unique.contains(&path) {
+                unique.push(path);
+            }
+        }
+        unique
+    }
+
+    fn wide(value: &str) -> Vec<u16> {
+        OsStr::new(value).encode_wide().chain(Some(0)).collect()
+    }
+
+    fn wide_os(value: &OsStr) -> Vec<u16> {
+        value.encode_wide().chain(Some(0)).collect()
+    }
+
+    fn last_error(operation: &str) -> SandboxError {
+        let error = std::io::Error::last_os_error();
+        SandboxError::CreationError(format!("{operation} failed: {error}"))
+    }
+
+    fn win32_error(operation: &str, code: u32) -> SandboxError {
+        SandboxError::CreationError(format!(
+            "{operation} failed: {}",
+            std::io::Error::from_raw_os_error(code as i32)
+        ))
+    }
+
+    fn nt_error(operation: &str, status: i32) -> SandboxError {
+        let code = unsafe { windows_sys::Win32::Foundation::RtlNtStatusToDosError(status) };
+        SandboxError::CreationError(format!(
+            "{operation} failed: NTSTATUS 0x{status:08X} ({})",
+            std::io::Error::from_raw_os_error(code as i32)
+        ))
+    }
+}
+
+#[cfg(target_os = "windows")]
+pub(crate) use imp::AppContainer;
+
+/// Whether the AppContainer runtime is available — always false off Windows.
+#[cfg(not(target_os = "windows"))]
+#[must_use]
+pub(crate) const fn app_container_available() -> bool {
+    false
+}
+
+#[cfg(target_os = "windows")]
+pub(crate) use imp::app_container_available;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn config() -> SandboxConfig {
+        SandboxConfig {
+            // Forward slashes so `Path::ancestors` behaves the same on the
+            // macOS host these pure tests run on as it does on Windows.
+            allowed_read_paths: vec![PathBuf::from("C:/work/project")],
+            allowed_write_paths: vec![PathBuf::from("C:/work/project")],
+            allowed_exec_paths: vec![PathBuf::from("C:/tools/bin")],
+            additional_working_dirs: vec![PathBuf::from("C:/work/project")],
+            allow_network: false,
+            ..SandboxConfig::default()
+        }
+    }
+
+    fn plan() -> Vec<AclGrant> {
+        acl_plan(
+            &config(),
+            &[PathBuf::from("C:/Windows")],
+            &[
+                PathBuf::from("C:/tools/bin"),
+                PathBuf::from("C:/Windows/System32/WindowsPowerShell/v1.0"),
+            ],
+            std::path::Path::new("C:/Users/me/AppData/Local/Temp"),
+        )
+    }
+
+    fn grant_for<'a>(plan: &'a [AclGrant], path: &str) -> &'a AclGrant {
+        plan.iter()
+            .find(|grant| grant.path.as_path() == std::path::Path::new(path))
+            .unwrap_or_else(|| panic!("{path} should be granted"))
+    }
+
+    #[test]
+    fn acl_plan_grants_read_execute_on_system_and_search_paths() {
+        let plan = plan();
+        for path in ["C:/Windows", "C:/Windows/System32/WindowsPowerShell/v1.0"] {
+            let grant = grant_for(&plan, path);
+            assert_eq!(grant.access, AclAccess::ReadExecute);
+            assert!(!grant.recursive);
+            assert!(grant.best_effort, "{path} should be best-effort");
+        }
+    }
+
+    /// A path named by the policy is required even when it is also on `PATH`.
+    #[test]
+    fn acl_plan_treats_a_configured_exec_path_as_required() {
+        let plan = plan();
+        let grant = grant_for(&plan, "C:/tools/bin");
+        assert_eq!(grant.access, AclAccess::ReadExecute);
+        assert!(!grant.best_effort);
+        assert!(grant.recursive, "an exec tree may already contain files");
+    }
+
+    #[test]
+    fn acl_plan_grants_read_write_on_the_workspace() {
+        let plan = plan();
+        let grant = grant_for(&plan, "C:/work/project");
+        assert_eq!(grant.access, AclAccess::Modify);
+        assert!(grant.recursive, "existing files need the ACL walk");
+        assert!(!grant.best_effort, "a policy path must be granted");
+    }
+
+    /// The temp tree can be huge and pre-existing files are not needed.
+    #[test]
+    fn acl_plan_does_not_walk_the_whole_temp_tree() {
+        let plan = plan();
+        let grant = grant_for(&plan, "C:/Users/me/AppData/Local/Temp");
+        assert_eq!(grant.access, AclAccess::Modify);
+        assert!(!grant.recursive);
+        assert!(!grant.best_effort);
+    }
+
+    /// An AppContainer token has no bypass-traverse privilege.
+    #[test]
+    fn acl_plan_grants_traverse_on_ancestors() {
+        let plan = plan();
+        for path in ["C:/work", "C:/Users/me/AppData/Local"] {
+            let grant = grant_for(&plan, path);
+            assert_eq!(grant.access, AclAccess::Traverse);
+            assert!(!grant.recursive, "traverse must not widen the subtree");
+        }
+    }
+
+    /// Traverse is weaker than read/execute, so merging must not downgrade.
+    #[test]
+    fn acl_plan_keeps_the_strongest_access_for_a_shared_path() {
+        let plan = plan();
+        // C:/Windows is both a system root and an ancestor of a search path.
+        let grant = grant_for(&plan, "C:/Windows");
+        assert_eq!(grant.access, AclAccess::ReadExecute);
+    }
+
+    /// The workspace appears in three fields; it must not produce three ACEs.
+    #[test]
+    fn acl_plan_deduplicates_and_upgrades() {
+        let plan = plan();
+        let project = PathBuf::from("C:/work/project");
+        let entries: Vec<&AclGrant> = plan.iter().filter(|grant| grant.path == project).collect();
+        assert_eq!(entries.len(), 1, "duplicate ACL entries: {entries:?}");
+        assert_eq!(entries[0].access, AclAccess::Modify);
+    }
+
+    #[test]
+    fn no_network_means_no_capabilities() {
+        assert!(capability_names(&config()).is_empty());
+    }
+
+    #[test]
+    fn network_permission_grants_only_internet_client() {
+        let mut config = config();
+        config.allow_network = true;
+        assert_eq!(capability_names(&config), vec!["internetClient"]);
+    }
+
+    #[test]
+    fn command_line_quotes_arguments_with_spaces() {
+        let line = build_command_line(
+            r"C:\Program Files\PowerShell\pwsh.exe",
+            &["-Command".to_string(), "Write-Output hi".to_string()],
+        );
+        assert_eq!(
+            line,
+            r#""C:\Program Files\PowerShell\pwsh.exe" -Command "Write-Output hi""#
+        );
+    }
+
+    #[test]
+    fn command_line_leaves_plain_arguments_alone() {
+        assert_eq!(
+            build_command_line("cmd.exe", &["/C".to_string(), "echo".to_string()]),
+            "cmd.exe /C echo"
+        );
+    }
+
+    #[test]
+    fn command_line_escapes_quotes_and_trailing_backslashes() {
+        assert_eq!(quote_windows_arg(r#"a"b"#), r#""a\"b""#);
+        assert_eq!(
+            quote_windows_arg(r"C:\dir with space\"),
+            r#""C:\dir with space\\""#
+        );
+        assert_eq!(quote_windows_arg(""), r#""""#);
+    }
+
+    #[test]
+    fn acl_plan_is_stable_order_for_the_same_input() {
+        assert_eq!(plan(), plan());
+    }
+
+    #[cfg(target_os = "windows")]
+    mod windows {
+        use super::*;
+        use std::ffi::OsString;
+
+        /// A scratch tree outside `%TEMP%`, which the sandbox always grants.
+        fn scratch(name: &str) -> PathBuf {
+            let base = std::env::var_os("LOCALAPPDATA")
+                .map(PathBuf::from)
+                .unwrap_or_else(std::env::temp_dir);
+            base.join(format!(
+                "coderex-appcontainer-{}-{name}",
+                std::process::id()
+            ))
+        }
+
+        /// The documented `STARTUPINFOEX` path, exercised on Windows.
+        ///
+        /// The container can write inside the granted directory and cannot
+        /// write into a sibling `denied` directory that was never granted.
+        #[test]
+        fn spawn_in_container_confines_a_real_process() {
+            if !app_container_available() {
+                eprintln!("skipping: AppContainer APIs are not available");
+                return;
+            }
+
+            let root = scratch("spawn");
+            let allowed = root.join("allowed");
+            let denied = root.join("denied");
+            let _ = std::fs::remove_dir_all(&root);
+            std::fs::create_dir_all(&allowed).unwrap();
+            std::fs::create_dir_all(&denied).unwrap();
+
+            let config = SandboxConfig {
+                allowed_read_paths: vec![allowed.clone()],
+                allowed_write_paths: vec![allowed.clone()],
+                additional_working_dirs: vec![allowed.clone()],
+                ..SandboxConfig::default()
+            };
+            let container = AppContainer::create(&config).unwrap();
+            assert!(!container.sid().is_null());
+
+            let system_root =
+                std::env::var_os("SystemRoot").unwrap_or_else(|| OsString::from(r"C:\Windows"));
+            let cmd = PathBuf::from(system_root).join("System32").join("cmd.exe");
+            let script = format!(
+                "echo inside> \"{}\" & echo outside> \"{}\"",
+                allowed.join("inside.txt").display(),
+                denied.join("outside.txt").display()
+            );
+            let child = container
+                .spawn(
+                    &cmd,
+                    &[OsString::from("/C"), OsString::from(script)],
+                    Some(&allowed),
+                )
+                .expect("the container should spawn cmd.exe");
+            let _ = child.wait();
+
+            assert!(
+                allowed.join("inside.txt").exists(),
+                "the granted workspace was not writable"
+            );
+            assert!(
+                !denied.join("outside.txt").exists(),
+                "a path outside the policy was writable"
+            );
+
+            let _ = std::fs::remove_dir_all(&root);
+        }
+    }
+}

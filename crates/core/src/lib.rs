@@ -38,6 +38,7 @@ pub mod providers;
 pub mod query_profiles;
 pub mod runtime;
 pub mod sandbox;
+pub mod sandbox_windows;
 pub mod scheduler;
 pub mod session_memory;
 pub mod shell_security;
