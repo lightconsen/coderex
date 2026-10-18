@@ -45,35 +45,105 @@ fn write_response(stream: &mut TcpStream, status: &str, content_type: &str, body
     stream.write_all(response.as_bytes()).unwrap();
 }
 
+/// Whether a recorded request is the standalone stream's GET.
+fn is_get(request: &str) -> bool {
+    request.starts_with("GET ")
+}
+
+/// The value of `name` in a recorded HTTP request's headers.
+fn header_value(request: &str, name: &str) -> Option<String> {
+    request.lines().find_map(|line| {
+        let (header, value) = line.split_once(':')?;
+        header
+            .eq_ignore_ascii_case(name)
+            .then(|| value.trim().to_string())
+    })
+}
+
+/// A server that answers the transport-level methods and refuses the
+/// standalone stream, recording every request it saw.
+///
+/// The refusal is deliberate: these tests exercise the POST paths, and a 405
+/// is the specified quiet fallback.
+fn spawn_session_server() -> (SocketAddr, Arc<std::sync::Mutex<Vec<String>>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let recorded = Arc::clone(&requests);
+
+    std::thread::spawn(move || {
+        for mut stream in listener.incoming().flatten() {
+            let request = read_request(&mut stream);
+            recorded.lock().unwrap().push(request.clone());
+
+            if is_get(&request) {
+                write_response(&mut stream, "405 Method Not Allowed", "application/json", "");
+            } else if request.contains("\"method\":\"initialize\"") {
+                let body =
+                    r#"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2024-11-05"}}"#;
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nMcp-Session-Id: session-alpha\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                stream.write_all(response.as_bytes()).unwrap();
+            } else if request.contains("\"method\":\"initialized\"") {
+                write_response(&mut stream, "202 Accepted", "application/json", "");
+            } else if request.contains("\"method\":\"tools/list\"") {
+                write_response(
+                    &mut stream,
+                    "200 OK",
+                    "application/json",
+                    r#"{"jsonrpc":"2.0","id":2,"result":{"tools":[{"name":"remote_read"}]}}"#,
+                );
+            } else if request.contains("\"method\":\"resources/list\"") {
+                write_response(
+                    &mut stream,
+                    "200 OK",
+                    "application/json",
+                    r#"{"jsonrpc":"2.0","id":3,"result":{"resources":[]}}"#,
+                );
+            } else {
+                write_response(
+                    &mut stream,
+                    "200 OK",
+                    "application/json",
+                    r#"{"jsonrpc":"2.0","id":4,"result":{}}"#,
+                );
+            }
+        }
+    });
+
+    (address, requests)
+}
+
 fn spawn_server() -> SocketAddr {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let address = listener.local_addr().unwrap();
     std::thread::spawn(move || {
-        for (index, expected_method) in ["initialize", "initialized", "tools/list"]
-            .into_iter()
-            .enumerate()
-        {
-            let (mut stream, _) = listener.accept().unwrap();
+        for mut stream in listener.incoming().flatten() {
             let request = read_request(&mut stream);
-            assert!(
-                request.contains(&format!("\"method\":\"{expected_method}\"")),
-                "unexpected request: {request}"
-            );
+            if is_get(&request) {
+                write_response(&mut stream, "405 Method Not Allowed", "application/json", "");
+                continue;
+            }
             assert!(
                 request
                     .to_ascii_lowercase()
-                    .contains("authorization: bearer test")
+                    .contains("authorization: bearer test"),
+                "unexpected request without the configured header: {request}"
             );
 
-            match index {
-                0 => write_response(
+            if request.contains("\"method\":\"initialize\"") {
+                write_response(
                     &mut stream,
                     "200 OK",
                     "application/json",
                     r#"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2024-11-05"}}"#,
-                ),
-                1 => write_response(&mut stream, "202 Accepted", "application/json", ""),
-                _ => write_response(
+                );
+            } else if request.contains("\"method\":\"initialized\"") {
+                write_response(&mut stream, "202 Accepted", "application/json", "");
+            } else if request.contains("\"method\":\"tools/list\"") {
+                write_response(
                     &mut stream,
                     "200 OK",
                     "text/event-stream",
@@ -81,7 +151,21 @@ fn spawn_server() -> SocketAddr {
                         "data: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/message\"}\n\n",
                         "data: {\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"tools\":[{\"name\":\"remote_read\"}]}}\n\n"
                     ),
-                ),
+                );
+            } else if request.contains("\"method\":\"resources/list\"") {
+                write_response(
+                    &mut stream,
+                    "200 OK",
+                    "application/json",
+                    r#"{"jsonrpc":"2.0","id":3,"result":{"resources":[]}}"#,
+                );
+            } else {
+                write_response(
+                    &mut stream,
+                    "200 OK",
+                    "application/json",
+                    r#"{"jsonrpc":"2.0","id":4,"result":{}}"#,
+                );
             }
         }
     });
@@ -112,56 +196,58 @@ fn spawn_asking_server() -> (SocketAddr, std::thread::JoinHandle<String>) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let address = listener.local_addr().unwrap();
     let handle = std::thread::spawn(move || {
-        // initialize
-        {
-            let (mut stream, _) = listener.accept().unwrap();
+        let mut answer = String::new();
+        let mut open_stream: Option<TcpStream> = None;
+
+        for mut stream in listener.incoming().flatten() {
             let request = read_request(&mut stream);
-            assert!(request.contains("\"method\":\"initialize\""), "{request}");
-            write_response(
-                &mut stream,
-                "200 OK",
-                "application/json",
-                r#"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2024-11-05"}}"#,
-            );
+
+            if is_get(&request) {
+                // The per-response path is what this server exercises; the
+                // standalone stream is refused quietly.
+                write_response(&mut stream, "405 Method Not Allowed", "application/json", "");
+                continue;
+            }
+
+            if request.contains("\"method\":\"initialize\"") {
+                write_response(
+                    &mut stream,
+                    "200 OK",
+                    "application/json",
+                    r#"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2024-11-05"}}"#,
+                );
+            } else if request.contains("\"method\":\"initialized\"") {
+                write_response(&mut stream, "202 Accepted", "application/json", "");
+            } else if request.contains("\"method\":\"tools/list\"") {
+                // The server asks before answering this request.
+                stream
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n",
+                    )
+                    .unwrap();
+                stream
+                    .write_all(
+                        b"data: {\"jsonrpc\":\"2.0\",\"id\":99,\"method\":\"elicitation/create\",\"params\":{\"message\":\"pick one\"}}\n\n",
+                    )
+                    .unwrap();
+                stream.flush().unwrap();
+                open_stream = Some(stream);
+            } else if request.contains("\"id\":99") {
+                // The answer has to arrive on its own connection while the
+                // request's stream is still open.
+                answer = request;
+                write_response(&mut stream, "202 Accepted", "application/json", "");
+                if let Some(ref mut open) = open_stream {
+                    // Only now can the original request complete.
+                    open.write_all(
+                        b"data: {\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"tools\":[{\"name\":\"remote_read\"}]}}\n\n",
+                    )
+                    .unwrap();
+                    open.flush().unwrap();
+                }
+                break;
+            }
         }
-
-        // initialized notification
-        {
-            let (mut stream, _) = listener.accept().unwrap();
-            let request = read_request(&mut stream);
-            assert!(request.contains("\"method\":\"initialized\""), "{request}");
-            write_response(&mut stream, "202 Accepted", "application/json", "");
-        }
-
-        // tools/list: the server asks before answering.
-        let (mut stream, _) = listener.accept().unwrap();
-        let request = read_request(&mut stream);
-        assert!(request.contains("\"method\":\"tools/list\""), "{request}");
-        stream
-            .write_all(
-                b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n",
-            )
-            .unwrap();
-        stream
-            .write_all(
-                b"data: {\"jsonrpc\":\"2.0\",\"id\":99,\"method\":\"elicitation/create\",\"params\":{\"message\":\"pick one\"}}\n\n",
-            )
-            .unwrap();
-        stream.flush().unwrap();
-
-        // The answer has to arrive on its own connection while this stream is
-        // still open; the client must not wait for the response body to end.
-        let (mut answer_stream, _) = listener.accept().unwrap();
-        let answer = read_request(&mut answer_stream);
-        write_response(&mut answer_stream, "202 Accepted", "application/json", "");
-
-        // Only now can the original request complete.
-        stream
-            .write_all(
-                b"data: {\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"tools\":[{\"name\":\"remote_read\"}]}}\n\n",
-            )
-            .unwrap();
-        stream.flush().unwrap();
 
         answer
     });
@@ -373,6 +459,292 @@ async fn an_expiring_token_is_refreshed_before_the_second_request() {
         "{token_request}"
     );
 
+    channel.terminate().await.unwrap();
+}
+
+/// Poll `condition` until it holds or five seconds pass.
+async fn wait_until(mut condition: impl FnMut() -> bool) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while !condition() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "condition did not hold within five seconds"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+}
+
+/// The initialize response's `Mcp-Session-Id` must be carried by every later
+/// POST, including the `initialized` notification and the standalone GET.
+#[tokio::test]
+async fn the_session_id_is_sent_on_every_later_request() {
+    let (address, requests) = spawn_session_server();
+    let mut channel =
+        JsonRpcChannel::new_http(&format!("http://{address}/mcp"), HashMap::new()).unwrap();
+
+    channel.spawn().await.unwrap();
+    channel.initialize().await.unwrap();
+    assert_eq!(channel.session_id().as_deref(), Some("session-alpha"));
+
+    channel.list_tools().await.unwrap();
+
+    // Wait for the standalone stream's GET, which also carries the session id.
+    let recorded = Arc::clone(&requests);
+    wait_until(|| {
+        recorded
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|request| is_get(request))
+    })
+    .await;
+
+    let recorded = requests.lock().unwrap();
+    let initialize = recorded
+        .iter()
+        .find(|request| request.contains("\"method\":\"initialize\""))
+        .expect("initialize was sent");
+    assert_eq!(
+        header_value(initialize, "mcp-session-id"),
+        None,
+        "the initialize request cannot carry a session it does not know yet: {initialize}"
+    );
+
+    for method in ["initialized", "tools/list"] {
+        let request = recorded
+            .iter()
+            .find(|request| request.contains(&format!("\"method\":\"{method}\"")))
+            .unwrap_or_else(|| panic!("{method} was not sent"));
+        assert_eq!(
+            header_value(request, "mcp-session-id").as_deref(),
+            Some("session-alpha"),
+            "{method} did not carry the session id: {request}"
+        );
+    }
+
+    let get = recorded.iter().find(|request| is_get(request)).expect("GET");
+    assert_eq!(
+        header_value(get, "mcp-session-id").as_deref(),
+        Some("session-alpha"),
+        "the GET stream did not carry the session id: {get}"
+    );
+    assert_eq!(
+        header_value(get, "accept").as_deref(),
+        Some("text/event-stream"),
+        "the GET stream did not ask for SSE: {get}"
+    );
+
+    channel.terminate().await.unwrap();
+}
+
+/// A 405 to the standalone GET is the specified quiet fallback: the stream
+/// stops and the server remains usable.
+#[tokio::test]
+async fn a_get_405_stops_the_stream_without_failing_the_server() {
+    let (address, requests) = spawn_session_server();
+    let mut channel =
+        JsonRpcChannel::new_http(&format!("http://{address}/mcp"), HashMap::new()).unwrap();
+
+    channel.spawn().await.unwrap();
+    channel.initialize().await.unwrap();
+
+    let recorded = Arc::clone(&requests);
+    wait_until(|| {
+        recorded
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|request| is_get(request))
+    })
+    .await;
+
+    // The client observes the 405 and stops the task.
+    wait_until(|| !channel.event_stream_active()).await;
+
+    let tools = channel.list_tools().await.unwrap();
+    assert_eq!(tools["tools"][0]["name"], "remote_read");
+
+    channel.terminate().await.unwrap();
+}
+
+/// A request that meets an expired session (404/405) drops the id and
+/// re-initializes once before retrying.
+#[tokio::test]
+async fn an_expired_session_is_cleared_and_reinitialized_once() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let recorded = Arc::clone(&requests);
+
+    std::thread::spawn(move || {
+        let mut initializes = 0_usize;
+        let mut tools_attempts = 0_usize;
+
+        for mut stream in listener.incoming().flatten() {
+            let request = read_request(&mut stream);
+            recorded.lock().unwrap().push(request.clone());
+
+            if is_get(&request) {
+                write_response(&mut stream, "405 Method Not Allowed", "application/json", "");
+            } else if request.contains("\"method\":\"initialize\"") {
+                initializes += 1;
+                let session = if initializes == 1 {
+                    "session-1"
+                } else {
+                    "session-2"
+                };
+                let body = format!(
+                    r#"{{"jsonrpc":"2.0","id":{},"result":{{"protocolVersion":"2024-11-05"}}}}"#,
+                    if request.contains("\"id\":0") { 0 } else { 1 }
+                );
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nMcp-Session-Id: {session}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                stream.write_all(response.as_bytes()).unwrap();
+            } else if request.contains("\"method\":\"initialized\"") {
+                write_response(&mut stream, "202 Accepted", "application/json", "");
+            } else if request.contains("\"method\":\"tools/list\"") {
+                tools_attempts += 1;
+                if tools_attempts == 1 {
+                    write_response(
+                        &mut stream,
+                        "404 Not Found",
+                        "application/json",
+                        r#"{"error":"unknown session"}"#,
+                    );
+                } else {
+                    write_response(
+                        &mut stream,
+                        "200 OK",
+                        "application/json",
+                        r#"{"jsonrpc":"2.0","id":2,"result":{"tools":[{"name":"remote_read"}]}}"#,
+                    );
+                }
+            } else {
+                write_response(&mut stream, "200 OK", "application/json", "{}");
+            }
+        }
+    });
+
+    let mut channel =
+        JsonRpcChannel::new_http(&format!("http://{address}/mcp"), HashMap::new()).unwrap();
+    channel.spawn().await.unwrap();
+    channel.initialize().await.unwrap();
+    assert_eq!(channel.session_id().as_deref(), Some("session-1"));
+
+    let tools = channel.list_tools().await.unwrap();
+    assert_eq!(tools["tools"][0]["name"], "remote_read");
+    assert_eq!(
+        channel.session_id().as_deref(),
+        Some("session-2"),
+        "the retry did not use the re-initialized session"
+    );
+
+    let recorded = requests.lock().unwrap();
+    let tools_requests: Vec<&String> = recorded
+        .iter()
+        .filter(|request| request.contains("\"method\":\"tools/list\""))
+        .collect();
+    assert_eq!(tools_requests.len(), 2, "the request must be retried once");
+    assert_eq!(
+        header_value(tools_requests[0], "mcp-session-id").as_deref(),
+        Some("session-1")
+    );
+    assert_eq!(
+        header_value(tools_requests[1], "mcp-session-id").as_deref(),
+        Some("session-2")
+    );
+
+    channel.terminate().await.unwrap();
+}
+
+/// A request pushed on the standalone GET stream is answered over POST with
+/// the session id, while the stream is still open.
+#[tokio::test]
+async fn a_question_on_the_get_stream_is_answered_over_post() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let recorded = Arc::clone(&requests);
+
+    std::thread::spawn(move || {
+        // Keep GET streams alive while answers arrive on other connections.
+        let mut open_streams: Vec<TcpStream> = Vec::new();
+
+        for mut stream in listener.incoming().flatten() {
+            let request = read_request(&mut stream);
+            recorded.lock().unwrap().push(request.clone());
+
+            if is_get(&request) {
+                // Hold this connection open and push a question on it.
+                stream
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: keep-alive\r\n\r\nid: evt-1\ndata: {\"jsonrpc\":\"2.0\",\"id\":77,\"method\":\"elicitation/create\",\"params\":{\"message\":\"pick a number\",\"requestedSchema\":{\"type\":\"object\",\"properties\":{\"answer\":{\"type\":\"integer\"}},\"required\":[\"answer\"]}}}\n\n",
+                    )
+                    .unwrap();
+                stream.flush().unwrap();
+                open_streams.push(stream);
+            } else if request.contains("\"method\":\"initialize\"") {
+                let body =
+                    r#"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2024-11-05"}}"#;
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nMcp-Session-Id: session-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                stream.write_all(response.as_bytes()).unwrap();
+            } else if request.contains("\"method\":\"initialized\"") {
+                write_response(&mut stream, "202 Accepted", "application/json", "");
+            } else if request.contains("\"id\":77") {
+                write_response(&mut stream, "202 Accepted", "application/json", "");
+            } else {
+                write_response(&mut stream, "200 OK", "application/json", "{}");
+            }
+        }
+    });
+
+    let mut channel =
+        JsonRpcChannel::new_http(&format!("http://{address}/mcp"), HashMap::new()).unwrap();
+    channel.set_inbound_handler(Arc::new(AcceptingHandler));
+    channel.spawn().await.unwrap();
+    channel.initialize().await.unwrap();
+
+    let recorded = Arc::clone(&requests);
+    wait_until(|| {
+        recorded
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|request| request.contains("\"id\":77"))
+    })
+    .await;
+
+    let recorded = requests.lock().unwrap();
+    let answer = recorded
+        .iter()
+        .find(|request| request.contains("\"id\":77"))
+        .expect("the answer was posted");
+    assert!(
+        answer.contains("\"answer\":42"),
+        "the handler's content was not delivered: {answer}"
+    );
+    assert_eq!(
+        header_value(answer, "mcp-session-id").as_deref(),
+        Some("session-stream"),
+        "the answer did not carry the session id: {answer}"
+    );
+
+    let get = recorded.iter().find(|request| is_get(request)).expect("GET");
+    assert_eq!(
+        header_value(get, "mcp-session-id").as_deref(),
+        Some("session-stream")
+    );
+    assert_eq!(
+        header_value(get, "accept").as_deref(),
+        Some("text/event-stream")
+    );
+
+    drop(recorded);
     channel.terminate().await.unwrap();
 }
 

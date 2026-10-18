@@ -238,6 +238,11 @@ impl JsonRpcChannel {
 
     /// Answer requests the server makes of the client.
     pub fn set_inbound_handler(&mut self, handler: std::sync::Arc<dyn InboundRequestHandler>) {
+        // The remote transport's standalone GET stream runs in its own task,
+        // so it needs its own owned handle to the same handler.
+        if let Some(http) = self.http.as_mut() {
+            http.set_event_stream_handler(std::sync::Arc::clone(&handler));
+        }
         self.handler = Some(handler);
     }
 
@@ -320,11 +325,33 @@ impl JsonRpcChannel {
 
         let result = self.send_request("initialize", Some(init_params)).await?;
 
-        // Send initialized notification (no response expected)
+        // Send initialized notification (no response expected). The initialize
+        // response may have assigned a session id; every later POST carries it.
         self.send_notification("initialized", None).await?;
         self.initialized = true;
 
+        // The standalone server-to-client stream is only meaningful once the
+        // session exists. A server that does not support it answers 405 and
+        // the stream task stops quietly.
+        if let Some(ref http) = self.http {
+            http.start_event_stream();
+        }
+
         Ok(result)
+    }
+
+    /// The remote session id, once the server has assigned one.
+    #[must_use]
+    pub fn session_id(&self) -> Option<String> {
+        self.http.as_ref().and_then(crate::http::HttpChannel::session_id)
+    }
+
+    /// Whether the remote standalone GET stream is running.
+    #[must_use]
+    pub fn event_stream_active(&self) -> bool {
+        self.http
+            .as_ref()
+            .is_some_and(crate::http::HttpChannel::event_stream_active)
     }
 
     /// Discover tools from the MCP server.
@@ -596,7 +623,11 @@ impl JsonRpcChannel {
 
     /// Terminate the process.
     pub async fn terminate(&mut self) -> Result<(), String> {
-        if self.http.take().is_some() {
+        if let Some(http) = self.http.take() {
+            // Stop the standalone stream before dropping the channel; a
+            // detached task would otherwise keep polling a server that the
+            // session has finished with.
+            http.stop_event_stream();
             self.initialized = false;
             return Ok(());
         }

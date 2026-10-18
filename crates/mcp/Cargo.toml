@@ -18,7 +18,9 @@ thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 serde.workspace = true
-serde_json.workspace = true
+# `preserve_order` keeps `requestedSchema.properties` in the order the server
+# declared them, which is the order the elicitation questions are asked in.
+serde_json = { workspace = true, features = ["preserve_order"] }
 dashmap.workspace = true
 tokio-tungstenite.workspace = true
 oauth2.workspace = true
