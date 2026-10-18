@@ -60,10 +60,11 @@ pub enum HookEvent {
 impl HookEvent {
     /// The canonical wire name for this event.
     ///
-    /// This is the single source of truth for event names: registry matching
-    /// compares the fired name against the name configured in settings, so any
-    /// two spellings of the same event silently never match. Call sites should
-    /// build the name from here rather than writing the literal.
+    /// This is the single source of truth for event names. Registry matching
+    /// canonicalizes both the fired name and the configured name through
+    /// [`FromStr`](std::str::FromStr), so the historical `PostToolUseFail`
+    /// alias still matches. Call sites should build the name from here rather
+    /// than writing the literal.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {

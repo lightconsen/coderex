@@ -658,21 +658,20 @@ pub(crate) fn prepare_windows_limits(
         return None;
     }
 
-    let sandbox =
-        coderex_core::sandbox::SandboxHandle::create_limits_only(
-            coderex_core::sandbox::SandboxConfig {
-                allowed_read_paths: Vec::new(),
-                allowed_write_paths: Vec::new(),
-                allowed_exec_paths: Vec::new(),
-                additional_working_dirs: Vec::new(),
-                max_open_files: None,
-                max_memory_bytes: config
-                    .max_memory_mb
-                    .map(|mb| mb.saturating_mul(1024 * 1024)),
-                max_cpu_seconds: config.max_cpu_seconds,
-                allow_network: true,
-            },
-        );
+    let sandbox = coderex_core::sandbox::SandboxHandle::create_limits_only(
+        coderex_core::sandbox::SandboxConfig {
+            allowed_read_paths: Vec::new(),
+            allowed_write_paths: Vec::new(),
+            allowed_exec_paths: Vec::new(),
+            additional_working_dirs: Vec::new(),
+            max_open_files: None,
+            max_memory_bytes: config
+                .max_memory_mb
+                .map(|mb| mb.saturating_mul(1024 * 1024)),
+            max_cpu_seconds: config.max_cpu_seconds,
+            allow_network: true,
+        },
+    );
 
     match sandbox {
         Ok(sandbox) => Some(sandbox),
@@ -891,9 +890,11 @@ mod policy_tests {
         let policy = sandbox_config(&hook);
 
         assert!(policy.allowed_write_paths.contains(&workspace));
-        assert!(policy
-            .allowed_write_paths
-            .contains(&canonicalize_lenient(&std::env::temp_dir())));
+        assert!(
+            policy
+                .allowed_write_paths
+                .contains(&canonicalize_lenient(&std::env::temp_dir()))
+        );
         assert!(policy.allowed_read_paths.contains(&workspace));
         assert_eq!(policy.additional_working_dirs, vec![workspace]);
         assert!(!policy.allow_network, "network must be denied by default");
@@ -920,16 +921,22 @@ mod policy_tests {
 
         assert!(policy.allow_network);
         assert!(policy.allowed_read_paths.contains(&workspace));
-        assert!(policy
-            .allowed_read_paths
-            .contains(&PathBuf::from("/srv/policy")));
+        assert!(
+            policy
+                .allowed_read_paths
+                .contains(&PathBuf::from("/srv/policy"))
+        );
         assert!(policy.allowed_write_paths.contains(&workspace));
-        assert!(policy
-            .allowed_write_paths
-            .contains(&PathBuf::from("/srv/out")));
-        assert!(policy
-            .allowed_exec_paths
-            .contains(&PathBuf::from("/srv/bin")));
+        assert!(
+            policy
+                .allowed_write_paths
+                .contains(&PathBuf::from("/srv/out"))
+        );
+        assert!(
+            policy
+                .allowed_exec_paths
+                .contains(&PathBuf::from("/srv/bin"))
+        );
     }
 
     /// A hook may opt out; the plan then applies no OS confinement.
@@ -1004,33 +1011,44 @@ mod policy_tests {
     }
 
     /// A relative path would resolve against the workspace and confine
-    /// nothing; it is a load error, not a silent no-op.
+    /// nothing; the entry is refused at load and skipped. It must not fail the
+    /// whole document — the rest of the hook chain still loads.
     #[test]
     fn relative_sandbox_paths_are_refused_at_load() {
         let value = serde_json::json!({
-            "hooks": [{
-                "event": "PreToolUse",
-                "command": "echo hi",
-                "sandbox": { "allowed_read_paths": ["relative/path"] }
-            }]
+            "hooks": [
+                {
+                    "event": "PreToolUse",
+                    "command": "echo hi",
+                    "sandbox": { "allowed_read_paths": ["relative/path"] }
+                },
+                { "event": "PreToolUse", "command": "kept" }
+            ]
         });
-        assert!(matches!(
-            HookRegistry::load_from_settings(&value),
-            Err(HookError::InvalidSandboxConfig(_))
-        ));
+        let registry = HookRegistry::load_from_settings(&value).unwrap();
+        let hooks = registry.matches_for_event(&crate::events::HookEvent::PreToolUse);
+        assert_eq!(hooks.len(), 1);
+        assert_eq!(hooks[0].command, "kept");
     }
 
-    /// An unknown key in the sandbox object is visible, not ignored.
+    /// An unknown key in the sandbox object is visible, not ignored: the entry
+    /// is skipped while the rest of the document loads.
     #[test]
     fn unknown_sandbox_fields_are_refused_at_load() {
         let value = serde_json::json!({
-            "hooks": [{
-                "event": "PreToolUse",
-                "command": "echo hi",
-                "sandbox": { "allow_netwrok": true }
-            }]
+            "hooks": [
+                {
+                    "event": "PreToolUse",
+                    "command": "echo hi",
+                    "sandbox": { "allow_netwrok": true }
+                },
+                { "event": "PreToolUse", "command": "kept" }
+            ]
         });
-        assert!(HookRegistry::load_from_settings(&value).is_err());
+        let registry = HookRegistry::load_from_settings(&value).unwrap();
+        let hooks = registry.matches_for_event(&crate::events::HookEvent::PreToolUse);
+        assert_eq!(hooks.len(), 1);
+        assert_eq!(hooks[0].command, "kept");
     }
 
     /// Both shapes of the `sandbox` key load: a boolean toggle and an object.

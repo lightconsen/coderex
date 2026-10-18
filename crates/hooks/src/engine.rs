@@ -9,8 +9,8 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{ChildStderr, ChildStdin};
 
 use crate::action::{
-    interpolate_tool_input, parse_answer, substitute_arguments, ActionPrompt, HookActionRunner,
-    McpToolHook, AGENT_DEFAULT_MODEL, AGENT_DEFAULT_TIMEOUT_MS, PROMPT_DEFAULT_TIMEOUT_MS,
+    AGENT_DEFAULT_MODEL, AGENT_DEFAULT_TIMEOUT_MS, ActionPrompt, HookActionRunner, McpToolHook,
+    PROMPT_DEFAULT_TIMEOUT_MS, interpolate_tool_input, parse_answer, substitute_arguments,
 };
 use crate::events::{HookAction, HookError, HookEvent, HookResult};
 use crate::sandbox::HookSandboxConfig;
@@ -279,28 +279,40 @@ pub struct HookSettings {
     pub hooks: Vec<RawHookConfig>,
 }
 
-/// The two shapes the hook settings arrive in.
+/// Extract the raw hook entries from either accepted document shape.
 ///
 /// `Settings.hooks` in `coderex-config` holds the bare array — the value under
 /// the `hooks` key of `settings.json` — while a whole settings object is
 /// `{"hooks": [...]}`. The install API accepts either so the caller does not
 /// have to know which it has.
-#[derive(Debug, Clone, Deserialize)]
-#[serde(untagged)]
-enum HookSettingsValue {
-    /// `{"hooks": [...]}` — a whole settings object.
-    Wrapped(HookSettings),
-    /// `[...]` — the bare array, as `Settings.hooks` holds it.
-    Bare(Vec<RawHookConfig>),
-}
-
-impl HookSettingsValue {
-    /// The hook list, whichever shape it came in.
-    fn into_hooks(self) -> Vec<RawHookConfig> {
-        match self {
-            Self::Wrapped(settings) => settings.hooks,
-            Self::Bare(hooks) => hooks,
-        }
+///
+/// The entries stay as [`serde_json::Value`] on purpose: [`parse_settings_hooks`]
+/// deserializes them one at a time so one malformed entry can be skipped
+/// without discarding the rest of the document. Only a document that is
+/// neither shape is a structural error.
+///
+/// [`parse_settings_hooks`]: HookRegistry::parse_settings_hooks
+fn settings_hook_entries(value: &serde_json::Value) -> Result<Vec<serde_json::Value>, HookError> {
+    if value.is_null() {
+        return Ok(Vec::new());
+    }
+    match value {
+        // `[...]` — the bare array, as `Settings.hooks` holds it.
+        serde_json::Value::Array(entries) => Ok(entries.clone()),
+        // `{"hooks": [...]}` — a whole settings object. An object with no
+        // `hooks` key contributes nothing, matching `HookSettings`'s
+        // `#[serde(default)]`.
+        serde_json::Value::Object(map) => match map.get("hooks") {
+            None => Ok(Vec::new()),
+            Some(hooks) => Ok(serde_json::from_value::<Vec<serde_json::Value>>(
+                hooks.clone(),
+            )?),
+        },
+        // Neither shape: a scalar or boolean cannot be a hooks document. This
+        // is a top-level shape error, not an entry-level one.
+        _ => Err(HookError::JsonError(serde::de::Error::custom(
+            "expected a hooks array or an object with a 'hooks' array",
+        ))),
     }
 }
 
@@ -393,7 +405,8 @@ pub struct RawHookConfig {
 ///
 /// `false` is the short opt-out; an object is a policy. `true` means the
 /// default policy. Anything else — including an unknown key inside the object
-/// — is a load error rather than a silent fallback.
+/// — is refused at load rather than silently ignored; that entry is skipped
+/// and the rest of the source still loads.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(untagged)]
 pub enum RawSandboxSetting {
@@ -590,9 +603,14 @@ impl HookRegistry {
     /// `mcp_tool`. The last three need a
     /// [`HookActionRunner`] installed by the session (see
     /// [`set_action_runner`](Self::set_action_runner)); without one they load
-    /// and then **fail when they fire**, they are not skipped. A hook missing
-    /// the field its kind requires — no `command`, no `url`, no `prompt`, no
-    /// `server`/`tool` — is a configuration error and fails the load.
+    /// and then **fail when they fire**, they are not skipped.
+    ///
+    /// One invalid entry does **not** fail the load: it is skipped with a
+    /// warning and the remaining entries in the document are kept. A hook
+    /// missing the field its kind requires (no `command`, no `url`, no
+    /// `prompt`, no `server`/`tool`) is one such entry. Only a document that
+    /// is not a hooks array — or an object whose `hooks` value is not an array
+    /// — is a structural error and returns `Err`.
     pub fn load_from_settings_with_tier(
         value: &serde_json::Value,
         tier: HookTier,
@@ -609,6 +627,12 @@ impl HookRegistry {
     /// Parse one settings document into hook configs, tagging every hook with
     /// `tier`.
     ///
+    /// Entries are deserialized and validated one at a time. An entry that
+    /// fails either step is logged and skipped, so a mistyped hook in a
+    /// repository-controlled document cannot remove the rest of the chain.
+    /// Only a structural error in the document itself (neither a bare hooks
+    /// array nor an object with a `hooks` array) is returned as `Err`.
+    ///
     /// The tier comes from the caller, never from the document: `HookConfig`'s
     /// `tier` field is `#[serde(skip)]`, so a `"tier": "managed"` written into
     /// a repository's settings is simply an unknown field and is ignored.
@@ -616,114 +640,136 @@ impl HookRegistry {
         value: &serde_json::Value,
         tier: HookTier,
     ) -> Result<Vec<HookConfig>, HookError> {
-        if value.is_null() {
-            return Ok(Vec::new());
-        }
-        // Accept both `{"hooks": [...]}` and the bare `[...]` that
-        // `Settings.hooks` holds.
-        let raw_hooks = serde_json::from_value::<HookSettingsValue>(value.clone())?.into_hooks();
+        let raw_hooks = settings_hook_entries(value)?;
         let mut hooks = Vec::with_capacity(raw_hooks.len());
-        for raw in raw_hooks {
-            warn_about_unimplemented_fields(&raw);
-            let mut config = match raw.kind {
-                HookType::Command => {
-                    let Some(command) = raw.command.clone() else {
-                        return Err(HookError::InvalidCommand(format!(
-                            "hook for event '{}' is type 'command' but has no 'command' field",
-                            raw.event
-                        )));
-                    };
-                    HookConfig {
-                        command,
-                        ..from_raw(&raw, raw.timeout_ms.unwrap_or_else(default_timeout))
-                    }
-                }
-                HookType::Http => {
-                    let Some(url) = raw.url.clone() else {
-                        return Err(HookError::InvalidHttpHook(format!(
-                            "hook for event '{}' is type 'http' but has no 'url' field",
-                            raw.event
-                        )));
-                    };
-                    let http = HttpHook {
-                        url,
-                        headers: raw.headers.clone().unwrap_or_default(),
-                        allowed_env_vars: raw.allowed_env_vars.clone().unwrap_or_default(),
-                        block_private_hosts: raw.block_private_hosts.unwrap_or(false),
-                    };
-                    http.validate()?;
-                    HookConfig {
-                        http: Some(http),
-                        ..from_raw(&raw, raw.timeout_ms.unwrap_or_else(default_timeout))
-                    }
-                }
-                HookType::Prompt | HookType::Agent => {
-                    let Some(prompt) = raw.prompt.clone() else {
-                        return Err(HookError::InvalidPromptHook(format!(
-                            "hook for event '{}' is type '{}' but has no 'prompt' field",
-                            raw.event,
-                            raw.kind.as_str()
-                        )));
-                    };
-                    // The two kinds differ on purpose: an `agent` hook is a
-                    // verifier, so it gets the cheap model and a longer
-                    // timeout; a `prompt` hook is one question and keeps the
-                    // session's model.
-                    let agent = raw.kind == HookType::Agent;
-                    let timeout_ms = raw.timeout_ms.unwrap_or(if agent {
-                        AGENT_DEFAULT_TIMEOUT_MS
-                    } else {
-                        PROMPT_DEFAULT_TIMEOUT_MS
-                    });
-                    let model = if agent {
-                        Some(
-                            raw.model
-                                .clone()
-                                .unwrap_or_else(|| AGENT_DEFAULT_MODEL.to_string()),
-                        )
-                    } else {
-                        raw.model.clone()
-                    };
-                    HookConfig {
-                        prompt: Some(prompt),
-                        model,
-                        ..from_raw(&raw, timeout_ms)
-                    }
-                }
-                HookType::McpTool => {
-                    let Some(server) = raw.server.clone() else {
-                        return Err(HookError::InvalidMcpToolHook(format!(
-                            "hook for event '{}' is type 'mcp_tool' but has no 'server' field",
-                            raw.event
-                        )));
-                    };
-                    let Some(tool) = raw.tool.clone() else {
-                        return Err(HookError::InvalidMcpToolHook(format!(
-                            "hook for event '{}' is type 'mcp_tool' but has no 'tool' field",
-                            raw.event
-                        )));
-                    };
-                    let mcp = McpToolHook {
-                        server,
-                        tool,
-                        input: raw
-                            .input
-                            .clone()
-                            .unwrap_or_else(|| serde_json::Value::Object(serde_json::Map::new())),
-                    };
-                    HookConfig {
-                        mcp: Some(mcp),
-                        ..from_raw(&raw, raw.timeout_ms.unwrap_or_else(default_timeout))
-                    }
+        for raw_value in raw_hooks {
+            let raw = match serde_json::from_value::<RawHookConfig>(raw_value) {
+                Ok(raw) => raw,
+                Err(error) => {
+                    tracing::warn!(
+                        tier = ?tier,
+                        %error,
+                        "skipping a malformed hook entry; the rest of this settings source still loads"
+                    );
+                    continue;
                 }
             };
-            if let Some(sandbox) = &config.sandbox {
-                sandbox.validate()?;
+            match Self::hook_from_raw(&raw, tier) {
+                Ok(config) => hooks.push(config),
+                Err(error) => tracing::warn!(
+                    tier = ?tier,
+                    event = %raw.event,
+                    %error,
+                    "skipping an invalid hook entry; the rest of this settings source still loads"
+                ),
             }
-            config.tier = tier;
-            hooks.push(config);
         }
         Ok(hooks)
+    }
+
+    /// Turn one deserialized entry into a [`HookConfig`], or explain why it
+    /// cannot be used.
+    ///
+    /// The caller skips an `Err` rather than failing the whole document.
+    fn hook_from_raw(raw: &RawHookConfig, tier: HookTier) -> Result<HookConfig, HookError> {
+        warn_about_unimplemented_fields(raw);
+        let mut config = match raw.kind {
+            HookType::Command => {
+                let Some(command) = raw.command.clone() else {
+                    return Err(HookError::InvalidCommand(format!(
+                        "hook for event '{}' is type 'command' but has no 'command' field",
+                        raw.event
+                    )));
+                };
+                HookConfig {
+                    command,
+                    ..from_raw(raw, raw.timeout_ms.unwrap_or_else(default_timeout))
+                }
+            }
+            HookType::Http => {
+                let Some(url) = raw.url.clone() else {
+                    return Err(HookError::InvalidHttpHook(format!(
+                        "hook for event '{}' is type 'http' but has no 'url' field",
+                        raw.event
+                    )));
+                };
+                let http = HttpHook {
+                    url,
+                    headers: raw.headers.clone().unwrap_or_default(),
+                    allowed_env_vars: raw.allowed_env_vars.clone().unwrap_or_default(),
+                    block_private_hosts: raw.block_private_hosts.unwrap_or(false),
+                };
+                http.validate()?;
+                HookConfig {
+                    http: Some(http),
+                    ..from_raw(raw, raw.timeout_ms.unwrap_or_else(default_timeout))
+                }
+            }
+            HookType::Prompt | HookType::Agent => {
+                let Some(prompt) = raw.prompt.clone() else {
+                    return Err(HookError::InvalidPromptHook(format!(
+                        "hook for event '{}' is type '{}' but has no 'prompt' field",
+                        raw.event,
+                        raw.kind.as_str()
+                    )));
+                };
+                // The two kinds differ on purpose: an `agent` hook is a
+                // verifier, so it gets the cheap model and a longer
+                // timeout; a `prompt` hook is one question and keeps the
+                // session's model.
+                let agent = raw.kind == HookType::Agent;
+                let timeout_ms = raw.timeout_ms.unwrap_or(if agent {
+                    AGENT_DEFAULT_TIMEOUT_MS
+                } else {
+                    PROMPT_DEFAULT_TIMEOUT_MS
+                });
+                let model = if agent {
+                    Some(
+                        raw.model
+                            .clone()
+                            .unwrap_or_else(|| AGENT_DEFAULT_MODEL.to_string()),
+                    )
+                } else {
+                    raw.model.clone()
+                };
+                HookConfig {
+                    prompt: Some(prompt),
+                    model,
+                    ..from_raw(raw, timeout_ms)
+                }
+            }
+            HookType::McpTool => {
+                let Some(server) = raw.server.clone() else {
+                    return Err(HookError::InvalidMcpToolHook(format!(
+                        "hook for event '{}' is type 'mcp_tool' but has no 'server' field",
+                        raw.event
+                    )));
+                };
+                let Some(tool) = raw.tool.clone() else {
+                    return Err(HookError::InvalidMcpToolHook(format!(
+                        "hook for event '{}' is type 'mcp_tool' but has no 'tool' field",
+                        raw.event
+                    )));
+                };
+                let mcp = McpToolHook {
+                    server,
+                    tool,
+                    input: raw
+                        .input
+                        .clone()
+                        .unwrap_or_else(|| serde_json::Value::Object(serde_json::Map::new())),
+                };
+                HookConfig {
+                    mcp: Some(mcp),
+                    ..from_raw(raw, raw.timeout_ms.unwrap_or_else(default_timeout))
+                }
+            }
+        };
+        if let Some(sandbox) = &config.sandbox {
+            sandbox.validate()?;
+        }
+        config.tier = tier;
+        Ok(config)
     }
 
     /// Load hooks from a settings.json value.
@@ -775,15 +821,51 @@ impl HookRegistry {
     /// as `(tier, document)` pairs and may be `serde_json::Value::Null`, which
     /// contributes nothing.
     ///
+    /// Sources are parsed independently, so a failure in one cannot discard
+    /// the hooks from the others. This matters most for a managed source: a
+    /// repository can write its own settings, and a single malformed project
+    /// hook must not remove administrator-controlled gating hooks
+    /// (`PreToolUse`/`UserPromptSubmit`). A structural error in a source is
+    /// therefore logged — at `error` level for a managed source, `warn` for
+    /// the rest — and the remaining sources still load. The alternative,
+    /// dropping every hook, is strictly worse: the invalid source contributes
+    /// nothing either way, and the valid ones may be the gates enforcing
+    /// policy.
+    ///
+    /// Entry-level errors do not even reach this point: individual malformed
+    /// entries within a source are skipped by [`parse_settings_hooks`], so the
+    /// valid entries in that same source still load. The `Result` return is
+    /// kept for compatibility, but per-source structural errors are isolated
+    /// here and logged rather than returned.
+    ///
     /// The resulting registry sorts by tier first, then priority, exactly like
     /// one built with [`register`](Self::register).
+    ///
+    /// [`parse_settings_hooks`]: Self::parse_settings_hooks
     pub fn from_settings_sources<'a, I>(sources: I) -> Result<Self, HookError>
     where
         I: IntoIterator<Item = (HookTier, &'a serde_json::Value)>,
     {
         let mut hooks = Vec::new();
         for (tier, value) in sources {
-            hooks.extend(Self::parse_settings_hooks(value, tier)?);
+            match Self::parse_settings_hooks(value, tier) {
+                Ok(parsed) => hooks.extend(parsed),
+                Err(error) => match tier {
+                    // A managed source carries policy the user cannot repair;
+                    // losing it is an operator-visible problem. Say so at
+                    // error level, but keep every other source's hooks.
+                    HookTier::Managed => tracing::error!(
+                        tier = ?tier,
+                        %error,
+                        "hook source is structurally invalid; continuing without it"
+                    ),
+                    HookTier::Plugin | HookTier::Core => tracing::warn!(
+                        tier = ?tier,
+                        %error,
+                        "hook source is structurally invalid; continuing without it"
+                    ),
+                },
+            }
         }
         Self::warn_about_inert_hooks(&hooks);
         Ok(Self {
@@ -851,11 +933,26 @@ impl HookRegistry {
     }
 
     /// Find hooks matching the given event name string, in chain order.
+    ///
+    /// Both sides are parsed as a [`HookEvent`] before comparing, so a
+    /// configured historical alias such as `PostToolUseFail` matches the
+    /// canonical `PostToolUseFailure` that is fired. Names that do not parse
+    /// match nothing (except `"*"`): matching raw strings would make every
+    /// alias and every typo silently inert.
     fn matches_for_event_name(&self, event_name: &str) -> Vec<&HookConfig> {
+        let fired = event_name.parse::<HookEvent>().ok();
         let mut hooks: Vec<_> = self
             .hooks
             .iter()
-            .filter(|h| h.event == event_name || h.event == "*")
+            .filter(|h| {
+                if h.event == "*" {
+                    return true;
+                }
+                match (h.event.parse::<HookEvent>(), fired) {
+                    (Ok(configured), Some(fired)) => configured == fired,
+                    _ => false,
+                }
+            })
             .collect();
         // Stable sort: tier ascending, then priority descending. Equal keys
         // keep registration order.
@@ -1666,9 +1763,11 @@ mod tests {
     #[test]
     fn hook_registry_starts_empty() {
         let registry = HookRegistry::new();
-        assert!(registry
-            .matches_for_event(&HookEvent::SessionStart)
-            .is_empty());
+        assert!(
+            registry
+                .matches_for_event(&HookEvent::SessionStart)
+                .is_empty()
+        );
     }
 
     #[test]
@@ -1733,6 +1832,56 @@ mod tests {
         assert_eq!(registry.matches_for_event(&HookEvent::Stop).len(), 1);
     }
 
+    /// Settings written with the historical `PostToolUseFail` spelling used to
+    /// parse but then never match: matching compared the raw configured string
+    /// against the canonical fired name. Both sides are canonicalized now.
+    #[tokio::test]
+    async fn legacy_event_alias_hook_fires_on_the_canonical_event() {
+        let mut registry = HookRegistry::new();
+        registry.register(tiered(
+            "PostToolUseFail",
+            r#"echo '{"action":"continue","additional_context":"alias fired"}'"#,
+            HookTier::Core,
+            0,
+        ));
+
+        let results = registry
+            .execute_sync(
+                &HookEvent::PostToolUseFailure,
+                &HookInput {
+                    event: "PostToolUseFailure".to_string(),
+                    session_id: None,
+                    input: Some("{}".to_string()),
+                    context: None,
+                },
+            )
+            .await;
+
+        assert_eq!(results.len(), 1, "the alias must match the fired name");
+        assert_eq!(
+            results[0]
+                .as_ref()
+                .unwrap()
+                .hook_result
+                .additional_context
+                .as_deref(),
+            Some("alias fired")
+        );
+    }
+
+    /// Canonicalizing the configured name must not turn unknown names into
+    /// matches, and the wildcard must keep matching every event.
+    #[test]
+    fn canonical_matching_keeps_wildcards_and_drops_unknown_names() {
+        let mut registry = HookRegistry::new();
+        registry.register(tiered("*", "wildcard", HookTier::Core, 0));
+        registry.register(tiered("NoSuchEvent", "unknown", HookTier::Core, 0));
+
+        let matches = registry.matches_for_event(&HookEvent::PreToolUse);
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].command, "wildcard");
+    }
+
     #[test]
     fn load_from_settings_parses_hooks() {
         let value = serde_json::json!({
@@ -1764,9 +1913,11 @@ mod tests {
     #[test]
     fn load_from_settings_null_returns_empty() {
         let registry = HookRegistry::load_from_settings(&serde_json::Value::Null).unwrap();
-        assert!(registry
-            .matches_for_event(&HookEvent::SessionStart)
-            .is_empty());
+        assert!(
+            registry
+                .matches_for_event(&HookEvent::SessionStart)
+                .is_empty()
+        );
     }
 
     #[test]
@@ -2222,6 +2373,97 @@ mod tests {
         assert_eq!(matches.len(), 2);
     }
 
+    /// A bad entry in the repository-controlled core document must not remove
+    /// the administrator's managed `PreToolUse` gate. Before fault isolation a
+    /// single typo made `from_settings_sources` return `Err` and the CLI
+    /// install no hooks at all.
+    #[test]
+    fn a_malformed_core_hook_does_not_suppress_a_managed_hook() {
+        let managed = serde_json::json!({
+            "hooks": [{ "event": "PreToolUse", "command": "managed-gate" }]
+        });
+        // `command` is required for the `command` kind, so this entry is
+        // invalid while the document shape itself is fine.
+        let core = serde_json::json!({
+            "hooks": [{ "event": "PreToolUse", "type": "command" }]
+        });
+
+        let registry = HookRegistry::from_settings_sources([
+            (HookTier::Managed, &managed),
+            (HookTier::Core, &core),
+        ])
+        .unwrap();
+
+        let matches = registry.matches_for_event(&HookEvent::PreToolUse);
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].command, "managed-gate");
+        assert_eq!(matches[0].tier, HookTier::Managed);
+    }
+
+    /// Entry-level fault isolation applies both when an entry cannot be
+    /// deserialized and when it deserializes but cannot be validated: the
+    /// invalid entries are skipped and the valid entry in the same source is
+    /// kept.
+    #[test]
+    fn one_invalid_entry_does_not_discard_valid_entries_in_its_source() {
+        let value = serde_json::json!({
+            "hooks": [
+                // No `event`: fails to deserialize.
+                { "command": "missing-event" },
+                // Deserializes, but a `command` hook with no command is invalid.
+                { "event": "PreToolUse", "type": "command" },
+                // The one that must survive.
+                { "event": "PreToolUse", "command": "kept" }
+            ]
+        });
+
+        let registry = HookRegistry::load_from_settings(&value).unwrap();
+        let commands: Vec<&str> = registry
+            .matches_for_event(&HookEvent::PreToolUse)
+            .iter()
+            .map(|h| h.command.as_str())
+            .collect();
+        assert_eq!(commands, vec!["kept"]);
+    }
+
+    /// A structurally invalid document (here `hooks` is not an array) is
+    /// isolated to its own source. The sources around it still load, whichever
+    /// tier they are.
+    #[test]
+    fn a_structurally_invalid_source_does_not_discard_other_sources() {
+        let bad = serde_json::json!({ "hooks": "not an array" });
+        let managed = serde_json::json!({
+            "hooks": [{ "event": "PreToolUse", "command": "managed-gate" }]
+        });
+        let core = serde_json::json!({
+            "hooks": [{ "event": "PreToolUse", "command": "core-hook" }]
+        });
+
+        // A broken managed source must not discard the core source.
+        let registry = HookRegistry::from_settings_sources([
+            (HookTier::Managed, &bad),
+            (HookTier::Core, &core),
+        ])
+        .unwrap();
+        let commands: Vec<&str> = registry
+            .matches_for_event(&HookEvent::PreToolUse)
+            .iter()
+            .map(|h| h.command.as_str())
+            .collect();
+        assert_eq!(commands, vec!["core-hook"]);
+
+        // And a broken core source must not discard the managed source.
+        let registry = HookRegistry::from_settings_sources([
+            (HookTier::Managed, &managed),
+            (HookTier::Core, &bad),
+        ])
+        .unwrap();
+        let matches = registry.matches_for_event(&HookEvent::PreToolUse);
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].command, "managed-gate");
+        assert_eq!(matches[0].tier, HookTier::Managed);
+    }
+
     /// Within a tier, higher priority still wins, and equal keys keep
     /// registration order.
     #[test]
@@ -2311,40 +2553,51 @@ mod tests {
         );
     }
 
-    /// A `prompt` hook with no `prompt` is a config error, and so is an
-    /// `agent` one: the field is what the kind *is*.
+    /// A `prompt` hook with no `prompt` — and an `agent` one — is an invalid
+    /// entry: it is skipped, and a valid entry beside it still loads. The field
+    /// is what the kind *is*, so the entry cannot be repaired.
     #[test]
-    fn a_prompt_or_agent_hook_without_a_prompt_is_a_config_error() {
+    fn a_prompt_or_agent_hook_without_a_prompt_is_skipped() {
         for kind in ["prompt", "agent"] {
             let value = serde_json::json!({
-                "hooks": [{ "event": "PreToolUse", "type": kind }]
+                "hooks": [
+                    { "event": "PreToolUse", "type": kind },
+                    { "event": "PreToolUse", "command": "kept" }
+                ]
             });
-            assert!(
-                matches!(
-                    HookRegistry::load_from_settings(&value),
-                    Err(HookError::InvalidPromptHook(_))
-                ),
-                "a {kind} hook with no prompt must be refused"
+            let registry = HookRegistry::load_from_settings(&value).unwrap();
+            let matches = registry.matches_for_event(&HookEvent::PreToolUse);
+            assert_eq!(
+                matches.len(),
+                1,
+                "a {kind} hook with no prompt must be skipped, not fail the source"
             );
+            assert_eq!(matches[0].command, "kept");
         }
     }
 
-    /// An `mcp_tool` hook names a server and a tool; one without either is a
-    /// config error rather than a call to nothing.
+    /// An `mcp_tool` hook must name both a server and a tool. One missing
+    /// either is skipped; a valid entry in the same document still loads.
     #[test]
-    fn an_mcp_tool_hook_without_a_server_or_tool_is_a_config_error() {
+    fn an_mcp_tool_hook_without_a_server_or_tool_is_skipped() {
         for hook in [
             serde_json::json!({ "event": "PreToolUse", "type": "mcp_tool", "tool": "t" }),
             serde_json::json!({ "event": "PreToolUse", "type": "mcp_tool", "server": "s" }),
         ] {
-            let value = serde_json::json!({ "hooks": [hook] });
-            assert!(
-                matches!(
-                    HookRegistry::load_from_settings(&value),
-                    Err(HookError::InvalidMcpToolHook(_))
-                ),
-                "an mcp_tool hook must name both server and tool"
+            let value = serde_json::json!({
+                "hooks": [
+                    hook,
+                    { "event": "PreToolUse", "command": "kept" }
+                ]
+            });
+            let registry = HookRegistry::load_from_settings(&value).unwrap();
+            let matches = registry.matches_for_event(&HookEvent::PreToolUse);
+            assert_eq!(
+                matches.len(),
+                1,
+                "an mcp_tool hook must name both server and tool; the bad entry is skipped"
             );
+            assert_eq!(matches[0].command, "kept");
         }
     }
 
@@ -2503,9 +2756,11 @@ mod tests {
             "{}",
             prompts[0].prompt
         );
-        assert!(prompts[0]
-            .prompt
-            .contains(r#"\"file_path\":\"/etc/hosts\""#));
+        assert!(
+            prompts[0]
+                .prompt
+                .contains(r#"\"file_path\":\"/etc/hosts\""#)
+        );
     }
 
     /// `$ARGUMENTS` is how a prompt hook sees what it is gating: the hook input
@@ -2677,15 +2932,21 @@ mod tests {
     }
 
     #[test]
-    fn http_hook_without_a_url_is_a_config_error() {
+    fn http_hook_without_a_url_is_skipped() {
         let value = serde_json::json!({
             "hooks": [{ "event": "PreToolUse", "type": "http" }]
         });
-        assert!(HookRegistry::load_from_settings(&value).is_err());
+        let registry = HookRegistry::load_from_settings(&value).unwrap();
+        assert!(
+            registry
+                .matches_for_event(&HookEvent::PreToolUse)
+                .is_empty()
+        );
     }
 
     /// The body is the conversation, so the destination has to be absolute and
     /// speak http(s) — not a relative path, and not a scheme that reads a file.
+    /// An endpoint that fails validation is skipped, not loaded.
     #[test]
     fn http_hook_url_must_be_absolute_http() {
         for url in [
@@ -2695,16 +2956,24 @@ mod tests {
             "ftp://example.test/hook",
         ] {
             let value = serde_json::json!({
-                "hooks": [{ "event": "PreToolUse", "type": "http", "url": url }]
+                "hooks": [
+                    { "event": "PreToolUse", "type": "http", "url": url },
+                    { "event": "PreToolUse", "command": "kept" }
+                ]
             });
-            assert!(
-                HookRegistry::load_from_settings(&value).is_err(),
+            let registry = HookRegistry::load_from_settings(&value).unwrap();
+            let matches = registry.matches_for_event(&HookEvent::PreToolUse);
+            assert_eq!(
+                matches.len(),
+                1,
                 "{url} should not be accepted as a hook endpoint"
             );
+            assert_eq!(matches[0].command, "kept");
         }
     }
 
-    /// A header may only read a variable the configuration granted it.
+    /// A header may only read a variable the configuration granted it. The
+    /// refused entry is skipped while the rest of the document loads.
     #[test]
     fn http_hook_header_cannot_reference_an_ungranted_variable() {
         let refused = serde_json::json!({
@@ -2713,12 +2982,19 @@ mod tests {
                 "type": "http",
                 "url": "https://example.test/hook",
                 "headers": { "authorization": "Bearer $ANTHROPIC_API_KEY" }
+            }, {
+                "event": "PreToolUse",
+                "command": "kept"
             }]
         });
-        assert!(
-            HookRegistry::load_from_settings(&refused).is_err(),
+        let registry = HookRegistry::load_from_settings(&refused).unwrap();
+        let matches = registry.matches_for_event(&HookEvent::PreToolUse);
+        assert_eq!(
+            matches.len(),
+            1,
             "a header read a variable that allowedEnvVars did not grant"
         );
+        assert_eq!(matches[0].command, "kept");
 
         let granted = serde_json::json!({
             "hooks": [{
@@ -2729,26 +3005,41 @@ mod tests {
                 "allowedEnvVars": ["HOOK_TOKEN"]
             }]
         });
-        assert!(HookRegistry::load_from_settings(&granted).is_ok());
+        assert_eq!(
+            HookRegistry::load_from_settings(&granted)
+                .unwrap()
+                .matches_for_event(&HookEvent::PreToolUse)
+                .len(),
+            1
+        );
     }
 
+    /// An unknown `type` cannot be deserialized; that entry is skipped rather
+    /// than failing the source.
     #[test]
-    fn unknown_hook_type_is_a_config_error() {
+    fn unknown_hook_type_is_skipped() {
         let value = serde_json::json!({
             "hooks": [{ "event": "PreToolUse", "type": "telepathy", "command": "echo hi" }]
         });
-        assert!(HookRegistry::load_from_settings(&value).is_err());
+        let registry = HookRegistry::load_from_settings(&value).unwrap();
+        assert!(
+            registry
+                .matches_for_event(&HookEvent::PreToolUse)
+                .is_empty()
+        );
     }
 
     #[test]
-    fn command_type_without_a_command_is_a_config_error() {
+    fn command_type_without_a_command_is_skipped() {
         let value = serde_json::json!({
             "hooks": [{ "event": "PreToolUse", "type": "command" }]
         });
-        assert!(matches!(
-            HookRegistry::load_from_settings(&value),
-            Err(HookError::InvalidCommand(_))
-        ));
+        let registry = HookRegistry::load_from_settings(&value).unwrap();
+        assert!(
+            registry
+                .matches_for_event(&HookEvent::PreToolUse)
+                .is_empty()
+        );
     }
 
     // ─── Fail-closed contract ───────────────────────────────────────────────
