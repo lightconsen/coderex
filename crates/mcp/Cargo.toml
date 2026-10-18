@@ -12,6 +12,7 @@ workspace = true
 
 [dependencies]
 coderex-core = { path = "../core" }
+coderex-config = { path = "../config", features = ["keyring"] }
 coderex-tools = { path = "../tools" }
 
 thiserror.workspace = true

@@ -13,7 +13,16 @@ workspace = true
 [features]
 default = []
 enterprise = []
-keyring = ["dep:keyring"]
+# `keyring` pulls in the platform backend as well as the crate: without one of
+# these, keyring-rs silently falls back to its in-memory mock store, which
+# would look like a successful save and lose the credential at process exit.
+keyring = [
+    "dep:keyring",
+    "keyring/apple-native",
+    "keyring/windows-native",
+    "keyring/linux-native-sync-persistent",
+    "keyring/crypto-rust",
+]
 hot-reload = ["dep:notify"]
 
 [dependencies]

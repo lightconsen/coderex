@@ -673,21 +673,23 @@ fn oauth_manager_get_mut_updates_tokens() {
 
 #[test]
 fn oauth_token_persistence_roundtrip() {
-    let mut mgr = OAuthManager::new();
+    // An explicit path is file-only: the test must never touch the developer's
+    // keychain or ~/.coderex.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("mcp_tokens.json");
+
+    let mut mgr = OAuthManager::with_path(&path);
     let mut state = McpOAuthState::new("http://server1", "client1");
     state.update_tokens("access_123".into(), Some("refresh_456".into()), 3600);
     mgr.register(state);
 
-    mgr.save_tokens().unwrap();
-    let loaded = OAuthManager::load_tokens().unwrap();
+    mgr.save_tokens_to(&path).unwrap();
+    let loaded = OAuthManager::load_tokens_from(&path).unwrap();
 
     assert!(loaded.is_authenticated("http://server1"));
     let s = loaded.get("http://server1").unwrap();
     assert_eq!(s.access_token.as_ref().unwrap(), "access_123");
     assert_eq!(s.refresh_token.as_ref().unwrap(), "refresh_456");
-
-    // Clean up
-    let _ = std::fs::remove_file(OAuthManager::token_path());
 }
 
 /// The token the `McpAuth` tool writes has to be the token the MCP client

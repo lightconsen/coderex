@@ -5,6 +5,7 @@
 pub mod dirs;
 pub mod experiments;
 pub mod flags;
+pub mod secret_store;
 pub mod settings;
 
 #[cfg(feature = "enterprise")]

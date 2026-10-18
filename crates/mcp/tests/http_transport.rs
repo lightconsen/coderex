@@ -4,11 +4,12 @@ use coderex_mcp::channel::{InboundRequestHandler, JsonRpcChannel, JsonRpcError};
 use coderex_mcp::config::{McpConfig, McpServerConfig, McpTransport};
 use coderex_mcp::manager::McpManager;
 use coderex_mcp::oauth::{McpOAuthState, OAuthManager, OAuthTokenProvider};
-use coderex_mcp::{EventStreamRetryPolicy, EventStreamState};
+use coderex_mcp::{EventStreamRetryPolicy, EventStreamState, TokenProvider};
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 fn read_request(stream: &mut TcpStream) -> String {
     let mut request = Vec::new();
@@ -473,6 +474,188 @@ async fn an_expiring_token_is_refreshed_before_the_second_request() {
         token_request.contains("refresh_token=refresh_me"),
         "{token_request}"
     );
+
+    channel.terminate().await.unwrap();
+}
+
+/// A bearer challenge response, with the `WWW-Authenticate` header the
+/// transport inspects before deciding whether recovery is allowed.
+fn write_unauthorized(stream: &mut TcpStream, challenge: &str) {
+    let body = r#"{"error":"unauthorized"}"#;
+    let response = format!(
+        "HTTP/1.1 401 Unauthorized\r\nContent-Type: application/json\r\nWWW-Authenticate: {challenge}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    stream.write_all(response.as_bytes()).unwrap();
+}
+
+/// Answer `responses` POSTs: the first `unauthorized` get a 401 carrying
+/// `challenge`, the rest a successful JSON-RPC response.
+fn spawn_challenge_server(
+    challenge: &'static str,
+    responses: usize,
+    unauthorized: usize,
+) -> (SocketAddr, std::thread::JoinHandle<Vec<String>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let handle = std::thread::spawn(move || {
+        let mut requests = Vec::new();
+        for index in 0..responses {
+            let (mut stream, _) = listener.accept().unwrap();
+            requests.push(read_request(&mut stream));
+            if index < unauthorized {
+                write_unauthorized(&mut stream, challenge);
+            } else {
+                write_response(
+                    &mut stream,
+                    "200 OK",
+                    "application/json",
+                    r#"{"jsonrpc":"2.0","id":1,"result":{}}"#,
+                );
+            }
+        }
+        requests
+    });
+    (address, handle)
+}
+
+/// A provider that stands in for the OAuth manager, counting the times the
+/// transport asks it to recover from a 401.
+#[derive(Debug)]
+struct CountingProvider {
+    token: std::sync::Mutex<Option<String>>,
+    replacement: &'static str,
+    recoveries: Arc<AtomicUsize>,
+}
+
+#[async_trait::async_trait]
+impl TokenProvider for CountingProvider {
+    async fn access_token(&self) -> Option<String> {
+        self.token.lock().unwrap().clone()
+    }
+
+    async fn handle_unauthorized(
+        &self,
+        _www_authenticate: Option<&str>,
+        _rejected_token: Option<&str>,
+    ) -> Result<Option<String>, String> {
+        self.recoveries.fetch_add(1, Ordering::SeqCst);
+        *self.token.lock().unwrap() = Some(self.replacement.to_string());
+        Ok(Some(self.replacement.to_string()))
+    }
+}
+
+fn counting_provider(recoveries: &Arc<AtomicUsize>) -> Arc<CountingProvider> {
+    Arc::new(CountingProvider {
+        token: std::sync::Mutex::new(Some("stale_access".into())),
+        replacement: "fresh_access",
+        recoveries: Arc::clone(recoveries),
+    })
+}
+
+/// A 401 whose bearer challenge says `invalid_token` is recoverable: the
+/// provider is asked once, and the retried request carries the new token.
+#[tokio::test]
+async fn an_invalid_token_401_refreshes_once_and_retries_with_the_new_token() {
+    let (address, server) = spawn_challenge_server(
+        r#"Bearer error="invalid_token", error_description="expired""#,
+        2,
+        1,
+    );
+    let server_url = format!("http://{address}/mcp");
+    let recoveries = Arc::new(AtomicUsize::new(0));
+
+    let mut channel = JsonRpcChannel::new_http(&server_url, HashMap::new()).unwrap();
+    channel.set_token_provider(counting_provider(&recoveries));
+    channel.spawn().await.unwrap();
+
+    channel.send_request("tools/list", None).await.unwrap();
+
+    let requests = server.join().unwrap();
+    assert_eq!(requests.len(), 2, "the request was not retried exactly once");
+    assert_eq!(
+        authorization(&requests[0]).as_deref(),
+        Some("Bearer stale_access")
+    );
+    assert_eq!(
+        authorization(&requests[1]).as_deref(),
+        Some("Bearer fresh_access"),
+        "the retry did not carry the refreshed token: {}",
+        requests[1]
+    );
+    assert_eq!(
+        recoveries.load(Ordering::SeqCst),
+        1,
+        "the refresh token was spent more than once"
+    );
+
+    channel.terminate().await.unwrap();
+}
+
+/// A 401 that is not `invalid_token` (here `insufficient_scope`) is an
+/// ordinary failure: recovery is not attempted and no refresh token is spent.
+#[tokio::test]
+async fn a_non_invalid_token_401_does_not_spend_the_refresh_token() {
+    let (address, server) = spawn_challenge_server(
+        r#"Bearer error="insufficient_scope", scope="files:read""#,
+        1,
+        1,
+    );
+    let server_url = format!("http://{address}/mcp");
+    let recoveries = Arc::new(AtomicUsize::new(0));
+
+    let mut channel = JsonRpcChannel::new_http(&server_url, HashMap::new()).unwrap();
+    channel.set_token_provider(counting_provider(&recoveries));
+    channel.spawn().await.unwrap();
+
+    let error = channel
+        .send_request("tools/list", None)
+        .await
+        .expect_err("a non-recoverable 401 must surface");
+    assert!(error.contains("401"), "{error}");
+    assert_eq!(
+        recoveries.load(Ordering::SeqCst),
+        0,
+        "a non-invalid_token 401 must not refresh"
+    );
+    assert_eq!(server.join().unwrap().len(), 1);
+
+    channel.terminate().await.unwrap();
+}
+
+/// If the retried request is also rejected, the transport reports the second
+/// 401 instead of retrying forever.
+#[tokio::test]
+async fn a_second_401_after_the_retry_is_an_error_not_a_loop() {
+    let (address, server) =
+        spawn_challenge_server(r#"Bearer error="invalid_token""#, 2, 2);
+    let server_url = format!("http://{address}/mcp");
+    let recoveries = Arc::new(AtomicUsize::new(0));
+
+    let mut channel = JsonRpcChannel::new_http(&server_url, HashMap::new()).unwrap();
+    channel.set_token_provider(counting_provider(&recoveries));
+    channel.spawn().await.unwrap();
+
+    let error = channel
+        .send_request("tools/list", None)
+        .await
+        .expect_err("a second 401 must be an error");
+    assert!(
+        error.contains("after refreshing the access token"),
+        "unexpected error: {error}"
+    );
+
+    let requests = server.join().unwrap();
+    assert_eq!(requests.len(), 2, "the transport looped past one retry");
+    assert_eq!(
+        authorization(&requests[0]).as_deref(),
+        Some("Bearer stale_access")
+    );
+    assert_eq!(
+        authorization(&requests[1]).as_deref(),
+        Some("Bearer fresh_access")
+    );
+    assert_eq!(recoveries.load(Ordering::SeqCst), 1);
 
     channel.terminate().await.unwrap();
 }
