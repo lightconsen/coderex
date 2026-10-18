@@ -763,6 +763,9 @@ pub struct ReplLoop {
     feature_flags: coderex_config::flags::FeatureFlags,
     /// Capabilities derived from [`Self::feature_flags`].
     capabilities: coderex_config::flags::CapabilitySet,
+    /// Settings-file context-window overrides, layered into the engine's
+    /// resolver together with the environment, client data, and experiments.
+    context_window_settings: coderex_core::types::ContextWindowOverrides,
     /// Pull-request context fetched for `--from-pr`.
     pr_context: Option<String>,
     /// Live IDE MCP connection for `--ide`, kept for the session.
@@ -923,6 +926,7 @@ impl ReplLoop {
             betas: Vec::new(),
             feature_flags: coderex_config::flags::FeatureFlags::from_env(),
             capabilities: coderex_config::flags::FeatureFlags::from_env().capabilities(),
+            context_window_settings: coderex_core::types::ContextWindowOverrides::default(),
             pr_context: None,
             ide_manager: None,
             ide_status: None,
@@ -944,6 +948,14 @@ impl ReplLoop {
         };
         this.init_command_persistence();
         this
+    }
+
+    /// Supply settings-file context-window overrides for this session.
+    pub fn with_context_window_settings(
+        &mut self,
+        overrides: coderex_core::types::ContextWindowOverrides,
+    ) {
+        self.context_window_settings = overrides;
     }
 
     /// Create a new REPL loop wired to a QueryEngine (14.1).
@@ -1216,6 +1228,7 @@ impl ReplLoop {
             betas: Vec::new(),
             feature_flags: coderex_config::flags::FeatureFlags::from_env(),
             capabilities: coderex_config::flags::FeatureFlags::from_env().capabilities(),
+            context_window_settings: coderex_core::types::ContextWindowOverrides::default(),
             pr_context: None,
             ide_manager: None,
             ide_status: None,
@@ -1649,6 +1662,23 @@ impl ReplLoop {
                     self.running = false;
                 }
             }
+        }
+
+        // 9a. The dispatcher was built before `--betas` was resolved. Its flag
+        // is shared, so the session's final capability set can still decide
+        // whether gated tools are offered.
+        if let Some(dispatcher) = &self.dispatcher {
+            dispatcher.set_feature_flags_enabled(!self.capabilities.is_empty());
+        }
+
+        // 9b. Context-window overrides. The engine already honors the
+        // environment, client-data file and built-in table; settings and
+        // experiment values are only reachable here, where both are resolved.
+        if let Some(ref mut engine) = self.engine {
+            let resolver = coderex_core::types::ContextWindowResolver::from_env_and_client_data()
+                .with_settings(self.context_window_settings.clone())
+                .with_experiment(self.feature_flags.experiment_context_windows());
+            engine.set_context_window_resolver(resolver);
         }
 
         // 10. Pull-request context. The orchestrator fetches this before the

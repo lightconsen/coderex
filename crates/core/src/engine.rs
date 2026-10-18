@@ -29,7 +29,9 @@ use crate::state::SessionState;
 use crate::stop_hook::{self, StopHookContext, StopHookDecision};
 use crate::tool_executor::{NoOpToolExecutor, ToolExecutor};
 use crate::tool_scheduler;
-use crate::types::{EngineEvent, Message, ModelId, ToolCall, ToolResult, UsageSummary};
+use crate::types::{
+    ContextWindowResolver, EngineEvent, Message, ModelId, ToolCall, ToolResult, UsageSummary,
+};
 use std::path::PathBuf;
 
 // ─── Structured Output Validation ───────────────────────────────────────────
@@ -822,8 +824,8 @@ impl std::fmt::Display for TurnError {
     }
 }
 
-/// Every transition a turn made, for the test that checks the graph against
-/// what the engine actually does.
+// Every transition a turn made, for the test that checks the graph against
+// what the engine actually does.
 #[cfg(test)]
 thread_local! {
     static RECORDED_TRANSITIONS: std::cell::RefCell<Vec<(TurnState, TurnState)>> =
@@ -1170,6 +1172,12 @@ pub struct QueryEngine {
     prompt_compiler: PromptCompiler,
     /// Compact configuration.
     compact_config: CompactConfig,
+    /// Explicit context-window override chain (settings/experiment included).
+    ///
+    /// When absent, compaction uses the default resolver (environment, client
+    /// data, built-in table). The CLI installs one built from resolved
+    /// settings and experiment flags.
+    context_window_resolver: Option<ContextWindowResolver>,
     /// Hook executor for firing lifecycle hooks.
     hooks: Box<dyn HookExecutor + Send + Sync>,
     /// Tool executor for dispatching tool calls.
@@ -1283,6 +1291,7 @@ impl QueryEngine {
             structured_output: None,
             prompt_compiler: PromptCompiler::new(config),
             compact_config: config,
+            context_window_resolver: None,
             hooks: Box::new(NoOpHookExecutor),
             tools: Box::new(NoOpToolExecutor),
             elicitation_handler: Box::new(ReplElicitationHandler::default()),
@@ -1376,6 +1385,28 @@ impl QueryEngine {
     /// Replace the compaction configuration (thresholds, reserves, retries).
     pub fn set_compact_config(&mut self, config: CompactConfig) {
         self.compact_config = config;
+    }
+
+    /// Install a context-window override chain that includes settings and
+    /// experiment values.
+    ///
+    /// The CLI builds this from the resolved `Settings` and `FeatureFlags`;
+    /// without it the engine still honors the environment, client-data file,
+    /// and built-in table.
+    pub fn set_context_window_resolver(&mut self, resolver: ContextWindowResolver) {
+        self.context_window_resolver = Some(resolver);
+    }
+
+    /// Compaction thresholds for this engine's model and override chain.
+    fn compact_thresholds(&self) -> compact::CompactThresholds {
+        match &self.context_window_resolver {
+            Some(resolver) => compact::CompactThresholds::resolve_with(
+                &self.model,
+                &self.compact_config,
+                resolver,
+            ),
+            None => compact::CompactThresholds::resolve(&self.model, &self.compact_config),
+        }
     }
 
     /// Refresh the session-memory document at compaction time and return the
@@ -2629,12 +2660,21 @@ impl QueryEngine {
         let stop_reason = turn.last_stop_reason.as_deref().unwrap_or("end_turn");
         let strategy = match trigger {
             CompactTrigger::CacheTtl => CompactStrategy::Micro,
-            CompactTrigger::TokenThreshold => compact::select_compact_strategy(
-                stop_reason,
-                estimated_tokens,
-                &self.model,
-                &self.compact_config,
-            ),
+            CompactTrigger::TokenThreshold => match &self.context_window_resolver {
+                Some(resolver) => compact::select_compact_strategy_with(
+                    stop_reason,
+                    estimated_tokens,
+                    &self.model,
+                    &self.compact_config,
+                    resolver,
+                ),
+                None => compact::select_compact_strategy(
+                    stop_reason,
+                    estimated_tokens,
+                    &self.model,
+                    &self.compact_config,
+                ),
+            },
         };
 
         // Execute Stop hook with dead loop protection
@@ -2782,7 +2822,7 @@ impl QueryEngine {
         // The rule-based strategies take a target. Use the resolved line for
         // this model, not the configured fallback, which is sized for a window
         // that may not be this one.
-        let thresholds = compact::CompactThresholds::resolve(&self.model, &self.compact_config);
+        let thresholds = self.compact_thresholds();
         let result: CompactResult = match strategy {
             CompactStrategy::Micro => compact::micro_compact(&turn.messages, self.micro_params()),
             CompactStrategy::Auto => compact::auto_compact(&turn.messages, thresholds.auto),
@@ -2980,7 +3020,7 @@ impl QueryEngine {
         turn_number: u32,
     ) -> Option<TerminalReason> {
         let estimated = PromptCompiler::estimate_message_tokens(&turn.messages);
-        let thresholds = compact::CompactThresholds::resolve(&self.model, &self.compact_config);
+        let thresholds = self.compact_thresholds();
         let level = thresholds.level(estimated);
 
         match level {
@@ -3040,7 +3080,7 @@ impl QueryEngine {
         }
 
         let estimated_tokens = PromptCompiler::estimate_message_tokens(&turn.messages);
-        let thresholds = compact::CompactThresholds::resolve(&self.model, &self.compact_config);
+        let thresholds = self.compact_thresholds();
         if matches!(
             thresholds.level(estimated_tokens),
             compact::ContextLevel::Compact | compact::ContextLevel::Blocked

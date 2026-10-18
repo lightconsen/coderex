@@ -7,7 +7,7 @@
 
 use coderex_core::CompactConfig;
 use coderex_core::compact::{
-    CompactResult, CompactStrategy, MicroCompactParams, auto_compact, compact_boundary_message,
+    CompactStrategy, MicroCompactParams, auto_compact, compact_boundary_message,
     insert_compact_boundary, micro_compact, reactive_compact, select_compact_strategy,
     should_auto_compact, should_reactive_compact, snip_compact,
 };

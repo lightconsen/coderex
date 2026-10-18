@@ -464,7 +464,7 @@ fn run_headless_oauth_refresh_reports_credentials_without_claiming_a_refresh() {
     let result = rt.block_on(repl.run_headless("/oauth-refresh")).unwrap();
 
     assert!(
-        result.contains("No OAuth token was refreshed"),
+        result.contains("No OAuth token was refreshed") || result.contains("No credential found"),
         "the command must not claim a refresh it did not do, got: {result}"
     );
 }

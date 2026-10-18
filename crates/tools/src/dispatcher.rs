@@ -45,7 +45,10 @@ pub struct RegistryToolDispatcher {
     /// Whether this session's feature flags are on, which decides whether a
     /// gated tool is offered at all. Off until a session says otherwise: a
     /// tool registered to be withheld should be withheld by default.
-    feature_flags_enabled: bool,
+    ///
+    /// Shared across clones because `--betas` is resolved after the dispatcher
+    /// (and the agent manager's clone of it) already exists.
+    feature_flags_enabled: Arc<std::sync::atomic::AtomicBool>,
     sandbox_override: Option<coderex_core::sandbox::SandboxConfig>,
     task_store: Option<Arc<TaskStore>>,
     cron_scheduler: Option<Arc<CronScheduler>>,
@@ -72,8 +75,9 @@ impl RegistryToolDispatcher {
     }
 
     /// Tell the dispatcher whether the session's feature flags are on.
-    pub const fn set_feature_flags_enabled(&mut self, enabled: bool) {
-        self.feature_flags_enabled = enabled;
+    pub fn set_feature_flags_enabled(&self, enabled: bool) {
+        self.feature_flags_enabled
+            .store(enabled, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Move the working directory tools run in.
@@ -114,7 +118,7 @@ impl RegistryToolDispatcher {
             context,
             cwd: Arc::new(parking_lot::RwLock::new(cwd)),
             sandbox_enabled,
-            feature_flags_enabled: false,
+            feature_flags_enabled: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             sandbox_override: None,
             task_store: None,
             cron_scheduler: None,
@@ -208,7 +212,11 @@ impl CoreToolExecutor for RegistryToolDispatcher {
         // waste a turn discovering that.
         let available: std::collections::HashSet<String> = self
             .registry
-            .available_tool_names(self.context, self.feature_flags_enabled)
+            .available_tool_names(
+                self.context,
+                self.feature_flags_enabled
+                    .load(std::sync::atomic::Ordering::Relaxed),
+            )
             .into_iter()
             .collect();
 

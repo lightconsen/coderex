@@ -155,11 +155,14 @@ family.
 Both `auto` and `warn` have small-window floors so a 32K unknown model still
 compacts sensibly rather than reserving the whole window.
 
-`CompactThresholds::resolve` and `select_compact_strategy` use the default
-resolver (environment, client data, built-in table, unknown floor).
-Callers that own settings or experiment state should use
-`CompactThresholds::resolve_with` and `select_compact_strategy_with`, passing a
-`ContextWindowResolver` that includes them.
+`CompactThresholds::resolve` and `select_compact_strategy` use the resolver
+installed on the engine. `QueryEngine::set_context_window_resolver` installs
+one; the CLI builds it from environment, settings, client data, and experiment
+flags (`ReplLoop::apply_cli_config`, and the server engine factory), so all four
+sources participate in normal sessions. Callers embedding the engine directly
+can use `CompactThresholds::resolve_with` and
+`select_compact_strategy_with`, or install a resolver on the engine the same
+way.
 
 Example: an unknown gateway alias defaults to 32K (auto line 16K). Overriding
 it to 64K moves the auto line to 31K, so 20K tokens compact before the override

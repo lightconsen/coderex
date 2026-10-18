@@ -630,10 +630,11 @@ fn piped_commands_work_in_the_tui() {
     let dir = setup_project_dir();
     let mut session = session_without_engine(dir.path());
     session.wait_for_text("CodeRex v", SCREEN_TIMEOUT);
-    session.send_line("/version | /env");
-    // The env listing is longer than the screen, so look for a variable the
-    // harness itself set rather than the header (which scrolls off).
-    let screen = session.wait_for_text("CARGO_BIN_EXE_static-anthropic-server", SCREEN_TIMEOUT);
+    session.send_line("/version | /env CODEREX_LOG");
+    // Ask for one variable instead of relying on it landing in the first 50
+    // entries of an unordered environment listing. CODEREX_LOG is set by this
+    // harness, so it is present regardless of the developer's environment.
+    let screen = session.wait_for_text("CODEREX_LOG=off", SCREEN_TIMEOUT);
     assert!(
         !screen.contains("Unknown command"),
         "the later piped segment was not recognised:\n{screen}"

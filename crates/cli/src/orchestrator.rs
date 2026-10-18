@@ -1244,6 +1244,9 @@ impl StartupOrchestrator {
         if !self.ctx.allowed_tools.is_empty() {
             repl.with_allowed_tools(self.ctx.allowed_tools.clone());
         }
+        if let Some(settings) = &self.ctx.settings {
+            repl.with_context_window_settings(settings.context_window_overrides());
+        }
         repl.apply_cli_config();
     }
 
@@ -1426,9 +1429,23 @@ impl StartupOrchestrator {
         // Serve queries on a real engine. Without this the server could only
         // refuse them — and before it did, it echoed them back, which is worse
         // than refusing because it looked like an answer.
+        let context_window =
+            coderex_core::types::ContextWindowResolver::from_env_and_client_data()
+                .with_settings(
+                    self.ctx
+                        .settings
+                        .as_ref()
+                        .map(|settings| settings.context_window_overrides())
+                        .unwrap_or_default(),
+                )
+                .with_experiment(
+                    coderex_config::flags::FeatureFlags::from_env()
+                        .experiment_context_windows(),
+                );
         match Self::serve_engine_factory(
             cwd,
             self.ctx.model.clone().unwrap_or_else(ModelId::sonnet),
+            context_window,
         ) {
             Some(factory) => server.set_engine_factory(factory),
             None => tracing::warn!(
@@ -1463,6 +1480,7 @@ impl StartupOrchestrator {
     fn serve_engine_factory(
         cwd: &str,
         model: ModelId,
+        context_window: coderex_core::types::ContextWindowResolver,
     ) -> Option<coderex_server::session::EngineFactory> {
         use coderex_tools::{
             ExecutionConfig, ExecutionContext, RegistryToolDispatcher,
@@ -1501,6 +1519,7 @@ impl StartupOrchestrator {
                 tx,
             );
             engine.set_tool_executor(Box::new(dispatcher));
+            engine.set_context_window_resolver(context_window.clone());
             (engine, rx)
         }))
     }
