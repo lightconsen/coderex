@@ -15,6 +15,7 @@ use crate::rate_limiter::{RATE_LIMITER_KEY, RateLimiter};
 use crate::registry::ToolRegistry;
 use crate::sandbox_policy;
 use crate::task_store::{TASK_STORE_KEY, TaskStore};
+use crate::todo_store::{TODO_STORE_KEY, TodoStore};
 use crate::tool::{
     Backgrounding, JOB_SESSION_ID_KEY, RuleContentField, SharedState, ToolCapabilities, ToolContext,
     ToolInput,
@@ -51,6 +52,10 @@ pub struct RegistryToolDispatcher {
     feature_flags_enabled: Arc<std::sync::atomic::AtomicBool>,
     sandbox_override: Option<coderex_core::sandbox::SandboxConfig>,
     task_store: Option<Arc<TaskStore>>,
+    /// The session's todo list, held for the life of this dispatcher and
+    /// shared by every clone of it. `TodoWrite` writes here and the next call
+    /// (or anyone holding the dispatcher) sees the result.
+    todo_store: Arc<TodoStore>,
     cron_scheduler: Option<Arc<CronScheduler>>,
     rate_limiter: Option<Arc<RateLimiter>>,
     chrome_client: Option<ChromeClient>,
@@ -121,6 +126,7 @@ impl RegistryToolDispatcher {
             feature_flags_enabled: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             sandbox_override: None,
             task_store: None,
+            todo_store: Arc::new(TodoStore::new()),
             cron_scheduler: None,
             rate_limiter: None,
             chrome_client: None,
@@ -149,6 +155,15 @@ impl RegistryToolDispatcher {
     /// Attach a shared task store for task tools.
     pub fn set_task_store(&mut self, store: Arc<TaskStore>) {
         self.task_store = Some(store);
+    }
+
+    /// The session's todo list, as last written by `TodoWrite`.
+    ///
+    /// This is the same store the tools see in their context, so a caller can
+    /// read what a session wrote without building a `ToolContext` itself.
+    #[must_use]
+    pub fn todo_store(&self) -> &Arc<TodoStore> {
+        &self.todo_store
     }
 
     /// Attach a shared cron scheduler for cron tools.
@@ -315,6 +330,21 @@ impl CoreToolExecutor for RegistryToolDispatcher {
 
         // Build shared state map
         let mut extra = HashMap::new();
+
+        // The session's todo store: every call through this dispatcher (and
+        // its clones) sees the list the last `TodoWrite` wrote. Without this
+        // the tool reports a write that went nowhere.
+        extra.insert(
+            TODO_STORE_KEY.to_string(),
+            Box::new(Arc::clone(&self.todo_store)) as SharedState,
+        );
+
+        // The live registry, so `ToolSearch` searches the tools this session
+        // actually has rather than an empty map.
+        extra.insert(
+            "tool_registry".to_string(),
+            Box::new(Arc::clone(&self.registry)) as SharedState,
+        );
 
         // Inject sandbox config if enabled
         if self.sandbox_enabled {
@@ -1071,6 +1101,95 @@ mod tests {
                 .get("run_in_background")
                 .is_some(),
             "Agent honours run_in_background and must keep advertising it"
+        );
+    }
+
+    /// Two `TodoWrite` calls through the dispatcher a session actually uses,
+    /// and the store it wrote to is the dispatcher's own. Without the store in
+    /// `extra`, the tool still reports "Wrote N todo(s)" and the second call
+    /// has nothing to update.
+    #[tokio::test]
+    async fn todo_write_persists_across_dispatched_calls() {
+        let mut registry = ToolRegistry::new();
+        registry.register(Arc::new(crate::builtins::TodoWriteTool));
+        let dispatcher = RegistryToolDispatcher::new(
+            Arc::new(registry),
+            Arc::new(InnerExecutor::new(ExecutionConfig::default())),
+            ExecutionContext::Normal,
+            PathBuf::from("/tmp"),
+        );
+
+        let first = dispatcher
+            .execute(
+                "id-1",
+                "TodoWrite",
+                &serde_json::json!({"todos": [
+                    {"subject": "write the fix", "status": "in_progress"}
+                ]}),
+            )
+            .await;
+        assert!(!first.result.is_error, "{:?}", first.result);
+        let after_first = dispatcher.todo_store().get_all();
+        assert_eq!(after_first.len(), 1, "{after_first:?}");
+        assert_eq!(after_first[0].subject, "write the fix");
+        assert_eq!(
+            after_first[0].status,
+            crate::todo_store::TodoStatus::InProgress
+        );
+
+        let second = dispatcher
+            .execute(
+                "id-2",
+                "TodoWrite",
+                &serde_json::json!({"todos": [
+                    {"subject": "write the fix", "status": "completed"},
+                    {"subject": "add the test", "status": "pending"}
+                ]}),
+            )
+            .await;
+        assert!(!second.result.is_error, "{:?}", second.result);
+
+        let after_second = dispatcher.todo_store().get_all();
+        assert_eq!(after_second.len(), 2, "{after_second:?}");
+        assert_eq!(after_second[0].subject, "write the fix");
+        assert_eq!(
+            after_second[0].status,
+            crate::todo_store::TodoStatus::Completed
+        );
+        assert_eq!(after_second[1].subject, "add the test");
+
+        // A clone of the dispatcher is the same session, so it sees the same
+        // list rather than a fresh empty one.
+        assert_eq!(dispatcher.clone().todo_store().get_all().len(), 2);
+    }
+
+    /// `ToolSearch` searches the live registry the dispatcher was built with.
+    /// Without it in `extra`, every query answers "No tools found".
+    #[tokio::test]
+    async fn tool_search_finds_a_registered_tool_through_the_dispatcher() {
+        let mut registry = ToolRegistry::new();
+        registry.register(Arc::new(EchoTool));
+        registry.register(Arc::new(crate::builtins::ToolSearchTool));
+        let dispatcher = RegistryToolDispatcher::new(
+            Arc::new(registry),
+            Arc::new(InnerExecutor::new(ExecutionConfig::default())),
+            ExecutionContext::Normal,
+            PathBuf::from("/tmp"),
+        );
+
+        let outcome = dispatcher
+            .execute("id-1", "ToolSearch", &serde_json::json!({"query": "echo"}))
+            .await;
+        assert!(!outcome.result.is_error, "{:?}", outcome.result);
+        assert!(
+            !outcome.result.output.contains("No tools found"),
+            "{}",
+            outcome.result.output
+        );
+        assert!(
+            outcome.result.output.contains("**echo**"),
+            "{}",
+            outcome.result.output
         );
     }
 }
