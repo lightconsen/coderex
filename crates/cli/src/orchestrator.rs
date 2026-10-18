@@ -790,6 +790,30 @@ impl StartupOrchestrator {
         // Initialize telemetry subsystem with resolved settings.
         // Undecided (`None`) means no consent was recorded — stay off.
         let telemetry_enabled = settings.telemetry_enabled.unwrap_or(false);
+        // The panic hook is installed before settings are known, so it starts
+        // inert and is enabled here. A user who never opted in must not have
+        // crash files written on their behalf.
+        coderex_telemetry::set_capture_enabled(telemetry_enabled);
+        // Pending crash files written by an earlier (enabled) run are pruned
+        // on every startup. The TTL used to be enforced only inside
+        // `ingest_pending`, which the disabled path never reaches.
+        let pending_dir = coderex_config::config_home()
+            .join("crashes")
+            .join("pending");
+        let cutoff = std::time::SystemTime::now()
+            .checked_sub(std::time::Duration::from_secs(
+                coderex_telemetry::DEFAULT_PENDING_MAX_AGE_SECS,
+            ))
+            .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+        match coderex_telemetry::prune_pending(&pending_dir, cutoff) {
+            Ok(0) => {}
+            Ok(count) => tracing::info!(count, "pruned expired pending crash reports"),
+            Err(error) => tracing::warn!(
+                directory = %pending_dir.display(),
+                %error,
+                "could not prune pending crash reports"
+            ),
+        }
         if telemetry_enabled {
             if let Some((handle, uploader)) = Self::init_telemetry(&settings) {
                 self.ctx.telemetry_session = Some(TelemetrySessionGuard::start(handle.clone()));
@@ -1764,6 +1788,19 @@ impl StartupOrchestrator {
         repl.with_hook_layers(hook_layers);
         repl.with_max_turns(self.ctx.max_turns);
         repl.with_fallback_model(self.ctx.fallback_model.clone());
+        // `/vim` and `/statusline-setup` persist these; apply them at startup.
+        let vim_mode = self
+            .ctx
+            .settings
+            .as_ref()
+            .and_then(|settings| settings.vim_mode);
+        let statusline_theme = self
+            .ctx
+            .settings
+            .as_ref()
+            .and_then(|settings| settings.statusline.as_ref())
+            .and_then(|statusline| statusline.theme.clone());
+        repl.with_startup_preferences(vim_mode, statusline_theme);
         repl.with_replay_user_messages(self.ctx.replay_user_messages);
         repl.with_include_partial_messages(self.ctx.include_partial_messages);
         repl.with_betas(self.ctx.betas.clone());

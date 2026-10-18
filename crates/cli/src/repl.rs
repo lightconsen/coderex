@@ -1272,6 +1272,19 @@ fn org_memory_service(
     })
 }
 
+/// How many hook entries a settings document declares.
+///
+/// The loader accepts both a bare array and `{"hooks":[...]}`. This counts
+/// top-level entries for the status display; it deliberately does not try to
+/// validate them.
+fn count_configured_hooks(value: &serde_json::Value) -> usize {
+    value
+        .get("hooks")
+        .and_then(serde_json::Value::as_array)
+        .or_else(|| value.as_array())
+        .map_or(0, Vec::len)
+}
+
 /// The result of `/macro`: either text to show, or commands to execute.
 enum MacroCommandOutcome {
     Message(String),
@@ -1359,6 +1372,11 @@ pub struct ReplLoop {
     /// document is installed as `Core`, so a managed hook neither loses its
     /// position nor runs a second time through the merged document.
     hook_layers: Option<coderex_config::settings::HookLayers>,
+    /// How many hooks the installed executor is actually running.
+    ///
+    /// `/hooks` and `/status` used to read `CommandContext.active_hooks`,
+    /// which nothing ever assigned, so they always reported zero.
+    active_hooks: usize,
     /// Where the line-delimited protocol goes, when `--output-format
     /// stream-json` was asked for.
     ///
@@ -1492,6 +1510,10 @@ pub struct ReplLoop {
     vim_mode_enabled: bool,
     /// Active TUI theme name.
     current_theme: String,
+    /// `vim_mode` from settings, applied at startup.
+    settings_vim_mode: Option<bool>,
+    /// `statusline.theme` from settings, applied at startup.
+    settings_statusline_theme: Option<String>,
     /// Session id to resume into the current interactive loop.
     resume_session: Option<String>,
 }
@@ -1593,6 +1615,7 @@ impl ReplLoop {
             macro_registry: MacroRegistry::new(),
             hooks_settings: None,
             hook_layers: None,
+            active_hooks: 0,
             protocol_sink: None,
             headless_permission_control: false,
             pending_destructive_cmd: None,
@@ -1644,6 +1667,8 @@ impl ReplLoop {
             query_start_time: None,
             vim_mode_enabled: false,
             current_theme: "dark".into(),
+            settings_vim_mode: None,
+            settings_statusline_theme: None,
             resume_session: None,
         };
         this.init_command_persistence();
@@ -1947,6 +1972,7 @@ impl ReplLoop {
             macro_registry: MacroRegistry::new(),
             hooks_settings: None,
             hook_layers: None,
+            active_hooks: 0,
             protocol_sink: None,
             headless_permission_control: false,
             pending_destructive_cmd: None,
@@ -1998,6 +2024,8 @@ impl ReplLoop {
             query_start_time: None,
             vim_mode_enabled: false,
             current_theme: "dark".into(),
+            settings_vim_mode: None,
+            settings_statusline_theme: None,
             resume_session: None,
         };
         this.init_command_persistence();
@@ -2238,6 +2266,20 @@ impl ReplLoop {
         self.include_partial_messages = include;
     }
 
+    /// Startup preferences persisted in settings.
+    ///
+    /// `/vim` and `/statusline-setup` write these keys; without reading them
+    /// back at startup the commands claimed to persist a preference that was
+    /// never applied.
+    pub fn with_startup_preferences(
+        &mut self,
+        vim_mode: Option<bool>,
+        statusline_theme: Option<String>,
+    ) {
+        self.settings_vim_mode = vim_mode;
+        self.settings_statusline_theme = statusline_theme;
+    }
+
     pub fn with_betas(&mut self, betas: Vec<String>) {
         self.betas = betas;
     }
@@ -2363,6 +2405,14 @@ impl ReplLoop {
     /// Apply all CLI configuration settings to the engine, dispatcher, and session.
     /// Must be called after `with_engine` (or `new`) and before `run_tui`/`run_headless`.
     pub fn apply_cli_config(&mut self) {
+        // Persisted startup preferences come from settings, not from a flag.
+        if let Some(vim_mode) = self.settings_vim_mode {
+            self.vim_mode_enabled = vim_mode;
+        }
+        if let Some(ref theme) = self.settings_statusline_theme {
+            self.current_theme = theme.clone();
+        }
+
         // 0. Named custom agent. The orchestrator rejects unknown names before
         // the loop starts; applying the definition here makes the selection
         // affect the session prompt and tool whitelist rather than being
@@ -2514,6 +2564,11 @@ impl ReplLoop {
                 flag,
                 "feature flag is accepted for compatibility but has no effect in this build"
             );
+            // Tracing defaults to `off`, so a user who just passed
+            // `--betas +daemon` would otherwise see nothing at all.
+            eprintln!(
+                "warning: feature flag '{flag}' is accepted for compatibility but has no effect in this build"
+            );
         }
 
         // 9a. The dispatcher and the Workflow tool were built before `--betas`
@@ -2610,7 +2665,12 @@ impl ReplLoop {
         } else if let Some(hooks) = &self.hooks_settings {
             hook_sources.push((coderex_hooks::HookTier::Core, hooks));
         }
+        let mut installed_hook_count = 0;
         if !hook_sources.is_empty() {
+            let hook_count: usize = hook_sources
+                .iter()
+                .map(|(_, value)| count_configured_hooks(value))
+                .sum();
             if let Some(ref mut engine) = self.engine {
                 match coderex_hooks::HookRegistry::from_settings_sources(hook_sources) {
                     Ok(registry) => {
@@ -2647,11 +2707,13 @@ impl ReplLoop {
                             ),
                         ));
                         engine.set_hooks(registry.into_executor());
+                        installed_hook_count = hook_count;
                     }
                     Err(e) => tracing::warn!("hooks in settings were not loaded: {e}"),
                 }
             }
         }
+        self.active_hooks = installed_hook_count;
     }
 
     /// Apply the named custom agent selected with `--agent`.
@@ -6890,6 +6952,20 @@ impl ReplLoop {
         }
     }
 
+    /// Whether at least one configured MCP server is running.
+    fn mcp_connected(&self) -> bool {
+        let slot = self
+            .mcp_manager
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        slot.as_ref().is_some_and(|manager| {
+            manager
+                .list_servers()
+                .iter()
+                .any(|name| manager.is_running(name))
+        })
+    }
+
     fn build_context(&self) -> CommandContext {
         let (session_id, session_title, message_count, permission_mode) =
             if let Some(ref engine) = self.engine {
@@ -6934,6 +7010,15 @@ impl ReplLoop {
         // every flag-gated command dead in production, even when the user
         // passed `--betas` or `CODEREX_FEATURE_FLAGS`.
         ctx.feature_flags = self.feature_flags.as_map();
+        // These two fields were never assigned, so `/mcp`, `/status`,
+        // `/doctor`, `/config` always said "disconnected" and `/hooks`
+        // always said zero.
+        ctx.active_hooks = self.active_hooks;
+        ctx.mcp_connected = self.mcp_connected();
+        // Remote environment variables live in their own file, never in
+        // settings (a repository-controlled settings file must not be able to
+        // inject environment variables).
+        ctx.env = coderex_commands::load_remote_env();
         ctx.recent_commands = self
             .command_history
             .list(1000)
@@ -7087,6 +7172,27 @@ mod tests {
         let mut out = Vec::new();
         repl.execute_command("/bye", &mut out).await.unwrap();
         assert!(!repl.running, "the macro's built-in did not run");
+    }
+
+    #[test]
+    fn startup_preferences_from_settings_are_applied() {
+        let mut repl = ReplLoop::new("/tmp".into(), ModelId::sonnet());
+        repl.with_startup_preferences(Some(true), Some("light".into()));
+        repl.apply_cli_config();
+        assert!(repl.vim_mode_enabled, "vim_mode was not applied");
+        assert_eq!(repl.current_theme, "light");
+    }
+
+    #[test]
+    fn command_context_reports_installed_hooks_and_mcp_state() {
+        let mut repl = ReplLoop::new("/tmp".into(), ModelId::sonnet());
+        repl.active_hooks = 2;
+        let ctx = repl.build_context();
+        assert_eq!(ctx.active_hooks, 2, "the hook count was not reported");
+        assert!(
+            !ctx.mcp_connected,
+            "a session with no MCP manager must report disconnected"
+        );
     }
 
     #[test]
