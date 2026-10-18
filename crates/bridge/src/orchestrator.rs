@@ -13,7 +13,10 @@ use crate::heartbeat::{
     WsReconnector,
 };
 use crate::permission::{BridgePermissionRouter, PermissionResponse};
-use crate::poller::{BridgeWorkPoller, SpawnMode, WorkAssignment};
+use crate::poller::{
+    BridgeWorkPoller, CapacityReport, ControlPlaneClient, HttpControlPlaneClient, SpawnMode,
+    WorkAssignment,
+};
 use crate::relay::{ApprovedIntent, RelayApprovalGate, RelayCallBody, RelayDecision, RelayDenial};
 use crate::spawner::{BridgeSessionSpawner, SpawnConfig, SpawnResult};
 use crate::state::{BridgeSessionState, BridgeSessionStateMachine};
@@ -127,6 +130,13 @@ impl BridgeStopHandle {
     pub fn is_stopped(&self) -> bool {
         self.requested.load(Ordering::SeqCst)
     }
+
+    /// Wait until shutdown has been requested.
+    pub async fn wait(&self) {
+        while !self.is_stopped() {
+            self.notify.notified().await;
+        }
+    }
 }
 
 /// The main bridge orchestrator.
@@ -192,10 +202,27 @@ impl std::fmt::Debug for Bridge {
 impl Bridge {
     /// Create a new bridge from the given configuration and transport.
     pub fn new(config: BridgeConfig, transport: Box<dyn Transport>) -> Self {
-        let poller = BridgeWorkPoller::with_url(
+        let client = Arc::new(HttpControlPlaneClient::new(
+            config.control_plane_url.clone(),
+        ));
+        Self::with_control_plane(config, transport, client)
+    }
+
+    /// Create a bridge backed by an injected control-plane client.
+    ///
+    /// This is the seam for a worker that talks to a real control plane
+    /// through a different client, and for tests that do not want a live
+    /// server.
+    pub fn with_control_plane(
+        config: BridgeConfig,
+        transport: Box<dyn Transport>,
+        control_plane: Arc<dyn ControlPlaneClient>,
+    ) -> Self {
+        let poller = BridgeWorkPoller::with_client(
             config.env_id.clone(),
             config.max_concurrent,
             config.control_plane_url.clone(),
+            control_plane,
         );
 
         let spawner = BridgeSessionSpawner::new(
@@ -290,6 +317,22 @@ impl Bridge {
     /// Register this environment with the control plane.
     pub async fn register(&self) -> Result<(), String> {
         self.poller.register().await
+    }
+
+    /// Fetch assignments and enqueue them in the poller.
+    pub async fn fetch_assignments(&mut self) -> Result<usize, String> {
+        self.poller.fetch_assignments().await
+    }
+
+    /// Report current capacity to the control plane.
+    pub async fn report_capacity_to_server(&self) -> Result<(), String> {
+        self.poller.report_capacity_to_server().await
+    }
+
+    /// Snapshot of the current capacity report.
+    #[must_use]
+    pub fn capacity_report(&self) -> CapacityReport {
+        self.poller.report_capacity()
     }
 
     /// Submit a permission response for a pending request.
