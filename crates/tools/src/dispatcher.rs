@@ -224,13 +224,26 @@ impl CoreToolExecutor for RegistryToolDispatcher {
         // is every registered tool, including disabled ones; a tool the model
         // is shown but cannot use is an invitation to waste a turn discovering
         // that.
+        let feature_flags_enabled = self
+            .feature_flags_enabled
+            .load(std::sync::atomic::Ordering::Relaxed);
         let available: std::collections::HashSet<String> = self
             .registry
-            .available_tool_names(
-                self.context,
-                self.feature_flags_enabled
-                    .load(std::sync::atomic::Ordering::Relaxed),
-            )
+            .available_tool_names(self.context, feature_flags_enabled)
+            .into_iter()
+            .collect();
+
+        // Chrome is a session capability (`--no-chrome`), not one of the
+        // general feature flags; a session with no flags still has Chrome
+        // unless it turned it off. Build its candidate set with the feature
+        // gate forced on, though, so everything else the registry filters on
+        // — deny rules, the context allowlist, and the execution context's
+        // own rules (PlanMode is read-only, AsyncAgent excludes approval
+        // tools) — still applies. Listing a Chrome tool the execute path will
+        // refuse only spends a turn discovering that.
+        let chrome_available: std::collections::HashSet<String> = self
+            .registry
+            .available_tool_names(self.context, true)
             .into_iter()
             .collect();
 
@@ -242,11 +255,8 @@ impl CoreToolExecutor for RegistryToolDispatcher {
                 if !d.is_enabled {
                     return false;
                 }
-                // Chrome is a session capability (`--no-chrome`), not one of
-                // the general feature flags; a session with no flags still has
-                // Chrome unless it turned it off.
                 if d.name.starts_with("chrome_") {
-                    return chrome_enabled;
+                    return chrome_enabled && chrome_available.contains(&d.name);
                 }
                 available.contains(&d.name)
             })
@@ -288,7 +298,8 @@ impl CoreToolExecutor for RegistryToolDispatcher {
             }
         };
 
-        if tool_name.starts_with("chrome_") && !self.chrome_enabled() {
+        let is_chrome = tool_name.starts_with("chrome_");
+        if is_chrome && !self.chrome_enabled() {
             return ToolDispatchOutcome {
                 result: ToolResult {
                     tool_call_id: tool_call_id.to_string(),
@@ -313,6 +324,27 @@ impl CoreToolExecutor for RegistryToolDispatcher {
                     is_error: true,
                 },
             };
+        }
+
+        // The listing and the execute path have to agree on which Chrome
+        // tools exist for this turn. The feature flag is forced on (Chrome is
+        // a session capability, not a beta flag), which leaves the registry's
+        // deny rules and execution-context filters in charge — the same set
+        // `list_tools` consults for Chrome.
+        if is_chrome {
+            let available = self.registry.available_tool_names(self.context, true);
+            if !available.iter().any(|name| name == tool_name) {
+                return ToolDispatchOutcome {
+                    result: ToolResult {
+                        tool_call_id: tool_call_id.to_string(),
+                        output: format!(
+                            "tool '{tool_name}' is not available in this session's execution \
+                             context"
+                        ),
+                        is_error: true,
+                    },
+                };
+            }
         }
 
         // Read once rather than holding the lock across the call: the guard is
@@ -703,6 +735,34 @@ mod tests {
     fn chrome_tools_follow_the_session_capability() {
         let mut registry = ToolRegistry::new();
         registry.register(Arc::new(crate::builtins::chrome::ChromeListTabsTool));
+        registry.register(Arc::new(crate::builtins::chrome::ChromeNavigateTool));
+        let registry = Arc::new(registry);
+
+        let dispatcher = RegistryToolDispatcher::new(
+            registry,
+            Arc::new(InnerExecutor::new(ExecutionConfig::default())),
+            ExecutionContext::Normal,
+            PathBuf::from("/tmp"),
+        );
+
+        // No feature flags were set: Chrome is still offered by default.
+        let listed = dispatcher.listed_names();
+        assert!(listed.contains(&"chrome_list_tabs".into()), "{listed:?}");
+        assert!(listed.contains(&"chrome_navigate".into()), "{listed:?}");
+
+        dispatcher.set_chrome_enabled(false);
+        let listed = dispatcher.listed_names();
+        assert!(!listed.contains(&"chrome_list_tabs".into()), "{listed:?}");
+        assert!(!listed.contains(&"chrome_navigate".into()), "{listed:?}");
+    }
+
+    /// The Chrome bypass must not bypass deny rules: a name-based rule hides
+    /// the tool from the listing and refuses the call.
+    #[tokio::test]
+    async fn a_deny_rule_removes_a_chrome_tool_from_listing_and_execution() {
+        let mut registry = ToolRegistry::new();
+        registry.register(Arc::new(crate::builtins::chrome::ChromeListTabsTool));
+        registry.add_deny_rule(ToolDenyRule::for_tools(vec!["chrome_list_tabs".into()]));
         let registry = Arc::new(registry);
 
         let dispatcher = RegistryToolDispatcher::new(
@@ -713,15 +773,78 @@ mod tests {
         );
 
         assert!(
-            dispatcher
-                .listed_names()
-                .contains(&"chrome_list_tabs".into())
-        );
-        dispatcher.set_chrome_enabled(false);
-        assert!(
             !dispatcher
                 .listed_names()
-                .contains(&"chrome_list_tabs".into())
+                .contains(&"chrome_list_tabs".into()),
+            "a denied Chrome tool was offered: {:?}",
+            dispatcher.listed_names()
+        );
+
+        let outcome = dispatcher
+            .execute("id-1", "chrome_list_tabs", &serde_json::json!({}))
+            .await;
+        assert!(outcome.result.is_error, "{:?}", outcome.result);
+        assert!(
+            outcome.result.output.contains("denied"),
+            "{}",
+            outcome.result.output
+        );
+    }
+
+    /// PlanMode is read-only, Chrome included. The mutating tool is hidden
+    /// and refused; the read-only one stays listed.
+    #[tokio::test]
+    async fn plan_mode_hides_mutating_chrome_tools_and_keeps_read_only_ones() {
+        let mut registry = ToolRegistry::new();
+        registry.register(Arc::new(crate::builtins::chrome::ChromeListTabsTool));
+        registry.register(Arc::new(crate::builtins::chrome::ChromeNavigateTool));
+        let registry = Arc::new(registry);
+
+        // Pin the descriptors the filtering decision rests on.
+        assert!(
+            registry
+                .get_tool("chrome_list_tabs")
+                .expect("registered")
+                .descriptor()
+                .is_read_only
+        );
+        assert!(
+            !registry
+                .get_tool("chrome_navigate")
+                .expect("registered")
+                .descriptor()
+                .is_read_only
+        );
+
+        let dispatcher = RegistryToolDispatcher::new(
+            registry,
+            Arc::new(InnerExecutor::new(ExecutionConfig::default())),
+            ExecutionContext::PlanMode,
+            PathBuf::from("/tmp"),
+        );
+
+        let listed = dispatcher.listed_names();
+        assert!(
+            listed.contains(&"chrome_list_tabs".into()),
+            "the read-only Chrome tool was hidden: {listed:?}"
+        );
+        assert!(
+            !listed.contains(&"chrome_navigate".into()),
+            "a mutating Chrome tool was offered in PlanMode: {listed:?}"
+        );
+
+        let outcome = dispatcher
+            .execute(
+                "id-1",
+                "chrome_navigate",
+                &serde_json::json!({"url": "https://example.com"}),
+            )
+            .await;
+        assert!(outcome.result.is_error, "{:?}", outcome.result);
+        assert!(
+            outcome.result.output.contains("not available"),
+            "{}",
+            outcome.result.output
         );
     }
 
