@@ -414,6 +414,7 @@ impl TurnState {
     /// StreamAssistant → ExecuteTools → ApplyToolResults → EvaluateContinuation
     /// StreamAssistant → EvaluateContinuation            (no tools to run)
     /// EvaluateContinuation → CompactRecovery → StartRequest   (context too large)
+    /// CompactRecovery / StartRequest → StopHooks              (recovery gave up)
     /// EvaluateContinuation → StopHooks → Finalize → Terminated
     /// ExecuteTools → AwaitPermission ─┐                 (a decision is needed)
     /// StartRequest → AwaitElicitation ┘→ back where they came from
@@ -434,7 +435,13 @@ impl TurnState {
             // runs before the request, while the token line has not been
             // crossed.
             Self::RunPreSubmitHooks => matches!(next, Self::StartRequest | Self::CompactRecovery),
-            Self::StartRequest => matches!(next, Self::StreamAssistant | Self::AwaitElicitation),
+            // A recovery retry is re-requested from `StartRequest`; when that
+            // retry is still over budget the turn closes from here, so the
+            // stop hooks are reachable from this state too.
+            Self::StartRequest => matches!(
+                next,
+                Self::StreamAssistant | Self::AwaitElicitation | Self::StopHooks
+            ),
             Self::StreamAssistant => matches!(
                 next,
                 Self::ExecuteTools | Self::EvaluateContinuation | Self::AwaitElicitation
@@ -448,7 +455,12 @@ impl TurnState {
             Self::EvaluateContinuation => {
                 matches!(next, Self::CompactRecovery | Self::StopHooks)
             }
-            Self::CompactRecovery => matches!(next, Self::StartRequest | Self::Finalize),
+            // A compaction that fails (circuit breaker open / stop hook) ends
+            // the turn from `CompactRecovery`, and the closing path enters
+            // the stop hooks from here.
+            Self::CompactRecovery => {
+                matches!(next, Self::StartRequest | Self::StopHooks | Self::Finalize)
+            }
             Self::StopHooks => matches!(next, Self::Finalize),
             Self::Finalize => matches!(next, Self::Terminated),
             // Terminating an ended turn is a no-op, not a mistake.
@@ -882,8 +894,12 @@ fn stop_reason_eq(stop_reason: &str, expected: &str) -> bool {
 /// produced. The two texts therefore share a prefix, and taking the longer one
 /// keeps the reader from being shown the same sentence twice. When the retry
 /// instead picks up past where the first attempt stopped — or diverges — both
-/// are kept, so nothing already delivered is lost. The result never shrinks,
-/// which is what lets the caller emit only the growth.
+/// are kept, so nothing already delivered is lost.
+///
+/// This is the all-at-once form, kept as the reference behaviour for tests.
+/// The streaming loop uses [`StreamTextMerger`], which reaches the same result
+/// one delta at a time.
+#[cfg(test)]
 #[must_use]
 fn merge_stream_text(delivered: &str, retried: &str) -> String {
     if retried.starts_with(delivered) {
@@ -895,6 +911,95 @@ fn merge_stream_text(delivered: &str, retried: &str) -> String {
         merged.push_str(delivered);
         merged.push_str(retried);
         merged
+    }
+}
+
+/// Incrementally merge the text of a retried stream.
+///
+/// A retry regenerates the answer from the beginning. Comparing the whole
+/// accumulated attempt against the whole delivered text on every delta — as
+/// the loop used to — re-applied the repeated opening once per delta, so a
+/// divergent retry emitted `x`, then `xy`, then `xyz` instead of the three
+/// fragments once, and the output grew quadratically.
+///
+/// This tracks the attempt separately from what the reader has seen. Each
+/// delta is examined exactly once: it is skipped while it still reproduces
+/// the delivered prefix, and from the point the retry diverges (or picks up
+/// past what was delivered) the new suffix is emitted once and appended to
+/// the delivered text.
+#[derive(Debug, Default)]
+struct StreamTextMerger {
+    /// Everything emitted to the reader so far, across attempts.
+    delivered: String,
+    /// The current attempt's text. A retry starts it again from empty.
+    attempt: String,
+    /// Set once the attempt stops matching the delivered prefix.
+    diverged: bool,
+}
+
+impl StreamTextMerger {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    /// Start a fresh attempt. A retry regenerates the answer from the top, so
+    /// the comparison with what was delivered starts over.
+    fn begin_attempt(&mut self) {
+        self.attempt.clear();
+        self.diverged = false;
+    }
+
+    /// The text emitted to the reader so far.
+    fn delivered(&self) -> &str {
+        &self.delivered
+    }
+
+    /// Finish streaming, returning the full delivered text.
+    fn into_delivered(self) -> String {
+        self.delivered
+    }
+
+    /// Merge one delta from the current attempt.
+    ///
+    /// Returns only the bytes the reader has not seen yet, or `None` when the
+    /// delta merely repeats the already-delivered opening.
+    fn push_delta(&mut self, delta: &str) -> Option<String> {
+        if delta.is_empty() {
+            return None;
+        }
+
+        let start = self.attempt.len();
+        self.attempt.push_str(delta);
+
+        if self.diverged {
+            self.delivered.push_str(delta);
+            return Some(delta.to_string());
+        }
+
+        // Until the attempt diverges, its prefix matches the delivered text
+        // byte for byte, so `position` is a char boundary in both strings.
+        let mut position = start;
+        for ch in delta.chars() {
+            match self
+                .delivered
+                .get(position..)
+                .and_then(|s| s.chars().next())
+            {
+                Some(delivered_ch) if delivered_ch == ch => {
+                    position += ch.len_utf8();
+                }
+                _ => {
+                    // The retry has either diverged from the delivered answer
+                    // or run past its end. Everything from here is new.
+                    self.diverged = true;
+                    let new_text = self.attempt[position..].to_string();
+                    self.delivered.push_str(&new_text);
+                    return Some(new_text);
+                }
+            }
+        }
+
+        None
     }
 }
 
@@ -1023,16 +1128,10 @@ pub enum CompactOutcome {
 }
 
 impl CompactOutcome {
-    /// Whether this outcome ends the turn.
-    #[must_use]
-    pub const fn is_failure(&self) -> bool {
-        matches!(
-            self,
-            Self::CircuitBreakerOpen { .. } | Self::StopHookTerminated { .. }
-        )
-    }
-
     /// The message to terminate the turn with, when this outcome is a failure.
+    ///
+    /// This is the only failure test the engine uses: every terminal consumer
+    /// needs the reason, and `None` is exactly "not a failure".
     #[must_use]
     pub fn failure_message(&self) -> Option<String> {
         match self {
@@ -2090,8 +2189,16 @@ impl QueryEngine {
                         )
                         .await;
                     if let Some(reason) = outcome.failure_message() {
-                        turn.terminate(TerminalReason::Error(reason.clone()));
-                        return Ok(TerminalReason::Error(reason));
+                        return Ok(self
+                            .finish_turn(
+                                turn,
+                                turn_number,
+                                &api_response.stop_reason,
+                                &api_response.usage,
+                                &[],
+                                TerminalReason::Error(reason),
+                            )
+                            .await);
                     }
                     // Retry the request with compacted context
                     turn.transition_to(TurnState::StartRequest);
@@ -2105,8 +2212,16 @@ impl QueryEngine {
 
                     // After recovery retry, check if we still need to compact
                     if !turn.budget.should_continue() {
-                        turn.terminate(TerminalReason::BudgetExhausted);
-                        return Ok(TerminalReason::BudgetExhausted);
+                        return Ok(self
+                            .finish_turn(
+                                turn,
+                                turn_number,
+                                "budget_exhausted",
+                                &api_response.usage,
+                                &[],
+                                TerminalReason::BudgetExhausted,
+                            )
+                            .await);
                     }
 
                     if let Some(reason) = self
@@ -2124,8 +2239,16 @@ impl QueryEngine {
                     return Ok(Self::reason_for(&api_response.stop_reason));
                 }
 
-                turn.terminate(TerminalReason::BudgetExhausted);
-                return Ok(TerminalReason::BudgetExhausted);
+                return Ok(self
+                    .finish_turn(
+                        turn,
+                        turn_number,
+                        "budget_exhausted",
+                        &api_response.usage,
+                        &[],
+                        TerminalReason::BudgetExhausted,
+                    )
+                    .await);
             }
 
             if let Some(reason) = self
@@ -2173,18 +2296,30 @@ impl QueryEngine {
                     )
                     .await;
                 if let Some(reason) = outcome.failure_message() {
-                    turn.terminate(TerminalReason::Error(reason.clone()));
-                    self.cost_tracker
-                        .end_turn(turn_number, &api_response.usage, &self.model);
-                    return Ok(TerminalReason::Error(reason));
+                    return Ok(self
+                        .finish_turn(
+                            turn,
+                            turn_number,
+                            &api_response.stop_reason,
+                            &api_response.usage,
+                            &pending_for_loop,
+                            TerminalReason::Error(reason),
+                        )
+                        .await);
                 }
                 // After compact, tool results are still pending — the caller
                 // will start the next turn with the compacted context
             } else {
-                turn.terminate(TerminalReason::BudgetExhausted);
-                self.cost_tracker
-                    .end_turn(turn_number, &api_response.usage, &self.model);
-                return Ok(TerminalReason::BudgetExhausted);
+                return Ok(self
+                    .finish_turn(
+                        turn,
+                        turn_number,
+                        "budget_exhausted",
+                        &api_response.usage,
+                        &pending_for_loop,
+                        TerminalReason::BudgetExhausted,
+                    )
+                    .await);
             }
         }
 
@@ -2358,8 +2493,16 @@ impl QueryEngine {
                         )
                         .await;
                     if let Some(reason) = outcome.failure_message() {
-                        turn.terminate(TerminalReason::Error(reason.clone()));
-                        return Ok(TerminalReason::Error(reason));
+                        return Ok(self
+                            .finish_turn(
+                                turn,
+                                turn_number,
+                                &stop_reason,
+                                &usage,
+                                &pending_for_loop,
+                                TerminalReason::Error(reason),
+                            )
+                            .await);
                     }
                     turn.transition_to(TurnState::StartRequest);
                     let retried = self.send_request_streaming(turn, options).await?;
@@ -2370,8 +2513,16 @@ impl QueryEngine {
                     let usage = retried.usage;
 
                     if !turn.budget.should_continue() {
-                        turn.terminate(TerminalReason::BudgetExhausted);
-                        return Ok(TerminalReason::BudgetExhausted);
+                        return Ok(self
+                            .finish_turn(
+                                turn,
+                                turn_number,
+                                "budget_exhausted",
+                                &usage,
+                                &pending_for_loop,
+                                TerminalReason::BudgetExhausted,
+                            )
+                            .await);
                     }
 
                     let stop_reason = retried.stop_reason.clone();
@@ -2384,8 +2535,16 @@ impl QueryEngine {
                     }
                     return Ok(Self::reason_for(&stop_reason));
                 }
-                turn.terminate(TerminalReason::BudgetExhausted);
-                return Ok(TerminalReason::BudgetExhausted);
+                return Ok(self
+                    .finish_turn(
+                        turn,
+                        turn_number,
+                        "budget_exhausted",
+                        &usage,
+                        &pending_for_loop,
+                        TerminalReason::BudgetExhausted,
+                    )
+                    .await);
             }
             if let Some(reason) = self
                 .close_turn(turn, turn_number, &stop_reason, &usage, &pending_for_loop)
@@ -2424,14 +2583,28 @@ impl QueryEngine {
                     )
                     .await;
                 if let Some(reason) = outcome.failure_message() {
-                    turn.terminate(TerminalReason::Error(reason.clone()));
-                    self.cost_tracker.end_turn(turn_number, &usage, &self.model);
-                    return Ok(TerminalReason::Error(reason));
+                    return Ok(self
+                        .finish_turn(
+                            turn,
+                            turn_number,
+                            &stop_reason,
+                            &usage,
+                            &pending_for_loop,
+                            TerminalReason::Error(reason),
+                        )
+                        .await);
                 }
             } else {
-                turn.terminate(TerminalReason::BudgetExhausted);
-                self.cost_tracker.end_turn(turn_number, &usage, &self.model);
-                return Ok(TerminalReason::BudgetExhausted);
+                return Ok(self
+                    .finish_turn(
+                        turn,
+                        turn_number,
+                        "budget_exhausted",
+                        &usage,
+                        &pending_for_loop,
+                        TerminalReason::BudgetExhausted,
+                    )
+                    .await);
             }
         }
 
@@ -2474,6 +2647,33 @@ impl QueryEngine {
         }
 
         self.record_and_check_loop(pending_for_loop)
+    }
+
+    /// Close a turn that ends for a reason other than how the model stopped.
+    ///
+    /// Budget exhaustion and recovery failure used to return straight out of
+    /// the turn loop — `turn.terminate(...)` and a `return` — without running
+    /// the Stop/TurnEnd hooks, the cost bookkeeping, or the loop check every
+    /// model-ended turn goes through. They now take the same closing path and
+    /// terminate afterwards.
+    ///
+    /// A loop the detector reports takes precedence over the reason passed in:
+    /// it is the more specific diagnosis of why the run must end.
+    async fn finish_turn(
+        &mut self,
+        turn: &mut TurnRuntime,
+        turn_number: u32,
+        stop_reason: &str,
+        usage: &UsageSummary,
+        pending_for_loop: &[PendingToolCall],
+        reason: TerminalReason,
+    ) -> TerminalReason {
+        let detected = self
+            .close_turn(turn, turn_number, stop_reason, usage, pending_for_loop)
+            .await;
+        let reason = detected.unwrap_or(reason);
+        turn.terminate(reason.clone());
+        reason
     }
 
     /// The reason a closed turn reports, given how the model stopped.
@@ -3294,14 +3494,15 @@ impl QueryEngine {
         // the retry re-requests the turn — but what the first attempt already
         // delivered is kept and merged with what the retry produces, so an
         // interruption costs the reader nothing that had already arrived.
-        // `emitted_len` is how much of the merged text the UI has seen; only
-        // the growth past it is sent again.
-        let mut carried_text = String::new();
-        let mut emitted_len = 0usize;
+        // `StreamTextMerger` emits only the growth, once per delta.
+        let mut stream_text = StreamTextMerger::new();
 
         let mut attempt: u32 = 0;
         loop {
             attempt += 1;
+            // A retry regenerates the answer from the top; start comparing
+            // again from the first character.
+            stream_text.begin_attempt();
             let request_client = self
                 .api_client
                 .with_request_context(self.build_request_context(self.current_turn, options));
@@ -3316,7 +3517,7 @@ impl QueryEngine {
                 .await;
             self.last_request_at = Some(Instant::now());
 
-            // Per-attempt state. Text is merged into `carried_text` as it
+            // Per-attempt state. Text is merged into `stream_text` as it
             // arrives; tool calls are the attempt's own — a retry re-asks the
             // model, and executing a call twice because two attempts both
             // proposed it would double its side effects.
@@ -3327,7 +3528,6 @@ impl QueryEngine {
                 cache_read_tokens: 0,
                 cache_creation_tokens: 0,
             };
-            let mut attempt_text = String::new();
             let mut early_calls: Vec<ToolCall> = Vec::new();
             let mut early_results: Vec<ToolResult> = Vec::new();
             let mut deferred_calls: Vec<ToolCall> = Vec::new();
@@ -3343,12 +3543,8 @@ impl QueryEngine {
                     break;
                 }
                 match event.clone() {
-                    StreamEvent::TextDelta(ref text) => {
-                        attempt_text.push_str(text);
-                        carried_text = merge_stream_text(&carried_text, &attempt_text);
-                        if carried_text.len() > emitted_len {
-                            let new_text = carried_text[emitted_len..].to_string();
-                            emitted_len = carried_text.len();
+                    StreamEvent::TextDelta(ref delta) => {
+                        if let Some(new_text) = stream_text.push_delta(delta) {
                             let _ = self.event_tx.send(EngineEvent::TextDelta(new_text));
                         }
                     }
@@ -3379,11 +3575,11 @@ impl QueryEngine {
                         {
                             tracing::warn!(
                                 "streaming network error on attempt {attempt} ({} bytes received): {e} — re-requesting",
-                                carried_text.len()
+                                stream_text.delivered().len()
                             );
                             let _ = self.event_tx.send(EngineEvent::StreamInterrupted {
                                 reason: "error".into(),
-                                partial_len: carried_text.len(),
+                                partial_len: stream_text.delivered().len(),
                                 will_retry: true,
                             });
                             tokio::time::sleep(std::time::Duration::from_millis(
@@ -3397,7 +3593,7 @@ impl QueryEngine {
                         }
                         tracing::warn!(
                             "streaming network error ({} bytes received so far): {e}",
-                            carried_text.len()
+                            stream_text.delivered().len()
                         );
                         stream_failed = true;
                         // Fail-open: stop consuming the stream but return
@@ -3476,7 +3672,7 @@ impl QueryEngine {
             }
 
             if stream_failed
-                && carried_text.is_empty()
+                && stream_text.delivered().is_empty()
                 && early_results.is_empty()
                 && deferred_calls.is_empty()
             {
@@ -3504,14 +3700,14 @@ impl QueryEngine {
             if self.interrupt.is_interrupted() {
                 let _ = self.event_tx.send(EngineEvent::StreamInterrupted {
                     reason: "user".into(),
-                    partial_len: carried_text.len(),
+                    partial_len: stream_text.delivered().len(),
                     will_retry: false,
                 });
                 // Whatever arrived before the interrupt is kept: a partial
                 // answer is what the person asked to stop at, and throwing it
                 // away would lose the tokens they already paid for.
                 return Ok(StreamedResponse {
-                    content: carried_text,
+                    content: stream_text.into_delivered(),
                     tool_calls: deferred_calls,
                     early_calls,
                     early_results,
@@ -3523,7 +3719,7 @@ impl QueryEngine {
             if stream_failed {
                 let _ = self.event_tx.send(EngineEvent::StreamInterrupted {
                     reason: "error".into(),
-                    partial_len: carried_text.len(),
+                    partial_len: stream_text.delivered().len(),
                     will_retry: false,
                 });
             } else if matches!(stop_reason.as_deref(), Some("max_tokens") | Some("length")) {
@@ -3531,13 +3727,13 @@ impl QueryEngine {
                 // not retryable (re-requesting would loop and double cost).
                 let _ = self.event_tx.send(EngineEvent::StreamInterrupted {
                     reason: stop_reason.clone().unwrap_or_default(),
-                    partial_len: carried_text.len(),
+                    partial_len: stream_text.delivered().len(),
                     will_retry: false,
                 });
             }
 
             return Ok(StreamedResponse {
-                content: carried_text,
+                content: stream_text.into_delivered(),
                 tool_calls: deferred_calls,
                 early_calls,
                 early_results,
@@ -4062,6 +4258,106 @@ mod tests {
         );
         engine.set_tool_executor(Box::new(StubOkToolExecutor));
         (engine, rx, session)
+    }
+
+    /// A hook executor that records the events the engine fires and their
+    /// context, so tests can assert that lifecycle hooks really ran.
+    struct RecordingHooks {
+        events: Arc<std::sync::Mutex<Vec<(String, HashMap<String, String>)>>>,
+    }
+
+    impl RecordingHooks {
+        fn new() -> (
+            Self,
+            Arc<std::sync::Mutex<Vec<(String, HashMap<String, String>)>>>,
+        ) {
+            let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+            (
+                Self {
+                    events: Arc::clone(&events),
+                },
+                events,
+            )
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl HookExecutor for RecordingHooks {
+        async fn fire_hook(
+            &self,
+            event_name: &str,
+            _input: &str,
+            context: &HashMap<String, String>,
+        ) -> HookFireResult {
+            self.events
+                .lock()
+                .expect("the recording hook lock is not poisoned")
+                .push((event_name.to_string(), context.clone()));
+            HookFireResult::default()
+        }
+    }
+
+    fn recorded_event_names(
+        events: &Arc<std::sync::Mutex<Vec<(String, HashMap<String, String>)>>>,
+    ) -> Vec<String> {
+        events
+            .lock()
+            .expect("the recording hook lock is not poisoned")
+            .iter()
+            .map(|(name, _)| name.clone())
+            .collect()
+    }
+
+    /// A streaming client whose response consumes more than a one-token
+    /// budget, so the turn loop reaches its budget-exhausted exits.
+    struct BudgetStreamMock;
+
+    #[async_trait::async_trait]
+    impl ApiClient for BudgetStreamMock {
+        fn clone_box(&self) -> Box<dyn ApiClient> {
+            Box::new(Self)
+        }
+
+        async fn create_message(
+            &self,
+            _system: &str,
+            _messages: &[serde_json::Value],
+            _model: &ModelId,
+            _max_tokens: u32,
+            _tools: &[crate::tool_executor::ToolInfo],
+        ) -> Result<ApiResponse, crate::api_client::ApiError> {
+            Ok(ApiResponse {
+                content: "budgeted answer".into(),
+                tool_calls: Vec::new(),
+                usage: UsageSummary {
+                    input_tokens: 10,
+                    output_tokens: 50,
+                    cache_read_tokens: 0,
+                    cache_creation_tokens: 0,
+                },
+                stop_reason: "end_turn".into(),
+            })
+        }
+
+        async fn create_message_streaming(
+            &self,
+            _system: &str,
+            _messages: &[serde_json::Value],
+            _model: &ModelId,
+            _max_tokens: u32,
+            _tools: &[crate::tool_executor::ToolInfo],
+        ) -> std::pin::Pin<Box<dyn futures::Stream<Item = StreamEvent> + Send + 'static>> {
+            Box::pin(futures::stream::iter(vec![
+                StreamEvent::UsageSummary(UsageSummary {
+                    input_tokens: 10,
+                    output_tokens: 50,
+                    cache_read_tokens: 0,
+                    cache_creation_tokens: 0,
+                }),
+                StreamEvent::StopReason("end_turn".into()),
+                StreamEvent::StreamEnd,
+            ]))
+        }
     }
 
     /// Test-only tool executor that echoes back a successful result so
@@ -4856,6 +5152,160 @@ mod tests {
         }
     }
 
+    /// A real turn that goes through `CompactRecovery` also only makes legal
+    /// moves. The recorder test above only exercised the tool loop; the
+    /// compaction edges (`CompactRecovery -> StartRequest`,
+    /// `StartRequest -> StopHooks`) are what this covers.
+    #[tokio::test]
+    async fn a_real_turn_through_compaction_only_makes_legal_moves() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let session = SessionState::new(std::path::PathBuf::from("/tmp/test"));
+        let checker = PermissionChecker::new(PermissionMode::BypassPermissions);
+        let mut engine = QueryEngine::new(
+            Box::new(BudgetStreamMock),
+            ModelId::sonnet(),
+            session,
+            PermissionEngine::new(checker),
+            tx,
+        );
+
+        let mut budget = TokenBudget::with_defaults();
+        budget.thresholds.max_tokens_per_session = 1;
+        let mut turn = TurnRuntime::new(budget);
+
+        let _ = take_recorded_transitions();
+        let reason = engine
+            .execute_turn_streaming(&mut turn, &SubmitOptions::default(), 1)
+            .await
+            .unwrap();
+        assert_eq!(reason, TerminalReason::BudgetExhausted);
+
+        let recorded = take_recorded_transitions();
+        assert!(
+            recorded
+                .iter()
+                .any(|(from, to)| matches!(from, TurnState::CompactRecovery)
+                    && matches!(to, TurnState::StartRequest)),
+            "the turn never took the compaction-retry edge: {recorded:?}"
+        );
+        assert!(
+            recorded
+                .iter()
+                .any(|(_, to)| matches!(to, TurnState::StopHooks)),
+            "the turn never entered the stop hooks: {recorded:?}"
+        );
+        for (from, to) in &recorded {
+            assert!(
+                from.can_transition_to(*to),
+                "a real turn went {} → {}, which the graph refuses",
+                from.as_str(),
+                to.as_str()
+            );
+        }
+    }
+
+    /// A budget-exhausted turn still runs the Stop and TurnEnd hooks: it used
+    /// to return straight out of the loop, past every closing step.
+    #[tokio::test]
+    async fn a_budget_exhausted_turn_runs_stop_and_turn_end_hooks() {
+        let (mut engine, _rx, _session) = make_test_engine();
+        let (hooks, recorded) = RecordingHooks::new();
+        engine.set_hooks(Box::new(hooks));
+        // No recovery budget, so the turn takes the direct budget exit.
+        engine.compact_config.max_recovery_retries = 0;
+
+        let mut budget = TokenBudget::with_defaults();
+        budget.thresholds.max_tokens_per_session = 1;
+        let mut turn = TurnRuntime::new(budget);
+
+        let reason = engine
+            .execute_turn(&mut turn, &SubmitOptions::default(), 1)
+            .await
+            .unwrap();
+
+        assert_eq!(reason, TerminalReason::BudgetExhausted);
+        let names = recorded_event_names(&recorded);
+        assert!(
+            names.iter().any(|name| name == hook_events::STOP),
+            "the Stop hook did not fire: {names:?}"
+        );
+        assert!(
+            names.iter().any(|name| name == hook_events::TURN_END),
+            "the TurnEnd hook did not fire: {names:?}"
+        );
+        assert!(matches!(turn.state, TurnState::Terminated));
+        assert_eq!(turn.terminal_reason, Some(TerminalReason::BudgetExhausted));
+    }
+
+    /// The streaming path's post-recovery over-budget exit closes through the
+    /// same hooks as a normal end of turn.
+    #[tokio::test]
+    async fn a_budget_exhausted_streaming_turn_runs_stop_and_turn_end_hooks() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let session = SessionState::new(std::path::PathBuf::from("/tmp/test"));
+        let checker = PermissionChecker::new(PermissionMode::BypassPermissions);
+        let mut engine = QueryEngine::new(
+            Box::new(BudgetStreamMock),
+            ModelId::sonnet(),
+            session,
+            PermissionEngine::new(checker),
+            tx,
+        );
+        let (hooks, recorded) = RecordingHooks::new();
+        engine.set_hooks(Box::new(hooks));
+
+        let mut budget = TokenBudget::with_defaults();
+        budget.thresholds.max_tokens_per_session = 1;
+        let mut turn = TurnRuntime::new(budget);
+
+        let reason = engine
+            .execute_turn_streaming(&mut turn, &SubmitOptions::default(), 1)
+            .await
+            .unwrap();
+
+        assert_eq!(reason, TerminalReason::BudgetExhausted);
+        let names = recorded_event_names(&recorded);
+        assert!(
+            names.iter().any(|name| name == hook_events::STOP),
+            "the Stop hook did not fire: {names:?}"
+        );
+        assert!(
+            names.iter().any(|name| name == hook_events::TURN_END),
+            "the TurnEnd hook did not fire: {names:?}"
+        );
+        assert_eq!(turn.terminal_reason, Some(TerminalReason::BudgetExhausted));
+    }
+
+    /// A compaction failure also closes through the hooks, from
+    /// `CompactRecovery` (an edge the graph did not have).
+    #[tokio::test]
+    async fn a_recovery_failure_runs_stop_and_turn_end_hooks() {
+        let (mut engine, _rx, _session) = make_test_engine();
+        let (hooks, recorded) = RecordingHooks::new();
+        engine.set_hooks(Box::new(hooks));
+
+        let mut budget = TokenBudget::with_defaults();
+        budget.thresholds.max_tokens_per_session = 1;
+        let mut turn = TurnRuntime::new(budget);
+        turn.compact_failures = engine.compact_config.max_consecutive_failures;
+
+        let reason = engine
+            .execute_turn(&mut turn, &SubmitOptions::default(), 1)
+            .await
+            .unwrap();
+
+        assert!(matches!(reason, TerminalReason::Error(_)), "{reason:?}");
+        let names = recorded_event_names(&recorded);
+        assert!(
+            names.iter().any(|name| name == hook_events::STOP),
+            "the Stop hook did not fire: {names:?}"
+        );
+        assert!(
+            names.iter().any(|name| name == hook_events::TURN_END),
+            "the TurnEnd hook did not fire: {names:?}"
+        );
+    }
+
     /// The exact graph, state by state.
     ///
     /// Written as the whole set rather than a few `assert!(!...)` lines: a
@@ -4875,7 +5325,12 @@ mod tests {
             ),
             (
                 S::StartRequest,
-                &[S::StreamAssistant, S::AwaitElicitation, S::Terminated],
+                &[
+                    S::StreamAssistant,
+                    S::AwaitElicitation,
+                    S::StopHooks,
+                    S::Terminated,
+                ],
             ),
             (
                 S::StreamAssistant,
@@ -4908,7 +5363,7 @@ mod tests {
             ),
             (
                 S::CompactRecovery,
-                &[S::StartRequest, S::Finalize, S::Terminated],
+                &[S::StartRequest, S::StopHooks, S::Finalize, S::Terminated],
             ),
             (S::StopHooks, &[S::Finalize, S::Terminated]),
             (S::Finalize, &[S::Terminated]),
@@ -6017,6 +6472,60 @@ mod tests {
         assert_eq!(turn.recovery_count, 1, "the compaction was not recorded");
     }
 
+    /// `Reactive` compaction is reachable from the engine, not dead code: a
+    /// response that stopped on `max_tokens` while the context is over the
+    /// compact line selects it.
+    #[tokio::test]
+    async fn a_max_tokens_stop_over_the_line_selects_reactive_compaction() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let checker = PermissionChecker::new(PermissionMode::BypassPermissions);
+        let mut engine = QueryEngine::new(
+            Box::new(MockApiClient),
+            ModelId("unknown-small-window".into()),
+            SessionState::new(std::path::PathBuf::from("/tmp/test")),
+            PermissionEngine::new(checker),
+            tx,
+        );
+        let (hooks, recorded) = RecordingHooks::new();
+        engine.set_hooks(Box::new(hooks));
+
+        let mut turn = TurnRuntime::new(TokenBudget::with_defaults());
+        turn.last_stop_reason = Some("max_tokens".into());
+        turn.messages
+            .push(Message::user("the original request that must be preserved"));
+        for i in 0..10 {
+            turn.messages.push(Message {
+                role: crate::types::Role::Assistant,
+                content: crate::types::MessageContent::Text(format!(
+                    "assistant turn {i}: {}",
+                    "x".repeat(10_000)
+                )),
+            });
+        }
+
+        let before = PromptCompiler::estimate_message_tokens(&turn.messages);
+        assert!(before > 16_000, "the test context is too small: {before}");
+
+        let reason = engine
+            .maybe_compact_on_threshold(&mut turn, &SubmitOptions::default(), 1)
+            .await;
+        assert!(reason.is_none(), "the turn was blocked: {reason:?}");
+
+        let events = recorded
+            .lock()
+            .expect("the recording hook lock is not poisoned");
+        let strategy = events
+            .iter()
+            .find(|(name, _)| name == hook_events::PRE_COMPACT)
+            .and_then(|(_, context)| context.get("strategy"))
+            .cloned();
+        assert_eq!(
+            strategy.as_deref(),
+            Some("Reactive"),
+            "max_tokens did not select reactive compaction: {events:?}"
+        );
+    }
+
     #[test]
     fn persist_assistant_tool_calls_records_tool_use_messages() {
         let (mut engine, _rx, _session) = make_test_engine();
@@ -6523,6 +7032,39 @@ mod tests {
         assert_eq!(merge_stream_text("abc", "def"), "abcdef");
     }
 
+    /// The incremental merger skips an opening the retry repeats, then emits
+    /// the rest once — it does not re-append the attempt's prefix per delta.
+    #[test]
+    fn an_identical_retry_opening_is_merged_incrementally() {
+        let mut merger = StreamTextMerger::new();
+        assert_eq!(
+            merger.push_delta("The answer is ").as_deref(),
+            Some("The answer is ")
+        );
+
+        merger.begin_attempt();
+        assert_eq!(
+            merger.push_delta("The answer is 42.").as_deref(),
+            Some("42.")
+        );
+        assert_eq!(merger.delivered(), "The answer is 42.");
+    }
+
+    /// A retry that diverges immediately hands back only each newly arrived
+    /// fragment: `x`, then `y`, then `z`, never `x`, `xy`, `xyz`.
+    #[test]
+    fn a_divergent_retry_is_merged_incrementally() {
+        let mut merger = StreamTextMerger::new();
+        assert_eq!(merger.push_delta("abc").as_deref(), Some("abc"));
+
+        merger.begin_attempt();
+        assert_eq!(merger.push_delta("x").as_deref(), Some("x"));
+        assert_eq!(merger.push_delta("y").as_deref(), Some("y"));
+        assert_eq!(merger.push_delta("z").as_deref(), Some("z"));
+
+        assert_eq!(merger.delivered(), "abcxyz");
+    }
+
     /// A stream that dies mid-answer is re-requested, and what it already
     /// delivered reaches the reader once. The old recovery re-requested from
     /// scratch and threw the partial text away.
@@ -6644,6 +7186,119 @@ mod tests {
         );
     }
 
+    /// A retry that diverges after a partial answer emits each new fragment
+    /// once. The old per-delta merge re-applied the accumulated attempt, so
+    /// the reader saw `x`, then `xy`, then `xyz` — and the output grew
+    /// quadratically with the retry's length.
+    #[tokio::test]
+    async fn a_divergent_retry_emits_each_fragment_once() {
+        struct DivergingRetryMock {
+            attempts: Arc<std::sync::atomic::AtomicUsize>,
+        }
+
+        #[async_trait::async_trait]
+        impl ApiClient for DivergingRetryMock {
+            fn clone_box(&self) -> Box<dyn ApiClient> {
+                Box::new(Self {
+                    attempts: Arc::clone(&self.attempts),
+                })
+            }
+
+            async fn create_message(
+                &self,
+                _system: &str,
+                _messages: &[serde_json::Value],
+                _model: &ModelId,
+                _max_tokens: u32,
+                _tools: &[crate::tool_executor::ToolInfo],
+            ) -> Result<ApiResponse, crate::api_client::ApiError> {
+                Ok(ApiResponse {
+                    content: "fallback".into(),
+                    tool_calls: Vec::new(),
+                    usage: UsageSummary {
+                        input_tokens: 1,
+                        output_tokens: 1,
+                        cache_read_tokens: 0,
+                        cache_creation_tokens: 0,
+                    },
+                    stop_reason: "end_turn".into(),
+                })
+            }
+
+            async fn create_message_streaming(
+                &self,
+                _system: &str,
+                _messages: &[serde_json::Value],
+                _model: &ModelId,
+                _max_tokens: u32,
+                _tools: &[crate::tool_executor::ToolInfo],
+            ) -> std::pin::Pin<
+                Box<dyn futures::Stream<Item = crate::api_client::StreamEvent> + Send + 'static>,
+            > {
+                let n = self
+                    .attempts
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if n == 0 {
+                    Box::pin(futures::stream::iter(vec![
+                        StreamEvent::TextDelta("abc".into()),
+                        StreamEvent::Error(crate::api_client::ApiError::Transport {
+                            kind: crate::api_client::TransportError::Other,
+                            class: crate::api_client::ErrorClass::Stream,
+                            message: "connection reset mid-body".into(),
+                        }),
+                    ]))
+                } else {
+                    Box::pin(futures::stream::iter(vec![
+                        StreamEvent::TextDelta("x".into()),
+                        StreamEvent::TextDelta("y".into()),
+                        StreamEvent::TextDelta("z".into()),
+                        StreamEvent::StopReason("end_turn".into()),
+                        StreamEvent::StreamEnd,
+                    ]))
+                }
+            }
+        }
+
+        let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let session = SessionState::new(std::path::PathBuf::from("/tmp/test"));
+        let checker = PermissionChecker::new(PermissionMode::BypassPermissions);
+        let mut engine = QueryEngine::new(
+            Box::new(DivergingRetryMock {
+                attempts: Arc::clone(&attempts),
+            }),
+            ModelId::sonnet(),
+            session,
+            PermissionEngine::new(checker),
+            tx,
+        );
+
+        let reason = engine
+            .submit_streaming("go".into(), SubmitOptions::default())
+            .await
+            .unwrap();
+        assert!(matches!(reason, TerminalReason::Completed), "{reason:?}");
+        assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 2);
+
+        let mut deltas: Vec<String> = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            if let EngineEvent::TextDelta(text) = event {
+                deltas.push(text);
+            }
+        }
+
+        assert_eq!(
+            deltas,
+            vec!["abc".to_string(), "x".into(), "y".into(), "z".into()],
+            "the retry's fragments were replayed: {deltas:?}"
+        );
+        assert_eq!(
+            deltas.concat(),
+            "abcxyz",
+            "the answer grew by more than the retry's text"
+        );
+    }
+
     // ─── Compaction outcomes ───────────────────────────────────────────────
 
     /// Why compaction did not happen is returned, not only logged.
@@ -6667,7 +7322,6 @@ mod tests {
             matches!(outcome, CompactOutcome::CircuitBreakerOpen { .. }),
             "{outcome:?}"
         );
-        assert!(outcome.is_failure());
         assert!(outcome.failure_message().is_some());
     }
 
@@ -6681,19 +7335,16 @@ mod tests {
             messages_remaining: 2,
             summary: SummaryOutcome::Summarized,
         };
-        assert!(!compacted.is_failure());
         assert!(compacted.failure_message().is_none());
 
         let deferred = CompactOutcome::DeferredToThresholdPath {
             estimated_tokens: 200_000,
         };
-        assert!(!deferred.is_failure());
         assert!(deferred.failure_message().is_none());
 
         let stopped = CompactOutcome::StopHookTerminated {
             reason: "stop".into(),
         };
-        assert!(stopped.is_failure());
         assert_eq!(stopped.failure_message().as_deref(), Some("stop"));
     }
 
