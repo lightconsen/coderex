@@ -1,11 +1,13 @@
 //! Settings loading, merging, validation, schema migration, and resolution.
 
+use coderex_core::types::ContextWindowOverrides;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use thiserror::Error;
 
 /// The current config schema version. Increment when the format changes.
-pub const CURRENT_SCHEMA_VERSION: u32 = 3;
+pub const CURRENT_SCHEMA_VERSION: u32 = 4;
 
 /// Errors from config loading and validation.
 #[derive(Debug, Error)]
@@ -55,7 +57,7 @@ pub enum ConfigError {
 pub const MAX_SETTINGS_FILE_BYTES: u64 = 2 * 1024 * 1024;
 
 /// The set of keys a settings file may contain.
-const KNOWN_SETTINGS_FIELDS: [&str; 9] = [
+const KNOWN_SETTINGS_FIELDS: [&str; 10] = [
     "config_version",
     "model",
     "permission_mode",
@@ -65,6 +67,7 @@ const KNOWN_SETTINGS_FIELDS: [&str; 9] = [
     "hooks",
     "mcp_servers",
     "api_key",
+    "context_window",
 ];
 
 /// Permission modes accepted in settings, most restrictive first.
@@ -146,6 +149,49 @@ pub struct TelemetrySubConfig {
     pub pinned_cert_pem: Option<String>,
 }
 
+/// Per-model context-window overrides in settings.
+///
+/// Shape matches the client-data file (`~/.coderex/context_windows.json`) and
+/// the resolver's override type:
+///
+/// ```json
+/// {
+///   "context_window": {
+///     "default": 128000,
+///     "models": { "my-gateway-alias": 200000 }
+///   }
+/// }
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct ContextWindowSettings {
+    /// Optional fallback for models without a per-model entry.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default: Option<usize>,
+    /// Per-model windows, keyed by model name.
+    #[serde(default)]
+    pub models: HashMap<String, usize>,
+}
+
+impl ContextWindowSettings {
+    /// Convert to the core resolver's override type.
+    ///
+    /// Zero values and blank model names are dropped rather than disabling
+    /// compaction: the resolver falls through to the next source instead.
+    #[must_use]
+    pub fn to_overrides(&self) -> ContextWindowOverrides {
+        let models = self
+            .models
+            .iter()
+            .filter(|(model, tokens)| !model.trim().is_empty() && **tokens > 0)
+            .map(|(model, tokens)| (model.clone(), *tokens))
+            .collect();
+        ContextWindowOverrides {
+            default: self.default.filter(|tokens| *tokens > 0),
+            models,
+        }
+    }
+}
+
 /// Resolved settings after merging all sources.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Settings {
@@ -168,6 +214,9 @@ pub struct Settings {
     pub mcp_servers: Option<serde_json::Value>,
     /// API key — may be a raw value or a `"keyring://..."` reference.
     pub api_key: Option<String>,
+    /// Per-model context-window overrides, with an optional default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_window: Option<ContextWindowSettings>,
 }
 
 impl Settings {
@@ -190,6 +239,7 @@ impl Settings {
             hooks: None,
             mcp_servers: None,
             api_key: None,
+            context_window: None,
         }
     }
 
@@ -253,7 +303,42 @@ impl Settings {
                 }
             }
         }
+        if let Some(ref context_window) = self.context_window {
+            if context_window.default == Some(0) {
+                return Err(ConfigError::Validation {
+                    field: "context_window.default".to_string(),
+                    message: "context window must be > 0 tokens".to_string(),
+                });
+            }
+            for (model, tokens) in &context_window.models {
+                if model.trim().is_empty() {
+                    return Err(ConfigError::Validation {
+                        field: "context_window.models".to_string(),
+                        message: "model name must not be empty".to_string(),
+                    });
+                }
+                if *tokens == 0 {
+                    return Err(ConfigError::Validation {
+                        field: format!("context_window.models.{model}"),
+                        message: "context window must be > 0 tokens".to_string(),
+                    });
+                }
+            }
+        }
         Ok(())
+    }
+
+    /// Context-window overrides from this settings layer, ready to hand to
+    /// [`coderex_core::types::ContextWindowResolver`].
+    ///
+    /// Zero and blank entries are dropped here as a defensive measure; settings
+    /// validation rejects them when the file is loaded.
+    #[must_use]
+    pub fn context_window_overrides(&self) -> ContextWindowOverrides {
+        self.context_window.as_ref().map_or_else(
+            ContextWindowOverrides::default,
+            ContextWindowSettings::to_overrides,
+        )
     }
 
     /// Merge another Settings into this one.
@@ -282,6 +367,10 @@ impl Settings {
                 .clone()
                 .or_else(|| self.mcp_servers.clone()),
             api_key: other.api_key.clone().or_else(|| self.api_key.clone()),
+            context_window: other
+                .context_window
+                .clone()
+                .or_else(|| self.context_window.clone()),
         }
     }
 
@@ -303,6 +392,7 @@ impl Settings {
             "hooks",
             "mcp_servers",
             "api_key",
+            "context_window",
         ];
         let mut changes = Vec::new();
 
@@ -337,6 +427,10 @@ pub fn migrate_settings(settings: &mut Settings, source: &str) {
     if from < 3 {
         // v2 → v3: add telemetry sub-config field (already present via Default)
         settings.config_version = 3;
+    }
+    if from < 4 {
+        // v3 → v4: add context_window overrides (already present via Default)
+        settings.config_version = 4;
     }
     if settings.config_version != from {
         tracing::info!(
@@ -927,6 +1021,7 @@ mod tests {
             hooks: None,
             mcp_servers: None,
             api_key: None,
+            context_window: None,
         };
         migrate_settings(&mut settings, "test");
         assert_eq!(settings.config_version, CURRENT_SCHEMA_VERSION);
@@ -1207,5 +1302,134 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let service = ConfigService::new(temp.path().join("user.json"), None);
         assert!(service.load_managed_config().unwrap().is_none());
+    }
+
+    #[test]
+    fn settings_context_window_parses_and_flows_through_resolve() {
+        let temp = tempfile::tempdir().unwrap();
+        let user_path = temp.path().join("settings.json");
+        std::fs::write(
+            &user_path,
+            r#"{
+                "model": "my-gateway-alias",
+                "context_window": {
+                    "default": 64000,
+                    "models": { "my-gateway-alias": 200000 }
+                }
+            }"#,
+        )
+        .unwrap();
+
+        let resolved = ConfigService::new(user_path, None).resolve().unwrap();
+        let overrides = resolved.context_window_overrides();
+        assert_eq!(overrides.resolve("my-gateway-alias"), Some(200_000));
+        assert_eq!(overrides.resolve("other-model"), Some(64_000));
+    }
+
+    #[test]
+    fn settings_context_window_merge_is_winner_take_all() {
+        let user = Settings {
+            context_window: Some(ContextWindowSettings {
+                default: Some(64_000),
+                models: HashMap::from([("user-alias".into(), 128_000)]),
+            }),
+            ..Default::default()
+        };
+        let project = Settings {
+            context_window: Some(ContextWindowSettings {
+                default: Some(96_000),
+                models: HashMap::from([("project-alias".into(), 256_000)]),
+            }),
+            ..Default::default()
+        };
+
+        let merged = user.merge(&project);
+        let overrides = merged.context_window_overrides();
+        // The project layer replaces the whole value: the user's per-model
+        // entry is gone, so that alias falls back to the project default.
+        assert_eq!(overrides.resolve("user-alias"), Some(96_000));
+        assert_eq!(overrides.resolve("project-alias"), Some(256_000));
+        assert_eq!(overrides.resolve("other"), Some(96_000));
+    }
+
+    #[test]
+    fn settings_context_window_rejects_zero_and_blank_entries() {
+        let zero = Settings {
+            context_window: Some(ContextWindowSettings {
+                default: Some(0),
+                models: HashMap::new(),
+            }),
+            ..Default::default()
+        };
+        let err = zero.validate().unwrap_err();
+        assert!(
+            matches!(err, ConfigError::Validation { ref field, .. } if field == "context_window.default")
+        );
+
+        let blank = Settings {
+            context_window: Some(ContextWindowSettings {
+                default: None,
+                models: HashMap::from([("  ".into(), 128_000)]),
+            }),
+            ..Default::default()
+        };
+        let err = blank.validate().unwrap_err();
+        assert!(
+            matches!(err, ConfigError::Validation { ref field, .. } if field == "context_window.models")
+        );
+    }
+
+    #[test]
+    fn settings_context_window_conversion_drops_invalid_values() {
+        let settings = Settings {
+            context_window: Some(ContextWindowSettings {
+                default: Some(0),
+                models: HashMap::from([
+                    ("valid".into(), 128_000),
+                    ("zero".into(), 0),
+                    ("".into(), 64_000),
+                ]),
+            }),
+            ..Default::default()
+        };
+
+        let overrides = settings.context_window_overrides();
+        assert_eq!(overrides.resolve("valid"), Some(128_000));
+        assert_eq!(overrides.resolve("zero"), None);
+        assert_eq!(overrides.default, None);
+    }
+
+    #[test]
+    fn settings_context_window_appears_in_diff() {
+        let settings = Settings {
+            context_window: Some(ContextWindowSettings {
+                default: None,
+                models: HashMap::from([("alias".into(), 128_000)]),
+            }),
+            ..Settings::defaults()
+        };
+        let diff = settings.diff_from_defaults("user");
+        assert!(
+            diff.changes
+                .iter()
+                .any(|entry| entry.key == "context_window")
+        );
+    }
+
+    #[test]
+    fn settings_context_window_is_a_known_field() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("settings.json");
+        std::fs::write(
+            &path,
+            r#"{"context_window":{"default":64000,"models":{"alias":128000}}}"#,
+        )
+        .unwrap();
+
+        let loaded = load_settings_file(&path, "user").unwrap().unwrap();
+        assert_eq!(
+            loaded.context_window.unwrap().models.get("alias"),
+            Some(&128_000)
+        );
     }
 }

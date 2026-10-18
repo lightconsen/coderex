@@ -9,16 +9,17 @@ Three-level configuration system: defaults → user config (`~/.coderex/settings
 ### Key Types
 
 - **`ConfigService`** (`settings.rs`) — Loads and merges configuration from all three levels.
-- **`Settings`** (`settings.rs`) — Strongly-typed configuration struct with `config_version`, `api_key`, and validation.
+- **`Settings`** (`settings.rs`) — Strongly-typed configuration struct with `config_version`, `api_key`, `context_window`, and validation.
+- **`ContextWindowSettings`** (`settings.rs`) — Per-model context-window overrides plus an optional default.
 - **`RuntimeOverrides`** (`settings.rs`) — Environment-variable and CLI-arg overrides.
 - **`ConfigError`** (`settings.rs`) — Error enum with `Io`, `Json`, `Validation`, `UnknownField`, and `TooLarge` variants.
 - **`ConfigDiff`/`ConfigDiffEntry`** (`settings.rs`) — Structured diff between current settings and defaults with `render()` for human-readable output.
 - **`ConfigWatcher`** (`settings.rs`) — File watcher (feature-gated on `hot-reload`) that emits change events via watch channel.
 - **`config_home()`** (`settings.rs`) — Returns `~/.coderex`.
-- **`FeatureFlags`** (`flags.rs`) — Toggleable features with project-level overrides.
+- **`FeatureFlags`** (`flags.rs`) — Toggleable features with project-level overrides, including context-window experiment values.
 - **`Experiments`** (`experiments.rs`) — A/B experiment configuration with disk caching.
 - **`resolve_api_key()`** (`settings.rs`) — Resolves `keyring://` URI references to OS keychain secrets.
-- **`migrate_settings()`** (`settings.rs`) — Schema migration chain (v0 → v1 → v2 → v3).
+- **`migrate_settings()`** (`settings.rs`) — Schema migration chain (v0 → v1 → v2 → v3 → v4).
 
 ### Configuration Hierarchy
 
@@ -39,6 +40,33 @@ value rather than merging into it (the `telemetry` sub-config is replaced
 wholesale, not field-by-field). Claude's `WINNER_ONLY_UNDER_MERGE` key table
 therefore has no counterpart here — the property already holds for all keys, and
 no key is excluded from it.
+
+### Context Window Overrides
+
+`context_window` maps model names to context-window sizes in tokens and may
+carry a `default` for models without a per-model entry:
+
+```json
+{
+  "context_window": {
+    "default": 64000,
+    "models": {
+      "my-gateway-alias": 200000,
+      "claude-sonnet-4-6": 200000
+    }
+  }
+}
+```
+
+The value flows through every settings source and the normal merge chain.
+Validation rejects zero windows and blank model names, so a mistyped value
+cannot turn compaction off.
+
+`Settings::context_window_overrides()` converts the field into the
+`coderex_core::types::ContextWindowOverrides` type used by the resolver.
+Resolution precedence, environment variables, the client-data file
+(`~/.coderex/context_windows.json`), experiment syntax, and the built-in model
+table are documented in [`docs/compact.md`](compact.md).
 
 ### Source Policies (repository-controlled files cannot relax privacy)
 

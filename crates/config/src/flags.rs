@@ -1,6 +1,7 @@
 //! Feature flags and capability sets.
 
 use bitflags::bitflags;
+use coderex_core::types::ContextWindowOverrides;
 use std::collections::HashMap;
 
 /// All feature flags supported by CodeRex.
@@ -40,6 +41,16 @@ pub struct FeatureFlags {
     pub team_collaboration: bool,
     /// Enable auto dream mode.
     pub auto_dream: bool,
+    /// Enable experiment-supplied context-window overrides.
+    ///
+    /// The window values themselves live in [`Self::context_window_default`]
+    /// and [`Self::context_windows`]; this flag gates whether they participate
+    /// in resolution.
+    pub context_window_overrides: bool,
+    /// Experiment-supplied fallback context window, in tokens.
+    pub context_window_default: Option<usize>,
+    /// Experiment-supplied per-model context windows, in tokens.
+    pub context_windows: HashMap<String, usize>,
 }
 
 bitflags! {
@@ -76,12 +87,21 @@ impl FeatureFlags {
     ///
     /// Format: `+flag_name` enables, `-flag_name` disables. Bare names default to enable.
     /// Example: `"+streaming_tool_execution,-daemon"`
+    ///
+    /// Context-window experiment values use assignment tokens:
+    /// `context_window_default=64000`, `context_window=my-alias:128000`, or
+    /// `context_window.my-alias=128000`. A valid value also enables
+    /// `context_window_overrides`.
     #[must_use]
     pub fn parse(input: &str) -> Self {
         let mut flags = Self::default();
         for token in input.split(',') {
             let token = token.trim();
             if token.is_empty() {
+                continue;
+            }
+            if let Some((name, value)) = token.split_once('=') {
+                flags.apply_value_flag(name.trim(), value.trim());
                 continue;
             }
             let (enable, name) = match token.chars().next() {
@@ -185,6 +205,68 @@ impl FeatureFlags {
             .unwrap_or_default()
     }
 
+    /// Context-window overrides supplied by experiments.
+    ///
+    /// Returns an empty override set unless [`Self::context_window_overrides`]
+    /// is enabled, so experiment data only participates when the experiment
+    /// itself is active. Invalid values are dropped so resolution falls through
+    /// to the next source.
+    #[must_use]
+    pub fn experiment_context_windows(&self) -> ContextWindowOverrides {
+        if !self.context_window_overrides {
+            return ContextWindowOverrides::default();
+        }
+        let models = self
+            .context_windows
+            .iter()
+            .filter(|(model, tokens)| !model.trim().is_empty() && **tokens > 0)
+            .map(|(model, tokens)| (model.clone(), *tokens))
+            .collect();
+        ContextWindowOverrides {
+            default: self.context_window_default.filter(|tokens| *tokens > 0),
+            models,
+        }
+    }
+
+    fn apply_value_flag(&mut self, name: &str, value: &str) {
+        match name {
+            "context_window_default" => {
+                if let Some(tokens) = parse_context_window_tokens(value) {
+                    self.context_window_default = Some(tokens);
+                    self.context_window_overrides = true;
+                }
+            }
+            "context_window" => {
+                // `context_window=<model>:<tokens>`. Split from the right so
+                // Bedrock version suffixes (`...-v1:0`) stay part of the name.
+                if let Some((model, tokens)) = value.rsplit_once(':') {
+                    if let Some(tokens) = parse_context_window_tokens(tokens) {
+                        self.set_context_window(model, tokens);
+                    }
+                } else {
+                    tracing::warn!("invalid context_window experiment value: {value}");
+                }
+            }
+            other if other.starts_with("context_window.") => {
+                let model = &other["context_window.".len()..];
+                if let Some(tokens) = parse_context_window_tokens(value) {
+                    self.set_context_window(model, tokens);
+                }
+            }
+            other => tracing::warn!("unknown feature flag: {other}"),
+        }
+    }
+
+    fn set_context_window(&mut self, model: &str, tokens: usize) {
+        let model = model.trim();
+        if model.is_empty() {
+            tracing::warn!("context_window experiment entry has an empty model name");
+            return;
+        }
+        self.context_windows.insert(model.to_string(), tokens);
+        self.context_window_overrides = true;
+    }
+
     fn apply_flag(&mut self, name: &str, enable: bool) {
         match name {
             "streaming_tool_execution" => self.streaming_tool_execution = enable,
@@ -204,9 +286,18 @@ impl FeatureFlags {
             "kairos" => self.kairos = enable,
             "team_collaboration" => self.team_collaboration = enable,
             "auto_dream" => self.auto_dream = enable,
+            "context_window_overrides" => self.context_window_overrides = enable,
             _ => tracing::warn!("unknown feature flag: {name}"),
         }
     }
+}
+
+fn parse_context_window_tokens(value: &str) -> Option<usize> {
+    value
+        .trim()
+        .parse::<usize>()
+        .ok()
+        .filter(|tokens| *tokens > 0)
 }
 
 /// Gate a block of code behind a compile-time feature flag.
@@ -496,5 +587,74 @@ mod tests {
         assert!(registry.has_capability(CapabilitySet::VOICE));
 
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn context_window_experiment_values_parse() {
+        let flags = FeatureFlags::parse(
+            "context_window_default=64000,\
+             context_window=my-gateway:128000,\
+             context_window.anthropic/claude-sonnet-4-6=210000",
+        );
+
+        assert!(flags.context_window_overrides);
+        assert_eq!(flags.context_window_default, Some(64_000));
+        assert_eq!(flags.context_windows.get("my-gateway"), Some(&128_000));
+        assert_eq!(
+            flags.context_windows.get("anthropic/claude-sonnet-4-6"),
+            Some(&210_000)
+        );
+
+        let overrides = flags.experiment_context_windows();
+        assert_eq!(overrides.resolve("my-gateway"), Some(128_000));
+        assert_eq!(
+            overrides.resolve("claude-sonnet-4-6"),
+            Some(210_000),
+            "provider-prefixed experiment keys match the bare model name"
+        );
+        assert_eq!(overrides.resolve("unknown"), Some(64_000));
+    }
+
+    #[test]
+    fn invalid_context_window_experiment_values_are_ignored() {
+        let flags = FeatureFlags::parse(
+            "context_window_default=0,\
+             context_window=my-gateway:not-a-number,\
+             context_window.=128000",
+        );
+
+        assert!(!flags.context_window_overrides);
+        assert_eq!(flags.context_window_default, None);
+        assert!(flags.context_windows.is_empty());
+        assert!(flags.experiment_context_windows().is_empty());
+    }
+
+    #[test]
+    fn context_window_experiment_requires_enabled_flag() {
+        let mut flags = FeatureFlags {
+            context_window_default: Some(64_000),
+            ..Default::default()
+        };
+        flags.context_windows.insert("my-gateway".into(), 128_000);
+        assert!(
+            flags.experiment_context_windows().is_empty(),
+            "values do not participate while the experiment flag is off"
+        );
+
+        flags.context_window_overrides = true;
+        let overrides = flags.experiment_context_windows();
+        assert_eq!(overrides.resolve("my-gateway"), Some(128_000));
+        assert_eq!(overrides.resolve("unknown"), Some(64_000));
+    }
+
+    #[test]
+    fn boolean_context_window_flag_can_be_disabled_by_project_override() {
+        let flags = FeatureFlags::parse("context_window_overrides");
+        assert!(flags.context_window_overrides);
+
+        let mut overrides = HashMap::new();
+        overrides.insert("context_window_overrides".into(), false);
+        let with_project = flags.with_project_overrides(&overrides);
+        assert!(!with_project.context_window_overrides);
     }
 }

@@ -1,6 +1,8 @@
 //! Public type definitions for CodeRex.
 
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 
 /// Role of a message in the conversation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -200,31 +202,53 @@ impl ModelId {
 
     /// Return the model's context window size in tokens.
     ///
-    /// Compaction thresholds are derived from this value (50% trigger, 90%
-    /// reactive), so over-reporting it means context overflows before anything
-    /// compacts. Known Claude models are matched by family prefix so dated
-    /// variants (`claude-sonnet-4-6-20260101`) resolve correctly; anything
-    /// unrecognised — a gateway alias, a local model, a future release — gets
-    /// a deliberately conservative floor rather than the largest window we
-    /// happen to know, so the failure mode is early compaction rather than a
-    /// hard context-length error.
+    /// This keeps the original API shape but now consults the full override
+    /// chain: environment, the client-data file, the built-in model table, and
+    /// finally the conservative unknown floor. Settings and experiment
+    /// overrides are supplied by the config crate through
+    /// [`ModelId::context_window_with`] and [`ContextWindowResolver`].
+    ///
+    /// Compaction thresholds are derived from this value, so over-reporting it
+    /// means context overflows before anything compacts. Known families are
+    /// matched by prefix so dated variants (`claude-sonnet-4-6-20260101`) and
+    /// provider-prefixed aliases (`anthropic/claude-sonnet-4-6`) resolve
+    /// correctly; anything unrecognised gets a deliberately conservative floor
+    /// rather than the largest window we happen to know, so the failure mode is
+    /// early compaction rather than a hard context-length error.
     #[must_use]
     pub fn context_window(&self) -> usize {
         Self::context_window_for(&self.0)
     }
 
-    /// Context window for a raw model name.
+    /// Context window for this model, resolved through an explicit override
+    /// chain.
+    #[must_use]
+    pub fn context_window_with(&self, resolver: &ContextWindowResolver) -> usize {
+        resolver.resolve(&self.0)
+    }
+
+    /// Context window for a raw model name, using the process environment,
+    /// client-data file, and built-in table.
     #[must_use]
     pub fn context_window_for(name: &str) -> usize {
-        // Claude families all ship a 200k window today.
-        if name.starts_with("claude-") {
-            return CLAUDE_CONTEXT_WINDOW;
-        }
-        UNKNOWN_CONTEXT_WINDOW
+        ContextWindowResolver::from_env_and_client_data().resolve(name)
+    }
+
+    /// Context window from the built-in model table only, ignoring overrides.
+    ///
+    /// Useful for diagnostics and for callers that need a pure,
+    /// environment-independent answer.
+    #[must_use]
+    pub fn table_context_window_for(name: &str) -> usize {
+        table_context_window(name).unwrap_or(UNKNOWN_CONTEXT_WINDOW)
     }
 }
 
 /// Context window for Claude model families.
+///
+/// Kept at 200k deliberately: it is the conservative floor across the Claude
+/// family, including older and gateway-provided variants. Newer models with
+/// larger windows can be raised per model through an override.
 pub const CLAUDE_CONTEXT_WINDOW: usize = 200_000;
 
 /// Conservative window assumed for models we cannot identify.
@@ -233,6 +257,429 @@ pub const CLAUDE_CONTEXT_WINDOW: usize = 200_000;
 /// wrong guess that is too small costs some context, a wrong guess that is too
 /// large loses the conversation.
 pub const UNKNOWN_CONTEXT_WINDOW: usize = 32_000;
+
+/// Global environment variable overriding the context window for every model.
+pub const CONTEXT_WINDOW_ENV: &str = "CODEREX_CONTEXT_WINDOW";
+
+/// Prefix for per-model context-window environment variables.
+///
+/// The model name is upper-cased and every non-alphanumeric character is
+/// replaced with `_`, e.g. `claude-sonnet-4-6` becomes
+/// `CODEREX_CONTEXT_WINDOW_CLAUDE_SONNET_4_6`.
+pub const CONTEXT_WINDOW_MODEL_ENV_PREFIX: &str = "CODEREX_CONTEXT_WINDOW_";
+
+/// File name, relative to the CodeRex config home, for client-data overrides.
+pub const CONTEXT_WINDOW_CLIENT_DATA_FILE: &str = "context_windows.json";
+
+/// Built-in per-model context windows, matched by exact name or family prefix.
+///
+/// Entries are deliberately conservative: a window that is too small costs
+/// some context, while one that is too large loses the conversation. Only
+/// documented families are listed; everything else falls through to
+/// [`UNKNOWN_CONTEXT_WINDOW`]. Order matters — more specific entries must come
+/// before their prefixes (`gpt-4o` before `gpt-4`).
+pub const MODEL_CONTEXT_WINDOWS: &[(&str, usize)] = &[
+    // Anthropic Claude: 200k across the family (conservative floor).
+    ("claude", CLAUDE_CONTEXT_WINDOW),
+    // OpenAI.
+    ("gpt-4o", 128_000),
+    ("gpt-4.1", 1_000_000),
+    ("gpt-4-turbo", 128_000),
+    ("gpt-4", 8_192),
+    ("gpt-3.5-turbo", 16_000),
+    ("o1-mini", 128_000),
+    ("o1", 200_000),
+    ("o3", 200_000),
+    ("o4-mini", 200_000),
+    // Google Gemini.
+    ("gemini-2.5-pro", 1_000_000),
+    ("gemini-2.5-flash", 1_000_000),
+    // DeepSeek.
+    ("deepseek-chat", 64_000),
+    ("deepseek-reasoner", 64_000),
+    ("deepseek-r1", 64_000),
+    // Meta Llama.
+    ("llama-3.3", 128_000),
+    ("llama-3.1", 128_000),
+    // Alibaba Qwen.
+    ("qwen2.5", 128_000),
+    // Mistral.
+    ("mistral-large", 128_000),
+];
+
+/// Per-model context-window overrides with an optional fallback.
+///
+/// The same shape is used by settings (`context_window`), client data
+/// (`~/.coderex/context_windows.json`), experiments, and the environment
+/// parser:
+///
+/// ```json
+/// {
+///   "default": 128000,
+///   "models": {
+///     "my-gateway-alias": 200000
+///   }
+/// }
+/// ```
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContextWindowOverrides {
+    /// Fallback window for models without a per-model entry.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default: Option<usize>,
+    /// Per-model windows, keyed by model name.
+    #[serde(default)]
+    pub models: HashMap<String, usize>,
+}
+
+impl ContextWindowOverrides {
+    /// Whether this source contributes no values.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.default.is_none() && self.models.is_empty()
+    }
+
+    /// Resolve a model within this source: a per-model value beats the
+    /// source's default. Zero values are ignored.
+    #[must_use]
+    pub fn resolve(&self, model: &str) -> Option<usize> {
+        lookup_model_window(&self.models, model).or_else(|| valid_window(self.default))
+    }
+
+    /// Drop blank model keys and zero windows in place.
+    pub fn retain_valid(&mut self) {
+        self.default = valid_window(self.default);
+        self.models
+            .retain(|model, tokens| !model.trim().is_empty() && *tokens > 0);
+    }
+
+    /// Parse overrides from the process environment.
+    ///
+    /// Reads [`CONTEXT_WINDOW_ENV`] as the global default and every
+    /// `CODEREX_CONTEXT_WINDOW_<SANITIZED_MODEL>` as a per-model override.
+    #[must_use]
+    pub fn from_env() -> Self {
+        Self::from_env_vars(std::env::vars())
+    }
+
+    /// Parse overrides from an arbitrary key/value iterator.
+    ///
+    /// This is the testable form of [`Self::from_env`]; invalid and zero
+    /// values are ignored so the next source can supply a window.
+    #[must_use]
+    pub fn from_env_vars<I, K, V>(vars: I) -> Self
+    where
+        I: IntoIterator<Item = (K, V)>,
+        K: AsRef<str>,
+        V: AsRef<str>,
+    {
+        let mut overrides = Self::default();
+        for (key, value) in vars {
+            let key = key.as_ref();
+            if key == CONTEXT_WINDOW_ENV {
+                overrides.default = parse_window(value.as_ref());
+                continue;
+            }
+            let Some(suffix) = key.strip_prefix(CONTEXT_WINDOW_MODEL_ENV_PREFIX) else {
+                continue;
+            };
+            if suffix.is_empty() {
+                continue;
+            }
+            if let Some(tokens) = parse_window(value.as_ref()) {
+                overrides.models.insert(suffix.to_ascii_uppercase(), tokens);
+            }
+        }
+        overrides
+    }
+
+    /// Parse the JSON file shape.
+    ///
+    /// # Errors
+    ///
+    /// Returns the serde error when the document is not a valid override map.
+    pub fn from_json_str(json: &str) -> Result<Self, serde_json::Error> {
+        let mut overrides: Self = serde_json::from_str(json)?;
+        overrides.retain_valid();
+        Ok(overrides)
+    }
+
+    /// Load overrides from a JSON file, returning `None` if the file is
+    /// missing or invalid.
+    #[must_use]
+    pub fn from_json_file(path: &Path) -> Option<Self> {
+        let content = match std::fs::read_to_string(path) {
+            Ok(content) => content,
+            Err(error) => {
+                if error.kind() != std::io::ErrorKind::NotFound {
+                    tracing::warn!(
+                        "could not read context window file {}: {error}",
+                        path.display()
+                    );
+                }
+                return None;
+            }
+        };
+        match Self::from_json_str(&content) {
+            Ok(overrides) => Some(overrides),
+            Err(error) => {
+                tracing::warn!("invalid context window file {}: {error}", path.display());
+                None
+            }
+        }
+    }
+
+    /// Load the client-data override file for the active config home.
+    #[must_use]
+    pub fn load_client_data() -> Self {
+        Self::from_json_file(&context_window_client_data_path()).unwrap_or_default()
+    }
+}
+
+/// Resolve context windows from an ordered chain of sources.
+///
+/// Precedence (highest first):
+/// 1. environment (per-model, then global)
+/// 2. settings (per-model, then default)
+/// 3. client data (per-model, then default)
+/// 4. experiment/feature flag (per-model, then default)
+/// 5. built-in model table
+/// 6. [`UNKNOWN_CONTEXT_WINDOW`]
+///
+/// Source order is authoritative: a global default in a higher-priority source
+/// beats a per-model entry in a lower-priority one, while within a single
+/// source a per-model entry beats that source's default.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ContextWindowResolver {
+    /// Process-environment overrides.
+    pub env: ContextWindowOverrides,
+    /// Settings-file overrides.
+    pub settings: ContextWindowOverrides,
+    /// Client-data file overrides.
+    pub client_data: ContextWindowOverrides,
+    /// Experiment/feature-flag overrides.
+    pub experiment: ContextWindowOverrides,
+}
+
+impl ContextWindowResolver {
+    /// Build a resolver from all four override sources.
+    #[must_use]
+    pub fn new(
+        env: ContextWindowOverrides,
+        settings: ContextWindowOverrides,
+        client_data: ContextWindowOverrides,
+        experiment: ContextWindowOverrides,
+    ) -> Self {
+        Self {
+            env,
+            settings,
+            client_data,
+            experiment,
+        }
+    }
+
+    /// Build a resolver from the sources core can read on its own: the process
+    /// environment and the client-data file.
+    ///
+    /// Settings and experiment overrides are layered in by the config crate
+    /// with [`Self::with_settings`] and [`Self::with_experiment`].
+    #[must_use]
+    pub fn from_env_and_client_data() -> Self {
+        Self {
+            env: ContextWindowOverrides::from_env(),
+            client_data: ContextWindowOverrides::load_client_data(),
+            ..Self::default()
+        }
+    }
+
+    /// Attach settings overrides.
+    #[must_use]
+    pub fn with_settings(mut self, settings: ContextWindowOverrides) -> Self {
+        self.settings = settings;
+        self
+    }
+
+    /// Attach experiment/feature-flag overrides.
+    #[must_use]
+    pub fn with_experiment(mut self, experiment: ContextWindowOverrides) -> Self {
+        self.experiment = experiment;
+        self
+    }
+
+    /// Resolve the window for a model name.
+    #[must_use]
+    pub fn resolve(&self, model: &str) -> usize {
+        for source in [
+            &self.env,
+            &self.settings,
+            &self.client_data,
+            &self.experiment,
+        ] {
+            if let Some(window) = source.resolve(model) {
+                return window;
+            }
+        }
+        table_context_window(model).unwrap_or(UNKNOWN_CONTEXT_WINDOW)
+    }
+}
+
+/// Path to the client-data context-window file.
+///
+/// Uses `CLAUDE_CONFIG_DIR` when set, otherwise `$HOME/.coderex`, matching
+/// [`crate`]'s config home convention. Falls back to `.coderex` when no home
+/// directory can be determined.
+#[must_use]
+pub fn context_window_client_data_path() -> PathBuf {
+    if let Some(dir) = std::env::var_os("CLAUDE_CONFIG_DIR") {
+        return PathBuf::from(dir).join(CONTEXT_WINDOW_CLIENT_DATA_FILE);
+    }
+    if let Some(home) = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")) {
+        return PathBuf::from(home)
+            .join(".coderex")
+            .join(CONTEXT_WINDOW_CLIENT_DATA_FILE);
+    }
+    PathBuf::from(".coderex").join(CONTEXT_WINDOW_CLIENT_DATA_FILE)
+}
+
+/// Normalize a model name for lookup and matching.
+///
+/// Lower-cases the name, drops a trailing `[1m]` marker, and strips common
+/// provider/router prefixes (`models/`, `anthropic/`, `openai/`,
+/// `bedrock/`, regional `us.`/`eu.` prefixes, and similar). The result is
+/// what the table matcher and normalized map lookups compare against.
+#[must_use]
+pub fn normalized_model_name(name: &str) -> String {
+    const PREFIXES: &[&str] = &[
+        "models/",
+        "anthropic/",
+        "anthropic.",
+        "openai/",
+        "openai.",
+        "google/",
+        "google.",
+        "vertex/",
+        "bedrock/",
+        "openrouter/",
+        "azure/",
+        "aws/",
+        "meta/",
+        "meta-llama/",
+        "deepseek/",
+        "mistral/",
+        "qwen/",
+        "x-ai/",
+        "us.",
+        "eu.",
+        "apac.",
+    ];
+
+    let mut normalized = name.trim().to_ascii_lowercase();
+    if let Some(stripped) = normalized.strip_suffix("[1m]") {
+        normalized = stripped.trim_end().to_string();
+    }
+    loop {
+        let before = normalized.clone();
+        for prefix in PREFIXES {
+            if let Some(rest) = normalized.strip_prefix(prefix) {
+                normalized = rest.to_string();
+            }
+        }
+        if normalized == before {
+            break;
+        }
+    }
+    normalized
+}
+
+/// Sanitize a model name for use in an environment variable suffix.
+///
+/// Upper-cases the name and replaces every non-alphanumeric character with
+/// `_`. Distinct names can collide (for example `a.b` and `a-b`), so the
+/// per-model environment form is best reserved for conventional model ids.
+#[must_use]
+pub fn sanitized_model_env_name(name: &str) -> String {
+    name.trim()
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() {
+                c.to_ascii_uppercase()
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+fn parse_window(value: &str) -> Option<usize> {
+    value
+        .trim()
+        .parse::<usize>()
+        .ok()
+        .filter(|tokens| *tokens > 0)
+}
+
+fn valid_window(window: Option<usize>) -> Option<usize> {
+    window.filter(|tokens| *tokens > 0)
+}
+
+fn model_name_candidates(name: &str) -> Vec<String> {
+    let trimmed = name.trim();
+    let mut candidates = Vec::with_capacity(4);
+    if trimmed.is_empty() {
+        return candidates;
+    }
+    candidates.push(trimmed.to_string());
+    let lower = trimmed.to_ascii_lowercase();
+    if !candidates.contains(&lower) {
+        candidates.push(lower);
+    }
+    let normalized = normalized_model_name(trimmed);
+    if !candidates.contains(&normalized) {
+        candidates.push(normalized);
+    }
+    candidates
+}
+
+fn lookup_model_window(models: &HashMap<String, usize>, name: &str) -> Option<usize> {
+    if models.is_empty() {
+        return None;
+    }
+
+    // Exact and case-normalized candidates first, then the sanitized form used
+    // by per-model environment variables (which stores upper-case keys).
+    for candidate in model_name_candidates(name) {
+        if let Some(window) = models.get(&candidate).and_then(|v| valid_window(Some(*v))) {
+            return Some(window);
+        }
+        let sanitized = sanitized_model_env_name(&candidate);
+        if let Some(window) = models.get(&sanitized).and_then(|v| valid_window(Some(*v))) {
+            return Some(window);
+        }
+    }
+
+    // Then compare fully normalized keys, so a map key written as
+    // `anthropic/claude-sonnet-4-6` still matches `claude-sonnet-4-6`.
+    let target = normalized_model_name(name);
+    let mut matches: Vec<(&String, usize)> = models
+        .iter()
+        .filter(|(key, _)| normalized_model_name(key) == target)
+        .filter_map(|(key, tokens)| valid_window(Some(*tokens)).map(|tokens| (key, tokens)))
+        .collect();
+    matches.sort_by(|left, right| left.0.cmp(right.0));
+    matches.first().map(|(_, tokens)| *tokens)
+}
+
+fn table_context_window(name: &str) -> Option<usize> {
+    let normalized = normalized_model_name(name);
+    MODEL_CONTEXT_WINDOWS
+        .iter()
+        .find(|(prefix, _)| {
+            normalized == *prefix
+                || normalized
+                    .strip_prefix(*prefix)
+                    .is_some_and(|rest| rest.starts_with('-'))
+        })
+        .map(|(_, window)| *window)
+}
 
 /// Lifecycle events for a sub-agent.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -504,8 +951,22 @@ mod tests {
 mod context_window_tests {
     use super::*;
 
+    fn overrides(default: Option<usize>, models: &[(&str, usize)]) -> ContextWindowOverrides {
+        ContextWindowOverrides {
+            default,
+            models: models
+                .iter()
+                .map(|(model, tokens)| ((*model).to_string(), *tokens))
+                .collect(),
+        }
+    }
+
     #[test]
     fn known_families_report_their_full_window() {
+        assert_eq!(
+            ModelId::table_context_window_for("claude-opus-4-6"),
+            CLAUDE_CONTEXT_WINDOW
+        );
         assert_eq!(ModelId::opus().context_window(), CLAUDE_CONTEXT_WINDOW);
         assert_eq!(ModelId::sonnet().context_window(), CLAUDE_CONTEXT_WINDOW);
         assert_eq!(ModelId::haiku().context_window(), CLAUDE_CONTEXT_WINDOW);
@@ -527,12 +988,45 @@ mod context_window_tests {
         }
     }
 
+    #[test]
+    fn normalization_handles_case_and_provider_prefixes() {
+        for name in [
+            "CLAUDE-SONNET-4-6",
+            "anthropic/claude-sonnet-4-6",
+            "models/claude-sonnet-4-6",
+            "us.anthropic.claude-sonnet-4-6",
+            "claude-sonnet-4-6[1m]",
+        ] {
+            assert_eq!(
+                ModelId::table_context_window_for(name),
+                CLAUDE_CONTEXT_WINDOW,
+                "{name} should normalize before matching"
+            );
+        }
+    }
+
+    #[test]
+    fn model_table_has_conservative_entries_for_common_gateways() {
+        for (name, expected) in [
+            ("gpt-4o", 128_000),
+            ("gpt-4o-2024-08-06", 128_000),
+            ("gpt-4.1-mini", 1_000_000),
+            ("gemini-2.5-pro", 1_000_000),
+            ("deepseek-chat", 64_000),
+            ("llama-3.3-70b-instruct", 128_000),
+            ("qwen2.5-72b-instruct", 128_000),
+            ("mistral-large-latest", 128_000),
+        ] {
+            assert_eq!(ModelId::table_context_window_for(name), expected, "{name}");
+        }
+    }
+
     /// The bug this guards: an unknown model previously reported 200k, so
     /// compaction would not trigger until ~180k tokens.
     #[test]
     fn unknown_models_are_conservative_not_maximal() {
-        for name in ["gpt-4o", "local-llama-3", "my-gateway-alias"] {
-            let window = ModelId(name.to_string()).context_window();
+        for name in ["local-llama-3", "my-gateway-alias", "totally-unknown"] {
+            let window = ModelId::table_context_window_for(name);
             assert_eq!(window, UNKNOWN_CONTEXT_WINDOW, "{name}");
             assert!(
                 window < CLAUDE_CONTEXT_WINDOW,
@@ -542,12 +1036,182 @@ mod context_window_tests {
     }
 
     #[test]
-    fn case_sensitivity_is_a_known_limitation() {
-        // Model ids are lowercase in practice; document the boundary rather
-        // than silently normalising, so a mismatch shows up in the window.
+    fn per_model_env_name_is_sanitized() {
         assert_eq!(
-            ModelId("CLAUDE-SONNET-4-6".to_string()).context_window(),
-            UNKNOWN_CONTEXT_WINDOW
+            sanitized_model_env_name("claude-sonnet-4-6"),
+            "CLAUDE_SONNET_4_6"
+        );
+        assert_eq!(sanitized_model_env_name("gpt-4o"), "GPT_4O");
+        assert_eq!(
+            sanitized_model_env_name("vendor/model.v2"),
+            "VENDOR_MODEL_V2"
+        );
+    }
+
+    #[test]
+    fn env_per_model_beats_env_global() {
+        let env = ContextWindowOverrides::from_env_vars([
+            (CONTEXT_WINDOW_ENV, "64000"),
+            ("CODEREX_CONTEXT_WINDOW_MY_GATEWAY", "128000"),
+        ]);
+        let resolver = ContextWindowResolver::new(
+            env,
+            Default::default(),
+            Default::default(),
+            Default::default(),
+        );
+
+        assert_eq!(resolver.resolve("my-gateway"), 128_000);
+        assert_eq!(resolver.resolve("some-other-model"), 64_000);
+    }
+
+    #[test]
+    fn env_matches_provider_prefixed_and_case_variant_model_names() {
+        let env = ContextWindowOverrides::from_env_vars([(
+            "CODEREX_CONTEXT_WINDOW_CLAUDE_SONNET_4_6",
+            "500000",
+        )]);
+        let resolver = ContextWindowResolver::new(
+            env,
+            Default::default(),
+            Default::default(),
+            Default::default(),
+        );
+
+        for name in [
+            "claude-sonnet-4-6",
+            "CLAUDE-SONNET-4-6",
+            "anthropic/claude-sonnet-4-6",
+        ] {
+            assert_eq!(resolver.resolve(name), 500_000, "{name}");
+        }
+    }
+
+    /// Source order is authoritative: a higher-priority global default beats a
+    /// lower-priority per-model value, while a per-model value beats the global
+    /// default inside the same source.
+    #[test]
+    fn override_chain_precedence_at_every_level() {
+        let model = "gateway-alias";
+
+        let resolver = ContextWindowResolver::new(
+            overrides(Some(100_000), &[(model, 110_000)]),
+            overrides(Some(200_000), &[(model, 210_000)]),
+            overrides(Some(300_000), &[(model, 310_000)]),
+            overrides(Some(400_000), &[(model, 410_000)]),
+        );
+        assert_eq!(resolver.resolve(model), 110_000, "env wins");
+
+        let resolver = ContextWindowResolver::new(
+            Default::default(),
+            overrides(Some(200_000), &[(model, 210_000)]),
+            overrides(Some(300_000), &[(model, 310_000)]),
+            overrides(Some(400_000), &[(model, 410_000)]),
+        );
+        assert_eq!(resolver.resolve(model), 210_000, "settings wins");
+
+        let resolver = ContextWindowResolver::new(
+            Default::default(),
+            Default::default(),
+            overrides(Some(300_000), &[(model, 310_000)]),
+            overrides(Some(400_000), &[(model, 410_000)]),
+        );
+        assert_eq!(resolver.resolve(model), 310_000, "client data wins");
+
+        let resolver = ContextWindowResolver::new(
+            Default::default(),
+            Default::default(),
+            Default::default(),
+            overrides(Some(400_000), &[(model, 410_000)]),
+        );
+        assert_eq!(resolver.resolve(model), 410_000, "experiment wins");
+
+        let resolver = ContextWindowResolver::default();
+        assert_eq!(
+            resolver.resolve("claude-sonnet-4-6"),
+            CLAUDE_CONTEXT_WINDOW,
+            "table is the final known source"
+        );
+        assert_eq!(
+            resolver.resolve(model),
+            UNKNOWN_CONTEXT_WINDOW,
+            "unknown falls back conservatively"
+        );
+    }
+
+    #[test]
+    fn global_default_beats_a_lower_source_per_model_value() {
+        let resolver = ContextWindowResolver::new(
+            overrides(Some(90_000), &[]),
+            overrides(None, &[("gateway-alias", 210_000)]),
+            Default::default(),
+            Default::default(),
+        );
+        assert_eq!(
+            resolver.resolve("gateway-alias"),
+            90_000,
+            "env global default outranks a settings per-model value"
+        );
+    }
+
+    #[test]
+    fn invalid_and_zero_values_fall_through() {
+        let resolver = ContextWindowResolver::new(
+            overrides(Some(0), &[("gateway-alias", 0)]),
+            overrides(Some(0), &[("gateway-alias", 0)]),
+            overrides(Some(0), &[("gateway-alias", 0)]),
+            overrides(Some(0), &[("gateway-alias", 0)]),
+        );
+        assert_eq!(resolver.resolve("gateway-alias"), UNKNOWN_CONTEXT_WINDOW);
+
+        let env = ContextWindowOverrides::from_env_vars([
+            (CONTEXT_WINDOW_ENV, "not-a-number"),
+            ("CODEREX_CONTEXT_WINDOW_MY_GATEWAY", "0"),
+        ]);
+        assert!(env.is_empty());
+
+        let resolver = ContextWindowResolver::new(
+            env,
+            overrides(Some(0), &[("gateway-alias", 0)]),
+            Default::default(),
+            overrides(Some(123_000), &[]),
+        );
+        assert_eq!(
+            resolver.resolve("gateway-alias"),
+            123_000,
+            "a valid lower source is used after invalid higher ones"
+        );
+    }
+
+    #[test]
+    fn client_data_json_uses_the_documented_shape() {
+        let overrides = ContextWindowOverrides::from_json_str(
+            r#"{
+                "default": 64000,
+                "models": {
+                    "my-gateway-alias": 128000,
+                    "claude-sonnet-4-6": 200000,
+                    "zero-is-ignored": 0
+                }
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(overrides.resolve("my-gateway-alias"), Some(128_000));
+        assert_eq!(overrides.resolve("claude-sonnet-4-6"), Some(200_000));
+        // The zero entry is dropped, so the model falls through to the
+        // source's default rather than disabling compaction.
+        assert_eq!(overrides.resolve("zero-is-ignored"), Some(64_000));
+        assert_eq!(overrides.resolve("other"), Some(64_000));
+    }
+
+    #[test]
+    fn client_data_map_matches_normalized_keys() {
+        let overrides = overrides(None, &[("anthropic/claude-sonnet-4-6", 210_000)]);
+        assert_eq!(
+            overrides.resolve("claude-sonnet-4-6"),
+            Some(210_000),
+            "provider-prefixed map keys still match the bare model name"
         );
     }
 }

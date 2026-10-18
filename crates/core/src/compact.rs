@@ -16,7 +16,7 @@
 //! - **Snip**: Truncate history at a boundary point, preserving essential context
 
 use crate::prompt::{CompactConfig, PromptCompiler};
-use crate::types::{Message, MessageContent, ModelId, Role, ToolResult};
+use crate::types::{ContextWindowResolver, Message, MessageContent, ModelId, Role, ToolResult};
 
 // ─── Compact Strategy ───────────────────────────────────────────────────────
 
@@ -524,9 +524,36 @@ pub struct CompactThresholds {
 
 impl CompactThresholds {
     /// Resolve the lines for a model's context window.
+    ///
+    /// Uses the default override chain: process environment, the client-data
+    /// file, the built-in model table, and finally the conservative unknown
+    /// floor. Callers that own settings or experiment state should use
+    /// [`Self::resolve_with`] so those sources participate too.
     #[must_use]
     pub fn resolve(model: &ModelId, config: &CompactConfig) -> Self {
-        let window = model.context_window();
+        Self::resolve_with(
+            model,
+            config,
+            &ContextWindowResolver::from_env_and_client_data(),
+        )
+    }
+
+    /// Resolve the lines through an explicit context-window override chain.
+    #[must_use]
+    pub fn resolve_with(
+        model: &ModelId,
+        config: &CompactConfig,
+        resolver: &ContextWindowResolver,
+    ) -> Self {
+        Self::resolve_for_window(config, resolver.resolve(&model.0))
+    }
+
+    /// Resolve the lines for a context window that has already been looked up.
+    ///
+    /// Useful when a caller has a provider-reported window or a resolved value
+    /// in hand and does not want a second lookup.
+    #[must_use]
+    pub fn resolve_for_window(config: &CompactConfig, window: usize) -> Self {
         Self {
             auto: config.resolve_auto_threshold(window),
             warn: config.resolve_warning_threshold(window),
@@ -561,11 +588,32 @@ pub fn select_compact_strategy(
     model: &ModelId,
     config: &CompactConfig,
 ) -> CompactStrategy {
+    select_compact_strategy_with(
+        stop_reason,
+        estimated_tokens,
+        model,
+        config,
+        &ContextWindowResolver::from_env_and_client_data(),
+    )
+}
+
+/// Select a compact strategy through an explicit context-window override chain.
+///
+/// This is the settings/experiment-aware form of
+/// [`select_compact_strategy`]; the strategy arithmetic is identical.
+#[must_use]
+pub fn select_compact_strategy_with(
+    stop_reason: &str,
+    estimated_tokens: usize,
+    model: &ModelId,
+    config: &CompactConfig,
+    resolver: &ContextWindowResolver,
+) -> CompactStrategy {
     if stop_reason == "max_tokens" {
         return CompactStrategy::Reactive;
     }
 
-    let thresholds = CompactThresholds::resolve(model, config);
+    let thresholds = CompactThresholds::resolve_with(model, config, resolver);
     match thresholds.level(estimated_tokens) {
         // The window is spent: keep only what still fits.
         ContextLevel::Blocked => CompactStrategy::Snip,
@@ -1347,6 +1395,46 @@ mod tests {
         let thresholds =
             CompactThresholds::resolve(&ModelId("custom-model".into()), &CompactConfig::default());
         assert_eq!(thresholds.warn, thresholds.auto / 2);
+    }
+
+    /// A gateway alias is unknown by default (32K), so it compacts early. A
+    /// per-model override must move every line and change the strategy chosen
+    /// for the same token count.
+    #[test]
+    fn a_context_window_override_moves_the_compaction_lines() {
+        let model = ModelId("gateway-alias".into());
+        let config = CompactConfig::default();
+
+        let defaults = CompactThresholds::resolve_for_window(
+            &config,
+            ModelId::table_context_window_for(&model.0),
+        );
+        assert_eq!(defaults.auto, 16_000);
+        assert_eq!(defaults.warn, 8_000);
+        assert_eq!(defaults.blocked, 29_000);
+
+        let resolver = ContextWindowResolver::new(
+            crate::types::ContextWindowOverrides::from_env_vars([(
+                "CODEREX_CONTEXT_WINDOW_GATEWAY_ALIAS",
+                "64000",
+            )]),
+            Default::default(),
+            Default::default(),
+            Default::default(),
+        );
+        let overridden = CompactThresholds::resolve_with(&model, &config, &resolver);
+        assert_eq!(overridden.auto, config.resolve_auto_threshold(64_000));
+        assert_eq!(overridden.warn, config.resolve_warning_threshold(64_000));
+        assert_eq!(overridden.blocked, config.resolve_blocked_threshold(64_000));
+        assert!(overridden.auto > defaults.auto);
+
+        // 20K tokens: past the 16K line before, still below the 31K line with
+        // the override.
+        let default_strategy = select_compact_strategy("end_turn", 20_000, &model, &config);
+        assert!(matches!(default_strategy, CompactStrategy::Auto));
+        let overridden_strategy =
+            select_compact_strategy_with("end_turn", 20_000, &model, &config, &resolver);
+        assert!(matches!(overridden_strategy, CompactStrategy::Micro));
     }
 
     // ═════════════════════════════════════════════════════════════════════
