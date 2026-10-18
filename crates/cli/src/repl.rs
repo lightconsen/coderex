@@ -1283,6 +1283,9 @@ pub struct ReplLoop {
     commands: CommandRegistry,
     /// Current model.
     model: ModelId,
+    /// Model to retry with once when the primary model is unavailable
+    /// (`--fallback-model`).
+    fallback_model: Option<ModelId>,
     /// Maximum output tokens per provider request.
     ///
     /// A named custom agent may set this; the CLI has no override flag, so an
@@ -1561,6 +1564,7 @@ impl ReplLoop {
         let mut this = Self {
             commands,
             model,
+            fallback_model: None,
             max_tokens: QueryEngine::DEFAULT_MAX_TOKENS,
             explicit_model_override: false,
             cwd,
@@ -1916,6 +1920,7 @@ impl ReplLoop {
         let mut this = Self {
             commands,
             model,
+            fallback_model: None,
             max_tokens: QueryEngine::DEFAULT_MAX_TOKENS,
             explicit_model_override: false,
             cwd,
@@ -2207,6 +2212,24 @@ impl ReplLoop {
         self.max_turns = turns;
     }
 
+    /// Configure the one-retry fallback model (`--fallback-model`).
+    ///
+    /// The engine retries the same request once when the primary model is
+    /// unavailable, then continues the turn and session on the fallback.
+    /// Works for interactive and headless sessions alike.
+    pub fn with_fallback_model(&mut self, fallback: Option<ModelId>) {
+        self.fallback_model = fallback.clone();
+        if let Some(ref mut engine) = self.engine {
+            engine.set_fallback_model(fallback);
+        }
+    }
+
+    /// Test accessor for the configured fallback model.
+    #[cfg(test)]
+    pub(crate) fn fallback_model(&self) -> Option<&ModelId> {
+        self.fallback_model.as_ref()
+    }
+
     pub fn with_replay_user_messages(&mut self, replay: bool) {
         self.replay_user_messages = replay;
     }
@@ -2242,6 +2265,13 @@ impl ReplLoop {
     #[must_use]
     pub fn feature_flags(&self) -> &coderex_config::flags::FeatureFlags {
         &self.feature_flags
+    }
+
+    /// The hook documents split by source tier, as installed.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn hook_layers_for_test(&self) -> Option<&coderex_config::settings::HookLayers> {
+        self.hook_layers.as_ref()
     }
 
     /// The capability set derived from the session's feature flags.
@@ -2473,6 +2503,17 @@ impl ReplLoop {
                     self.running = false;
                 }
             }
+        }
+
+        // 9. Inert flags. These names are accepted for configuration
+        // compatibility but nothing in this build reads them; saying so once
+        // at startup is better than letting `--betas` imply an effect it does
+        // not have.
+        for flag in self.feature_flags.inert_flags() {
+            tracing::warn!(
+                flag,
+                "feature flag is accepted for compatibility but has no effect in this build"
+            );
         }
 
         // 9a. The dispatcher and the Workflow tool were built before `--betas`
@@ -5008,6 +5049,10 @@ impl ReplLoop {
 
         let options = self.build_submit_options();
         let mut engine = self.engine.take().unwrap();
+        // Reapply the session's fallback model: the engine crosses the task
+        // boundary below, and an agent selection or `/model` may have rebuilt
+        // the engine's model after `configure_repl` ran.
+        engine.set_fallback_model(self.fallback_model.clone());
         // Installed before the turn task starts so an `Ask` on the very first
         // tool call sees the bus.
         if let Some(bus) = permission_bus.as_ref() {
@@ -5749,6 +5794,7 @@ impl ReplLoop {
 
         let options = self.build_submit_options();
         let mut engine = self.engine.take().unwrap();
+        engine.set_fallback_model(self.fallback_model.clone());
         // The engine moves into the task below, so the handle is what Ctrl+C
         // can reach: without it the key abandoned the result while the work
         // carried on.

@@ -1579,39 +1579,6 @@ impl StartupOrchestrator {
         Ok(())
     }
 
-    /// Choose the fallback model for a retry, if the error indicates the
-    /// primary model itself is unavailable.
-    ///
-    /// Deliberately narrow: transport failures and authentication errors are
-    /// not retried with a different model (they would fail the same way and
-    /// could double-charge a partially completed turn).
-    fn fallback_after_model_error(
-        primary: &ModelId,
-        fallback: Option<&ModelId>,
-        error: &anyhow::Error,
-    ) -> Option<ModelId> {
-        let fallback = fallback?;
-        if fallback.0 == primary.0 {
-            return None;
-        }
-        let message = format!("{error:#}").to_ascii_lowercase();
-        const MODEL_UNAVAILABLE_MARKERS: [&str; 9] = [
-            "model_not_found",
-            "not_found_error",
-            "model not found",
-            "unknown model",
-            "invalid model",
-            "model_not_available",
-            "model is not available",
-            "unsupported model",
-            "overloaded_error",
-        ];
-        MODEL_UNAVAILABLE_MARKERS
-            .iter()
-            .any(|marker| message.contains(marker))
-            .then(|| fallback.clone())
-    }
-
     /// Create an API client from environment variables.
     ///
     /// Uses `ProviderConfig::from_env()` to build a [`ModelRouter`] that
@@ -1773,13 +1740,30 @@ impl StartupOrchestrator {
         repl.with_hooks(hooks);
         // The merged document above is only the compatibility fallback. The
         // split view is what preserves the managed-before-core guarantee.
-        let hook_layers = self
+        let mut hook_layers = self
             .ctx
             .settings
             .as_ref()
             .and_then(|s| s.hook_layers.clone());
+        // Plugins are the producer for the `Plugin` tier: their manifests
+        // contribute hooks that run ahead of core hooks and behind managed
+        // ones. Without this the tier could only ever be empty.
+        if let Some(plugin_hooks) = self
+            .ctx
+            .plugin_manager
+            .as_ref()
+            .and_then(|manager| manager.plugin_hooks())
+        {
+            let layers = hook_layers.get_or_insert_with(|| coderex_config::settings::HookLayers {
+                core: None,
+                plugin: None,
+                managed: None,
+            });
+            layers.plugin = Some(plugin_hooks);
+        }
         repl.with_hook_layers(hook_layers);
         repl.with_max_turns(self.ctx.max_turns);
+        repl.with_fallback_model(self.ctx.fallback_model.clone());
         repl.with_replay_user_messages(self.ctx.replay_user_messages);
         repl.with_include_partial_messages(self.ctx.include_partial_messages);
         repl.with_betas(self.ctx.betas.clone());
@@ -1853,8 +1837,8 @@ impl StartupOrchestrator {
 
     /// Build and configure a REPL loop for a model.
     ///
-    /// Extracted so the headless fallback-model retry can create a second loop
-    /// with identical configuration and a different model.
+    /// The one-retry `--fallback-model` behaviour lives in the engine, so this
+    /// no longer needs to build a second loop after a failure.
     fn prepare_repl(
         &self,
         cwd: &str,
@@ -1880,28 +1864,8 @@ impl StartupOrchestrator {
         repl
     }
 
-    /// Refuse an option that only the headless path can honour.
-    ///
-    /// The fallback retry is implemented around `run_headless`: it rebuilds the
-    /// loop with the fallback model after an error. The interactive loop has no
-    /// equivalent — accepting `--fallback-model` there would look like a
-    /// configured safety net while every failure still stopped the session, so
-    /// startup fails instead.
-    fn reject_interactive_fallback(&self) -> Result<()> {
-        if let Some(fallback) = &self.ctx.fallback_model {
-            bail!(
-                "--fallback-model '{}' is not supported in interactive sessions: the one-retry \
-                 fallback runs only in non-interactive mode (--print or a positional prompt). \
-                 Omit --fallback-model or run headless.",
-                fallback.0
-            );
-        }
-        Ok(())
-    }
-
     #[allow(clippy::unused_async)]
     async fn run_repl(&self, cwd: &str, model: ModelId) -> Result<()> {
-        self.reject_interactive_fallback()?;
         if !std::io::stdin().is_terminal() {
             bail!("interactive REPL requires a terminal on stdin");
         }
@@ -1940,30 +1904,10 @@ impl StartupOrchestrator {
         let streaming_protocol = self.ctx.output_format == "stream-json";
         let mut repl = self.prepare_repl(cwd, model.clone(), streaming_protocol, false);
 
-        let result = match repl.run_headless(&final_prompt).await {
-            Ok(result) => result,
-            Err(error) => {
-                // One honest retry, and only for an error that names an
-                // unavailable/unknown model. Rebuilding the loop is necessary
-                // because the model is part of its construction; nothing else
-                // about the session configuration changes.
-                if let Some(fallback) = Self::fallback_after_model_error(
-                    &model,
-                    self.ctx.fallback_model.as_ref(),
-                    &error,
-                ) {
-                    tracing::warn!(
-                        primary = %model.0,
-                        fallback = %fallback.0,
-                        "primary model unavailable; retrying once with --fallback-model: {error}"
-                    );
-                    let mut retry = self.prepare_repl(cwd, fallback, streaming_protocol, false);
-                    retry.run_headless(&final_prompt).await?
-                } else {
-                    return Err(error);
-                }
-            }
-        };
+        // The engine owns the one-retry fallback for both interactive and
+        // headless sessions, so the headless path must not retry again: doing
+        // so would send the same failure to the same fallback a second time.
+        let result = repl.run_headless(&final_prompt).await?;
 
         if streaming_protocol {
             return Ok(());
@@ -2778,7 +2722,6 @@ impl StartupOrchestrator {
 
     #[allow(clippy::unused_async)]
     async fn run_resume(&self, cwd: &str, session_id: &str, model: ModelId) -> Result<()> {
-        self.reject_interactive_fallback()?;
         let resolved_session_id = if session_id.eq_ignore_ascii_case("latest") {
             session_resume::latest_session_id(cwd).ok_or_else(|| {
                 anyhow::anyhow!("No transcript found to resume in .coderex/transcripts")
@@ -2895,6 +2838,38 @@ mod tests {
         let null =
             StartupOrchestrator::parse_settings_mcp_servers(&serde_json::Value::Null).unwrap();
         assert!(null.is_empty());
+    }
+
+    #[test]
+    fn configure_repl_installs_plugin_hooks_as_their_own_tier() {
+        let manager = coderex_plugins::plugins::PluginManager::new();
+        let manifest: coderex_plugins::plugins::PluginManifest =
+            serde_json::from_value(serde_json::json!({
+                "name": "hooky",
+                "version": "1.0.0",
+                "hooks": [{
+                    "event": "PreToolUse",
+                    "hooks": [{ "type": "command", "command": "true" }]
+                }]
+            }))
+            .expect("the manifest should parse");
+        manager.load_plugin(manifest, std::path::PathBuf::from("/tmp/hooky"));
+
+        let mut orch = StartupOrchestrator::new();
+        orch.ctx.plugin_manager = Some(Arc::new(manager));
+        let mut repl = crate::repl::ReplLoop::new("/tmp".into(), ModelId::sonnet());
+        orch.configure_repl(&mut repl, true);
+
+        let layers = repl
+            .hook_layers_for_test()
+            .expect("plugin hooks should create a layer document");
+        let plugin = layers.plugin.as_ref().expect("the Plugin tier is empty");
+        let entries = plugin
+            .get("hooks")
+            .and_then(serde_json::Value::as_array)
+            .expect("the tier carries a hooks array");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0]["event"], "PreToolUse");
     }
 
     #[test]
@@ -3259,47 +3234,38 @@ mod tests {
     fn fallback_is_used_only_for_model_unavailability() {
         let primary = ModelId("claude-opus-4-6".into());
         let fallback = ModelId("claude-haiku-4-5-20251001".into());
-        let unavailable = anyhow::anyhow!("404 model_not_found: claude-opus-4-6");
+        let choose = coderex_core::engine::fallback_after_model_error;
+
         assert_eq!(
-            StartupOrchestrator::fallback_after_model_error(
+            choose(
                 &primary,
                 Some(&fallback),
-                &unavailable
+                "404 model_not_found: claude-opus-4-6"
             )
             .map(|model| model.0),
             Some(fallback.0.clone())
         );
-
-        let transport = anyhow::anyhow!("connection reset by peer");
         assert!(
-            StartupOrchestrator::fallback_after_model_error(&primary, Some(&fallback), &transport)
-                .is_none(),
+            choose(&primary, Some(&fallback), "connection reset by peer").is_none(),
             "a transport error is not evidence the model is unavailable"
         );
-
-        let same = anyhow::anyhow!("model_not_found");
-        assert!(
-            StartupOrchestrator::fallback_after_model_error(&primary, Some(&primary), &same)
-                .is_none()
-        );
-        assert!(StartupOrchestrator::fallback_after_model_error(&primary, None, &same).is_none());
+        assert!(choose(&primary, Some(&primary), "model_not_found").is_none());
+        assert!(choose(&primary, None, "model_not_found").is_none());
     }
 
-    /// Interactive mode refuses `--fallback-model` instead of accepting it and
-    /// never using it.
+    /// Interactive mode accepts `--fallback-model` and wires it into the
+    /// session instead of refusing it.
     #[test]
-    fn interactive_rejects_the_headless_only_fallback_model() {
+    fn interactive_accepts_and_wires_the_fallback_model() {
         let mut orch = StartupOrchestrator::new();
-        assert!(orch.reject_interactive_fallback().is_ok());
-
         orch.ctx.fallback_model = Some(ModelId("claude-haiku-4-5-20251001".into()));
-        let error = orch
-            .reject_interactive_fallback()
-            .expect_err("interactive fallback must be refused");
-        let message = error.to_string();
-        assert!(message.contains("--fallback-model"));
-        assert!(message.contains("interactive"));
-        assert!(message.contains("non-interactive"));
+
+        let mut interactive = crate::repl::ReplLoop::new("/tmp".into(), ModelId::sonnet());
+        orch.configure_repl(&mut interactive, true);
+        assert_eq!(
+            interactive.fallback_model().map(|model| model.0.as_str()),
+            Some("claude-haiku-4-5-20251001")
+        );
     }
 
     #[test]
