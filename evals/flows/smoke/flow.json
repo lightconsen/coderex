@@ -1,0 +1,29 @@
+{
+  "name": "smoke",
+  "description": "A checked-in, offline flow: the binary starts, answers through the static Anthropic fixture, and runs a local slash command.",
+  "command": "sh \"{flow}/run-case.sh\" \"{prompt}\"",
+  "reps": 1,
+  "concurrency": 1,
+  "timeout_s": 600,
+  "cases": [
+    {
+      "id": "hello-from-fixture",
+      "description": "A text turn goes through the checked-in static provider fixture.",
+      "prompt": "hello",
+      "expect": {
+        "exit_code": 0,
+        "output_contains": ["Hello! Yes, I'd be happy to help you with coding."],
+        "output_not_contains": ["No QueryEngine", "error: "]
+      }
+    },
+    {
+      "id": "local-status-command",
+      "description": "A slash command runs without any provider call.",
+      "prompt": "/status",
+      "expect": {
+        "exit_code": 0,
+        "output_contains": ["System Status"]
+      }
+    }
+  ]
+}

@@ -58,6 +58,31 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - run: scripts/test-code-agent-benchmark.sh mock
 
+  evals:
+    name: Eval Harness
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build eval fixtures
+        run: cargo build -p coderex-cli --bin coderex --bin static-anthropic-server
+      - name: Run checked-in smoke flow
+        run: |
+          cargo run -p coderex-evals --bin run-eval -- \
+            --flow-dir evals/flows/smoke \
+            --variant baseline \
+            --approve-harness \
+            --force
+      - name: Upload eval report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: eval-report
+          path: |
+            evals/flows/smoke/report.html
+            evals/flows/smoke/baseline/results.jsonl
+          if-no-files-found: warn
+
   nightly-mock-depth:
     name: Nightly Mock Depth
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'

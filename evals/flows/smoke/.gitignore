@@ -1,0 +1,6 @@
+# Run output, not harness.
+/baseline/
+/ref/
+/v*/
+/_state.json
+/report.html

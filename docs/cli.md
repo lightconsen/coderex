@@ -7,7 +7,7 @@ The main binary crate. Parses CLI arguments, bootstraps the REPL, wires together
 ## Key Types
 
 - **`Cli`** (`cli.rs`) — Clap argument struct with 40+ flags and subcommands matching Claude Code's interface.
-- **`Command`** (`cli.rs`) — Subcommands: `Repl`, `Serve`, `ServeStop`, `ServeStatus`, `Agents`, `Auth`, `Doctor`, `Update`, `Mcp`, `Plugin`, `AutoMode`.
+- **`Command`** (`cli.rs`) — Subcommands: `Repl`, `Serve`, `ServeStop`, `ServeStatus`, `Agents`, `Auth`, `Doctor`, `Update`, `Mcp`, `Plugin`, `AutoMode`, `Telemetry` (`preview-crash`), `Bridge`.
 - **`ReplLoop`** (`repl.rs`) — Main REPL event loop: reads keys, dispatches to Vim handler, updates UI state, orchestrates queries and commands.
 - **`StartupOrchestrator`** (`orchestrator.rs`) — Bridges REPL to `QueryEngine`. Manages startup phases, API client creation, mode routing (TUI, headless, server, resume), telemetry init, and CLI flag application.
 
@@ -120,6 +120,24 @@ main() → parse_args() → StartupOrchestrator::run()
 | `plugin uninstall NAME` | Uninstall a plugin |
 | `plugin update` | Update all plugins |
 | `auto-mode` | Show auto-mode settings (reads `dream_config.json`) |
+| `telemetry preview-crash [FILE]` | Print the JSON that would be uploaded for a pending crash (never uploads) |
+
+### Telemetry inspection
+
+`coderex telemetry preview-crash` loads the newest pending crash from
+`<config-home>/crashes/pending/` (or the file given as its argument), converts
+it with the same modes ingestion uses, and prints the exact wire payload:
+
+```bash
+coderex telemetry preview-crash
+coderex telemetry preview-crash /path/to/crash_1729.json
+CODEREX_CRASH_VERBOSE=1 coderex telemetry preview-crash
+CODEREX_HIPAA=1 coderex telemetry preview-crash
+```
+
+The file is read, not consumed: nothing is ingested, deleted, or uploaded.
+`CODEREX_HIPAA` wins over `CODEREX_CRASH_VERBOSE`, matching the uploader. See
+`docs/telemetry.md` for the payload fields and redaction markers.
 
 ### Positional Arguments
 

@@ -102,6 +102,7 @@ picks up where it stopped, and a variant can be extended case by case. Use
 
 ```
 --flow DIR          the flow to run (under .coderex/hillclimb/)
+--flow-dir PATH     the flow's directory, wherever it is checked in
 --variant ID        'baseline' or 'v<N>'
 --model ID          passed to the command as {model}
 --repo DIR          the repository the flow lives in (default: here)
@@ -114,6 +115,38 @@ picks up where it stopped, and a variant can be extended case by case. Use
 ```
 
 `run-eval` exits non-zero when any case in that run failed, so it can gate CI.
+
+## The checked-in smoke flow
+
+`evals/flows/smoke/` is a minimal flow that lives in the repository rather
+than under `.coderex/hillclimb/`. `--flow-dir` points the runner at it
+directly, and the flow name is taken from `flow.json` when `--flow` is not
+given:
+
+```bash
+cargo build -p coderex-cli --bin coderex --bin static-anthropic-server
+cargo run -p coderex-evals --bin run-eval -- \
+  --flow-dir evals/flows/smoke \
+  --variant baseline \
+  --approve-harness \
+  --force
+```
+
+It needs no network and no API key. Each case's command is
+`evals/flows/smoke/run-case.sh`, which starts the repository's
+`static-anthropic-server` fixture on a free loopback port with
+`tests/responses.json`, points `ANTHROPIC_BASE_URL` at it, and runs the real
+`coderex` binary:
+
+- `hello-from-fixture` exercises a streamed text turn through the fixture.
+- `local-status-command` runs `/status`, which needs no provider call at all.
+
+Run output (`baseline/`, `report.html`, `_state.json`) is ignored by the flow's
+`.gitignore`; the harness hash covers only checked-in files.
+
+The `evals` job in `.github/workflows/ci.yml` builds the two binaries and runs
+the command above, then uploads `report.html` and `baseline/results.jsonl` as
+the `eval-report` artifact (on failure too).
 
 ## Safety
 
