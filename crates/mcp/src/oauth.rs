@@ -13,6 +13,7 @@
 //! place. Servers that do not issue one are not refreshable here, and
 //! [`OAuthManager::refresh`] says so rather than pretending.
 
+use coderex_config::secret_store::TokenPersistence;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Weak};
@@ -982,6 +983,34 @@ impl crate::http::TokenProvider for OAuthTokenProvider {
             }
         }
     }
+
+    async fn handle_unauthorized(
+        &self,
+        www_authenticate: Option<&str>,
+        rejected_token: Option<&str>,
+    ) -> Result<Option<String>, String> {
+        let Some(shared) = self.oauth.upgrade() else {
+            // Nothing is left that could refresh the credential.
+            return Ok(None);
+        };
+        // The lock is held across the refresh on purpose: concurrent 401s
+        // serialize here, and the rejected-token check inside the manager
+        // means the second one reuses the token the first just obtained
+        // instead of spending the refresh token again.
+        let mut oauth = shared.lock().await;
+        match oauth
+            .handle_unauthorized_for(
+                &self.server_url,
+                &self.client,
+                www_authenticate,
+                rejected_token,
+            )
+            .await
+        {
+            Ok(token) => Ok(Some(token)),
+            Err(error) => Err(error.to_string()),
+        }
+    }
 }
 
 /// OAuth flow manager.
@@ -991,6 +1020,11 @@ pub struct OAuthManager {
     /// Cached authorization-server documents, keyed by normalized issuer.
     issuer_metadata: std::collections::BTreeMap<String, IssuerMetadataCache>,
     path: PathBuf,
+    /// The private store the document is read from and written to. The default
+    /// manager prefers the OS keychain; an explicitly named path is file-only,
+    /// so tests and callers that chose a file cannot touch the developer's
+    /// keychain.
+    persistence: TokenPersistence,
 }
 
 impl Default for OAuthManager {
@@ -1000,65 +1034,99 @@ impl Default for OAuthManager {
 }
 
 impl OAuthManager {
-    /// Create a new OAuth manager backed by the default token file.
+    /// Create a new OAuth manager backed by the default token location.
+    ///
+    /// The default location prefers the OS keychain and falls back to
+    /// `~/.coderex/mcp_tokens.json` with mode `0600`.
     #[must_use]
     pub fn new() -> Self {
-        Self {
-            states: Vec::new(),
-            issuer_metadata: std::collections::BTreeMap::new(),
-            path: Self::token_path(),
-        }
+        let path = Self::token_path();
+        let persistence = TokenPersistence::new(&path);
+        Self::with_persistence(path, persistence)
     }
 
-    /// Create a new OAuth manager backed by `path`.
+    /// Create a new OAuth manager backed by `path`, in a private file.
+    ///
+    /// An explicitly named path is never redirected to the keychain: tests and
+    /// callers that named a file get that file, and cannot reach the real
+    /// developer keychain.
     #[must_use]
     pub fn with_path(path: impl Into<PathBuf>) -> Self {
+        let path = path.into();
+        let persistence = TokenPersistence::file_only(&path);
+        Self::with_persistence(path, persistence)
+    }
+
+    /// Create a manager backed by an injected persistence layer.
+    #[must_use]
+    pub fn with_persistence(path: impl Into<PathBuf>, persistence: TokenPersistence) -> Self {
         Self {
             states: Vec::new(),
             issuer_metadata: std::collections::BTreeMap::new(),
             path: path.into(),
+            persistence,
         }
     }
 
-    /// Load tokens from the default persistence file.
+    /// Load tokens from the default persistence location.
     pub fn load_tokens() -> Result<Self, std::io::Error> {
-        Self::load_tokens_from(&Self::token_path())
+        let path = Self::token_path();
+        let persistence = TokenPersistence::new(&path);
+        Self::load_tokens_with(path, &persistence)
     }
 
-    /// Load tokens from `path`.
+    /// Load tokens from `path`, in a private file.
     ///
     /// A missing file is not an error — it just means nothing has signed in yet.
     pub fn load_tokens_from(path: &Path) -> Result<Self, std::io::Error> {
-        if !path.exists() {
-            return Ok(Self::with_path(path));
-        }
-        let content = std::fs::read_to_string(path)?;
-        let store: TokenStore = serde_json::from_str(&content)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        let persistence = TokenPersistence::file_only(path);
+        Self::load_tokens_with(path.to_path_buf(), &persistence)
+    }
+
+    fn load_tokens_with(
+        path: PathBuf,
+        persistence: &TokenPersistence,
+    ) -> Result<Self, std::io::Error> {
+        let content = persistence.load()?;
+        let store = match content {
+            Some(content) => serde_json::from_str(&content)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?,
+            None => TokenStore {
+                states: Vec::new(),
+                issuer_metadata: std::collections::BTreeMap::new(),
+            },
+        };
         Ok(Self {
             states: store.states,
             issuer_metadata: store.issuer_metadata,
-            path: path.to_path_buf(),
+            path,
+            persistence: persistence.clone(),
         })
     }
 
-    /// Save tokens to the default persistence file.
+    /// Save tokens to the manager's persistence layer.
     pub fn save_tokens(&self) -> Result<(), std::io::Error> {
-        self.save_tokens_to(&self.path)
-    }
-
-    /// Save tokens to `path`.
-    pub fn save_tokens_to(&self, path: &Path) -> Result<(), std::io::Error> {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
         let store = TokenStore {
             states: self.states.clone(),
             issuer_metadata: self.issuer_metadata.clone(),
         };
         let content = serde_json::to_string_pretty(&store)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-        std::fs::write(path, content)
+        self.persistence.save(&content)
+    }
+
+    /// Save tokens to `path`, in a private file.
+    ///
+    /// This bypasses the manager's own persistence layer and always writes the
+    /// named file.
+    pub fn save_tokens_to(&self, path: &Path) -> Result<(), std::io::Error> {
+        let store = TokenStore {
+            states: self.states.clone(),
+            issuer_metadata: self.issuer_metadata.clone(),
+        };
+        let content = serde_json::to_string_pretty(&store)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        TokenPersistence::file_only(path).save(&content)
     }
 
     /// Default token file path: ~/.coderex/mcp_tokens.json
@@ -1518,6 +1586,24 @@ impl OAuthManager {
         client: &reqwest::Client,
         www_authenticate: Option<&str>,
     ) -> Result<String, OAuthError> {
+        self.handle_unauthorized_for(server_url, client, www_authenticate, None)
+            .await
+    }
+
+    /// [`Self::handle_unauthorized`], aware of which token the rejected
+    /// request actually carried.
+    ///
+    /// Concurrent requests can both fail with the same stale token. The first
+    /// one refreshes; when the second reaches the manager, `rejected_token` no
+    /// longer matches the stored access token, so the freshly obtained token is
+    /// returned instead of clearing it and spending the refresh token again.
+    pub async fn handle_unauthorized_for(
+        &mut self,
+        server_url: &str,
+        client: &reqwest::Client,
+        www_authenticate: Option<&str>,
+        rejected_token: Option<&str>,
+    ) -> Result<String, OAuthError> {
         let challenge = www_authenticate
             .map(parse_www_authenticate)
             .unwrap_or_default();
@@ -1527,6 +1613,22 @@ impl OAuthManager {
                     server_url: server_url.to_string(),
                     detail: format!("the server rejected the credential with '{error}'"),
                 });
+            }
+        }
+
+        if let Some(rejected) = rejected_token {
+            if let Some(current) = self
+                .get(server_url)
+                .and_then(|state| state.access_token.as_deref())
+            {
+                if current != rejected {
+                    tracing::debug!(
+                        server = %server_url,
+                        "another request already replaced the rejected access token; \
+                         reusing it instead of refreshing again"
+                    );
+                    return Ok(current.to_string());
+                }
             }
         }
 

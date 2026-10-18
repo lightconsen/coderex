@@ -5,7 +5,9 @@ use crate::channel::{
     JsonRpcServerRequest, METHOD_NOT_FOUND, ServerNotificationHandler,
 };
 use reqwest::Url;
-use reqwest::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue};
+use reqwest::header::{
+    ACCEPT, AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue, WWW_AUTHENTICATE,
+};
 use serde::Serialize;
 use serde_json::Value;
 use std::collections::{HashMap, VecDeque};
@@ -189,6 +191,23 @@ impl RequestDedup {
 pub trait TokenProvider: Send + Sync + std::fmt::Debug {
     /// The bearer token to attach, if one is available.
     async fn access_token(&self) -> Option<String>;
+
+    /// Recover from a `401` whose bearer challenge says `invalid_token`.
+    ///
+    /// `rejected_token` is the token the failed request actually carried, so a
+    /// provider can tell a stale 401 from one that raced with a refresh. The
+    /// returned token is used for exactly one retry; `Ok(None)` means "no
+    /// recovery available" and the original 401 is surfaced unchanged.
+    ///
+    /// The default keeps the historical behaviour for plain bearer providers:
+    /// a 401 is an ordinary error.
+    async fn handle_unauthorized(
+        &self,
+        _www_authenticate: Option<&str>,
+        _rejected_token: Option<&str>,
+    ) -> Result<Option<String>, String> {
+        Ok(None)
+    }
 }
 
 /// The configuration a remote request needs.
@@ -266,23 +285,34 @@ impl RequestContext {
             .and_then(|slot| slot.clone())
     }
 
-    /// Headers for one request, with a freshly resolved bearer token, the
-    /// current session id, and the negotiated protocol revision.
+    /// The headers for one request plus the bearer token that went into them.
     ///
-    /// A token from the provider replaces a configured `Authorization` header;
-    /// this is what lets a configured static token give way to a refreshed one.
-    /// If the provider has nothing, the configured headers go out unchanged.
-    async fn request_headers(&self) -> HeaderMap {
+    /// The token is returned so a 401 can name the credential the request
+    /// carried. It is `None` when the provider had nothing (or there is no
+    /// provider), which is also the case where a configured static
+    /// `Authorization` header is left in place.
+    async fn resolved_headers(&self) -> (HeaderMap, Option<String>) {
+        let token = match &self.token_provider {
+            Some(provider) => provider.access_token().await,
+            None => None,
+        };
+        (self.request_headers_with_token(token.clone()), token)
+    }
+
+    /// Headers for one request with an explicit token.
+    ///
+    /// Used for the single retry after a refresh: it must carry the token the
+    /// provider just returned, not ask the provider again (which could refresh
+    /// a second time).
+    fn request_headers_with_token(&self, token: Option<String>) -> HeaderMap {
         let mut headers = self.headers.clone();
-        if let Some(provider) = &self.token_provider {
-            if let Some(token) = provider.access_token().await {
-                match HeaderValue::from_str(&format!("Bearer {token}")) {
-                    Ok(value) => {
-                        headers.insert(AUTHORIZATION, value);
-                    }
-                    Err(error) => {
-                        tracing::warn!("MCP OAuth token cannot be sent as an HTTP header: {error}");
-                    }
+        if let Some(token) = token {
+            match HeaderValue::from_str(&format!("Bearer {token}")) {
+                Ok(value) => {
+                    headers.insert(AUTHORIZATION, value);
+                }
+                Err(error) => {
+                    tracing::warn!("MCP OAuth token cannot be sent as an HTTP header: {error}");
                 }
             }
         }
@@ -311,23 +341,74 @@ impl RequestContext {
         headers
     }
 
+    /// Send one request, recovering once from a stale-token `401`.
+    ///
+    /// Recovery is attempted only for a `401` carrying
+    /// `WWW-Authenticate: Bearer ... error="invalid_token"`, which is the one
+    /// challenge that says the access token is stale. `insufficient_scope` and
+    /// every other 401 are returned unchanged so the caller surfaces the
+    /// ordinary error without spending the refresh token. A second 401 after
+    /// the retry is an error; there is no loop.
+    async fn send_with_recovery<F>(
+        &self,
+        context: &str,
+        build: F,
+    ) -> Result<reqwest::Response, String>
+    where
+        F: Fn(HeaderMap) -> reqwest::RequestBuilder,
+    {
+        let (headers, token) = self.resolved_headers().await;
+        let response = build(headers)
+            .send()
+            .await
+            .map_err(|error| format!("{context}: {error}"))?;
+
+        let Some(challenge) = invalid_token_challenge(&response) else {
+            return Ok(response);
+        };
+        let Some(provider) = &self.token_provider else {
+            return Ok(response);
+        };
+
+        let token = provider
+            .handle_unauthorized(Some(&challenge), token.as_deref())
+            .await
+            .map_err(|error| format!("{context}: {error}"))?;
+        let Some(token) = token else {
+            // No recovery is available; the caller reports the 401 honestly.
+            return Ok(response);
+        };
+
+        let retried = build(self.request_headers_with_token(Some(token)))
+            .send()
+            .await
+            .map_err(|error| format!("{context}: {error}"))?;
+        if retried.status() == reqwest::StatusCode::UNAUTHORIZED {
+            let status = retried.status();
+            let body = retried.text().await.unwrap_or_default();
+            return Err(format!(
+                "{context}: still {status} after refreshing the access token: {body}"
+            ));
+        }
+        Ok(retried)
+    }
+
     /// POST one JSON-RPC message, remembering any session id the answer sets.
     async fn post<T: Serialize>(
         &self,
         body: &T,
         accept: &'static str,
     ) -> Result<reqwest::Response, String> {
-        let headers = self.request_headers().await;
         let response = self
-            .client
-            .post(self.url.clone())
-            .headers(headers)
-            .header(ACCEPT, accept)
-            .header(CONTENT_TYPE, "application/json")
-            .json(body)
-            .send()
-            .await
-            .map_err(|error| format!("MCP HTTP request failed: {error}"))?;
+            .send_with_recovery("MCP HTTP request failed", |headers| {
+                self.client
+                    .post(self.url.clone())
+                    .headers(headers)
+                    .header(ACCEPT, accept)
+                    .header(CONTENT_TYPE, "application/json")
+                    .json(body)
+            })
+            .await?;
         self.capture_session_id(response.headers());
         Ok(response)
     }
@@ -369,21 +450,16 @@ impl RequestContext {
             },
         };
 
-        let headers = self.request_headers().await;
+        let context = format!("failed to answer the server's '{}' request", request.method);
         let delivered = self
-            .client
-            .post(self.url.clone())
-            .headers(headers)
-            .header(CONTENT_TYPE, "application/json")
-            .json(&response)
-            .send()
-            .await
-            .map_err(|error| {
-                format!(
-                    "failed to answer the server's '{}' request: {error}",
-                    request.method
-                )
-            })?;
+            .send_with_recovery(&context, |headers| {
+                self.client
+                    .post(self.url.clone())
+                    .headers(headers)
+                    .header(CONTENT_TYPE, "application/json")
+                    .json(&response)
+            })
+            .await?;
 
         let status = delivered.status();
         if !status.is_success() {
@@ -715,6 +791,20 @@ impl Drop for HttpChannel {
     }
 }
 
+/// The `Bearer ... error="invalid_token"` challenge on a 401, if this is one.
+///
+/// Only this challenge means "the access token is stale". Any other 401 —
+/// `insufficient_scope`, a basic-auth challenge, or no challenge at all — is
+/// left to the ordinary error path.
+fn invalid_token_challenge(response: &reqwest::Response) -> Option<String> {
+    if response.status() != reqwest::StatusCode::UNAUTHORIZED {
+        return None;
+    }
+    let header = response.headers().get(WWW_AUTHENTICATE)?.to_str().ok()?;
+    let challenge = crate::oauth::parse_www_authenticate(header);
+    (challenge.error.as_deref() == Some("invalid_token")).then(|| header.to_string())
+}
+
 /// How one attempt at the standalone stream ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum StreamEnd {
@@ -941,27 +1031,35 @@ async fn read_event_stream_once(
     cancel: &CancellationToken,
     state: &Arc<RwLock<EventStreamState>>,
 ) -> Result<StreamAttempt, String> {
-    let mut headers = context.request_headers().await;
-    headers.insert(ACCEPT, HeaderValue::from_static(EVENT_STREAM_ACCEPT));
+    let accept = HeaderValue::from_static(EVENT_STREAM_ACCEPT);
     let resume_from = last_event_id.lock().ok().and_then(|slot| slot.clone());
-    if let Some(id) = resume_from.as_deref() {
+    let resume_value = resume_from.as_deref().and_then(|id| {
         match HeaderValue::from_str(id) {
-            Ok(value) => {
-                headers.insert(HeaderName::from_static(LAST_EVENT_ID_HEADER), value);
-            }
+            Ok(value) => Some(value),
             Err(error) => {
                 tracing::warn!("MCP Last-Event-ID cannot be sent as an HTTP header: {error}");
+                None
             }
         }
-    }
+    });
 
     let response = tokio::select! {
         () = cancel.cancelled() => {
             return Ok(StreamAttempt { end: StreamEnd::Cancelled, events: 0 });
         }
-        response = context.client.get(context.url.clone()).headers(headers).send() => {
-            response.map_err(|error| format!("connecting to the GET stream failed: {error}"))?
-        }
+        response = context.send_with_recovery(
+            "connecting to the GET stream failed",
+            |mut headers| {
+                headers.insert(ACCEPT, accept.clone());
+                if let Some(value) = &resume_value {
+                    headers.insert(
+                        HeaderName::from_static(LAST_EVENT_ID_HEADER),
+                        value.clone(),
+                    );
+                }
+                context.client.get(context.url.clone()).headers(headers)
+            },
+        ) => response?,
     };
 
     let status = response.status();

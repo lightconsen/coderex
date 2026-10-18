@@ -26,6 +26,7 @@
 use crate::context::{ToolError, ToolOutput};
 use crate::tool::{Tool, ToolContext, ToolDescriptor, ToolInput, ToolTier};
 use async_trait::async_trait;
+use coderex_config::secret_store::TokenPersistence;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -80,15 +81,29 @@ impl Tool for McpAuthTool {
         input: ToolInput,
         _ctx: ToolContext<'_>,
     ) -> Result<ToolOutput, ToolError> {
-        authenticate(input, &default_token_path()).await
+        // The real sign-in path prefers the OS keychain and falls back to a
+        // private file; the store is shared with `coderex_mcp::oauth`.
+        let persistence = TokenPersistence::new(default_token_path());
+        authenticate_with(input, &persistence).await
     }
 }
 
 /// Run the flow, writing any token it obtains to `token_path`.
 ///
 /// Split out from [`Tool::execute`] so a test can aim the write at a temporary
-/// file instead of the user's real `~/.coderex/mcp_tokens.json`.
+/// file instead of the user's real `~/.coderex/mcp_tokens.json`. An explicit
+/// path is file-only and never consults the developer's keychain.
+#[cfg(test)]
 async fn authenticate(input: ToolInput, token_path: &Path) -> Result<ToolOutput, ToolError> {
+    authenticate_with(input, &TokenPersistence::file_only(token_path)).await
+}
+
+/// Run the flow against an injected persistence layer.
+async fn authenticate_with(
+    input: ToolInput,
+    persistence: &TokenPersistence,
+) -> Result<ToolOutput, ToolError> {
+    let token_path = persistence.path();
     let server_url = extract_string(&input.arguments, "server_url")?;
     // The caller naming a client id is what suppresses dynamic registration.
     let requested_client_id = extract_string(&input.arguments, "client_id").ok();
@@ -105,7 +120,7 @@ async fn authenticate(input: ToolInput, token_path: &Path) -> Result<ToolOutput,
         &client,
         &server_url,
         requested_client_id.as_deref().unwrap_or(""),
-        token_path,
+        persistence,
     )
     .await;
 
@@ -116,7 +131,7 @@ async fn authenticate(input: ToolInput, token_path: &Path) -> Result<ToolOutput,
     // A client id the caller named wins; otherwise a stored (possibly
     // dynamically registered) one is reused. Registration happens only when
     // neither exists.
-    let stored_entry = load_token_entry(token_path, &server_url);
+    let stored_entry = load_token_entry(persistence, &server_url);
     let mut client_id = requested_client_id
         .clone()
         .or_else(|| stored_entry.as_ref().map(|entry| entry.client_id.clone()))
@@ -131,7 +146,7 @@ async fn authenticate(input: ToolInput, token_path: &Path) -> Result<ToolOutput,
                 &client,
                 registration_endpoint,
                 &discovery,
-                token_path,
+                persistence,
                 &server_url,
             )
             .await?;
@@ -340,7 +355,7 @@ async fn authenticate(input: ToolInput, token_path: &Path) -> Result<ToolOutput,
         .and_then(|v| v.as_str())
         .map(String::from);
     let persisted = persist_authenticated_at(
-        token_path,
+        persistence,
         &server_url,
         &client_id,
         client_secret.as_deref(),
@@ -858,8 +873,11 @@ fn issuer_matches(value: &serde_json::Value, requested: &str) -> bool {
 /// second sign-in attempt does not re-probe metadata that is still valid. An
 /// entry with no recorded issuer predates RFC 9728, so it is re-discovered
 /// rather than trusted.
-fn load_cached_discovery(token_path: &Path, server_url: &str) -> Option<DiscoveredEndpoints> {
-    let store = load_token_store(token_path).ok()?;
+fn load_cached_discovery(
+    persistence: &TokenPersistence,
+    server_url: &str,
+) -> Option<DiscoveredEndpoints> {
+    let store = load_token_store(persistence).ok()?;
     let entry = store
         .states
         .into_iter()
@@ -882,9 +900,9 @@ fn load_cached_discovery(token_path: &Path, server_url: &str) -> Option<Discover
 async fn fetch_protected_resource(
     client: &reqwest::Client,
     server_url: &str,
-    token_path: &Path,
+    persistence: &TokenPersistence,
 ) -> Option<(ProtectedResourceMetadata, String, Option<String>, u64)> {
-    let entry = load_token_entry(token_path, server_url);
+    let entry = load_token_entry(persistence, server_url);
     let now = chrono::Utc::now().timestamp();
     if let Some(entry) = &entry {
         if let (Some(metadata), Some(expires_at)) =
@@ -1067,9 +1085,9 @@ async fn discover_endpoints(
     client: &reqwest::Client,
     server_url: &str,
     client_id: &str,
-    token_path: &Path,
+    persistence: &TokenPersistence,
 ) -> DiscoveredEndpoints {
-    if let Some(cached) = load_cached_discovery(token_path, server_url) {
+    if let Some(cached) = load_cached_discovery(persistence, server_url) {
         tracing::debug!(server = %server_url, "Using cached MCP OAuth metadata");
         return cached;
     }
@@ -1079,7 +1097,7 @@ async fn discover_endpoints(
     };
 
     // 1. RFC 9728: the resource may name an authorization server elsewhere.
-    let protected = fetch_protected_resource(client, server_url, token_path).await;
+    let protected = fetch_protected_resource(client, server_url, persistence).await;
     let (protected_metadata, protected_url, protected_etag, protected_ttl) = match protected {
         Some((metadata, url, etag, ttl)) => (Some(metadata), Some(url), etag, ttl),
         None => (None, None, None, 0),
@@ -1094,7 +1112,7 @@ async fn discover_endpoints(
         .unwrap_or_else(|| server_url.to_string());
 
     // 2. RFC 8414 / OIDC metadata, cached by normalized issuer.
-    let cached_entry = load_token_store(token_path)
+    let cached_entry = load_token_store(persistence)
         .ok()
         .and_then(|store| store.issuer_metadata.get(&issuer).cloned());
     let Some((mut discovery, issuer_entry)) =
@@ -1139,7 +1157,7 @@ async fn discover_endpoints(
     tracing::debug!(server = %server_url, "Discovered MCP OAuth endpoints");
 
     // Best-effort: a cache write must never stop a sign-in.
-    let _ = cache_discovery_record_at(token_path, server_url, client_id, &discovery);
+    let _ = cache_discovery_record_at(persistence, server_url, client_id, &discovery);
 
     discovery
 }
@@ -1439,26 +1457,26 @@ impl TokenEntry {
     }
 }
 
-fn load_token_store(path: &Path) -> Result<TokenStore, String> {
-    if !path.exists() {
+fn load_token_store(persistence: &TokenPersistence) -> Result<TokenStore, String> {
+    let Some(content) = persistence.load().map_err(|e| format!("read: {e}"))? else {
         return Ok(TokenStore::default());
-    }
-    let content = std::fs::read_to_string(path).map_err(|e| format!("read: {e}"))?;
-    serde_json::from_str(&content)
-        .map_err(|e| format!("{} is not a readable token store: {e}", path.display()))
+    };
+    serde_json::from_str(&content).map_err(|e| {
+        format!(
+            "{} is not a readable token store: {e}",
+            persistence.path().display()
+        )
+    })
 }
 
-fn save_token_store(path: &Path, store: &TokenStore) -> Result<(), String> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| format!("create dir: {e}"))?;
-    }
+fn save_token_store(persistence: &TokenPersistence, store: &TokenStore) -> Result<(), String> {
     let content = serde_json::to_string_pretty(store).map_err(|e| format!("serialize: {e}"))?;
-    std::fs::write(path, content).map_err(|e| format!("write: {e}"))
+    persistence.save(&content).map_err(|e| format!("write: {e}"))
 }
 
 /// The persisted entry for one server, if the store has one.
-fn load_token_entry(path: &Path, server_url: &str) -> Option<TokenEntry> {
-    load_token_store(path)
+fn load_token_entry(persistence: &TokenPersistence, server_url: &str) -> Option<TokenEntry> {
+    load_token_store(persistence)
         .ok()?
         .states
         .into_iter()
@@ -1505,7 +1523,30 @@ pub fn persist_token_with_endpoints_at(
     token_endpoint: Option<&str>,
     authorization_endpoint: Option<&str>,
 ) -> Result<(), String> {
-    let mut store = load_token_store(path)?;
+    persist_token_with_endpoints(
+        &TokenPersistence::file_only(path),
+        server_url,
+        client_id,
+        access_token,
+        expires_in,
+        refresh_token,
+        token_endpoint,
+        authorization_endpoint,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn persist_token_with_endpoints(
+    persistence: &TokenPersistence,
+    server_url: &str,
+    client_id: &str,
+    access_token: &str,
+    expires_in: i64,
+    refresh_token: Option<&str>,
+    token_endpoint: Option<&str>,
+    authorization_endpoint: Option<&str>,
+) -> Result<(), String> {
+    let mut store = load_token_store(persistence)?;
     let expires_at = chrono::Utc::now().timestamp().saturating_add(expires_in);
     let entry = entry_for(&mut store, server_url, client_id);
     entry.client_id = client_id.to_string();
@@ -1518,7 +1559,7 @@ pub fn persist_token_with_endpoints_at(
     if let Some(endpoint) = authorization_endpoint {
         entry.authorization_endpoint = Some(endpoint.to_string());
     }
-    save_token_store(path, &store)
+    save_token_store(persistence, &store)
 }
 
 /// Persist a completed sign-in together with everything discovery learned.
@@ -1529,7 +1570,7 @@ pub fn persist_token_with_endpoints_at(
 /// were rather than erased.
 #[allow(clippy::too_many_arguments)]
 fn persist_authenticated_at(
-    path: &Path,
+    persistence: &TokenPersistence,
     server_url: &str,
     client_id: &str,
     client_secret: Option<&str>,
@@ -1538,7 +1579,7 @@ fn persist_authenticated_at(
     refresh_token: Option<&str>,
     discovery: &DiscoveredEndpoints,
 ) -> Result<(), String> {
-    let mut store = load_token_store(path)?;
+    let mut store = load_token_store(persistence)?;
     let now = chrono::Utc::now().timestamp();
     let entry = entry_for(&mut store, server_url, client_id);
     entry.client_id = client_id.to_string();
@@ -1552,7 +1593,7 @@ fn persist_authenticated_at(
             store.issuer_metadata.insert(issuer.clone(), cache.clone());
         }
     }
-    save_token_store(path, &store)
+    save_token_store(persistence, &store)
 }
 
 /// Copy a discovery result into a persisted entry.
@@ -1619,12 +1660,12 @@ fn record_discovery_fields(entry: &mut TokenEntry, discovery: &DiscoveredEndpoin
 
 /// Write the authorization-server cache entry and the per-server snapshot.
 fn cache_discovery_record_at(
-    path: &Path,
+    persistence: &TokenPersistence,
     server_url: &str,
     client_id: &str,
     discovery: &DiscoveredEndpoints,
 ) -> Result<(), String> {
-    let mut store = load_token_store(path)?;
+    let mut store = load_token_store(persistence)?;
     let now = chrono::Utc::now().timestamp();
     let entry = entry_for(&mut store, server_url, client_id);
     record_discovery_fields(entry, discovery, now);
@@ -1633,7 +1674,7 @@ fn cache_discovery_record_at(
             store.issuer_metadata.insert(issuer.clone(), cache.clone());
         }
     }
-    save_token_store(path, &store)
+    save_token_store(persistence, &store)
 }
 
 /// Cache discovered authorization-server metadata in the token store.
@@ -1653,7 +1694,27 @@ pub fn cache_discovery_at(
     scopes_supported: &[String],
     expires_in: i64,
 ) -> Result<(), String> {
-    let mut store = load_token_store(path)?;
+    cache_discovery(
+        &TokenPersistence::file_only(path),
+        server_url,
+        client_id,
+        authorization_endpoint,
+        token_endpoint,
+        scopes_supported,
+        expires_in,
+    )
+}
+
+fn cache_discovery(
+    persistence: &TokenPersistence,
+    server_url: &str,
+    client_id: &str,
+    authorization_endpoint: Option<&str>,
+    token_endpoint: Option<&str>,
+    scopes_supported: &[String],
+    expires_in: i64,
+) -> Result<(), String> {
+    let mut store = load_token_store(persistence)?;
     let discovery_expires_at = Some(chrono::Utc::now().timestamp().saturating_add(expires_in));
     let issuer = normalize_issuer(server_url);
     let entry = entry_for(&mut store, server_url, client_id);
@@ -1689,7 +1750,7 @@ pub fn cache_discovery_at(
                 .and_then(|candidates| candidates.into_iter().next());
         }
     }
-    save_token_store(path, &store)
+    save_token_store(persistence, &store)
 }
 
 /// A client registered dynamically with the authorization server.
@@ -1710,7 +1771,7 @@ async fn register_client(
     client: &reqwest::Client,
     endpoint: &str,
     discovery: &DiscoveredEndpoints,
-    token_path: &Path,
+    persistence: &TokenPersistence,
     server_url: &str,
 ) -> Result<ClientRegistration, ToolError> {
     let advertised = &discovery.token_endpoint_auth_methods_supported;
@@ -1772,7 +1833,7 @@ async fn register_client(
         .and_then(|value| value.as_str())
         .map(String::from);
 
-    let mut store = load_token_store(token_path).map_err(|error| ToolError::InvalidInput {
+    let mut store = load_token_store(persistence).map_err(|error| ToolError::InvalidInput {
         message: format!("the registered client could not be stored: {error}"),
     })?;
     let entry = entry_for(&mut store, server_url, &client_id);
@@ -1783,7 +1844,7 @@ async fn register_client(
             .unwrap_or("none")
             .to_string(),
     );
-    save_token_store(token_path, &store).map_err(|error| ToolError::InvalidInput {
+    save_token_store(persistence, &store).map_err(|error| ToolError::InvalidInput {
         message: format!("the registered client could not be stored: {error}"),
     })?;
 
