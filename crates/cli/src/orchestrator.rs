@@ -1495,7 +1495,7 @@ impl StartupOrchestrator {
             let mut registry = ToolRegistry::new();
             register_builtin_tools(&mut registry);
 
-            let mut dispatcher = RegistryToolDispatcher::new(
+            let dispatcher = RegistryToolDispatcher::new(
                 std::sync::Arc::new(registry),
                 std::sync::Arc::new(ToolsExecutor::new(ExecutionConfig::default())),
                 ExecutionContext::Normal,

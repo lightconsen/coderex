@@ -95,7 +95,7 @@ main() → parse_args() → StartupOrchestrator::run()
 | `--chrome` | | Enable browser / web integration |
 | `--no-chrome` | | Disable browser / web integration (removes `ChromeClient` from dispatcher) |
 | `--tmux` | | Run in tmux: re-launch in a new session outside tmux, set the title inside tmux |
-| `--agent AGENT` | | Use a specific agent (currently accepted but inert) |
+| `--agent AGENT` | | Use a named built-in or custom agent definition for the session |
 | `--ide IDE` | | Connect to a configured IDE MCP server and register its tools |
 | `--worktree` | `-w` | Worktree mode (detects git branch, sets `WorktreeState`) |
 
