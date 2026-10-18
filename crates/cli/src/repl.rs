@@ -3,7 +3,9 @@
 use crate::mcp_elicitation::{SessionElicitationHandler, TuiElicitationRequest};
 use crate::session_resume;
 use anyhow::Result;
-use coderex_agents::manager::{AgentManager, AgentObservableEvent, ParentContextSnapshot};
+use coderex_agents::manager::{
+    AgentManager, AgentSubscription, ParentContextSnapshot, TeammateEvent,
+};
 use coderex_commands::registry::{CommandContext, CommandRegistry, CommandResult};
 use coderex_commands::{CommandHistory, MacroRegistry};
 use coderex_core::api_client::ApiClient;
@@ -56,6 +58,35 @@ struct SessionEffects {
     extra_context: Vec<String>,
     /// Whether a title has been generated for this session.
     title_generated: bool,
+}
+
+/// Translate a teammate callback event into the parent engine's lifecycle
+/// event, so the UI and headless event stream consume the existing
+/// `EngineEvent::AgentEvent` path instead of a second event system.
+fn teammate_event_to_lifecycle(event: &TeammateEvent) -> (String, AgentLifecycleEvent) {
+    match event {
+        TeammateEvent::Idle { agent_id, reason } => (
+            agent_id.clone(),
+            AgentLifecycleEvent::Idle {
+                reason: reason.clone(),
+            },
+        ),
+        TeammateEvent::TaskCompleted {
+            agent_id,
+            subject,
+            summary,
+        } => {
+            let summary = if subject.is_empty() {
+                summary.clone()
+            } else {
+                format!("{subject}: {summary}")
+            };
+            (
+                agent_id.clone(),
+                AgentLifecycleEvent::Completed { summary },
+            )
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -626,6 +657,14 @@ pub struct ReplLoop {
     commands: CommandRegistry,
     /// Current model.
     model: ModelId,
+    /// Maximum output tokens per provider request.
+    ///
+    /// A named custom agent may set this; the CLI has no override flag, so an
+    /// explicit programmatic value is the only thing that wins over the file.
+    max_tokens: u32,
+    /// True when `--model` was given. A named custom agent's `model` must not
+    /// override an explicitly chosen session model.
+    explicit_model_override: bool,
     /// Current working directory.
     cwd: String,
     /// Whether the loop should continue.
@@ -703,9 +742,10 @@ pub struct ReplLoop {
     /// sub-agent. Updated immediately before each turn so a spawn reuses the
     /// conversation as it was when the turn started.
     parent_context_snapshot: Arc<std::sync::Mutex<Option<ParentContextSnapshot>>>,
-    /// Broadcast subscription used to observe sub-agent events directly (as
-    /// opposed to lifecycle events forwarded through the parent engine bus).
-    agent_observable_rx: Option<tokio::sync::broadcast::Receiver<AgentObservableEvent>>,
+    /// Filtered broadcast subscription used to observe sub-agent events
+    /// directly (as opposed to lifecycle events forwarded through the parent
+    /// engine bus).
+    agent_observable_rx: Option<AgentSubscription>,
     /// The live MCP servers, filled in by `with_mcp_manager`.
     ///
     /// A slot rather than a plain field because the sub-agent tool factory is
@@ -872,6 +912,8 @@ impl ReplLoop {
         let mut this = Self {
             commands,
             model,
+            max_tokens: QueryEngine::DEFAULT_MAX_TOKENS,
+            explicit_model_override: false,
             cwd,
             running: true,
             setup_error: None,
@@ -1033,6 +1075,19 @@ impl ReplLoop {
         let mut agent_manager = AgentManager::standalone();
         agent_manager.set_api_client(api_client.clone_box());
         agent_manager.set_model(model.clone());
+        // Teammate events are a callback surface on the manager; forward them
+        // into the session's existing engine event channel so the UI renders
+        // them and headless mode logs them, rather than leaving the callback
+        // without a production subscriber.
+        let teammate_event_tx = event_tx.clone();
+        agent_manager.set_event_callback(move |event| {
+            let (agent_id, lifecycle) = teammate_event_to_lifecycle(&event);
+            tracing::info!(agent_id = %agent_id, event = ?event, "teammate event");
+            let _ = teammate_event_tx.send(EngineEvent::AgentEvent {
+                agent_id,
+                event: lifecycle,
+            });
+        });
         agent_manager.set_event_sender(event_tx);
         agent_manager.set_permission_checker(engine.permission_checker());
         let mcp_slot: Arc<std::sync::RwLock<Option<Arc<coderex_mcp::manager::McpManager>>>> =
@@ -1073,7 +1128,7 @@ impl ReplLoop {
         // parent engine bus carries lifecycle transitions; this receiver
         // carries the child's raw events for headless logging and future
         // frontends.
-        let agent_observable_rx = agent_manager.subscribe_to_agent("all");
+        let agent_observable_rx = agent_manager.subscribe_all();
         let agent_manager = Arc::new(tokio::sync::Mutex::new(agent_manager));
 
         let mut registry = ToolRegistry::new();
@@ -1174,6 +1229,8 @@ impl ReplLoop {
         let mut this = Self {
             commands,
             model,
+            max_tokens: QueryEngine::DEFAULT_MAX_TOKENS,
+            explicit_model_override: false,
             cwd,
             running: true,
             setup_error: None,
@@ -1473,6 +1530,14 @@ impl ReplLoop {
 
     pub fn with_agent(&mut self, agent: Option<String>) {
         self.agent = agent;
+    }
+
+    /// Record whether `--model` was given explicitly.
+    ///
+    /// A named custom agent supplies a default model, but an explicit CLI
+    /// choice is more specific and must win.
+    pub fn with_explicit_model_override(&mut self, explicit: bool) {
+        self.explicit_model_override = explicit;
     }
 
     pub fn with_ide(&mut self, ide: Option<String>) {
@@ -1792,6 +1857,23 @@ impl ReplLoop {
         }
         if self.session_effects.allowed_tools_override.is_none() && !agent.allowed_tools.is_empty() {
             self.session_effects.allowed_tools_override = Some(agent.allowed_tools);
+        }
+
+        // Resource defaults from the definition apply unless the person chose
+        // otherwise on the command line. `--model` is the only CLI override;
+        // there is no max-token flag, so the definition's limit always wins
+        // over the engine default.
+        if !self.explicit_model_override {
+            if let Some(model) = agent.model {
+                self.model = ModelId(model);
+            }
+        }
+        if let Some(max_tokens) = agent.max_tokens.filter(|limit| *limit > 0) {
+            self.max_tokens = max_tokens;
+        }
+        if let Some(ref mut engine) = self.engine {
+            engine.set_model(self.model.clone());
+            engine.set_max_tokens(self.max_tokens);
         }
     }
 
@@ -6964,6 +7046,130 @@ mod tests {
         assert_eq!(
             repl.session_effects.allowed_tools_override,
             Some(Vec::new())
+        );
+    }
+
+    fn custom_agent(
+        model: Option<&str>,
+        max_tokens: Option<u32>,
+    ) -> crate::agent_selection::ResolvedAgent {
+        crate::agent_selection::ResolvedAgent {
+            name: "reviewer".into(),
+            system_prompt: "You review code.".into(),
+            allowed_tools: vec!["Read".into()],
+            model: model.map(ToString::to_string),
+            max_tokens,
+        }
+    }
+
+    #[test]
+    fn resolved_agent_model_and_max_tokens_apply_unless_cli_model_wins() {
+        let mut repl = ReplLoop::new("/tmp".into(), ModelId::sonnet());
+        repl.apply_resolved_agent(custom_agent(Some("agent-model"), Some(2048)));
+        assert_eq!(repl.model.0, "agent-model");
+        assert_eq!(repl.max_tokens, 2048);
+
+        // `--model` is more specific than the agent file.
+        let cli_model = ModelId::sonnet();
+        let mut explicit = ReplLoop::new("/tmp".into(), cli_model.clone());
+        explicit.with_explicit_model_override(true);
+        explicit.apply_resolved_agent(custom_agent(Some("agent-model"), Some(2048)));
+        assert_eq!(explicit.model, cli_model);
+        assert_eq!(
+            explicit.max_tokens, 2048,
+            "there is no CLI max-token override; the definition still applies"
+        );
+    }
+
+    #[tokio::test]
+    async fn resolved_agent_settings_reach_the_session_engine() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut repl = ReplLoop::with_engine(
+            Box::new(CountingApi::new()),
+            temp.path().to_string_lossy().into_owned(),
+            ModelId::sonnet(),
+        );
+
+        repl.apply_resolved_agent(custom_agent(Some("agent-model"), Some(2048)));
+
+        let engine = repl.engine.as_ref().expect("engine is wired");
+        assert_eq!(engine.model().0, "agent-model");
+        assert_eq!(engine.max_tokens(), 2048);
+    }
+
+    #[tokio::test]
+    async fn teammate_events_reach_the_session_event_channel() {
+        let temp = tempfile::tempdir().unwrap();
+        let cwd = temp.path().to_string_lossy().into_owned();
+        let mut repl =
+            ReplLoop::with_engine(Box::new(CountingApi::new()), cwd.clone(), ModelId::sonnet());
+        let manager = Arc::clone(
+            repl.agent_manager
+                .as_ref()
+                .expect("with_engine installs an agent manager"),
+        );
+
+        let agent_id = {
+            let mut mgr = manager.lock().await;
+            let instance = mgr
+                .spawn_agent(
+                    coderex_agents::AgentType::GeneralPurpose,
+                    "wait for work",
+                    coderex_agents::SpawnOptions::default(),
+                    "sess_teammate",
+                    &cwd,
+                    0,
+                )
+                .await
+                .unwrap();
+            let agent_id = instance.task_handle.id.clone();
+            mgr.mark_idle(&agent_id, "waiting for work").await.unwrap();
+            agent_id
+        };
+
+        let mut saw_idle = false;
+        while let Ok(event) = repl.event_rx.as_mut().unwrap().try_recv() {
+            if let EngineEvent::AgentEvent {
+                agent_id: seen,
+                event: AgentLifecycleEvent::Idle { reason },
+            } = event
+            {
+                assert_eq!(seen, agent_id);
+                assert_eq!(reason, "waiting for work");
+                saw_idle = true;
+            }
+        }
+        assert!(
+            saw_idle,
+            "the teammate callback never reached the engine event channel"
+        );
+    }
+
+    #[test]
+    fn teammate_events_map_onto_engine_lifecycle_events() {
+        let (agent_id, lifecycle) = teammate_event_to_lifecycle(&TeammateEvent::TaskCompleted {
+            agent_id: "agent-7".into(),
+            subject: "review".into(),
+            summary: "done".into(),
+        });
+        assert_eq!(agent_id, "agent-7");
+        assert_eq!(
+            lifecycle,
+            AgentLifecycleEvent::Completed {
+                summary: "review: done".into()
+            }
+        );
+
+        let (agent_id, lifecycle) = teammate_event_to_lifecycle(&TeammateEvent::Idle {
+            agent_id: "agent-8".into(),
+            reason: "no work".into(),
+        });
+        assert_eq!(agent_id, "agent-8");
+        assert_eq!(
+            lifecycle,
+            AgentLifecycleEvent::Idle {
+                reason: "no work".into()
+            }
         );
     }
 

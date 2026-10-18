@@ -462,6 +462,57 @@ pub struct AgentObservableEvent {
     pub event: EngineEvent,
 }
 
+/// A filtered subscription to [`AgentObservableEvent`]s.
+///
+/// The manager broadcasts every agent's events on one channel; this wrapper
+/// drops events belonging to other agents so a subscriber sees only the agent
+/// it asked for (or all of them, for [`AgentManager::subscribe_all`]).
+#[derive(Debug)]
+pub struct AgentSubscription {
+    agent_id: Option<String>,
+    rx: broadcast::Receiver<AgentObservableEvent>,
+}
+
+impl AgentSubscription {
+    /// The agent this subscription is filtered to, or `None` for all agents.
+    #[must_use]
+    pub fn agent_id(&self) -> Option<&str> {
+        self.agent_id.as_deref()
+    }
+
+    /// Receive the next event for this subscription's agent.
+    ///
+    /// Events for other agents are skipped. Lags are reported by the
+    /// underlying broadcast channel; the next call resumes after the gap.
+    pub async fn recv(
+        &mut self,
+    ) -> Result<AgentObservableEvent, broadcast::error::RecvError> {
+        loop {
+            let event = self.rx.recv().await?;
+            if Self::matches(self.agent_id.as_deref(), &event) {
+                return Ok(event);
+            }
+        }
+    }
+
+    /// Try to receive the next event for this subscription's agent without
+    /// waiting.
+    pub fn try_recv(
+        &mut self,
+    ) -> Result<AgentObservableEvent, broadcast::error::TryRecvError> {
+        loop {
+            let event = self.rx.try_recv()?;
+            if Self::matches(self.agent_id.as_deref(), &event) {
+                return Ok(event);
+            }
+        }
+    }
+
+    fn matches(agent_id: Option<&str>, event: &AgentObservableEvent) -> bool {
+        agent_id.is_none_or(|id| id == event.agent_id)
+    }
+}
+
 /// A running agent instance.
 #[derive(Debug)]
 pub struct AgentInstance {
@@ -693,13 +744,32 @@ impl AgentManager {
         self.test_mode = true;
     }
 
-    /// Subscribe to agent observable events.
+    /// Subscribe to one agent's observable events.
+    ///
+    /// The returned [`AgentSubscription`] filters the manager-wide broadcast
+    /// down to `agent_id`, so a subscriber does not have to match on the id
+    /// itself. The special id `"all"` keeps the manager-wide behaviour and is
+    /// equivalent to [`Self::subscribe_all`].
     #[must_use]
-    pub fn subscribe_to_agent(
-        &self,
-        _agent_id: &str,
-    ) -> Option<broadcast::Receiver<AgentObservableEvent>> {
-        self.agent_event_broadcast.as_ref().map(|tx| tx.subscribe())
+    pub fn subscribe_to_agent(&self, agent_id: &str) -> Option<AgentSubscription> {
+        let filter = (agent_id != "all").then(|| agent_id.to_string());
+        self.agent_event_broadcast
+            .as_ref()
+            .map(|tx| AgentSubscription {
+                agent_id: filter,
+                rx: tx.subscribe(),
+            })
+    }
+
+    /// Subscribe to observable events from every agent.
+    #[must_use]
+    pub fn subscribe_all(&self) -> Option<AgentSubscription> {
+        self.agent_event_broadcast
+            .as_ref()
+            .map(|tx| AgentSubscription {
+                agent_id: None,
+                rx: tx.subscribe(),
+            })
     }
 
     /// Wait for an agent to complete (synchronous execution).
@@ -1971,6 +2041,83 @@ mod tests {
         let mgr = make_manager();
         assert!(mgr.list_agents().is_empty());
         assert_eq!(mgr.running_count(), 0);
+    }
+
+    fn observable(agent_id: &str, text: &str) -> AgentObservableEvent {
+        AgentObservableEvent {
+            agent_id: agent_id.to_string(),
+            event: EngineEvent::TextDelta(text.to_string()),
+        }
+    }
+
+    #[tokio::test]
+    async fn per_agent_subscriptions_only_see_their_agent() {
+        let mgr = make_manager();
+        let mut first = mgr.subscribe_to_agent("agent-1").unwrap();
+        let mut second = mgr.subscribe_to_agent("agent-2").unwrap();
+        let tx = mgr
+            .agent_event_broadcast
+            .as_ref()
+            .expect("manager has a broadcast channel");
+
+        tx.send(observable("agent-1", "one")).unwrap();
+        tx.send(observable("agent-2", "two")).unwrap();
+        tx.send(observable("agent-1", "three")).unwrap();
+
+        let first_event = first.try_recv().expect("agent-1's first event");
+        assert_eq!(first_event.agent_id, "agent-1");
+        assert!(matches!(
+            first_event.event,
+            EngineEvent::TextDelta(ref text) if text == "one"
+        ));
+        let first_again = first.try_recv().expect("agent-1's second event");
+        assert_eq!(first_again.agent_id, "agent-1");
+        assert!(
+            first.try_recv().is_err(),
+            "agent-1's subscriber saw another agent's event"
+        );
+
+        let second_event = second.try_recv().expect("agent-2's event");
+        assert_eq!(second_event.agent_id, "agent-2");
+        assert!(
+            second.try_recv().is_err(),
+            "agent-2's subscriber saw another agent's event"
+        );
+    }
+
+    #[tokio::test]
+    async fn subscribe_all_receives_every_agent() {
+        let mgr = make_manager();
+        let mut all = mgr.subscribe_all().unwrap();
+        let tx = mgr
+            .agent_event_broadcast
+            .as_ref()
+            .expect("manager has a broadcast channel");
+
+        tx.send(observable("agent-1", "one")).unwrap();
+        tx.send(observable("agent-2", "two")).unwrap();
+
+        let first = all.recv().await.unwrap();
+        let second = all.recv().await.unwrap();
+        assert_eq!(first.agent_id, "agent-1");
+        assert_eq!(second.agent_id, "agent-2");
+    }
+
+    #[tokio::test]
+    async fn the_all_alias_keeps_the_manager_wide_subscription() {
+        let mgr = make_manager();
+        let mut all = mgr.subscribe_to_agent("all").unwrap();
+        assert!(all.agent_id().is_none());
+        let tx = mgr
+            .agent_event_broadcast
+            .as_ref()
+            .expect("manager has a broadcast channel");
+
+        tx.send(observable("agent-1", "one")).unwrap();
+        tx.send(observable("agent-2", "two")).unwrap();
+
+        assert_eq!(all.recv().await.unwrap().agent_id, "agent-1");
+        assert_eq!(all.recv().await.unwrap().agent_id, "agent-2");
     }
 
     #[tokio::test]
