@@ -1773,6 +1773,67 @@ mod tests {
         assert!(service.load_managed_config().unwrap().is_none());
     }
 
+    /// The size cap applies to the managed JSON carrier too: an oversized file
+    /// is skipped whole, so not even its valid keys apply.
+    #[test]
+    fn managed_settings_file_over_the_size_limit_is_skipped_whole() {
+        let temp = tempfile::tempdir().unwrap();
+        let managed_path = temp.path().join("managed_settings.json");
+        let padding = "a".repeat(usize::try_from(MAX_SETTINGS_FILE_BYTES).unwrap());
+        write_managed(
+            &managed_path,
+            serde_json::json!({ "model": "managed-model", "api_key": padding }),
+        );
+        assert!(
+            std::fs::metadata(&managed_path).unwrap().len() > MAX_SETTINGS_FILE_BYTES,
+            "the fixture must exceed the cap"
+        );
+
+        let service = ConfigService::new(temp.path().join("user.json"), None)
+            .with_managed_settings_path(managed_path);
+        assert!(matches!(
+            service.load_managed_config(),
+            Err(ConfigError::TooLarge { .. })
+        ));
+
+        // The whole file is dropped, including the otherwise-valid model.
+        assert_eq!(
+            service.resolve().unwrap().model,
+            Some("claude-sonnet-4-6".into())
+        );
+    }
+
+    /// A managed JSON carrier of exactly the cap is accepted and applied.
+    #[test]
+    fn managed_settings_file_at_the_size_limit_is_accepted() {
+        let temp = tempfile::tempdir().unwrap();
+        let managed_path = temp.path().join("managed_settings.json");
+
+        // The checksum is fixed-length, so measuring the empty document gives
+        // the wrapper overhead to subtract from the cap.
+        let overhead = serde_json::to_string(&crate::dirs::ManagedSettings::new(
+            serde_json::json!({ "model": "managed-model", "api_key": "" }),
+        ))
+        .unwrap()
+        .len();
+        let padding = "a".repeat(usize::try_from(MAX_SETTINGS_FILE_BYTES).unwrap() - overhead);
+        write_managed(
+            &managed_path,
+            serde_json::json!({ "model": "managed-model", "api_key": padding }),
+        );
+        assert_eq!(
+            std::fs::metadata(&managed_path).unwrap().len(),
+            MAX_SETTINGS_FILE_BYTES
+        );
+
+        let service = ConfigService::new(temp.path().join("user.json"), None)
+            .with_managed_settings_path(managed_path);
+        assert_eq!(
+            service.resolve().unwrap().model,
+            Some("managed-model".into())
+        );
+    }
+
     // ── macOS plist carrier ──────────────────────────────────────────────
 
     #[cfg(target_os = "macos")]

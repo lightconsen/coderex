@@ -3,10 +3,8 @@
 use coderex_mcp::channel::{InboundRequestHandler, JsonRpcChannel, JsonRpcError};
 use coderex_mcp::config::{McpConfig, McpServerConfig, McpTransport};
 use coderex_mcp::manager::McpManager;
+use coderex_mcp::oauth::{McpOAuthState, OAuthManager, OAuthTokenProvider, ReauthHandler};
 use coderex_mcp::server::{McpServer, ServerStatus};
-use coderex_mcp::oauth::{
-    McpOAuthState, OAuthManager, OAuthTokenProvider, ReauthHandler,
-};
 use coderex_mcp::{EventStreamRetryPolicy, EventStreamState, TokenProvider};
 use std::collections::HashMap;
 use std::io::{Read, Write};
@@ -600,7 +598,11 @@ async fn an_invalid_token_401_refreshes_once_and_retries_with_the_new_token() {
     channel.send_request("tools/list", None).await.unwrap();
 
     let requests = server.join().unwrap();
-    assert_eq!(requests.len(), 2, "the request was not retried exactly once");
+    assert_eq!(
+        requests.len(),
+        2,
+        "the request was not retried exactly once"
+    );
     assert_eq!(
         authorization(&requests[0]).as_deref(),
         Some("Bearer stale_access")
@@ -626,8 +628,7 @@ async fn an_invalid_token_401_refreshes_once_and_retries_with_the_new_token() {
 /// POST, the resource-metadata GET from the 401 policy, and the retry.
 #[tokio::test]
 async fn an_invalid_token_401_without_a_refresh_token_reauthorizes_and_retries() {
-    let (address, server) =
-        spawn_challenge_server(r#"Bearer error="invalid_token""#, 3, 1);
+    let (address, server) = spawn_challenge_server(r#"Bearer error="invalid_token""#, 3, 1);
     let server_url = format!("http://{address}/mcp");
     let dir = tempfile::tempdir().unwrap();
     let token_path = dir.path().join("mcp_tokens.json");
@@ -661,7 +662,10 @@ async fn an_invalid_token_401_without_a_refresh_token_reauthorizes_and_retries()
         authorization(&requests[0]).as_deref(),
         Some("Bearer stale_access")
     );
-    assert!(is_get(&requests[1]), "the 401 policy did not re-read metadata");
+    assert!(
+        is_get(&requests[1]),
+        "the 401 policy did not re-read metadata"
+    );
     assert_eq!(
         authorization(&requests[2]).as_deref(),
         Some("Bearer reauth_access"),
@@ -712,8 +716,7 @@ async fn a_non_invalid_token_401_does_not_spend_the_refresh_token() {
 /// 401 instead of retrying forever.
 #[tokio::test]
 async fn a_second_401_after_the_retry_is_an_error_not_a_loop() {
-    let (address, server) =
-        spawn_challenge_server(r#"Bearer error="invalid_token""#, 2, 2);
+    let (address, server) = spawn_challenge_server(r#"Bearer error="invalid_token""#, 2, 2);
     let server_url = format!("http://{address}/mcp");
     let recoveries = Arc::new(AtomicUsize::new(0));
 
@@ -1313,6 +1316,92 @@ async fn a_get_404_reinitializes_once_and_resumes() {
     channel.terminate().await.unwrap();
 }
 
+/// A standalone GET stream that delivers an event and then ends must reconnect
+/// with `Last-Event-ID` set to that event's id, so the server can resume after
+/// the last message the client actually processed.
+#[tokio::test]
+async fn a_reconnecting_get_stream_sends_the_last_event_id() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let recorded = Arc::clone(&requests);
+    let gets = Arc::new(AtomicUsize::new(0));
+    let counted = Arc::clone(&gets);
+
+    std::thread::spawn(move || {
+        for mut stream in listener.incoming().flatten() {
+            let request = read_request(&mut stream);
+            recorded.lock().unwrap().push(request.clone());
+
+            if is_get(&request) {
+                if counted.fetch_add(1, Ordering::SeqCst) == 0 {
+                    // Deliver one event carrying an id, then let the response
+                    // body end so the client sees EOF and reconnects.
+                    let body = concat!(
+                        "id: evt-42\n",
+                        "data: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/message\",\"params\":{\"level\":\"info\",\"data\":\"hello\"}}\n\n"
+                    );
+                    write_response(&mut stream, "200 OK", "text/event-stream", body);
+                } else {
+                    // The reconnect has been observed; stop the retry loop.
+                    write_response(
+                        &mut stream,
+                        "405 Method Not Allowed",
+                        "application/json",
+                        "",
+                    );
+                }
+            } else if request.contains("\"method\":\"initialize\"") {
+                let body = r#"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2024-11-05"}}"#;
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nMcp-Session-Id: session-resume\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                stream.write_all(response.as_bytes()).unwrap();
+            } else {
+                write_response(&mut stream, "202 Accepted", "application/json", "");
+            }
+        }
+    });
+
+    let mut channel =
+        JsonRpcChannel::new_http(&format!("http://{address}/mcp"), HashMap::new()).unwrap();
+    channel.set_event_stream_retry_policy(EventStreamRetryPolicy {
+        max_attempts: 3,
+        base_delay: std::time::Duration::from_millis(10),
+        max_delay: std::time::Duration::from_millis(20),
+        max_duration: std::time::Duration::from_secs(10),
+    });
+    channel.spawn().await.unwrap();
+    channel.initialize().await.unwrap();
+
+    // The server counts a GET after recording it, so two GETs means the
+    // reconnecting request is in `requests`.
+    wait_until(|| gets.load(Ordering::SeqCst) >= 2).await;
+
+    let recorded = requests.lock().unwrap();
+    let gets: Vec<&String> = recorded.iter().filter(|request| is_get(request)).collect();
+    assert!(
+        gets.len() >= 2,
+        "the client did not reconnect the GET stream: {recorded:?}"
+    );
+    assert_eq!(
+        header_value(gets[0], "last-event-id"),
+        None,
+        "the first GET has no event to resume from: {}",
+        gets[0]
+    );
+    assert_eq!(
+        header_value(gets[1], "last-event-id").as_deref(),
+        Some("evt-42"),
+        "the reconnecting GET did not resume from the last event: {}",
+        gets[1]
+    );
+
+    drop(recorded);
+    channel.terminate().await.unwrap();
+}
+
 /// The JSON-RPC id of a recorded POST request.
 fn jsonrpc_id(request: &str) -> u64 {
     request
@@ -1473,10 +1562,8 @@ fn spawn_legacy_sse_server() -> (SocketAddr, Arc<std::sync::Mutex<Vec<String>>>)
                     *open_stream.lock().unwrap() = Some(stream);
                     let mut guard = open_stream.lock().unwrap();
                     if let Some(sse) = guard.as_mut() {
-                        sse.write_all(
-                            b"event: endpoint\ndata: /messages?sessionId=legacy-1\n\n",
-                        )
-                        .unwrap();
+                        sse.write_all(b"event: endpoint\ndata: /messages?sessionId=legacy-1\n\n")
+                            .unwrap();
                         sse.flush().unwrap();
                     }
                     return;
