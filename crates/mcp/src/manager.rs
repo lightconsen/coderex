@@ -42,6 +42,12 @@ pub struct McpManager {
     oauth: tokio::sync::Mutex<OAuthManager>,
     /// Elicitation state.
     elicitation: ElicitationManager,
+    /// Answers requests the servers make of the client.
+    ///
+    /// One slot shared by every server, so the session can install its UI
+    /// handler at any time — including after `start_all` — and every running
+    /// channel sees it.
+    inbound_handler: crate::channel::SharedInboundHandler,
     /// Whether a refresh (re-discovery) is needed.
     needs_refresh: AtomicBool,
     /// Health monitor cancellation sender.
@@ -66,6 +72,7 @@ impl McpManager {
             cache_ttl: Duration::from_secs(60),
             oauth: tokio::sync::Mutex::new(OAuthManager::new()),
             elicitation: ElicitationManager::new(),
+            inbound_handler: crate::channel::SharedInboundHandler::new(),
             needs_refresh: AtomicBool::new(false),
             health_cancel: Mutex::new(None),
         }
@@ -96,7 +103,7 @@ impl McpManager {
     /// Load servers from a configuration.
     pub fn load_config(&self, config: &McpConfig) {
         for (name, server_config) in &config.mcp_servers {
-            let server = match server_config.transport {
+            let mut server = match server_config.transport {
                 McpTransport::Stdio => McpServer::new(
                     name.clone(),
                     server_config.command.clone(),
@@ -120,6 +127,7 @@ impl McpManager {
                     )
                 }
             };
+            server.share_inbound_handler(self.inbound_handler.clone());
             self.servers.insert(name.clone(), server);
         }
         self.needs_refresh.store(true, Ordering::SeqCst);
@@ -508,6 +516,27 @@ impl McpManager {
     #[must_use]
     pub fn needs_refresh(&self) -> bool {
         self.needs_refresh.load(Ordering::Relaxed)
+    }
+
+    /// Install the handler that answers requests the servers make.
+    ///
+    /// This covers every server the manager knows, including ones already
+    /// running and ones created later by [`McpManager::load_config`]. Calling
+    /// it again replaces the handler. When no handler is installed at all,
+    /// server requests are refused with `-32601` rather than left waiting.
+    pub fn set_inbound_handler(&self, handler: Arc<dyn crate::channel::InboundRequestHandler>) {
+        self.inbound_handler.install(handler);
+    }
+
+    /// Remove the inbound handler; later server requests are refused.
+    pub fn clear_inbound_handler(&self) {
+        self.inbound_handler.clear();
+    }
+
+    /// Whether a handler is installed for server requests.
+    #[must_use]
+    pub fn has_inbound_handler(&self) -> bool {
+        self.inbound_handler.has_handler()
     }
 
     /// Access the elicitation manager.

@@ -302,8 +302,9 @@ struct RecordingHandler {
     asked: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
 }
 
+#[async_trait::async_trait]
 impl coderex_mcp::channel::InboundRequestHandler for RecordingHandler {
-    fn handle(
+    async fn handle(
         &self,
         method: &str,
         _params: Option<&serde_json::Value>,
@@ -313,10 +314,64 @@ impl coderex_mcp::channel::InboundRequestHandler for RecordingHandler {
     }
 }
 
+/// A handler that waits before answering, standing in for the user's turn at
+/// the keyboard.
+#[derive(Debug)]
+struct SlowHandler {
+    asked: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    answer: serde_json::Value,
+    delay: std::time::Duration,
+}
+
+#[async_trait::async_trait]
+impl coderex_mcp::channel::InboundRequestHandler for SlowHandler {
+    async fn handle(
+        &self,
+        method: &str,
+        _params: Option<&serde_json::Value>,
+    ) -> Result<serde_json::Value, coderex_mcp::channel::JsonRpcError> {
+        self.asked.lock().unwrap().push(method.to_string());
+        tokio::time::sleep(self.delay).await;
+        Ok(self.answer.clone())
+    }
+}
+
+fn answer_log() -> PathBuf {
+    let log = std::env::temp_dir().join(format!(
+        "coderex_mock_answers_{}.jsonl",
+        MOCK_ID.fetch_add(1, Ordering::SeqCst)
+    ));
+    let _ = std::fs::remove_file(&log);
+    log
+}
+
+fn answer_env(log: &PathBuf) -> HashMap<String, String> {
+    HashMap::from([(
+        "CODEREX_MOCK_ANSWER_LOG".to_string(),
+        log.to_string_lossy().into_owned(),
+    )])
+}
+
+/// The answer the mock server logged, as the client sent it.
+fn logged_answer(log: &PathBuf) -> serde_json::Value {
+    let logged = std::fs::read_to_string(log).unwrap_or_default();
+    let line = logged
+        .lines()
+        .next()
+        .unwrap_or_else(|| panic!("the server never received an answer (log {log:?})"));
+    let entry: serde_json::Value =
+        serde_json::from_str(line).expect("the server logged valid JSON");
+    entry
+        .get("received")
+        .cloned()
+        .expect("the log entry carries the received message")
+}
+
 #[tokio::test]
-async fn a_request_from_the_server_is_answered() {
+async fn an_accepting_handler_answers_the_server_and_the_request_completes() {
     let script = asking_server_path();
-    let mut server = McpServer::new("asking", script.to_str().unwrap(), vec![], HashMap::new());
+    let log = answer_log();
+    let mut server = McpServer::new("asking", script.to_str().unwrap(), vec![], answer_env(&log));
 
     let asked = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
     server.set_inbound_handler(std::sync::Arc::new(RecordingHandler {
@@ -336,24 +391,51 @@ async fn a_request_from_the_server_is_answered() {
         "the client never answered the server's request: {asked:?}"
     );
 
+    let answer = logged_answer(&log);
+    assert_eq!(answer["id"], 9001, "the answer used the wrong id: {answer}");
+    assert_eq!(answer["result"]["action"], "accept", "{answer}");
+    assert_eq!(
+        answer["result"]["content"]["environment"], "test",
+        "{answer}"
+    );
+
+    let _ = std::fs::remove_file(&log);
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn a_slow_decline_is_awaited_and_reaches_the_server() {
+    let script = asking_server_path();
+    let log = answer_log();
+    let mut server = McpServer::new("asking", script.to_str().unwrap(), vec![], answer_env(&log));
+
+    let asked = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    server.set_inbound_handler(std::sync::Arc::new(SlowHandler {
+        asked: std::sync::Arc::clone(&asked),
+        answer: serde_json::json!({"action": "decline"}),
+        delay: std::time::Duration::from_millis(100),
+    }));
+
+    server.spawn().await.unwrap();
+
+    let tools = server.discover_tools().await.unwrap();
+    assert!(tools.get("tools").is_some(), "{tools}");
+
+    let answer = logged_answer(&log);
+    assert_eq!(
+        answer["result"]["action"], "decline",
+        "the handler's decline did not reach the server: {answer}"
+    );
+
+    let _ = std::fs::remove_file(&log);
     server.stop().await;
 }
 
 #[tokio::test]
 async fn a_request_from_the_server_with_no_handler_is_refused_not_ignored() {
     let script = asking_server_path();
-    let log = std::env::temp_dir().join(format!(
-        "coderex_mock_answers_{}.jsonl",
-        MOCK_ID.fetch_add(1, Ordering::SeqCst)
-    ));
-    let _ = std::fs::remove_file(&log);
-
-    let mut env = HashMap::new();
-    env.insert(
-        "CODEREX_MOCK_ANSWER_LOG".to_string(),
-        log.to_string_lossy().into_owned(),
-    );
-    let mut server = McpServer::new("asking", script.to_str().unwrap(), vec![], env);
+    let log = answer_log();
+    let mut server = McpServer::new("asking", script.to_str().unwrap(), vec![], answer_env(&log));
     server.spawn().await.unwrap();
 
     // No handler was set: the client must still answer — the server is waiting
@@ -365,19 +447,7 @@ async fn a_request_from_the_server_with_no_handler_is_refused_not_ignored() {
         "the server never got an answer, so the request never completed: {tools:?}"
     );
 
-    let logged = std::fs::read_to_string(&log).unwrap_or_default();
-    assert!(!logged.is_empty(), "the server never received an answer");
-    let answer: serde_json::Value = serde_json::from_str(
-        logged
-            .lines()
-            .next()
-            .and_then(|line| serde_json::from_str::<serde_json::Value>(line).ok())
-            .and_then(|entry| entry.get("received").cloned())
-            .map(|received| received.to_string())
-            .unwrap_or_default()
-            .as_str(),
-    )
-    .expect("the answer was logged as JSON");
+    let answer = logged_answer(&log);
     assert_eq!(
         answer
             .get("error")

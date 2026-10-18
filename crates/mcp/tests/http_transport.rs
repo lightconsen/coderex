@@ -170,14 +170,33 @@ fn spawn_asking_server() -> (SocketAddr, std::thread::JoinHandle<String>) {
 #[derive(Debug)]
 struct AcceptingHandler;
 
+#[async_trait::async_trait]
 impl InboundRequestHandler for AcceptingHandler {
-    fn handle(
+    async fn handle(
         &self,
         method: &str,
         _params: Option<&serde_json::Value>,
     ) -> Result<serde_json::Value, JsonRpcError> {
         assert_eq!(method, "elicitation/create");
         Ok(serde_json::json!({"action": "accept", "content": {"answer": 42}}))
+    }
+}
+
+/// A handler that waits, then declines — the answer still has to be delivered
+/// on a new POST while the SSE stream is held open.
+#[derive(Debug)]
+struct SlowDecliningHandler;
+
+#[async_trait::async_trait]
+impl InboundRequestHandler for SlowDecliningHandler {
+    async fn handle(
+        &self,
+        method: &str,
+        _params: Option<&serde_json::Value>,
+    ) -> Result<serde_json::Value, JsonRpcError> {
+        assert_eq!(method, "elicitation/create");
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        Ok(serde_json::json!({"action": "decline"}))
     }
 }
 
@@ -202,6 +221,28 @@ async fn a_server_request_in_an_sse_stream_is_answered_while_it_is_open() {
     assert!(
         answer.contains("\"answer\":42"),
         "the handler's result was not in the answer: {answer}"
+    );
+
+    channel.terminate().await.unwrap();
+}
+
+#[tokio::test]
+async fn an_sse_server_request_awaits_a_slow_decline() {
+    let (address, server) = spawn_asking_server();
+    let mut channel =
+        JsonRpcChannel::new_http(&format!("http://{address}/mcp"), HashMap::new()).unwrap();
+    channel.set_inbound_handler(Arc::new(SlowDecliningHandler));
+
+    channel.spawn().await.unwrap();
+    channel.initialize().await.unwrap();
+    let tools = channel.list_tools().await.unwrap();
+    assert!(tools.get("tools").is_some(), "{tools}");
+
+    let answer = server.join().unwrap();
+    assert!(answer.contains("\"id\":99"), "wrong answer: {answer}");
+    assert!(
+        answer.contains("\"action\":\"decline\""),
+        "the handler's decline was not delivered: {answer}"
     );
 
     channel.terminate().await.unwrap();

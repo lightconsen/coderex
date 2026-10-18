@@ -243,19 +243,21 @@ impl HttpChannel {
         request: &JsonRpcServerRequest,
         handler: Option<&dyn InboundRequestHandler>,
     ) -> Result<(), String> {
-        let answer = handler.map_or_else(
-            || {
-                Err(JsonRpcError {
-                    code: METHOD_NOT_FOUND,
-                    message: format!(
-                        "this client has no handler for '{}'; nothing here can answer it",
-                        request.method
-                    ),
-                    data: None,
-                })
-            },
-            |handler| handler.handle(&request.method, request.params.as_ref()),
-        );
+        let answer = match handler {
+            Some(handler) => {
+                handler
+                    .handle(&request.method, request.params.as_ref())
+                    .await
+            }
+            None => Err(JsonRpcError {
+                code: METHOD_NOT_FOUND,
+                message: format!(
+                    "this client has no handler for '{}'; nothing here can answer it",
+                    request.method
+                ),
+                data: None,
+            }),
+        };
 
         let response = match answer {
             Ok(result) => JsonRpcResponse {
