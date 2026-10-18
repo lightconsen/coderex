@@ -987,7 +987,21 @@ impl StartupOrchestrator {
         let settings = self.ctx.settings.clone().unwrap_or_default();
         // Starts with whatever the McpAuth tool persisted, so a server signed
         // into in an earlier session is authenticated in this one.
-        let manager = Arc::new(coderex_mcp::manager::McpManager::new_with_stored_credentials());
+        let mut manager = coderex_mcp::manager::McpManager::new_with_stored_credentials();
+
+        // A `401 invalid_token` on a server that issued no refresh token is
+        // recoverable only by signing in again. The CLI owns the interactive
+        // session, so it installs the seam before any server starts: the same
+        // McpAuth flow when a person is present, or an authorization-URL
+        // hand-off in a headless run. `oauth_mut` is the setup-time hook that
+        // does not require the manager to be shared yet.
+        manager
+            .oauth_mut()
+            .set_reauth_handler(Arc::new(crate::mcp_reauth::CliReauthHandler::new(
+                !self.ctx.non_interactive,
+                self.ctx.cwd.clone(),
+            )));
+        let manager = Arc::new(manager);
 
         // A server may ask the person a question mid-tool-call. Install the
         // session's answerer before any server is spawned; the TUI attaches

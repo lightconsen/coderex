@@ -44,6 +44,16 @@ chrono.workspace = true
 keyring = { version = "3", optional = true }
 notify = { version = "7", optional = true }
 
+[target.'cfg(windows)'.dependencies]
+# Real DACL construction for the private token-file fallback. `std` has no ACL
+# API, and `icacls` is neither atomic nor locale-stable.
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_System_Threading",
+] }
+
 [dev-dependencies]
 tempfile.workspace = true
 wiremock.workspace = true
