@@ -815,10 +815,27 @@ fn two_turn_transcript_is_preserved() {
     session.send_line("hello");
     session.wait_for_any_text(&["Hello!", "happy to help"], SCREEN_TIMEOUT);
     session.send_line("cargo test results");
-    let screen =
-        session.wait_for_any_text(&["I don't have the ability", "cargo test"], SCREEN_TIMEOUT);
-    assert!(screen.contains("hello"));
-    assert!(screen.contains("cargo test") || session.raw_text().contains("cargo test results"));
+    // Wait for the second turn's *answer*, not for "cargo test" — that string
+    // also appears in the user message the transcript echoes, so matching it
+    // would return before the redraw this test is about. The response is long,
+    // so its opening line has already scrolled off; the last line is stable.
+    session.wait_for_text("Explain test organization patterns", SCREEN_TIMEOUT);
+
+    // Scroll back to the beginning of the transcript. The assertion is about
+    // the redrawn history, so `raw_text()` is deliberately not consulted: it
+    // includes the bytes typed into the PTY, which would make it vacuous.
+    for _ in 0..20 {
+        session.page_up();
+    }
+    let screen = session.wait_for_text("hello", SCREEN_TIMEOUT);
+    assert!(
+        screen.contains("hello"),
+        "the first turn fell out of the redrawn transcript:\n{screen}"
+    );
+    assert!(
+        screen.contains("cargo test results"),
+        "the second turn is missing from the redrawn transcript:\n{screen}"
+    );
 }
 
 #[test]
@@ -1100,18 +1117,20 @@ fn vim_visual_mode_selects_and_deletes_input() {
 
     // The cursor sits at the end of the line. v -> visual, b -> back to the
     // start of "world", d -> delete the selection.
+    //
+    // Do not wait for an intermediate screen here: "❯ hello" already matches
+    // the pre-deletion "❯ hello world", so that wait could return before `vbd`
+    // was processed. `A!` is queued behind the edits on the same PTY stream,
+    // and "❯ hello !" exists only once the deletion and the append have both
+    // happened, which is a sound proof of the Visual-mode edit.
     session.send_text("vbd");
-    let screen = session.wait_for_text("❯ hello", SCREEN_TIMEOUT);
-    assert!(screen.contains("❯ hello"), "{screen}");
+    session.send_text("A!");
+    let screen = session.wait_for_text("❯ hello !", SCREEN_TIMEOUT);
+    assert!(screen.contains("❯ hello !"), "{screen}");
     assert!(
         !screen.contains("world"),
         "the deleted selection is still rendered:\n{screen}"
     );
-
-    // Normal-mode entry points still work after a Visual-mode edit.
-    session.send_text("A!");
-    let screen = session.wait_for_text("❯ hello !", SCREEN_TIMEOUT);
-    assert!(screen.contains("❯ hello !"), "{screen}");
 }
 
 #[test]
