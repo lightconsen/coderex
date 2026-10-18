@@ -3,7 +3,7 @@
 use crate::mcp_elicitation::{SessionElicitationHandler, TuiElicitationRequest};
 use crate::session_resume;
 use anyhow::Result;
-use coderex_agents::manager::AgentManager;
+use coderex_agents::manager::{AgentManager, AgentObservableEvent, ParentContextSnapshot};
 use coderex_commands::registry::{CommandContext, CommandRegistry, CommandResult};
 use coderex_commands::{CommandHistory, MacroRegistry};
 use coderex_core::api_client::ApiClient;
@@ -20,6 +20,7 @@ use coderex_core::permissions::{PermissionChecker, PermissionMode};
 use coderex_core::prompts;
 use coderex_core::query_profiles::{ModelProfile, PromptProfile, QueryKind, QueryRequest};
 use coderex_core::state::SessionState;
+use coderex_core::tool_executor::ToolExecutor as _;
 use coderex_core::types::ModelId;
 use coderex_core::types::{AgentLifecycleEvent, EngineEvent, Message, ToolCall};
 use coderex_memory::{
@@ -698,6 +699,13 @@ pub struct ReplLoop {
     dispatcher: Option<Arc<RegistryToolDispatcher>>,
     /// Sub-agent lifecycle manager shared with the registered Agent tool.
     agent_manager: Option<Arc<tokio::sync::Mutex<AgentManager>>>,
+    /// Parent conversation snapshot read by the Agent tool when it forks a
+    /// sub-agent. Updated immediately before each turn so a spawn reuses the
+    /// conversation as it was when the turn started.
+    parent_context_snapshot: Arc<std::sync::Mutex<Option<ParentContextSnapshot>>>,
+    /// Broadcast subscription used to observe sub-agent events directly (as
+    /// opposed to lifecycle events forwarded through the parent engine bus).
+    agent_observable_rx: Option<tokio::sync::broadcast::Receiver<AgentObservableEvent>>,
     /// The live MCP servers, filled in by `with_mcp_manager`.
     ///
     /// A slot rather than a plain field because the sub-agent tool factory is
@@ -878,6 +886,8 @@ impl ReplLoop {
             _primary_tool_executor: None,
             dispatcher: None,
             agent_manager: None,
+            parent_context_snapshot: Arc::new(std::sync::Mutex::new(None)),
+            agent_observable_rx: None,
             mcp_manager: Arc::new(std::sync::RwLock::new(None)),
             mcp_elicitation: None,
             artifact_server: None,
@@ -1022,6 +1032,16 @@ impl ReplLoop {
             // tool instead reports that nested delegation is unavailable.
             Box::new(dispatcher)
         });
+        // The agent tool cannot reach the engine's live session, so it reads
+        // a snapshot the REPL refreshes before each turn.
+        let parent_context_snapshot =
+            Arc::new(std::sync::Mutex::new(None::<ParentContextSnapshot>));
+        let snapshot_for_agent_tool = Arc::clone(&parent_context_snapshot);
+        // Production subscriber for the manager's streaming broadcast. The
+        // parent engine bus carries lifecycle transitions; this receiver
+        // carries the child's raw events for headless logging and future
+        // frontends.
+        let agent_observable_rx = agent_manager.subscribe_to_agent("all");
         let agent_manager = Arc::new(tokio::sync::Mutex::new(agent_manager));
 
         let mut registry = ToolRegistry::new();
@@ -1030,7 +1050,10 @@ impl ReplLoop {
             AgentTool::new()
                 .with_manager(Arc::clone(&agent_manager))
                 .with_session_id(session_id.to_string())
-                .with_cwd(cwd.clone()),
+                .with_cwd(cwd.clone())
+                .with_parent_context_provider(move || {
+                    snapshot_for_agent_tool.lock().unwrap().clone()
+                }),
         ));
         // Workflow scripts spawn agents, so they are opt-in: the flag is what
         // turns the tool from "not enabled" into callable.
@@ -1138,6 +1161,8 @@ impl ReplLoop {
             _primary_tool_executor: Some(primary_executor),
             dispatcher: Some(dispatcher),
             agent_manager: Some(agent_manager),
+            parent_context_snapshot: Arc::clone(&parent_context_snapshot),
+            agent_observable_rx,
             mcp_manager: mcp_slot,
             mcp_elicitation: None,
             artifact_server: None,
@@ -1413,6 +1438,13 @@ impl ReplLoop {
     /// Apply all CLI configuration settings to the engine, dispatcher, and session.
     /// Must be called after `with_engine` (or `new`) and before `run_tui`/`run_headless`.
     pub fn apply_cli_config(&mut self) {
+        // 0. Named custom agent. The orchestrator rejects unknown names before
+        // the loop starts; applying the definition here makes the selection
+        // affect the session prompt and tool whitelist rather than being
+        // recorded and ignored. Explicit flags win: they are more specific
+        // than the agent file.
+        self.apply_agent_selection();
+
         // 1. Permission mode
         if self.skip_permissions {
             if let Some(ref mut engine) = self.engine {
@@ -1526,10 +1558,10 @@ impl ReplLoop {
         //
         // Each of these used to push a sentence into the model's context
         // saying the thing was on — "Enabled beta features: x", "IDE mode:
-        // y", "Active agent: z" — while none of it was true: the values were
-        // stored and never read again. Telling the model it has an IDE, a
-        // selected agent, or a beta turned on is worse than ignoring the flag,
-        // because the model then behaves as if it did.
+        // y" — while none of it was true: the values were stored and never
+        // read again. Telling the model it has an IDE or a beta turned on is
+        // worse than ignoring the flag, because the model then behaves as if
+        // it did. (`--agent` is no longer on this list: it is applied above.)
         self.warn_about_unimplemented_flags();
 
         // 14. Debug file — log that it would be configured
@@ -1576,6 +1608,37 @@ impl ReplLoop {
         }
     }
 
+    /// Apply the named custom agent selected with `--agent`.
+    ///
+    /// The definition's system prompt replaces the default prompt unless a
+    /// `--system-prompt` was supplied. Its tool whitelist is applied unless
+    /// `--allowed-tools` already provided one; an explicitly empty list is
+    /// still a whitelist (it denies every tool), so it wins too. Resolution
+    /// should already have succeeded in the orchestrator; a failure here is
+    /// logged rather than silently running the default agent.
+    fn apply_agent_selection(&mut self) {
+        let Some(name) = self.agent.clone() else {
+            return;
+        };
+        match crate::agent_selection::resolve_agent(&name) {
+            Ok(agent) => self.apply_resolved_agent(agent),
+            Err(error) => tracing::warn!("--agent was not applied: {error}"),
+        }
+    }
+
+    /// Merge a resolved agent definition into the session effects.
+    ///
+    /// Split from [`Self::apply_agent_selection`] so the precedence rules can
+    /// be tested without reading the user's `~/.coderex/agents/`.
+    fn apply_resolved_agent(&mut self, agent: crate::agent_selection::ResolvedAgent) {
+        if self.session_effects.override_system_prompt.is_none() {
+            self.session_effects.override_system_prompt = Some(agent.system_prompt);
+        }
+        if self.session_effects.allowed_tools_override.is_none() && !agent.allowed_tools.is_empty() {
+            self.session_effects.allowed_tools_override = Some(agent.allowed_tools);
+        }
+    }
+
     /// Say plainly which flags this build accepts but does not act on.
     ///
     /// They are still accepted so a script written against the full CLI does
@@ -1585,9 +1648,6 @@ impl ReplLoop {
         let mut unimplemented = Vec::new();
         if self.from_pr.is_some() {
             unimplemented.push("--from-pr");
-        }
-        if self.agent.is_some() {
-            unimplemented.push("--agent");
         }
         if self.ide.is_some() {
             unimplemented.push("--ide");
@@ -2693,7 +2753,9 @@ impl ReplLoop {
                     }
                 }
 
-                _ = tokio::time::sleep(Duration::from_millis(100)), if thinking => {}
+                _ = tokio::time::sleep(Duration::from_millis(100)), if thinking => {
+                    self.drain_agent_observable_events();
+                }
 
                 Some(engine_event) = async {
                     event_rx.as_mut().unwrap().recv().await
@@ -3118,6 +3180,37 @@ impl ReplLoop {
                 }
             }
         }
+        self.drain_agent_observable_events();
+    }
+
+    /// Drain the agent manager's broadcast of sub-agent events.
+    ///
+    /// The UI already renders sub-agent lifecycle through
+    /// [`EngineEvent::AgentEvent`]; this subscription is the separate surface
+    /// for external observers (and what `subscribe_to_agent` is for). Keeping
+    /// it drained prevents the broadcast buffer from growing and records
+    /// sub-agent activity in debug logs.
+    fn drain_agent_observable_events(&mut self) {
+        let Some(rx) = self.agent_observable_rx.as_mut() else {
+            return;
+        };
+        loop {
+            match rx.try_recv() {
+                Ok(observed) => tracing::debug!(
+                    agent_id = %observed.agent_id,
+                    event = ?observed.event,
+                    "sub-agent observable event"
+                ),
+                Err(tokio::sync::broadcast::error::TryRecvError::Empty) => break,
+                Err(tokio::sync::broadcast::error::TryRecvError::Lagged(skipped)) => {
+                    tracing::warn!(skipped, "sub-agent event stream lagged");
+                }
+                Err(tokio::sync::broadcast::error::TryRecvError::Closed) => {
+                    self.agent_observable_rx = None;
+                    break;
+                }
+            }
+        }
     }
 
     fn normalize_headless_read_output(&self, prompt: &str, mut output: String) -> String {
@@ -3262,6 +3355,37 @@ impl ReplLoop {
         // transcript as normal messages. The engine's fallback elicitation prompt writes to
         // stderr/stdin directly, which breaks the TUI and duplicates the normal next-turn flow.
         options.handle_elicitation = false;
+
+        // Refresh the snapshot the Agent tool reads when it forks a
+        // sub-agent. This runs immediately before the turn is submitted, so a
+        // delegation inside the turn reuses the parent's prefix as it was
+        // when the turn began.
+        if let Some(ref engine) = self.engine {
+            let messages: Vec<serde_json::Value> = engine
+                .session()
+                .messages
+                .iter()
+                .filter_map(|message| serde_json::to_value(message).ok())
+                .collect();
+            let tool_names = self
+                .dispatcher
+                .as_ref()
+                .map(|dispatcher| {
+                    dispatcher
+                        .list_tools()
+                        .into_iter()
+                        .map(|tool| tool.name)
+                        .collect()
+                })
+                .unwrap_or_default();
+            let snapshot = ParentContextSnapshot::new(
+                messages,
+                self.model.0.clone(),
+                options.custom_system_prompt.clone().unwrap_or_default(),
+                tool_names,
+            );
+            *self.parent_context_snapshot.lock().unwrap() = Some(snapshot);
+        }
 
         options
     }
@@ -6620,6 +6744,101 @@ mod tests {
             repl.engine.as_ref().unwrap().transcript_path().is_none(),
             "--no-session-persistence must also disable the engine's backup"
         );
+    }
+
+    #[test]
+    fn resolved_agent_sets_prompt_and_tools_unless_flags_win() {
+        use crate::agent_selection::ResolvedAgent;
+
+        let mut repl = ReplLoop::new("/tmp".into(), ModelId::sonnet());
+        repl.apply_resolved_agent(ResolvedAgent {
+            name: "reviewer".into(),
+            system_prompt: "You review code.".into(),
+            allowed_tools: vec!["Read".into(), "Grep".into()],
+            model: None,
+            max_tokens: None,
+        });
+        assert_eq!(
+            repl.session_effects.override_system_prompt.as_deref(),
+            Some("You review code.")
+        );
+        assert_eq!(
+            repl.session_effects.allowed_tools_override,
+            Some(vec!["Read".into(), "Grep".into()])
+        );
+
+        // Explicit CLI flags are more specific than the agent file.
+        repl.session_effects.override_system_prompt = Some("explicit prompt".into());
+        repl.session_effects.allowed_tools_override = Some(vec!["Bash".into()]);
+        repl.apply_resolved_agent(ResolvedAgent {
+            name: "reviewer".into(),
+            system_prompt: "You review code.".into(),
+            allowed_tools: vec!["Read".into()],
+            model: None,
+            max_tokens: None,
+        });
+        assert_eq!(
+            repl.session_effects.override_system_prompt.as_deref(),
+            Some("explicit prompt")
+        );
+        assert_eq!(
+            repl.session_effects.allowed_tools_override,
+            Some(vec!["Bash".into()])
+        );
+
+        // An explicitly empty whitelist denies every tool; the agent file
+        // must not silently re-grant its own list.
+        repl.session_effects.allowed_tools_override = Some(Vec::new());
+        repl.apply_resolved_agent(ResolvedAgent {
+            name: "reviewer".into(),
+            system_prompt: "You review code.".into(),
+            allowed_tools: vec!["Read".into()],
+            model: None,
+            max_tokens: None,
+        });
+        assert_eq!(
+            repl.session_effects.allowed_tools_override,
+            Some(Vec::new())
+        );
+    }
+
+    #[tokio::test]
+    async fn build_submit_options_refreshes_the_parent_context_snapshot() {
+        let temp = tempfile::tempdir().unwrap();
+        let api = ReadThenAnswerApi {
+            call: Arc::new(std::sync::Mutex::new(0)),
+            expected_contents: "unused",
+        };
+        let mut repl = ReplLoop::with_engine(
+            Box::new(api),
+            temp.path().to_string_lossy().into_owned(),
+            ModelId::sonnet(),
+        );
+
+        let mut session = repl.engine.as_ref().unwrap().session().clone();
+        session.messages.push(Message::user("earlier turn"));
+        repl.engine.as_mut().unwrap().set_session(session);
+
+        let expected_model = repl.model.0.clone();
+        let options = repl.build_submit_options();
+        let expected_prompt = options.custom_system_prompt.clone().unwrap_or_default();
+        let snapshot = repl
+            .parent_context_snapshot
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("build_submit_options did not refresh the parent snapshot");
+
+        assert_eq!(snapshot.messages.len(), 1, "parent messages were not captured");
+        assert_eq!(snapshot.messages[0]["role"], "User");
+        assert_eq!(snapshot.model, expected_model);
+        assert_eq!(snapshot.system_prompt, expected_prompt);
+        assert!(
+            snapshot.tool_names.iter().any(|name| name == "Read"),
+            "the snapshot did not capture the advertised tools: {:?}",
+            snapshot.tool_names
+        );
+        assert!(snapshot.has_prefix());
     }
 
     /// A failed `--worktree` must stop a headless run, not fall back to the

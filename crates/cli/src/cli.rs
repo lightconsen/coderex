@@ -189,8 +189,11 @@ pub struct Cli {
     #[arg(long)]
     pub tmux: bool,
 
-    /// Accepted, but this build does not switch agents — the flag is
-    /// recorded and nothing else happens.
+    /// Run the session as a named custom agent.
+    ///
+    /// The name refers to a JSON definition in `~/.coderex/agents/`; its
+    /// system prompt and tool whitelist are applied to the session. An
+    /// unknown name is an error listing the configured agents.
     #[arg(long, value_name = "AGENT")]
     pub agent: Option<String>,
 
@@ -225,7 +228,7 @@ pub enum Command {
     ServeStop,
     /// Show status of a running daemon server.
     ServeStatus,
-    /// List available agents.
+    /// List available agents (built-in and custom).
     Agents {
         /// Show detailed agent information.
         #[arg(long)]
