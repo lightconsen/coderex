@@ -43,6 +43,11 @@ pub struct PluginHandle {
     pub commands: Vec<String>,
     /// Skills registered by this plugin.
     pub skills: Vec<String>,
+    /// The manifest's `hooks` document, as written.
+    ///
+    /// Kept so [`PluginManager::plugin_hooks`] can contribute the plugin's
+    /// hooks to the Plugin hook tier.
+    pub hooks: Option<Value>,
     /// Number of retry attempts for error recovery.
     pub retry_count: u32,
     /// Maximum retry attempts before giving up.
@@ -272,13 +277,17 @@ pub struct PluginManifest {
     /// Options the user configures, injected as `CODEREX_PLUGIN_OPTION_<KEY>`.
     #[serde(rename = "userConfig", default)]
     pub user_config: HashMap<String, UserConfigField>,
+    /// Hooks this plugin contributes to the Plugin hook tier.
+    ///
+    /// Either a bare array (`[{ ... }, ...]`) or an object wrapping one
+    /// (`{"hooks": [ ... ]}`). [`PluginManager::plugin_hooks`] normalizes both
+    /// into the document the hooks loader accepts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hooks: Option<Value>,
 
     // ── Accepted, not implemented ────────────────────────────────────────
     // Declared so a Claude-shaped manifest parses and so the fields are named
     // in the warning `unimplemented_fields()` produces, rather than vanishing.
-    /// Hook matchers (CodeRex hooks come from settings, not from plugins).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub hooks: Option<Value>,
     /// Agent definitions shipped by the plugin.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agents: Option<Value>,
@@ -343,7 +352,6 @@ impl PluginManifest {
                 fields.push(name);
             }
         };
-        note(self.hooks.is_some(), "hooks");
         note(self.agents.is_some(), "agents");
         note(self.output_styles.is_some(), "outputStyles");
         note(self.themes.is_some(), "themes");
@@ -1450,6 +1458,7 @@ impl PluginManager {
                 path: path.clone(),
                 commands: Vec::new(),
                 skills: Vec::new(),
+                hooks: manifest.hooks.clone(),
                 retry_count: 0,
                 max_retries: 3,
                 verified: false,
@@ -1466,6 +1475,7 @@ impl PluginManager {
             path: path.clone(),
             commands: manifest.commands.clone(),
             skills: manifest.skills.clone(),
+            hooks: manifest.hooks.clone(),
             retry_count: 0,
             max_retries: 3,
             // A plugin loaded from a directory has no archive to check, so
@@ -1768,6 +1778,7 @@ impl PluginManager {
                 path: h.path.clone(),
                 commands: h.commands.clone(),
                 skills: h.skills.clone(),
+                hooks: h.hooks.clone(),
                 retry_count: h.retry_count,
                 max_retries: h.max_retries,
                 verified: h.verified,
@@ -1780,6 +1791,64 @@ impl PluginManager {
     #[must_use]
     pub fn list_plugins(&self) -> Vec<String> {
         self.plugins.iter().map(|e| e.key().clone()).collect()
+    }
+
+    /// Collect the hooks contributed by active plugins for the Plugin hook tier.
+    ///
+    /// Only [`PluginState::Active`] plugins contribute. Each manifest's
+    /// `hooks` may be a bare array (`[{ ... }, ...]`) or an object wrapping
+    /// one (`{"hooks": [ ... ]}`); both are normalized and concatenated in
+    /// plugin-name order, so the result does not depend on map iteration
+    /// order. A malformed value is skipped with a warning naming the plugin.
+    ///
+    /// Returns `Some({"hooks": [...]})` when at least one hook was collected,
+    /// otherwise `None`.
+    #[must_use]
+    pub fn plugin_hooks(&self) -> Option<Value> {
+        let mut active: Vec<(String, Value)> = self
+            .plugins
+            .iter()
+            .filter(|entry| matches!(entry.value().state, PluginState::Active))
+            .filter_map(|entry| {
+                entry
+                    .value()
+                    .hooks
+                    .clone()
+                    .map(|hooks| (entry.key().clone(), hooks))
+            })
+            .collect();
+        active.sort_by(|a, b| a.0.cmp(&b.0));
+
+        let mut collected = Vec::new();
+        for (name, hooks) in active {
+            let entries = match &hooks {
+                Value::Array(entries) => entries.clone(),
+                Value::Object(object) => match object.get("hooks") {
+                    Some(Value::Array(entries)) => entries.clone(),
+                    _ => {
+                        tracing::warn!(
+                            plugin = %name,
+                            "plugin hooks object has no `hooks` array; skipping"
+                        );
+                        continue;
+                    }
+                },
+                _ => {
+                    tracing::warn!(
+                        plugin = %name,
+                        "plugin hooks is neither an array nor an object; skipping"
+                    );
+                    continue;
+                }
+            };
+            collected.extend(entries);
+        }
+
+        if collected.is_empty() {
+            None
+        } else {
+            Some(serde_json::json!({ "hooks": collected }))
+        }
     }
 
     /// Count loaded plugins.
@@ -2596,6 +2665,7 @@ impl PluginManager {
             path: target_dir.clone(),
             commands: manifest.commands.clone(),
             skills: manifest.skills.clone(),
+            hooks: manifest.hooks.clone(),
             retry_count: 0,
             max_retries: 3,
             verified,
@@ -2722,6 +2792,7 @@ impl PluginManager {
             path: target_dir.clone(),
             commands: Vec::new(),
             skills: Vec::new(),
+            hooks: None,
             retry_count: 0,
             max_retries: 3,
             verified: false,
@@ -2901,6 +2972,7 @@ impl PluginManager {
             path: target_dir.clone(),
             commands: manifest.commands,
             skills: manifest.skills,
+            hooks: manifest.hooks.clone(),
             retry_count: 0,
             max_retries: 3,
             verified,
@@ -4124,6 +4196,200 @@ mod tests {
         .unwrap_err()
         .to_string();
         assert!(err.contains("displayname"), "{err}");
+    }
+
+    // ── plugin hooks ─────────────────────────────────────────────────────
+
+    fn manifest_with_hooks(name: &str, hooks: serde_json::Value) -> PluginManifest {
+        serde_json::from_value(serde_json::json!({
+            "name": name,
+            "version": "1.0.0",
+            "hooks": hooks,
+        }))
+        .unwrap()
+    }
+
+    /// A bare array and an object-wrapped one are the two shapes a manifest
+    /// may use; both contribute.
+    #[test]
+    fn plugin_hooks_accepts_bare_and_wrapped_documents() {
+        let mgr = PluginManager::new();
+        mgr.load_plugin(
+            manifest_with_hooks(
+                "wrapped",
+                serde_json::json!({"hooks": [{"event": "PostToolUse", "command": "b"}]}),
+            ),
+            PathBuf::from("/plugins/wrapped"),
+        );
+        mgr.load_plugin(
+            manifest_with_hooks(
+                "bare",
+                serde_json::json!([{"event": "PreToolUse", "command": "a"}]),
+            ),
+            PathBuf::from("/plugins/bare"),
+        );
+
+        let collected = mgr.plugin_hooks().expect("both plugins contribute hooks");
+        let hooks = collected["hooks"].as_array().unwrap();
+        assert_eq!(hooks.len(), 2, "{collected}");
+        // Names sort "bare" before "wrapped".
+        assert_eq!(hooks[0]["event"], "PreToolUse");
+        assert_eq!(hooks[1]["event"], "PostToolUse");
+    }
+
+    /// Only `Active` plugins contribute: a discovered, loading, broken,
+    /// disabled (uninstalled), or installing plugin does not.
+    #[test]
+    fn plugin_hooks_ignores_inactive_plugins() {
+        let mgr = PluginManager::new();
+        mgr.load_plugin(
+            manifest_with_hooks("active", serde_json::json!([{"event": "Active"}])),
+            PathBuf::from("/plugins/active"),
+        );
+
+        let inactive = [
+            (PluginState::Discovered, "discovered"),
+            (PluginState::Loading, "loading"),
+            (PluginState::Error("broke".into()), "broken"),
+            (PluginState::Uninstalled, "disabled"),
+            (PluginState::Installing, "installing"),
+        ];
+        for (state, name) in inactive {
+            mgr.load_plugin(
+                manifest_with_hooks(name, serde_json::json!([{"event": name}])),
+                PathBuf::from(format!("/plugins/{name}")),
+            );
+            mgr.set_plugin_state(name, state);
+        }
+
+        let collected = mgr.plugin_hooks().unwrap();
+        assert_eq!(
+            collected,
+            serde_json::json!({"hooks": [{"event": "Active"}]})
+        );
+    }
+
+    /// Map iteration order must not leak into the collected document.
+    #[test]
+    fn plugin_hooks_is_deterministically_ordered_by_plugin_name() {
+        let mgr = PluginManager::new();
+        for name in ["zeta", "middle", "alpha"] {
+            mgr.load_plugin(
+                manifest_with_hooks(name, serde_json::json!([{"event": name}])),
+                PathBuf::from(format!("/plugins/{name}")),
+            );
+        }
+
+        let collected = mgr.plugin_hooks().unwrap();
+        let events: Vec<&str> = collected["hooks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|hook| hook["event"].as_str().unwrap())
+            .collect();
+        assert_eq!(events, vec!["alpha", "middle", "zeta"]);
+    }
+
+    /// Test subscriber that records warning events on the current thread.
+    #[derive(Clone, Default)]
+    struct WarningLog(std::sync::Arc<std::sync::Mutex<Vec<String>>>);
+
+    impl WarningLog {
+        fn warnings(&self) -> Vec<String> {
+            self.0.lock().unwrap().clone()
+        }
+    }
+
+    impl tracing::Subscriber for WarningLog {
+        fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
+            *metadata.level() <= tracing::Level::WARN
+        }
+
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+
+        fn enter(&self, _: &tracing::span::Id) {}
+
+        fn exit(&self, _: &tracing::span::Id) {}
+
+        fn event(&self, event: &tracing::Event<'_>) {
+            struct Visitor<'a>(&'a mut Vec<String>);
+
+            impl tracing::field::Visit for Visitor<'_> {
+                fn record_debug(
+                    &mut self,
+                    field: &tracing::field::Field,
+                    value: &dyn std::fmt::Debug,
+                ) {
+                    self.0.push(format!("{}={value:?}", field.name()));
+                }
+            }
+
+            let mut fields = Vec::new();
+            event.record(&mut Visitor(&mut fields));
+            self.0.lock().unwrap().push(fields.join(" "));
+        }
+    }
+
+    /// A malformed `hooks` value does not take the other plugins' hooks with
+    /// it, and the author is told which plugin was skipped.
+    #[test]
+    fn malformed_plugin_hooks_are_skipped_with_a_warning() {
+        let mgr = PluginManager::new();
+        mgr.load_plugin(
+            manifest_with_hooks("valid", serde_json::json!([{"event": "Kept"}])),
+            PathBuf::from("/plugins/valid"),
+        );
+        mgr.load_plugin(
+            manifest_with_hooks("stringly", serde_json::json!("not hooks")),
+            PathBuf::from("/plugins/stringly"),
+        );
+        mgr.load_plugin(
+            manifest_with_hooks("no-array", serde_json::json!({"notHooks": []})),
+            PathBuf::from("/plugins/no-array"),
+        );
+
+        let log = WarningLog::default();
+        let collected = tracing::subscriber::with_default(log.clone(), || mgr.plugin_hooks())
+            .expect("the valid plugin still contributes");
+
+        assert_eq!(collected, serde_json::json!({"hooks": [{"event": "Kept"}]}));
+        let warnings = log.warnings();
+        assert_eq!(warnings.len(), 2, "{warnings:?}");
+        assert!(
+            warnings.iter().any(|warning| warning.contains("stringly")),
+            "{warnings:?}"
+        );
+        assert!(
+            warnings.iter().any(|warning| warning.contains("no-array")),
+            "{warnings:?}"
+        );
+    }
+
+    /// `hooks` now feeds the Plugin hook tier, so it is no longer reported as
+    /// accepted-but-unimplemented; the remaining twelve fields still are.
+    #[test]
+    fn hooks_is_no_longer_reported_as_unimplemented() {
+        let manifest = manifest_with_hooks("hooked", serde_json::json!([]));
+        assert!(
+            !manifest.unimplemented_fields().contains(&"hooks"),
+            "{:?}",
+            manifest.unimplemented_fields()
+        );
+        assert!(manifest.unimplemented_fields().is_empty());
+
+        let with_other_fields: PluginManifest =
+            serde_json::from_str(r#"{"name":"n","hooks":[],"mcpServers":{},"experimental":true}"#)
+                .unwrap();
+        assert_eq!(
+            with_other_fields.unimplemented_fields(),
+            vec!["mcpServers", "experimental"]
+        );
     }
 
     // ── userConfig injection ─────────────────────────────────────────────

@@ -245,12 +245,11 @@ pub struct MarketplaceSetting {
 pub struct HookLayers {
     /// Hooks from built-in defaults, user settings, and project settings.
     pub core: Option<serde_json::Value>,
-    /// Hooks supplied by plugins.
+    /// Hooks supplied by active plugins.
     ///
-    /// No producer exists today: `PluginManifest::hooks` parses but
-    /// `coderex-plugins` reports it as unimplemented, so this layer is always
-    /// `None`. It is kept in the shape so the day plugin hooks are honoured
-    /// they already have a tier to land in.
+    /// Filled by the orchestrator from `PluginManager::plugin_hooks()`, which
+    /// normalizes the `hooks` value of every active manifest into
+    /// `{"hooks":[...]}`. Settings resolution leaves it `None`.
     pub plugin: Option<serde_json::Value>,
     /// Hooks from the administrator-controlled managed-settings carriers.
     pub managed: Option<serde_json::Value>,
