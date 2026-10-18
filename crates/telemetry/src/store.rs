@@ -39,12 +39,23 @@ impl TelemetryStore {
                 uploaded_at TEXT
             );
 
+            -- `panic_info` holds raw text only in verbose mode (a local copy);
+            -- every other mode stores a structured summary. The classification
+            -- columns are added to older databases by `ensure_crash_columns`.
             CREATE TABLE IF NOT EXISTS crash_reports (
-                id          INTEGER PRIMARY KEY AUTOINCREMENT,
-                panic_info  TEXT NOT NULL,
-                backtrace   TEXT,
-                created_at  TEXT NOT NULL,
-                uploaded_at TEXT
+                id                      INTEGER PRIMARY KEY AUTOINCREMENT,
+                panic_info              TEXT NOT NULL,
+                backtrace               TEXT,
+                created_at              TEXT NOT NULL,
+                uploaded_at             TEXT,
+                panic_template          TEXT,
+                panic_fields            TEXT,
+                panic_message_len       INTEGER,
+                panic_message_sha256    TEXT,
+                backtrace_symbols       TEXT,
+                backtrace_frame_count   INTEGER,
+                backtrace_symbols_len   INTEGER,
+                backtrace_symbols_sha256 TEXT
             );
 
             CREATE INDEX IF NOT EXISTS idx_events_uploaded
@@ -73,6 +84,15 @@ impl TelemetryStore {
             END;
 ",
         )?;
+
+        // Databases created before the structured crash taxonomy lack the
+        // classification columns. Add them in place so existing rows survive.
+        ensure_crash_columns(&conn)?;
+
+        // The verbose crash path keeps a raw local copy in this database. Make
+        // the file (and SQLite's sidecars) user-only on Unix, matching the
+        // pending-file mode.
+        restrict_db_permissions(path);
 
         let store = Self {
             conn,
@@ -156,16 +176,45 @@ impl TelemetryStore {
     }
 
     /// Insert a crash report.
+    ///
+    /// This legacy entry point stores free-form text as given and leaves the
+    /// structured columns empty. The ingestion path uses
+    /// [`Self::insert_crash_record`].
     pub fn insert_crash(
         &self,
         panic_info: &str,
         backtrace: Option<&str>,
     ) -> Result<i64, TelemetryError> {
+        self.insert_crash_record(&CrashRecord {
+            panic_info: panic_info.to_string(),
+            backtrace: backtrace.map(str::to_string),
+            ..CrashRecord::default()
+        })
+    }
+
+    /// Insert a crash report with its structured classification.
+    pub(crate) fn insert_crash_record(&self, record: &CrashRecord) -> Result<i64, TelemetryError> {
         let now = chrono::Utc::now().to_rfc3339();
         self.conn.execute(
-            "INSERT INTO crash_reports (panic_info, backtrace, created_at)
-             VALUES (?1, ?2, ?3)",
-            params![panic_info, backtrace, now],
+            "INSERT INTO crash_reports (
+                panic_info, backtrace, created_at, panic_template, panic_fields,
+                panic_message_len, panic_message_sha256, backtrace_symbols,
+                backtrace_frame_count, backtrace_symbols_len,
+                backtrace_symbols_sha256
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            params![
+                record.panic_info,
+                record.backtrace,
+                now,
+                record.panic_template,
+                record.panic_fields,
+                record.panic_message_len,
+                record.panic_message_sha256,
+                record.backtrace_symbols,
+                record.backtrace_frame_count,
+                record.backtrace_symbols_len,
+                record.backtrace_symbols_sha256,
+            ],
         )?;
         Ok(self.conn.last_insert_rowid())
     }
@@ -173,7 +222,10 @@ impl TelemetryStore {
     /// Get pending crash reports.
     pub fn pending_crashes(&self, limit: usize) -> Result<Vec<PendingCrash>, TelemetryError> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, panic_info, backtrace, created_at
+            "SELECT id, panic_info, backtrace, created_at, panic_template,
+                    panic_fields, panic_message_len, panic_message_sha256,
+                    backtrace_symbols, backtrace_frame_count,
+                    backtrace_symbols_len, backtrace_symbols_sha256
              FROM crash_reports
              WHERE uploaded_at IS NULL
              ORDER BY created_at ASC
@@ -186,6 +238,14 @@ impl TelemetryStore {
                 panic_info: row.get(1)?,
                 backtrace: row.get(2)?,
                 created_at: row.get(3)?,
+                panic_template: row.get(4)?,
+                panic_fields: row.get(5)?,
+                panic_message_len: row.get(6)?,
+                panic_message_sha256: row.get(7)?,
+                backtrace_symbols: row.get(8)?,
+                backtrace_frame_count: row.get(9)?,
+                backtrace_symbols_len: row.get(10)?,
+                backtrace_symbols_sha256: row.get(11)?,
             })
         })?;
 
@@ -194,6 +254,20 @@ impl TelemetryStore {
             crashes.push(row?);
         }
         Ok(crashes)
+    }
+
+    /// Delete crash rows older than `max_age`.
+    ///
+    /// Applies to uploaded and pending rows alike: this is local retention for
+    /// the verbose raw copy, which must not live forever. Returns the number of
+    /// rows removed.
+    pub fn prune_crashes(&self, max_age: chrono::Duration) -> Result<usize, TelemetryError> {
+        let cutoff = (chrono::Utc::now() - max_age).to_rfc3339();
+        let deleted = self.conn.execute(
+            "DELETE FROM crash_reports WHERE created_at < ?1",
+            params![cutoff],
+        )?;
+        Ok(deleted)
     }
 
     /// Mark crash reports as uploaded.
@@ -275,6 +349,62 @@ impl TelemetryStore {
     }
 }
 
+/// Add the structured-crash columns to a database created by an older build.
+fn ensure_crash_columns(conn: &Connection) -> Result<(), TelemetryError> {
+    const COLUMNS: [(&str, &str); 8] = [
+        ("panic_template", "TEXT"),
+        ("panic_fields", "TEXT"),
+        ("panic_message_len", "INTEGER"),
+        ("panic_message_sha256", "TEXT"),
+        ("backtrace_symbols", "TEXT"),
+        ("backtrace_frame_count", "INTEGER"),
+        ("backtrace_symbols_len", "INTEGER"),
+        ("backtrace_symbols_sha256", "TEXT"),
+    ];
+
+    let mut existing = std::collections::HashSet::new();
+    {
+        let mut stmt = conn.prepare("PRAGMA table_info(crash_reports)")?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(1))?;
+        for row in rows {
+            existing.insert(row?);
+        }
+    }
+
+    for (name, kind) in COLUMNS {
+        if !existing.contains(name) {
+            // Names and types are compile-time constants, never user input.
+            conn.execute_batch(&format!(
+                "ALTER TABLE crash_reports ADD COLUMN {name} {kind}"
+            ))?;
+        }
+    }
+    Ok(())
+}
+
+/// Restrict the database and its SQLite sidecars to the current user.
+fn restrict_db_permissions(path: &Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        let mut candidates = vec![path.to_path_buf()];
+        candidates.push(std::path::PathBuf::from(format!("{}-wal", path.display())));
+        candidates.push(std::path::PathBuf::from(format!("{}-shm", path.display())));
+        for candidate in candidates {
+            if let Ok(metadata) = std::fs::metadata(&candidate) {
+                let mut permissions = metadata.permissions();
+                permissions.set_mode(0o600);
+                let _ = std::fs::set_permissions(&candidate, permissions);
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+    }
+}
+
 /// Cap on the on-disk event store.
 ///
 /// The row-count trigger bounds how many events are kept, but payloads vary in
@@ -296,16 +426,64 @@ pub struct PendingEvent {
 }
 
 /// A crash report pending upload.
+///
+/// `panic_info` is a structured summary in every mode except verbose, where it
+/// is the raw local copy. `backtrace` is likewise a verbose-only local copy;
+/// the upload uses the symbol-only `backtrace_symbols` instead.
 #[derive(Debug, Clone)]
 pub struct PendingCrash {
     /// Database row ID.
     pub id: i64,
-    /// Panic info string.
+    /// Panic info string (structured summary, or raw text in verbose mode).
     pub panic_info: String,
-    /// Optional backtrace.
+    /// Optional raw backtrace (verbose mode only; never uploaded).
     pub backtrace: Option<String>,
     /// ISO-8601 timestamp.
     pub created_at: String,
+    /// Wire identifier of the classified panic template.
+    pub panic_template: Option<String>,
+    /// JSON object of safe parsed fields.
+    pub panic_fields: Option<String>,
+    /// Byte length of the panic message.
+    pub panic_message_len: Option<i64>,
+    /// SHA-256 of the panic message.
+    pub panic_message_sha256: Option<String>,
+    /// JSON array of symbol-only backtrace frames.
+    pub backtrace_symbols: Option<String>,
+    /// Total symbol-bearing frames parsed.
+    pub backtrace_frame_count: Option<i64>,
+    /// Byte length of the joined symbol representation.
+    pub backtrace_symbols_len: Option<i64>,
+    /// SHA-256 of the joined symbol representation.
+    pub backtrace_symbols_sha256: Option<String>,
+}
+
+/// A crash report about to be stored, including its structured classification.
+///
+/// This is an internal ingestion shape; it exists so the crash module can hand
+/// every column to the store in one value.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct CrashRecord {
+    /// Structured summary, or raw text in verbose mode.
+    pub panic_info: String,
+    /// Raw backtrace in verbose mode only.
+    pub backtrace: Option<String>,
+    /// Wire identifier of the panic template.
+    pub panic_template: Option<String>,
+    /// JSON object of safe parsed fields.
+    pub panic_fields: Option<String>,
+    /// Byte length of the panic message.
+    pub panic_message_len: Option<i64>,
+    /// SHA-256 of the panic message.
+    pub panic_message_sha256: Option<String>,
+    /// JSON array of symbol-only frames.
+    pub backtrace_symbols: Option<String>,
+    /// Total symbol-bearing frames parsed.
+    pub backtrace_frame_count: Option<i64>,
+    /// Byte length of the joined symbol representation.
+    pub backtrace_symbols_len: Option<i64>,
+    /// SHA-256 of the joined symbol representation.
+    pub backtrace_symbols_sha256: Option<String>,
 }
 
 /// Types of telemetry events.
@@ -471,5 +649,103 @@ mod tests {
         assert_eq!(pending[0].id, id);
         assert_eq!(pending[0].panic_info, "panic at foo.rs:42");
         assert_eq!(pending[0].backtrace.as_deref(), Some("backtrace..."));
+    }
+
+    #[test]
+    fn crash_record_roundtrip_carries_classification() {
+        let store = temp_store();
+        let record = CrashRecord {
+            panic_info: "[strict-crash-summary] type=&str; thread=main; location=src/a.rs:1:1; template=index_out_of_bounds; message_len=40; message=omitted; backtrace=omitted".into(),
+            backtrace: None,
+            panic_template: Some("index_out_of_bounds".into()),
+            panic_fields: Some(r#"{"panic_container_len":3,"panic_index":7}"#.into()),
+            panic_message_len: Some(40),
+            panic_message_sha256: Some("a".repeat(64)),
+            backtrace_symbols: Some(r#"["crate::run"]"#.into()),
+            backtrace_frame_count: Some(1),
+            backtrace_symbols_len: Some(10),
+            backtrace_symbols_sha256: Some("b".repeat(64)),
+        };
+        store.insert_crash_record(&record).unwrap();
+
+        let pending = store.pending_crashes(10).unwrap();
+        assert_eq!(pending.len(), 1);
+        let row = &pending[0];
+        assert_eq!(row.panic_template.as_deref(), Some("index_out_of_bounds"));
+        assert_eq!(row.panic_fields.as_deref(), record.panic_fields.as_deref());
+        assert_eq!(row.panic_message_len, Some(40));
+        assert_eq!(row.panic_message_sha256, record.panic_message_sha256);
+        assert_eq!(row.backtrace_symbols, record.backtrace_symbols);
+        assert_eq!(row.backtrace_frame_count, Some(1));
+        assert_eq!(row.backtrace_symbols_len, Some(10));
+        assert_eq!(row.backtrace_symbols_sha256, record.backtrace_symbols_sha256);
+    }
+
+    /// A database created before the structured taxonomy is migrated in place;
+    /// the old row keeps loading with empty classification columns.
+    #[test]
+    fn older_crash_schema_is_migrated_in_place() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        {
+            let conn = Connection::open(tmp.path()).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE crash_reports (
+                    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                    panic_info  TEXT NOT NULL,
+                    backtrace   TEXT,
+                    created_at  TEXT NOT NULL,
+                    uploaded_at TEXT
+                 );",
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO crash_reports (panic_info, backtrace, created_at)
+                 VALUES (?1, ?2, ?3)",
+                params!["legacy text", "legacy backtrace", "2020-01-01T00:00:00+00:00"],
+            )
+            .unwrap();
+        }
+
+        let store = TelemetryStore::open(tmp.path()).unwrap();
+        let pending = store.pending_crashes(10).unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].panic_info, "legacy text");
+        assert!(pending[0].panic_template.is_none());
+        assert!(pending[0].backtrace_symbols.is_none());
+
+        // New rows can use the added columns.
+        store
+            .insert_crash_record(&CrashRecord {
+                panic_info: "[strict-crash-summary]".into(),
+                panic_template: Some("explicit_panic".into()),
+                ..CrashRecord::default()
+            })
+            .unwrap();
+        let pending = store.pending_crashes(10).unwrap();
+        assert_eq!(pending.len(), 2);
+        assert_eq!(pending[1].panic_template.as_deref(), Some("explicit_panic"));
+    }
+
+    /// Local crash retention: rows older than the maximum age are deleted.
+    #[test]
+    fn prune_crashes_removes_rows_past_retention() {
+        let store = temp_store();
+        store
+            .conn
+            .execute(
+                "INSERT INTO crash_reports (panic_info, created_at)
+                 VALUES (?1, ?2)",
+                params!["old", "2020-01-01T00:00:00+00:00"],
+            )
+            .unwrap();
+        store
+            .insert_crash("[strict-crash-summary] fresh", None)
+            .unwrap();
+
+        let deleted = store.prune_crashes(chrono::Duration::days(30)).unwrap();
+        assert_eq!(deleted, 1);
+        let pending = store.pending_crashes(10).unwrap();
+        assert_eq!(pending.len(), 1);
+        assert!(pending[0].panic_info.contains("fresh"));
     }
 }

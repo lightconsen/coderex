@@ -20,11 +20,17 @@ mod scrubber;
 mod store;
 mod uploader;
 
-pub use crash::{CRASH_VERBOSE_ENV, CrashReport, CrashReporter, crash_verbose, crash_verbose_with};
+pub use crash::{
+    BacktraceSymbols, CRASH_VERBOSE_ENV, CrashReport, CrashReporter, DEFAULT_CRASH_RETENTION_DAYS,
+    DEFAULT_PENDING_MAX_AGE_SECS, MAX_BACKTRACE_FRAMES, PanicClassification, PanicTemplate,
+    classify_panic_message, crash_verbose, crash_verbose_with, symbolize_backtrace,
+    symbolize_backtrace_limited,
+};
 pub use scrubber::Scrubber;
 pub use store::{PendingCrash, PendingEvent, TelemetryEvent, TelemetryStore};
 pub use uploader::{
     HIPAA_ENV, TelemetryConfig, TelemetryUploader, hipaa_enabled, hipaa_enabled_with,
+    preview_crash_payload, preview_crash_payload_with,
 };
 
 use std::collections::hash_map::DefaultHasher;

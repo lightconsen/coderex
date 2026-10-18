@@ -298,6 +298,24 @@ impl TelemetryUploader {
         }
     }
 
+    /// Override the resolved modes in tests without touching the environment.
+    #[cfg(test)]
+    fn with_mode_for_test(mut self, verbose: bool, strict: bool) -> Self {
+        self.verbose = verbose;
+        self.strict = strict;
+        self
+    }
+
+    /// Preview the exact crash payload this uploader would send.
+    ///
+    /// Uses the uploader's own resolved strict/verbose mode and scrubber, so it
+    /// matches the bytes of the next upload rather than re-reading the
+    /// environment.
+    #[must_use]
+    pub fn preview_crash_payload(&self, crash: &PendingCrash) -> serde_json::Value {
+        build_crash_payload(&self.scrubber, crash, self.verbose, self.strict)
+    }
+
     /// Open a fresh connection to the telemetry database.
     fn open_store(&self) -> Result<TelemetryStore, TelemetryError> {
         TelemetryStore::open(&self.db_path)
@@ -491,15 +509,21 @@ fn build_event_payload(
 
 /// Build the wire payload for one pending crash report.
 ///
-/// The default (and strict mode, which always wins) sends **metadata only**:
-/// `panic_type`, `thread_name`, `panic_location`, the OS and CodeRex version,
-/// and `redaction_status: "structured"`. No free-form panic text and no
-/// backtrace leave the machine. A legacy raw row is reduced to its panic
-/// location; its message is never forwarded.
+/// The default path sends the structured panic taxonomy
+/// (`panic_template` plus numeric/identifier fields, `panic_message_len`,
+/// `panic_message_sha256`) and a symbol-only backtrace (`backtrace_frames`,
+/// frame count, symbol length/hash). It never sends `panic_info`, a raw
+/// `backtrace`, or any free-form message text. Strict mode
+/// (`CODEREX_HIPAA`) additionally drops the symbols.
 ///
-/// Only `CODEREX_CRASH_VERBOSE` (without strict mode) sends the panic message
-/// and backtrace. Both are re-scrubbed on the way out (defence in depth) and
-/// the payload is marked `redaction_status: "pattern"` — never "clean".
+/// Only `CODEREX_CRASH_VERBOSE` (without strict mode) adds `panic_info` — the
+/// stored raw text scrubbed again here — and marks the payload
+/// `redaction_status: "pattern"`. The raw backtrace is never uploaded; verbose
+/// payloads still use symbols only.
+///
+/// The marker is one of `structured` (metadata + taxonomy), `symbolized`
+/// (adds symbol frames) or `pattern` (adds scrubbed free-form text). It is
+/// never `clean`, and the keys present always match the marker.
 fn build_crash_payload(
     scrubber: &Scrubber,
     crash: &PendingCrash,
@@ -507,38 +531,108 @@ fn build_crash_payload(
     strict: bool,
 ) -> serde_json::Value {
     let metadata = crate::crash::crash_metadata_from_stored(&crash.panic_info);
+    let (classification, symbols) = crate::crash::stored_crash_view(crash);
+
     let mut payload = serde_json::json!({
         "panic_type": metadata.panic_type,
         "thread_name": metadata.thread_name,
-        "panic_location": metadata.panic_location,
+        "panic_location": sanitize_location(&metadata.panic_location, scrubber),
         "os": std::env::consts::OS,
         "version": env!("CARGO_PKG_VERSION"),
         "timestamp": crash.created_at,
+        "panic_template": classification.template.as_str(),
+        "panic_message_len": classification.message_len,
+        "panic_message_sha256": classification.message_sha256,
     });
-
-    // Strict mode wins over verbose. A row already ingested in structured form
-    // has no free-form text to send, even under verbose.
-    if strict || !verbose || crate::crash::is_structured(&crash.panic_info) {
-        payload["redaction_status"] =
-            serde_json::Value::String(crate::crash::CRASH_STRUCTURED_MARKER.to_string());
-        if strict {
-            // `redaction_status` and every structured field are on the
-            // allowlist, so this leaves the explicit mark intact and only
-            // marks genuinely unknown fields.
-            crate::scrubber::mark_unredacted_if_unallowlisted(&mut payload);
-        }
-        return payload;
+    for (key, value) in &classification.fields {
+        payload[key] = value.clone();
     }
 
-    payload["panic_info"] = serde_json::Value::String(scrubber.scrub(&crash.panic_info));
-    payload["backtrace"] = crash
-        .backtrace
-        .as_deref()
-        .map(|backtrace| serde_json::Value::String(scrubber.scrub(backtrace)))
-        .unwrap_or(serde_json::Value::Null);
-    payload["redaction_status"] =
-        serde_json::Value::String(crate::crash::CRASH_PATTERN_MARKER.to_string());
+    // Strict mode wins over verbose and over symbol capture.
+    let symbolized = if strict {
+        None
+    } else {
+        symbols.filter(|symbols| !symbols.frames.is_empty())
+    };
+    if let Some(symbols) = &symbolized {
+        payload["backtrace_frames"] = serde_json::json!(symbols.frames);
+        payload["backtrace_frame_count"] = serde_json::json!(symbols.frame_count);
+        payload["backtrace_symbols_len"] = serde_json::json!(symbols.symbols_len);
+        payload["backtrace_symbols_sha256"] = serde_json::json!(symbols.symbols_sha256);
+    }
+
+    // Free-form text exists only when the row itself holds raw text (verbose
+    // ingestion) and verbose is still enabled without strict mode.
+    let include_text = !strict
+        && verbose
+        && !crate::crash::is_structured(&crash.panic_info)
+        && !crash.panic_info.is_empty();
+    if include_text {
+        payload["panic_info"] = serde_json::Value::String(scrubber.scrub(&crash.panic_info));
+    }
+
+    let marker = if include_text {
+        crate::crash::CRASH_PATTERN_MARKER
+    } else if symbolized.is_some() {
+        crate::crash::CRASH_SYMBOLIZED_MARKER
+    } else {
+        crate::crash::CRASH_STRUCTURED_MARKER
+    };
+    payload["redaction_status"] = serde_json::Value::String(marker.to_string());
+
+    if strict {
+        // Every key produced above is on the strict allowlist; this is a
+        // defence-in-depth check that should leave the mark intact.
+        crate::scrubber::mark_unredacted_if_unallowlisted(&mut payload);
+    }
     payload
+}
+
+/// Remove absolute-path information from a panic location.
+///
+/// The location is scrubbed first (home directories and high-entropy path
+/// components), then the leading root / Windows drive is removed so no
+/// absolute path survives. The file:line:column remainder is still useful for
+/// grouping.
+fn sanitize_location(location: &str, scrubber: &Scrubber) -> String {
+    let scrubbed = scrubber.scrub(location);
+    let trimmed = scrubbed.trim();
+    let mut relative = trimmed.trim_start_matches('/');
+    if relative.len() >= 2 && relative.as_bytes()[1] == b':' {
+        relative = &relative[2..];
+    }
+    let relative = relative.trim_start_matches('\\');
+    relative
+        .chars()
+        .map(|ch| if ch.is_control() { ' ' } else { ch })
+        .take(200)
+        .collect::<String>()
+        .replace(';', ",")
+}
+
+/// Preview the exact JSON payload that would be uploaded for `crash`.
+///
+/// This resolves `CODEREX_CRASH_VERBOSE` and `CODEREX_HIPAA` at call time, so
+/// it matches a newly constructed uploader in the same process. Pass the same
+/// row the uploader would read (`TelemetryStore::pending_crashes`) and the
+/// returned value is the element of the upload's `crashes` array.
+///
+/// It deliberately returns the *wire* payload, not the local copy: verbose
+/// text is pattern-scrubbed exactly as it will be on upload.
+#[must_use]
+pub fn preview_crash_payload(crash: &PendingCrash) -> serde_json::Value {
+    preview_crash_payload_with(crash, crate::crash_verbose(), crate::hipaa_enabled())
+}
+
+/// [`preview_crash_payload`] with explicit modes, for callers and tests that
+/// must not read the process environment.
+#[must_use]
+pub fn preview_crash_payload_with(
+    crash: &PendingCrash,
+    verbose: bool,
+    strict: bool,
+) -> serde_json::Value {
+    build_crash_payload(&Scrubber::new(), crash, verbose, strict)
 }
 
 /// Compress a JSON value into a gzip-encoded byte vector.
@@ -859,6 +953,39 @@ mod tests {
             panic_info: panic_info.into(),
             backtrace: backtrace.map(str::to_string),
             created_at: "2026-01-01T00:00:00Z".into(),
+            panic_template: None,
+            panic_fields: None,
+            panic_message_len: None,
+            panic_message_sha256: None,
+            backtrace_symbols: None,
+            backtrace_frame_count: None,
+            backtrace_symbols_len: None,
+            backtrace_symbols_sha256: None,
+        }
+    }
+
+    fn pending_classified_crash(
+        panic_info: &str,
+        template: &str,
+        fields: &str,
+        symbols: Option<&str>,
+    ) -> PendingCrash {
+        let frames = symbols.map(crate::symbolize_backtrace);
+        PendingCrash {
+            id: 1,
+            panic_info: panic_info.into(),
+            backtrace: None,
+            created_at: "2026-01-01T00:00:00Z".into(),
+            panic_template: Some(template.into()),
+            panic_fields: Some(fields.into()),
+            panic_message_len: Some(42),
+            panic_message_sha256: Some("a".repeat(64)),
+            backtrace_symbols: frames
+                .as_ref()
+                .and_then(|symbols| serde_json::to_string(&symbols.frames).ok()),
+            backtrace_frame_count: frames.as_ref().map(|symbols| symbols.frame_count as i64),
+            backtrace_symbols_len: frames.as_ref().map(|symbols| symbols.symbols_len as i64),
+            backtrace_symbols_sha256: frames.map(|symbols| symbols.symbols_sha256),
         }
     }
 
@@ -870,6 +997,16 @@ mod tests {
         );
         assert!(payload.get("panic_info").is_none(), "{payload}");
         assert!(payload.get("backtrace").is_none(), "{payload}");
+        assert!(payload.get("message").is_none(), "{payload}");
+        assert_eq!(payload["panic_template"], serde_json::json!("unknown"));
+        assert!(
+            payload["panic_message_len"].is_number(),
+            "the length must be sent even for unknown messages: {payload}"
+        );
+        assert!(
+            payload["panic_message_sha256"].is_string(),
+            "the hash must be sent even for unknown messages: {payload}"
+        );
         for field in [
             "panic_type",
             "thread_name",
@@ -979,14 +1116,15 @@ mod tests {
     }
 
     /// Verbose mode is the only path that sends free-form text, and it is
-    /// scrubbed first and marked `pattern` — never claimed clean.
+    /// scrubbed first and marked `pattern` — never claimed clean. The raw
+    /// backtrace is still not sent; only symbol frames are.
     #[test]
     fn verbose_crash_payload_is_pattern_scrubbed() {
         let scrubber = Scrubber::new();
         let crash = pending_crash_with(
             "panicked at src/main.rs:10:5:\nfailed for bob@example.com carrying A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6",
             Some(
-                "coderex_core::engine::run\n    at /home/bob/project/crates/core/src/engine.rs:42:9\nat file.rs:12:9",
+                "   0: coderex_core::engine::run\n             at /home/bob/project/crates/core/src/engine.rs:42:9\n   1: at file.rs:12:9",
             ),
         );
         let payload = build_crash_payload(&scrubber, &crash, true, false);
@@ -1000,19 +1138,27 @@ mod tests {
             payload["panic_location"],
             serde_json::json!("src/main.rs:10:5")
         );
+        assert!(
+            payload.get("backtrace").is_none(),
+            "the raw backtrace must never be uploaded: {payload}"
+        );
+        assert_eq!(
+            payload["backtrace_frames"],
+            serde_json::json!(["coderex_core::engine::run"])
+        );
+
         let rendered = payload.to_string();
         for forbidden in [
             "bob@example.com",
             "A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6",
             "/home/bob",
+            "engine.rs:42:9",
         ] {
             assert!(!rendered.contains(forbidden), "{forbidden}: {rendered}");
         }
         for expected in [
             "failed for",
             "coderex_core::engine::run",
-            "crates/core/src/engine.rs:42:9",
-            "file.rs:12:9",
             "<SECRET>",
             "<EMAIL>",
         ] {
@@ -1033,5 +1179,219 @@ mod tests {
         let payload = build_crash_payload(&scrubber, &crash, true, false);
         assert_structured_payload(&payload);
         assert_eq!(payload["thread_name"], serde_json::json!("main"));
+    }
+
+    /// A classified row with symbols is marked `symbolized`: the payload keys
+    /// match the marker (no free-form key anywhere).
+    #[test]
+    fn symbolized_crash_payload_has_symbols_and_no_paths() {
+        let backtrace = "   0: std::panicking::begin_panic_handler\n             at /rustc/abcdef0123456789abcdef0123456789/library/std/src/panicking.rs:123:5\n   1: coderex_core::engine::QueryEngine::submit\n             at /home/somebody/project/crates/core/src/engine.rs:42:9\n";
+        let crash = pending_classified_crash(
+            "[strict-crash-summary] type=&str; thread=main; location=src/main.rs:10:5; template=index_out_of_bounds; message_len=42; message_sha256=aaa; message=omitted; backtrace=omitted",
+            "index_out_of_bounds",
+            r#"{"panic_container_len":3,"panic_index":7}"#,
+            Some(backtrace),
+        );
+        let payload = build_crash_payload(&Scrubber::new(), &crash, false, false);
+
+        assert_eq!(
+            payload["redaction_status"],
+            serde_json::json!("symbolized")
+        );
+        assert_eq!(
+            payload["panic_template"],
+            serde_json::json!("index_out_of_bounds")
+        );
+        assert_eq!(payload["panic_container_len"], serde_json::json!(3));
+        assert_eq!(payload["panic_index"], serde_json::json!(7));
+        assert_eq!(payload["backtrace_frame_count"], serde_json::json!(2));
+        assert!(payload.get("panic_info").is_none(), "{payload}");
+        assert!(payload.get("backtrace").is_none(), "{payload}");
+        assert!(payload.get("message").is_none(), "{payload}");
+
+        let rendered = payload.to_string();
+        for forbidden in ["/rustc", "/home", "somebody", "panicking.rs", "engine.rs"] {
+            assert!(!rendered.contains(forbidden), "{forbidden}: {rendered}");
+        }
+        assert!(rendered.contains("QueryEngine::submit"), "{rendered}");
+    }
+
+    /// An unknown message contributes only its length and SHA-256; no text and
+    /// no guessed fields reach the wire.
+    #[test]
+    fn unknown_message_sends_only_length_and_hash() {
+        let message = "user said something private that is not a known panic shape";
+        let classification = crate::classify_panic_message(message);
+        let crash = pending_crash_with(&format!("panicked at src/a.rs:1:1:\n{message}"), None);
+        let payload = build_crash_payload(&Scrubber::new(), &crash, false, false);
+
+        assert_eq!(payload["panic_template"], serde_json::json!("unknown"));
+        assert_eq!(
+            payload["panic_message_len"],
+            serde_json::json!(classification.message_len)
+        );
+        assert_eq!(
+            payload["panic_message_sha256"],
+            serde_json::json!(classification.message_sha256)
+        );
+        let rendered = payload.to_string();
+        assert!(!rendered.contains("user said"), "{rendered}");
+        assert!(!rendered.contains("private"), "{rendered}");
+        for key in ["panic_index", "panic_container_len", "panic_error_type"] {
+            assert!(payload.get(key).is_none(), "{key}: {payload}");
+        }
+    }
+
+    /// A pending file or database row is local input, not a trusted source. A
+    /// tampered classification blob must not smuggle prose, paths, or a fake
+    /// fingerprint onto the wire; only the fixed key set and value shapes the
+    /// classifier itself produces survive.
+    #[test]
+    fn tampered_pending_row_cannot_smuggle_free_form_text() {
+        let mut crash = pending_classified_crash(
+            "[strict-crash-summary] type=&str; thread=main; location=src/main.rs:1:1; message=omitted; backtrace=omitted",
+            "index_out_of_bounds",
+            r#"{"panic_index":7,"panic_container_len":"/home/bob/secret","panic_error_type":"USER SAID SECRET","free_form":"hello bob@example.com","panic_operation":["add"]}"#,
+            None,
+        );
+        crash.backtrace_symbols = Some(
+            serde_json::to_string(&vec![
+                "coderex_core::engine::run".to_string(),
+                "/home/bob/private.rs:1:1".to_string(),
+                "std::thread::spawn::<user@example.com>".to_string(),
+            ])
+            .unwrap(),
+        );
+        crash.backtrace_frame_count = Some(9);
+        crash.panic_message_sha256 = Some("not a hash: private text".into());
+
+        let payload = build_crash_payload(&Scrubber::new(), &crash, false, false);
+
+        let rendered = payload.to_string();
+        for forbidden in [
+            "/home/bob",
+            "private.rs",
+            "USER SAID",
+            "bob@example.com",
+            "not a hash",
+            "hello",
+        ] {
+            assert!(!rendered.contains(forbidden), "{forbidden}: {rendered}");
+        }
+        assert_eq!(payload["panic_index"], serde_json::json!(7));
+        assert!(payload.get("panic_container_len").is_none(), "{payload}");
+        assert!(payload.get("panic_error_type").is_none(), "{payload}");
+        assert!(payload.get("free_form").is_none(), "{payload}");
+        assert!(payload.get("panic_operation").is_none(), "{payload}");
+        assert_eq!(payload["panic_message_sha256"], serde_json::json!(""));
+        assert_eq!(
+            payload["backtrace_frames"],
+            serde_json::json!(["coderex_core::engine::run"])
+        );
+        assert_eq!(payload["backtrace_frame_count"], serde_json::json!(9));
+        assert_eq!(
+            payload["redaction_status"],
+            serde_json::json!("symbolized")
+        );
+    }
+
+    /// The preview API returns exactly what the upload path builds — including
+    /// the verbose scrub — so a user can see the wire form before enabling it.
+    #[test]
+    fn preview_shows_the_exact_scrubbed_wire_payload() {
+        let crash = pending_crash_with(
+            "panicked at src/main.rs:10:5:\nfailed for bob@example.com carrying A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6",
+            Some("   0: coderex_core::engine::run\n             at /home/bob/x.rs:1:1\n"),
+        );
+
+        let preview = preview_crash_payload_with(&crash, true, false);
+        let uploaded = build_crash_payload(&Scrubber::new(), &crash, true, false);
+        assert_eq!(preview, uploaded, "preview must match the wire payload");
+        assert_eq!(preview["redaction_status"], serde_json::json!("pattern"));
+        let rendered = preview.to_string();
+        assert!(!rendered.contains("bob@example.com"), "{rendered}");
+        assert!(!rendered.contains("A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6"));
+        assert!(!rendered.contains("/home/bob"), "{rendered}");
+        assert!(rendered.contains("<EMAIL>"), "{rendered}");
+        assert!(rendered.contains("<SECRET>"), "{rendered}");
+    }
+
+    /// HIPAA wins over verbose in the preview: structured-only, no text, no
+    /// symbols.
+    #[test]
+    fn preview_under_hipaa_is_structured_even_when_verbose() {
+        let crash = pending_classified_crash(
+            "panicked at src/main.rs:10:5:\nuser said something private",
+            "index_out_of_bounds",
+            r#"{"panic_container_len":3,"panic_index":7}"#,
+            Some("   0: coderex_core::engine::run\n"),
+        );
+        let preview = preview_crash_payload_with(&crash, true, true);
+
+        assert_eq!(preview["redaction_status"], serde_json::json!("structured"));
+        assert!(preview.get("panic_info").is_none(), "{preview}");
+        assert!(preview.get("backtrace_frames").is_none(), "{preview}");
+        assert!(preview.get("backtrace").is_none(), "{preview}");
+        let rendered = preview.to_string();
+        assert!(!rendered.contains("user said"), "{rendered}");
+        assert!(!rendered.contains("coderex_core::engine::run"), "{rendered}");
+        // The strict allowlist must accept every key we produce.
+        assert_ne!(
+            preview["redaction_status"],
+            serde_json::json!("unredacted"),
+            "{preview}"
+        );
+    }
+
+    /// The uploader-bound preview uses the uploader's resolved modes, so it is
+    /// byte-identical to what that uploader sends.
+    #[test]
+    fn uploader_preview_uses_its_resolved_mode() {
+        let crash = pending_crash_with(
+            "panicked at src/main.rs:10:5:\nfailed for bob@example.com",
+            None,
+        );
+        let uploader = TelemetryUploader::new(
+            std::path::PathBuf::from("/tmp/coderex-preview.db"),
+            TelemetryConfig::default(),
+        )
+        .with_mode_for_test(false, true);
+        let preview = uploader.preview_crash_payload(&crash);
+        assert_eq!(preview["redaction_status"], serde_json::json!("structured"));
+        assert!(preview.get("panic_info").is_none(), "{preview}");
+    }
+
+    /// A legacy raw row never uploads its text by default; only the taxonomy
+    /// fingerprint is sent.
+    #[test]
+    fn legacy_row_default_never_uploads_free_form() {
+        let crash = pending_crash_with(
+            "panicked at src/old.rs:3:1:\nuser said something private",
+            Some("   0: coderex_core::engine::run\n             at /home/bob/secret.rs:3:1\n"),
+        );
+        let payload = build_crash_payload(&Scrubber::new(), &crash, false, false);
+        let rendered = payload.to_string();
+        assert!(!rendered.contains("user said"), "{rendered}");
+        assert!(!rendered.contains("/home/bob"), "{rendered}");
+        assert!(!rendered.contains("secret.rs"), "{rendered}");
+        assert_eq!(
+            payload["redaction_status"],
+            serde_json::json!("symbolized")
+        );
+    }
+
+    /// A panic location with an absolute path is made relative and the home
+    /// user is redacted.
+    #[test]
+    fn payload_has_no_absolute_location_path() {
+        let crash = pending_crash_with(
+            "[strict-crash-summary] type=&str; thread=main; location=/Users/somebody/project/src/main.rs:10:5; message=omitted; backtrace=omitted",
+            None,
+        );
+        let payload = build_crash_payload(&Scrubber::new(), &crash, false, false);
+        let location = payload["panic_location"].as_str().unwrap();
+        assert!(!location.starts_with('/'), "{location}");
+        assert!(!location.contains("somebody"), "{location}");
+        assert!(location.ends_with("src/main.rs:10:5"), "{location}");
     }
 }

@@ -123,46 +123,82 @@ after these patterns run, and it is explicitly marked as pattern-scrubbed rather
 
 ### Key Types (crash.rs)
 
-- **`CrashReport`** — Serializable crash data: `panic_info`, optional `backtrace`, timestamp, plus panic metadata (`panic_location`, `thread_name`, `panic_type`; defaulted on deserialization for older pending files).
-- **`CrashReporter`** — Panic hook + pending directory ingestion with disk-space enforcement. `strict` is resolved from `CODEREX_HIPAA` and `verbose` from `CODEREX_CRASH_VERBOSE` at construction (overridable with `with_strict` / `with_verbose` for tests).
-- **`crash_verbose()` / `crash_verbose_with()`** — the `CODEREX_CRASH_VERBOSE` trigger (non-empty and not `0`/`false`/`no`).
+- **`CrashReport`** — Serializable crash data: `panic_info`, optional raw `backtrace`, timestamp,
+  panic metadata (`panic_location`, `thread_name`, `panic_type`), the structured classification
+  (`panic_template`, `panic_fields`, `panic_message_len`, `panic_message_sha256`) and the
+  symbol-only backtrace (`backtrace_symbols`, frame count, symbol length/hash). Older pending files
+  deserialize with all new fields defaulted.
+- **`PanicTemplate` / `PanicClassification` / `classify_panic_message`** — the panic taxonomy. A
+  message is reduced to a fixed template (`unwrap_err`, `unwrap_none`, `expect_err`, `expect_none`,
+  `index_out_of_bounds`, `slice_range`, `capacity_overflow`, `arithmetic_overflow`,
+  `assertion_failed`, `explicit_panic`, `poisoned_lock`, or `unknown`) plus at most a few safe
+  numeric/identifier fields. The raw message is never retained by the classifier; its byte length
+  and SHA-256 are.
+- **`BacktraceSymbols` / `symbolize_backtrace`** — frame symbols only. `at <path>` continuation
+  lines, `note:` lines and `<unknown>` frames are dropped; a symbol containing `/`, `\`, `@` or `~`
+  is dropped rather than truncated. At most **`MAX_BACKTRACE_FRAMES` = 24** frames are kept, and
+  `symbols_len` / `symbols_sha256` describe exactly the kept frames joined by `\n`.
+- **`CrashReporter`** — Panic hook + pending directory ingestion with age and disk-space enforcement.
+  `strict` is resolved from `CODEREX_HIPAA` and `verbose` from `CODEREX_CRASH_VERBOSE` at
+  construction (overridable with `with_strict` / `with_verbose` for tests).
+- **`crash_verbose()` / `crash_verbose_with()`** — the `CODEREX_CRASH_VERBOSE` trigger (non-empty
+  and not `0`/`false`/`no`).
+- **`preview_crash_payload` / `preview_crash_payload_with` /
+  `TelemetryUploader::preview_crash_payload`** — return the **exact JSON** that would be uploaded
+  for a `PendingCrash` row. The free functions resolve the two environment variables at call time;
+  the method uses the uploader's own resolved modes and scrubber. Verbose text is already scrubbed
+  in the preview, so the user sees the wire form rather than the raw local copy.
 
 ### Crash reports: safe by default
 
 A panic message is `format!("{info}")` of whatever the panicking code carried — potentially
-conversation text. Pattern scrubbing cannot make that safe, so **structured-only is the default**:
+conversation text. Pattern scrubbing cannot make that safe, so **free-form text is never uploaded
+by default**:
 
-- **Panic hook (capture at the source):** by default, and always under `CODEREX_HIPAA`, the pending
-  file never contains the free-form payload or a backtrace. It records only panic type
-  (`&str`/`String`/`unknown`), thread name, and source location.
-- **Ingestion:** `ingest_pending` stores a `[strict-crash-summary]` string with
-  `type=…; thread=…; location=…; message=omitted; backtrace=omitted`, and stores no backtrace.
-  A legacy pending file or database row with raw text is reduced to its
-  `panicked at <file:line:column>:` location; the message is never stored.
-- **Upload:** `build_crash_payload` sends **only structured fields**:
-  `panic_type`, `thread_name`, `panic_location`, `os`, `version`, `timestamp`, and
-  `"redaction_status": "structured"`. There is no `panic_info` field and no backtrace.
+- **Panic hook (capture at the source):** the message is classified *in memory* into a
+  `PanicTemplate` plus safe parsed fields, and its length and SHA-256 are recorded. The default
+  pending file contains no message text. A backtrace is captured and immediately reduced to frame
+  symbols; only the symbols are kept. Under `CODEREX_HIPAA` no backtrace is captured at all and no
+  symbols are kept.
+- **Ingestion:** the structured summary and the classification columns are stored. A legacy pending
+  file or database row with raw text is classified on the fly and reduced to a summary; the message
+  is never stored outside verbose mode. A legacy raw backtrace is symbolized on ingestion.
+- **Upload:** `build_crash_payload` sends `panic_type`, `thread_name`, `panic_location`, `os`,
+  `version`, `timestamp`, `panic_template`, `panic_message_len`, `panic_message_sha256`, the safe
+  parsed fields, and — when available — `backtrace_frames`, `backtrace_frame_count`,
+  `backtrace_symbols_len` and `backtrace_symbols_sha256`. The location has its leading root
+  removed and its home user redacted, so no absolute path is uploaded. There is no `panic_info`
+  field, no raw `backtrace` field and no `message` field.
 
-`CODEREX_CRASH_VERBOSE` (non-empty and not `0`/`false`/`no`) opts into diagnostics:
+`CODEREX_CRASH_VERBOSE` (non-empty and not `0`/`false`/`no`) opts into a **raw local copy**:
 
-- **Panic hook:** the message and backtrace are captured into the pending file.
-- **Ingestion and upload:** both are scrubbed (pattern set, checksum detectors and high-entropy
-  detector) and re-scrubbed at upload, then sent alongside the structured fields with
+- **Panic hook:** the free-form message and raw backtrace are written to the pending file, which is
+  mode **`0600`** on Unix. The message is still classified and the backtrace is still symbolized.
+- **Ingestion:** the raw text is kept in the local SQLite store (the database and its SQLite
+  sidecars are also set to `0600` on Unix). This is the user-only copy for diagnosis. The raw
+  backtrace is **never** uploaded.
+- **Retention:** pending files are deleted after **7 days** (`DEFAULT_PENDING_MAX_AGE_SECS`), and
+  stored crash rows after **30 days** (`DEFAULT_CRASH_RETENTION_DAYS`). The pending directory is
+  additionally capped at 50 MB (oldest first).
+- **Upload:** `panic_info` is re-scrubbed at upload (pattern set, checksum detectors and
+  high-entropy detector) and sent with the taxonomy and symbol-only frames, marked
   `"redaction_status": "pattern"`. The marker never claims the text is clean, because the scrubber
   has no semantic understanding.
-- **`CODEREX_HIPAA` always wins:** even with verbose enabled, strict mode sends structured-only.
+- **`CODEREX_HIPAA` always wins:** even with verbose enabled, strict mode sends structured-only —
+  no text and no symbols.
 
 `redaction_status` markers are payload fields, so they travel with the report rather than living in
-a log line:
+a log line. The tri-state deliberately has no `clean` value:
 
 | Value | Meaning |
 |---|---|
-| `structured` | Only panic metadata is present; no free-form text and no backtrace. |
-| `pattern` | Free-form panic text/backtrace is present after pattern scrubbing. Not a claim of safety. |
+| `structured` | Taxonomy/metadata only; no free-form text and no backtrace frames. |
+| `symbolized` | Adds `backtrace_frames` (symbols only, no paths); still no free-form text. |
+| `pattern` | Adds `panic_info` after pattern scrubbing. Not a claim of safety. |
 | `unredacted` | Strict-mode allowlist validation failed for a non-crash payload (event path). |
 
-Both ingestion and upload run the scrubber again as defence in depth for any verbose text that
-reached the store.
+The keys are selected by the marker: `structured` and `symbolized` payloads contain neither
+`panic_info` nor `message`, and the raw `backtrace` key is never produced in any mode.
 
 ### Architecture Patterns
 
@@ -182,7 +218,7 @@ reached the store.
 
 ### Public API Surface
 
-- `TelemetryHandle`, `TelemetryEvent`, `TelemetryStore`, `TelemetryUploader`, `TelemetryConfig`, `CrashReporter`, `CrashReport`, `PendingEvent`, `PendingCrash`, `Scrubber`, `HIPAA_ENV`, `hipaa_enabled`, `CRASH_VERBOSE_ENV`, `crash_verbose`, `crash_verbose_with`.
+- `TelemetryHandle`, `TelemetryEvent`, `TelemetryStore`, `TelemetryUploader`, `TelemetryConfig`, `CrashReporter`, `CrashReport`, `PendingEvent`, `PendingCrash`, `Scrubber`, `HIPAA_ENV`, `hipaa_enabled`, `CRASH_VERBOSE_ENV`, `crash_verbose`, `crash_verbose_with`, `PanicTemplate`, `PanicClassification`, `classify_panic_message`, `BacktraceSymbols`, `symbolize_backtrace`, `symbolize_backtrace_limited`, `MAX_BACKTRACE_FRAMES`, `DEFAULT_PENDING_MAX_AGE_SECS`, `DEFAULT_CRASH_RETENTION_DAYS`, `preview_crash_payload`, `preview_crash_payload_with`.
 
 ## Current Status
 
@@ -206,7 +242,7 @@ reached the store.
 - **Explicit crash endpoint** override (`TelemetryConfig.crash_endpoint`) or derived from events endpoint.
 - **DB size queries** via `PRAGMA page_count * page_size`.
 - **PII scrubbing** via `Scrubber` (emails, IPs, home paths, AWS/GitHub/Slack tokens, bearer values, JWTs, PEM private-key blocks, Luhn-valid card numbers, SSA-valid SSNs, mod-97-valid IBANs, and 32+ character high-entropy tokens as `<SECRET>`) applied to `Error`, `ApiCall`, and `ToolUsed` events, plus an `EXCLUDED_FIELDS` exclusion set applied recursively to payloads at upload time. Detection is pattern/checksum-based and deliberately conservative: paths, URLs, symbols, frames and ordinary prose are not touched, and card-like runs in paths or filenames survive.
-- **Crash reports are structured-only by default**: the panic hook captures no free-form payload or backtrace; ingestion stores a metadata summary; upload sends `panic_type`, `thread_name`, `panic_location`, `os`, `version`, `timestamp` and `"redaction_status": "structured"` only. `CODEREX_CRASH_VERBOSE` opts into scrubbed message/backtrace marked `"pattern"`; `CODEREX_HIPAA` always forces structured-only. Legacy raw rows are reduced to their location on ingestion and at upload unless verbose is enabled.
+- **Crash reports are structured/symbolized by default**: the panic hook classifies the message into a fixed taxonomy (never storing the raw text), records its length and SHA-256, and reduces the backtrace to at most 24 symbol frames with no paths. Upload sends the taxonomy, the safe parsed fields (`panic_index`, `panic_container_len`, `panic_range_start`, `panic_range_end`, `panic_slice_len`, `panic_operation`, `panic_error_type`) and the symbol frame list/hash. `CODEREX_CRASH_VERBOSE` opts into a raw local copy (`0600`) whose text is scrubbed at upload and marked `"pattern"`; the raw backtrace is never uploaded. `CODEREX_HIPAA` always forces structured-only (no symbols either). Legacy raw rows are classified on the fly and never upload free-form text unless verbose is enabled.
 - **Model-name redaction**: the model-field key regex (including `*_models` / `*Models`), the always-model keys (`chain_entry`, `fallbackFrom`, `shortName`), the `repository_model` exclusion, the never-replaced placeholder set, and the `"confidential"` constant. Applied recursively to every uploaded payload by `Scrubber::scrub_json`.
 - **Strict (confidentiality) mode**: `CODEREX_HIPAA` turns on a recursive field-allowlist check; a payload that fails it is uploaded marked `"redaction_status": "unredacted"` in the payload itself.
 - **Worker panic recovery** with `catch_unwind`, fresh DB connection per respawn, 3-attempt limit, 10s cooldown.
@@ -234,11 +270,13 @@ from the telemetry crate).
 
 ### Tests
 
-- 5 tests in `store.rs` (insert, batch, mark uploaded, crash roundtrip, size retention).
-- 26 tests in `uploader.rs` (config defaults, crash endpoint explicit/derived, circuit breaker, gzip encoding/header, rate limiter window/suppression, rejection statuses, HIPAA trigger parsing, strict-mode payload marking, default/verbose/strict crash payloads).
-- 11 tests in `crash.rs` (serialization, default structured-only ingestion, verbose scrubbing, strict-over-verbose precedence, legacy raw-file handling, `CODEREX_CRASH_VERBOSE` parsing, backtrace path/symbol survival).
+- 8 tests in `store.rs` (insert, batch, mark uploaded, crash roundtrip, structured-record roundtrip, old-schema migration, crash retention, size retention).
+- 34 tests in `uploader.rs` (config defaults, crash endpoint explicit/derived, circuit breaker, gzip encoding/header, rate limiter window/suppression, rejection statuses, HIPAA trigger parsing, strict-mode payload marking, structured/symbolized/pattern crash payloads, unknown-message length/hash only, no absolute paths, preview API, HIPAA precedence, legacy rows, tampered-row field validation).
+- 22 tests in `crash.rs` (taxonomy for every known template, safe-field parsing, unknown length/hash, symbolization/top-N/path rejection, default structured+symbolized ingestion, verbose raw local copy, strict-over-verbose precedence, legacy raw-file handling, `CODEREX_CRASH_VERBOSE` parsing, `0600` mode, TTL prune, serialization).
 - 49 tests in `scrubber.rs` (email, IPv4, home path, API key, GitHub/AWS/Slack/bearer/JWT/private-key, Luhn card/SSN/IBAN, event scrubbing, exclusion set, nested JSON scrubbing, model-key regex, model redaction, placeholder preservation, `repository_model` exclusion, strict allowlist/marker, high-entropy true positives, and path/symbol/URL/prose/numeric false positives).
 - Tests use tempfile/NamedTempFile for SQLite.
+
+M1 verification: `cargo test -p coderex-telemetry --offline` → **113 passed / 0 failed**.
 
 ## Gaps for Production
 

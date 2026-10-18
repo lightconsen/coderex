@@ -137,7 +137,7 @@ pub fn redact_model_fields(value: &mut serde_json::Value) {
 /// `redaction_status` is allowed so a payload that already carries an explicit
 /// redaction mark (for example a structured crash summary) validates instead
 /// of having its mark overwritten with `unredacted`.
-pub const STRICT_ALLOWED_FIELDS: [&str; 20] = [
+pub const STRICT_ALLOWED_FIELDS: [&str; 34] = [
     "type",
     "session_id",
     "tool_name",
@@ -159,6 +159,23 @@ pub const STRICT_ALLOWED_FIELDS: [&str; 20] = [
     "panic_location",
     "os",
     "version",
+    // Panic taxonomy: the template identity, length/hash for unknown messages,
+    // and the fixed safe parsed fields.
+    "panic_template",
+    "panic_message_len",
+    "panic_message_sha256",
+    "panic_index",
+    "panic_container_len",
+    "panic_range_start",
+    "panic_range_end",
+    "panic_slice_len",
+    "panic_operation",
+    "panic_error_type",
+    // Symbol-only backtrace (no paths or source text).
+    "backtrace_frames",
+    "backtrace_frame_count",
+    "backtrace_symbols_len",
+    "backtrace_symbols_sha256",
 ];
 
 /// Key inserted into a payload that strict mode could not validate.
