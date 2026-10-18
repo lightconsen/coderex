@@ -178,18 +178,16 @@ async fn agent_background_spawn_returns_immediately() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-//  6.5 SendMessage — a registered (not running) agent cannot receive messages
+//  6.5 SendMessage — an unknown agent cannot receive messages
 // ═══════════════════════════════════════════════════════════════════════════
 
 #[tokio::test]
-async fn agent_send_message_to_registered_agent_fails() {
-    let mut mgr = test_manager();
+async fn agent_send_message_to_unknown_agent_fails() {
+    let mgr = test_manager();
 
-    // Registration only records the id. It starts no task, so there is no
-    // receiver and the message must be refused rather than silently dropped.
-    mgr.register_agent("external_agent_1").unwrap();
-    assert!(mgr.is_registered("external_agent_1"));
-
+    // There is no external-agent transport in this product: an id that was
+    // not spawned by this manager has no receiver, so the message is refused
+    // rather than silently dropped.
     let result = mgr
         .send_message("external_agent_1", "please also check tests")
         .await;

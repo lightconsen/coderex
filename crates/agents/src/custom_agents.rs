@@ -6,6 +6,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::path::Path;
 
 /// A user-defined custom agent loaded from a JSON config file.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -31,14 +32,22 @@ pub struct CustomAgentDef {
 /// or malformed files.
 #[must_use]
 pub fn load_custom_agents() -> HashMap<String, CustomAgentDef> {
+    match home::home_dir() {
+        Some(home) => load_custom_agents_from_dir(&home.join(".coderex").join("agents")),
+        None => HashMap::new(),
+    }
+}
+
+/// Load custom agent definitions from an explicit directory.
+///
+/// This is the testable form of [`load_custom_agents`]: callers that manage
+/// their own configuration directory (tests, embedders, project-local agent
+/// sets) do not have to pretend to be `$HOME`.
+#[must_use]
+pub fn load_custom_agents_from_dir(agents_dir: &Path) -> HashMap<String, CustomAgentDef> {
     let mut agents = HashMap::new();
 
-    let agents_dir = match home::home_dir() {
-        Some(home) => home.join(".coderex").join("agents"),
-        None => return agents,
-    };
-
-    let entries = match std::fs::read_dir(&agents_dir) {
+    let entries = match std::fs::read_dir(agents_dir) {
         Ok(entries) => entries,
         Err(_) => return agents,
     };
@@ -98,13 +107,26 @@ mod tests {
         file.write_all(serde_json::to_string(&def).unwrap().as_bytes())
             .unwrap();
 
-        // Temporarily override home dir by creating a custom loader
-        // Since load_custom_agents uses home::home_dir(), we can't easily
-        // mock it. Instead, test the parsing directly.
-        let json = r#"{"name":"parsed_agent","system_prompt":"hello","allowed_tools":["Read"],"model":null,"max_tokens":null,"output_schema":null}"#;
-        let parsed: CustomAgentDef = serde_json::from_str(json).unwrap();
-        assert_eq!(parsed.name, "parsed_agent");
-        assert_eq!(parsed.system_prompt, "hello");
+        let loaded = load_custom_agents_from_dir(&agents_dir);
+        let loaded_def = loaded.get("test_agent").expect("agent was not loaded");
+        assert_eq!(loaded_def.system_prompt, "You are a test agent.");
+        assert_eq!(loaded_def.allowed_tools, vec!["Read"]);
+        assert_eq!(loaded_def.model.as_deref(), Some("claude-sonnet"));
+        assert_eq!(loaded_def.max_tokens, Some(1024));
+    }
+
+    #[test]
+    fn missing_directory_loads_nothing() {
+        let loaded = load_custom_agents_from_dir(std::path::Path::new("/definitely/not/a/real/dir"));
+        assert!(loaded.is_empty());
+    }
+
+    #[test]
+    fn malformed_files_are_skipped() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("broken.json"), "{ not json").unwrap();
+        std::fs::write(tmp.path().join("ignored.txt"), "not an agent").unwrap();
+        assert!(load_custom_agents_from_dir(tmp.path()).is_empty());
     }
 
     #[test]

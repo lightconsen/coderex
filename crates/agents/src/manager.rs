@@ -29,6 +29,7 @@ use std::time::Duration;
 use thiserror::Error;
 use tokio::sync::{broadcast, mpsc, watch, Mutex};
 
+use crate::custom_agents::CustomAgentDef;
 use crate::types::AgentType;
 
 // ─── Errors ─────────────────────────────────────────────────────────────────
@@ -57,6 +58,24 @@ pub enum AgentError {
     /// Missing required configuration.
     #[error("configuration error: {0}")]
     Configuration(String),
+    /// A named custom agent was requested but no definition matches.
+    #[error("unknown custom agent {name:?}; available agents: {available}")]
+    UnknownCustomAgent {
+        /// The name the caller asked for.
+        name: String,
+        /// Comma-separated names that are configured, or an explanation when
+        /// none are.
+        available: String,
+    },
+}
+
+/// Describe the available custom agent names for an error message.
+fn available_agents_description(names: &[String]) -> String {
+    if names.is_empty() {
+        "none configured (add JSON definitions under ~/.coderex/agents/)".to_string()
+    } else {
+        names.join(", ")
+    }
 }
 
 // ─── Retry Policy ───────────────────────────────────────────────────────────
@@ -72,7 +91,12 @@ pub enum FailureAction {
 }
 
 /// Retry policy for agent execution.
+///
+/// Missing fields in a JSON policy fall back to [`RetryPolicy::default`], so
+/// a caller can send just `{"max_retries": 3}` (the Agent tool's schema does
+/// not require the other keys).
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct RetryPolicy {
     /// Maximum number of retries.
     pub max_retries: u32,
@@ -173,6 +197,56 @@ impl Default for SpawnOptions {
             parent_prefix: Vec::new(),
             parent_cache_safe_params: None,
         }
+    }
+}
+
+/// A snapshot of the parent request, taken at the point a sub-agent is
+/// spawned.
+///
+/// The tool layer cannot reach the parent engine directly, so the session
+/// supplies a provider that returns the parent conversation and the request
+/// components that determine prompt-cache reuse. [`crate::SpawnOptions`]
+/// turns this into `parent_prefix` + `parent_cache_safe_params`; the manager
+/// then stores it in [`ForkedContext`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ParentContextSnapshot {
+    /// Parent conversation messages, serialized exactly as they were sent.
+    pub messages: Vec<serde_json::Value>,
+    /// Model the parent request used.
+    pub model: String,
+    /// System prompt the parent request sent.
+    pub system_prompt: String,
+    /// Tool names the parent advertised, in order.
+    pub tool_names: Vec<String>,
+}
+
+impl ParentContextSnapshot {
+    /// Create a snapshot from the parent request's components.
+    #[must_use]
+    pub fn new(
+        messages: Vec<serde_json::Value>,
+        model: impl Into<String>,
+        system_prompt: impl Into<String>,
+        tool_names: Vec<String>,
+    ) -> Self {
+        Self {
+            messages,
+            model: model.into(),
+            system_prompt: system_prompt.into(),
+            tool_names,
+        }
+    }
+
+    /// The cache-safety parameters implied by this snapshot.
+    #[must_use]
+    pub fn cache_safe_params(&self) -> CacheSafeParams {
+        CacheSafeParams::new(self.model.clone(), self.system_prompt.clone(), self.tool_names.clone())
+    }
+
+    /// Whether there is a conversation prefix worth reusing.
+    #[must_use]
+    pub fn has_prefix(&self) -> bool {
+        !self.messages.is_empty()
     }
 }
 
@@ -499,8 +573,6 @@ pub struct AgentManager {
     agents: HashMap<String, AgentInstance>,
     /// Callback for teammate events.
     event_callback: Option<TeammateEventCallback>,
-    /// Agent ids registered as managed outside this manager.
-    registered_agents: Vec<String>,
     /// API client for forked/background AI execution.
     api_client: Option<Box<dyn ApiClient>>,
     /// Default model inherited from the parent session.
@@ -526,7 +598,7 @@ impl std::fmt::Debug for AgentManager {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("AgentManager")
             .field("agents", &self.agents.len())
-            .field("registered_agents", &self.registered_agents)
+            .field("custom_agents", &self.custom_agents.len())
             .finish_non_exhaustive()
     }
 }
@@ -540,7 +612,6 @@ impl AgentManager {
             task_manager,
             agents: HashMap::new(),
             event_callback: None,
-            registered_agents: Vec::new(),
             api_client: None,
             model: ModelId::sonnet(),
             event_tx: None,
@@ -1032,40 +1103,80 @@ impl AgentManager {
             .count()
     }
 
-    // ─── Registered (externally managed) agents ─────────────────────────
+    // ─── Custom (named) agents ──────────────────────────────────────────
 
-    /// Register an agent id that is managed outside this manager.
+    /// Replace the loaded custom agent definitions.
     ///
-    /// This does **not** resume execution, and it cannot: CodeRex does not
-    /// persist a sub-agent's transcript, so there is no prior conversation or
-    /// task to resume from. The previous name for this method
-    /// (`resume_agent`) promised a resume it never performed — it created an
-    /// instance marked [`AgentStatus::Running`] whose message channel had no
-    /// receiver, so `send_message` reported success while nothing ever
-    /// received the message.
-    ///
-    /// The id is recorded only so callers can ask
-    /// [`AgentManager::is_registered`]. No [`AgentInstance`] is created, so
-    /// `send_message`, `get_agent`, and `wait_for_completion` treat the id as
-    /// unknown rather than as a running agent.
-    pub fn register_agent(&mut self, agent_id: &str) -> Result<(), AgentError> {
-        if self.is_registered(agent_id) {
-            return Err(AgentError::SpawnFailed(format!(
-                "agent {agent_id} is already registered"
-            )));
-        }
-
-        self.registered_agents.push(agent_id.to_string());
-
-        tracing::info!("agent registered (no execution attached): agent_id={agent_id}");
-
-        Ok(())
+    /// Production managers load `~/.coderex/agents/*.json` in
+    /// [`AgentManager::new`]. Tests and embedders use this to install a
+    /// known set without touching the user's home directory.
+    pub fn set_custom_agents(&mut self, agents: HashMap<String, CustomAgentDef>) {
+        self.custom_agents = agents;
     }
 
-    /// Check whether an agent id was registered via [`AgentManager::register_agent`].
+    /// Add or replace one custom agent definition.
+    pub fn register_custom_agent(&mut self, def: CustomAgentDef) {
+        self.custom_agents.insert(def.name.clone(), def);
+    }
+
+    /// Look up a custom agent definition by name.
     #[must_use]
-    pub fn is_registered(&self, agent_id: &str) -> bool {
-        self.registered_agents.iter().any(|id| id == agent_id)
+    pub fn custom_agent(&self, name: &str) -> Option<&CustomAgentDef> {
+        self.custom_agents.get(name)
+    }
+
+    /// Whether a custom agent with this name is configured.
+    #[must_use]
+    pub fn has_custom_agent(&self, name: &str) -> bool {
+        self.custom_agents.contains_key(name)
+    }
+
+    /// Names of all configured custom agents, sorted for stable output.
+    #[must_use]
+    pub fn custom_agent_names(&self) -> Vec<String> {
+        let mut names: Vec<String> = self.custom_agents.keys().cloned().collect();
+        names.sort();
+        names
+    }
+
+    /// Spawn a configured custom agent by name.
+    ///
+    /// This is the production entry point for named agents: it resolves the
+    /// [`CustomAgentDef`], reports an error listing the available names when
+    /// the lookup fails, and delegates to [`AgentManager::spawn_agent`] with
+    /// [`AgentType::Custom`]. `spawn_agent` merges the definition's system
+    /// prompt, tool whitelist, model, token limit and output schema into the
+    /// spawn.
+    ///
+    /// # Errors
+    /// Returns [`AgentError::UnknownCustomAgent`] when no definition matches.
+    pub async fn spawn_named_agent(
+        &mut self,
+        name: &str,
+        prompt: &str,
+        options: SpawnOptions,
+        parent_session_id: &str,
+        cwd: &str,
+        message_count: usize,
+    ) -> Result<&AgentInstance, AgentError> {
+        if !self.custom_agents.contains_key(name) {
+            return Err(AgentError::UnknownCustomAgent {
+                name: name.to_string(),
+                available: available_agents_description(&self.custom_agent_names()),
+            });
+        }
+
+        self.spawn_agent(
+            AgentType::Custom {
+                prompt: name.to_string(),
+            },
+            prompt,
+            options,
+            parent_session_id,
+            cwd,
+            message_count,
+        )
+        .await
     }
 
     // ─── Forked / Background Agent Execution ─────────────────────────────────
@@ -1263,12 +1374,7 @@ async fn run_agent_task(
     msg_rx: &mut mpsc::UnboundedReceiver<AgentMessage>,
 ) -> Result<AgentResult, AgentError> {
     // Notify parent that the agent started
-    if let Some(ref tx) = parent_event_tx {
-        let _ = tx.send(EngineEvent::AgentEvent {
-            agent_id: agent_id.clone(),
-            event: AgentLifecycleEvent::Started,
-        });
-    }
+    emit_lifecycle(&parent_event_tx, &agent_id, AgentLifecycleEvent::Started);
 
     let max_retries = retry_policy.as_ref().map(|r| r.max_retries).unwrap_or(0);
     let _on_failure = retry_policy
@@ -1329,20 +1435,7 @@ async fn run_agent_task(
         // tool call looks interactive.
         options.agent_id = Some(agent_id.clone());
         options.custom_system_prompt = Some(system_prompt.clone());
-        options.allowed_tools_override = if writable {
-            allowed_tools.clone()
-        } else {
-            let read_only = vec!["Read".into(), "Grep".into(), "Glob".into()];
-            match allowed_tools.clone() {
-                Some(tools) => Some(
-                    tools
-                        .into_iter()
-                        .filter(|t| read_only.iter().any(|r: &String| r.eq_ignore_ascii_case(t)))
-                        .collect(),
-                ),
-                None => Some(read_only),
-            }
-        };
+        options.allowed_tools_override = effective_allowed_tools(allowed_tools.clone(), writable);
         options.max_turns = max_turns;
         options.task_budget_tokens = u64::from(max_tokens);
 
@@ -1368,8 +1461,33 @@ async fn run_agent_task(
                 attempt_prompt.push_str(&format!("\n\n[Message from parent]: {}", msg.content));
             }
 
-            if let EngineEvent::TextDelta(ref text) = event {
-                attempt_output.push_str(text);
+            match &event {
+                EngineEvent::TextDelta(text) => {
+                    attempt_output.push_str(text);
+                    // Let the parent observe the sub-agent's output as it is
+                    // produced, rather than only in the final Completed
+                    // summary.
+                    emit_lifecycle(
+                        &parent_event_tx,
+                        &agent_id,
+                        AgentLifecycleEvent::TextDelta(text.clone()),
+                    );
+                }
+                EngineEvent::ToolCallStart { name, summary, .. } => {
+                    // The engine's start event carries the activity summary,
+                    // not the parsed tool input (the input never leaves the
+                    // engine as a standalone event). Surface the summary here
+                    // so a subscriber still gets a usable payload.
+                    emit_lifecycle(
+                        &parent_event_tx,
+                        &agent_id,
+                        AgentLifecycleEvent::ToolCall {
+                            name: name.clone(),
+                            args: serde_json::json!({ "summary": summary }),
+                        },
+                    );
+                }
+                _ => {}
             }
 
             // Forward to broadcast subscribers
@@ -1400,6 +1518,17 @@ async fn run_agent_task(
                 }
             }
         }
+
+        // The turn's work is done: the engine returned and its event stream is
+        // drained. Report idleness before the terminal Completed/Failed event
+        // so observers can distinguish "waiting for more work" from "finished".
+        emit_lifecycle(
+            &parent_event_tx,
+            &agent_id,
+            AgentLifecycleEvent::Idle {
+                reason: "turn complete".to_string(),
+            },
+        );
 
         match engine_result {
             Ok(Ok(_)) => {
@@ -1466,19 +1595,14 @@ async fn run_agent_task(
     let (status, error) = (final_status, final_error);
 
     // Notify parent of completion/failure
-    if let Some(ref tx) = parent_event_tx {
-        let lifecycle = if let Some(ref err) = error {
-            AgentLifecycleEvent::Failed { error: err.clone() }
-        } else {
-            AgentLifecycleEvent::Completed {
-                summary: final_output.clone(),
-            }
-        };
-        let _ = tx.send(EngineEvent::AgentEvent {
-            agent_id: agent_id.clone(),
-            event: lifecycle,
-        });
-    }
+    let lifecycle = if let Some(ref err) = error {
+        AgentLifecycleEvent::Failed { error: err.clone() }
+    } else {
+        AgentLifecycleEvent::Completed {
+            summary: final_output.clone(),
+        }
+    };
+    emit_lifecycle(&parent_event_tx, &agent_id, lifecycle);
 
     // Write output to file
     let _ = tokio::fs::write(&output_file, &final_output).await;
@@ -1496,6 +1620,46 @@ async fn run_agent_task(
         status,
         token_usage: total_token_usage,
     })
+}
+
+/// Send a lifecycle event to the parent engine, if one is attached.
+fn emit_lifecycle(
+    tx: &Option<mpsc::UnboundedSender<EngineEvent>>,
+    agent_id: &str,
+    event: AgentLifecycleEvent,
+) {
+    if let Some(tx) = tx {
+        let _ = tx.send(EngineEvent::AgentEvent {
+            agent_id: agent_id.to_string(),
+            event,
+        });
+    }
+}
+
+/// Tools a read-only (`writable = false`) agent may use.
+const READ_ONLY_TOOLS: [&str; 3] = ["Read", "Grep", "Glob"];
+
+/// Narrow a tool whitelist for a read-only agent.
+///
+/// `None` means "no explicit whitelist", which for a writable agent leaves the
+/// full tool set available. For a read-only agent it becomes the read-only
+/// set; for an explicit whitelist, entries that are not read-only are
+/// dropped. The engine enforces the result through
+/// `SubmitOptions::allowed_tools_override`.
+fn effective_allowed_tools(allowed_tools: Option<Vec<String>>, writable: bool) -> Option<Vec<String>> {
+    if writable {
+        return allowed_tools;
+    }
+
+    match allowed_tools {
+        Some(tools) => Some(
+            tools
+                .into_iter()
+                .filter(|tool| READ_ONLY_TOOLS.iter().any(|allowed| allowed.eq_ignore_ascii_case(tool)))
+                .collect(),
+        ),
+        None => Some(READ_ONLY_TOOLS.iter().map(|tool| (*tool).to_string()).collect()),
+    }
 }
 
 /// Get the string name of an agent type.
@@ -1805,38 +1969,6 @@ mod tests {
         assert_eq!(mgr.list_agents()[0].status(), AgentStatus::Stopped);
     }
 
-    #[test]
-    fn register_agent_tracks_without_running() {
-        let mut mgr = make_manager();
-        mgr.register_agent("external_1").unwrap();
-
-        assert!(mgr.is_registered("external_1"));
-        // Registration starts nothing: there is no task and no instance, so
-        // the agent is not counted as running and cannot be fetched.
-        assert_eq!(mgr.running_count(), 0);
-        assert!(mgr.get_agent("external_1").is_none());
-    }
-
-    #[test]
-    fn register_duplicate_agent_errors() {
-        let mut mgr = make_manager();
-        mgr.register_agent("dup_1").unwrap();
-
-        let result = mgr.register_agent("dup_1");
-        assert!(matches!(result, Err(AgentError::SpawnFailed(_))));
-    }
-
-    #[tokio::test]
-    async fn send_message_to_registered_agent_errors() {
-        let mut mgr = make_manager();
-        mgr.register_agent("external_1").unwrap();
-
-        // A registered agent has no receiver; the message must be refused
-        // rather than silently dropped.
-        let result = mgr.send_message("external_1", "hello").await;
-        assert!(matches!(result, Err(AgentError::NotFound(_))));
-    }
-
     /// Create a git repository with one commit so `git worktree add` can run.
     fn init_git_repo(dir: &std::path::Path) {
         let run = |args: &[&str]| {
@@ -2129,6 +2261,238 @@ mod tests {
         assert_eq!(ctx.conversation_prefix, prefix);
         assert_eq!(ctx.fork_point, prefix.len());
         assert_eq!(ctx.fork_messages("sub-task").len(), prefix.len() + 1);
+    }
+
+    fn reviewer_def() -> CustomAgentDef {
+        CustomAgentDef {
+            name: "reviewer".into(),
+            system_prompt: "You review code carefully.".into(),
+            allowed_tools: vec!["Read".into(), "Grep".into()],
+            model: Some("claude-test".into()),
+            max_tokens: Some(1234),
+            output_schema: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn spawn_named_agent_uses_definition() {
+        let mut mgr = make_manager();
+        mgr.register_custom_agent(reviewer_def());
+
+        let instance = mgr
+            .spawn_named_agent(
+                "reviewer",
+                "review auth.rs",
+                SpawnOptions::default(),
+                "sess_named",
+                "/tmp",
+                0,
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            instance.prompt.contains("You review code carefully."),
+            "system prompt was not applied: {}",
+            instance.prompt
+        );
+        assert_eq!(
+            instance.options.allowed_tools,
+            Some(vec!["Read".into(), "Grep".into()])
+        );
+        assert_eq!(
+            instance.options.model_override.as_deref(),
+            Some("claude-test")
+        );
+        assert_eq!(instance.options.max_tokens, Some(1234));
+        // The custom name is carried as the agent type.
+        assert!(matches!(
+            instance.agent_type,
+            AgentType::Custom { ref prompt } if prompt == "reviewer"
+        ));
+    }
+
+    #[tokio::test]
+    async fn spawn_named_agent_unknown_lists_available_names() {
+        let mut mgr = make_manager();
+        mgr.register_custom_agent(reviewer_def());
+
+        let error = mgr
+            .spawn_named_agent(
+                "missing",
+                "do work",
+                SpawnOptions::default(),
+                "sess_named",
+                "/tmp",
+                0,
+            )
+            .await
+            .unwrap_err();
+
+        match error {
+            AgentError::UnknownCustomAgent { name, available } => {
+                assert_eq!(name, "missing");
+                assert!(available.contains("reviewer"), "{available}");
+            }
+            other => panic!("expected UnknownCustomAgent, got {other:?}"),
+        }
+        assert!(mgr.list_agents().is_empty());
+    }
+
+    #[test]
+    fn read_only_spawn_narrows_tools() {
+        assert_eq!(
+            effective_allowed_tools(None, false),
+            Some(vec!["Read".into(), "Grep".into(), "Glob".into()])
+        );
+        assert_eq!(
+            effective_allowed_tools(
+                Some(vec!["Read".into(), "Write".into(), "Bash".into()]),
+                false
+            ),
+            Some(vec!["Read".into()])
+        );
+        // A writable agent keeps its whitelist untouched.
+        assert_eq!(
+            effective_allowed_tools(Some(vec!["Read".into(), "Write".into()]), true),
+            Some(vec!["Read".into(), "Write".into()])
+        );
+        assert_eq!(effective_allowed_tools(None, true), None);
+    }
+
+    struct ScriptedApi {
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl ApiClient for ScriptedApi {
+        fn clone_box(&self) -> Box<dyn ApiClient> {
+            Box::new(Self {
+                calls: Arc::clone(&self.calls),
+            })
+        }
+
+        async fn create_message(
+            &self,
+            _system: &str,
+            _messages: &[serde_json::Value],
+            _model: &ModelId,
+            _max_tokens: u32,
+            _tools: &[coderex_core::tool_executor::ToolInfo],
+        ) -> Result<coderex_core::api_client::ApiResponse, coderex_core::api_client::ApiError>
+        {
+            use coderex_core::api_client::ApiResponse;
+            use coderex_core::types::UsageSummary;
+
+            let call = self
+                .calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let usage = UsageSummary {
+                input_tokens: 1,
+                output_tokens: 1,
+                cache_read_tokens: 0,
+                cache_creation_tokens: 0,
+            };
+            if call == 0 {
+                Ok(ApiResponse {
+                    content: String::new(),
+                    tool_calls: vec![coderex_core::types::ToolCall {
+                        id: "call_1".into(),
+                        name: "Read".into(),
+                        input: serde_json::json!({"file_path": "note.txt"}),
+                    }],
+                    usage,
+                    stop_reason: "tool_use".into(),
+                })
+            } else {
+                Ok(ApiResponse {
+                    content: "done from the mock".into(),
+                    tool_calls: Vec::new(),
+                    usage,
+                    stop_reason: "end_turn".into(),
+                })
+            }
+        }
+
+        async fn create_message_streaming(
+            &self,
+            _system: &str,
+            _messages: &[serde_json::Value],
+            _model: &ModelId,
+            _max_tokens: u32,
+            _tools: &[coderex_core::tool_executor::ToolInfo],
+        ) -> std::pin::Pin<
+            Box<
+                dyn futures::Stream<Item = coderex_core::api_client::StreamEvent>
+                    + Send
+                    + 'static,
+            >,
+        > {
+            Box::pin(futures::stream::iter([
+                coderex_core::api_client::StreamEvent::StreamEnd,
+            ]))
+        }
+    }
+
+    #[tokio::test]
+    async fn lifecycle_emits_tool_call_text_delta_and_idle() {
+        let mut mgr = make_manager();
+        mgr.set_api_client(Box::new(ScriptedApi {
+            calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        }));
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        mgr.set_event_sender(tx);
+
+        let instance = mgr
+            .spawn_agent(
+                AgentType::GeneralPurpose,
+                "read the note",
+                SpawnOptions::default(),
+                "sess_lifecycle",
+                "/tmp",
+                0,
+            )
+            .await
+            .unwrap();
+        let agent_id = instance.task_handle.id.clone();
+        mgr.wait_for_completion(&agent_id).await.unwrap();
+
+        let mut events = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            if let EngineEvent::AgentEvent { event, .. } = event {
+                events.push(event);
+            }
+        }
+
+        assert!(
+            events.iter().any(|event| matches!(event, AgentLifecycleEvent::Started)),
+            "missing Started: {events:?}"
+        );
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                AgentLifecycleEvent::ToolCall { name, .. } if name == "Read"
+            )),
+            "missing ToolCall: {events:?}"
+        );
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                AgentLifecycleEvent::TextDelta(text) if text.contains("done from the mock")
+            )),
+            "missing TextDelta: {events:?}"
+        );
+        assert!(
+            events.iter().any(|event| matches!(event, AgentLifecycleEvent::Idle { .. })),
+            "missing Idle: {events:?}"
+        );
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                AgentLifecycleEvent::Completed { summary } if summary.contains("done from the mock")
+            )),
+            "missing Completed: {events:?}"
+        );
     }
 
     #[test]

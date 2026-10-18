@@ -308,6 +308,14 @@ impl StartupOrchestrator {
         self.ctx.no_chrome = args.no_chrome;
         self.ctx.tmux = args.tmux;
         self.ctx.agent = args.agent.clone();
+        // Resolve the name before any startup phase runs. A typo must fail
+        // loudly with the configured names, not start a default session that
+        // silently ignores the flag.
+        if let Some(ref name) = self.ctx.agent {
+            if let Err(error) = crate::agent_selection::resolve_agent(name) {
+                bail!("{error}");
+            }
+        }
         self.ctx.ide = args.ide.clone();
         self.ctx.worktree = args.worktree;
         self.ctx.fork_session = args.fork_session.clone();
@@ -1516,13 +1524,43 @@ impl StartupOrchestrator {
 
     #[allow(clippy::unused_async)]
     async fn run_agents(&self, detailed: bool) -> Result<()> {
-        println!("Available agents:");
+        println!("Built-in agents:");
         if detailed {
-            println!("  advisor    - Code review and architectural guidance");
-            println!("  bughunter  - Bug detection and root cause analysis");
-            println!("  reviewer   - PR-style code review");
+            println!("  general_purpose   - General multi-step tasks");
+            println!("  explore           - Codebase exploration (quick/medium/very_thorough)");
+            println!("  plan              - Implementation planning");
+            println!("  verification      - Review and verification");
+            println!("  claude_code_guide - Questions about Claude Code");
+            println!("  statusline_setup  - Status line configuration");
         } else {
-            println!("  advisor  bughunter  reviewer");
+            println!(
+                "  general_purpose  explore  plan  verification  claude_code_guide  statusline_setup"
+            );
+        }
+
+        // Custom agents are user files; listing them is the discoverability
+        // half of resolving `--agent <name>` and the Agent tool's `agent`.
+        let custom = coderex_agents::custom_agents::load_custom_agents();
+        let mut names: Vec<&str> = custom.keys().map(String::as_str).collect();
+        names.sort_unstable();
+        println!();
+        println!("Custom agents (~/.coderex/agents/*.json):");
+        if names.is_empty() {
+            println!("  none configured");
+        } else if detailed {
+            for name in names {
+                if let Some(def) = custom.get(name) {
+                    let tools = if def.allowed_tools.is_empty() {
+                        "all tools".to_string()
+                    } else {
+                        def.allowed_tools.join(", ")
+                    };
+                    let summary = def.system_prompt.lines().next().unwrap_or("");
+                    println!("  {name:<17} - {summary} (tools: {tools})");
+                }
+            }
+        } else {
+            println!("  {}", names.join("  "));
         }
         Ok(())
     }

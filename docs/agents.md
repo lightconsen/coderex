@@ -35,7 +35,7 @@ Sub-agent system for spawning autonomous worker agents, dream agents (background
 │  │  └──────────────────────────────────────────────────┘   │  │  │
 │  │                                                          │  │  │
 │  │  Observability Pipeline:                                 │  │  │
-│  │   engine events ──► broadcast<TelemetryEvent>            │  │  │
+│  │   engine events ──► broadcast<AgentObservableEvent>      │  │  │
 │  │                   ──► NDJSON log (~/.coderex/agent_logs) │  │  │
 │  │                   ──► parent EngineEvent channel         │  │  │
 │  └────────────────────────────────────────────────────────────┘  │
@@ -58,18 +58,20 @@ Sub-agent system for spawning autonomous worker agents, dream agents (background
 ### Custom Agents (`custom_agents.rs`)
 
 - **`CustomAgentDef`** — User-defined agent loaded from `~/.coderex/agents/*.json` with fields: `name`, `system_prompt`, `allowed_tools`, `model`, `max_tokens`, `output_schema`.
-- **`load_custom_agents()`** — Scans `~/.coderex/agents/*.json` and returns a name-to-definition map.
+- **`load_custom_agents()`** — Scans `~/.coderex/agents/` and returns a name-to-definition map. Files that fail to parse are skipped (with a warning) rather than failing the session.
+- **`load_custom_agents_from_dir(dir)`** — The same scan against an explicit directory, used by tests and embedders that keep definitions elsewhere.
 - **`get_custom_agent()`** — Lookup helper for a named custom agent.
+- Definitions are loaded when `AgentManager::standalone()` is created and can be replaced with `set_custom_agents()` / extended with `register_custom_agent()`. `custom_agent_names()` returns the sorted names used in unknown-name errors.
 
 ### Agent Manager (`manager.rs`)
 
 #### Core Types
 
-- **`AgentManager`** — Central manager: spawns, tracks, messages, and registers agents. Holds `Arc<Mutex<TaskManager>>`, active instances, custom agent defs, event broadcast, and tool executor factory.
+- **`AgentManager`** — Central manager: spawns, tracks, and messages agents. Holds `Arc<Mutex<TaskManager>>`, active instances, custom agent defs, event broadcast, and tool executor factory. `spawn_named_agent()` is the production entry point for a configured custom agent; `spawn_agent()` remains the built-in/`AgentType` entry point.
 - **`AgentInstance`** — Running agent handle with `task_handle`, `status`, `context`, `message_tx`, `output_file`, `model`, `prompt`, `completion_notify`.
 - **`AgentStatus`** — Lifecycle states: `Starting`, `Running`, `Completed`, `Failed`, `Stopped`.
 - **`AgentResult`** — Completion result: `output`, `status`, `token_usage`.
-- **`AgentError`** — Error type: `NotFound`, `NotRunning`, `SpawnFailed`, `ChannelClosed`, `ValidationFailed`, `Timeout`.
+- **`AgentError`** — Error type: `NotFound`, `NotRunning`, `SpawnFailed`, `ChannelClosed`, `ValidationFailed`, `Timeout`, `UnknownCustomAgent { name, available }`. The unknown-agent error lists the configured names (or says that none are configured and where they go).
 
 #### Spawn Configuration
 
@@ -95,6 +97,7 @@ Sub-agent system for spawning autonomous worker agents, dream agents (background
 
 - **`ForkedContext`** — Context inherited from parent: `parent_session_id`, `cwd`, `recent_message_count`, `allowed_tools`, `env_snapshot`, plus the cache-aware fork fields `conversation_prefix`, `fork_point` and `cache_safe_params`. Builder pattern with `with_tools()`, `with_env()`, `with_conversation_prefix()` and `with_cache_safe_params()`.
 - **`CacheSafeParams`** — The request components that must match the parent for a fork to hit the provider's prefix cache: `model`, `system_prompt`, `tool_names`.
+- **`ParentContextSnapshot`** — Serializable snapshot of the parent at turn start: `messages`, `model`, `system_prompt`, `tool_names`. `cache_safe_params()` derives the matching [`CacheSafeParams`], and `has_prefix()` reports whether there is a prefix worth forking. The REPL refreshes one before each turn and the Agent tool reads it at spawn time.
 - **`AgentMessage`** — Parent-to-agent message: `agent_id`, `content`, `message_id`.
 
 #### Events & Observability
@@ -123,8 +126,11 @@ Sub-agent system for spawning autonomous worker agents, dream agents (background
   3. Parent engine event bus (`EngineEvent::AgentEvent`)
 - **Sandbox override** — Per-agent `SandboxConfig` injected into the tool executor factory.
 - **Token tracking** — `QueryEngine.total_usage()` captured after each attempt, persisted to companion `.meta.json` file alongside the output file.
-- **Custom agent definitions** — Users define agents in `~/.coderex/agents/{name}.json`; resolved by name in `AgentType::Custom`.
-- **Registered (externally managed) agents** — `register_agent()` records an agent id managed outside the manager. It does **not** resume execution and cannot: CodeRex does not persist a sub-agent transcript, so there is nothing to resume. `send_message`/`get_agent` treat a registered id as unknown rather than as a running agent (the old `resume_agent()` created a fake instance whose channel had no receiver).
+- **Custom agent definitions** — Users define agents in `~/.coderex/agents/{name}.json`; `spawn_named_agent(name, ...)` resolves the definition and delegates to `AgentType::Custom`, which merges the system prompt, tool whitelist, model, token limit and output schema into the spawn.
+- **Named agents from the CLI** — `coderex --agent <name>` resolves the same definitions at session start. The definition's system prompt replaces the default session prompt and its `allowed_tools` narrows the session; an explicit `--system-prompt` or `--allowed-tools` wins, and an unknown name fails before the REPL starts with the list of configured names. The `coderex agents` subcommand lists built-in and custom agents.
+- **Parent prefix wiring** — The REPL refreshes a [`ParentContextSnapshot`] immediately before each turn and the Agent tool's parent-context provider reads it when spawning. When the snapshot has messages, the tool sets `SpawnOptions::parent_prefix` and `parent_cache_safe_params` (derived from the same model/system-prompt/tool list) and reports `message_count = prefix.len()`, so `ForkedContext` knows where the parent prefix ends. Without a provider (managers used directly, tests) a spawn still works but starts a fresh prefix.
+- **Lifecycle producers** — `run_agent_task()` emits `AgentLifecycleEvent::Started`, `TextDelta` for each streamed text delta, `ToolCall { name, args }` for each tool invocation (the engine exposes the call summary, so `args` currently carries `{"summary": ...}` rather than the parsed arguments), `Idle { reason: "turn complete" }` after the event stream drains, and finally `Completed` or `Failed`. They travel as `EngineEvent::AgentEvent`, which the TUI already renders.
+- **External subscriptions** — `subscribe_to_agent()` returns a `tokio::sync::broadcast` receiver of `AgentObservableEvent` (the same engine events tagged with the agent id). The REPL creates one in `with_engine` and drains it on the TUI tick and in headless event draining (debug logs); the UI itself uses `EngineEvent::AgentEvent`, so the broadcast is the external-observer surface, not a second rendering path. `register_agent()` was removed: there is no transport for an externally managed agent in CodeRex (sub-agents are in-process `tokio` tasks), so it could only ever record a dangling id.
 
 ## Current Status
 
@@ -134,7 +140,7 @@ All features are implemented. No known stubs.
 
 - **Agent type definitions** — All 7 built-in types plus custom agents.
 - **Custom agent loading** — Scans `~/.coderex/agents/*.json` on manager creation; merged options override spawn defaults.
-- **AgentManager** — Full lifecycle: spawn, send_message, complete, stop, list, running_count, register.
+- **AgentManager** — Full lifecycle: spawn (built-in or named custom), send_message, complete, stop, list, running_count.
 - **Real engine execution** — `spawn_agent()` creates a `tokio::spawn` task running `run_agent_task()` with a full `QueryEngine`.
 - **`execute_via_agent()`** — Short-lived agent execution for command-style tasks.
 - **`spawn_dream_agent()`** — Read-only background analysis agent with Read/Glob/Grep whitelist.
@@ -148,10 +154,12 @@ All features are implemented. No known stubs.
 - **Token usage tracking** — Captured from `QueryEngine.total_usage()`, persisted to `.meta.json`, returned by `wait_for_completion()`.
 - **Observability** — Broadcast channel, NDJSON log files, parent event bus integration.
 - **Teammate events** — `TaskCompleted` and `Idle` events emitted with callback support.
-- **Registered agents** — `register_agent()` tracks an externally managed id; no execution is attached (see the pattern note above).
-- **Cache-aware forking** — `ForkedContext` reuses the parent's conversation prefix verbatim (`fork_messages()`, `prefix_fingerprint()`, `is_cache_safe()`), so a fork can hit the provider's prefix cache instead of paying for a fresh prefix.
+- **Sub-agent lifecycle events** — `Started`, `TextDelta`, `ToolCall`, `Idle` and terminal `Completed`/`Failed` are emitted to the parent engine (see the lifecycle pattern above).
+- **Cache-aware forking** — `ForkedContext` reuses the parent's conversation prefix verbatim (`fork_messages()`, `prefix_fingerprint()`, `is_cache_safe()`), so a fork can hit the provider's prefix cache instead of paying for a fresh prefix. The REPL supplies the production prefix/cache-safe params through `ParentContextSnapshot`.
 - **Forked/background delegation** — `run_forked_agent()` and `run_background_feature()` via `coderex-core` orchestrator.
-- **Custom agent resolution** — `AgentType::Custom` resolves named custom agents from loaded definitions, merging allowed_tools, model, max_tokens, and output_schema.
+- **Custom agent resolution** — `spawn_named_agent()` (and `--agent` for the session) resolves named custom agents from loaded definitions, merging allowed_tools, model, max_tokens, and output_schema.
+- **Agent tool spawn options** — The Agent tool exposes `agent` (custom name, takes precedence over `subagent_type`), `writable` / `read_only`, and `retry_policy` / `max_retries`, and passes them into `SpawnOptions`. `writable: false` enforces the Read/Grep/Glob whitelist.
+- **Removed registration API** — `register_agent()` and `is_registered()` no longer exist: there is no external-agent transport, so they were dangling. See the pattern note above.
 
 ## Background Job Records and Adoption (`coderex-core::job_record`)
 
@@ -289,6 +297,12 @@ while let Ok(event) = rx.recv().await {
 }
 ```
 
+The manager keeps one broadcast channel for all agents; the `agent_id`
+argument is accepted for call-site clarity and filtering is the subscriber's
+job (match on `event.agent_id`). A receiver is present only when the manager
+was created with an event broadcast. The REPL is the production subscriber;
+the TUI reads the same lifecycle through `EngineEvent::AgentEvent`.
+
 ### Custom Agent Config (`~/.coderex/agents/my_agent.json`)
 
 ```json
@@ -302,12 +316,12 @@ while let Ok(event) = rx.recv().await {
 }
 ```
 
-Spawn by name:
+Spawn by name (this is what the Agent tool and `--agent` use):
 
 ```rust
 let agent = mgr
-    .spawn_agent(
-        AgentType::Custom { prompt: "my_agent".into() },
+    .spawn_named_agent(
+        "my_agent",
         "Review auth.rs for vulnerabilities",
         SpawnOptions::default(),
         "parent_session",
@@ -316,3 +330,39 @@ let agent = mgr
     )
     .await?;
 ```
+
+An unknown name returns `AgentError::UnknownCustomAgent`, whose message lists
+the configured names (or explains where to add a definition when none are
+configured) instead of silently falling back to a general-purpose agent.
+
+When a definition is used for the **session** (`coderex --agent <name>`), its
+`system_prompt` and `allowed_tools` are applied; `model` and `max_tokens` are
+used for spawned sub-agents, while the session model still comes from
+`--model`/configuration. Explicit `--system-prompt` or `--allowed-tools` win
+over the file.
+
+### Parent Prefix / Cache-Safe Spawn
+
+```rust
+let snapshot = ParentContextSnapshot::new(messages, model, system_prompt, tool_names);
+let options = SpawnOptions {
+    parent_prefix: snapshot.messages.clone(),
+    parent_cache_safe_params: Some(snapshot.cache_safe_params()),
+    ..Default::default()
+};
+let agent = mgr
+    .spawn_agent(
+        AgentType::GeneralPurpose,
+        "Summarize the change",
+        options,
+        "parent_session",
+        "/project",
+        snapshot.messages.len(),
+    )
+    .await?;
+```
+
+`ParentContextSnapshot::cache_safe_params()` derives `model`,
+`system_prompt` and `tool_names` from the same snapshot, so the prefix and
+the params cannot disagree. The REPL builds this snapshot before each turn and
+the Agent tool reads it through `with_parent_context_provider()`.

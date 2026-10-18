@@ -6,9 +6,10 @@ pub mod custom_agents;
 pub mod manager;
 pub mod types;
 
-pub use custom_agents::{load_custom_agents, CustomAgentDef};
+pub use custom_agents::{load_custom_agents, load_custom_agents_from_dir, CustomAgentDef};
 pub use manager::{
     execute_via_agent, spawn_dream_agent, AgentError, AgentInstance, AgentManager, AgentMessage,
-    AgentResult, AgentStatus, CacheSafeParams, ForkedContext, SpawnOptions, TeammateEvent,
+    AgentObservableEvent, AgentResult, AgentStatus, CacheSafeParams, FailureAction, ForkedContext,
+    ParentContextSnapshot, RetryPolicy, SpawnOptions, TeammateEvent, TeammateEventCallback,
 };
 pub use types::{AgentType, Thoroughness};
