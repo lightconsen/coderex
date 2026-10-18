@@ -99,6 +99,13 @@ pub enum PermissionResult {
     },
     /// The operation requires user confirmation, but the answer
     /// should be cached for the rest of the session.
+    ///
+    /// Nothing in [`PermissionChecker`] constructs this variant: a
+    /// session-wide approval is recorded with
+    /// [`PermissionChecker::record_session_approval`] once the user has
+    /// answered. It remains part of the public result type because callers
+    /// still carry it through their match arms. It always means "no answer
+    /// yet", so [`Self::is_allowed`] is false for it.
     AskForSession {
         /// Human-readable reason for the prompt.
         reason: String,
@@ -134,12 +141,13 @@ impl PermissionResult {
 
 impl PermissionResult {
     /// Returns true if the operation can proceed without user input.
+    ///
+    /// `AskForSession` is deliberately not allowed: it means "ask, then cache
+    /// the answer", so no answer exists yet. Treating it as allowed would let
+    /// a caller that trusts this predicate skip the prompt entirely.
     #[must_use]
     pub const fn is_allowed(&self) -> bool {
-        matches!(
-            self,
-            Self::Allow | Self::AllowForPath { .. } | Self::AskForSession { .. }
-        )
+        matches!(self, Self::Allow | Self::AllowForPath { .. })
     }
 }
 
@@ -603,6 +611,37 @@ mod tests {
             checker.check("write", None),
             PermissionResult::Allow
         ));
+    }
+
+    #[test]
+    fn ask_for_session_is_not_allowed_until_answered() {
+        // `AskForSession` means "ask and cache the answer", not "approved".
+        // A caller trusting `is_allowed` must not skip the prompt.
+        assert!(!PermissionResult::AskForSession {
+            reason: "needs approval".into()
+        }
+        .is_allowed());
+
+        // The two genuinely pre-approved results stay allowed.
+        assert!(PermissionResult::Allow.is_allowed());
+        assert!(PermissionResult::AllowForPath {
+            patterns: vec!["/tmp/**".into()],
+        }
+        .is_allowed());
+
+        // The remaining results all mean "cannot proceed unattended".
+        assert!(!PermissionResult::Ask {
+            reason: "needs approval".into()
+        }
+        .is_allowed());
+        assert!(!PermissionResult::Deny {
+            reason: "no".into()
+        }
+        .is_allowed());
+        assert!(!PermissionResult::Elevated {
+            reason: "runs as another user".into()
+        }
+        .is_allowed());
     }
 
     #[test]
