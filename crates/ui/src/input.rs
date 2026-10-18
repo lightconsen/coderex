@@ -122,6 +122,12 @@ pub struct InputBuffer {
     pub history_pos: usize,
     /// Inline prompt suggestion displayed as ghost text.
     pub suggestion: Option<String>,
+    /// Visual-mode selection anchor (byte index). `None` when no selection is
+    /// active. The other end of the selection is always `cursor`.
+    pub visual_anchor: Option<usize>,
+    /// Whether the active Visual selection is linewise (`V`) rather than
+    /// characterwise (`v`).
+    pub visual_linewise: bool,
 }
 
 impl Default for InputBuffer {
@@ -140,6 +146,8 @@ impl InputBuffer {
             history: Vec::new(),
             history_pos: 0,
             suggestion: None,
+            visual_anchor: None,
+            visual_linewise: false,
         }
     }
 
@@ -210,6 +218,7 @@ impl InputBuffer {
             }
             InputAction::Submit => {
                 self.suggestion = None;
+                self.clear_visual_selection();
                 if !self.text.is_empty() {
                     let submitted = self.text.clone();
                     self.history.push(self.text.clone());
@@ -325,6 +334,240 @@ impl InputBuffer {
     #[must_use]
     pub fn cursor_display_column(&self) -> usize {
         self.display_column()
+    }
+
+    /// Begin a Visual selection anchored at the cursor.
+    ///
+    /// Switching between `v` and `V` keeps the existing anchor; only the
+    /// characterwise/linewise flag changes.
+    pub fn start_visual(&mut self, linewise: bool) {
+        if self.visual_anchor.is_none() {
+            self.visual_anchor = Some(self.cursor);
+        }
+        self.visual_linewise = linewise;
+        self.suggestion = None;
+    }
+
+    /// Drop the Visual selection without editing the buffer.
+    pub fn clear_visual_selection(&mut self) {
+        self.visual_anchor = None;
+        self.visual_linewise = false;
+    }
+
+    /// The selected byte range, as `[start, end)`, or `None` when no
+    /// non-empty range is selected.
+    ///
+    /// A linewise selection always covers the whole buffer: the input is a
+    /// single logical line, so `V` selects all of it. Characterwise
+    /// selections run between the anchor and the insertion-point cursor.
+    #[must_use]
+    pub fn selection_range(&self) -> Option<(usize, usize)> {
+        let anchor = self.floor_char_boundary(self.visual_anchor?);
+        let len = self.text.len();
+        if self.visual_linewise {
+            return (len > 0).then_some((0, len));
+        }
+        let cursor = self.floor_char_boundary(self.cursor);
+        let start = anchor.min(cursor);
+        let end = anchor.max(cursor);
+        (start < end).then_some((start, end))
+    }
+
+    /// Round `index` down to a UTF-8 character boundary.
+    ///
+    /// Cursor and anchor are maintained on boundaries already; this keeps the
+    /// slicing in `selection_range` safe if a caller writes the public fields
+    /// directly.
+    fn floor_char_boundary(&self, index: usize) -> usize {
+        let mut index = index.min(self.text.len());
+        while index > 0 && !self.text.is_char_boundary(index) {
+            index -= 1;
+        }
+        index
+    }
+
+    /// The selected text, if any.
+    #[must_use]
+    pub fn selection_text(&self) -> Option<&str> {
+        let (start, end) = self.selection_range()?;
+        self.text.get(start..end)
+    }
+
+    /// Copy the selection into a string and leave Visual mode.
+    ///
+    /// Like Vim, the cursor moves to the start of the yanked range.
+    pub fn yank_selection(&mut self) -> Option<String> {
+        let range = self.selection_range();
+        let yanked = range
+            .and_then(|(start, end)| self.text.get(start..end))
+            .map(str::to_string);
+        if let Some((start, _)) = range {
+            self.cursor = start;
+            self.history_pos = 0;
+        }
+        self.suggestion = None;
+        self.clear_visual_selection();
+        yanked
+    }
+
+    /// Delete the selection and leave Visual mode.
+    ///
+    /// The cursor lands where the deleted text began.
+    pub fn delete_selection(&mut self) -> Option<String> {
+        let range = self.selection_range();
+        let deleted = range.map(|(start, end)| {
+            let deleted: String = self.text.drain(start..end).collect();
+            self.cursor = start;
+            deleted
+        });
+        if range.is_some() {
+            self.history_pos = 0;
+        }
+        self.suggestion = None;
+        self.clear_visual_selection();
+        deleted
+    }
+
+    /// Move to the start of the next word (Vim `w`).
+    ///
+    /// Word boundaries follow character classes: a run of whitespace, a run of
+    /// alphanumeric/underscore characters, and a run of other punctuation each
+    /// count as their own token.
+    pub fn word_forward(&mut self) {
+        let len = self.text.len();
+        if self.cursor >= len {
+            return;
+        }
+        let mut chars = self.text[self.cursor..].char_indices().peekable();
+        let Some(&(_, first)) = chars.peek() else {
+            return;
+        };
+        let class = char_class(first);
+        while let Some(&(_, c)) = chars.peek() {
+            if char_class(c) != class {
+                break;
+            }
+            chars.next();
+        }
+        // The previous run may have been whitespace; skip any that remains so
+        // the cursor lands on a word rather than the space before it.
+        while let Some(&(_, c)) = chars.peek() {
+            if !c.is_whitespace() {
+                break;
+            }
+            chars.next();
+        }
+        self.cursor = match chars.peek() {
+            Some(&(offset, _)) => self.cursor + offset,
+            None => len,
+        };
+        self.suggestion = None;
+    }
+
+    /// Move to the start of the previous word (Vim `b`).
+    pub fn word_backward(&mut self) {
+        if self.cursor == 0 {
+            return;
+        }
+        // Start at the character before the insertion point, then walk back
+        // over whitespace and the preceding same-class run.
+        let mut idx = self
+            .text
+            .get(..self.cursor)
+            .and_then(|before| before.char_indices().last())
+            .map_or(0, |(i, _)| i);
+        while idx > 0 {
+            let Some(c) = self.text.get(idx..).and_then(|s| s.chars().next()) else {
+                break;
+            };
+            if !c.is_whitespace() {
+                break;
+            }
+            idx = self
+                .text
+                .get(..idx)
+                .and_then(|before| before.char_indices().last())
+                .map_or(0, |(i, _)| i);
+        }
+        let Some(class) = self
+            .text
+            .get(idx..)
+            .and_then(|s| s.chars().next())
+            .map(char_class)
+        else {
+            return;
+        };
+        while idx > 0 {
+            let Some(prev_idx) = self
+                .text
+                .get(..idx)
+                .and_then(|before| before.char_indices().last())
+                .map(|(i, _)| i)
+            else {
+                break;
+            };
+            let same_class = self
+                .text
+                .get(prev_idx..)
+                .and_then(|s| s.chars().next())
+                .is_some_and(|c| char_class(c) == class);
+            if !same_class {
+                break;
+            }
+            idx = prev_idx;
+        }
+        self.cursor = idx;
+        self.suggestion = None;
+    }
+
+    /// Move to the end of the current or next word (Vim `e`).
+    ///
+    /// The cursor is an insertion point, so the returned position is just past
+    /// the word's final character — the position at which a Visual selection
+    /// includes that character.
+    pub fn word_end(&mut self) {
+        let len = self.text.len();
+        if self.cursor >= len {
+            return;
+        }
+        let mut chars = self.text[self.cursor..].char_indices().peekable();
+        while let Some(&(_, c)) = chars.peek() {
+            if !c.is_whitespace() {
+                break;
+            }
+            chars.next();
+        }
+        let Some(&(_, first)) = chars.peek() else {
+            self.cursor = len;
+            return;
+        };
+        let class = char_class(first);
+        let mut end = self.cursor;
+        while let Some(&(offset, c)) = chars.peek() {
+            if char_class(c) != class {
+                break;
+            }
+            chars.next();
+            end = self.cursor + offset + c.len_utf8();
+        }
+        self.cursor = end;
+        self.suggestion = None;
+    }
+}
+
+/// Vim's notion of a word character, simplified: letters, digits, underscore.
+fn is_word_char(c: char) -> bool {
+    c.is_alphanumeric() || c == '_'
+}
+
+/// Character class used by the word motions: whitespace, word, punctuation.
+fn char_class(c: char) -> u8 {
+    if c.is_whitespace() {
+        0
+    } else if is_word_char(c) {
+        1
+    } else {
+        2
     }
 }
 
@@ -616,5 +859,161 @@ mod tests {
         assert_eq!(buf.byte_from_column(2), 1); // middle of '中', rounds down
         assert_eq!(buf.byte_from_column(3), 4); // before 'b'
         assert_eq!(buf.byte_from_column(4), 5); // after 'b' (text.len())
+    }
+
+    fn buffer_with(text: &str) -> InputBuffer {
+        let mut buf = InputBuffer::new();
+        buf.text = text.to_string();
+        buf.cursor = text.len();
+        buf
+    }
+
+    #[test]
+    fn start_visual_anchors_at_cursor() {
+        let mut buf = buffer_with("hello");
+        buf.cursor = 2;
+        buf.start_visual(false);
+        assert_eq!(buf.visual_anchor, Some(2));
+        assert!(!buf.visual_linewise);
+        // No characters between anchor and cursor yet.
+        assert_eq!(buf.selection_range(), None);
+
+        buf.cursor = 4;
+        assert_eq!(buf.selection_range(), Some((2, 4)));
+        assert_eq!(buf.selection_text(), Some("ll"));
+    }
+
+    #[test]
+    fn selection_range_works_backwards() {
+        let mut buf = buffer_with("hello");
+        buf.cursor = 4;
+        buf.start_visual(false);
+        buf.cursor = 1;
+        assert_eq!(buf.selection_range(), Some((1, 4)));
+        assert_eq!(buf.selection_text(), Some("ell"));
+    }
+
+    #[test]
+    fn selection_handles_multibyte_utf8() {
+        let mut buf = buffer_with("a中文b");
+        // Bytes: a=0, 中=1..4, 文=4..7, b=7.
+        buf.cursor = 1;
+        buf.start_visual(false);
+        buf.cursor = 7;
+        assert_eq!(buf.selection_range(), Some((1, 7)));
+        assert_eq!(buf.selection_text(), Some("中文"));
+
+        let yanked = buf.yank_selection();
+        assert_eq!(yanked.as_deref(), Some("中文"));
+        // Yanking leaves the text intact and clears the selection.
+        assert_eq!(buf.text, "a中文b");
+        assert_eq!(buf.visual_anchor, None);
+    }
+
+    #[test]
+    fn linewise_selection_covers_the_whole_buffer() {
+        let mut buf = buffer_with("hello world");
+        buf.cursor = 3;
+        buf.start_visual(true);
+        assert!(buf.visual_linewise);
+        assert_eq!(buf.selection_range(), Some((0, 11)));
+        assert_eq!(buf.selection_text(), Some("hello world"));
+    }
+
+    #[test]
+    fn switching_visual_kind_keeps_anchor() {
+        let mut buf = buffer_with("hello");
+        buf.cursor = 2;
+        buf.start_visual(false);
+        buf.cursor = 4;
+        buf.start_visual(true);
+        assert_eq!(buf.visual_anchor, Some(2));
+        assert_eq!(buf.selection_range(), Some((0, 5)));
+    }
+
+    #[test]
+    fn delete_selection_removes_range_and_moves_cursor() {
+        let mut buf = buffer_with("hello world");
+        buf.cursor = 0;
+        buf.start_visual(false);
+        buf.cursor = 5;
+        assert_eq!(buf.delete_selection().as_deref(), Some("hello"));
+        assert_eq!(buf.text, " world");
+        assert_eq!(buf.cursor, 0);
+        assert_eq!(buf.visual_anchor, None);
+        // The rest of the buffer is untouched and still editable.
+        buf.cursor = buf.text.len();
+        buf.apply(&InputAction::InsertChar('!'));
+        assert_eq!(buf.text, " world!");
+    }
+
+    #[test]
+    fn yank_selection_moves_cursor_to_start() {
+        let mut buf = buffer_with("one two");
+        buf.cursor = 4;
+        buf.start_visual(false);
+        buf.cursor = 7;
+        assert_eq!(buf.yank_selection().as_deref(), Some("two"));
+        assert_eq!(buf.cursor, 4);
+        assert_eq!(buf.text, "one two");
+    }
+
+    #[test]
+    fn word_motions_match_vim_boundaries() {
+        let mut buf = buffer_with("hello world");
+        buf.cursor = 0;
+        buf.word_forward();
+        assert_eq!(buf.cursor, 6); // start of "world"
+        buf.word_backward();
+        assert_eq!(buf.cursor, 0);
+        buf.word_end();
+        assert_eq!(buf.cursor, 5); // just past "hello"
+        buf.word_forward();
+        assert_eq!(buf.cursor, 6);
+        buf.word_end();
+        assert_eq!(buf.cursor, 11); // end of buffer
+    }
+
+    #[test]
+    fn word_motions_handle_multibyte_and_punctuation() {
+        let mut buf = buffer_with("你好 world");
+        buf.cursor = 0;
+        buf.word_end();
+        // "你好" is one word run; the cursor sits just past 好 (byte 6).
+        assert_eq!(buf.cursor, 6);
+        buf.word_forward();
+        assert_eq!(buf.cursor, 7); // start of "world" after the space
+        buf.word_backward();
+        assert_eq!(buf.cursor, 0);
+
+        let mut buf = buffer_with("foo.bar");
+        buf.cursor = 0;
+        buf.word_end();
+        assert_eq!(buf.cursor, 3); // end of "foo"
+        buf.word_forward();
+        assert_eq!(buf.cursor, 4); // punctuation is its own token
+        buf.word_end();
+        assert_eq!(buf.cursor, 7); // past "bar"
+    }
+
+    #[test]
+    fn word_motion_does_not_split_utf8() {
+        let mut buf = buffer_with("a中 b");
+        buf.cursor = 0;
+        buf.word_end();
+        assert_eq!(buf.cursor, 4); // past 中, before the space
+        assert!(buf.text.is_char_boundary(buf.cursor));
+    }
+
+    #[test]
+    fn visual_selection_survives_history_state() {
+        let mut buf = buffer_with("draft");
+        buf.history.push("older".into());
+        buf.cursor = 5;
+        buf.start_visual(false);
+        buf.cursor = 0;
+        assert_eq!(buf.selection_text(), Some("draft"));
+        // History position is independent of selection state.
+        assert_eq!(buf.history_pos, 0);
     }
 }

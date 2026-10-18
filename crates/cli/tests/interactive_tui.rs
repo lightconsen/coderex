@@ -1084,6 +1084,36 @@ fn vim_command_enables_normal_mode_editing() {
     assert!(raw.contains("abc!"));
 }
 
+/// Visual mode operates on the input buffer: select the first word with
+/// `v` + `e`, delete it with `d`, and the remaining text stays editable.
+#[test]
+fn vim_visual_mode_selects_and_deletes_input() {
+    let dir = setup_project_dir();
+    let mut session = session_without_engine(dir.path());
+    session.wait_for_text("CodeRex v", SCREEN_TIMEOUT);
+    session.send_line("/vim");
+    session.wait_for_text("Vim mode: enabled", SCREEN_TIMEOUT);
+
+    session.send_text("hello world");
+    session.esc();
+    thread::sleep(Duration::from_millis(150));
+
+    // The cursor sits at the end of the line. v -> visual, b -> back to the
+    // start of "world", d -> delete the selection.
+    session.send_text("vbd");
+    let screen = session.wait_for_text("❯ hello", SCREEN_TIMEOUT);
+    assert!(screen.contains("❯ hello"), "{screen}");
+    assert!(
+        !screen.contains("world"),
+        "the deleted selection is still rendered:\n{screen}"
+    );
+
+    // Normal-mode entry points still work after a Visual-mode edit.
+    session.send_text("A!");
+    let screen = session.wait_for_text("❯ hello !", SCREEN_TIMEOUT);
+    assert!(screen.contains("❯ hello !"), "{screen}");
+}
+
 #[test]
 fn unicode_input_is_preserved_in_interactive_session() {
     let dir = setup_project_dir();

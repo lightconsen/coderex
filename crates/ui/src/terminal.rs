@@ -996,11 +996,28 @@ fn render_input(
     input: &crate::input::InputBuffer,
     theme: &Theme,
 ) {
-    let cursor = input.cursor.min(input.text.len());
-    let mut spans: Vec<Span> = vec![
-        Span::styled("❯ ", Style::default().fg(theme.accent)),
-        Span::styled(input.text.clone(), Style::default().fg(theme.input_fg)),
-    ];
+    // Byte offsets are not columns: a CJK character occupies two cells. Place
+    // the terminal cursor by display width so it lines up while selecting.
+    let cursor = input.cursor_display_column();
+    let text_style = Style::default().fg(theme.input_fg);
+    let mut spans: Vec<Span> = vec![Span::styled("❯ ", Style::default().fg(theme.accent))];
+    match input.selection_range() {
+        Some((start, end)) if start < end => {
+            if start > 0 {
+                spans.push(Span::styled(input.text[..start].to_string(), text_style));
+            }
+            spans.push(Span::styled(
+                input.text[start..end].to_string(),
+                Style::default()
+                    .fg(theme.selection_fg)
+                    .bg(theme.selection_bg),
+            ));
+            if end < input.text.len() {
+                spans.push(Span::styled(input.text[end..].to_string(), text_style));
+            }
+        }
+        _ => spans.push(Span::styled(input.text.clone(), text_style)),
+    }
     if let Some(ref sug) = input.suggestion {
         spans.push(Span::styled(
             format!("  {sug}"),

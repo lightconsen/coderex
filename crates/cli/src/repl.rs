@@ -2746,10 +2746,17 @@ impl ReplLoop {
                                     ui_state.input.apply(&InputAction::CursorRight);
                                 }
                                 VimAction::Up => {
-                                    ui_state.input.apply(&InputAction::HistoryUp);
+                                    // A Visual selection must not be replaced
+                                    // by a history entry; the input buffer is
+                                    // a single line, so there is no line above.
+                                    if !vim.is_visual() {
+                                        ui_state.input.apply(&InputAction::HistoryUp);
+                                    }
                                 }
                                 VimAction::Down => {
-                                    ui_state.input.apply(&InputAction::HistoryDown);
+                                    if !vim.is_visual() {
+                                        ui_state.input.apply(&InputAction::HistoryDown);
+                                    }
                                 }
                                 VimAction::JumpToStart => {
                                     ui_state.input.apply(&InputAction::MoveToStart);
@@ -2807,11 +2814,21 @@ impl ReplLoop {
                                     ui_state.messages.scroll_down_by(half_page);
                                 }
                                 VimAction::JumpTop => {
-                                    ui_state.messages.start = 0;
-                                    ui_state.messages.scroll_offset = usize::MAX;
+                                    if vim.is_visual() {
+                                        // `gg` in Visual mode moves to the
+                                        // first character of the buffer.
+                                        ui_state.input.apply(&InputAction::MoveToStart);
+                                    } else {
+                                        ui_state.messages.start = 0;
+                                        ui_state.messages.scroll_offset = usize::MAX;
+                                    }
                                 }
                                 VimAction::JumpBottom => {
-                                    ui_state.messages.scroll_to_bottom();
+                                    if vim.is_visual() {
+                                        ui_state.input.apply(&InputAction::MoveToEnd);
+                                    } else {
+                                        ui_state.messages.scroll_to_bottom();
+                                    }
                                 }
                                 VimAction::Command => {
                                     let cmds: Vec<String> = self
@@ -2892,6 +2909,46 @@ impl ReplLoop {
                                     if self.vim_mode_enabled {
                                         ui_state.input.cursor = 0;
                                         vim.mode = VimMode::Insert;
+                                    }
+                                }
+                                VimAction::EnterVisual => {
+                                    ui_state.input.start_visual(false);
+                                }
+                                VimAction::EnterVisualLine => {
+                                    ui_state.input.start_visual(true);
+                                }
+                                VimAction::ExitVisual => {
+                                    let linewise = ui_state.input.visual_linewise;
+                                    let anchor = ui_state.input.visual_anchor;
+                                    ui_state.input.clear_visual_selection();
+                                    // Vim leaves the cursor at the low end of
+                                    // the range when Visual mode ends; a
+                                    // linewise selection of this one-line
+                                    // buffer starts at column zero.
+                                    if linewise {
+                                        ui_state.input.cursor = 0;
+                                    } else if let Some(anchor) = anchor {
+                                        ui_state.input.cursor =
+                                            anchor.min(ui_state.input.cursor);
+                                    }
+                                }
+                                VimAction::WordForward => {
+                                    ui_state.input.word_forward();
+                                }
+                                VimAction::WordBackward => {
+                                    ui_state.input.word_backward();
+                                }
+                                VimAction::WordEnd => {
+                                    ui_state.input.word_end();
+                                }
+                                VimAction::YankSelection => {
+                                    if let Some(text) = ui_state.input.yank_selection() {
+                                        vim.yank(&text);
+                                    }
+                                }
+                                VimAction::DeleteSelection => {
+                                    if let Some(text) = ui_state.input.delete_selection() {
+                                        vim.yank(&text);
                                     }
                                 }
                             }
