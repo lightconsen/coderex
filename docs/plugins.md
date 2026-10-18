@@ -63,7 +63,7 @@ Manages plugin lifecycle (discovery, loading, execution, unloading), marketplace
 - **Dependency resolution**: Kahn's topological sort with cycle detection for plugin load ordering.
 - **Error recovery**: Exponential-backoff retry for Error-state plugins (re-reads manifest, re-validates).
 - **MCP skills bridge**: Discovered MCP tools converted to `SkillMetadata` and stored in `SessionContext.mcp_skills`.
-- **Hybrid execution model**: Default tier = external process (JSON-RPC over stdio). Fast tier = WASM (reserved for future high-performance plugins).
+- **Hybrid execution model**: Default tier = external process (JSON-RPC over stdio). Fast tier = WASM (compiled in-process, sandboxed, and loaded by `spawn_plugin`).
 - **Plugin command registration**: Dynamic `SlashCommand` registration via `Box::leak` for `&'static str` names/descriptions.
 - **Plugin tool fallback**: `PluginToolExecutor` chains as a tertiary fallback behind primary registry -> MCP -> plugin.
 
@@ -93,9 +93,48 @@ External process plugins communicate via JSON-RPC 2.0 over stdio using the `code
 
 Process plugins declare an optional `entrypoint` (e.g., `"bin/plugin"`, `"node index.js"`) and custom `env` variables in their manifest. The orchestrator spawns them during `InitPlugins`, discovers commands/skills dynamically, and wires them into the REPL via `with_plugin_manager`.
 
-### WASM Plugins (Fast Tier — Future)
+### WASM Plugins (Fast Tier)
 
-WASM runtime is gated behind the `wasm-runtime` Cargo feature (`wasmtime` dependency). Currently, `spawn_plugin` logs a warning and skips WASM plugins. The infrastructure (manifest field, feature flag) is in place; the `wasmtime` integration is reserved for future high-performance, sandboxed plugins. `userConfig` is not injected into WASM plugins — there is no process environment to inject it into — and `spawn_plugin` says so out loud when a WASM manifest declares options.
+The WASM runtime is enabled by default: `crates/plugins/Cargo.toml` has
+`default = ["process-runtime", "wasm-runtime"]`, and `wasm-runtime` pulls in
+`wasmtime` 20. With the feature off, `PluginWasmInstance::new` returns a
+"WASM runtime not enabled" error instead of loading anything.
+
+`spawn_plugin` loads a `runtime: "wasm"` plugin from its `entrypoint` (default
+`plugin.wasm`) by compiling the module, running `coderex_initialize`, and
+discovering commands and skills, then keeps the instance in
+`active_wasm_instances`. `userConfig` is not injected into WASM plugins — there
+is no process environment to inject it into — and `spawn_plugin` warns when a
+WASM manifest declares options.
+
+The sandbox is enforced by the host, not by trusting the module:
+
+- **Fuel**: every call gets a fresh store with 100,000,000 fuel units
+  (`PLUGIN_FUEL`). Fuel is charged per WebAssembly instruction, so a runaway
+  loop traps instead of pinning the thread.
+- **Memory**: a `StoreLimits` resource limiter caps guest linear memory at
+  64 MiB (`PLUGIN_MAX_MEMORY_BYTES`). It is consulted both for memory declared
+  at instantiation and for every `memory.grow`.
+- **Shared memory**: the threads proposal is disabled (`wasm_threads(false)`),
+  so a module cannot create a shared memory (which wasmtime's store limiter
+  deliberately does not bound) or use atomics.
+- **No host interface**: instances are created with an empty import set, so a
+  module importing WASI or anything else fails to instantiate.
+- **Compile-time input**: the module file must be at most 16 MiB
+  (`PLUGIN_MAX_WASM_BYTES`). `PluginWasmInstance::new` checks the file length —
+  from metadata before reading, and again after reading — and refuses an
+  oversized file with an error naming its size, *before* it reaches
+  `Module::new`.
+
+**Honest remaining boundary:** wasmtime 20 has no compile-time fuel or epoch
+budget, so compilation itself cannot be interrupted or time-limited. The 16 MiB
+cap bounds how much input compilation can be asked to process; it is not a CPU
+or wall-clock budget, and a pathological module at or below the cap can still
+consume compiler time. wasmtime's seemingly related configuration does not
+close this: `parallel_compilation(false)` only chooses single-threaded
+compilation (it does not reduce total work), and `max_wasm_stack` bounds the
+guest stack at runtime, not compilation. No option is set for either, because
+neither is a genuine compile-time bound.
 
 ## `plugin.json` Field Table
 
@@ -276,7 +315,7 @@ During REPL construction:
 - Skill frontmatter parsing via `serde_yaml` with custom scalar/array deserializers.
 - Repo-specific skills from `.coderex/skills/`.
 - MCP skills bridge: `phase_init_mcp` converts discovered MCP tools to `SkillMetadata`.
-- **WASM feature flag prep**: `process-runtime` (default) and `wasm-runtime` Cargo features.
+- **WASM runtime enabled by default**: `process-runtime` and `wasm-runtime` are both default Cargo features; WASM modules are compiled in-process under fuel (100M per call), a 64 MiB memory limiter, disabled threads, no host imports, and a 16 MiB pre-compilation file-size cap.
 - **Full manifest field table** with `deny_unknown_fields`, `PluginAuthor` accepting a string or an object, and a load-time warning for fields CodeRex accepts but does not implement.
 - **`userConfig` injection**: `CODEREX_PLUGIN_OPTION_<KEY>` in the child's environment and `${user_config.KEY}` substitution in `env` and `entrypoint`; sensitive options refuse a plaintext default and refuse an unresolved `keyring://` reference; a required option with no value stops the spawn.
 - **Install sources**: marketplace listing, local directory, git URL, GitHub `owner/repo` shorthand, a git subdirectory, and HTTPS archive — with `PluginSource::detect()` classifying a CLI argument, and the unimplemented `npm`/`command` kinds recognised and refused rather than silently reinterpreted.
@@ -288,12 +327,14 @@ During REPL construction:
 - `options`/`min`/`max`/`type` in `userConfig` are parsed and ignored: no validation.
 - Pin files are created by the first install; a user cannot pre-seed a pin before installing.
 - WASM plugins get no `userConfig` (no process environment).
+- WASM compilation has no CPU/epoch budget in wasmtime 20. The 16 MiB input cap is the only compile-time bound; a pathological module within the cap can still take a long time to compile (see "WASM Plugins").
 - `npm` and `command` sources are not implemented (see above for why, and for the reference citation on `npm`).
 - `crates/cli/src/orchestrator.rs` still parses `plugin.json` itself in `phase_init_plugins` and ignores a parse error silently; the library's `discover()` warns, but the CLI's own loop has not been changed here.
 
 ### Tests
 
-- 70 tests in `plugins.rs` (manager ops, load/unload, marketplace, discovery, reconciler, URL validation, version checks, signature verification, dependency resolution, error recovery, custom endpoints, the manifest field table, `userConfig` resolution and injection end-to-end, source detection and git URL validation, directory/git/git-subdir installs, structured source specs, the `npm`/`command` refusals, SHA-256 vectors and pin enforcement).
+- 71 tests in `plugins.rs` (manager ops, load/unload, marketplace, discovery, reconciler, URL validation, version checks, signature verification, dependency resolution, error recovery, custom endpoints, the manifest field table, `userConfig` resolution and injection end-to-end, source detection and git URL validation, directory/git/git-subdir installs, structured source specs, the `npm`/`command` refusals, SHA-256 vectors and pin enforcement).
 - 14 tests in `skills.rs` (parsing, loader, plugin/MCP skills, repo dir, conflict resolution, precedence, quoted strings).
-- 7 tests in `runtime.rs` (spawn, initialize, terminate, invalid command), plus 1 in `wasm_runtime.rs`.
+- 7 tests in `runtime.rs` (spawn, initialize, terminate, invalid command).
+- 9 tests in `wasm_runtime.rs`, all run by the default `cargo test -p coderex-plugins`: the loader stub, the 5 sandbox tests (fuel, memory growth, initial memory, shared memory, WASI import), and 3 size-cap tests (over the 16 MiB cap, exactly at it, and a valid module below it).
 - Tests use `tempfile` for filesystem operations. The git and git-subdir install tests create a throwaway repository inside a `tempfile::tempdir()` and pin every git command with `-C`, so they never touch the project's own repository. The subdirectory tests use `file://` clone URLs, so they need no network.

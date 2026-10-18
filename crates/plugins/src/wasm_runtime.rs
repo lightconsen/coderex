@@ -33,6 +33,17 @@ const PLUGIN_FUEL: u64 = 100_000_000;
 #[cfg(feature = "wasm-runtime")]
 const PLUGIN_MAX_MEMORY_BYTES: usize = 64 * 1024 * 1024;
 
+/// Maximum size of a plugin `.wasm` file, in bytes (16 MiB).
+///
+/// wasmtime 20 has no compile-time fuel or epoch budget: once `Module::new`
+/// starts compiling, the embedder cannot interrupt it. Bounding the input is
+/// the compile-time control that can actually be enforced here, so
+/// `PluginWasmInstance::new` checks the file length and refuses anything over
+/// this cap *before* handing the bytes to wasmtime. This limits how much work
+/// compilation can be asked to do; it is not a CPU-time or epoch budget.
+#[cfg(feature = "wasm-runtime")]
+const PLUGIN_MAX_WASM_BYTES: usize = 16 * 1024 * 1024;
+
 /// Build the sandboxed engine shared by every plugin instance.
 ///
 /// Plugins are untrusted code, so the engine is configured with:
@@ -44,12 +55,35 @@ const PLUGIN_MAX_MEMORY_BYTES: usize = 64 * 1024 * 1024;
 /// No WASI (or any other host interface) is linked: instances are created with
 /// an empty import set, so a module that imports anything at all fails to
 /// instantiate. The plugin ABI is self-contained and needs no imports.
+///
+/// Compilation itself is not bounded here: wasmtime 20 has no compile-time
+/// fuel or epoch setting. The only enforced compile-time control is the input
+/// size cap in [`PluginWasmInstance::new`]. `parallel_compilation(false)` was
+/// considered and deliberately not set: it chooses single-threaded compilation
+/// rather than reducing the total work, so it is not a compile-time bound.
 #[cfg(feature = "wasm-runtime")]
 fn sandboxed_engine() -> Result<wasmtime::Engine, String> {
     let mut config = wasmtime::Config::new();
     config.consume_fuel(true);
     config.wasm_threads(false);
     wasmtime::Engine::new(&config).map_err(|e| format!("failed to build WASM engine: {e}"))
+}
+
+/// Reject a module whose length exceeds [`PLUGIN_MAX_WASM_BYTES`].
+///
+/// Kept separate from [`PluginWasmInstance::new`] so both the pre-read
+/// metadata check and the post-read length check report the same error.
+#[cfg(feature = "wasm-runtime")]
+fn ensure_within_size_cap(wasm_path: &std::path::Path, len: u64) -> Result<(), String> {
+    if len > PLUGIN_MAX_WASM_BYTES as u64 {
+        return Err(format!(
+            "WASM module '{}' is {len} bytes, which exceeds the {} byte plugin limit \
+             (PLUGIN_MAX_WASM_BYTES)",
+            wasm_path.display(),
+            PLUGIN_MAX_WASM_BYTES
+        ));
+    }
+    Ok(())
 }
 
 /// A loaded WASM plugin instance.
@@ -95,9 +129,22 @@ impl std::fmt::Debug for PluginWasmInstance {
 #[cfg(feature = "wasm-runtime")]
 impl PluginWasmInstance {
     /// Load a WASM module from the given path.
+    ///
+    /// The file is rejected before compilation if it is larger than
+    /// `PLUGIN_MAX_WASM_BYTES`. The metadata check avoids reading an oversized
+    /// file into memory at all; the length is checked again after reading in
+    /// case the file changed between the two calls.
     pub fn new(wasm_path: &std::path::Path) -> Result<Self, String> {
         let engine = sandboxed_engine()?;
-        let module = wasmtime::Module::from_file(&engine, wasm_path)
+
+        let metadata = std::fs::metadata(wasm_path)
+            .map_err(|e| format!("failed to read WASM module '{}': {e}", wasm_path.display()))?;
+        ensure_within_size_cap(wasm_path, metadata.len())?;
+        let bytes = std::fs::read(wasm_path)
+            .map_err(|e| format!("failed to read WASM module '{}': {e}", wasm_path.display()))?;
+        ensure_within_size_cap(wasm_path, bytes.len() as u64)?;
+
+        let module = wasmtime::Module::new(&engine, &bytes)
             .map_err(|e| format!("failed to load WASM module '{}': {e}", wasm_path.display()))?;
         Ok(Self {
             engine,
@@ -409,19 +456,21 @@ mod tests {
 
     #[test]
     fn stub_instance_not_initialized() {
-        // When wasm-runtime is off, new() returns an error.
+        // Without wasm-runtime every path fails; with it, a missing file does.
         let result = PluginWasmInstance::new(std::path::Path::new("/nonexistent/plugin.wasm"));
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(
-            err.contains("not enabled") || err.contains("failed to load"),
+            err.contains("not enabled")
+                || err.contains("failed to read")
+                || err.contains("failed to load"),
             "unexpected error: {err}"
         );
     }
 }
 
-/// Sandbox tests. These only exist when the WASM runtime is compiled in; run
-/// them with `cargo test -p coderex-plugins --features wasm-runtime`.
+/// Sandbox tests. These only exist when the WASM runtime is compiled in, which
+/// it is by default: `wasm-runtime` is part of the crate's default features.
 ///
 /// Each test writes a small WAT module to a temp file and asserts the sandbox
 /// stops behaviour a hostile plugin would use to take the host down.
@@ -435,6 +484,58 @@ mod sandbox_tests {
         let path = dir.join(name);
         std::fs::write(&path, wat).expect("failed to write WAT module");
         path
+    }
+
+    /// A file over the cap is refused by the size check, before wasmtime
+    /// parses it. The contents are zeros, so a missing check would surface as
+    /// a parse error instead of this size error.
+    #[test]
+    fn module_over_size_cap_is_rejected_before_compilation() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("huge.wasm");
+        let size = PLUGIN_MAX_WASM_BYTES + 1;
+        std::fs::write(&path, vec![0u8; size]).unwrap();
+
+        let err = PluginWasmInstance::new(&path).unwrap_err();
+        assert!(
+            err.contains("exceeds") && err.contains(&size.to_string()),
+            "expected the size cap to name the oversized module, got: {err}"
+        );
+    }
+
+    /// A file exactly at the cap passes the size gate. It is still not a valid
+    /// module, so the error comes from wasmtime's parser, not from the cap.
+    #[test]
+    fn module_at_size_cap_reaches_the_compiler() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("at-cap.wasm");
+        std::fs::write(&path, vec![0u8; PLUGIN_MAX_WASM_BYTES]).unwrap();
+
+        let err = PluginWasmInstance::new(&path).unwrap_err();
+        assert!(
+            !err.contains("exceeds"),
+            "a file at the cap must not be rejected by the size gate: {err}"
+        );
+        assert!(
+            err.contains("failed to load"),
+            "expected a parse error from wasmtime, got: {err}"
+        );
+    }
+
+    /// A normal module below the cap compiles and loads.
+    #[test]
+    fn module_below_size_cap_loads() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_module(
+            dir.path(),
+            "small.wasm",
+            r#"(module (memory (export "memory") 1))"#,
+        );
+
+        assert!(
+            PluginWasmInstance::new(&path).is_ok(),
+            "a module below the size cap must load"
+        );
     }
 
     /// A plugin that spins forever must be stopped by the fuel budget rather

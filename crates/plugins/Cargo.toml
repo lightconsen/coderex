@@ -33,7 +33,7 @@ ed25519-dalek.workspace = true
 async-trait.workspace = true
 
 [features]
-default = ["process-runtime"]
+default = ["process-runtime", "wasm-runtime"]
 process-runtime = []
 wasm-runtime = ["dep:wasmtime"]
 
