@@ -65,7 +65,7 @@ pub enum ConfigError {
 pub const MAX_SETTINGS_FILE_BYTES: u64 = 2 * 1024 * 1024;
 
 /// The set of keys a settings file may contain.
-const KNOWN_SETTINGS_FIELDS: [&str; 10] = [
+const KNOWN_SETTINGS_FIELDS: [&str; 12] = [
     "config_version",
     "model",
     "permission_mode",
@@ -74,6 +74,8 @@ const KNOWN_SETTINGS_FIELDS: [&str; 10] = [
     "telemetry",
     "hooks",
     "mcp_servers",
+    "plugins",
+    "marketplaces",
     "api_key",
     "context_window",
 ];
@@ -212,6 +214,47 @@ impl ContextWindowSettings {
     }
 }
 
+/// A plugin marketplace configured in settings.
+///
+/// Install and update paths register each entry with the plugin manager before
+/// resolving a plugin name, so `coderex plugin install <name>` can find plugins
+/// in an organisation's marketplace without an environment variable.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MarketplaceSetting {
+    /// Marketplace name, used in status and error messages.
+    pub name: String,
+    /// HTTPS base URL of the marketplace.
+    pub url: String,
+}
+
+/// Hook documents grouped by the trust tier of the source they came from.
+///
+/// [`Settings::hooks`] stays the merged view for compatibility: it is what a
+/// caller that just wants "the configured hooks" reads. The session that
+/// installs hooks needs the split, though, because a hook's tier is a security
+/// property (managed hooks run before plugin hooks, which run before core
+/// hooks) and a merged document cannot express it. [`ConfigService::resolve`]
+/// therefore also records each layer here.
+///
+/// The tier is assigned from *where the document was read*, never from a field
+/// in the JSON. A repository-controlled settings file cannot put anything into
+/// [`managed`](Self::managed), and writing `tier` inside a hook is ignored by
+/// the hooks loader.
+#[derive(Debug, Clone, Default)]
+pub struct HookLayers {
+    /// Hooks from built-in defaults, user settings, and project settings.
+    pub core: Option<serde_json::Value>,
+    /// Hooks supplied by plugins.
+    ///
+    /// No producer exists today: `PluginManifest::hooks` parses but
+    /// `coderex-plugins` reports it as unimplemented, so this layer is always
+    /// `None`. It is kept in the shape so the day plugin hooks are honoured
+    /// they already have a tier to land in.
+    pub plugin: Option<serde_json::Value>,
+    /// Hooks from the administrator-controlled managed-settings carriers.
+    pub managed: Option<serde_json::Value>,
+}
+
 /// Resolved settings after merging all sources.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Settings {
@@ -228,8 +271,17 @@ pub struct Settings {
     pub telemetry_enabled: Option<bool>,
     /// Telemetry sub-configuration (endpoint, batch size, etc.).
     pub telemetry: Option<TelemetrySubConfig>,
-    /// Hook configurations.
+    /// Hook configurations (the merged, compatibility view).
     pub hooks: Option<serde_json::Value>,
+    /// Hook configurations split by the tier of the source they came from.
+    ///
+    /// Populated by [`ConfigService::resolve`]. Skipped by serde: a settings
+    /// file cannot declare its own layers, and the value is omitted when
+    /// settings are written back out. `None` means "not resolved" (settings
+    /// built by hand); callers then treat [`hooks`](Self::hooks) as the core
+    /// layer.
+    #[serde(skip)]
+    pub hook_layers: Option<HookLayers>,
     /// MCP server configurations.
     pub mcp_servers: Option<serde_json::Value>,
     /// API key — may be a raw value or a `"keyring://..."` reference.
@@ -257,6 +309,7 @@ impl Settings {
             telemetry_enabled: None,
             telemetry: None,
             hooks: None,
+            hook_layers: None,
             mcp_servers: None,
             api_key: None,
             context_window: None,
@@ -382,6 +435,10 @@ impl Settings {
             telemetry_enabled: other.telemetry_enabled.or(self.telemetry_enabled),
             telemetry: other.telemetry.clone().or_else(|| self.telemetry.clone()),
             hooks: other.hooks.clone().or_else(|| self.hooks.clone()),
+            // The layer split is recomputed by `resolve` from the actual
+            // sources; carrying a stale one through a merge would claim
+            // provenance the merged value no longer has.
+            hook_layers: None,
             mcp_servers: other
                 .mcp_servers
                 .clone()
@@ -506,6 +563,52 @@ impl RuntimeOverrides {
         }
         settings
     }
+
+    /// Values that apply to the live session rather than the merged settings.
+    ///
+    /// `Settings` is the on-disk configuration shape; prompt, fallback-model
+    /// and effort choices are session-scoped and are not persisted by this
+    /// type, so they are surfaced separately instead of being silently
+    /// dropped inside [`Self::apply`].
+    #[must_use]
+    pub fn session_overrides(&self) -> SessionOverrides {
+        SessionOverrides {
+            system_prompt: self.system_prompt.clone(),
+            append_system_prompt: self.append_system_prompt,
+            fallback_model: self.fallback_model.clone(),
+            effort: self.effort.clone(),
+            allowed_tools: self.allowed_tools.clone(),
+        }
+    }
+}
+
+/// Host-provided plugin configuration read from settings files.
+///
+/// These keys are not part of [`Settings`] because they configure the plugin
+/// host (marketplace registration and `userConfig` values), not the engine's
+/// merged configuration. They are still validated as known fields so a typo
+/// is reported instead of ignored.
+#[derive(Debug, Clone, Default)]
+pub struct PluginHostSettings {
+    /// The raw `plugins` value, in the plugin manager's settings shape.
+    pub plugins: Option<serde_json::Value>,
+    /// Configured marketplaces.
+    pub marketplaces: Vec<MarketplaceSetting>,
+}
+
+/// Session-scoped overrides extracted from [`RuntimeOverrides`].
+#[derive(Debug, Clone, Default)]
+pub struct SessionOverrides {
+    /// Custom system prompt.
+    pub system_prompt: Option<String>,
+    /// Append to the default system prompt instead of replacing it.
+    pub append_system_prompt: bool,
+    /// Fallback model.
+    pub fallback_model: Option<String>,
+    /// Reasoning effort level.
+    pub effort: Option<String>,
+    /// Allowed tools list.
+    pub allowed_tools: Option<Vec<String>>,
 }
 
 /// Service for loading and merging settings from all sources.
@@ -583,6 +686,43 @@ impl ConfigService {
     #[must_use]
     pub fn with_default_windows_managed_registry(self) -> Self {
         self.with_managed_settings_registry_key(crate::managed::WINDOWS_MANAGED_REGISTRY_KEY)
+    }
+
+    /// Attach the platform's default OS managed-settings carrier.
+    ///
+    /// On macOS this is `/Library/Managed Preferences/dev.coderex.plist`; on
+    /// Windows it is `HKLM\SOFTWARE\CodeRex`. Other platforms get no extra
+    /// carrier. A carrier already configured explicitly is left untouched, so
+    /// an explicit path always wins over the platform default.
+    #[must_use]
+    pub fn with_platform_managed_settings(mut self) -> Self {
+        #[cfg(target_os = "macos")]
+        if self.managed_plist_path.is_none() {
+            self = self.with_default_macos_managed_plist();
+        }
+        #[cfg(windows)]
+        if self.managed_registry_key.is_none() {
+            self = self.with_default_windows_managed_registry();
+        }
+        self
+    }
+
+    /// The managed JSON file carrier path, if one is configured.
+    #[must_use]
+    pub fn managed_config_path(&self) -> Option<&Path> {
+        self.managed_config_path.as_deref()
+    }
+
+    /// The managed plist carrier path, if one is configured.
+    #[must_use]
+    pub fn managed_plist_path(&self) -> Option<&Path> {
+        self.managed_plist_path.as_deref()
+    }
+
+    /// The managed Windows registry key, if one is configured.
+    #[must_use]
+    pub fn managed_registry_key(&self) -> Option<&str> {
+        self.managed_registry_key.as_deref()
     }
 
     /// Load managed settings from every configured carrier.
@@ -708,7 +848,21 @@ impl ConfigService {
             .unwrap_or(None)
             .unwrap_or_default();
 
-        let mut merged = defaults.merge(&user).merge(&project).merge(&managed);
+        // Keep the pre-managed view so the hooks it contains can be installed
+        // at the core tier. Built-in defaults have no hooks today, but they are
+        // included so this remains correct if that ever changes.
+        let core = defaults.merge(&user).merge(&project);
+        let core_hooks = core.hooks.clone();
+        let managed_hooks = managed.hooks.clone();
+
+        let mut merged = core.merge(&managed);
+        merged.hook_layers = Some(HookLayers {
+            core: core_hooks,
+            // See `HookLayers::plugin` — plugin manifests accept a `hooks`
+            // field but it is not implemented, so there is no producer.
+            plugin: None,
+            managed: managed_hooks,
+        });
 
         // Migrate schema if needed
         migrate_settings(&mut merged, "resolved");
@@ -723,6 +877,48 @@ impl ConfigService {
     pub fn diff(&self) -> Result<ConfigDiff, ConfigError> {
         let resolved = self.resolve()?;
         Ok(resolved.diff_from_defaults("merged"))
+    }
+
+    /// Load plugin host configuration (`plugins`, `marketplaces`) from the
+    /// user and project settings files.
+    ///
+    /// Project values override user values, matching the normal settings
+    /// precedence. Files that fail to parse are skipped with a debug log, just
+    /// like [`Self::resolve`] does, so a broken plugin block cannot prevent the
+    /// session from starting. Managed carriers are not consulted here; their
+    /// settings are policy values and plugin hosting is a user/project choice.
+    pub fn load_plugin_host_config(&self) -> PluginHostSettings {
+        let mut config = PluginHostSettings::default();
+        Self::merge_plugin_host_file(&mut config, &self.user_config_path);
+        if let Some(path) = &self.project_config_path {
+            Self::merge_plugin_host_file(&mut config, path);
+        }
+        config
+    }
+
+    fn merge_plugin_host_file(config: &mut PluginHostSettings, path: &Path) {
+        if !path.exists() {
+            return;
+        }
+        let Ok(content) = std::fs::read_to_string(path) else {
+            tracing::debug!("plugin host settings not read from {path:?}");
+            return;
+        };
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(&content) else {
+            tracing::debug!("plugin host settings not parsed from {path:?}");
+            return;
+        };
+        if let Some(plugins) = value.get("plugins") {
+            config.plugins = Some(plugins.clone());
+        }
+        if let Some(marketplaces) = value.get("marketplaces") {
+            match serde_json::from_value::<Vec<MarketplaceSetting>>(marketplaces.clone()) {
+                Ok(parsed) => config.marketplaces = parsed,
+                Err(error) => {
+                    tracing::warn!("marketplaces in {path:?} ignored: {error}");
+                }
+            }
+        }
     }
 }
 
@@ -1094,6 +1290,105 @@ mod tests {
     }
 
     #[test]
+    fn runtime_overrides_expose_session_scoped_values() {
+        let overrides = RuntimeOverrides {
+            system_prompt: Some("be terse".into()),
+            append_system_prompt: true,
+            fallback_model: Some("claude-haiku-4-5-20251001".into()),
+            effort: Some("high".into()),
+            allowed_tools: Some(vec!["Read".into()]),
+            ..Default::default()
+        };
+        let session = overrides.session_overrides();
+        assert_eq!(session.system_prompt.as_deref(), Some("be terse"));
+        assert!(session.append_system_prompt);
+        assert_eq!(
+            session.fallback_model.as_deref(),
+            Some("claude-haiku-4-5-20251001")
+        );
+        assert_eq!(session.effort.as_deref(), Some("high"));
+        assert_eq!(session.allowed_tools, Some(vec!["Read".to_string()]));
+    }
+
+    #[test]
+    fn append_system_prompt_flag_is_off_by_default() {
+        let session = RuntimeOverrides::default().session_overrides();
+        assert!(!session.append_system_prompt);
+    }
+
+    #[test]
+    fn platform_managed_settings_attaches_the_os_carrier() {
+        let service = ConfigService::new(std::path::PathBuf::from("/tmp/user.json"), None)
+            .with_platform_managed_settings();
+        #[cfg(target_os = "macos")]
+        assert_eq!(
+            service.managed_plist_path(),
+            Some(Path::new(
+                "/Library/Managed Preferences/dev.coderex.plist"
+            ))
+        );
+        #[cfg(windows)]
+        assert_eq!(service.managed_registry_key(), Some(r"SOFTWARE\CodeRex"));
+        #[cfg(not(any(target_os = "macos", windows)))]
+        assert_eq!(service.managed_plist_path(), None);
+    }
+
+    #[test]
+    fn explicit_managed_carrier_wins_over_the_platform_default() {
+        let explicit = std::path::PathBuf::from("/tmp/explicit.plist");
+        let service = ConfigService::new(std::path::PathBuf::from("/tmp/user.json"), None)
+            .with_managed_settings_plist(explicit.clone())
+            .with_platform_managed_settings();
+        assert_eq!(service.managed_plist_path(), Some(explicit.as_path()));
+    }
+
+    #[test]
+    fn plugin_host_config_reads_user_and_project_values() {
+        let tmp = tempfile::tempdir().unwrap();
+        let user_path = tmp.path().join("user.json");
+        let project_path = tmp.path().join("project.json");
+        std::fs::write(
+            &user_path,
+            r#"{
+                "plugins": {"demo": {"options": {"token": "user"}}},
+                "marketplaces": [{"name": "user", "url": "https://user.example"}]
+            }"#,
+        )
+        .unwrap();
+        std::fs::write(
+            &project_path,
+            r#"{
+                "plugins": {"demo": {"options": {"token": "project"}}}
+            }"#,
+        )
+        .unwrap();
+
+        let service = ConfigService::new(user_path, Some(project_path));
+        let host = service.load_plugin_host_config();
+        let plugins = host.plugins.expect("project plugins override user plugins");
+        assert_eq!(
+            plugins["demo"]["options"]["token"].as_str(),
+            Some("project"),
+            "project settings must win over user settings"
+        );
+        assert_eq!(host.marketplaces.len(), 1);
+        assert_eq!(host.marketplaces[0].name, "user");
+    }
+
+    #[test]
+    fn plugin_host_config_skips_malformed_marketplaces() {
+        let tmp = tempfile::tempdir().unwrap();
+        let user_path = tmp.path().join("user.json");
+        std::fs::write(
+            &user_path,
+            r#"{"marketplaces": [{"name": "missing-url"}]}"#,
+        )
+        .unwrap();
+        let service = ConfigService::new(user_path, None);
+        assert!(service.load_plugin_host_config().marketplaces.is_empty());
+    }
+
+    #[test]
     fn diff_from_defaults_detects_changes() {
         let settings = Settings {
             model: Some("custom-model".into()),
@@ -1137,6 +1432,7 @@ mod tests {
             telemetry_enabled: Some(true),
             telemetry: None,
             hooks: None,
+            hook_layers: None,
             mcp_servers: None,
             api_key: None,
             context_window: None,
@@ -1377,6 +1673,49 @@ mod tests {
             service.resolve().unwrap().model,
             Some("managed-model".into())
         );
+    }
+
+    /// Resolution keeps the hook documents apart by the tier of their source:
+    /// the merged `hooks` value is winner-take-all (so it only holds the
+    /// managed document), while `hook_layers` still carries the core document
+    /// that the merged view dropped.
+    #[test]
+    fn resolve_records_hook_layers_by_source_tier() {
+        let temp = tempfile::tempdir().unwrap();
+        let user_path = temp.path().join("user.json");
+        let project_path = temp.path().join("project.json");
+        let managed_path = temp.path().join("managed_settings.json");
+
+        let core_hooks = serde_json::json!([
+            { "event": "PreToolUse", "command": "core-hook" }
+        ]);
+        let managed_hooks = serde_json::json!([
+            { "event": "PreToolUse", "command": "managed-hook" }
+        ]);
+        std::fs::write(
+            &user_path,
+            serde_json::to_string(&serde_json::json!({ "hooks": core_hooks })).unwrap(),
+        )
+        .unwrap();
+        write_managed(&managed_path, serde_json::json!({ "hooks": managed_hooks }));
+
+        let service = ConfigService::new(user_path, Some(project_path))
+            .with_managed_settings_path(managed_path);
+        let resolved = service.resolve().unwrap();
+
+        let layers = resolved
+            .hook_layers
+            .as_ref()
+            .expect("resolve must record hook layers");
+        assert_eq!(layers.core, Some(core_hooks));
+        assert_eq!(layers.managed, Some(managed_hooks.clone()));
+        assert_eq!(layers.plugin, None);
+        // Compatibility view: winner-take-all leaves only managed's document.
+        assert_eq!(resolved.hooks, Some(managed_hooks));
+
+        // The split is derived state; it must not leak into a written file.
+        let serialized = serde_json::to_value(&resolved).unwrap();
+        assert!(serialized.get("hook_layers").is_none());
     }
 
     #[test]

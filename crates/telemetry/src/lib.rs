@@ -24,6 +24,7 @@ mod uploader;
 pub use channels::{
     ChannelConfig, DATADOG_API_KEY_ENV, DATADOG_ENDPOINT_ENV, DATADOG_SITE_ENV, DD_API_KEY_ENV,
     DEFAULT_DATADOG_SITE, OTLP_ENDPOINT_ENV, OTLP_HEADERS_ENV, TelemetryChannels,
+    parse_otlp_headers,
 };
 pub use crash::{
     BacktraceSymbols, CRASH_VERBOSE_ENV, CrashReport, CrashReporter, DEFAULT_CRASH_RETENTION_DAYS,
@@ -116,6 +117,19 @@ impl TelemetryHandle {
     pub fn session_start(&self, session_id: String) {
         self.record(TelemetryEvent::SessionStart {
             session_id,
+            timestamp: chrono::Utc::now(),
+        });
+    }
+
+    /// Record a session-end event.
+    ///
+    /// Callers should record this once for each [`Self::session_start`] with
+    /// the same session id, so a session that never ends can be distinguished
+    /// from one that crashed.
+    pub fn session_end(&self, session_id: String, duration_secs: u64) {
+        self.record(TelemetryEvent::SessionEnd {
+            session_id,
+            duration_secs,
             timestamp: chrono::Utc::now(),
         });
     }
@@ -268,6 +282,72 @@ fn should_sample(sample_rate: f64, event: &TelemetryEvent) -> bool {
     json.hash(&mut hasher);
     let hash = hasher.finish();
     (hash as f64 / u64::MAX as f64) < sample_rate
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn store() -> (tempfile::TempDir, TelemetryStore) {
+        let dir = tempfile::tempdir().unwrap();
+        let store = TelemetryStore::open(&dir.path().join("telemetry.db")).unwrap();
+        (dir, store)
+    }
+
+    #[test]
+    fn disabled_config_does_not_create_an_uploader() {
+        let (_dir, store) = store();
+        let config = TelemetryConfig {
+            enabled: false,
+            ..TelemetryConfig::default()
+        };
+        let (_handle, uploader) = TelemetryHandle::new(store, Some(config));
+        assert!(
+            uploader.is_none(),
+            "an opted-out session must not spawn an uploader"
+        );
+    }
+
+    #[test]
+    fn enabled_config_creates_an_uploader() {
+        let (_dir, store) = store();
+        let config = TelemetryConfig {
+            enabled: true,
+            ..TelemetryConfig::default()
+        };
+        let (_handle, uploader) = TelemetryHandle::new(store, Some(config));
+        assert!(
+            uploader.is_some(),
+            "an opted-in session must expose the uploader task for the host to spawn"
+        );
+    }
+
+    #[test]
+    fn session_end_round_trips_through_the_store() {
+        let (_dir, store) = store();
+        let event = TelemetryEvent::SessionEnd {
+            session_id: "session-1".into(),
+            duration_secs: 42,
+            timestamp: chrono::Utc::now(),
+        };
+        store.insert(&event).unwrap();
+        let pending = store.pending_events(10).unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].event_type, "session_end");
+        assert!(pending[0].payload.contains("\"duration_secs\":42"));
+    }
+
+    #[test]
+    fn otlp_header_parser_skips_malformed_entries() {
+        let parsed = parse_otlp_headers(Some("Authorization=Bearer x,broken,  x-team = core "));
+        assert_eq!(
+            parsed,
+            vec![
+                ("Authorization".to_string(), "Bearer x".to_string()),
+                ("x-team".to_string(), "core".to_string()),
+            ]
+        );
+    }
 }
 
 /// Errors from telemetry operations.

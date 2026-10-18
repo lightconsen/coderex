@@ -695,7 +695,7 @@ impl Scrubber {
             TelemetryEvent::ToolUsed { tool_name, .. } => {
                 *tool_name = self.scrub(tool_name);
             }
-            TelemetryEvent::SessionStart { .. } => {}
+            TelemetryEvent::SessionStart { .. } | TelemetryEvent::SessionEnd { .. } => {}
         }
     }
 }

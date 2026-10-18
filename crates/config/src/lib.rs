@@ -30,8 +30,9 @@ pub use remote_settings::{
 #[cfg(feature = "hot-reload")]
 pub use settings::ConfigWatcher;
 pub use settings::{
-    CURRENT_SCHEMA_VERSION, ConfigDiff, ConfigDiffEntry, ConfigError, ConfigService,
-    RuntimeOverrides, Settings, config_home, migrate_settings, resolve_api_key,
+    CURRENT_SCHEMA_VERSION, ConfigDiff, ConfigDiffEntry, ConfigError, ConfigService, HookLayers,
+    MarketplaceSetting, PluginHostSettings, RuntimeOverrides, SessionOverrides, Settings,
+    config_home, migrate_settings, resolve_api_key,
 };
 #[cfg(feature = "enterprise")]
 pub use trusted_device::{

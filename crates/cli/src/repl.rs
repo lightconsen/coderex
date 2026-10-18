@@ -38,7 +38,7 @@ use coderex_tools::{
     register_builtin_tools,
 };
 use std::collections::HashMap;
-use std::io::{BufRead, Write};
+use std::io::Write;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -58,6 +58,489 @@ struct SessionEffects {
     extra_context: Vec<String>,
     /// Whether a title has been generated for this session.
     title_generated: bool,
+}
+
+// ─── Runtime tool handles ───────────────────────────────────────────────────
+//
+// `TeamCreate`, `TeamDelete`, `EnterWorktree`, `ExitWorktree`,
+// `ListMcpResources`, and `ReadMcpResource` are baseline tools that expect a
+// handle in `ToolContext.extra` under `TEAM_MANAGER_KEY`,
+// `WORKTREE_HANDLE_KEY`, and `MCP_RESOURCE_HANDLE_KEY`. The tools crate keeps
+// those types and keys private (`mod builtins` is not public), and the
+// dispatcher has no generic extra-injection setter, so the session cannot put
+// the handles into the context from here.
+//
+// What it can do is register a tool of the same name that delegates its
+// metadata to the built-in implementation and performs the work against the
+// concrete manager directly. `ToolRegistry::register` replaces by name, so
+// registering these after `register_builtin_tools` swaps the unusable built-in
+// for the wired one without changing the tool set the model sees.
+
+/// The live MCP manager slot shared with [`ReplLoop`].
+pub(crate) type McpManagerSlot =
+    Arc<std::sync::RwLock<Option<Arc<coderex_mcp::manager::McpManager>>>>;
+
+/// Shared team state for the `TeamCreate`/`TeamDelete` replacements.
+#[derive(Debug, Default)]
+pub(crate) struct TeamToolState {
+    manager: std::sync::Mutex<coderex_core::TeamManager>,
+}
+
+impl TeamToolState {
+    fn create(&self, name: &str) -> Result<String, String> {
+        let mut manager = self
+            .manager
+            .lock()
+            .map_err(|_| "team manager lock poisoned".to_string())?;
+        Ok(manager.create_team(name).id.clone())
+    }
+
+    fn delete(&self, team_id: &str) -> Result<(), String> {
+        let mut manager = self
+            .manager
+            .lock()
+            .map_err(|_| "team manager lock poisoned".to_string())?;
+        manager
+            .delete_team(team_id)
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+    }
+}
+
+/// Shared worktree state for the `EnterWorktree`/`ExitWorktree` replacements.
+///
+/// `base` is the checkout the session started in; worktrees are created under
+/// `<base>/.coderex/worktrees`, the same layout `--worktree` uses.
+pub(crate) struct WorktreeToolState {
+    base: std::path::PathBuf,
+    manager: std::sync::Mutex<coderex_core::worktree::WorktreeManager>,
+    active: std::sync::Mutex<Option<std::path::PathBuf>>,
+}
+
+impl WorktreeToolState {
+    fn new(base: &std::path::Path) -> Self {
+        let config = coderex_core::worktree::WorktreeConfig {
+            base_dir: base.join(".coderex").join("worktrees"),
+            ..coderex_core::worktree::WorktreeConfig::default()
+        };
+        Self {
+            base: base.to_path_buf(),
+            manager: std::sync::Mutex::new(coderex_core::worktree::WorktreeManager::new(config)),
+            active: std::sync::Mutex::new(None),
+        }
+    }
+
+    fn enter(&self, branch: Option<&str>) -> Result<String, String> {
+        let mut manager = self
+            .manager
+            .lock()
+            .map_err(|_| "worktree manager lock poisoned".to_string())?;
+        let created = manager
+            .create_worktree(&self.base, branch)
+            .map_err(|error| error.to_string())?;
+        *self
+            .active
+            .lock()
+            .map_err(|_| "worktree state lock poisoned".to_string())? =
+            Some(created.path.clone());
+        Ok(created.path.to_string_lossy().to_string())
+    }
+
+    fn exit(&self) -> Result<(), String> {
+        let Some(path) = self
+            .active
+            .lock()
+            .map_err(|_| "worktree state lock poisoned".to_string())?
+            .take()
+        else {
+            return Err("no active worktree".to_string());
+        };
+        let mut manager = self
+            .manager
+            .lock()
+            .map_err(|_| "worktree manager lock poisoned".to_string())?;
+        manager
+            .remove_worktree(&path)
+            .map_err(|error| error.to_string())
+    }
+}
+
+/// MCP resource access backed by the session's live manager.
+///
+/// Reads come from the manager's resource cache. The manager exposes no
+/// synchronous live-read entry point, so an uncached URI is reported as such
+/// instead of blocking the tool thread on an async server call.
+pub(crate) struct McpResourceToolState {
+    slot: McpManagerSlot,
+}
+
+impl McpResourceToolState {
+    fn list(&self) -> Vec<(String, String, String)> {
+        let Some(manager) = self.slot.read().unwrap().as_ref().cloned() else {
+            return Vec::new();
+        };
+        manager
+            .list_resources()
+            .into_iter()
+            .map(|uri| {
+                let name = uri.clone();
+                // The manager's listing carries only URIs; no MIME type is
+                // stored beside them.
+                (uri, name, String::new())
+            })
+            .collect()
+    }
+
+    fn read(&self, uri: &str) -> Result<String, String> {
+        let Some(manager) = self.slot.read().unwrap().as_ref().cloned() else {
+            return Err("no MCP manager is attached to this session".to_string());
+        };
+        for server in manager.list_servers() {
+            if let Some(content) = manager.get_cached_resource(&server, uri) {
+                if let Some(text) = content.text {
+                    return Ok(text);
+                }
+                if let Some(blob) = content.blob {
+                    return Ok(blob);
+                }
+                return Err(format!("resource '{uri}' has no text content"));
+            }
+        }
+        Err(format!(
+            "resource '{uri}' is not in the MCP resource cache; list resources after the \
+             server has discovered it"
+        ))
+    }
+}
+
+/// Concrete handles for the baseline tools that need runtime state.
+#[derive(Clone)]
+pub(crate) struct RuntimeToolHandles {
+    pub(crate) team: Arc<TeamToolState>,
+    pub(crate) worktree: Arc<WorktreeToolState>,
+    pub(crate) mcp: Arc<McpResourceToolState>,
+}
+
+impl RuntimeToolHandles {
+    pub(crate) fn new(cwd: &str, mcp_slot: &McpManagerSlot) -> Self {
+        Self {
+            team: Arc::new(TeamToolState::default()),
+            worktree: Arc::new(WorktreeToolState::new(std::path::Path::new(cwd))),
+            mcp: Arc::new(McpResourceToolState {
+                slot: Arc::clone(mcp_slot),
+            }),
+        }
+    }
+
+    /// Install the wired replacements into `registry`.
+    ///
+    /// Call after `register_builtin_tools`: registration is by name and the
+    /// later registration wins.
+    pub(crate) fn install(&self, registry: &mut ToolRegistry) {
+        Self::replace(registry, "TeamCreate", |original| {
+            Arc::new(TeamCreateWithState {
+                original,
+                state: Arc::clone(&self.team),
+            })
+        });
+        Self::replace(registry, "TeamDelete", |original| {
+            Arc::new(TeamDeleteWithState {
+                original,
+                state: Arc::clone(&self.team),
+            })
+        });
+        Self::replace(registry, "EnterWorktree", |original| {
+            Arc::new(EnterWorktreeWithState {
+                original,
+                state: Arc::clone(&self.worktree),
+            })
+        });
+        Self::replace(registry, "ExitWorktree", |original| {
+            Arc::new(ExitWorktreeWithState {
+                original,
+                state: Arc::clone(&self.worktree),
+            })
+        });
+        Self::replace(registry, "ListMcpResources", |original| {
+            Arc::new(ListMcpResourcesWithState {
+                original,
+                state: Arc::clone(&self.mcp),
+            })
+        });
+        Self::replace(registry, "ReadMcpResource", |original| {
+            Arc::new(ReadMcpResourceWithState {
+                original,
+                state: Arc::clone(&self.mcp),
+            })
+        });
+    }
+
+    fn replace(
+        registry: &mut ToolRegistry,
+        name: &str,
+        make: impl FnOnce(Arc<dyn coderex_tools::Tool>) -> Arc<dyn coderex_tools::Tool>,
+    ) {
+        if let Some(original) = registry.get_tool_arc(name) {
+            registry.register(make(original));
+        }
+    }
+}
+
+struct TeamCreateWithState {
+    original: Arc<dyn coderex_tools::Tool>,
+    state: Arc<TeamToolState>,
+}
+
+#[async_trait::async_trait]
+impl coderex_tools::Tool for TeamCreateWithState {
+    fn descriptor(&self) -> coderex_tools::ToolDescriptor {
+        self.original.descriptor()
+    }
+
+    fn capabilities(&self) -> coderex_tools::ToolCapabilities {
+        self.original.capabilities()
+    }
+
+    fn rule_exemptions_for(
+        &self,
+        input: &serde_json::Value,
+    ) -> coderex_tools::ToolRuleExemptions {
+        self.original.rule_exemptions_for(input)
+    }
+
+    async fn execute(
+        &self,
+        input: coderex_tools::ToolInput,
+        _ctx: coderex_tools::ToolContext<'_>,
+    ) -> Result<coderex_tools::ToolOutput, coderex_tools::ToolError> {
+        let name = input
+            .arguments
+            .get("name")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| coderex_tools::ToolError::InvalidInput {
+                message: "missing required field: name".into(),
+            })?;
+        let team_id =
+            self.state
+                .create(name)
+                .map_err(|message| coderex_tools::ToolError::InvalidInput {
+                    message,
+                })?;
+        Ok(coderex_tools::ToolOutput {
+            output: team_id,
+            is_display: true,
+        })
+    }
+}
+
+struct TeamDeleteWithState {
+    original: Arc<dyn coderex_tools::Tool>,
+    state: Arc<TeamToolState>,
+}
+
+#[async_trait::async_trait]
+impl coderex_tools::Tool for TeamDeleteWithState {
+    fn descriptor(&self) -> coderex_tools::ToolDescriptor {
+        self.original.descriptor()
+    }
+
+    fn capabilities(&self) -> coderex_tools::ToolCapabilities {
+        self.original.capabilities()
+    }
+
+    fn rule_exemptions_for(
+        &self,
+        input: &serde_json::Value,
+    ) -> coderex_tools::ToolRuleExemptions {
+        self.original.rule_exemptions_for(input)
+    }
+
+    async fn execute(
+        &self,
+        input: coderex_tools::ToolInput,
+        _ctx: coderex_tools::ToolContext<'_>,
+    ) -> Result<coderex_tools::ToolOutput, coderex_tools::ToolError> {
+        let team_id = input
+            .arguments
+            .get("team_id")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| coderex_tools::ToolError::InvalidInput {
+                message: "missing required field: team_id".into(),
+            })?;
+        self.state
+            .delete(team_id)
+            .map_err(|message| coderex_tools::ToolError::InvalidInput { message })?;
+        Ok(coderex_tools::ToolOutput {
+            output: format!("deleted {team_id}"),
+            is_display: true,
+        })
+    }
+}
+
+struct EnterWorktreeWithState {
+    original: Arc<dyn coderex_tools::Tool>,
+    state: Arc<WorktreeToolState>,
+}
+
+#[async_trait::async_trait]
+impl coderex_tools::Tool for EnterWorktreeWithState {
+    fn descriptor(&self) -> coderex_tools::ToolDescriptor {
+        self.original.descriptor()
+    }
+
+    fn capabilities(&self) -> coderex_tools::ToolCapabilities {
+        self.original.capabilities()
+    }
+
+    fn rule_exemptions_for(
+        &self,
+        input: &serde_json::Value,
+    ) -> coderex_tools::ToolRuleExemptions {
+        self.original.rule_exemptions_for(input)
+    }
+
+    async fn execute(
+        &self,
+        input: coderex_tools::ToolInput,
+        _ctx: coderex_tools::ToolContext<'_>,
+    ) -> Result<coderex_tools::ToolOutput, coderex_tools::ToolError> {
+        let branch = input
+            .arguments
+            .get("branch")
+            .and_then(serde_json::Value::as_str);
+        let path = self
+            .state
+            .enter(branch)
+            .map_err(|message| coderex_tools::ToolError::InvalidInput { message })?;
+        Ok(coderex_tools::ToolOutput {
+            output: path,
+            is_display: true,
+        })
+    }
+}
+
+struct ExitWorktreeWithState {
+    original: Arc<dyn coderex_tools::Tool>,
+    state: Arc<WorktreeToolState>,
+}
+
+#[async_trait::async_trait]
+impl coderex_tools::Tool for ExitWorktreeWithState {
+    fn descriptor(&self) -> coderex_tools::ToolDescriptor {
+        self.original.descriptor()
+    }
+
+    fn capabilities(&self) -> coderex_tools::ToolCapabilities {
+        self.original.capabilities()
+    }
+
+    fn rule_exemptions_for(
+        &self,
+        input: &serde_json::Value,
+    ) -> coderex_tools::ToolRuleExemptions {
+        self.original.rule_exemptions_for(input)
+    }
+
+    async fn execute(
+        &self,
+        _input: coderex_tools::ToolInput,
+        _ctx: coderex_tools::ToolContext<'_>,
+    ) -> Result<coderex_tools::ToolOutput, coderex_tools::ToolError> {
+        self.state
+            .exit()
+            .map_err(|message| coderex_tools::ToolError::InvalidInput { message })?;
+        Ok(coderex_tools::ToolOutput {
+            output: "exited".into(),
+            is_display: true,
+        })
+    }
+}
+
+struct ListMcpResourcesWithState {
+    original: Arc<dyn coderex_tools::Tool>,
+    state: Arc<McpResourceToolState>,
+}
+
+#[async_trait::async_trait]
+impl coderex_tools::Tool for ListMcpResourcesWithState {
+    fn descriptor(&self) -> coderex_tools::ToolDescriptor {
+        self.original.descriptor()
+    }
+
+    fn capabilities(&self) -> coderex_tools::ToolCapabilities {
+        self.original.capabilities()
+    }
+
+    fn rule_exemptions_for(
+        &self,
+        input: &serde_json::Value,
+    ) -> coderex_tools::ToolRuleExemptions {
+        self.original.rule_exemptions_for(input)
+    }
+
+    async fn execute(
+        &self,
+        _input: coderex_tools::ToolInput,
+        _ctx: coderex_tools::ToolContext<'_>,
+    ) -> Result<coderex_tools::ToolOutput, coderex_tools::ToolError> {
+        let resources: Vec<_> = self
+            .state
+            .list()
+            .into_iter()
+            .map(|(uri, name, mime_type)| {
+                serde_json::json!({ "uri": uri, "name": name, "mime_type": mime_type })
+            })
+            .collect();
+        Ok(coderex_tools::ToolOutput {
+            output: serde_json::to_string_pretty(&resources).unwrap_or_else(|_| "[]".into()),
+            is_display: true,
+        })
+    }
+}
+
+struct ReadMcpResourceWithState {
+    original: Arc<dyn coderex_tools::Tool>,
+    state: Arc<McpResourceToolState>,
+}
+
+#[async_trait::async_trait]
+impl coderex_tools::Tool for ReadMcpResourceWithState {
+    fn descriptor(&self) -> coderex_tools::ToolDescriptor {
+        self.original.descriptor()
+    }
+
+    fn capabilities(&self) -> coderex_tools::ToolCapabilities {
+        self.original.capabilities()
+    }
+
+    fn rule_exemptions_for(
+        &self,
+        input: &serde_json::Value,
+    ) -> coderex_tools::ToolRuleExemptions {
+        self.original.rule_exemptions_for(input)
+    }
+
+    async fn execute(
+        &self,
+        input: coderex_tools::ToolInput,
+        _ctx: coderex_tools::ToolContext<'_>,
+    ) -> Result<coderex_tools::ToolOutput, coderex_tools::ToolError> {
+        let uri = input
+            .arguments
+            .get("uri")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| coderex_tools::ToolError::InvalidInput {
+                message: "missing required field: uri".into(),
+            })?;
+        let content = self
+            .state
+            .read(uri)
+            .map_err(|message| coderex_tools::ToolError::InvalidInput { message })?;
+        Ok(coderex_tools::ToolOutput {
+            output: content,
+            is_display: true,
+        })
+    }
 }
 
 /// Translate a teammate callback event into the parent engine's lifecycle
@@ -337,6 +820,75 @@ fn protocol_frame(
             )]),
         }),
         _ => return None,
+    })
+}
+
+/// Requests whose `allow_session` bit is true, keyed by request id.
+///
+/// Shared between the turn loop (which emits the request) and the stdin
+/// reader (which decides whether an `allow_session` answer may become
+/// [`ConfirmationResponse::ApproveSession`]).
+type PermissionSessionApprovals = std::sync::Arc<std::sync::Mutex<HashMap<String, bool>>>;
+
+/// Turn one stdin line into a bus response.
+///
+/// `None` for anything that is not a usable `control_response`; the reader
+/// ignores those lines rather than treating a chatty host as an error.
+///
+/// An `error` answer denies the tool: failing closed is the only safe reading
+/// of "the host could not answer". A session-wide approval is honoured only
+/// when the original request offered it — otherwise it degrades to a
+/// single-call approval instead of widening silently.
+fn control_response_from_line(
+    line: &str,
+    request_allows_session: bool,
+) -> Option<(String, ConfirmationResponse)> {
+    use coderex_events::protocol::{ControlDecision, ControlResponseFrame};
+
+    let frame = ControlResponseFrame::parse_line(line).ok()?;
+    let request_id = frame.response.request_id.clone();
+    let response = match frame.decision().ok()? {
+        ControlDecision::Allow => ConfirmationResponse::Approved,
+        ControlDecision::AllowSession if request_allows_session => {
+            ConfirmationResponse::ApproveSession
+        }
+        ControlDecision::AllowSession => ConfirmationResponse::Approved,
+        ControlDecision::Deny | ControlDecision::Error(_) => ConfirmationResponse::Denied,
+    };
+    Some((request_id, response))
+}
+
+/// Read `control_response` lines from stdin for one turn.
+///
+/// Unknown and malformed lines are ignored: stdin is shared with whatever
+/// else the host sends, and one bad line must not strand the turn. EOF ends
+/// the reader silently. The task is aborted when the turn ends.
+fn spawn_headless_control_reader(
+    bus: ConfirmationBus,
+    approvals: PermissionSessionApprovals,
+) -> tokio::task::JoinHandle<()> {
+    use tokio::io::AsyncBufReadExt as _;
+
+    tokio::spawn(async move {
+        let mut lines =
+            tokio::io::BufReader::new(tokio::io::stdin()).lines();
+        while let Ok(Some(line)) = lines.next_line().await {
+            // Parse the id once to look up whether this request permitted a
+            // session-wide answer; the helper re-parses the same line to
+            // apply the mapping.
+            let Ok(frame) = coderex_events::protocol::ControlResponseFrame::parse_line(&line)
+            else {
+                continue;
+            };
+            let request_id = &frame.response.request_id;
+            let allowed = approvals
+                .lock()
+                .map(|approvals| approvals.get(request_id).copied().unwrap_or(false))
+                .unwrap_or(false);
+            if let Some((request_id, response)) = control_response_from_line(&line, allowed) {
+                bus.respond(&request_id, response).await;
+            }
+        }
     })
 }
 
@@ -652,6 +1204,116 @@ impl coderex_workflow::AgentRunner for WorkflowAgentRunner {
     }
 }
 
+/// The Workflow tool, with its enablement decided per call.
+///
+/// `--betas` is applied in [`ReplLoop::apply_cli_config`], after
+/// [`ReplLoop::with_engine`] has built and shared the tool registry. The
+/// registry is immutable once shared, so a plain `WorkflowTool` frozen its
+/// `enabled` bit at construction and `--betas +workflow_scripts` could not
+/// reach it. This wrapper keeps the bit shared: the descriptor (what the model
+/// is offered) and the execute gate both read it, so the later overlay turns
+/// the already-registered tool on without rebuilding the registry.
+struct BetaGatedWorkflowTool {
+    inner: coderex_workflow::WorkflowTool,
+    enabled: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl BetaGatedWorkflowTool {
+    fn new(inner: coderex_workflow::WorkflowTool) -> Self {
+        Self {
+            // The inner tool always accepts calls; the wrapper is the gate.
+            inner: inner.with_enabled(true),
+            enabled: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        }
+    }
+
+    fn enabled_flag(&self) -> Arc<std::sync::atomic::AtomicBool> {
+        Arc::clone(&self.enabled)
+    }
+
+    fn set_enabled(&self, enabled: bool) {
+        self.enabled
+            .store(enabled, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+#[async_trait::async_trait]
+impl coderex_tools::Tool for BetaGatedWorkflowTool {
+    fn descriptor(&self) -> coderex_tools::ToolDescriptor {
+        let mut descriptor = self.inner.descriptor();
+        descriptor.is_enabled = self
+            .enabled
+            .load(std::sync::atomic::Ordering::Relaxed);
+        descriptor
+    }
+
+    async fn execute(
+        &self,
+        input: coderex_tools::ToolInput,
+        ctx: coderex_tools::ToolContext<'_>,
+    ) -> Result<coderex_tools::ToolOutput, coderex_tools::ToolError> {
+        if !self
+            .enabled
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            return Err(coderex_tools::ToolError::InvalidInput {
+                message: "workflow scripts are not enabled in this session — set \
+                          --betas +workflow_scripts (or \
+                          CODEREX_FEATURE_FLAGS=+workflow_scripts) to turn them on"
+                    .to_string(),
+            });
+        }
+        self.inner.execute(input, ctx).await
+    }
+}
+
+/// Resolve the organization scope for org memory.
+///
+/// `CODEREX_ORG_ID` wins; otherwise the org id from the remote-managed
+/// settings cache (written by the orchestrator's startup phase) is used. An
+/// absent or blank value leaves org memory unconfigured rather than inventing
+/// a scope, which would silently mix organizations.
+fn configured_org_id(raw: Option<String>) -> Option<String> {
+    raw.map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+/// The org id from a remote-settings cache document.
+///
+/// Kept as a pure parse so the file layout is tested without touching the
+/// developer's real config home.
+fn org_id_from_remote_settings_json(json: &str) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_str(json).ok()?;
+    configured_org_id(
+        value
+            .get("settings")?
+            .get("org_id")?
+            .as_str()
+            .map(str::to_string),
+    )
+}
+
+/// Read the org id the orchestrator cached, when remote settings configured one.
+fn cached_org_id() -> Option<String> {
+    let path = coderex_config::config_home().join("remote_settings_cache.json");
+    let document = std::fs::read_to_string(path).ok()?;
+    org_id_from_remote_settings_json(&document)
+}
+
+/// Build the org-scoped store, when an organization is configured.
+fn org_memory_service(
+    memory_base: &std::path::Path,
+    org_id: Option<String>,
+) -> Option<Arc<TeamMemorySyncService>> {
+    org_id.map(|org_id| {
+        Arc::new(TeamMemorySyncService::new_with_org(
+            "default".to_string(),
+            memory_base.join("org"),
+            org_id,
+        ))
+    })
+}
+
 pub struct ReplLoop {
     /// Command registry.
     commands: CommandRegistry,
@@ -720,6 +1382,16 @@ pub struct ReplLoop {
     /// Lifecycle hooks from settings, installed on the engine by
     /// [`apply_cli_config`](Self::apply_cli_config).
     hooks_settings: Option<serde_json::Value>,
+    /// The same hooks split by source tier, when the settings service resolved
+    /// them.
+    ///
+    /// [`hooks_settings`](Self::hooks_settings) is the merged view kept for
+    /// compatibility. When this is present it is authoritative for
+    /// installation: managed hooks are installed as
+    /// [`HookTier::Managed`](coderex_hooks::HookTier::Managed) and the core
+    /// document is installed as `Core`, so a managed hook neither loses its
+    /// position nor runs a second time through the merged document.
+    hook_layers: Option<coderex_config::settings::HookLayers>,
     /// Where the line-delimited protocol goes, when `--output-format
     /// stream-json` was asked for.
     ///
@@ -727,6 +1399,14 @@ pub struct ReplLoop {
     /// boxed rather than pinned to `Stdout` so a test can read back what a turn
     /// emitted.
     protocol_sink: Option<coderex_events::MessageSink<Box<dyn std::io::Write + Send>>>,
+    /// Whether a headless turn negotiates tool approvals over stdin.
+    ///
+    /// Enabled only when the host can answer (see
+    /// [`with_headless_permission_control`](Self::with_headless_permission_control)):
+    /// a `can_use_tool` request goes out on the protocol sink and a
+    /// `control_response` line is read from stdin. When this is off, an `Ask`
+    /// keeps the pre-existing headless behaviour (the tool does not run).
+    headless_permission_control: bool,
     /// Pending destructive command awaiting confirmation.
     pending_destructive_cmd: Option<(String, Vec<String>)>,
     /// Plugin manager for dynamic plugin commands and tools.
@@ -801,6 +1481,11 @@ pub struct ReplLoop {
     /// Feature flags resolved for this session: the environment plus
     /// `--betas` overrides.
     feature_flags: coderex_config::flags::FeatureFlags,
+    /// Shared enable bit of the already-registered Workflow tool.
+    ///
+    /// The registry is built before `--betas` is applied and cannot be
+    /// mutated afterwards, so the tool reads this bit on every call.
+    workflow_enabled: Arc<std::sync::atomic::AtomicBool>,
     /// Capabilities derived from [`Self::feature_flags`].
     capabilities: coderex_config::flags::CapabilitySet,
     /// Settings-file context-window overrides, layered into the engine's
@@ -933,10 +1618,15 @@ impl ReplLoop {
             dream_shutdown_tx: None,
             team_memory_service: None,
             memory_writable: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            workflow_enabled: Arc::new(std::sync::atomic::AtomicBool::new(
+                coderex_config::flags::FeatureFlags::from_env().workflow_scripts,
+            )),
             command_history: CommandHistory::new(1000),
             macro_registry: MacroRegistry::new(),
             hooks_settings: None,
+            hook_layers: None,
             protocol_sink: None,
+            headless_permission_control: false,
             pending_destructive_cmd: None,
             plugin_manager: None,
             _primary_tool_executor: None,
@@ -1045,15 +1735,29 @@ impl ReplLoop {
         // The model-facing memory family. A write to a shared store is decided
         // by the model rather than assumed safe, and the service refuses such a
         // write outright when no classifier is installed.
-        let memory_service = Arc::new(
-            coderex_memory::service::MemoryService::new(
-                Arc::clone(&long_term_store),
-                Arc::clone(&team_memory_service),
-            )
-            .with_classifier(Arc::new(
-                crate::memory_tools::ModelMemoryClassifier::new(api_client.clone_box()),
-            )),
-        );
+        //
+        // `org` is part of the advertised store set, so it has to be wired, not
+        // merely named. The explicit environment override wins; otherwise the
+        // org id from the orchestrator's remote-settings cache is used. When
+        // neither exists the org store stays unconfigured and the tools report
+        // that honestly.
+        let org_id = configured_org_id(std::env::var("CODEREX_ORG_ID").ok())
+            .or_else(cached_org_id);
+        if org_id.is_none() {
+            tracing::debug!("no organization id configured; org memory is not configured");
+        }
+        let org_memory_service = org_memory_service(&memory_base, org_id);
+        let mut memory_service = coderex_memory::service::MemoryService::new(
+            Arc::clone(&long_term_store),
+            Arc::clone(&team_memory_service),
+        )
+        .with_classifier(Arc::new(
+            crate::memory_tools::ModelMemoryClassifier::new(api_client.clone_box()),
+        ));
+        if let Some(org) = org_memory_service {
+            memory_service = memory_service.with_org(org);
+        }
+        let memory_service = Arc::new(memory_service);
         let memory_writable = Arc::new(std::sync::atomic::AtomicBool::new(true));
 
         let engine = QueryEngine::new(
@@ -1093,6 +1797,12 @@ impl ReplLoop {
         let mcp_slot: Arc<std::sync::RwLock<Option<Arc<coderex_mcp::manager::McpManager>>>> =
             Arc::new(std::sync::RwLock::new(None));
         let mcp_for_subagents = Arc::clone(&mcp_slot);
+        // Team and MCP-resource state is session-wide; the worktree state is
+        // per checkout, so the sub-agent factory builds its own from the
+        // child's cwd.
+        let runtime_handles = RuntimeToolHandles::new(&cwd, &mcp_slot);
+        let subagent_team = Arc::clone(&runtime_handles.team);
+        let subagent_mcp = Arc::clone(&runtime_handles.mcp);
         // Background tools run inside a sub-agent's turn too, and a job record
         // written there must still name the session that owns it.
         let subagent_session_id = session_id.to_string();
@@ -1102,6 +1812,12 @@ impl ReplLoop {
             if let Some(mcp) = mcp_for_subagents.read().unwrap().as_ref() {
                 mcp.register_tools_into(&registry);
             }
+            RuntimeToolHandles {
+                team: Arc::clone(&subagent_team),
+                worktree: Arc::new(WorktreeToolState::new(&cwd)),
+                mcp: Arc::clone(&subagent_mcp),
+            }
+            .install(&mut registry);
             let executor = Arc::new(ToolsExecutor::new(ExecutionConfig::default()));
             let mut dispatcher = RegistryToolDispatcher::new(
                 Arc::new(registry),
@@ -1133,6 +1849,10 @@ impl ReplLoop {
 
         let mut registry = ToolRegistry::new();
         register_builtin_tools(&mut registry);
+        // Replace the six handle-driven baseline tools with implementations
+        // that own the concrete managers. The originals would find no handle
+        // in `ToolContext.extra` and fail every call.
+        runtime_handles.install(&mut registry);
         registry.register(Arc::new(
             AgentTool::new()
                 .with_manager(Arc::clone(&agent_manager))
@@ -1143,18 +1863,22 @@ impl ReplLoop {
                 }),
         ));
         // Workflow scripts spawn agents, so they are opt-in: the flag is what
-        // turns the tool from "not enabled" into callable.
+        // turns the tool from "not enabled" into callable. `--betas` is
+        // applied after this registry exists, so the wrapper shares the bit
+        // with `apply_cli_config` rather than freezing it here.
         let workflows_enabled = coderex_config::flags::FeatureFlags::from_env().workflow_scripts;
-        registry.register(Arc::new(
+        let workflow_tool = BetaGatedWorkflowTool::new(
             coderex_workflow::WorkflowTool::new(Arc::new(WorkflowAgentRunner {
                 manager: Arc::clone(&agent_manager),
                 session_id: session_id.to_string(),
                 cwd: cwd.clone(),
             }))
-            .with_enabled(workflows_enabled)
             .with_root(coderex_workflow::default_root())
             .with_project_dir(std::path::Path::new(&cwd).join(".coderex/workflows")),
-        ));
+        );
+        workflow_tool.set_enabled(workflows_enabled);
+        let workflow_enabled = workflow_tool.enabled_flag();
+        registry.register(Arc::new(workflow_tool));
         for tool in crate::memory_tools::memory_tools(Arc::clone(&memory_service), &memory_writable)
         {
             registry.register(tool);
@@ -1250,10 +1974,13 @@ impl ReplLoop {
             dream_shutdown_tx: None,
             team_memory_service: Some(team_memory_service),
             memory_writable,
+            workflow_enabled,
             command_history: CommandHistory::new(1000),
             macro_registry: MacroRegistry::new(),
             hooks_settings: None,
+            hook_layers: None,
             protocol_sink: None,
+            headless_permission_control: false,
             pending_destructive_cmd: None,
             plugin_manager: None,
             _primary_tool_executor: Some(primary_executor),
@@ -1458,6 +2185,15 @@ impl ReplLoop {
         self.hooks_settings = hooks;
     }
 
+    /// Attach the hook documents split by source tier (see
+    /// [`ConfigService::resolve`](coderex_config::settings::ConfigService::resolve)).
+    ///
+    /// When set, this supersedes [`with_hooks`](Self::with_hooks) at
+    /// installation time.
+    pub fn with_hook_layers(&mut self, layers: Option<coderex_config::settings::HookLayers>) {
+        self.hook_layers = layers;
+    }
+
     /// Emit the line-delimited protocol on stdout as the turn runs.
     ///
     /// This is the `stream-json` output format: one JSON object per line, for a
@@ -1468,6 +2204,24 @@ impl ReplLoop {
         sink: Option<coderex_events::MessageSink<Box<dyn std::io::Write + Send>>>,
     ) {
         self.protocol_sink = sink;
+    }
+
+    /// Answer tool approvals over the stream-json control channel.
+    ///
+    /// The caller must only enable this when stdin is free for the host's
+    /// `control_response` lines: in practice, `--print --output-format
+    /// stream-json` with the prompt given positionally. Interactive sessions
+    /// and a prompt read from stdin keep it off.
+    pub fn with_headless_permission_control(&mut self, enabled: bool) {
+        self.headless_permission_control = enabled;
+    }
+
+    /// Test accessor for the gate that
+    /// [`with_headless_permission_control`](Self::with_headless_permission_control)
+    /// sets.
+    #[cfg(test)]
+    pub(crate) fn headless_permission_control(&self) -> bool {
+        self.headless_permission_control
     }
 
     pub fn with_no_persistence(&mut self, no_persist: bool) {
@@ -1500,6 +2254,20 @@ impl ReplLoop {
 
     pub fn with_betas(&mut self, betas: Vec<String>) {
         self.betas = betas;
+    }
+
+    /// Replace the base system prompt (`--system-prompt`).
+    ///
+    /// Interactive sessions receive this from the orchestrator's
+    /// [`configure_repl`](crate::orchestrator::StartupOrchestrator::configure_repl);
+    /// without the setter the flag was parsed and then silently ignored.
+    pub fn with_system_prompt(&mut self, prompt: Option<String>) {
+        self.session_effects.override_system_prompt = prompt;
+    }
+
+    /// Append text to the system prompt (`--append-system-prompt`).
+    pub fn with_append_system_prompt(&mut self, prompt: Option<String>) {
+        self.session_effects.append_system_prompt = prompt;
     }
 
     /// Attach pull-request context fetched for `--from-pr`.
@@ -1744,9 +2512,13 @@ impl ReplLoop {
             }
         }
 
-        // 9a. The dispatcher was built before `--betas` was resolved. Its flag
-        // is shared, so the session's final capability set can still decide
-        // whether gated tools are offered.
+        // 9a. The dispatcher and the Workflow tool were built before `--betas`
+        // was resolved. Both bits are shared, so the session's final flag set
+        // still decides whether the tools are offered and callable.
+        self.workflow_enabled.store(
+            self.feature_flags.workflow_scripts,
+            std::sync::atomic::Ordering::Relaxed,
+        );
         if let Some(dispatcher) = &self.dispatcher {
             dispatcher.set_feature_flags_enabled(!self.capabilities.is_empty());
         }
@@ -1795,10 +2567,8 @@ impl ReplLoop {
             tracing::debug!("tmux session/title was applied before startup");
         }
 
-        // 12. The one flag still accepted without behaviour (owned elsewhere).
-        // 12. Every accepted flag now has behavior; the call stays so a future
-        // flag that is accepted without an implementation is still reported.
-        self.warn_about_unimplemented_flags();
+        // 12. Every accepted flag now has behavior; there is no list of
+        // accepted-but-unimplemented flags to warn about.
 
         // 14. Debug file — log that it would be configured
         if let Some(ref debug_path) = self.debug_file {
@@ -1812,12 +2582,33 @@ impl ReplLoop {
         // was parsed, validated, and then did nothing whatsoever. This is the
         // call that makes a configured event actually fire.
         //
-        // These hooks come from settings, which a repository can write, so they
-        // are loaded in the `Core` tier — a managed policy hook runs ahead of
-        // them regardless of the priority they give themselves.
-        if let Some(ref hooks) = self.hooks_settings {
+        // Hooks from user/project settings come from a source a repository can
+        // write, so they are loaded in the `Core` tier. Managed hooks come from
+        // an administrator-controlled carrier and are loaded separately as
+        // `Managed`, ahead of every core hook regardless of priority. The two
+        // documents are never combined first: doing that would either demote
+        // the managed hooks or run them twice.
+        //
+        // `hook_layers` is the resolved split. `hooks_settings` alone is the
+        // compatibility path for a hand-built `Settings` (and for callers of
+        // `with_hooks`), where the merged value is treated as core.
+        let mut hook_sources: Vec<(coderex_hooks::HookTier, &serde_json::Value)> = Vec::new();
+        if let Some(layers) = self.hook_layers.as_ref() {
+            if let Some(value) = &layers.managed {
+                hook_sources.push((coderex_hooks::HookTier::Managed, value));
+            }
+            if let Some(value) = &layers.plugin {
+                hook_sources.push((coderex_hooks::HookTier::Plugin, value));
+            }
+            if let Some(value) = &layers.core {
+                hook_sources.push((coderex_hooks::HookTier::Core, value));
+            }
+        } else if let Some(hooks) = &self.hooks_settings {
+            hook_sources.push((coderex_hooks::HookTier::Core, hooks));
+        }
+        if !hook_sources.is_empty() {
             if let Some(ref mut engine) = self.engine {
-                match coderex_hooks::HookRegistry::from_settings_json(hooks) {
+                match coderex_hooks::HookRegistry::from_settings_sources(hook_sources) {
                     Ok(registry) => {
                         // Three kinds — `prompt`, `agent`, `mcp_tool` — need a
                         // model client and the tool registry, which the hooks
@@ -1890,25 +2681,6 @@ impl ReplLoop {
             engine.set_model(self.model.clone());
             engine.set_max_tokens(self.max_tokens);
         }
-    }
-
-    /// Say plainly which flags this build accepts but does not act on.
-    ///
-    /// They are still accepted so a script written against the full CLI does
-    /// not fail on an unknown argument, but a person reading the output should
-    /// not have to guess whether `--ide` did anything.
-    fn warn_about_unimplemented_flags(&self) {
-        // Every flag that used to be listed here now has real behavior:
-        // `--betas`, `--from-pr`, `--ide`, `--tmux` and `--agent`.
-        let unimplemented: Vec<&str> = Vec::new();
-
-        if unimplemented.is_empty() {
-            return;
-        }
-        tracing::warn!(
-            flags = %unimplemented.join(", "),
-            "these flags were accepted but this build does not act on them"
-        );
     }
 
     /// Create a worktree and move the session into it.
@@ -2234,72 +3006,6 @@ impl ReplLoop {
                 None
             }
         }
-    }
-
-    /// Run the interactive REPL loop reading from stdin.
-    ///
-    /// Artifacts are served from a loopback origin here too, because a page
-    /// published in the plain (non-TUI) REPL is only useful if there is
-    /// something to open it. The server is shut down on every exit path.
-    pub async fn run_interactive(&mut self) -> Result<()> {
-        self.start_artifact_serving().await;
-        let result = self.run_interactive_loop().await;
-        self.stop_artifact_serving().await;
-        result
-    }
-
-    async fn run_interactive_loop(&mut self) -> Result<()> {
-        let stdin = std::io::stdin();
-        let stdout = std::io::stdout();
-        let mut stdout = stdout.lock();
-
-        crate::welcome::print_welcome_screen(
-            &mut stdout,
-            env!("CARGO_PKG_VERSION"),
-            &self.model.0,
-            &self.cwd,
-            self.engine.is_some(),
-        )?;
-
-        loop {
-            if !self.running {
-                break;
-            }
-
-            // Drain any cron fire events
-            if let Some(ref mut rx) = self.cron_rx {
-                while let Ok((job_id, prompt)) = rx.try_recv() {
-                    writeln!(stdout, "[Cron {job_id}] {prompt}")?;
-                    // The runner only yields; recording the fire (and retiring
-                    // a one-shot definition) is the consumer's job.
-                    if let Some(scheduler) =
-                        self.dispatcher.as_ref().and_then(|d| d.cron_scheduler())
-                    {
-                        scheduler.mark_fired(&job_id);
-                    }
-                }
-            }
-
-            write!(stdout, "❯ ")?;
-            stdout.flush()?;
-
-            let mut line = String::new();
-            let bytes = stdin.lock().read_line(&mut line)?;
-            if bytes == 0 {
-                // EOF (Ctrl+D)
-                break;
-            }
-
-            let line = line.trim_end();
-            if line.is_empty() {
-                continue;
-            }
-
-            self.handle_input(line, &mut stdout).await?;
-        }
-
-        writeln!(stdout, "\nGoodbye!")?;
-        Ok(())
     }
 
     /// Run the interactive REPL with full ratatui TUI.
@@ -2803,9 +3509,16 @@ impl ReplLoop {
                                 VimAction::Insert => {
                                     if vim.is_insert() {
                                         match key.code {
-                                            KeyCode::Char(c) => {
+                                            // A control character never enters the
+                                            // single-line buffer, whichever encoding
+                                            // delivered it. `key_event_to_action` guards
+                                            // this at the other input boundary; this
+                                            // inline Vim insert path has to apply the
+                                            // same rule.
+                                            KeyCode::Char(c) if !c.is_control() => {
                                                 ui_state.input.apply(&InputAction::InsertChar(c));
                                             }
+                                            KeyCode::Char(_) => {}
                                             KeyCode::Backspace => {
                                                 ui_state.input.apply(&InputAction::Backspace);
                                             }
@@ -2889,7 +3602,10 @@ impl ReplLoop {
                                 }
                                 VimAction::Paste => {
                                     let yanked = vim.yanked().to_string();
-                                    for c in yanked.chars() {
+                                    // The register is text from this buffer today,
+                                    // but paste is still an insertion path: never
+                                    // let it carry a control character in.
+                                    for c in yanked.chars().filter(|c| !c.is_control()) {
                                         ui_state.input.apply(&InputAction::InsertChar(c));
                                     }
                                 }
@@ -4249,6 +4965,45 @@ impl ReplLoop {
         // `self` so the turn can hold it across the loop below without
         // borrowing the whole REPL.
         let mut protocol = self.protocol_sink.take();
+
+        // The headless control channel, when the host asked for one and can
+        // answer: the engine's `Ask` becomes a `control_request` on the
+        // protocol sink and the host's answer comes back on stdin. When it is
+        // off the engine keeps its existing headless behaviour (the tool does
+        // not run), so nothing changes for callers that opted out.
+        //
+        // A host that never answers leaves the turn waiting on the bus. That
+        // is deliberate: a timeout would turn a slow person into a silent
+        // denial. Turn shutdown and process exit drop the pending responders
+        // with the bus.
+        let permission_bus = if self.headless_permission_control && protocol.is_some() {
+            let bus = ConfirmationBus::new(16);
+            self.confirmation_bus = Some(bus.clone());
+            Some(bus)
+        } else {
+            None
+        };
+        let permission_approvals: PermissionSessionApprovals =
+            std::sync::Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let (permission_tx, mut permission_rx) =
+            tokio::sync::mpsc::unbounded_channel::<ConfirmationRequest>();
+        let mut permission_forwarder = permission_bus.as_ref().map(|bus| {
+            let bus = bus.clone();
+            tokio::spawn(async move {
+                while let Some(request) = bus.next_request().await {
+                    if permission_tx.send(request).is_err() {
+                        break;
+                    }
+                }
+            })
+        });
+        let mut permission_reader = permission_bus.as_ref().map(|bus| {
+            spawn_headless_control_reader(
+                bus.clone(),
+                std::sync::Arc::clone(&permission_approvals),
+            )
+        });
+
         let session_id = self.current_session_id().unwrap_or_default();
         let turn_started = std::time::Instant::now();
         // Watched in the loop rather than drained at the end, so the host sees
@@ -4257,6 +5012,11 @@ impl ReplLoop {
 
         let options = self.build_submit_options();
         let mut engine = self.engine.take().unwrap();
+        // Installed before the turn task starts so an `Ask` on the very first
+        // tool call sees the bus.
+        if let Some(bus) = permission_bus.as_ref() {
+            engine.set_confirmation_bus(bus.clone());
+        }
         let prompt_owned = prompt.to_string();
         // A channel rather than a one-shot: the wait for it happens inside
         // `select!`, and a one-shot receiver is consumed by its own future —
@@ -4269,7 +5029,7 @@ impl ReplLoop {
             let result = engine.submit_streaming(prompt_owned, options).await;
             let _ = engine_tx.send((engine, result)).await;
         });
-        let (engine, result) = loop {
+        let (mut engine, result) = loop {
             tokio::select! {
             Some(event) = async {
                 match live_events.as_mut() {
@@ -4312,17 +5072,61 @@ impl ReplLoop {
                 let answers = serde_json::json!({ "answer": answer });
                 let _ = request.response_tx.send(answers);
             }
+            Some(request) = permission_rx.recv(), if permission_forwarder.is_some() => {
+                // Record whether a session-wide answer is allowed before the
+                // frame reaches the host, so an immediate reply cannot race
+                // the mapping.
+                if let Ok(mut approvals) = permission_approvals.lock() {
+                    approvals.insert(request.id.clone(), request.allow_session);
+                }
+                if let Some(sink) = protocol.as_mut() {
+                    let frame = coderex_events::protocol::ControlRequestFrame::can_use_tool(
+                        request.id.clone(),
+                        request.tool_name.clone(),
+                        permission_request_args(&request.arguments),
+                        request.reason.clone(),
+                        request.allow_session,
+                    );
+                    if let Err(error) =
+                        sink.emit(&coderex_events::ProtocolMessage::ControlRequest(frame))
+                    {
+                        tracing::warn!("could not write a control request: {error}");
+                    }
+                }
+            }
             received = engine_rx.recv() => {
                 match received {
                     Some(handoff) => break handoff,
                     // The task is gone and took the engine with it. Say so
                     // rather than waiting for a handoff that cannot come.
                     None => {
+                        if let Some(handle) = permission_forwarder.take() {
+                            handle.abort();
+                        }
+                        if let Some(handle) = permission_reader.take() {
+                            handle.abort();
+                        }
                         return "the query task ended without returning its engine".to_string();
                     }
                 }
             }            }
         };
+
+        // The turn is over: no further request can arrive, and a reader left
+        // blocked on stdin would outlive the turn.
+        if let Some(handle) = permission_forwarder.take() {
+            handle.abort();
+        }
+        if let Some(handle) = permission_reader.take() {
+            handle.abort();
+        }
+        // The bus belonged to this turn. Leave it installed and a later turn
+        // without the control channel would ask a host that is no longer
+        // listening and wait forever.
+        if permission_bus.is_some() {
+            engine.clear_confirmation_bus();
+            self.confirmation_bus = None;
+        }
 
         self.engine = Some(engine);
         self.event_rx = live_events;
@@ -5174,27 +5978,6 @@ impl ReplLoop {
                 folded: false,
             });
         }
-    }
-
-    async fn handle_input(&mut self, line: &str, stdout: &mut impl Write) -> std::io::Result<()> {
-        if line.starts_with('/') {
-            self.execute_command(line, stdout).await?;
-        } else if line.starts_with('#') {
-            // Comment line, ignore
-        } else {
-            // 14.1: Route to QueryEngine instead of placeholder
-            if self.engine.is_some() {
-                self.history.push(line.to_string());
-                let output = self.submit_prompt(line, false).await;
-                writeln!(stdout, "{output}")?;
-            } else {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::NotConnected,
-                    "No QueryEngine configured. Set ANTHROPIC_API_KEY or run `coderex --api-key <key>`",
-                ));
-            }
-        }
-        Ok(())
     }
 
     /// Run one command line outside the TUI.
@@ -6779,6 +7562,69 @@ mod tests {
         assert_eq!(results, 1, "a turn must close with exactly one result");
     }
 
+    #[test]
+    fn control_response_lines_map_to_confirmation_responses() {
+        let allow = r#"{"type":"control_response","response":{"subtype":"success","request_id":"r1","response":{"behavior":"allow","message":"ok"}}}"#;
+        let deny = r#"{"type":"control_response","response":{"subtype":"success","request_id":"r2","response":{"behavior":"deny","message":"no"}}}"#;
+        let session = r#"{"type":"control_response","response":{"subtype":"success","request_id":"r3","response":{"behavior":"allow","message":"always","allow_session":true}}}"#;
+        let error = r#"{"type":"control_response","response":{"subtype":"error","request_id":"r4","error":"unsupported"}}"#;
+
+        assert_eq!(
+            control_response_from_line(allow, false),
+            Some(("r1".to_string(), ConfirmationResponse::Approved))
+        );
+        assert_eq!(
+            control_response_from_line(deny, true),
+            Some(("r2".to_string(), ConfirmationResponse::Denied))
+        );
+        assert_eq!(
+            control_response_from_line(session, true),
+            Some(("r3".to_string(), ConfirmationResponse::ApproveSession)),
+            "a request that offered a session answer may receive one"
+        );
+        assert_eq!(
+            control_response_from_line(session, false),
+            Some(("r3".to_string(), ConfirmationResponse::Approved)),
+            "a session answer must not widen a request that did not offer it"
+        );
+        assert_eq!(
+            control_response_from_line(error, false),
+            Some(("r4".to_string(), ConfirmationResponse::Denied)),
+            "an unusable answer fails closed"
+        );
+    }
+
+    #[test]
+    fn lines_that_are_not_control_responses_are_ignored() {
+        assert_eq!(control_response_from_line("not json", false), None);
+        // A normal protocol frame is not an answer.
+        assert_eq!(
+            control_response_from_line(
+                &protocol_frame(&EngineEvent::TextDelta("hi".into()), "s1")
+                    .unwrap()
+                    .to_line(),
+                false,
+            ),
+            None
+        );
+        // A response without a decision is unusable.
+        assert_eq!(
+            control_response_from_line(
+                r#"{"type":"control_response","response":{"subtype":"success","request_id":"r"}}"#,
+                false
+            ),
+            None
+        );
+    }
+
+    /// The producer half of the channel is off unless the host explicitly
+    /// enabled it; the CLI gate is what decides that.
+    #[test]
+    fn headless_permission_control_is_off_by_default() {
+        let repl = ReplLoop::new("/tmp".into(), ModelId::sonnet());
+        assert!(!repl.headless_permission_control());
+    }
+
     /// A dialog this process asks a person is not something a host can act on,
     /// so it is not in the stream.
     #[test]
@@ -7499,6 +8345,83 @@ mod tests {
         );
     }
 
+    /// `--betas` arrives after the tool registry is shared. The Workflow tool
+    /// has to read the final flag at call/listing time, not at construction.
+    #[tokio::test]
+    async fn workflow_tool_is_enabled_by_betas_after_registration() {
+        let mut repl = ReplLoop::with_engine(
+            Box::new(CountingApi::new()),
+            "/tmp".into(),
+            ModelId::sonnet(),
+        );
+        let dispatcher = repl.dispatcher.clone().expect("engine has a dispatcher");
+        let tool = dispatcher
+            .registry()
+            .get_tool_arc("Workflow")
+            .expect("Workflow is registered");
+
+        // The default is off: a workflow spawns agents, so it must not be
+        // discoverable without an opt-in.
+        assert!(
+            !tool.descriptor().is_enabled,
+            "the Workflow tool was advertised without --betas"
+        );
+
+        repl.with_betas(vec!["+workflow_scripts".into()]);
+        repl.apply_cli_config();
+
+        assert!(repl.setup_error.is_none(), "{:?}", repl.setup_error);
+        assert!(repl.feature_flags().workflow_scripts);
+        assert!(
+            tool.descriptor().is_enabled,
+            "--betas +workflow_scripts did not reach the already-registered tool"
+        );
+    }
+
+    #[test]
+    fn org_memory_is_only_scoped_when_an_org_id_is_configured() {
+        assert_eq!(configured_org_id(None), None);
+        assert_eq!(configured_org_id(Some(String::new())), None);
+        assert_eq!(configured_org_id(Some("   ".into())), None);
+        assert_eq!(
+            configured_org_id(Some(" acme-corp ".into())),
+            Some("acme-corp".to_string())
+        );
+
+        let temp = tempfile::tempdir().unwrap();
+        assert!(org_memory_service(temp.path(), None).is_none());
+
+        let service = org_memory_service(temp.path(), Some("acme-corp".into()))
+            .expect("a configured org gets a store");
+        assert_eq!(service.org_id.as_deref(), Some("acme-corp"));
+    }
+
+    /// Remote-managed settings already carry the org id; the REPL reads the
+    /// orchestrator's cache rather than asking enterprise users to duplicate
+    /// it in an environment variable.
+    #[test]
+    fn org_id_is_read_from_the_remote_settings_cache_shape() {
+        let settings = r#"{
+            "settings": { "org_id": "acme-corp", "enforced_model": null },
+            "checksum": "abc",
+            "fetched_at": "2026-01-01T00:00:00Z"
+        }"#;
+        assert_eq!(
+            org_id_from_remote_settings_json(settings),
+            Some("acme-corp".into())
+        );
+
+        assert_eq!(
+            org_id_from_remote_settings_json(r#"{"settings": {"org_id": "  "}}"#),
+            None
+        );
+        assert_eq!(
+            org_id_from_remote_settings_json(r#"{"settings": {}}"#),
+            None
+        );
+        assert_eq!(org_id_from_remote_settings_json("not json"), None);
+    }
+
     #[test]
     fn an_unknown_beta_is_a_setup_error_not_a_silent_drop() {
         let mut repl = ReplLoop::new("/tmp".into(), ModelId::sonnet());
@@ -7587,5 +8510,105 @@ mod tests {
             registry.get_tool_arc("Bash").is_some(),
             "built-in tools disappeared"
         );
+    }
+
+    /// `--system-prompt` / `--append-system-prompt` reach the effects the
+    /// engine reads when it builds the prompt.
+    #[test]
+    fn system_prompt_builders_write_the_session_effects() {
+        let mut repl = ReplLoop::new("/tmp".into(), ModelId::sonnet());
+        repl.with_system_prompt(Some("replace the prompt".into()));
+        repl.with_append_system_prompt(Some("add this".into()));
+        assert_eq!(
+            repl.session_effects.override_system_prompt.as_deref(),
+            Some("replace the prompt")
+        );
+        assert_eq!(
+            repl.session_effects.append_system_prompt.as_deref(),
+            Some("add this")
+        );
+
+        // Explicit option values can be cleared, too.
+        repl.with_system_prompt(None);
+        assert!(repl.session_effects.override_system_prompt.is_none());
+    }
+
+    /// The baseline team tools are replaced with ones that own a real
+    /// `TeamManager`, so a call gets a team id instead of "manager not
+    /// available in this context".
+    #[tokio::test]
+    async fn team_tools_use_the_session_manager() {
+        let api = ReadThenAnswerApi {
+            call: Arc::new(std::sync::Mutex::new(0)),
+            expected_contents: "unused",
+        };
+        let mut repl = ReplLoop::with_engine(Box::new(api), "/tmp".into(), ModelId::sonnet());
+        let dispatcher = repl.dispatcher.take().unwrap();
+        let registry = dispatcher.registry();
+        let ctx = coderex_tools::ToolContext::new(
+            coderex_tools::ExecutionContext::Normal,
+            std::path::Path::new("/tmp"),
+        );
+
+        let created = registry
+            .get_tool("TeamCreate")
+            .unwrap()
+            .execute(
+                coderex_tools::ToolInput {
+                    call_id: "1".into(),
+                    name: "TeamCreate".into(),
+                    arguments: serde_json::json!({"name": "alpha"}),
+                },
+                ctx.clone(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(created.output, "team_0");
+
+        let deleted = registry
+            .get_tool("TeamDelete")
+            .unwrap()
+            .execute(
+                coderex_tools::ToolInput {
+                    call_id: "2".into(),
+                    name: "TeamDelete".into(),
+                    arguments: serde_json::json!({"team_id": "team_0"}),
+                },
+                ctx,
+            )
+            .await
+            .unwrap();
+        assert_eq!(deleted.output, "deleted team_0");
+    }
+
+    /// The MCP resource listing is wired to the session slot: with no manager
+    /// it reports an empty list rather than "handle not available".
+    #[tokio::test]
+    async fn mcp_resource_tools_are_wired_to_the_session_slot() {
+        let api = ReadThenAnswerApi {
+            call: Arc::new(std::sync::Mutex::new(0)),
+            expected_contents: "unused",
+        };
+        let mut repl = ReplLoop::with_engine(Box::new(api), "/tmp".into(), ModelId::sonnet());
+        let dispatcher = repl.dispatcher.take().unwrap();
+        let ctx = coderex_tools::ToolContext::new(
+            coderex_tools::ExecutionContext::Normal,
+            std::path::Path::new("/tmp"),
+        );
+        let listed = dispatcher
+            .registry()
+            .get_tool("ListMcpResources")
+            .unwrap()
+            .execute(
+                coderex_tools::ToolInput {
+                    call_id: "1".into(),
+                    name: "ListMcpResources".into(),
+                    arguments: serde_json::json!({}),
+                },
+                ctx,
+            )
+            .await
+            .unwrap();
+        assert_eq!(listed.output, "[]");
     }
 }

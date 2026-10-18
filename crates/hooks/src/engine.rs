@@ -597,8 +597,27 @@ impl HookRegistry {
         value: &serde_json::Value,
         tier: HookTier,
     ) -> Result<Self, HookError> {
+        let hooks = Self::parse_settings_hooks(value, tier)?;
+        Self::warn_about_inert_hooks(&hooks);
+        Ok(Self {
+            hooks,
+            action_runner: None,
+            request_handler: None,
+        })
+    }
+
+    /// Parse one settings document into hook configs, tagging every hook with
+    /// `tier`.
+    ///
+    /// The tier comes from the caller, never from the document: `HookConfig`'s
+    /// `tier` field is `#[serde(skip)]`, so a `"tier": "managed"` written into
+    /// a repository's settings is simply an unknown field and is ignored.
+    fn parse_settings_hooks(
+        value: &serde_json::Value,
+        tier: HookTier,
+    ) -> Result<Vec<HookConfig>, HookError> {
         if value.is_null() {
-            return Ok(Self::new());
+            return Ok(Vec::new());
         }
         // Accept both `{"hooks": [...]}` and the bare `[...]` that
         // `Settings.hooks` holds.
@@ -704,12 +723,7 @@ impl HookRegistry {
             config.tier = tier;
             hooks.push(config);
         }
-        Self::warn_about_inert_hooks(&hooks);
-        Ok(Self {
-            hooks,
-            action_runner: None,
-            request_handler: None,
-        })
+        Ok(hooks)
     }
 
     /// Load hooks from a settings.json value.
@@ -749,6 +763,34 @@ impl HookRegistry {
         tier: HookTier,
     ) -> Result<Self, HookError> {
         Self::load_from_settings_with_tier(value, tier)
+    }
+
+    /// Install API: build one registry from several settings documents, each
+    /// with the tier of the source it came from.
+    ///
+    /// This is what a session should use: managed hooks must run at
+    /// [`HookTier::Managed`] and must **not** also be present in the core
+    /// document (loading the merged `Settings.hooks` as `Core` would both lose
+    /// the ordering guarantee and run a managed hook twice). Sources are given
+    /// as `(tier, document)` pairs and may be `serde_json::Value::Null`, which
+    /// contributes nothing.
+    ///
+    /// The resulting registry sorts by tier first, then priority, exactly like
+    /// one built with [`register`](Self::register).
+    pub fn from_settings_sources<'a, I>(sources: I) -> Result<Self, HookError>
+    where
+        I: IntoIterator<Item = (HookTier, &'a serde_json::Value)>,
+    {
+        let mut hooks = Vec::new();
+        for (tier, value) in sources {
+            hooks.extend(Self::parse_settings_hooks(value, tier)?);
+        }
+        Self::warn_about_inert_hooks(&hooks);
+        Ok(Self {
+            hooks,
+            action_runner: None,
+            request_handler: None,
+        })
     }
 
     /// Install API: turn the registry into the boxed executor the engine takes,
@@ -2151,6 +2193,33 @@ mod tests {
             .map(|h| h.command.as_str())
             .collect();
         assert_eq!(commands, vec!["managed", "plugin", "core", "core-low"]);
+    }
+
+    /// Loading separate source documents into one registry keeps the tier of
+    /// each source: a managed hook runs before a core hook that gives itself a
+    /// higher priority, and the managed document is not also installed as core.
+    #[test]
+    fn multi_source_loading_preserves_tiers() {
+        let managed = serde_json::json!({
+            "hooks": [{ "event": "PreToolUse", "command": "managed", "priority": 0 }]
+        });
+        let core = serde_json::json!({
+            "hooks": [{ "event": "PreToolUse", "command": "core", "priority": 100 }]
+        });
+        let registry = HookRegistry::from_settings_sources([
+            (HookTier::Core, &core),
+            (HookTier::Managed, &managed),
+        ])
+        .unwrap();
+
+        let matches = registry.matches_for_event(&HookEvent::PreToolUse);
+        let commands: Vec<&str> = matches.iter().map(|h| h.command.as_str()).collect();
+        assert_eq!(commands, vec!["managed", "core"]);
+        assert_eq!(matches[0].tier, HookTier::Managed);
+        assert_eq!(matches[1].tier, HookTier::Core);
+        // Exactly two hooks: the managed document was installed once, at its
+        // own tier, not folded into core.
+        assert_eq!(matches.len(), 2);
     }
 
     /// Within a tier, higher priority still wins, and equal keys keep

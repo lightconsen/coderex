@@ -534,6 +534,16 @@ pub enum TelemetryEvent {
         #[serde(with = "chrono::serde::ts_seconds")]
         timestamp: chrono::DateTime<chrono::Utc>,
     },
+    /// Session ended cleanly.
+    SessionEnd {
+        /// Unique session identifier, matching the session's start event.
+        session_id: String,
+        /// Wall-clock duration of the session in seconds.
+        duration_secs: u64,
+        /// When the event occurred.
+        #[serde(with = "chrono::serde::ts_seconds")]
+        timestamp: chrono::DateTime<chrono::Utc>,
+    },
 }
 
 impl TelemetryEvent {
@@ -543,6 +553,7 @@ impl TelemetryEvent {
             TelemetryEvent::ToolUsed { timestamp, .. } => ("tool_used", *timestamp),
             TelemetryEvent::ApiCall { timestamp, .. } => ("api_call", *timestamp),
             TelemetryEvent::Error { timestamp, .. } => ("error", *timestamp),
+            TelemetryEvent::SessionEnd { timestamp, .. } => ("session_end", *timestamp),
         };
         let payload = serde_json::to_string(self).unwrap_or_default();
         let created_at = timestamp.to_rfc3339();

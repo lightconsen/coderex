@@ -169,6 +169,7 @@ fn settings_json_serde_roundtrip() {
             datadog_endpoint: None,
         }),
         hooks: None,
+        hook_layers: None,
         mcp_servers: None,
         api_key: Some("sk-test".into()),
         context_window: None,

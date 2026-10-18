@@ -1481,9 +1481,18 @@ fn mcp_cli_test_server_found() {
     .unwrap();
 
     let out = run_command(dir.path(), &["mcp", "test", "mock"], 60);
+    // `echo` is not an MCP server: it is spawned but never answers the
+    // initialize handshake. The command must still start the configured
+    // server, report that it did, and report the (zero) discovered tools
+    // instead of the old "is configured" stub.
     assert!(
-        out.stdout.contains("is configured"),
-        "expected configured message, got: {}",
+        out.stdout.contains("MCP server 'mock' started"),
+        "expected started message, got: {}",
+        out.stdout
+    );
+    assert!(
+        out.stdout.contains("Tools discovered:"),
+        "expected tool discovery output, got: {}",
         out.stdout
     );
 }

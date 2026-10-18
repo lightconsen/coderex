@@ -155,6 +155,14 @@ impl InputBuffer {
     pub fn apply(&mut self, action: &InputAction) -> Option<String> {
         match action {
             InputAction::InsertChar(c) => {
+                // The single-line buffer invariant is enforced here as well as
+                // at the event boundary. Callers that build an `InsertChar`
+                // directly (the REPL's Vim insert path, a yank/paste) must not
+                // be able to smuggle in a newline or another control character
+                // that would break the one-row input.
+                if c.is_control() {
+                    return None;
+                }
                 self.text.insert(self.cursor, *c);
                 self.cursor += c.len_utf8();
                 self.history_pos = 0;
@@ -692,6 +700,26 @@ mod tests {
         assert_eq!(action(KeyCode::Right), InputAction::CursorRight);
         assert_eq!(action(KeyCode::Up), InputAction::HistoryUp);
         assert_eq!(action(KeyCode::Down), InputAction::HistoryDown);
+    }
+
+    /// The buffer itself is the last line of defence: even a caller that
+    /// constructs `InsertChar` directly (rather than going through
+    /// `key_event_to_action`) cannot put a control character in a single-line
+    /// input.
+    #[test]
+    fn buffer_never_accepts_control_characters() {
+        let mut buf = InputBuffer::new();
+        for control in ['\n', '\r', '\u{1b}', '\u{1}', '\u{7f}'] {
+            buf.apply(&InputAction::InsertChar(control));
+        }
+        assert!(buf.text.is_empty(), "a control character was inserted");
+        assert_eq!(buf.cursor, 0);
+
+        buf.apply(&InputAction::InsertChar('a'));
+        buf.apply(&InputAction::InsertChar('\n'));
+        buf.apply(&InputAction::InsertChar('b'));
+        assert_eq!(buf.text, "ab");
+        assert_eq!(buf.cursor, 2);
     }
 
     #[test]

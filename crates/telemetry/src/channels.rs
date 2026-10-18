@@ -178,6 +178,16 @@ impl ChannelConfig {
     }
 }
 
+/// Parse `key=value,key2=value2` OTLP headers, skipping malformed entries.
+///
+/// This is the same syntax accepted by `CODEREX_OTLP_HEADERS`, exposed so a
+/// host that carries the value in its own settings file can build a
+/// [`ChannelConfig`] without duplicating the parser.
+#[must_use]
+pub fn parse_otlp_headers(raw: Option<&str>) -> Vec<(String, String)> {
+    parse_headers(raw)
+}
+
 /// Parse `key=value,key2=value2` headers, skipping malformed entries.
 fn parse_headers(raw: Option<&str>) -> Vec<(String, String)> {
     let Some(raw) = raw else {

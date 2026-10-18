@@ -13,13 +13,89 @@ use coderex_config::{
     LoadingBarrier, RemoteManagedSettings, RemoteManagedSettingsClient, RemoteSettingsManager,
 };
 use coderex_core::api_client::ApiClient;
+use coderex_core::provider_config::ProviderConfig;
+use coderex_core::providers::cloud::{CloudEndpoint, ProviderKind};
 use coderex_core::types::ModelId;
 use std::io::IsTerminal;
 use std::sync::Arc;
+use std::time::Instant;
 
 /// Duration (ms) to wait for remote settings before timing out and failing open.
 #[cfg(feature = "enterprise")]
 const REMOTE_SETTINGS_TIMEOUT_MS: u64 = 5000;
+
+/// Owns the background telemetry uploader task.
+///
+/// `TelemetryHandle::new` returns the uploader but nothing runs it; this guard
+/// is the production caller. Dropping it aborts the task, so the uploader
+/// cannot outlive the session that owns it.
+#[derive(Debug)]
+pub struct TelemetryUploaderGuard {
+    handle: tokio::task::JoinHandle<()>,
+}
+
+impl TelemetryUploaderGuard {
+    /// Spawn an uploader onto the current tokio runtime.
+    fn spawn(uploader: coderex_telemetry::TelemetryUploader) -> Self {
+        Self {
+            handle: tokio::spawn(async move {
+                uploader.run().await;
+            }),
+        }
+    }
+
+    /// Whether the uploader task has stopped.
+    ///
+    /// A freshly spawned uploader is expected to be running; a `true` value
+    /// means it exited (for example because the telemetry endpoint was
+    /// disabled at runtime).
+    #[must_use]
+    pub fn is_finished(&self) -> bool {
+        self.handle.is_finished()
+    }
+}
+
+impl Drop for TelemetryUploaderGuard {
+    fn drop(&mut self) {
+        self.handle.abort();
+    }
+}
+
+/// Records session start/end events and flushes the telemetry worker.
+///
+/// The guard holds its own handle clone so queued events survive the session
+/// context's own handle being dropped. `shutdown` on drop flushes the worker's
+/// pending batch; the event remains queued in SQLite for the next run if it
+/// could not be uploaded in time.
+#[derive(Debug)]
+pub struct TelemetrySessionGuard {
+    handle: coderex_telemetry::TelemetryHandle,
+    session_id: String,
+    started: Instant,
+}
+
+impl TelemetrySessionGuard {
+    /// Record a session-start event with a fresh session id.
+    fn start(handle: coderex_telemetry::TelemetryHandle) -> Self {
+        let session_id = uuid::Uuid::new_v4().to_string();
+        handle.session_start(session_id.clone());
+        Self {
+            handle,
+            session_id,
+            started: Instant::now(),
+        }
+    }
+}
+
+impl Drop for TelemetrySessionGuard {
+    fn drop(&mut self) {
+        self.handle.session_end(
+            self.session_id.clone(),
+            self.started.elapsed().as_secs(),
+        );
+        self.handle.shutdown();
+    }
+}
 
 /// Resolved settings and state passed between startup phases.
 #[derive(Debug, Default)]
@@ -61,8 +137,16 @@ pub struct SessionContext {
     pub cwd: String,
     /// Plugin manager (initialized during InitPlugins).
     pub plugin_manager: Option<Arc<coderex_plugins::plugins::PluginManager>>,
+    /// Host `userConfig` values from the `plugins` settings key.
+    pub plugin_settings: Option<serde_json::Value>,
+    /// Marketplaces configured in settings.
+    pub marketplaces: Vec<coderex_config::MarketplaceSetting>,
     /// Telemetry handle (initialized during LoadSettings).
     pub telemetry_handle: Option<coderex_telemetry::TelemetryHandle>,
+    /// Background uploader task, stopped when the session context is dropped.
+    pub telemetry_uploader: Option<TelemetryUploaderGuard>,
+    /// Session lifecycle guard (start/end events), dropped with the context.
+    pub telemetry_session: Option<TelemetrySessionGuard>,
     /// Session name for transcript naming.
     pub session_name: Option<String>,
     /// Whether to skip permission prompts.
@@ -81,6 +165,12 @@ pub struct SessionContext {
     pub no_slash_commands: bool,
     /// Output format preference.
     pub output_format: String,
+    /// Whether a headless run may negotiate tool approvals over stdin.
+    ///
+    /// Requires all three of `--print`, `--output-format stream-json`, and a
+    /// positional prompt: the protocol sink exists to carry the request out,
+    /// and stdin must be free to carry the answer in.
+    pub headless_permission_control: bool,
     /// Debug file path.
     pub debug_file: Option<std::path::PathBuf>,
     /// Fallback model.
@@ -206,6 +296,19 @@ fn plugin_manager_with_signing_key() -> coderex_plugins::plugins::PluginManager 
     manager
 }
 
+/// Whether a headless run may enable the stdin tool-approval channel.
+///
+/// All three conditions matter: the protocol sink only exists for
+/// `stream-json`, `--print` is the only headless mode, and a prompt read from
+/// stdin leaves stdin unavailable for `control_response` lines.
+fn headless_permission_control_allowed(
+    print: bool,
+    output_format: &str,
+    prompt_from_stdin: bool,
+) -> bool {
+    print && output_format == "stream-json" && !prompt_from_stdin
+}
+
 impl StartupOrchestrator {
     /// Create a new orchestrator.
     #[must_use]
@@ -228,7 +331,11 @@ impl StartupOrchestrator {
                 remote_services_ready: false,
                 cwd: String::new(),
                 plugin_manager: None,
+                plugin_settings: None,
+                marketplaces: Vec::new(),
                 telemetry_handle: None,
+                telemetry_uploader: None,
+                telemetry_session: None,
                 session_name: None,
                 skip_permissions: false,
                 add_dir: Vec::new(),
@@ -238,6 +345,7 @@ impl StartupOrchestrator {
                 no_persistence: false,
                 no_slash_commands: false,
                 output_format: "text".into(),
+                headless_permission_control: false,
                 debug_file: None,
                 fallback_model: None,
                 allowed_tools: Vec::new(),
@@ -278,6 +386,12 @@ impl StartupOrchestrator {
         // the process with a tmux session running the same binary; inside
         // tmux it only sets the titles and returns.
         crate::tmux::apply(args.tmux)?;
+
+        // No provider request in this workspace carries a reasoning-effort
+        // field. Accepting the flag and silently ignoring it would make
+        // `--effort high` look effective when it is not, so fail before any
+        // startup work happens.
+        Self::validate_effort(args.effort.as_deref())?;
 
         // Store working directory early
         // Recorded before settings resolution folds the CLI value into the
@@ -358,6 +472,15 @@ impl StartupOrchestrator {
         // answer it.
         self.ctx.non_interactive =
             args.print || !args.prompt.is_empty() || !std::io::stdin().is_terminal();
+        // The control channel needs a protocol sink to ask on and a free
+        // stdin to answer on. Both hold only for `--print` with `stream-json`
+        // output and a positional prompt; a prompt read from stdin leaves
+        // stdin busy, and interactive mode has its own confirmation UI.
+        self.ctx.headless_permission_control = headless_permission_control_allowed(
+            args.print,
+            &args.output_format,
+            args.prompt.is_empty(),
+        );
 
         self.run_phase(StartupPhase::Bootstrap, &args).await?;
         self.run_phase(StartupPhase::LoadSettings, &args).await?;
@@ -575,9 +698,26 @@ impl StartupOrchestrator {
             .map(std::path::PathBuf::from)
             .unwrap_or_else(|_| config_dir.join("managed_settings.json"));
 
+        // Platform carriers are attached after the file carrier: an explicit
+        // `--settings`/environment file path keeps precedence, and the OS
+        // policy carrier is added only when it was not explicitly configured.
         let config_service = ConfigService::new(user_path.clone(), project_path.clone())
-            .with_managed_settings_path(managed_path);
+            .with_managed_settings_path(managed_path)
+            .with_platform_managed_settings();
+        // Explicit environment overrides for the platform carriers exist for
+        // deployments and tests that need a non-default location.
+        let config_service = match std::env::var("CODEREX_MANAGED_SETTINGS_PLIST_PATH") {
+            Ok(path) => config_service.with_managed_settings_plist(path.into()),
+            Err(_) => config_service,
+        };
+        let config_service = match std::env::var("CODEREX_MANAGED_SETTINGS_REGISTRY_KEY") {
+            Ok(key) => config_service.with_managed_settings_registry_key(key),
+            Err(_) => config_service,
+        };
         let mut settings = config_service.resolve()?;
+        let plugin_host = config_service.load_plugin_host_config();
+        self.ctx.plugin_settings = plugin_host.plugins;
+        self.ctx.marketplaces = plugin_host.marketplaces;
 
         // First-run consent gate. Telemetry is opt-in: `telemetry_enabled` is
         // `None` until the user decides (the built-in defaults no longer force
@@ -612,7 +752,25 @@ impl StartupOrchestrator {
             fallback_model: args.fallback_model.clone(),
             effort: args.effort.clone(),
         };
+        // These values are session-scoped, not settings keys. Take them before
+        // `apply` consumes the overrides so none of them is silently dropped.
+        let session = overrides.session_overrides();
         settings = overrides.apply(settings);
+
+        if let Some(system_prompt) = session.system_prompt {
+            self.ctx.system_prompt = Some(system_prompt);
+        }
+        self.ctx.append_system_prompt = session.append_system_prompt;
+        if let Some(fallback_model) = session.fallback_model {
+            self.ctx.fallback_model = Some(ModelId(fallback_model));
+        }
+        if let Some(allowed_tools) = session.allowed_tools {
+            if !allowed_tools.is_empty() {
+                self.ctx.allowed_tools = allowed_tools;
+            }
+        }
+        Self::validate_effort(session.effort.as_deref())?;
+        self.ctx.effort = session.effort;
 
         tracing::info!(
             "settings loaded: model={}, effective_model={}",
@@ -635,7 +793,10 @@ impl StartupOrchestrator {
         // Undecided (`None`) means no consent was recorded — stay off.
         let telemetry_enabled = settings.telemetry_enabled.unwrap_or(false);
         if telemetry_enabled {
-            if let Some((handle, _uploader)) = Self::init_telemetry(&settings) {
+            if let Some((handle, uploader)) = Self::init_telemetry(&settings) {
+                self.ctx.telemetry_session =
+                    Some(TelemetrySessionGuard::start(handle.clone()));
+                self.ctx.telemetry_uploader = Self::spawn_telemetry_uploader(uploader);
                 self.ctx.telemetry_handle = Some(handle);
             }
         } else {
@@ -644,6 +805,62 @@ impl StartupOrchestrator {
 
         self.ctx.settings = Some(settings);
         Ok(())
+    }
+
+    /// Start the uploader task when telemetry produced one.
+    ///
+    /// `TelemetryHandle::new` returns `None` for an opted-out configuration, so
+    /// a disabled session has no task to start.
+    fn spawn_telemetry_uploader(
+        uploader: Option<coderex_telemetry::TelemetryUploader>,
+    ) -> Option<TelemetryUploaderGuard> {
+        uploader.map(TelemetryUploaderGuard::spawn)
+    }
+
+    /// Build export-channel configuration from resolved settings, falling back
+    /// to the environment for values the settings file does not set.
+    fn telemetry_channels(settings: &Settings) -> coderex_telemetry::ChannelConfig {
+        Self::apply_telemetry_channel_settings(
+            coderex_telemetry::ChannelConfig::from_env(),
+            settings,
+        )
+    }
+
+    /// Pure settings overlay for [`Self::telemetry_channels`].
+    fn apply_telemetry_channel_settings(
+        mut channels: coderex_telemetry::ChannelConfig,
+        settings: &Settings,
+    ) -> coderex_telemetry::ChannelConfig {
+        if let Some(telemetry) = &settings.telemetry {
+            let set = |slot: &mut Option<String>, value: &Option<String>| {
+                if let Some(value) = value.as_ref().map(|v| v.trim()).filter(|v| !v.is_empty()) {
+                    *slot = Some(value.to_string());
+                }
+            };
+            set(&mut channels.otlp_endpoint, &telemetry.otlp_endpoint);
+            if let Some(headers) = telemetry
+                .otlp_headers
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            {
+                channels.otlp_headers = coderex_telemetry::parse_otlp_headers(Some(headers));
+            }
+            set(&mut channels.datadog_api_key, &telemetry.datadog_api_key);
+            set(&mut channels.datadog_endpoint, &telemetry.datadog_endpoint);
+            if let Some(site) = telemetry
+                .datadog_site
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            {
+                channels.datadog_site = site.to_string();
+            }
+        }
+        // Channels are constructed only for an opted-in session, and the
+        // source policy has already dropped repository-controlled opt-ins.
+        channels.enabled = true;
+        channels
     }
 
     /// Initialize the telemetry subsystem using resolved settings.
@@ -676,28 +893,40 @@ impl StartupOrchestrator {
             Err(e) => tracing::warn!("failed to ingest pending crashes: {e}"),
         }
 
-        // Build TelemetryConfig from settings sub-config
-        let telemetry_config = settings.telemetry.as_ref().map(|t| {
+        // Build TelemetryConfig from the settings sub-config. An opted-in
+        // session with no sub-config still gets a working uploader with the
+        // built-in defaults; otherwise `telemetry_enabled = true` would only
+        // write to the local database.
+        let telemetry_config = {
             let api_key = settings
                 .api_key
                 .as_ref()
                 .map(|k| coderex_config::resolve_api_key(k));
-            coderex_telemetry::TelemetryConfig {
+            let defaults = coderex_telemetry::TelemetryConfig::default();
+            let t = settings.telemetry.as_ref();
+            Some(coderex_telemetry::TelemetryConfig {
                 endpoint: t
-                    .endpoint
-                    .clone()
-                    .unwrap_or_else(|| "https://telemetry.coderex.dev/v1/events".into()),
-                crash_endpoint: t.crash_endpoint.clone(),
+                    .and_then(|t| t.endpoint.clone())
+                    .unwrap_or(defaults.endpoint),
+                crash_endpoint: t.and_then(|t| t.crash_endpoint.clone()),
                 api_key,
-                batch_size: t.batch_size.unwrap_or(100),
-                upload_interval_secs: t.upload_interval_secs.unwrap_or(300),
+                batch_size: t.and_then(|t| t.batch_size).unwrap_or(defaults.batch_size),
+                upload_interval_secs: t
+                    .and_then(|t| t.upload_interval_secs)
+                    .unwrap_or(defaults.upload_interval_secs),
                 enabled: true,
-                sample_rate: t.sample_rate.unwrap_or(1.0),
-                pinned_cert_pem: t.pinned_cert_pem.clone(),
-            }
-        });
+                sample_rate: t.and_then(|t| t.sample_rate).unwrap_or(defaults.sample_rate),
+                pinned_cert_pem: t.and_then(|t| t.pinned_cert_pem.clone()),
+            })
+        };
 
         let (handle, uploader) = coderex_telemetry::TelemetryHandle::new(store, telemetry_config);
+        // `TelemetryUploader::new` derives channels from the environment; the
+        // settings file is the host's own configuration and must be able to
+        // supply (or override) OTLP/Datadog values too.
+        let uploader = uploader.map(|uploader| {
+            uploader.with_channels(Self::telemetry_channels(settings))
+        });
         Some((handle, uploader))
     }
 
@@ -917,17 +1146,48 @@ impl StartupOrchestrator {
                 for entry in entries.flatten() {
                     let manifest_path = entry.path().join("plugin.json");
                     if manifest_path.exists() {
-                        if let Ok(content) = std::fs::read_to_string(&manifest_path) {
-                            if let Ok(manifest) = serde_json::from_str::<
+                        match std::fs::read_to_string(&manifest_path) {
+                            Ok(content) => match serde_json::from_str::<
                                 coderex_plugins::plugins::PluginManifest,
                             >(&content)
                             {
-                                manager.load_plugin(manifest, entry.path());
-                                loaded += 1;
-                            }
+                                Ok(manifest) => {
+                                    manager.load_plugin(manifest, entry.path());
+                                    loaded += 1;
+                                }
+                                // `deny_unknown_fields` turns a misspelled
+                                // field into a parse error. Dropping it in
+                                // silence was how an author's field vanished:
+                                // say which plugin and why.
+                                Err(error) => tracing::warn!(
+                                    plugin = %entry.path().display(),
+                                    %error,
+                                    "ignoring plugin: plugin.json is not a valid manifest"
+                                ),
+                            },
+                            Err(error) => tracing::warn!(
+                                plugin = %entry.path().display(),
+                                %error,
+                                "ignoring plugin: plugin.json could not be read"
+                            ),
                         }
                     }
                 }
+            }
+        }
+
+        // Resolve host-provided `userConfig` option values before spawning so
+        // each process receives them in its environment. `ctx.plugin_settings`
+        // was filled by the settings phase; load it here as a fallback for a
+        // caller that reached plugin init without that phase running.
+        let plugin_settings = self.ctx.plugin_settings.clone().or_else(|| {
+            let config_service = self.plugin_host_config_service();
+            config_service.load_plugin_host_config().plugins
+        });
+        if let Some(plugins) = plugin_settings.as_ref() {
+            match manager.apply_options_from_settings(plugins) {
+                Ok(count) => tracing::info!("applied userConfig for {count} plugin option(s)"),
+                Err(error) => tracing::warn!("plugin userConfig ignored: {error}"),
             }
         }
 
@@ -951,9 +1211,117 @@ impl StartupOrchestrator {
         // Error-state plugins are retried while the session runs. The loop
         // holds a Weak reference and exits when the manager is dropped; the
         // handle is detached deliberately.
-        let _retry_loop = manager.spawn_retry_loop(std::time::Duration::from_secs(1));
+        let _retry_loop = Self::spawn_plugin_restart_loop(
+            &manager,
+            std::time::Duration::from_secs(1),
+        );
         self.ctx.plugin_manager = Some(manager);
         Ok(())
+    }
+
+    /// The settings service used to read host-only plugin configuration.
+    fn plugin_host_config_service(&self) -> ConfigService {
+        let user_path = self
+            .ctx
+            .settings_path
+            .clone()
+            .unwrap_or_else(|| coderex_config::config_home().join("settings.json"));
+        ConfigService::new(user_path, Self::find_project_config(&self.ctx.cwd))
+    }
+
+    /// Retry failed plugins and actually restart the ones that recover.
+    ///
+    /// `PluginManager::spawn_retry_loop` only logs `RestartRequired`: it holds
+    /// a `Weak` and has no way to await `spawn_plugin` from a synchronous
+    /// retry pass. This loop does both — it upgrades the weak reference for
+    /// each tick, calls `retry_failed_plugins`, and awaits `spawn_plugin` for
+    /// every plugin the retry brought back to `Loading`.
+    fn spawn_plugin_restart_loop(
+        manager: &Arc<coderex_plugins::plugins::PluginManager>,
+        interval: std::time::Duration,
+    ) -> tokio::task::JoinHandle<()> {
+        let manager = Arc::downgrade(manager);
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(interval);
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                ticker.tick().await;
+                // Upgrade per tick, then drop the strong reference at the end
+                // of the iteration: the task must not keep the manager (and
+                // its plugin processes) alive after the session lets go.
+                let Some(manager) = manager.upgrade() else {
+                    break;
+                };
+                for outcome in manager.retry_failed_plugins() {
+                    if let coderex_plugins::plugins::RetryOutcome::RestartRequired(name) = outcome {
+                        match manager.spawn_plugin(&name).await {
+                            Ok(()) => tracing::info!(
+                                plugin = %name,
+                                "plugin recovered and was restarted"
+                            ),
+                            Err(error) => tracing::warn!(
+                                plugin = %name,
+                                "plugin recovered but restart failed: {error}"
+                            ),
+                        }
+                    }
+                }
+            }
+        })
+    }
+
+    /// Marketplaces configured in settings plus the legacy environment pair.
+    ///
+    /// Later duplicates (by name or URL) are dropped so a settings entry wins
+    /// over the environment fallback rather than being registered twice.
+    fn configured_marketplaces(
+        configured: &[coderex_config::MarketplaceSetting],
+    ) -> Vec<(String, String)> {
+        let mut entries: Vec<(String, String)> = configured
+            .iter()
+            .filter_map(|marketplace| {
+                let name = marketplace.name.trim();
+                let url = marketplace.url.trim();
+                (!name.is_empty() && !url.is_empty())
+                    .then(|| (name.to_string(), url.to_string()))
+            })
+            .collect();
+
+        if let Ok(url) = std::env::var("CODEREX_MARKETPLACE_URL") {
+            let url = url.trim().to_string();
+            if !url.is_empty() {
+                let name = std::env::var("CODEREX_MARKETPLACE_NAME")
+                    .unwrap_or_else(|_| "default".into());
+                entries.push((name, url));
+            }
+        }
+
+        let mut seen_names = std::collections::HashSet::new();
+        let mut seen_urls = std::collections::HashSet::new();
+        entries.retain(|(name, url)| {
+            let new_name = seen_names.insert(name.clone());
+            let new_url = seen_urls.insert(url.clone());
+            new_name && new_url
+        });
+        entries
+    }
+
+    /// Register configured marketplaces on a plugin manager.
+    ///
+    /// A registration failure (for example an HTTP URL) is reported and
+    /// skipped; it must not stop an install that may still be a direct URL.
+    fn register_marketplaces(
+        manager: &coderex_plugins::plugins::PluginManager,
+        marketplaces: &[(String, String)],
+    ) {
+        for (name, url) in marketplaces {
+            match manager.register_marketplace(name.clone(), url.clone()) {
+                Ok(()) => tracing::info!(marketplace = %name, "registered plugin marketplace"),
+                Err(error) => {
+                    tracing::warn!(marketplace = %name, %url, "marketplace not registered: {error}");
+                }
+            }
+        }
     }
 
     /// ReconcileMarketplaces: sync marketplace state.
@@ -961,14 +1329,8 @@ impl StartupOrchestrator {
         let manager = plugin_manager_with_signing_key();
         let reconciler = coderex_plugins::plugins::MarketplaceReconciler::new(300);
 
-        // Register marketplace if configured via environment
-        if let Ok(url) = std::env::var("CODEREX_MARKETPLACE_URL") {
-            if !url.is_empty() {
-                let name =
-                    std::env::var("CODEREX_MARKETPLACE_NAME").unwrap_or_else(|_| "default".into());
-                let _ = manager.register_marketplace(name, url);
-            }
-        }
+        let marketplaces = Self::configured_marketplaces(&self.ctx.marketplaces);
+        Self::register_marketplaces(&manager, &marketplaces);
 
         let install_dir = std::path::Path::new(&self.ctx.cwd).join(".coderex/plugins");
         match reconciler.reconcile(&manager, Some(&install_dir)).await {
@@ -1195,24 +1557,164 @@ impl StartupOrchestrator {
         None
     }
 
+    /// Reject `--effort`/`effort` loudly while no transport field exists.
+    fn validate_effort(effort: Option<&str>) -> Result<()> {
+        if let Some(level) = effort {
+            bail!(
+                "reasoning effort '{level}' is not supported: the provider request and session \
+                 APIs in this build have no reasoning-effort field, so the value cannot be sent. \
+                 Remove --effort instead of relying on a no-op."
+            );
+        }
+        Ok(())
+    }
+
+    /// Choose the fallback model for a retry, if the error indicates the
+    /// primary model itself is unavailable.
+    ///
+    /// Deliberately narrow: transport failures and authentication errors are
+    /// not retried with a different model (they would fail the same way and
+    /// could double-charge a partially completed turn).
+    fn fallback_after_model_error(
+        primary: &ModelId,
+        fallback: Option<&ModelId>,
+        error: &anyhow::Error,
+    ) -> Option<ModelId> {
+        let fallback = fallback?;
+        if fallback.0 == primary.0 {
+            return None;
+        }
+        let message = format!("{error:#}").to_ascii_lowercase();
+        const MODEL_UNAVAILABLE_MARKERS: [&str; 9] = [
+            "model_not_found",
+            "not_found_error",
+            "model not found",
+            "unknown model",
+            "invalid model",
+            "model_not_available",
+            "model is not available",
+            "unsupported model",
+            "overloaded_error",
+        ];
+        MODEL_UNAVAILABLE_MARKERS
+            .iter()
+            .any(|marker| message.contains(marker))
+            .then(|| fallback.clone())
+    }
+
     /// Create an API client from environment variables.
     ///
     /// Uses `ProviderConfig::from_env()` to build a [`ModelRouter`] that
     /// supports multi-provider fallback (Anthropic → OpenAI → Groq → custom).
     fn try_create_api_client(api_key_override: Option<&str>) -> Option<Box<dyn ApiClient>> {
-        let mut config = coderex_core::provider_config::ProviderConfig::from_env();
+        Self::api_client_from_provider_config(ProviderConfig::from_env(), api_key_override, |name| {
+            std::env::var(name).ok()
+        })
+    }
+
+    /// Build an API client from a [`ProviderConfig`], gated on usable
+    /// credentials.
+    ///
+    /// Split out from [`Self::try_create_api_client`] so the gate can be
+    /// tested without mutating process environment variables. A cloud
+    /// deployment is a provider in its own right: it must not require a
+    /// first-party Anthropic key when the configured cloud auth style supplies
+    /// credentials (for example AWS SigV4 variables for Bedrock).
+    fn api_client_from_provider_config(
+        mut config: ProviderConfig,
+        api_key_override: Option<&str>,
+        get_env: impl Fn(&str) -> Option<String>,
+    ) -> Option<Box<dyn ApiClient>> {
         if let Some(key) = api_key_override {
             config.set_anthropic_api_key(key.into());
         }
-        // Only build a router if at least one provider is configured.
-        if config.anthropic.is_none()
-            && config.openai.is_none()
-            && config.groq.is_none()
-            && config.custom.is_empty()
-        {
+        // Core's transport rejects an empty key before it reaches the cloud
+        // auth branch. For AWS SigV4 providers the key is not actually used
+        // when AWS credentials are present, so a non-empty sentinel lets the
+        // request reach the signer. Other cloud kinds genuinely need a token.
+        if let Some(kind) = config.cloud.as_ref().map(|cloud| cloud.kind) {
+            let has_key = config
+                .anthropic
+                .as_ref()
+                .is_some_and(|endpoint| !endpoint.api_key.trim().is_empty());
+            let aws_credentials = Self::env_non_empty(&get_env, "AWS_ACCESS_KEY_ID")
+                && Self::env_non_empty(&get_env, "AWS_SECRET_ACCESS_KEY");
+            let uses_sigv4 = matches!(
+                kind,
+                ProviderKind::Bedrock | ProviderKind::AnthropicAws | ProviderKind::Mantle
+            );
+            if uses_sigv4 && !has_key && aws_credentials {
+                config.set_anthropic_api_key("aws-sigv4".into());
+            }
+        }
+        if !Self::provider_config_is_usable_with(&config, &get_env) {
             return None;
         }
         Some(Box::new(config.build_router()) as Box<dyn ApiClient>)
+    }
+
+    fn env_non_empty(get_env: &impl Fn(&str) -> Option<String>, name: &str) -> bool {
+        get_env(name)
+            .map(|value| !value.trim().is_empty())
+            .unwrap_or(false)
+    }
+
+    /// Whether a provider configuration has credentials the transport can use.
+    fn provider_config_is_usable_with(
+        config: &ProviderConfig,
+        get_env: &impl Fn(&str) -> Option<String>,
+    ) -> bool {
+        let non_empty = |value: &str| !value.trim().is_empty();
+        if config
+            .anthropic
+            .as_ref()
+            .is_some_and(|endpoint| non_empty(&endpoint.api_key))
+            || config
+                .openai
+                .as_ref()
+                .is_some_and(|endpoint| non_empty(&endpoint.api_key))
+            || config
+                .groq
+                .as_ref()
+                .is_some_and(|endpoint| non_empty(&endpoint.api_key))
+            || config
+                .custom
+                .iter()
+                .any(|endpoint| non_empty(&endpoint.api_key))
+        {
+            return true;
+        }
+        config
+            .cloud
+            .as_ref()
+            .is_some_and(|cloud| Self::cloud_credentials_present_with(cloud, get_env))
+    }
+
+    /// Whether the credentials the cloud transport reads are present.
+    ///
+    /// AWS-backed providers can authenticate with SigV4 (`AWS_ACCESS_KEY_ID` /
+    /// `AWS_SECRET_ACCESS_KEY`) or with a bearer key. Vertex, Anthropic on
+    /// Google Cloud, and Foundry use the API key slot as their token, because
+    /// that is what the core transport sends. A gateway may be unauthenticated.
+    fn cloud_credentials_present_with(
+        cloud: &CloudEndpoint,
+        get_env: &impl Fn(&str) -> Option<String>,
+    ) -> bool {
+        let present = |name: &str| {
+            get_env(name)
+                .map(|value| !value.trim().is_empty())
+                .unwrap_or(false)
+        };
+        let api_key = present("ANTHROPIC_API_KEY");
+        match cloud.kind {
+            ProviderKind::Bedrock | ProviderKind::AnthropicAws | ProviderKind::Mantle => {
+                api_key || (present("AWS_ACCESS_KEY_ID") && present("AWS_SECRET_ACCESS_KEY"))
+            }
+            ProviderKind::Vertex | ProviderKind::AnthropicGoogleCloud | ProviderKind::Foundry => {
+                api_key
+            }
+            ProviderKind::Gateway | ProviderKind::FirstParty => true,
+        }
     }
 
     /// Get the API key override from settings if set.
@@ -1224,7 +1726,12 @@ impl StartupOrchestrator {
     }
 
     /// Configure a ReplLoop with all CLI-derived settings.
-    fn configure_repl(&self, repl: &mut crate::repl::ReplLoop) {
+    ///
+    /// `interactive` selects context delivery: headless builds the whole
+    /// prompt itself (including `--file` blocks), while the interactive loop
+    /// has no public file hook yet and receives the same blocks through the
+    /// existing extra-context channel that `--from-pr` uses.
+    fn configure_repl(&self, repl: &mut crate::repl::ReplLoop, interactive: bool) {
         if let Some(ref manager) = self.ctx.mcp_manager {
             repl.with_mcp_manager(Arc::clone(manager));
         }
@@ -1232,6 +1739,12 @@ impl StartupOrchestrator {
             repl.with_mcp_elicitation_handler(Arc::clone(elicitation));
         }
         repl.with_skip_permissions(self.ctx.skip_permissions);
+        // Only the headless path reads `control_response` from stdin; the
+        // interactive loop has its own confirmation UI and owns stdin for the
+        // editor.
+        if !interactive {
+            repl.with_headless_permission_control(self.ctx.headless_permission_control);
+        }
         let perm_mode = self
             .ctx
             .settings
@@ -1246,10 +1759,30 @@ impl StartupOrchestrator {
         repl.with_max_budget_usd(budget);
         let hooks = self.ctx.settings.as_ref().and_then(|s| s.hooks.clone());
         repl.with_hooks(hooks);
+        // The merged document above is only the compatibility fallback. The
+        // split view is what preserves the managed-before-core guarantee.
+        let hook_layers = self
+            .ctx
+            .settings
+            .as_ref()
+            .and_then(|s| s.hook_layers.clone());
+        repl.with_hook_layers(hook_layers);
         repl.with_max_turns(self.ctx.max_turns);
         repl.with_replay_user_messages(self.ctx.replay_user_messages);
         repl.with_include_partial_messages(self.ctx.include_partial_messages);
         repl.with_betas(self.ctx.betas.clone());
+        // `--system-prompt` replaces the base prompt; `--append-system-prompt`
+        // adds to it. Both were parsed and then dropped on the interactive
+        // path — the REPL applied neither. The headless path already folds the
+        // value into the prompt (`build_headless_prompt`), so applying it here
+        // as well would send it twice.
+        if interactive {
+            if self.ctx.append_system_prompt {
+                repl.with_append_system_prompt(self.ctx.system_prompt.clone());
+            } else {
+                repl.with_system_prompt(self.ctx.system_prompt.clone());
+            }
+        }
         repl.with_chrome_enabled(self.ctx.chrome && !self.ctx.no_chrome);
         repl.with_agent(self.ctx.agent.clone());
         repl.with_explicit_model_override(self.ctx.model_explicit);
@@ -1257,7 +1790,7 @@ impl StartupOrchestrator {
         repl.with_worktree(self.ctx.worktree);
         repl.with_fork_session(self.ctx.fork_session.clone());
         repl.with_from_pr(self.ctx.from_pr.clone());
-        repl.with_pr_context(self.ctx.from_pr_context.clone());
+        repl.with_pr_context(self.interactive_context(interactive));
         if let Some(ref ide) = self.ctx.ide_connection {
             repl.with_ide_connection(Arc::clone(&ide.manager), ide.status_line());
         }
@@ -1275,12 +1808,48 @@ impl StartupOrchestrator {
         repl.apply_cli_config();
     }
 
-    #[allow(clippy::unused_async)]
-    async fn run_repl(&self, cwd: &str, model: ModelId) -> Result<()> {
-        if !std::io::stdin().is_terminal() {
-            bail!("interactive REPL requires a terminal on stdin");
+    /// Context delivered to the interactive loop's extra-context channel.
+    ///
+    /// Headless sessions get files from [`Self::build_headless_prompt`]; the
+    /// interactive path has no dedicated file hook, so it reuses the same
+    /// extra-context mechanism as `--from-pr`. System prompts are not included
+    /// here: they belong in the engine's system prompt, not a user message.
+    fn interactive_context(&self, interactive: bool) -> Option<String> {
+        let mut context = self.ctx.from_pr_context.clone();
+        if !interactive {
+            return context;
         }
+        for file_path in &self.ctx.file {
+            match std::fs::read_to_string(file_path) {
+                Ok(content) => {
+                    let block = format!("--- {} ---\n{content}", file_path.display());
+                    match &mut context {
+                        Some(existing) => {
+                            existing.push_str("\n\n");
+                            existing.push_str(&block);
+                        }
+                        None => context = Some(block),
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!("failed to read file {}: {error}", file_path.display());
+                }
+            }
+        }
+        context
+    }
 
+    /// Build and configure a REPL loop for a model.
+    ///
+    /// Extracted so the headless fallback-model retry can create a second loop
+    /// with identical configuration and a different model.
+    fn prepare_repl(
+        &self,
+        cwd: &str,
+        model: ModelId,
+        streaming_protocol: bool,
+        interactive: bool,
+    ) -> crate::repl::ReplLoop {
         let api_key = self.api_key_from_settings();
         let mut repl = if let Some(api_client) = Self::try_create_api_client(api_key) {
             crate::repl::ReplLoop::with_engine(api_client, cwd.to_string(), model)
@@ -1290,7 +1859,42 @@ impl StartupOrchestrator {
         if let Some(ref pm) = self.ctx.plugin_manager {
             repl.with_plugin_manager(Arc::clone(pm));
         }
-        self.configure_repl(&mut repl);
+        self.configure_repl(&mut repl, interactive);
+        if streaming_protocol {
+            repl.with_protocol_sink(Some(coderex_events::MessageSink::new(
+                Box::new(std::io::stdout()) as Box<dyn std::io::Write + Send>,
+            )));
+        }
+        repl
+    }
+
+    /// Refuse an option that only the headless path can honour.
+    ///
+    /// The fallback retry is implemented around `run_headless`: it rebuilds the
+    /// loop with the fallback model after an error. The interactive loop has no
+    /// equivalent — accepting `--fallback-model` there would look like a
+    /// configured safety net while every failure still stopped the session, so
+    /// startup fails instead.
+    fn reject_interactive_fallback(&self) -> Result<()> {
+        if let Some(fallback) = &self.ctx.fallback_model {
+            bail!(
+                "--fallback-model '{}' is not supported in interactive sessions: the one-retry \
+                 fallback runs only in non-interactive mode (--print or a positional prompt). \
+                 Omit --fallback-model or run headless.",
+                fallback.0
+            );
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::unused_async)]
+    async fn run_repl(&self, cwd: &str, model: ModelId) -> Result<()> {
+        self.reject_interactive_fallback()?;
+        if !std::io::stdin().is_terminal() {
+            bail!("interactive REPL requires a terminal on stdin");
+        }
+
+        let mut repl = self.prepare_repl(cwd, model, false, true);
         repl.run_tui().await
     }
 
@@ -1301,17 +1905,6 @@ impl StartupOrchestrator {
         model: ModelId,
         prompt: &str,
     ) -> Result<()> {
-        let api_key = self.api_key_from_settings();
-        let mut repl = if let Some(api_client) = Self::try_create_api_client(api_key) {
-            crate::repl::ReplLoop::with_engine(api_client, cwd.to_string(), model)
-        } else {
-            crate::repl::ReplLoop::new(cwd.to_string(), model)
-        };
-        if let Some(ref pm) = self.ctx.plugin_manager {
-            repl.with_plugin_manager(Arc::clone(pm));
-        }
-        self.configure_repl(&mut repl);
-
         // Parse input based on --input-format
         let user_prompt = if self.ctx.input_format == "json" {
             match serde_json::from_str::<serde_json::Value>(prompt) {
@@ -1333,13 +1926,33 @@ impl StartupOrchestrator {
         // host reads that instead of a printed string. So the sink goes on the
         // loop before the turn starts, and nothing is echoed after it.
         let streaming_protocol = self.ctx.output_format == "stream-json";
-        if streaming_protocol {
-            repl.with_protocol_sink(Some(coderex_events::MessageSink::new(
-                Box::new(std::io::stdout()) as Box<dyn std::io::Write + Send>,
-            )));
-        }
+        let mut repl = self.prepare_repl(cwd, model.clone(), streaming_protocol, false);
 
-        let result = repl.run_headless(&final_prompt).await?;
+        let result = match repl.run_headless(&final_prompt).await {
+            Ok(result) => result,
+            Err(error) => {
+                // One honest retry, and only for an error that names an
+                // unavailable/unknown model. Rebuilding the loop is necessary
+                // because the model is part of its construction; nothing else
+                // about the session configuration changes.
+                if let Some(fallback) = Self::fallback_after_model_error(
+                    &model,
+                    self.ctx.fallback_model.as_ref(),
+                    &error,
+                ) {
+                    tracing::warn!(
+                        primary = %model.0,
+                        fallback = %fallback.0,
+                        "primary model unavailable; retrying once with --fallback-model: {error}"
+                    );
+                    let mut retry =
+                        self.prepare_repl(cwd, fallback, streaming_protocol, false);
+                    retry.run_headless(&final_prompt).await?
+                } else {
+                    return Err(error);
+                }
+            }
+        };
 
         if streaming_protocol {
             return Ok(());
@@ -1365,7 +1978,16 @@ impl StartupOrchestrator {
         }
 
         if let Some(ref sp) = self.ctx.system_prompt {
-            final_prompt.push_str("System: ");
+            // `--append-system-prompt` means "add this to the engine's own
+            // system prompt", not "replace it". Headless turns carry it in the
+            // prompt instead of the engine's system prompt (the interactive
+            // path is the one that sets `SessionEffects`), so label the block
+            // so the model treats it as additive rather than authoritative.
+            if self.ctx.append_system_prompt {
+                final_prompt.push_str("Additional system instructions: ");
+            } else {
+                final_prompt.push_str("System: ");
+            }
             final_prompt.push_str(sp);
             final_prompt.push('\n');
             final_prompt.push('\n');
@@ -1471,6 +2093,7 @@ impl StartupOrchestrator {
             cwd,
             self.ctx.model.clone().unwrap_or_else(ModelId::sonnet),
             context_window,
+            self.ctx.mcp_manager.clone(),
         ) {
             Some(factory) => server.set_engine_factory(factory),
             None => tracing::warn!(
@@ -1506,21 +2129,48 @@ impl StartupOrchestrator {
         cwd: &str,
         model: ModelId,
         context_window: coderex_core::types::ContextWindowResolver,
+        mcp_manager: Option<std::sync::Arc<coderex_mcp::manager::McpManager>>,
     ) -> Option<coderex_server::session::EngineFactory> {
         use coderex_tools::{
-            ExecutionConfig, ExecutionContext, RegistryToolDispatcher,
-            ToolExecutor as ToolsExecutor, ToolRegistry, register_builtin_tools,
+            ChromeClient, CronScheduler, ExecutionConfig, ExecutionContext, RateLimiter,
+            RegistryToolDispatcher, TaskStore, ToolExecutor as ToolsExecutor, ToolRegistry,
+            register_builtin_tools,
         };
 
         let api_key = std::env::var("ANTHROPIC_API_KEY").ok();
         let api_client = Self::try_create_api_client(api_key.as_deref())?;
 
         let cwd = cwd.to_string();
+        // One manager slot shared by every served session; the manager is the
+        // same object the startup phases populated.
+        let mcp_slot: crate::repl::McpManagerSlot =
+            std::sync::Arc::new(std::sync::RwLock::new(mcp_manager));
         Some(std::sync::Arc::new(move || {
             let mut registry = ToolRegistry::new();
             register_builtin_tools(&mut registry);
+            // Same wired baseline tools the REPL registers.
+            crate::repl::RuntimeToolHandles::new(&cwd, &mcp_slot).install(&mut registry);
 
-            let dispatcher = RegistryToolDispatcher::new(
+            let config_home = coderex_config::config_home();
+            let session_id = uuid::Uuid::new_v4().to_string();
+
+            // The same shared state the REPL installs. Without it a served
+            // session's background tools, cron jobs, and rate-limited web
+            // tools each behaved as if no session state existed.
+            let task_store =
+                std::sync::Arc::new(TaskStore::new().with_storage(config_home.join("tasks.jsonl")));
+            let _ = task_store.load();
+            let cron_scheduler = std::sync::Arc::new(
+                CronScheduler::new()
+                    .with_storage(config_home.join("scheduled_tasks.json"))
+                    .with_job_records(
+                        std::path::PathBuf::from(&cwd),
+                        session_id.clone(),
+                    ),
+            );
+            let _ = cron_scheduler.load();
+
+            let mut dispatcher = RegistryToolDispatcher::new(
                 std::sync::Arc::new(registry),
                 std::sync::Arc::new(ToolsExecutor::new(ExecutionConfig::default())),
                 ExecutionContext::Normal,
@@ -1530,6 +2180,11 @@ impl StartupOrchestrator {
                 coderex_config::flags::FeatureFlags::from_env().capabilities()
                     != coderex_config::flags::CapabilitySet::empty(),
             );
+            dispatcher.set_task_store(task_store);
+            dispatcher.set_cron_scheduler(cron_scheduler);
+            dispatcher.set_rate_limiter(std::sync::Arc::new(RateLimiter::new()));
+            dispatcher.set_chrome_client(ChromeClient::new());
+            dispatcher.set_session_id(session_id);
 
             let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
             let mut engine = coderex_core::engine::QueryEngine::new(
@@ -1756,18 +2411,65 @@ impl StartupOrchestrator {
                     println!("No MCP config found at {mcp_path:?}");
                     return Ok(());
                 }
-                match coderex_mcp::config::McpConfig::load(&mcp_path) {
-                    Ok(config) => {
-                        if config.mcp_servers.contains_key(&name) {
-                            println!("MCP server '{name}' is configured.");
-                            println!(
-                                "(Live connection test requires server spawn — not yet implemented)"
-                            );
-                        } else {
-                            println!("MCP server '{name}' not found in config.");
-                        }
+                let config = match coderex_mcp::config::McpConfig::load(&mcp_path) {
+                    Ok(config) => config,
+                    Err(e) => {
+                        println!("Error loading config: {e}");
+                        return Ok(());
                     }
-                    Err(e) => println!("Error loading config: {e}"),
+                };
+                let Some(server_config) = config.mcp_servers.get(&name).cloned() else {
+                    println!("MCP server '{name}' not found in config.");
+                    return Ok(());
+                };
+
+                // Start exactly the named server. `load_config` inserts it
+                // into a fresh manager, so unrelated or broken servers in the
+                // same config file cannot affect this test.
+                let mut selected = coderex_mcp::config::McpConfig::new();
+                selected
+                    .mcp_servers
+                    .insert(name.clone(), server_config);
+                let manager = coderex_mcp::manager::McpManager::new();
+                manager.load_config(&selected);
+                manager.start_all().await;
+
+                let running = manager.is_running(&name);
+                let tools: Vec<coderex_mcp::proxy::McpToolInfo> = manager
+                    .list_tool_info()
+                    .into_iter()
+                    .filter(|tool| tool.server == name)
+                    .collect();
+                let status = manager
+                    .get_server(&name)
+                    .map(|server| format!("{:?}", server.status))
+                    .unwrap_or_else(|| "not registered".to_string());
+
+                // Always tear the connection down, including on failure.
+                manager.stop_all().await;
+
+                if !running {
+                    bail!(
+                        "MCP server '{name}' did not start (status: {status}). \
+                         Check the command/URL and the server's stderr."
+                    );
+                }
+
+                // "Started", not "connected": a stdio process can be alive
+                // while its initialize handshake failed. The tool count below
+                // is the evidence of whether it is actually usable.
+                println!("MCP server '{name}' started (status: {status}).");
+                println!("Tools discovered: {}", tools.len());
+                for tool in &tools {
+                    if tool.description.trim().is_empty() {
+                        println!("  {} (mcp__{}__{})", tool.qualified_name(), tool.server, tool.name);
+                    } else {
+                        println!(
+                            "  {} — {}",
+                            tool.qualified_name(),
+                            tool.description.trim()
+                        );
+                    }
                 }
             }
             None => {
@@ -1799,13 +2501,51 @@ impl StartupOrchestrator {
             Some(crate::cli::PluginAction::Install { source }) => {
                 println!("Installing plugin from '{source}'...");
                 let manager = plugin_manager_with_signing_key();
-                let plugin = coderex_plugins::plugins::MarketplacePlugin {
-                    name: source.clone(),
-                    version: "latest".into(),
-                    url: source.clone(),
-                    description: String::new(),
+                // Read plugin host configuration from the settings files
+                // directly. `ctx.plugin_settings`/`ctx.marketplaces` are
+                // populated by the startup phases, but this subcommand must
+                // also work when it is reached without them.
+                let plugin_host = self.plugin_host_config_service().load_plugin_host_config();
+                let plugin_settings = self
+                    .ctx
+                    .plugin_settings
+                    .clone()
+                    .or(plugin_host.plugins);
+                // Resolve host `userConfig` values before installing; the
+                // install path consults them when materialising the plugin.
+                if let Some(plugins) = plugin_settings.as_ref() {
+                    match manager.apply_options_from_settings(plugins) {
+                        Ok(count) => tracing::info!(
+                            "applied userConfig for {count} plugin option(s) before install"
+                        ),
+                        Err(error) => tracing::warn!("plugin userConfig ignored: {error}"),
+                    }
+                }
+                // Settings-configured marketplaces first, then the startup
+                // view, then the legacy environment pair; duplicates collapse
+                // in `configured_marketplaces`. Registration happens on the
+                // same manager that performs the install, so a bare name
+                // resolves against these marketplaces.
+                let mut configured = plugin_host.marketplaces;
+                configured.extend(self.ctx.marketplaces.iter().cloned());
+                let marketplaces = Self::configured_marketplaces(&configured);
+                Self::register_marketplaces(&manager, &marketplaces);
+
+                // A bare name is a marketplace listing; a URL, git remote, or
+                // existing directory is a source. `PluginSource` is the same
+                // classifier `install_plugin` uses internally.
+                let detected = coderex_plugins::plugins::PluginSource::detect(&source);
+                let result = if detected.is_marketplace() {
+                    manager.install_plugin_by_name(&source, &install_dir).await
+                } else {
+                    let plugin = coderex_plugins::plugins::MarketplacePlugin {
+                        name: source.clone(),
+                        version: "latest".into(),
+                        url: source.clone(),
+                        description: String::new(),
+                    };
+                    manager.install_plugin(&plugin, &install_dir).await
                 };
-                let result = manager.install_plugin(&plugin, &install_dir).await;
                 match result {
                     Ok(path) => println!("Plugin installed to: {path:?}"),
                     Err(e) => println!("Installation failed: {e}"),
@@ -1956,6 +2696,7 @@ impl StartupOrchestrator {
 
     #[allow(clippy::unused_async)]
     async fn run_resume(&self, cwd: &str, session_id: &str, model: ModelId) -> Result<()> {
+        self.reject_interactive_fallback()?;
         let resolved_session_id = if session_id.eq_ignore_ascii_case("latest") {
             session_resume::latest_session_id(cwd).ok_or_else(|| {
                 anyhow::anyhow!("No transcript found to resume in .coderex/transcripts")
@@ -2005,7 +2746,7 @@ impl StartupOrchestrator {
         if let Some(ref pm) = self.ctx.plugin_manager {
             repl.with_plugin_manager(Arc::clone(pm));
         }
-        self.configure_repl(&mut repl);
+        self.configure_repl(&mut repl, true);
         repl.run_tui().await
     }
 
@@ -2025,6 +2766,47 @@ impl StartupOrchestrator {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_permission_control_gate_needs_print_stream_json_and_a_positional_prompt() {
+        // The only combination with both an output channel and a free stdin.
+        assert!(headless_permission_control_allowed(
+            true,
+            "stream-json",
+            false
+        ));
+        // A prompt read from stdin leaves no stdin for the answer.
+        assert!(!headless_permission_control_allowed(
+            true,
+            "stream-json",
+            true
+        ));
+        // Interactive mode owns stdin and has its own confirmation UI.
+        assert!(!headless_permission_control_allowed(
+            false,
+            "stream-json",
+            false
+        ));
+        // No stream-json sink means nowhere to emit the request.
+        assert!(!headless_permission_control_allowed(true, "text", false));
+    }
+
+    #[test]
+    fn configure_repl_enables_the_control_channel_only_for_headless() {
+        let mut orch = StartupOrchestrator::new();
+        orch.ctx.headless_permission_control = true;
+
+        let mut interactive = crate::repl::ReplLoop::new("/tmp".into(), ModelId::sonnet());
+        orch.configure_repl(&mut interactive, true);
+        assert!(
+            !interactive.headless_permission_control(),
+            "interactive mode must keep the confirmation UI"
+        );
+
+        let mut headless = crate::repl::ReplLoop::new("/tmp".into(), ModelId::sonnet());
+        orch.configure_repl(&mut headless, false);
+        assert!(headless.headless_permission_control());
+    }
 
     #[test]
     fn session_context_defaults() {
@@ -2229,6 +3011,26 @@ mod tests {
     }
 
     #[test]
+    fn interactive_context_carries_files_but_headless_does_not_duplicate_them() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file_path = tmp.path().join("notes.txt");
+        std::fs::write(&file_path, "remember this").unwrap();
+        let mut orch = StartupOrchestrator::new();
+        orch.ctx.file = vec![file_path.clone()];
+
+        let interactive = orch
+            .interactive_context(true)
+            .expect("interactive context should include the file");
+        assert!(interactive.contains("remember this"));
+        assert!(interactive.contains("notes.txt"));
+
+        assert!(
+            orch.interactive_context(false).is_none(),
+            "headless already includes files in its prompt and must not add them twice"
+        );
+    }
+
+    #[test]
     fn no_pull_request_context_leaves_the_prompt_untouched() {
         let orch = StartupOrchestrator::new();
         assert_eq!(orch.build_headless_prompt("hello"), "hello");
@@ -2259,14 +3061,274 @@ mod tests {
     }
 
     #[test]
-    fn try_create_api_client_reads_env_var() {
-        // The function checks ANTHROPIC_API_KEY at call time.
-        // In CI/tests the env var is typically unset, so we verify
-        // the function returns None when no key is configured.
-        // Direct env manipulation is blocked by -D unsafe-code.
-        let result = StartupOrchestrator::try_create_api_client(None);
-        // We can't guarantee env state, but verify the function compiles and runs
-        // In practice: None when ANTHROPIC_API_KEY is unset, Some when set
-        let _ = result;
+    fn provider_gate_rejects_an_empty_configuration() {
+        let config = ProviderConfig::default();
+        assert!(
+            !StartupOrchestrator::provider_config_is_usable_with(&config, &|_| None),
+            "a config with no provider and no credentials must not build a client"
+        );
+    }
+
+    #[test]
+    fn provider_gate_accepts_an_anthropic_key() {
+        let config = ProviderConfig {
+            anthropic: Some(coderex_core::provider_config::ProviderEndpoint {
+                api_key: "sk-test".into(),
+                base_url: None,
+                provider_profile: None,
+                custom_headers: std::collections::BTreeMap::new(),
+            }),
+            ..Default::default()
+        };
+        assert!(StartupOrchestrator::provider_config_is_usable_with(
+            &config,
+            &|_| None
+        ));
+    }
+
+    fn bedrock_config() -> ProviderConfig {
+        ProviderConfig {
+            cloud: Some(CloudEndpoint::new(ProviderKind::Bedrock, "us-east-1")),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn cloud_gate_accepts_bedrock_with_aws_credentials_only() {
+        let get_env = |name: &str| match name {
+            "AWS_ACCESS_KEY_ID" => Some("AKIAEXAMPLE".to_string()),
+            "AWS_SECRET_ACCESS_KEY" => Some("secret".to_string()),
+            _ => None,
+        };
+        assert!(
+            StartupOrchestrator::provider_config_is_usable_with(&bedrock_config(), &get_env),
+            "AWS SigV4 credentials are sufficient for Bedrock; a first-party key is not required"
+        );
+    }
+
+    #[test]
+    fn cloud_gate_rejects_a_cloud_selector_without_credentials() {
+        assert!(!StartupOrchestrator::provider_config_is_usable_with(
+            &bedrock_config(),
+            &|_| None
+        ));
+    }
+
+    #[test]
+    fn cloud_client_is_constructed_without_a_first_party_key() {
+        let get_env = |name: &str| match name {
+            "AWS_ACCESS_KEY_ID" => Some("AKIAEXAMPLE".to_string()),
+            "AWS_SECRET_ACCESS_KEY" => Some("secret".to_string()),
+            _ => None,
+        };
+        let client = StartupOrchestrator::api_client_from_provider_config(
+            bedrock_config(),
+            None,
+            get_env,
+        );
+        assert!(
+            client.is_some(),
+            "a valid cloud deployment must not be blocked by the CLI provider gate"
+        );
+    }
+
+    #[test]
+    fn effort_is_rejected_loudly_instead_of_ignored() {
+        let error = StartupOrchestrator::validate_effort(Some("high"))
+            .expect_err("--effort has no transport field and must not be accepted silently");
+        assert!(error.to_string().contains("not supported"), "{error}");
+        assert!(StartupOrchestrator::validate_effort(None).is_ok());
+    }
+
+    #[test]
+    fn append_system_prompt_is_labelled_as_additive() {
+        let mut orch = StartupOrchestrator::new();
+        orch.ctx.system_prompt = Some("be terse".into());
+        orch.ctx.append_system_prompt = true;
+        let prompt = orch.build_headless_prompt("hello");
+        assert!(prompt.contains("Additional system instructions: be terse"));
+        assert!(!prompt.contains("System: be terse"));
+    }
+
+    #[test]
+    fn fallback_is_used_only_for_model_unavailability() {
+        let primary = ModelId("claude-opus-4-6".into());
+        let fallback = ModelId("claude-haiku-4-5-20251001".into());
+        let unavailable = anyhow::anyhow!("404 model_not_found: claude-opus-4-6");
+        assert_eq!(
+            StartupOrchestrator::fallback_after_model_error(
+                &primary,
+                Some(&fallback),
+                &unavailable
+            )
+            .map(|model| model.0),
+            Some(fallback.0.clone())
+        );
+
+        let transport = anyhow::anyhow!("connection reset by peer");
+        assert!(
+            StartupOrchestrator::fallback_after_model_error(
+                &primary,
+                Some(&fallback),
+                &transport
+            )
+            .is_none(),
+            "a transport error is not evidence the model is unavailable"
+        );
+
+        let same = anyhow::anyhow!("model_not_found");
+        assert!(
+            StartupOrchestrator::fallback_after_model_error(&primary, Some(&primary), &same)
+                .is_none()
+        );
+        assert!(StartupOrchestrator::fallback_after_model_error(&primary, None, &same).is_none());
+    }
+
+    /// Interactive mode refuses `--fallback-model` instead of accepting it and
+    /// never using it.
+    #[test]
+    fn interactive_rejects_the_headless_only_fallback_model() {
+        let mut orch = StartupOrchestrator::new();
+        assert!(orch.reject_interactive_fallback().is_ok());
+
+        orch.ctx.fallback_model = Some(ModelId("claude-haiku-4-5-20251001".into()));
+        let error = orch
+            .reject_interactive_fallback()
+            .expect_err("interactive fallback must be refused");
+        let message = error.to_string();
+        assert!(message.contains("--fallback-model"));
+        assert!(message.contains("interactive"));
+        assert!(message.contains("non-interactive"));
+    }
+
+    #[test]
+    fn telemetry_settings_override_environment_channels() {
+        let settings = Settings {
+            telemetry: Some(coderex_config::settings::TelemetrySubConfig {
+                otlp_endpoint: Some("https://collector.example/v1/logs".into()),
+                otlp_headers: Some("Authorization=Bearer token,x-team=core".into()),
+                datadog_api_key: Some("dd-key".into()),
+                datadog_site: Some("datadoghq.eu".into()),
+                datadog_endpoint: None,
+                ..Default::default()
+            }),
+            ..Settings::defaults()
+        };
+        let channels =
+            StartupOrchestrator::apply_telemetry_channel_settings(Default::default(), &settings);
+        assert_eq!(
+            channels.otlp_endpoint.as_deref(),
+            Some("https://collector.example/v1/logs")
+        );
+        assert_eq!(
+            channels.otlp_headers,
+            vec![
+                ("Authorization".to_string(), "Bearer token".to_string()),
+                ("x-team".to_string(), "core".to_string()),
+            ]
+        );
+        assert_eq!(channels.datadog_api_key.as_deref(), Some("dd-key"));
+        assert_eq!(channels.datadog_site, "datadoghq.eu");
+    }
+
+    #[tokio::test]
+    async fn uploader_task_is_spawned_only_when_enabled() {
+        let dir = tempfile::tempdir().unwrap();
+        let disabled_store = coderex_telemetry::TelemetryStore::open(&dir.path().join("off.db"))
+            .unwrap();
+        let (_handle, uploader) = coderex_telemetry::TelemetryHandle::new(
+            disabled_store,
+            Some(coderex_telemetry::TelemetryConfig {
+                enabled: false,
+                ..Default::default()
+            }),
+        );
+        assert!(
+            StartupOrchestrator::spawn_telemetry_uploader(uploader).is_none(),
+            "an opted-out session must not start an uploader task"
+        );
+
+        let enabled_store = coderex_telemetry::TelemetryStore::open(&dir.path().join("on.db"))
+            .unwrap();
+        let (_handle, uploader) = coderex_telemetry::TelemetryHandle::new(
+            enabled_store,
+            Some(coderex_telemetry::TelemetryConfig {
+                enabled: true,
+                upload_interval_secs: 3600,
+                ..Default::default()
+            }),
+        );
+        let guard = StartupOrchestrator::spawn_telemetry_uploader(uploader)
+            .expect("an opted-in session must start an uploader task");
+        assert!(!guard.is_finished(), "the uploader task should be running");
+        drop(guard);
+    }
+
+    #[test]
+    fn session_guard_records_start_and_end_events() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("telemetry.db");
+        let store = coderex_telemetry::TelemetryStore::open(&db_path).unwrap();
+        let (handle, _uploader) = coderex_telemetry::TelemetryHandle::new(store, None);
+        {
+            let _session = TelemetrySessionGuard::start(handle);
+        }
+        let store = coderex_telemetry::TelemetryStore::open(&db_path).unwrap();
+        assert_eq!(
+            store.event_count().unwrap(),
+            2,
+            "a clean session must record both a start and an end event"
+        );
+    }
+
+    #[test]
+    fn configured_marketplaces_include_settings_and_drop_duplicates() {
+        let configured = vec![
+            coderex_config::MarketplaceSetting {
+                name: "internal".into(),
+                url: "https://plugins.example".into(),
+            },
+            coderex_config::MarketplaceSetting {
+                name: "internal".into(),
+                url: "https://plugins.example".into(),
+            },
+        ];
+        let entries = StartupOrchestrator::configured_marketplaces(&configured);
+        assert_eq!(
+            entries
+                .iter()
+                .filter(|(name, _)| name == "internal")
+                .count(),
+            1,
+            "the same marketplace must be registered once"
+        );
+        assert!(entries.contains(&(
+            "internal".to_string(),
+            "https://plugins.example".to_string()
+        )));
+    }
+
+    #[test]
+    fn try_create_api_client_builds_a_router_for_a_configured_key() {
+        // Direct process-environment mutation is blocked by `-D unsafe-code`,
+        // so exercise the deterministic constructor instead of guessing what
+        // the ambient environment contains.
+        let client = StartupOrchestrator::api_client_from_provider_config(
+            ProviderConfig {
+                anthropic: Some(coderex_core::provider_config::ProviderEndpoint {
+                    api_key: "sk-test".into(),
+                    base_url: None,
+                    provider_profile: None,
+                    custom_headers: std::collections::BTreeMap::new(),
+                }),
+                ..Default::default()
+            },
+            None,
+            |_| None,
+        );
+        assert!(
+            client.is_some(),
+            "a configured provider endpoint must produce a client"
+        );
     }
 }
