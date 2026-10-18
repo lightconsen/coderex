@@ -20,6 +20,94 @@
 #![allow(unsafe_code)]
 
 use crate::runtime::{PluginCommandInfo, PluginSkillInfo};
+use std::ffi::OsString;
+use std::path::PathBuf;
+use std::sync::{LazyLock, RwLock};
+
+// ─── Host-injected compiler command ─────────────────────────────────────────
+
+/// A compiler command supplied by the host: a program plus leading arguments.
+///
+/// The runtime appends `<input> <output>` and runs the result as a killable
+/// child. The CodeRex CLI configures this to `current_exe()` with
+/// [`INTERNAL_WASM_COMPILE_FLAG`], so the installed binary compiles modules
+/// itself and no sibling helper is required.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WasmCompilerCommand {
+    program: PathBuf,
+    args: Vec<OsString>,
+}
+
+impl WasmCompilerCommand {
+    /// Create a command for `program` with no leading arguments.
+    #[must_use]
+    pub fn new(program: impl Into<PathBuf>) -> Self {
+        Self {
+            program: program.into(),
+            args: Vec::new(),
+        }
+    }
+
+    /// Append one leading argument (for example the hidden subcommand flag).
+    #[must_use]
+    pub fn arg(mut self, arg: impl Into<OsString>) -> Self {
+        self.args.push(arg.into());
+        self
+    }
+
+    /// The program to execute.
+    #[must_use]
+    pub fn program(&self) -> &std::path::Path {
+        &self.program
+    }
+
+    /// Arguments that precede `<input> <output>`.
+    #[must_use]
+    pub fn args(&self) -> &[OsString] {
+        &self.args
+    }
+}
+
+/// The host-injected compiler command, when one has been configured.
+static COMPILER_COMMAND: LazyLock<RwLock<Option<WasmCompilerCommand>>> =
+    LazyLock::new(|| RwLock::new(None));
+
+/// An explicit AOT cache directory, when the host configured one.
+static CACHE_DIR_OVERRIDE: LazyLock<RwLock<Option<PathBuf>>> = LazyLock::new(|| RwLock::new(None));
+
+/// Inject the compiler command the WASM runtime must use.
+///
+/// This is the only way production hosts enable WASM compilation: when no
+/// command is configured (and no helper is found next to the executable), the
+/// runtime refuses to load a WASM plugin rather than compiling untrusted code
+/// in-process. The setting is process-wide and should be installed once at
+/// startup, before any plugin is loaded.
+pub fn set_compiler_command(command: WasmCompilerCommand) {
+    let mut slot = COMPILER_COMMAND
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    *slot = Some(command);
+}
+
+/// The compiler command currently configured by the host, if any.
+#[must_use]
+pub fn configured_compiler_command() -> Option<WasmCompilerCommand> {
+    COMPILER_COMMAND
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone()
+}
+
+/// Override the AOT cache directory for this process.
+///
+/// Equivalent to setting `CODEREX_WASM_CACHE_DIR`, but without touching the
+/// process environment. The directory is created on the first cache write.
+pub fn set_cache_dir(dir: impl Into<PathBuf>) {
+    let mut slot = CACHE_DIR_OVERRIDE
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    *slot = Some(dir.into());
+}
 
 /// Fuel granted to each plugin call.
 ///
@@ -79,12 +167,21 @@ const PLUGIN_MAX_NESTING_DEPTH: usize = 256;
 #[cfg(feature = "wasm-runtime")]
 const PLUGIN_MAX_WAT_BYTES: usize = 1024 * 1024;
 
-/// Name of the out-of-process compiler binary.
+/// Name of the out-of-process compiler helper binary.
 ///
-/// The parent looks for it next to its own executable (for example
-/// `target/debug/coderex-wasm-compile`).
+/// Kept as a `[[bin]]` target for tests and for hosts that prefer a separate
+/// compiler process to the CLI's hidden subcommand. The CodeRex CLI does *not*
+/// depend on it: the CLI injects its own executable instead (see
+/// [`INTERNAL_WASM_COMPILE_FLAG`]).
 #[cfg(feature = "wasm-runtime")]
 const WASM_COMPILE_HELPER: &str = "coderex-wasm-compile";
+
+/// Hidden argument that makes the host binary act as the WASM compiler.
+///
+/// The host runs `current_exe() --internal-wasm-compile <input> <output>`.
+/// The CLI handles this before normal argument parsing, so packaged builds and
+/// `cargo run` use the same compiler path without shipping a sibling binary.
+pub const INTERNAL_WASM_COMPILE_FLAG: &str = "--internal-wasm-compile";
 
 /// CPU-seconds limit installed on the compiler child (`RLIMIT_CPU` on Unix,
 /// job user time on Windows).
@@ -103,7 +200,7 @@ const WASM_COMPILE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs
 /// Environment override for the compiler helper path.
 ///
 /// Compiled into debug builds only; it exists so the subprocess tests can
-/// exercise both the helper and the missing-helper fallback.
+/// simulate a helper that is missing or that points at a test binary.
 #[cfg(all(feature = "wasm-runtime", debug_assertions))]
 const WASM_COMPILE_HELPER_ENV: &str = "CODEREX_WASM_COMPILE_HELPER";
 
@@ -112,6 +209,36 @@ const WASM_COMPILE_HELPER_ENV: &str = "CODEREX_WASM_COMPILE_HELPER";
 /// Compiled into debug builds only; used by the "slow helper is killed" test.
 #[cfg(all(feature = "wasm-runtime", debug_assertions))]
 const WASM_COMPILE_TIMEOUT_ENV: &str = "CODEREX_WASM_COMPILE_TIMEOUT_MS";
+
+/// Environment override for the AOT cache directory.
+///
+/// Honoured in every build so operators can place the cache on a different
+/// volume (and so tests can isolate it). The platform default is documented in
+/// `docs/plugins.md`.
+#[cfg(feature = "wasm-runtime")]
+const WASM_CACHE_DIR_ENV: &str = "CODEREX_WASM_CACHE_DIR";
+
+/// Total size the AOT cache is pruned back to after a new entry is written.
+///
+/// The most recently modified entry is kept even when it alone exceeds the
+/// bound, so a single very large module cannot make every load a recompile.
+#[cfg(feature = "wasm-runtime")]
+const WASM_CACHE_MAX_BYTES: u64 = 256 * 1024 * 1024;
+
+/// Version of the on-disk cache entry envelope.
+///
+/// A different value invalidates every existing entry (they are deleted when
+/// read). It changes only with this file's format, not with wasmtime.
+#[cfg(feature = "wasm-runtime")]
+const WASM_CACHE_FORMAT_VERSION: u32 = 1;
+
+/// Magic bytes at the start of every cache entry.
+#[cfg(feature = "wasm-runtime")]
+const WASM_CACHE_MAGIC: &[u8; 8] = b"CRXCWASM";
+
+/// `magic + version + engine hash + module hash + payload length`.
+#[cfg(feature = "wasm-runtime")]
+const WASM_CACHE_HEADER_LEN: usize = 8 + 4 + 32 + 32 + 8;
 
 /// Build the sandboxed engine shared by every plugin instance.
 ///
@@ -296,25 +423,46 @@ fn prescan_module<'a>(
     Ok(binary)
 }
 
-/// Find the out-of-process compiler next to the current executable.
+/// Find the compiler helper next to the current executable.
 ///
-/// In debug builds `CODEREX_WASM_COMPILE_HELPER` overrides the path, which the
-/// tests use to point at the real helper, a deliberately slow one, or a
-/// nonexistent path (the fallback case).
+/// Debug builds also honour `CODEREX_WASM_COMPILE_HELPER`, which the tests use
+/// to point at the helper, at a slow one, or at a path that does not exist (to
+/// prove the fail-closed behaviour). The search walks up a few directories so
+/// unit tests — whose binary lives in `target/<profile>/deps/` — find the
+/// helper in `target/<profile>/`.
 #[cfg(feature = "wasm-runtime")]
-fn compile_helper_path() -> Option<std::path::PathBuf> {
+fn helper_next_to_current_exe() -> Option<PathBuf> {
     #[cfg(debug_assertions)]
     if let Some(overridden) = std::env::var_os(WASM_COMPILE_HELPER_ENV) {
-        let path = std::path::PathBuf::from(overridden);
+        let path = PathBuf::from(overridden);
+        // An explicit override is authoritative: when it names a missing
+        // file, the load fails closed rather than silently picking another
+        // helper.
         return path.is_file().then_some(path);
     }
 
-    let current = std::env::current_exe().ok()?;
-    let candidate = current.parent()?.join(format!(
-        "{WASM_COMPILE_HELPER}{}",
-        std::env::consts::EXE_SUFFIX
-    ));
-    candidate.is_file().then_some(candidate)
+    let name = format!("{WASM_COMPILE_HELPER}{}", std::env::consts::EXE_SUFFIX);
+    let mut dir = std::env::current_exe().ok()?;
+    dir.pop();
+    for _ in 0..3 {
+        let candidate = dir.join(&name);
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+        if !dir.pop() {
+            break;
+        }
+    }
+    None
+}
+
+/// The compiler command to use when the host has not injected one.
+///
+/// A host setting wins; otherwise a helper next to the executable is accepted.
+/// When neither exists, this returns `None` and loading fails closed.
+#[cfg(feature = "wasm-runtime")]
+fn resolved_compiler_command() -> Option<WasmCompilerCommand> {
+    configured_compiler_command().or_else(|| helper_next_to_current_exe().map(WasmCompilerCommand::new))
 }
 
 /// Wall-clock timeout for the compiler child.
@@ -331,68 +479,432 @@ fn compile_timeout() -> std::time::Duration {
     WASM_COMPILE_TIMEOUT
 }
 
-/// Compile a module, preferring the out-of-process helper.
-///
-/// The pre-scan has already run on `binary` by the time this is called. When
-/// the helper exists, compilation happens in a child process that the parent
-/// can kill. When it does not, compilation falls back in-process under the
-/// pre-scan limits; that fallback is *not* CPU-bounded, which is why the
-/// fallback is logged loudly.
+/// The AOT cache directory, honouring (in order) a host override, the
+/// `CODEREX_WASM_CACHE_DIR` environment variable, and the platform default.
 #[cfg(feature = "wasm-runtime")]
-fn compile_module(
+fn resolved_cache_dir() -> PathBuf {
+    if let Some(dir) = CACHE_DIR_OVERRIDE
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone()
+    {
+        return dir;
+    }
+    if let Some(dir) = std::env::var_os(WASM_CACHE_DIR_ENV) {
+        return PathBuf::from(dir);
+    }
+    default_cache_dir()
+}
+
+/// The platform's per-user cache directory for compiled WASM modules.
+#[cfg(feature = "wasm-runtime")]
+fn default_cache_dir() -> PathBuf {
+    #[cfg(target_os = "macos")]
+    {
+        if let Some(home) = home::home_dir() {
+            return home.join("Library/Caches/coderex/wasm");
+        }
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        if let Some(xdg) = std::env::var_os("XDG_CACHE_HOME") {
+            if !xdg.is_empty() {
+                return PathBuf::from(xdg).join("coderex/wasm");
+            }
+        }
+        if let Some(home) = home::home_dir() {
+            return home.join(".cache/coderex/wasm");
+        }
+    }
+    #[cfg(target_os = "windows")]
+    {
+        if let Some(local) = std::env::var_os("LOCALAPPDATA") {
+            return PathBuf::from(local).join("coderex").join("wasm");
+        }
+        if let Some(home) = home::home_dir() {
+            return home.join("AppData").join("Local").join("coderex").join("wasm");
+        }
+    }
+    std::env::temp_dir().join("coderex-wasm")
+}
+
+// ─── AOT cache ──────────────────────────────────────────────────────────────
+
+/// A SHA-256 hasher usable through `std::hash::Hash`.
+///
+/// wasmtime exposes its compatibility fingerprint only as `impl Hash`; feeding
+/// it through SHA-256 gives the cache a fixed-size, process-independent key.
+#[cfg(feature = "wasm-runtime")]
+#[derive(Clone)]
+struct Sha256Hasher(sha2::Sha256);
+
+#[cfg(feature = "wasm-runtime")]
+impl std::hash::Hasher for Sha256Hasher {
+    fn finish(&self) -> u64 {
+        use sha2::Digest;
+        let digest = self.0.clone().finalize();
+        u64::from_le_bytes(digest[..8].try_into().expect("SHA-256 is 32 bytes"))
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        use sha2::Digest;
+        self.0.update(bytes);
+    }
+}
+
+/// Hash the engine's configuration and wasmtime version.
+///
+/// `precompile_compatibility_hash` is wasmtime's own answer to "will bytes
+/// compiled under this engine deserialize under that one", and it covers the
+/// version and every configuration knob that affects code generation. The
+/// leading tag is ours: bump it when the cache entry format or the policies in
+/// [`sandboxed_engine`] change.
+#[cfg(feature = "wasm-runtime")]
+fn engine_config_hash(engine: &wasmtime::Engine) -> [u8; 32] {
+    use sha2::Digest;
+    use std::hash::Hash;
+
+    let mut hasher = Sha256Hasher(sha2::Sha256::new());
+    hasher.0.update(b"coderex-wasm-aot-v1");
+    engine.precompile_compatibility_hash().hash(&mut hasher);
+    hasher.0.finalize().into()
+}
+
+/// SHA-256 of the exact (pre-scanned, WAT-translated) module bytes.
+#[cfg(feature = "wasm-runtime")]
+fn module_sha256(bytes: &[u8]) -> [u8; 32] {
+    use sha2::Digest;
+    sha2::Sha256::digest(bytes).into()
+}
+
+/// `<root>/<engine hash>/<module hash>.cwasm`.
+#[cfg(feature = "wasm-runtime")]
+fn cache_entry_path(root: &std::path::Path, engine_hash: &[u8; 32], module_hash: &[u8; 32]) -> PathBuf {
+    root.join(hex::encode(engine_hash))
+        .join(format!("{}.cwasm", hex::encode(module_hash)))
+}
+
+/// Wrap serialized module bytes in the self-describing cache envelope.
+///
+/// The envelope makes the two checks the runtime needs explicit at read time:
+/// the entry was produced by a compatible engine, and it belongs to the module
+/// file whose bytes produced `module_hash`.
+#[cfg(feature = "wasm-runtime")]
+fn encode_cache_entry(engine_hash: &[u8; 32], module_hash: &[u8; 32], payload: &[u8]) -> Vec<u8> {
+    let mut entry = Vec::with_capacity(WASM_CACHE_HEADER_LEN + payload.len());
+    entry.extend_from_slice(WASM_CACHE_MAGIC);
+    entry.extend_from_slice(&WASM_CACHE_FORMAT_VERSION.to_le_bytes());
+    entry.extend_from_slice(engine_hash);
+    entry.extend_from_slice(module_hash);
+    entry.extend_from_slice(&(payload.len() as u64).to_le_bytes());
+    entry.extend_from_slice(payload);
+    entry
+}
+
+/// Verify an envelope and return its serialized module bytes.
+#[cfg(feature = "wasm-runtime")]
+fn decode_cache_entry<'a>(
+    entry: &'a [u8],
+    engine_hash: &[u8; 32],
+    module_hash: &[u8; 32],
+) -> Result<&'a [u8], String> {
+    if entry.len() < WASM_CACHE_HEADER_LEN {
+        return Err("cache entry is truncated".into());
+    }
+    if entry[..8] != WASM_CACHE_MAGIC[..] {
+        return Err("cache entry has a bad magic number".into());
+    }
+    let version = u32::from_le_bytes(entry[8..12].try_into().expect("4 bytes"));
+    if version != WASM_CACHE_FORMAT_VERSION {
+        return Err(format!(
+            "cache entry uses format version {version}, expected {WASM_CACHE_FORMAT_VERSION}"
+        ));
+    }
+    if entry[12..44] != engine_hash[..] {
+        return Err("cache entry was compiled by a different engine configuration".into());
+    }
+    if entry[44..76] != module_hash[..] {
+        return Err("cache entry does not match the module file's SHA-256".into());
+    }
+    let len = u64::from_le_bytes(entry[76..84].try_into().expect("8 bytes")) as usize;
+    let payload = &entry[WASM_CACHE_HEADER_LEN..];
+    if payload.len() != len {
+        return Err(format!(
+            "cache entry payload is {} bytes, header says {len}",
+            payload.len()
+        ));
+    }
+    Ok(payload)
+}
+
+/// Try to load a cached module. A corrupt or incompatible entry is deleted and
+/// treated as a miss, so the next step compiles and replaces it.
+#[cfg(feature = "wasm-runtime")]
+fn read_cached_module(
+    engine: &wasmtime::Engine,
+    engine_hash: &[u8; 32],
+    module_hash: &[u8; 32],
+    cache_path: &std::path::Path,
+    wasm_path: &std::path::Path,
+) -> Option<wasmtime::Module> {
+    let entry = match std::fs::read(cache_path) {
+        Ok(entry) => entry,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(e) => {
+            tracing::warn!(
+                cache = %cache_path.display(),
+                "failed to read WASM AOT cache entry: {e}"
+            );
+            return None;
+        }
+    };
+    let payload = match decode_cache_entry(&entry, engine_hash, module_hash) {
+        Ok(payload) => payload,
+        Err(e) => {
+            tracing::warn!(
+                cache = %cache_path.display(),
+                "ignoring WASM AOT cache entry: {e}"
+            );
+            let _ = std::fs::remove_file(cache_path);
+            return None;
+        }
+    };
+
+    // SAFETY: the envelope verified that this payload is the `Module::serialize`
+    // output of an engine with the same precompile-compatibility hash, for the
+    // exact module bytes being loaded. The cache lives in the user's private
+    // cache directory; a same-user process that tampers with it is already
+    // inside this process's trust boundary.
+    match unsafe { wasmtime::Module::deserialize(engine, payload) } {
+        Ok(module) => {
+            tracing::debug!(
+                module = %wasm_path.display(),
+                cache = %cache_path.display(),
+                "loaded WASM module from the AOT cache"
+            );
+            Some(module)
+        }
+        Err(e) => {
+            tracing::warn!(
+                cache = %cache_path.display(),
+                "ignoring incompatible WASM AOT cache entry: {e}"
+            );
+            let _ = std::fs::remove_file(cache_path);
+            None
+        }
+    }
+}
+
+/// Write a cache entry atomically and prune the cache back to its size bound.
+#[cfg(feature = "wasm-runtime")]
+fn store_cached_module(
+    cache_path: &std::path::Path,
+    engine_hash: &[u8; 32],
+    module_hash: &[u8; 32],
+    payload: &[u8],
+) -> std::io::Result<()> {
+    use std::io::Write as _;
+
+    let parent = cache_path
+        .parent()
+        .ok_or_else(|| std::io::Error::other("cache entry has no parent directory"))?;
+    std::fs::create_dir_all(parent)?;
+
+    let entry = encode_cache_entry(engine_hash, module_hash, payload);
+    let tmp = parent.join(format!(
+        ".{}.{}.tmp",
+        hex::encode(module_hash),
+        std::process::id()
+    ));
+    {
+        let mut file = std::fs::File::create(&tmp)?;
+        file.write_all(&entry)?;
+        file.sync_all()?;
+    }
+
+    if let Err(rename_error) = std::fs::rename(&tmp, cache_path) {
+        let _ = std::fs::remove_file(&tmp);
+        // Another process may have written the same entry first. That is a
+        // success as long as a complete file is there now.
+        if !cache_path.is_file() {
+            return Err(rename_error);
+        }
+    }
+
+    if let Some(root) = parent.parent() {
+        prune_cache(root, WASM_CACHE_MAX_BYTES);
+    }
+    Ok(())
+}
+
+/// Delete the oldest cache entries until the cache is at or below `max_bytes`.
+///
+/// Only engine-hash directories (64 hex characters) are considered, so the
+/// staging directories used by in-flight compilations are never pruned. The
+/// most recent entry is kept even when it alone exceeds the bound, so a single
+/// large module cannot turn every load into a recompile.
+#[cfg(feature = "wasm-runtime")]
+fn prune_cache(root: &std::path::Path, max_bytes: u64) {
+    let mut entries: Vec<(PathBuf, u64, std::time::SystemTime)> = Vec::new();
+    collect_cache_files(root, &mut entries);
+
+    let mut total: u64 = entries.iter().map(|(_, size, _)| *size).sum();
+    if total <= max_bytes {
+        return;
+    }
+
+    entries.sort_by_key(|(_, _, modified)| *modified);
+    while entries.len() > 1 && total > max_bytes {
+        let (path, size, _) = entries.remove(0);
+        if std::fs::remove_file(&path).is_ok() {
+            total = total.saturating_sub(size);
+        }
+    }
+    tracing::debug!(
+        root = %root.display(),
+        total_bytes = total,
+        "pruned the WASM AOT cache"
+    );
+}
+
+/// Collect cache files under engine-hash directories only.
+#[cfg(feature = "wasm-runtime")]
+fn collect_cache_files(
+    root: &std::path::Path,
+    entries: &mut Vec<(PathBuf, u64, std::time::SystemTime)>,
+) {
+    let Ok(dirs) = std::fs::read_dir(root) else {
+        return;
+    };
+    for dir in dirs.flatten() {
+        let name = dir.file_name();
+        let name = name.to_string_lossy();
+        if name.len() != 64 || !name.chars().all(|c| c.is_ascii_hexdigit()) {
+            continue;
+        }
+        let Ok(files) = std::fs::read_dir(dir.path()) else {
+            continue;
+        };
+        for file in files.flatten() {
+            let Ok(metadata) = file.metadata() else {
+                continue;
+            };
+            if !metadata.is_file() {
+                continue;
+            }
+            let Ok(modified) = metadata.modified() else {
+                continue;
+            };
+            entries.push((file.path(), metadata.len(), modified));
+        }
+    }
+}
+
+/// Load the module, using the AOT cache and failing closed when no compiler is
+/// available.
+#[cfg(feature = "wasm-runtime")]
+fn load_module(
     engine: &wasmtime::Engine,
     wasm_path: &std::path::Path,
     binary: &[u8],
+    compiler: Option<&WasmCompilerCommand>,
+    cache_dir: &std::path::Path,
 ) -> Result<wasmtime::Module, String> {
-    let Some(helper) = compile_helper_path() else {
-        tracing::warn!(
-            module = %wasm_path.display(),
-            "WASM compile helper '{WASM_COMPILE_HELPER}' was not found next to the current \
-             executable; compiling in-process. Pre-scan limits apply, but in-process compilation \
-             has no CPU bound."
-        );
-        return wasmtime::Module::new(engine, binary)
-            .map_err(|e| format!("failed to load WASM module '{}': {e}", wasm_path.display()));
+    let engine_hash = engine_config_hash(engine);
+    let module_hash = module_sha256(binary);
+    let cache_path = cache_entry_path(cache_dir, &engine_hash, &module_hash);
+
+    if let Some(module) =
+        read_cached_module(engine, &engine_hash, &module_hash, &cache_path, wasm_path)
+    {
+        return Ok(module);
+    }
+
+    let Some(command) = compiler else {
+        return Err(format!(
+            "refusing to load WASM plugin '{}': no WASM compiler command is configured. \
+             The host must inject one with \
+             coderex_plugins::wasm_runtime::set_compiler_command (the CodeRex CLI points it at \
+             its own executable with '{INTERNAL_WASM_COMPILE_FLAG}'). Refusing to compile \
+             untrusted code in-process.",
+            wasm_path.display()
+        ));
     };
 
-    let serialized = run_compile_helper(&helper, binary)?;
+    let serialized = run_compile_helper(command, binary, cache_dir)?;
 
-    // SAFETY: `serialized` is the `Module::serialize` output of our own helper
-    // binary, linked against the same wasmtime version and built with the same
-    // engine configuration (`sandboxed_engine`). The helper writes it into a
-    // private `tempfile` directory (mode 0700 on Unix) and the parent reads it
-    // only after the helper exits successfully. wasmtime's safety requirement
-    // is that the bytes are trusted precompiled code; the helper compiles an
-    // untrusted module, but the bytes it emits are produced by wasmtime itself.
-    unsafe { wasmtime::Module::deserialize(engine, &serialized) }.map_err(|e| {
+    // SAFETY: the bytes were produced by `Module::serialize` in our own
+    // compiler process, running the same wasmtime version and the same
+    // `sandboxed_engine` configuration, and were transported through a private
+    // staging directory. A mismatch (for example a stale helper binary) makes
+    // deserialization fail, which is a hard error here.
+    let module = unsafe { wasmtime::Module::deserialize(engine, &serialized) }.map_err(|e| {
         format!(
-            "failed to deserialize compiled WASM module '{}': {e}",
-            wasm_path.display()
+            "WASM compiler '{}' produced bytes this runtime cannot load (engine mismatch?): {e}",
+            command.program().display()
         )
-    })
+    })?;
+
+    if let Err(e) = store_cached_module(&cache_path, &engine_hash, &module_hash, &serialized) {
+        tracing::warn!(
+            cache = %cache_path.display(),
+            "failed to store the WASM AOT cache entry: {e}"
+        );
+    }
+    Ok(module)
 }
 
-/// Run the helper in a killable child and return its serialized module.
+// ─── Out-of-process compilation ─────────────────────────────────────────────
+
+/// Run the compiler command in a killable child and return its serialized
+/// module.
+///
+/// The child is put in its own process group (Unix) or a Job Object with
+/// `KILL_ON_JOB_CLOSE` (Windows), so a timeout kills the whole tree, not just
+/// the direct child. Where the platform sandbox primitives fit, they wrap the
+/// command as well; see [`wrap_with_macos_sandbox`] and
+/// [`wrap_with_bubblewrap`].
 #[cfg(feature = "wasm-runtime")]
 fn run_compile_helper(
-    helper: &std::path::Path,
+    command: &WasmCompilerCommand,
     binary: &[u8],
+    cache_root: &std::path::Path,
 ) -> Result<Vec<u8>, String> {
-    let dir = tempfile::tempdir()
+    // Stage under the cache root rather than the system temp directory:
+    // bubblewrap replaces `/tmp` with a fresh tmpfs, which would make a bind
+    // mount of a staging path under `/tmp` resolve against the empty tmpfs.
+    let staging_root = cache_root.join("staging");
+    std::fs::create_dir_all(&staging_root)
+        .map_err(|e| format!("failed to create the WASM compile staging directory: {e}"))?;
+    let dir = tempfile::Builder::new()
+        .prefix("compile-")
+        .tempdir_in(&staging_root)
         .map_err(|e| format!("failed to create a temp dir for WASM compilation: {e}"))?;
-    let input_path = dir.path().join("input.wasm");
-    let output_path = dir.path().join("output.cwasm");
-    let stderr_path = dir.path().join("helper.stderr");
+    // Sandbox profiles match the kernel's resolved paths, so canonicalize
+    // (`/tmp` is a symlink to `/private/tmp` on macOS).
+    let work_dir = std::fs::canonicalize(dir.path()).unwrap_or_else(|_| dir.path().to_path_buf());
+    let input_path = work_dir.join("input.wasm");
+    let output_path = work_dir.join("output.cwasm");
+    let stderr_path = work_dir.join("helper.stderr");
 
     std::fs::write(&input_path, binary)
         .map_err(|e| format!("failed to stage WASM input for compilation: {e}"))?;
     let stderr = std::fs::File::create(&stderr_path)
         .map_err(|e| format!("failed to create WASM compiler stderr file: {e}"))?;
 
-    let mut command = std::process::Command::new(helper);
-    command
-        .arg(&input_path)
-        .arg(&output_path)
+    let mut program: OsString = command.program().as_os_str().to_os_string();
+    let mut args: Vec<OsString> = command.args().to_vec();
+    args.push(input_path.clone().into_os_string());
+    args.push(output_path.clone().into_os_string());
+
+    #[cfg(target_os = "linux")]
+    let _wrapper = wrap_with_bubblewrap(&mut program, &mut args, &work_dir);
+    #[cfg(target_os = "macos")]
+    let _sandbox = wrap_with_macos_sandbox(&mut program, &mut args, &work_dir, command.program());
+
+    let mut child_command = std::process::Command::new(&program);
+    child_command
+        .args(&args)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::from(stderr));
@@ -400,73 +912,203 @@ fn run_compile_helper(
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
+        // A new process group is what makes `kill(-pid, SIGKILL)` on timeout
+        // take the whole tree with it, including wrapper processes and any
+        // descendants the compiler created.
+        child_command.process_group(0);
         // SAFETY: `pre_exec` runs between fork and exec in the child. The
         // closure only calls `setrlimit`, which is async-signal-safe, and
         // captures two integers.
         unsafe {
-            command.pre_exec(|| {
-                apply_compile_rlimits()?;
-                Ok(())
-            });
+            child_command.pre_exec(apply_compile_rlimits);
         }
     }
 
     #[cfg(target_os = "windows")]
-    let sandbox = {
-        use coderex_core::sandbox::{SandboxConfig, SandboxHandle};
-        let config = SandboxConfig {
-            max_cpu_seconds: Some(WASM_COMPILE_CPU_SECONDS),
-            max_memory_bytes: Some(WASM_COMPILE_MEMORY_BYTES),
-            ..SandboxConfig::default()
-        };
-        let handle = SandboxHandle::create(config)
-            .map_err(|e| format!("failed to create WASM compile job object: {e}"))?;
-        handle
-            .prepare(&mut command)
-            .map_err(|e| format!("failed to prepare WASM compile helper: {e}"))?;
-        handle
-    };
+    let job = CompileJob::create(WASM_COMPILE_CPU_SECONDS, WASM_COMPILE_MEMORY_BYTES)
+        .map_err(|e| format!("failed to create the WASM compile job object: {e}"))?;
 
-    let mut child = command.spawn().map_err(|e| {
+    let mut child = child_command.spawn().map_err(|e| {
         format!(
-            "failed to spawn WASM compile helper '{}': {e}",
-            helper.display()
+            "failed to spawn WASM compiler '{}': {e}",
+            command.program().display()
         )
     })?;
 
     #[cfg(target_os = "windows")]
-    sandbox.post_spawn(&child).map_err(|e| {
+    job.assign(&child).map_err(|e| {
         let _ = child.kill();
-        format!("failed to assign WASM compile helper to its job object: {e}")
+        format!("failed to assign the WASM compiler to its job object: {e}")
     })?;
 
-    let status = wait_for_compile_child(&mut child, compile_timeout())?;
+    #[cfg(unix)]
+    let killer = ChildKiller::Group;
+    #[cfg(target_os = "windows")]
+    let killer = ChildKiller::Job(&job);
+    #[cfg(not(any(unix, windows)))]
+    let killer = ChildKiller::Plain;
+
+    let status =
+        wait_for_compile_child(&mut child, compile_timeout(), |child| killer.kill(child))?;
     if !status.success() {
         let detail = std::fs::read_to_string(&stderr_path).unwrap_or_default();
         let detail = detail.trim();
         return Err(if detail.is_empty() {
-            format!("WASM compile helper '{}' failed with {status}", helper.display())
+            format!(
+                "WASM compiler '{}' failed with {status}",
+                command.program().display()
+            )
         } else {
             format!(
-                "WASM compile helper '{}' failed with {status}: {detail}",
-                helper.display()
+                "WASM compiler '{}' failed with {status}: {detail}",
+                command.program().display()
             )
         });
     }
 
     let serialized = std::fs::read(&output_path).map_err(|e| {
         format!(
-            "WASM compile helper '{}' exited successfully but produced no output: {e}",
-            helper.display()
+            "WASM compiler '{}' exited successfully but produced no output: {e}",
+            command.program().display()
         )
     })?;
     if serialized.is_empty() {
         return Err(format!(
-            "WASM compile helper '{}' produced an empty serialized module",
-            helper.display()
+            "WASM compiler '{}' produced an empty serialized module",
+            command.program().display()
         ));
     }
     Ok(serialized)
+}
+
+/// Run the compiler under macOS `sandbox-exec` when the core sandbox can build
+/// a profile for it.
+///
+/// The profile allows reading and writing the staging directory, executing the
+/// compiler, and the system roots the dynamic loader needs; it denies network
+/// access. It is inherited by the compiler's descendants. When sandbox-exec is
+/// unavailable or profile creation fails, the command runs with rlimits and
+/// the process-group kill only, and the caller's documentation says so.
+#[cfg(all(target_os = "macos", feature = "wasm-runtime"))]
+fn wrap_with_macos_sandbox(
+    program: &mut OsString,
+    args: &mut Vec<OsString>,
+    work_dir: &std::path::Path,
+    compiler: &std::path::Path,
+) -> Option<coderex_core::sandbox::SandboxHandle> {
+    use coderex_core::sandbox::{SandboxConfig, SandboxHandle};
+
+    // Test hook: the leading-argument forwarding test uses a shell script
+    // wrapper, which the compiler profile intentionally does not execute.
+    #[cfg(debug_assertions)]
+    if std::env::var_os("CODEREX_WASM_COMPILE_TEST_NO_SANDBOX").is_some() {
+        return None;
+    }
+
+    if !std::path::Path::new("/usr/bin/sandbox-exec").is_file() {
+        tracing::warn!(
+            "sandbox-exec is not available; compiling WASM with rlimits and the process-group \
+             kill but no filesystem or network sandbox"
+        );
+        return None;
+    }
+
+    let compiler = std::fs::canonicalize(compiler).unwrap_or_else(|_| compiler.to_path_buf());
+    let mut allowed_read_paths = vec![work_dir.to_path_buf(), compiler.clone()];
+    if let Some(parent) = compiler.parent() {
+        allowed_read_paths.push(parent.to_path_buf());
+    }
+    let mut allowed_exec_paths = vec![compiler];
+    // Debug builds add the orchestrator's child-spawn test hook (`sleep`).
+    #[cfg(debug_assertions)]
+    {
+        allowed_exec_paths.push(PathBuf::from("/bin/sleep"));
+        allowed_exec_paths.push(PathBuf::from("/usr/bin/sleep"));
+    }
+
+    let config = SandboxConfig {
+        allowed_read_paths,
+        allowed_write_paths: vec![work_dir.to_path_buf()],
+        allowed_exec_paths,
+        additional_working_dirs: vec![work_dir.to_path_buf()],
+        max_cpu_seconds: Some(WASM_COMPILE_CPU_SECONDS),
+        max_memory_bytes: Some(WASM_COMPILE_MEMORY_BYTES),
+        allow_network: false,
+        ..SandboxConfig::default()
+    };
+
+    let handle = match SandboxHandle::create(config) {
+        Ok(handle) => handle,
+        Err(e) => {
+            tracing::warn!(
+                "failed to create the macOS sandbox for WASM compilation ({e}); continuing with \
+                 rlimits and the process-group kill only"
+            );
+            return None;
+        }
+    };
+    let (wrapper, wrapper_args) = handle.sandboxed_program()?;
+
+    let inner_program = program.clone();
+    let inner_args = std::mem::take(args);
+    let mut wrapped: Vec<OsString> = wrapper_args.into_iter().map(OsString::from).collect();
+    wrapped.push(inner_program);
+    wrapped.extend(inner_args);
+    *program = OsString::from(wrapper);
+    *args = wrapped;
+    Some(handle)
+}
+
+/// Run the compiler inside a bubblewrap mount/network namespace when `bwrap`
+/// is in force.
+///
+/// The root is read-only, the staging directory is the only writable path, and
+/// the network namespace is unshared. The core seccomp allowlist is *not*
+/// applied: it is written for shells and would reject wasmtime's syscalls.
+/// rlimits and the process-group kill still apply through `pre_exec`.
+#[cfg(all(target_os = "linux", feature = "wasm-runtime"))]
+fn wrap_with_bubblewrap(
+    program: &mut OsString,
+    args: &mut Vec<OsString>,
+    work_dir: &std::path::Path,
+) -> bool {
+    use coderex_core::sandbox::{SandboxConfig, bubblewrap_program};
+
+    // `bubblewrap_args` replaces `/tmp` with a fresh tmpfs. A staging
+    // directory under `/tmp` would then resolve inside that empty tmpfs and
+    // the writable bind would fail, so fall back to rlimits for that layout
+    // instead of claiming a sandbox that cannot be applied.
+    let system_temp =
+        std::fs::canonicalize(std::env::temp_dir()).unwrap_or_else(|_| std::env::temp_dir());
+    if work_dir.starts_with(&system_temp) {
+        tracing::warn!(
+            staging = %work_dir.display(),
+            "WASM compilation staging is inside the system temp directory, which bubblewrap \
+             replaces; compiling with rlimits and the process-group kill but no bubblewrap"
+        );
+        return false;
+    }
+
+    let config = SandboxConfig {
+        allowed_write_paths: vec![work_dir.to_path_buf()],
+        additional_working_dirs: vec![work_dir.to_path_buf()],
+        max_cpu_seconds: Some(WASM_COMPILE_CPU_SECONDS),
+        max_memory_bytes: Some(WASM_COMPILE_MEMORY_BYTES),
+        allow_network: false,
+        ..SandboxConfig::default()
+    };
+    let Some((wrapper, wrapper_args)) = bubblewrap_program(&config) else {
+        return false;
+    };
+
+    let inner_program = program.clone();
+    let inner_args = std::mem::take(args);
+    let mut wrapped: Vec<OsString> = wrapper_args.into_iter().map(OsString::from).collect();
+    wrapped.push(inner_program);
+    wrapped.extend(inner_args);
+    *program = OsString::from(wrapper);
+    *args = wrapped;
+    true
 }
 
 /// Install `RLIMIT_CPU` and `RLIMIT_AS` on the compiler child.
@@ -506,11 +1148,69 @@ fn apply_compile_rlimits() -> std::io::Result<()> {
     Ok(())
 }
 
-/// Wait for the compiler child, killing it when the wall-clock budget expires.
+/// How a timed-out compiler child is killed.
+#[cfg(all(unix, feature = "wasm-runtime"))]
+enum ChildKiller {
+    /// The child leads its own process group (`process_group(0)`).
+    Group,
+}
+
+#[cfg(all(unix, feature = "wasm-runtime"))]
+impl ChildKiller {
+    fn kill(&self, child: &mut std::process::Child) {
+        match self {
+            Self::Group => {
+                if let Ok(pid) = libc::pid_t::try_from(child.id()) {
+                    // SAFETY: `process_group(0)` made the child the leader of
+                    // a new group and it has not exec'd anything that changes
+                    // that. `-pid` therefore names exactly the spawned tree.
+                    unsafe {
+                        libc::kill(-pid, libc::SIGKILL);
+                    }
+                }
+                let _ = child.kill();
+            }
+        }
+    }
+}
+
+#[cfg(all(windows, feature = "wasm-runtime"))]
+enum ChildKiller<'a> {
+    /// The child and every descendant live in this Job Object.
+    Job(&'a CompileJob),
+}
+
+#[cfg(all(windows, feature = "wasm-runtime"))]
+impl ChildKiller<'_> {
+    fn kill(&self, child: &mut std::process::Child) {
+        match self {
+            Self::Job(job) => {
+                job.terminate();
+                let _ = child.kill();
+            }
+        }
+    }
+}
+
+#[cfg(all(not(any(unix, windows)), feature = "wasm-runtime"))]
+enum ChildKiller {
+    Plain,
+}
+
+#[cfg(all(not(any(unix, windows)), feature = "wasm-runtime"))]
+impl ChildKiller {
+    fn kill(&self, child: &mut std::process::Child) {
+        let _ = child.kill();
+    }
+}
+
+/// Wait for the compiler child, killing its whole tree when the wall-clock
+/// budget expires.
 #[cfg(feature = "wasm-runtime")]
 fn wait_for_compile_child(
     child: &mut std::process::Child,
     timeout: std::time::Duration,
+    killer: impl Fn(&mut std::process::Child),
 ) -> Result<std::process::ExitStatus, String> {
     let started = std::time::Instant::now();
     loop {
@@ -518,18 +1218,18 @@ fn wait_for_compile_child(
             Ok(Some(status)) => return Ok(status),
             Ok(None) => {
                 if started.elapsed() >= timeout {
-                    let _ = child.kill();
+                    killer(child);
                     let _ = child.wait();
                     return Err(format!(
-                        "WASM compilation exceeded the {} ms wall-clock limit; the helper was \
-                         killed",
+                        "WASM compilation exceeded the {} ms wall-clock limit; the helper process \
+                         tree was killed",
                         timeout.as_millis()
                     ));
                 }
                 std::thread::sleep(std::time::Duration::from_millis(10));
             }
             Err(e) => {
-                let _ = child.kill();
+                killer(child);
                 let _ = child.wait();
                 return Err(format!("failed to wait for the WASM compile helper: {e}"));
             }
@@ -539,9 +1239,10 @@ fn wait_for_compile_child(
 
 /// Compile a WASM module and return wasmtime's serialized representation.
 ///
-/// Internal entry point for the hidden `coderex-wasm-compile` helper binary;
-/// not part of the stable plugin API. The pre-scan runs here too so a directly
-/// invoked helper still refuses pathological input.
+/// Entry point for the hidden compiler process (the `coderex-wasm-compile`
+/// helper binary and the CLI's `--internal-wasm-compile` argument); not part
+/// of the stable plugin API. The pre-scan runs here too, so a directly invoked
+/// compiler still refuses pathological input.
 #[cfg(feature = "wasm-runtime")]
 #[doc(hidden)]
 pub fn compile_to_serialized(bytes: &[u8]) -> Result<Vec<u8>, String> {
@@ -562,13 +1263,186 @@ pub fn compile_to_serialized(bytes: &[u8]) -> Result<Vec<u8>, String> {
 #[doc(hidden)]
 pub fn deserialize_compiled_module(bytes: &[u8]) -> Result<(), String> {
     let engine = sandboxed_engine()?;
-    // SAFETY: see the safety comment in `compile_module`. This entry point is
-    // an internal test hook; it trusts the caller the same way the parent
-    // trusts its own helper's output.
+    // SAFETY: this test hook trusts its caller the same way the load path
+    // trusts the output of its own compiler process.
     unsafe { wasmtime::Module::deserialize(&engine, bytes) }
         .map(|_| ())
         .map_err(|e| format!("failed to deserialize compiled WASM module: {e}"))
 }
+
+/// Run the hidden compiler protocol: `<args> <input> <output>`.
+///
+/// Both the `coderex-wasm-compile` helper binary and the CLI's internal
+/// subcommand call this. It reads the input file, pre-scans and compiles it,
+/// and writes `Module::serialize` bytes to the output path.
+#[cfg(feature = "wasm-runtime")]
+#[doc(hidden)]
+pub fn compile_helper_main<I>(args: I) -> Result<(), String>
+where
+    I: IntoIterator<Item = OsString>,
+{
+    #[cfg(debug_assertions)]
+    compiler_test_hooks::before_compile();
+
+    let mut args = args.into_iter();
+    let (Some(input), Some(output)) = (args.next(), args.next()) else {
+        return Err("usage: <input> <output>".into());
+    };
+    if args.next().is_some() {
+        return Err("usage: <input> <output>".into());
+    }
+
+    let bytes = std::fs::read(&input)
+        .map_err(|e| format!("failed to read '{}': {e}", input.to_string_lossy()))?;
+    let serialized = compile_to_serialized(&bytes)?;
+    std::fs::write(&output, serialized)
+        .map_err(|e| format!("failed to write '{}': {e}", output.to_string_lossy()))?;
+    Ok(())
+}
+
+/// Stub when the WASM runtime is compiled out.
+#[cfg(not(feature = "wasm-runtime"))]
+#[doc(hidden)]
+pub fn compile_helper_main<I>(_args: I) -> Result<(), String>
+where
+    I: IntoIterator<Item = OsString>,
+{
+    Err("WASM runtime not enabled. Rebuild with --features wasm-runtime".into())
+}
+
+/// Debug-build hooks used by the subprocess tests.
+///
+/// They are inert unless the corresponding environment variable is set, and
+/// they are compiled out of release builds entirely.
+#[cfg(all(feature = "wasm-runtime", debug_assertions))]
+mod compiler_test_hooks {
+    use std::io::Write as _;
+
+    pub fn before_compile() {
+        if let Ok(path) = std::env::var("CODEREX_WASM_COMPILE_TEST_COUNT_FILE") {
+            if let Ok(mut file) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)
+            {
+                let _ = writeln!(file, "compile");
+            }
+        }
+
+        // Spawn a descendant that outlives the compiler unless the parent's
+        // timeout kill takes the whole process group / job.
+        #[cfg(unix)]
+        if let Ok(path) = std::env::var("CODEREX_WASM_COMPILE_TEST_CHILD_PID_FILE") {
+            if let Ok(child) = std::process::Command::new("sleep")
+                .arg("60")
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+            {
+                let _ = std::fs::write(path, child.id().to_string());
+                // Dropping `Child` does not kill it; it runs until the group
+                // kill or its own `sleep` ends.
+            }
+        }
+
+        if let Ok(raw) = std::env::var("CODEREX_WASM_COMPILE_TEST_SLEEP_MS") {
+            if let Ok(millis) = raw.parse::<u64>() {
+                std::thread::sleep(std::time::Duration::from_millis(millis));
+            }
+        }
+    }
+}
+
+/// Windows Job Object used to bound and kill the compiler tree.
+///
+/// `KILL_ON_JOB_CLOSE` is the important flag: the runtime also calls
+/// `TerminateJobObject` on timeout, and closing the handle kills any
+/// descendant that is somehow still alive, so no orphan survives the load.
+#[cfg(all(windows, feature = "wasm-runtime"))]
+mod windows_job {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
+    use windows_sys::Win32::System::JobObjects::{
+        AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
+        SetInformationJobObject, TerminateJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+        JOB_OBJECT_LIMIT_JOB_MEMORY, JOB_OBJECT_LIMIT_JOB_TIME,
+        JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+    };
+
+    /// A job object holding the compiler and its descendants.
+    pub struct CompileJob(HANDLE);
+
+    impl CompileJob {
+        pub fn create(cpu_seconds: u64, memory_bytes: u64) -> std::io::Result<Self> {
+            // SAFETY: null attributes/name ask for an anonymous, default
+            // security job object.
+            let handle = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
+            if handle.is_null() {
+                return Err(std::io::Error::last_os_error());
+            }
+
+            // SAFETY: the structure is zero-initialized and every field that
+            // is read is set below.
+            let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = unsafe { std::mem::zeroed() };
+            info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+                | JOB_OBJECT_LIMIT_JOB_TIME
+                | JOB_OBJECT_LIMIT_JOB_MEMORY;
+            info.BasicLimitInformation.PerJobUserTimeLimit = (cpu_seconds * 10_000_000) as i64;
+            info.JobMemoryLimit = memory_bytes as usize;
+
+            // SAFETY: `info` outlives the call and the size is its own.
+            let ok = unsafe {
+                SetInformationJobObject(
+                    handle,
+                    JobObjectExtendedLimitInformation,
+                    std::ptr::from_ref(&info).cast(),
+                    std::mem::size_of_val(&info) as u32,
+                )
+            };
+            if ok == 0 {
+                let error = std::io::Error::last_os_error();
+                // SAFETY: `handle` was created above and is not used again.
+                unsafe { CloseHandle(handle) };
+                return Err(error);
+            }
+            Ok(Self(handle))
+        }
+
+        /// Put an already-spawned child (and its future descendants) in the
+        /// job. Descendants created before this call are not covered; the
+        /// compiler does not spawn any in normal operation.
+        pub fn assign(&self, child: &std::process::Child) -> std::io::Result<()> {
+            // SAFETY: both handles are valid for the duration of the call.
+            let ok =
+                unsafe { AssignProcessToJobObject(self.0, child.as_raw_handle() as HANDLE) };
+            if ok == 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        }
+
+        /// Kill every process in the job.
+        pub fn terminate(&self) {
+            // SAFETY: the handle is valid until this value is dropped.
+            unsafe {
+                TerminateJobObject(self.0, 1);
+            }
+        }
+    }
+
+    impl Drop for CompileJob {
+        fn drop(&mut self) {
+            // `KILL_ON_JOB_CLOSE` turns this close into a kill for any process
+            // still in the job.
+            // SAFETY: this is the only owner of the handle.
+            unsafe { CloseHandle(self.0) };
+        }
+    }
+}
+
+#[cfg(all(windows, feature = "wasm-runtime"))]
+use windows_job::CompileJob;
 
 /// A loaded WASM plugin instance.
 ///
@@ -618,7 +1492,27 @@ impl PluginWasmInstance {
     /// `PLUGIN_MAX_WASM_BYTES`. The metadata check avoids reading an oversized
     /// file into memory at all; the length is checked again after reading in
     /// case the file changed between the two calls.
+    ///
+    /// The module is loaded from the AOT cache when a compatible entry exists;
+    /// otherwise it is compiled by the host-injected command (or a helper next
+    /// to the executable). With neither available, loading **fails closed** —
+    /// this function never compiles untrusted code in-process.
     pub fn new(wasm_path: &std::path::Path) -> Result<Self, String> {
+        Self::load_with(wasm_path, resolved_compiler_command(), None)
+    }
+
+    /// Load with an explicit compiler command and cache directory.
+    ///
+    /// `compiler: None` disables compilation for this call, which makes the
+    /// fail-closed path testable. `cache_dir: None` uses the resolved default.
+    /// This is an internal seam; hosts configure the runtime with
+    /// [`set_compiler_command`] and call [`PluginWasmInstance::new`].
+    #[doc(hidden)]
+    pub fn load_with(
+        wasm_path: &std::path::Path,
+        compiler: Option<WasmCompilerCommand>,
+        cache_dir: Option<PathBuf>,
+    ) -> Result<Self, String> {
         let engine = sandboxed_engine()?;
 
         let metadata = std::fs::metadata(wasm_path)
@@ -628,13 +1522,20 @@ impl PluginWasmInstance {
             .map_err(|e| format!("failed to read WASM module '{}': {e}", wasm_path.display()))?;
         ensure_within_size_cap(wasm_path, bytes.len() as u64)?;
 
-        // The linear pre-scan is the floor: it runs before either compilation
-        // path, so even the in-process fallback refuses modules that demand
-        // excessive code size, function count, operator count, or nesting.
+        // The linear pre-scan is the first gate: it runs before any compiler
+        // process is started, and the compiler repeats it for the bytes it
+        // receives.
         let name = wasm_path.display().to_string();
         let scanned = prescan_module(&name, &bytes, PrescanLimits::default())?;
 
-        let module = compile_module(&engine, wasm_path, &scanned)?;
+        let cache_dir = cache_dir.unwrap_or_else(resolved_cache_dir);
+        let module = load_module(
+            &engine,
+            wasm_path,
+            &scanned,
+            compiler.as_ref(),
+            &cache_dir,
+        )?;
         Ok(Self {
             engine,
             module,
@@ -956,6 +1857,39 @@ mod tests {
             "unexpected error: {err}"
         );
     }
+
+    /// The injected command keeps its program and leading arguments distinct;
+    /// the runtime appends `<input> <output>` at execution time.
+    #[test]
+    fn compiler_command_keeps_program_and_leading_args() {
+        let command = WasmCompilerCommand::new("/usr/bin/example")
+            .arg("--internal-wasm-compile")
+            .arg("extra");
+        assert_eq!(command.program(), std::path::Path::new("/usr/bin/example"));
+        assert_eq!(
+            command.args(),
+            [
+                OsString::from("--internal-wasm-compile"),
+                OsString::from("extra"),
+            ]
+        );
+    }
+
+    /// Debug builds resolve the helper binary shipped next to the tests, which
+    /// is what lets `cargo test -p coderex-plugins` exercise the real
+    /// compiler without configuring a command explicitly.
+    #[cfg(all(feature = "wasm-runtime", debug_assertions))]
+    #[test]
+    fn helper_binary_is_discovered_next_to_the_test_binary() {
+        let helper = helper_next_to_current_exe().expect("helper must be discoverable");
+        assert!(
+            helper
+                .file_name()
+                .is_some_and(|name| name.to_string_lossy().starts_with(WASM_COMPILE_HELPER)),
+            "unexpected helper path: {}",
+            helper.display()
+        );
+    }
 }
 
 /// Sandbox tests. These only exist when the WASM runtime is compiled in, which
@@ -975,6 +1909,23 @@ mod sandbox_tests {
         path
     }
 
+    /// The real helper binary built next to the test binary.
+    fn test_compiler() -> WasmCompilerCommand {
+        let helper = helper_next_to_current_exe()
+            .expect("the coderex-wasm-compile helper must be built next to the test binary");
+        WasmCompilerCommand::new(helper)
+    }
+
+    /// Load through the injected-command path with a private cache directory.
+    fn load(path: &Path) -> Result<PluginWasmInstance, String> {
+        let cache = tempfile::tempdir().expect("failed to create a test cache dir");
+        PluginWasmInstance::load_with(
+            path,
+            Some(test_compiler()),
+            Some(cache.path().to_path_buf()),
+        )
+    }
+
     /// A file over the cap is refused by the size check, before wasmtime
     /// parses it. The contents are zeros, so a missing check would surface as
     /// a parse error instead of this size error.
@@ -985,7 +1936,7 @@ mod sandbox_tests {
         let size = PLUGIN_MAX_WASM_BYTES + 1;
         std::fs::write(&path, vec![0u8; size]).unwrap();
 
-        let err = PluginWasmInstance::new(&path).unwrap_err();
+        let err = load(&path).unwrap_err();
         assert!(
             err.contains("exceeds") && err.contains(&size.to_string()),
             "expected the size cap to name the oversized module, got: {err}"
@@ -1001,7 +1952,7 @@ mod sandbox_tests {
         let path = dir.path().join("at-cap.wasm");
         std::fs::write(&path, vec![0u8; PLUGIN_MAX_WASM_BYTES]).unwrap();
 
-        let err = PluginWasmInstance::new(&path).unwrap_err();
+        let err = load(&path).unwrap_err();
         assert!(
             !err.contains("PLUGIN_MAX_WASM_BYTES"),
             "a file at the cap must not be rejected by the file-size gate: {err}"
@@ -1025,7 +1976,7 @@ mod sandbox_tests {
         );
 
         assert!(
-            PluginWasmInstance::new(&path).is_ok(),
+            load(&path).is_ok(),
             "a module below the size cap must load"
         );
     }
@@ -1049,7 +2000,7 @@ mod sandbox_tests {
                    i32.const 0))"#,
         );
 
-        let mut instance = PluginWasmInstance::new(&path).unwrap();
+        let mut instance = load(&path).unwrap();
         let err = instance
             .initialize()
             .await
@@ -1086,7 +2037,7 @@ mod sandbox_tests {
                      (else i32.const 0))))"#,
         );
 
-        let mut instance = PluginWasmInstance::new(&path).unwrap();
+        let mut instance = load(&path).unwrap();
         let err = instance
             .initialize()
             .await
@@ -1115,7 +2066,7 @@ mod sandbox_tests {
                    i32.const 16))"#,
         );
 
-        let mut instance = PluginWasmInstance::new(&path).unwrap();
+        let mut instance = load(&path).unwrap();
         let err = instance
             .initialize()
             .await
@@ -1141,7 +2092,7 @@ mod sandbox_tests {
         );
 
         assert!(
-            PluginWasmInstance::new(&path).is_err(),
+            load(&path).is_err(),
             "a module using shared memory must not load"
         );
     }
@@ -1166,7 +2117,7 @@ mod sandbox_tests {
                    i32.const 0))"#,
         );
 
-        let mut instance = PluginWasmInstance::new(&path).unwrap();
+        let mut instance = load(&path).unwrap();
         let err = instance
             .initialize()
             .await

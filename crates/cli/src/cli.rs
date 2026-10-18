@@ -282,3 +282,52 @@ pub enum PluginAction {
 pub fn parse_args() -> Cli {
     Cli::parse()
 }
+
+/// The hidden argument that makes this binary act as the WASM compiler.
+///
+/// Shared with the plugins crate so the injected command and the handler can
+/// never disagree about the spelling.
+pub const INTERNAL_WASM_COMPILE_FLAG: &str =
+    coderex_plugins::wasm_runtime::INTERNAL_WASM_COMPILE_FLAG;
+
+/// Run the hidden WASM compiler subcommand when it is the first argument.
+///
+/// This runs *before* clap sees the arguments, so
+/// `coderex --internal-wasm-compile <input> <output>` cannot be mistaken for a
+/// user-facing flag. Returns `Some(exit_code)` when the command was handled.
+#[must_use]
+pub fn maybe_run_internal_wasm_compile() -> Option<i32> {
+    let mut args = std::env::args_os();
+    let _program = args.next()?;
+    if args.next().as_deref() != Some(std::ffi::OsStr::new(INTERNAL_WASM_COMPILE_FLAG)) {
+        return None;
+    }
+
+    Some(
+        match coderex_plugins::wasm_runtime::compile_helper_main(args) {
+            Ok(()) => 0,
+            Err(err) => {
+                eprintln!("coderex: {err}");
+                1
+            }
+        },
+    )
+}
+
+/// Point the WASM runtime at this executable as its compiler.
+///
+/// The runtime appends `<input> <output>` to the injected command, so a
+/// packaged `coderex` binary needs no sibling `coderex-wasm-compile`.
+///
+/// # Errors
+///
+/// Returns the platform error when the current executable's path cannot be
+/// determined.
+pub fn install_wasm_compiler() -> std::io::Result<()> {
+    let program = std::env::current_exe()?;
+    coderex_plugins::wasm_runtime::set_compiler_command(
+        coderex_plugins::wasm_runtime::WasmCompilerCommand::new(program)
+            .arg(INTERNAL_WASM_COMPILE_FLAG),
+    );
+    Ok(())
+}
