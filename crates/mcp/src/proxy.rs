@@ -235,6 +235,17 @@ impl McpToolRegistry {
         self.tools.remove(name)
     }
 
+    /// Remove every tool a server exposed.
+    ///
+    /// A `tools/list_changed` notification means the previous list is no
+    /// longer authoritative: tools the server removed must disappear too, not
+    /// just be shadowed by the ones it still lists.
+    pub fn unregister_server(&mut self, server: &str) -> usize {
+        let before = self.tools.len();
+        self.tools.retain(|_, info| info.server != server);
+        before - self.tools.len()
+    }
+
     /// List all registered tools.
     #[must_use]
     pub fn list(&self) -> Vec<&McpToolInfo> {

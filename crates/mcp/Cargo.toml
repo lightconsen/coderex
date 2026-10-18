@@ -28,6 +28,8 @@ reqwest.workspace = true
 url.workspace = true
 chrono.workspace = true
 async-trait.workspace = true
+regex.workspace = true
+tokio-util.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

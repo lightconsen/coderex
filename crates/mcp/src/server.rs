@@ -89,6 +89,14 @@ pub struct McpServer {
     inbound_handler: crate::channel::SharedInboundHandler,
     /// Resolves the bearer token before each remote request, when installed.
     token_provider: Option<Arc<dyn crate::http::TokenProvider>>,
+    /// Receives notifications the server pushes, when installed.
+    ///
+    /// Held on the server for the same reason as the inbound handler: a
+    /// reconnect builds a fresh channel, which must keep the sink.
+    notification_handler: Option<Arc<dyn crate::channel::ServerNotificationHandler>>,
+    /// Retry settings for the standalone GET stream, when changed from the
+    /// default.
+    event_stream_retry_policy: Option<crate::http::EventStreamRetryPolicy>,
 }
 
 impl McpServer {
@@ -114,6 +122,8 @@ impl McpServer {
             channel: None,
             inbound_handler: crate::channel::SharedInboundHandler::new(),
             token_provider: None,
+            notification_handler: None,
+            event_stream_retry_policy: None,
         }
     }
 
@@ -139,6 +149,8 @@ impl McpServer {
             channel: None,
             inbound_handler: crate::channel::SharedInboundHandler::new(),
             token_provider: None,
+            notification_handler: None,
+            event_stream_retry_policy: None,
         }
     }
 
@@ -165,7 +177,41 @@ impl McpServer {
         if let Some(ref provider) = self.token_provider {
             channel.set_token_provider(Arc::clone(provider));
         }
+        if let Some(ref handler) = self.notification_handler {
+            channel.set_notification_handler(Arc::clone(handler));
+        }
+        if let Some(policy) = self.event_stream_retry_policy {
+            channel.set_event_stream_retry_policy(policy);
+        }
         Ok(channel)
+    }
+
+    /// Receive notifications the server pushes (`tools/list_changed`, …).
+    pub fn set_notification_handler(
+        &mut self,
+        handler: Arc<dyn crate::channel::ServerNotificationHandler>,
+    ) {
+        self.notification_handler = Some(handler);
+    }
+
+    /// Change how hard the standalone GET stream retries before it degrades.
+    pub fn set_event_stream_retry_policy(&mut self, policy: crate::http::EventStreamRetryPolicy) {
+        self.event_stream_retry_policy = Some(policy);
+        if let Some(channel) = &self.channel {
+            // Best effort: the channel may be locked by an in-flight request,
+            // in which case the stored policy still applies to a reconnect.
+            if let Ok(mut channel) = channel.try_lock() {
+                channel.set_event_stream_retry_policy(policy);
+            }
+        }
+    }
+
+    /// The standalone GET stream's state, when this is a remote server that is
+    /// running.
+    pub async fn event_stream_state(&self) -> Option<crate::http::EventStreamState> {
+        let channel = self.channel.as_ref()?;
+        let channel = channel.lock().await;
+        channel.event_stream_state()
     }
 
     /// Resolve the credential for this server before every remote request.
