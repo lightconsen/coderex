@@ -62,7 +62,7 @@ pub struct PluginHandle {
 pub enum RuntimeType {
     /// External process (JSON-RPC over stdio).
     Process,
-    /// WASM module (not yet implemented).
+    /// WASM module, run in-process by the `wasm-runtime` feature.
     Wasm,
 }
 
@@ -252,7 +252,12 @@ pub struct PluginManifest {
     /// Other plugins this plugin depends on.
     #[serde(default)]
     pub dependencies: Vec<String>,
-    /// Ed25519 signature of the plugin archive (hex-encoded).
+    /// Ed25519 signature carried inside the manifest (hex-encoded).
+    ///
+    /// Advisory only: the manifest lives inside the archive it would have to
+    /// sign, so a signature here can never be checked against the archive
+    /// bytes. Archive installs use a detached signature instead — a
+    /// `<archive>.sig` sidecar, or one supplied by the caller.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub signature: Option<String>,
     /// Runtime type: "process" (default) or "wasm".
@@ -531,6 +536,49 @@ pub enum SignatureCheck {
     Verified,
     /// No key is configured, so nothing was checked.
     Unverified,
+}
+
+/// A callback a host registers to re-spawn a plugin that a retry recovered.
+///
+/// `retry_failed_plugins` runs synchronously and cannot await a spawn, so the
+/// host can either spawn asynchronously here (for example with `tokio::spawn`)
+/// and return `Ok(())`, or leave the handler unset and act on the
+/// [`RetryOutcome::RestartRequired`] signal the retry returns.
+#[derive(Clone)]
+pub struct PluginRestartHandler {
+    inner: Arc<dyn Fn(&str) -> Result<(), String> + Send + Sync>,
+}
+
+impl std::fmt::Debug for PluginRestartHandler {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("PluginRestartHandler")
+    }
+}
+
+impl PluginRestartHandler {
+    /// Wrap a restart callback.
+    #[must_use]
+    pub fn new(f: impl Fn(&str) -> Result<(), String> + Send + Sync + 'static) -> Self {
+        Self { inner: Arc::new(f) }
+    }
+
+    /// Invoke the callback for a plugin.
+    pub fn call(&self, plugin: &str) -> Result<(), String> {
+        (self.inner)(plugin)
+    }
+}
+
+/// What a single retry of an errored plugin did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RetryOutcome {
+    /// The manifest was readable again and the registered restart callback
+    /// re-spawned the plugin successfully.
+    Restarted(String),
+    /// The manifest was readable again, but no restart callback is registered:
+    /// the caller has to call [`PluginManager::spawn_plugin`] for this plugin.
+    RestartRequired(String),
+    /// The plugin is still in `Error`; the reason is in its state.
+    StillFailed(String),
 }
 
 /// Marketplace plugin listing.
@@ -1185,6 +1233,8 @@ pub struct PluginManager {
     public_key: Option<String>,
     /// `userConfig` values the host has resolved, per plugin.
     plugin_options: DashMap<String, HashMap<String, String>>,
+    /// Callback that re-spawns a plugin a retry recovered, if the host set one.
+    restart_handler: Option<PluginRestartHandler>,
 }
 
 impl Default for PluginManager {
@@ -1209,6 +1259,7 @@ impl PluginManager {
             install_locks: DashMap::new(),
             public_key: None,
             plugin_options: DashMap::new(),
+            restart_handler: None,
         }
     }
 
@@ -1236,6 +1287,99 @@ impl PluginManager {
             .get(plugin)
             .map(|e| e.value().clone())
             .unwrap_or_default()
+    }
+
+    /// Apply host-resolved `userConfig` values for every plugin at once.
+    ///
+    /// This is the settings-backed entry point: the host reads its own
+    /// configuration (a settings file, the keychain, or an environment it
+    /// controls), resolves the values, and hands the result here. Values are
+    /// merged into whatever was already supplied, with the map winning.
+    pub fn apply_options_from_map(&self, options: &HashMap<String, HashMap<String, String>>) {
+        for (plugin, values) in options {
+            let mut entry = self.plugin_options.entry(plugin.clone()).or_default();
+            for (key, value) in values {
+                entry.insert(key.clone(), value.clone());
+            }
+        }
+    }
+
+    /// Apply host-resolved values for one plugin, replacing the previous set.
+    pub fn apply_options(&self, plugin: &str, values: impl IntoIterator<Item = (String, String)>) {
+        let values: HashMap<String, String> = values.into_iter().collect();
+        self.plugin_options.insert(plugin.to_string(), values);
+    }
+
+    /// Apply `userConfig` values from a settings-shaped JSON document.
+    ///
+    /// Accepts `{"plugins": {"<plugin>": {"options": {...}}}}`, which is the
+    /// shape a settings file uses for per-plugin options, and the flatter
+    /// `{"pluginOptions": {"<plugin>": {...}}}`. Scalar values are stringified
+    /// exactly as they would be for the environment; an object or array is an
+    /// error, because it has no environment-variable form and silently dropping
+    /// it would leave the plugin thinking an option was configured.
+    ///
+    /// Returns how many values were applied.
+    pub fn apply_options_from_settings(&self, settings: &Value) -> Result<usize, String> {
+        let per_plugin = settings
+            .get("plugins")
+            .and_then(|plugins| plugins.as_object())
+            .map(|plugins| {
+                plugins
+                    .iter()
+                    .filter_map(|(name, entry)| {
+                        let options = entry.get("options")?;
+                        Some((name.clone(), options))
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_else(|| {
+                settings
+                    .get("pluginOptions")
+                    .and_then(Value::as_object)
+                    .map(|map| {
+                        map.iter()
+                            .map(|(name, options)| (name.clone(), options))
+                            .collect()
+                    })
+                    .unwrap_or_default()
+            });
+
+        let mut applied = 0;
+        for (plugin, options) in per_plugin {
+            let options = options.as_object().ok_or_else(|| {
+                format!("settings for plugin '{plugin}' must map option names to scalar values")
+            })?;
+            let mut values = HashMap::new();
+            for (key, value) in options {
+                let text = value_to_env_string(value).ok_or_else(|| {
+                    format!("plugin '{plugin}' option '{key}' must be a string, number or boolean")
+                })?;
+                values.insert(key.clone(), text);
+                applied += 1;
+            }
+            let mut entry = self.plugin_options.entry(plugin).or_default();
+            entry.extend(values);
+        }
+        Ok(applied)
+    }
+
+    /// Register the callback a successful [`Self::retry_failed_plugins`] uses
+    /// to re-spawn a plugin.
+    ///
+    /// A retry that only marks a plugin `Active` without spawning it is a
+    /// plugin CodeRex reports as loaded but cannot run. With a handler set, the
+    /// plugin becomes `Active` only after the handler returns `Ok(())`.
+    pub fn set_restart_handler(
+        &mut self,
+        handler: impl Fn(&str) -> Result<(), String> + Send + Sync + 'static,
+    ) {
+        self.restart_handler = Some(PluginRestartHandler::new(handler));
+    }
+
+    /// Remove the restart callback, if any.
+    pub fn clear_restart_handler(&mut self) {
+        self.restart_handler = None;
     }
 
     /// Set the marketplace domain allowlist.
@@ -1377,7 +1521,27 @@ impl PluginManager {
     /// Spawn a process plugin's subprocess and perform initialize handshake.
     ///
     /// Discovers commands and skills dynamically from the plugin process.
+    ///
+    /// A failure is recorded on the plugin as [`PluginState::Error`], which is
+    /// what gives [`Self::retry_failed_plugins`] something real to retry. A
+    /// success marks the plugin `Active`.
     pub async fn spawn_plugin(&self, name: &str) -> Result<(), String> {
+        match self.spawn_plugin_inner(name).await {
+            Ok(()) => {
+                if let Some(mut entry) = self.plugins.get_mut(name) {
+                    entry.state = PluginState::Active;
+                    entry.retry_count = 0;
+                }
+                Ok(())
+            }
+            Err(e) => {
+                self.set_plugin_state(name, PluginState::Error(e.clone()));
+                Err(e)
+            }
+        }
+    }
+
+    async fn spawn_plugin_inner(&self, name: &str) -> Result<(), String> {
         let handle = self
             .plugins
             .get(name)
@@ -1825,16 +1989,90 @@ impl PluginManager {
         ))
     }
 
-    /// Note that a configured signing key cannot apply to this kind of source.
-    fn warn_unverifiable_source(&self, name: &str, kind: &str) {
-        if self.public_key.is_some() {
+    /// Check a source that has no archive signature to verify.
+    ///
+    /// Without a configured key the old behaviour stands: say that nothing was
+    /// checked and install. With a key configured, an unverifiable source is
+    /// accepted only when a previous trust-on-first-use install pinned exactly
+    /// these contents. Otherwise the install fails closed.
+    fn check_unverifiable_source(
+        &self,
+        name: &str,
+        kind: &str,
+        install_dir: &Path,
+        pin: &PluginPin,
+    ) -> Result<(), String> {
+        if self.public_key.is_none() {
             tracing::warn!(
                 plugin = %name,
                 source = kind,
-                "a signing key is configured, but a {kind} source has no archive signature \
-                 to check against it; this plugin is installed unverified"
+                "no signing key is configured, so this {kind} source cannot be verified; \
+                 this plugin is installed unverified"
             );
+            return Ok(());
         }
+
+        let store = PluginPinStore::load(&install_dir.join(PIN_FILE_NAME))?;
+        let Some(existing) = store.get(name) else {
+            return Err(format!(
+                "a signing key is configured, but a {kind} source has no archive signature \
+                 to check against it; refusing to install '{name}' unless it is already pinned \
+                 by trust-on-first-use (see {PIN_FILE_NAME} in {})",
+                install_dir.display()
+            ));
+        };
+        existing
+            .check(pin)
+            .map_err(|e| format!("a signing key is configured; {e}"))
+    }
+
+    /// A content digest of a directory, used as its trust-on-first-use pin.
+    ///
+    /// Relative file names and contents are hashed in sorted order, so the pin
+    /// changes if a file is added, removed or edited, and does not depend on
+    /// the order the filesystem lists entries in.
+    fn directory_digest(dir: &Path) -> Result<String, String> {
+        fn collect(
+            root: &Path,
+            dir: &Path,
+            out: &mut Vec<(String, PathBuf)>,
+        ) -> Result<(), String> {
+            let entries = std::fs::read_dir(dir)
+                .map_err(|e| format!("failed to read {}: {e}", dir.display()))?;
+            for entry in entries.flatten() {
+                let path = entry.path();
+                let file_type = entry
+                    .file_type()
+                    .map_err(|e| format!("failed to stat {}: {e}", path.display()))?;
+                if file_type.is_dir() {
+                    collect(root, &path, out)?;
+                } else if file_type.is_file() {
+                    let relative = path
+                        .strip_prefix(root)
+                        .map_err(|_| format!("{} is outside {}", path.display(), root.display()))?
+                        .to_string_lossy()
+                        .replace('\\', "/");
+                    out.push((relative, path));
+                }
+            }
+            Ok(())
+        }
+
+        let mut files = Vec::new();
+        collect(dir, dir, &mut files)?;
+        files.sort_by(|a, b| a.0.cmp(&b.0));
+
+        use sha2::Digest as _;
+        let mut hasher = sha2::Sha256::new();
+        for (relative, path) in files {
+            let contents = std::fs::read(&path)
+                .map_err(|e| format!("failed to read {}: {e}", path.display()))?;
+            hasher.update(relative.as_bytes());
+            hasher.update([0u8]);
+            hasher.update((contents.len() as u64).to_le_bytes());
+            hasher.update(&contents);
+        }
+        Ok(hex::encode(hasher.finalize()))
     }
 
     /// Install a plugin from any supported source.
@@ -1894,6 +2132,16 @@ impl PluginManager {
         let manifest = Self::read_manifest_dir(src)?;
         self.check_install_compatible(&manifest)?;
 
+        // A directory has no signature, so its pin is a digest of its contents:
+        // that is what lets a configured key accept a directory only after a
+        // trust-on-first-use install has recorded exactly this directory.
+        // Decide before copying anything, so a refused install does no work.
+        let pin = PluginPin {
+            sha256: Some(Self::directory_digest(src)?),
+            git_commit: None,
+        };
+        self.check_unverifiable_source(&manifest.name, "directory", install_dir, &pin)?;
+
         let staged = Self::staging_dir(install_dir, &manifest.name);
         let _ = std::fs::remove_dir_all(&staged);
         std::fs::create_dir_all(install_dir)
@@ -1903,16 +2151,8 @@ impl PluginManager {
             return Err(e);
         }
 
-        self.warn_unverifiable_source(&manifest.name, "directory");
-        self.finalize_install(
-            &manifest.name,
-            &staged,
-            install_dir,
-            &manifest,
-            false,
-            PluginPin::default(),
-        )
-        .await
+        self.finalize_install(&manifest.name, &staged, install_dir, &manifest, false, pin)
+            .await
     }
 
     /// Install a plugin from a git repository.
@@ -1953,19 +2193,16 @@ impl PluginManager {
             return Err(e);
         }
 
-        self.warn_unverifiable_source(&manifest.name, "git");
-        self.finalize_install(
-            &manifest.name,
-            &staged,
-            install_dir,
-            &manifest,
-            false,
-            PluginPin {
-                sha256: None,
-                git_commit: Some(commit),
-            },
-        )
-        .await
+        let pin = PluginPin {
+            sha256: None,
+            git_commit: Some(commit),
+        };
+        if let Err(e) = self.check_unverifiable_source(&manifest.name, "git", install_dir, &pin) {
+            let _ = std::fs::remove_dir_all(&staged);
+            return Err(e);
+        }
+        self.finalize_install(&manifest.name, &staged, install_dir, &manifest, false, pin)
+            .await
     }
 
     /// Install a plugin from a subdirectory of a git repository.
@@ -2031,19 +2268,18 @@ impl PluginManager {
         }
         let _ = std::fs::remove_dir_all(&clone_dir);
 
-        self.warn_unverifiable_source(&manifest.name, "git subdirectory");
-        self.finalize_install(
-            &manifest.name,
-            &staged,
-            install_dir,
-            &manifest,
-            false,
-            PluginPin {
-                sha256: None,
-                git_commit: Some(commit),
-            },
-        )
-        .await
+        let pin = PluginPin {
+            sha256: None,
+            git_commit: Some(commit),
+        };
+        if let Err(e) =
+            self.check_unverifiable_source(&manifest.name, "git subdirectory", install_dir, &pin)
+        {
+            let _ = std::fs::remove_dir_all(&staged);
+            return Err(e);
+        }
+        self.finalize_install(&manifest.name, &staged, install_dir, &manifest, false, pin)
+            .await
     }
 
     /// Resolve a `git-subdir` path against a clone, refusing anything that
@@ -2135,8 +2371,11 @@ impl PluginManager {
 
     /// Install a plugin from an HTTPS archive.
     ///
-    /// The archive is verified against the configured signing key exactly as a
-    /// marketplace archive is, and its SHA-256 is recorded as a pin.
+    /// With a signing key configured, the detached signature is fetched from
+    /// `<url>.sig` (hex-encoded) and checked against exactly the downloaded
+    /// bytes. The manifest's own `signature` field is not used: the manifest is
+    /// inside the archive, so it cannot sign that archive. The archive's
+    /// SHA-256 is recorded as a pin.
     pub async fn install_archive(
         &self,
         url: &str,
@@ -2149,10 +2388,6 @@ impl PluginManager {
             ));
         }
 
-        let staged = Self::staging_dir(install_dir, url);
-        let _ = std::fs::remove_dir_all(&staged);
-        std::fs::create_dir_all(&staged).map_err(|e| format!("failed to create temp dir: {e}"))?;
-
         let client = Client::builder()
             .timeout(std::time::Duration::from_secs(30))
             .build()
@@ -2161,25 +2396,15 @@ impl PluginManager {
         let bytes = match client.get(url).send().await {
             Ok(response) if response.status().is_success() => match response.bytes().await {
                 Ok(bytes) => bytes.to_vec(),
-                Err(e) => {
-                    let _ = std::fs::remove_dir_all(&staged);
-                    return Err(format!("failed to read plugin archive: {e}"));
-                }
+                Err(e) => return Err(format!("failed to read plugin archive: {e}")),
             },
-            Ok(response) => {
-                let _ = std::fs::remove_dir_all(&staged);
-                return Err(format!("download failed: HTTP {}", response.status()));
-            }
-            Err(e) => {
-                let _ = std::fs::remove_dir_all(&staged);
-                return Err(format!("failed to download plugin archive: {e}"));
-            }
+            Ok(response) => return Err(format!("download failed: HTTP {}", response.status())),
+            Err(e) => return Err(format!("failed to download plugin archive: {e}")),
         };
 
-        let digest = sha256_hex(&bytes);
         if let Some(expected) = sha256 {
+            let digest = sha256_hex(&bytes);
             if !expected.eq_ignore_ascii_case(&digest) {
-                let _ = std::fs::remove_dir_all(&staged);
                 return Err(format!(
                     "plugin archive does not match the requested SHA-256 (expected {expected}, \
                      got {digest})"
@@ -2187,7 +2412,82 @@ impl PluginManager {
             }
         }
 
-        if let Err(e) = Self::extract_archive(&bytes, &staged) {
+        // Only fetch the sidecar when there is a key to check it with: with no
+        // key the archive is installed unverified, exactly as before.
+        let signature = if self.public_key.is_some() {
+            Some(Self::fetch_detached_signature(&client, url).await?)
+        } else {
+            None
+        };
+
+        self.install_archive_contents(&bytes, signature.as_deref(), install_dir)
+            .await
+    }
+
+    /// Install an archive the caller has already fetched.
+    ///
+    /// `detached_signature_hex` is a signature over exactly `bytes`, supplied
+    /// by the caller instead of read from a sidecar. With a public key
+    /// configured it is mandatory; without one it is ignored and the install is
+    /// reported as unverified.
+    pub async fn install_archive_bytes(
+        &self,
+        bytes: &[u8],
+        detached_signature_hex: Option<&str>,
+        install_dir: &Path,
+    ) -> Result<PathBuf, String> {
+        self.install_archive_contents(bytes, detached_signature_hex, install_dir)
+            .await
+    }
+
+    /// Fetch the detached signature that sits beside an archive.
+    async fn fetch_detached_signature(
+        client: &Client,
+        archive_url: &str,
+    ) -> Result<String, String> {
+        let signature_url = format!("{archive_url}.sig");
+        let response = client
+            .get(&signature_url)
+            .send()
+            .await
+            .map_err(|e| format!("failed to download signature '{signature_url}': {e}"))?;
+        if !response.status().is_success() {
+            return Err(format!(
+                "plugin signature missing: '{signature_url}' returned HTTP {} but a signing key \
+                 is configured",
+                response.status()
+            ));
+        }
+        let text = response
+            .text()
+            .await
+            .map_err(|e| format!("failed to read signature '{signature_url}': {e}"))?;
+        let text = text.trim();
+        if text.is_empty() {
+            return Err(format!(
+                "plugin signature missing: '{signature_url}' is empty but a signing key is \
+                 configured"
+            ));
+        }
+        Ok(text.to_string())
+    }
+
+    /// Extract, verify and install archive bytes.
+    async fn install_archive_contents(
+        &self,
+        bytes: &[u8],
+        detached_signature_hex: Option<&str>,
+        install_dir: &Path,
+    ) -> Result<PathBuf, String> {
+        let digest = sha256_hex(bytes);
+        let staged = Self::staging_dir(
+            install_dir,
+            &format!("archive-{}", &digest[..16.min(digest.len())]),
+        );
+        let _ = std::fs::remove_dir_all(&staged);
+        std::fs::create_dir_all(&staged).map_err(|e| format!("failed to create temp dir: {e}"))?;
+
+        if let Err(e) = Self::extract_archive(bytes, &staged) {
             let _ = std::fs::remove_dir_all(&staged);
             return Err(e);
         }
@@ -2204,7 +2504,9 @@ impl PluginManager {
             return Err(e);
         }
 
-        let verified = match self.verify_signature(&bytes, manifest.signature.as_deref()) {
+        // The signature is detached: it covers the archive bytes, not a field
+        // inside the archive (which could never be self-referential anyway).
+        let verified = match self.verify_signature(bytes, detached_signature_hex) {
             Ok(check) => matches!(check, SignatureCheck::Verified),
             Err(e) => {
                 let _ = std::fs::remove_dir_all(&staged);
@@ -2351,6 +2653,15 @@ impl PluginManager {
     /// Uses atomic temp-dir staging: downloads and extracts into a temporary
     /// directory, validates the structure, then renames atomically to the final
     /// location. On failure, the temporary directory is removed.
+    ///
+    /// Two forms are accepted:
+    /// - a real [`MarketplacePlugin`] listing, whose `url` is its download URL;
+    /// - a listing whose `url` is a bare plugin name, which is looked up in the
+    ///   registered marketplaces. [`Self::install_plugin_by_name`] is the typed
+    ///   entry point for that form.
+    ///
+    /// Whichever form is used, the archive's detached signature is fetched
+    /// from `<download-url>.sig` when a signing key is configured.
     pub async fn install_plugin(
         &self,
         plugin: &MarketplacePlugin,
@@ -2365,14 +2676,31 @@ impl PluginManager {
             return self.install_from_source(&detected, install_dir).await;
         }
 
-        Self::validate_plugin_name(&plugin.name)?;
-        let target_dir = install_dir.join(&plugin.name);
+        // A bare string is a marketplace plugin name; anything with a scheme is
+        // the download URL of an already-fetched listing.
+        let marketplace_name = match &detected {
+            PluginSource::Marketplace { name } if !name.contains("://") => Some(name.clone()),
+            _ => None,
+        };
+        let plugin_name = marketplace_name
+            .clone()
+            .unwrap_or_else(|| plugin.name.clone());
+
+        if marketplace_name.is_some() && self.marketplaces.is_empty() {
+            return Err(format!(
+                "'{plugin_name}' is a marketplace plugin name, but no marketplace is \
+                 registered; call PluginManager::register_marketplace(name, base_url) first"
+            ));
+        }
+
+        Self::validate_plugin_name(&plugin_name)?;
+        let target_dir = install_dir.join(&plugin_name);
 
         // Acquire install lock for this plugin name
         let lock = {
             let arc = self
                 .install_locks
-                .entry(plugin.name.clone())
+                .entry(plugin_name.clone())
                 .or_insert_with(|| Arc::new(TokioMutex::new(())))
                 .clone();
             arc
@@ -2382,14 +2710,13 @@ impl PluginManager {
         // Check if already installed
         if target_dir.exists() {
             return Err(format!(
-                "plugin '{}' is already installed at {:?}",
-                plugin.name, target_dir
+                "plugin '{plugin_name}' is already installed at {target_dir:?}"
             ));
         }
 
         // Mark as installing
         let handle = PluginHandle {
-            name: plugin.name.clone(),
+            name: plugin_name.clone(),
             version: plugin.version.clone(),
             state: PluginState::Installing,
             path: target_dir.clone(),
@@ -2400,55 +2727,61 @@ impl PluginManager {
             verified: false,
             last_retry_at: None,
         };
-        self.plugins.insert(plugin.name.clone(), handle);
+        self.plugins.insert(plugin_name.clone(), handle);
 
         // Create a temporary staging directory
-        let temp_dir = install_dir.join(format!(".install-{}", plugin.name));
+        let temp_dir = install_dir.join(format!(".install-{plugin_name}"));
         let _ = std::fs::remove_dir_all(&temp_dir); // clean up any previous failed attempt
 
         if let Err(e) = std::fs::create_dir_all(&temp_dir) {
             self.set_plugin_state(
-                &plugin.name,
+                &plugin_name,
                 PluginState::Error(format!("temp dir creation failed: {e}")),
             );
             return Err(format!("failed to create temp dir: {e}"));
         }
 
-        // Download the plugin archive
-        let archive_bytes = 'download: {
+        // Download the plugin archive. Keep the URL and client that served it
+        // so the detached signature can be fetched from beside the archive.
+        let archive = 'download: {
             for entry in self.marketplaces.iter() {
                 let conn = entry.value();
-                let download_path = conn.download_endpoint.replace("{name}", &plugin.name);
+                let download_path = conn.download_endpoint.replace("{name}", &plugin_name);
                 let url = format!("{}{}", conn.base_url, download_path);
 
                 match conn.client.get(&url).send().await {
                     Ok(response) => {
                         if response.status().is_success() {
                             match response.bytes().await {
-                                Ok(bytes) => break 'download Some(bytes.to_vec()),
+                                Ok(bytes) => {
+                                    break 'download Some((
+                                        bytes.to_vec(),
+                                        url,
+                                        conn.client.clone(),
+                                    ));
+                                }
                                 Err(e) => tracing::warn!("failed to read plugin archive: {e}"),
                             }
                         }
                     }
                     Err(e) => {
-                        tracing::warn!("failed to download plugin '{}': {e}", plugin.name);
+                        tracing::warn!("failed to download plugin '{plugin_name}': {e}");
                     }
                 }
             }
             None
         };
 
-        let bytes = match archive_bytes {
-            Some(b) => b,
+        let (bytes, download_url, client) = match archive {
+            Some(found) => found,
             None => {
                 let _ = std::fs::remove_dir_all(&temp_dir);
                 self.set_plugin_state(
-                    &plugin.name,
+                    &plugin_name,
                     PluginState::Error("download failed from all marketplaces".into()),
                 );
                 return Err(format!(
-                    "failed to download plugin '{}' from any marketplace",
-                    plugin.name
+                    "failed to download plugin '{plugin_name}' from any marketplace"
                 ));
             }
         };
@@ -2457,7 +2790,7 @@ impl PluginManager {
         if let Err(e) = Self::extract_archive(&bytes, &temp_dir) {
             let _ = std::fs::remove_dir_all(&temp_dir);
             self.set_plugin_state(
-                &plugin.name,
+                &plugin_name,
                 PluginState::Error(format!("extraction failed: {e}")),
             );
             return Err(e);
@@ -2469,7 +2802,7 @@ impl PluginManager {
             Err(e) => {
                 let _ = std::fs::remove_dir_all(&temp_dir);
                 self.set_plugin_state(
-                    &plugin.name,
+                    &plugin_name,
                     PluginState::Error(format!("validation failed: {e}")),
                 );
                 return Err(e);
@@ -2480,23 +2813,38 @@ impl PluginManager {
         if !self.is_version_compatible(manifest.min_version.as_deref()) {
             let _ = std::fs::remove_dir_all(&temp_dir);
             let msg = format!(
-                "plugin '{}' requires CodeRex >= {} (current: {})",
-                plugin.name,
+                "plugin '{plugin_name}' requires CodeRex >= {} (current: {})",
                 manifest.min_version.as_deref().unwrap_or("unknown"),
                 self.app_version
             );
-            self.set_plugin_state(&plugin.name, PluginState::Error(msg.clone()));
+            self.set_plugin_state(&plugin_name, PluginState::Error(msg.clone()));
             return Err(msg);
         }
 
-        // Signature verification. A configured key makes a signature
-        // mandatory: a plugin that cannot be checked is not installed.
-        let signature = match self.verify_signature(&bytes, manifest.signature.as_deref()) {
+        // Signature verification. The signature is detached (`<url>.sig`); a
+        // signature inside the manifest cannot cover the archive it lives in.
+        // With a configured key the detached signature is mandatory.
+        let detached_signature = if self.public_key.is_some() {
+            match Self::fetch_detached_signature(&client, &download_url).await {
+                Ok(signature) => Some(signature),
+                Err(e) => {
+                    let _ = std::fs::remove_dir_all(&temp_dir);
+                    self.set_plugin_state(
+                        &plugin_name,
+                        PluginState::Error(format!("signature verification failed: {e}")),
+                    );
+                    return Err(e);
+                }
+            }
+        } else {
+            None
+        };
+        let signature = match self.verify_signature(&bytes, detached_signature.as_deref()) {
             Ok(check) => check,
             Err(e) => {
                 let _ = std::fs::remove_dir_all(&temp_dir);
                 self.set_plugin_state(
-                    &plugin.name,
+                    &plugin_name,
                     PluginState::Error(format!("signature verification failed: {e}")),
                 );
                 return Err(e);
@@ -2505,7 +2853,7 @@ impl PluginManager {
         let verified = matches!(signature, SignatureCheck::Verified);
         if !verified {
             tracing::warn!(
-                plugin = %plugin.name,
+                plugin = %plugin_name,
                 "installing unsigned plugin: no signing key is configured, so nothing about \
                  this archive has been checked"
             );
@@ -2518,11 +2866,11 @@ impl PluginManager {
             sha256: Some(sha256_hex(&bytes)),
             git_commit: None,
         };
-        let store = match Self::check_pin(install_dir, &plugin.name, &pin) {
+        let store = match Self::check_pin(install_dir, &plugin_name, &pin) {
             Ok(store) => store,
             Err(e) => {
                 let _ = std::fs::remove_dir_all(&temp_dir);
-                self.set_plugin_state(&plugin.name, PluginState::Error(e.clone()));
+                self.set_plugin_state(&plugin_name, PluginState::Error(e.clone()));
                 return Err(e);
             }
         };
@@ -2531,13 +2879,13 @@ impl PluginManager {
         if let Err(e) = std::fs::rename(&temp_dir, &target_dir) {
             let _ = std::fs::remove_dir_all(&temp_dir);
             self.set_plugin_state(
-                &plugin.name,
+                &plugin_name,
                 PluginState::Error(format!("atomic rename failed: {e}")),
             );
             return Err(format!("failed to finalize plugin install: {e}"));
         }
 
-        Self::record_pin(install_dir, store, &plugin.name, &pin);
+        Self::record_pin(install_dir, store, &plugin_name, &pin);
 
         // Clean up the archive file if it was left in the target dir
         let archive_path = target_dir.join("plugin.tar.gz");
@@ -2547,7 +2895,7 @@ impl PluginManager {
 
         // Update state to active
         let handle = PluginHandle {
-            name: plugin.name.clone(),
+            name: plugin_name.clone(),
             version: plugin.version.clone(),
             state: PluginState::Active,
             path: target_dir.clone(),
@@ -2558,12 +2906,36 @@ impl PluginManager {
             verified,
             last_retry_at: None,
         };
-        self.plugins.insert(plugin.name.clone(), handle);
+        self.plugins.insert(plugin_name.clone(), handle);
 
-        tracing::info!("installed plugin '{}' v{}", plugin.name, plugin.version);
+        tracing::info!("installed plugin '{plugin_name}' v{}", plugin.version);
 
         self.mark_needs_refresh();
         Ok(target_dir)
+    }
+
+    /// Install a plugin by its name in a registered marketplace.
+    ///
+    /// This is the production entry point for `coderex plugin install <name>`:
+    /// register the marketplace once (see [`Self::register_marketplace`]), then
+    /// call this with the name the marketplace lists. It fails with a clear
+    /// error if no marketplace is registered, instead of silently reporting a
+    /// download failure.
+    pub async fn install_plugin_by_name(
+        &self,
+        name: &str,
+        install_dir: &Path,
+    ) -> Result<PathBuf, String> {
+        let listing = MarketplacePlugin {
+            name: name.to_string(),
+            version: "latest".to_string(),
+            // A bare name is what install_plugin resolves against the
+            // registered marketplaces.
+            url: name.to_string(),
+            description: String::new(),
+        };
+        self.install_plugin(&listing, &install_dir.to_path_buf())
+            .await
     }
 
     /// Set the state of a plugin by name.
@@ -2597,7 +2969,15 @@ impl PluginManager {
                 let Some(manager) = manager.upgrade() else {
                     break;
                 };
-                manager.retry_failed_plugins();
+                for outcome in manager.retry_failed_plugins() {
+                    if let RetryOutcome::RestartRequired(name) = outcome {
+                        tracing::warn!(
+                            plugin = %name,
+                            "plugin recovered but no restart handler is registered; call \
+                             spawn_plugin to bring it back"
+                        );
+                    }
+                }
             }
         })
     }
@@ -2606,7 +2986,16 @@ impl PluginManager {
     ///
     /// Uses exponential backoff: waits `2^retry_count` seconds before retrying.
     /// Plugins that exceed `max_retries` are left in Error state.
-    pub fn retry_failed_plugins(&self) {
+    ///
+    /// A retry that can read the manifest again is not enough to call the
+    /// plugin loaded: the runtime may never have been spawned. If a restart
+    /// handler was registered with [`Self::set_restart_handler`], it is invoked
+    /// and the plugin becomes `Active` only when it returns `Ok`. Without a
+    /// handler the plugin becomes `Loading` and the outcome is
+    /// [`RetryOutcome::RestartRequired`], so the caller knows to spawn it.
+    pub fn retry_failed_plugins(&self) -> Vec<RetryOutcome> {
+        let mut outcomes = Vec::new();
+
         for mut entry in self.plugins.iter_mut() {
             let plugin = entry.value_mut();
             if !matches!(plugin.state, PluginState::Error(_)) {
@@ -2631,6 +3020,7 @@ impl PluginManager {
 
             plugin.retry_count += 1;
             plugin.last_retry_at = Some(chrono::Utc::now());
+            let name = plugin.name.clone();
 
             // Attempt to re-read the manifest
             let manifest_path = plugin.path.join("plugin.json");
@@ -2639,27 +3029,55 @@ impl PluginManager {
                     "manifest missing (retry {}/{})",
                     plugin.retry_count, plugin.max_retries
                 ));
+                outcomes.push(RetryOutcome::StillFailed(name));
                 continue;
             }
 
             match std::fs::read_to_string(&manifest_path) {
                 Ok(content) => match serde_json::from_str::<PluginManifest>(&content) {
                     Ok(manifest) => {
-                        if self.is_version_compatible(manifest.min_version.as_deref()) {
-                            plugin.version = manifest.version;
-                            plugin.commands = manifest.commands;
-                            plugin.skills = manifest.skills;
-                            plugin.state = PluginState::Active;
-                            tracing::info!(
-                                plugin = %plugin.name,
-                                retry = plugin.retry_count,
-                                "plugin recovered from error state"
-                            );
-                        } else {
+                        if !self.is_version_compatible(manifest.min_version.as_deref()) {
                             plugin.state = PluginState::Error(format!(
                                 "incompatible version (retry {}/{})",
                                 plugin.retry_count, plugin.max_retries
                             ));
+                            outcomes.push(RetryOutcome::StillFailed(name));
+                            continue;
+                        }
+
+                        plugin.version = manifest.version;
+                        plugin.commands = manifest.commands;
+                        plugin.skills = manifest.skills;
+
+                        if let Some(handler) = &self.restart_handler {
+                            match handler.call(&name) {
+                                Ok(()) => {
+                                    plugin.state = PluginState::Active;
+                                    plugin.retry_count = 0;
+                                    tracing::info!(
+                                        plugin = %name,
+                                        "plugin recovered from error state and was restarted"
+                                    );
+                                    outcomes.push(RetryOutcome::Restarted(name));
+                                }
+                                Err(e) => {
+                                    plugin.state = PluginState::Error(format!(
+                                        "restart failed after recovery: {e} (retry {}/{})",
+                                        plugin.retry_count, plugin.max_retries
+                                    ));
+                                    outcomes.push(RetryOutcome::StillFailed(name));
+                                }
+                            }
+                        } else {
+                            // The manifest is readable again, but nothing has
+                            // spawned the runtime: say so instead of pretending
+                            // the plugin is active.
+                            plugin.state = PluginState::Loading;
+                            tracing::info!(
+                                plugin = %name,
+                                "plugin manifest recovered; waiting for the caller to spawn it"
+                            );
+                            outcomes.push(RetryOutcome::RestartRequired(name));
                         }
                     }
                     Err(e) => {
@@ -2667,6 +3085,7 @@ impl PluginManager {
                             "manifest parse failed: {e} (retry {}/{})",
                             plugin.retry_count, plugin.max_retries
                         ));
+                        outcomes.push(RetryOutcome::StillFailed(name));
                     }
                 },
                 Err(e) => {
@@ -2674,9 +3093,12 @@ impl PluginManager {
                         "manifest read failed: {e} (retry {}/{})",
                         plugin.retry_count, plugin.max_retries
                     ));
+                    outcomes.push(RetryOutcome::StillFailed(name));
                 }
             }
         }
+
+        outcomes
     }
 
     /// Reconcile marketplace state — detect new, updated, or removed plugins.
@@ -3592,9 +4014,13 @@ mod tests {
         )
         .unwrap();
 
-        let mgr = Arc::new(PluginManager::new());
+        let mut mgr = PluginManager::new();
         mgr.load_plugin(manifest, plugin_dir);
         mgr.set_plugin_state("recovering", PluginState::Error("manual".into()));
+        // A recovered manifest must be followed by a real restart; the loop
+        // cannot await one itself, so the host registers the callback.
+        mgr.set_restart_handler(|_| Ok(()));
+        let mgr = Arc::new(mgr);
 
         let loop_handle = mgr.spawn_retry_loop(std::time::Duration::from_millis(10));
 
@@ -4641,5 +5067,445 @@ done
         assert!(commit_pin.check(&archive).is_err());
         assert!(archive.check(&archive).is_ok());
         assert!(PluginPin::default().check(&archive).is_ok());
+    }
+
+    // ── detached archive signatures ──────────────────────────────────────
+
+    /// Build a one-file `.tar.gz` plugin archive in memory.
+    fn plugin_archive(manifest_json: &str) -> Vec<u8> {
+        use flate2::Compression;
+        use flate2::write::GzEncoder;
+
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+        {
+            let mut builder = tar::Builder::new(&mut encoder);
+            let mut header = tar::Header::new_gnu();
+            header.set_size(manifest_json.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            builder
+                .append_data(&mut header, "plugin.json", manifest_json.as_bytes())
+                .unwrap();
+            builder.finish().unwrap();
+        }
+        encoder.finish().unwrap()
+    }
+
+    fn test_signing_key() -> ed25519_dalek::SigningKey {
+        // A deterministic test key: no RNG feature is required, and the same
+        // bytes make the child-process test below reproducible.
+        ed25519_dalek::SigningKey::from_bytes(&[7u8; 32])
+    }
+
+    fn sign_archive(key: &ed25519_dalek::SigningKey, archive: &[u8]) -> String {
+        hex::encode(ed25519_dalek::Signer::sign(key, archive).to_bytes())
+    }
+
+    #[tokio::test]
+    async fn a_detached_signature_over_the_archive_installs_it() {
+        let archive = plugin_archive(r#"{"name":"signed-plugin","version":"1.0.0"}"#);
+        let key = test_signing_key();
+        let signature = sign_archive(&key, &archive);
+
+        let mut mgr = PluginManager::new();
+        mgr.set_public_key(hex::encode(key.verifying_key().to_bytes()));
+        let install_dir = tempfile::tempdir().unwrap();
+
+        let installed = mgr
+            .install_archive_bytes(&archive, Some(&signature), install_dir.path())
+            .await
+            .unwrap();
+
+        assert_eq!(installed, install_dir.path().join("signed-plugin"));
+        let handle = mgr.get_plugin("signed-plugin").unwrap();
+        assert_eq!(handle.state, PluginState::Active);
+        assert!(
+            handle.verified,
+            "a matching detached signature was not recorded"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_detached_signature_for_different_bytes_is_refused() {
+        let archive = plugin_archive(r#"{"name":"signed-plugin","version":"1.0.0"}"#);
+        let key = test_signing_key();
+        let signature = sign_archive(&key, b"a different archive");
+
+        let mut mgr = PluginManager::new();
+        mgr.set_public_key(hex::encode(key.verifying_key().to_bytes()));
+        let install_dir = tempfile::tempdir().unwrap();
+
+        let err = mgr
+            .install_archive_bytes(&archive, Some(&signature), install_dir.path())
+            .await
+            .unwrap_err();
+        assert!(err.contains("signature verification failed"), "{err}");
+        assert!(!install_dir.path().join("signed-plugin").exists());
+        assert!(mgr.list_plugins().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_missing_detached_signature_is_refused_when_a_key_is_configured() {
+        let archive = plugin_archive(r#"{"name":"signed-plugin","version":"1.0.0"}"#);
+        let key = test_signing_key();
+
+        let mut mgr = PluginManager::new();
+        mgr.set_public_key(hex::encode(key.verifying_key().to_bytes()));
+        let install_dir = tempfile::tempdir().unwrap();
+
+        let err = mgr
+            .install_archive_bytes(&archive, None, install_dir.path())
+            .await
+            .unwrap_err();
+        assert!(err.contains("plugin signature missing"), "{err}");
+        assert!(!install_dir.path().join("signed-plugin").exists());
+    }
+
+    #[tokio::test]
+    async fn without_a_key_an_archive_still_installs_unverified() {
+        let archive = plugin_archive(r#"{"name":"unsigned-plugin","version":"1.0.0"}"#);
+        let mgr = PluginManager::new();
+        let install_dir = tempfile::tempdir().unwrap();
+
+        let installed = mgr
+            .install_archive_bytes(&archive, None, install_dir.path())
+            .await
+            .unwrap();
+        assert!(installed.join("plugin.json").exists());
+        assert!(!mgr.get_plugin("unsigned-plugin").unwrap().verified);
+    }
+
+    // ── unverifiable sources with a configured key ───────────────────────
+
+    fn configure_test_key(mgr: &mut PluginManager) -> String {
+        let key = test_signing_key();
+        mgr.set_public_key(hex::encode(key.verifying_key().to_bytes()));
+        hex::encode(key.verifying_key().to_bytes())
+    }
+
+    #[tokio::test]
+    async fn a_configured_key_refuses_an_unpinned_directory_install() {
+        let source = tempfile::tempdir().unwrap();
+        write_local_plugin(source.path(), "local-plugin");
+        let install_dir = tempfile::tempdir().unwrap();
+
+        let mut mgr = PluginManager::new();
+        configure_test_key(&mut mgr);
+
+        let err = mgr
+            .install_from_source(
+                &PluginSource::LocalDir(source.path().to_path_buf()),
+                install_dir.path(),
+            )
+            .await
+            .unwrap_err();
+        assert!(err.contains("pinned by trust-on-first-use"), "{err}");
+        assert!(!install_dir.path().join("local-plugin").exists());
+        assert!(mgr.list_plugins().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_directory_pinned_by_tofu_installs_with_a_configured_key() {
+        let source = tempfile::tempdir().unwrap();
+        write_local_plugin(source.path(), "local-plugin");
+        let install_dir = tempfile::tempdir().unwrap();
+
+        // A previous (unkeyed) install would have recorded this pin.
+        let digest = PluginManager::directory_digest(source.path()).unwrap();
+        let store = PluginPinStore {
+            plugins: HashMap::from([(
+                "local-plugin".to_string(),
+                PluginPin {
+                    sha256: Some(digest),
+                    git_commit: None,
+                },
+            )]),
+        };
+        store.save(&install_dir.path().join(PIN_FILE_NAME)).unwrap();
+
+        let mut mgr = PluginManager::new();
+        configure_test_key(&mut mgr);
+        let installed = mgr
+            .install_from_source(
+                &PluginSource::LocalDir(source.path().to_path_buf()),
+                install_dir.path(),
+            )
+            .await
+            .unwrap();
+        assert!(installed.join("plugin.json").exists());
+        // Pinned, not signature-checked.
+        assert!(!mgr.get_plugin("local-plugin").unwrap().verified);
+    }
+
+    #[tokio::test]
+    async fn a_configured_key_refuses_an_unpinned_git_install() {
+        let Some((repo, _)) = fixture_repo("git-plugin").await else {
+            eprintln!("skipping: git is not available");
+            return;
+        };
+        let install_dir = tempfile::tempdir().unwrap();
+        let mut mgr = PluginManager::new();
+        configure_test_key(&mut mgr);
+
+        let err = mgr
+            .install_from_source(
+                &PluginSource::Git {
+                    url: format!("file://{}", repo.path().display()),
+                    rev: None,
+                },
+                install_dir.path(),
+            )
+            .await
+            .unwrap_err();
+        assert!(err.contains("pinned by trust-on-first-use"), "{err}");
+        assert!(!install_dir.path().join("git-plugin").exists());
+    }
+
+    #[tokio::test]
+    async fn a_git_install_pinned_by_tofu_is_allowed_with_a_configured_key() {
+        let Some((repo, commit)) = fixture_repo("git-plugin").await else {
+            eprintln!("skipping: git is not available");
+            return;
+        };
+        let install_dir = tempfile::tempdir().unwrap();
+        let store = PluginPinStore {
+            plugins: HashMap::from([(
+                "git-plugin".to_string(),
+                PluginPin {
+                    sha256: None,
+                    git_commit: Some(commit),
+                },
+            )]),
+        };
+        store.save(&install_dir.path().join(PIN_FILE_NAME)).unwrap();
+
+        let mut mgr = PluginManager::new();
+        configure_test_key(&mut mgr);
+        let installed = mgr
+            .install_from_source(
+                &PluginSource::Git {
+                    url: format!("file://{}", repo.path().display()),
+                    rev: None,
+                },
+                install_dir.path(),
+            )
+            .await
+            .unwrap();
+        assert!(installed.join("plugin.json").exists());
+    }
+
+    #[tokio::test]
+    async fn a_configured_key_refuses_an_unpinned_git_subdir_install() {
+        let Some((repo, _)) = fixture_repo_with_subdir("plugins/inner", "sub-plugin").await else {
+            eprintln!("skipping: git is not available");
+            return;
+        };
+        let install_dir = tempfile::tempdir().unwrap();
+        let mut mgr = PluginManager::new();
+        configure_test_key(&mut mgr);
+
+        let err = mgr
+            .install_from_source(
+                &PluginSource::GitSubdir {
+                    url: format!("file://{}", repo.path().display()),
+                    path: "plugins/inner".into(),
+                    rev: None,
+                    sha: None,
+                },
+                install_dir.path(),
+            )
+            .await
+            .unwrap_err();
+        assert!(err.contains("pinned by trust-on-first-use"), "{err}");
+        assert!(!install_dir.path().join("sub-plugin").exists());
+    }
+
+    // ── retry is backed by a real spawn ──────────────────────────────────
+
+    #[tokio::test]
+    async fn a_spawn_failure_is_recorded_as_an_error_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let manifest_json = r#"{"name":"unspawnable","entrypoint":"coderex-no-such-binary-9d8f"}"#;
+        std::fs::write(dir.path().join("plugin.json"), manifest_json).unwrap();
+        let manifest: PluginManifest = serde_json::from_str(manifest_json).unwrap();
+
+        let mgr = PluginManager::new();
+        mgr.load_plugin(manifest, dir.path().to_path_buf());
+
+        assert!(mgr.spawn_plugin("unspawnable").await.is_err());
+        let state = mgr.get_plugin("unspawnable").unwrap().state;
+        assert!(
+            matches!(state, PluginState::Error(_)),
+            "a failed spawn left the plugin in {state:?}"
+        );
+    }
+
+    fn write_recoverable_plugin(dir: &Path, name: &str) -> PluginManifest {
+        let manifest_json =
+            format!(r#"{{"name":"{name}","version":"1.0.0","commands":["hello"]}}"#);
+        std::fs::write(dir.join("plugin.json"), &manifest_json).unwrap();
+        serde_json::from_str(&manifest_json).unwrap()
+    }
+
+    #[test]
+    fn a_successful_retry_invokes_the_restart_callback() {
+        let dir = tempfile::tempdir().unwrap();
+        let manifest = write_recoverable_plugin(dir.path(), "restartable");
+
+        let mut mgr = PluginManager::new();
+        mgr.load_plugin(manifest, dir.path().to_path_buf());
+        mgr.set_plugin_state("restartable", PluginState::Error("broke".into()));
+
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        {
+            let calls = Arc::clone(&calls);
+            let seen = Arc::clone(&seen);
+            mgr.set_restart_handler(move |name| {
+                calls.fetch_add(1, Ordering::SeqCst);
+                seen.lock().unwrap().push(name.to_string());
+                Ok(())
+            });
+        }
+
+        let outcomes = mgr.retry_failed_plugins();
+        assert_eq!(
+            outcomes,
+            vec![RetryOutcome::Restarted("restartable".into())]
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(*seen.lock().unwrap(), vec!["restartable".to_string()]);
+        assert_eq!(
+            mgr.get_plugin("restartable").unwrap().state,
+            PluginState::Active
+        );
+    }
+
+    #[test]
+    fn a_retry_without_a_restart_handler_reports_that_a_restart_is_needed() {
+        let dir = tempfile::tempdir().unwrap();
+        let manifest = write_recoverable_plugin(dir.path(), "needs-spawn");
+
+        let mgr = PluginManager::new();
+        mgr.load_plugin(manifest, dir.path().to_path_buf());
+        mgr.set_plugin_state("needs-spawn", PluginState::Error("broke".into()));
+
+        let outcomes = mgr.retry_failed_plugins();
+        assert_eq!(
+            outcomes,
+            vec![RetryOutcome::RestartRequired("needs-spawn".into())]
+        );
+        // Not Active: nothing has spawned it yet.
+        assert_eq!(
+            mgr.get_plugin("needs-spawn").unwrap().state,
+            PluginState::Loading
+        );
+    }
+
+    #[test]
+    fn a_retry_whose_restart_fails_stays_in_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let manifest = write_recoverable_plugin(dir.path(), "still-broken");
+
+        let mut mgr = PluginManager::new();
+        mgr.load_plugin(manifest, dir.path().to_path_buf());
+        mgr.set_plugin_state("still-broken", PluginState::Error("broke".into()));
+        mgr.set_restart_handler(|_| Err("spawn exploded".into()));
+
+        let outcomes = mgr.retry_failed_plugins();
+        assert_eq!(
+            outcomes,
+            vec![RetryOutcome::StillFailed("still-broken".into())]
+        );
+        let state = mgr.get_plugin("still-broken").unwrap().state;
+        assert!(
+            matches!(state, PluginState::Error(ref message) if message.contains("restart failed")),
+            "{state:?}"
+        );
+    }
+
+    // ── host-supplied userConfig from settings ───────────────────────────
+
+    #[test]
+    fn host_options_from_a_map_are_applied() {
+        let mgr = PluginManager::new();
+        let options = HashMap::from([(
+            "configured".to_string(),
+            HashMap::from([("TOKEN".to_string(), "from-settings".to_string())]),
+        )]);
+        mgr.apply_options_from_map(&options);
+
+        assert_eq!(mgr.plugin_options("configured")["TOKEN"], "from-settings");
+    }
+
+    #[test]
+    fn options_from_settings_json_are_applied_and_stringified() {
+        let mgr = PluginManager::new();
+        let settings = serde_json::json!({
+            "plugins": {
+                "configured": {
+                    "options": {
+                        "TOKEN": "from-settings",
+                        "PORT": 8080,
+                        "DEBUG": true
+                    }
+                }
+            }
+        });
+
+        assert_eq!(mgr.apply_options_from_settings(&settings).unwrap(), 3);
+        let options = mgr.plugin_options("configured");
+        assert_eq!(options["TOKEN"], "from-settings");
+        assert_eq!(options["PORT"], "8080");
+        assert_eq!(options["DEBUG"], "true");
+    }
+
+    #[test]
+    fn a_non_scalar_setting_is_an_error_not_a_silent_drop() {
+        let mgr = PluginManager::new();
+        let settings = serde_json::json!({
+            "pluginOptions": {
+                "configured": {"TOKEN": {"nested": "secret"}}
+            }
+        });
+        let err = mgr.apply_options_from_settings(&settings).unwrap_err();
+        assert!(err.contains("TOKEN"), "{err}");
+    }
+
+    // ── marketplace-name installs ────────────────────────────────────────
+
+    #[tokio::test]
+    async fn installing_by_name_without_a_marketplace_says_what_is_missing() {
+        let install_dir = tempfile::tempdir().unwrap();
+        let mgr = PluginManager::new();
+
+        let err = mgr
+            .install_plugin_by_name("some-plugin", install_dir.path())
+            .await
+            .unwrap_err();
+        assert!(err.contains("no marketplace is registered"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn installing_by_name_uses_a_registered_marketplace() {
+        let install_dir = tempfile::tempdir().unwrap();
+        let mgr = PluginManager::new();
+        // Port 1 refuses immediately; the point is that the registered
+        // marketplace was the one asked, not that a download happened.
+        mgr.register_marketplace("main".into(), "https://127.0.0.1:1".into())
+            .unwrap();
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            mgr.install_plugin_by_name("some-plugin", install_dir.path()),
+        )
+        .await
+        .expect("the marketplace download attempt timed out");
+
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("failed to download plugin 'some-plugin'"),
+            "{err}"
+        );
     }
 }
