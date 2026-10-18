@@ -1,6 +1,6 @@
 //! Config extension commands: /theme, /hooks, /mcp, /plugin, /memory, /skills, /tasks, /plan.
 
-use crate::registry::{CommandContext, CommandRegistry, CommandResult, SlashCommand};
+use crate::registry::{CommandArgs, CommandContext, CommandRegistry, CommandResult, SlashCommand};
 use std::sync::Arc;
 
 thread_local! {
@@ -77,72 +77,75 @@ fn read_memory_entries() -> Vec<String> {
 /// Register config extension commands.
 pub fn register(registry: &mut CommandRegistry) {
     // /theme — switch/view theme
-    registry.register(SlashCommand::local(
-        "theme",
-        "View or change the UI theme",
-        true,
-        true,
-        true,
-        Arc::new(|ctx: &CommandContext, args: &[String]| {
-            if args.is_empty() {
-                let home = config_home();
-                let themes_path = home.join("themes");
-                let available = list_dir_items(&themes_path);
-                let mut output = format!("Current theme: {}", ctx.theme);
-                if !available.is_empty() {
-                    output.push_str(&format!(
-                        "\nAvailable themes:\n{}",
-                        available
-                            .iter()
-                            .take(10)
-                            .map(|t| format!("  {t}"))
-                            .collect::<Vec<_>>()
-                            .join("\n")
-                    ));
-                }
-                CommandResult::success(output)
-            } else {
-                let new_theme = &args[0];
-                let home = config_home();
-                let themes_path = home.join("themes");
-                let theme_file = themes_path.join(format!("{new_theme}.toml"));
-                let theme_dir = themes_path.join(new_theme);
-                if theme_file.exists()
-                    || theme_dir.is_dir()
-                    || new_theme == "light"
-                    || new_theme == "dark"
-                    || new_theme == "high-contrast"
-                    || new_theme == "tokyo-night"
-                {
-                    let mut settings = read_user_settings().unwrap_or_default();
-                    settings.insert(
-                        "theme".to_string(),
-                        serde_json::Value::String(new_theme.clone()),
-                    );
-                    let _ = write_user_settings(&settings);
-                    CommandResult::success(format!(
-                        "Theme changed to: {new_theme}\nSaved to settings.json.",
-                    ))
-                    .with_state_change(true)
-                } else {
+    registry.register(
+        SlashCommand::local(
+            "theme",
+            "View or change the UI theme",
+            true,
+            true,
+            true,
+            Arc::new(|ctx: &CommandContext, args: &[String]| {
+                if args.is_empty() {
+                    let home = config_home();
+                    let themes_path = home.join("themes");
                     let available = list_dir_items(&themes_path);
-                    let hint = if !available.is_empty() {
-                        format!(
+                    let mut output = format!("Current theme: {}", ctx.theme);
+                    if !available.is_empty() {
+                        output.push_str(&format!(
                             "\nAvailable themes:\n{}",
                             available
                                 .iter()
+                                .take(10)
                                 .map(|t| format!("  {t}"))
                                 .collect::<Vec<_>>()
                                 .join("\n")
-                        )
+                        ));
+                    }
+                    CommandResult::success(output)
+                } else {
+                    let new_theme = &args[0];
+                    let home = config_home();
+                    let themes_path = home.join("themes");
+                    let theme_file = themes_path.join(format!("{new_theme}.toml"));
+                    let theme_dir = themes_path.join(new_theme);
+                    if theme_file.exists()
+                        || theme_dir.is_dir()
+                        || new_theme == "light"
+                        || new_theme == "dark"
+                        || new_theme == "high-contrast"
+                        || new_theme == "tokyo-night"
+                    {
+                        let mut settings = read_user_settings().unwrap_or_default();
+                        settings.insert(
+                            "theme".to_string(),
+                            serde_json::Value::String(new_theme.clone()),
+                        );
+                        let _ = write_user_settings(&settings);
+                        CommandResult::success(format!(
+                            "Theme changed to: {new_theme}\nSaved to settings.json.",
+                        ))
+                        .with_state_change(true)
                     } else {
-                        "\nNo custom themes installed in ~/.coderex/themes/".to_string()
-                    };
-                    CommandResult::error(format!("Theme not found: {new_theme}{hint}"))
+                        let available = list_dir_items(&themes_path);
+                        let hint = if !available.is_empty() {
+                            format!(
+                                "\nAvailable themes:\n{}",
+                                available
+                                    .iter()
+                                    .map(|t| format!("  {t}"))
+                                    .collect::<Vec<_>>()
+                                    .join("\n")
+                            )
+                        } else {
+                            "\nNo custom themes installed in ~/.coderex/themes/".to_string()
+                        };
+                        CommandResult::error(format!("Theme not found: {new_theme}{hint}"))
+                    }
                 }
-            }
-        }),
-    ));
+            }),
+        )
+        .with_args(CommandArgs::AtMost(1)),
+    );
 
     // /hooks — view/manage hooks
     registry.register(SlashCommand::local(

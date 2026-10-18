@@ -1,6 +1,6 @@
 //! Content & context commands: /copy, /init, /summary, /files, /open, /context, /ctx_viz, /add-dir.
 
-use crate::registry::{CommandContext, CommandRegistry, CommandResult, SlashCommand};
+use crate::registry::{CommandArgs, CommandContext, CommandRegistry, CommandResult, SlashCommand};
 use std::sync::Arc;
 
 /// Copy text to system clipboard.
@@ -274,16 +274,15 @@ pub fn register(registry: &mut CommandRegistry) {
     ));
 
     // /add-dir — add directory to project context
-    registry.register(SlashCommand::local(
-        "add-dir",
-        "Add a directory to project context",
-        true,
-        true,
-        true,
-        Arc::new(|ctx: &CommandContext, args: &[String]| {
-            if args.is_empty() {
-                CommandResult::error("Usage: /add-dir <path>")
-            } else {
+    registry.register(
+        SlashCommand::local(
+            "add-dir",
+            "Add a directory to project context",
+            true,
+            true,
+            true,
+            Arc::new(|ctx: &CommandContext, args: &[String]| {
+                // Arity is enforced by the registry (`AtLeast(1)`).
                 let path = args[0].clone();
                 let full_path = std::path::Path::new(&ctx.cwd).join(&path);
                 if full_path.is_dir() {
@@ -310,9 +309,10 @@ pub fn register(registry: &mut CommandRegistry) {
                 } else {
                     CommandResult::error(format!("Directory not found: {path}"))
                 }
-            }
-        }),
-    ));
+            }),
+        )
+        .with_args(CommandArgs::AtLeast(1)),
+    );
 }
 
 #[cfg(test)]
@@ -475,7 +475,11 @@ mod tests {
             r
         };
         let result = reg.execute("add-dir", &ctx(), &[]);
-        assert!(result.output.contains("Usage"));
+        assert!(
+            result.output.contains("requires at least 1"),
+            "{}",
+            result.output
+        );
     }
 
     #[test]

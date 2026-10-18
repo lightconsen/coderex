@@ -1,6 +1,6 @@
 //! Session extension commands: /resume, /rename, /rewind.
 
-use crate::registry::{CommandContext, CommandRegistry, CommandResult, SlashCommand};
+use crate::registry::{CommandArgs, CommandContext, CommandRegistry, CommandResult, SlashCommand};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::sync::Arc;
@@ -77,13 +77,14 @@ fn default_session_base() -> std::path::PathBuf {
 /// Register session extension commands.
 pub fn register(registry: &mut CommandRegistry) {
     // /resume — resume previous session
-    registry.register(SlashCommand::local(
-        "resume",
-        "Resume a previous session",
-        true,
-        true,
-        true,
-        Arc::new(|_ctx: &CommandContext, args: &[String]| {
+    registry.register(
+        SlashCommand::local(
+            "resume",
+            "Resume a previous session",
+            true,
+            true,
+            true,
+            Arc::new(|_ctx: &CommandContext, args: &[String]| {
             let session_base = default_session_base();
             if args.is_empty() {
                 // Resume most recent session
@@ -135,22 +136,21 @@ pub fn register(registry: &mut CommandRegistry) {
                 }
             }
         }),
-    ));
+        )
+        .with_args(CommandArgs::AtMost(1)),
+    );
 
     // /rename — rename current session
-    registry.register(SlashCommand::local(
-        "rename",
-        "Rename the current session",
-        true,
-        true,
-        true,
-        Arc::new(|ctx: &CommandContext, args: &[String]| {
-            if args.is_empty() {
-                CommandResult::error(format!(
-                    "Usage: /rename <new-title>\nCurrent title: {}",
-                    ctx.session_title
-                ))
-            } else {
+    registry.register(
+        SlashCommand::local(
+            "rename",
+            "Rename the current session",
+            true,
+            true,
+            true,
+            Arc::new(|ctx: &CommandContext, args: &[String]| {
+                // Arity is enforced by the registry (`AtLeast(1)`); the title
+                // may span multiple words, so the remainder is joined.
                 let new_title = args.join(" ");
                 let session_base = default_session_base();
                 // Persist the rename to disk
@@ -173,9 +173,10 @@ pub fn register(registry: &mut CommandRegistry) {
                     ))
                     .with_state_change(true),
                 }
-            }
-        }),
-    ));
+            }),
+        )
+        .with_args(CommandArgs::AtLeast(1)),
+    );
 
     // /rewind — rewind to a point in history
     registry.register(SlashCommand::local(
@@ -274,7 +275,11 @@ mod tests {
             r
         };
         let result = reg.execute("rename", &ctx(), &[]);
-        assert!(result.output.contains("Usage"));
+        assert!(
+            result.output.contains("requires at least 1"),
+            "{}",
+            result.output
+        );
     }
 
     #[test]

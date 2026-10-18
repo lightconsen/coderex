@@ -38,6 +38,33 @@ pub const KNOWN_FLAGS: &[&str] = &[
     "stickers",
 ];
 
+/// Flags accepted for configuration compatibility that have no effect in
+/// this build.
+///
+/// These names are deliberately kept in [`KNOWN_FLAGS`]: configuration,
+/// experiment payloads, and per-project files written by other builds may
+/// mention them, and rejecting them would turn a compatibility name into a
+/// parse error. Nothing in this build reads them, so [`FeatureFlags`] stores
+/// their parsed state but no behavior depends on it. See
+/// [`FeatureFlags::inert_flags`].
+const INERT_FLAGS: &[&str] = &[
+    "streaming_tool_execution",
+    "tool_use_summaries",
+    "fast_mode",
+    "coordinator_mode",
+    "history_snip",
+    "agent_triggers",
+    "bridge_mode",
+    "daemon",
+    "buddy",
+    "web_browser_tool",
+    "context_collapse",
+    "terminal_panel",
+    "kairos",
+    "team_collaboration",
+    "auto_dream",
+];
+
 /// One or more feature flag names that this build does not know.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UnknownFeatureFlags {
@@ -268,6 +295,23 @@ impl FeatureFlags {
             caps.insert(CapabilitySet::KAIROS);
         }
         caps
+    }
+
+    /// The enabled flags from the compatibility-only set, in
+    /// [`KNOWN_FLAGS`] order.
+    ///
+    /// These names are accepted for configuration compatibility but have no
+    /// effect in this build: no production code reads them, and enabling one
+    /// changes no behavior. They are reported here so tooling and tests can
+    /// distinguish a flag that is merely stored from one that does something,
+    /// without removing the names from configuration files that mention them.
+    #[must_use]
+    pub fn inert_flags(&self) -> Vec<&'static str> {
+        INERT_FLAGS
+            .iter()
+            .copied()
+            .filter(|name| self.is_enabled(name))
+            .collect()
     }
 
     /// Every flag as a name → enabled map.
@@ -899,5 +943,40 @@ mod tests {
         overrides.insert("context_window_overrides".into(), false);
         let with_project = flags.with_project_overrides(&overrides);
         assert!(!with_project.context_window_overrides);
+    }
+
+    #[test]
+    fn inert_flags_are_empty_when_everything_is_off() {
+        assert!(FeatureFlags::default().inert_flags().is_empty());
+    }
+
+    #[test]
+    fn inert_flags_reports_exactly_the_enabled_names() {
+        let flags = FeatureFlags::parse("+streaming_tool_execution,+daemon,+kairos,-fast_mode");
+        assert_eq!(
+            flags.inert_flags(),
+            vec!["streaming_tool_execution", "daemon", "kairos"]
+        );
+
+        // Disabling one of the enabled names removes it from the report.
+        let fewer = FeatureFlags::parse("+streaming_tool_execution,+daemon,+kairos,-daemon");
+        assert_eq!(
+            fewer.inert_flags(),
+            vec!["streaming_tool_execution", "kairos"]
+        );
+    }
+
+    #[test]
+    fn inert_flags_excludes_flags_that_have_consumers() {
+        // `workflow_scripts` feeds the CapabilitySet, and the six command
+        // gates are consulted by their slash commands. None are inert.
+        let flags = FeatureFlags::parse(
+            "workflow_scripts,ultraplan,thinkback,heapdump,mock_limits,ctx_viz,stickers",
+        );
+        assert!(
+            flags.inert_flags().is_empty(),
+            "flags with consumers were reported as inert: {:?}",
+            flags.inert_flags()
+        );
     }
 }

@@ -1,6 +1,6 @@
 //! Config commands: /config, /model, /permissions.
 
-use crate::registry::{CommandContext, CommandRegistry, CommandResult, SlashCommand};
+use crate::registry::{CommandArgs, CommandContext, CommandRegistry, CommandResult, SlashCommand};
 use coderex_core::permissions::PermissionMode;
 use coderex_core::types::ModelId;
 use std::sync::Arc;
@@ -132,35 +132,38 @@ pub fn register(registry: &mut CommandRegistry) {
     ));
 
     // /model — switch model
-    registry.register(SlashCommand::local(
-        "model",
-        "Switch AI model",
-        true,
-        true,
-        true,
-        Arc::new(|ctx: &CommandContext, args: &[String]| {
-            if args.is_empty() {
-                CommandResult::success(format!(
-                    "Current model: {}\nUsage: /model <opus|sonnet|haiku|custom-model-id>",
-                    ctx.model.0
-                ))
-            } else {
-                let model_name = match args[0].to_lowercase().as_str() {
-                    "opus" => ModelId::opus().0,
-                    "sonnet" => ModelId::sonnet().0,
-                    "haiku" => ModelId::haiku().0,
-                    other => other.to_string(),
-                };
-                // Also persist to settings.json so the change survives restart
-                let mut settings = read_user_settings().unwrap_or_default();
-                settings.insert("model".to_string(), serde_json::Value::String(model_name.clone()));
-                let _ = write_user_settings(&settings);
-                CommandResult::success(format!(
-                    "Model switched to: {model_name}\nSaved to settings.json. Use in the REPL for immediate effect.",
-                )).with_state_change(true)
-            }
-        }),
-    ));
+    registry.register(
+        SlashCommand::local(
+            "model",
+            "Switch AI model",
+            true,
+            true,
+            true,
+            Arc::new(|ctx: &CommandContext, args: &[String]| {
+                if args.is_empty() {
+                    CommandResult::success(format!(
+                        "Current model: {}\nUsage: /model <opus|sonnet|haiku|custom-model-id>",
+                        ctx.model.0
+                    ))
+                } else {
+                    let model_name = match args[0].to_lowercase().as_str() {
+                        "opus" => ModelId::opus().0,
+                        "sonnet" => ModelId::sonnet().0,
+                        "haiku" => ModelId::haiku().0,
+                        other => other.to_string(),
+                    };
+                    // Also persist to settings.json so the change survives restart
+                    let mut settings = read_user_settings().unwrap_or_default();
+                    settings.insert("model".to_string(), serde_json::Value::String(model_name.clone()));
+                    let _ = write_user_settings(&settings);
+                    CommandResult::success(format!(
+                        "Model switched to: {model_name}\nSaved to settings.json. Use in the REPL for immediate effect.",
+                    )).with_state_change(true)
+                }
+            }),
+        )
+        .with_args(CommandArgs::AtMost(1)),
+    );
 
     // /permissions — view/set permission mode
     registry.register(SlashCommand::local(

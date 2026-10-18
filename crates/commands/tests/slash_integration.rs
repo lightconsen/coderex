@@ -307,7 +307,16 @@ fn bughunter_mode_sets_profile() {
 fn btw_requires_arg() {
     let reg = full_registry();
     let result = reg.execute("btw", &test_ctx(), &[]);
-    assert!(result.output.contains("Usage"));
+    assert!(
+        result.output.contains("requires at least 1"),
+        "{}",
+        result.output
+    );
+    assert!(
+        !result.output.contains("Added context"),
+        "{}",
+        result.output
+    );
 }
 
 #[test]
@@ -315,6 +324,143 @@ fn btw_adds_context() {
     let reg = full_registry();
     let result = reg.execute("btw", &test_ctx(), &["important".into(), "note".into()]);
     assert!(result.extra_context.is_some());
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  Argument arity — specs declared on the command are enforced by the registry
+// ═══════════════════════════════════════════════════════════════════════════
+
+#[test]
+fn rename_requires_a_title_and_accepts_a_multiword_one() {
+    let reg = full_registry();
+
+    let missing = reg.execute("rename", &test_ctx(), &[]);
+    assert!(
+        missing.output.contains("requires at least 1"),
+        "{}",
+        missing.output
+    );
+    assert!(
+        !missing.output.contains("Session renamed"),
+        "{}",
+        missing.output
+    );
+
+    // The handler joins the remaining words, so a multiword title is valid.
+    let renamed = reg.execute("rename", &test_ctx(), &["New".into(), "Title".into()]);
+    assert!(renamed.output.contains("New Title"), "{}", renamed.output);
+}
+
+#[test]
+fn add_dir_requires_a_path_and_accepts_one() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir(dir.path().join("src")).unwrap();
+    let mut context = test_ctx();
+    context.cwd = dir.path().to_string_lossy().into_owned();
+
+    let reg = full_registry();
+    let missing = reg.execute("add-dir", &context, &[]);
+    assert!(
+        missing.output.contains("requires at least 1"),
+        "{}",
+        missing.output
+    );
+    assert!(!missing.output.contains("added to project context"));
+
+    let added = reg.execute("add-dir", &context, &["src".into()]);
+    assert!(added.state_changed, "{}", added.output);
+    assert!(added.output.contains("src"), "{}", added.output);
+}
+
+#[test]
+fn model_accepts_zero_or_one_argument_and_rejects_two() {
+    let reg = full_registry();
+
+    // No argument prints the current model.
+    let current = reg.execute("model", &test_ctx(), &[]);
+    assert!(
+        current.output.contains("Current model"),
+        "{}",
+        current.output
+    );
+
+    let too_many = reg.execute("model", &test_ctx(), &["opus".into(), "extra".into()]);
+    assert!(
+        too_many.output.contains("takes at most 1"),
+        "{}",
+        too_many.output
+    );
+    assert!(
+        !too_many.output.contains("Model switched"),
+        "{}",
+        too_many.output
+    );
+
+    let one = reg.execute("model", &test_ctx(), &["opus".into()]);
+    assert!(one.output.contains("claude-opus"), "{}", one.output);
+}
+
+#[test]
+fn theme_accepts_zero_or_one_argument_and_rejects_two() {
+    let reg = full_registry();
+
+    // No argument prints the current theme.
+    let current = reg.execute("theme", &test_ctx(), &[]);
+    assert!(
+        current.output.contains("Current theme"),
+        "{}",
+        current.output
+    );
+
+    let too_many = reg.execute("theme", &test_ctx(), &["dark".into(), "extra".into()]);
+    assert!(
+        too_many.output.contains("takes at most 1"),
+        "{}",
+        too_many.output
+    );
+
+    let one = reg.execute("theme", &test_ctx(), &["dark".into()]);
+    assert!(!one.output.contains("takes at most 1"), "{}", one.output);
+}
+
+#[test]
+fn resume_accepts_zero_or_one_argument_and_rejects_two() {
+    let reg = full_registry();
+
+    // No argument resumes the most recent session.
+    let recent = reg.execute("resume", &test_ctx(), &[]);
+    assert!(
+        !recent.output.contains("takes at most 1"),
+        "{}",
+        recent.output
+    );
+
+    let too_many = reg.execute("resume", &test_ctx(), &["one".into(), "two".into()]);
+    assert!(
+        too_many.output.contains("takes at most 1"),
+        "{}",
+        too_many.output
+    );
+    assert!(!too_many.output.contains("Resuming"), "{}", too_many.output);
+
+    let one = reg.execute("resume", &test_ctx(), &["s_abc".into()]);
+    assert!(!one.output.contains("takes at most 1"), "{}", one.output);
+}
+
+/// `/history` deliberately has no arity spec: `search <query>` is intended to
+/// accept a multiword query, and the handler enforces its own per-form usage.
+#[test]
+fn history_keeps_multiword_search_queries() {
+    let reg = full_registry();
+    let mut context = test_ctx();
+    context.recent_commands = vec!["/diff now".into()];
+
+    let result = reg.execute(
+        "history",
+        &context,
+        &["search".into(), "diff".into(), "now".into()],
+    );
+    assert!(result.output.contains("/diff now"), "{}", result.output);
 }
 
 #[test]

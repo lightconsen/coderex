@@ -1,6 +1,6 @@
 //! Miscellaneous commands: /advisor, /btw, /good-claude, /stickers, /bughunter, /issue, /env, /diff, /oauth-refresh, /backfill-sessions.
 
-use crate::registry::{CommandContext, CommandRegistry, CommandResult, SlashCommand};
+use crate::registry::{CommandArgs, CommandContext, CommandRegistry, CommandResult, SlashCommand};
 use coderex_core::query_profiles::PromptProfile;
 use std::sync::Arc;
 
@@ -20,19 +20,18 @@ pub fn register(registry: &mut CommandRegistry) {
     ));
 
     // /btw — insert contextual information
-    registry.register(SlashCommand::prompt(
-        "btw",
-        "Insert contextual information",
-        true,
-        Arc::new(|_ctx: &CommandContext, args: &[String]| {
-            if args.is_empty() {
-                CommandResult::error("Usage: /btw <information to add>")
-            } else {
+    registry.register(
+        SlashCommand::prompt(
+            "btw",
+            "Insert contextual information",
+            true,
+            Arc::new(|_ctx: &CommandContext, args: &[String]| {
                 CommandResult::success(format!("Added context: {}", args.join(" ")))
                     .with_context(args.join(" "))
-            }
-        }),
-    ));
+            }),
+        )
+        .with_args(CommandArgs::AtLeast(1)),
+    );
 
     // /good-claude — positive feedback
     registry.register(SlashCommand::local(
@@ -458,7 +457,11 @@ mod tests {
             r
         };
         let result = reg.execute("btw", &ctx(), &[]);
-        assert!(result.output.contains("Usage"));
+        assert!(
+            result.output.contains("requires at least 1"),
+            "{}",
+            result.output
+        );
     }
 
     #[test]

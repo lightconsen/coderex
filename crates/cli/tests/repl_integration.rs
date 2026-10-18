@@ -114,9 +114,11 @@ fn run_headless_btw_without_args_errors() {
     let mut repl = ReplLoop::new("/tmp".into(), ModelId::sonnet());
     let rt = tokio::runtime::Runtime::new().unwrap();
     let result = rt.block_on(repl.run_headless("/btw")).unwrap();
+    // `/btw` now declares its arity, so the registry rejects the call before
+    // the handler's own usage message can run.
     assert!(
-        result.contains("Usage"),
-        "expected usage error, got: {result}"
+        result.contains("requires at least 1 argument"),
+        "expected the arity error, got: {result}"
     );
 }
 
