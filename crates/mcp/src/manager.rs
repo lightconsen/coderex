@@ -551,6 +551,78 @@ impl McpManager {
         self.resources.lock().unwrap().register(resource);
     }
 
+    /// Read one resource from a named server.
+    ///
+    /// Sends a live `resources/read` request, parses the first usable entry
+    /// (`text` or base64 `blob`) of the response into [`McpResourceContent`],
+    /// and caches it under the server that answered. `server_name` must name a
+    /// configured server; use [`McpManager::read_resource_any`] when the caller
+    /// only has a URI.
+    pub async fn read_resource(
+        &self,
+        server_name: &str,
+        uri: &str,
+    ) -> Result<McpResourceContent, String> {
+        let mut server = self
+            .get_server(server_name)
+            .ok_or_else(|| format!("MCP server '{server_name}' is not attached"))?;
+
+        let response = server.read_resource(uri).await.map_err(|error| {
+            format!("failed to read resource '{uri}' from server '{server_name}': {error}")
+        })?;
+
+        let content = parse_resource_contents(&response, uri)?;
+        self.cache_resource(server_name, uri, content.clone());
+        Ok(content)
+    }
+
+    /// Read a resource from whichever running server can serve it.
+    ///
+    /// Tries every running server in turn and returns the first successful
+    /// read. The response is cached under the server that answered. The error
+    /// lists each server's failure so a caller can tell "nothing is attached"
+    /// from "every server refused this URI".
+    pub async fn read_resource_any(&self, uri: &str) -> Result<McpResourceContent, String> {
+        let names = self.list_servers();
+        if names.is_empty() {
+            return Err(format!(
+                "no MCP server is attached; cannot read resource '{uri}'"
+            ));
+        }
+
+        // A previous read is authoritative until `resources/updated`
+        // invalidates it; avoid a round trip when the cache already has it.
+        for name in &names {
+            if let Some(content) = self.get_cached_resource(name, uri) {
+                return Ok(content);
+            }
+        }
+
+        let mut failures = Vec::new();
+        let mut attempted = false;
+        for name in names {
+            if !self.is_running(&name) {
+                continue;
+            }
+            attempted = true;
+            match self.read_resource(&name, uri).await {
+                Ok(content) => return Ok(content),
+                Err(error) => failures.push(format!("{name}: {error}")),
+            }
+        }
+
+        if !attempted {
+            return Err(format!(
+                "no MCP server is running; cannot read resource '{uri}'"
+            ));
+        }
+
+        Err(format!(
+            "no MCP server could read resource '{uri}': {}",
+            failures.join("; ")
+        ))
+    }
+
     /// Register every discovered tool into `registry`.
     ///
     /// This is what puts MCP tools on the same execution path as built-ins:
@@ -620,6 +692,16 @@ impl McpManager {
             .iter()
             .map(|r| r.uri.clone())
             .collect()
+    }
+
+    /// List all registered resources with their discovered metadata.
+    ///
+    /// Unlike [`McpManager::list_resources`], which returns bare URIs, this
+    /// lets a caller render a resource's name and MIME type instead of
+    /// inventing them from the URI.
+    #[must_use]
+    pub fn list_resource_info(&self) -> Vec<McpResource> {
+        self.resources.lock().unwrap().list().to_vec()
     }
 
     /// Number of registered tools.
@@ -736,6 +818,69 @@ impl McpManager {
             .expect("the OAuth manager has another strong owner")
             .get_mut()
     }
+}
+
+/// Parse the `contents` array of a `resources/read` response.
+///
+/// MCP allows a single read to return several entries; the first with actual
+/// content wins. A `text` entry and a base64 `blob` entry are both supported.
+/// Entries that carry neither are skipped, and both an empty list and a list
+/// of only unusable entries are reported rather than returned as empty
+/// content.
+fn parse_resource_contents(
+    response: &serde_json::Value,
+    requested_uri: &str,
+) -> Result<McpResourceContent, String> {
+    let contents = response
+        .get("contents")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| {
+            format!("resources/read response for '{requested_uri}' has no 'contents' array")
+        })?;
+
+    if contents.is_empty() {
+        return Err(format!(
+            "the server returned no contents for resource '{requested_uri}'"
+        ));
+    }
+
+    for entry in contents {
+        let text = entry
+            .get("text")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string);
+        let blob = entry
+            .get("blob")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string);
+
+        if text.is_none() && blob.is_none() {
+            continue;
+        }
+
+        let uri = entry
+            .get("uri")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or(requested_uri)
+            .to_string();
+        let mime_type = entry
+            .get("mimeType")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("application/octet-stream")
+            .to_string();
+
+        return Ok(McpResourceContent {
+            uri,
+            mime_type,
+            text,
+            blob,
+        });
+    }
+
+    Err(format!(
+        "the server returned no readable contents for resource '{requested_uri}' \
+         (entries had neither 'text' nor 'blob')"
+    ))
 }
 
 #[cfg(test)]

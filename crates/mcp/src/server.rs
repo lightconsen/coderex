@@ -404,6 +404,39 @@ impl McpServer {
         result
     }
 
+    /// Read one resource from the MCP server.
+    ///
+    /// Returns the raw `resources/read` JSON response.
+    pub async fn read_resource(&mut self, uri: &str) -> Result<serde_json::Value, McpServerError> {
+        if self.status != ServerStatus::Running {
+            return Err(McpServerError::HealthCheckFailed {
+                name: self.name.clone(),
+                reason: "server not running".to_string(),
+            });
+        }
+
+        let channel_opt = self.channel.take();
+        let result = if let Some(ref channel) = channel_opt {
+            let mut ch = channel.lock().await;
+            ch.read_resource(uri)
+                .await
+                .map_err(|e| McpServerError::HealthCheckFailed {
+                    name: self.name.clone(),
+                    reason: e,
+                })
+        } else {
+            Err(McpServerError::HealthCheckFailed {
+                name: self.name.clone(),
+                reason: "no channel".to_string(),
+            })
+        };
+
+        if let Some(channel) = channel_opt {
+            self.channel = Some(channel);
+        }
+        result
+    }
+
     /// Attempt reconnection — terminate old channel and spawn new one.
     pub async fn reconnect(&mut self) -> Result<(), McpServerError> {
         if self.reconnect_count >= self.max_reconnects {

@@ -475,6 +475,15 @@ impl JsonRpcChannel {
         self.send_request("resources/list", None).await
     }
 
+    /// Read one resource from the MCP server.
+    ///
+    /// Returns the raw `resources/read` JSON response, whose `contents` array
+    /// carries either `text` or base64 `blob` entries.
+    pub async fn read_resource(&mut self, uri: &str) -> Result<Value, String> {
+        self.send_request("resources/read", Some(serde_json::json!({"uri": uri})))
+            .await
+    }
+
     /// Send a JSON-RPC request and wait for the response.
     pub async fn send_request(
         &mut self,

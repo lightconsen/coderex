@@ -102,6 +102,39 @@ for line in sys.stdin:
                 }
             ]
         })
+    elif method == "resources/read":
+        params = req.get("params", {})
+        uri = params.get("uri", "")
+        if uri == "file:///tmp/test.txt":
+            send_response(req_id, {
+                "contents": [
+                    {
+                        "uri": uri,
+                        "mimeType": "text/plain",
+                        "text": "hello from resource"
+                    }
+                ]
+            })
+        elif uri == "file:///tmp/data.json":
+            send_response(req_id, {
+                "contents": [
+                    {
+                        "uri": uri,
+                        "mimeType": "application/json",
+                        "blob": "eyJvayI6dHJ1ZX0="
+                    }
+                ]
+            })
+        elif uri == "file:///tmp/empty":
+            send_response(req_id, {"contents": []})
+        elif uri == "file:///tmp/unsupported":
+            send_response(req_id, {
+                "contents": [{"uri": uri, "mimeType": "application/octet-stream"}]
+            })
+        elif uri == "file:///tmp/boom":
+            send_error(req_id, -32002, "resource unavailable")
+        else:
+            send_error(req_id, -32002, f"resource not found: {uri}")
     elif method == "tools/call":
         params = req.get("params", {})
         tool_name = params.get("name", "")
@@ -127,6 +160,25 @@ fn mock_server_path() -> PathBuf {
         std::fs::set_permissions(&path, perms).unwrap();
     }
     path
+}
+
+/// A started manager whose single `mock` server is the Python mock above.
+async fn running_mock_manager() -> McpManager {
+    let script = mock_server_path();
+    let mgr = McpManager::new();
+    let mut config = McpConfig::new();
+    config.add_server(
+        "mock",
+        McpServerConfig {
+            command: script.to_str().unwrap().into(),
+            args: vec![],
+            env: HashMap::new(),
+            ..Default::default()
+        },
+    );
+    mgr.load_config(&config);
+    mgr.start_all().await;
+    mgr
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -575,6 +627,185 @@ async fn resource_discovery_manager_discovers_and_registers() {
     mgr.stop_all().await;
 }
 
+#[tokio::test]
+async fn resource_read_server_returns_raw_contents() {
+    let script = mock_server_path();
+    let mut server = McpServer::new("test", script.to_str().unwrap(), vec![], HashMap::new());
+    server.spawn().await.unwrap();
+
+    let value = server.read_resource("file:///tmp/test.txt").await.unwrap();
+    let contents = value.get("contents").and_then(|c| c.as_array()).unwrap();
+    assert_eq!(contents.len(), 1);
+    assert_eq!(contents[0]["uri"], "file:///tmp/test.txt");
+    assert_eq!(contents[0]["text"], "hello from resource");
+
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn resource_read_text_is_returned_and_cached() {
+    let mgr = running_mock_manager().await;
+
+    let content = mgr
+        .read_resource("mock", "file:///tmp/test.txt")
+        .await
+        .unwrap();
+
+    // The mock only returns text for this exact URI, so the request carried
+    // the URI in `params` as `resources/read` requires.
+    assert_eq!(content.uri, "file:///tmp/test.txt");
+    assert_eq!(content.mime_type, "text/plain");
+    assert_eq!(content.text.as_deref(), Some("hello from resource"));
+    assert!(content.blob.is_none());
+
+    let cached = mgr
+        .get_cached_resource("mock", "file:///tmp/test.txt")
+        .expect("a successful read must be cached");
+    assert_eq!(cached.text.as_deref(), Some("hello from resource"));
+
+    mgr.stop_all().await;
+}
+
+#[tokio::test]
+async fn resource_read_blob_is_returned_and_cached() {
+    let mgr = running_mock_manager().await;
+
+    let content = mgr
+        .read_resource("mock", "file:///tmp/data.json")
+        .await
+        .unwrap();
+
+    assert_eq!(content.uri, "file:///tmp/data.json");
+    assert_eq!(content.mime_type, "application/json");
+    assert_eq!(content.blob.as_deref(), Some("eyJvayI6dHJ1ZX0="));
+    assert!(content.text.is_none());
+
+    let cached = mgr
+        .get_cached_resource("mock", "file:///tmp/data.json")
+        .expect("a blob read must be cached");
+    assert_eq!(cached.blob.as_deref(), Some("eyJvayI6dHJ1ZX0="));
+
+    mgr.stop_all().await;
+}
+
+#[tokio::test]
+async fn resource_read_any_finds_a_running_server() {
+    let mgr = running_mock_manager().await;
+
+    let content = mgr.read_resource_any("file:///tmp/test.txt").await.unwrap();
+    assert_eq!(content.text.as_deref(), Some("hello from resource"));
+
+    mgr.stop_all().await;
+}
+
+#[tokio::test]
+async fn resource_read_surfaces_a_json_rpc_error() {
+    let mgr = running_mock_manager().await;
+
+    let error = mgr
+        .read_resource("mock", "file:///tmp/boom")
+        .await
+        .unwrap_err();
+    assert!(error.contains("resource unavailable"), "{error}");
+    assert!(
+        mgr.get_cached_resource("mock", "file:///tmp/boom")
+            .is_none(),
+        "a failed read must not be cached"
+    );
+
+    mgr.stop_all().await;
+}
+
+#[tokio::test]
+async fn resource_read_empty_contents_is_an_error() {
+    let mgr = running_mock_manager().await;
+
+    let error = mgr
+        .read_resource("mock", "file:///tmp/empty")
+        .await
+        .unwrap_err();
+    assert!(error.contains("no contents"), "{error}");
+    assert!(
+        mgr.get_cached_resource("mock", "file:///tmp/empty")
+            .is_none()
+    );
+
+    mgr.stop_all().await;
+}
+
+#[tokio::test]
+async fn resource_read_entries_without_text_or_blob_are_an_error() {
+    let mgr = running_mock_manager().await;
+
+    let error = mgr
+        .read_resource("mock", "file:///tmp/unsupported")
+        .await
+        .unwrap_err();
+    assert!(error.contains("no readable contents"), "{error}");
+
+    mgr.stop_all().await;
+}
+
+#[tokio::test]
+async fn resource_read_unknown_server_is_an_error() {
+    let mgr = McpManager::new();
+
+    let error = mgr
+        .read_resource("missing", "file:///tmp/x")
+        .await
+        .unwrap_err();
+    assert!(error.contains("not attached"), "{error}");
+}
+
+#[tokio::test]
+async fn resource_read_any_without_servers_is_an_error() {
+    let mgr = McpManager::new();
+
+    let error = mgr.read_resource_any("file:///tmp/x").await.unwrap_err();
+    assert!(error.contains("no MCP server is attached"), "{error}");
+}
+
+#[tokio::test]
+async fn resource_read_any_with_no_running_servers_is_an_error() {
+    let mgr = McpManager::new();
+    let mut config = McpConfig::new();
+    config.add_server(
+        "idle",
+        McpServerConfig {
+            command: "echo".into(),
+            args: vec![],
+            env: HashMap::new(),
+            ..Default::default()
+        },
+    );
+    mgr.load_config(&config);
+
+    let error = mgr.read_resource_any("file:///tmp/x").await.unwrap_err();
+    assert!(error.contains("no MCP server is running"), "{error}");
+}
+
+#[tokio::test]
+async fn list_resource_info_exposes_discovered_metadata() {
+    let mgr = running_mock_manager().await;
+
+    let resources = mgr.list_resource_info();
+    let resource = resources
+        .iter()
+        .find(|resource| resource.uri == "file:///tmp/test.txt")
+        .expect("the discovered resource must be in the registry");
+    assert_eq!(resource.name, "test.txt");
+    assert_eq!(resource.mime_type, "text/plain");
+    assert_eq!(resource.description.as_deref(), Some("A test file"));
+
+    // The URI-only listing stays intact for existing callers.
+    assert!(
+        mgr.list_resources()
+            .contains(&"file:///tmp/test.txt".to_string())
+    );
+
+    mgr.stop_all().await;
+}
+
 #[test]
 fn resource_discovery_registry_filter_by_mime() {
     let mut reg = McpResourceRegistry::new();
@@ -748,10 +979,7 @@ async fn discovery_cached_by_the_mcp_auth_tool_is_reused_by_the_oauth_manager() 
     .unwrap();
 
     let mut mgr = OAuthManager::load_tokens_from(&path).unwrap();
-    let discovery = mgr
-        .discover(issuer, &reqwest::Client::new())
-        .await
-        .unwrap();
+    let discovery = mgr.discover(issuer, &reqwest::Client::new()).await.unwrap();
     assert_eq!(
         discovery.authorization_endpoint.as_deref(),
         Some(authorization)
@@ -886,8 +1114,14 @@ fn the_discovery_fields_written_by_the_tool_survive_and_parse_in_the_manager() {
         state.token_endpoint_auth_method.as_deref(),
         Some("client_secret_basic")
     );
-    assert_eq!(state.registration_endpoint.as_deref(), Some("https://id.example/realms/demo/register"));
-    assert_eq!(state.grant_types_supported, vec!["authorization_code", "refresh_token"]);
+    assert_eq!(
+        state.registration_endpoint.as_deref(),
+        Some("https://id.example/realms/demo/register")
+    );
+    assert_eq!(
+        state.grant_types_supported,
+        vec!["authorization_code", "refresh_token"]
+    );
     assert_eq!(state.code_challenge_methods_supported, vec!["S256"]);
     assert_eq!(
         state
