@@ -7,10 +7,15 @@
 //!   prefix (`ulimit -t N; …; <command>`): a command could end its own limit
 //!   with `ulimit -v unlimited`, and the prefix looked like enforcement while
 //!   being advisory.
-//! - **Filesystem and network confinement** — a Seatbelt profile on macOS, a
-//!   bubblewrap mount and network namespace on Linux. Both reuse
+//! - **Filesystem and network confinement** — a Seatbelt profile on macOS; on
+//!   Linux a bubblewrap mount and network namespace, or the Landlock
+//!   path-beneath fallback when bubblewrap is unavailable. Both reuse
 //!   `coderex_core::sandbox`, the same primitives the shell tools use, rather
 //!   than defining a second policy language.
+//! - **cgroup v2 limits (Linux)** — when `max_memory_mb` is configured, the
+//!   hook is placed in a `coderex-*` cgroup with `memory.max`/`pids.max`
+//!   after spawn, in addition to `RLIMIT_AS`. If the cgroup tree is not
+//!   writable or delegated, the hook runs with the rlimit and a warning.
 //!
 //! ## Default policy
 //!
@@ -25,8 +30,8 @@
 //! `CODEREX_HOOK_SANDBOX=0` (or `false`/`no`) and a hook's
 //! `sandbox.enabled: false` both disable confinement explicitly; resource
 //! limits still apply. When confinement **cannot** be created — Windows has no
-//! path isolation, Linux has no bubblewrap, macOS has no `sandbox-exec` — the
-//! hook is not silently run unconfined: a gating event
+//! path isolation, Linux has neither bubblewrap nor Landlock, macOS has no
+//! `sandbox-exec` — the hook is not silently run unconfined: a gating event
 //! (`PreToolUse`/`UserPromptSubmit`) fails closed, and a non-gating event runs
 //! with a warning. See [`enforce`].
 //!
@@ -34,10 +39,15 @@
 //!
 //! - **macOS** — `sandbox-exec` with `(deny default)`: reads are confined to
 //!   the policy paths plus system roots (metadata everywhere is allowed), and
-//!   writes and network are confined.
-//! - **Linux** — `bwrap`: the root is read-only, policy paths are the only
-//!   writable mounts, and `--unshare-net` denies the network. Without `bwrap`
-//!   there is no path confinement, so a gating hook fails closed.
+//!   writes and network are confined. `max_memory_mb` additionally attempts a
+//!   best-effort `RLIMIT_DATA` ceiling; modern Darwin rejects it with `EINVAL`
+//!   and the hook still runs (the limit is not in force).
+//! - **Linux** — `bwrap` when in force: the root is read-only, policy paths
+//!   are the only writable mounts, and `--unshare-net` denies the network.
+//!   Otherwise Landlock path-beneath rules confine reads, writes and executes
+//!   (and, from ABI 4, network bind/connect), with the seccomp table and
+//!   rlimits still installed. A gating hook fails closed only when neither
+//!   backend exists.
 //! - **Windows** — Job Objects limit CPU and memory only; there is no
 //!   filesystem or network isolation, so a gating hook fails closed unless it
 //!   opts out.
@@ -156,15 +166,28 @@ fn confinement_availability() -> Result<(), String> {
     }
     #[cfg(target_os = "linux")]
     {
-        if coderex_core::sandbox::bubblewrap_in_force() {
+        if coderex_core::sandbox::bubblewrap_in_force()
+            || coderex_core::sandbox::landlock_in_force()
+        {
             Ok(())
         } else if coderex_core::sandbox::bubblewrap_available() {
             Err(format!(
-                "bubblewrap (bwrap) is installed but switched off by {}",
-                coderex_core::sandbox::BWRAP_ENV
+                "bubblewrap (bwrap) is installed but switched off by {}, and the Landlock \
+                 fallback is switched off by {}",
+                coderex_core::sandbox::BWRAP_ENV,
+                coderex_core::sandbox::LANDLOCK_ENV
+            ))
+        } else if coderex_core::sandbox::landlock_available() {
+            Err(format!(
+                "bubblewrap (bwrap) is not installed and the Landlock fallback is switched \
+                 off by {}",
+                coderex_core::sandbox::LANDLOCK_ENV
             ))
         } else {
-            Err("bubblewrap (bwrap) is not installed".to_string())
+            Err(
+                "bubblewrap (bwrap) is not installed and the kernel does not provide Landlock"
+                    .to_string(),
+            )
         }
     }
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
@@ -437,10 +460,14 @@ impl HookSandboxConfig {
 
 /// Apply the hook's configured limits to a command that is about to spawn.
 ///
-/// Unix installs `RLIMIT_CPU` and `RLIMIT_FSIZE`, plus `RLIMIT_AS` on Linux.
-/// macOS rejects `RLIMIT_AS`; the memory limit is therefore Linux-only rather
-/// than a silent no-op that looks applied. Windows uses a Job Object through
-/// [`coderex_core::sandbox`]; see [`prepare_windows_limits`].
+/// Unix installs `RLIMIT_CPU` and `RLIMIT_FSIZE`. Linux adds `RLIMIT_AS`;
+/// macOS attempts `RLIMIT_DATA` as a **best-effort** ceiling and ignores the
+/// kernel's rejection (modern Darwin returns `EINVAL` for every useful finite
+/// value, as it does for `RLIMIT_AS` and `RLIMIT_RSS`). Windows uses a Job
+/// Object through [`coderex_core::sandbox`]; see [`prepare_windows_limits`].
+///
+/// On Linux a cgroup with `memory.max` is applied after spawn in addition to
+/// these limits — see [`prepare_cgroup_limits`] and [`attach_cgroup_limits`].
 pub(crate) fn apply_resource_limits(command: &mut Command, config: &HookConfig) {
     #[cfg(unix)]
     {
@@ -463,19 +490,20 @@ fn apply_unix_limits(command: &mut Command, config: &HookConfig) {
         .max_file_size_mb
         .map(|mb| mb.saturating_mul(1024 * 1024));
 
-    // macOS refuses RLIMIT_AS (EINVAL), so setting it there would either fail
-    // the spawn or pretend to work. Memory confinement on macOS belongs to the
-    // OS-sandbox layer.
-    #[cfg(target_os = "linux")]
+    // Linux enforces RLIMIT_AS. macOS rejects RLIMIT_AS (EINVAL) but accepts
+    // RLIMIT_DATA on kernels that honour it, so it is attempted there as a
+    // best-effort data-segment ceiling; the helper reports and ignores a
+    // rejection instead of failing the spawn.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     let memory_bytes = config
         .max_memory_mb
         .map(|mb| mb.saturating_mul(1024 * 1024));
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     let memory_bytes: Option<u64> = None;
 
-    // A memory limit that cannot be installed is said out loud once, rather
-    // than looking enforced because the field was accepted.
-    #[cfg(not(target_os = "linux"))]
+    // A memory limit that cannot even be attempted is said out loud once,
+    // rather than looking enforced because the field was accepted.
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     if config.max_memory_mb.is_some() {
         static WARNED: std::sync::Once = std::sync::Once::new();
         WARNED.call_once(|| {
@@ -517,17 +545,83 @@ fn apply_unix_limits(command: &mut Command, config: &HookConfig) {
             }
 
             if let Some(bytes) = memory_bytes {
-                let limit = libc::rlimit {
-                    rlim_cur: bytes as libc::rlim_t,
-                    rlim_max: bytes as libc::rlim_t,
-                };
-                if libc::setrlimit(libc::RLIMIT_AS, &raw const limit) != 0 {
-                    return Err(std::io::Error::last_os_error());
+                #[cfg(target_os = "linux")]
+                {
+                    let limit = libc::rlimit {
+                        rlim_cur: bytes as libc::rlim_t,
+                        rlim_max: bytes as libc::rlim_t,
+                    };
+                    if libc::setrlimit(libc::RLIMIT_AS, &raw const limit) != 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                }
+                // Best effort: modern Darwin rejects RLIMIT_DATA (EINVAL) and
+                // does not enforce RLIMIT_RSS, so a rejection is not a spawn
+                // failure. Where it is accepted, it bounds the data segment.
+                #[cfg(target_os = "macos")]
+                {
+                    let _ = coderex_core::sandbox::apply_darwin_memory_limit(bytes);
                 }
             }
 
             Ok(())
         });
+    }
+}
+
+/// Create the cgroup that will carry a hook's memory limit, if one is set.
+///
+/// Linux only. The group is created before the spawn and the child is added
+/// with [`attach_cgroup_limits`] the moment it exists. A tree that is not
+/// writable or does not delegate the memory controller is reported and the
+/// hook falls back to `RLIMIT_AS` — never silently counted as cgroup-limited.
+#[cfg(target_os = "linux")]
+pub(crate) fn prepare_cgroup_limits(
+    config: &HookConfig,
+) -> Option<coderex_core::sandbox::CgroupMemoryLimit> {
+    let bytes = config
+        .max_memory_mb
+        .map(|mb| mb.saturating_mul(1024 * 1024))?;
+
+    match coderex_core::sandbox::CgroupMemoryLimit::create(
+        Some(bytes),
+        Some(coderex_core::sandbox::cgroup::DEFAULT_PIDS_MAX),
+    ) {
+        Ok(limit) => Some(limit),
+        Err(error) => {
+            tracing::warn!(
+                %error,
+                memory_bytes = bytes,
+                "hook cgroup v2 memory limit unavailable; the hook runs with RLIMIT_AS only"
+            );
+            None
+        }
+    }
+}
+
+/// Add a spawned hook to its cgroup.
+///
+/// The child already exists, so a failure here cannot be undone by refusing
+/// the spawn: it is logged, and the hook is explicitly said to be running with
+/// the rlimit rather than the cgroup limit.
+#[cfg(target_os = "linux")]
+pub(crate) fn attach_cgroup_limits(
+    limit: &coderex_core::sandbox::CgroupMemoryLimit,
+    child: &tokio::process::Child,
+) {
+    let Some(pid) = child.id() else {
+        tracing::warn!(
+            "the hook exited before it could be added to its memory cgroup; \
+             this hook ran with RLIMIT_AS only"
+        );
+        return;
+    };
+    if let Err(error) = limit.attach(pid) {
+        tracing::warn!(
+            %error,
+            cgroup = %limit.path().display(),
+            "could not add the hook to its memory cgroup; it runs with RLIMIT_AS only"
+        );
     }
 }
 
@@ -640,6 +734,86 @@ mod tests {
             "the hook raised RLIMIT_FSIZE and wrote {written} bytes"
         );
     }
+
+    /// A memory-hogging hook is constrained by the best-effort Darwin
+    /// `RLIMIT_DATA` ceiling where the kernel honours it.
+    ///
+    /// Modern Darwin (Monterey and later) rejects `RLIMIT_DATA` with `EINVAL`
+    /// just as it rejects `RLIMIT_AS`, so when the probe says the limit cannot
+    /// be installed this test says so and stops asserting enforcement rather
+    /// than pretending. The hook itself must still run either way — a rejected
+    /// limit is not a spawn failure.
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn macos_memory_ceiling_constrains_a_memory_hogging_hook() {
+        let Some(python) = python3_on_path() else {
+            eprintln!("skipping: python3 is not available to allocate memory");
+            return;
+        };
+
+        // Is a finite RLIMIT_DATA accepted by this kernel at all?
+        let supported = std::process::Command::new("sh")
+            .arg("-c")
+            .arg("ulimit -d 131072 2>/dev/null")
+            .status()
+            .is_ok_and(|status| status.success());
+
+        let marker = std::env::temp_dir().join(format!(
+            "coderex-hook-memory-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos())
+        ));
+        let _ = std::fs::remove_file(&marker);
+
+        let mut hook = config();
+        hook.max_memory_mb = Some(128);
+        hook.max_cpu_seconds = Some(20);
+        hook.max_file_size_mb = None;
+        // 512 MiB touches more than the 128 MiB data ceiling. If the limit is
+        // in force the allocation fails and the marker is never written.
+        hook.command = format!(
+            "{python} -I -c 'a=bytearray(536870912); a[0]=1; \
+             open({:?}, \"w\").write(\"allocated\")' 2>/dev/null; \
+             echo '{{\"action\":\"continue\"}}'",
+            marker.display()
+        );
+
+        let mut command = Command::new("sh");
+        command.arg("-c").arg(&hook.command);
+        apply_resource_limits(&mut command, &hook);
+        let output = command.output().await.unwrap();
+        let allocated = marker.exists();
+        let _ = std::fs::remove_file(&marker);
+
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("continue"),
+            "a rejected memory limit must not stop the hook: {output:?}"
+        );
+
+        if supported {
+            assert!(
+                !allocated,
+                "the hook allocated 512 MiB despite a 128 MiB RLIMIT_DATA ceiling"
+            );
+        } else {
+            eprintln!(
+                "skipping enforcement: this Darwin kernel rejects RLIMIT_DATA with EINVAL, so \
+                 the best-effort ceiling cannot be installed; the hook ran unconstrained"
+            );
+        }
+    }
+
+    /// The first `python3` on `PATH`, for the memory test above.
+    #[cfg(target_os = "macos")]
+    fn python3_on_path() -> Option<String> {
+        let path = std::env::var_os("PATH")?;
+        std::env::split_paths(&path)
+            .map(|dir| dir.join("python3"))
+            .find(|candidate| candidate.is_file())
+            .map(|candidate| candidate.to_string_lossy().to_string())
+    }
 }
 
 // ─── Sandbox policy and failure semantics ───────────────────────────────────
@@ -691,11 +865,9 @@ mod policy_tests {
         let policy = sandbox_config(&hook);
 
         assert!(policy.allowed_write_paths.contains(&workspace));
-        assert!(
-            policy
-                .allowed_write_paths
-                .contains(&canonicalize_lenient(&std::env::temp_dir()))
-        );
+        assert!(policy
+            .allowed_write_paths
+            .contains(&canonicalize_lenient(&std::env::temp_dir())));
         assert!(policy.allowed_read_paths.contains(&workspace));
         assert_eq!(policy.additional_working_dirs, vec![workspace]);
         assert!(!policy.allow_network, "network must be denied by default");
@@ -722,22 +894,16 @@ mod policy_tests {
 
         assert!(policy.allow_network);
         assert!(policy.allowed_read_paths.contains(&workspace));
-        assert!(
-            policy
-                .allowed_read_paths
-                .contains(&PathBuf::from("/srv/policy"))
-        );
+        assert!(policy
+            .allowed_read_paths
+            .contains(&PathBuf::from("/srv/policy")));
         assert!(policy.allowed_write_paths.contains(&workspace));
-        assert!(
-            policy
-                .allowed_write_paths
-                .contains(&PathBuf::from("/srv/out"))
-        );
-        assert!(
-            policy
-                .allowed_exec_paths
-                .contains(&PathBuf::from("/srv/bin"))
-        );
+        assert!(policy
+            .allowed_write_paths
+            .contains(&PathBuf::from("/srv/out")));
+        assert!(policy
+            .allowed_exec_paths
+            .contains(&PathBuf::from("/srv/bin")));
     }
 
     /// A hook may opt out; the plan then applies no OS confinement.
@@ -1016,13 +1182,64 @@ mod policy_tests {
         let _ = std::fs::remove_dir_all(&workspace);
     }
 
-    /// Without bubblewrap there is no path confinement, so a gating hook must
-    /// be refused rather than run unconfined.
+    /// When bubblewrap is unavailable, Landlock is the filesystem backend and
+    /// a hook is confined by path-beneath rules. Skipped when bubblewrap is in
+    /// force (it takes precedence) or the kernel has no Landlock.
     #[cfg(target_os = "linux")]
     #[tokio::test]
-    async fn linux_gating_hook_is_denied_when_bubblewrap_is_missing() {
-        if coderex_core::sandbox::bubblewrap_in_force() {
-            eprintln!("skipping: bubblewrap is in force");
+    async fn linux_hook_landlock_denies_a_write_outside_the_allowed_paths() {
+        if !coderex_core::sandbox::landlock_in_force() {
+            eprintln!("skipping: Landlock is not the backend in force");
+            return;
+        }
+        let Some(home) = home_dir() else {
+            eprintln!("skipping: HOME is not set");
+            return;
+        };
+
+        let workspace = unique_dir("landlock");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let inside = workspace.join("inside.txt");
+        let forbidden = home.join(format!(
+            ".coderex-hook-landlock-escape-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&forbidden);
+
+        let mut hook = hook_config();
+        hook.cwd = Some(workspace.clone());
+        hook.command = format!(
+            "printf '%s\\n' ok > {}; \
+             printf '%s\\n' escaped > {} 2>/dev/null; \
+             echo '{{\"action\":\"continue\"}}'",
+            inside.display(),
+            forbidden.display()
+        );
+
+        let result = run_hook(hook).await.expect("the hook should answer");
+        assert!(matches!(
+            result.hook_result.action,
+            crate::events::HookAction::Continue
+        ));
+        assert_eq!(std::fs::read_to_string(&inside).unwrap().trim(), "ok");
+        assert!(
+            !forbidden.exists(),
+            "Landlock let the hook write outside its write paths: {}",
+            forbidden.display()
+        );
+
+        let _ = std::fs::remove_dir_all(&workspace);
+    }
+
+    /// Only when *neither* backend exists is there no path confinement, and a
+    /// gating hook must be refused rather than run unconfined.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn linux_gating_hook_is_denied_when_no_confinement_exists() {
+        if coderex_core::sandbox::bubblewrap_in_force()
+            || coderex_core::sandbox::landlock_in_force()
+        {
+            eprintln!("skipping: bubblewrap or Landlock is in force");
             return;
         }
         let error = run_hook(hook_config())

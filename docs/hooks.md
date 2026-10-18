@@ -272,11 +272,18 @@ and the matching side cannot drift.
 - **Resource limits.** `max_cpu_seconds` (`RLIMIT_CPU`) and
   `max_file_size_mb` (`RLIMIT_FSIZE`) are installed in `pre_exec`, before the
   hook program runs, so `ulimit -f unlimited` inside the hook cannot raise
-  them. `max_memory_mb` (`RLIMIT_AS`) is Linux-only: macOS rejects that limit.
-  Windows uses a Job Object through `coderex_core::sandbox`.
+  them. On Linux `max_memory_mb` installs `RLIMIT_AS` **and** creates a cgroup
+  v2 group (`memory.max`, `pids.max`) that the hook is attached to after spawn;
+  if the cgroup tree is unwritable or not delegated, the hook logs a warning and
+  keeps `RLIMIT_AS` only. On macOS `max_memory_mb` attempts `RLIMIT_DATA` as a
+  best-effort ceiling — macOS rejects `RLIMIT_AS`, does not enforce `RLIMIT_RSS`,
+  and current Darwin returns `EINVAL` for `RLIMIT_DATA` too, so it is not a
+  guarantee and not a full address-space cap. Windows uses a Job Object through
+  `coderex_core::sandbox`.
 - **OS sandbox.** A `command` hook is additionally confined with the same
-  primitives the shell tools use: `sandbox-exec` on macOS, `bubblewrap` on
-  Linux. See the next section.
+  primitives the shell tools use: `sandbox-exec` on macOS; `bubblewrap` on
+  Linux, falling back to Landlock when `bwrap` is unavailable. See the next
+  section.
 - **Streaming protocol.** With `stream: true`, stdout is line-delimited JSON.
   A line without a control `type` is the answer (the historical contract,
   unchanged). Before it a hook may emit `{"type":"log",...}`,
@@ -297,8 +304,9 @@ and the matching side cannot drift.
 
 Every `command` hook runs inside the platform sandbox, in addition to its
 resource limits. The layer is `coderex_core::sandbox` — the same
-`SandboxHandle`, Seatbelt profile, and bubblewrap argument builder the Bash and
-PowerShell tools use — so there is one policy implementation, not two.
+`SandboxHandle`, Seatbelt profile, bubblewrap argument builder and Landlock
+ruleset the Bash and PowerShell tools use — so there is one policy
+implementation, not two.
 
 ### Default policy
 
@@ -312,9 +320,15 @@ PowerShell tools use — so there is one policy implementation, not two.
 On macOS this is a `(deny default)` Seatbelt profile: reads of file contents
 outside the policy paths are refused (metadata and the root listing are
 allowed, as for the shell tools), writes outside the write set are refused,
-and `(deny network*)` is emitted. On Linux this is bubblewrap: the root is
-bound read-only, only the write set is re-bound writable, and `--unshare-net`
-denies the network.
+and `(deny network*)` is emitted. On Linux with `bwrap` this is a mount
+namespace: the root is bound read-only, only the write set is re-bound
+writable, and `--unshare-net` denies the network. Without `bwrap` the same
+policy becomes a Landlock ruleset: read/execute on the policy paths and system
+roots, write on the write set (plus `/dev/null`), and — on ABI 4 or newer —
+`BIND_TCP`/`CONNECT_TCP` denied unless `allow_network` is set. On older ABIs the
+seccomp table installed alongside Landlock is what removes the network syscalls.
+Landlock denies access, not path existence: a path outside the ruleset may still
+be `stat`-ed.
 
 `HOME` is readable but not writable. That keeps hooks that read
 `~/.gitconfig` or a config directory working without granting them the home
@@ -355,9 +369,9 @@ with `CODEREX_BWRAP`, only an explicit negative switches it off.
 
 ### When the platform cannot confine
 
-The sandbox is not pretended. If the wrapper cannot be created — Windows has
-no path/network isolation, Linux has no `bwrap`, macOS has no `sandbox-exec` —
-then:
+The sandbox is not pretended. If no backend can confine — Windows has no
+path/network isolation, Linux has neither `bwrap` nor Landlock (or Landlock is
+switched off with `CODEREX_LANDLOCK=0`), macOS has no `sandbox-exec` — then:
 
 - On a **gating event** (`PreToolUse`, `UserPromptSubmit`) the hook fails with
   `HookError::SandboxUnavailable`, which is a failure and therefore a deny. A
@@ -373,9 +387,10 @@ run hooks on a platform without confinement.
 
 | Platform | Filesystem | Network | Resource limits |
 |---|---|---|---|
-| macOS | **Kernel** — Seatbelt read/write paths | **Kernel** — `deny network*` | CPU/file-size; no `RLIMIT_AS` |
-| Linux with `bwrap` | **Kernel** — read-only root, writable policy paths | **Kernel** — network namespace | CPU/file-size/address space |
-| Linux without `bwrap` | **None** — gating hooks fail closed | None (no wrapper) | CPU/file-size/address space |
+| macOS | **Kernel** — Seatbelt read/write paths; gating hooks fail closed without `sandbox-exec` | **Kernel** — `deny network*` | CPU/file-size; `RLIMIT_DATA` attempted best-effort (current Darwin rejects it) |
+| Linux with `bwrap` | **Kernel** — read-only root, writable policy paths | **Kernel** — network namespace | CPU/file-size/address space; cgroup v2 memory when the tree is writable |
+| Linux without `bwrap`, with Landlock | **Kernel** — Landlock read/write/execute path rules | **Kernel** — Landlock ABI 4+; seccomp table on older ABIs | CPU/file-size/address space; cgroup v2 memory when the tree is writable |
+| Linux with neither | **None** — gating hooks fail closed | None (seccomp `EPERM` for denied syscalls only) | CPU/file-size/address space; cgroup v2 memory when the tree is writable |
 | Windows | **None** — Job Objects limit resources/UI only; gating hooks fail closed | None | Job Object CPU/memory |
 | Other | **None** — gating hooks fail closed | None | — |
 
@@ -383,6 +398,16 @@ The streaming protocol is unaffected: stdin/stdout/stderr are inherited
 through the wrapper, so `stream: true` hooks keep their line-delimited
 protocol, and the one-way contract still closes stdin after the input. The
 macOS profile file and the Windows Job Object are held until the child exits.
+
+**Verification status.** On macOS (Darwin 24.6), the 13 hook-sandbox tests pass;
+`macos_memory_ceiling_constrains_a_memory_hogging_hook` reports that current
+Darwin rejects `RLIMIT_DATA` with `EINVAL` and skips enforcement rather than
+asserting a ceiling. In a Linux `rust:1.94` container (no `bwrap`,
+`--security-opt seccomp=unconfined`), the Linux-gated Landlock test runs a real
+hook and asserts a write outside its allowed paths is refused. The cgroup tests
+skip with an explicit message when `/sys/fs/cgroup` is read-only or the needed
+controllers are not delegated; that is the normal container case. The Windows
+row is compiled only on Windows and has not been run here.
 
 ## Worker isolation
 
@@ -405,7 +430,7 @@ provides are implemented in process-appropriate form instead:
   pipe or exhaust its memory.
 
 **OS confinement is applied** to `command` hooks: `sandbox-exec` on macOS and
-bubblewrap on Linux, reusing `coderex_core::sandbox` (see
+bubblewrap-or-Landlock on Linux, reusing `coderex_core::sandbox` (see
 [OS sandbox for command hooks](#os-sandbox-for-command-hooks)). Windows has no
 filesystem isolation in the primitive CodeRex uses; there, a gating hook fails
 closed rather than running unconfined, and a non-gating hook warns. An explicit
@@ -417,8 +442,9 @@ per-hook or environment opt-out is available.
 API; all five hook kinds — `command` (stdin/stdout), `http` (POST), `prompt`
 and `agent` (one model query through an injected runner), and `mcp_tool` (one
 MCP call through the same runner); timeout with process kill; kernel-enforced
-CPU/file-size/address-space limits and OS filesystem/network confinement for
-`command` subprocesses (with per-hook policy and explicit opt-outs); the
+CPU/file-size/address-space limits (plus a Linux cgroup v2 memory cap when the
+tree is writable) and OS filesystem/network confinement for `command`
+subprocesses (with per-hook policy and explicit opt-outs); the
 `stream: true` protocol (events, logs, host-answered requests, best-effort
 cancel, bounded output); dry-run; fail-closed failure classification and the
 deny-on-gate behaviour; inert-event warnings; structured logging.

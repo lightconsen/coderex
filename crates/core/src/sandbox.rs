@@ -58,6 +58,9 @@ pub enum SandboxError {
     /// Failed to create the sandbox environment.
     #[error("failed to create sandbox: {0}")]
     CreationError(String),
+    /// A Linux cgroup v2 limit could not be created or applied.
+    #[error("failed to apply cgroup limit: {0}")]
+    CgroupError(String),
 }
 
 // ─── Configuration ──────────────────────────────────────────────────────────
@@ -224,18 +227,21 @@ pub enum FilesystemIsolation {
 // - macOS: `Kernel` — `sandbox-exec` applies a Seatbelt profile that restricts
 //   reads to the configured paths plus the system roots, and writes to the
 //   configured paths.
-// - Linux: `Kernel` when bubblewrap is installed and not switched off — the
-//   command runs in a mount namespace with a read-only root and only the
-//   configured paths writable. `None` otherwise, where the sandbox is a seccomp
-//   syscall allowlist plus rlimits and a wrapped process can still read and
-//   write anything its user could.
+// - Linux: `Kernel` when bubblewrap is in force — the command runs in a mount
+//   namespace with a read-only root and only the configured paths writable —
+//   or when the Landlock fallback is in force, where path-beneath rules grant
+//   read/write/execute only beneath the configured paths. `None` only when
+//   neither backend is available, where the sandbox is a seccomp syscall
+//   allowlist plus rlimits and a wrapped process can still read and write
+//   anything its user could.
 // - Windows: `None` — the Job Object limits memory, CPU and UI access, not file
 //   paths.
 
 /// Report the filesystem confinement in force on this platform.
 ///
 /// On Linux this is a runtime answer, not a compile-time one: it depends on
-/// whether bubblewrap is installed and not switched off.
+/// whether bubblewrap is in force or, failing that, whether the kernel
+/// provides Landlock.
 #[must_use]
 #[allow(clippy::missing_const_for_fn)] // the Linux body reads the environment
 pub fn filesystem_isolation() -> FilesystemIsolation {
@@ -245,7 +251,7 @@ pub fn filesystem_isolation() -> FilesystemIsolation {
     }
     #[cfg(target_os = "linux")]
     {
-        if bubblewrap_in_force() {
+        if bubblewrap_in_force() || landlock_in_force() {
             FilesystemIsolation::Kernel
         } else {
             FilesystemIsolation::None
@@ -391,6 +397,453 @@ pub fn bubblewrap_args(config: &SandboxConfig, cwd: &std::path::Path) -> Vec<Str
     args
 }
 
+// ─── macOS: best-effort memory ceiling ──────────────────────────────────────
+
+/// Try to install a Darwin memory ceiling in the **calling** process.
+///
+/// macOS rejects `RLIMIT_AS` and does not enforce `RLIMIT_RSS`, so
+/// `RLIMIT_DATA` is the only memory-shaped limit worth attempting. It is
+/// best-effort by design: modern Darwin (Monterey and later, including Sonoma
+/// and the macOS 15 line) returns `EINVAL` for every useful finite value, just
+/// as it does for `RLIMIT_AS`. The call therefore reports whether the kernel
+/// accepted the limit instead of turning an unsupported limit into a spawn
+/// failure. Callers install it from `pre_exec`, where it is inherited by the
+/// sandbox wrapper and the program it execs.
+///
+/// A `true` result is not a full address-space cap: `RLIMIT_DATA` bounds the
+/// data segment, not mappings the allocator creates with `mmap`. It is a
+/// ceiling where the kernel honours it and a documented no-op where it does
+/// not — see `docs/sandbox.md`.
+#[cfg(target_os = "macos")]
+#[must_use]
+pub fn apply_darwin_memory_limit(bytes: u64) -> bool {
+    let limit = libc::rlimit {
+        rlim_cur: bytes as libc::rlim_t,
+        rlim_max: bytes as libc::rlim_t,
+    };
+    // SAFETY: setrlimit only reads the struct passed to it. Failure (EINVAL on
+    // current Darwin) is deliberately ignored; the caller treats this as a
+    // best-effort ceiling rather than a condition of spawning.
+    unsafe { libc::setrlimit(libc::RLIMIT_DATA, &raw const limit) == 0 }
+}
+
+// ─── Linux: Landlock path confinement ───────────────────────────────────────
+
+/// The environment variable that switches the Landlock fallback off.
+pub const LANDLOCK_ENV: &str = "CODEREX_LANDLOCK";
+
+/// System roots a confined process needs just to start: the loader, its
+/// libraries, name-service configuration, and the pseudo-filesystems most
+/// programs touch. These are read-only. They are added to every Landlock plan
+/// because a path-beneath allowlist that named only the workspace would leave
+/// `execve` unable to load libc.
+pub const LANDLOCK_SYSTEM_READ_PATHS: &[&str] = &[
+    "/usr", "/lib", "/lib64", "/bin", "/sbin", "/etc", "/proc", "/dev", "/sys", "/run",
+];
+
+/// System directories a confined process may execute from. This mirrors the
+/// exec paths the other backends name; a configured `allowed_exec_paths`
+/// extends it.
+///
+/// The library directories are included because executing a dynamically
+/// linked program makes the kernel open its ELF interpreter (for example
+/// `/lib64/ld-linux-x86-64.so.2`) with `MAY_EXEC`. Without `EXECUTE` on the
+/// loader path, `execve` fails with `EACCES` even though the program itself is
+/// under an allowed directory.
+pub const LANDLOCK_SYSTEM_EXEC_PATHS: &[&str] = &[
+    "/bin",
+    "/sbin",
+    "/usr/bin",
+    "/usr/sbin",
+    "/usr/local/bin",
+    "/lib",
+    "/lib64",
+    "/usr/lib",
+    "/usr/lib64",
+];
+
+/// The path rules Landlock would install for a config.
+///
+/// Pure, so the policy is compiled and tested on every platform; only the
+/// syscall layer in [`linux_impl`] is Linux-only. Paths are de-duplicated and
+/// kept in a stable order. Whether a path exists is decided when the ruleset
+/// is built, not here.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LandlockPlan {
+    /// ABI version the access masks were chosen for.
+    pub abi: u32,
+    /// Paths granted `READ_FILE` and `READ_DIR`.
+    pub read_paths: Vec<PathBuf>,
+    /// Paths granted the write-side access rights.
+    pub write_paths: Vec<PathBuf>,
+    /// Paths granted `EXECUTE`.
+    pub exec_paths: Vec<PathBuf>,
+    /// Whether the ruleset handles the network access rights.
+    ///
+    /// Only possible from ABI 4. When true and [`SandboxConfig::allow_network`]
+    /// is false, the ruleset handles `BIND_TCP`/`CONNECT_TCP` and adds no
+    /// network rules, so both are denied.
+    pub handle_network: bool,
+}
+
+/// Build the Landlock path plan for a config and ABI version.
+#[must_use]
+pub fn landlock_plan(config: &SandboxConfig, abi: u32) -> LandlockPlan {
+    let mut read_paths = Vec::new();
+    for path in LANDLOCK_SYSTEM_READ_PATHS {
+        push_unique_path(&mut read_paths, PathBuf::from(path));
+    }
+    for path in &config.allowed_read_paths {
+        push_unique_path(&mut read_paths, path.clone());
+    }
+    for path in &config.allowed_write_paths {
+        // A path the child may write is also one it must be able to read.
+        push_unique_path(&mut read_paths, path.clone());
+    }
+    for path in &config.additional_working_dirs {
+        push_unique_path(&mut read_paths, path.clone());
+    }
+    // `/dev/null` is a write target for ordinary redirection (`2>/dev/null`);
+    // `/dev` itself is only readable, so devices cannot be opened writable.
+    push_unique_path(&mut read_paths, PathBuf::from("/dev/null"));
+
+    let mut write_paths = Vec::new();
+    for path in &config.allowed_write_paths {
+        push_unique_path(&mut write_paths, path.clone());
+    }
+    for path in &config.additional_working_dirs {
+        push_unique_path(&mut write_paths, path.clone());
+    }
+    push_unique_path(&mut write_paths, PathBuf::from("/dev/null"));
+
+    let mut exec_paths = Vec::new();
+    for path in LANDLOCK_SYSTEM_EXEC_PATHS {
+        push_unique_path(&mut exec_paths, PathBuf::from(path));
+    }
+    for path in &config.allowed_exec_paths {
+        push_unique_path(&mut exec_paths, path.clone());
+    }
+
+    LandlockPlan {
+        abi,
+        read_paths,
+        write_paths,
+        exec_paths,
+        // Landlock's network rules arrived in ABI 4. Below that, the seccomp
+        // table (installed alongside this fallback) is what denies the network.
+        handle_network: abi >= 4 && !config.allow_network,
+    }
+}
+
+fn push_unique_path(paths: &mut Vec<PathBuf>, path: PathBuf) {
+    if !paths.contains(&path) {
+        paths.push(path);
+    }
+}
+
+/// The Landlock ABI version the kernel supports, or `None` when Landlock is
+/// compiled out, disabled, or absent.
+///
+/// `landlock_create_ruleset(NULL, 0, LANDLOCK_CREATE_RULESET_VERSION)` returns
+/// the ABI version without creating anything.
+#[must_use]
+#[cfg(target_os = "linux")]
+pub fn landlock_abi_version() -> Option<u32> {
+    const LANDLOCK_CREATE_RULESET_VERSION: u32 = 1;
+
+    // SAFETY: the version query takes no attribute and no size; both are zero
+    // by contract. A negative return is a failure (ENOSYS/EOPNOTSUPP/...).
+    let ret = unsafe {
+        libc::syscall(
+            libc::SYS_landlock_create_ruleset,
+            std::ptr::null::<u8>(),
+            0usize,
+            LANDLOCK_CREATE_RULESET_VERSION,
+        )
+    };
+    if ret < 0 {
+        None
+    } else {
+        Some(ret as u32)
+    }
+}
+
+/// The Landlock ABI version — `None` outside Linux.
+#[must_use]
+#[cfg(not(target_os = "linux"))]
+pub const fn landlock_abi_version() -> Option<u32> {
+    None
+}
+
+/// Whether the kernel provides Landlock (ABI 1 or newer).
+#[must_use]
+#[cfg(target_os = "linux")]
+pub fn landlock_available() -> bool {
+    landlock_abi_version().is_some_and(|abi| abi >= 1)
+}
+
+/// Whether the kernel provides Landlock — always false outside Linux.
+#[must_use]
+#[cfg(not(target_os = "linux"))]
+pub const fn landlock_available() -> bool {
+    false
+}
+
+/// Whether an environment value explicitly switches Landlock off.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn landlock_disabled_by_env(value: Option<&str>) -> bool {
+    matches!(value, Some("0" | "false" | "no"))
+}
+
+/// Whether Landlock is the filesystem backend in force.
+///
+/// It is the fallback used **when bubblewrap is not in force**: on a host
+/// without `bwrap`, or with `CODEREX_BWRAP=0`. `CODEREX_LANDLOCK=0` (or
+/// `false`/`no`) turns it off as well, which restores the old
+/// seccomp-and-rlimits-only mode.
+#[must_use]
+#[cfg(target_os = "linux")]
+pub fn landlock_in_force() -> bool {
+    !bubblewrap_in_force()
+        && landlock_available()
+        && !landlock_disabled_by_env(std::env::var(LANDLOCK_ENV).ok().as_deref())
+}
+
+/// Whether Landlock is the filesystem backend in force — always false outside
+/// Linux.
+#[must_use]
+#[cfg(not(target_os = "linux"))]
+pub const fn landlock_in_force() -> bool {
+    false
+}
+
+// ─── Linux: cgroup v2 limits ────────────────────────────────────────────────
+
+/// A live cgroup v2 group carrying a memory and/or process ceiling.
+///
+/// This is the reusable helper the shell tools and command hooks use, and the
+/// one a WASM helper can use without borrowing policy from either:
+///
+/// 1. [`CgroupMemoryLimit::create`] before spawning, with the configured
+///    memory ceiling (and a process ceiling).
+/// 2. Spawn the child.
+/// 3. [`CgroupMemoryLimit::attach`] its pid as soon as it exists.
+/// 4. Keep the value alive until the child exits; dropping it removes the
+///    group.
+///
+/// Creation is deliberately fallible. Most unprivileged sessions cannot create
+/// groups in the systemd-managed tree, and a read-only `/sys/fs/cgroup` cannot
+/// carry one at all. Callers **warn and fall back to `RLIMIT_AS`**, never
+/// pretend the cgroup limit is in force. `CODEREX_CGROUP_ROOT` names a
+/// writable delegated tree for containers and tests.
+#[cfg(target_os = "linux")]
+pub mod cgroup {
+    use super::SandboxError;
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    /// Environment override for the cgroup v2 tree to create groups under.
+    pub const CGROUP_ROOT_ENV: &str = "CODEREX_CGROUP_ROOT";
+
+    /// Default process ceiling for a limited child. A shell command that
+    /// forks without bound is a resource hazard even when its memory is
+    /// bounded.
+    pub const DEFAULT_PIDS_MAX: u64 = 256;
+
+    static NEXT_ID: AtomicU64 = AtomicU64::new(0);
+
+    /// A live cgroup v2 group. Dropping it removes the directory (best effort).
+    #[derive(Debug)]
+    pub struct CgroupMemoryLimit {
+        dir: PathBuf,
+    }
+
+    impl CgroupMemoryLimit {
+        /// Create a group and write `memory.max` and/or `pids.max`.
+        ///
+        /// Tries the process's own cgroup first, then the cgroup v2 mount
+        /// root. A candidate that is not writable, or whose parent has not
+        /// delegated the needed controllers, is reported in the error the
+        /// caller logs on the way to the rlimit-only fallback.
+        ///
+        /// # Errors
+        ///
+        /// Returns [`SandboxError::CgroupError`] when no candidate tree can be
+        /// created or configured. The caller should warn and continue.
+        pub fn create(
+            memory_max_bytes: Option<u64>,
+            pids_max: Option<u64>,
+        ) -> Result<Self, SandboxError> {
+            if memory_max_bytes.is_none() && pids_max.is_none() {
+                return Err(SandboxError::CgroupError(
+                    "no memory or process limit was configured".to_string(),
+                ));
+            }
+
+            let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+            let name = cgroup_name(std::process::id(), id);
+            let mut reasons = Vec::new();
+
+            for parent in candidate_parents() {
+                if !parent.join("cgroup.controllers").is_file() {
+                    reasons.push(format!("{} is not a cgroup v2 tree", parent.display()));
+                    continue;
+                }
+
+                let dir = parent.join(&name);
+                match std::fs::create_dir(&dir) {
+                    Ok(()) => {}
+                    Err(error) => {
+                        reasons.push(format!("{}: {error}", dir.display()));
+                        continue;
+                    }
+                }
+
+                match configure(&dir, memory_max_bytes, pids_max) {
+                    Ok(()) => return Ok(Self { dir }),
+                    Err(error) => {
+                        // Do not leave a half-configured group behind.
+                        let _ = std::fs::remove_dir(&dir);
+                        reasons.push(format!("{}: {error}", dir.display()));
+                    }
+                }
+            }
+
+            Err(SandboxError::CgroupError(format!(
+                "no writable cgroup v2 tree with the needed controllers ({}); set {} to a \
+                 delegated writable tree, or accept the RLIMIT_AS fallback",
+                reasons.join("; "),
+                CGROUP_ROOT_ENV
+            )))
+        }
+
+        /// Add a spawned child to the group.
+        ///
+        /// # Errors
+        ///
+        /// Returns [`SandboxError::CgroupError`] when `cgroup.procs` cannot be
+        /// written. The child is already running, so callers warn rather than
+        /// treating this as a spawn failure.
+        pub fn attach(&self, pid: u32) -> Result<(), SandboxError> {
+            std::fs::write(self.dir.join("cgroup.procs"), pid.to_string()).map_err(|error| {
+                SandboxError::CgroupError(format!(
+                    "could not add pid {pid} to {}: {error}",
+                    self.dir.display()
+                ))
+            })
+        }
+
+        /// The cgroup directory, for logging and tests.
+        #[must_use]
+        pub fn path(&self) -> &Path {
+            &self.dir
+        }
+    }
+
+    impl Drop for CgroupMemoryLimit {
+        fn drop(&mut self) {
+            if let Err(error) = std::fs::remove_dir(&self.dir) {
+                tracing::debug!(
+                    cgroup = %self.dir.display(),
+                    %error,
+                    "could not remove cgroup; a child may still be attached"
+                );
+            }
+        }
+    }
+
+    /// The `0::<path>` line of a `/proc/self/cgroup` body.
+    ///
+    /// cgroup v2 has a single unified hierarchy, so the only relevant line is
+    /// the one with an empty controller list.
+    pub(crate) fn current_cgroup_from_proc(content: &str) -> Option<&str> {
+        content.lines().find_map(|line| line.strip_prefix("0::"))
+    }
+
+    /// A group name that cannot collide with a concurrent process or group.
+    pub(crate) fn cgroup_name(pid: u32, id: u64) -> String {
+        format!("coderex-{pid}-{id}")
+    }
+
+    /// Candidate parent directories, most specific first.
+    fn candidate_parents() -> Vec<PathBuf> {
+        if let Some(root) = std::env::var_os(CGROUP_ROOT_ENV) {
+            return vec![PathBuf::from(root)];
+        }
+
+        let mount = Path::new("/sys/fs/cgroup");
+        let mut parents = Vec::new();
+
+        if let Ok(content) = std::fs::read_to_string("/proc/self/cgroup") {
+            if let Some(relative) = current_cgroup_from_proc(&content) {
+                let path = if relative == "/" {
+                    mount.to_path_buf()
+                } else {
+                    mount.join(relative.trim_start_matches('/'))
+                };
+                if path.exists() {
+                    parents.push(path);
+                }
+            }
+        }
+        if !parents.iter().any(|path| path == mount) {
+            parents.push(mount.to_path_buf());
+        }
+        parents
+    }
+
+    /// Turn on the controllers a child group needs, then write its limits.
+    fn configure(
+        dir: &Path,
+        memory_max_bytes: Option<u64>,
+        pids_max: Option<u64>,
+    ) -> Result<(), std::io::Error> {
+        let wanted: Vec<&str> = match (memory_max_bytes.is_some(), pids_max.is_some()) {
+            (true, true) => vec!["memory", "pids"],
+            (true, false) => vec!["memory"],
+            (false, true) => vec!["pids"],
+            (false, false) => Vec::new(),
+        };
+
+        // In cgroup v2 a controller exists in the child only when the parent
+        // delegated it through `cgroup.subtree_control`. A non-delegated tree
+        // makes this write fail; the caller falls back rather than pretending.
+        let parent = dir
+            .parent()
+            .ok_or_else(|| std::io::Error::other("cgroup directory has no parent"))?;
+        let enabled = std::fs::read_to_string(parent.join("cgroup.subtree_control"))
+            .unwrap_or_default()
+            .split_whitespace()
+            .map(ToOwned::to_owned)
+            .collect::<Vec<_>>();
+        let mut additions = String::new();
+        for controller in &wanted {
+            if !enabled.iter().any(|name| name == controller) {
+                additions.push('+');
+                additions.push_str(controller);
+                additions.push(' ');
+            }
+        }
+        if !additions.is_empty() {
+            std::fs::write(parent.join("cgroup.subtree_control"), additions.trim_end())?;
+        }
+
+        if let Some(bytes) = memory_max_bytes {
+            std::fs::write(dir.join("memory.max"), bytes.to_string())?;
+            // OOM-kill the whole group rather than whichever process is
+            // first; best effort, the file is absent on older kernels.
+            let _ = std::fs::write(dir.join("memory.oom.group"), "1");
+        }
+        if let Some(pids) = pids_max {
+            std::fs::write(dir.join("pids.max"), pids.to_string())?;
+        }
+        Ok(())
+    }
+}
+
+#[cfg(target_os = "linux")]
+pub use cgroup::CgroupMemoryLimit;
+
 // ─── Public Handle ──────────────────────────────────────────────────────────
 
 /// Handle to an active sandbox configuration.
@@ -413,10 +866,13 @@ impl SandboxHandle {
 
     /// Prepare a `std::process::Command` to run inside the sandbox.
     ///
-    /// - **Linux**: installs a `pre_exec` closure that applies rlimits and
-    ///   seccomp filters in the child process before `execve`.
-    /// - **macOS**: no-op. Use [`SandboxHandle::sandboxed_program`] to get the
-    ///   wrapper command.
+    /// - **Linux**: installs a `pre_exec` closure that applies rlimits,
+    ///   Landlock path rules (when bubblewrap is not in force) and seccomp
+    ///   filters in the child process before `execve`.
+    /// - **macOS**: installs a best-effort `RLIMIT_DATA` ceiling when
+    ///   [`SandboxConfig::max_memory_bytes`] is set. Modern Darwin rejects it;
+    ///   that is logged and does not fail the spawn. Use
+    ///   [`SandboxHandle::sandboxed_program`] to get the wrapper command.
     /// - **Windows**: no-op. Use [`SandboxHandle::post_spawn`] after spawning.
     /// - **Unsupported**: no-op.
     pub fn prepare(&self, cmd: &mut std::process::Command) -> Result<(), SandboxError> {
@@ -426,9 +882,22 @@ impl SandboxHandle {
     /// Complete sandbox setup after the child process has spawned.
     ///
     /// - **Windows**: assigns the child process to the Job Object.
+    /// - **Linux**: adds the child to the cgroup created for its memory limit,
+    ///   when one was configured and could be created.
     /// - **Other platforms**: no-op.
     pub fn post_spawn(&self, child: &std::process::Child) -> Result<(), SandboxError> {
         self.inner.post_spawn(child)
+    }
+
+    /// Complete sandbox setup for a child identified by pid.
+    ///
+    /// The shell tools and hooks spawn through `tokio::process::Child`, whose
+    /// only portable handle is its pid. On Linux this is where the cgroup
+    /// attachment happens; elsewhere it is a no-op. A cgroup attaches after
+    /// spawn because a process cannot be placed in a group before it exists.
+    #[cfg(unix)]
+    pub fn post_spawn_pid(&self, pid: u32) -> Result<(), SandboxError> {
+        self.inner.post_spawn_pid(pid)
     }
 
     /// Complete sandbox setup for an asynchronously spawned child.
@@ -498,7 +967,7 @@ impl PlatformSandbox {
             #[cfg(target_os = "linux")]
             Self::Linux(s) => s.prepare(cmd),
             #[cfg(target_os = "macos")]
-            Self::MacOs(_) => Ok(()),
+            Self::MacOs(s) => s.prepare(cmd),
             #[cfg(target_os = "windows")]
             Self::Windows(_) => Ok(()),
             Self::Unsupported => Ok(()),
@@ -517,11 +986,23 @@ impl PlatformSandbox {
         }
     }
 
+    #[cfg(unix)]
+    fn post_spawn_pid(&self, pid: u32) -> Result<(), SandboxError> {
+        match self {
+            #[cfg(target_os = "linux")]
+            Self::Linux(s) => s.post_spawn_pid(pid),
+            #[cfg(target_os = "macos")]
+            Self::MacOs(s) => s.post_spawn_pid(pid),
+            #[allow(unreachable_patterns)]
+            _ => {
+                let _ = pid;
+                Ok(())
+            }
+        }
+    }
+
     #[cfg(target_os = "windows")]
-    fn post_spawn_raw(
-        &self,
-        handle: std::os::windows::io::RawHandle,
-    ) -> Result<(), SandboxError> {
+    fn post_spawn_raw(&self, handle: std::os::windows::io::RawHandle) -> Result<(), SandboxError> {
         match self {
             Self::Windows(s) => s.post_spawn_raw(handle),
             _ => Ok(()),
@@ -738,10 +1219,271 @@ mod seccomp_arch {
 #[cfg(target_os = "linux")]
 mod linux_impl {
     use super::{SandboxConfig, SandboxError};
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    use std::os::unix::ffi::OsStrExt;
     use std::os::unix::process::CommandExt;
     use std::process::Command;
+    use std::sync::Arc;
 
-    /// Linux sandbox using seccomp + rlimit.
+    // Landlock userspace ABI. `libc` exposes the syscall numbers but not these
+    // structs or access bits, so they are declared here from
+    // `include/uapi/linux/landlock.h`.
+    const LANDLOCK_ACCESS_FS_EXECUTE: u64 = 1 << 0;
+    const LANDLOCK_ACCESS_FS_WRITE_FILE: u64 = 1 << 1;
+    const LANDLOCK_ACCESS_FS_READ_FILE: u64 = 1 << 2;
+    const LANDLOCK_ACCESS_FS_READ_DIR: u64 = 1 << 3;
+    const LANDLOCK_ACCESS_FS_REMOVE_DIR: u64 = 1 << 4;
+    const LANDLOCK_ACCESS_FS_REMOVE_FILE: u64 = 1 << 5;
+    const LANDLOCK_ACCESS_FS_MAKE_CHAR: u64 = 1 << 6;
+    const LANDLOCK_ACCESS_FS_MAKE_DIR: u64 = 1 << 7;
+    const LANDLOCK_ACCESS_FS_MAKE_REG: u64 = 1 << 8;
+    const LANDLOCK_ACCESS_FS_MAKE_SOCK: u64 = 1 << 9;
+    const LANDLOCK_ACCESS_FS_MAKE_FIFO: u64 = 1 << 10;
+    const LANDLOCK_ACCESS_FS_MAKE_BLOCK: u64 = 1 << 11;
+    const LANDLOCK_ACCESS_FS_MAKE_SYM: u64 = 1 << 12;
+    const LANDLOCK_ACCESS_FS_REFER: u64 = 1 << 13;
+    const LANDLOCK_ACCESS_FS_TRUNCATE: u64 = 1 << 14;
+
+    const LANDLOCK_ACCESS_NET_BIND_TCP: u64 = 1 << 0;
+    const LANDLOCK_ACCESS_NET_CONNECT_TCP: u64 = 1 << 1;
+
+    const LANDLOCK_RULE_PATH_BENEATH: u32 = 1;
+    const PR_SET_NO_NEW_PRIVS: libc::c_int = 38;
+
+    #[repr(C)]
+    struct LandlockRulesetAttr {
+        handled_access_fs: u64,
+        handled_access_net: u64,
+    }
+
+    #[repr(C)]
+    struct LandlockPathBeneathAttr {
+        allowed_access: u64,
+        parent_fd: i32,
+    }
+
+    /// The filesystem rights this backend handles.
+    ///
+    /// Anything *not* listed here is unrestricted by Landlock, which is why
+    /// `IOCTL_DEV` (ABI 5) is deliberately left out: confining it would break
+    /// ordinary terminal handling unless every device path were granted.
+    pub(super) fn handled_fs_access(abi: u32) -> u64 {
+        let mut access = LANDLOCK_ACCESS_FS_EXECUTE
+            | LANDLOCK_ACCESS_FS_WRITE_FILE
+            | LANDLOCK_ACCESS_FS_READ_FILE
+            | LANDLOCK_ACCESS_FS_READ_DIR
+            | LANDLOCK_ACCESS_FS_REMOVE_DIR
+            | LANDLOCK_ACCESS_FS_REMOVE_FILE
+            | LANDLOCK_ACCESS_FS_MAKE_CHAR
+            | LANDLOCK_ACCESS_FS_MAKE_DIR
+            | LANDLOCK_ACCESS_FS_MAKE_REG
+            | LANDLOCK_ACCESS_FS_MAKE_SOCK
+            | LANDLOCK_ACCESS_FS_MAKE_FIFO
+            | LANDLOCK_ACCESS_FS_MAKE_BLOCK
+            | LANDLOCK_ACCESS_FS_MAKE_SYM;
+        if abi >= 2 {
+            access |= LANDLOCK_ACCESS_FS_REFER;
+        }
+        if abi >= 3 {
+            access |= LANDLOCK_ACCESS_FS_TRUNCATE;
+        }
+        access
+    }
+
+    fn read_access() -> u64 {
+        LANDLOCK_ACCESS_FS_READ_FILE | LANDLOCK_ACCESS_FS_READ_DIR
+    }
+
+    /// Which family of rights a rule grants.
+    #[derive(Clone, Copy)]
+    pub(super) enum AccessKind {
+        Read,
+        Write,
+        Exec,
+    }
+
+    /// Rights applicable to a path of this type.
+    ///
+    /// A path-beneath rule on a **regular file** must not name directory-only
+    /// rights (`READ_DIR`, `MAKE_*`, `REMOVE_*`, `REFER`): the kernel rejects
+    /// such a rule with `EINVAL`. This matters for `/dev/null` and for any
+    /// configured path that names a single binary.
+    pub(super) fn access_for(kind: AccessKind, is_dir: bool, abi: u32) -> u64 {
+        match (kind, is_dir) {
+            (AccessKind::Read, true) => read_access(),
+            (AccessKind::Read, false) => LANDLOCK_ACCESS_FS_READ_FILE,
+            (AccessKind::Write, true) => write_access(abi),
+            (AccessKind::Write, false) => {
+                let mut access = LANDLOCK_ACCESS_FS_WRITE_FILE;
+                if abi >= 3 {
+                    access |= LANDLOCK_ACCESS_FS_TRUNCATE;
+                }
+                access
+            }
+            (AccessKind::Exec, _) => exec_access(),
+        }
+    }
+
+    pub(super) fn write_access(abi: u32) -> u64 {
+        let mut access = LANDLOCK_ACCESS_FS_WRITE_FILE
+            | LANDLOCK_ACCESS_FS_REMOVE_DIR
+            | LANDLOCK_ACCESS_FS_REMOVE_FILE
+            | LANDLOCK_ACCESS_FS_MAKE_CHAR
+            | LANDLOCK_ACCESS_FS_MAKE_DIR
+            | LANDLOCK_ACCESS_FS_MAKE_REG
+            | LANDLOCK_ACCESS_FS_MAKE_SOCK
+            | LANDLOCK_ACCESS_FS_MAKE_FIFO
+            | LANDLOCK_ACCESS_FS_MAKE_BLOCK
+            | LANDLOCK_ACCESS_FS_MAKE_SYM;
+        // `REFER` is what permits rename/link across directories; without it
+        // in the write set, `mv` inside the workspace fails. It only exists
+        // from ABI 2.
+        if abi >= 2 {
+            access |= LANDLOCK_ACCESS_FS_REFER;
+        }
+        // `TRUNCATE` is separate from `WRITE_FILE` from ABI 3; granting it
+        // with the write paths keeps `> existing-file` working.
+        if abi >= 3 {
+            access |= LANDLOCK_ACCESS_FS_TRUNCATE;
+        }
+        access
+    }
+
+    fn exec_access() -> u64 {
+        LANDLOCK_ACCESS_FS_EXECUTE
+    }
+
+    /// Build a ruleset in the parent. The returned descriptor is inherited by
+    /// the child, which calls `landlock_restrict_self` before exec.
+    ///
+    /// Rules are attached to inodes when added, so the path descriptors can be
+    /// closed as soon as each rule is in place. A path that cannot be opened is
+    /// skipped with a warning: a policy path that does not exist yet has no
+    /// inode to grant, exactly as `bwrap` cannot bind a missing source.
+    fn build_landlock_ruleset(plan: &super::LandlockPlan) -> Result<OwnedFd, std::io::Error> {
+        let handled_access_net = if plan.handle_network {
+            LANDLOCK_ACCESS_NET_BIND_TCP | LANDLOCK_ACCESS_NET_CONNECT_TCP
+        } else {
+            0
+        };
+        let attr = LandlockRulesetAttr {
+            handled_access_fs: handled_fs_access(plan.abi),
+            handled_access_net,
+        };
+        // Kernels before ABI 4 know only the first 8 bytes; passing zeroes in
+        // the tail is explicitly allowed, but staying at the known size is
+        // simpler and equally correct.
+        let attr_size = if plan.abi >= 4 {
+            std::mem::size_of::<LandlockRulesetAttr>()
+        } else {
+            std::mem::size_of::<u64>()
+        };
+
+        // SAFETY: `attr` is a valid pointer to `attr_size` initialized bytes;
+        // flags are zero for a normal creation.
+        let ret = unsafe {
+            libc::syscall(
+                libc::SYS_landlock_create_ruleset,
+                &raw const attr,
+                attr_size,
+                0u32,
+            )
+        };
+        if ret < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        // SAFETY: a non-negative return from landlock_create_ruleset is a new
+        // owned file descriptor.
+        let ruleset = unsafe { OwnedFd::from_raw_fd(ret as i32) };
+        set_cloexec(ruleset.as_raw_fd());
+
+        for (paths, kind) in [
+            (&plan.read_paths, AccessKind::Read),
+            (&plan.write_paths, AccessKind::Write),
+            (&plan.exec_paths, AccessKind::Exec),
+        ] {
+            for path in paths {
+                let is_dir = match std::fs::metadata(path) {
+                    Ok(metadata) => metadata.is_dir(),
+                    Err(error) => {
+                        tracing::warn!(
+                            path = %path.display(),
+                            %error,
+                            "landlock: skipping a path whose type cannot be determined"
+                        );
+                        continue;
+                    }
+                };
+                let allowed_access = access_for(kind, is_dir, plan.abi);
+
+                let Ok(c_path) = std::ffi::CString::new(path.as_os_str().as_bytes()) else {
+                    tracing::warn!(path = %path.display(), "landlock: path contains a NUL byte");
+                    continue;
+                };
+                // SAFETY: `c_path` is NUL-terminated; the flags are read-only.
+                let path_fd =
+                    unsafe { libc::open(c_path.as_ptr(), libc::O_PATH | libc::O_CLOEXEC) };
+                if path_fd < 0 {
+                    let error = std::io::Error::last_os_error();
+                    tracing::warn!(
+                        path = %path.display(),
+                        %error,
+                        "landlock: skipping a path that cannot be opened"
+                    );
+                    continue;
+                }
+
+                let rule = LandlockPathBeneathAttr {
+                    allowed_access,
+                    parent_fd: path_fd,
+                };
+                // SAFETY: `rule` is a valid path-beneath rule and `path_fd`
+                // stays open until the rule has been added.
+                let added = unsafe {
+                    libc::syscall(
+                        libc::SYS_landlock_add_rule,
+                        ruleset.as_raw_fd(),
+                        LANDLOCK_RULE_PATH_BENEATH as libc::c_ulong,
+                        &raw const rule,
+                        0u32,
+                    )
+                };
+                let error = std::io::Error::last_os_error();
+                // SAFETY: `path_fd` was opened above and is owned here.
+                unsafe { libc::close(path_fd) };
+                if added < 0 {
+                    return Err(error);
+                }
+            }
+        }
+
+        Ok(ruleset)
+    }
+
+    fn set_cloexec(fd: i32) {
+        // SAFETY: fcntl only reads the descriptor and the argument.
+        unsafe {
+            libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC);
+        }
+    }
+
+    /// Enter the ruleset in the calling (child) process.
+    fn restrict_self(ruleset: i32) -> Result<(), std::io::Error> {
+        // Landlock requires no_new_privs before it will restrict a process.
+        // SAFETY: prctl with this option has no pointer arguments.
+        let ret = unsafe { libc::prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) };
+        if ret != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        // SAFETY: `ruleset` is the descriptor built above and still open here.
+        let ret = unsafe { libc::syscall(libc::SYS_landlock_restrict_self, ruleset, 0u32) };
+        if ret != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    /// Linux sandbox using bubblewrap or Landlock, plus seccomp + rlimits.
     pub struct LinuxSandbox {
         config: SandboxConfig,
         /// Whether commands are wrapped in `bubblewrap`.
@@ -749,14 +1491,22 @@ mod linux_impl {
         /// Decided once, at creation: both the warning and whether the syscall
         /// filter may be installed depend on it.
         use_bwrap: bool,
+        /// Whether the Landlock fallback is in force.
+        use_landlock: bool,
+        /// The cgroup carrying this child's memory/pids limits, if one could
+        /// be created. A failure to create one is logged and falls back to
+        /// `RLIMIT_AS` rather than silently claiming a cgroup limit.
+        cgroup: Option<super::CgroupMemoryLimit>,
     }
 
     impl LinuxSandbox {
         pub fn create(config: SandboxConfig) -> Result<Self, SandboxError> {
             let use_bwrap = super::bubblewrap_in_force();
+            let use_landlock = super::landlock_in_force();
+            let abi = super::landlock_abi_version().unwrap_or(0);
 
-            // Say plainly what this sandbox is, in each of the three cases,
-            // because they confine very different things.
+            // Say plainly what this sandbox is, in each case, because they
+            // confine very different things.
             if use_bwrap {
                 tracing::info!(
                     "sandbox: filesystem isolation is enforced by bubblewrap — the root is \
@@ -767,43 +1517,120 @@ mod linux_impl {
                         "denied by a network namespace"
                     }
                 );
+            } else if use_landlock {
+                tracing::info!(
+                    abi,
+                    "sandbox: filesystem isolation is enforced by Landlock — path-beneath rules \
+                     grant read, write and execute only beneath the configured paths; reads of \
+                     system roots stay allowed so the loader can start; network access is {}",
+                    if config.allow_network {
+                        "allowed (no network rules are added)"
+                    } else if abi >= 4 {
+                        "denied by Landlock network rules"
+                    } else {
+                        "denied by the seccomp syscall table"
+                    }
+                );
             } else if super::bubblewrap_available() {
                 tracing::warn!(
                     "sandbox: filesystem isolation is NOT enforced on Linux — bubblewrap is \
-                     installed but switched off by {}; seccomp syscall filtering and rlimits are \
-                     the only restrictions in force",
+                     installed but switched off by {}, and the Landlock fallback is unavailable \
+                     or switched off; seccomp syscall filtering and rlimits are the only \
+                     restrictions in force",
                     super::BWRAP_ENV
                 );
             } else {
                 tracing::warn!(
                     "sandbox: filesystem isolation is NOT enforced on Linux — bubblewrap (bwrap) \
-                     is not installed; seccomp syscall filtering and rlimits are the only \
-                     restrictions in force"
+                     is not installed and the kernel does not provide (or {} switched off) \
+                     Landlock; seccomp syscall filtering and rlimits are the only restrictions \
+                     in force",
+                    super::LANDLOCK_ENV
                 );
             }
 
-            Ok(Self { config, use_bwrap })
+            // The cgroup is created before the spawn so the child can be
+            // attached the moment it exists. If the tree is not delegated or
+            // is read-only, say so and keep the rlimit.
+            let cgroup = config.max_memory_bytes.and_then(|bytes| {
+                match super::CgroupMemoryLimit::create(
+                    Some(bytes),
+                    Some(super::cgroup::DEFAULT_PIDS_MAX),
+                ) {
+                    Ok(cgroup) => {
+                        tracing::debug!(
+                            cgroup = %cgroup.path().display(),
+                            memory_bytes = bytes,
+                            "sandbox: cgroup v2 memory limit prepared"
+                        );
+                        Some(cgroup)
+                    }
+                    Err(error) => {
+                        tracing::warn!(
+                            %error,
+                            memory_bytes = bytes,
+                            "sandbox: cgroup v2 memory limit unavailable; the child falls back \
+                             to RLIMIT_AS, which does not bound every mapping"
+                        );
+                        None
+                    }
+                }
+            });
+
+            Ok(Self {
+                config,
+                use_bwrap,
+                use_landlock,
+                cgroup,
+            })
         }
 
         pub fn prepare(&self, cmd: &mut Command) -> Result<(), SandboxError> {
             let config = self.config.clone();
             let use_bwrap = self.use_bwrap;
+
+            // Build the Landlock ruleset in the parent: adding rules opens
+            // paths and allocates, neither of which belongs between fork and
+            // exec. The child only has to enter the inherited ruleset.
+            let ruleset = if self.use_landlock {
+                let abi = super::landlock_abi_version().unwrap_or(0);
+                let plan = super::landlock_plan(&config, abi);
+                Some(Arc::new(build_landlock_ruleset(&plan).map_err(
+                    |error| SandboxError::CreationError(format!("landlock ruleset: {error}")),
+                )?))
+            } else {
+                None
+            };
+
             let apply = move || -> Result<(), std::io::Error> {
                 Self::apply_rlimits(&config)?;
+                if let Some(ruleset) = &ruleset {
+                    restrict_self(ruleset.as_raw_fd())?;
+                    // The descriptor is CLOEXEC, but close it explicitly so a
+                    // failing exec cannot leave it behind.
+                    // SAFETY: the descriptor is owned by `ruleset` and this is
+                    // its last use in the child.
+                    unsafe { libc::close(ruleset.as_raw_fd()) };
+                }
                 // The syscall allowlist is not installed when bubblewrap wraps
                 // the command: the filter would be inherited by the wrapper
                 // itself, and mounting, unsharing and pivoting a root are
                 // exactly the syscalls an allowlist for a shell refuses. What
                 // the filter buys when it is in force — no network syscalls —
                 // bubblewrap provides with a network namespace instead.
+                //
+                // With Landlock in force the seccomp table is still installed;
+                // it is built and entered after the ruleset, so the Landlock
+                // setup syscalls are not filtered.
                 if !use_bwrap {
                     Self::apply_seccomp(config.allow_network)?;
                 }
                 Ok(())
             };
             // SAFETY: pre_exec runs in the child process before exec().
-            // The closure captures only `config` (Clone) and references no
-            // parent-process state that would be invalid after fork.
+            // The closure captures only `config` (Clone) and an `Arc` holding
+            // a ruleset descriptor; it references no parent-process state that
+            // would be invalid after fork.
             unsafe { cmd.pre_exec(apply) };
             Ok(())
         }
@@ -816,8 +1643,16 @@ mod linux_impl {
             super::bubblewrap_program(&self.config)
         }
 
-        pub fn post_spawn(&self, _child: &std::process::Child) -> Result<(), SandboxError> {
-            Ok(())
+        pub fn post_spawn(&self, child: &std::process::Child) -> Result<(), SandboxError> {
+            self.post_spawn_pid(child.id())
+        }
+
+        /// Attach a spawned child to the memory cgroup, when one exists.
+        pub fn post_spawn_pid(&self, pid: u32) -> Result<(), SandboxError> {
+            match &self.cgroup {
+                Some(cgroup) => cgroup.attach(pid),
+                None => Ok(()),
+            }
         }
 
         // ─── rlimits ─────────────────────────────────────────────────────────
@@ -1068,7 +1903,33 @@ mod macos_impl {
             ("sandbox-exec", vec!["-f".to_string(), profile])
         }
 
+        /// Install the best-effort memory ceiling, if one is configured.
+        ///
+        /// Modern Darwin rejects `RLIMIT_DATA` with `EINVAL`, so the result is
+        /// deliberately ignored: an unsupported limit must not turn a spawn
+        /// into a failure. Where the kernel honours it, the limit is in place
+        /// before the wrapper and the program it execs.
+        pub fn prepare(&self, cmd: &mut std::process::Command) -> Result<(), SandboxError> {
+            use std::os::unix::process::CommandExt;
+
+            if let Some(bytes) = self.config.max_memory_bytes {
+                // SAFETY: pre_exec runs in the child between fork and exec and
+                // only calls setrlimit, which is async-signal-safe.
+                unsafe {
+                    cmd.pre_exec(move || {
+                        let _ = super::apply_darwin_memory_limit(bytes);
+                        Ok(())
+                    });
+                }
+            }
+            Ok(())
+        }
+
         pub fn post_spawn(&self, _child: &std::process::Child) -> Result<(), SandboxError> {
+            Ok(())
+        }
+
+        pub fn post_spawn_pid(&self, _pid: u32) -> Result<(), SandboxError> {
             Ok(())
         }
 
@@ -1660,12 +2521,12 @@ mod tests {
     fn isolation_report_matches_the_platform() {
         #[cfg(target_os = "macos")]
         assert_eq!(filesystem_isolation(), FilesystemIsolation::Kernel);
-        // On Linux the answer depends on bubblewrap, so the report is pinned to
-        // what is actually in force rather than to the platform.
+        // On Linux the answer depends on bubblewrap or Landlock, so the report
+        // is pinned to what is actually in force rather than to the platform.
         #[cfg(target_os = "linux")]
         assert_eq!(
             filesystem_isolation(),
-            if bubblewrap_in_force() {
+            if bubblewrap_in_force() || landlock_in_force() {
                 FilesystemIsolation::Kernel
             } else {
                 FilesystemIsolation::None
@@ -1673,6 +2534,173 @@ mod tests {
         );
         #[cfg(not(any(target_os = "macos", target_os = "linux")))]
         assert_eq!(filesystem_isolation(), FilesystemIsolation::None);
+    }
+
+    // ─── Landlock policy (pure) ─────────────────────────────────────────────
+
+    fn landlock_config() -> SandboxConfig {
+        SandboxConfig {
+            allowed_read_paths: vec![PathBuf::from("/work/project")],
+            allowed_write_paths: vec![PathBuf::from("/work/project")],
+            allowed_exec_paths: vec![PathBuf::from("/opt/tool/bin")],
+            additional_working_dirs: vec![PathBuf::from("/work/project")],
+            allow_network: false,
+            ..SandboxConfig::default()
+        }
+    }
+
+    /// The configured paths are present once each, and system roots are added
+    /// so the loader and the programs the sandbox starts can run.
+    #[test]
+    fn landlock_plan_deduplicates_and_includes_system_roots() {
+        let plan = landlock_plan(&landlock_config(), 3);
+
+        assert_eq!(
+            plan.read_paths
+                .iter()
+                .filter(|path| path.as_path() == std::path::Path::new("/work/project"))
+                .count(),
+            1,
+            "a path named in several fields must be granted once: {:?}",
+            plan.read_paths
+        );
+        assert!(plan.read_paths.contains(&PathBuf::from("/usr")));
+        assert!(plan.read_paths.contains(&PathBuf::from("/lib")));
+        assert!(plan.write_paths.contains(&PathBuf::from("/work/project")));
+        assert!(plan.write_paths.contains(&PathBuf::from("/dev/null")));
+        assert!(plan.exec_paths.contains(&PathBuf::from("/bin")));
+        assert!(plan.exec_paths.contains(&PathBuf::from("/opt/tool/bin")));
+    }
+
+    /// Landlock's network rules exist from ABI 4; below that the seccomp table
+    /// is what denies the network, so the plan must not claim a network rule.
+    #[test]
+    fn landlock_network_rules_are_only_requested_from_abi_4() {
+        assert!(!landlock_plan(&landlock_config(), 3).handle_network);
+        assert!(landlock_plan(&landlock_config(), 4).handle_network);
+
+        let mut network_config = landlock_config();
+        network_config.allow_network = true;
+        assert!(
+            !landlock_plan(&network_config, 5).handle_network,
+            "a command that may use the network must not have its connect/bind rights handled"
+        );
+    }
+
+    /// ABI-dependent rights: `REFER` needs ABI 2 and `TRUNCATE` ABI 3. Asking
+    /// an older kernel for them makes `landlock_create_ruleset` fail with
+    /// EINVAL, so the masks must not include them there.
+    #[test]
+    fn landlock_access_masks_follow_the_abi() {
+        #[cfg(target_os = "linux")]
+        {
+            use linux_impl::{handled_fs_access, write_access};
+            const REFER: u64 = 1 << 13;
+            const TRUNCATE: u64 = 1 << 14;
+
+            assert_eq!(handled_fs_access(1) & REFER, 0);
+            assert_eq!(handled_fs_access(1) & TRUNCATE, 0);
+            assert_ne!(handled_fs_access(2) & REFER, 0);
+            assert_eq!(handled_fs_access(2) & TRUNCATE, 0);
+            assert_ne!(handled_fs_access(3) & TRUNCATE, 0);
+            assert_eq!(write_access(1) & REFER, 0);
+            assert_ne!(write_access(2) & REFER, 0);
+            assert_eq!(write_access(2) & TRUNCATE, 0);
+            assert_ne!(write_access(3) & TRUNCATE, 0);
+        }
+    }
+
+    /// A path-beneath rule on a regular file must not name directory-only
+    /// rights: the kernel rejects that with `EINVAL`. `/dev/null` is the case
+    /// every shell hits.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn landlock_file_rules_omit_directory_only_rights() {
+        use linux_impl::{access_for, AccessKind};
+
+        const READ_DIR: u64 = 1 << 3;
+        const MAKE_REG: u64 = 1 << 8;
+        const REFER: u64 = 1 << 13;
+        const TRUNCATE: u64 = 1 << 14;
+        const WRITE_FILE: u64 = 1 << 1;
+        const READ_FILE: u64 = 1 << 2;
+
+        let file_read = access_for(AccessKind::Read, false, 3);
+        assert_eq!(file_read, READ_FILE);
+        assert_eq!(file_read & READ_DIR, 0);
+
+        let file_write = access_for(AccessKind::Write, false, 3);
+        assert_ne!(file_write & WRITE_FILE, 0);
+        assert_ne!(file_write & TRUNCATE, 0);
+        assert_eq!(file_write & MAKE_REG, 0);
+        assert_eq!(file_write & REFER, 0);
+
+        let dir_write = access_for(AccessKind::Write, true, 3);
+        assert_ne!(dir_write & MAKE_REG, 0);
+        assert_ne!(dir_write & REFER, 0);
+    }
+
+    #[test]
+    fn landlock_toggle_is_explicit() {
+        for off in ["0", "false", "no"] {
+            assert!(landlock_disabled_by_env(Some(off)));
+        }
+        for on in [None, Some("1"), Some("true"), Some("yes"), Some("")] {
+            assert!(!landlock_disabled_by_env(on), "{on:?}");
+        }
+    }
+
+    // ─── cgroup policy (pure) ───────────────────────────────────────────────
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn cgroup_name_is_unique_per_pid_and_creation() {
+        assert_eq!(cgroup::cgroup_name(42, 0), "coderex-42-0");
+        assert_eq!(cgroup::cgroup_name(42, 1), "coderex-42-1");
+        assert_ne!(cgroup::cgroup_name(42, 1), cgroup::cgroup_name(43, 1));
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn proc_self_cgroup_uses_the_unified_line() {
+        assert_eq!(
+            cgroup::current_cgroup_from_proc(
+                "12:pids:/user.slice\n0::/user.slice/user-1000.slice/session-2.scope\n"
+            ),
+            Some("/user.slice/user-1000.slice/session-2.scope")
+        );
+        assert_eq!(cgroup::current_cgroup_from_proc("0::/\n"), Some("/"));
+        assert_eq!(cgroup::current_cgroup_from_proc(""), None);
+    }
+
+    // ─── macOS memory ceiling ───────────────────────────────────────────────
+
+    /// The helper must never turn an unsupported kernel limit into a panic or
+    /// an error: modern Darwin rejects `RLIMIT_DATA` with EINVAL.
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn darwin_memory_limit_is_best_effort() {
+        // This runs in the test process, so only call it with a value that
+        // cannot lower the process's own ceiling when accepted. Either answer
+        // is valid; the contract is that it returns rather than failing.
+        let accepted = apply_darwin_memory_limit(u64::MAX);
+        eprintln!("RLIMIT_DATA accepted by this kernel: {accepted}");
+    }
+
+    /// `prepare` stays usable when the kernel rejects the memory limit: a
+    /// spawn that would otherwise succeed must not fail because of it.
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn macos_prepare_with_a_rejected_memory_limit_still_spawns() {
+        let handle = SandboxHandle::create(SandboxConfig {
+            max_memory_bytes: Some(64 * 1024 * 1024),
+            ..SandboxConfig::default()
+        })
+        .unwrap();
+        let mut cmd = std::process::Command::new("true");
+        handle.prepare(&mut cmd).expect("prepare must not fail");
+        let status = cmd.status().expect("spawn must not fail");
+        assert!(status.success(), "the child did not run: {status:?}");
     }
 
     // ─── bubblewrap policy ──────────────────────────────────────────────────
@@ -1875,7 +2903,9 @@ mod tests {
     #[cfg(target_os = "linux")]
     fn the_seccomp_allowlist_lets_a_real_process_run() {
         if bubblewrap_in_force() {
-            eprintln!("skipping: bubblewrap is in force; set CODEREX_BWRAP=0 to test the syscall table");
+            eprintln!(
+                "skipping: bubblewrap is in force; set CODEREX_BWRAP=0 to test the syscall table"
+            );
             return;
         }
 
@@ -1937,6 +2967,164 @@ mod tests {
         handle.prepare(&mut cmd).unwrap();
     }
 
+    /// The Landlock fallback, exercised on a real process.
+    ///
+    /// Skipped when bubblewrap is in force (it is the better backend and
+    /// Landlock is not applied then), when the kernel has no Landlock, or when
+    /// `CODEREX_LANDLOCK=0` switched it off.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn landlock_fallback_confines_a_real_process() {
+        if !landlock_in_force() {
+            eprintln!(
+                "skipping: Landlock is not in force (bwrap is in force, the kernel lacks \
+                 Landlock, or CODEREX_LANDLOCK=0)"
+            );
+            return;
+        }
+
+        let root = std::env::temp_dir().join(format!("coderex-landlock-{}", std::process::id()));
+        let allowed = root.join("allowed");
+        let secret = root.join("secret");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&allowed).unwrap();
+        std::fs::create_dir_all(&secret).unwrap();
+        std::fs::write(allowed.join("f.txt"), "ALLOWED\n").unwrap();
+        std::fs::write(secret.join("f.txt"), "SECRET\n").unwrap();
+
+        let config = SandboxConfig {
+            allowed_read_paths: vec![allowed.clone()],
+            allowed_write_paths: vec![allowed.clone()],
+            allowed_exec_paths: vec![PathBuf::from("/bin"), PathBuf::from("/usr/bin")],
+            additional_working_dirs: vec![allowed.clone()],
+            ..SandboxConfig::default()
+        };
+        let handle = SandboxHandle::create(config).unwrap();
+        let mut cmd = std::process::Command::new("sh");
+        cmd.arg("-c").arg(format!(
+            "cat {}/f.txt; cat {}/f.txt 2>/dev/null || echo read-denied; \
+             echo ok > {}/new.txt; echo bad > {}/escape.txt 2>/dev/null || echo write-denied",
+            allowed.display(),
+            secret.display(),
+            allowed.display(),
+            secret.display()
+        ));
+        handle.prepare(&mut cmd).expect("prepare installs Landlock");
+
+        let output = cmd.output().expect("spawn");
+        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+        let allowed_written = std::fs::read_to_string(allowed.join("new.txt")).unwrap_or_default();
+        let escaped = secret.join("escape.txt").exists();
+        let _ = std::fs::remove_dir_all(&root);
+
+        assert!(
+            stdout.contains("ALLOWED"),
+            "the allowed read failed: {stdout} {stderr}"
+        );
+        assert!(
+            !stdout.contains("SECRET"),
+            "a file outside the read rules was readable: {stdout}"
+        );
+        assert_eq!(
+            allowed_written.trim(),
+            "ok",
+            "the allowed write failed: {stderr}"
+        );
+        assert!(
+            !escaped,
+            "a write outside the Landlock write rules succeeded"
+        );
+    }
+
+    /// A cgroup limit is created with the configured values, and a spawned
+    /// process can be attached. Skips with an explicit message when the tree
+    /// is not writable/delegated (the normal unprivileged case).
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn cgroup_memory_limit_attaches_a_real_child() {
+        let limit = match CgroupMemoryLimit::create(Some(64 * 1024 * 1024), Some(64)) {
+            Ok(limit) => limit,
+            Err(error) => {
+                eprintln!("skipping: cgroup v2 limits are unavailable here: {error}");
+                return;
+            }
+        };
+
+        let memory_max = std::fs::read_to_string(limit.path().join("memory.max")).unwrap();
+        let pids_max = std::fs::read_to_string(limit.path().join("pids.max")).unwrap();
+        assert_eq!(memory_max.trim(), (64 * 1024 * 1024).to_string());
+        assert_eq!(pids_max.trim(), "64");
+
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("sleep should spawn");
+        limit
+            .attach(child.id())
+            .expect("the child should be attachable");
+
+        let membership =
+            std::fs::read_to_string(format!("/proc/{}/cgroup", child.id())).unwrap_or_default();
+        let name = limit
+            .path()
+            .file_name()
+            .expect("the cgroup directory has a name")
+            .to_string_lossy()
+            .to_string();
+
+        let _ = child.kill();
+        let _ = child.wait();
+        drop(limit);
+
+        assert!(
+            membership.contains(&name),
+            "the child is not in {name}: {membership}"
+        );
+    }
+
+    /// `memory.max` actually fires: a process that allocates past the ceiling
+    /// is killed or gets `MemoryError`. Skipped when python3 or cgroups are
+    /// unavailable.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn cgroup_memory_limit_stops_a_memory_hog() {
+        let python = std::process::Command::new("python3")
+            .arg("--version")
+            .output();
+        if python.is_err() {
+            eprintln!("skipping: python3 is not available to allocate memory");
+            return;
+        }
+        let limit = match CgroupMemoryLimit::create(Some(64 * 1024 * 1024), Some(64)) {
+            Ok(limit) => limit,
+            Err(error) => {
+                eprintln!("skipping: cgroup v2 limits are unavailable here: {error}");
+                return;
+            }
+        };
+
+        let mut child = std::process::Command::new("python3")
+            .arg("-I")
+            .arg("-c")
+            .arg("a=[]\nwhile True:\n a.append(bytearray(8*1024*1024))")
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("python3 should spawn");
+        limit
+            .attach(child.id())
+            .expect("the child should be attachable");
+
+        let output = child.wait_with_output().expect("python3 should exit");
+        drop(limit);
+
+        assert!(
+            !output.status.success(),
+            "a 64 MiB cgroup should stop an unbounded allocator, but it exited successfully"
+        );
+    }
+
     #[test]
     #[cfg(target_os = "windows")]
     fn windows_sandbox_creates_job_object() {
@@ -1956,6 +3144,7 @@ mod tests {
 }
 
 #[cfg(all(
+    test,
     target_os = "linux",
     any(target_arch = "x86_64", target_arch = "aarch64")
 ))]

@@ -2,10 +2,11 @@
 
 This document describes the guarantees the sandbox makes today, per platform, and
 draws the line between what the kernel enforces and what is only an in-process
-check. The short version: **macOS and Linux-with-bubblewrap confine the
-filesystem; Windows and Linux without bubblewrap do not.** Where they do not,
-the sandbox is a syscall allowlist, a resource budget, or nothing at all — and
-it says so at runtime rather than letting the caller assume otherwise.
+check. The short version: **macOS, Linux-with-bubblewrap and Linux-with-Landlock
+confine the filesystem; Windows and Linux with neither bubblewrap nor Landlock do
+not.** Where they do not, the sandbox is a syscall allowlist, a resource
+budget, or nothing at all — and it says so at runtime rather than letting the
+caller assume otherwise.
 
 ## Where it is wired
 
@@ -48,15 +49,26 @@ Two allowances are wider than the configured paths and are called out so they ar
 not mistaken for confinement: metadata reads are global, and the root directory
 listing is readable. Neither discloses file contents.
 
-**rlimits are not applied on macOS.** `SandboxHandle::prepare` is a no-op there
-(`sandbox.rs`), so `max_open_files`, `max_memory_bytes` and `max_cpu_seconds` in a
-`SandboxConfig` have no effect on a macOS child. Only the command's own timeout
-bounds it.
+**Memory is best-effort on macOS; the other rlimits are not applied.**
+`SandboxHandle::prepare` installs `RLIMIT_DATA` in `pre_exec` when
+`max_memory_bytes` is set, and the hook path does the same. It is attempted, not
+guaranteed: macOS rejects `RLIMIT_AS`, does not enforce `RLIMIT_RSS`, and on
+current Darwin (macOS 15 was tested) `setrlimit(RLIMIT_DATA, …)` also returns
+`EINVAL` for any useful finite value. The rejection is ignored rather than
+failing the spawn. Even where the kernel accepts it, `RLIMIT_DATA` bounds the
+data segment (`brk`), **not** `mmap` allocations, so it is not an address-space
+cap and an allocator that maps memory can exceed it. `max_open_files` and
+`max_cpu_seconds` have no effect on a macOS child; only the command's own
+timeout bounds its lifetime. The test
+`sandbox::tests::darwin_memory_limit_is_best_effort` records whether the running
+kernel accepts the limit, and the hooks test
+`macos_memory_ceiling_constrains_a_memory_hogging_hook` skips enforcement with a
+clear message when it does not.
 
-### Linux — bubblewrap, seccomp + rlimits
+### Linux — bubblewrap, Landlock, seccomp + rlimits
 
-Two mechanisms, and which one is in force depends on whether bubblewrap is
-installed.
+Which filesystem backend is in force depends on whether bubblewrap is installed;
+resource limits and the syscall filter are layered on top.
 
 **With `bwrap` on `PATH`** (and not switched off — see below), the command is
 wrapped in a mount namespace: the root is bound read-only, `/proc`, `/dev` and
@@ -74,33 +86,107 @@ one that runs it.
 (`0`, `false`, `no`) leaves it on, because a sandbox that disables itself over an
 unexpected value is worse than one that says what it wants.
 
-**Without `bwrap`**, `prepare()` installs a `pre_exec` closure that applies
-`RLIMIT_NOFILE`, `RLIMIT_AS` and `RLIMIT_CPU`, then installs a seccomp-BPF filter
-with an explicit allowlist of syscalls and a default action of **`EPERM`**. The
-default used to be `KILL`, which turned every syscall nobody had listed into
-`SIGSYS` — and, because the filter read `seccomp_data.arch` and `.nr` at each
-other's offsets, it never matched the architecture and killed every process at
-its first syscall. A sandbox should refuse a call, not murder the process it was
-asked to confine; network syscalls are still absent from the allowlist when the
-network is denied, so they fail with `EPERM` either way. The audit
-token and the syscall numbers come from the current architecture
-(`seccomp_arch`), so an aarch64 host does not get the x86_64 table.
-`allow_network` **is** honoured there: the network syscalls are a separate table
-concatenated only when the flag is set, and a test asserts the two tables do not
-overlap. In this mode `filesystem_isolation()` reports `None` — seccomp filters
-syscalls, not paths, so a wrapped process can still read and write anything its
-user could — and the sandbox logs a warning saying so. Nothing silently claims
-otherwise.
+**Without `bwrap` — Landlock first.** When bubblewrap is absent, or switched off
+with `CODEREX_BWRAP=0`, `prepare()` uses the Landlock LSM as the filesystem
+fallback. It is in force (`landlock_in_force()`) when the kernel reports ABI 1 or
+newer and `CODEREX_LANDLOCK` is not `0`/`false`/`no`. The ABI is read with
+`landlock_create_ruleset(NULL, 0, LANDLOCK_CREATE_RULESET_VERSION)`; the ruleset
+is built in the parent, its descriptor survives `fork`, and `pre_exec` calls
+`landlock_restrict_self` after the rlimits and before `execve`.
 
-**Verified on Linux, in a container.** The whole workspace is compiled and its
-core and tools suites run on a Linux kernel (Debian, `bwrap` 0.12) in both modes
-— wrapper on, and `CODEREX_BWRAP=0` for the syscall path. Three tests exist so it
-stays that way: `the_bubblewrap_arguments_confine_a_real_process` runs `bwrap`
-with the arguments this module produces and asserts the root is read-only, the
-configured path writable, the child starts where it was told to, and the network
-namespace has no interface but loopback; `sandboxed_echo_works_on_linux` and
-`sandboxed_echo_works_without_bubblewrap` drive the Bash tool's own spawn path
-through each mode.
+The ruleset is path-beneath, not a mount namespace:
+
+| Access | Paths |
+|---|---|
+| Read (`READ_FILE`, `READ_DIR`) | Fixed system roots (`/usr`, `/lib`, `/lib64`, `/bin`, `/sbin`, `/etc`, `/proc`, `/dev`, `/sys`, `/run`), configured read paths, configured write paths, additional working dirs, `/dev/null` |
+| Write (`WRITE_FILE`, `MAKE_*`, `REMOVE_*`, `REFER`, `TRUNCATE`) | Configured write paths, additional working dirs, `/dev/null` |
+| Execute (`EXECUTE`) | `/bin`, `/sbin`, `/usr/bin`, `/usr/sbin`, `/usr/local/bin`, the loader/library directories (`/lib`, `/lib64`, `/usr/lib`, `/usr/lib64`), configured exec paths |
+| Network (`BIND_TCP`, `CONNECT_TCP`) | Handled and denied when `allow_network` is false **and the ABI is 4 or newer** |
+
+The library directories are in the exec set because the kernel opens a dynamic
+program's ELF interpreter (for example `/lib64/ld-linux-x86-64.so.2`) with
+`MAY_EXEC`; without `EXECUTE` on the loader path every dynamically linked
+command fails with `EACCES`. `REFER` is handled from ABI 2 and `TRUNCATE` from
+ABI 3, so the access mask follows the kernel. Directory-only rights are never
+requested on a regular file —
+the kernel rejects that with `EINVAL`, and `/dev/null` is the case every shell
+hits. Below ABI 4 the network is still denied by the seccomp table installed
+alongside Landlock, not by Landlock itself. Landlock does not hide path
+existence: a denied path can still be `stat`-ed; its contents and writes are
+what the kernel refuses.
+
+`prepare()` also installs a `pre_exec` closure that applies `RLIMIT_NOFILE`,
+`RLIMIT_AS` and `RLIMIT_CPU`, then a seccomp-BPF filter with an explicit
+allowlist of syscalls and a default action of **`EPERM`**. Unlike the `bwrap`
+path, the syscall filter stays installed under Landlock — the process does not
+need mount or namespace syscalls, so the list is usable. The default used to be
+`KILL`, which turned every syscall nobody had listed into `SIGSYS`, and the
+filter read `seccomp_data.arch` and `.nr` at each other's offsets, so it never
+matched the architecture and killed every process at its first syscall. A
+sandbox should refuse a call, not murder the process it was asked to confine;
+network syscalls are absent from the allowlist when the network is denied, so
+they fail with `EPERM` either way. The audit token and the syscall numbers come
+from the current architecture (`seccomp_arch`), so an aarch64 host does not get
+the x86_64 table. `allow_network` **is** honoured there: the network syscalls are
+a separate table concatenated only when the flag is set, and a test asserts the
+two tables do not overlap.
+
+When both backends are unavailable — no `bwrap`, `CODEREX_LANDLOCK=0` set or a
+kernel without Landlock — `filesystem_isolation()` reports `None` and a gating
+hook is denied rather than run unconfined. Nothing silently claims otherwise.
+
+**cgroup v2 memory limits.** When `max_memory_bytes` is configured, Linux also
+creates a `coderex-<pid>-<id>` cgroup under the process's own cgroup (or
+`$CODEREX_CGROUP_ROOT`, or `/sys/fs/cgroup`), sets `memory.max`, `pids.max`
+(default 256) and `memory.oom.group=1`, and attaches the child by writing its pid
+to `cgroup.procs` immediately after spawn. This is in addition to `RLIMIT_AS`:
+`RLIMIT_AS` caps one process's address space, while the cgroup caps the whole
+process tree the child forks. Groups are removed on drop.
+
+Creation is deliberately fallible. Most unprivileged sessions cannot create
+groups in a systemd-managed tree, containers often mount `/sys/fs/cgroup`
+read-only, and a parent that has not delegated `memory`/`pids` through
+`cgroup.subtree_control` rejects the child's limits. In every one of those cases
+the caller logs a warning naming the failed path and continues with `RLIMIT_AS`
+only — the command is never counted as cgroup-limited when it was not.
+`CODEREX_CGROUP_ROOT` selects a writable delegated tree for containers and
+tests. The helper is reusable (`coderex_core::sandbox::CgroupMemoryLimit`):
+create, spawn, `attach(pid)`, keep alive until exit.
+
+**Verified on Linux, in containers.** Two runs, because the backends need
+different environments.
+
+- A Debian container with `bwrap` 0.12 exercises the wrapper path.
+  `the_bubblewrap_arguments_confine_a_real_process` runs `bwrap` with the
+  arguments this module produces and asserts the root is read-only, the
+  configured path writable, the child starts where it was told to, and the
+  network namespace has no interface but loopback;
+  `sandboxed_echo_works_on_linux` drives the Bash tool's own spawn path.
+- A `rust:1.94` container without `bwrap`, run with
+  `--security-opt seccomp=unconfined`, exercises the Landlock fallback. The
+  full `sandbox::` suite (37 tests) passes, including
+  `landlock_fallback_confines_a_real_process` (a real `sh` reads and writes
+  inside the policy and is denied outside it),
+  `the_seccomp_allowlist_lets_a_real_process_run`, and the pure plan/ABI tests.
+  The hooks sandbox suite (13 tests) and the shell-tool suite (3 tests) pass in
+  the same container, including
+  `linux_hook_landlock_denies_a_write_outside_the_allowed_paths`.
+  `CODEREX_BWRAP=0` is not needed there because the image has no `bwrap`.
+
+The first Landlock run failed at `execve` with `EACCES` for every dynamically
+linked program: the kernel opens the ELF interpreter with `MAY_EXEC`, and the
+exec allowlist named only `/bin` and `/usr/bin`. The loader directories are now
+in the exec set. That defect was invisible in planning tests and only a real
+process could show it.
+
+The cgroup tests (`cgroup_memory_limit_attaches_a_real_child` and
+`cgroup_memory_limit_stops_a_memory_hog`) **skipped** in the standard container
+with an explicit message: Docker mounts `/sys/fs/cgroup` read-only, so there is
+no writable delegated tree. They run where one exists — a host with delegation,
+or a container started with a writable cgroup mount and
+`CODEREX_CGROUP_ROOT` pointing at a delegated subtree. The creation/attach
+failure path is what the standard container exercised, and it fell back to
+`RLIMIT_AS` with a warning rather than reporting a cgroup limit.
 
 That verification is what found the defects this file used to describe as
 "reviewed only": `coderex-core` did not compile on Linux at all (`libc` was
@@ -163,12 +249,16 @@ process-wide. Additional paths are absolute or the load is refused; unknown
 sandbox keys are load errors. See `docs/hooks.md` for the settings shape.
 
 Enforcement matches the platform table above. On macOS the hook is wrapped in
-`sandbox-exec`; on Linux with `bwrap` it is wrapped in bubblewrap. Where there
-is no filesystem isolation — Windows, or Linux without `bwrap` — a gating hook
+`sandbox-exec`; on Linux with `bwrap` it is wrapped in bubblewrap; on Linux
+without `bwrap` it is confined by Landlock when the kernel provides it. Where
+there is no filesystem isolation at all — Windows, or Linux with neither
+`bwrap` nor Landlock (or with `CODEREX_LANDLOCK=0`) — a gating hook
 (`PreToolUse`, `UserPromptSubmit`) fails closed with
 `HookError::SandboxUnavailable` rather than running unconfined, and a
 non-gating hook logs a warning and runs with resource limits only. An explicit
-opt-out is not a failure.
+opt-out is not a failure. On Linux a configured `max_memory_mb` additionally
+creates a cgroup v2 group for the hook and attaches it after spawn; if the tree
+is unwritable the hook logs a warning and keeps `RLIMIT_AS`.
 
 The wrapper is transparent to the hook protocols: stdin/stdout/stderr are
 inherited, so both the one-way contract and `stream: true` line protocol work
@@ -279,22 +369,25 @@ does not go through the tool layer is not bound by them either.
 
 ## Not enforced, and not claimed
 
-- Linux filesystem confinement **when `bwrap` is absent or switched off** — it is
-  enforced when bubblewrap is installed, and `filesystem_isolation()` reports
-  which of the two is the case.
+- Linux filesystem confinement when **neither** `bwrap` nor Landlock is
+  available (an old kernel, Landlock compiled out, or `CODEREX_LANDLOCK=0`).
+  `filesystem_isolation()` reports which backend, if any, is in force.
 - Any filesystem confinement on Windows or unsupported platforms.
-- rlimits on macOS.
+- Full rlimits on macOS. Only `RLIMIT_DATA` is attempted, it is best-effort
+  (current Darwin returns `EINVAL`), and it does not cap `mmap` allocations.
+  `max_open_files` and `max_cpu_seconds` are Linux-only.
 - Network confinement on Windows.
-- cgroup memory control. The reference uses a cgroup v1 memory controller for
-  tool and MCP children; this is Linux-only and is **not implemented** here. It
-  is deferred rather than written blind: there is no way to exercise it from
-  macOS, and a memory limit that is never observed to fire is a claim rather
-  than a control.
+- A cgroup memory limit when the cgroup v2 tree is not writable or has not
+  delegated `memory`/`pids`. Linux then falls back to `RLIMIT_AS` and logs a
+  warning; `RLIMIT_AS` bounds one process, not the tree it forks.
+- Landlock hiding path existence. It denies access rights, not `stat`; a path
+  outside the ruleset can still be observed to exist.
 - Path checks for processes that do not go through the tool layer.
 - Filesystem or network confinement for a `command` hook on Windows, or on
-  Linux without `bwrap`. There, a gating hook is denied rather than run
-  unconfined; a non-gating one runs with a warning. `CODEREX_HOOK_SANDBOX=0`
-  and the per-hook `sandbox.enabled: false` opt out deliberately.
+  Linux with neither `bwrap` nor Landlock. There, a gating hook is denied rather
+  than run unconfined; a non-gating one runs with a warning.
+  `CODEREX_HOOK_SANDBOX=0` and the per-hook `sandbox.enabled: false` opt out
+  deliberately.
 
 ## Verifying the macOS guarantees
 
@@ -304,18 +397,28 @@ The Seatbelt behaviour is covered by tests that actually spawn `sandbox-exec`:
   outside the configured read paths is not readable.
 - `sandbox::tests::macos_sandbox_allows_executing_a_tool_from_an_allowed_path` —
   a real binary (`ls`), not a shell builtin, runs from an allowed exec path.
+- `sandbox::tests::macos_prepare_with_a_rejected_memory_limit_still_spawns` —
+  setting `max_memory_bytes` does not fail the spawn when Darwin rejects the
+  limit.
 - `crates/core/tests/sandbox_integration.rs` — writes inside/outside the allowed
   paths, and network denial.
 - `crates/tools/src/builtins/bash_tool.rs` — the `Bash` tool end to end, including
   credential stripping and the safeSpawn refusal.
 - `crates/hooks/src/sandbox.rs` — command hooks end to end: a normal hook runs
   and writes inside its workspace, a write under `$HOME` is refused, and
-  `unavailable_sandbox_fails_closed_on_a_gating_event` pins the deny path. The
-  macOS tests skip themselves when `/usr/bin/sandbox-exec` is absent; the
-  Linux write test skips unless `bwrap` is in force.
+  `unavailable_sandbox_fails_closed_on_a_gating_event` pins the deny path.
+  `macos_memory_ceiling_constrains_a_memory_hogging_hook` probes
+  `RLIMIT_DATA`: on macOS 15 it prints that the kernel rejects the limit and
+  skips enforcement instead of claiming a ceiling that is not there.
 
-Linux hooks (mount-namespace write denial, and fail-closed without `bwrap`) are
-covered by Linux-gated tests that cannot run on macOS.
+**Run on macOS (Darwin 24.6, macOS 15):** `cargo test -p coderex-core --lib
+sandbox::` — 34 passed; `cargo test -p coderex-hooks --lib sandbox::` — 13
+passed (including the skip above). The macOS tests skip themselves when
+`/usr/bin/sandbox-exec` is absent.
 
-Linux behaviour (seccomp allowlist, `allow_network`, rlimits) is covered by
-Linux-gated tests that cannot run on macOS.
+Linux hooks (Landlock write denial, and fail-closed when neither `bwrap` nor
+Landlock exists) are covered by Linux-gated tests that cannot run on macOS.
+
+Linux behaviour (seccomp allowlist, Landlock planning and confinement,
+`allow_network`, rlimits, cgroup fallback) is covered by Linux-gated tests that
+cannot run on macOS.
