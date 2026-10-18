@@ -150,40 +150,32 @@ impl BridgeSessionSpawner {
         remote_path: &str,
         identity_file: Option<&str>,
     ) -> Result<SpawnResult, String> {
-        let session_dir = format!("{remote_path}/{}", config.session_id);
+        let session_dir = remote_session_dir(remote_path, &config.session_id);
 
+        // The identity file is resolved before connecting: naming a key that
+        // is not there is an error rather than a silent fall back to the agent.
         let builder = ssh_builder(identity_file)?;
         let session = builder
             .connect(host)
             .await
             .map_err(|e| format!("ssh connect failed: {e}"))?;
 
-        // Create session directory on remote: ssh host mkdir -p /path
-        let output = session
-            .command("mkdir")
-            .arg("-p")
-            .arg(&session_dir)
-            .output()
-            .await
-            .map_err(|e| format!("ssh mkdir failed: {e}"))?;
+        // `ssh host mkdir -p <dir>` then `ssh host which coderex`.
+        for command in ssh_remote_commands(&session_dir) {
+            let output = session
+                .command(&command.program)
+                .args(&command.args)
+                .output()
+                .await
+                .map_err(|e| format!("ssh {} failed: {e}", command.program))?;
 
-        if !output.status.success() {
-            return Err(format!(
-                "remote mkdir failed: {}",
-                String::from_utf8_lossy(&output.stderr),
-            ));
-        }
-
-        // Verify coderex is available on remote
-        let output = session
-            .command("which")
-            .arg("coderex")
-            .output()
-            .await
-            .map_err(|e| format!("ssh which coderex failed: {e}"))?;
-
-        if !output.status.success() {
-            return Err("coderex not found on remote host".to_string());
+            if !output.status.success() {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                return Err(match command.program.as_str() {
+                    "which" => "coderex not found on remote host".to_string(),
+                    program => format!("remote {program} failed: {stderr}"),
+                });
+            }
         }
 
         Ok(SpawnResult {
@@ -192,6 +184,35 @@ impl BridgeSessionSpawner {
             worktree_created: false,
         })
     }
+}
+
+/// The remote directory a session works in.
+fn remote_session_dir(remote_path: &str, session_id: &str) -> String {
+    format!("{remote_path}/{session_id}")
+}
+
+/// One command a remote session setup runs over SSH.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RemoteCommand {
+    program: String,
+    args: Vec<String>,
+}
+
+/// The remote setup commands, in order.
+///
+/// Kept separate from the connection so what the spawner sends can be checked
+/// without a live SSH server.
+fn ssh_remote_commands(session_dir: &str) -> Vec<RemoteCommand> {
+    vec![
+        RemoteCommand {
+            program: "mkdir".into(),
+            args: vec!["-p".into(), session_dir.to_string()],
+        },
+        RemoteCommand {
+            program: "which".into(),
+            args: vec!["coderex".into()],
+        },
+    ]
 }
 
 /// How a bridge SSH connection treats the host's key.
@@ -446,5 +467,34 @@ mod tests {
             identity_file: None,
         };
         assert_eq!(ssh_mode.as_str(), "ssh");
+    }
+
+    #[test]
+    fn ssh_spawn_builds_the_remote_setup_commands() {
+        let session_dir = remote_session_dir("/srv/coderex", "sess_7");
+        assert_eq!(session_dir, "/srv/coderex/sess_7");
+
+        assert_eq!(
+            ssh_remote_commands(&session_dir),
+            vec![
+                RemoteCommand {
+                    program: "mkdir".into(),
+                    args: vec!["-p".into(), "/srv/coderex/sess_7".into()],
+                },
+                RemoteCommand {
+                    program: "which".into(),
+                    args: vec!["coderex".into()],
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn a_named_identity_file_is_part_of_the_ssh_configuration() {
+        let key = tempfile::NamedTempFile::new().unwrap();
+        let resolved = resolve_identity_file(Some(key.path().to_str().unwrap()))
+            .unwrap()
+            .expect("a named key resolves");
+        assert_eq!(resolved, key.path());
     }
 }

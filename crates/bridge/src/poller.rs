@@ -18,6 +18,21 @@ pub struct WorkAssignment {
     pub spawn_mode: SpawnMode,
 }
 
+/// Where an SSH-spawned session should live.
+///
+/// Carried beside the `"ssh"` spawn mode string on the wire, because the mode
+/// name alone does not say which host to reach or where on it to work.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SshTarget {
+    /// Remote host (user@hostname).
+    pub host: String,
+    /// Remote working directory.
+    pub remote_path: String,
+    /// SSH private key path (optional, defaults to ssh-agent).
+    #[serde(default)]
+    pub identity_file: Option<String>,
+}
+
 /// How a session should be spawned.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SpawnMode {
@@ -51,12 +66,31 @@ impl SpawnMode {
     }
 
     /// Parse from the string format used by the control plane server.
+    ///
+    /// An `"ssh"` mode without a target cannot name a host or directory, so it
+    /// falls back to a local single session rather than spawning an SSH
+    /// session to `""`. Use [`SpawnMode::from_str_with_ssh`] when the
+    /// assignment carries its target.
     #[must_use]
     pub fn from_str(s: &str) -> Self {
-        match s {
-            "single_session" => SpawnMode::SingleSession,
-            "same_dir" => SpawnMode::SameDir,
-            "worktree" => SpawnMode::Worktree,
+        Self::from_str_with_ssh(s, None)
+    }
+
+    /// Parse a spawn mode string together with the optional SSH target the
+    /// control plane supplies beside it.
+    #[must_use]
+    pub fn from_str_with_ssh(s: &str, ssh: Option<SshTarget>) -> Self {
+        match (s, ssh) {
+            ("single_session", _) => SpawnMode::SingleSession,
+            ("same_dir", _) => SpawnMode::SameDir,
+            ("worktree", _) => SpawnMode::Worktree,
+            ("ssh", Some(target)) => SpawnMode::Ssh {
+                host: target.host,
+                remote_path: target.remote_path,
+                identity_file: target.identity_file,
+            },
+            // `"ssh"` with no target, and every unknown spelling, degrades to
+            // the local mode instead of inventing an unreachable host.
             _ => SpawnMode::SingleSession,
         }
     }
@@ -258,13 +292,7 @@ impl ControlPlaneClient for HttpControlPlaneClient {
         Ok(parsed
             .assignments
             .into_iter()
-            .map(|entry| WorkAssignment {
-                assignment_id: entry.assignment_id,
-                session_id: entry.session_id,
-                working_directory: entry.working_directory,
-                prompt: entry.prompt,
-                spawn_mode: SpawnMode::from_str(&entry.spawn_mode),
-            })
+            .map(ServerAssignment::into_work_assignment)
             .collect())
     }
 
@@ -342,6 +370,23 @@ struct ServerAssignment {
     working_directory: String,
     prompt: String,
     spawn_mode: String,
+    /// SSH target, present when `spawn_mode` is `"ssh"`.
+    #[serde(default)]
+    ssh: Option<SshTarget>,
+}
+
+impl ServerAssignment {
+    /// Turn the control-plane spelling into a runnable assignment, carrying
+    /// the SSH target (when any) into [`SpawnMode::Ssh`].
+    fn into_work_assignment(self) -> WorkAssignment {
+        WorkAssignment {
+            assignment_id: self.assignment_id,
+            session_id: self.session_id,
+            working_directory: self.working_directory,
+            prompt: self.prompt,
+            spawn_mode: SpawnMode::from_str_with_ssh(&self.spawn_mode, self.ssh),
+        }
+    }
 }
 
 /// Server response from the assignments endpoint.
@@ -701,5 +746,51 @@ mod tests {
     fn spawn_modes() {
         assert_eq!(SpawnMode::SingleSession, SpawnMode::SingleSession);
         assert_ne!(SpawnMode::Worktree, SpawnMode::SameDir);
+    }
+
+    #[test]
+    fn an_ssh_assignment_maps_to_ssh_with_its_fields() {
+        let json = r#"{
+            "assignments": [{
+                "assignment_id": "a1",
+                "session_id": "s1",
+                "working_directory": "/srv/work",
+                "prompt": "Fix the bug",
+                "spawn_mode": "ssh",
+                "ssh": {
+                    "host": "deploy@remote.example",
+                    "remote_path": "/srv/coderex",
+                    "identity_file": "/home/deploy/.ssh/id_ed25519"
+                }
+            }],
+            "count": 1
+        }"#;
+
+        let parsed: AssignmentsResponse = serde_json::from_str(json).unwrap();
+        let assignment = parsed
+            .assignments
+            .into_iter()
+            .next()
+            .unwrap()
+            .into_work_assignment();
+
+        assert_eq!(
+            assignment.spawn_mode,
+            SpawnMode::Ssh {
+                host: "deploy@remote.example".into(),
+                remote_path: "/srv/coderex".into(),
+                identity_file: Some("/home/deploy/.ssh/id_ed25519".into()),
+            }
+        );
+    }
+
+    #[test]
+    fn ssh_without_a_target_does_not_invent_one() {
+        // A mode name on its own cannot say where to connect; it must not
+        // become an SSH spawn to an empty host.
+        assert_eq!(
+            SpawnMode::from_str_with_ssh("ssh", None),
+            SpawnMode::SingleSession
+        );
     }
 }

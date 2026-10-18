@@ -11,7 +11,8 @@
 use anyhow::{Context, Result};
 use coderex_bridge::archive::UsageStats;
 use coderex_bridge::heartbeat::HeartbeatConfig;
-use coderex_bridge::orchestrator::{Bridge, BridgeConfig, BridgeStopHandle};
+use coderex_bridge::orchestrator::{Bridge, BridgeConfig, BridgeEvent, BridgeStopHandle};
+use coderex_bridge::permission::PermissionResponse;
 use coderex_bridge::poller::{
     ClaimOutcome, ControlPlaneClient, DEFAULT_CLAIM_PATH_TEMPLATE, HttpControlPlaneClient,
 };
@@ -24,7 +25,7 @@ use std::process::{ExitStatus, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
-use tokio::io::{AsyncBufReadExt, AsyncRead, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWriteExt, BufReader};
 use tokio::process::{Child, Command};
 
 use crate::cli::BridgeArgs;
@@ -122,8 +123,64 @@ impl Default for SessionStop {
     }
 }
 
+/// One line of a session's stdout or stderr, bound for the transport.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionOutputLine {
+    /// Session the line came from.
+    pub session_id: String,
+    /// `"stdout"` or `"stderr"`.
+    pub stream: &'static str,
+    /// The line, without its trailing newline.
+    pub line: String,
+}
+
+/// One tool-approval request emitted by a session's child process.
+///
+/// This is the launcher's view of a `control_request`/`can_use_tool` frame:
+/// the child has stopped and will not continue until it receives an answer on
+/// stdin.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChildPermissionRequest {
+    /// Session whose child asked.
+    pub session_id: String,
+    /// The id the child chose; the answer must echo it.
+    pub request_id: String,
+    /// Tool that wants to run.
+    pub tool_name: String,
+    /// The tool's input, unmodified.
+    pub input: Value,
+    /// Why the tool needs approval.
+    pub reason: String,
+    /// Whether the child offered a session-wide answer.
+    pub allow_session: bool,
+}
+
+/// The launcher's answer to a [`ChildPermissionRequest`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChildPermissionDecision {
+    /// Request being answered.
+    pub request_id: String,
+    /// Whether the tool may run.
+    pub allow: bool,
+    /// Whether the approval covers the rest of the session.
+    pub allow_session: bool,
+    /// Detail written into the `control_response`.
+    pub message: String,
+}
+
+/// The receiving half of a session's decision channel.
+///
+/// Stored in a slot because [`SessionRunner::run`] receives a shared reference
+/// to the context; the process runner takes the receiver once, at the start of
+/// the run.
+pub type PermissionDecisionSlot = Arc<
+    std::sync::Mutex<
+        Option<tokio::sync::mpsc::UnboundedReceiver<ChildPermissionDecision>>,
+    >,
+>;
+
 /// Everything a [`SessionRunner`] needs for one session.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct SessionContext<'a> {
     /// Session ID assigned by the control plane.
     pub session_id: &'a str,
@@ -133,6 +190,19 @@ pub struct SessionContext<'a> {
     pub work_dir: &'a Path,
     /// Directory where the runner writes the transcript and stderr log.
     pub session_dir: &'a Path,
+    /// Where the runner sends each output line as the child produces it.
+    ///
+    /// `None` when the caller does not want streaming (a test, or a runner
+    /// used outside the worker loop).
+    pub output: Option<tokio::sync::mpsc::UnboundedSender<SessionOutputLine>>,
+    /// Where the runner sends each `can_use_tool` request the child emits.
+    ///
+    /// `None` when nobody is listening; the child then keeps waiting, which is
+    /// the pre-existing behaviour for a runner used outside the worker loop.
+    pub permission_requests:
+        Option<tokio::sync::mpsc::UnboundedSender<ChildPermissionRequest>>,
+    /// Answers the launcher routed to this session.
+    pub permission_decisions: Option<PermissionDecisionSlot>,
 }
 
 /// What a successful session produced.
@@ -209,7 +279,9 @@ fn session_command(prompt: &str, work_dir: &Path) -> Result<Command, String> {
         .arg("--")
         .arg(prompt)
         .current_dir(work_dir)
-        .stdin(Stdio::null())
+        // The child's `control_response` answers arrive here. The prompt is
+        // still positional, so stdin carries the control channel only.
+        .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         // Dropping the future (shutdown, panic) kills the child instead of
@@ -229,10 +301,21 @@ impl SessionRunner for ProcessSessionRunner {
         let child = session_command(context.prompt, context.work_dir)?
             .spawn()
             .map_err(|err| format!("failed to start the session process: {err}"))?;
+        // A shared reference cannot move the receiver out, so the launcher
+        // leaves it in the slot and the one runner that owns the child takes
+        // it here.
+        let decisions = context.permission_decisions.as_ref().and_then(|slot| {
+            slot.lock()
+                .ok()
+                .and_then(|mut slot| slot.take())
+        });
         run_child_streaming(
             child,
             context.session_id,
             context.session_dir,
+            context.output.clone(),
+            context.permission_requests.clone(),
+            decisions,
             stop,
             self.grace,
         )
@@ -259,6 +342,9 @@ async fn run_child_streaming(
     mut child: Child,
     session_id: &str,
     session_dir: &Path,
+    output: Option<tokio::sync::mpsc::UnboundedSender<SessionOutputLine>>,
+    permission_requests: Option<tokio::sync::mpsc::UnboundedSender<ChildPermissionRequest>>,
+    decisions: Option<tokio::sync::mpsc::UnboundedReceiver<ChildPermissionDecision>>,
     stop: SessionStop,
     grace: Duration,
 ) -> Result<SessionOutput, String> {
@@ -270,21 +356,49 @@ async fn run_child_streaming(
         .stderr
         .take()
         .ok_or_else(|| "session process has no stderr pipe".to_string())?;
+    let mut child_stdin = child.stdin.take();
 
     let stdout_session = session_id.to_string();
     let stderr_session = session_id.to_string();
-    let stdout_task = tokio::spawn(read_stdout(stdout, stdout_session));
-    let stderr_task = tokio::spawn(read_stderr(stderr, stderr_session));
+    let stdout_output = output.clone();
+    let stderr_output = output;
+    let stdout_task = tokio::spawn(read_stdout(
+        stdout,
+        stdout_session,
+        stdout_output,
+        permission_requests,
+    ));
+    let stderr_task = tokio::spawn(read_stderr(stderr, stderr_session, stderr_output));
 
-    let (status, cancelled) = tokio::select! {
-        status = child.wait() => (
-            status.map_err(|err| format!("failed to wait for the session process: {err}"))?,
-            false,
-        ),
-        () = stop.wait() => (
-            terminate_child(&mut child, grace).await?,
-            true,
-        ),
+    // A runner with no launcher still needs a channel to select on, or the
+    // select has to special-case its absence. Keeping a sender alive means
+    // this receiver never reports "all senders dropped" and spins.
+    let (keepalive_tx, keepalive_rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut decisions = decisions.unwrap_or(keepalive_rx);
+    let _keepalive = keepalive_tx;
+    let mut decision_channel_open = true;
+
+    let (status, cancelled) = loop {
+        tokio::select! {
+            status = child.wait() => break (
+                status.map_err(|err| format!("failed to wait for the session process: {err}"))?,
+                false,
+            ),
+            () = stop.wait() => break (
+                terminate_child(&mut child, grace).await?,
+                true,
+            ),
+            decision = decisions.recv(), if decision_channel_open => {
+                match decision {
+                    Some(decision) => {
+                        write_child_decision(&mut child_stdin, decision).await;
+                    }
+                    // The launcher dropped every sender; stop polling rather
+                    // than spin on a permanently ready `None`.
+                    None => decision_channel_open = false,
+                }
+            }
+        }
     };
 
     let capture = stdout_task
@@ -321,8 +435,68 @@ async fn run_child_streaming(
     })
 }
 
-/// Read stdout line by line, forwarding it to tracing and capturing frames.
-async fn read_stdout<R>(reader: R, session_id: String) -> Result<StreamCapture, String>
+/// Write one decision to the child as a `control_response` line.
+///
+/// A broken pipe is not an error: the child may have exited between asking
+/// and being answered. Logging it keeps the session's reader alive and lets
+/// the exit status explain what happened.
+async fn write_child_decision(
+    stdin: &mut Option<tokio::process::ChildStdin>,
+    decision: ChildPermissionDecision,
+) {
+    let Some(stdin) = stdin.as_mut() else {
+        tracing::warn!(
+            request_id = %decision.request_id,
+            "session child has no stdin pipe; dropping permission decision"
+        );
+        return;
+    };
+
+    let frame = if decision.allow {
+        let mut frame = coderex_events::protocol::ControlResponseFrame::allow(
+            &decision.request_id,
+            &decision.message,
+        );
+        if decision.allow_session {
+            frame = frame.with_allow_session(true);
+        }
+        frame
+    } else {
+        coderex_events::protocol::ControlResponseFrame::deny(
+            &decision.request_id,
+            &decision.message,
+        )
+    };
+    let line = frame.to_line();
+
+    if let Err(error) = stdin.write_all(line.as_bytes()).await {
+        tracing::warn!(
+            request_id = %decision.request_id,
+            error = %error,
+            "could not write a control response to the session child"
+        );
+        return;
+    }
+    if let Err(error) = stdin.flush().await {
+        tracing::warn!(
+            request_id = %decision.request_id,
+            error = %error,
+            "could not flush a control response to the session child"
+        );
+    }
+}
+
+/// Read stdout line by line, forwarding it to tracing, the transport, and the
+/// captured transcript.
+///
+/// A `control_request` line is also handed to the launcher loop: the child is
+/// waiting on the answer, and the transcript alone does not unblock it.
+async fn read_stdout<R>(
+    reader: R,
+    session_id: String,
+    output: Option<tokio::sync::mpsc::UnboundedSender<SessionOutputLine>>,
+    permission_requests: Option<tokio::sync::mpsc::UnboundedSender<ChildPermissionRequest>>,
+) -> Result<StreamCapture, String>
 where
     R: AsyncRead + Unpin,
 {
@@ -335,14 +509,41 @@ where
         .map_err(|err| format!("failed to read session stdout: {err}"))?
     {
         tracing::debug!(session_id = %session_id, stream = "stdout", "{}", line);
+        forward_output(&output, &session_id, "stdout", &line);
         capture.transcript.push_str(&line);
         capture.transcript.push('\n');
 
         let Ok(frame) = serde_json::from_str::<Value>(&line) else {
             continue;
         };
-        if frame.get("type").and_then(Value::as_str) != Some("result") {
-            continue;
+        match frame.get("type").and_then(Value::as_str) {
+            Some("control_request") => {
+                match coderex_events::protocol::ControlRequestFrame::parse_line(&line) {
+                    Ok(request) => {
+                        if let Some(sender) = permission_requests.as_ref() {
+                            let _ = sender.send(ChildPermissionRequest {
+                                session_id: session_id.clone(),
+                                request_id: request.request_id,
+                                tool_name: request.request.tool_name,
+                                input: request.request.input,
+                                reason: request.request.reason,
+                                allow_session: request.request.allow_session,
+                            });
+                        }
+                    }
+                    // One malformed line must not take down the reader: the
+                    // child is still waiting for an answer it will not get,
+                    // but the rest of the transcript is still useful.
+                    Err(error) => tracing::warn!(
+                        session_id = %session_id,
+                        error = %error,
+                        "ignoring a malformed control_request from the session child"
+                    ),
+                }
+                continue;
+            }
+            Some("result") => {}
+            _ => continue,
         }
 
         capture.usage = usage_from_result(&frame);
@@ -358,8 +559,13 @@ where
     Ok(capture)
 }
 
-/// Read stderr line by line, forwarding it to tracing and keeping the text.
-async fn read_stderr<R>(reader: R, session_id: String) -> Result<String, String>
+/// Read stderr line by line, forwarding it to tracing and the transport, and
+/// keeping the text.
+async fn read_stderr<R>(
+    reader: R,
+    session_id: String,
+    output: Option<tokio::sync::mpsc::UnboundedSender<SessionOutputLine>>,
+) -> Result<String, String>
 where
     R: AsyncRead + Unpin,
 {
@@ -372,11 +578,31 @@ where
         .map_err(|err| format!("failed to read session stderr: {err}"))?
     {
         tracing::warn!(session_id = %session_id, stream = "stderr", "{}", line);
+        forward_output(&output, &session_id, "stderr", &line);
         text.push_str(&line);
         text.push('\n');
     }
 
     Ok(text)
+}
+
+/// Hand one line to the worker's output channel, if one was supplied.
+///
+/// A closed channel means the worker is gone; the local transcript is still
+/// written, so this is not an error.
+fn forward_output(
+    output: &Option<tokio::sync::mpsc::UnboundedSender<SessionOutputLine>>,
+    session_id: &str,
+    stream: &'static str,
+    line: &str,
+) {
+    if let Some(output) = output {
+        let _ = output.send(SessionOutputLine {
+            session_id: session_id.to_string(),
+            stream,
+            line: line.to_string(),
+        });
+    }
 }
 
 /// Extract usage from a stream-json `result` frame.
@@ -532,6 +758,18 @@ struct SpawnedSession {
 struct RunningSession {
     handle: tokio::task::JoinHandle<()>,
     stop: SessionStop,
+    /// Keeps the session's decision channel open while it runs.
+    ///
+    /// Per-request clones live in the pending map; this one exists so a
+    /// session with no outstanding request still has a live sender and its
+    /// runner never sees the channel close.
+    permission_tx: tokio::sync::mpsc::UnboundedSender<ChildPermissionDecision>,
+}
+
+/// A child permission request waiting for the person's answer.
+#[derive(Debug)]
+struct PendingChildPermission {
+    decisions: tokio::sync::mpsc::UnboundedSender<ChildPermissionDecision>,
 }
 
 /// Errors raised while turning CLI arguments into a launch configuration.
@@ -865,6 +1103,20 @@ async fn run_worker(
 
     let (completion_tx, mut completion_rx) =
         tokio::sync::mpsc::unbounded_channel::<SessionCompletion>();
+    // Lines a session's readers produce. The original sender stays alive for
+    // the life of the worker so `recv` never reports "all senders dropped"
+    // while sessions can still be spawned.
+    let (output_tx, mut output_rx) =
+        tokio::sync::mpsc::unbounded_channel::<SessionOutputLine>();
+    // Permission requests the children emit. The launcher owns the bridge
+    // (and its transport), so the request has to travel back here before it
+    // can become a `permission_request` frame.
+    let (permission_request_tx, mut permission_request_rx) =
+        tokio::sync::mpsc::unbounded_channel::<ChildPermissionRequest>();
+    let mut pending_child_permissions: HashMap<String, PendingChildPermission> = HashMap::new();
+    // Subscribed once: `respond_to_permission` broadcasts the resolution, and
+    // the serve loop may complete at any point in the select.
+    let mut bridge_events = bridge.subscribe();
     let mut running: HashMap<String, RunningSession> = HashMap::new();
     let mut serve_error = None;
 
@@ -875,6 +1127,9 @@ async fn run_worker(
 
         tokio::select! {
             served = bridge.serve_transport() => {
+                // Exhausted reconnect attempts surface as an error here, and
+                // the worker exits rather than silently sitting on a dead
+                // transport.
                 if let Err(err) = served {
                     serve_error = Some(err);
                 } else {
@@ -886,6 +1141,74 @@ async fn run_worker(
                 if let Some(done) = done {
                     running.remove(&done.session_id);
                     finish_session(bridge, done).await;
+                }
+            }
+            line = output_rx.recv() => {
+                if let Some(line) = line {
+                    if let Err(err) = bridge
+                        .forward_session_output(&line.session_id, line.stream, &line.line)
+                        .await
+                    {
+                        tracing::warn!(
+                            session_id = %line.session_id,
+                            error = %err,
+                            "could not forward session output"
+                        );
+                    }
+                }
+            }
+            request = permission_request_rx.recv() => {
+                if let Some(request) = request {
+                    handle_child_permission_request(
+                        bridge,
+                        &running,
+                        &mut pending_child_permissions,
+                        request,
+                    )
+                    .await;
+                }
+            }
+            event = bridge_events.recv() => {
+                // Every event other than a resolution is informational here;
+                // lagging is fine because the resolution is also visible in
+                // the router (`get_permission_response`).
+                if let Ok(BridgeEvent::PermissionResolved {
+                    request_id,
+                    allowed,
+                }) = event
+                {
+                    if let Some(pending) = pending_child_permissions.remove(&request_id) {
+                        let (allow_session, message) =
+                            match bridge.get_permission_response(&request_id) {
+                                Some(PermissionResponse::Allow { always }) => (
+                                    *always,
+                                    if *always {
+                                        "approved for the session"
+                                    } else {
+                                        "approved"
+                                    },
+                                ),
+                                Some(PermissionResponse::Deny) => (false, "denied"),
+                                None => (
+                                    false,
+                                    if allowed { "approved" } else { "denied" },
+                                ),
+                            };
+                        if pending
+                            .decisions
+                            .send(ChildPermissionDecision {
+                                request_id,
+                                allow: allowed,
+                                allow_session: allow_session && allowed,
+                                message: message.to_string(),
+                            })
+                            .is_err()
+                        {
+                            tracing::warn!(
+                                "session ended before its permission decision could be delivered"
+                            );
+                        }
+                    }
                 }
             }
             _ = ticker.tick() => {
@@ -901,7 +1224,19 @@ async fn run_worker(
                         );
                     }
                 } else {
-                    spawn_session_tasks(spawned, &runner, &completion_tx, &mut running);
+                    spawn_session_tasks(
+                        spawned,
+                        &runner,
+                        &completion_tx,
+                        &output_tx,
+                        &permission_request_tx,
+                        &mut running,
+                    );
+                }
+                // Permission requests created by a bridge-side producer wait
+                // here until this loop owns the transport again.
+                if let Err(err) = bridge.send_pending_permission_requests().await {
+                    tracing::warn!(error = %err, "could not send pending permission requests");
                 }
             }
         }
@@ -916,25 +1251,97 @@ async fn run_worker(
     )
 }
 
+/// Register a child's approval request with the bridge and wait for its
+/// answer.
+///
+/// The request is queued under the child's id and flushed immediately: the
+/// child is blocked on stdin, so waiting for the poll tick would add its whole
+/// interval to every approval.
+async fn handle_child_permission_request(
+    bridge: &mut Bridge,
+    running: &HashMap<String, RunningSession>,
+    pending: &mut HashMap<String, PendingChildPermission>,
+    request: ChildPermissionRequest,
+) {
+    if pending.contains_key(&request.request_id) {
+        tracing::warn!(
+            session_id = %request.session_id,
+            request_id = %request.request_id,
+            "ignoring a child permission request id that is already pending"
+        );
+        return;
+    }
+
+    let Some(decisions) = running
+        .get(&request.session_id)
+        .map(|session| session.permission_tx.clone())
+    else {
+        // The session finished while its last frame was in the pipe; nobody
+        // can act on the answer, and there is no child left to receive it.
+        tracing::warn!(
+            session_id = %request.session_id,
+            request_id = %request.request_id,
+            "ignoring a permission request from a session that is no longer running"
+        );
+        return;
+    };
+
+    let args = request.input.to_string();
+    match bridge.request_permission_with_id(
+        &request.request_id,
+        &request.session_id,
+        &request.tool_name,
+        &args,
+    ) {
+        Ok(request_id) => {
+            // Route the answer before the frame is flushed: the person can
+            // answer as soon as it appears in the gateway.
+            pending.insert(request_id, PendingChildPermission { decisions });
+            if let Err(error) = bridge.send_pending_permission_requests().await {
+                tracing::warn!(error = %error, "could not send a permission request");
+            }
+        }
+        Err(error) => tracing::warn!(
+            session_id = %request.session_id,
+            error = %error,
+            "ignoring a child permission request with a known id"
+        ),
+    }
+}
+
 /// Start one task per spawned session and remember it for shutdown.
 fn spawn_session_tasks(
     sessions: Vec<SpawnedSession>,
     runner: &Arc<dyn SessionRunner>,
     completion_tx: &tokio::sync::mpsc::UnboundedSender<SessionCompletion>,
+    output_tx: &tokio::sync::mpsc::UnboundedSender<SessionOutputLine>,
+    permission_request_tx: &tokio::sync::mpsc::UnboundedSender<ChildPermissionRequest>,
     running: &mut HashMap<String, RunningSession>,
 ) {
     for session in sessions {
         let session_id = session.session_id.clone();
         let completion_tx = completion_tx.clone();
+        let output_tx = output_tx.clone();
+        let permission_request_tx = permission_request_tx.clone();
         let runner = Arc::clone(runner);
         let stop = SessionStop::new();
         let task_stop = stop.clone();
+        // One decision channel per child. The task owns the receiving end
+        // (through the slot) and the running-session entry keeps the sending
+        // end alive; per-request clones go into the launcher's pending map.
+        let (permission_tx, permission_rx) =
+            tokio::sync::mpsc::unbounded_channel::<ChildPermissionDecision>();
+        let decision_slot: PermissionDecisionSlot =
+            Arc::new(std::sync::Mutex::new(Some(permission_rx)));
         let handle = tokio::spawn(async move {
             let context = SessionContext {
                 session_id: &session.session_id,
                 prompt: &session.prompt,
                 work_dir: &session.work_dir,
                 session_dir: &session.session_dir,
+                output: Some(output_tx),
+                permission_requests: Some(permission_request_tx),
+                permission_decisions: Some(decision_slot),
             };
             let outcome = runner.run(&context, task_stop).await;
             let _ = completion_tx.send(SessionCompletion {
@@ -942,7 +1349,14 @@ fn spawn_session_tasks(
                 outcome,
             });
         });
-        running.insert(session_id, RunningSession { handle, stop });
+        running.insert(
+            session_id,
+            RunningSession {
+                handle,
+                stop,
+                permission_tx,
+            },
+        );
     }
 }
 
@@ -1372,6 +1786,36 @@ mod tests {
             self.started.notify_one();
             stop.wait().await;
             Err("session cancelled by shutdown".into())
+        }
+    }
+
+    /// Runner that emits output lines the way the process runner's readers
+    /// do, then finishes successfully.
+    #[derive(Debug)]
+    struct StreamingRunner {
+        lines: Vec<(&'static str, &'static str)>,
+    }
+
+    #[async_trait::async_trait]
+    impl SessionRunner for StreamingRunner {
+        async fn run(
+            &self,
+            context: &SessionContext<'_>,
+            _stop: SessionStop,
+        ) -> Result<SessionOutput, String> {
+            if let Some(output) = &context.output {
+                for (stream, line) in &self.lines {
+                    let _ = output.send(SessionOutputLine {
+                        session_id: context.session_id.to_string(),
+                        stream,
+                        line: (*line).to_string(),
+                    });
+                }
+            }
+            Ok(SessionOutput {
+                transcript: "{\"type\":\"result\",\"subtype\":\"success\"}\n".into(),
+                usage: UsageStats::default(),
+            })
         }
     }
 
@@ -1845,15 +2289,39 @@ mod tests {
             .spawn()
             .unwrap();
 
+        let (output_tx, mut output_rx) = tokio::sync::mpsc::unbounded_channel();
         let output = run_child_streaming(
             child,
             "s1",
             &session_dir,
+            Some(output_tx),
+            None,
+            None,
             SessionStop::new(),
             Duration::from_secs(2),
         )
         .await
         .unwrap();
+
+        let mut forwarded = Vec::new();
+        while let Some(line) = output_rx.recv().await {
+            forwarded.push(line);
+        }
+        assert_eq!(
+            forwarded
+                .iter()
+                .filter(|line| line.stream == "stdout")
+                .count(),
+            3,
+            "every stdout line should be forwarded: {forwarded:?}"
+        );
+        assert!(
+            forwarded
+                .iter()
+                .any(|line| line.stream == "stderr" && line.line == "a warning"),
+            "the stderr line should be forwarded: {forwarded:?}"
+        );
+        assert!(forwarded.iter().all(|line| line.session_id == "s1"));
 
         assert_eq!(output.usage.input_tokens, 11);
         assert_eq!(output.usage.output_tokens, 22);
@@ -1867,6 +2335,88 @@ mod tests {
         assert_eq!(transcript, output.transcript);
         let stderr = std::fs::read_to_string(session_dir.join("stderr.log")).unwrap();
         assert!(stderr.contains("a warning"), "{stderr}");
+    }
+
+    /// The full stdio round trip: the child asks, the launcher answers, and
+    /// the child reads the answer off its stdin.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_child_permission_request_is_answered_over_stdin() {
+        let tmp = tempfile::tempdir().unwrap();
+        let session_dir = tmp.path().join("session");
+        let script = r#"printf '%s\n' '{"type":"control_request","request_id":"child-req-1","request":{"subtype":"can_use_tool","tool_name":"Bash","input":{"command":"ls"},"reason":"needs approval","allow_session":true}}'
+IFS= read -r line
+printf 'ECHO:%s\n' "$line""#;
+
+        let child = Command::new("sh")
+            .arg("-c")
+            .arg(script)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+
+        let (request_tx, mut request_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (decision_tx, decision_rx) = tokio::sync::mpsc::unbounded_channel();
+
+        let task = tokio::spawn(async move {
+            run_child_streaming(
+                child,
+                "sess-1",
+                &session_dir,
+                None,
+                Some(request_tx),
+                Some(decision_rx),
+                SessionStop::new(),
+                Duration::from_secs(5),
+            )
+            .await
+        });
+
+        let request = tokio::time::timeout(Duration::from_secs(5), request_rx.recv())
+            .await
+            .expect("the child's request should reach the launcher")
+            .expect("the request channel should stay open");
+        assert_eq!(request.session_id, "sess-1");
+        assert_eq!(request.request_id, "child-req-1");
+        assert_eq!(request.tool_name, "Bash");
+        assert_eq!(request.input["command"], "ls");
+        assert_eq!(request.reason, "needs approval");
+        assert!(request.allow_session);
+
+        decision_tx
+            .send(ChildPermissionDecision {
+                request_id: request.request_id.clone(),
+                allow: true,
+                allow_session: true,
+                message: "approved".into(),
+            })
+            .unwrap();
+
+        let output = tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("the child should exit once it has its answer")
+            .unwrap()
+            .unwrap();
+
+        assert!(
+            output.transcript.contains("\"type\":\"control_request\""),
+            "the request should remain in the transcript: {}",
+            output.transcript
+        );
+        let echoed = output
+            .transcript
+            .lines()
+            .find_map(|line| line.strip_prefix("ECHO:"))
+            .expect("the child should echo the response it read");
+        let response: Value = serde_json::from_str(echoed).unwrap();
+        assert_eq!(response["type"], "control_response");
+        assert_eq!(response["response"]["subtype"], "success");
+        assert_eq!(response["response"]["request_id"], "child-req-1");
+        assert_eq!(response["response"]["response"]["behavior"], "allow");
+        assert_eq!(response["response"]["response"]["allow_session"], true);
     }
 
     #[cfg(unix)]
@@ -1892,7 +2442,17 @@ mod tests {
         let stop = SessionStop::new();
         let task_stop = stop.clone();
         let handle = tokio::spawn(async move {
-            run_child_streaming(child, "s1", &session_dir, task_stop, Duration::from_secs(2)).await
+            run_child_streaming(
+                child,
+                "s1",
+                &session_dir,
+                None,
+                None,
+                None,
+                task_stop,
+                Duration::from_secs(2),
+            )
+            .await
         });
 
         // Give `sh` time to install the trap, then ask it to stop.
@@ -1934,6 +2494,9 @@ mod tests {
                 child,
                 "s1",
                 &session_dir,
+                None,
+                None,
+                None,
                 task_stop,
                 Duration::from_millis(200),
             )
@@ -2063,6 +2626,68 @@ mod tests {
             archive_base.join("s1/metadata.json").exists(),
             "a successful session should be archived"
         );
+
+        shutdown_tx.send(()).unwrap();
+        let result = tokio::time::timeout(Duration::from_secs(1), running)
+            .await
+            .expect("shutdown should stop the worker")
+            .unwrap();
+        assert!(result.is_ok());
+    }
+
+    /// Session output is not only written locally: each line reaches the
+    /// gateway as a `session_output` frame on the active transport.
+    #[tokio::test]
+    async fn session_output_is_forwarded_over_the_transport() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = worker_config(tmp.path());
+        let session_base = config.session_base.clone();
+
+        let control_plane = Arc::new(FakeControlPlane::default());
+        control_plane
+            .assignments
+            .lock()
+            .unwrap()
+            .push(sample_assignment(&session_base));
+        let runner = Arc::new(StreamingRunner {
+            lines: vec![("stdout", "hello from the child"), ("stderr", "a warning")],
+        });
+
+        let (bridge_transport, mut remote) =
+            InProcessTransport::create_pair("bridge-env".into(), "gateway".into());
+        remote.connect().await.unwrap();
+
+        let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+        let running = tokio::spawn(async move {
+            run_with_control_plane(
+                config,
+                Box::new(bridge_transport),
+                control_plane,
+                runner,
+                async move {
+                    let _ = shutdown_rx.await;
+                },
+            )
+            .await
+        });
+
+        let mut forwarded = Vec::new();
+        while forwarded.len() < 2 {
+            let frame = tokio::time::timeout(Duration::from_secs(2), remote.receive())
+                .await
+                .expect("the session output should reach the transport")
+                .unwrap();
+            if frame.r#type == "session_output" {
+                let payload: serde_json::Value = serde_json::from_str(&frame.payload).unwrap();
+                forwarded.push(payload);
+            }
+        }
+
+        assert_eq!(forwarded[0]["session_id"], "s1");
+        assert_eq!(forwarded[0]["stream"], "stdout");
+        assert_eq!(forwarded[0]["line"], "hello from the child");
+        assert_eq!(forwarded[1]["stream"], "stderr");
+        assert_eq!(forwarded[1]["line"], "a warning");
 
         shutdown_tx.send(()).unwrap();
         let result = tokio::time::timeout(Duration::from_secs(1), running)

@@ -39,6 +39,21 @@ pub struct RegisterResponse {
     pub env_id: String,
 }
 
+/// Where an SSH-spawned session should live.
+///
+/// Sent beside `spawn_mode: "ssh"`; the mode name alone cannot say which host
+/// to reach or where on it to work.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SshTarget {
+    /// Remote host (user@hostname).
+    pub host: String,
+    /// Remote working directory.
+    pub remote_path: String,
+    /// SSH private key path (optional, defaults to ssh-agent).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identity_file: Option<String>,
+}
+
 /// A pending work assignment.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AssignmentEntry {
@@ -50,8 +65,11 @@ pub struct AssignmentEntry {
     pub working_directory: String,
     /// Initial prompt.
     pub prompt: String,
-    /// Spawn mode string (single_session, same_dir, worktree).
+    /// Spawn mode string (single_session, same_dir, worktree, ssh).
     pub spawn_mode: String,
+    /// SSH target, present when `spawn_mode` is `"ssh"`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ssh: Option<SshTarget>,
     /// Target environment ID (None = unassigned).
     pub assigned_to: Option<String>,
     /// Whether this assignment has been claimed.
@@ -531,11 +549,39 @@ mod tests {
             working_directory: "/tmp".into(),
             prompt: "fix it".into(),
             spawn_mode: "single_session".into(),
+            ssh: None,
             assigned_to: None,
             claimed: false,
         });
         let assignments = state.get_available_assignments("env1");
         assert_eq!(assignments.len(), 1);
+    }
+
+    #[test]
+    fn an_ssh_assignment_carries_its_target_on_the_wire() {
+        let entry = AssignmentEntry {
+            assignment_id: "a1".into(),
+            session_id: "s1".into(),
+            working_directory: "/srv/work".into(),
+            prompt: "fix it".into(),
+            spawn_mode: "ssh".into(),
+            ssh: Some(SshTarget {
+                host: "deploy@remote.example".into(),
+                remote_path: "/srv/coderex".into(),
+                identity_file: Some("/home/deploy/.ssh/id_ed25519".into()),
+            }),
+            assigned_to: None,
+            claimed: false,
+        };
+
+        let json = serde_json::to_value(&entry).unwrap();
+        assert_eq!(json["spawn_mode"], "ssh");
+        assert_eq!(json["ssh"]["host"], "deploy@remote.example");
+        assert_eq!(json["ssh"]["remote_path"], "/srv/coderex");
+        assert_eq!(
+            json["ssh"]["identity_file"],
+            "/home/deploy/.ssh/id_ed25519"
+        );
     }
 
     #[test]
@@ -547,6 +593,7 @@ mod tests {
             working_directory: "/tmp".into(),
             prompt: "fix it".into(),
             spawn_mode: "single_session".into(),
+            ssh: None,
             assigned_to: None,
             claimed: false,
         });
@@ -566,6 +613,7 @@ mod tests {
             working_directory: "/tmp".into(),
             prompt: "fix".into(),
             spawn_mode: "single_session".into(),
+            ssh: None,
             assigned_to: None,
             claimed: false,
         });
@@ -575,6 +623,7 @@ mod tests {
             working_directory: "/tmp".into(),
             prompt: "fix2".into(),
             spawn_mode: "single_session".into(),
+            ssh: None,
             assigned_to: None,
             claimed: true, // already claimed
         });
@@ -622,6 +671,7 @@ mod tests {
             working_directory: "/tmp".into(),
             prompt: "fix".into(),
             spawn_mode: "single_session".into(),
+            ssh: None,
             assigned_to: None,
             claimed: false,
         });
@@ -639,6 +689,7 @@ mod tests {
             working_directory: "/tmp".into(),
             prompt: "fix".into(),
             spawn_mode: "single_session".into(),
+            ssh: None,
             assigned_to: None,
             claimed: true,
         });

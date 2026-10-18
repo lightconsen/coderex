@@ -12,7 +12,7 @@ use crate::heartbeat::{
     HeartbeatConfig, HeartbeatLoop, HeartbeatStatus, SequenceCursor, SessionRecoveryState,
     WsReconnector,
 };
-use crate::permission::{BridgePermissionRouter, PermissionResponse};
+use crate::permission::{BridgePermissionRouter, PendingPermission, PermissionResponse};
 use crate::poller::{
     BridgeWorkPoller, CapacityReport, ClaimOutcome, ControlPlaneClient, HttpControlPlaneClient,
     SpawnMode, WorkAssignment,
@@ -24,6 +24,14 @@ use crate::transport::{Transport, TransportMessage};
 
 /// Message type the gateway sends for a relayed tool call.
 pub const RELAY_CALL_TYPE: &str = "relay_call";
+/// Message type the bridge sends when a session needs a person's approval.
+pub const PERMISSION_REQUEST_TYPE: &str = "permission_request";
+/// Message type the gateway (or a client behind it) sends to answer one.
+pub const PERMISSION_RESPONSE_TYPE: &str = "permission_response";
+/// Message type the bridge answers a permission response with.
+pub const PERMISSION_RESULT_TYPE: &str = "permission_result";
+/// Message type carrying one line of a session's stdout or stderr.
+pub const SESSION_OUTPUT_TYPE: &str = "session_output";
 /// Message type the worker answers a relayed call with.
 pub const RELAY_RESULT_TYPE: &str = "relay_result";
 /// Message type a worker sends to report a session's state.
@@ -158,6 +166,18 @@ pub struct Bridge {
     heartbeat_loop: Option<HeartbeatLoop>,
     /// Reconnection logic for transport disconnects.
     reconnector: WsReconnector,
+    /// Whether a reconnect is owed to the transport.
+    ///
+    /// The launcher recreates `serve_transport`'s future whenever another
+    /// branch of its select wins (a poll tick, a finished session), so the
+    /// state that says "we were dropped and have not reconnected yet" has to
+    /// outlive one call.
+    reconnect_pending: bool,
+    /// When the current backoff wait ends. Kept across calls for the same
+    /// reason: a cancelled sleep must resume, not restart from the top.
+    reconnect_deadline: Option<tokio::time::Instant>,
+    /// Why the most recent reconnect attempt failed, for the terminal error.
+    reconnect_last_error: String,
     /// Work poller for receiving assignments.
     poller: BridgeWorkPoller,
     /// Session spawner for worktree/directory creation.
@@ -166,6 +186,23 @@ pub struct Bridge {
     permission_router: BridgePermissionRouter,
     /// Confirmations the person has given, for relayed calls to match against.
     relay_approvals: RelayApprovalGate,
+    /// Permission requests waiting to be sent to the gateway.
+    ///
+    /// `request_permission` can be called by any bridge-side producer; the
+    /// transport is owned by the serve loop, so the frames wait here until
+    /// [`Bridge::send_pending_permission_requests`] flushes them.
+    pending_permission_requests: Vec<TransportMessage>,
+    /// Caller-supplied request ids mapped to the router's internal ids.
+    ///
+    /// A child process generates its own request ids. The router generates
+    /// `perm_N`, so a request that arrives with an id already on the wire
+    /// keeps that id externally and resolves through this alias.
+    permission_aliases: std::collections::HashMap<String, String>,
+    /// Every caller-supplied id ever registered, including answered ones.
+    ///
+    /// A repeated id from the child is a protocol error, not a new question;
+    /// this is what makes that detectable after the alias is removed.
+    known_permission_ids: std::collections::HashSet<String>,
     /// Highest downstream sequence number that reached this worker.
     cursor: SequenceCursor,
     /// Per-session write fences, so a replaced worker cannot write back over
@@ -243,10 +280,16 @@ impl Bridge {
             transport: Some(transport),
             heartbeat_loop: Some(heartbeat_loop),
             reconnector,
+            reconnect_pending: false,
+            reconnect_deadline: None,
+            reconnect_last_error: String::new(),
             poller,
             spawner,
             permission_router: BridgePermissionRouter::new(),
             relay_approvals: RelayApprovalGate::new(),
+            pending_permission_requests: Vec::new(),
+            permission_aliases: std::collections::HashMap::new(),
+            known_permission_ids: std::collections::HashSet::new(),
             cursor: SequenceCursor::new(),
             write_fences: std::collections::HashMap::new(),
             worker_reports: std::collections::HashMap::new(),
@@ -345,13 +388,22 @@ impl Bridge {
         request_id: &str,
         response: PermissionResponse,
     ) -> bool {
-        let pending = self.permission_router.get_pending(request_id).cloned();
-        let resolved = self.permission_router.respond(request_id, response);
+        // A child-originated request reached the gateway under the child's
+        // own id; the router knows it under the id generated for it.
+        let router_id = self
+            .permission_aliases
+            .get(request_id)
+            .cloned()
+            .unwrap_or_else(|| request_id.to_string());
+        let pending = self.permission_router.get_pending(&router_id).cloned();
+        let resolved = self.permission_router.respond(&router_id, response);
         if resolved {
-            if let Some(resp) = self.permission_router.get_response(request_id) {
+            if let Some(resp) = self.permission_router.get_response(&router_id) {
                 let allowed = matches!(resp, PermissionResponse::Allow { .. });
                 if allowed {
                     if let Some(ref request) = pending {
+                        // Keyed by the id the person actually saw and the
+                        // relayed call will carry.
                         self.relay_approvals.confirm(
                             request_id,
                             ApprovedIntent::for_call(
@@ -367,6 +419,9 @@ impl Bridge {
                     allowed,
                 });
             }
+            // The alias stays: the response has to remain readable under the
+            // id the gateway knows, and `known_permission_ids` is what
+            // rejects a reused id.
         }
         resolved
     }
@@ -555,6 +610,31 @@ impl Bridge {
                     payload.to_string(),
                 ))
             }
+            // `approval` is accepted as an alias so a gateway that spells the
+            // answer that way still reaches the same router and gate.
+            PERMISSION_RESPONSE_TYPE | "approval" => {
+                let response: PermissionResponseFrame =
+                    match serde_json::from_str(&message.payload) {
+                        Ok(response) => response,
+                        Err(e) => {
+                            return Some(transport_error(
+                                &message,
+                                &format!("permission_response body: {e}"),
+                            ));
+                        }
+                    };
+                let (request_id, response) = response.into_response();
+                let resolved = self.respond_to_permission(&request_id, response);
+                Some(transport_reply(
+                    &message,
+                    PERMISSION_RESULT_TYPE,
+                    serde_json::json!({
+                        "request_id": request_id,
+                        "resolved": resolved,
+                    })
+                    .to_string(),
+                ))
+            }
             "heartbeat" => {
                 if let Some(heartbeat) = self.heartbeat_loop.as_ref().map(|h| h.heartbeat()) {
                     if let Ok(mut beat) = heartbeat.lock() {
@@ -574,12 +654,23 @@ impl Bridge {
     ///
     /// This is the loop the relay endpoint lives on: every frame is sequenced,
     /// a `stream_end` makes the worker come back asking to resume rather than
-    /// reconnecting blind, and everything else is routed by type.
+    /// reconnecting blind, and everything else is routed by type. A dropped
+    /// socket is retried with bounded backoff and the same resume cursor; once
+    /// the attempts are exhausted the loop returns an error, which the launcher
+    /// treats as terminal.
     pub async fn serve_transport(&mut self) -> Result<(), String> {
         self.running = true;
         let stop_requested = Arc::clone(&self.stop_requested);
         let stop_notify = Arc::clone(&self.stop_notify);
         while self.running && !stop_requested.load(Ordering::SeqCst) {
+            // This future is recreated whenever the launcher's select picks
+            // another branch, so a reconnect that was interrupted mid-backoff
+            // is resumed here instead of being lost.
+            if self.reconnect_pending {
+                self.reconnect_with_resume().await?;
+                continue;
+            }
+
             let shutdown = stop_notify.notified();
             let received = {
                 let transport = self.transport.as_mut().ok_or("no transport configured")?;
@@ -593,14 +684,22 @@ impl Bridge {
             };
             let message = match received {
                 Ok(message) => message,
-                // The stream ended; a gateway that wants the worker back says
-                // so with `stream_end` instead.
-                Err(_) => break,
+                // A dropped socket is not the end of the worker: reconnect
+                // with the resume cursor, exactly as a `stream_end` does.
+                // When the bounded attempts run out, surface it as terminal.
+                Err(err) => {
+                    if stop_requested.load(Ordering::SeqCst) {
+                        break;
+                    }
+                    tracing::warn!(error = %err, "bridge transport dropped; reconnecting");
+                    self.reconnect_pending = true;
+                    continue;
+                }
             };
             self.note_sequence(&message);
 
             if message.r#type == STREAM_END_TYPE {
-                self.reconnect_with_resume().await?;
+                self.reconnect_pending = true;
                 continue;
             }
 
@@ -617,23 +716,72 @@ impl Bridge {
 
     /// Reconnect after the downstream ended, and ask to resume the stream from
     /// the last sequence number that reached this worker.
+    ///
+    /// Retries with the reconnector's bounded exponential backoff. `Err` means
+    /// the attempts are exhausted (or no transport is configured), which the
+    /// serve loop treats as terminal. A shutdown requested while waiting for a
+    /// delay stops the retry loop without error so the serve loop can exit
+    /// promptly.
     pub async fn reconnect_with_resume(&mut self) -> Result<(), String> {
-        self.emit(BridgeEvent::TransportReconnecting {
-            attempt: self.reconnector.attempt_count() + 1,
-        });
+        self.reconnect_pending = true;
 
-        if let Some(delay) = self.reconnector.next_delay() {
-            tokio::time::sleep(delay).await;
+        loop {
+            // Pick the deadline once and keep it in the bridge: this future is
+            // cancelled whenever the launcher's select takes another branch,
+            // and restarting the backoff from zero would let a steady tick or
+            // output stream postpone reconnection indefinitely.
+            let deadline = match self.reconnect_deadline {
+                Some(deadline) => deadline,
+                None => {
+                    let Some(delay) = self.reconnector.next_delay() else {
+                        self.reconnect_pending = false;
+                        return Err(format!(
+                            "transport reconnect exhausted after {} attempts: {}",
+                            self.reconnector.attempt_count(),
+                            self.reconnect_last_error,
+                        ));
+                    };
+
+                    self.emit(BridgeEvent::TransportReconnecting {
+                        attempt: self.reconnector.attempt_count(),
+                    });
+
+                    let deadline = tokio::time::Instant::now() + delay;
+                    self.reconnect_deadline = Some(deadline);
+                    deadline
+                }
+            };
+
+            let stop_notify = Arc::clone(&self.stop_notify);
+            tokio::select! {
+                () = tokio::time::sleep_until(deadline) => {}
+                () = stop_notify.notified() => {
+                    if self.stop_requested.load(Ordering::SeqCst) {
+                        self.reconnect_pending = false;
+                        self.reconnect_deadline = None;
+                        return Ok(());
+                    }
+                }
+            }
+
+            // The wait is over; this attempt is spent even if it fails.
+            self.reconnect_deadline = None;
+
+            let resume = self.resume_request();
+            let transport = self.transport.as_mut().ok_or("no transport configured")?;
+            match transport.connect().await {
+                Ok(()) => match transport.send(resume).await {
+                    Ok(()) => {
+                        self.reconnector.reset();
+                        self.reconnect_pending = false;
+                        self.emit(BridgeEvent::TransportReconnected);
+                        return Ok(());
+                    }
+                    Err(err) => self.reconnect_last_error = format!("resume send failed: {err}"),
+                },
+                Err(err) => self.reconnect_last_error = format!("reconnect failed: {err}"),
+            }
         }
-
-        let resume = self.resume_request();
-        let transport = self.transport.as_mut().ok_or("no transport configured")?;
-        transport.connect().await.map_err(|e| e.to_string())?;
-        transport.send(resume).await.map_err(|e| e.to_string())?;
-
-        self.reconnector.reset();
-        self.emit(BridgeEvent::TransportReconnected);
-        Ok(())
     }
 
     /// Get the heartbeat status.
@@ -846,31 +994,29 @@ impl Bridge {
         self.poller.session_completed();
     }
 
-    /// ─── Internal: Handle transport disconnect with reconnection ───
-    #[allow(dead_code)]
-    async fn handle_transport_disconnect(&mut self) {
-        let attempt = self.reconnector.attempt_count() + 1;
-        self.emit(BridgeEvent::TransportReconnecting { attempt });
-
-        if let Some(delay) = self.reconnector.next_delay() {
-            tokio::time::sleep(delay).await;
-            // Attempt reconnect
-            if let Some(transport) = self.transport.as_mut() {
-                let _ = transport.connect().await;
-                self.reconnector.reset();
-                self.emit(BridgeEvent::TransportReconnected);
-            }
-        }
-    }
-
     /// ─── Internal: Request permission for a tool call ───
 
+    /// Create a pending permission request and queue the frame that tells the
+    /// gateway about it.
+    ///
+    /// Producer gap: nothing on the production path calls this yet. The child
+    /// is started headless with `stream-json` output, and that protocol has no
+    /// permission-request frame, so `read_stdout` in `bridge_launcher` cannot
+    /// turn one into a request. When the child protocol grows such a frame,
+    /// parsing it there and calling this method is the missing half; the
+    /// response half (an inbound `permission_response` reaching the router and
+    /// the relay gate) is implemented here.
     pub fn request_permission(&mut self, session_id: &str, tool: &str, args: &str) -> String {
         let request_id = self.permission_router.create_request(
             session_id.to_string(),
             tool.to_string(),
             args.to_string(),
         );
+        self.known_permission_ids.insert(request_id.clone());
+        if let Some(request) = self.permission_router.get_pending(&request_id) {
+            self.pending_permission_requests
+                .push(permission_request_frame(request));
+        }
         self.emit(BridgeEvent::PermissionRequested {
             request_id: request_id.clone(),
             session_id: session_id.to_string(),
@@ -879,10 +1025,104 @@ impl Bridge {
         request_id
     }
 
+    /// Register a permission request under an id chosen by its producer.
+    ///
+    /// The headless child generates request ids of its own. They are what the
+    /// child and the gateway see, so the request goes on the wire under that
+    /// id; the router entry is created separately and linked through
+    /// `permission_aliases` for resolution.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when `request_id` was already used. A repeated id is a
+    /// producer bug: silently replacing the pending entry would strand the
+    /// person answering the first question and could resolve the wrong tool
+    /// call.
+    pub fn request_permission_with_id(
+        &mut self,
+        request_id: &str,
+        session_id: &str,
+        tool: &str,
+        args: &str,
+    ) -> Result<String, String> {
+        if self.known_permission_ids.contains(request_id) {
+            return Err(format!(
+                "permission request id '{request_id}' is already known"
+            ));
+        }
+
+        let router_id = self.permission_router.create_request(
+            session_id.to_string(),
+            tool.to_string(),
+            args.to_string(),
+        );
+        if let Some(request) = self.permission_router.get_pending(&router_id) {
+            self.pending_permission_requests
+                .push(permission_request_frame_with_id(request_id, request));
+        }
+        self.permission_aliases
+            .insert(request_id.to_string(), router_id);
+        self.known_permission_ids.insert(request_id.to_string());
+        self.emit(BridgeEvent::PermissionRequested {
+            request_id: request_id.to_string(),
+            session_id: session_id.to_string(),
+            tool: tool.to_string(),
+        });
+        Ok(request_id.to_string())
+    }
+
+    /// Take the permission requests waiting to go out over the transport.
+    #[must_use]
+    pub fn take_pending_permission_requests(&mut self) -> Vec<TransportMessage> {
+        std::mem::take(&mut self.pending_permission_requests)
+    }
+
+    /// Send the queued `permission_request` frames over the active transport.
+    ///
+    /// The serve loop owns the transport, so the launcher (or any other owner
+    /// of `&mut Bridge`) calls this when it next has control.
+    pub async fn send_pending_permission_requests(&mut self) -> Result<(), String> {
+        // Send head-first and only drop a frame once the transport took it:
+        // a failed send leaves the request queued for the next attempt
+        // instead of losing the person's chance to answer it.
+        while let Some(frame) = self.pending_permission_requests.first().cloned() {
+            let transport = self.transport.as_mut().ok_or("no transport configured")?;
+            transport.send(frame).await.map_err(|e| e.to_string())?;
+            self.pending_permission_requests.remove(0);
+        }
+        Ok(())
+    }
+
+    /// Forward one line of a session's output over the transport.
+    pub async fn forward_session_output(
+        &mut self,
+        session_id: &str,
+        stream: &str,
+        line: &str,
+    ) -> Result<(), String> {
+        let transport = self.transport.as_mut().ok_or("no transport configured")?;
+        let frame = TransportMessage {
+            r#type: SESSION_OUTPUT_TYPE.to_string(),
+            correlation_id: None,
+            payload: serde_json::json!({
+                "session_id": session_id,
+                "stream": stream,
+                "line": line,
+            })
+            .to_string(),
+            metadata: std::collections::HashMap::new(),
+        };
+        transport.send(frame).await.map_err(|e| e.to_string())
+    }
+
     /// ─── Internal: Check if a permission has been resolved ───
 
     #[must_use]
     pub fn is_permission_resolved(&self, request_id: &str) -> bool {
+        let request_id = self
+            .permission_aliases
+            .get(request_id)
+            .map_or(request_id, String::as_str);
         self.permission_router.is_resolved(request_id)
     }
 
@@ -890,6 +1130,10 @@ impl Bridge {
 
     #[must_use]
     pub fn get_permission_response(&self, request_id: &str) -> Option<&PermissionResponse> {
+        let request_id = self
+            .permission_aliases
+            .get(request_id)
+            .map_or(request_id, String::as_str);
         self.permission_router.get_response(request_id)
     }
 
@@ -926,6 +1170,68 @@ impl Bridge {
             state.record_sequence(seq);
         }
         state
+    }
+}
+
+/// Build the frame that asks the gateway to show a pending permission.
+fn permission_request_frame(request: &PendingPermission) -> TransportMessage {
+    permission_request_frame_with_id(&request.id, request)
+}
+
+/// Build the frame under an explicit wire id.
+fn permission_request_frame_with_id(
+    request_id: &str,
+    request: &PendingPermission,
+) -> TransportMessage {
+    TransportMessage {
+        r#type: PERMISSION_REQUEST_TYPE.to_string(),
+        correlation_id: Some(request_id.to_string()),
+        payload: serde_json::json!({
+            "request_id": request_id,
+            "session_id": request.session_id,
+            "tool": request.tool,
+            "args": request.args,
+        })
+        .to_string(),
+        metadata: std::collections::HashMap::new(),
+    }
+}
+
+/// A `permission_response` frame.
+///
+/// Two spellings are accepted so a gateway can answer with the router's own
+/// `PermissionResponse` shape (`{"response": {...}}`) or the simpler
+/// `{"allowed": true, "always": false}`. `allowed` wins when both are present.
+#[derive(Debug, Deserialize)]
+struct PermissionResponseFrame {
+    request_id: String,
+    #[serde(default)]
+    allowed: Option<bool>,
+    #[serde(default)]
+    always: bool,
+    #[serde(default)]
+    response: Option<PermissionResponse>,
+}
+
+impl PermissionResponseFrame {
+    /// The request this answers and the decision to feed the router.
+    fn into_response(self) -> (String, PermissionResponse) {
+        let response = match (self.allowed, self.response) {
+            (Some(allowed), _) => {
+                if allowed {
+                    PermissionResponse::Allow {
+                        always: self.always,
+                    }
+                } else {
+                    PermissionResponse::Deny
+                }
+            }
+            (None, Some(response)) => response,
+            // An answer that says neither allow nor deny is a denial: silence
+            // must not become consent.
+            (None, None) => PermissionResponse::Deny,
+        };
+        (self.request_id, response)
     }
 }
 
@@ -995,6 +1301,55 @@ mod tests {
             crate::relay::APPROVED_INTENT_HEADER => Some(encoded.clone()),
             _ => None,
         }
+    }
+
+    #[test]
+    fn request_permission_with_id_keeps_the_callers_id_and_queues_one_frame() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut bridge = test_bridge(tmp.path());
+
+        let id = bridge
+            .request_permission_with_id("child-req-7", "sess_1", "Bash", r#"{"command":"ls"}"#)
+            .unwrap();
+        assert_eq!(id, "child-req-7");
+
+        // Exactly one frame, carrying the child's id rather than the router's.
+        let frames = bridge.take_pending_permission_requests();
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].r#type, PERMISSION_REQUEST_TYPE);
+        assert_eq!(frames[0].correlation_id.as_deref(), Some("child-req-7"));
+        let payload: serde_json::Value = serde_json::from_str(&frames[0].payload).unwrap();
+        assert_eq!(payload["request_id"], "child-req-7");
+        assert_eq!(payload["session_id"], "sess_1");
+        assert_eq!(payload["tool"], "Bash");
+
+        // The answer arrives under the same id and reaches the router.
+        assert!(bridge.respond_to_permission(
+            "child-req-7",
+            PermissionResponse::Allow { always: false }
+        ));
+        assert!(matches!(
+            bridge.get_permission_response("child-req-7"),
+            Some(PermissionResponse::Allow { always: false })
+        ));
+    }
+
+    #[test]
+    fn a_repeated_child_request_id_is_rejected_without_queueing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut bridge = test_bridge(tmp.path());
+
+        bridge
+            .request_permission_with_id("child-req-7", "sess_1", "Bash", "ls")
+            .unwrap();
+        let _ = bridge.take_pending_permission_requests();
+
+        assert!(
+            bridge
+                .request_permission_with_id("child-req-7", "sess_1", "Bash", "ls")
+                .is_err()
+        );
+        assert!(bridge.take_pending_permission_requests().is_empty());
     }
 
     #[test]
@@ -1358,5 +1713,249 @@ mod tests {
 
         let single = bridge.create_recovery_state("s1");
         assert!(single.is_some());
+    }
+
+    #[tokio::test]
+    async fn a_permission_response_frame_resolves_the_pending_request() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (bridge_transport, mut gateway) =
+            InProcessTransport::create_pair("bridge".into(), "gateway".into());
+        gateway.connect().await.unwrap();
+        let mut bridge = Bridge::new(test_config(tmp.path()), Box::new(bridge_transport));
+        bridge.connect().await.unwrap();
+
+        let request_id = bridge.request_permission("sess_1", "Bash", r#"{"command":"ls"}"#);
+
+        // The request reaches the gateway, carrying what the person must see.
+        bridge.send_pending_permission_requests().await.unwrap();
+        let request = gateway.receive().await.unwrap();
+        assert_eq!(request.r#type, PERMISSION_REQUEST_TYPE);
+        assert_eq!(request.correlation_id.as_deref(), Some(request_id.as_str()));
+        let payload: serde_json::Value = serde_json::from_str(&request.payload).unwrap();
+        assert_eq!(payload["request_id"], request_id);
+        assert_eq!(payload["session_id"], "sess_1");
+        assert_eq!(payload["tool"], "Bash");
+
+        // The answer resolves the router, and an approval populates the gate
+        // the relay endpoint checks.
+        let reply = bridge
+            .handle_transport_message(TransportMessage {
+                r#type: PERMISSION_RESPONSE_TYPE.into(),
+                correlation_id: Some(request_id.clone()),
+                payload: serde_json::json!({
+                    "request_id": request_id,
+                    "allowed": true,
+                    "always": false,
+                })
+                .to_string(),
+                metadata: std::collections::HashMap::new(),
+            })
+            .unwrap();
+        assert_eq!(reply.r#type, PERMISSION_RESULT_TYPE);
+        let payload: serde_json::Value = serde_json::from_str(&reply.payload).unwrap();
+        assert_eq!(payload["resolved"], true);
+        assert!(bridge.is_permission_resolved(&request_id));
+        assert_eq!(bridge.outstanding_relay_approvals(), 1);
+    }
+
+    #[tokio::test]
+    async fn an_unknown_permission_response_resolves_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut bridge = test_bridge(tmp.path());
+
+        let reply = bridge
+            .handle_transport_message(TransportMessage {
+                r#type: "approval".into(),
+                correlation_id: None,
+                payload: serde_json::json!({
+                    "request_id": "perm_missing",
+                    "allowed": false,
+                })
+                .to_string(),
+                metadata: std::collections::HashMap::new(),
+            })
+            .unwrap();
+        let payload: serde_json::Value = serde_json::from_str(&reply.payload).unwrap();
+        assert_eq!(payload["resolved"], false);
+        assert_eq!(bridge.outstanding_relay_approvals(), 0);
+    }
+
+    /// A socket that drops is retried, and the resume frame carries the point
+    /// the downstream stream reached.
+    #[tokio::test]
+    async fn a_dropped_transport_reconnects_with_the_resume_cursor() {
+        let state = Arc::new(std::sync::Mutex::new(ScriptedState {
+            connects: 0,
+            fail_connect: false,
+            sent: Vec::new(),
+            script: std::collections::VecDeque::from([
+                Ok(TransportMessage {
+                    r#type: "heartbeat".into(),
+                    correlation_id: Some("h7".into()),
+                    payload: "{}".into(),
+                    metadata: std::collections::HashMap::from([(
+                        SEQUENCE_NUM_KEY.to_string(),
+                        "7".to_string(),
+                    )]),
+                }),
+                Err(crate::transport::TransportError::ConnectionLost(
+                    "socket dropped".into(),
+                )),
+            ]),
+        }));
+
+        let tmp = tempfile::tempdir().unwrap();
+        let mut bridge = Bridge::new(
+            test_config(tmp.path()),
+            Box::new(ScriptedTransport::new("scripted", Arc::clone(&state))),
+        );
+        bridge.reconnector = WsReconnector::new(3);
+        bridge.reconnector.base_delay_ms = 0;
+        bridge.connect().await.unwrap();
+
+        let stop = bridge.stop_handle();
+        let serving = tokio::spawn(async move { bridge.serve_transport().await });
+
+        let resume = wait_for_sent(&state, RESUME_TYPE).await;
+        let payload: serde_json::Value = serde_json::from_str(&resume.payload).unwrap();
+        assert_eq!(payload["from_sequence_num"], 8);
+        assert_eq!(
+            resume.metadata.get(LAST_EVENT_ID_KEY).map(String::as_str),
+            Some("7")
+        );
+
+        // A clean stop after reconnecting ends the loop rather than retrying.
+        stop.stop();
+        let result = tokio::time::timeout(std::time::Duration::from_secs(1), serving)
+            .await
+            .expect("the serve loop should stop")
+            .unwrap();
+        assert!(result.is_ok(), "{result:?}");
+    }
+
+    /// Exhausted reconnect attempts are terminal: the serve loop returns an
+    /// error instead of spinning on a dead socket.
+    #[tokio::test]
+    async fn exhausted_reconnects_are_terminal() {
+        let state = Arc::new(std::sync::Mutex::new(ScriptedState {
+            connects: 0,
+            fail_connect: true,
+            sent: Vec::new(),
+            script: std::collections::VecDeque::from([Err(
+                crate::transport::TransportError::ConnectionLost("socket dropped".into()),
+            )]),
+        }));
+
+        let tmp = tempfile::tempdir().unwrap();
+        let mut bridge = Bridge::new(
+            test_config(tmp.path()),
+            Box::new(ScriptedTransport::new("scripted", Arc::clone(&state))),
+        );
+        bridge.reconnector = WsReconnector::new(2);
+        bridge.reconnector.base_delay_ms = 0;
+
+        let error = bridge.serve_transport().await.unwrap_err();
+        assert!(error.contains("exhausted"), "{error}");
+        assert_eq!(
+            state.lock().unwrap().connects,
+            2,
+            "the initial connect is skipped; exactly the bounded attempts run"
+        );
+    }
+
+    /// Wait until a frame of `kind` was sent by the bridge.
+    async fn wait_for_sent(
+        state: &Arc<std::sync::Mutex<ScriptedState>>,
+        kind: &str,
+    ) -> TransportMessage {
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if let Some(frame) = state
+                    .lock()
+                    .unwrap()
+                    .sent
+                    .iter()
+                    .find(|frame| frame.r#type == kind)
+                {
+                    return frame.clone();
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("the bridge never sent a {kind} frame"))
+    }
+
+    #[derive(Debug)]
+    struct ScriptedState {
+        connects: usize,
+        fail_connect: bool,
+        sent: Vec<TransportMessage>,
+        script: std::collections::VecDeque<
+            Result<TransportMessage, crate::transport::TransportError>,
+        >,
+    }
+
+    /// A transport whose receive results are scripted, so a dropped socket can
+    /// be exercised without a network.
+    #[derive(Debug)]
+    struct ScriptedTransport {
+        id: String,
+        state: Arc<std::sync::Mutex<ScriptedState>>,
+    }
+
+    impl ScriptedTransport {
+        fn new(id: &str, state: Arc<std::sync::Mutex<ScriptedState>>) -> Self {
+            Self {
+                id: id.to_string(),
+                state,
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Transport for ScriptedTransport {
+        async fn connect(&mut self) -> Result<(), crate::transport::TransportError> {
+            let mut state = self.state.lock().unwrap();
+            state.connects += 1;
+            if state.fail_connect {
+                Err(crate::transport::TransportError::ConnectionLost(
+                    "refused by test".into(),
+                ))
+            } else {
+                Ok(())
+            }
+        }
+
+        async fn disconnect(&mut self) -> Result<(), crate::transport::TransportError> {
+            Ok(())
+        }
+
+        fn is_connected(&self) -> bool {
+            true
+        }
+
+        async fn send(
+            &mut self,
+            message: TransportMessage,
+        ) -> Result<(), crate::transport::TransportError> {
+            self.state.lock().unwrap().sent.push(message);
+            Ok(())
+        }
+
+        async fn receive(
+            &mut self,
+        ) -> Result<TransportMessage, crate::transport::TransportError> {
+            // Drop the guard before awaiting: the worker's future must be Send.
+            let next = self.state.lock().unwrap().script.pop_front();
+            match next {
+                Some(result) => result,
+                None => std::future::pending().await,
+            }
+        }
+
+        fn connection_id(&self) -> &str {
+            &self.id
+        }
     }
 }
