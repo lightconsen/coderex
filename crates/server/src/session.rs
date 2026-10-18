@@ -289,6 +289,15 @@ struct Shared {
     next_session_id: u64,
 }
 
+/// The numeric part of a `sess_N` id, if it has one.
+///
+/// Restored rows are the only ids the process did not generate itself; a row
+/// with a spelling this build does not recognise is skipped rather than
+/// guessed at.
+fn session_id_number(id: &str) -> Option<u64> {
+    id.strip_prefix("sess_")?.parse().ok()
+}
+
 impl Shared {
     /// Open a session for a token that is allowed to have one.
     fn authenticate(
@@ -846,7 +855,7 @@ impl DaemonServer {
     /// Create a new daemon server with the given config.
     #[must_use]
     pub fn with_config(config: ServerConfig) -> Self {
-        let mut server = Self {
+        let server = Self {
             config: config.clone(),
             shared: Arc::new(parking_lot::Mutex::new(Shared::default())),
             session_count_atomic: Arc::new(AtomicUsize::new(0)),
@@ -864,6 +873,15 @@ impl DaemonServer {
                         let session = crate::persistence::restore_session(ps);
                         shared.sessions.insert(session.id.clone(), session);
                     }
+                    // The counter starts at zero in a fresh process, but the
+                    // ids it would hand out may already belong to restored
+                    // sessions — the first new auth would overwrite `sess_1`.
+                    // Resume past the highest id that came back.
+                    shared.next_session_id = restored
+                        .iter()
+                        .filter_map(|ps| session_id_number(&ps.id))
+                        .max()
+                        .unwrap_or(0);
                     if !restored.is_empty() {
                         info!("Restored {} sessions from database", restored.len());
                     }
@@ -1159,6 +1177,56 @@ mod tests {
             server.get_session(&second).is_some(),
             "the live session must not be overwritten"
         );
+    }
+
+    /// Restored rows already own their ids, so the first new auth must continue
+    /// past them instead of handing out `sess_1` again and overwriting one.
+    #[test]
+    fn restored_sessions_advance_the_session_id_counter() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "coderex_session_restore_{}_{nanos}.db",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+
+        {
+            let mut store = crate::persistence::SessionStore::open(&path).unwrap();
+            for id in ["sess_1", "sess_9"] {
+                store
+                    .save(&crate::persistence::PersistedSession {
+                        id: id.to_string(),
+                        token_fingerprint: "fingerprint".into(),
+                        created_at: "2026-01-01T00:00:00Z".into(),
+                        last_activity: "2026-01-01T00:00:00Z".into(),
+                    })
+                    .unwrap();
+            }
+        }
+
+        let mut server = DaemonServer::with_config(ServerConfig {
+            valid_keys: vec!["key1".to_string()],
+            allow_anonymous: false,
+            idle_timeout: Duration::from_secs(3600),
+            max_sessions: 10,
+            rate_limit_per_minute: 100,
+            health_port: None,
+            persist_path: Some(path.clone()),
+        });
+
+        assert!(server.get_session("sess_9").is_some(), "rows were restored");
+
+        let id = server.authenticate("key1").unwrap();
+        assert_eq!(id, "sess_10", "the counter must resume past restored ids");
+        assert!(
+            server.get_session("sess_1").is_some(),
+            "the restored session must not be overwritten"
+        );
+
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]
