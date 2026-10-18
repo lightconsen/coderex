@@ -147,7 +147,7 @@ pub async fn run_tool_calls(
                     },
                 ));
             }
-            PermissionResult::Ask { reason } | PermissionResult::AskForSession { reason } => {
+            PermissionResult::Ask { reason } => {
                 let _ = event_tx.send(EngineEvent::PermissionRequest {
                     id: call.id.clone(),
                     tool: call.name.clone(),

@@ -224,8 +224,8 @@ impl PermissionEngine {
 
     /// Set the confirmation bus for async permission requests.
     ///
-    /// When a bus is configured, `evaluate()` will send `Ask`/`AskForSession`
-    /// results through the bus and await the user response before returning.
+    /// When a bus is configured, `evaluate()` will send `Ask` results through
+    /// the bus and await the user response before returning.
     pub fn set_confirmation_bus(&mut self, bus: ConfirmationBus) {
         self.confirmation_bus = Some(bus);
     }
@@ -254,8 +254,8 @@ impl PermissionEngine {
     ///
     /// 1. Run hooks (first hook returning `Some` short-circuits)
     /// 2. Fall back to the permission checker
-    /// 3. If result is `Ask`/`AskForSession` and a [`ConfirmationBus`] is
-    ///    configured, send the request through the bus and await the response.
+    /// 3. If result is `Ask` and a [`ConfirmationBus`] is configured, send the
+    ///    request through the bus and await the response.
     pub async fn evaluate(
         &mut self,
         tool_name: &str,
@@ -294,8 +294,8 @@ impl PermissionEngine {
         // are resolved once and reused below: the same answer decides whether a
         // whole-tool allow rule is honoured and whether the session-wide
         // approval is offered or written.
-        let arguments: serde_json::Value = serde_json::from_str(&request.arguments)
-            .unwrap_or(serde_json::Value::Null);
+        let arguments: serde_json::Value =
+            serde_json::from_str(&request.arguments).unwrap_or(serde_json::Value::Null);
         let exemptions = self.exemptions_for(tool_name, &arguments);
         let result = {
             let checker = self.checker.lock().unwrap();
@@ -317,13 +317,6 @@ impl PermissionEngine {
                     .map_or(reason, crate::shell_security::BashAst::summary);
                 PermissionResult::Ask { reason }
             }
-            PermissionResult::AskForSession { reason } => {
-                let reason = shell_analysis
-                    .as_ref()
-                    .filter(|ast| ast.needs_warning())
-                    .map_or(reason, crate::shell_security::BashAst::summary);
-                PermissionResult::AskForSession { reason }
-            }
             other => other,
         };
 
@@ -336,13 +329,10 @@ impl PermissionEngine {
         // `PermissionResult::Elevated`, and without it the elevation flow
         // downstream is unreachable.
         let result = match result {
-            PermissionResult::Ask { .. } | PermissionResult::AskForSession { .. } => {
-                privilege_escalation_in(tool_name, &request.arguments).map_or(result, |program| {
-                    PermissionResult::Elevated {
-                        reason: format!("{program} runs the command as another user"),
-                    }
-                })
-            }
+            PermissionResult::Ask { .. } => privilege_escalation_in(tool_name, &request.arguments)
+                .map_or(result, |program| PermissionResult::Elevated {
+                    reason: format!("{program} runs the command as another user"),
+                }),
             other => other,
         };
 
@@ -352,8 +342,7 @@ impl PermissionEngine {
         // one-shot approval only.
         let suppresses_always_allow = exemptions.suppresses_always_allow_rule;
         let result = match result {
-            PermissionResult::Ask { ref reason }
-            | PermissionResult::AskForSession { ref reason } => {
+            PermissionResult::Ask { ref reason } => {
                 if let Some(ref bus) = self.confirmation_bus {
                     let confirmation_req = ConfirmationRequest {
                         id: id.clone(),
@@ -361,12 +350,7 @@ impl PermissionEngine {
                         arguments: request.arguments.clone(),
                         path: request.path.clone(),
                         reason: reason.clone(),
-                        allow_session: !suppresses_always_allow
-                            && matches!(
-                                result,
-                                PermissionResult::Ask { .. }
-                                    | PermissionResult::AskForSession { .. }
-                            ),
+                        allow_session: !suppresses_always_allow,
                         context: request.context.clone(),
                     };
 
@@ -437,7 +421,10 @@ impl PermissionEngine {
                     )
                 });
             if let Some((tool, arguments)) = found {
-                if !self.exemptions_for(&tool, &arguments).suppresses_always_allow_rule {
+                if !self
+                    .exemptions_for(&tool, &arguments)
+                    .suppresses_always_allow_rule
+                {
                     let mut checker = self.checker.lock().unwrap();
                     checker.record_session_approval(tool, true);
                 }
@@ -1123,7 +1110,10 @@ mod tests {
             panic!("an unanswered ask closes the operation");
         };
         assert!(reason.contains("closed"), "{reason}");
-        assert!(!reason.contains("by user"), "a person was not asked: {reason}");
+        assert!(
+            !reason.contains("by user"),
+            "a person was not asked: {reason}"
+        );
     }
 
     #[tokio::test]
@@ -1317,7 +1307,10 @@ mod tests {
             ConfirmationResponse::Approved,
         )
         .await;
-        assert!(offered, "an ordinary call must still offer the session option");
+        assert!(
+            offered,
+            "an ordinary call must still offer the session option"
+        );
 
         let (offered, _verdict, _written) = one_bus_call(
             "write",

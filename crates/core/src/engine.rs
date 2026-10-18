@@ -13,7 +13,7 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio::time::Instant;
 
-use crate::api_client::{ApiClient, ApiResponse, RequestContext, StreamEvent};
+use crate::api_client::{ApiClient, ApiError, ApiResponse, RequestContext, StreamEvent};
 use crate::budget::TokenBudget;
 use crate::compact::{self, CompactResult, CompactStrategy};
 use crate::confirmation_bus::{ConfirmationBus, ConfirmationRequest, ConfirmationResponse};
@@ -1266,6 +1266,11 @@ pub struct QueryEngine {
     api_client: Box<dyn ApiClient>,
     /// Model to use for API requests.
     model: ModelId,
+    /// Model to retry with, once, when the primary is unavailable.
+    ///
+    /// After a successful fallback retry the engine keeps using this model for
+    /// the rest of the turn and session.
+    fallback_model: Option<ModelId>,
     /// Session state for the current conversation.
     session: SessionState,
     /// Cost tracker for billing.
@@ -1337,6 +1342,49 @@ pub struct DeniedToolCall {
     pub reason: String,
 }
 
+/// Error markers that identify the requested model itself as unavailable.
+///
+/// Deliberately narrow: a transport or authentication failure would fail the
+/// same way on another model, so it must not trigger a fallback.
+const MODEL_UNAVAILABLE_MARKERS: [&str; 9] = [
+    "model_not_found",
+    "not_found_error",
+    "model not found",
+    "unknown model",
+    "invalid model",
+    "model_not_available",
+    "model is not available",
+    "unsupported model",
+    "overloaded_error",
+];
+
+/// Whether an error message says the requested model is unavailable.
+#[must_use]
+pub fn is_model_unavailable_message(message: &str) -> bool {
+    let message = message.to_ascii_lowercase();
+    MODEL_UNAVAILABLE_MARKERS
+        .iter()
+        .any(|marker| message.contains(marker))
+}
+
+/// Choose the fallback model for a retry, if `error_message` indicates the
+/// primary model itself is unavailable.
+///
+/// The caller retries at most once: after switching, the primary and fallback
+/// are the same model, so this returns `None` for the next failure.
+#[must_use]
+pub fn fallback_after_model_error(
+    primary: &ModelId,
+    fallback: Option<&ModelId>,
+    error_message: &str,
+) -> Option<ModelId> {
+    let fallback = fallback?;
+    if fallback.0 == primary.0 {
+        return None;
+    }
+    is_model_unavailable_message(error_message).then(|| fallback.clone())
+}
+
 impl QueryEngine {
     fn persist_assistant_tool_calls(&mut self, turn: &mut TurnRuntime, tool_calls: &[ToolCall]) {
         for tool_call in tool_calls {
@@ -1400,6 +1448,7 @@ impl QueryEngine {
         Self {
             api_client,
             model,
+            fallback_model: None,
             session,
             cost_tracker: CostTracker::new(),
             interrupt: InterruptHandle::default(),
@@ -1451,6 +1500,66 @@ impl QueryEngine {
     #[must_use]
     pub fn model(&self) -> &ModelId {
         &self.model
+    }
+
+    /// Configure the one-retry fallback model (`--fallback-model`).
+    ///
+    /// The engine retries the same request with this model when the primary
+    /// model is unavailable, and then continues the turn and session on it.
+    pub fn set_fallback_model(&mut self, fallback: Option<ModelId>) {
+        self.fallback_model = fallback;
+    }
+
+    /// The configured fallback model, if any.
+    #[must_use]
+    pub fn fallback_model(&self) -> Option<&ModelId> {
+        self.fallback_model.as_ref()
+    }
+
+    /// The model to retry with for this failure, if the primary is unavailable.
+    fn fallback_for_api_error(&self, error: &ApiError) -> Option<ModelId> {
+        fallback_after_model_error(
+            &self.model,
+            self.fallback_model.as_ref(),
+            &error.to_string(),
+        )
+    }
+
+    /// Switch the engine to the fallback model for this and later requests.
+    fn switch_to_fallback_model(&mut self, fallback: ModelId) {
+        tracing::warn!(
+            primary = %self.model.0,
+            fallback = %fallback.0,
+            "primary model unavailable; retrying once with the fallback model"
+        );
+        self.model = fallback;
+    }
+
+    /// Classify a provider failure the way the turn loop expects.
+    fn turn_error_from_api_error(&self, error: ApiError) -> TurnError {
+        match error {
+            ApiError::RetryExhausted {
+                attempts,
+                last_error_message: _,
+            } => {
+                let message = format!(
+                    "The AI service is temporarily unavailable after {attempts} attempts. Please try again later."
+                );
+                let _ = self.event_tx.send(EngineEvent::Notification {
+                    message: message.clone(),
+                });
+                TurnError::ApiUnavailable { message }
+            }
+            // A transport failure that ran out of retries is the same
+            // question — try later — and is classified by kind rather than
+            // by reading the message.
+            error if crate::api_client::is_retryable(&error) => TurnError::ApiUnavailable {
+                message: error.to_string(),
+            },
+            error => TurnError::Fatal {
+                message: error.to_string(),
+            },
+        }
     }
 
     /// Set the maximum output tokens requested from the provider.
@@ -3457,31 +3566,20 @@ impl QueryEngine {
             .await
         {
             Ok(resp) => resp,
-            Err(crate::api_client::ApiError::RetryExhausted {
-                attempts,
-                last_error_message: _,
-            }) => {
-                let message = format!(
-                    "The AI service is temporarily unavailable after {attempts} attempts. Please try again later."
-                );
-                let _ = self.event_tx.send(EngineEvent::Notification {
-                    message: message.clone(),
-                });
-                return Err(TurnError::ApiUnavailable { message });
-            }
-            Err(e) => {
-                // A transport failure that ran out of retries is the same
-                // question — try later — and is classified by kind rather than
-                // by reading the message.
-                return Err(if crate::api_client::is_retryable(&e) {
-                    TurnError::ApiUnavailable {
-                        message: e.to_string(),
-                    }
-                } else {
-                    TurnError::Fatal {
-                        message: e.to_string(),
-                    }
-                });
+            Err(error) => {
+                let Some(fallback) = self.fallback_for_api_error(&error) else {
+                    return Err(self.turn_error_from_api_error(error));
+                };
+                // One retry of the same request. Switching the engine's model
+                // means this turn and every later request stay on the fallback.
+                self.switch_to_fallback_model(fallback);
+                match request_client
+                    .create_message(&system, &messages, &self.model, self.max_tokens, &tools)
+                    .await
+                {
+                    Ok(resp) => resp,
+                    Err(error) => return Err(self.turn_error_from_api_error(error)),
+                }
             }
         };
 
@@ -3599,6 +3697,23 @@ impl QueryEngine {
                         // proposes. If this attempt already executed a tool,
                         // retrying can repeat its side effects, so the partial
                         // result is returned instead.
+                        //
+                        // Model unavailability gets one dedicated retry with
+                        // the fallback model, independent of the transient
+                        // retry budget below. Switching the engine's model
+                        // makes a second fallback attempt impossible.
+                        if early_calls.is_empty() {
+                            if let Some(fallback) = self.fallback_for_api_error(e) {
+                                self.switch_to_fallback_model(fallback);
+                                let _ = self.event_tx.send(EngineEvent::StreamInterrupted {
+                                    reason: "error".into(),
+                                    partial_len: stream_text.delivered().len(),
+                                    will_retry: true,
+                                });
+                                retry_requested = true;
+                                break;
+                            }
+                        }
                         if early_calls.is_empty()
                             && attempt < MAX_STREAM_ATTEMPTS
                             && crate::api_client::is_retryable(e)
@@ -3882,7 +3997,7 @@ impl QueryEngine {
                 });
                 Ok(Some(result))
             }
-            PermissionResult::Ask { reason } | PermissionResult::AskForSession { reason } => {
+            PermissionResult::Ask { reason } => {
                 let _ = self.event_tx.send(EngineEvent::PermissionRequest {
                     id: call.id.clone(),
                     tool: call.name.clone(),
@@ -4613,6 +4728,126 @@ mod tests {
             after_first, after_second,
             "rebuilding context must be idempotent per turn, not append"
         );
+    }
+
+    #[test]
+    fn fallback_is_used_only_for_model_unavailability() {
+        let primary = ModelId("claude-opus-4-6".into());
+        let fallback = ModelId("claude-haiku-4-5-20251001".into());
+
+        assert_eq!(
+            fallback_after_model_error(
+                &primary,
+                Some(&fallback),
+                "404 model_not_found: claude-opus-4-6"
+            )
+            .map(|model| model.0),
+            Some(fallback.0.clone())
+        );
+        assert!(
+            fallback_after_model_error(&primary, Some(&fallback), "connection reset by peer")
+                .is_none(),
+            "a transport error is not evidence the model is unavailable"
+        );
+        assert!(fallback_after_model_error(&primary, Some(&primary), "model_not_found").is_none());
+        assert!(fallback_after_model_error(&primary, None, "model_not_found").is_none());
+    }
+
+    /// The engine retries the same request exactly once when the primary model
+    /// is unavailable, then continues on the fallback.
+    #[tokio::test]
+    async fn unavailable_primary_retries_once_with_the_fallback_model() {
+        struct FallbackMock {
+            primary: String,
+            models: Arc<std::sync::Mutex<Vec<String>>>,
+        }
+
+        #[async_trait::async_trait]
+        impl ApiClient for FallbackMock {
+            fn clone_box(&self) -> Box<dyn ApiClient> {
+                Box::new(Self {
+                    primary: self.primary.clone(),
+                    models: Arc::clone(&self.models),
+                })
+            }
+
+            async fn create_message(
+                &self,
+                _system: &str,
+                _messages: &[serde_json::Value],
+                model: &ModelId,
+                _max_tokens: u32,
+                _tools: &[crate::tool_executor::ToolInfo],
+            ) -> Result<ApiResponse, crate::api_client::ApiError> {
+                self.models
+                    .lock()
+                    .expect("the request log lock is not poisoned")
+                    .push(model.0.clone());
+                if model.0 == self.primary {
+                    Err(crate::api_client::ApiError::InvalidModel(
+                        "model_not_found".into(),
+                    ))
+                } else {
+                    Ok(ApiResponse {
+                        content: "fallback answer".into(),
+                        tool_calls: Vec::new(),
+                        usage: UsageSummary {
+                            input_tokens: 10,
+                            output_tokens: 5,
+                            cache_read_tokens: 0,
+                            cache_creation_tokens: 0,
+                        },
+                        stop_reason: "end_turn".into(),
+                    })
+                }
+            }
+
+            async fn create_message_streaming(
+                &self,
+                _system: &str,
+                _messages: &[serde_json::Value],
+                _model: &ModelId,
+                _max_tokens: u32,
+                _tools: &[crate::tool_executor::ToolInfo],
+            ) -> std::pin::Pin<Box<dyn futures::Stream<Item = StreamEvent> + Send + 'static>>
+            {
+                Box::pin(futures::stream::iter(vec![StreamEvent::StreamEnd]))
+            }
+        }
+
+        let models = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let checker = PermissionChecker::new(PermissionMode::BypassPermissions);
+        let permission_engine = PermissionEngine::new(checker);
+        let session = SessionState::new(std::path::PathBuf::from("/tmp/test"));
+        let mut engine = QueryEngine::new(
+            Box::new(FallbackMock {
+                primary: "primary-model".into(),
+                models: Arc::clone(&models),
+            }),
+            ModelId("primary-model".into()),
+            session,
+            permission_engine,
+            tx,
+        );
+        engine.set_tool_executor(Box::new(StubOkToolExecutor));
+        engine.set_fallback_model(Some(ModelId("fallback-model".into())));
+
+        let options = SubmitOptions {
+            handle_elicitation: false,
+            ..SubmitOptions::default()
+        };
+        let result = engine.submit("hello".into(), options).await;
+        assert!(
+            matches!(result, Ok(TerminalReason::Completed)),
+            "expected the fallback response to complete the turn, got {result:?}"
+        );
+        assert_eq!(
+            *models.lock().expect("the request log lock is not poisoned"),
+            vec!["primary-model".to_string(), "fallback-model".to_string()],
+            "the request is retried once, with the fallback"
+        );
+        assert_eq!(engine.model().0, "fallback-model");
     }
 
     #[test]

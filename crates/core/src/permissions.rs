@@ -83,6 +83,12 @@ impl std::str::FromStr for PermissionMode {
 }
 
 /// The result of a permission check.
+///
+/// A session-wide approval is not a result of its own: once the user answers
+/// with `ConfirmationResponse::ApproveSession`, the checker records it with
+/// [`PermissionChecker::record_session_approval`] and later checks return
+/// [`Self::Allow`]. In other words, the result always describes the current
+/// call and never caches a future decision.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PermissionResult {
     /// The operation is allowed.
@@ -95,19 +101,6 @@ pub enum PermissionResult {
     /// The operation is denied.
     Deny {
         /// Human-readable reason for denial.
-        reason: String,
-    },
-    /// The operation requires user confirmation, but the answer
-    /// should be cached for the rest of the session.
-    ///
-    /// Nothing in [`PermissionChecker`] constructs this variant: a
-    /// session-wide approval is recorded with
-    /// [`PermissionChecker::record_session_approval`] once the user has
-    /// answered. It remains part of the public result type because callers
-    /// still carry it through their match arms. It always means "no answer
-    /// yet", so [`Self::is_allowed`] is false for it.
-    AskForSession {
-        /// Human-readable reason for the prompt.
         reason: String,
     },
     /// The operation is allowed only for the given path patterns.
@@ -141,10 +134,6 @@ impl PermissionResult {
 
 impl PermissionResult {
     /// Returns true if the operation can proceed without user input.
-    ///
-    /// `AskForSession` is deliberately not allowed: it means "ask, then cache
-    /// the answer", so no answer exists yet. Treating it as allowed would let
-    /// a caller that trusts this predicate skip the prompt entirely.
     #[must_use]
     pub const fn is_allowed(&self) -> bool {
         matches!(self, Self::Allow | Self::AllowForPath { .. })
@@ -514,7 +503,6 @@ impl PermissionChecker {
                     let reason = match other {
                         PermissionResult::Deny { reason }
                         | PermissionResult::Ask { reason }
-                        | PermissionResult::AskForSession { reason }
                         | PermissionResult::Elevated { reason } => reason,
                         PermissionResult::Allow | PermissionResult::AllowForPath { .. } => {
                             unreachable!()
@@ -614,34 +602,35 @@ mod tests {
     }
 
     #[test]
-    fn ask_for_session_is_not_allowed_until_answered() {
-        // `AskForSession` means "ask and cache the answer", not "approved".
-        // A caller trusting `is_allowed` must not skip the prompt.
-        assert!(!PermissionResult::AskForSession {
-            reason: "needs approval".into()
-        }
-        .is_allowed());
-
-        // The two genuinely pre-approved results stay allowed.
+    fn is_allowed_only_for_preapproved_results() {
+        // The two genuinely pre-approved results are allowed.
         assert!(PermissionResult::Allow.is_allowed());
-        assert!(PermissionResult::AllowForPath {
-            patterns: vec!["/tmp/**".into()],
-        }
-        .is_allowed());
+        assert!(
+            PermissionResult::AllowForPath {
+                patterns: vec!["/tmp/**".into()],
+            }
+            .is_allowed()
+        );
 
         // The remaining results all mean "cannot proceed unattended".
-        assert!(!PermissionResult::Ask {
-            reason: "needs approval".into()
-        }
-        .is_allowed());
-        assert!(!PermissionResult::Deny {
-            reason: "no".into()
-        }
-        .is_allowed());
-        assert!(!PermissionResult::Elevated {
-            reason: "runs as another user".into()
-        }
-        .is_allowed());
+        assert!(
+            !PermissionResult::Ask {
+                reason: "needs approval".into()
+            }
+            .is_allowed()
+        );
+        assert!(
+            !PermissionResult::Deny {
+                reason: "no".into()
+            }
+            .is_allowed()
+        );
+        assert!(
+            !PermissionResult::Elevated {
+                reason: "runs as another user".into()
+            }
+            .is_allowed()
+        );
     }
 
     #[test]
@@ -810,7 +799,14 @@ mod tests {
         let auto = PermissionChecker::new(PermissionMode::Auto);
         let default = PermissionChecker::new(PermissionMode::Default);
         for tool in [
-            "read", "ls", "grep", "bash", "write", "edit", "multi_edit", "notebook_edit",
+            "read",
+            "ls",
+            "grep",
+            "bash",
+            "write",
+            "edit",
+            "multi_edit",
+            "notebook_edit",
         ] {
             assert_eq!(
                 auto.check(tool, None),
@@ -890,7 +886,10 @@ mod tests {
             },
         );
         assert!(
-            matches!(checker.check("artifact", None), PermissionResult::Ask { .. }),
+            matches!(
+                checker.check("artifact", None),
+                PermissionResult::Ask { .. }
+            ),
             "a blanket allow approved a tool that refuses blanket allows"
         );
     }
@@ -988,7 +987,9 @@ mod tests {
         ));
         // This call is a publish: it refuses the allow, so the ask behind it decides.
         match checker.check_with_exemptions("artifact", None, Some(exemptions)) {
-            PermissionResult::Ask { reason } => assert!(reason.contains("needs a look"), "{reason}"),
+            PermissionResult::Ask { reason } => {
+                assert!(reason.contains("needs a look"), "{reason}")
+            }
             other => panic!("a refused allow rule must not approve the call, got {other:?}"),
         }
 
