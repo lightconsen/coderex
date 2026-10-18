@@ -1394,17 +1394,21 @@ impl PluginManager {
         };
 
         if manifest.runtime == RuntimeType::Wasm {
-            if !manifest.user_config.is_empty() {
-                tracing::warn!(
-                    plugin = %name,
-                    "userConfig is not injected into WASM plugins; the declared options have \
-                     no effect"
-                );
-            }
+            // Resolve `userConfig` exactly as for a process plugin. The
+            // values are handed to the module through the `coderex.user_config`
+            // import rather than an environment, because a WASM module has no
+            // environment. Errors (a missing required option, a plaintext
+            // default for a secret, an unresolved `keyring://` reference) stop
+            // the spawn before anything is compiled.
+            let provided = self.plugin_options(name);
+            let option_values = manifest
+                .resolve_options(&provided, |key| std::env::var(key).ok())
+                .map_err(|e| format!("plugin '{name}' userConfig: {e}"))?;
+
             let wasm_file = manifest.entrypoint.as_deref().unwrap_or("plugin.wasm");
             let wasm_path = handle.path.join(wasm_file);
 
-            let mut instance = PluginWasmInstance::new(&wasm_path)
+            let mut instance = PluginWasmInstance::new_with_options(&wasm_path, option_values)
                 .map_err(|e| format!("failed to load WASM plugin '{name}': {e}"))?;
 
             instance
@@ -3805,6 +3809,33 @@ mod tests {
             .resolve_options(&HashMap::new(), |_| None)
             .unwrap_err();
         assert!(err.contains("bad-key"), "{err}");
+    }
+
+    /// WASM plugins resolve `userConfig` through the same code path as process
+    /// plugins. A missing required option therefore fails the spawn *before*
+    /// the module is loaded, even though a WASM module has no environment to
+    /// fall back to.
+    #[tokio::test]
+    async fn wasm_plugin_required_user_config_is_enforced_before_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let manifest_json = r#"{
+            "name": "wasm-config",
+            "runtime": "wasm",
+            "entrypoint": "plugin.wasm",
+            "userConfig": {"TOKEN": {"type": "string", "required": true}}
+        }"#;
+        std::fs::write(dir.path().join("plugin.json"), manifest_json).unwrap();
+        let manifest: PluginManifest = serde_json::from_str(manifest_json).unwrap();
+
+        let mgr = PluginManager::new();
+        mgr.load_plugin(manifest, dir.path().to_path_buf());
+
+        let err = mgr
+            .spawn_plugin("wasm-config")
+            .await
+            .expect_err("a required option with no value must stop a WASM spawn");
+        assert!(err.contains("userConfig"), "{err}");
+        assert!(err.contains("TOKEN"), "{err}");
     }
 
     /// The environment really reaches the child process: a plugin script that

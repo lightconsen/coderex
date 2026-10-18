@@ -103,9 +103,11 @@ The WASM runtime is enabled by default: `crates/plugins/Cargo.toml` has
 `spawn_plugin` loads a `runtime: "wasm"` plugin from its `entrypoint` (default
 `plugin.wasm`) by compiling the module, running `coderex_initialize`, and
 discovering commands and skills, then keeps the instance in
-`active_wasm_instances`. `userConfig` is not injected into WASM plugins — there
-is no process environment to inject it into — and `spawn_plugin` warns when a
-WASM manifest declares options.
+`active_wasm_instances`. `userConfig` is resolved by the same code path as for
+a process plugin and delivered through the host import described below. A WASM
+manifest's `entrypoint` is a file name, so `${user_config.KEY}` substitution
+applies to process `env`/`entrypoint` only; the resolved values reach a WASM
+module through the import.
 
 The sandbox is enforced by the host, not by trusting the module:
 
@@ -118,8 +120,55 @@ The sandbox is enforced by the host, not by trusting the module:
 - **Shared memory**: the threads proposal is disabled (`wasm_threads(false)`),
   so a module cannot create a shared memory (which wasmtime's store limiter
   deliberately does not bound) or use atomics.
-- **No host interface**: instances are created with an empty import set, so a
-  module importing WASI or anything else fails to instantiate.
+- **Minimal host interface**: the only import the host provides is
+  `coderex.user_config`. WASI and everything else remain unlinked, so a module
+  importing them fails to instantiate. A module that imports nothing is still
+  instantiated with an empty import set and runs unchanged.
+
+#### `userConfig` ABI for WASM plugins
+
+The host links one function:
+
+```wat
+(import "coderex" "user_config"
+  (func $user_config (param i32 i32) (result i32)))
+;; (ptr, capacity) -> required_len
+```
+
+It writes the resolved options into the plugin's exported linear `memory` at
+`ptr` and returns the **full** JSON length, not the number of bytes written.
+The JSON value is one object whose keys and values are exactly what a process
+plugin receives as `CODEREX_PLUGIN_OPTION_<KEY>` (and what `${user_config.KEY}`
+substitutes). For example:
+
+```json
+{"REGION":"eu","TOKEN":"s3cret"}
+```
+
+- An option with no value is **absent** from the object. It is not `null` and
+  not an empty string, matching the process path, where no environment
+  variable is set.
+- Sensitive options are included verbatim. As with environment injection, the
+  host is expected to have resolved any `keyring://` reference first; an
+  unresolved one stops the spawn. The runtime does not redact the value from
+  the plugin it is being given to.
+- The guest can call `(0, 0)` to query the length without writing anything,
+  then allocate a buffer and call again. If the returned length is greater
+  than the capacity passed, the JSON was truncated (only `capacity` bytes are
+  written), so query first or retry with a larger buffer.
+- No NUL terminator is written: the returned length is authoritative. (Do not
+  assume the byte after the JSON belongs to the host.)
+- The host returns `-1` for a negative pointer/capacity, a missing `memory`
+  export, or a write that would fall outside guest memory.
+- Options apply to the whole instance: every call gets a fresh store, but the
+  same serialized options are served each time.
+
+**Existing plugins must import the function to receive options.** Linking is
+opt-in at the module level: a plugin that does not declare the import
+instantiates exactly as it did before and simply has no way to read the
+options. This keeps the empty-import set working, at the cost that adding
+`userConfig` to a plugin requires an ABI change on the plugin side (a new
+import, and a rebuild) rather than being transparent.
 
 Compilation is bounded in two layers. The first runs in-process and bounds the
 *work*, the second runs in a killable child and bounds the *time*. Compilation
@@ -172,7 +221,8 @@ timeout.
 The parent also installs:
 
 - `RLIMIT_CPU` = 20 s (Unix, mandatory);
-- `RLIMIT_AS` = 2 GiB (Unix, best-effort — see the boundary note);
+- a 2 GiB memory limit (Unix, best-effort): `RLIMIT_AS` on Linux and other
+  Unix, `RLIMIT_DATA` on Darwin (see the boundary note);
 - a 30 s wall-clock timer;
 - on Windows, Job Object job user-time and job memory limits in addition to
   kill-on-close.
@@ -220,10 +270,14 @@ this document does not claim a sandbox that was not applied.
 
 **Honest remaining boundaries:**
 
-- `RLIMIT_AS` is attempted on Unix but Darwin rejects finite address-space
-  limits with `EINVAL`. The failure is ignored (it cannot be logged from
-  `pre_exec`): on macOS the child still has the hard CPU limit, the wall-clock
-  kill, and the sandbox-exec profile, but **no memory ceiling**.
+- On Darwin the memory bound is `RLIMIT_DATA`, because Darwin rejects finite
+  `RLIMIT_AS` values with `EINVAL`. `RLIMIT_DATA` caps the data segment rather
+  than the whole address space: direct mappings, the stack and the executable
+  image are outside it, so it is **not a full address-space cap**. The limit is
+  best-effort (a failure is ignored, because it cannot be logged from
+  `pre_exec`); the child still has the hard CPU limit, the wall-clock kill and
+  the sandbox-exec profile. Other Unix platforms use `RLIMIT_AS`, subject to
+  the same best-effort handling.
 - Windows Job Object code is written against `windows-sys` but is not exercised
   on this (macOS) host; it has not been run on Windows.
 - The compiler child inherits this process's environment. It is the same
@@ -279,6 +333,7 @@ A manifest declares options, and `spawn_plugin` turns them into the child's envi
 - `${user_config.KEY}` is substituted in the manifest's `env` values and in the `entrypoint`. An unresolved placeholder is left as written and logged, so an author can see what did not resolve.
 - Values are resolved in order: what the host supplied via `PluginManager::set_plugin_option`, then CodeRex's own `CODEREX_PLUGIN_OPTION_<KEY>`, then the manifest's `default`.
 - Option keys must be usable as environment variable names (`[A-Za-z_][A-Za-z0-9_]*`); anything else is refused, because a key with a dash or an `=` in it is a way to smuggle a second variable into the environment.
+- WASM plugins use the same resolution and the same validation errors, but the resolved values are encoded as one JSON object and served through the `coderex.user_config` import rather than an environment (see "`userConfig` ABI for WASM plugins"). A WASM plugin receives them only if it imports that function; a required option with no value still stops the spawn, even though there is no environment.
 
 **Sensitive options.** There is no keychain dependency in this crate (the workspace's keychain access lives in `coderex-config`, behind its `keyring` feature), so the sensitive path is strict rather than quiet:
 
@@ -286,9 +341,9 @@ A manifest declares options, and `spawn_plugin` turns them into the child's envi
 - A sensitive value that is still an unresolved `keyring://item` reference is refused: injecting the literal reference would hand the plugin a string that is not the secret, and resolving it needs the keychain. The host is expected to resolve it first (`coderex_config::resolve_api_key` is the existing convention).
 - A `required` option with no value stops the spawn with an error naming the variable to set. A plugin that silently runs without the secret it asked for is worse than one that does not run.
 - An optional option with no value is simply not injected (debug log).
-- Sensitive values travel by environment variable, which is Claude's design too: visible to the plugin, and to the process table of the same user.
+- Sensitive values travel by environment variable (process plugins) or through the resolved options object (WASM plugins). Either way they are visible to the plugin that asked for them; for process plugins they are also visible in the process table of the same user, which is Claude's design too.
 
-**Honest gap:** there is no interactive prompt and no plugin settings store, so options come from the host or from the environment — nothing writes a user's answers back to `settings.json` the way Claude does. There is also no option *validation* (`options`, `min`, `max`, `type` are parsed and ignored).
+**Honest gap:** there is no interactive prompt and no plugin settings store, so options come from the host or from the environment — nothing writes a user's answers back to `settings.json` the way Claude does. There is also no option *validation* (`options`, `min`, `max`, `type` are parsed and ignored). For WASM plugins, options require an explicit import in the module; they are not delivered retroactively to existing plugins.
 
 ## Install Sources
 
@@ -422,7 +477,8 @@ During REPL construction:
 - Skill frontmatter parsing via `serde_yaml` with custom scalar/array deserializers.
 - Repo-specific skills from `.coderex/skills/`.
 - MCP skills bridge: `phase_init_mcp` converts discovered MCP tools to `SkillMetadata`.
-- **WASM runtime enabled by default**: `process-runtime` and `wasm-runtime` are both default Cargo features; WASM calls run under fuel (100M per call), a 64 MiB memory limiter, disabled threads, and no host imports. Compilation is guarded by a `wasmparser` pre-scan (16 MiB file, 8 MiB code section, 50,000 functions, 1,000,000 operators, 256 nesting levels) and always runs out-of-process through a host-injected compiler command (the CLI re-executes itself with `--internal-wasm-compile`) with `RLIMIT_CPU`/`RLIMIT_AS`, a wall-clock timeout, and a process-group or Job Object kill. There is no in-process fallback: a missing or failing compiler refuses the load. Successful compilations are cached as serialized modules keyed by engine-config and module SHA-256 (256 MiB bounded).
+- **WASM runtime enabled by default**: `process-runtime` and `wasm-runtime` are both default Cargo features; WASM calls run under fuel (100M per call), a 64 MiB memory limiter, disabled threads, and one optional host import (`coderex.user_config`). Compilation is guarded by a `wasmparser` pre-scan (16 MiB file, 8 MiB code section, 50,000 functions, 1,000,000 operators, 256 nesting levels) and always runs out-of-process through a host-injected compiler command (the CLI re-executes itself with `--internal-wasm-compile`) with `RLIMIT_CPU` and a best-effort 2 GiB memory limit (`RLIMIT_AS`, or `RLIMIT_DATA` on Darwin), a wall-clock timeout, and a process-group or Job Object kill. There is no in-process fallback: a missing or failing compiler refuses the load. Successful compilations are cached as serialized modules keyed by engine-config and module SHA-256 (256 MiB bounded).
+- **WASM `userConfig` injection**: the same resolution and validation as process plugins, delivered to a module that imports `coderex.user_config(ptr, capacity) -> required_len` as one JSON object in its linear memory; modules that do not import it are unchanged.
 - **Full manifest field table** with `deny_unknown_fields`, `PluginAuthor` accepting a string or an object, and a load-time warning for fields CodeRex accepts but does not implement.
 - **`userConfig` injection**: `CODEREX_PLUGIN_OPTION_<KEY>` in the child's environment and `${user_config.KEY}` substitution in `env` and `entrypoint`; sensitive options refuse a plaintext default and refuse an unresolved `keyring://` reference; a required option with no value stops the spawn.
 - **Install sources**: marketplace listing, local directory, git URL, GitHub `owner/repo` shorthand, a git subdirectory, and HTTPS archive — with `PluginSource::detect()` classifying a CLI argument, and the unimplemented `npm`/`command` kinds recognised and refused rather than silently reinterpreted.
@@ -433,16 +489,16 @@ During REPL construction:
 - No keychain access in this crate, so sensitive options are host-supplied or environment-supplied; nothing prompts the user or writes answers back to settings (see "userConfig Injection").
 - `options`/`min`/`max`/`type` in `userConfig` are parsed and ignored: no validation.
 - Pin files are created by the first install; a user cannot pre-seed a pin before installing.
-- WASM plugins get no `userConfig` (no process environment).
-- WASM compilation always requires a host-injected compiler command (or a `coderex-wasm-compile` next to the executable); with neither, loads fail closed. `RLIMIT_AS` is unavailable on Darwin, the Windows Job Object path is untested, and the compiler sandbox degrades to rlimits plus process-group kill where `sandbox-exec`/`bwrap` cannot be applied (see "WASM Plugins").
+- WASM plugins must import `coderex.user_config` to receive options; an existing module cannot be given `userConfig` without that ABI change.
+- WASM compilation always requires a host-injected compiler command (or a `coderex-wasm-compile` next to the executable); with neither, loads fail closed. On Darwin the memory bound is `RLIMIT_DATA`, which does not cap the full address space; the Windows Job Object path is untested, and the compiler sandbox degrades to rlimits plus process-group kill where `sandbox-exec`/`bwrap` cannot be applied (see "WASM Plugins").
 - `npm` and `command` sources are not implemented (see above for why, and for the reference citation on `npm`).
 - `crates/cli/src/orchestrator.rs` still parses `plugin.json` itself in `phase_init_plugins` and ignores a parse error silently; the library's `discover()` warns, but the CLI's own loop has not been changed here.
 
 ### Tests
 
-- 71 tests in `plugins.rs` (manager ops, load/unload, marketplace, discovery, reconciler, URL validation, version checks, signature verification, dependency resolution, error recovery, custom endpoints, the manifest field table, `userConfig` resolution and injection end-to-end, source detection and git URL validation, directory/git/git-subdir installs, structured source specs, the `npm`/`command` refusals, SHA-256 vectors and pin enforcement).
+- 72 tests in `plugins.rs` (manager ops, load/unload, marketplace, discovery, reconciler, URL validation, version checks, signature verification, dependency resolution, error recovery, custom endpoints, the manifest field table, `userConfig` resolution and injection end-to-end including the WASM required-option path, source detection and git URL validation, directory/git/git-subdir installs, structured source specs, the `npm`/`command` refusals, SHA-256 vectors and pin enforcement).
 - 14 tests in `skills.rs` (parsing, loader, plugin/MCP skills, repo dir, conflict resolution, precedence, quoted strings).
 - 7 tests in `runtime.rs` (spawn, initialize, terminate, invalid command).
-- 17 tests in `wasm_runtime.rs`, all run by the default `cargo test -p coderex-plugins`: 3 core/unit tests (the loader stub, the injected command's program/leading-argument shape, and helper discovery), 8 sandbox tests (fuel, memory growth, initial memory, shared memory, WASI import, and the 3 size-cap cases), and 6 pre-scan tests (normal module, oversized code section, too many functions, too many operators, excessive nesting, nesting exactly at the cap).
+- 20 tests in `wasm_runtime.rs`, all run by the default `cargo test -p coderex-plugins`: 4 core/unit tests (the loader stub, the injected command's program/leading-argument shape, helper discovery, and the platform rlimit plan), 10 sandbox tests (fuel, memory growth, initial memory, shared memory, WASI import, the 3 size-cap cases, `userConfig` injection into an importing module, and an empty-import module still running), and 6 pre-scan tests (normal module, oversized code section, too many functions, too many operators, excessive nesting, nesting exactly at the cap).
 - 7 integration tests in `tests/wasm_compile_subprocess.rs`: an injected command compiles, serializes, and deserializes; leading arguments are forwarded; the host-injected global command is used; a missing command fails closed with an actionable error and leaves no artifacts; a slow helper and its spawned descendant are killed at the wall-clock limit; a second load hits the AOT cache with exactly one compiler invocation; and a pathological module is rejected by the pre-scan without starting the compiler.
 - Tests use `tempfile` for filesystem operations. The git and git-subdir install tests create a throwaway repository inside a `tempfile::tempdir()` and pin every git command with `-C`, so they never touch the project's own repository. The subdirectory tests use `file://` clone URLs, so they need no network.
