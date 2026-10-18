@@ -17,8 +17,8 @@ use crate::sandbox_policy;
 use crate::task_store::{TASK_STORE_KEY, TaskStore};
 use crate::todo_store::{TODO_STORE_KEY, TodoStore};
 use crate::tool::{
-    Backgrounding, JOB_SESSION_ID_KEY, RuleContentField, SharedState, ToolCapabilities, ToolContext,
-    ToolInput,
+    Backgrounding, JOB_SESSION_ID_KEY, RuleContentField, SharedState, ToolCapabilities,
+    ToolContext, ToolInput,
 };
 use coderex_core::tool_executor::{ToolDispatchOutcome, ToolExecutor as CoreToolExecutor};
 use coderex_core::types::ToolResult;
@@ -221,10 +221,9 @@ impl RegistryToolDispatcher {
 impl CoreToolExecutor for RegistryToolDispatcher {
     fn list_tools(&self) -> Vec<coderex_core::tool_executor::ToolInfo> {
         // What the model is told about is what it can call. `all_descriptors`
-        // is every registered tool, including the ones registered only to
-        // refuse — thirteen of them answer "feature-gated and not enabled" —
-        // and a tool the model is shown but cannot use is an invitation to
-        // waste a turn discovering that.
+        // is every registered tool, including disabled ones; a tool the model
+        // is shown but cannot use is an invitation to waste a turn discovering
+        // that.
         let available: std::collections::HashSet<String> = self
             .registry
             .available_tool_names(
@@ -632,19 +631,53 @@ mod tests {
         }
     }
 
+    /// A tool registered but disabled: the model must not be offered it.
+    struct DisabledTool;
+
+    #[async_trait::async_trait]
+    impl Tool for DisabledTool {
+        fn descriptor(&self) -> ToolDescriptor {
+            ToolDescriptor {
+                name: "disabled".into(),
+                tier: ToolTier::Baseline,
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {}
+                }),
+                output_schema: serde_json::json!({}),
+                requires_approval: false,
+                is_enabled: false,
+                is_read_only: true,
+                is_concurrency_safe: true,
+                interrupt_behavior: InterruptBehavior::RunToCompletion,
+            }
+        }
+
+        async fn execute(
+            &self,
+            _input: ToolInput,
+            _ctx: ToolContext<'_>,
+        ) -> Result<ToolOutput, ToolError> {
+            Ok(ToolOutput {
+                output: "tool is disabled".into(),
+                is_display: true,
+            })
+        }
+    }
+
     fn registry_with_echo() -> Arc<ToolRegistry> {
         let mut registry = ToolRegistry::new();
         registry.register(Arc::new(EchoTool));
         Arc::new(registry)
     }
 
-    /// What the model is told about is what it can call: a tool that would answer
-    /// "feature-gated and not enabled" is not offered.
+    /// What the model is told about is what it can call: a disabled tool is not
+    /// offered.
     #[tokio::test]
     async fn the_listing_leaves_out_tools_that_would_refuse() {
         let mut registry = ToolRegistry::new();
         registry.register(Arc::new(EchoTool));
-        crate::builtins::register_feature_gated_tools(&mut registry);
+        registry.register(Arc::new(DisabledTool));
         let registry = Arc::new(registry);
 
         let executor = Arc::new(InnerExecutor::new(ExecutionConfig::default()));
@@ -658,7 +691,7 @@ mod tests {
         let listed = dispatcher.listed_names();
         assert!(listed.contains(&"echo".to_string()), "{listed:?}");
         assert!(
-            !listed.iter().any(|name| name == "Monitor"),
+            !listed.iter().any(|name| name == "disabled"),
             "a disabled tool was offered: {listed:?}"
         );
     }
@@ -767,7 +800,11 @@ mod tests {
         );
 
         let denied = dispatcher
-            .execute("id-1", "Bash", &serde_json::json!({"command": "rm -rf build"}))
+            .execute(
+                "id-1",
+                "Bash",
+                &serde_json::json!({"command": "rm -rf build"}),
+            )
             .await;
         assert!(denied.result.is_error, "{:?}", denied.result);
         assert!(
@@ -794,7 +831,11 @@ mod tests {
         );
 
         let allowed = dispatcher
-            .execute("id-1", "Bash", &serde_json::json!({"command": "echo hello"}))
+            .execute(
+                "id-1",
+                "Bash",
+                &serde_json::json!({"command": "echo hello"}),
+            )
             .await;
         assert!(!allowed.result.is_error, "{:?}", allowed.result);
     }

@@ -13,7 +13,6 @@ mod current_dir_tool;
 mod edit_tool;
 mod enter_plan_mode_tool;
 mod exit_plan_mode_tool;
-mod feature_gated_tools;
 mod glob_tool;
 mod grep_tool;
 mod list_dir_tool;
@@ -61,7 +60,6 @@ pub use current_dir_tool::CurrentDirTool;
 pub use edit_tool::EditTool;
 pub use enter_plan_mode_tool::EnterPlanModeTool;
 pub use exit_plan_mode_tool::ExitPlanModeTool;
-pub use feature_gated_tools::register_feature_gated_tools;
 pub use glob_tool::GlobTool;
 pub use grep_tool::GrepTool;
 pub use list_dir_tool::ListDirTool;
@@ -236,7 +234,12 @@ pub fn register_shell_tool(reg: &mut crate::registry::ToolRegistry) {
     }
 }
 
-/// Register all baseline built-in tools into the given registry.
+/// Register all built-in tools into the given registry.
+///
+/// This registers 45 baseline tools plus the 5 feature-gated Chrome DevTools
+/// tools, for 50 registrations in total. The platform registers one shell tool,
+/// so `Bash` and `PowerShell` are alternatives rather than two slots. No stub
+/// tools are registered: every tool here is one the model can actually use.
 pub fn register_builtin_tools(reg: &mut crate::registry::ToolRegistry) {
     use std::sync::Arc;
     reg.register(Arc::new(ReadTool));
@@ -293,9 +296,6 @@ pub fn register_builtin_tools(reg: &mut crate::registry::ToolRegistry) {
     reg.register(Arc::new(ChromeExecuteJsTool));
     reg.register(Arc::new(ChromeScreenshotTool));
     reg.register(Arc::new(ChromeGetContentTool));
-
-    // Feature-gated tools
-    register_feature_gated_tools(reg);
 }
 
 #[cfg(test)]
@@ -608,6 +608,43 @@ mod tests {
         assert!(
             !names.iter().any(|name| name == other),
             "the other platform's shell tool is advertised too: {names:?}"
+        );
+    }
+
+    /// The registry carries 45 baseline tools and the 5 Chrome DevTools tools
+    /// (50 in total). Nothing is registered that the model cannot use: the
+    /// former feature-gated stubs are gone, and every descriptor is enabled.
+    #[test]
+    fn the_registry_has_no_refusing_stubs() {
+        let mut registry = crate::registry::ToolRegistry::new();
+        register_builtin_tools(&mut registry);
+        let descriptors = registry.all_descriptors();
+
+        assert_eq!(descriptors.len(), 50, "unexpected registration count");
+        assert_eq!(
+            descriptors
+                .iter()
+                .filter(|d| matches!(d.tier, ToolTier::Baseline))
+                .count(),
+            45,
+            "unexpected baseline tool count"
+        );
+        assert_eq!(
+            descriptors
+                .iter()
+                .filter(|d| matches!(d.tier, ToolTier::FeatureGated))
+                .count(),
+            5,
+            "the only feature-gated tools are the Chrome DevTools tools"
+        );
+        assert!(
+            descriptors.iter().all(|d| d.is_enabled),
+            "a registered tool is disabled: {:?}",
+            descriptors
+                .iter()
+                .filter(|d| !d.is_enabled)
+                .map(|d| d.name.as_str())
+                .collect::<Vec<_>>()
         );
     }
 
