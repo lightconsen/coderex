@@ -2,11 +2,18 @@
 //!
 //! Sanitizes sensitive data from event payloads before storage.
 //! Covers: email addresses, IP addresses, file paths containing usernames,
-//! API keys and other credential shapes, an exclusion set of field names that
-//! are dropped from payloads entirely, and model-name redaction (a dedicated
-//! key regex plus an exclusion set). A stricter mode — enabled for
-//! confidentiality-sensitive deployments — additionally validates a payload
-//! against a field allowlist and marks anything it cannot validate.
+//! API keys and other credential shapes, long high-entropy tokens, an
+//! exclusion set of field names that are dropped from payloads entirely, and
+//! model-name redaction (a dedicated key regex plus an exclusion set). A
+//! stricter mode — enabled for confidentiality-sensitive deployments —
+//! additionally validates a payload against a field allowlist and marks
+//! anything it cannot validate.
+//!
+//! The scrubber removes *patterns*, not *meaning*. A sentence copied from a
+//! conversation is left in the clear unless it happens to contain one of the
+//! patterns above. Crash reporting accounts for this explicitly: under strict
+//! mode it never ships free-form panic text. See `crash.rs` and
+//! `docs/telemetry.md`.
 
 use regex::Regex;
 use std::sync::OnceLock;
@@ -127,7 +134,10 @@ pub fn redact_model_fields(value: &mut serde_json::Value) {
 ///
 /// The union of the event schema fields and the crash schema fields: strict
 /// mode sends a payload only if every key at every level is one of these.
-pub const STRICT_ALLOWED_FIELDS: [&str; 14] = [
+/// `redaction_status` is allowed so a payload that already carries an explicit
+/// redaction mark (for example a structured crash summary) validates instead
+/// of having its mark overwritten with `unredacted`.
+pub const STRICT_ALLOWED_FIELDS: [&str; 15] = [
     "type",
     "session_id",
     "tool_name",
@@ -142,6 +152,7 @@ pub const STRICT_ALLOWED_FIELDS: [&str; 14] = [
     "timestamp",
     "panic_info",
     "backtrace",
+    "redaction_status",
 ];
 
 /// Key inserted into a payload that strict mode could not validate.
@@ -187,6 +198,122 @@ pub fn mark_unredacted_if_unallowlisted(value: &mut serde_json::Value) -> bool {
         }
         _ => false,
     }
+}
+
+/// Minimum length of a candidate high-entropy token.
+///
+/// 32 characters is the shortest common digest / key length (MD5 is 32 hex
+/// characters, SHA-256 is 64); shorter runs collide with ordinary identifiers.
+pub const HIGH_ENTROPY_MIN_LEN: usize = 32;
+
+/// Replacement written over a detected high-entropy secret.
+pub const SECRET_PLACEHOLDER: &str = "<SECRET>";
+
+/// Minimum Shannon entropy, in bits per character, for a non-hex candidate.
+///
+/// Random base64/mixed-alphanumeric secrets sit around 5–6 bits/char; a
+/// repeated or structured identifier sits below 3. Hex digests top out at 4
+/// bits/char and random ones sit near 3.9.
+const MIN_TOKEN_ENTROPY_BITS: f64 = 3.0;
+
+/// Candidate runs: base64url/hex/mixed-alphanumeric characters.
+///
+/// `/`, `.` and `:` are deliberately excluded so paths, URLs and symbol paths
+/// (`module::function`) are split into short segments rather than matched as a
+/// single token.
+fn high_entropy_regex() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"[A-Za-z0-9_+=\-]{32,}").expect("high-entropy regex is valid"))
+}
+
+/// Shannon entropy per character over the token's bytes.
+fn shannon_entropy(token: &str) -> f64 {
+    let mut counts = [0usize; 256];
+    let mut total = 0usize;
+    for byte in token.bytes() {
+        counts[byte as usize] += 1;
+        total += 1;
+    }
+    if total == 0 {
+        return 0.0;
+    }
+    let total = total as f64;
+    counts
+        .iter()
+        .filter(|&&count| count > 0)
+        .map(|&count| {
+            let p = count as f64 / total;
+            -p * p.log2()
+        })
+        .sum()
+}
+
+/// Whether the run at `text[start..end]` is a secret-like high-entropy token.
+///
+/// Conservative by design: a false positive mangles a file path or symbol that
+/// diagnostics depend on, so ambiguous runs are left alone. The checks are:
+///
+/// - at least [`HIGH_ENTROPY_MIN_LEN`] characters;
+/// - not part of a path or URL (adjacent `/`, `\`, `.`, `@`, `~`) and not the
+///   segment of a Rust symbol path (adjacent `::`);
+/// - not a Rust mangled symbol (`_ZN…` legacy / `_R…` v0);
+/// - all-hex runs of that length are accepted (digests);
+/// - otherwise the run must mix uppercase, lowercase and digits, and have
+///   entropy of at least [`MIN_TOKEN_ENTROPY_BITS`]. All-lowercase
+///   (`snake_case`) and all-uppercase (`CONSTANT`) identifiers are rejected.
+fn is_high_entropy_token(text: &str, start: usize, end: usize) -> bool {
+    let token = &text[start..end];
+    if token.len() < HIGH_ENTROPY_MIN_LEN {
+        return false;
+    }
+
+    // Neighbouring path / URL / symbol punctuation means this is a component
+    // of something structured, not a standalone secret.
+    let prev = text[..start].chars().next_back();
+    let next = text[end..].chars().next();
+    if matches!(prev, Some('/' | '\\' | '.' | '@' | '~'))
+        || matches!(next, Some('/' | '\\' | '.' | '@' | '~'))
+        || text[..start].ends_with("::")
+        || text[end..].starts_with("::")
+    {
+        return false;
+    }
+
+    // Rust mangled symbols are long, mixed, and not secrets.
+    if token.starts_with("_ZN") || token.starts_with("_R") {
+        return false;
+    }
+
+    let has_lower = token.chars().any(|c| c.is_ascii_lowercase());
+    let has_upper = token.chars().any(|c| c.is_ascii_uppercase());
+    let has_digit = token.chars().any(|c| c.is_ascii_digit());
+
+    // Pure hex of digest length (MD5/SHA/HMAC) is a secret shape even though it
+    // uses only two character classes.
+    if token.chars().all(|c| c.is_ascii_hexdigit()) {
+        return shannon_entropy(token) >= MIN_TOKEN_ENTROPY_BITS;
+    }
+
+    // Everything else must genuinely mix character classes: letters in both
+    // cases plus digits. That excludes snake_case, kebab-case, CamelCase and
+    // CONSTANT identifiers, which are the shapes backtraces and prose contain.
+    has_lower && has_upper && has_digit && shannon_entropy(token) >= MIN_TOKEN_ENTROPY_BITS
+}
+
+/// Replace detected high-entropy tokens with [`SECRET_PLACEHOLDER`].
+fn scrub_high_entropy_tokens(text: &str) -> String {
+    let mut result = String::with_capacity(text.len());
+    let mut last_end = 0;
+    for candidate in high_entropy_regex().find_iter(text) {
+        if !is_high_entropy_token(text, candidate.start(), candidate.end()) {
+            continue;
+        }
+        result.push_str(&text[last_end..candidate.start()]);
+        result.push_str(SECRET_PLACEHOLDER);
+        last_end = candidate.end();
+    }
+    result.push_str(&text[last_end..]);
+    result
 }
 
 /// Scrubber that regex-replaces sensitive patterns.
@@ -269,12 +396,16 @@ impl Scrubber {
     }
 
     /// Scrub sensitive data from a string, returning the sanitized version.
+    ///
+    /// The named patterns run first (so labelled credentials report their
+    /// specific placeholder), then any remaining long high-entropy run is
+    /// replaced with [`SECRET_PLACEHOLDER`].
     pub fn scrub(&self, text: &str) -> String {
         let mut result = text.to_string();
         for (re, replacement) in &self.patterns {
             result = re.replace_all(&result, replacement.as_str()).to_string();
         }
-        result
+        scrub_high_entropy_tokens(&result)
     }
 
     /// Recursively scrub a JSON value in place.
@@ -650,5 +781,84 @@ mod tests {
         assert!(!rendered.contains("/Users/alice"));
         assert!(rendered.contains("<EMAIL>"));
         assert!(rendered.contains("<USER>"));
+    }
+
+    // ── High-entropy secret tokens ───────────────────────────────────────
+
+    #[test]
+    fn high_entropy_mixed_alphanumeric_token_is_redacted() {
+        let scrubber = Scrubber::new();
+        let token = "A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6";
+        let scrubbed = scrubber.scrub(&format!("key was {token} here"));
+        assert!(!scrubbed.contains(token), "{scrubbed}");
+        assert_eq!(scrubbed, "key was <SECRET> here");
+    }
+
+    #[test]
+    fn high_entropy_base64url_token_is_redacted() {
+        let scrubber = Scrubber::new();
+        let token = "dGhpcy1pcy1hLXNlY3JldC10b2tlbi12YWx1ZS0xMjM0";
+        assert!(token.len() >= HIGH_ENTROPY_MIN_LEN);
+        let scrubbed = scrubber.scrub(&format!("value={token}"));
+        assert!(!scrubbed.contains(token), "{scrubbed}");
+        assert!(scrubbed.contains(SECRET_PLACEHOLDER));
+    }
+
+    #[test]
+    fn high_entropy_hex_digest_is_redacted() {
+        let scrubber = Scrubber::new();
+        let token = "0123456789abcdef0123456789abcdef01234567";
+        let scrubbed = scrubber.scrub(&format!("sha1 {token}"));
+        assert!(!scrubbed.contains(token), "{scrubbed}");
+        assert!(scrubbed.contains(SECRET_PLACEHOLDER));
+    }
+
+    #[test]
+    fn repeated_low_entropy_run_is_not_a_secret() {
+        let scrubber = Scrubber::new();
+        // Mixed character classes, but far too repetitive to be a secret.
+        let token = "AbcAbcAbcAbcAbcAbcAbcAbcAbcAbc123Abc";
+        let scrubbed = scrubber.scrub(&format!("payload {token}"));
+        assert!(scrubbed.contains(token), "{scrubbed}");
+    }
+
+    /// File paths, Rust symbols, backtrace frames and URLs are diagnostics, not
+    /// secrets. The detector must not touch them.
+    #[test]
+    fn diagnostic_shapes_survive_high_entropy_scrubbing() {
+        let scrubber = Scrubber::new();
+        for text in [
+            "at /rustc/abcdef0123456789abcdef0123456789/library/std/src/panicking.rs:123:5",
+            "coderex_core::engine::QueryEngine::submit",
+            "at file.rs:12:9",
+            "this_is_a_very_long_function_name_with_digits_12345",
+            "ThisIsAVeryLongCamelCaseTypeNameWithoutDigits",
+            "_ZN4core3fmt9Formatter3pad17h0123456789abcdefE",
+            "https://example.com/docs/abcdefghijklmnopqrstuvwxyz012345",
+            "The quick brown fox jumps over the lazy dog and keeps running.",
+        ] {
+            let scrubbed = scrubber.scrub(text);
+            assert!(
+                !scrubbed.contains(SECRET_PLACEHOLDER),
+                "{text} -> {scrubbed}"
+            );
+        }
+    }
+
+    /// A hashed path component is part of a path, not a standalone token.
+    #[test]
+    fn long_hashed_path_component_survives() {
+        let scrubber = Scrubber::new();
+        let text = "/repo/.git/objects/ab/0123456789abcdef0123456789abcdef01234567";
+        assert_eq!(scrubber.scrub(text), text);
+    }
+
+    /// The labelled-credential patterns run first, so a recognized key keeps its
+    /// specific placeholder rather than the generic one.
+    #[test]
+    fn labelled_key_keeps_its_specific_placeholder() {
+        let scrubber = Scrubber::new();
+        let scrubbed = scrubber.scrub("api_key=sk-abc123def456ghi789jkl012mno345");
+        assert_eq!(scrubbed, "<API_KEY>");
     }
 }

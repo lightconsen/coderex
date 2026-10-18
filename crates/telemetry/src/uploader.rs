@@ -413,7 +413,7 @@ impl TelemetryUploader {
         let payload = serde_json::json!({
             "crashes": crashes
                 .iter()
-                .map(|c| build_crash_payload(c, self.strict))
+                .map(|c| build_crash_payload(&self.scrubber, c, self.strict))
                 .collect::<Vec<_>>(),
         });
 
@@ -485,16 +485,41 @@ fn build_event_payload(
 }
 
 /// Build the wire payload for one pending crash report.
-fn build_crash_payload(crash: &PendingCrash, strict: bool) -> serde_json::Value {
-    let mut payload = serde_json::json!({
-        "panic_info": crash.panic_info,
-        "backtrace": crash.backtrace,
-        "timestamp": crash.created_at,
-    });
+///
+/// In strict mode the free-form panic text is never sent: a stored structured
+/// summary is passed through, and a legacy raw row is reduced to its panic
+/// location only. The payload carries an explicit `redaction_status` field so
+/// the receiver can tell a structured report from a merely scrubbed one. The
+/// backtrace is omitted entirely (sent as `null`).
+///
+/// Outside strict mode the stored text is re-scrubbed on the way out
+/// (defence in depth), including the high-entropy detector.
+fn build_crash_payload(
+    scrubber: &Scrubber,
+    crash: &PendingCrash,
+    strict: bool,
+) -> serde_json::Value {
     if strict {
+        let summary = scrubber.scrub(&crate::crash::structured_summary_from_stored(
+            &crash.panic_info,
+        ));
+        let mut payload = serde_json::json!({
+            "panic_info": summary,
+            "backtrace": serde_json::Value::Null,
+            "timestamp": crash.created_at,
+            "redaction_status": crate::crash::CRASH_STRUCTURED_MARKER,
+        });
+        // `redaction_status` is on the allowlist, so this leaves the explicit
+        // structured mark intact and only marks genuinely unknown fields.
         crate::scrubber::mark_unredacted_if_unallowlisted(&mut payload);
+        return payload;
     }
-    payload
+
+    serde_json::json!({
+        "panic_info": scrubber.scrub(&crash.panic_info),
+        "backtrace": crash.backtrace.as_deref().map(|backtrace| scrubber.scrub(backtrace)),
+        "timestamp": crash.created_at,
+    })
 }
 
 /// Compress a JSON value into a gzip-encoded byte vector.
@@ -805,5 +830,97 @@ mod tests {
         }));
         let built = build_event_payload(&scrubber, &event, false);
         assert!(built["payload"].get("redaction_status").is_none());
+    }
+
+    // ── Crash payloads ──────────────────────────────────────────────────
+
+    fn pending_crash_with(panic_info: &str, backtrace: Option<&str>) -> PendingCrash {
+        PendingCrash {
+            id: 1,
+            panic_info: panic_info.into(),
+            backtrace: backtrace.map(str::to_string),
+            created_at: "2026-01-01T00:00:00Z".into(),
+        }
+    }
+
+    /// Strict mode sends a structured summary, an explicit payload marker and
+    /// no backtrace — the free-form panic text never reaches the wire.
+    #[test]
+    fn strict_crash_payload_is_structured_and_marked() {
+        let scrubber = Scrubber::new();
+        let crash = pending_crash_with(
+            "panicked at src/main.rs:10:5:\nuser said: key A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6 mail bob@example.com",
+            Some("at /home/bob/project/src/main.rs:10:5"),
+        );
+        let payload = build_crash_payload(&scrubber, &crash, true);
+
+        assert_eq!(
+            payload["redaction_status"],
+            serde_json::json!("structured"),
+            "the marker must be a payload field"
+        );
+        assert!(payload["backtrace"].is_null(), "no frames in strict mode");
+
+        let rendered = payload.to_string();
+        for forbidden in [
+            "user said",
+            "bob@example.com",
+            "A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6",
+            "/home/bob",
+        ] {
+            assert!(!rendered.contains(forbidden), "{forbidden}: {rendered}");
+        }
+        // Panic location is metadata, and it is retained.
+        assert!(rendered.contains("src/main.rs:10:5"), "{rendered}");
+        assert!(rendered.contains("[strict-crash-summary]"), "{rendered}");
+    }
+
+    /// A legacy raw row is reduced to its location under strict mode; it is
+    /// never forwarded as if it had been scrubbed.
+    #[test]
+    fn strict_crash_payload_sanitizes_legacy_raw_rows() {
+        let scrubber = Scrubber::new();
+        let crash = pending_crash_with(
+            "panicked at src/old.rs:3:1:\nuser said something private",
+            Some("at /home/bob/secret.rs:3:1"),
+        );
+        let payload = build_crash_payload(&scrubber, &crash, true);
+        let rendered = payload.to_string();
+        assert!(!rendered.contains("user said"), "{rendered}");
+        assert!(!rendered.contains("/home/bob"), "{rendered}");
+        assert!(rendered.contains("location=src/old.rs:3:1"), "{rendered}");
+        assert_eq!(payload["redaction_status"], serde_json::json!("structured"));
+    }
+
+    /// Non-strict mode keeps diagnostics but scrubs secrets, including the
+    /// high-entropy token — symbols, frames and paths survive.
+    #[test]
+    fn non_strict_crash_payload_scrubs_secrets_and_keeps_symbols() {
+        let scrubber = Scrubber::new();
+        let crash = pending_crash_with(
+            "failed for bob@example.com carrying A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6",
+            Some(
+                "coderex_core::engine::run\n    at /home/bob/project/crates/core/src/engine.rs:42:9\nat file.rs:12:9",
+            ),
+        );
+        let payload = build_crash_payload(&scrubber, &crash, false);
+
+        assert!(payload.get("redaction_status").is_none());
+        let rendered = payload.to_string();
+        for forbidden in [
+            "bob@example.com",
+            "A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6",
+            "/home/bob",
+        ] {
+            assert!(!rendered.contains(forbidden), "{forbidden}: {rendered}");
+        }
+        for expected in [
+            "coderex_core::engine::run",
+            "crates/core/src/engine.rs:42:9",
+            "file.rs:12:9",
+            "<SECRET>",
+        ] {
+            assert!(rendered.contains(expected), "{expected}: {rendered}");
+        }
     }
 }
