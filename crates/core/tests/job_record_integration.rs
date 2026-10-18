@@ -356,3 +356,66 @@ fn adopt_outcome_accounts_for_every_record_found() {
     assert_eq!(result.outcome.total(), 5);
     assert_eq!(result.notifications.len(), 1);
 }
+
+// ─── Lifecycle settlement ───────────────────────────────────────────────────
+
+#[test]
+fn settle_stamps_end_fields_and_is_idempotent_for_terminal_states() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = JobStore::new(tmp.path());
+    let running = record("shell-1", JobKind::Shell, JobState::Running, NOW);
+    store.write(&running).unwrap();
+
+    assert!(store
+        .settle(
+            "shell-1",
+            JobState::Failed,
+            NOW + 500,
+            Some(7),
+            Some("command exited with status 7".into()),
+        )
+        .unwrap());
+
+    let failed = store.load("shell-1").unwrap().unwrap();
+    assert_eq!(failed.state, JobState::Failed);
+    assert_eq!(failed.ended_at_ms, Some(NOW + 500));
+    assert_eq!(failed.updated_at_ms, NOW + 500);
+    assert_eq!(failed.exit_code, Some(7));
+    assert_eq!(
+        failed.error.as_deref(),
+        Some("command exited with status 7")
+    );
+
+    // Cancellation/adoption may have won the race; a late completion must not
+    // rewrite the record.
+    assert!(!store
+        .settle("shell-1", JobState::Done, NOW + 900, Some(0), None)
+        .unwrap());
+    assert_eq!(store.load("shell-1").unwrap().unwrap(), failed);
+}
+
+#[test]
+fn settle_missing_job_is_a_no_op() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = JobStore::new(tmp.path());
+    assert!(!store
+        .settle("absent", JobState::Done, NOW, None, None)
+        .unwrap());
+}
+
+#[test]
+fn adoption_of_a_written_running_record_marks_it_interrupted() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = JobStore::new(tmp.path());
+    let running = record("shell-2", JobKind::Shell, JobState::Running, NOW - 10);
+    store.write(&running).unwrap();
+
+    let adopted = coderex_core::job_record::adopt_for_session(&store, NOW, "sess_a")
+        .expect("adoption succeeds");
+    assert_eq!(adopted.outcome.interrupted, vec![running.clone()]);
+    assert_eq!(adopted.notifications.len(), 1);
+
+    let reconciled = store.load("shell-2").unwrap().unwrap();
+    assert_eq!(reconciled.state, JobState::Interrupted);
+    assert_eq!(reconciled.ended_at_ms, Some(NOW));
+}

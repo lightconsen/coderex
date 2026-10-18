@@ -23,3 +23,5 @@ strum.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+futures.workspace = true
+async-trait.workspace = true

@@ -16,7 +16,8 @@ use crate::registry::ToolRegistry;
 use crate::sandbox_policy;
 use crate::task_store::{TASK_STORE_KEY, TaskStore};
 use crate::tool::{
-    Backgrounding, RuleContentField, SharedState, ToolCapabilities, ToolContext, ToolInput,
+    Backgrounding, JOB_SESSION_ID_KEY, RuleContentField, SharedState, ToolCapabilities, ToolContext,
+    ToolInput,
 };
 use coderex_core::tool_executor::{ToolDispatchOutcome, ToolExecutor as CoreToolExecutor};
 use coderex_core::types::ToolResult;
@@ -55,6 +56,9 @@ pub struct RegistryToolDispatcher {
     /// arrives after both were made, so a plain copy cannot be flipped.
     chrome_enabled: Arc<std::sync::atomic::AtomicBool>,
     elicit_tx: Arc<std::sync::Mutex<Option<tokio::sync::mpsc::Sender<crate::tool::ElicitRequest>>>>,
+    /// Session that owns work started by these tools, when known. Tools that
+    /// write durable job records use it to attribute the record.
+    session_id: Option<String>,
 }
 
 impl RegistryToolDispatcher {
@@ -118,6 +122,7 @@ impl RegistryToolDispatcher {
             chrome_client: None,
             chrome_enabled: Arc::new(std::sync::atomic::AtomicBool::new(true)),
             elicit_tx: Arc::new(std::sync::Mutex::new(None)),
+            session_id: None,
         }
     }
 
@@ -131,6 +136,12 @@ impl RegistryToolDispatcher {
         self.sandbox_override = config;
     }
 
+    /// Attach the owning session id, used by tools that write durable job
+    /// records (background shell commands).
+    pub fn set_session_id(&mut self, session_id: impl Into<String>) {
+        self.session_id = Some(session_id.into());
+    }
+
     /// Attach a shared task store for task tools.
     pub fn set_task_store(&mut self, store: Arc<TaskStore>) {
         self.task_store = Some(store);
@@ -139,6 +150,15 @@ impl RegistryToolDispatcher {
     /// Attach a shared cron scheduler for cron tools.
     pub fn set_cron_scheduler(&mut self, scheduler: Arc<CronScheduler>) {
         self.cron_scheduler = Some(scheduler);
+    }
+
+    /// The shared cron scheduler, when one is attached.
+    ///
+    /// The REPL uses it to report a fired job back to the scheduler so its
+    /// durable definition (and its job record) stays current.
+    #[must_use]
+    pub fn cron_scheduler(&self) -> Option<Arc<CronScheduler>> {
+        self.cron_scheduler.clone()
     }
 
     /// Attach a shared rate limiter for web tools.
@@ -300,6 +320,14 @@ impl CoreToolExecutor for RegistryToolDispatcher {
                     Box::new(config) as SharedState,
                 );
             }
+        }
+
+        // Inject the owning session id for durable job records.
+        if let Some(ref session_id) = self.session_id {
+            extra.insert(
+                JOB_SESSION_ID_KEY.to_string(),
+                Box::new(session_id.clone()) as SharedState,
+            );
         }
 
         // Inject task store
@@ -524,8 +552,47 @@ pub fn path_arguments(input: &Value) -> Vec<std::path::PathBuf> {
 mod tests {
     use super::*;
     use crate::builtins::EchoTool;
+    use crate::context::ToolOutput;
     use crate::executor::ExecutionConfig;
     use crate::registry::ToolDenyRule;
+    use crate::tool::{InterruptBehavior, Tool, ToolDescriptor, ToolTier};
+
+    /// A tool whose schema advertises `run_in_background` without declaring
+    /// any backgrounding behaviour, as a copied schema would.
+    struct AdvertisesButIgnoresBackground;
+
+    #[async_trait::async_trait]
+    impl Tool for AdvertisesButIgnoresBackground {
+        fn descriptor(&self) -> ToolDescriptor {
+            ToolDescriptor {
+                name: "ignores_background".into(),
+                tier: ToolTier::Baseline,
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "run_in_background": { "type": "boolean" }
+                    }
+                }),
+                output_schema: serde_json::json!({}),
+                requires_approval: false,
+                is_enabled: true,
+                is_read_only: true,
+                is_concurrency_safe: true,
+                interrupt_behavior: InterruptBehavior::Interruptible,
+            }
+        }
+
+        async fn execute(
+            &self,
+            _input: ToolInput,
+            _ctx: ToolContext<'_>,
+        ) -> Result<ToolOutput, ToolError> {
+            Ok(ToolOutput {
+                output: String::new(),
+                is_display: false,
+            })
+        }
+    }
 
     fn registry_with_echo() -> Arc<ToolRegistry> {
         let mut registry = ToolRegistry::new();
@@ -949,6 +1016,7 @@ mod tests {
     #[tokio::test]
     async fn a_tool_that_ignores_run_in_background_does_not_advertise_it() {
         let mut registry = ToolRegistry::new();
+        registry.register(Arc::new(AdvertisesButIgnoresBackground));
         registry.register(Arc::new(crate::builtins::BashTool::new()));
         registry.register(Arc::new(crate::builtins::AgentTool::new()));
         let registry = Arc::new(registry);
@@ -970,16 +1038,24 @@ mod tests {
                 .unwrap_or_else(|| panic!("{name} was not listed"))
         };
 
-        // Bash advertises the argument and does not read it, so it is gone.
+        // This one advertises the argument and never reads it, so it is gone.
+        assert!(
+            schema_of("ignores_background")
+                .get("properties")
+                .unwrap()
+                .get("run_in_background")
+                .is_none(),
+            "a tool that ignores the flag still advertises it"
+        );
+        // Bash and Agent read it and really do background, so they keep it.
         assert!(
             schema_of("Bash")
                 .get("properties")
                 .unwrap()
                 .get("run_in_background")
-                .is_none(),
-            "Bash still advertises a flag it ignores"
+                .is_some(),
+            "Bash honours run_in_background and must keep advertising it"
         );
-        // Agent reads it and really does background, so it keeps it.
         assert!(
             schema_of("Agent")
                 .get("properties")

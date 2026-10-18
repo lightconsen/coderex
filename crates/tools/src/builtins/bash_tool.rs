@@ -10,9 +10,13 @@
 use std::time::Duration;
 
 use crate::context::{ToolError, ToolOutput};
-use crate::tool::{Tool, ToolContext, ToolDescriptor, ToolInput, ToolTier};
+use crate::tool::{
+    Backgrounding, Tool, ToolContext, ToolDescriptor, ToolInput, ToolTier, JOB_SESSION_ID_KEY,
+};
 use async_trait::async_trait;
+use coderex_core::job_record::{JobKind, JobRecord, JobState, JobStore};
 use coderex_core::shell_security::BashAst;
+use coderex_core::task::now_ms;
 use tokio::process::Command;
 
 
@@ -57,6 +61,122 @@ impl BashTool {
         self
     }
 
+    /// Spawn a command detached from the tool call and return a handle.
+    ///
+    /// The child's pid and the job record are written before this returns, so
+    /// a later session can find the work even if this process dies. Completion
+    /// (or failure/timeout) is observed by a tokio task that settles the
+    /// record atomically; closing the process leaves it `Running`, which the
+    /// adopt path reports as interrupted.
+    async fn spawn_background(
+        ctx: &ToolContext<'_>,
+        command: String,
+        timeout_secs: u64,
+        mut cmd: Command,
+        sandbox_handle: Option<coderex_core::sandbox::SandboxHandle>,
+    ) -> Result<ToolOutput, ToolError> {
+        cmd.stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            // A timed-out background command must not outlive its record.
+            .kill_on_drop(true);
+
+        let child = cmd.spawn().map_err(ToolError::Io)?;
+        crate::sandbox_shell::finish_spawn(sandbox_handle.as_ref(), &child)?;
+
+        let pid = child.id();
+        let started_at_ms = now_ms();
+        let store = JobStore::new(ctx.cwd);
+        let id = background_job_id(pid, started_at_ms);
+        let session_id = ctx
+            .extra
+            .get(JOB_SESSION_ID_KEY)
+            .and_then(|value| value.downcast_ref::<String>())
+            .map(String::as_str);
+
+        let mut record = JobRecord::new(
+            id.clone(),
+            JobKind::Shell,
+            job_description(&command),
+            ctx.cwd,
+            session_id,
+            started_at_ms,
+        );
+        record.pid = pid;
+        if let Err(error) = store.write(&record) {
+            // Refusing to run a working command because its record could not
+            // be written would be a new failure mode; run it, but make the
+            // lost durability visible.
+            tracing::warn!(
+                job = %id,
+                path = %store.root().display(),
+                error = %error,
+                "could not write the background shell job record"
+            );
+        }
+
+        let output_path = store.root().join(format!("{id}.out"));
+        let store_for_task = store.clone();
+        let id_for_task = id.clone();
+        let output_path_for_task = output_path.clone();
+        tokio::spawn(async move {
+            // The handle keeps the platform sandbox alive for the child's
+            // whole lifetime (a macOS profile, a Windows Job Object).
+            let _sandbox_keepalive = sandbox_handle;
+            let result = tokio::time::timeout(
+                Duration::from_secs(timeout_secs),
+                child.wait_with_output(),
+            )
+            .await;
+
+            let (state, exit_code, error, bytes) = match result {
+                Ok(Ok(output)) => {
+                    let mut bytes = output.stdout;
+                    if !output.stderr.is_empty() {
+                        bytes.extend_from_slice(b"\n--- stderr ---\n");
+                        bytes.extend_from_slice(&output.stderr);
+                    }
+                    let code = output.status.code().unwrap_or(-1);
+                    let (state, error) = if output.status.success() {
+                        (JobState::Done, None)
+                    } else {
+                        (
+                            JobState::Failed,
+                            Some(format!("command exited with status {code}")),
+                        )
+                    };
+                    (state, Some(code), error, bytes)
+                }
+                Ok(Err(error)) => {
+                    (JobState::Failed, None, Some(error.to_string()), Vec::new())
+                }
+                Err(_) => (
+                    JobState::Failed,
+                    None,
+                    Some(format!("timed out after {timeout_secs}s")),
+                    Vec::new(),
+                ),
+            };
+
+            if let Some(parent) = output_path_for_task.parent() {
+                let _ = tokio::fs::create_dir_all(parent).await;
+            }
+            let _ = tokio::fs::write(&output_path_for_task, &bytes).await;
+            let _ = store_for_task.settle(&id_for_task, state, now_ms(), exit_code, error);
+        });
+
+        Ok(ToolOutput {
+            output: serde_json::json!({
+                "job_id": id,
+                "pid": pid,
+                "output_file": output_path,
+                "note": "command running in background",
+            })
+            .to_string(),
+            is_display: true,
+        })
+    }
+
     /// Validate that `command` does not contain shell metacharacters
     /// and that its first token is in the allowlist (if configured).
     fn validate_command(&self, command: &str) -> Result<(), ToolError> {
@@ -90,6 +210,9 @@ impl Tool for BashTool {
     fn capabilities(&self) -> crate::tool::ToolCapabilities {
         crate::tool::ToolCapabilities {
             rule_content_field: Some(crate::tool::RuleContentField::Scalar("command")),
+            // `run_in_background` is genuinely handled: the tool spawns the
+            // child, returns a handle, and records the job before returning.
+            backgrounding: Backgrounding::SelfManaged,
             ..crate::tool::ToolCapabilities::default()
         }
     }
@@ -132,6 +255,11 @@ impl Tool for BashTool {
         let timeout_secs = extract_number(&input.arguments, "timeout")
             .unwrap_or(DEFAULT_TIMEOUT_SECS as i64)
             .clamp(1, MAX_TIMEOUT_SECS as i64) as u64;
+        let run_in_background = input
+            .arguments
+            .get("run_in_background")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
 
         // Validate against allowlist and metacharacters
         self.validate_command(&command)?;
@@ -150,6 +278,10 @@ impl Tool for BashTool {
         // this session's credentials out of the environment it inherits.
         for key in coderex_core::sandbox::credential_scrub_keys() {
             cmd.env_remove(key);
+        }
+
+        if run_in_background {
+            return Self::spawn_background(&ctx, command, timeout_secs, cmd, sandbox_handle).await;
         }
 
         // Spawned rather than `output()`ed because Windows has to place the
@@ -227,6 +359,33 @@ fn extract_string(args: &serde_json::Value, key: &str) -> Result<String, ToolErr
 
 fn extract_number(args: &serde_json::Value, key: &str) -> Option<i64> {
     args.get(key).and_then(serde_json::Value::as_i64)
+}
+
+/// A job id that is safe as a file stem (no separators) and unique enough:
+/// the child pid plus the start time distinguishes two commands.
+fn background_job_id(pid: Option<u32>, started_at_ms: i64) -> String {
+    let started_at_ms = started_at_ms.max(0);
+    match pid {
+        Some(pid) => format!("shell-{pid}-{started_at_ms}"),
+        None => format!("shell-{started_at_ms}"),
+    }
+}
+
+/// A bounded, human-readable description for a job record.
+fn job_description(command: &str) -> String {
+    const LIMIT: usize = 200;
+    let mut out = String::with_capacity(command.len().min(LIMIT) + 1);
+    let mut chars = command.chars();
+    for _ in 0..LIMIT {
+        match chars.next() {
+            Some(c) => out.push(c),
+            None => return out,
+        }
+    }
+    if chars.next().is_some() {
+        out.push('…');
+    }
+    out
 }
 
 #[cfg(test)]
@@ -531,5 +690,107 @@ mod tests {
     fn system_shell_is_not_refused() {
         // The ordinary case: `sh` comes from the system, not the workspace.
         crate::sandbox_shell::guard_program_origin("sh", Path::new("/tmp")).unwrap();
+    }
+
+    fn background_input(command: &str, timeout: u64) -> ToolInput {
+        ToolInput {
+            call_id: "bg".into(),
+            name: "Bash".into(),
+            arguments: serde_json::json!({
+                "command": command,
+                "timeout": timeout,
+                "run_in_background": true,
+            }),
+        }
+    }
+
+    async fn wait_for_terminal(
+        store: &JobStore,
+        id: &str,
+    ) -> coderex_core::job_record::JobRecord {
+        for _ in 0..200 {
+            if let Ok(Some(record)) = store.load(id) {
+                if record.state != JobState::Running {
+                    return record;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        panic!("background job {id} never reached a terminal state");
+    }
+
+    #[tokio::test]
+    async fn background_job_is_recorded_running_then_done() {
+        let dir = tempfile::tempdir().unwrap();
+        let output = BashTool::new()
+            .execute(
+                background_input("sleep 0.3; echo background-done", 10),
+                test_ctx(dir.path()),
+            )
+            .await
+            .unwrap();
+
+        let handle: serde_json::Value = serde_json::from_str(&output.output).unwrap();
+        let id = handle["job_id"].as_str().unwrap().to_string();
+        assert!(
+            !id.contains('/') && !id.contains('\\'),
+            "job id must be a safe file stem: {id}"
+        );
+        assert_eq!(handle["note"], "command running in background");
+
+        let store = JobStore::new(dir.path());
+        let running = store.load(&id).unwrap().expect("record written at spawn");
+        assert_eq!(running.state, JobState::Running);
+        assert_eq!(running.kind, JobKind::Shell);
+        assert!(running.pid.is_some());
+        assert!(running.ended_at_ms.is_none());
+        assert!(running.description.contains("background-done"));
+
+        let done = wait_for_terminal(&store, &id).await;
+        assert_eq!(done.state, JobState::Done);
+        assert_eq!(done.exit_code, Some(0));
+        assert!(done.error.is_none());
+        assert!(done.ended_at_ms.is_some());
+        assert!(done.ended_at_ms.unwrap() >= done.started_at_ms);
+
+        let captured = std::fs::read_to_string(dir.path().join(".coderex/jobs").join(format!("{id}.out")))
+            .unwrap();
+        assert!(captured.contains("background-done"));
+    }
+
+    #[tokio::test]
+    async fn background_failure_records_exit_code() {
+        let dir = tempfile::tempdir().unwrap();
+        let output = BashTool::new()
+            .execute(
+                background_input("sleep 0.2; exit 7", 10),
+                test_ctx(dir.path()),
+            )
+            .await
+            .unwrap();
+        let handle: serde_json::Value = serde_json::from_str(&output.output).unwrap();
+        let id = handle["job_id"].as_str().unwrap().to_string();
+
+        let failed = wait_for_terminal(&JobStore::new(dir.path()), &id).await;
+        assert_eq!(failed.state, JobState::Failed);
+        assert_eq!(failed.exit_code, Some(7));
+        assert!(failed.error.unwrap().contains("status 7"));
+        assert!(failed.ended_at_ms.is_some());
+    }
+
+    #[tokio::test]
+    async fn background_timeout_settles_failed_not_running() {
+        let dir = tempfile::tempdir().unwrap();
+        let output = BashTool::new()
+            .execute(background_input("sleep 30", 1), test_ctx(dir.path()))
+            .await
+            .unwrap();
+        let handle: serde_json::Value = serde_json::from_str(&output.output).unwrap();
+        let id = handle["job_id"].as_str().unwrap().to_string();
+
+        let timed_out = wait_for_terminal(&JobStore::new(dir.path()), &id).await;
+        assert_eq!(timed_out.state, JobState::Failed);
+        assert!(timed_out.error.unwrap().contains("timed out"));
+        assert!(timed_out.ended_at_ms.is_some());
     }
 }
