@@ -120,21 +120,72 @@ The sandbox is enforced by the host, not by trusting the module:
   deliberately does not bound) or use atomics.
 - **No host interface**: instances are created with an empty import set, so a
   module importing WASI or anything else fails to instantiate.
-- **Compile-time input**: the module file must be at most 16 MiB
-  (`PLUGIN_MAX_WASM_BYTES`). `PluginWasmInstance::new` checks the file length —
-  from metadata before reading, and again after reading — and refuses an
-  oversized file with an error naming its size, *before* it reaches
-  `Module::new`.
 
-**Honest remaining boundary:** wasmtime 20 has no compile-time fuel or epoch
-budget, so compilation itself cannot be interrupted or time-limited. The 16 MiB
-cap bounds how much input compilation can be asked to process; it is not a CPU
-or wall-clock budget, and a pathological module at or below the cap can still
-consume compiler time. wasmtime's seemingly related configuration does not
-close this: `parallel_compilation(false)` only chooses single-threaded
-compilation (it does not reduce total work), and `max_wasm_stack` bounds the
-guest stack at runtime, not compilation. No option is set for either, because
-neither is a genuine compile-time bound.
+Compilation is bounded in two layers. The first runs in-process and bounds the
+*work*, the second runs in a killable child and bounds the *time*.
+
+**Layer 1 — linear pre-scan (always on).** Before either compilation path,
+`PluginWasmInstance::new` parses the module linearly with `wasmparser` and
+rejects it when any of these limits is exceeded:
+
+| Limit | Constant | Value |
+|---|---|---|
+| Module file | `PLUGIN_MAX_WASM_BYTES` | 16 MiB |
+| Code section bytes | `PLUGIN_MAX_CODE_SECTION_BYTES` | 8 MiB |
+| Declared functions | `PLUGIN_MAX_FUNCTIONS` | 50,000 |
+| Total operators (all bodies) | `PLUGIN_MAX_OPERATORS` | 1,000,000 |
+| `block`/`loop`/`if` nesting | `PLUGIN_MAX_NESTING_DEPTH` | 256 |
+| WAT text input | `PLUGIN_MAX_WAT_BYTES` | 1 MiB |
+
+The file-size check runs from metadata before reading and again after reading,
+so an oversized file is never loaded. The pre-scan translates WAT text to the
+binary format first, so the text form cannot bypass the limits; every error
+names the limit it crossed. The scan deliberately does not validate the module
+— wasmtime still does that — it only measures work.
+
+**Layer 2 — out-of-process compilation (when the helper is present).** The
+parent looks for a hidden helper binary named `coderex-wasm-compile` next to
+its own executable (for example `target/debug/coderex-wasm-compile`). When it
+is there, the parent stages the scanned bytes in a private temp directory and
+runs `coderex-wasm-compile <input> <output>`. The helper builds the engine with
+the same `sandboxed_engine()` configuration, compiles, and writes
+`Module::serialize` output; the parent `Module::deserialize`s it.
+
+The parent installs limits on the child before it executes:
+
+- `RLIMIT_CPU` = 20 s (Unix, mandatory);
+- `RLIMIT_AS` = 2 GiB (Unix, best-effort — see the boundary note);
+- a 30 s wall-clock timer, after which the child is killed;
+- on Windows, a Job Object with job user-time and job memory limits, via the
+  core sandbox's synchronous `prepare`/`post_spawn` API.
+
+The helper is built by `cargo build -p coderex-plugins` alongside the library
+(it is a `[[bin]]` target requiring the `wasm-runtime` feature). Packaging that
+ships the plugin runtime must ship the helper too.
+
+**Fallback — no helper next to the executable.** If the helper does not exist,
+the parent logs a warning and compiles in-process under the Layer 1 pre-scan
+limits. This keeps a bare library or test build working, but **the in-process
+fallback is not a CPU bound**: a pathological module that passes the pre-scan
+can still consume compiler time. If the helper exists and fails (non-zero
+exit, timeout, bad output), that is an error — the parent does not silently
+fall back and lose the CPU bound.
+
+**Honest remaining boundaries:**
+
+- In-process fallback has no CPU or wall-clock budget. wasmtime 20 has no
+  compile-time fuel or epoch option; `parallel_compilation(false)` only
+  chooses single-threaded compilation (it does not reduce total work), and
+  `max_wasm_stack` bounds the guest stack at runtime, not compilation.
+- `RLIMIT_AS` is attempted on Unix but Darwin rejects finite address-space
+  limits with `EINVAL`, and some sandboxes do the same. The failure is
+  ignored (it cannot be logged from `pre_exec`): on macOS the child still has
+  the hard CPU limit and the parent's wall-clock kill, but no memory ceiling.
+- Compilation is one child process; `Child::kill` kills that process, not a
+  hypothetical descendant tree (the helper does not spawn children).
+- The helper path and timeout have debug-build-only environment overrides
+  (`CODEREX_WASM_COMPILE_HELPER`, `CODEREX_WASM_COMPILE_TIMEOUT_MS`) used by
+  the tests. Release builds look only next to the executable.
 
 ## `plugin.json` Field Table
 
@@ -315,7 +366,7 @@ During REPL construction:
 - Skill frontmatter parsing via `serde_yaml` with custom scalar/array deserializers.
 - Repo-specific skills from `.coderex/skills/`.
 - MCP skills bridge: `phase_init_mcp` converts discovered MCP tools to `SkillMetadata`.
-- **WASM runtime enabled by default**: `process-runtime` and `wasm-runtime` are both default Cargo features; WASM modules are compiled in-process under fuel (100M per call), a 64 MiB memory limiter, disabled threads, no host imports, and a 16 MiB pre-compilation file-size cap.
+- **WASM runtime enabled by default**: `process-runtime` and `wasm-runtime` are both default Cargo features; WASM calls run under fuel (100M per call), a 64 MiB memory limiter, disabled threads, and no host imports. Compilation is guarded by a `wasmparser` pre-scan (16 MiB file, 8 MiB code section, 50,000 functions, 1,000,000 operators, 256 nesting levels) and, when `coderex-wasm-compile` is present next to the executable, runs in a child with `RLIMIT_CPU`/`RLIMIT_AS` and a wall-clock kill.
 - **Full manifest field table** with `deny_unknown_fields`, `PluginAuthor` accepting a string or an object, and a load-time warning for fields CodeRex accepts but does not implement.
 - **`userConfig` injection**: `CODEREX_PLUGIN_OPTION_<KEY>` in the child's environment and `${user_config.KEY}` substitution in `env` and `entrypoint`; sensitive options refuse a plaintext default and refuse an unresolved `keyring://` reference; a required option with no value stops the spawn.
 - **Install sources**: marketplace listing, local directory, git URL, GitHub `owner/repo` shorthand, a git subdirectory, and HTTPS archive — with `PluginSource::detect()` classifying a CLI argument, and the unimplemented `npm`/`command` kinds recognised and refused rather than silently reinterpreted.
@@ -327,7 +378,7 @@ During REPL construction:
 - `options`/`min`/`max`/`type` in `userConfig` are parsed and ignored: no validation.
 - Pin files are created by the first install; a user cannot pre-seed a pin before installing.
 - WASM plugins get no `userConfig` (no process environment).
-- WASM compilation has no CPU/epoch budget in wasmtime 20. The 16 MiB input cap is the only compile-time bound; a pathological module within the cap can still take a long time to compile (see "WASM Plugins").
+- WASM compilation is CPU/wall-clock bounded only when `coderex-wasm-compile` sits next to the executable. If the helper is missing, compilation falls back in-process with the pre-scan limits but no CPU bound; `RLIMIT_AS` is also unavailable on Darwin (see "WASM Plugins").
 - `npm` and `command` sources are not implemented (see above for why, and for the reference citation on `npm`).
 - `crates/cli/src/orchestrator.rs` still parses `plugin.json` itself in `phase_init_plugins` and ignores a parse error silently; the library's `discover()` warns, but the CLI's own loop has not been changed here.
 
@@ -336,5 +387,6 @@ During REPL construction:
 - 71 tests in `plugins.rs` (manager ops, load/unload, marketplace, discovery, reconciler, URL validation, version checks, signature verification, dependency resolution, error recovery, custom endpoints, the manifest field table, `userConfig` resolution and injection end-to-end, source detection and git URL validation, directory/git/git-subdir installs, structured source specs, the `npm`/`command` refusals, SHA-256 vectors and pin enforcement).
 - 14 tests in `skills.rs` (parsing, loader, plugin/MCP skills, repo dir, conflict resolution, precedence, quoted strings).
 - 7 tests in `runtime.rs` (spawn, initialize, terminate, invalid command).
-- 9 tests in `wasm_runtime.rs`, all run by the default `cargo test -p coderex-plugins`: the loader stub, the 5 sandbox tests (fuel, memory growth, initial memory, shared memory, WASI import), and 3 size-cap tests (over the 16 MiB cap, exactly at it, and a valid module below it).
+- 15 tests in `wasm_runtime.rs`, all run by the default `cargo test -p coderex-plugins`: the loader stub, 8 sandbox tests (fuel, memory growth, initial memory, shared memory, WASI import, and the 3 size-cap cases), and 6 pre-scan tests (normal module, oversized code section, too many functions, too many operators, excessive nesting, nesting exactly at the cap).
+- 4 integration tests in `tests/wasm_compile_subprocess.rs`: the real helper compiles/serializes and the parent deserializes (directly and through `PluginWasmInstance::new`), a slow helper is killed at the wall-clock limit, a missing helper falls back in-process, and the fallback still enforces the pre-scan.
 - Tests use `tempfile` for filesystem operations. The git and git-subdir install tests create a throwaway repository inside a `tempfile::tempdir()` and pin every git command with `-C`, so they never touch the project's own repository. The subdirectory tests use `file://` clone URLs, so they need no network.
