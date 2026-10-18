@@ -3,6 +3,7 @@
 use coderex_mcp::channel::{InboundRequestHandler, JsonRpcChannel, JsonRpcError};
 use coderex_mcp::config::{McpConfig, McpServerConfig, McpTransport};
 use coderex_mcp::manager::McpManager;
+use coderex_mcp::oauth::{McpOAuthState, OAuthManager, OAuthTokenProvider};
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
@@ -264,6 +265,112 @@ async fn a_server_request_in_an_sse_stream_with_no_handler_is_refused() {
     assert!(
         answer.contains("-32601"),
         "a request nothing can answer should be refused: {answer}"
+    );
+
+    channel.terminate().await.unwrap();
+}
+
+/// The authorization header of one recorded request, if it had one.
+fn authorization(request: &str) -> Option<String> {
+    request.lines().find_map(|line| {
+        let (name, value) = line.split_once(':')?;
+        name.eq_ignore_ascii_case("authorization")
+            .then(|| value.trim().to_string())
+    })
+}
+
+/// A server that answers `count` JSON-RPC requests, recording each one.
+fn spawn_rpc_server(count: usize) -> (SocketAddr, std::thread::JoinHandle<Vec<String>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let handle = std::thread::spawn(move || {
+        let mut requests = Vec::new();
+        for index in 0..count {
+            let (mut stream, _) = listener.accept().unwrap();
+            let request = read_request(&mut stream);
+            requests.push(request);
+            let body = format!(r#"{{"jsonrpc":"2.0","id":{},"result":{{}}}}"#, index + 1);
+            write_response(&mut stream, "200 OK", "application/json", &body);
+        }
+        requests
+    });
+    (address, handle)
+}
+
+/// A one-shot token endpoint, recording the request it was sent.
+fn spawn_token_endpoint(body: &'static str) -> (String, std::thread::JoinHandle<String>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let handle = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let request = read_request(&mut stream);
+        write_response(&mut stream, "200 OK", "application/json", body);
+        request
+    });
+    (format!("http://{address}/oauth/token"), handle)
+}
+
+/// A token that expires between two requests must be refreshed for the second
+/// one. This is the difference between "authenticated at startup" and
+/// "authenticated for the life of the session".
+#[tokio::test]
+async fn an_expiring_token_is_refreshed_before_the_second_request() {
+    let (mcp_address, mcp_server) = spawn_rpc_server(2);
+    let (token_endpoint, token_server) = spawn_token_endpoint(
+        r#"{"access_token":"new_access","refresh_token":"rotated","expires_in":3600}"#,
+    );
+    let server_url = format!("http://{mcp_address}/mcp");
+
+    let dir = tempfile::tempdir().unwrap();
+    let mut oauth = OAuthManager::with_path(dir.path().join("mcp_tokens.json"));
+    let mut state = McpOAuthState::new(&server_url, "client1");
+    state.access_token = Some("old_access".into());
+    state.refresh_token = Some("refresh_me".into());
+    state.expires_at = Some(chrono::Utc::now().timestamp() + 3600);
+    state.token_endpoint = Some(token_endpoint);
+    oauth.register(state);
+    let oauth = Arc::new(tokio::sync::Mutex::new(oauth));
+
+    let mut channel = JsonRpcChannel::new_http(&server_url, HashMap::new()).unwrap();
+    channel.set_token_provider(Arc::new(OAuthTokenProvider::new(
+        Arc::clone(&oauth),
+        server_url.clone(),
+        reqwest::Client::new(),
+    )));
+    channel.spawn().await.unwrap();
+
+    channel.send_request("tools/list", None).await.unwrap();
+
+    // Move the token inside the 5-minute window. The next request has to
+    // notice and refresh before sending.
+    {
+        let mut oauth = oauth.lock().await;
+        oauth.get_mut(&server_url).expect("state").expires_at =
+            Some(chrono::Utc::now().timestamp() + 60);
+    }
+    channel.send_request("tools/list", None).await.unwrap();
+
+    let requests = mcp_server.join().unwrap();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(
+        authorization(&requests[0]).as_deref(),
+        Some("Bearer old_access")
+    );
+    assert_eq!(
+        authorization(&requests[1]).as_deref(),
+        Some("Bearer new_access"),
+        "the second request did not use the refreshed token: {}",
+        requests[1]
+    );
+
+    let token_request = token_server.join().unwrap();
+    assert!(
+        token_request.contains("grant_type=refresh_token"),
+        "{token_request}"
+    );
+    assert!(
+        token_request.contains("refresh_token=refresh_me"),
+        "{token_request}"
     );
 
     channel.terminate().await.unwrap();

@@ -87,6 +87,8 @@ pub struct McpServer {
     /// every server, so a session can install its UI handler after the servers
     /// have already been spawned, and a reconnecting server keeps it.
     inbound_handler: crate::channel::SharedInboundHandler,
+    /// Resolves the bearer token before each remote request, when installed.
+    token_provider: Option<Arc<dyn crate::http::TokenProvider>>,
 }
 
 impl McpServer {
@@ -111,6 +113,7 @@ impl McpServer {
             max_reconnects: 3,
             channel: None,
             inbound_handler: crate::channel::SharedInboundHandler::new(),
+            token_provider: None,
         }
     }
 
@@ -135,6 +138,7 @@ impl McpServer {
             max_reconnects: 3,
             channel: None,
             inbound_handler: crate::channel::SharedInboundHandler::new(),
+            token_provider: None,
         }
     }
 
@@ -158,7 +162,25 @@ impl McpServer {
         // requests with `-32601`, which is the honest answer; when the session
         // fills it later, this channel sees the change without being rebuilt.
         channel.set_inbound_handler(Arc::new(self.inbound_handler.clone()));
+        if let Some(ref provider) = self.token_provider {
+            channel.set_token_provider(Arc::clone(provider));
+        }
         Ok(channel)
+    }
+
+    /// Resolve the credential for this server before every remote request.
+    ///
+    /// The provider is stored on the server rather than on a channel because
+    /// [`McpServer::spawn`] and [`McpServer::reconnect`] build a fresh channel;
+    /// a provider set on a pre-spawn handle would otherwise be dropped.
+    pub fn set_token_provider(&mut self, provider: Arc<dyn crate::http::TokenProvider>) {
+        self.token_provider = Some(provider);
+    }
+
+    /// The credential resolver installed on this server, if any.
+    #[must_use]
+    pub fn token_provider(&self) -> Option<&Arc<dyn crate::http::TokenProvider>> {
+        self.token_provider.as_ref()
     }
 
     /// Answer requests this server makes of the client.

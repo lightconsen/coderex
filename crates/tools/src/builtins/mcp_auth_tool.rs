@@ -7,9 +7,18 @@
 //!
 //! Two things it needs from the user and cannot supply itself: a browser to
 //! visit the URL, and a click to approve. When the browser cannot be opened,
-//! the tool returns the URL and the PKCE verifier so the flow can be finished
-//! by hand with a second call carrying `code` and `code_verifier` — it does not
-//! sit waiting for a callback that can never arrive.
+//! the tool returns the URL, the PKCE verifier and the `state` it generated so
+//! the flow can be finished by hand — it does not sit waiting for a callback
+//! that can never arrive. The hand-off is persisted under
+//! `~/.coderex/mcp_oauth_pending.json`, because the finishing call is usually a
+//! different invocation: it accepts either a pasted full redirect URL (whose
+//! `code` and `state` are parsed and the state checked against the pending
+//! flow) or a bare `code` with the `code_verifier` from the first call.
+//!
+//! Endpoints come from the server's RFC 8414 metadata when it publishes any
+//! (`/.well-known/oauth-authorization-server`, then OpenID Connect discovery);
+//! otherwise the conventional `/oauth/authorize` and `/oauth/token` paths are
+//! used.
 
 use crate::context::{ToolError, ToolOutput};
 use crate::tool::{Tool, ToolContext, ToolDescriptor, ToolInput, ToolTier};
@@ -19,6 +28,9 @@ use std::time::Duration;
 
 /// Local redirect URI used to capture the OAuth callback.
 const LOCAL_REDIRECT_URI: &str = "http://localhost:8765/callback";
+
+/// Pending hand-off flows, beside the token store.
+const PENDING_FILE: &str = "mcp_oauth_pending.json";
 
 /// Trigger MCP OAuth authentication flow for a server.
 #[derive(Debug)]
@@ -37,8 +49,9 @@ impl Tool for McpAuthTool {
                     "server_url": { "type": "string", "description": "MCP server URL to authenticate with" },
                     "client_id": { "type": "string", "description": "OAuth client ID (default: coderex-cli)" },
                     "scope": { "type": "string", "description": "OAuth scope (default: mcp)" },
+                    "redirect_url": { "type": "string", "description": "The full URL the browser was redirected to after approval. Its code and state are parsed and the state is verified against the pending flow." },
                     "code": { "type": "string", "description": "Authorization code, when finishing by hand after the browser callback did not arrive" },
-                    "code_verifier": { "type": "string", "description": "PKCE verifier returned by the earlier call that produced the auth_url" }
+                    "code_verifier": { "type": "string", "description": "PKCE verifier returned by the earlier call that produced the auth_url (optional when a pending flow is on disk)" }
                 }
             }),
             output_schema: serde_json::json!({
@@ -78,34 +91,117 @@ async fn authenticate(input: ToolInput, token_path: &Path) -> Result<ToolOutput,
         extract_string(&input.arguments, "client_id").unwrap_or_else(|_| "coderex-cli".into());
     let scope = extract_string(&input.arguments, "scope").unwrap_or_else(|_| "mcp".into());
 
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new());
+
+    let pending_path = pending_path(token_path);
+    let pending = load_pending(&pending_path, &server_url);
+    let discovery = discover_endpoints(&client, &server_url).await;
+
+    let authorization_endpoint = [
+        discovery.authorization_endpoint.clone(),
+        pending
+            .as_ref()
+            .and_then(|pending| pending.authorization_endpoint.clone()),
+    ]
+    .into_iter()
+    .flatten()
+    .find(|endpoint| url::Url::parse(endpoint).is_ok())
+    .unwrap_or_else(|| format!("{}/oauth/authorize", server_url.trim_end_matches('/')));
+    // The token endpoint the exchange is posted to. A pending flow keeps the
+    // one discovered during the first call, in case the metadata endpoint is
+    // unreachable now but was reachable then.
+    let token_endpoint = discovery
+        .token_endpoint
+        .clone()
+        .or_else(|| pending.as_ref().and_then(|p| p.token_endpoint.clone()))
+        .unwrap_or_else(|| format!("{}/oauth/token", server_url.trim_end_matches('/')));
+
     // PKCE: the verifier stays here, the challenge travels in the URL. A
     // code intercepted from the redirect is useless without the verifier.
-    let verifier = code_verifier();
-    let challenge = code_challenge(&verifier);
-
-    // Generate a random state parameter
+    let fresh_verifier = code_verifier();
+    let challenge = code_challenge(&fresh_verifier);
     let state = format!("coderex-{}", uuid::Uuid::new_v4());
 
-    // Build authorization URL
-    let auth_url = format!(
-        "{server_url}/oauth/authorize?response_type=code&client_id={client_id}&redirect_uri={}&scope={}&state={}&code_challenge={}&code_challenge_method=S256",
-        url_encode(LOCAL_REDIRECT_URI),
-        url_encode(&scope),
-        url_encode(&state),
-        url_encode(&challenge),
-    );
+    let redirect_url = extract_string(&input.arguments, "redirect_url").ok();
+    let supplied_code = extract_string(&input.arguments, "code").ok();
+    let supplied_verifier = extract_string(&input.arguments, "code_verifier").ok();
 
-    // A code supplied by the caller means the flow is being finished by hand:
-    // the verifier must be the one that built the auth_url this code came from.
-    let (code, verifier) = if let Ok(code) = extract_string(&input.arguments, "code") {
-        let verifier = extract_string(&input.arguments, "code_verifier").unwrap_or(verifier);
+    let mut auth_url = None;
+    let (code, verifier) = if let Some(redirect_url) = redirect_url {
+        // Finishing from a pasted redirect URL. The state is only meaningful
+        // against the flow that produced it, so there must be a pending flow
+        // and the two must agree.
+        let (code, received_state) =
+            parse_redirect_url(&redirect_url).map_err(|message| ToolError::InvalidInput {
+                message: format!("redirect_url is not usable: {message}"),
+            })?;
+        let Some(pending) = pending else {
+            return Err(ToolError::InvalidInput {
+                message: format!(
+                    "no pending authorization for {server_url}. Run McpAuth without a \
+                     redirect_url first, so there is a state and PKCE verifier to check this \
+                     redirect against."
+                ),
+            });
+        };
+        if received_state.as_deref() != Some(pending.state.as_str()) {
+            return Err(ToolError::InvalidInput {
+                message: format!(
+                    "the redirect URL's state does not match the pending authorization for \
+                     {server_url}. A state mismatch means the redirect did not come from this \
+                     flow; start again with a fresh McpAuth call."
+                ),
+            });
+        }
+        let verifier = supplied_verifier.unwrap_or(pending.code_verifier);
+        (code, verifier)
+    } else if let Some(code) = supplied_code {
+        // A bare code carries no state to check. The verifier must still be
+        // the one that built the auth_url this code came from; the pending
+        // flow has it when the caller does not.
+        let verifier = match supplied_verifier {
+            Some(verifier) => verifier,
+            None => pending
+                .as_ref()
+                .map(|pending| pending.code_verifier.clone())
+                .ok_or_else(|| ToolError::InvalidInput {
+                    message: "a bare `code` needs the `code_verifier` from the call that \
+                              produced the auth_url (none is pending for this server)"
+                        .into(),
+                })?,
+        };
         (code, verifier)
     } else {
-        if let Err(error) = open_browser(&auth_url) {
+        // Nobody supplied a finished flow, so this is the browser path. When
+        // no browser can be opened there is no callback to wait for: return
+        // the hand-off immediately instead of blocking for the timeout.
+        let url = authorization_url(
+            &authorization_endpoint,
+            &client_id,
+            &scope,
+            &state,
+            &challenge,
+        )?;
+        auth_url = Some(url.clone());
+
+        if let Err(error) = open_browser(&url) {
+            let note = format!("Could not open a browser: {error}.");
             return Ok(pending_output(
-                &auth_url,
-                &verifier,
-                &format!("Could not open a browser: {error}."),
+                &url,
+                &fresh_verifier,
+                &state,
+                &pending_note(
+                    &pending_path,
+                    &server_url,
+                    &state,
+                    &fresh_verifier,
+                    &authorization_endpoint,
+                    &token_endpoint,
+                    &note,
+                ),
             ));
         }
 
@@ -115,22 +211,30 @@ async fn authenticate(input: ToolInput, token_path: &Path) -> Result<ToolOutput,
         #[cfg(not(test))]
         let callback_timeout = Duration::from_secs(300);
         match wait_for_callback(&state, callback_timeout).await {
-            Ok(code) => (code, verifier),
-            Err(e) => {
+            Ok(code) => (code, fresh_verifier),
+            Err(error) => {
+                let note = format!("Waiting for the OAuth callback failed: {error}.");
                 return Ok(pending_output(
-                    &auth_url,
-                    &verifier,
-                    &format!("Waiting for the OAuth callback failed: {e}."),
+                    &url,
+                    &fresh_verifier,
+                    &state,
+                    &pending_note(
+                        &pending_path,
+                        &server_url,
+                        &state,
+                        &fresh_verifier,
+                        &authorization_endpoint,
+                        &token_endpoint,
+                        &note,
+                    ),
                 ));
             }
         }
     };
 
     // Exchange code for token
-    let token_url = format!("{server_url}/oauth/token");
-    let client = reqwest::Client::new();
     let resp = client
-        .post(&token_url)
+        .post(&token_endpoint)
         .form(&[
             ("grant_type", "authorization_code"),
             ("code", &code),
@@ -163,7 +267,9 @@ async fn authenticate(input: ToolInput, token_path: &Path) -> Result<ToolOutput,
             message: "token response missing access_token".into(),
         })?;
 
-    // Persist token locally, in the store `coderex_mcp::oauth` reads back.
+    // Persist token locally, in the store `coderex_mcp::oauth` reads back. The
+    // endpoints are persisted too, so a refresh in a later process does not
+    // depend on discovery succeeding again.
     let expires_in = token_resp
         .get("expires_in")
         .and_then(|v| v.as_i64())
@@ -172,23 +278,30 @@ async fn authenticate(input: ToolInput, token_path: &Path) -> Result<ToolOutput,
         .get("refresh_token")
         .and_then(|v| v.as_str())
         .map(String::from);
-    let persisted = persist_token_at(
+    let persisted = persist_token_with_endpoints_at(
         token_path,
         &server_url,
         &client_id,
         access_token,
         expires_in,
         refresh_token.as_deref(),
+        discovery.token_endpoint.as_deref(),
+        discovery.authorization_endpoint.as_deref(),
     );
+
+    // The flow is finished; a pending hand-off for this server is now stale.
+    remove_pending(&pending_path, &server_url);
 
     // The access token itself is deliberately absent: it is a credential,
     // and this output is part of the transcript. What matters to the caller
     // is whether it reached the store the MCP client reads.
     let mut output = serde_json::json!({
         "authenticated": true,
-        "auth_url": auth_url,
         "persisted": persisted.is_ok(),
     });
+    if let Some(auth_url) = auth_url {
+        output["auth_url"] = serde_json::Value::String(auth_url);
+    }
     if let Err(error) = persisted {
         output["note"] = serde_json::Value::String(format!(
             "Signed in, but the token could not be saved ({error}), so it will not be \
@@ -202,21 +315,241 @@ async fn authenticate(input: ToolInput, token_path: &Path) -> Result<ToolOutput,
     })
 }
 
+/// Persist a pending hand-off and describe any failure in the note the caller
+/// sees, because a hand-off that was not written is not finishable later.
+#[allow(clippy::too_many_arguments)]
+fn pending_note(
+    path: &Path,
+    server_url: &str,
+    state: &str,
+    code_verifier: &str,
+    authorization_endpoint: &str,
+    token_endpoint: &str,
+    reason: &str,
+) -> String {
+    match save_pending(
+        path,
+        PendingFlow {
+            server_url: server_url.to_string(),
+            state: state.to_string(),
+            code_verifier: code_verifier.to_string(),
+            authorization_endpoint: Some(authorization_endpoint.to_string()),
+            token_endpoint: Some(token_endpoint.to_string()),
+        },
+    ) {
+        Ok(()) => reason.to_string(),
+        Err(error) => format!(
+            "{reason} The pending hand-off could not be saved ({error}), so a later call \
+             will need both `code` and `code_verifier`."
+        ),
+    }
+}
+
 /// The response for a flow that has to be finished by hand.
-fn pending_output(auth_url: &str, code_verifier: &str, note: &str) -> ToolOutput {
+///
+/// `state` is included because a pasted redirect URL is checked against it;
+/// the verifier is included because the finishing call may be a different
+/// invocation from the one that started the flow.
+fn pending_output(auth_url: &str, code_verifier: &str, state: &str, note: &str) -> ToolOutput {
     ToolOutput {
         output: serde_json::json!({
             "authenticated": false,
             "auth_url": auth_url,
             "code_verifier": code_verifier,
+            "state": state,
             "note": format!(
-                "{note} Open auth_url in a browser, then call McpAuth again with `code` and \
-                 this `code_verifier`."
+                "{note} Open auth_url in a browser, then call McpAuth again with the full \
+                 redirect_url, or with `code` and this `code_verifier`."
             ),
         })
         .to_string(),
         is_display: true,
     }
+}
+
+/// One hand-off flow waiting to be finished by a later call.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct PendingFlow {
+    server_url: String,
+    state: String,
+    code_verifier: String,
+    #[serde(default)]
+    authorization_endpoint: Option<String>,
+    #[serde(default)]
+    token_endpoint: Option<String>,
+}
+
+#[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
+struct PendingStore {
+    #[serde(default)]
+    flows: Vec<PendingFlow>,
+}
+
+/// The pending-flow file that sits beside the token store.
+fn pending_path(token_path: &Path) -> PathBuf {
+    token_path.with_file_name(PENDING_FILE)
+}
+
+/// The pending flow for `server_url`, if one was written.
+fn load_pending(path: &Path, server_url: &str) -> Option<PendingFlow> {
+    let content = std::fs::read_to_string(path).ok()?;
+    let store: PendingStore = serde_json::from_str(&content).ok()?;
+    store
+        .flows
+        .into_iter()
+        .find(|flow| flow.server_url == server_url)
+}
+
+fn save_pending(path: &Path, flow: PendingFlow) -> Result<(), String> {
+    // Pending hand-offs are ephemeral: a corrupt file is replaced rather than
+    // blocking sign-in. The token store is the durable one and is never
+    // overwritten this way.
+    let mut store = std::fs::read_to_string(path)
+        .ok()
+        .and_then(|content| serde_json::from_str::<PendingStore>(&content).ok())
+        .unwrap_or_default();
+    store
+        .flows
+        .retain(|entry| entry.server_url != flow.server_url);
+    store.flows.push(flow);
+
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("create dir: {e}"))?;
+    }
+    let content = serde_json::to_string_pretty(&store).map_err(|e| format!("serialize: {e}"))?;
+    std::fs::write(path, content).map_err(|e| format!("write: {e}"))
+}
+
+fn remove_pending(path: &Path, server_url: &str) {
+    let Ok(content) = std::fs::read_to_string(path) else {
+        return;
+    };
+    let Ok(mut store) = serde_json::from_str::<PendingStore>(&content) else {
+        return;
+    };
+    store.flows.retain(|flow| flow.server_url != server_url);
+    if let Ok(content) = serde_json::to_string_pretty(&store) {
+        let _ = std::fs::write(path, content);
+    }
+}
+
+/// Parse `code` and `state` out of a pasted redirect URL.
+///
+/// The URL comes from the user's address bar, so it is untrusted input: the
+/// query is percent-decoded by `Url`, and an `error` parameter is reported
+/// rather than mistaken for a missing code.
+fn parse_redirect_url(value: &str) -> Result<(String, Option<String>), String> {
+    let url = url::Url::parse(value).map_err(|error| format!("not a URL: {error}"))?;
+
+    let mut code = None;
+    let mut state = None;
+    let mut error = None;
+    for (name, value) in url.query_pairs() {
+        match name.as_ref() {
+            "code" => code = Some(value.into_owned()),
+            "state" => state = Some(value.into_owned()),
+            "error" => error = Some(value.into_owned()),
+            _ => {}
+        }
+    }
+
+    if let Some(error) = error {
+        return Err(format!("authorization was not granted: {error}"));
+    }
+    let code = code.ok_or_else(|| "no `code` parameter".to_string())?;
+    Ok((code, state))
+}
+
+/// Endpoints advertised by the server's metadata documents.
+#[derive(Debug, Default)]
+struct DiscoveredEndpoints {
+    authorization_endpoint: Option<String>,
+    token_endpoint: Option<String>,
+}
+
+/// Fetch RFC 8414 metadata, falling back to OpenID Connect discovery.
+///
+/// Discovery is best-effort by design: an MCP server that publishes nothing
+/// still works at the conventional paths. Nothing here is fatal.
+async fn discover_endpoints(client: &reqwest::Client, server_url: &str) -> DiscoveredEndpoints {
+    let Some(origin) = origin_of(server_url) else {
+        return DiscoveredEndpoints::default();
+    };
+
+    for path in [
+        ".well-known/oauth-authorization-server",
+        ".well-known/openid-configuration",
+    ] {
+        let url = format!("{origin}/{path}");
+        let Ok(response) = client
+            .get(&url)
+            .header("accept", "application/json")
+            .send()
+            .await
+        else {
+            continue;
+        };
+        if !response.status().is_success() {
+            continue;
+        }
+        let Ok(body) = response.text().await else {
+            continue;
+        };
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(&body) else {
+            continue;
+        };
+        let authorization_endpoint = value
+            .get("authorization_endpoint")
+            .and_then(|v| v.as_str())
+            .map(String::from);
+        let token_endpoint = value
+            .get("token_endpoint")
+            .and_then(|v| v.as_str())
+            .map(String::from);
+        if authorization_endpoint.is_some() || token_endpoint.is_some() {
+            tracing::debug!(server = %server_url, "Discovered MCP OAuth endpoints");
+            return DiscoveredEndpoints {
+                authorization_endpoint,
+                token_endpoint,
+            };
+        }
+    }
+
+    tracing::debug!(
+        server = %server_url,
+        "No OAuth metadata found; using the conventional endpoints"
+    );
+    DiscoveredEndpoints::default()
+}
+
+fn origin_of(server_url: &str) -> Option<String> {
+    let url = url::Url::parse(server_url).ok()?;
+    if !matches!(url.scheme(), "http" | "https") {
+        return None;
+    }
+    Some(url.origin().ascii_serialization())
+}
+
+/// Build the authorization URL with the discovered endpoint and PKCE.
+fn authorization_url(
+    endpoint: &str,
+    client_id: &str,
+    scope: &str,
+    state: &str,
+    challenge: &str,
+) -> Result<String, ToolError> {
+    let mut url = url::Url::parse(endpoint).map_err(|error| ToolError::InvalidInput {
+        message: format!("authorization endpoint {endpoint} is not a URL: {error}"),
+    })?;
+    url.query_pairs_mut()
+        .append_pair("response_type", "code")
+        .append_pair("client_id", client_id)
+        .append_pair("redirect_uri", LOCAL_REDIRECT_URI)
+        .append_pair("scope", scope)
+        .append_pair("state", state)
+        .append_pair("code_challenge", challenge)
+        .append_pair("code_challenge_method", "S256");
+    Ok(url.into())
 }
 
 /// A PKCE code verifier (RFC 7636 §4.1): 64 unreserved characters.
@@ -349,18 +682,6 @@ fn open_browser(url: &str) -> std::io::Result<()> {
     Ok(())
 }
 
-fn url_encode(s: &str) -> String {
-    s.chars()
-        .map(|c| {
-            if c.is_alphanumeric() || matches!(c, '-' | '_' | '.' | '~') {
-                c.to_string()
-            } else {
-                format!("%{:02X}", c as u32)
-            }
-        })
-        .collect()
-}
-
 /// The token file the MCP client reads: `~/.coderex/mcp_tokens.json`.
 #[must_use]
 pub fn default_token_path() -> PathBuf {
@@ -392,6 +713,34 @@ pub fn persist_token_at(
     expires_in: i64,
     refresh_token: Option<&str>,
 ) -> Result<(), String> {
+    persist_token_with_endpoints_at(
+        path,
+        server_url,
+        client_id,
+        access_token,
+        expires_in,
+        refresh_token,
+        None,
+        None,
+    )
+}
+
+/// [`persist_token_at`], also recording the endpoints discovery found.
+///
+/// Writing them here is what lets a later process refresh without asking the
+/// server for its metadata again. `None` leaves the conventional-path fallback
+/// in place.
+#[allow(clippy::too_many_arguments)]
+pub fn persist_token_with_endpoints_at(
+    path: &Path,
+    server_url: &str,
+    client_id: &str,
+    access_token: &str,
+    expires_in: i64,
+    refresh_token: Option<&str>,
+    token_endpoint: Option<&str>,
+    authorization_endpoint: Option<&str>,
+) -> Result<(), String> {
     #[derive(serde::Serialize, serde::Deserialize, Default)]
     struct TokenStore {
         #[serde(default)]
@@ -414,6 +763,8 @@ pub fn persist_token_at(
         scopes: Vec<String>,
         #[serde(default)]
         token_endpoint: Option<String>,
+        #[serde(default)]
+        authorization_endpoint: Option<String>,
     }
 
     let mut store: TokenStore = if path.exists() {
@@ -434,7 +785,8 @@ pub fn persist_token_at(
         refresh_token: refresh_token.map(String::from),
         expires_at: Some(chrono::Utc::now().timestamp() + expires_in),
         scopes: Vec::new(),
-        token_endpoint: None,
+        token_endpoint: token_endpoint.map(String::from),
+        authorization_endpoint: authorization_endpoint.map(String::from),
     });
 
     if let Some(parent) = path.parent() {
@@ -474,17 +826,19 @@ mod tests {
 
     #[tokio::test]
     async fn mcp_auth_returns_auth_url() {
-        let output = McpAuthTool
-            .execute(
-                ToolInput {
-                    call_id: "1".into(),
-                    name: "McpAuth".into(),
-                    arguments: serde_json::json!({ "server_url": "https://example.com" }),
-                },
-                test_ctx(),
-            )
-            .await
-            .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let output = authenticate(
+            ToolInput {
+                call_id: "1".into(),
+                name: "McpAuth".into(),
+                // Nothing listens here, so discovery fails fast and the
+                // conventional endpoint is used.
+                arguments: serde_json::json!({ "server_url": "http://127.0.0.1:1" }),
+            },
+            &dir.path().join("mcp_tokens.json"),
+        )
+        .await
+        .unwrap();
         assert!(output.output.contains("auth_url"));
     }
 
@@ -501,12 +855,6 @@ mod tests {
             )
             .await;
         assert!(result.is_err());
-    }
-
-    #[test]
-    fn url_encode_encodes_special_chars() {
-        assert_eq!(url_encode("hello world"), "hello%20world");
-        assert!(url_encode("http://localhost:8765/callback").contains("%3A"));
     }
 
     #[test]
@@ -537,19 +885,24 @@ mod tests {
 
     /// The pending (manual) response has to carry everything a second call
     /// needs, or the instruction it prints is not followable.
+    /// The headless path must return immediately with everything a later call
+    /// needs, and must persist the pending flow for a different invocation.
     #[tokio::test]
     async fn an_unusable_browser_returns_a_finishable_flow() {
-        let output = McpAuthTool
-            .execute(
-                ToolInput {
-                    call_id: "1".into(),
-                    name: "McpAuth".into(),
-                    arguments: serde_json::json!({ "server_url": "https://example.com" }),
-                },
-                test_ctx(),
-            )
-            .await
-            .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mcp_tokens.json");
+        let started = std::time::Instant::now();
+        let output = authenticate(
+            ToolInput {
+                call_id: "1".into(),
+                name: "McpAuth".into(),
+                arguments: serde_json::json!({ "server_url": "http://127.0.0.1:1" }),
+            },
+            &path,
+        )
+        .await
+        .unwrap();
+        let elapsed = started.elapsed();
         let parsed: serde_json::Value = serde_json::from_str(&output.output).unwrap();
 
         assert_eq!(parsed["authenticated"], false);
@@ -567,7 +920,216 @@ mod tests {
                 .is_some_and(|v| v.len() >= 43),
             "no verifier to finish the flow with: {parsed}"
         );
+        assert!(
+            parsed["state"]
+                .as_str()
+                .is_some_and(|v| v.starts_with("coderex-")),
+            "no state to verify a pasted redirect with: {parsed}"
+        );
         assert!(parsed["note"].as_str().unwrap().contains("`code`"));
+
+        // No browser means no callback: the call must not sit on the timeout.
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "the headless path blocked for {elapsed:?}"
+        );
+
+        // The hand-off has to be readable by the next process.
+        let pending = pending_path(&path);
+        let stored: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&pending).unwrap()).unwrap();
+        assert_eq!(stored["flows"][0]["state"], parsed["state"]);
+        assert_eq!(stored["flows"][0]["code_verifier"], parsed["code_verifier"]);
+    }
+
+    /// A pasted full redirect URL is parsed, its state checked against the
+    /// pending flow, and its code exchanged with the original verifier.
+    #[tokio::test]
+    async fn a_pasted_redirect_url_finishes_the_pending_flow() {
+        let (endpoint, server) = spawn_token_endpoint(
+            r#"{"access_token":"tok","refresh_token":"ref","expires_in":3600}"#,
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mcp_tokens.json");
+
+        // First call: no browser in tests, so this is the headless hand-off.
+        let pending_output = authenticate(
+            ToolInput {
+                call_id: "1".into(),
+                name: "McpAuth".into(),
+                arguments: serde_json::json!({ "server_url": endpoint }),
+            },
+            &path,
+        )
+        .await
+        .unwrap();
+        let pending: serde_json::Value = serde_json::from_str(&pending_output.output).unwrap();
+        let state = pending["state"].as_str().unwrap();
+        let verifier = pending["code_verifier"].as_str().unwrap();
+
+        // Second call: paste what the browser landed on.
+        let redirect_url = format!("http://localhost:8765/callback?code=the_code&state={state}");
+        let output = authenticate(
+            ToolInput {
+                call_id: "2".into(),
+                name: "McpAuth".into(),
+                arguments: serde_json::json!({
+                    "server_url": endpoint,
+                    "redirect_url": redirect_url,
+                }),
+            },
+            &path,
+        )
+        .await
+        .unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&output.output).unwrap();
+        assert_eq!(parsed["authenticated"], true, "{parsed}");
+        assert_eq!(parsed["persisted"], true);
+
+        let request = server.join().unwrap();
+        assert!(request.contains("code=the_code"), "{request}");
+        assert!(
+            request.contains(&format!("code_verifier={verifier}")),
+            "the original verifier was not used: {request}"
+        );
+
+        let store: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(store["states"][0]["access_token"], "tok");
+
+        // The finished flow is no longer pending.
+        assert!(load_pending(&pending_path(&path), &endpoint).is_none());
+    }
+
+    /// Discovery's advertised endpoints are the ones actually used: the
+    /// authorize URL comes from the metadata, and the exchange goes to the
+    /// advertised token endpoint rather than `/oauth/token`.
+    #[tokio::test]
+    async fn discovered_endpoints_drive_the_authorization_and_token_urls() {
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let metadata = format!(
+            r#"{{"authorization_endpoint":"{base}/custom/authorize","token_endpoint":"{base}/custom/token"}}"#
+        );
+        let handle = std::thread::spawn(move || {
+            let mut probes = Vec::new();
+            loop {
+                let (mut stream, _) = listener.accept().unwrap();
+                let request = read_request(&mut stream);
+                if request.starts_with("POST ") {
+                    write_response(
+                        &mut stream,
+                        "200 OK",
+                        r#"{"access_token":"tok","expires_in":3600}"#,
+                    );
+                    return (probes, request);
+                }
+                probes.push(request);
+                write_response(&mut stream, "200 OK", &metadata);
+            }
+        });
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mcp_tokens.json");
+
+        // First call has no code: it returns the pending hand-off, whose
+        // authorize URL must come from discovery.
+        let pending = authenticate(
+            ToolInput {
+                call_id: "1".into(),
+                name: "McpAuth".into(),
+                arguments: serde_json::json!({ "server_url": base }),
+            },
+            &path,
+        )
+        .await
+        .unwrap();
+        let pending: serde_json::Value = serde_json::from_str(&pending.output).unwrap();
+        assert!(
+            pending["auth_url"]
+                .as_str()
+                .unwrap()
+                .starts_with(&format!("{base}/custom/authorize?")),
+            "the conventional authorize path was used: {}",
+            pending["auth_url"]
+        );
+
+        // Second call finishes the flow with a code.
+        let output = authenticate(
+            ToolInput {
+                call_id: "2".into(),
+                name: "McpAuth".into(),
+                arguments: serde_json::json!({
+                    "server_url": base,
+                    "code": "the_code",
+                    "code_verifier": pending["code_verifier"],
+                }),
+            },
+            &path,
+        )
+        .await
+        .unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&output.output).unwrap();
+        assert_eq!(parsed["authenticated"], true, "{parsed}");
+
+        let (probes, exchange) = handle.join().unwrap();
+        assert!(!probes.is_empty());
+        assert!(
+            probes
+                .iter()
+                .all(|probe| probe.starts_with("GET /.well-known/oauth-authorization-server ")),
+            "{probes:?}"
+        );
+        assert!(
+            exchange.starts_with("POST /custom/token "),
+            "the conventional token path was used: {exchange}"
+        );
+
+        // The discovered endpoints are persisted for the refresh path.
+        let store: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(
+            store["states"][0]["token_endpoint"],
+            format!("{base}/custom/token")
+        );
+    }
+
+    /// A redirect from a different flow must be refused rather than exchanged.
+    #[tokio::test]
+    async fn a_redirect_url_with_the_wrong_state_is_refused() {
+        let endpoint = "http://127.0.0.1:1";
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mcp_tokens.json");
+        authenticate(
+            ToolInput {
+                call_id: "1".into(),
+                name: "McpAuth".into(),
+                arguments: serde_json::json!({ "server_url": endpoint }),
+            },
+            &path,
+        )
+        .await
+        .unwrap();
+
+        let error = authenticate(
+            ToolInput {
+                call_id: "2".into(),
+                name: "McpAuth".into(),
+                arguments: serde_json::json!({
+                    "server_url": endpoint,
+                    "redirect_url": "http://localhost:8765/callback?code=abc&state=coderex-wrong",
+                }),
+            },
+            &path,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("state does not match"),
+            "unexpected error: {error}"
+        );
     }
 
     /// A pasted code is exchanged instead of waiting for a callback that will
@@ -694,45 +1256,62 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "not json at all");
     }
 
-    /// A one-shot token endpoint that records the form body it was sent.
+    fn read_request(stream: &mut std::net::TcpStream) -> String {
+        use std::io::Read;
+        let mut request = Vec::new();
+        let mut chunk = [0_u8; 4096];
+        loop {
+            let count = stream.read(&mut chunk).unwrap();
+            if count == 0 {
+                break;
+            }
+            request.extend_from_slice(&chunk[..count]);
+            let text = String::from_utf8_lossy(&request);
+            if let Some(head_end) = text.find("\r\n\r\n") {
+                let length = text
+                    .lines()
+                    .find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse::<usize>().ok())?
+                    })
+                    .unwrap_or(0);
+                if request.len() >= head_end + 4 + length {
+                    break;
+                }
+            }
+        }
+        String::from_utf8_lossy(&request).into_owned()
+    }
+
+    fn write_response(stream: &mut std::net::TcpStream, status: &str, body: &str) {
+        use std::io::Write;
+        let response = format!(
+            "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        stream.write_all(response.as_bytes()).unwrap();
+        stream.flush().unwrap();
+    }
+
+    /// A token endpoint that also answers (with 404) the discovery probes a
+    /// real server URL receives, and records the token request it was sent.
     fn spawn_token_endpoint(body: &'static str) -> (String, std::thread::JoinHandle<String>) {
-        use std::io::{Read, Write};
         use std::net::TcpListener;
 
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
         let handle = std::thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            let mut request = Vec::new();
-            let mut chunk = [0_u8; 4096];
             loop {
-                let count = stream.read(&mut chunk).unwrap();
-                if count == 0 {
-                    break;
+                let (mut stream, _) = listener.accept().unwrap();
+                let request = read_request(&mut stream);
+                if request.starts_with("POST ") {
+                    write_response(&mut stream, "200 OK", body);
+                    return request;
                 }
-                request.extend_from_slice(&chunk[..count]);
-                let text = String::from_utf8_lossy(&request);
-                if let Some(head_end) = text.find("\r\n\r\n") {
-                    let length = text
-                        .lines()
-                        .find_map(|line| {
-                            let (name, value) = line.split_once(':')?;
-                            name.eq_ignore_ascii_case("content-length")
-                                .then(|| value.trim().parse::<usize>().ok())?
-                        })
-                        .unwrap_or(0);
-                    if request.len() >= head_end + 4 + length {
-                        break;
-                    }
-                }
+                // A `.well-known` probe: this server publishes no metadata.
+                write_response(&mut stream, "404 Not Found", "");
             }
-            let response = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                body.len()
-            );
-            stream.write_all(response.as_bytes()).unwrap();
-            stream.flush().unwrap();
-            String::from_utf8_lossy(&request).into_owned()
         });
         (format!("http://{address}"), handle)
     }
