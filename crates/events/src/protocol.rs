@@ -6,17 +6,24 @@
 //! bridge, or the transcript mirror. There is deliberately no in-process
 //! registry here: one producer, one serialized output.
 //!
-//! The five frame kinds mirror the reference's wire format: [`Assistant`],
-//! [`User`], [`System`], [`Result`] and [`StreamEvent`]. `System` carries a
-//! `subtype` string, `result` carries a `subtype` too, and [`Result`] is the
-//! **turn-complete signal** — exactly one per turn, including when the turn
-//! failed.
+//! The five message frame kinds mirror the reference's wire format:
+//! [`Assistant`], [`User`], [`System`], [`Result`] and [`StreamEvent`].
+//! `System` carries a `subtype` string, `result` carries a `subtype` too, and
+//! [`Result`] is the **turn-complete signal** — exactly one per turn, including
+//! when the turn failed.
+//!
+//! On top of those, [`ControlRequest`] and [`ControlResponse`] carry the
+//! out-of-band approval exchange: the headless child asks a host whether a
+//! tool may run, and the host answers on stdin. They are not turn frames and
+//! do not participate in the one-result guard.
 //!
 //! [`Assistant`]: ProtocolMessage::Assistant
 //! [`User`]: ProtocolMessage::User
 //! [`System`]: ProtocolMessage::System
 //! [`Result`]: ProtocolMessage::Result
 //! [`StreamEvent`]: ProtocolMessage::StreamEvent
+//! [`ControlRequest`]: ProtocolMessage::ControlRequest
+//! [`ControlResponse`]: ProtocolMessage::ControlResponse
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -34,6 +41,21 @@ pub mod result_subtype {
     /// The turn failed while running.
     pub const ERROR_DURING_EXECUTION: &str = "error_during_execution";
 }
+
+/// Subtype of a [`ControlRequestFrame`] that asks whether a tool may run.
+pub const CAN_USE_TOOL_SUBTYPE: &str = "can_use_tool";
+/// Subtype of a successful [`ControlResponseFrame`].
+pub const CONTROL_SUCCESS_SUBTYPE: &str = "success";
+/// Subtype of a failed [`ControlResponseFrame`].
+pub const CONTROL_ERROR_SUBTYPE: &str = "error";
+
+/// Behavior value in a [`ControlResponseBody`] that approves the tool call.
+pub const CONTROL_BEHAVIOR_ALLOW: &str = "allow";
+/// Behavior value in a [`ControlResponseBody`] that approves the tool for the
+/// rest of the session.
+pub const CONTROL_BEHAVIOR_ALLOW_SESSION: &str = "allow_session";
+/// Behavior value in a [`ControlResponseBody`] that refuses the tool call.
+pub const CONTROL_BEHAVIOR_DENY: &str = "deny";
 
 // ── Frames ──────────────────────────────────────────────────────────────
 
@@ -56,6 +78,17 @@ pub enum ProtocolMessage {
     Result(ResultFrame),
     /// A raw streaming event forwarded from the model API, unmodified.
     StreamEvent(StreamEventFrame),
+    /// A tool-approval request from the agent to its host.
+    ///
+    /// This is the producer half of the out-of-band control channel: the
+    /// agent stops waiting on the tool and asks the host, which answers with a
+    /// [`ProtocolMessage::ControlResponse`] on stdin.
+    ControlRequest(ControlRequestFrame),
+    /// A host's answer to a [`ProtocolMessage::ControlRequest`].
+    ///
+    /// This frame travels in the opposite direction from every other frame in
+    /// the enum: the host writes it to the agent's stdin.
+    ControlResponse(ControlResponseFrame),
 }
 
 impl ProtocolMessage {
@@ -90,6 +123,8 @@ impl ProtocolMessage {
             Self::System(_) => "system",
             Self::Result(_) => "result",
             Self::StreamEvent(_) => "stream_event",
+            Self::ControlRequest(_) => "control_request",
+            Self::ControlResponse(_) => "control_response",
         }
     }
 
@@ -279,6 +314,325 @@ pub struct StreamEventFrame {
     pub parent_tool_use_id: Option<String>,
     /// The session this event belongs to.
     pub session_id: String,
+}
+
+// ── Control frames ──────────────────────────────────────────────────────
+
+/// A `control_request` frame: the agent asks its host to approve a tool call.
+///
+/// Unlike the other frames, this one is a question: the turn does not proceed
+/// until the host writes a [`ControlResponseFrame`] back on stdin. A host that
+/// never answers leaves the turn waiting — there is deliberately no timeout,
+/// because a timeout would turn a slow person into a silent denial.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ControlRequestFrame {
+    /// Correlates the answer with this request. The agent generates it; the
+    /// host must echo it on the response.
+    pub request_id: String,
+    /// The request body. Only `can_use_tool` is defined today.
+    pub request: CanUseToolRequest,
+}
+
+/// The `can_use_tool` body of a [`ControlRequestFrame`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CanUseToolRequest {
+    /// Always [`CAN_USE_TOOL_SUBTYPE`] for a tool approval.
+    pub subtype: String,
+    /// Name of the tool that wants to run.
+    pub tool_name: String,
+    /// The tool's input, exactly as the model produced it.
+    pub input: Value,
+    /// Why the tool needs approval.
+    #[serde(default)]
+    pub reason: String,
+    /// Whether the host may answer "approve for the rest of the session".
+    #[serde(default)]
+    pub allow_session: bool,
+}
+
+impl ControlRequestFrame {
+    /// Build a `can_use_tool` request.
+    #[must_use]
+    pub fn can_use_tool(
+        request_id: impl Into<String>,
+        tool_name: impl Into<String>,
+        input: Value,
+        reason: impl Into<String>,
+        allow_session: bool,
+    ) -> Self {
+        Self {
+            request_id: request_id.into(),
+            request: CanUseToolRequest {
+                subtype: CAN_USE_TOOL_SUBTYPE.into(),
+                tool_name: tool_name.into(),
+                input,
+                reason: reason.into(),
+                allow_session,
+            },
+        }
+    }
+
+    /// Serialize as exactly one line, including the `type` discriminant.
+    #[must_use]
+    pub fn to_line(&self) -> String {
+        ProtocolMessage::ControlRequest(self.clone()).to_line()
+    }
+
+    /// Parse one protocol line and require it to be a `can_use_tool` request.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ControlFrameError`] for malformed JSON, a different frame
+    /// type, or a request subtype other than `can_use_tool`.
+    pub fn parse_line(line: &str) -> Result<Self, ControlFrameError> {
+        let message: ProtocolMessage = serde_json::from_str(line)?;
+        match message {
+            ProtocolMessage::ControlRequest(frame) => {
+                if frame.request.subtype != CAN_USE_TOOL_SUBTYPE {
+                    return Err(ControlFrameError::UnexpectedSubtype(
+                        frame.request.subtype,
+                    ));
+                }
+                Ok(frame)
+            }
+            other => Err(ControlFrameError::WrongType {
+                expected: "control_request",
+                actual: other.kind(),
+            }),
+        }
+    }
+}
+
+/// A `control_response` frame: the host's answer to a
+/// [`ControlRequestFrame`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ControlResponseFrame {
+    /// The answer envelope.
+    pub response: ControlResponseEnvelope,
+}
+
+/// The `response` object of a `control_response`.
+///
+/// `subtype` is `"success"` when [`response`](Self::response) is present and
+/// `"error"` when the host could not handle the request; the message then
+/// lives in [`error`](Self::error).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ControlResponseEnvelope {
+    /// [`CONTROL_SUCCESS_SUBTYPE`] or [`CONTROL_ERROR_SUBTYPE`].
+    pub subtype: String,
+    /// The request being answered.
+    pub request_id: String,
+    /// The decision, for a `success` answer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub response: Option<ControlResponseBody>,
+    /// The failure detail, for an `error` answer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// The decision object of a successful control response.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ControlResponseBody {
+    /// [`CONTROL_BEHAVIOR_ALLOW`], [`CONTROL_BEHAVIOR_ALLOW_SESSION`], or
+    /// [`CONTROL_BEHAVIOR_DENY`].
+    pub behavior: String,
+    /// Human-readable detail; may be empty.
+    #[serde(default)]
+    pub message: String,
+    /// When `true` and the original request permitted it, approve the tool for
+    /// the rest of the session rather than just this call.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub allow_session: bool,
+}
+
+/// The decision carried by a [`ControlResponseFrame`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ControlDecision {
+    /// Run this one call.
+    Allow,
+    /// Run this call and stop asking for the tool for the rest of the session.
+    AllowSession,
+    /// Do not run the call.
+    Deny,
+    /// The host could not answer; the caller decides how to fail closed.
+    Error(String),
+}
+
+impl ControlResponseFrame {
+    /// Build a successful answer.
+    #[must_use]
+    pub fn success(
+        request_id: impl Into<String>,
+        behavior: impl Into<String>,
+        message: impl Into<String>,
+    ) -> Self {
+        Self {
+            response: ControlResponseEnvelope {
+                subtype: CONTROL_SUCCESS_SUBTYPE.into(),
+                request_id: request_id.into(),
+                response: Some(ControlResponseBody {
+                    behavior: behavior.into(),
+                    message: message.into(),
+                    allow_session: false,
+                }),
+                error: None,
+            },
+        }
+    }
+
+    /// Approve one call.
+    #[must_use]
+    pub fn allow(request_id: impl Into<String>, message: impl Into<String>) -> Self {
+        Self::success(request_id, CONTROL_BEHAVIOR_ALLOW, message)
+    }
+
+    /// Deny the call.
+    #[must_use]
+    pub fn deny(request_id: impl Into<String>, message: impl Into<String>) -> Self {
+        Self::success(request_id, CONTROL_BEHAVIOR_DENY, message)
+    }
+
+    /// Report that the host could not answer.
+    #[must_use]
+    pub fn error(request_id: impl Into<String>, message: impl Into<String>) -> Self {
+        Self {
+            response: ControlResponseEnvelope {
+                subtype: CONTROL_ERROR_SUBTYPE.into(),
+                request_id: request_id.into(),
+                response: None,
+                error: Some(message.into()),
+            },
+        }
+    }
+
+    /// Mark a successful allow as session-wide.
+    #[must_use]
+    pub fn with_allow_session(mut self, allow_session: bool) -> Self {
+        if let Some(body) = self.response.response.as_mut() {
+            body.allow_session = allow_session;
+        }
+        self
+    }
+
+    /// Serialize as exactly one line, including the `type` discriminant.
+    #[must_use]
+    pub fn to_line(&self) -> String {
+        ProtocolMessage::ControlResponse(self.clone()).to_line()
+    }
+
+    /// Parse one protocol line and require it to be a `control_response`.
+    ///
+    /// A `success` answer must carry a `response` object whose behavior is
+    /// `allow`, `allow_session`, or `deny`; an `error` answer must name the
+    /// request it failed.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ControlFrameError`] for malformed JSON, a different frame
+    /// type, an unknown envelope subtype, or a success answer with no usable
+    /// decision.
+    pub fn parse_line(line: &str) -> Result<Self, ControlFrameError> {
+        let message: ProtocolMessage = serde_json::from_str(line)?;
+        let frame = match message {
+            ProtocolMessage::ControlResponse(frame) => frame,
+            other => {
+                return Err(ControlFrameError::WrongType {
+                    expected: "control_response",
+                    actual: other.kind(),
+                });
+            }
+        };
+        frame.validate()?;
+        Ok(frame)
+    }
+
+    /// The decision this frame carries.
+    ///
+    /// # Errors
+    ///
+    /// Same validation as [`parse_line`](Self::parse_line).
+    pub fn decision(&self) -> Result<ControlDecision, ControlFrameError> {
+        self.validate()?;
+        match self.response.subtype.as_str() {
+            CONTROL_SUCCESS_SUBTYPE => {
+                let body = self
+                    .response
+                    .response
+                    .as_ref()
+                    .ok_or(ControlFrameError::MissingResponse)?;
+                Ok(match body.behavior.as_str() {
+                    CONTROL_BEHAVIOR_ALLOW_SESSION => ControlDecision::AllowSession,
+                    CONTROL_BEHAVIOR_ALLOW if body.allow_session => ControlDecision::AllowSession,
+                    CONTROL_BEHAVIOR_ALLOW => ControlDecision::Allow,
+                    CONTROL_BEHAVIOR_DENY => ControlDecision::Deny,
+                    other => {
+                        return Err(ControlFrameError::UnknownBehavior(other.to_string()));
+                    }
+                })
+            }
+            CONTROL_ERROR_SUBTYPE => Ok(ControlDecision::Error(
+                self.response
+                    .error
+                    .clone()
+                    .or_else(|| {
+                        self.response
+                            .response
+                            .as_ref()
+                            .map(|body| body.message.clone())
+                    })
+                    .unwrap_or_else(|| "the host could not answer the request".into()),
+            )),
+            _ => unreachable!("validate rejects unknown subtypes"),
+        }
+    }
+
+    fn validate(&self) -> Result<(), ControlFrameError> {
+        match self.response.subtype.as_str() {
+            CONTROL_SUCCESS_SUBTYPE => match self.response.response.as_ref() {
+                Some(body)
+                    if body.behavior == CONTROL_BEHAVIOR_ALLOW
+                        || body.behavior == CONTROL_BEHAVIOR_ALLOW_SESSION
+                        || body.behavior == CONTROL_BEHAVIOR_DENY =>
+                {
+                    Ok(())
+                }
+                Some(body) => Err(ControlFrameError::UnknownBehavior(body.behavior.clone())),
+                None => Err(ControlFrameError::MissingResponse),
+            },
+            CONTROL_ERROR_SUBTYPE => Ok(()),
+            other => Err(ControlFrameError::UnexpectedSubtype(other.to_string())),
+        }
+    }
+}
+
+/// `serde` helper: omit a `false` boolean from the wire form.
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
+/// Error parsing a control frame.
+#[derive(Debug, thiserror::Error)]
+pub enum ControlFrameError {
+    /// The line was not valid JSON, or did not have the expected shape.
+    #[error("malformed control frame: {0}")]
+    Json(#[from] serde_json::Error),
+    /// The line carried a different protocol frame type.
+    #[error("expected a {expected} frame, got {actual}")]
+    WrongType {
+        /// The frame kind the caller required.
+        expected: &'static str,
+        /// The frame kind that was actually present.
+        actual: &'static str,
+    },
+    /// The request/response subtype is not one this crate understands.
+    #[error("unexpected control subtype: {0}")]
+    UnexpectedSubtype(String),
+    /// A successful response carried no decision object.
+    #[error("control response is missing its response body")]
+    MissingResponse,
+    /// The decision object named a behavior other than allow or deny.
+    #[error("unknown control response behavior: {0}")]
+    UnknownBehavior(String),
 }
 
 // ── Content-block constructors ──────────────────────────────────────────
@@ -726,5 +1080,153 @@ mod tests {
             !shared.borrow().is_empty(),
             "emit must flush, or a slow reader never sees the frame"
         );
+    }
+
+    #[test]
+    fn control_request_roundtrips_with_the_documented_shape() {
+        let frame = ControlRequestFrame::can_use_tool(
+            "req-1",
+            "Bash",
+            serde_json::json!({"command": "rm -rf /tmp/x"}),
+            "Bash needs approval",
+            true,
+        );
+        let line = frame.to_line();
+        assert!(line.ends_with('\n'));
+        assert_eq!(line.matches('\n').count(), 1, "one frame, one line");
+
+        let value: Value = serde_json::from_str(line.trim_end()).unwrap();
+        assert_eq!(value["type"], "control_request");
+        assert_eq!(value["request_id"], "req-1");
+        assert_eq!(value["request"]["subtype"], "can_use_tool");
+        assert_eq!(value["request"]["tool_name"], "Bash");
+        assert_eq!(value["request"]["input"]["command"], "rm -rf /tmp/x");
+        assert_eq!(value["request"]["reason"], "Bash needs approval");
+        assert_eq!(value["request"]["allow_session"], true);
+
+        assert_eq!(ControlRequestFrame::parse_line(line.trim_end()).unwrap(), frame);
+    }
+
+    #[test]
+    fn control_response_roundtrips_for_success_and_error() {
+        for frame in [
+            ControlResponseFrame::allow("req-1", "ok"),
+            ControlResponseFrame::deny("req-2", "no"),
+            ControlResponseFrame::allow("req-3", "always").with_allow_session(true),
+            ControlResponseFrame::error("req-4", "unsupported tool"),
+        ] {
+            let line = frame.to_line();
+            assert!(line.ends_with('\n'));
+            assert_eq!(line.matches('\n').count(), 1, "one frame, one line");
+            let value: Value = serde_json::from_str(line.trim_end()).unwrap();
+            assert_eq!(value["type"], "control_response");
+            assert_eq!(
+                ControlResponseFrame::parse_line(line.trim_end()).unwrap(),
+                frame
+            );
+        }
+    }
+
+    #[test]
+    fn control_response_decisions_match_the_behavior() {
+        assert_eq!(
+            ControlResponseFrame::allow("r", "").decision().unwrap(),
+            ControlDecision::Allow
+        );
+        assert_eq!(
+            ControlResponseFrame::deny("r", "").decision().unwrap(),
+            ControlDecision::Deny
+        );
+        assert_eq!(
+            ControlResponseFrame::allow("r", "")
+                .with_allow_session(true)
+                .decision()
+                .unwrap(),
+            ControlDecision::AllowSession
+        );
+        // A host may also spell the session-wide answer as its own behavior.
+        let line = r#"{"type":"control_response","response":{"subtype":"success","request_id":"r","response":{"behavior":"allow_session"}}}"#;
+        assert_eq!(
+            ControlResponseFrame::parse_line(line).unwrap().decision().unwrap(),
+            ControlDecision::AllowSession
+        );
+        assert!(matches!(
+            ControlResponseFrame::error("r", "boom").decision().unwrap(),
+            ControlDecision::Error(message) if message == "boom"
+        ));
+    }
+
+    #[test]
+    fn malformed_control_frames_are_rejected() {
+        // Not JSON at all.
+        assert!(ControlRequestFrame::parse_line("not json").is_err());
+        assert!(ControlResponseFrame::parse_line("not json").is_err());
+
+        // A different frame kind.
+        assert!(matches!(
+            ControlRequestFrame::parse_line(&assistant_line("s1", "hi").to_line()),
+            Err(ControlFrameError::WrongType { expected: "control_request", .. })
+        ));
+
+        // Missing required field.
+        assert!(ControlRequestFrame::parse_line(
+            r#"{"type":"control_request","request_id":"r"}"#
+        )
+        .is_err());
+
+        // Unknown request subtype.
+        assert!(matches!(
+            ControlRequestFrame::parse_line(
+                r#"{"type":"control_request","request_id":"r","request":{"subtype":"other","tool_name":"Bash","input":{}}}"#
+            ),
+            Err(ControlFrameError::UnexpectedSubtype(_))
+        ));
+
+        // A success response with no decision.
+        assert!(matches!(
+            ControlResponseFrame::parse_line(
+                r#"{"type":"control_response","response":{"subtype":"success","request_id":"r"}}"#
+            ),
+            Err(ControlFrameError::MissingResponse)
+        ));
+
+        // A success response with an unknown behavior.
+        assert!(matches!(
+            ControlResponseFrame::parse_line(
+                r#"{"type":"control_response","response":{"subtype":"success","request_id":"r","response":{"behavior":"maybe","message":""}}}"#
+            ),
+            Err(ControlFrameError::UnknownBehavior(_))
+        ));
+
+        // An unknown envelope subtype.
+        assert!(matches!(
+            ControlResponseFrame::parse_line(
+                r#"{"type":"control_response","response":{"subtype":"weird","request_id":"r"}}"#
+            ),
+            Err(ControlFrameError::UnexpectedSubtype(_))
+        ));
+    }
+
+    /// The control frames are real protocol frames: the same one-line and
+    /// discriminant guarantees apply to them.
+    #[test]
+    fn control_frames_report_their_kind_and_stay_on_one_line() {
+        let request = ProtocolMessage::ControlRequest(ControlRequestFrame::can_use_tool(
+            "r",
+            "Bash",
+            serde_json::json!({"command": "a\nb"}),
+            "reason\nwith newline",
+            false,
+        ));
+        let response = ProtocolMessage::ControlResponse(ControlResponseFrame::deny("r", "no"));
+
+        assert_eq!(request.kind(), "control_request");
+        assert_eq!(response.kind(), "control_response");
+        for frame in [request, response] {
+            assert_eq!(frame.to_line().matches('\n').count(), 1);
+            let decoded: ProtocolMessage =
+                serde_json::from_str(frame.to_line().trim_end()).unwrap();
+            assert_eq!(decoded, frame);
+        }
     }
 }
