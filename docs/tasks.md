@@ -230,7 +230,7 @@
 
 ### 5.1 权限模式与规则 (crate: `core`)
 - [x] 定义 `PermissionMode` 枚举（Default, AcceptEdits, BypassPermissions, DontAsk, Plan, Auto）
-- [x] 定义 `PermissionResult` 枚举（Allow, Ask, Deny, AskForSession, AllowForPath, Elevated）
+- [x] 定义 `PermissionResult` 枚举（Allow, Ask, Deny, AllowForPath, Elevated）
 - [x] 定义 `PermissionChecker` 结构体
 - [x] 实现 allow/deny/ask rule 合并逻辑
 - [x] 实现 path allowlist 匹配

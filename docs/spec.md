@@ -724,7 +724,6 @@ pub struct MemorySystem {
 - Allow
 - Ask
 - Deny
-- AskForSession
 - AllowForPath
 - Elevated
 

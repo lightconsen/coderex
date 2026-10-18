@@ -61,7 +61,7 @@ main() → parse_args() → StartupOrchestrator::run()
 | `--model MODEL` | `-m` | Model to use (e.g., `claude-sonnet-4-6`, `claude-opus-4-6`) |
 | `--fallback-model MODEL` | | Retry the same request once with this model when the primary is unavailable; if that succeeds the session continues on the fallback. Works in interactive and headless mode; other errors never trigger it |
 | `--system-prompt PROMPT` | | Custom system prompt (replaces default), in headless and interactive mode |
-| `--append-system-prompt` | | Append to the default system prompt instead of replacing it, in headless and interactive mode |
+| `--append-system-prompt` | | Modifier for `--system-prompt`: append its text to the default prompt instead of replacing it. It takes no value of its own, so without `--system-prompt` it has no effect |
 | `--file FILE` | `-f` | Include a file in context (can be repeated) |
 | `--print` | `-p` | Non-interactive mode: read from stdin, print response, exit |
 | `--brief` | | Concise output (minimal formatting) |

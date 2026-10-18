@@ -180,7 +180,11 @@ by default**:
   backtrace is **never** uploaded.
 - **Retention:** pending files are deleted after **7 days** (`DEFAULT_PENDING_MAX_AGE_SECS`), and
   stored crash rows after **30 days** (`DEFAULT_CRASH_RETENTION_DAYS`). The pending directory is
-  additionally capped at 50 MB (oldest first).
+  additionally capped at 50 MB (oldest first). `prune_pending` runs on **every** startup, including
+  when telemetry is disabled, so a previously opted-in run cannot leave files behind forever.
+- **Capture is opt-in:** the panic hook is installed at process start but inert until settings
+  resolve and telemetry is enabled (`set_capture_enabled`). A user who never opted in gets no
+  pending crash files. Pending crash uploads also run when a session produced no events.
 - **Upload:** `panic_info` is re-scrubbed at upload (pattern set, checksum detectors and
   high-entropy detector) and sent with the taxonomy and symbol-only frames, marked
   `"redaction_status": "pattern"`. The marker never claims the text is clean, because the scrubber

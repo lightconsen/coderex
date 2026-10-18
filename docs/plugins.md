@@ -474,7 +474,7 @@ During REPL construction:
 - Dependency resolution: topological sort with cycle detection via Kahn's algorithm.
 - Error recovery: `retry_failed_plugins()` attempts to re-read manifests for Error-state plugins up to `max_retries`.
 - Reconciliation: detect new, updated, removed plugins.
-- Auto-install new plugins from marketplace.
+- Auto-install new plugins from marketplace: `MarketplaceReconciler::with_auto_install()` exists and is unit-tested, but production reconciliation runs with `auto_install = false`; there is no CLI wiring for it yet.
 - Skill loading from all 5 sources with conflict resolution.
 - Skill frontmatter parsing via `serde_yaml` with custom scalar/array deserializers.
 - Repo-specific skills from `.coderex/skills/`.

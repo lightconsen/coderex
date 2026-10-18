@@ -57,7 +57,7 @@ Re-exports 50+ types from 44 submodules: `types`, `state`, `runtime`, `engine`, 
 - Anthropic API client with retry, Bearer auth for non-Anthropic endpoints.
 - Full SSE streaming parser with tool call assembly, stress-tested (50 concurrent tool calls, 100KB payloads, fragmented chunks).
 - Turn state machine with both blocking and streaming paths.
-- Permission engine with Allow/Deny/Ask/AskForSession/Elevated modes, hooks, and `PermissionManager` rule groups.
+- Permission engine with Allow/Deny/Ask/AllowForPath/Elevated results, hooks, and `PermissionManager` rule groups. Session-wide approval is recorded with `record_session_approval`.
 - Token budget tracking and cost estimation with `~/.coderex/pricing.json` loading.
 - Context compaction with 4 strategies (micro, auto, reactive, snip).
 - Transcript persistence (atomic temp-file + rename).
@@ -78,15 +78,15 @@ Re-exports 50+ types from 44 submodules: `types`, `state`, `runtime`, `engine`, 
 - Syntax highlighting integrated into TUI for assistant code blocks.
 - Graceful degradation with API unavailability handling.
 - `Runtime::shutdown()` aborts background task cleanly.
-- Comprehensive tests: 424 tests covering all major paths.
+- Comprehensive tests: 681 library tests plus the engine/integration suites.
 
 ### What Is Stubbed/Partial
 
-*None remaining.*
+No stubs. The list of accepted-but-inert surfaces lives in `docs/tools.md`, `docs/plugins.md`, and `docs/mcp.md`; this section is not an absolute claim.
 
 ### Gaps for Production
 
-*None remaining.*
+No known production gaps in the core loop itself. Documented platform and library-only boundaries are in `docs/sandbox.md` and `docs/bridge.md`.
 
 ## Recently Fixed
 

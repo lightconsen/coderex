@@ -16,7 +16,7 @@
 | Main agent streaming | ✅ | `QueryEngine::submit_streaming` |
 | Side query (single-shot) | ✅ | `orchestrator::run_side_query` |
 | Lightweight query | ✅ | `orchestrator::run_lightweight_query` |
-| Forked agent | ✅ (库能力) | `orchestrator::run_forked_agent` — implemented and tested, but no production caller: sub-agents use the Agent tool, not this helper |
+| Forked agent | ✅ | `orchestrator::run_forked_agent` — used transitively by background features (`run_background_feature` → `run_forked_agent_with_profile` → `run_forked_agent`); Agent-tool delegation uses the manager path |
 | Background feature | ✅ | `orchestrator::run_background_feature` |
 | Writable flag for forked agents | ✅ | `BackgroundFeatureRequest::writable` |
 
@@ -92,7 +92,7 @@
 | Lifecycle tracking | ✅ | `TaskManager` integration |
 | Teammate events | ✅ | `TeammateEvent` callback |
 | Resume support | — | Removed. Sub-agents are in-process tasks with no persisted transcript, so there is nothing to resume; `register_agent`/`resume_agent` no longer exist. |
-| Forked agent execution | ✅ (库能力) | `orchestrator::run_forked_agent()` is implemented and tested but has no production caller; the product path is the Agent tool. The `AgentManager` wrapper was removed. |
+| Forked agent execution | ✅ | `orchestrator::run_forked_agent()` is reached through background features; the `AgentManager` wrapper was removed. |
 
 ## REPL Commands
 

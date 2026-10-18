@@ -29,11 +29,11 @@ Model Context Protocol (MCP) support — enables CodeRex to act as an MCP client
 
 Public names are `mcp__<server>__<tool>`, which is load-bearing: two servers may expose the same raw tool name, and the prefix is what keeps them apart. Setting `CLAUDE_AGENT_SDK_MCP_NO_PREFIX` (to anything but `0`/`false`) addresses tools by their raw server-side name instead — the raw name is what the server expects in `tools/call` either way.
 
-Without the prefix a shared raw name cannot address both servers, so the second registration is **refused** rather than allowed to take the name over (which would route its calls to the other server). The refusal is reported by `McpToolRegistry::conflicts()` and logged; turn the prefix back on to reach that tool. `McpToolInfo::prefixed_name()` always gives the unambiguous spelling.
+Without the prefix a shared raw name cannot address both servers, so the second registration is **refused** rather than allowed to take the name over (which would route its calls to the other server). The refusal is logged and recorded by `McpToolRegistry::conflicts()` (a programmatic accessor; there is no CLI surface for it yet); turn the prefix back on to reach that tool. `McpToolInfo::prefixed_name()` always gives the unambiguous spelling.
 
 ### Hooked Into CLI
 
-- **`StartupOrchestrator.phase_init_mcp()`** (`crates/cli/src/orchestrator.rs:495`) — Loads `.mcp.json`, starts servers, discovers tools/resources, sets `mcp_ready`.
+- **`StartupOrchestrator.phase_init_mcp()`** (`crates/cli/src/orchestrator.rs:1353`) — Loads `.mcp.json`, starts servers, discovers tools/resources, sets `mcp_ready`.
 - **`/mcp` commands** — Server listing and status via config extension commands.
 
 ### Architecture Patterns
@@ -46,7 +46,6 @@ Without the prefix a shared raw name cannot address both servers, so the second 
 - **OAuth2 token management** — Token storage with expiry tracking, near-expiry detection, file persistence, and refresh-token exchange. Every remote request resolves its own `Authorization: Bearer` credential through a token provider, so a token inside the 5-minute window is refreshed before that request. Discovery follows Protected Resource Metadata to the resource's authorization server, then caches that server's endpoints, scopes, grants, PKCE methods and client-auth methods in an issuer-keyed map with an `ETag` and a `Cache-Control`/`Expires`-derived expiry; a fresh cache is reused without a request, a stale one is revalidated, and when discovery fails the conventional paths are used.
 - **Result adaptation** — MCP content arrays (text/image/resource) normalized to `ToolResult`.
 - **Resource caching** — In-memory TTL cache (default 60s) keyed by `(server_id, resource_uri)`.
-- **Composite dispatch** — Primary tool executor + MCP fallback in a single `ToolExecutor`.
 
 ## Current Status
 
@@ -73,10 +72,10 @@ Without the prefix a shared raw name cannot address both servers, so the second 
 - Server notifications: `notifications/tools/list_changed` triggers a fresh `tools/list` and re-registers that server's tools; `notifications/resources/updated` invalidates the affected resource in the cache (or all of that server's cached resources when no `uri` is given). Unknown notifications are still logged.
 - Config loading: `.mcp.json` file parsing + settings.json integration, save/load roundtrip.
 - Result adapter: `McpResultAdapter` converts MCP content (text, image, resource) to `ToolResult`.
-- Tool executor: `McpToolExecutor` implements `ToolExecutor` trait; `CompositeToolExecutor` provides fallback dispatch.
+- Tool registration: discovered tools are `McpTool` entries in the shared `ToolRegistry` (`register_tools_into`); there is no separate MCP executor.
 - Health monitor: Background task checks all servers every 30s.
 - Startup wiring: `StartupOrchestrator` phase loads config, starts servers, discovers tools/resources, sets `mcp_ready`.
-- 191 tests: 139 unit tests plus 18 socket-level Streamable HTTP tests and 34 integration tests covering channel, server, proxy, config, OAuth, re-authorization, typed elicitation, notification handling, manager, result adapter, and tool executor.
+- 208 tests: 140 unit tests plus 23 socket-level HTTP/SSE tests and 45 integration tests covering channel, server, proxy, config, OAuth, re-authorization, typed elicitation, notification handling, manager, result adapter, and tool executor.
 
 ### What Is Stubbed/Partial
 
@@ -107,7 +106,7 @@ Without the prefix a shared raw name cannot address both servers, so the second 
 
 ### IDE tool whitelist
 
-The reference allows two IDE tools (`mcp__ide__executeCode`, `mcp__ide__getDiagnostics`) to be used without a prompt. CodeRex has no IDE product to allowlist for: the only `ide` surfaces are the `--ide` CLI flag, which is accepted and explicitly does nothing ("this build has no IDE integration"), and the `/ide` status command, which reports "Not connected" and defers to a REPL that never connects. There is no `ide` MCP server, so there is no tool to whitelist — adding one would be building a policy for a product that does not exist.
+The reference allows two IDE tools (`mcp__ide__executeCode`, `mcp__ide__getDiagnostics`) to be used without a prompt. `--ide` in CodeRex connects to a configured IDE MCP endpoint and registers its tools like any other server, but there is no bundled IDE product, no fixed `ide` server, and no automatic allow rule for those names. Users who want them prompt-free add an explicit `mcp__ide__*` rule; CodeRex does not ship a product-specific allowlist.
 
 ## Remaining Considerations
 

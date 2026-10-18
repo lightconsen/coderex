@@ -58,7 +58,7 @@ Sub-agent system for spawning autonomous worker agents, dream agents (background
 ### Custom Agents (`custom_agents.rs`)
 
 - **`CustomAgentDef`** — User-defined agent loaded from `~/.coderex/agents/*.json` with fields: `name`, `system_prompt`, `allowed_tools`, `model`, `max_tokens`, `output_schema`.
-- **`load_custom_agents()`** — Scans `~/.coderex/agents/` and returns a name-to-definition map. Files that fail to parse are skipped (with a warning) rather than failing the session.
+- **`load_custom_agents()`** — Scans `~/.coderex/agents/` and returns a name-to-definition map. Files that fail to read or parse are skipped rather than failing the session; parse failures are not currently logged.
 - **`load_custom_agents_from_dir(dir)`** — The same scan against an explicit directory, used by tests and embedders that keep definitions elsewhere.
 - **`get_custom_agent()`** — Lookup helper for a named custom agent.
 - Definitions are loaded when `AgentManager::standalone()` is created and can be replaced with `set_custom_agents()` / extended with `register_custom_agent()`. `custom_agent_names()` returns the sorted names used in unknown-name errors.
@@ -68,7 +68,7 @@ Sub-agent system for spawning autonomous worker agents, dream agents (background
 #### Core Types
 
 - **`AgentManager`** — Central manager: spawns, tracks, and messages agents. Holds `Arc<Mutex<TaskManager>>`, active instances, custom agent defs, event broadcast, and tool executor factory. `spawn_named_agent()` is the production entry point for a configured custom agent; `spawn_agent()` remains the built-in/`AgentType` entry point.
-- **`AgentInstance`** — Running agent handle with `task_handle`, `status`, `context`, `message_tx`, `output_file`, `model`, `prompt`, `completion_notify`.
+- **`AgentInstance`** — Running agent handle with `task_handle`, `status`, `context`, `message_tx`, `output_file`, `model`, `prompt`.
 - **`AgentStatus`** — Lifecycle states: `Starting`, `Running`, `Completed`, `Failed`, `Stopped`.
 - **`AgentResult`** — Completion result: `output`, `status`, `token_usage`.
 - **`AgentError`** — Error type: `NotFound`, `NotRunning`, `SpawnFailed`, `ChannelClosed`, `ValidationFailed`, `Timeout`, `UnknownCustomAgent { name, available }`. The unknown-agent error lists the configured names (or says that none are configured and where they go).
@@ -112,9 +112,10 @@ Sub-agent system for spawning autonomous worker agents, dream agents (background
 #### Helper Functions
 
 - **`orchestrator::run_forked_agent()`** — Delegation helper on the core
-  orchestrator. It is implemented and tested but has no production caller; the
-  product path for delegation is the `Agent` tool. The `AgentManager` wrapper
-  around it was removed as a dead API.
+  orchestrator. It is reached transitively by background features
+  (`run_background_feature` → `run_forked_agent_with_profile` →
+  `run_forked_agent`); Agent-tool delegation uses the manager path instead.
+  The `AgentManager` wrapper around it was removed as a dead API.
 - **`run_background_feature()`** — Background AI feature execution through the core orchestrator.
 
 `execute_via_agent()` and `spawn_dream_agent()` were removed as dead APIs: nothing called them, and the background/dream paths go through `run_background_feature`.
@@ -150,9 +151,10 @@ foreground agents).
 
 ## Current Status
 
-All wired features are implemented. No known stubs. Two documented boundaries remain:
-`run_forked_agent` has no production caller, and `extra_env` is rejected rather than
-silently ignored.
+All wired features are implemented. No known stubs. Documented boundaries:
+`run_forked_agent` is reached only through background features (not the Agent
+tool), `extra_env` is rejected rather than silently ignored, and custom-agent
+files that fail to parse are skipped without a log line.
 
 ### What Works
 

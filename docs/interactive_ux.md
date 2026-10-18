@@ -113,9 +113,9 @@ Current limitations:
 
 - runtime mostly only displays `Thinking`
 - no full phase model (`Planning`, `Running tests`, `Applying patch`, etc.)
-- plan state is structurally present but not wired end-to-end
-- no complete, true interactive PTY E2E test harness
-- most current E2E coverage is headless or `-p`-driven
+- plan state is populated and persisted by the REPL, though the UI still renders a coarse view
+- a portable-PTY E2E harness exists at `crates/cli/tests/interactive_tui.rs`
+- coverage is split between that PTY suite and headless `-p` flows
 
 ## Screen Model
 

@@ -100,8 +100,8 @@ No image capability detection was added either: a detection method with nothing 
 
 ## Current Status
 
-The `coderex-ui` crate is fully implemented with no stubs or gaps for production.
+The `coderex-ui` crate has no stubs. The integration gap below is real, and the Vim/Kittty boundaries in the checklist apply.
 
 Known integration gap (owned by `crates/cli/src/repl.rs`, not this crate): the REPL matches key events inline rather than routing every key through `input::key_event_to_action`. The two safety properties that matter are nevertheless applied at the boundary: `repl.rs` calls `input::key_press` on every incoming event (release events are dropped), and `InputBuffer::apply(InsertChar)` rejects control characters, as does the REPL's Vim-insert path. `TerminalUi::profile()` is still not surfaced in the UI.
 
-Tests: `cargo test -p coderex-ui` (152 passing).
+Tests: `cargo test -p coderex-ui` (174 passing).

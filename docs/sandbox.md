@@ -22,7 +22,7 @@ sandbox fails rather than silently degrading.
 | `Bash` applies the sandbox | `crates/tools/src/builtins/bash_tool.rs` |
 | `PowerShell` applies the sandbox too | `crates/tools/src/builtins/powershell_tool.rs` |
 | **Command hooks apply it** (policy, wrapper, opt-outs) | `crates/hooks/src/sandbox.rs`, called from `execute_hook` in `crates/hooks/src/engine.rs` |
-| MCP servers spawn outside it | `JsonRpcChannel::spawn`, `crates/mcp/src/channel.rs:176` |
+| MCP servers spawn outside it | `JsonRpcChannel::spawn`, `crates/mcp/src/channel.rs:347` |
 
 Sandboxing is on by default (`ExecutionConfig::sandbox_enabled = true`, the
 `Default` impl in `crates/tools/src/executor.rs`). The default policy for `Bash`
@@ -285,8 +285,10 @@ start if it is missing.
   its spawn and has no post-spawn attach step, so a handle given to it uses
   `create_limits_only` (Job Object only). Gating hooks fail closed instead of
   claiming confinement. See `docs/hooks.md`.
-- The MCP server and the WASM compiler helper still spawn through their own
-  paths; only the Job Object applies to them.
+- MCP servers spawn through `JsonRpcChannel::spawn` and get **only** the
+  safeSpawn path check and credential scrubbing — no Job Object, AppContainer,
+  or other resource confinement. The WASM compiler helper gets its own rlimit
+  and (where available) sandbox-exec/bwrap wrappers.
 
 **Verification status.** The pure policy functions (ACL plan, capability set,
 command-line quoting) are compiled and unit-tested on macOS. With mingw-w64
@@ -407,13 +409,13 @@ The rule is *strip when the child does not need it*: a tool or MCP server is not
 itself a provider client, so it is given the variables it names and nothing else.
 An MCP server that genuinely needs one gets it back by naming it in its own
 `env` block — an explicit environment entry beats a removal, so the configured
-environment always arrives (`crates/mcp/src/channel.rs:196-204`).
+environment always arrives (`crates/mcp/src/channel.rs:376-379`).
 
 Implemented in `crates/core/src/sandbox.rs` (`is_credential_key`,
 `credential_scrub_keys`, `credential_scrub_keys_from`) and applied at
-`crates/tools/src/builtins/bash_tool.rs:223`,
-`crates/tools/src/builtins/powershell_tool.rs:81` and
-`crates/mcp/src/channel.rs:199`.
+`crates/tools/src/builtins/bash_tool.rs:279`,
+`crates/tools/src/builtins/powershell_tool.rs:77` and
+`crates/mcp/src/channel.rs:376`.
 
 Not scrubbed: anything the child's own configuration names, and any credential
 that is not in the lists above (for example `AWS_SECRET_ACCESS_KEY`, which a
@@ -465,8 +467,8 @@ does not go through the tool layer is not bound by them either.
 |---|---|---|
 | `Edit` refuses a path outside the configured read/write paths | `crates/tools/src/builtins/edit_tool.rs:59-76` | in-process |
 | `Write` refuses a path outside the configured write paths | `crates/tools/src/builtins/write_tool.rs:51-68` | in-process |
-| `Bash` command allowlist and shell-metacharacter rejection | `BashTool::validate_command`, `crates/tools/src/builtins/bash_tool.rs:145` | in-process, only active when an allowlist is configured |
-| `Bash` dangerous-command warning (`BashAst`) | `crates/tools/src/builtins/bash_tool.rs:211-216` | advisory — it prepends a warning to the output, it does not block |
+| `Bash` command allowlist and shell-metacharacter rejection | `BashTool::validate_command`, `crates/tools/src/builtins/bash_tool.rs:182` | in-process, only active when an allowlist is configured |
+| `Bash` dangerous-command warning (`BashAst`) | `crates/tools/src/builtins/bash_tool.rs:268-314` | advisory — it prepends a warning to the output, it does not block |
 
 ## Not enforced, and not claimed
 

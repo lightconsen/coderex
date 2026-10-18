@@ -2,7 +2,7 @@
 
 ## Goal
 
-Implements the `/` slash command system that users type in the REPL. Provides a registry with type-safe dispatch across ~75 commands covering sessions, configuration, diagnostics, Git integration, context management, macros, history, and advanced features.
+Implements the `/` slash command system that users type in the REPL. Provides a registry with type-safe dispatch across 77 commands covering sessions, configuration, diagnostics, Git integration, context management, macros, history, and advanced features.
 
 ## Design
 
@@ -48,7 +48,7 @@ Implements the `/` slash command system that users type in the REPL. Provides a 
 - **Macro expansion** — Command names resolved against `MacroRegistry` before registry dispatch; macro sequences expanded and executed in order.
 - **Scrollable output** — `CommandResult.scrollable` flag causes TUI to render output as an `Assistant` message (scrollable in message list) rather than a single-line `System` message.
 - **Command history** — Every command execution appended to `CommandHistory` ring buffer with file persistence; `/history` command queries and searches.
-- **Modular organization** — Commands grouped by domain across 15 files, each with a `register(&mut CommandRegistry)` function.
+- **Modular organization** — Commands grouped by domain across 13 registered modules, each with a `register(&mut CommandRegistry)` function.
 
 ## Current Status
 

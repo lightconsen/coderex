@@ -101,7 +101,7 @@ Remote session orchestration for connecting to remote CodeRex instances or manag
 
 ### Session Lifecycle
 
-**`BridgeSessionStateMachine`** (`state.rs`) — 11 states with validated transitions:
+**`BridgeSessionStateMachine`** (`state.rs`) — 10 states with validated transitions:
 
 ```
 Assigned → Preparing → CreatingWorktree → Spawning → Running → AwaitingPermission → Archiving → CleaningUp → Completed/Failed
@@ -486,8 +486,8 @@ Control Plane                      Bridge                          Remote/Local
 ## Architecture Patterns
 
 - **Transport abstraction** — Pluggable `Transport` trait with `InProcessTransport` (channels) and `WebSocketTransport` (TLS WebSocket via `tokio-tungstenite`).
-- **Heartbeat with reconnect** — `HeartbeatLoop` runs async ping; `WsReconnector` provides exponential backoff (1s→30s, 10 max attempts), integrated into `Bridge.handle_transport_disconnect()`.
-- **State machine lifecycle** — 11 states with validated transitions, terminal guards, history audit trail. Sessions progress: `Assigned → Preparing → Spawning → Running → Archiving → CleaningUp → Completed`.
+- **Heartbeat with reconnect** — `HeartbeatLoop` runs async ping; `WsReconnector` provides exponential backoff (1s→30s, 10 max attempts), integrated into `serve_transport` / `reconnect_with_resume` (the old `handle_transport_disconnect` was removed).
+- **State machine lifecycle** — 10 states with validated transitions, terminal guards, history audit trail. Production currently drives `Assigned → Preparing → Spawning → Running → Archiving → CleaningUp`; `CreatingWorktree`, `AwaitingPermission`, `Completed` and `Failed` exist in the machine but are not entered by the launcher today.
 - **Multi-mode spawning** — Local worktree isolation, single-dir, same-dir, and SSH remote spawning via `openssh` crate.
 - **Capacity-aware polling** — Work assignments only dispensed when `active_sessions < max_concurrent`.
 - **Session-scoped permissions** — Permission requests tracked per session with Allow/Deny responses and prune lifecycle.
@@ -524,11 +524,11 @@ Control Plane                      Bridge                          Remote/Local
   `CODEREX_BRIDGE_TOKEN` is used for the gateway transport and the control-plane
   HTTP API. There is no second credential setting, so a deployment that issues
   different tokens for the two must front the control plane to translate them.
-- **Live output over the bridge transport.** The default runner streams the
-  child's stdout/stderr to tracing, writes the transcript under the session
-  directory, and archives it on completion; it does not push each line through
-  the gateway. A deployment that needs live output injects a runner that
-  writes it to the transport as well.
+- **Live output over the bridge transport.** The default launcher forwards each
+  child stdout/stderr line as a `session_output` frame, records it in tracing,
+  and keeps the local transcript/`stderr.log`; the transcript is archived on
+  completion. A custom `SessionRunner` can produce output through the same
+  channel.
 - **A gateway path convention.** The default transport URL rewrites the
   control-plane scheme and keeps the same host and path. A gateway mounted on a
   different path must be given `--transport-url` / `CODEREX_BRIDGE_URL`.
