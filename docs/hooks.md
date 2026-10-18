@@ -297,7 +297,11 @@ and the matching side cannot drift.
   `{"type":"event",...}`, and `{"type":"request","id":N,"method":...}`. The
   host answers the request on stdin with `{"type":"response","id":N,...}` —
   through the session's `HookRequestHandler`, or with `-32601` when none is
-  installed. The first line on stdin is always the `HookInput`.
+  installed. The production CLI installs one: `"context"` returns
+  `{cwd, session_id, model, permission_mode}`, `"permission_mode"` returns the
+  current mode string, and every other method is refused with `-32601`. It is
+  read-only and exposes no environment variables or credentials. The first line
+  on stdin is always the `HookInput`.
 - **Output bounds.** One stdout line is capped at 1 MiB and the whole output at
   4 MiB; stderr is drained completely but only the first 1 MiB is kept. A hook
   cannot exhaust the host's memory through a pipe.

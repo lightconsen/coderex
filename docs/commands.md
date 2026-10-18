@@ -33,8 +33,8 @@ Implements the `/` slash command system that users type in the REPL. Provides a 
 | `git_commands` | `/commit`, `/commit-push-pr`, `/review`, `/security-review`, `/autofix-pr`, `/branch` | Git & code review |
 | `debug_commands` | `/debug-tool-call`, `/heapdump`, `/mock-limits`, `/perf-issue`, `/ant-trace`, `/break-cache`, `/reload-plugins` | Debugging tools |
 | `advanced_commands` | `/bridge`, `/bridge-kick`, `/teleport`, `/ultraplan`, `/insights`, `/thinkback`, `/thinkback-play`, `/statusline` | Advanced/feature-gated |
-| `misc_commands` | `/advisor`, `/btw`, `/good-claude`, `/stickers`, `/bughunter`, `/issue`, `/env`, `/diff`, `/oauth-refresh`, `/backfill-sessions`, `/history` | Miscellaneous. `/history` is currently a placeholder (see gaps). |
-| `macro_commands` | *(none registered)* | `MacroRegistry` loads/expands macros, but no `/macro` command is registered and `define()` has no production caller. Hand-edited `~/.coderex/macros.json` still expands. |
+| `misc_commands` | `/advisor`, `/btw`, `/good-claude`, `/stickers`, `/bughunter`, `/issue`, `/env`, `/diff`, `/oauth-refresh`, `/backfill-sessions`, `/history` | Miscellaneous. `/history [n]` and `/history search <q>` read the session's recorded command lines. |
+| `macro_commands` | `/macro` (REPL built-in) | `MacroRegistry` loads, persists and expands macros. `/macro define <name> <command[; command…]>`, `list`, `run <name>`, `delete <name>` are handled by the REPL; a defined macro also runs by typing `/<name>`. |
 
 ### Architecture Patterns
 
@@ -67,8 +67,8 @@ Implements the `/` slash command system that users type in the REPL. Provides a 
 - `/bridge` and `/bridge-kick` check `CODEREX_BRIDGE_URL` env var.
 - `/insights` aggregates project file counts, git info, and session token usage.
 - Command chaining via `|` operator (e.g., `/diff | /commit`) passes output between commands.
-- Command history is recorded and persisted (`CommandHistory`), but `/history` does not read it yet.
-- Macros from `~/.coderex/macros.json` expand before registry dispatch; there is no `/macro` command to define them from inside the REPL.
+- Command history is recorded for built-ins and registry commands alike (both REPL paths record before dispatch) and persisted; `/history` reads it, with `[n]` and `search <query>`.
+- `/macro define|list|run|delete` is a REPL built-in backed by `~/.coderex/macros.json`; macro names also expand directly.
 - All commands have basic error handling with usage messages.
 
 ### Feature-Gated Commands
@@ -86,7 +86,10 @@ These return an error message when the feature is not enabled. The flag names ar
 
 ## Remaining Gaps
 
-- **`/macro` is not registered.** `MacroRegistry` supports define/delete/get/list/load and expansion runs in both REPL paths, but `define()` has no production caller, so users must edit `macros.json` by hand.
-- **`/history` is a placeholder.** Command history is persisted, but the handler prints "No command history available." / "Use /history in the REPL for full history." rather than querying it.
-- **`CommandArgs` validation has no production declarers.** The enum and the pre-dispatch check are live, but no shipped command calls `.with_args(...)`; `/btw` and `/history` do ad-hoc checks instead.
+- **`/macro` is a REPL built-in, not a registry command.** It mutates the session's
+  `MacroRegistry` and can therefore run in the TUI and headless paths, but remote/bridge
+  sessions (which dispatch through the registry) do not see it.
+- **`CommandArgs` validation has no production declarers.** The enum and the pre-dispatch
+  check are live, but no shipped command calls `.with_args(...)`; `/btw` and `/history` do
+  ad-hoc checks instead.
 - **Remote/bridge availability filtering is only used by the server.** The local TUI does not consult the availability matrix.

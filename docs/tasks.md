@@ -551,22 +551,14 @@
 - **依赖**：4.1, 6.5
 
 ### 9.13 Feature-Gated/Internal 工具 (crate: `tools`)
-- [x] 实现 `WebBrowser` 工具（浏览器自动化与页面交互）— feature-gated stub
-- [x] 实现 `TerminalCapture` 工具（终端输出捕获与解析）— feature-gated stub
-- [x] 实现 `CtxInspect` 工具（上下文/环境状态检查）— feature-gated stub
-- [x] 实现 `Monitor` 工具（系统资源监控）— feature-gated stub
-- [x] 实现 `WorkflowTool` 工具（工作流编排与执行）— feature-gated stub
-- [x] 实现 `SnipTool` 工具（手动触发历史截断）— feature-gated stub
-- [x] 实现 `VerifyPlanExecution` 工具（计划执行结果验证）— feature-gated stub
-- [x] 实现 `SuggestBackgroundPR` 工具（后台建议 PR）— feature-gated stub
-- [x] 实现 `PushNotification` 工具（推送通知到外部服务）— feature-gated stub
-- [x] 实现 `SendUserFile` 工具（向用户发送文件）— feature-gated stub
-- [x] 实现 `SubscribePR` 工具（订阅 PR 更新通知）— feature-gated stub
-- [x] 实现 `ListPeers` 工具（列出当前连接的 peer 环境）— feature-gated stub
-- [x] 实现 `Tungsten` 工具（内部调试/诊断工具）— feature-gated stub
-- **测试**：
-  - 各工具在 feature flag 关闭时不可见的单元测试
-  - 各工具在 feature flag 开启时可用并可执行的集成测试
+- [x] 清理 13 个占位工具（WebBrowser、TerminalCapture、CtxInspect、Monitor、
+  WorkflowTool、SnipTool、VerifyPlanExecution、SuggestBackgroundPR、
+  PushNotification、SendUserFile、SubscribePR、ListPeers、Tungsten）——
+  它们 `is_enabled: false`，没有任何开关能启用，模型也看不到，唯一行为是返回拒绝信息。
+  模块与注册已删除，不再计入工具数。
+- 真正 feature-gated 的工具只有 5 个 Chrome DevTools 工具，由 `--no-chrome` 控制。
+- **测试**：`the_registry_has_no_refusing_stubs` 断言注册表只有 45 个 baseline + 5 个
+  Chrome，且没有任何 `is_enabled: false` 的工具。
 - **依赖**：4.1, 4.4, 1.2
 
 ---

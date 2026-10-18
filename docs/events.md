@@ -100,8 +100,10 @@ This is enforced by construction rather than by convention:
 - Dropping a `Turn` without completing it logs a warning; the reference always
   emits a result, even for a failed turn.
 
-A turn that never reached the engine and genuinely has no result can simply
-drop the guard (warning included), which is the only zero-result path.
+The CLI closes the turn explicitly when the engine task disappears without
+handing the engine back: it emits one `error_during_execution` result and keeps
+the sink for the next turn. The only zero-result paths left are a failed write
+and a caller that drops the guard without completing it.
 
 ### The sink
 

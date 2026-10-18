@@ -385,21 +385,14 @@ MCP：
 
 5.5 feature-gated / internal 工具
 
-为实现功能对等，CodeRex必须允许这些工具作为可选模块接入：
+早期版本为下列 13 个名字注册了“永远不可用”的占位工具（`is_enabled: false`，
+任何开关都无法启用，模型也看不到它们）：WebBrowser、TerminalCapture、CtxInspect、
+Monitor、WorkflowTool、SnipTool、VerifyPlanExecution、SuggestBackgroundPR、
+PushNotification、SendUserFile、SubscribePR、ListPeers、Tungsten。
 
-- WebBrowser
-- TerminalCapture
-- CtxInspect
-- Monitor
-- WorkflowTool
-- SnipTool
-- VerifyPlanExecution
-- SuggestBackgroundPR
-- PushNotification
-- SendUserFile
-- SubscribePR
-- ListPeers
-- Tungsten
+它们已全部删除，不再作为“已实现”计数。真正需要 feature gate 的只有 5 个 Chrome
+DevTools 工具（`ToolTier::FeatureGated`、`is_enabled: true`，由 `--no-chrome` 控制）。
+将来若要新增上述能力，应当连同真实实现与开关一起加入，而不是先注册一个只会拒绝的桩。
 
 建模：
 

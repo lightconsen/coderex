@@ -260,6 +260,13 @@ A worker reports state with a `session_write` frame:
 current epoch; a stale worker gets `{"accepted": false, "reason": "...", "current_epoch": 2}`
 and the session's state is left with the worker that actually owns it.
 
+The epoch comes from the registration response (`worker_epoch`, also accepted as
+`workerEpoch`); the launcher stores it and queues a `session_write` with state
+`running` after a session spawns and `completed`/`failed` when it finishes. If
+the control plane did not return an epoch, the launcher logs it once and keeps
+running without producing writes — a write without an epoch is refused
+everywhere and would be noise rather than fencing.
+
 ## Stream resume
 
 Reconnecting with exponential backoff re-establishes the connection but not the

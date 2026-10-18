@@ -92,7 +92,7 @@
 | Lifecycle tracking | ✅ | `TaskManager` integration |
 | Teammate events | ✅ | `TeammateEvent` callback |
 | Resume support | — | Removed. Sub-agents are in-process tasks with no persisted transcript, so there is nothing to resume; `register_agent`/`resume_agent` no longer exist. |
-| Forked agent execution | ✅ (库能力) | `AgentManager::run_forked_agent()` is implemented and tested but has no production caller; the product path is the Agent tool. |
+| Forked agent execution | ✅ (库能力) | `orchestrator::run_forked_agent()` is implemented and tested but has no production caller; the product path is the Agent tool. The `AgentManager` wrapper was removed. |
 
 ## REPL Commands
 

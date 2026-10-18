@@ -54,25 +54,17 @@ Implements the tool trait system, registers built-in tools, and provides executi
 | SyntheticOutputTool | Output formatting | Functional (plain/json/display modes) |
 | ToolSearchTool | Tool discovery | Functional |
 
-#### Feature-Gated Tools (13)
+#### Feature-Gated Tools
 
-Registered with `ToolTier::FeatureGated` and `is_enabled: false`. Return a "feature-gated and not enabled" message when invoked.
-
-| Tool | Description |
-|------|-------------|
-| WebBrowser | Browser automation |
-| TerminalCapture | Terminal output capture |
-| CtxInspect | Context inspection |
-| Monitor | System monitoring |
-| WorkflowTool | Workflow execution |
-| SnipTool | Code snippet management |
-| VerifyPlanExecution | Plan verification |
-| SuggestBackgroundPR | Background PR suggestions |
-| PushNotification | Push notifications |
-| SendUserFile | File sharing |
-| SubscribePR | PR subscription |
-| ListPeers | Peer discovery |
-| Tungsten | Tungsten integration |
+The only `FeatureGated` tools are the five Chrome DevTools tools, which are
+enabled (`is_enabled: true`) and controlled by the session's Chrome capability
+(`--no-chrome`). Thirteen placeholder tools (WebBrowser, TerminalCapture,
+CtxInspect, Monitor, WorkflowTool, SnipTool, VerifyPlanExecution,
+SuggestBackgroundPR, PushNotification, SendUserFile, SubscribePR, ListPeers,
+Tungsten) were removed: they were permanently `is_enabled: false`, no feature
+flag could turn them on, the dispatcher filtered them out of every listing, and
+their only behavior was a refusal string. `register_builtin_tools` now registers
+45 baseline tools plus 5 Chrome tools.
 
 ### The result-size ladder
 
@@ -156,11 +148,13 @@ on Windows the `PowerShell` entry is the live one.
 
 ### What Is Stubbed/Partial
 
-None — all previously stubbed items are now implemented.
+None. The thirteen `FeatureGated` placeholders that only returned a refusal were
+removed rather than kept as advertised-but-unusable tools.
 
 ## Gaps for Production
 
-None — all previously identified gaps are now implemented.
+None for the built-in tool set. The deliberate differences are recorded below
+(rule-exemption vocabulary) and in the subsystem docs.
 
 ### Rule-exemption gaps (recorded, not implemented)
 

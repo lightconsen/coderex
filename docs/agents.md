@@ -111,7 +111,10 @@ Sub-agent system for spawning autonomous worker agents, dream agents (background
 
 #### Helper Functions
 
-- **`run_forked_agent()`** — Delegation helper on the core orchestrator. It is implemented and tested but has no production caller; the product path for delegation is the `Agent` tool.
+- **`orchestrator::run_forked_agent()`** — Delegation helper on the core
+  orchestrator. It is implemented and tested but has no production caller; the
+  product path for delegation is the `Agent` tool. The `AgentManager` wrapper
+  around it was removed as a dead API.
 - **`run_background_feature()`** — Background AI feature execution through the core orchestrator.
 
 `execute_via_agent()` and `spawn_dream_agent()` were removed as dead APIs: nothing called them, and the background/dream paths go through `run_background_feature`.
