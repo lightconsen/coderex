@@ -2077,10 +2077,25 @@ impl QueryEngine {
                     }
                 }
                 // The error says which kind it is; the loop does not read the
-                // message to find out.
+                // message to find out. A failed request still ended a turn:
+                // close it through the same hooks and bookkeeping as any
+                // other, with no usage because nothing was billed.
                 Err(error) => {
                     let reason = error.terminal_reason();
-                    turn.terminate(reason.clone());
+                    let stop_reason = match &error {
+                        TurnError::ApiUnavailable { .. } => "api_unavailable",
+                        TurnError::Fatal { .. } => "error",
+                    };
+                    let _ = self
+                        .finish_turn(
+                            &mut turn,
+                            turn_number,
+                            stop_reason,
+                            &UsageSummary::default(),
+                            &[],
+                            reason.clone(),
+                        )
+                        .await;
                     self.current_turn = turn_number;
                     return match error {
                         TurnError::ApiUnavailable { .. } => Ok(reason),
@@ -2182,10 +2197,25 @@ impl QueryEngine {
                     }
                 }
                 // The error says which kind it is; the loop does not read the
-                // message to find out.
+                // message to find out. As in `submit`, a failed request still
+                // closes the turn through Stop/TurnEnd and the cost and loop
+                // bookkeeping, with zero usage.
                 Err(error) => {
                     let reason = error.terminal_reason();
-                    turn.terminate(reason.clone());
+                    let stop_reason = match &error {
+                        TurnError::ApiUnavailable { .. } => "api_unavailable",
+                        TurnError::Fatal { .. } => "error",
+                    };
+                    let _ = self
+                        .finish_turn(
+                            &mut turn,
+                            turn_number,
+                            stop_reason,
+                            &UsageSummary::default(),
+                            &[],
+                            reason.clone(),
+                        )
+                        .await;
                     self.current_turn = turn_number;
                     return match error {
                         TurnError::ApiUnavailable { .. } => Ok(reason),
@@ -2227,8 +2257,23 @@ impl QueryEngine {
             .fire_hook(hook_events::USER_PROMPT_SUBMIT, &user_prompt, &ctx)
             .await;
         if hook_result.stop {
-            turn.terminate(TerminalReason::Completed);
-            return Ok(TerminalReason::Completed);
+            // The hook stopped the turn before a request. Close it like any
+            // other turn so Stop/TurnEnd and the bookkeeping run; the closing
+            // path enters StopHooks from `CompactRecovery`, the graph-legal
+            // predecessor reachable from the pre-submit state.
+            if !matches!(turn.state, TurnState::CompactRecovery) {
+                turn.transition_to(TurnState::CompactRecovery);
+            }
+            return Ok(self
+                .finish_turn(
+                    turn,
+                    turn_number,
+                    "user_prompt_submit_stop",
+                    &UsageSummary::default(),
+                    &[],
+                    TerminalReason::Completed,
+                )
+                .await);
         }
 
         // The prompt cache may have gone cold while this session sat idle:
@@ -2252,6 +2297,15 @@ impl QueryEngine {
             // here, before a request. Close it like any other turn so the
             // Stop/TurnEnd hooks, cost bookkeeping, and loop check run, and so
             // the loop sees a terminal reason instead of re-running forever.
+            //
+            // The retry-budget exit returns without having run compaction, so
+            // the turn is still in `RunPreSubmitHooks`; StopHooks is not a
+            // legal move from there. `CompactRecovery` is the recovery
+            // decision this turn reached and the predecessor the closing path
+            // leaves from.
+            if !matches!(turn.state, TurnState::CompactRecovery) {
+                turn.transition_to(TurnState::CompactRecovery);
+            }
             return Ok(self
                 .finish_turn(
                     turn,
@@ -2511,8 +2565,21 @@ impl QueryEngine {
             .fire_hook(hook_events::USER_PROMPT_SUBMIT, &user_prompt, &ctx)
             .await;
         if hook_result.stop {
-            turn.terminate(TerminalReason::Completed);
-            return Ok(TerminalReason::Completed);
+            // See `execute_turn`: a stopped pre-submit turn still closes
+            // through Stop/TurnEnd and the bookkeeping.
+            if !matches!(turn.state, TurnState::CompactRecovery) {
+                turn.transition_to(TurnState::CompactRecovery);
+            }
+            return Ok(self
+                .finish_turn(
+                    turn,
+                    turn_number,
+                    "user_prompt_submit_stop",
+                    &UsageSummary::default(),
+                    &[],
+                    TerminalReason::Completed,
+                )
+                .await);
         }
 
         // The prompt cache may have gone cold while this session sat idle:
@@ -2533,7 +2600,11 @@ impl QueryEngine {
         {
             // See `execute_turn`: a blocked context closes the turn through
             // the normal path so hooks and bookkeeping are not skipped and the
-            // loop terminates.
+            // loop terminates. The retry-budget exit never reached a
+            // compaction, so it still needs the graph-legal predecessor.
+            if !matches!(turn.state, TurnState::CompactRecovery) {
+                turn.transition_to(TurnState::CompactRecovery);
+            }
             return Ok(self
                 .finish_turn(
                     turn,
@@ -2802,11 +2873,12 @@ impl QueryEngine {
 
     /// Close a turn that ends for a reason other than how the model stopped.
     ///
-    /// Budget exhaustion and recovery failure used to return straight out of
-    /// the turn loop — `turn.terminate(...)` and a `return` — without running
-    /// the Stop/TurnEnd hooks, the cost bookkeeping, or the loop check every
-    /// model-ended turn goes through. They now take the same closing path and
-    /// terminate afterwards.
+    /// Budget exhaustion, recovery failure, a pre-submit hook stop, and an
+    /// outright request failure used to return straight out of the turn loop —
+    /// `turn.terminate(...)` and a `return` — without running the Stop/TurnEnd
+    /// hooks, the cost bookkeeping, or the loop check every model-ended turn
+    /// goes through. They now take the same closing path and terminate
+    /// afterwards. Request failures pass zero usage because nothing was billed.
     ///
     /// A loop the detector reports takes precedence over the reason passed in:
     /// it is the more specific diagnosis of why the run must end.
@@ -3432,6 +3504,15 @@ impl QueryEngine {
             };
         }
 
+        // This is compaction, so the turn is in `CompactRecovery` while it
+        // runs. Entering the state here does two things the pre-request path
+        // needs: it records what actually happened, and it leaves the turn in
+        // the state from which either the retry's `StartRequest` or the
+        // closing path's `StopHooks` is a legal move. The cache-TTL pass may
+        // already have entered it, hence the check.
+        if !matches!(turn.state, TurnState::CompactRecovery) {
+            turn.transition_to(TurnState::CompactRecovery);
+        }
         let outcome = self
             .run_compact_recovery(turn, options, turn_number, CompactTrigger::TokenThreshold)
             .await;
@@ -5136,6 +5217,161 @@ mod tests {
             matches!(reason, TerminalReason::ApiUnavailable { .. }),
             "an unreachable provider came back as {reason:?}"
         );
+    }
+
+    /// An engine with the supplied API client and a hook executor that records
+    /// lifecycle events.
+    fn engine_with_recording_hooks(api: Box<dyn ApiClient>) -> (QueryEngine, RecordedEvents) {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let checker = PermissionChecker::new(PermissionMode::BypassPermissions);
+        let mut engine = QueryEngine::new(
+            api,
+            ModelId::sonnet(),
+            SessionState::new(std::path::PathBuf::from("/tmp/test")),
+            PermissionEngine::new(checker),
+            tx,
+        );
+        engine.set_tool_executor(Box::new(StubOkToolExecutor));
+        let (hooks, recorded) = RecordingHooks::new();
+        engine.set_hooks(Box::new(hooks));
+        (engine, recorded)
+    }
+
+    /// Both hooks the closing path owns must have run, with the reason the
+    /// turn closed.
+    fn assert_closing_hooks_ran(recorded: &RecordedEvents, stop_reason: &str) {
+        let events = recorded
+            .lock()
+            .expect("the recording hook lock is not poisoned");
+        let stop = events
+            .iter()
+            .find(|(name, _)| name == hook_events::STOP)
+            .unwrap_or_else(|| panic!("the Stop hook did not fire: {events:?}"));
+        let turn_end = events
+            .iter()
+            .find(|(name, _)| name == hook_events::TURN_END)
+            .unwrap_or_else(|| panic!("the TurnEnd hook did not fire: {events:?}"));
+        assert_eq!(
+            stop.1.get("stop_reason").map(String::as_str),
+            Some(stop_reason),
+            "Stop saw the wrong stop reason: {events:?}"
+        );
+        assert_eq!(
+            turn_end.1.get("stop_reason").map(String::as_str),
+            Some(stop_reason),
+            "TurnEnd saw the wrong stop reason: {events:?}"
+        );
+    }
+
+    /// A fatal request error used to return straight out of `submit`, past the
+    /// Stop/TurnEnd hooks and the cost and loop bookkeeping.
+    #[tokio::test]
+    async fn a_fatal_error_runs_stop_and_turn_end_hooks() {
+        struct FatalMock;
+
+        fn failure() -> crate::api_client::ApiError {
+            crate::api_client::ApiError::Response {
+                status: 400,
+                message: "messages: field required".into(),
+            }
+        }
+
+        #[async_trait::async_trait]
+        impl ApiClient for FatalMock {
+            fn clone_box(&self) -> Box<dyn ApiClient> {
+                Box::new(FatalMock)
+            }
+
+            async fn create_message(
+                &self,
+                _system: &str,
+                _messages: &[serde_json::Value],
+                _model: &ModelId,
+                _max_tokens: u32,
+                _tools: &[crate::tool_executor::ToolInfo],
+            ) -> Result<ApiResponse, crate::api_client::ApiError> {
+                Err(failure())
+            }
+
+            async fn create_message_streaming(
+                &self,
+                _system: &str,
+                _messages: &[serde_json::Value],
+                _model: &ModelId,
+                _max_tokens: u32,
+                _tools: &[crate::tool_executor::ToolInfo],
+            ) -> std::pin::Pin<Box<dyn futures::Stream<Item = StreamEvent> + Send + 'static>>
+            {
+                Box::pin(futures::stream::iter(vec![StreamEvent::Error(failure())]))
+            }
+        }
+
+        let (mut engine, recorded) = engine_with_recording_hooks(Box::new(FatalMock));
+        let outcome = engine
+            .submit("hello".into(), SubmitOptions::default())
+            .await;
+
+        assert!(
+            outcome.is_err(),
+            "a fatal error was reported as: {outcome:?}"
+        );
+        assert_closing_hooks_ran(&recorded, "error");
+    }
+
+    /// An unavailable provider is still an error the caller may recover from,
+    /// but the turn it ended closes like any other.
+    #[tokio::test]
+    async fn an_api_unavailable_error_runs_stop_and_turn_end_hooks() {
+        struct UnavailableMock;
+
+        fn failure() -> crate::api_client::ApiError {
+            crate::api_client::ApiError::RetryExhausted {
+                attempts: 3,
+                last_error_message: "connection refused".into(),
+            }
+        }
+
+        #[async_trait::async_trait]
+        impl ApiClient for UnavailableMock {
+            fn clone_box(&self) -> Box<dyn ApiClient> {
+                Box::new(UnavailableMock)
+            }
+
+            async fn create_message(
+                &self,
+                _system: &str,
+                _messages: &[serde_json::Value],
+                _model: &ModelId,
+                _max_tokens: u32,
+                _tools: &[crate::tool_executor::ToolInfo],
+            ) -> Result<ApiResponse, crate::api_client::ApiError> {
+                Err(failure())
+            }
+
+            async fn create_message_streaming(
+                &self,
+                _system: &str,
+                _messages: &[serde_json::Value],
+                _model: &ModelId,
+                _max_tokens: u32,
+                _tools: &[crate::tool_executor::ToolInfo],
+            ) -> std::pin::Pin<Box<dyn futures::Stream<Item = StreamEvent> + Send + 'static>>
+            {
+                Box::pin(futures::stream::iter(vec![StreamEvent::Error(failure())]))
+            }
+        }
+
+        let (mut engine, recorded) = engine_with_recording_hooks(Box::new(UnavailableMock));
+        let reason = engine
+            .submit("hello".into(), SubmitOptions::default())
+            .await
+            .expect("provider unavailability remains a recoverable outcome");
+
+        assert!(
+            matches!(reason, TerminalReason::ApiUnavailable { .. }),
+            "an unavailable provider came back as {reason:?}"
+        );
+        assert_closing_hooks_ran(&recorded, "api_unavailable");
     }
 
     /// And a failure that is ours is not dressed up as a provider outage.
@@ -7439,6 +7675,46 @@ mod tests {
             0,
             "a blocked context was sent to the provider"
         );
+    }
+
+    /// A blocked context closes through `finish_turn`, and the move into the
+    /// closing state is one the graph allows. Before the fix this recorded
+    /// `RunPreSubmitHooks -> StopHooks`, which `can_transition_to` refuses.
+    #[tokio::test]
+    async fn a_context_blocked_turn_only_makes_legal_moves() {
+        let (mut engine, _calls, _recorded) = blocked_context_engine();
+        let mut turn = TurnRuntime::new(TokenBudget::with_defaults());
+        turn.messages.push(Message::user("x".repeat(200_000)));
+
+        let _ = take_recorded_transitions();
+        let reason = engine
+            .execute_turn(&mut turn, &SubmitOptions::default(), 1)
+            .await
+            .expect("a blocked context returns a reason, not a fatal error");
+
+        assert!(matches!(reason, TerminalReason::Error(_)), "{reason:?}");
+        let recorded = take_recorded_transitions();
+        assert!(
+            recorded
+                .iter()
+                .any(|(from, to)| matches!(from, TurnState::RunPreSubmitHooks)
+                    && matches!(to, TurnState::CompactRecovery)),
+            "the blocked turn did not route through CompactRecovery: {recorded:?}"
+        );
+        assert!(
+            recorded
+                .iter()
+                .any(|(_, to)| matches!(to, TurnState::StopHooks)),
+            "the blocked turn never entered StopHooks: {recorded:?}"
+        );
+        for (from, to) in &recorded {
+            assert!(
+                from.can_transition_to(*to),
+                "a blocked turn went {} -> {}, which the graph refuses",
+                from.as_str(),
+                to.as_str()
+            );
+        }
     }
 
     // ─── Mid-stream interruption recovery ──────────────────────────────────
