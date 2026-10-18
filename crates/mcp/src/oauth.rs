@@ -91,6 +91,21 @@ pub struct McpOAuthState {
     /// Scopes granted.
     #[serde(default)]
     pub scopes: Vec<String>,
+    /// The scopes the authorization server advertised as supported.
+    ///
+    /// Cached from discovery so a later `McpAuth` call, or the refresh path,
+    /// does not have to ask again while the metadata is still fresh.
+    #[serde(default)]
+    pub scopes_supported: Vec<String>,
+    /// When the cached discovery metadata (endpoints and scopes) expires,
+    /// in epoch seconds.
+    ///
+    /// Derived from the metadata document's `Cache-Control: max-age`, with a
+    /// one-hour default. `None` means no metadata has been cached yet, and
+    /// discovery will fetch. A cached document is not re-fetched before this
+    /// time.
+    #[serde(default)]
+    pub discovery_expires_at: Option<i64>,
     /// The token endpoint to refresh against.
     ///
     /// Left unset by [`McpOAuthState::new`]; [`McpOAuthState::token_endpoint`]
@@ -120,6 +135,8 @@ impl McpOAuthState {
             refresh_token: None,
             expires_at: None,
             scopes: Vec::new(),
+            scopes_supported: Vec::new(),
+            discovery_expires_at: None,
             token_endpoint: None,
             authorization_endpoint: None,
         }
@@ -184,6 +201,47 @@ impl McpOAuthState {
         self.refresh_token = refresh;
         self.expires_at = Some(chrono::Utc::now().timestamp() + expires_in);
     }
+
+    /// The discovery metadata cached by a previous run, if it is still fresh.
+    ///
+    /// The cache is the persisted `authorization_endpoint`, `token_endpoint`
+    /// and `scopes_supported` plus [`Self::discovery_expires_at`]. A state with
+    /// no expiry, an expired one, or no endpoint has nothing to reuse.
+    #[must_use]
+    pub fn cached_discovery(&self) -> Option<OAuthDiscovery> {
+        let expires_at = self.discovery_expires_at?;
+        if chrono::Utc::now().timestamp() >= expires_at {
+            return None;
+        }
+        if self.authorization_endpoint.is_none() && self.token_endpoint.is_none() {
+            return None;
+        }
+        Some(OAuthDiscovery {
+            issuer: None,
+            authorization_endpoint: self.authorization_endpoint.clone(),
+            token_endpoint: self.token_endpoint.clone(),
+            scopes_supported: self.scopes_supported.clone(),
+        })
+    }
+
+    /// Record freshly discovered metadata and when it should be fetched again.
+    ///
+    /// Endpoints that the document omits are left as they were, so an older
+    /// document cannot erase a working endpoint.
+    fn record_discovery(&mut self, discovery: &OAuthDiscovery, max_age: u64) {
+        if discovery.authorization_endpoint.is_some() {
+            self.authorization_endpoint
+                .clone_from(&discovery.authorization_endpoint);
+        }
+        if discovery.token_endpoint.is_some() {
+            self.token_endpoint.clone_from(&discovery.token_endpoint);
+        }
+        self.scopes_supported
+            .clone_from(&discovery.scopes_supported);
+        let now = chrono::Utc::now().timestamp();
+        let ttl = i64::try_from(max_age).unwrap_or(i64::MAX);
+        self.discovery_expires_at = Some(now.saturating_add(ttl));
+    }
 }
 
 /// Token store for persistence.
@@ -197,18 +255,27 @@ struct TokenStore {
     states: Vec<McpOAuthState>,
 }
 
-/// The endpoints an authorization server advertises (RFC 8414).
+/// Metadata an authorization server advertises (RFC 8414 or OpenID Connect).
 ///
-/// Both fields are optional in the document, but a document that advertises
+/// The endpoints are optional in the document, but a document that advertises
 /// neither is not useful and is treated as a failed discovery.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OAuthDiscovery {
+    /// The issuer this document describes.
+    ///
+    /// Checked against the issuer we asked about: a document for a different
+    /// issuer is not usable, even if it was served from this host.
+    #[serde(default)]
+    pub issuer: Option<String>,
     /// Where the user is sent to approve the client.
     #[serde(default)]
     pub authorization_endpoint: Option<String>,
     /// Where an authorization code or refresh token is exchanged.
     #[serde(default)]
     pub token_endpoint: Option<String>,
+    /// Scopes the authorization server supports.
+    #[serde(default)]
+    pub scopes_supported: Vec<String>,
 }
 
 impl OAuthDiscovery {
@@ -217,17 +284,131 @@ impl OAuthDiscovery {
     }
 }
 
-/// The `scheme://host[:port]` part of a server URL, or `None` for anything
-/// that is not a usable http(s) URL.
-fn origin_of(server_url: &str) -> Option<String> {
-    let url = reqwest::Url::parse(server_url).ok()?;
+/// One hour is the default when the server sends no usable `max-age`.
+const DEFAULT_DISCOVERY_TTL_SECONDS: u64 = 3600;
+
+/// Normalize an issuer for discovery and comparison.
+///
+/// Query and fragment are irrelevant to identity, and a trailing slash is not
+/// part of it. The path is kept: `https://id.example/realms/demo` and
+/// `https://id.example` are different issuers.
+fn normalize_issuer(value: &str) -> Option<String> {
+    let mut url = reqwest::Url::parse(value).ok()?;
     if !matches!(url.scheme(), "http" | "https") {
         return None;
     }
-    Some(url.origin().ascii_serialization())
+    url.set_query(None);
+    url.set_fragment(None);
+    let path = url.path().trim_end_matches('/').to_string();
+    url.set_path(&path);
+    let normalized = url.as_str().trim_end_matches('/').to_string();
+    (!normalized.is_empty()).then_some(normalized)
 }
 
-async fn fetch_discovery(client: &reqwest::Client, url: &str) -> Result<OAuthDiscovery, String> {
+/// Whether discovery may talk to this URL in plain HTTP.
+///
+/// HTTPS everywhere, except loopback: a local development server has no
+/// certificate to present, and the traffic never leaves the machine.
+fn allows_plain_http(url: &reqwest::Url) -> bool {
+    match url.scheme() {
+        "https" => true,
+        "http" => match url.host() {
+            Some(url::Host::Domain(host)) => host.eq_ignore_ascii_case("localhost"),
+            Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
+            Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
+            None => false,
+        },
+        _ => false,
+    }
+}
+
+/// The metadata documents to try, in precedence order.
+///
+/// RFC 8414 inserts `/.well-known/oauth-authorization-server` *before* the
+/// issuer's path, while OpenID Connect appends
+/// `/.well-known/openid-configuration` *after* it. Both forms are tried, and
+/// the origin-level documents remain as a fallback for issuers that publish
+/// them there. Duplicates are removed so an issuer without a path does not
+/// probe the same URL twice.
+fn discovery_candidates(issuer: &str) -> Result<Vec<String>, String> {
+    let normalized = normalize_issuer(issuer)
+        .ok_or_else(|| format!("{issuer} is not a usable http(s) issuer"))?;
+    let url = reqwest::Url::parse(&normalized).map_err(|error| error.to_string())?;
+    if !allows_plain_http(&url) {
+        return Err(format!(
+            "{normalized}: discovery requires https, except for localhost"
+        ));
+    }
+    let origin = url.origin().ascii_serialization();
+    let path = url.path().trim_end_matches('/');
+    let candidates = [
+        format!("{origin}/.well-known/oauth-authorization-server{path}"),
+        format!("{origin}/.well-known/oauth-authorization-server"),
+        format!("{origin}{path}/.well-known/openid-configuration"),
+        format!("{origin}/.well-known/openid-configuration"),
+    ];
+
+    let mut unique: Vec<String> = Vec::with_capacity(candidates.len());
+    for candidate in candidates {
+        if !unique.contains(&candidate) {
+            unique.push(candidate);
+        }
+    }
+    Ok(unique)
+}
+
+/// How long a metadata document may be reused, per `Cache-Control`.
+///
+/// `max-age` is the only directive that matters here; anything else (including
+/// a missing header) falls back to one hour. `no-store` and `no-cache` mean
+/// "fetch again next time", which is a zero-second TTL.
+fn cache_max_age(headers: &reqwest::header::HeaderMap) -> u64 {
+    let Some(value) = headers
+        .get(reqwest::header::CACHE_CONTROL)
+        .and_then(|value| value.to_str().ok())
+    else {
+        return DEFAULT_DISCOVERY_TTL_SECONDS;
+    };
+    for directive in value.split(',') {
+        let directive = directive.trim();
+        if directive.eq_ignore_ascii_case("no-store") || directive.eq_ignore_ascii_case("no-cache")
+        {
+            return 0;
+        }
+        let Some((name, raw)) = directive.split_once('=') else {
+            continue;
+        };
+        if name.trim().eq_ignore_ascii_case("max-age") {
+            if let Ok(seconds) = raw.trim().trim_matches('"').parse::<u64>() {
+                return seconds;
+            }
+        }
+    }
+    DEFAULT_DISCOVERY_TTL_SECONDS
+}
+
+/// Whether a fetched document describes the issuer we asked about.
+///
+/// The comparison is normalized exact match: a trailing slash or a query
+/// string does not make a different issuer, but a different host or path does.
+/// A document with no `issuer` is accepted for compatibility with servers that
+/// publish only endpoint fields; RFC 8414 requires the field, so servers that
+/// follow the RFC are still checked.
+fn issuer_matches(discovery: &OAuthDiscovery, requested: &str) -> bool {
+    discovery.issuer.as_deref().map_or(true, |advertised| {
+        normalize_issuer(advertised).as_deref() == Some(requested)
+    })
+}
+
+struct FetchedDiscovery {
+    discovery: OAuthDiscovery,
+    max_age: u64,
+}
+
+async fn fetch_discovery(
+    client: &reqwest::Client,
+    url: &str,
+) -> Result<FetchedDiscovery, String> {
     let response = client
         .get(url)
         .header("accept", "application/json")
@@ -235,11 +416,14 @@ async fn fetch_discovery(client: &reqwest::Client, url: &str) -> Result<OAuthDis
         .await
         .map_err(|error| error.to_string())?;
     let status = response.status();
+    let max_age = cache_max_age(response.headers());
     let body = response.text().await.map_err(|error| error.to_string())?;
     if !status.is_success() {
         return Err(format!("HTTP {status}"));
     }
-    serde_json::from_str(&body).map_err(|error| format!("invalid JSON: {error}"))
+    let discovery =
+        serde_json::from_str(&body).map_err(|error| format!("invalid JSON: {error}"))?;
+    Ok(FetchedDiscovery { discovery, max_age })
 }
 
 /// Resolves the access token for one MCP server before each HTTP request.
@@ -415,47 +599,70 @@ impl OAuthManager {
 
     /// Fetch the server's OAuth metadata and record the endpoints it advertises.
     ///
-    /// RFC 8414 puts the document at `{origin}/.well-known/oauth-authorization-server`.
-    /// Some servers only publish OpenID Connect discovery, so
-    /// `{origin}/.well-known/openid-configuration` is tried when the first
-    /// document is missing or unusable. The origin — not the MCP endpoint path —
-    /// is used, because the metadata is about the authorization server.
+    /// The issuer is the server URL with its query, fragment and trailing slash
+    /// removed; its path is load-bearing. Four documents are tried in order:
     ///
-    /// Discovered endpoints are written into the state for `server_url` (which
-    /// is created with the conventional client id if the server has not been
-    /// registered yet) and persisted, so the next process does not have to ask
-    /// again. Callers that cannot use `Result` — [`OAuthManager::refresh`] —
-    /// treat a failure as "no metadata" and fall back to the conventional paths.
+    /// 1. `{origin}/.well-known/oauth-authorization-server{path}` — RFC 8414
+    ///    path insertion, the Keycloak/Auth0 shape.
+    /// 2. `{origin}/.well-known/oauth-authorization-server` — issuer at origin.
+    /// 3. `{path}/.well-known/openid-configuration` — OpenID Connect appends to
+    ///    the issuer.
+    /// 4. `{origin}/.well-known/openid-configuration` — OpenID Connect at
+    ///    origin.
+    ///
+    /// A document whose `issuer` does not match the normalized issuer is
+    /// rejected and the next candidate is tried. HTTPS is required, except for
+    /// loopback hosts (plain HTTP is allowed there for local development).
+    ///
+    /// Discovered endpoints and `scopes_supported` are written into the state
+    /// for `server_url` (created with the conventional client id if the server
+    /// has not been registered yet) and persisted together with an expiry
+    /// derived from `Cache-Control: max-age` (one hour by default). A cached
+    /// document is returned without a request until that expiry.
+    ///
+    /// Callers that cannot use `Result` — [`OAuthManager::refresh`] — treat a
+    /// failure as "no metadata" and fall back to the conventional paths.
     pub async fn discover(
         &mut self,
         server_url: &str,
         client: &reqwest::Client,
     ) -> Result<OAuthDiscovery, OAuthError> {
-        let Some(origin) = origin_of(server_url) else {
-            return Err(OAuthError::Discovery {
+        if let Some(cached) = self.get(server_url).and_then(McpOAuthState::cached_discovery) {
+            return Ok(cached);
+        }
+
+        let normalized = normalize_issuer(server_url).ok_or_else(|| OAuthError::Discovery {
+            server_url: server_url.to_string(),
+            detail: "the server URL has no usable http(s) issuer".to_string(),
+        })?;
+        let candidates =
+            discovery_candidates(&normalized).map_err(|detail| OAuthError::Discovery {
                 server_url: server_url.to_string(),
-                detail: "the server URL has no usable http(s) origin".to_string(),
-            });
-        };
+                detail,
+            })?;
 
         let mut attempts = Vec::new();
         let mut found = None;
-        for path in [
-            ".well-known/oauth-authorization-server",
-            ".well-known/openid-configuration",
-        ] {
-            let url = format!("{origin}/{path}");
+        for url in candidates {
             match fetch_discovery(client, &url).await {
-                Ok(discovery) if !discovery.is_empty() => {
-                    found = Some(discovery);
+                Ok(fetched) if fetched.discovery.is_empty() => {
+                    attempts.push(format!("{url}: advertised no endpoints"));
+                }
+                Ok(fetched) if !issuer_matches(&fetched.discovery, &normalized) => {
+                    attempts.push(format!(
+                        "{url}: issuer {:?} does not match {normalized}",
+                        fetched.discovery.issuer
+                    ));
+                }
+                Ok(fetched) => {
+                    found = Some(fetched);
                     break;
                 }
-                Ok(_) => attempts.push(format!("{url}: advertised no endpoints")),
                 Err(error) => attempts.push(format!("{url}: {error}")),
             }
         }
 
-        let Some(discovery) = found else {
+        let Some(fetched) = found else {
             return Err(OAuthError::Discovery {
                 server_url: server_url.to_string(),
                 detail: attempts.join("; "),
@@ -468,19 +675,14 @@ impl OAuthManager {
         let state = self
             .get_mut(server_url)
             .expect("the state was just registered");
-        if discovery.authorization_endpoint.is_some() {
-            state.authorization_endpoint = discovery.authorization_endpoint.clone();
-        }
-        if discovery.token_endpoint.is_some() {
-            state.token_endpoint = discovery.token_endpoint.clone();
-        }
+        state.record_discovery(&fetched.discovery, fetched.max_age);
 
         self.save_tokens().map_err(|source| OAuthError::Store {
             path: self.path.display().to_string(),
             source,
         })?;
 
-        Ok(discovery)
+        Ok(fetched.discovery)
     }
 
     /// Trade the stored refresh token for a fresh access token.
@@ -950,25 +1152,56 @@ mod tests {
         String::from_utf8_lossy(&request).into_owned()
     }
 
-    /// Serve a fixed sequence of responses, one connection each, and return
-    /// the requests that arrived. The response bodies are built after the
-    /// listener is bound so they can name its address.
-    fn spawn_http_sequence<F>(make_responses: F) -> (String, std::thread::JoinHandle<Vec<String>>)
+    struct HttpReply {
+        status: u16,
+        headers: Vec<(String, String)>,
+        body: String,
+    }
+
+    impl HttpReply {
+        fn new(status: u16, body: impl Into<String>) -> Self {
+            Self {
+                status,
+                headers: Vec::new(),
+                body: body.into(),
+            }
+        }
+
+        fn with_header(mut self, name: &str, value: &str) -> Self {
+            self.headers.push((name.to_string(), value.to_string()));
+            self
+        }
+    }
+
+    /// Serve a fixed sequence of replies, one connection each, and return the
+    /// requests that arrived. The bodies are built after the listener is bound
+    /// so they can name its address.
+    fn spawn_http_replies<F>(make_responses: F) -> (String, std::thread::JoinHandle<Vec<String>>)
     where
-        F: FnOnce(&str) -> Vec<(u16, String)> + Send + 'static,
+        F: FnOnce(&str) -> Vec<HttpReply> + Send + 'static,
     {
+        use std::fmt::Write as _;
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
         let base = format!("http://{address}");
         let responses = make_responses(&base);
         let handle = std::thread::spawn(move || {
             let mut requests = Vec::new();
-            for (status, body) in responses {
+            for reply in responses {
                 let (mut stream, _) = listener.accept().unwrap();
                 requests.push(read_http_request(&mut stream));
-                let response = format!(
-                    "HTTP/1.1 {status} OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                    body.len()
+                let mut response = format!(
+                    "HTTP/1.1 {} OK\r\nContent-Type: application/json\r\n",
+                    reply.status
+                );
+                for (name, value) in &reply.headers {
+                    let _ = write!(response, "{name}: {value}\r\n");
+                }
+                let _ = write!(
+                    response,
+                    "Content-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    reply.body.len(),
+                    reply.body
                 );
                 stream.write_all(response.as_bytes()).unwrap();
                 stream.flush().unwrap();
@@ -978,18 +1211,97 @@ mod tests {
         (base, handle)
     }
 
+    fn spawn_http_sequence<F>(make_responses: F) -> (String, std::thread::JoinHandle<Vec<String>>)
+    where
+        F: FnOnce(&str) -> Vec<(u16, String)> + Send + 'static,
+    {
+        spawn_http_replies(move |base| {
+            make_responses(base)
+                .into_iter()
+                .map(|(status, body)| HttpReply::new(status, body))
+                .collect()
+        })
+    }
+
+    #[test]
+    fn issuer_normalization_keeps_the_path_and_drops_the_rest() {
+        assert_eq!(
+            normalize_issuer("https://id.example/realms/demo/?foo=bar#frag").as_deref(),
+            Some("https://id.example/realms/demo")
+        );
+        assert_eq!(
+            normalize_issuer("https://id.example/").as_deref(),
+            Some("https://id.example")
+        );
+        assert_eq!(normalize_issuer("not a url"), None);
+        assert_eq!(normalize_issuer("ftp://id.example/realms/demo"), None);
+    }
+
+    #[test]
+    fn discovery_candidates_put_path_insertion_before_origin_documents() {
+        let candidates =
+            discovery_candidates("https://id.example/realms/demo/?ignored=1#frag").unwrap();
+        assert_eq!(
+            candidates,
+            vec![
+                "https://id.example/.well-known/oauth-authorization-server/realms/demo",
+                "https://id.example/.well-known/oauth-authorization-server",
+                "https://id.example/realms/demo/.well-known/openid-configuration",
+                "https://id.example/.well-known/openid-configuration",
+            ]
+        );
+
+        // Without a path the path-insertion and origin documents are the same
+        // URL; it must still be probed only once.
+        let origin_only = discovery_candidates("https://id.example").unwrap();
+        assert_eq!(
+            origin_only,
+            vec![
+                "https://id.example/.well-known/oauth-authorization-server",
+                "https://id.example/.well-known/openid-configuration",
+            ]
+        );
+    }
+
+    #[test]
+    fn discovery_rejects_plain_http_outside_localhost() {
+        let error = discovery_candidates("http://id.example/realms/demo").unwrap_err();
+        assert!(error.contains("requires https"), "{error}");
+        assert!(discovery_candidates("http://127.0.0.1:8080/realms/demo").is_ok());
+        assert!(discovery_candidates("http://localhost:8080/realms/demo").is_ok());
+    }
+
+    #[test]
+    fn cache_control_max_age_defaults_to_one_hour() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        assert_eq!(cache_max_age(&headers), 3600);
+        headers.insert(
+            reqwest::header::CACHE_CONTROL,
+            "public, max-age=120".parse().unwrap(),
+        );
+        assert_eq!(cache_max_age(&headers), 120);
+        headers.insert(reqwest::header::CACHE_CONTROL, "no-store".parse().unwrap());
+        assert_eq!(cache_max_age(&headers), 0);
+    }
+
     #[tokio::test]
-    async fn discovery_reads_the_authorization_server_metadata_and_persists_it() {
-        let metadata = r#"{
-            "authorization_endpoint": "https://auth.example/authorize",
-            "token_endpoint": "https://auth.example/token"
-        }"#;
-        let (base, server) = spawn_http_sequence(move |_| vec![(200, metadata.to_string())]);
+    async fn discovery_uses_rfc_8414_path_insertion_and_persists_the_cache() {
+        let (base, server) = spawn_http_replies(|base| {
+            vec![HttpReply::new(
+                200,
+                format!(
+                    r#"{{"issuer":"{base}/realms/demo/","authorization_endpoint":"https://auth.example/authorize","token_endpoint":"https://auth.example/token","scopes_supported":["openid","mcp"]}}"#
+                ),
+            )
+            .with_header("cache-control", "public, max-age=120")]
+        });
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("mcp_tokens.json");
         let mut mgr = OAuthManager::with_path(&path);
-        let server_url = format!("{base}/mcp");
+        // The trailing slash on the issuer must not change identity.
+        let server_url = format!("{base}/realms/demo/");
         mgr.register(McpOAuthState::new(&server_url, "client1"));
+        let before = chrono::Utc::now().timestamp();
 
         let discovery = mgr
             .discover(&server_url, &reqwest::Client::new())
@@ -1003,6 +1315,7 @@ mod tests {
             discovery.token_endpoint.as_deref(),
             Some("https://auth.example/token")
         );
+        assert_eq!(discovery.scopes_supported, vec!["openid", "mcp"]);
 
         let state = mgr.get(&server_url).unwrap();
         assert_eq!(
@@ -1010,6 +1323,12 @@ mod tests {
             "https://auth.example/authorize"
         );
         assert_eq!(state.token_endpoint(), "https://auth.example/token");
+        assert_eq!(state.scopes_supported, vec!["openid", "mcp"]);
+        let expires_at = state.discovery_expires_at.unwrap();
+        assert!(
+            (before + 100..=before + 125).contains(&expires_at),
+            "the Cache-Control max-age was not used: {expires_at} vs {before}"
+        );
 
         // The cache has to survive the process, or every restart asks again.
         let on_disk = std::fs::read_to_string(&path).unwrap();
@@ -1018,28 +1337,75 @@ mod tests {
             on_disk.contains("https://auth.example/authorize"),
             "{on_disk}"
         );
+        assert!(on_disk.contains("scopes_supported"), "{on_disk}");
+        assert!(on_disk.contains("discovery_expires_at"), "{on_disk}");
 
-        // The origin was used, not the MCP endpoint path.
+        // Path insertion came first, and the issuer path was kept.
         let requests = server.join().unwrap();
         assert_eq!(requests.len(), 1);
         assert!(
-            requests[0].starts_with("GET /.well-known/oauth-authorization-server "),
+            requests[0]
+                .starts_with("GET /.well-known/oauth-authorization-server/realms/demo "),
             "unexpected discovery request: {}",
             requests[0]
         );
     }
 
     #[tokio::test]
-    async fn discovery_falls_back_to_openid_configuration() {
-        let openid = r#"{
-            "issuer": "https://auth.example",
-            "authorization_endpoint": "https://openid.example/authorize",
-            "token_endpoint": "https://openid.example/token"
-        }"#;
-        let (base, server) =
-            spawn_http_sequence(move |_| vec![(404, String::new()), (200, openid.to_string())]);
+    async fn discovery_rejects_a_mismatched_issuer_and_continues() {
+        let (base, server) = spawn_http_sequence(|base| {
+            vec![
+                (
+                    200,
+                    r#"{"issuer":"https://evil.example","authorization_endpoint":"https://evil.example/authorize","token_endpoint":"https://evil.example/token"}"#.to_string(),
+                ),
+                (
+                    200,
+                    format!(
+                        r#"{{"issuer":"{base}/realms/demo","authorization_endpoint":"https://good.example/authorize","token_endpoint":"https://good.example/token"}}"#
+                    ),
+                ),
+            ]
+        });
         let mut mgr = OAuthManager::with_path(tempfile::tempdir().unwrap().path().join("t.json"));
-        let server_url = format!("{base}/mcp");
+        let server_url = format!("{base}/realms/demo");
+
+        let discovery = mgr
+            .discover(&server_url, &reqwest::Client::new())
+            .await
+            .unwrap();
+        assert_eq!(
+            discovery.token_endpoint.as_deref(),
+            Some("https://good.example/token"),
+            "the mismatched document was accepted"
+        );
+
+        // The second document is the origin-level RFC 8414 path.
+        let requests = server.join().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert!(
+            requests[1].starts_with("GET /.well-known/oauth-authorization-server "),
+            "{}",
+            requests[1]
+        );
+    }
+
+    #[tokio::test]
+    async fn discovery_falls_back_to_openid_configuration_at_the_issuer_path() {
+        let (base, server) = spawn_http_sequence(|base| {
+            vec![
+                (404, String::new()),
+                (404, String::new()),
+                (
+                    200,
+                    format!(
+                        r#"{{"issuer":"{base}/realms/demo","authorization_endpoint":"https://openid.example/authorize","token_endpoint":"https://openid.example/token"}}"#
+                    ),
+                ),
+            ]
+        });
+        let mut mgr = OAuthManager::with_path(tempfile::tempdir().unwrap().path().join("t.json"));
+        let server_url = format!("{base}/realms/demo");
 
         let discovery = mgr
             .discover(&server_url, &reqwest::Client::new())
@@ -1051,16 +1417,69 @@ mod tests {
         );
 
         let requests = server.join().unwrap();
-        assert_eq!(requests.len(), 2);
+        assert_eq!(requests.len(), 3);
         assert!(
-            requests[0].starts_with("GET /.well-known/oauth-authorization-server "),
+            requests[0]
+                .starts_with("GET /.well-known/oauth-authorization-server/realms/demo "),
             "{}",
             requests[0]
         );
         assert!(
-            requests[1].starts_with("GET /.well-known/openid-configuration "),
+            requests[1].starts_with("GET /.well-known/oauth-authorization-server "),
             "{}",
             requests[1]
+        );
+        assert!(
+            requests[2].starts_with("GET /realms/demo/.well-known/openid-configuration "),
+            "{}",
+            requests[2]
+        );
+    }
+
+    #[tokio::test]
+    async fn discovery_reuses_fresh_cached_metadata_without_a_request() {
+        let mut mgr = OAuthManager::with_path(tempfile::tempdir().unwrap().path().join("t.json"));
+        // Port 1 is closed: any fetch attempt fails, so Ok proves the cache
+        // path was taken.
+        let server_url = "http://127.0.0.1:1/realms/demo";
+        let mut state = McpOAuthState::new(server_url, "client1");
+        state.authorization_endpoint = Some("https://id.example/auth".into());
+        state.token_endpoint = Some("https://id.example/token".into());
+        state.scopes_supported = vec!["openid".into(), "mcp".into()];
+        state.discovery_expires_at = Some(chrono::Utc::now().timestamp() + 3600);
+        mgr.register(state);
+
+        let discovery = mgr
+            .discover(server_url, &reqwest::Client::new())
+            .await
+            .unwrap();
+        assert_eq!(
+            discovery.authorization_endpoint.as_deref(),
+            Some("https://id.example/auth")
+        );
+        assert_eq!(
+            discovery.token_endpoint.as_deref(),
+            Some("https://id.example/token")
+        );
+        assert_eq!(discovery.scopes_supported, vec!["openid", "mcp"]);
+    }
+
+    #[tokio::test]
+    async fn an_expired_cache_is_not_used() {
+        let mut mgr = OAuthManager::with_path(tempfile::tempdir().unwrap().path().join("t.json"));
+        let server_url = "http://127.0.0.1:1/realms/demo";
+        let mut state = McpOAuthState::new(server_url, "client1");
+        state.token_endpoint = Some("https://id.example/token".into());
+        state.discovery_expires_at = Some(chrono::Utc::now().timestamp() - 1);
+        mgr.register(state);
+
+        let error = mgr
+            .discover(server_url, &reqwest::Client::new())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, OAuthError::Discovery { .. }),
+            "an expired cache was reused: {error}"
         );
     }
 
@@ -1071,7 +1490,7 @@ mod tests {
                 (
                     200,
                     format!(
-                        r#"{{"authorization_endpoint":"{base}/authorize","token_endpoint":"{base}/custom/token"}}"#
+                        r#"{{"issuer":"{base}/mcp","authorization_endpoint":"{base}/authorize","token_endpoint":"{base}/custom/token"}}"#
                     ),
                 ),
                 (
@@ -1104,20 +1523,58 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn discovery_failure_is_reported_rather_than_invented() {
-        let (base, server) =
-            spawn_http_sequence(|_| vec![(404, String::new()), (404, String::new())]);
+    async fn a_failed_discovery_leaves_the_conventional_endpoints() {
+        let (base, server) = spawn_http_sequence(|_| {
+            vec![
+                (404, String::new()),
+                (404, String::new()),
+                (404, String::new()),
+                (404, String::new()),
+            ]
+        });
         let mut mgr = OAuthManager::with_path(tempfile::tempdir().unwrap().path().join("t.json"));
+        let server_url = format!("{base}/mcp");
+        mgr.register(McpOAuthState::new(&server_url, "client1"));
 
         let error = mgr
-            .discover(&format!("{base}/mcp"), &reqwest::Client::new())
+            .discover(&server_url, &reqwest::Client::new())
             .await
             .unwrap_err();
         assert!(
             matches!(error, OAuthError::Discovery { .. }),
             "unexpected error: {error}"
         );
-        server.join().unwrap();
+
+        // Nothing was published, so the conventional path remains in effect.
+        assert_eq!(
+            mgr.get(&server_url).unwrap().token_endpoint(),
+            format!("{server_url}/oauth/token")
+        );
+
+        // All four candidates were tried, in precedence order.
+        let requests = server.join().unwrap();
+        assert_eq!(requests.len(), 4);
+        assert!(
+            requests[0]
+                .starts_with("GET /.well-known/oauth-authorization-server/mcp "),
+            "{}",
+            requests[0]
+        );
+        assert!(
+            requests[1].starts_with("GET /.well-known/oauth-authorization-server "),
+            "{}",
+            requests[1]
+        );
+        assert!(
+            requests[2].starts_with("GET /mcp/.well-known/openid-configuration "),
+            "{}",
+            requests[2]
+        );
+        assert!(
+            requests[3].starts_with("GET /.well-known/openid-configuration "),
+            "{}",
+            requests[3]
+        );
     }
 
     #[test]

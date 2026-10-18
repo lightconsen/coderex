@@ -98,7 +98,7 @@ async fn authenticate(input: ToolInput, token_path: &Path) -> Result<ToolOutput,
 
     let pending_path = pending_path(token_path);
     let pending = load_pending(&pending_path, &server_url);
-    let discovery = discover_endpoints(&client, &server_url).await;
+    let discovery = discover_endpoints(&client, &server_url, &client_id, token_path).await;
 
     let authorization_endpoint = [
         discovery.authorization_endpoint.clone(),
@@ -460,6 +460,9 @@ fn parse_redirect_url(value: &str) -> Result<(String, Option<String>), String> {
     Ok((code, state))
 }
 
+/// One hour is the default when the server sends no usable `max-age`.
+const DEFAULT_DISCOVERY_TTL_SECONDS: u64 = 3600;
+
 /// Endpoints advertised by the server's metadata documents.
 #[derive(Debug, Default)]
 struct DiscoveredEndpoints {
@@ -467,22 +470,176 @@ struct DiscoveredEndpoints {
     token_endpoint: Option<String>,
 }
 
-/// Fetch RFC 8414 metadata, falling back to OpenID Connect discovery.
+/// Normalize an issuer for discovery and comparison.
+///
+/// Query and fragment are irrelevant to identity, and a trailing slash is not
+/// part of it. The path is kept: `https://id.example/realms/demo` and
+/// `https://id.example` are different issuers.
+fn normalize_issuer(value: &str) -> Option<String> {
+    let mut url = url::Url::parse(value).ok()?;
+    if !matches!(url.scheme(), "http" | "https") {
+        return None;
+    }
+    url.set_query(None);
+    url.set_fragment(None);
+    let path = url.path().trim_end_matches('/').to_string();
+    url.set_path(&path);
+    let normalized = url.as_str().trim_end_matches('/').to_string();
+    (!normalized.is_empty()).then_some(normalized)
+}
+
+/// Whether discovery may talk to this URL in plain HTTP.
+///
+/// HTTPS everywhere, except loopback: a local development server has no
+/// certificate to present, and the traffic never leaves the machine.
+fn allows_plain_http(url: &url::Url) -> bool {
+    match url.scheme() {
+        "https" => true,
+        "http" => match url.host() {
+            Some(url::Host::Domain(host)) => host.eq_ignore_ascii_case("localhost"),
+            Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
+            Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
+            None => false,
+        },
+        _ => false,
+    }
+}
+
+/// The metadata documents to try, in precedence order.
+///
+/// RFC 8414 inserts `/.well-known/oauth-authorization-server` *before* the
+/// issuer's path, while OpenID Connect appends
+/// `/.well-known/openid-configuration` *after* it. Origin-level documents are
+/// the fallback. Duplicates are removed so an issuer without a path does not
+/// probe the same URL twice.
+fn discovery_candidates(issuer: &str) -> Option<Vec<String>> {
+    let normalized = normalize_issuer(issuer)?;
+    let url = url::Url::parse(&normalized).ok()?;
+    if !allows_plain_http(&url) {
+        return None;
+    }
+    let origin = url.origin().ascii_serialization();
+    let path = url.path().trim_end_matches('/');
+    let candidates = [
+        format!("{origin}/.well-known/oauth-authorization-server{path}"),
+        format!("{origin}/.well-known/oauth-authorization-server"),
+        format!("{origin}{path}/.well-known/openid-configuration"),
+        format!("{origin}/.well-known/openid-configuration"),
+    ];
+
+    let mut unique: Vec<String> = Vec::with_capacity(candidates.len());
+    for candidate in candidates {
+        if !unique.contains(&candidate) {
+            unique.push(candidate);
+        }
+    }
+    Some(unique)
+}
+
+/// How long a metadata document may be reused, per `Cache-Control`.
+///
+/// `max-age` is the only directive that matters here; anything else (including
+/// a missing header) falls back to one hour. `no-store` and `no-cache` mean
+/// "fetch again next time", which is a zero-second TTL.
+fn cache_max_age(headers: &reqwest::header::HeaderMap) -> u64 {
+    let Some(value) = headers
+        .get(reqwest::header::CACHE_CONTROL)
+        .and_then(|value| value.to_str().ok())
+    else {
+        return DEFAULT_DISCOVERY_TTL_SECONDS;
+    };
+    for directive in value.split(',') {
+        let directive = directive.trim();
+        if directive.eq_ignore_ascii_case("no-store") || directive.eq_ignore_ascii_case("no-cache")
+        {
+            return 0;
+        }
+        let Some((name, raw)) = directive.split_once('=') else {
+            continue;
+        };
+        if name.trim().eq_ignore_ascii_case("max-age") {
+            if let Ok(seconds) = raw.trim().trim_matches('"').parse::<u64>() {
+                return seconds;
+            }
+        }
+    }
+    DEFAULT_DISCOVERY_TTL_SECONDS
+}
+
+/// Whether a fetched document describes the issuer we asked about.
+///
+/// Normalized exact match: a trailing slash or query string does not make a
+/// different issuer, but a different host or path does. A document without an
+/// `issuer` is accepted for compatibility with servers that publish only
+/// endpoint fields.
+fn issuer_matches(value: &serde_json::Value, requested: &str) -> bool {
+    value
+        .get("issuer")
+        .and_then(|issuer| issuer.as_str())
+        .map_or(true, |advertised| {
+            normalize_issuer(advertised).as_deref() == Some(requested)
+        })
+}
+
+/// Fresh discovery metadata already persisted for `server_url`, if any.
+///
+/// This is the read half of the cache that both `McpAuth` and
+/// `coderex_mcp::oauth::OAuthManager` share through the token store, so a
+/// second sign-in attempt does not re-probe metadata that is still valid.
+fn load_cached_discovery(token_path: &Path, server_url: &str) -> Option<DiscoveredEndpoints> {
+    let store = load_token_store(token_path).ok()?;
+    let entry = store
+        .states
+        .into_iter()
+        .find(|entry| entry.server_url == server_url)?;
+    let expires_at = entry.discovery_expires_at?;
+    if expires_at <= chrono::Utc::now().timestamp() {
+        return None;
+    }
+    if entry.authorization_endpoint.is_none() && entry.token_endpoint.is_none() {
+        return None;
+    }
+    Some(DiscoveredEndpoints {
+        authorization_endpoint: entry.authorization_endpoint,
+        token_endpoint: entry.token_endpoint,
+    })
+}
+
+/// Fetch RFC 8414 / OpenID Connect metadata, falling back to the conventional
+/// paths when nothing usable is published.
+///
+/// The issuer is `server_url` normalized (path kept). Candidates are tried in
+/// the order described by [`discovery_candidates`], and a document whose
+/// `issuer` does not match is rejected. A fresh cache entry is returned
+/// without a request.
 ///
 /// Discovery is best-effort by design: an MCP server that publishes nothing
 /// still works at the conventional paths. Nothing here is fatal.
-async fn discover_endpoints(client: &reqwest::Client, server_url: &str) -> DiscoveredEndpoints {
-    let Some(origin) = origin_of(server_url) else {
+async fn discover_endpoints(
+    client: &reqwest::Client,
+    server_url: &str,
+    client_id: &str,
+    token_path: &Path,
+) -> DiscoveredEndpoints {
+    if let Some(cached) = load_cached_discovery(token_path, server_url) {
+        tracing::debug!(server = %server_url, "Using cached MCP OAuth metadata");
+        return cached;
+    }
+
+    let Some(normalized) = normalize_issuer(server_url) else {
+        return DiscoveredEndpoints::default();
+    };
+    let Some(candidates) = discovery_candidates(&normalized) else {
+        tracing::debug!(
+            server = %server_url,
+            "Discovery requires https outside localhost; using the conventional endpoints"
+        );
         return DiscoveredEndpoints::default();
     };
 
-    for path in [
-        ".well-known/oauth-authorization-server",
-        ".well-known/openid-configuration",
-    ] {
-        let url = format!("{origin}/{path}");
+    for candidate in candidates {
         let Ok(response) = client
-            .get(&url)
+            .get(&candidate)
             .header("accept", "application/json")
             .send()
             .await
@@ -492,12 +649,21 @@ async fn discover_endpoints(client: &reqwest::Client, server_url: &str) -> Disco
         if !response.status().is_success() {
             continue;
         }
+        let max_age = cache_max_age(response.headers());
         let Ok(body) = response.text().await else {
             continue;
         };
         let Ok(value) = serde_json::from_str::<serde_json::Value>(&body) else {
             continue;
         };
+        if !issuer_matches(&value, &normalized) {
+            tracing::debug!(
+                server = %server_url,
+                candidate = %candidate,
+                "Rejecting OAuth metadata for a different issuer"
+            );
+            continue;
+        }
         let authorization_endpoint = value
             .get("authorization_endpoint")
             .and_then(|v| v.as_str())
@@ -506,13 +672,37 @@ async fn discover_endpoints(client: &reqwest::Client, server_url: &str) -> Disco
             .get("token_endpoint")
             .and_then(|v| v.as_str())
             .map(String::from);
-        if authorization_endpoint.is_some() || token_endpoint.is_some() {
-            tracing::debug!(server = %server_url, "Discovered MCP OAuth endpoints");
-            return DiscoveredEndpoints {
-                authorization_endpoint,
-                token_endpoint,
-            };
+        if authorization_endpoint.is_none() && token_endpoint.is_none() {
+            continue;
         }
+        let scopes_supported: Vec<String> = value
+            .get("scopes_supported")
+            .and_then(|v| v.as_array())
+            .map(|scopes| {
+                scopes
+                    .iter()
+                    .filter_map(|scope| scope.as_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        tracing::debug!(server = %server_url, "Discovered MCP OAuth endpoints");
+
+        // Best-effort: a cache write must never stop a sign-in.
+        let _ = cache_discovery_at(
+            token_path,
+            server_url,
+            client_id,
+            authorization_endpoint.as_deref(),
+            token_endpoint.as_deref(),
+            &scopes_supported,
+            i64::try_from(max_age).unwrap_or(i64::MAX),
+        );
+
+        return DiscoveredEndpoints {
+            authorization_endpoint,
+            token_endpoint,
+        };
     }
 
     tracing::debug!(
@@ -520,14 +710,6 @@ async fn discover_endpoints(client: &reqwest::Client, server_url: &str) -> Disco
         "No OAuth metadata found; using the conventional endpoints"
     );
     DiscoveredEndpoints::default()
-}
-
-fn origin_of(server_url: &str) -> Option<String> {
-    let url = url::Url::parse(server_url).ok()?;
-    if !matches!(url.scheme(), "http" | "https") {
-        return None;
-    }
-    Some(url.origin().ascii_serialization())
 }
 
 /// Build the authorization URL with the discovered endpoint and PKCE.
@@ -725,11 +907,65 @@ pub fn persist_token_at(
     )
 }
 
+/// The token store shape shared with `coderex_mcp::oauth`.
+///
+/// Kept here rather than imported because the dependency runs `tools <- mcp`.
+/// Every field has a default so a store written by an older version still
+/// parses.
+#[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
+struct TokenStore {
+    #[serde(default)]
+    states: Vec<TokenEntry>,
+}
+
+/// One server's persisted OAuth state.
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+struct TokenEntry {
+    server_url: String,
+    client_id: String,
+    #[serde(default)]
+    client_secret: Option<String>,
+    #[serde(default)]
+    access_token: Option<String>,
+    #[serde(default)]
+    refresh_token: Option<String>,
+    #[serde(default)]
+    expires_at: Option<i64>,
+    #[serde(default)]
+    scopes: Vec<String>,
+    #[serde(default)]
+    token_endpoint: Option<String>,
+    #[serde(default)]
+    authorization_endpoint: Option<String>,
+    #[serde(default)]
+    scopes_supported: Vec<String>,
+    #[serde(default)]
+    discovery_expires_at: Option<i64>,
+}
+
+fn load_token_store(path: &Path) -> Result<TokenStore, String> {
+    if !path.exists() {
+        return Ok(TokenStore::default());
+    }
+    let content = std::fs::read_to_string(path).map_err(|e| format!("read: {e}"))?;
+    serde_json::from_str(&content)
+        .map_err(|e| format!("{} is not a readable token store: {e}", path.display()))
+}
+
+fn save_token_store(path: &Path, store: &TokenStore) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("create dir: {e}"))?;
+    }
+    let content = serde_json::to_string_pretty(store).map_err(|e| format!("serialize: {e}"))?;
+    std::fs::write(path, content).map_err(|e| format!("write: {e}"))
+}
+
 /// [`persist_token_at`], also recording the endpoints discovery found.
 ///
 /// Writing them here is what lets a later process refresh without asking the
-/// server for its metadata again. `None` leaves the conventional-path fallback
-/// in place.
+/// server for its metadata again. `None` leaves whatever was previously
+/// recorded — including the conventional-path fallback — in place. Cached
+/// `scopes_supported` and the discovery expiry are preserved.
 #[allow(clippy::too_many_arguments)]
 pub fn persist_token_with_endpoints_at(
     path: &Path,
@@ -741,60 +977,93 @@ pub fn persist_token_with_endpoints_at(
     token_endpoint: Option<&str>,
     authorization_endpoint: Option<&str>,
 ) -> Result<(), String> {
-    #[derive(serde::Serialize, serde::Deserialize, Default)]
-    struct TokenStore {
-        #[serde(default)]
-        states: Vec<TokenEntry>,
-    }
+    let mut store = load_token_store(path)?;
+    let expires_at = chrono::Utc::now().timestamp().saturating_add(expires_in);
 
-    #[derive(serde::Serialize, serde::Deserialize)]
-    struct TokenEntry {
-        server_url: String,
-        client_id: String,
-        #[serde(default)]
-        client_secret: Option<String>,
-        #[serde(default)]
-        access_token: Option<String>,
-        #[serde(default)]
-        refresh_token: Option<String>,
-        #[serde(default)]
-        expires_at: Option<i64>,
-        #[serde(default)]
-        scopes: Vec<String>,
-        #[serde(default)]
-        token_endpoint: Option<String>,
-        #[serde(default)]
-        authorization_endpoint: Option<String>,
-    }
-
-    let mut store: TokenStore = if path.exists() {
-        let content = std::fs::read_to_string(path).map_err(|e| format!("read: {e}"))?;
-        serde_json::from_str(&content)
-            .map_err(|e| format!("{} is not a readable token store: {e}", path.display()))?
+    if let Some(entry) = store
+        .states
+        .iter_mut()
+        .find(|entry| entry.server_url == server_url)
+    {
+        entry.client_id = client_id.to_string();
+        entry.access_token = Some(access_token.to_string());
+        entry.refresh_token = refresh_token.map(String::from);
+        entry.expires_at = Some(expires_at);
+        if let Some(endpoint) = token_endpoint {
+            entry.token_endpoint = Some(endpoint.to_string());
+        }
+        if let Some(endpoint) = authorization_endpoint {
+            entry.authorization_endpoint = Some(endpoint.to_string());
+        }
     } else {
-        TokenStore::default()
-    };
-
-    // Replace this server's entry, keep everyone else's.
-    store.states.retain(|e| e.server_url != server_url);
-    store.states.push(TokenEntry {
-        server_url: server_url.to_string(),
-        client_id: client_id.to_string(),
-        client_secret: None,
-        access_token: Some(access_token.to_string()),
-        refresh_token: refresh_token.map(String::from),
-        expires_at: Some(chrono::Utc::now().timestamp() + expires_in),
-        scopes: Vec::new(),
-        token_endpoint: token_endpoint.map(String::from),
-        authorization_endpoint: authorization_endpoint.map(String::from),
-    });
-
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| format!("create dir: {e}"))?;
+        store.states.push(TokenEntry {
+            server_url: server_url.to_string(),
+            client_id: client_id.to_string(),
+            client_secret: None,
+            access_token: Some(access_token.to_string()),
+            refresh_token: refresh_token.map(String::from),
+            expires_at: Some(expires_at),
+            scopes: Vec::new(),
+            token_endpoint: token_endpoint.map(String::from),
+            authorization_endpoint: authorization_endpoint.map(String::from),
+            scopes_supported: Vec::new(),
+            discovery_expires_at: None,
+        });
     }
-    let content = serde_json::to_string_pretty(&store).map_err(|e| format!("serialize: {e}"))?;
-    std::fs::write(path, content).map_err(|e| format!("write: {e}"))?;
-    Ok(())
+
+    save_token_store(path, &store)
+}
+
+/// Cache discovered authorization-server metadata in the token store.
+///
+/// This writes the same fields `coderex_mcp::oauth` reads and records when
+/// *it* discovers metadata, plus an expiry derived from `Cache-Control:
+/// max-age`. Both halves of MCP OAuth then agree on where to authorize, where
+/// to exchange a code or refresh token, and when the document must be fetched
+/// again. Existing tokens are preserved; a server not yet registered gets an
+/// entry with no credential, which `OAuthManager` accepts.
+pub fn cache_discovery_at(
+    path: &Path,
+    server_url: &str,
+    client_id: &str,
+    authorization_endpoint: Option<&str>,
+    token_endpoint: Option<&str>,
+    scopes_supported: &[String],
+    expires_in: i64,
+) -> Result<(), String> {
+    let mut store = load_token_store(path)?;
+    let discovery_expires_at = Some(chrono::Utc::now().timestamp().saturating_add(expires_in));
+
+    if let Some(entry) = store
+        .states
+        .iter_mut()
+        .find(|entry| entry.server_url == server_url)
+    {
+        if let Some(endpoint) = authorization_endpoint {
+            entry.authorization_endpoint = Some(endpoint.to_string());
+        }
+        if let Some(endpoint) = token_endpoint {
+            entry.token_endpoint = Some(endpoint.to_string());
+        }
+        entry.scopes_supported = scopes_supported.to_vec();
+        entry.discovery_expires_at = discovery_expires_at;
+    } else {
+        store.states.push(TokenEntry {
+            server_url: server_url.to_string(),
+            client_id: client_id.to_string(),
+            client_secret: None,
+            access_token: None,
+            refresh_token: None,
+            expires_at: None,
+            scopes: Vec::new(),
+            token_endpoint: token_endpoint.map(String::from),
+            authorization_endpoint: authorization_endpoint.map(String::from),
+            scopes_supported: scopes_supported.to_vec(),
+            discovery_expires_at,
+        });
+    }
+
+    save_token_store(path, &store)
 }
 
 fn extract_string(args: &serde_json::Value, key: &str) -> Result<String, ToolError> {
@@ -999,6 +1268,139 @@ mod tests {
 
         // The finished flow is no longer pending.
         assert!(load_pending(&pending_path(&path), &endpoint).is_none());
+    }
+
+    /// The helpers here mirror `coderex_mcp::oauth`; this pins the shapes the
+    /// two crates have to agree on.
+    #[test]
+    fn discovery_helpers_mirror_the_mcp_crate() {
+        assert_eq!(
+            normalize_issuer("https://id.example/realms/demo/?a=1#f").as_deref(),
+            Some("https://id.example/realms/demo")
+        );
+        assert_eq!(
+            discovery_candidates("https://id.example/realms/demo").unwrap(),
+            vec![
+                "https://id.example/.well-known/oauth-authorization-server/realms/demo",
+                "https://id.example/.well-known/oauth-authorization-server",
+                "https://id.example/realms/demo/.well-known/openid-configuration",
+                "https://id.example/.well-known/openid-configuration",
+            ]
+        );
+        assert!(discovery_candidates("http://id.example/realms/demo").is_none());
+
+        let matching = serde_json::json!({ "issuer": "https://id.example/realms/demo/" });
+        assert!(issuer_matches(&matching, "https://id.example/realms/demo"));
+        let mismatched = serde_json::json!({ "issuer": "https://id.example/other" });
+        assert!(!issuer_matches(
+            &mismatched,
+            "https://id.example/realms/demo"
+        ));
+    }
+
+    /// A Keycloak-style issuer mounted under a path is discovered via RFC 8414
+    /// path insertion, and the result is cached so a second invocation does
+    /// not probe the metadata again.
+    #[tokio::test]
+    async fn a_path_mounted_issuer_is_discovered_and_cached() {
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let issuer = format!("{base}/realms/demo");
+        let metadata = format!(
+            r#"{{"issuer":"{issuer}","authorization_endpoint":"{issuer}/protocol/openid-connect/auth","token_endpoint":"{issuer}/protocol/openid-connect/token","scopes_supported":["openid","mcp"]}}"#
+        );
+        let handle = std::thread::spawn(move || {
+            let mut probes = Vec::new();
+            loop {
+                let (mut stream, _) = listener.accept().unwrap();
+                let request = read_request(&mut stream);
+                if request.starts_with("POST ") {
+                    write_response(
+                        &mut stream,
+                        "200 OK",
+                        r#"{"access_token":"tok","refresh_token":"ref","expires_in":3600}"#,
+                    );
+                    return (probes, request);
+                }
+                probes.push(request);
+                write_response(&mut stream, "200 OK", &metadata);
+            }
+        });
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mcp_tokens.json");
+
+        let pending = authenticate(
+            ToolInput {
+                call_id: "1".into(),
+                name: "McpAuth".into(),
+                arguments: serde_json::json!({ "server_url": issuer }),
+            },
+            &path,
+        )
+        .await
+        .unwrap();
+        let pending: serde_json::Value = serde_json::from_str(&pending.output).unwrap();
+        assert!(
+            pending["auth_url"]
+                .as_str()
+                .unwrap()
+                .starts_with(&format!("{issuer}/protocol/openid-connect/auth?")),
+            "the discovered authorize endpoint was not used: {}",
+            pending["auth_url"]
+        );
+
+        let output = authenticate(
+            ToolInput {
+                call_id: "2".into(),
+                name: "McpAuth".into(),
+                arguments: serde_json::json!({
+                    "server_url": issuer,
+                    "code": "the_code",
+                    "code_verifier": pending["code_verifier"],
+                }),
+            },
+            &path,
+        )
+        .await
+        .unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&output.output).unwrap();
+        assert_eq!(parsed["authenticated"], true, "{parsed}");
+
+        let (probes, exchange) = handle.join().unwrap();
+        assert_eq!(
+            probes.len(),
+            1,
+            "the fresh metadata cache was ignored: {probes:?}"
+        );
+        assert!(
+            probes[0].starts_with("GET /.well-known/oauth-authorization-server/realms/demo "),
+            "path insertion was not tried first: {}",
+            probes[0]
+        );
+        assert!(
+            exchange.starts_with("POST /realms/demo/protocol/openid-connect/token "),
+            "the discovered token endpoint was not used: {exchange}"
+        );
+
+        let store: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(
+            store["states"][0]["token_endpoint"],
+            format!("{issuer}/protocol/openid-connect/token")
+        );
+        assert_eq!(
+            store["states"][0]["scopes_supported"],
+            serde_json::json!(["openid", "mcp"])
+        );
+        assert!(
+            store["states"][0]["discovery_expires_at"]
+                .as_i64()
+                .is_some_and(|at| at > chrono::Utc::now().timestamp()),
+            "the discovery cache has no future expiry: {store}"
+        );
     }
 
     /// Discovery's advertised endpoints are the ones actually used: the

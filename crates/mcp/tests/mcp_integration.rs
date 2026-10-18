@@ -721,6 +721,48 @@ fn a_token_written_by_the_mcp_auth_tool_is_readable_by_the_oauth_manager() {
     assert_eq!(state.token_endpoint(), "https://mcp.example/oauth/token");
 }
 
+/// The discovery cache has to be the same cache on both sides of the crate
+/// boundary: `McpAuth` writes the endpoints, scopes and expiry, and
+/// `OAuthManager::discover` reuses them instead of probing again. The issuer
+/// here is a closed loopback port, so an attempted fetch would fail; returning
+/// the cached document is what proves the two agree.
+#[tokio::test]
+async fn discovery_cached_by_the_mcp_auth_tool_is_reused_by_the_oauth_manager() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("mcp_tokens.json");
+    let issuer = "http://127.0.0.1:1/realms/demo";
+    let authorization = "https://id.example/realms/demo/protocol/openid-connect/auth";
+    let token = "https://id.example/realms/demo/protocol/openid-connect/token";
+
+    coderex_tools::cache_discovery_at(
+        &path,
+        issuer,
+        "coderex-cli",
+        Some(authorization),
+        Some(token),
+        &["openid".to_string(), "mcp".to_string()],
+        3600,
+    )
+    .unwrap();
+
+    let mut mgr = OAuthManager::load_tokens_from(&path).unwrap();
+    let discovery = mgr
+        .discover(issuer, &reqwest::Client::new())
+        .await
+        .unwrap();
+    assert_eq!(
+        discovery.authorization_endpoint.as_deref(),
+        Some(authorization)
+    );
+    assert_eq!(discovery.token_endpoint.as_deref(), Some(token));
+    assert_eq!(discovery.scopes_supported, vec!["openid", "mcp"]);
+
+    // The refresh path reads the same persisted endpoint.
+    let state = mgr.get(issuer).unwrap();
+    assert_eq!(state.token_endpoint(), token);
+    assert_eq!(state.authorization_endpoint(), authorization);
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 //  11.5 Connection Management — reconnect after failure
 // ═══════════════════════════════════════════════════════════════════════════
