@@ -1,8 +1,11 @@
-//! Vim mode — normal/insert mode switching with Vim keybindings.
+//! Vim mode — normal/insert/visual mode switching with Vim keybindings.
 //!
 //! When enabled, the input layer switches between Vim's normal and insert modes.
 //! Normal mode provides hjkl navigation, dd/yy/p editing, and : command access.
-//! Insert mode behaves like a standard text input.
+//! Insert mode behaves like a standard text input. Visual mode (`v`) and
+//! Visual-line mode (`V`) select part of the input buffer for yanking or
+//! deleting; the selection anchor itself lives with the buffer (`InputBuffer`),
+//! because only the buffer knows the text being selected.
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
@@ -13,9 +16,13 @@ pub enum VimMode {
     Normal,
     /// Insert mode — free text entry.
     Insert,
+    /// Visual mode — characterwise selection.
+    Visual,
+    /// Visual-line mode — linewise selection.
+    VisualLine,
 }
 
-/// An action produced by a Vim normal-mode key event.
+/// An action produced by a Vim normal- or Visual-mode key event.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum VimAction {
     /// Move cursor left.
@@ -84,6 +91,22 @@ pub enum VimAction {
     ExportCopy,
     /// Toggle split-pane view.
     ToggleSplit,
+    /// Enter characterwise Visual mode (`v`).
+    EnterVisual,
+    /// Enter linewise Visual mode (`V`).
+    EnterVisualLine,
+    /// Leave Visual mode without changing the buffer.
+    ExitVisual,
+    /// Move to the start of the next word (Visual `w`).
+    WordForward,
+    /// Move to the start of the previous word (Visual `b`).
+    WordBackward,
+    /// Move to the end of the current or next word (Visual `e`).
+    WordEnd,
+    /// Yank the Visual selection and leave Visual mode.
+    YankSelection,
+    /// Delete the Visual selection and leave Visual mode.
+    DeleteSelection,
     /// Ignore this key.
     Ignore,
 }
@@ -150,6 +173,7 @@ impl VimState {
         match self.mode {
             VimMode::Insert => self.handle_insert(event),
             VimMode::Normal => self.handle_normal(event),
+            VimMode::Visual | VimMode::VisualLine => self.handle_visual(event),
         }
     }
 
@@ -230,6 +254,16 @@ impl VimState {
             KeyCode::Char('A') => VimAction::InsertAtEnd,
             KeyCode::Char('i') => VimAction::Insert,
             KeyCode::Char('a') => VimAction::Append,
+
+            // Visual mode entry
+            KeyCode::Char('v') => {
+                self.mode = VimMode::Visual;
+                VimAction::EnterVisual
+            }
+            KeyCode::Char('V') => {
+                self.mode = VimMode::VisualLine;
+                VimAction::EnterVisualLine
+            }
 
             // Command and search
             KeyCode::Char(':') => VimAction::Command,
@@ -314,6 +348,87 @@ impl VimState {
         action
     }
 
+    /// Handle keys in Visual or Visual-line mode.
+    ///
+    /// Motions are returned as actions; the UI layer applies them to the input
+    /// buffer, which owns the selection anchor and the text. Operators (`y`,
+    /// `d`, `x`) leave Visual mode and are applied to the selected range.
+    fn handle_visual(&mut self, event: KeyEvent) -> VimAction {
+        if event.modifiers.contains(KeyModifiers::CONTROL) {
+            // Ctrl+C leaves Visual mode, matching its "get me out" role in
+            // insert mode. Other control chords have no selection meaning in a
+            // single-line buffer.
+            return match event.code {
+                KeyCode::Char('c') => {
+                    self.leave_visual();
+                    VimAction::ExitVisual
+                }
+                _ => VimAction::Ignore,
+            };
+        }
+
+        let linewise = self.mode == VimMode::VisualLine;
+        match event.code {
+            KeyCode::Esc => {
+                self.leave_visual();
+                VimAction::ExitVisual
+            }
+            // `v` exits characterwise Visual, and switches linewise Visual
+            // back to characterwise. `V` is the mirror image.
+            KeyCode::Char('v') => {
+                if linewise {
+                    self.mode = VimMode::Visual;
+                    VimAction::EnterVisual
+                } else {
+                    self.leave_visual();
+                    VimAction::ExitVisual
+                }
+            }
+            KeyCode::Char('V') => {
+                if linewise {
+                    self.leave_visual();
+                    VimAction::ExitVisual
+                } else {
+                    self.mode = VimMode::VisualLine;
+                    VimAction::EnterVisualLine
+                }
+            }
+
+            // Motions. On a single-line buffer j/k have nowhere to go; the UI
+            // layer treats them as no-ops rather than walking history.
+            KeyCode::Char('h') | KeyCode::Left => VimAction::Left,
+            KeyCode::Char('l') | KeyCode::Right => VimAction::Right,
+            KeyCode::Char('j') | KeyCode::Down => VimAction::Down,
+            KeyCode::Char('k') | KeyCode::Up => VimAction::Up,
+            KeyCode::Char('w') => VimAction::WordForward,
+            KeyCode::Char('b') => VimAction::WordBackward,
+            KeyCode::Char('e') => VimAction::WordEnd,
+            KeyCode::Char('0') | KeyCode::Home => VimAction::JumpToStart,
+            KeyCode::Char('$') | KeyCode::End => VimAction::JumpToEnd,
+            KeyCode::Char('g') => VimAction::JumpTop,
+            KeyCode::Char('G') => VimAction::JumpBottom,
+
+            // Operators.
+            KeyCode::Char('y') => {
+                self.leave_visual();
+                VimAction::YankSelection
+            }
+            KeyCode::Char('d' | 'x') => {
+                self.leave_visual();
+                VimAction::DeleteSelection
+            }
+
+            _ => VimAction::Ignore,
+        }
+    }
+
+    /// Return to normal mode and drop any pending count/operator state.
+    fn leave_visual(&mut self) {
+        self.mode = VimMode::Normal;
+        self.count = None;
+        self.pending_op = None;
+    }
+
     /// Save current text to yank register.
     pub fn yank(&mut self, text: &str) {
         self.yank_register = text.to_string();
@@ -351,11 +466,18 @@ impl VimState {
         self.mode == VimMode::Insert
     }
 
-    /// Toggle between normal and insert mode.
+    /// Check if currently in either Visual mode.
+    #[must_use]
+    pub fn is_visual(&self) -> bool {
+        matches!(self.mode, VimMode::Visual | VimMode::VisualLine)
+    }
+
+    /// Toggle between normal and insert mode. Visual modes return to normal:
+    /// there is no insert equivalent to toggle into.
     pub fn toggle_mode(&mut self) {
         self.mode = match self.mode {
             VimMode::Normal => VimMode::Insert,
-            VimMode::Insert => VimMode::Normal,
+            VimMode::Insert | VimMode::Visual | VimMode::VisualLine => VimMode::Normal,
         };
     }
 }
@@ -366,6 +488,8 @@ pub fn mode_indicator(mode: VimMode) -> &'static str {
     match mode {
         VimMode::Normal => "NORMAL",
         VimMode::Insert => "INSERT",
+        VimMode::Visual => "VISUAL",
+        VimMode::VisualLine => "VISUAL LINE",
     }
 }
 
@@ -591,5 +715,119 @@ mod tests {
         let mut state = VimState::new();
         assert_eq!(state.handle_key(key('I')), VimAction::InsertAtStart);
         assert_eq!(state.handle_key(key('A')), VimAction::InsertAtEnd);
+    }
+
+    fn visual_state() -> VimState {
+        let mut state = VimState::new();
+        state.mode = VimMode::Visual;
+        state
+    }
+
+    #[test]
+    fn v_enters_visual_and_escape_leaves() {
+        let mut state = VimState::new();
+        assert_eq!(state.handle_key(key('v')), VimAction::EnterVisual);
+        assert_eq!(state.mode, VimMode::Visual);
+        assert!(state.is_visual());
+
+        let esc = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
+        assert_eq!(state.handle_key(esc), VimAction::ExitVisual);
+        assert_eq!(state.mode, VimMode::Normal);
+        assert!(!state.is_visual());
+    }
+
+    #[test]
+    fn shift_v_enters_visual_line() {
+        let mut state = VimState::new();
+        assert_eq!(state.handle_key(shift_key('V')), VimAction::EnterVisualLine);
+        assert_eq!(state.mode, VimMode::VisualLine);
+
+        // V again leaves linewise visual mode.
+        assert_eq!(state.handle_key(shift_key('V')), VimAction::ExitVisual);
+        assert_eq!(state.mode, VimMode::Normal);
+    }
+
+    #[test]
+    fn visual_v_toggles_linewise_and_exits() {
+        let mut state = VimState::new();
+        state.mode = VimMode::VisualLine;
+
+        assert_eq!(state.handle_key(key('v')), VimAction::EnterVisual);
+        assert_eq!(state.mode, VimMode::Visual);
+
+        assert_eq!(state.handle_key(key('v')), VimAction::ExitVisual);
+        assert_eq!(state.mode, VimMode::Normal);
+    }
+
+    #[test]
+    fn visual_motions() {
+        let mut state = visual_state();
+        assert_eq!(state.handle_key(key('h')), VimAction::Left);
+        assert_eq!(state.handle_key(key('l')), VimAction::Right);
+        assert_eq!(state.handle_key(key('j')), VimAction::Down);
+        assert_eq!(state.handle_key(key('k')), VimAction::Up);
+        assert_eq!(state.handle_key(key('w')), VimAction::WordForward);
+        assert_eq!(state.handle_key(key('b')), VimAction::WordBackward);
+        assert_eq!(state.handle_key(key('e')), VimAction::WordEnd);
+        assert_eq!(state.handle_key(key('0')), VimAction::JumpToStart);
+        assert_eq!(state.handle_key(key('$')), VimAction::JumpToEnd);
+        assert_eq!(state.handle_key(key('g')), VimAction::JumpTop);
+        assert_eq!(state.handle_key(key('G')), VimAction::JumpBottom);
+        // Motions do not leave visual mode.
+        assert!(state.is_visual());
+    }
+
+    /// `w` means "delete word" in this codebase's normal mode, but it must be
+    /// the word motion in Visual mode.
+    #[test]
+    fn visual_w_is_a_motion_not_delete_word() {
+        let mut normal = VimState::new();
+        assert_eq!(normal.handle_key(key('w')), VimAction::DeleteWord);
+
+        let mut visual = visual_state();
+        assert_eq!(visual.handle_key(key('w')), VimAction::WordForward);
+    }
+
+    #[test]
+    fn y_yanks_visual_selection_and_leaves_visual() {
+        let mut state = visual_state();
+        assert_eq!(state.handle_key(key('y')), VimAction::YankSelection);
+        assert_eq!(state.mode, VimMode::Normal);
+    }
+
+    #[test]
+    fn d_and_x_delete_visual_selection() {
+        let mut state = visual_state();
+        assert_eq!(state.handle_key(key('d')), VimAction::DeleteSelection);
+        assert_eq!(state.mode, VimMode::Normal);
+
+        let mut state = visual_state();
+        assert_eq!(state.handle_key(key('x')), VimAction::DeleteSelection);
+        assert_eq!(state.mode, VimMode::Normal);
+    }
+
+    #[test]
+    fn ctrl_c_leaves_visual() {
+        let mut state = visual_state();
+        let ctrl_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
+        assert_eq!(state.handle_key(ctrl_c), VimAction::ExitVisual);
+        assert_eq!(state.mode, VimMode::Normal);
+    }
+
+    #[test]
+    fn visual_mode_does_not_change_insert_or_normal_bindings() {
+        let mut insert = VimState::new_insert();
+        assert_eq!(insert.handle_key(key('v')), VimAction::Insert);
+
+        let mut normal = VimState::new();
+        assert_eq!(normal.handle_key(key('x')), VimAction::DeleteChar);
+        assert_eq!(normal.handle_key(key('y')), VimAction::Ignore);
+        assert_eq!(normal.handle_key(key('y')), VimAction::YankLine);
+    }
+
+    #[test]
+    fn visual_mode_indicator_strings() {
+        assert_eq!(super::mode_indicator(VimMode::Visual), "VISUAL");
+        assert_eq!(super::mode_indicator(VimMode::VisualLine), "VISUAL LINE");
     }
 }

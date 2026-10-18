@@ -19,7 +19,7 @@ Terminal user interface via ratatui. Renders messages, statusline, input line, c
 - **`Statusline`** (`statusline.rs:8`) — Model, tokens, cost, git branch, session title, thinking spinner. The permission mode is not here: it lives in `PermissionBar` (`permission_bar.rs`), drawn on its own line.
 - **`InputBuffer`** (`input.rs`) — Cursor-positioned text input with history.
 - **`OverlayStack`** (`overlay.rs`) — Modal dialog stack: PermissionDialog, Notification, CommandPalette, Confirm.
-- **`VimState`** (`vim.rs`) — Vim mode state machine: Normal and Insert. Visual mode is not implemented.
+- **`VimState`** (`vim.rs`) — Vim mode state machine: Normal, Insert, Visual (`v`) and Visual-line (`V`). Selection anchors and the selected text live in `InputBuffer` (`input.rs`), which is the layer that knows the buffer contents.
 - **`Theme`** (`themes.rs`) — Color scheme definitions.
 
 ### Layout (bottom-up)
@@ -92,7 +92,7 @@ No image capability detection was added either: a detection method with nothing 
 ## Architecture Patterns
 
 - **ratatui widget composition** — Paragraph, Block, Layout with Constraint-based sizing.
-- **Vim modal editing** — Normal and Insert modes. Key handling is classified in one place, `input::key_event_to_action` (`input.rs`), which maps a `KeyEvent` to an `InputAction`.
+- **Vim modal editing** — Normal, Insert, Visual and Visual-line modes. `VimState::handle_key` classifies normal/visual keys into `VimAction`s; `input::key_event_to_action` remains the classifier for non-Vim (insert) input. Visual mode supports `h/j/k/l`, `w/b/e`, `0/$`, `gg/G` motions, `v`/`V` to switch selection kind, `y` to yank, `d`/`x` to delete, and `Esc` to leave. Selections operate on byte ranges while cursor movement and word motions step whole UTF-8 characters, so multi-byte input is never split. The selected range is highlighted with the theme's `selection_fg`/`selection_bg`, and the terminal cursor is positioned by display width (`unicode-width`) rather than byte offset.
 - **Virtualization** — `MessageView` computes visible messages based on per-message height (not just message count).
 - **Word wrapping** — Custom `wrap_text()` with `unicode-width` for CJK support.
 - **Overlay stack** — Modal dialogs can nest; inline palette is special-cased above statusline.
