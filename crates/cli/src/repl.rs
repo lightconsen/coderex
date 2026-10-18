@@ -141,8 +141,7 @@ impl WorktreeToolState {
         *self
             .active
             .lock()
-            .map_err(|_| "worktree state lock poisoned".to_string())? =
-            Some(created.path.clone());
+            .map_err(|_| "worktree state lock poisoned".to_string())? = Some(created.path.clone());
         Ok(created.path.to_string_lossy().to_string())
     }
 
@@ -167,9 +166,8 @@ impl WorktreeToolState {
 
 /// MCP resource access backed by the session's live manager.
 ///
-/// Reads come from the manager's resource cache. The manager exposes no
-/// synchronous live-read entry point, so an uncached URI is reported as such
-/// instead of blocking the tool thread on an async server call.
+/// Discovery fills the manager's registry and cache; a URI that is not cached
+/// is read from its server with `resources/read` and cached for next time.
 pub(crate) struct McpResourceToolState {
     slot: McpManagerSlot,
 }
@@ -180,36 +178,24 @@ impl McpResourceToolState {
             return Vec::new();
         };
         manager
-            .list_resources()
+            .list_resource_info()
             .into_iter()
-            .map(|uri| {
-                let name = uri.clone();
-                // The manager's listing carries only URIs; no MIME type is
-                // stored beside them.
-                (uri, name, String::new())
-            })
+            .map(|resource| (resource.uri, resource.name, resource.mime_type))
             .collect()
     }
 
-    fn read(&self, uri: &str) -> Result<String, String> {
+    async fn read(&self, uri: &str) -> Result<String, String> {
         let Some(manager) = self.slot.read().unwrap().as_ref().cloned() else {
             return Err("no MCP manager is attached to this session".to_string());
         };
-        for server in manager.list_servers() {
-            if let Some(content) = manager.get_cached_resource(&server, uri) {
-                if let Some(text) = content.text {
-                    return Ok(text);
-                }
-                if let Some(blob) = content.blob {
-                    return Ok(blob);
-                }
-                return Err(format!("resource '{uri}' has no text content"));
-            }
+        let content = manager.read_resource_any(uri).await?;
+        if let Some(text) = content.text {
+            return Ok(text);
         }
-        Err(format!(
-            "resource '{uri}' is not in the MCP resource cache; list resources after the \
-             server has discovered it"
-        ))
+        if let Some(blob) = content.blob {
+            return Ok(blob);
+        }
+        Err(format!("resource '{uri}' has no text content"))
     }
 }
 
@@ -301,10 +287,7 @@ impl coderex_tools::Tool for TeamCreateWithState {
         self.original.capabilities()
     }
 
-    fn rule_exemptions_for(
-        &self,
-        input: &serde_json::Value,
-    ) -> coderex_tools::ToolRuleExemptions {
+    fn rule_exemptions_for(&self, input: &serde_json::Value) -> coderex_tools::ToolRuleExemptions {
         self.original.rule_exemptions_for(input)
     }
 
@@ -320,12 +303,10 @@ impl coderex_tools::Tool for TeamCreateWithState {
             .ok_or_else(|| coderex_tools::ToolError::InvalidInput {
                 message: "missing required field: name".into(),
             })?;
-        let team_id =
-            self.state
-                .create(name)
-                .map_err(|message| coderex_tools::ToolError::InvalidInput {
-                    message,
-                })?;
+        let team_id = self
+            .state
+            .create(name)
+            .map_err(|message| coderex_tools::ToolError::InvalidInput { message })?;
         Ok(coderex_tools::ToolOutput {
             output: team_id,
             is_display: true,
@@ -348,10 +329,7 @@ impl coderex_tools::Tool for TeamDeleteWithState {
         self.original.capabilities()
     }
 
-    fn rule_exemptions_for(
-        &self,
-        input: &serde_json::Value,
-    ) -> coderex_tools::ToolRuleExemptions {
+    fn rule_exemptions_for(&self, input: &serde_json::Value) -> coderex_tools::ToolRuleExemptions {
         self.original.rule_exemptions_for(input)
     }
 
@@ -392,10 +370,7 @@ impl coderex_tools::Tool for EnterWorktreeWithState {
         self.original.capabilities()
     }
 
-    fn rule_exemptions_for(
-        &self,
-        input: &serde_json::Value,
-    ) -> coderex_tools::ToolRuleExemptions {
+    fn rule_exemptions_for(&self, input: &serde_json::Value) -> coderex_tools::ToolRuleExemptions {
         self.original.rule_exemptions_for(input)
     }
 
@@ -434,10 +409,7 @@ impl coderex_tools::Tool for ExitWorktreeWithState {
         self.original.capabilities()
     }
 
-    fn rule_exemptions_for(
-        &self,
-        input: &serde_json::Value,
-    ) -> coderex_tools::ToolRuleExemptions {
+    fn rule_exemptions_for(&self, input: &serde_json::Value) -> coderex_tools::ToolRuleExemptions {
         self.original.rule_exemptions_for(input)
     }
 
@@ -471,10 +443,7 @@ impl coderex_tools::Tool for ListMcpResourcesWithState {
         self.original.capabilities()
     }
 
-    fn rule_exemptions_for(
-        &self,
-        input: &serde_json::Value,
-    ) -> coderex_tools::ToolRuleExemptions {
+    fn rule_exemptions_for(&self, input: &serde_json::Value) -> coderex_tools::ToolRuleExemptions {
         self.original.rule_exemptions_for(input)
     }
 
@@ -513,10 +482,7 @@ impl coderex_tools::Tool for ReadMcpResourceWithState {
         self.original.capabilities()
     }
 
-    fn rule_exemptions_for(
-        &self,
-        input: &serde_json::Value,
-    ) -> coderex_tools::ToolRuleExemptions {
+    fn rule_exemptions_for(&self, input: &serde_json::Value) -> coderex_tools::ToolRuleExemptions {
         self.original.rule_exemptions_for(input)
     }
 
@@ -535,6 +501,7 @@ impl coderex_tools::Tool for ReadMcpResourceWithState {
         let content = self
             .state
             .read(uri)
+            .await
             .map_err(|message| coderex_tools::ToolError::InvalidInput { message })?;
         Ok(coderex_tools::ToolOutput {
             output: content,
@@ -564,10 +531,7 @@ fn teammate_event_to_lifecycle(event: &TeammateEvent) -> (String, AgentLifecycle
             } else {
                 format!("{subject}: {summary}")
             };
-            (
-                agent_id.clone(),
-                AgentLifecycleEvent::Completed { summary },
-            )
+            (agent_id.clone(), AgentLifecycleEvent::Completed { summary })
         }
     }
 }
@@ -870,8 +834,7 @@ fn spawn_headless_control_reader(
     use tokio::io::AsyncBufReadExt as _;
 
     tokio::spawn(async move {
-        let mut lines =
-            tokio::io::BufReader::new(tokio::io::stdin()).lines();
+        let mut lines = tokio::io::BufReader::new(tokio::io::stdin()).lines();
         while let Ok(Some(line)) = lines.next_line().await {
             // Parse the id once to look up whether this request permitted a
             // session-wide answer; the helper re-parses the same line to
@@ -1241,9 +1204,7 @@ impl BetaGatedWorkflowTool {
 impl coderex_tools::Tool for BetaGatedWorkflowTool {
     fn descriptor(&self) -> coderex_tools::ToolDescriptor {
         let mut descriptor = self.inner.descriptor();
-        descriptor.is_enabled = self
-            .enabled
-            .load(std::sync::atomic::Ordering::Relaxed);
+        descriptor.is_enabled = self.enabled.load(std::sync::atomic::Ordering::Relaxed);
         descriptor
     }
 
@@ -1252,10 +1213,7 @@ impl coderex_tools::Tool for BetaGatedWorkflowTool {
         input: coderex_tools::ToolInput,
         ctx: coderex_tools::ToolContext<'_>,
     ) -> Result<coderex_tools::ToolOutput, coderex_tools::ToolError> {
-        if !self
-            .enabled
-            .load(std::sync::atomic::Ordering::Relaxed)
-        {
+        if !self.enabled.load(std::sync::atomic::Ordering::Relaxed) {
             return Err(coderex_tools::ToolError::InvalidInput {
                 message: "workflow scripts are not enabled in this session — set \
                           --betas +workflow_scripts (or \
@@ -1741,8 +1699,7 @@ impl ReplLoop {
         // org id from the orchestrator's remote-settings cache is used. When
         // neither exists the org store stays unconfigured and the tools report
         // that honestly.
-        let org_id = configured_org_id(std::env::var("CODEREX_ORG_ID").ok())
-            .or_else(cached_org_id);
+        let org_id = configured_org_id(std::env::var("CODEREX_ORG_ID").ok()).or_else(cached_org_id);
         if org_id.is_none() {
             tracing::debug!("no organization id configured; org memory is not configured");
         }
@@ -1751,9 +1708,9 @@ impl ReplLoop {
             Arc::clone(&long_term_store),
             Arc::clone(&team_memory_service),
         )
-        .with_classifier(Arc::new(
-            crate::memory_tools::ModelMemoryClassifier::new(api_client.clone_box()),
-        ));
+        .with_classifier(Arc::new(crate::memory_tools::ModelMemoryClassifier::new(
+            api_client.clone_box(),
+        )));
         if let Some(org) = org_memory_service {
             memory_service = memory_service.with_org(org);
         }
@@ -2661,7 +2618,8 @@ impl ReplLoop {
         if self.session_effects.override_system_prompt.is_none() {
             self.session_effects.override_system_prompt = Some(agent.system_prompt);
         }
-        if self.session_effects.allowed_tools_override.is_none() && !agent.allowed_tools.is_empty() {
+        if self.session_effects.allowed_tools_override.is_none() && !agent.allowed_tools.is_empty()
+        {
             self.session_effects.allowed_tools_override = Some(agent.allowed_tools);
         }
 
@@ -4998,10 +4956,7 @@ impl ReplLoop {
             })
         });
         let mut permission_reader = permission_bus.as_ref().map(|bus| {
-            spawn_headless_control_reader(
-                bus.clone(),
-                std::sync::Arc::clone(&permission_approvals),
-            )
+            spawn_headless_control_reader(bus.clone(), std::sync::Arc::clone(&permission_approvals))
         });
 
         let session_id = self.current_session_id().unwrap_or_default();
@@ -5444,163 +5399,171 @@ impl ReplLoop {
             let cmd_name = parts[0].trim_start_matches('/');
             let args: Vec<String> = parts[1..].iter().map(|s| s.to_string()).collect();
 
-            // Built-in REPL commands that bypass the registry
-            match cmd_name {
-                "exit" | "quit" => {
-                    self.running = false;
-                    return;
-                }
-                "tokens" => {
-                    self.execute_and_display_command("usage", &[], ui_state)
-                        .await;
-                    return;
-                }
-                "compact" => {
-                    let msg = self.compact_context(ui_state).await;
-                    ui_state.notifications.info(&msg);
-                    ui_state.messages.push(coderex_ui::message_list::Message {
-                        role: coderex_ui::message_list::MessageRole::System,
-                        content: msg.into(),
-                        tool_name: None,
-                        streaming: false,
-                        folded: false,
-                    });
-                    return;
-                }
-                "model" => {
-                    if let Some(model) = args.first() {
-                        let mapped = match model.to_lowercase().as_str() {
-                            "opus" => ModelId::opus(),
-                            "sonnet" => ModelId::sonnet(),
-                            "haiku" => ModelId::haiku(),
-                            other => ModelId(other.to_string()),
+            // Built-in REPL commands that bypass the registry. With slash
+            // commands disabled none of these run either: they are still slash
+            // commands, and executing them anyway made the flag only hide
+            // them from `/help` (the non-TUI path already skipped them).
+            if !self.no_slash_commands {
+                match cmd_name {
+                    "exit" | "quit" => {
+                        self.running = false;
+                        return;
+                    }
+                    "tokens" => {
+                        self.execute_and_display_command("usage", &[], ui_state)
+                            .await;
+                        return;
+                    }
+                    "compact" => {
+                        let msg = self.compact_context(ui_state).await;
+                        ui_state.notifications.info(&msg);
+                        ui_state.messages.push(coderex_ui::message_list::Message {
+                            role: coderex_ui::message_list::MessageRole::System,
+                            content: msg.into(),
+                            tool_name: None,
+                            streaming: false,
+                            folded: false,
+                        });
+                        return;
+                    }
+                    "model" => {
+                        if let Some(model) = args.first() {
+                            let mapped = match model.to_lowercase().as_str() {
+                                "opus" => ModelId::opus(),
+                                "sonnet" => ModelId::sonnet(),
+                                "haiku" => ModelId::haiku(),
+                                other => ModelId(other.to_string()),
+                            };
+                            self.model = mapped;
+                        }
+                        self.execute_and_display_command(cmd_name, &args, ui_state)
+                            .await;
+                        return;
+                    }
+                    "vim" => {
+                        let ctx = self.build_context();
+                        let result = self.commands.execute("vim", &ctx, &args);
+                        let toggled = self.sync_command_state("vim", &result);
+                        if toggled {
+                            ui_state.notifications.info(&result.output);
+                        }
+                        ui_state.messages.push(coderex_ui::message_list::Message {
+                            role: coderex_ui::message_list::MessageRole::System,
+                            content: result.output.into(),
+                            tool_name: None,
+                            streaming: false,
+                            folded: false,
+                        });
+                        return;
+                    }
+                    "plan" => {
+                        let registry_output =
+                            self.commands.execute("plan", &self.build_context(), &args);
+                        let body = ui_state.plan.render_detail();
+                        show_detail_overlay(ui_state, "Current Plan", body);
+                        if !registry_output.output.is_empty() {
+                            ui_state.messages.push(coderex_ui::message_list::Message {
+                                role: coderex_ui::message_list::MessageRole::System,
+                                content: registry_output.output.into(),
+                                tool_name: None,
+                                streaming: false,
+                                folded: false,
+                            });
+                        }
+                        return;
+                    }
+                    "resume" => {
+                        if *thinking || query_done_rx.is_some() {
+                            let message =
+                                "Finish or cancel the active turn before resuming another session.";
+                            ui_state.notifications.warn(message);
+                            ui_state.messages.push(coderex_ui::message_list::Message {
+                                role: coderex_ui::message_list::MessageRole::System,
+                                content: message.into(),
+                                tool_name: None,
+                                streaming: false,
+                                folded: false,
+                            });
+                            return;
+                        }
+                        match self.resume_tui_session(args.first().map(String::as_str), ui_state) {
+                            Ok(_) => {}
+                            Err(err) => {
+                                ui_state.notifications.err(&err);
+                                ui_state.messages.push(coderex_ui::message_list::Message {
+                                    role: coderex_ui::message_list::MessageRole::System,
+                                    content: format!("Error: {err}").into(),
+                                    tool_name: None,
+                                    streaming: false,
+                                    folded: false,
+                                });
+                            }
+                        }
+                        return;
+                    }
+                    "activity" => {
+                        let body = if ui_state.activity_log.is_empty() {
+                            "No recent activity yet.".to_string()
+                        } else {
+                            ui_state.activity_log.join("\n")
                         };
-                        self.model = mapped;
-                    }
-                    self.execute_and_display_command(cmd_name, &args, ui_state)
-                        .await;
-                    return;
-                }
-                "vim" => {
-                    let ctx = self.build_context();
-                    let result = self.commands.execute("vim", &ctx, &args);
-                    let toggled = self.sync_command_state("vim", &result);
-                    if toggled {
-                        ui_state.notifications.info(&result.output);
-                    }
-                    ui_state.messages.push(coderex_ui::message_list::Message {
-                        role: coderex_ui::message_list::MessageRole::System,
-                        content: result.output.into(),
-                        tool_name: None,
-                        streaming: false,
-                        folded: false,
-                    });
-                    return;
-                }
-                "plan" => {
-                    let registry_output =
-                        self.commands.execute("plan", &self.build_context(), &args);
-                    let body = ui_state.plan.render_detail();
-                    show_detail_overlay(ui_state, "Current Plan", body);
-                    if !registry_output.output.is_empty() {
-                        ui_state.messages.push(coderex_ui::message_list::Message {
-                            role: coderex_ui::message_list::MessageRole::System,
-                            content: registry_output.output.into(),
-                            tool_name: None,
-                            streaming: false,
-                            folded: false,
-                        });
-                    }
-                    return;
-                }
-                "resume" => {
-                    if *thinking || query_done_rx.is_some() {
-                        let message =
-                            "Finish or cancel the active turn before resuming another session.";
-                        ui_state.notifications.warn(message);
-                        ui_state.messages.push(coderex_ui::message_list::Message {
-                            role: coderex_ui::message_list::MessageRole::System,
-                            content: message.into(),
-                            tool_name: None,
-                            streaming: false,
-                            folded: false,
-                        });
+                        show_detail_overlay(ui_state, "Recent Activity", body);
                         return;
                     }
-                    match self.resume_tui_session(args.first().map(String::as_str), ui_state) {
-                        Ok(_) => {}
-                        Err(err) => {
-                            ui_state.notifications.err(&err);
+                    "open" => {
+                        if args.is_empty() {
                             ui_state.messages.push(coderex_ui::message_list::Message {
                                 role: coderex_ui::message_list::MessageRole::System,
-                                content: format!("Error: {err}").into(),
+                                content: "Usage: /open <path>".into(),
                                 tool_name: None,
                                 streaming: false,
                                 folded: false,
                             });
+                            ui_state.notifications.warn("Usage: /open <path>");
+                            return;
                         }
-                    }
-                    return;
-                }
-                "activity" => {
-                    let body = if ui_state.activity_log.is_empty() {
-                        "No recent activity yet.".to_string()
-                    } else {
-                        ui_state.activity_log.join("\n")
-                    };
-                    show_detail_overlay(ui_state, "Recent Activity", body);
-                    return;
-                }
-                "open" => {
-                    if args.is_empty() {
-                        ui_state.messages.push(coderex_ui::message_list::Message {
-                            role: coderex_ui::message_list::MessageRole::System,
-                            content: "Usage: /open <path>".into(),
-                            tool_name: None,
-                            streaming: false,
-                            folded: false,
-                        });
-                        ui_state.notifications.warn("Usage: /open <path>");
+                        let raw_path = std::path::PathBuf::from(&args[0]);
+                        let path = if raw_path.is_absolute() {
+                            raw_path
+                        } else {
+                            std::path::Path::new(&self.cwd).join(raw_path)
+                        };
+                        match std::fs::read_to_string(&path) {
+                            Ok(content) => {
+                                ui_state.left_pane_content = content;
+                                ui_state.left_pane_title = args[0].clone();
+                                ui_state.layout_mode =
+                                    coderex_ui::state::LayoutMode::HorizontalSplit {
+                                        left_percent: 50,
+                                    };
+                                ui_state
+                                    .notifications
+                                    .success(format!("Opened {}", args[0]));
+                                push_activity_row(ui_state, &format!("Opened {}", args[0]));
+                                self.persist_interactive_snapshot(ui_state);
+                            }
+                            Err(err) => {
+                                let detail = format!("Failed to open {}: {}", args[0], err);
+                                ui_state.notifications.err(&detail);
+                                show_detail_overlay(ui_state, "Failure Details", detail.clone());
+                                ui_state.messages.push(coderex_ui::message_list::Message {
+                                    role: coderex_ui::message_list::MessageRole::System,
+                                    content: detail.into(),
+                                    tool_name: None,
+                                    streaming: false,
+                                    folded: false,
+                                });
+                            }
+                        }
                         return;
                     }
-                    let raw_path = std::path::PathBuf::from(&args[0]);
-                    let path = if raw_path.is_absolute() {
-                        raw_path
-                    } else {
-                        std::path::Path::new(&self.cwd).join(raw_path)
-                    };
-                    match std::fs::read_to_string(&path) {
-                        Ok(content) => {
-                            ui_state.left_pane_content = content;
-                            ui_state.left_pane_title = args[0].clone();
-                            ui_state.layout_mode =
-                                coderex_ui::state::LayoutMode::HorizontalSplit { left_percent: 50 };
-                            ui_state
-                                .notifications
-                                .success(format!("Opened {}", args[0]));
-                            push_activity_row(ui_state, &format!("Opened {}", args[0]));
-                            self.persist_interactive_snapshot(ui_state);
-                        }
-                        Err(err) => {
-                            let detail = format!("Failed to open {}: {}", args[0], err);
-                            ui_state.notifications.err(&detail);
-                            show_detail_overlay(ui_state, "Failure Details", detail.clone());
-                            ui_state.messages.push(coderex_ui::message_list::Message {
-                                role: coderex_ui::message_list::MessageRole::System,
-                                content: detail.into(),
-                                tool_name: None,
-                                streaming: false,
-                                folded: false,
-                            });
-                        }
-                    }
-                    return;
+                    _ => {}
                 }
-                _ => {}
             }
 
-            // Check for macro expansion first
-            if self.macro_registry.has(cmd_name) {
+            // Check for macro expansion first. A macro expands into slash
+            // commands, so it is subject to the same switch.
+            if !self.no_slash_commands && self.macro_registry.has(cmd_name) {
                 if let Some(commands) = self.macro_registry.get(cmd_name) {
                     let cmds: Vec<String> = commands.to_vec();
                     for macro_cmd in cmds {
@@ -6001,8 +5964,9 @@ impl ReplLoop {
         let cmd_name = parts[0].trim_start_matches('/');
         let args: Vec<String> = parts[1..].iter().map(|s| s.to_string()).collect();
 
-        // Check for macro expansion
-        if self.macro_registry.has(cmd_name) {
+        // Check for macro expansion. A macro expands into slash commands, so
+        // it follows the same switch as the built-ins below.
+        if !self.no_slash_commands && self.macro_registry.has(cmd_name) {
             if let Some(commands) = self.macro_registry.get(cmd_name) {
                 let cmds: Vec<String> = commands.to_vec();
                 for macro_cmd in cmds {
@@ -6764,7 +6728,11 @@ impl ReplLoop {
         ctx.theme = self.current_theme.clone();
         ctx.git_branch = current_git_branch(&self.cwd);
         ctx.version = env!("CARGO_PKG_VERSION").to_string();
-        ctx.feature_flags = HashMap::new();
+        // Commands gate themselves by name (`is_feature_enabled`), so the
+        // resolved flags have to reach the context. Leaving this empty made
+        // every flag-gated command dead in production, even when the user
+        // passed `--betas` or `CODEREX_FEATURE_FLAGS`.
+        ctx.feature_flags = self.feature_flags.as_map();
         ctx.api_key_set = self.api_client.is_some();
         ctx.elapsed_secs = self
             .query_start_time
@@ -6851,6 +6819,48 @@ mod tests {
         ToolDispatchOutcome, ToolExecutor as CoreToolExecutor, ToolInfo,
     };
     use coderex_core::types::{ToolResult, UsageSummary};
+
+    #[test]
+    fn command_context_carries_the_session_feature_flags() {
+        // The command context used to be built with an empty map, so a command
+        // that asked whether its flag was on always heard "no".
+        let mut repl = ReplLoop::new("/tmp".into(), ModelId::sonnet());
+        repl.feature_flags = coderex_config::flags::FeatureFlags::parse("+voice_mode,+heapdump");
+        let ctx = repl.build_context();
+        assert!(ctx.is_feature_enabled("voice_mode"));
+        assert!(ctx.is_feature_enabled("heapdump"));
+        assert!(!ctx.is_feature_enabled("ultraplan"));
+    }
+
+    #[tokio::test]
+    async fn disabled_slash_commands_skip_builtins_and_macros() {
+        // `--disable-slash-commands` used to clear the registry only: the
+        // built-ins and macro expansion still ran, so the flag hid commands
+        // from `/help` without disabling them.
+        let mut repl = ReplLoop::new("/tmp".into(), ModelId::sonnet());
+        repl.with_no_slash_commands(true);
+        // Production applies the flag through `apply_cli_config`, which is
+        // also what clears the registry.
+        repl.apply_cli_config();
+        repl.macro_registry
+            .define("show-help", vec!["/help".into()]);
+
+        let mut out = Vec::new();
+        repl.execute_command("/help", &mut out).await.unwrap();
+        let direct = String::from_utf8_lossy(&out).into_owned();
+        assert!(
+            !direct.contains("Available commands"),
+            "built-in /help ran despite the flag: {direct}"
+        );
+
+        let mut out = Vec::new();
+        repl.execute_command("/show-help", &mut out).await.unwrap();
+        let via_macro = String::from_utf8_lossy(&out).into_owned();
+        assert!(
+            !via_macro.contains("Available commands"),
+            "a macro expanded despite the flag: {via_macro}"
+        );
+    }
 
     #[derive(Clone)]
     struct StubToolExecutor {
@@ -8141,7 +8151,11 @@ mod tests {
             .clone()
             .expect("build_submit_options did not refresh the parent snapshot");
 
-        assert_eq!(snapshot.messages.len(), 1, "parent messages were not captured");
+        assert_eq!(
+            snapshot.messages.len(),
+            1,
+            "parent messages were not captured"
+        );
         assert_eq!(snapshot.messages[0]["role"], "User");
         assert_eq!(snapshot.model, expected_model);
         assert_eq!(snapshot.system_prompt, expected_prompt);
@@ -8322,11 +8336,7 @@ mod tests {
     #[test]
     fn cli_betas_update_the_session_flags_and_capabilities() {
         let mut repl = ReplLoop::new("/tmp".into(), ModelId::sonnet());
-        repl.with_betas(vec![
-            "+daemon".into(),
-            "-buddy".into(),
-            "voice_mode".into(),
-        ]);
+        repl.with_betas(vec!["+daemon".into(), "-buddy".into(), "voice_mode".into()]);
 
         repl.apply_cli_config();
 

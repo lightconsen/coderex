@@ -89,10 +89,8 @@ impl TelemetrySessionGuard {
 
 impl Drop for TelemetrySessionGuard {
     fn drop(&mut self) {
-        self.handle.session_end(
-            self.session_id.clone(),
-            self.started.elapsed().as_secs(),
-        );
+        self.handle
+            .session_end(self.session_id.clone(), self.started.elapsed().as_secs());
         self.handle.shutdown();
     }
 }
@@ -794,8 +792,7 @@ impl StartupOrchestrator {
         let telemetry_enabled = settings.telemetry_enabled.unwrap_or(false);
         if telemetry_enabled {
             if let Some((handle, uploader)) = Self::init_telemetry(&settings) {
-                self.ctx.telemetry_session =
-                    Some(TelemetrySessionGuard::start(handle.clone()));
+                self.ctx.telemetry_session = Some(TelemetrySessionGuard::start(handle.clone()));
                 self.ctx.telemetry_uploader = Self::spawn_telemetry_uploader(uploader);
                 self.ctx.telemetry_handle = Some(handle);
             }
@@ -915,7 +912,9 @@ impl StartupOrchestrator {
                     .and_then(|t| t.upload_interval_secs)
                     .unwrap_or(defaults.upload_interval_secs),
                 enabled: true,
-                sample_rate: t.and_then(|t| t.sample_rate).unwrap_or(defaults.sample_rate),
+                sample_rate: t
+                    .and_then(|t| t.sample_rate)
+                    .unwrap_or(defaults.sample_rate),
                 pinned_cert_pem: t.and_then(|t| t.pinned_cert_pem.clone()),
             })
         };
@@ -924,9 +923,8 @@ impl StartupOrchestrator {
         // `TelemetryUploader::new` derives channels from the environment; the
         // settings file is the host's own configuration and must be able to
         // supply (or override) OTLP/Datadog values too.
-        let uploader = uploader.map(|uploader| {
-            uploader.with_channels(Self::telemetry_channels(settings))
-        });
+        let uploader =
+            uploader.map(|uploader| uploader.with_channels(Self::telemetry_channels(settings)));
         Some((handle, uploader))
     }
 
@@ -1211,10 +1209,8 @@ impl StartupOrchestrator {
         // Error-state plugins are retried while the session runs. The loop
         // holds a Weak reference and exits when the manager is dropped; the
         // handle is detached deliberately.
-        let _retry_loop = Self::spawn_plugin_restart_loop(
-            &manager,
-            std::time::Duration::from_secs(1),
-        );
+        let _retry_loop =
+            Self::spawn_plugin_restart_loop(&manager, std::time::Duration::from_secs(1));
         self.ctx.plugin_manager = Some(manager);
         Ok(())
     }
@@ -1282,16 +1278,15 @@ impl StartupOrchestrator {
             .filter_map(|marketplace| {
                 let name = marketplace.name.trim();
                 let url = marketplace.url.trim();
-                (!name.is_empty() && !url.is_empty())
-                    .then(|| (name.to_string(), url.to_string()))
+                (!name.is_empty() && !url.is_empty()).then(|| (name.to_string(), url.to_string()))
             })
             .collect();
 
         if let Ok(url) = std::env::var("CODEREX_MARKETPLACE_URL") {
             let url = url.trim().to_string();
             if !url.is_empty() {
-                let name = std::env::var("CODEREX_MARKETPLACE_NAME")
-                    .unwrap_or_else(|_| "default".into());
+                let name =
+                    std::env::var("CODEREX_MARKETPLACE_NAME").unwrap_or_else(|_| "default".into());
                 entries.push((name, url));
             }
         }
@@ -1385,6 +1380,29 @@ impl StartupOrchestrator {
 
         let mut config_loaded = false;
 
+        // Servers defined inline in settings are the same shape as
+        // `.mcp.json`: either the bare `{name: {...}}` map or wrapped in
+        // `{"mcpServers": {...}}`. They are loaded first so the project file
+        // below can override a same-named server. This used to only set
+        // `config_loaded = true`, which reported MCP as ready while spawning
+        // zero servers and warning no one.
+        if let Some(ref mcp_servers) = settings.mcp_servers {
+            match Self::parse_settings_mcp_servers(mcp_servers) {
+                Ok(config) if !config.is_empty() => {
+                    tracing::info!(
+                        "MCP config loaded: {} servers from settings",
+                        config.server_names().len()
+                    );
+                    manager.load_config(&config);
+                    config_loaded = true;
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    tracing::warn!("MCP servers in settings were not loaded: {e}");
+                }
+            }
+        }
+
         // Load from custom --mcp-config or default .mcp.json
         let mcp_path = self
             .ctx
@@ -1412,14 +1430,6 @@ impl StartupOrchestrator {
             }
         } else if self.ctx.mcp_config_path.is_some() {
             tracing::warn!("custom MCP config not found: {mcp_path:?}");
-        }
-
-        // Also check inline config from settings
-        if let Some(ref mcp_servers) = settings.mcp_servers {
-            if !mcp_servers.to_string().is_empty() && mcp_servers.to_string() != "null" {
-                tracing::debug!("MCP servers configured in settings");
-                config_loaded = true;
-            }
         }
 
         if config_loaded {
@@ -1607,9 +1617,11 @@ impl StartupOrchestrator {
     /// Uses `ProviderConfig::from_env()` to build a [`ModelRouter`] that
     /// supports multi-provider fallback (Anthropic → OpenAI → Groq → custom).
     fn try_create_api_client(api_key_override: Option<&str>) -> Option<Box<dyn ApiClient>> {
-        Self::api_client_from_provider_config(ProviderConfig::from_env(), api_key_override, |name| {
-            std::env::var(name).ok()
-        })
+        Self::api_client_from_provider_config(
+            ProviderConfig::from_env(),
+            api_key_override,
+            |name| std::env::var(name).ok(),
+        )
     }
 
     /// Build an API client from a [`ProviderConfig`], gated on usable
@@ -1945,8 +1957,7 @@ impl StartupOrchestrator {
                         fallback = %fallback.0,
                         "primary model unavailable; retrying once with --fallback-model: {error}"
                     );
-                    let mut retry =
-                        self.prepare_repl(cwd, fallback, streaming_protocol, false);
+                    let mut retry = self.prepare_repl(cwd, fallback, streaming_protocol, false);
                     retry.run_headless(&final_prompt).await?
                 } else {
                     return Err(error);
@@ -2061,6 +2072,37 @@ impl StartupOrchestrator {
             .and_then(|s| s.parse::<u64>().ok())
             .unwrap_or(3600);
 
+        // Session persistence used to be hard-coded to `None`, which made the
+        // whole store unreachable from the production binary: sessions did not
+        // survive a restart, and the "advance the id counter past restored
+        // sessions" fix never ran. Persist to the config directory by default;
+        // `CODEREX_SERVER_PERSIST_PATH` overrides the file, and
+        // `CODEREX_SERVER_NO_PERSIST=1` turns it off. A failure to open the
+        // store is already non-fatal (the server warns and runs in memory).
+        let persist_path = if Self::env_flag("CODEREX_SERVER_NO_PERSIST") {
+            None
+        } else {
+            Some(
+                std::env::var_os("CODEREX_SERVER_PERSIST_PATH")
+                    .map(std::path::PathBuf::from)
+                    .unwrap_or_else(|| coderex_config::config_home().join("server-sessions.db")),
+            )
+        };
+        if let Some(ref path) = persist_path {
+            tracing::info!("server session store: {}", path.display());
+        }
+
+        let permission_mode = if self.ctx.skip_permissions {
+            coderex_core::permissions::PermissionMode::BypassPermissions
+        } else {
+            self.ctx
+                .settings
+                .as_ref()
+                .and_then(|settings| settings.permission_mode.as_deref())
+                .and_then(|mode| mode.parse().ok())
+                .unwrap_or_default()
+        };
+
         let config = ServerConfig {
             valid_keys,
             allow_anonymous: false,
@@ -2068,7 +2110,7 @@ impl StartupOrchestrator {
             max_sessions: 100,
             rate_limit_per_minute: 60,
             health_port: None,
-            persist_path: None,
+            persist_path,
         };
 
         let mut server = DaemonServer::with_config(config);
@@ -2076,24 +2118,23 @@ impl StartupOrchestrator {
         // Serve queries on a real engine. Without this the server could only
         // refuse them — and before it did, it echoed them back, which is worse
         // than refusing because it looked like an answer.
-        let context_window =
-            coderex_core::types::ContextWindowResolver::from_env_and_client_data()
-                .with_settings(
-                    self.ctx
-                        .settings
-                        .as_ref()
-                        .map(|settings| settings.context_window_overrides())
-                        .unwrap_or_default(),
-                )
-                .with_experiment(
-                    coderex_config::flags::FeatureFlags::from_env()
-                        .experiment_context_windows(),
-                );
+        let context_window = coderex_core::types::ContextWindowResolver::from_env_and_client_data()
+            .with_settings(
+                self.ctx
+                    .settings
+                    .as_ref()
+                    .map(|settings| settings.context_window_overrides())
+                    .unwrap_or_default(),
+            )
+            .with_experiment(
+                coderex_config::flags::FeatureFlags::from_env().experiment_context_windows(),
+            );
         match Self::serve_engine_factory(
             cwd,
             self.ctx.model.clone().unwrap_or_else(ModelId::sonnet),
             context_window,
             self.ctx.mcp_manager.clone(),
+            permission_mode,
         ) {
             Some(factory) => server.set_engine_factory(factory),
             None => tracing::warn!(
@@ -2118,6 +2159,36 @@ impl StartupOrchestrator {
         result
     }
 
+    /// Whether a boolean-ish environment variable is set to true.
+    fn env_flag(name: &str) -> bool {
+        std::env::var(name).ok().is_some_and(|value| {
+            matches!(value.to_ascii_lowercase().as_str(), "1" | "true" | "yes")
+        })
+    }
+
+    /// Parse the `mcp_servers` settings value.
+    ///
+    /// Accepts both spellings the ecosystem uses: the bare
+    /// `{name: {...}}` map and the wrapped `{"mcpServers": {...}}` object.
+    /// `McpConfig` ignores unknown fields, so a bare map parses as an empty
+    /// config without an error; the wrapped retry is what makes it usable.
+    fn parse_settings_mcp_servers(
+        value: &serde_json::Value,
+    ) -> Result<coderex_mcp::config::McpConfig, String> {
+        if value.is_null() {
+            return Ok(coderex_mcp::config::McpConfig::new());
+        }
+        if let Ok(config) = serde_json::from_value::<coderex_mcp::config::McpConfig>(value.clone())
+        {
+            if !config.is_empty() {
+                return Ok(config);
+            }
+        }
+        let wrapped = serde_json::json!({ "mcpServers": value });
+        serde_json::from_value::<coderex_mcp::config::McpConfig>(wrapped)
+            .map_err(|error| error.to_string())
+    }
+
     /// The engine every served session runs its queries on.
     ///
     /// One per session, built from the same pieces the REPL uses: the routed
@@ -2130,6 +2201,7 @@ impl StartupOrchestrator {
         model: ModelId,
         context_window: coderex_core::types::ContextWindowResolver,
         mcp_manager: Option<std::sync::Arc<coderex_mcp::manager::McpManager>>,
+        permission_mode: coderex_core::permissions::PermissionMode,
     ) -> Option<coderex_server::session::EngineFactory> {
         use coderex_tools::{
             ChromeClient, CronScheduler, ExecutionConfig, ExecutionContext, RateLimiter,
@@ -2163,15 +2235,13 @@ impl StartupOrchestrator {
             let cron_scheduler = std::sync::Arc::new(
                 CronScheduler::new()
                     .with_storage(config_home.join("scheduled_tasks.json"))
-                    .with_job_records(
-                        std::path::PathBuf::from(&cwd),
-                        session_id.clone(),
-                    ),
+                    .with_job_records(std::path::PathBuf::from(&cwd), session_id.clone()),
             );
             let _ = cron_scheduler.load();
 
+            let registry = std::sync::Arc::new(registry);
             let mut dispatcher = RegistryToolDispatcher::new(
-                std::sync::Arc::new(registry),
+                std::sync::Arc::clone(&registry),
                 std::sync::Arc::new(ToolsExecutor::new(ExecutionConfig::default())),
                 ExecutionContext::Normal,
                 std::path::PathBuf::from(&cwd),
@@ -2187,15 +2257,32 @@ impl StartupOrchestrator {
             dispatcher.set_session_id(session_id);
 
             let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+            // A served session used to run on `Default` with no hooks, so a
+            // configured `auto`/`bypass-permissions` mode and the classifier,
+            // explanation and background-deny hooks were all ignored on this
+            // path while they were active in the REPL.
+            let mut permission_engine = coderex_core::permission_engine::PermissionEngine::new(
+                coderex_core::permissions::PermissionChecker::new(permission_mode),
+            );
+            permission_engine.add_hook(std::sync::Arc::new(
+                coderex_core::permission_engine::ExplainPermissionHook::new_with_event_tx(
+                    api_client.clone_box(),
+                    tx.clone(),
+                ),
+            ));
+            permission_engine.add_hook(std::sync::Arc::new(
+                coderex_core::permission_engine::AutoClassifierHook::new(api_client.clone_box()),
+            ));
+            permission_engine.add_hook(std::sync::Arc::new(
+                coderex_core::permission_engine::BackgroundAgentDenyHook,
+            ));
+            coderex_tools::install_rule_exemptions(&mut permission_engine, &registry);
+
             let mut engine = coderex_core::engine::QueryEngine::new(
                 api_client.clone_box(),
                 model.clone(),
                 coderex_core::state::SessionState::new(std::path::PathBuf::from(&cwd)),
-                coderex_core::permission_engine::PermissionEngine::new(
-                    coderex_core::permissions::PermissionChecker::new(
-                        coderex_core::permissions::PermissionMode::Default,
-                    ),
-                ),
+                permission_engine,
                 tx,
             );
             engine.set_tool_executor(Box::new(dispatcher));
@@ -2427,9 +2514,7 @@ impl StartupOrchestrator {
                 // into a fresh manager, so unrelated or broken servers in the
                 // same config file cannot affect this test.
                 let mut selected = coderex_mcp::config::McpConfig::new();
-                selected
-                    .mcp_servers
-                    .insert(name.clone(), server_config);
+                selected.mcp_servers.insert(name.clone(), server_config);
                 let manager = coderex_mcp::manager::McpManager::new();
                 manager.load_config(&selected);
                 manager.start_all().await;
@@ -2462,13 +2547,14 @@ impl StartupOrchestrator {
                 println!("Tools discovered: {}", tools.len());
                 for tool in &tools {
                     if tool.description.trim().is_empty() {
-                        println!("  {} (mcp__{}__{})", tool.qualified_name(), tool.server, tool.name);
-                    } else {
                         println!(
-                            "  {} — {}",
+                            "  {} (mcp__{}__{})",
                             tool.qualified_name(),
-                            tool.description.trim()
+                            tool.server,
+                            tool.name
                         );
+                    } else {
+                        println!("  {} — {}", tool.qualified_name(), tool.description.trim());
                     }
                 }
             }
@@ -2506,11 +2592,7 @@ impl StartupOrchestrator {
                 // populated by the startup phases, but this subcommand must
                 // also work when it is reached without them.
                 let plugin_host = self.plugin_host_config_service().load_plugin_host_config();
-                let plugin_settings = self
-                    .ctx
-                    .plugin_settings
-                    .clone()
-                    .or(plugin_host.plugins);
+                let plugin_settings = self.ctx.plugin_settings.clone().or(plugin_host.plugins);
                 // Resolve host `userConfig` values before installing; the
                 // install path consults them when materialising the plugin.
                 if let Some(plugins) = plugin_settings.as_ref() {
@@ -2792,6 +2874,30 @@ mod tests {
     }
 
     #[test]
+    fn settings_mcp_servers_accept_both_shapes() {
+        let bare = serde_json::json!({
+            "files": { "command": "npx", "args": ["-y", "server"] }
+        });
+        let parsed = StartupOrchestrator::parse_settings_mcp_servers(&bare).unwrap();
+        assert_eq!(parsed.server_names(), vec!["files"]);
+
+        let wrapped = serde_json::json!({
+            "mcpServers": {
+                "remote": { "type": "http", "url": "https://example.test/mcp" }
+            }
+        });
+        let parsed = StartupOrchestrator::parse_settings_mcp_servers(&wrapped).unwrap();
+        assert_eq!(parsed.server_names(), vec!["remote"]);
+
+        let empty =
+            StartupOrchestrator::parse_settings_mcp_servers(&serde_json::json!({})).unwrap();
+        assert!(empty.is_empty());
+        let null =
+            StartupOrchestrator::parse_settings_mcp_servers(&serde_json::Value::Null).unwrap();
+        assert!(null.is_empty());
+    }
+
+    #[test]
     fn configure_repl_enables_the_control_channel_only_for_headless() {
         let mut orch = StartupOrchestrator::new();
         orch.ctx.headless_permission_control = true;
@@ -3048,7 +3154,9 @@ mod tests {
             .await
             .expect_err("--ide without configuration must fail");
         assert!(
-            error.to_string().contains("no IDE MCP server is configured"),
+            error
+                .to_string()
+                .contains("no IDE MCP server is configured"),
             "{error}"
         );
     }
@@ -3121,11 +3229,8 @@ mod tests {
             "AWS_SECRET_ACCESS_KEY" => Some("secret".to_string()),
             _ => None,
         };
-        let client = StartupOrchestrator::api_client_from_provider_config(
-            bedrock_config(),
-            None,
-            get_env,
-        );
+        let client =
+            StartupOrchestrator::api_client_from_provider_config(bedrock_config(), None, get_env);
         assert!(
             client.is_some(),
             "a valid cloud deployment must not be blocked by the CLI provider gate"
@@ -3167,12 +3272,8 @@ mod tests {
 
         let transport = anyhow::anyhow!("connection reset by peer");
         assert!(
-            StartupOrchestrator::fallback_after_model_error(
-                &primary,
-                Some(&fallback),
-                &transport
-            )
-            .is_none(),
+            StartupOrchestrator::fallback_after_model_error(&primary, Some(&fallback), &transport)
+                .is_none(),
             "a transport error is not evidence the model is unavailable"
         );
 
@@ -3234,8 +3335,8 @@ mod tests {
     #[tokio::test]
     async fn uploader_task_is_spawned_only_when_enabled() {
         let dir = tempfile::tempdir().unwrap();
-        let disabled_store = coderex_telemetry::TelemetryStore::open(&dir.path().join("off.db"))
-            .unwrap();
+        let disabled_store =
+            coderex_telemetry::TelemetryStore::open(&dir.path().join("off.db")).unwrap();
         let (_handle, uploader) = coderex_telemetry::TelemetryHandle::new(
             disabled_store,
             Some(coderex_telemetry::TelemetryConfig {
@@ -3248,8 +3349,8 @@ mod tests {
             "an opted-out session must not start an uploader task"
         );
 
-        let enabled_store = coderex_telemetry::TelemetryStore::open(&dir.path().join("on.db"))
-            .unwrap();
+        let enabled_store =
+            coderex_telemetry::TelemetryStore::open(&dir.path().join("on.db")).unwrap();
         let (_handle, uploader) = coderex_telemetry::TelemetryHandle::new(
             enabled_store,
             Some(coderex_telemetry::TelemetryConfig {
