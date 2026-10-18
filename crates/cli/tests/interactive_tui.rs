@@ -10,7 +10,10 @@ use std::time::{Duration, Instant};
 
 const ROWS: u16 = 40;
 const COLS: u16 = 120;
-const SCREEN_TIMEOUT: Duration = Duration::from_secs(15);
+// 30s, not 15s: this is a real PTY plus a real binary, and the whole file's
+// tests run in parallel. A 15s budget timed out under workspace load even
+// though the session was healthy.
+const SCREEN_TIMEOUT: Duration = Duration::from_secs(30);
 const LIVE_TIMEOUT: Duration = Duration::from_secs(90);
 
 fn strip_ansi(text: &str) -> String {

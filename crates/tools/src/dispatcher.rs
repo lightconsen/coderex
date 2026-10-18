@@ -50,6 +50,10 @@ pub struct RegistryToolDispatcher {
     cron_scheduler: Option<Arc<CronScheduler>>,
     rate_limiter: Option<Arc<RateLimiter>>,
     chrome_client: Option<ChromeClient>,
+    /// Whether Chrome tools are offered. Shared across clones: the engine and
+    /// the agent manager each hold a dispatcher clone, and `--no-chrome`
+    /// arrives after both were made, so a plain copy cannot be flipped.
+    chrome_enabled: Arc<std::sync::atomic::AtomicBool>,
     elicit_tx: Arc<std::sync::Mutex<Option<tokio::sync::mpsc::Sender<crate::tool::ElicitRequest>>>>,
 }
 
@@ -112,6 +116,7 @@ impl RegistryToolDispatcher {
             cron_scheduler: None,
             rate_limiter: None,
             chrome_client: None,
+            chrome_enabled: Arc::new(std::sync::atomic::AtomicBool::new(true)),
             elicit_tx: Arc::new(std::sync::Mutex::new(None)),
         }
     }
@@ -151,6 +156,20 @@ impl RegistryToolDispatcher {
         self.chrome_client = None;
     }
 
+    /// Turn the Chrome tool family on or off for every clone of this
+    /// dispatcher.
+    pub fn set_chrome_enabled(&self, enabled: bool) {
+        self.chrome_enabled
+            .store(enabled, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Whether the Chrome tool family is offered.
+    #[must_use]
+    pub fn chrome_enabled(&self) -> bool {
+        self.chrome_enabled
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     /// Attach an elicitation channel for mid-execution user questions.
     pub fn set_elicit_tx(&self, tx: Option<tokio::sync::mpsc::Sender<crate::tool::ElicitRequest>>) {
         if let Ok(mut guard) = self.elicit_tx.lock() {
@@ -173,10 +192,22 @@ impl CoreToolExecutor for RegistryToolDispatcher {
             .into_iter()
             .collect();
 
+        let chrome_enabled = self.chrome_enabled();
         self.registry
             .all_descriptors()
             .into_iter()
-            .filter(|d| d.is_enabled && available.contains(&d.name))
+            .filter(|d| {
+                if !d.is_enabled {
+                    return false;
+                }
+                // Chrome is a session capability (`--no-chrome`), not one of
+                // the general feature flags; a session with no flags still has
+                // Chrome unless it turned it off.
+                if d.name.starts_with("chrome_") {
+                    return chrome_enabled;
+                }
+                available.contains(&d.name)
+            })
             .map(|d| {
                 let caps = self
                     .registry
@@ -214,6 +245,16 @@ impl CoreToolExecutor for RegistryToolDispatcher {
                 };
             }
         };
+
+        if tool_name.starts_with("chrome_") && !self.chrome_enabled() {
+            return ToolDispatchOutcome {
+                result: ToolResult {
+                    tool_call_id: tool_call_id.to_string(),
+                    output: "Chrome tools are disabled for this session (--no-chrome)".into(),
+                    is_error: true,
+                },
+            };
+        }
 
         // Deny rules are checked here, with the call's own arguments: a rule
         // written against a path can only be judged against the path this call
@@ -514,6 +555,35 @@ mod tests {
         assert!(
             !listed.iter().any(|name| name == "Monitor"),
             "a disabled tool was offered: {listed:?}"
+        );
+    }
+
+    /// Chrome is a session capability (`--no-chrome`), not a general feature
+    /// flag: it is offered with no flags set, and withheld when the session
+    /// turns it off.
+    #[test]
+    fn chrome_tools_follow_the_session_capability() {
+        let mut registry = ToolRegistry::new();
+        registry.register(Arc::new(crate::builtins::chrome::ChromeListTabsTool));
+        let registry = Arc::new(registry);
+
+        let dispatcher = RegistryToolDispatcher::new(
+            registry,
+            Arc::new(InnerExecutor::new(ExecutionConfig::default())),
+            ExecutionContext::Normal,
+            PathBuf::from("/tmp"),
+        );
+
+        assert!(
+            dispatcher
+                .listed_names()
+                .contains(&"chrome_list_tabs".into())
+        );
+        dispatcher.set_chrome_enabled(false);
+        assert!(
+            !dispatcher
+                .listed_names()
+                .contains(&"chrome_list_tabs".into())
         );
     }
 

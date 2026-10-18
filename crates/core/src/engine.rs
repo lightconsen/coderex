@@ -673,6 +673,11 @@ pub struct TurnRuntime {
     pub agent_id: Option<String>,
     /// Terminal reason (set when state transitions to Terminated).
     pub terminal_reason: Option<TerminalReason>,
+    /// The last provider stop reason, for compaction strategy selection.
+    ///
+    /// `Reactive` compaction is for a response the model ran out of room for;
+    /// that fact lives on the response, not in the context estimate.
+    pub last_stop_reason: Option<String>,
 }
 
 impl TurnRuntime {
@@ -692,6 +697,7 @@ impl TurnRuntime {
             stop_hook_active: false,
             agent_id: None,
             terminal_reason: None,
+            last_stop_reason: None,
         }
     }
 
@@ -710,6 +716,7 @@ impl TurnRuntime {
         self.pending_permission = None;
         self.pending_elevation = None;
         self.pending_elicitation = None;
+        self.last_stop_reason = None;
         self.budget.reset_turn();
     }
 
@@ -842,6 +849,12 @@ fn take_recorded_transitions() -> Vec<(TurnState, TurnState)> {
 struct StreamedResponse {
     content: String,
     tool_calls: Vec<ToolCall>,
+    /// Calls that were executed while the stream was still running.
+    ///
+    /// Their `tool_use` messages still have to be written to the session: the
+    /// assistant turn and its `tool_result` are a pair, and a history with the
+    /// result but not the call is rejected by the provider.
+    early_calls: Vec<ToolCall>,
     early_results: Vec<ToolResult>,
     usage: UsageSummary,
     stop_reason: String,
@@ -1358,6 +1371,11 @@ impl QueryEngine {
         backend: Arc<dyn crate::compaction_backend::CompactionBackend>,
     ) {
         self.compaction_backend = Some(backend);
+    }
+
+    /// Replace the compaction configuration (thresholds, reserves, retries).
+    pub fn set_compact_config(&mut self, config: CompactConfig) {
+        self.compact_config = config;
     }
 
     /// Refresh the session-memory document at compaction time and return the
@@ -1933,12 +1951,23 @@ impl QueryEngine {
             tracing::debug!("cache-TTL compaction: {outcome:?}");
         }
 
+        // The context-size lines have to be checked before the request, not
+        // only after an output-token budget trips: by then the input may
+        // already be too large to send.
+        if let Some(reason) = self
+            .maybe_compact_on_threshold(turn, options, turn_number)
+            .await
+        {
+            return Ok(reason);
+        }
+
         // Phase 3: RunPreSubmitHooks → StartRequest
         turn.transition_to(TurnState::StartRequest);
 
         // Phase 4: StartRequest → StreamAssistant
         turn.transition_to(TurnState::StreamAssistant);
         let api_response = self.send_request(turn, options).await?;
+        turn.last_stop_reason = Some(api_response.stop_reason.clone());
 
         // Record budget and cost
         turn.budget.record_tokens(&api_response.usage);
@@ -2094,20 +2123,19 @@ impl QueryEngine {
             }
         }
 
-        self.run_stop_hooks(turn, turn_number, &api_response.stop_reason)
-            .await;
-        turn.transition_to(TurnState::Finalize);
-        self.cost_tracker
-            .end_turn(turn_number, &api_response.usage, &self.model);
-        let _ = self
-            .fire_turn_end_hook(turn_number, &api_response.stop_reason)
-            .await;
-
-        // If we have tool results, the model needs another turn
-        // Return Completed here — the caller will start the next turn
-        if let Some(reason) = self.record_and_check_loop(&pending_for_loop) {
+        if let Some(reason) = self
+            .close_turn(
+                turn,
+                turn_number,
+                &api_response.stop_reason,
+                &api_response.usage,
+                &pending_for_loop,
+            )
+            .await
+        {
             return Ok(reason);
         }
+        // Tool results are pending: the caller starts the next turn.
         Ok(TerminalReason::Completed)
     }
 
@@ -2158,6 +2186,15 @@ impl QueryEngine {
             tracing::debug!("cache-TTL compaction: {outcome:?}");
         }
 
+        // Check the context lines before sending: an input that is already
+        // past the window cannot be fixed by compacting after the fact.
+        if let Some(reason) = self
+            .maybe_compact_on_threshold(turn, options, turn_number)
+            .await
+        {
+            return Ok(reason);
+        }
+
         // Phase 3: RunPreSubmitHooks → StartRequest → StreamAssistant
         turn.transition_to(TurnState::StartRequest);
         turn.transition_to(TurnState::StreamAssistant);
@@ -2166,10 +2203,12 @@ impl QueryEngine {
         let StreamedResponse {
             mut content,
             mut tool_calls,
+            mut early_calls,
             mut early_results,
             mut usage,
             mut stop_reason,
         } = self.send_request_streaming(turn, options).await?;
+        turn.last_stop_reason = Some(stop_reason.clone());
 
         // Record budget and cost
         turn.budget.record_tokens(&usage);
@@ -2200,18 +2239,25 @@ impl QueryEngine {
                     self.last_usage = Some(answered.usage);
                     content = answered.content;
                     tool_calls = answered.tool_calls;
+                    early_calls = answered.early_calls;
                     early_results = answered.early_results;
                     usage = answered.usage;
                     stop_reason = answered.stop_reason;
+                    turn.last_stop_reason = Some(stop_reason.clone());
                     self.push_visible_assistant_message(turn, content.clone());
                 }
             }
         }
 
-        // Apply early-executed tool results immediately so the model can see them
+        // Apply early-executed tool results immediately so the model can see them.
+        // Their `tool_use` messages go first: a tool_result without the call it
+        // answers is not a valid assistant/user pair, and the next request
+        // would be rejected by the provider.
         tracing::info!("early_results count: {}", early_results.len());
+        self.persist_assistant_tool_calls(turn, &early_calls);
         for result in &early_results {
             let msg = Message::tool(result.clone());
+            turn.messages.push(msg.clone());
             self.session.messages.push(msg);
         }
         tracing::info!(
@@ -2254,6 +2300,7 @@ impl QueryEngine {
                     }
 
                     let stop_reason = retried.stop_reason.clone();
+                    turn.last_stop_reason = Some(stop_reason.clone());
                     if let Some(reason) = self
                         .close_turn(turn, turn_number, &stop_reason, &usage, &[])
                         .await
@@ -2314,13 +2361,13 @@ impl QueryEngine {
             }
         }
 
-        turn.transition_to(TurnState::Finalize);
-        self.cost_tracker.end_turn(turn_number, &usage, &self.model);
-        let _ = self.fire_turn_end_hook(turn_number, "end_turn").await;
-
-        if let Some(reason) = self.record_and_check_loop(&pending_for_loop) {
+        if let Some(reason) = self
+            .close_turn(turn, turn_number, &stop_reason, &usage, &pending_for_loop)
+            .await
+        {
             return Ok(reason);
         }
+        // Tool results are pending: the caller starts the next turn.
         Ok(TerminalReason::Completed)
     }
 
@@ -2568,7 +2615,9 @@ impl QueryEngine {
         // up cheaply, not a reason to rewrite history: it takes the lightest
         // pass and never calls the summarizer. Crossing the token line takes
         // the strategy the thresholds name.
-        let stop_reason = "end_turn"; // default — would come from last API response
+        // `Reactive` is the strategy for a response the model ran out of room
+        // for. It has to see the actual stop reason, not a placeholder.
+        let stop_reason = turn.last_stop_reason.as_deref().unwrap_or("end_turn");
         let strategy = match trigger {
             CompactTrigger::CacheTtl => CompactStrategy::Micro,
             CompactTrigger::TokenThreshold => compact::select_compact_strategy(
@@ -2721,15 +2770,18 @@ impl QueryEngine {
         }
 
         // ── Rule-based fallback (existing strategies) ──
+        // The rule-based strategies take a target. Use the resolved line for
+        // this model, not the configured fallback, which is sized for a window
+        // that may not be this one.
+        let thresholds = compact::CompactThresholds::resolve(&self.model, &self.compact_config);
         let result: CompactResult = match strategy {
             CompactStrategy::Micro => compact::micro_compact(&turn.messages, self.micro_params()),
-            CompactStrategy::Auto => {
-                compact::auto_compact(&turn.messages, self.compact_config.auto_compact_threshold)
-            }
+            CompactStrategy::Auto => compact::auto_compact(&turn.messages, thresholds.auto),
             CompactStrategy::Reactive => compact::reactive_compact(&turn.messages, 3),
-            CompactStrategy::Snip => {
-                compact::snip_compact(&turn.messages, self.compact_config.snip_target_tokens)
-            }
+            CompactStrategy::Snip => compact::snip_compact(
+                &turn.messages,
+                self.compact_config.snip_target_tokens.min(thresholds.auto),
+            ),
         };
 
         let summary = summary_failure.unwrap_or(SummaryOutcome::NotRequested);
@@ -2904,6 +2956,67 @@ impl QueryEngine {
     /// session that never sends another request never compacts. That is the
     /// honest limit of doing this inside the turn loop.
     ///
+    /// Compact before a request when the estimated context has crossed a line.
+    ///
+    /// `CompactThresholds` answers "how full is the window"; until this call
+    /// existed, only the output-token budget could trigger compaction, so a
+    /// large input could overflow a small-window model before anything ran.
+    ///
+    /// Returns `Some(reason)` only when the context is still blocked after a
+    /// compaction attempt; at the compact line the turn continues.
+    async fn maybe_compact_on_threshold(
+        &mut self,
+        turn: &mut TurnRuntime,
+        options: &SubmitOptions,
+        turn_number: u32,
+    ) -> Option<TerminalReason> {
+        let estimated = PromptCompiler::estimate_message_tokens(&turn.messages);
+        let thresholds = compact::CompactThresholds::resolve(&self.model, &self.compact_config);
+        let level = thresholds.level(estimated);
+
+        match level {
+            compact::ContextLevel::Ok => return None,
+            compact::ContextLevel::Warn => {
+                tracing::warn!(
+                    estimated_tokens = estimated,
+                    warn_at = thresholds.warn,
+                    "context is approaching the compaction line"
+                );
+                return None;
+            }
+            compact::ContextLevel::Compact | compact::ContextLevel::Blocked => {}
+        }
+
+        if turn.recovery_count >= self.compact_config.max_recovery_retries {
+            return if level == compact::ContextLevel::Blocked {
+                Some(TerminalReason::Error(format!(
+                    "context window is full ({estimated} estimated tokens) and the compaction \
+                     retry budget is spent"
+                )))
+            } else {
+                None
+            };
+        }
+
+        let outcome = self
+            .run_compact_recovery(turn, options, turn_number, CompactTrigger::TokenThreshold)
+            .await;
+        if let Some(reason) = outcome.failure_message() {
+            return Some(TerminalReason::Error(reason));
+        }
+
+        if level == compact::ContextLevel::Blocked {
+            let after = PromptCompiler::estimate_message_tokens(&turn.messages);
+            if thresholds.level(after) == compact::ContextLevel::Blocked {
+                return Some(TerminalReason::Error(format!(
+                    "context window is still full after compaction ({after} estimated tokens)"
+                )));
+            }
+        }
+
+        None
+    }
+
     /// On the compacting path the turn is left in `CompactRecovery` — the
     /// caller's next move to `StartRequest` is the one the graph already
     /// allows from there.
@@ -3120,6 +3233,7 @@ impl QueryEngine {
                 cache_creation_tokens: 0,
             };
             let mut attempt_text = String::new();
+            let mut early_calls: Vec<ToolCall> = Vec::new();
             let mut early_results: Vec<ToolResult> = Vec::new();
             let mut deferred_calls: Vec<ToolCall> = Vec::new();
             let mut stream_failed = false;
@@ -3160,7 +3274,14 @@ impl QueryEngine {
                         // Finalize pending tool calls — handled after loop
                     }
                     StreamEvent::Error(ref e) => {
-                        if attempt < MAX_STREAM_ATTEMPTS && crate::api_client::is_retryable(e) {
+                        // A retry re-asks the model and re-runs what it
+                        // proposes. If this attempt already executed a tool,
+                        // retrying can repeat its side effects, so the partial
+                        // result is returned instead.
+                        if early_calls.is_empty()
+                            && attempt < MAX_STREAM_ATTEMPTS
+                            && crate::api_client::is_retryable(e)
+                        {
                             tracing::warn!(
                                 "streaming network error on attempt {attempt} ({} bytes received): {e} — re-requesting",
                                 carried_text.len()
@@ -3193,11 +3314,25 @@ impl QueryEngine {
                 // Process event through assembler and execute completed tool
                 // calls immediately while the stream is still running.
                 for call in assembler.process_event(event) {
+                    let recorded = call.clone();
                     match self.execute_early_tool_call(turn, call, options).await {
-                        Ok(Some(result)) => early_results.push(result),
+                        Ok(Some(result)) => {
+                            early_calls.push(recorded);
+                            early_results.push(result);
+                        }
                         Ok(None) => { /* deferred — call already tracked */ }
                         Err(e) => {
+                            // An error here is not a reason to drop the call:
+                            // the model still has to see a result for the
+                            // tool_use, or the history is an invalid pair.
                             tracing::warn!("early tool execution failed: {e}");
+                            let id = recorded.id.clone();
+                            early_calls.push(recorded);
+                            early_results.push(ToolResult {
+                                tool_call_id: id,
+                                output: format!("tool execution failed: {e}"),
+                                is_error: true,
+                            });
                         }
                     }
                 }
@@ -3206,11 +3341,22 @@ impl QueryEngine {
             if !retry_requested {
                 // Stream ended — finalize any remaining pending calls.
                 for call in assembler.process_event(StreamEvent::StreamEnd) {
+                    let recorded = call.clone();
                     match self.execute_early_tool_call(turn, call, options).await {
-                        Ok(Some(result)) => early_results.push(result),
+                        Ok(Some(result)) => {
+                            early_calls.push(recorded);
+                            early_results.push(result);
+                        }
                         Ok(None) => { /* deferred */ }
                         Err(e) => {
                             tracing::warn!("early tool execution failed: {e}");
+                            let id = recorded.id.clone();
+                            early_calls.push(recorded);
+                            early_results.push(ToolResult {
+                                tool_call_id: id,
+                                output: format!("tool execution failed: {e}"),
+                                is_error: true,
+                            });
                         }
                     }
                 }
@@ -3249,6 +3395,7 @@ impl QueryEngine {
                     return Ok(StreamedResponse {
                         content: resp.content,
                         tool_calls: resp.tool_calls,
+                        early_calls: Vec::new(),
                         early_results: Vec::new(),
                         usage: resp.usage,
                         stop_reason: resp.stop_reason,
@@ -3271,6 +3418,7 @@ impl QueryEngine {
                 return Ok(StreamedResponse {
                     content: carried_text,
                     tool_calls: deferred_calls,
+                    early_calls,
                     early_results,
                     usage,
                     stop_reason: stop_reason.unwrap_or_else(|| "interrupted".to_string()),
@@ -3296,6 +3444,7 @@ impl QueryEngine {
             return Ok(StreamedResponse {
                 content: carried_text,
                 tool_calls: deferred_calls,
+                early_calls,
                 early_results,
                 usage,
                 stop_reason: stop_reason.unwrap_or_else(|| "end_turn".to_string()),
@@ -4551,9 +4700,15 @@ mod tests {
                     .create_message(system, messages, model, max_tokens, tools)
                     .await
                     .expect("the mock answers");
-                let mut events = vec![crate::api_client::StreamEvent::StopReason(
+                let mut events = Vec::new();
+                if !response.content.is_empty() {
+                    events.push(crate::api_client::StreamEvent::TextDelta(
+                        response.content.clone(),
+                    ));
+                }
+                events.push(crate::api_client::StreamEvent::StopReason(
                     response.stop_reason.clone(),
-                )];
+                ));
                 for call in &response.tool_calls {
                     events.insert(
                         0,
@@ -4794,9 +4949,15 @@ mod tests {
                     .create_message(system, messages, model, max_tokens, tools)
                     .await
                     .expect("the mock answers");
-                let mut events = vec![crate::api_client::StreamEvent::StopReason(
+                let mut events = Vec::new();
+                if !response.content.is_empty() {
+                    events.push(crate::api_client::StreamEvent::TextDelta(
+                        response.content.clone(),
+                    ));
+                }
+                events.push(crate::api_client::StreamEvent::StopReason(
                     response.stop_reason.clone(),
-                )];
+                ));
                 for call in &response.tool_calls {
                     // A call needs its start, its input, and its end: the
                     // assembler builds the call from the whole sequence.
@@ -5711,6 +5872,54 @@ mod tests {
         assert_eq!(messages[2]["role"], "user");
         assert_eq!(messages[2]["content"][0]["type"], "tool_result");
         assert_eq!(messages[2]["content"][0]["tool_use_id"], "tc_1");
+    }
+
+    /// The context-size line is checked before a request, not only after an
+    /// output-token budget trips. A small-window model with a large input must
+    /// compact before sending.
+    #[tokio::test]
+    async fn the_context_threshold_compacts_before_a_request() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let checker = PermissionChecker::new(PermissionMode::BypassPermissions);
+        let mut engine = QueryEngine::new(
+            Box::new(MockApiClient),
+            ModelId("unknown-small-window".into()),
+            SessionState::new(std::path::PathBuf::from("/tmp/test")),
+            PermissionEngine::new(checker),
+            tx,
+        );
+        engine.set_tool_executor(Box::new(StubOkToolExecutor));
+
+        let mut turn = TurnRuntime::new(TokenBudget::with_defaults());
+        turn.messages
+            .push(Message::user("the original request that must be preserved"));
+        for i in 0..10 {
+            turn.messages.push(Message {
+                role: crate::types::Role::Assistant,
+                content: crate::types::MessageContent::Text(format!(
+                    "assistant turn {i}: {}",
+                    "x".repeat(10_000)
+                )),
+            });
+        }
+
+        let before = PromptCompiler::estimate_message_tokens(&turn.messages);
+        assert!(before > 16_000, "the test context is too small: {before}");
+
+        let reason = engine
+            .maybe_compact_on_threshold(&mut turn, &SubmitOptions::default(), 1)
+            .await;
+        assert!(
+            reason.is_none(),
+            "an over-line context was refused: {reason:?}"
+        );
+
+        let after = PromptCompiler::estimate_message_tokens(&turn.messages);
+        assert!(
+            after < before,
+            "the context was not reduced: {before} -> {after}"
+        );
+        assert_eq!(turn.recovery_count, 1, "the compaction was not recorded");
     }
 
     #[test]

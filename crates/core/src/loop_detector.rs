@@ -148,6 +148,14 @@ impl LoopDetector {
         let start = history.len() - period * self.repeat_threshold;
         let window = &history[start..];
 
+        // A turn with no tool calls is not a repeated tool loop, even if three
+        // of them in a row look identical to a fingerprint. They still stay in
+        // the history: an empty turn between two tool turns breaks the run
+        // rather than being invisible to it.
+        if window.iter().any(|fingerprint| fingerprint.is_empty()) {
+            return None;
+        }
+
         // Verify that each chunk of `period` turns matches the first chunk
         let first_chunk = &window[0..period];
         for i in 1..self.repeat_threshold {
@@ -326,6 +334,30 @@ mod tests {
         detector.record_turn(&[make_call("read", serde_json::json!({"path": "/b"}))]);
         detector.record_turn(&[make_call("read", serde_json::json!({"path": "/c"}))]);
         assert!(matches!(detector.check(), LoopDetection::Ok));
+    }
+
+    /// Text-only turns are answers, not a repeated tool loop. Three of them
+    /// used to end an ordinary conversation with `LoopDetected`.
+    #[test]
+    fn empty_turns_never_count_as_a_loop() {
+        let mut detector = LoopDetector::new();
+        for _ in 0..5 {
+            detector.record_empty_turn();
+        }
+        assert_eq!(detector.check(), LoopDetection::Ok);
+    }
+
+    /// An empty turn between repeats still breaks the run: `A, A, empty, A`
+    /// must not match `A, A, A`.
+    #[test]
+    fn an_empty_turn_breaks_a_repeating_tool_sequence() {
+        let call = make_call("read", serde_json::json!({"path": "/tmp"}));
+        let mut detector = LoopDetector::with_thresholds(10, 3);
+        detector.record_turn(std::slice::from_ref(&call));
+        detector.record_turn(std::slice::from_ref(&call));
+        detector.record_empty_turn();
+        detector.record_turn(std::slice::from_ref(&call));
+        assert_eq!(detector.check(), LoopDetection::Ok);
     }
 
     #[test]

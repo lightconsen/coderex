@@ -346,6 +346,9 @@ fn build_options_from_request(request: &QueryRequest) -> SubmitOptions {
         ]));
     }
     options.append_system_prompt = request.append_system_prompt.clone();
+    // A sub-agent's identity is what makes the background-agent permission
+    // hook fire; dropping it here made the hook unreachable in production.
+    options.agent_id = request.agent_id.clone();
     options.allowed_tools_override = request
         .allowed_tools
         .clone()
@@ -884,5 +887,19 @@ mod tests {
             request.kind = kind;
             assert!(!build_options_from_request(&request).handle_elicitation);
         }
+    }
+
+    /// The sub-agent identity has to survive option building: the permission
+    /// engine's background-agent hook reads it, and dropping it made every
+    /// child tool call look interactive.
+    #[test]
+    fn a_query_request_keeps_its_agent_id() {
+        let mut request = QueryRequest::side_query("check");
+        request.agent_id = Some("task_7".into());
+
+        assert_eq!(
+            build_options_from_request(&request).agent_id.as_deref(),
+            Some("task_7")
+        );
     }
 }

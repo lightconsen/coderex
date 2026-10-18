@@ -24,7 +24,7 @@ Implements the tool trait system, registers built-in tools, and provides executi
 - **`SandboxConfig`** (`sandbox_policy.rs`) — Default per-tool sandbox policies injected by `RegistryToolDispatcher` when sandboxing is enabled.
 - **`ToolCache`** (`tool_cache.rs`) — Global LRU cache for read-only tool results using `moka`. Keys are `(tool_name, arguments_hash)`. `Read` tool entries are invalidated when the file's mtime changes.
 
-### Built-in Tools (44 baseline + 13 feature-gated)
+### Built-in Tools (45 baseline + 13 feature-gated)
 
 #### Baseline Tools
 
@@ -139,7 +139,7 @@ on Windows the `PowerShell` entry is the live one.
 
 ### What Works
 
-- **44 baseline tools** registered and functional.
+- **45 baseline tools** registered and functional.
 - **13 feature-gated tools** registered (disabled by default).
 - Tool registry with deny rules, tier filtering, and concurrent access.
 - `ToolExecutor` batch execution with permission integration, output truncation, timeout, and concurrency control.

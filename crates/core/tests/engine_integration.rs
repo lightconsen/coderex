@@ -438,6 +438,131 @@ async fn streaming_no_tool_calls_completes_cleanly() {
     assert!(tool_starts.is_empty());
 }
 
+/// A turn with no tool call is not a loop, however many of them arrive.
+#[tokio::test]
+async fn three_text_only_turns_are_not_a_loop() {
+    let api = Box::new(TextMock::new("plain answer"));
+    let tools = Box::new(EchoToolExecutor);
+    let (mut engine, _rx) = make_engine(api, tools);
+
+    for _ in 0..3 {
+        let mut options = SubmitOptions::default();
+        options.handle_elicitation = false;
+        let reason = engine.submit("hello".into(), options).await.unwrap();
+        assert_eq!(
+            reason,
+            TerminalReason::Completed,
+            "a third ordinary turn was reported as a tool-call loop"
+        );
+    }
+}
+
+/// A streaming tool call is executed early, but its `tool_use` still has to be
+/// persisted before the `tool_result`: a history with only the result is not a
+/// valid assistant/user pair.
+struct StreamingToolMock {
+    calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
+#[async_trait]
+impl ApiClient for StreamingToolMock {
+    fn clone_box(&self) -> Box<dyn ApiClient> {
+        Box::new(StreamingToolMock {
+            calls: std::sync::Arc::clone(&self.calls),
+        })
+    }
+
+    async fn create_message(
+        &self,
+        _system: &str,
+        _messages: &[serde_json::Value],
+        _model: &ModelId,
+        _max_tokens: u32,
+        _tools: &[ToolInfo],
+    ) -> Result<ApiResponse, ApiError> {
+        Ok(text_response("done"))
+    }
+
+    async fn create_message_streaming(
+        &self,
+        _system: &str,
+        _messages: &[serde_json::Value],
+        _model: &ModelId,
+        _max_tokens: u32,
+        _tools: &[ToolInfo],
+    ) -> Pin<Box<dyn Stream<Item = StreamEvent> + Send + 'static>> {
+        let first = self
+            .calls
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            == 0;
+        let stream = async_stream::stream! {
+            if first {
+                yield StreamEvent::ToolCallBlockStart {
+                    id: "tc_stream".into(),
+                    name: "echo".into(),
+                };
+                yield StreamEvent::ToolCallInputDelta {
+                    id: "tc_stream".into(),
+                    delta: r#"{"x":1}"#.into(),
+                };
+                yield StreamEvent::ToolCallBlockEnd {
+                    id: "tc_stream".into(),
+                    input: serde_json::Value::Null,
+                };
+            } else {
+                yield StreamEvent::TextDelta("done".into());
+            }
+            yield StreamEvent::UsageSummary(usage(10));
+            yield StreamEvent::StreamEnd;
+        };
+        Box::pin(stream)
+    }
+}
+
+#[tokio::test]
+async fn streaming_tool_calls_persist_the_assistant_tool_use() {
+    let api = Box::new(StreamingToolMock {
+        calls: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+    });
+    let tools = Box::new(EchoToolExecutor);
+    let (mut engine, _rx) = make_engine(api, tools);
+
+    let mut options = SubmitOptions::default();
+    options.handle_elicitation = false;
+    let reason = engine
+        .submit_streaming("use a tool".into(), options)
+        .await
+        .unwrap();
+    assert_eq!(reason, TerminalReason::Completed);
+
+    let msgs = &engine.session().messages;
+    let call_index = msgs.iter().position(|m| {
+        matches!(
+            &m.content,
+            coderex_core::types::MessageContent::ToolCall(tc) if tc.id == "tc_stream"
+        )
+    });
+    let result_index = msgs.iter().position(|m| {
+        matches!(
+            &m.content,
+            coderex_core::types::MessageContent::ToolResult(tr) if tr.tool_call_id == "tc_stream"
+        )
+    });
+
+    assert!(
+        call_index.is_some(),
+        "the streaming tool_use was not persisted: {msgs:?}"
+    );
+    assert!(
+        result_index.is_some(),
+        "the streaming tool_result was not persisted: {msgs:?}"
+    );
+    assert!(
+        call_index < result_index,
+        "the tool_use must come before its result"
+    );
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 //  1.4 Tool Call Loop
 // ═══════════════════════════════════════════════════════════════════════════

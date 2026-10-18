@@ -1427,13 +1427,11 @@ impl ReplLoop {
             engine.set_transcript_path(crate::session_resume::transcript_dir(&self.cwd));
         }
 
-        // 3. Chrome integration
-        if !self.chrome_enabled {
-            if let Some(arc_dispatcher) = self.dispatcher.as_mut() {
-                if let Some(dispatcher) = Arc::get_mut(arc_dispatcher) {
-                    dispatcher.clear_chrome_client();
-                }
-            }
+        // 3. Chrome integration. The dispatcher is behind an Arc with clones
+        // (the engine and the agent manager), so `Arc::get_mut` never succeeds;
+        // the flag is shared instead and both listing and execution honour it.
+        if let Some(ref dispatcher) = self.dispatcher {
+            dispatcher.set_chrome_enabled(self.chrome_enabled);
         }
 
         // 4. Session name / title

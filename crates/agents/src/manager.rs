@@ -1324,6 +1324,10 @@ async fn run_agent_task(
         }
 
         let mut options = SubmitOptions::default();
+        // The child must know it is a sub-agent: the permission engine's
+        // background-agent hook keys off this, and without it every child
+        // tool call looks interactive.
+        options.agent_id = Some(agent_id.clone());
         options.custom_system_prompt = Some(system_prompt.clone());
         options.allowed_tools_override = if writable {
             allowed_tools.clone()
