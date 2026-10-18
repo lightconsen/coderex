@@ -3,6 +3,7 @@
 use coderex_mcp::channel::{InboundRequestHandler, JsonRpcChannel, JsonRpcError};
 use coderex_mcp::config::{McpConfig, McpServerConfig, McpTransport};
 use coderex_mcp::manager::McpManager;
+use coderex_mcp::server::{McpServer, ServerStatus};
 use coderex_mcp::oauth::{
     McpOAuthState, OAuthManager, OAuthTokenProvider, ReauthHandler,
 };
@@ -1438,6 +1439,332 @@ async fn tools_list_changed_triggers_rediscovery() {
     );
 
     manager.stop_all().await;
+}
+
+/// A classic MCP SSE server: a long-lived GET stream announces the POST
+/// message endpoint with an `endpoint` event, and JSON-RPC responses are
+/// written back on that same stream, correlated by id.
+fn spawn_legacy_sse_server() -> (SocketAddr, Arc<std::sync::Mutex<Vec<String>>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let recorded = Arc::clone(&requests);
+    let open_stream: Arc<std::sync::Mutex<Option<TcpStream>>> =
+        Arc::new(std::sync::Mutex::new(None));
+
+    std::thread::spawn(move || {
+        for stream in listener.incoming().flatten() {
+            let recorded = Arc::clone(&recorded);
+            let open_stream = Arc::clone(&open_stream);
+            std::thread::spawn(move || {
+                let mut stream = stream;
+                let request = read_request(&mut stream);
+                recorded.lock().unwrap().push(request.clone());
+
+                if is_get(&request) {
+                    stream
+                        .write_all(
+                            b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: keep-alive\r\n\r\n",
+                        )
+                        .unwrap();
+                    stream.flush().unwrap();
+                    // Store the stream before announcing the endpoint, so a
+                    // POST triggered by that event cannot find it missing.
+                    *open_stream.lock().unwrap() = Some(stream);
+                    let mut guard = open_stream.lock().unwrap();
+                    if let Some(sse) = guard.as_mut() {
+                        sse.write_all(
+                            b"event: endpoint\ndata: /messages?sessionId=legacy-1\n\n",
+                        )
+                        .unwrap();
+                        sse.flush().unwrap();
+                    }
+                    return;
+                }
+
+                let body = request
+                    .split_once("\r\n\r\n")
+                    .map(|(_, body)| body)
+                    .unwrap_or("");
+                let message: serde_json::Value =
+                    serde_json::from_str(body).unwrap_or(serde_json::Value::Null);
+                let method = message
+                    .get("method")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("");
+                let id = message.get("id").and_then(serde_json::Value::as_u64);
+
+                // The initialize response sets a session header; every later
+                // POST must echo it along with the negotiated protocol version.
+                if method == "initialize" {
+                    stream
+                        .write_all(
+                            b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nMcp-Session-Id: legacy-session\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                        )
+                        .unwrap();
+                } else {
+                    stream
+                        .write_all(
+                            b"HTTP/1.1 202 Accepted\r\nContent-Type: application/json\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                        )
+                        .unwrap();
+                }
+                stream.flush().unwrap();
+
+                let event = match (method, id) {
+                    ("initialize", Some(id)) => Some(format!(
+                        "event: message\ndata: {{\"jsonrpc\":\"2.0\",\"id\":{id},\"result\":{{\"protocolVersion\":\"2024-11-05\"}}}}\n\n"
+                    )),
+                    ("tools/list", Some(id)) => Some(format!(
+                        "event: message\ndata: {{\"jsonrpc\":\"2.0\",\"id\":{id},\"result\":{{\"tools\":[{{\"name\":\"legacy_read\"}}]}}}}\n\n"
+                    )),
+                    ("resources/list", Some(id)) => Some(format!(
+                        "event: message\ndata: {{\"jsonrpc\":\"2.0\",\"id\":{id},\"result\":{{\"resources\":[]}}}}\n\n"
+                    )),
+                    _ => None,
+                };
+                if let Some(event) = event {
+                    if let Some(sse) = open_stream.lock().unwrap().as_mut() {
+                        sse.write_all(event.as_bytes()).unwrap();
+                        sse.flush().unwrap();
+                    }
+                }
+            });
+        }
+    });
+
+    (address, requests)
+}
+
+/// `type: "sse"` must use classic HTTP+SSE: GET an event stream, learn the
+/// separate POST endpoint from its `endpoint` event, and correlate responses
+/// by id — not POST to the stream URL as streamable HTTP would.
+#[tokio::test]
+async fn legacy_sse_uses_the_announced_message_endpoint_and_stream_responses() {
+    let (address, requests) = spawn_legacy_sse_server();
+    let mut channel = JsonRpcChannel::new_sse(
+        &format!("http://{address}/sse"),
+        HashMap::from([("authorization".into(), "Bearer legacy".into())]),
+    )
+    .unwrap();
+
+    channel.spawn().await.unwrap();
+    channel.initialize().await.unwrap();
+    let tools = channel.list_tools().await.unwrap();
+    assert_eq!(tools["tools"][0]["name"], "legacy_read");
+
+    let recorded = requests.lock().unwrap();
+    let get = recorded
+        .iter()
+        .find(|request| is_get(request))
+        .expect("no GET event stream:");
+    assert_eq!(
+        header_value(get, "accept").as_deref(),
+        Some("text/event-stream"),
+        "the SSE stream must ask for text/event-stream: {get}"
+    );
+    assert_eq!(
+        authorization(get).as_deref(),
+        Some("Bearer legacy"),
+        "the GET stream did not carry the configured auth header: {get}"
+    );
+
+    let initialize = recorded
+        .iter()
+        .find(|request| request.contains("\"method\":\"initialize\""))
+        .expect("no initialize POST: ");
+    assert!(
+        initialize.starts_with("POST /messages?sessionId=legacy-1 "),
+        "the request did not go to the announced endpoint: {initialize}"
+    );
+    assert_eq!(
+        authorization(initialize).as_deref(),
+        Some("Bearer legacy"),
+        "the POST did not carry the configured auth header: {initialize}"
+    );
+    assert_eq!(
+        header_value(initialize, "mcp-session-id"),
+        None,
+        "initialize cannot carry a session it does not know yet: {initialize}"
+    );
+
+    let tools_list = recorded
+        .iter()
+        .find(|request| request.contains("\"method\":\"tools/list\""))
+        .expect("no tools/list POST: ");
+    assert!(
+        tools_list.starts_with("POST /messages?sessionId=legacy-1 "),
+        "tools/list did not use the message endpoint: {tools_list}"
+    );
+    assert_eq!(
+        header_value(tools_list, "mcp-session-id").as_deref(),
+        Some("legacy-session"),
+        "the POST did not carry the session id learned from initialize: {tools_list}"
+    );
+    assert_eq!(
+        header_value(tools_list, "mcp-protocol-version").as_deref(),
+        Some("2024-11-05"),
+        "the POST did not carry the negotiated protocol version: {tools_list}"
+    );
+
+    drop(recorded);
+    // Graceful shutdown cancels the long-lived stream.
+    channel.terminate().await.unwrap();
+}
+
+/// A config entry with `type: "sse"` must drive the whole manager over the
+/// classic transport: the initialize POST goes to the endpoint announced by
+/// the GET event stream, not to the configured URL.
+#[tokio::test]
+async fn config_type_sse_drives_the_manager_over_the_legacy_transport() {
+    let (address, requests) = spawn_legacy_sse_server();
+    let config: McpConfig = serde_json::from_str(&format!(
+        r#"{{
+            "mcpServers": {{
+                "legacy": {{
+                    "type": "sse",
+                    "url": "http://{address}/sse",
+                    "headers": {{ "Authorization": "Bearer legacy" }}
+                }}
+            }}
+        }}"#
+    ))
+    .unwrap();
+
+    let manager = McpManager::new();
+    manager.load_config(&config);
+    assert_eq!(
+        manager.get_server("legacy").unwrap().transport,
+        McpTransport::Sse
+    );
+
+    manager.start_all().await;
+    assert!(manager.is_running("legacy"));
+    assert!(
+        manager
+            .list_tools()
+            .contains(&"mcp__legacy__legacy_read".to_string()),
+        "tools were not discovered over legacy SSE: {:?}",
+        manager.list_tools()
+    );
+
+    let recorded = requests.lock().unwrap();
+    let initialize = recorded
+        .iter()
+        .find(|request| request.contains("\"method\":\"initialize\""))
+        .expect("no initialize POST: ");
+    assert!(
+        initialize.starts_with("POST /messages?sessionId=legacy-1 "),
+        "`type: \"sse\"` was not sent to the announced message endpoint: {initialize}"
+    );
+
+    drop(recorded);
+    manager.stop_all().await;
+}
+
+/// An endpoint configured as `type: "sse"` that refuses the GET event stream
+/// must be rejected loudly, not silently treated as streamable HTTP.
+#[tokio::test]
+async fn an_sse_server_without_an_event_stream_is_rejected_loudly() {
+    let (address, _requests) = spawn_session_server();
+    let mut server = McpServer::new_http(
+        "legacy",
+        format!("http://{address}/mcp"),
+        McpTransport::Sse,
+        HashMap::new(),
+    );
+
+    let error = server
+        .spawn()
+        .await
+        .expect_err("a streamable-only endpoint must not be accepted as SSE");
+    assert!(
+        error.to_string().contains("405"),
+        "the rejection should name the 405: {error}"
+    );
+    assert_eq!(
+        server.status,
+        ServerStatus::Errored,
+        "a server that cannot serve SSE must not be reported as running"
+    );
+}
+
+/// A 405 to a POST is not the session-expired signal: it must surface as an
+/// ordinary HTTP error, keep the session id, and must not re-initialize.
+#[tokio::test]
+async fn a_post_405_is_not_reported_as_a_session_expiry() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let recorded = Arc::clone(&requests);
+
+    std::thread::spawn(move || {
+        for mut stream in listener.incoming().flatten() {
+            let request = read_request(&mut stream);
+            recorded.lock().unwrap().push(request.clone());
+
+            if is_get(&request) {
+                write_response(
+                    &mut stream,
+                    "405 Method Not Allowed",
+                    "application/json",
+                    "",
+                );
+            } else if request.contains("\"method\":\"initialize\"") {
+                let body = r#"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2024-11-05"}}"#;
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nMcp-Session-Id: session-405\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                stream.write_all(response.as_bytes()).unwrap();
+            } else if request.contains("\"method\":\"initialized\"") {
+                write_response(&mut stream, "202 Accepted", "application/json", "");
+            } else if request.contains("\"method\":\"tools/list\"") {
+                write_response(
+                    &mut stream,
+                    "405 Method Not Allowed",
+                    "application/json",
+                    "",
+                );
+            } else {
+                write_response(&mut stream, "202 Accepted", "application/json", "");
+            }
+        }
+    });
+
+    let mut channel =
+        JsonRpcChannel::new_http(&format!("http://{address}/mcp"), HashMap::new()).unwrap();
+    channel.spawn().await.unwrap();
+    channel.initialize().await.unwrap();
+    assert_eq!(channel.session_id().as_deref(), Some("session-405"));
+
+    let error = channel
+        .send_request("tools/list", None)
+        .await
+        .expect_err("a 405 on POST must be an error");
+    assert!(error.contains("405"), "unexpected error: {error}");
+    assert!(
+        !error.contains("after re-initializing"),
+        "a POST 405 must not trigger re-initialization: {error}"
+    );
+    assert_eq!(
+        channel.session_id().as_deref(),
+        Some("session-405"),
+        "a POST 405 must not clear the session id"
+    );
+
+    let recorded = requests.lock().unwrap();
+    let initializes = recorded
+        .iter()
+        .filter(|request| request.contains("\"method\":\"initialize\""))
+        .count();
+    assert_eq!(
+        initializes, 1,
+        "a POST 405 must not re-initialize the session: {recorded:?}"
+    );
+
+    drop(recorded);
+    channel.terminate().await.unwrap();
 }
 
 #[tokio::test]

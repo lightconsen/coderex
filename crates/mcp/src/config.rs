@@ -11,7 +11,9 @@ pub enum McpTransport {
     /// Launch a subprocess and exchange newline-delimited JSON-RPC over stdio.
     #[default]
     Stdio,
-    /// Connect to a remote HTTP endpoint and read SSE-framed responses.
+    /// Connect to a classic (legacy) HTTP+SSE endpoint: a long-lived GET
+    /// event stream announces a separate POST message endpoint, and responses
+    /// are correlated by JSON-RPC id.
     Sse,
     /// Connect to a remote streamable-HTTP endpoint.
     #[serde(alias = "streamable-http")]
@@ -218,6 +220,41 @@ mod tests {
         assert_eq!(server.url.as_deref(), Some("http://localhost:3000/mcp"));
         assert_eq!(server.headers["Authorization"], "Bearer test");
         assert!(server.command.is_empty());
+    }
+
+    /// `http` and its `streamable-http` alias are the streamable transport;
+    /// `sse` is the classic HTTP+SSE transport, not an alias for it.
+    #[test]
+    fn transport_names_select_distinct_transports() {
+        let config: McpConfig = serde_json::from_str(
+            r#"{
+                "mcpServers": {
+                    "streamable": { "type": "http", "url": "http://localhost/streamable" },
+                    "aliased": { "type": "streamable-http", "url": "http://localhost/aliased" },
+                    "legacy": { "type": "sse", "url": "http://localhost/sse" },
+                    "defaulted": { "url": "http://localhost/default" }
+                }
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            config.get_server("streamable").unwrap().transport,
+            McpTransport::Http
+        );
+        assert_eq!(
+            config.get_server("aliased").unwrap().transport,
+            McpTransport::Http
+        );
+        assert_eq!(
+            config.get_server("legacy").unwrap().transport,
+            McpTransport::Sse,
+            "`type: \"sse\"` must not be treated as streamable HTTP"
+        );
+        assert_eq!(
+            config.get_server("defaulted").unwrap().transport,
+            McpTransport::Stdio
+        );
     }
 
     #[test]

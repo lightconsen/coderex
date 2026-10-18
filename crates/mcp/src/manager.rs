@@ -261,6 +261,10 @@ impl McpManager {
                     server_config.args.clone(),
                     server_config.env.clone(),
                 ),
+                // Both remote transports keep their own identity here: the
+                // channel branches on the transport, so `Sse` gets the classic
+                // GET-stream + POST-endpoint flow while `Http` gets streamable
+                // HTTP. Neither is an alias for the other.
                 McpTransport::Sse | McpTransport::Http => {
                     let Some(url) = server_config.url.clone() else {
                         tracing::warn!(

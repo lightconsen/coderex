@@ -13,6 +13,7 @@ use serde_json::Value;
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
+use tokio::sync::{oneshot, watch};
 use tokio_util::sync::CancellationToken;
 
 /// The header the MCP streamable-HTTP transport uses to name a session.
@@ -34,6 +35,51 @@ const DEDUP_CAPACITY: usize = 256;
 const MAX_SSE_EVENT_BYTES: usize = 4 * 1024 * 1024;
 /// Messages the stream may hold while the handler is busy before it closes.
 const INBOUND_QUEUE_CAPACITY: usize = 64;
+/// How long a legacy-SSE request waits for its response on the event stream.
+///
+/// A streamable-HTTP response is bound to the POST that carried the request,
+/// but a classic SSE server answers asynchronously on the long-lived GET
+/// stream. Without a bound, a server that drops the message would leave the
+/// caller waiting forever.
+const LEGACY_SSE_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
+/// The two remote transports this module speaks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RemoteMode {
+    /// MCP streamable HTTP: POST requests, optional standalone GET stream.
+    StreamableHttp,
+    /// Legacy MCP SSE: a long-lived GET event stream that announces the POST
+    /// message endpoint, and responses correlated by JSON-RPC id.
+    LegacySse,
+}
+
+/// Why one legacy-SSE request attempt failed.
+#[derive(Debug)]
+enum LegacyRequestFailure {
+    /// The POST was rejected with an HTTP status.
+    Status {
+        /// The status the server returned.
+        status: reqwest::StatusCode,
+        /// The response body, for the error text.
+        body: String,
+    },
+    /// The request never reached the server, or the endpoint was never
+    /// announced.
+    Transport(String),
+    /// The server answered the request with a JSON-RPC error.
+    Response(String),
+}
+
+impl LegacyRequestFailure {
+    /// Render the failure for the caller.
+    fn into_message(self) -> String {
+        match self {
+            Self::Status { status, body } => {
+                format!("MCP SSE server returned {status}: {body}")
+            }
+            Self::Transport(message) | Self::Response(message) => message,
+        }
+    }
+}
 
 /// The state of a remote server's standalone server-to-client stream.
 ///
@@ -229,6 +275,13 @@ struct RequestContext {
     protocol_version: Arc<RwLock<Option<String>>>,
     /// Server requests already answered (or being answered) over either stream.
     dedup: Arc<RequestDedup>,
+    /// The POST message endpoint announced by a legacy-SSE `endpoint` event.
+    ///
+    /// Always `None` for streamable HTTP, whose requests go to `url`. A
+    /// `watch` channel rather than a plain lock: requests must wait for the
+    /// first `endpoint` event without a poll loop, and a reconnect may replace
+    /// it.
+    message_url: Arc<watch::Sender<Option<Url>>>,
 }
 
 impl RequestContext {
@@ -245,6 +298,56 @@ impl RequestContext {
         if let Ok(mut slot) = self.protocol_version.write() {
             *slot = None;
         }
+    }
+
+    /// The URL a JSON-RPC message is POSTed to.
+    ///
+    /// Streamable HTTP always uses the configured endpoint. Legacy SSE uses
+    /// the message endpoint announced by the event stream once it is known.
+    fn post_target(&self) -> Url {
+        self.message_url
+            .borrow()
+            .clone()
+            .unwrap_or_else(|| self.url.clone())
+    }
+
+    /// Remember the message endpoint announced by a legacy-SSE `endpoint`
+    /// event.
+    fn set_message_url(&self, url: Url) {
+        self.message_url.send_replace(Some(url));
+    }
+
+    /// Forget the announced message endpoint, e.g. before reconnecting.
+    fn clear_message_url(&self) {
+        self.message_url.send_replace(None);
+    }
+
+    /// Wait until the legacy-SSE stream has announced its POST endpoint.
+    async fn wait_for_message_url(&self) -> Result<Url, String> {
+        if let Some(url) = self.message_url.borrow().clone() {
+            return Ok(url);
+        }
+
+        let mut receiver = self.message_url.subscribe();
+        let wait = async {
+            loop {
+                if let Some(url) = receiver.borrow().clone() {
+                    return Ok(url);
+                }
+                receiver.changed().await.map_err(|_| {
+                    "the MCP SSE stream ended before it announced a message endpoint".to_string()
+                })?;
+            }
+        };
+
+        tokio::time::timeout(LEGACY_SSE_REQUEST_TIMEOUT, wait)
+            .await
+            .map_err(|_| {
+                format!(
+                    "timed out after {}s waiting for the MCP SSE endpoint event",
+                    LEGACY_SSE_REQUEST_TIMEOUT.as_secs()
+                )
+            })?
     }
 
     /// Remember a session id the server set on a response.
@@ -399,10 +502,11 @@ impl RequestContext {
         body: &T,
         accept: &'static str,
     ) -> Result<reqwest::Response, String> {
+        let url = self.post_target();
         let response = self
             .send_with_recovery("MCP HTTP request failed", |headers| {
                 self.client
-                    .post(self.url.clone())
+                    .post(url.clone())
                     .headers(headers)
                     .header(ACCEPT, accept)
                     .header(CONTENT_TYPE, "application/json")
@@ -451,10 +555,11 @@ impl RequestContext {
         };
 
         let context = format!("failed to answer the server's '{}' request", request.method);
+        let url = self.post_target();
         let delivered = self
             .send_with_recovery(&context, |headers| {
                 self.client
-                    .post(self.url.clone())
+                    .post(url.clone())
                     .headers(headers)
                     .header(CONTENT_TYPE, "application/json")
                     .json(&response)
@@ -533,6 +638,8 @@ impl RequestContext {
 #[derive(Debug)]
 pub struct HttpChannel {
     context: RequestContext,
+    /// Streamable HTTP or classic SSE.
+    mode: RemoteMode,
     /// The handler shared with the GET-stream task, per event.
     ///
     /// Shared rather than copied so a handler installed after the stream
@@ -547,6 +654,11 @@ pub struct HttpChannel {
     event_state: Arc<RwLock<EventStreamState>>,
     /// Retry settings for the standalone stream.
     retry_policy: EventStreamRetryPolicy,
+    /// Legacy SSE responses waiting for their JSON-RPC id on the event stream.
+    pending: Arc<Mutex<HashMap<u64, oneshot::Sender<Result<Value, String>>>>>,
+    /// Keeps the legacy message-endpoint watch channel open while no request
+    /// is waiting on it.
+    _message_url_receiver: watch::Receiver<Option<Url>>,
 }
 
 /// A running standalone-stream task together with its cancellation token.
@@ -557,7 +669,22 @@ struct EventStreamHandle {
 }
 
 impl HttpChannel {
+    /// A streamable-HTTP channel.
     pub fn new(url: &str, headers: HashMap<String, String>) -> Result<Self, String> {
+        Self::new_with_mode(url, headers, RemoteMode::StreamableHttp)
+    }
+
+    /// A legacy (HTTP+SSE) channel: a long-lived GET event stream plus a
+    /// separate POST message endpoint announced by that stream.
+    pub fn new_sse(url: &str, headers: HashMap<String, String>) -> Result<Self, String> {
+        Self::new_with_mode(url, headers, RemoteMode::LegacySse)
+    }
+
+    fn new_with_mode(
+        url: &str,
+        headers: HashMap<String, String>,
+        mode: RemoteMode,
+    ) -> Result<Self, String> {
         let url = Url::parse(url).map_err(|error| format!("invalid MCP server URL: {error}"))?;
         if !matches!(url.scheme(), "http" | "https") {
             return Err(format!(
@@ -575,6 +702,7 @@ impl HttpChannel {
             header_map.insert(name, value);
         }
 
+        let (message_url, message_url_receiver) = watch::channel(None);
         Ok(Self {
             context: RequestContext {
                 client: reqwest::Client::new(),
@@ -584,13 +712,23 @@ impl HttpChannel {
                 session_id: Arc::new(RwLock::new(None)),
                 protocol_version: Arc::new(RwLock::new(None)),
                 dedup: Arc::new(RequestDedup::default()),
+                message_url: Arc::new(message_url),
             },
+            mode,
             event_handler: Arc::new(RwLock::new(None)),
             notification_handler: Arc::new(RwLock::new(None)),
             event_stream: Mutex::new(None),
             event_state: Arc::new(RwLock::new(EventStreamState::Stopped)),
             retry_policy: EventStreamRetryPolicy::default(),
+            pending: Arc::new(Mutex::new(HashMap::new())),
+            _message_url_receiver: message_url_receiver,
         })
+    }
+
+    /// Whether this channel speaks legacy HTTP+SSE rather than streamable HTTP.
+    #[must_use]
+    pub fn is_legacy_sse(&self) -> bool {
+        self.mode == RemoteMode::LegacySse
     }
 
     /// Change how hard the standalone stream retries before it degrades.
@@ -646,6 +784,10 @@ impl HttpChannel {
         request: &JsonRpcRequest,
         handler: Option<&dyn InboundRequestHandler>,
     ) -> Result<Value, String> {
+        if self.is_legacy_sse() {
+            return self.send_request_legacy(request, handler).await;
+        }
+
         let mut reinitialized = false;
         loop {
             let response = self
@@ -698,6 +840,177 @@ impl HttpChannel {
         }
     }
 
+    /// Send one request over legacy HTTP+SSE and wait for its response on the
+    /// event stream.
+    ///
+    /// A 404 to the POST means the session (and with it the announced message
+    /// endpoint) is gone: the session id is cleared, a fresh event stream is
+    /// opened, the handshake runs once more, and the request is retried. A 405
+    /// is *not* a session expiry — it is an ordinary HTTP failure and is
+    /// surfaced as such.
+    async fn send_request_legacy(
+        &self,
+        request: &JsonRpcRequest,
+        handshake_handler: Option<&dyn InboundRequestHandler>,
+    ) -> Result<Value, String> {
+        let mut reinitialized = false;
+        loop {
+            match self.send_legacy_once(request).await {
+                Ok(value) => {
+                    if request.method == "initialize" {
+                        self.context.capture_protocol_version(&value);
+                    }
+                    return Ok(value);
+                }
+                Err(LegacyRequestFailure::Status { status, body })
+                    if status == reqwest::StatusCode::NOT_FOUND
+                        && request.method != "initialize" =>
+                {
+                    if reinitialized {
+                        return Err(format!(
+                            "MCP SSE server returned {status} after re-initializing: {body}"
+                        ));
+                    }
+                    tracing::debug!(
+                        method = %request.method,
+                        "the MCP SSE session is no longer valid; opening a new stream and re-initializing"
+                    );
+                    self.context.clear_session();
+                    self.context.clear_message_url();
+                    // A classic SSE session lives on its event stream, so the
+                    // new handshake needs a new stream and endpoint event.
+                    self.stop_event_stream().await;
+                    self.start_event_stream();
+                    self.reinitialize_legacy(handshake_handler).await?;
+                    reinitialized = true;
+                }
+                Err(error) => return Err(error.into_message()),
+            }
+        }
+    }
+
+    /// Re-run the initialize handshake over an already-restarted legacy-SSE
+    /// stream.
+    async fn reinitialize_legacy(
+        &self,
+        _handshake_handler: Option<&dyn InboundRequestHandler>,
+    ) -> Result<(), String> {
+        let request = JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            // The application request id space starts at 1; 0 cannot collide.
+            id: 0,
+            method: "initialize".to_string(),
+            params: Some(serde_json::json!({
+                "protocolVersion": DEFAULT_PROTOCOL_VERSION,
+                "capabilities": {},
+                "clientInfo": {"name": "coderex", "version": "0.1.0"}
+            })),
+        };
+        let result = self
+            .send_legacy_once(&request)
+            .await
+            .map_err(|error| format!("MCP SSE re-initialize failed: {}", error.into_message()))?;
+        self.context.capture_protocol_version(&result);
+
+        self.context
+            .send_notification(&JsonRpcNotification {
+                jsonrpc: "2.0".to_string(),
+                method: "initialized".to_string(),
+                params: None,
+            })
+            .await
+    }
+
+    /// POST one request to the announced message endpoint and wait for the
+    /// matching response on the event stream.
+    ///
+    /// The waiter is registered *before* the POST, so a server that answers
+    /// quickly cannot race the registration. The response arrives on the
+    /// long-lived GET stream and is matched by JSON-RPC id.
+    async fn send_legacy_once(
+        &self,
+        request: &JsonRpcRequest,
+    ) -> Result<Value, LegacyRequestFailure> {
+        // A stream that is gone cannot announce an endpoint; say so instead of
+        // waiting out the request timeout.
+        match self.event_stream_state() {
+            EventStreamState::Unsupported => {
+                return Err(LegacyRequestFailure::Transport(format!(
+                    "the MCP server at {} does not offer a classic SSE event stream",
+                    self.context.url
+                )));
+            }
+            EventStreamState::Degraded => {
+                return Err(LegacyRequestFailure::Transport(format!(
+                    "the MCP SSE event stream at {} is degraded",
+                    self.context.url
+                )));
+            }
+            EventStreamState::Stopped => {
+                return Err(LegacyRequestFailure::Transport(format!(
+                    "the MCP SSE event stream at {} is not running",
+                    self.context.url
+                )));
+            }
+            EventStreamState::Starting | EventStreamState::Active => {}
+        }
+
+        // Waiting here is what makes the first request after startup work: the
+        // `endpoint` event names the URL the POST must go to.
+        self.context
+            .wait_for_message_url()
+            .await
+            .map_err(LegacyRequestFailure::Transport)?;
+
+        let (sender, receiver) = oneshot::channel();
+        self.pending
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(request.id, sender);
+
+        let response = match self
+            .context
+            .post(request, "application/json, text/event-stream")
+            .await
+        {
+            Ok(response) => response,
+            Err(error) => {
+                self.take_pending(request.id);
+                return Err(LegacyRequestFailure::Transport(error));
+            }
+        };
+
+        let status = response.status();
+        if !status.is_success() {
+            let body = response.text().await.unwrap_or_default();
+            self.take_pending(request.id);
+            return Err(LegacyRequestFailure::Status { status, body });
+        }
+
+        match tokio::time::timeout(LEGACY_SSE_REQUEST_TIMEOUT, receiver).await {
+            Ok(Ok(Ok(value))) => Ok(value),
+            Ok(Ok(Err(error))) => Err(LegacyRequestFailure::Response(error)),
+            Ok(Err(_)) => Err(LegacyRequestFailure::Transport(
+                "the MCP SSE stream ended before the response arrived".to_string(),
+            )),
+            Err(_) => {
+                self.take_pending(request.id);
+                Err(LegacyRequestFailure::Transport(format!(
+                    "timed out after {}s waiting for the response to '{}' on the MCP SSE stream",
+                    LEGACY_SSE_REQUEST_TIMEOUT.as_secs(),
+                    request.method
+                )))
+            }
+        }
+    }
+
+    fn take_pending(&self, id: u64) {
+        self.pending
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&id);
+    }
+
     pub async fn send_notification(
         &self,
         notification: &JsonRpcNotification,
@@ -730,9 +1043,27 @@ impl HttpChannel {
         let policy = self.retry_policy;
         let token = cancel.clone();
         let task_state = Arc::clone(&state);
+        let mode = self.mode;
+        let pending = Arc::clone(&self.pending);
         let task = tokio::spawn(async move {
-            let final_state =
-                run_event_stream(context, handler, notifications, policy, token, task_state).await;
+            let final_state = match mode {
+                RemoteMode::StreamableHttp => {
+                    run_event_stream(context, handler, notifications, policy, token, task_state)
+                        .await
+                }
+                RemoteMode::LegacySse => {
+                    run_legacy_event_stream(
+                        context,
+                        handler,
+                        notifications,
+                        pending,
+                        policy,
+                        token,
+                        task_state,
+                    )
+                    .await
+                }
+            };
             set_stream_state(&state, final_state);
         });
         if let Ok(mut slot) = self.event_stream.lock() {
@@ -779,6 +1110,54 @@ impl HttpChannel {
             self.event_stream_state(),
             EventStreamState::Starting | EventStreamState::Active
         )
+    }
+
+    /// Wait for a legacy-SSE stream to connect, failing loudly when the
+    /// endpoint does not speak SSE.
+    ///
+    /// Without this the first request would wait for an `endpoint` event that
+    /// a streamable or plain HTTP endpoint will never send. A 405 is reported
+    /// as a configuration error instead of being silently retried as if it
+    /// were the optional standalone stream of the streamable transport.
+    pub async fn await_legacy_stream(&self) -> Result<(), String> {
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            match self.event_stream_state() {
+                // Connected *and* the endpoint event has been processed: only
+                // then can the first POST be sent.
+                EventStreamState::Active if self.context.message_url.borrow().is_some() => {
+                    return Ok(());
+                }
+                EventStreamState::Active => {}
+                EventStreamState::Unsupported => {
+                    return Err(format!(
+                        "the MCP server at {} answered 405 to the SSE GET; `type: \"sse\"` requires a classic SSE endpoint",
+                        self.context.url
+                    ));
+                }
+                EventStreamState::Degraded => {
+                    return Err(format!(
+                        "the MCP SSE event stream at {} could not be established",
+                        self.context.url
+                    ));
+                }
+                EventStreamState::Stopped => {
+                    return Err(format!(
+                        "the MCP SSE event stream at {} stopped before connecting",
+                        self.context.url
+                    ));
+                }
+                EventStreamState::Starting => {}
+            }
+
+            if Instant::now() >= deadline {
+                return Err(format!(
+                    "timed out connecting to the MCP SSE event stream at {}",
+                    self.context.url
+                ));
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
     }
 }
 
@@ -1001,6 +1380,360 @@ async fn run_event_stream(
             () = tokio::time::sleep(delay) => {}
         }
     }
+}
+
+/// Keep a classic MCP SSE event stream open, reconnecting with bounded
+/// backoff.
+///
+/// Unlike the streamable transport's optional standalone stream, this GET
+/// stream *is* the transport: it announces the POST message endpoint and
+/// carries every response. A 405 means the configured endpoint does not speak
+/// SSE, so the stream stops permanently and requests fail loudly instead of
+/// silently behaving like streamable HTTP.
+async fn run_legacy_event_stream(
+    context: RequestContext,
+    handler: Arc<RwLock<Option<Arc<dyn InboundRequestHandler>>>>,
+    notifications: Arc<RwLock<Option<Arc<dyn ServerNotificationHandler>>>>,
+    pending: Arc<Mutex<HashMap<u64, oneshot::Sender<Result<Value, String>>>>>,
+    policy: EventStreamRetryPolicy,
+    cancel: CancellationToken,
+    state: Arc<RwLock<EventStreamState>>,
+) -> EventStreamState {
+    let mut failures = 0_usize;
+    let mut last_progress = Instant::now();
+
+    loop {
+        if cancel.is_cancelled() {
+            return EventStreamState::Stopped;
+        }
+        set_stream_state(&state, EventStreamState::Starting);
+
+        let attempt = read_legacy_event_stream_once(
+            &context,
+            &handler,
+            &notifications,
+            &pending,
+            &cancel,
+            &state,
+        )
+        .await;
+
+        match attempt {
+            Err(error) => {
+                tracing::warn!(url = %context.url, "MCP SSE stream failed: {error}");
+            }
+            Ok(attempt) => match attempt.end {
+                StreamEnd::Cancelled => return EventStreamState::Stopped,
+                StreamEnd::Unsupported => {
+                    tracing::warn!(
+                        url = %context.url,
+                        "the configured MCP endpoint answered 405 to the SSE GET; the legacy SSE transport cannot be used"
+                    );
+                    return EventStreamState::Unsupported;
+                }
+                StreamEnd::Overflow => {
+                    tracing::warn!(
+                        url = %context.url,
+                        "the MCP SSE inbound queue overflowed; closing it rather than buffering without bound"
+                    );
+                    return EventStreamState::Degraded;
+                }
+                StreamEnd::SessionExpired => {
+                    // The legacy reader does not use this: a 404 to the GET is
+                    // an ordinary failed attempt, bounded by the retry policy.
+                }
+                StreamEnd::Closed => {
+                    tracing::debug!(
+                        url = %context.url,
+                        "MCP SSE stream closed; reconnecting"
+                    );
+                    if attempt.events > 0 {
+                        failures = 0;
+                        last_progress = Instant::now();
+                    }
+                }
+            },
+        }
+
+        failures += 1;
+        if failures >= policy.max_attempts || last_progress.elapsed() >= policy.max_duration {
+            tracing::warn!(
+                url = %context.url,
+                failures,
+                "the MCP SSE stream is degraded; stopping retries"
+            );
+            return EventStreamState::Degraded;
+        }
+
+        let delay = jittered_delay(backoff_delay(&policy, failures));
+        tokio::select! {
+            () = cancel.cancelled() => return EventStreamState::Stopped,
+            () = tokio::time::sleep(delay) => {}
+        }
+    }
+}
+
+/// Read one connection to the classic SSE stream until it ends.
+async fn read_legacy_event_stream_once(
+    context: &RequestContext,
+    handler: &Arc<RwLock<Option<Arc<dyn InboundRequestHandler>>>>,
+    notifications: &Arc<RwLock<Option<Arc<dyn ServerNotificationHandler>>>>,
+    pending: &Arc<Mutex<HashMap<u64, oneshot::Sender<Result<Value, String>>>>>,
+    cancel: &CancellationToken,
+    state: &Arc<RwLock<EventStreamState>>,
+) -> Result<StreamAttempt, String> {
+    // The endpoint event names the current session's message URL. Forget the
+    // previous one so a request cannot POST to a session that is gone.
+    context.clear_message_url();
+
+    let accept = HeaderValue::from_static(EVENT_STREAM_ACCEPT);
+    let response = tokio::select! {
+        () = cancel.cancelled() => {
+            return Ok(StreamAttempt { end: StreamEnd::Cancelled, events: 0 });
+        }
+        response = context.send_with_recovery(
+            "connecting to the MCP SSE stream failed",
+            |mut headers| {
+                headers.insert(ACCEPT, accept.clone());
+                context.client.get(context.url.clone()).headers(headers)
+            },
+        ) => response?,
+    };
+
+    let status = response.status();
+    if status == reqwest::StatusCode::METHOD_NOT_ALLOWED {
+        return Ok(StreamAttempt {
+            end: StreamEnd::Unsupported,
+            events: 0,
+        });
+    }
+    if !status.is_success() {
+        return Err(format!("the MCP SSE GET stream returned {status}"));
+    }
+    set_stream_state(state, EventStreamState::Active);
+
+    // `(event type, data)` pairs; the worker learns the endpoint URL and
+    // routes messages without blocking the socket read while a person answers
+    // an elicitation.
+    let (tx, mut rx) =
+        tokio::sync::mpsc::channel::<(String, String)>(INBOUND_QUEUE_CAPACITY);
+    let worker_context = context.clone();
+    let worker_handler = Arc::clone(handler);
+    let worker_notifications = Arc::clone(notifications);
+    let worker_pending = Arc::clone(pending);
+    let worker = tokio::spawn(async move {
+        let mut processed = 0_usize;
+        while let Some((event_type, data)) = rx.recv().await {
+            if process_legacy_event(
+                &worker_context,
+                &worker_handler,
+                &worker_notifications,
+                &worker_pending,
+                &event_type,
+                &data,
+            )
+            .await
+            {
+                processed += 1;
+            }
+        }
+        processed
+    });
+
+    let mut response = response;
+    let mut buffer = Vec::new();
+    let mut overflow = false;
+
+    'read: loop {
+        let mut events = take_events(&mut buffer);
+        for event in events.drain(..) {
+            let Some(data) = sse_event_data(&event) else {
+                continue;
+            };
+            let event_type = sse_event_type(&event).unwrap_or_default();
+            if tx.try_send((event_type, data)).is_err() {
+                overflow = true;
+                break 'read;
+            }
+        }
+
+        match tokio::select! {
+            () = cancel.cancelled() => {
+                drop(tx);
+                worker.abort();
+                return Ok(StreamAttempt { end: StreamEnd::Cancelled, events: 0 });
+            }
+            chunk = response.chunk() => chunk,
+        } {
+            Ok(Some(chunk)) => {
+                buffer.extend_from_slice(&chunk);
+                if buffer.len() > MAX_SSE_EVENT_BYTES {
+                    tracing::warn!(
+                        url = %context.url,
+                        "an MCP SSE event exceeded the size limit; closing the stream"
+                    );
+                    overflow = true;
+                    break;
+                }
+            }
+            Ok(None) => break,
+            Err(error) => {
+                drop(tx);
+                worker.abort();
+                return Err(format!("reading the MCP SSE stream failed: {error}"));
+            }
+        }
+    }
+
+    // The final event may not have its terminating blank line before the
+    // connection closed.
+    if !overflow && !buffer.is_empty() {
+        let event = String::from_utf8_lossy(&buffer).into_owned();
+        if let Some(data) = sse_event_data(&event) {
+            let event_type = sse_event_type(&event).unwrap_or_default();
+            if tx.try_send((event_type, data)).is_err() {
+                overflow = true;
+            }
+        }
+    }
+    drop(tx);
+
+    if overflow {
+        worker.abort();
+        return Ok(StreamAttempt {
+            end: StreamEnd::Overflow,
+            events: 0,
+        });
+    }
+
+    let events = worker.await.unwrap_or(0);
+    Ok(StreamAttempt {
+        end: StreamEnd::Closed,
+        events,
+    })
+}
+
+/// Route one legacy-SSE event: learn the message endpoint, or dispatch the
+/// JSON-RPC message it carries.
+async fn process_legacy_event(
+    context: &RequestContext,
+    handler: &Arc<RwLock<Option<Arc<dyn InboundRequestHandler>>>>,
+    notifications: &Arc<RwLock<Option<Arc<dyn ServerNotificationHandler>>>>,
+    pending: &Arc<Mutex<HashMap<u64, oneshot::Sender<Result<Value, String>>>>>,
+    event_type: &str,
+    data: &str,
+) -> bool {
+    if event_type == "endpoint" {
+        let endpoint = data.trim();
+        if endpoint.is_empty() {
+            return false;
+        }
+        match context.url.join(endpoint) {
+            Ok(url) => {
+                tracing::debug!(endpoint = %url, "MCP SSE server announced its message endpoint");
+                context.set_message_url(url);
+                true
+            }
+            Err(error) => {
+                tracing::warn!("the MCP SSE endpoint event named an invalid URL: {error}");
+                false
+            }
+        }
+    } else if event_type.is_empty() || event_type == "message" {
+        process_legacy_message(context, handler, notifications, pending, data).await
+    } else {
+        // Unknown event types are allowed by SSE; ignore them rather than
+        // failing a stream that may still carry the messages we need.
+        tracing::debug!(event_type, "ignoring an unknown MCP SSE event type");
+        false
+    }
+}
+
+/// Route one JSON-RPC message delivered over the classic SSE stream.
+async fn process_legacy_message(
+    context: &RequestContext,
+    handler: &Arc<RwLock<Option<Arc<dyn InboundRequestHandler>>>>,
+    notifications: &Arc<RwLock<Option<Arc<dyn ServerNotificationHandler>>>>,
+    pending: &Arc<Mutex<HashMap<u64, oneshot::Sender<Result<Value, String>>>>>,
+    data: &str,
+) -> bool {
+    if data.trim().is_empty() || data.trim() == "[DONE]" {
+        return false;
+    }
+
+    // Keep-alives and other non-JSON payloads are skipped.
+    let Ok(value) = serde_json::from_str::<Value>(data) else {
+        return false;
+    };
+
+    let has_method = value.get("method").is_some();
+    let has_id = value.get("id").is_some();
+
+    match (has_method, has_id) {
+        // A request from the server, answered over the message endpoint.
+        (true, true) => match serde_json::from_value::<JsonRpcServerRequest>(value.clone()) {
+            Ok(request) => {
+                let handler = handler
+                    .read()
+                    .ok()
+                    .and_then(|slot| slot.as_ref().map(Arc::clone));
+                if let Err(error) = context.answer_once(&request, handler.as_deref()).await {
+                    tracing::warn!(
+                        method = %request.method,
+                        "could not answer a request from the MCP SSE stream: {error}"
+                    );
+                }
+            }
+            Err(error) => {
+                tracing::warn!("failed to parse a server request from the MCP SSE stream: {error}");
+            }
+        },
+        // A notification, which may invalidate discovery or cached resources.
+        (true, false) => {
+            let method = value.get("method").and_then(Value::as_str).unwrap_or("");
+            dispatch_notification(notifications, method, value.get("params")).await;
+        }
+        // A response: hand it to the request waiting on that id.
+        (false, true) => {
+            let response: JsonRpcResponse = match serde_json::from_value(value.clone()) {
+                Ok(response) => response,
+                Err(error) => {
+                    tracing::warn!(
+                        "failed to parse a response from the MCP SSE stream: {error}"
+                    );
+                    return false;
+                }
+            };
+            let waiter = pending
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .remove(&response.id);
+            match waiter {
+                Some(sender) => {
+                    let outcome = match response.error {
+                        Some(error) => Err(format!(
+                            "JSON-RPC error (code {}): {}",
+                            error.code, error.message
+                        )),
+                        None => Ok(response.result.unwrap_or(Value::Null)),
+                    };
+                    let _ = sender.send(outcome);
+                }
+                None => tracing::debug!(
+                    id = response.id,
+                    "a response arrived on the MCP SSE stream with no request waiting on it"
+                ),
+            }
+        }
+        (false, false) => {
+            tracing::warn!(
+                message = %value,
+                "a message on the MCP SSE stream is neither a response nor a request"
+            );
+        }
+    }
+
+    true
 }
 
 /// The exponential part of the retry delay, capped by the policy.
@@ -1494,6 +2227,20 @@ fn sse_event_id(event: &str) -> Option<String> {
         let id = rest.strip_prefix(' ').unwrap_or(rest).trim();
         if !id.is_empty() {
             return Some(id.to_string());
+        }
+    }
+    None
+}
+
+/// The `event:` field of one SSE event, if it has one.
+fn sse_event_type(event: &str) -> Option<String> {
+    for line in event.split(['\n', '\r']) {
+        let Some(rest) = line.strip_prefix("event:") else {
+            continue;
+        };
+        let event_type = rest.strip_prefix(' ').unwrap_or(rest).trim();
+        if !event_type.is_empty() {
+            return Some(event_type.to_string());
         }
     }
     None

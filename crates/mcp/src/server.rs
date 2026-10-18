@@ -163,7 +163,13 @@ impl McpServer {
             McpTransport::Stdio => {
                 JsonRpcChannel::new(self.command.clone(), self.args.clone(), self.env.clone())
             }
-            McpTransport::Sse | McpTransport::Http => {
+            McpTransport::Sse => {
+                let url = self.url.as_deref().ok_or_else(|| {
+                    format!("remote MCP server '{}' has no URL configured", self.name)
+                })?;
+                JsonRpcChannel::new_sse(url, self.headers.clone())?
+            }
+            McpTransport::Http => {
                 let url = self.url.as_deref().ok_or_else(|| {
                     format!("remote MCP server '{}' has no URL configured", self.name)
                 })?;
@@ -278,7 +284,19 @@ impl McpServer {
                 tracing::debug!(server = %self.name, "MCP server initialized");
             }
             Err(e) => {
-                // Some servers may not support full MCP initialize — log but continue
+                // Classic SSE has no usable transport until the handshake
+                // succeeds: the GET stream must announce the POST endpoint.
+                // Refusing the server is honest; continuing would leave a
+                // "running" server that can never send a request.
+                if self.transport == McpTransport::Sse {
+                    self.status = ServerStatus::Errored;
+                    return Err(McpServerError::Spawn {
+                        name: self.name.clone(),
+                        source: std::io::Error::new(std::io::ErrorKind::Other, e),
+                    });
+                }
+                // Some other servers may not support full MCP initialize — log
+                // but continue.
                 tracing::warn!(server = %self.name, "MCP initialize failed (continuing anyway): {e}");
             }
         }
@@ -422,7 +440,24 @@ impl McpServer {
             }
         })?;
 
-        let _ = channel.initialize().await;
+        match channel.initialize().await {
+            Ok(_) => {}
+            Err(error) if self.transport == McpTransport::Sse => {
+                // The stream did not announce a message endpoint; the
+                // reconnected server cannot be used.
+                self.status = ServerStatus::Errored;
+                return Err(McpServerError::Spawn {
+                    name: self.name.clone(),
+                    source: std::io::Error::new(std::io::ErrorKind::Other, error),
+                });
+            }
+            Err(error) => {
+                tracing::warn!(
+                    server = %self.name,
+                    "MCP initialize failed after reconnecting (continuing anyway): {error}"
+                );
+            }
+        }
         self.channel = Some(Arc::new(Mutex::new(channel)));
         self.status = ServerStatus::Running;
         Ok(())

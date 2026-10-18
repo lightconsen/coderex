@@ -237,11 +237,31 @@ impl JsonRpcChannel {
         }
     }
 
-    /// Create a remote HTTP or SSE channel.
+    /// Create a streamable-HTTP channel.
     pub fn new_http(url: &str, headers: HashMap<String, String>) -> Result<Self, String> {
         Ok(Self {
             process: None,
             http: Some(crate::http::HttpChannel::new(url, headers)?),
+            stdin: None,
+            stdout: None,
+            next_id: AtomicU64::new(1),
+            command: String::new(),
+            args: Vec::new(),
+            env: HashMap::new(),
+            initialized: false,
+            handler: None,
+            notification_handler: None,
+        })
+    }
+
+    /// Create a legacy HTTP+SSE channel.
+    ///
+    /// The long-lived GET stream announces the separate POST message endpoint;
+    /// responses arrive there, correlated by JSON-RPC id.
+    pub fn new_sse(url: &str, headers: HashMap<String, String>) -> Result<Self, String> {
+        Ok(Self {
+            process: None,
+            http: Some(crate::http::HttpChannel::new_sse(url, headers)?),
             stdin: None,
             stdout: None,
             next_id: AtomicU64::new(1),
@@ -325,7 +345,13 @@ impl JsonRpcChannel {
 
     /// Spawn the subprocess and capture stdio handles.
     pub async fn spawn(&mut self) -> Result<(), String> {
-        if self.http.is_some() {
+        if let Some(http) = self.http.as_ref() {
+            // Legacy SSE has no request channel until its GET stream announces
+            // the POST endpoint, so the stream must be running before the
+            // initialize request can be sent.
+            if http.is_legacy_sse() {
+                http.start_event_stream();
+            }
             return Ok(());
         }
 
@@ -389,6 +415,19 @@ impl JsonRpcChannel {
             }
         });
 
+        // Legacy SSE cannot send a request until its GET stream has announced
+        // the POST endpoint. Wait for the connection here so a non-SSE
+        // endpoint is rejected immediately rather than after a request
+        // timeout.
+        if let Some(ref http) = self.http {
+            if http.is_legacy_sse() {
+                if http.event_stream_state() == crate::http::EventStreamState::Stopped {
+                    http.start_event_stream();
+                }
+                http.await_legacy_stream().await?;
+            }
+        }
+
         let result = self.send_request("initialize", Some(init_params)).await?;
 
         // Send initialized notification (no response expected). The initialize
@@ -398,9 +437,13 @@ impl JsonRpcChannel {
 
         // The standalone server-to-client stream is only meaningful once the
         // session exists. A server that does not support it answers 405 and
-        // the stream task stops quietly.
+        // the stream task stops quietly. Legacy SSE already started its
+        // mandatory stream before initialize; restarting it here would drop
+        // the session that just answered the handshake.
         if let Some(ref http) = self.http {
-            http.start_event_stream();
+            if !http.is_legacy_sse() {
+                http.start_event_stream();
+            }
         }
 
         Ok(result)
