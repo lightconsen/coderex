@@ -444,7 +444,10 @@ async fn worktree_bridge_full_session_with_worktree() {
         cache_creation_tokens: 0,
         cost_usd: 0.01,
     };
-    bridge.complete_session("wt_sess", usage).await.unwrap();
+    bridge
+        .complete_session("wt_sess", "{\"type\":\"result\"}\n", usage)
+        .await
+        .unwrap();
 
     // Session cleaned up
     assert!(!bridge.sessions.contains_key("wt_sess"));
@@ -612,7 +615,10 @@ async fn disconnect_recovery_full_lifecycle_with_recovery() {
         cache_creation_tokens: 0,
         cost_usd: 0.02,
     };
-    bridge.complete_session("s1", usage).await.unwrap();
+    bridge
+        .complete_session("s1", "{\"type\":\"result\"}\n", usage)
+        .await
+        .unwrap();
     assert!(!bridge.has_session("s1"));
 }
 
@@ -956,10 +962,17 @@ async fn archive_and_cleanup_integration() {
         cache_creation_tokens: 0,
         cost_usd: 0.01,
     };
-    bridge.complete_session("s1", usage).await.unwrap();
+    let transcript = "{\"type\":\"result\",\"subtype\":\"success\"}\n";
+    bridge
+        .complete_session("s1", transcript, usage)
+        .await
+        .unwrap();
 
     // Session should be archived and cleaned up
     assert!(!bridge.has_session("s1"));
+    let archived =
+        std::fs::read_to_string(tmp.path().join("archives/s1/transcript.jsonl")).unwrap();
+    assert_eq!(archived, transcript);
     bridge.disconnect().await.unwrap();
 }
 

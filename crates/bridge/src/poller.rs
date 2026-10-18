@@ -62,6 +62,29 @@ impl SpawnMode {
     }
 }
 
+/// The outcome of asking the control plane to claim an assignment.
+///
+/// A claim is a compare-and-set on the control plane: only one worker gets to
+/// run an assignment. `Lost` is a normal race, not an error, and the worker
+/// skips the assignment without recording a session failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClaimOutcome {
+    /// The assignment belongs to this environment and should be run.
+    Claimed,
+    /// The assignment was already claimed, no longer exists, or is otherwise
+    /// not runnable here. Skip it and release its slot.
+    Lost,
+}
+
+/// Default path template for claiming an assignment.
+///
+/// `{env_id}` and `{assignment_id}` are substituted by
+/// [`HttpControlPlaneClient`]. The template matches the control-plane server
+/// in `coderex-server`; deployments with a different route can override it
+/// with [`HttpControlPlaneClient::with_claim_path`].
+pub const DEFAULT_CLAIM_PATH_TEMPLATE: &str =
+    "/api/environments/{env_id}/assignments/{assignment_id}/claim";
+
 /// Capacity report from this environment.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CapacityReport {
@@ -97,6 +120,18 @@ pub trait ControlPlaneClient: Send + Sync + std::fmt::Debug {
     /// Fetch work assignments for this environment.
     async fn fetch_assignments(&self, env_id: &str) -> Result<Vec<WorkAssignment>, String>;
 
+    /// Claim an assignment before running it.
+    ///
+    /// `Ok(ClaimOutcome::Lost)` means the assignment was already claimed (or
+    /// no longer exists): the worker must skip it rather than run it twice.
+    /// `Err` means the claim could not be completed and the session should be
+    /// failed.
+    async fn claim_assignment(
+        &self,
+        env_id: &str,
+        assignment_id: &str,
+    ) -> Result<ClaimOutcome, String>;
+
     /// Report current capacity for this environment.
     async fn report_capacity(&self, env_id: &str, report: &CapacityReport) -> Result<(), String>;
 }
@@ -108,6 +143,8 @@ pub struct HttpControlPlaneClient {
     base_url: String,
     /// Optional bearer token sent with every control-plane request.
     auth_token: Option<String>,
+    /// Path template used for claims (`{env_id}`, `{assignment_id}`).
+    claim_path: String,
 }
 
 impl HttpControlPlaneClient {
@@ -117,6 +154,7 @@ impl HttpControlPlaneClient {
         Self {
             base_url: base_url.into().trim_end_matches('/').to_string(),
             auth_token: None,
+            claim_path: DEFAULT_CLAIM_PATH_TEMPLATE.to_string(),
         }
     }
 
@@ -127,6 +165,27 @@ impl HttpControlPlaneClient {
         self
     }
 
+    /// Override the claim path template.
+    ///
+    /// The template must contain `{assignment_id}`; `{env_id}` is substituted
+    /// when present. A deployment whose control plane exposes
+    /// `/api/assignments/{assignment_id}/claim` can supply that spelling.
+    #[must_use]
+    pub fn with_claim_path(mut self, template: impl Into<String>) -> Self {
+        self.claim_path = template.into();
+        self
+    }
+
+    /// The claim path for one assignment.
+    #[must_use]
+    pub fn claim_url(&self, env_id: &str, assignment_id: &str) -> String {
+        let path = self
+            .claim_path
+            .replace("{env_id}", env_id)
+            .replace("{assignment_id}", assignment_id);
+        format!("{}{}", self.base_url, path)
+    }
+
     fn request(&self, method: reqwest::Method, url: String) -> reqwest::RequestBuilder {
         let request = reqwest::Client::new().request(method, url);
         match self.auth_token {
@@ -134,6 +193,16 @@ impl HttpControlPlaneClient {
             None => request,
         }
     }
+}
+
+/// Whether a claim response means "this assignment is not ours to run".
+///
+/// The control-plane server answers 409 for an already-claimed (or missing)
+/// assignment. 404 and 422 are accepted too, so a load balancer, a proxy, or a
+/// compatible server that spells "gone"/"not claimable" differently still
+/// results in a skip rather than an error.
+fn claim_status_is_lost(status: reqwest::StatusCode) -> bool {
+    matches!(status.as_u16(), 404 | 409 | 422)
 }
 
 #[async_trait::async_trait]
@@ -197,6 +266,30 @@ impl ControlPlaneClient for HttpControlPlaneClient {
                 spawn_mode: SpawnMode::from_str(&entry.spawn_mode),
             })
             .collect())
+    }
+
+    async fn claim_assignment(
+        &self,
+        env_id: &str,
+        assignment_id: &str,
+    ) -> Result<ClaimOutcome, String> {
+        let url = self.claim_url(env_id, assignment_id);
+        let response = self
+            .request(reqwest::Method::POST, url)
+            .send()
+            .await
+            .map_err(|e| format!("claim assignment failed: {e}"))?;
+
+        let status = response.status();
+        if status.is_success() {
+            return Ok(ClaimOutcome::Claimed);
+        }
+        if claim_status_is_lost(status) {
+            return Ok(ClaimOutcome::Lost);
+        }
+
+        let text = response.text().await.unwrap_or_default();
+        Err(format!("claim assignment returned {status}: {text}"))
     }
 
     async fn report_capacity(&self, env_id: &str, report: &CapacityReport) -> Result<(), String> {
@@ -356,6 +449,19 @@ impl BridgeWorkPoller {
         Ok(count)
     }
 
+    /// Claim an assignment before running it.
+    ///
+    /// Calls the control plane's claim route (by default
+    /// `POST /api/environments/{env_id}/assignments/{assignment_id}/claim`).
+    pub async fn claim_assignment(
+        &self,
+        assignment: &WorkAssignment,
+    ) -> Result<ClaimOutcome, String> {
+        self.client
+            .claim_assignment(&self.env_id, &assignment.assignment_id)
+            .await
+    }
+
     /// Report current capacity to the control plane server.
     ///
     /// Calls `POST /api/environments/{env_id}/capacity`.
@@ -384,6 +490,9 @@ mod tests {
         registrations: std::sync::Mutex<Vec<(String, usize)>>,
         assignments: std::sync::Mutex<Vec<WorkAssignment>>,
         capacities: std::sync::Mutex<Vec<(String, CapacityReport)>>,
+        claims: std::sync::Mutex<Vec<(String, String)>>,
+        /// Result returned by the next claim; `None` means `Claimed`.
+        claim_outcome: std::sync::Mutex<Option<Result<ClaimOutcome, String>>>,
     }
 
     #[async_trait::async_trait]
@@ -398,6 +507,22 @@ mod tests {
 
         async fn fetch_assignments(&self, _env_id: &str) -> Result<Vec<WorkAssignment>, String> {
             Ok(std::mem::take(&mut *self.assignments.lock().unwrap()))
+        }
+
+        async fn claim_assignment(
+            &self,
+            env_id: &str,
+            assignment_id: &str,
+        ) -> Result<ClaimOutcome, String> {
+            self.claims
+                .lock()
+                .unwrap()
+                .push((env_id.to_string(), assignment_id.to_string()));
+            self.claim_outcome
+                .lock()
+                .unwrap()
+                .clone()
+                .unwrap_or(Ok(ClaimOutcome::Claimed))
         }
 
         async fn report_capacity(
@@ -446,12 +571,73 @@ mod tests {
         let taken = poller.take_assignment().unwrap();
         assert_eq!(taken.session_id, "s1");
 
+        assert_eq!(
+            poller.claim_assignment(&taken).await.unwrap(),
+            ClaimOutcome::Claimed
+        );
+        assert_eq!(
+            client.claims.lock().unwrap().as_slice(),
+            &[("env1".to_string(), "a1".to_string())]
+        );
+
         poller.report_capacity_to_server().await.unwrap();
         let capacities = client.capacities.lock().unwrap();
         assert_eq!(capacities.len(), 1);
         assert_eq!(capacities[0].0, "env1");
         assert_eq!(capacities[0].1.active_sessions, 1);
         assert_eq!(capacities[0].1.available_slots, 1);
+    }
+
+    #[tokio::test]
+    async fn claim_lost_and_claim_failure_are_distinct() {
+        let client = Arc::new(FakeClient::default());
+        let poller = BridgeWorkPoller::with_client(
+            "env1".into(),
+            2,
+            "http://unused.invalid".into(),
+            client.clone(),
+        );
+        let assignment = sample_assignment();
+
+        *client.claim_outcome.lock().unwrap() = Some(Ok(ClaimOutcome::Lost));
+        assert_eq!(
+            poller.claim_assignment(&assignment).await.unwrap(),
+            ClaimOutcome::Lost
+        );
+
+        *client.claim_outcome.lock().unwrap() = Some(Err("control plane unavailable".into()));
+        let error = poller.claim_assignment(&assignment).await.unwrap_err();
+        assert!(error.contains("unavailable"), "{error}");
+    }
+
+    #[test]
+    fn claim_path_is_explicit_and_overridable() {
+        let client = HttpControlPlaneClient::new("http://control.example/");
+        assert_eq!(
+            client.claim_url("env-1", "asn-1"),
+            "http://control.example/api/environments/env-1/assignments/asn-1/claim"
+        );
+
+        let client = client.with_claim_path("/api/assignments/{assignment_id}/claim");
+        assert_eq!(
+            client.claim_url("env-1", "asn-1"),
+            "http://control.example/api/assignments/asn-1/claim"
+        );
+    }
+
+    #[test]
+    fn lost_claim_statuses_are_skipped() {
+        for status in [404, 409, 422] {
+            let status = reqwest::StatusCode::from_u16(status).unwrap();
+            assert!(claim_status_is_lost(status), "{status} should be lost");
+        }
+        for status in [400, 401, 403, 500, 503] {
+            let status = reqwest::StatusCode::from_u16(status).unwrap();
+            assert!(
+                !claim_status_is_lost(status),
+                "{status} should surface as a failure"
+            );
+        }
     }
 
     #[test]
