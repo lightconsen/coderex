@@ -13,6 +13,12 @@
 //! All pointer returns point to a null-terminated UTF-8 JSON string in guest
 //! memory. The host reads the string, then deallocates it.
 
+// The compile subprocess needs `pre_exec` to install rlimits between fork and
+// exec, and wasmtime 20's `Module::deserialize` is an `unsafe fn` by design
+// (it loads precompiled code). Both uses are confined to `#[cfg(unix)]` /
+// deserialization sites with the safety arguments spelled out there.
+#![allow(unsafe_code)]
+
 use crate::runtime::{PluginCommandInfo, PluginSkillInfo};
 
 /// Fuel granted to each plugin call.
@@ -35,14 +41,77 @@ const PLUGIN_MAX_MEMORY_BYTES: usize = 64 * 1024 * 1024;
 
 /// Maximum size of a plugin `.wasm` file, in bytes (16 MiB).
 ///
-/// wasmtime 20 has no compile-time fuel or epoch budget: once `Module::new`
-/// starts compiling, the embedder cannot interrupt it. Bounding the input is
-/// the compile-time control that can actually be enforced here, so
 /// `PluginWasmInstance::new` checks the file length and refuses anything over
-/// this cap *before* handing the bytes to wasmtime. This limits how much work
-/// compilation can be asked to do; it is not a CPU-time or epoch budget.
+/// this cap before reading it, and checks again after reading. This bounds the
+/// input; [`PLUGIN_MAX_CODE_SECTION_BYTES`] and the other pre-scan limits bound
+/// how much work the module can demand, and (when the helper is present)
+/// compilation runs in a child process with hard CPU/memory limits.
 #[cfg(feature = "wasm-runtime")]
 const PLUGIN_MAX_WASM_BYTES: usize = 16 * 1024 * 1024;
+
+/// Maximum bytes in the module's code section (8 MiB).
+///
+/// The code section is what wasmtime spends compilation time on. The file-size
+/// cap above bounds the whole module including data segments; this cap bounds
+/// the part that drives compilation, and is checked from the linear pre-scan
+/// before `Module::new`.
+#[cfg(feature = "wasm-runtime")]
+const PLUGIN_MAX_CODE_SECTION_BYTES: usize = 8 * 1024 * 1024;
+
+/// Maximum number of functions declared by a module (50,000).
+#[cfg(feature = "wasm-runtime")]
+const PLUGIN_MAX_FUNCTIONS: usize = 50_000;
+
+/// Maximum total number of WebAssembly operators across all function bodies
+/// (1,000,000).
+#[cfg(feature = "wasm-runtime")]
+const PLUGIN_MAX_OPERATORS: usize = 1_000_000;
+
+/// Maximum `block`/`loop`/`if` nesting depth (256 levels).
+#[cfg(feature = "wasm-runtime")]
+const PLUGIN_MAX_NESTING_DEPTH: usize = 256;
+
+/// Maximum size of a WAT (text format) module (1 MiB).
+///
+/// Production plugins are binary `.wasm` files. The text format is accepted
+/// for tests and small hand-written plugins; the lower cap keeps text parsing
+/// itself from becoming an unbounded pre-scan cost.
+#[cfg(feature = "wasm-runtime")]
+const PLUGIN_MAX_WAT_BYTES: usize = 1024 * 1024;
+
+/// Name of the out-of-process compiler binary.
+///
+/// The parent looks for it next to its own executable (for example
+/// `target/debug/coderex-wasm-compile`).
+#[cfg(feature = "wasm-runtime")]
+const WASM_COMPILE_HELPER: &str = "coderex-wasm-compile";
+
+/// CPU-seconds limit installed on the compiler child (`RLIMIT_CPU` on Unix,
+/// job user time on Windows).
+#[cfg(feature = "wasm-runtime")]
+const WASM_COMPILE_CPU_SECONDS: u64 = 20;
+
+/// Address-space limit installed on the compiler child (`RLIMIT_AS` on Unix,
+/// job memory limit on Windows): 2 GiB.
+#[cfg(feature = "wasm-runtime")]
+const WASM_COMPILE_MEMORY_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+
+/// Wall-clock limit for the compiler child. A child that exceeds it is killed.
+#[cfg(feature = "wasm-runtime")]
+const WASM_COMPILE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Environment override for the compiler helper path.
+///
+/// Compiled into debug builds only; it exists so the subprocess tests can
+/// exercise both the helper and the missing-helper fallback.
+#[cfg(all(feature = "wasm-runtime", debug_assertions))]
+const WASM_COMPILE_HELPER_ENV: &str = "CODEREX_WASM_COMPILE_HELPER";
+
+/// Environment override for the wall-clock timeout, in milliseconds.
+///
+/// Compiled into debug builds only; used by the "slow helper is killed" test.
+#[cfg(all(feature = "wasm-runtime", debug_assertions))]
+const WASM_COMPILE_TIMEOUT_ENV: &str = "CODEREX_WASM_COMPILE_TIMEOUT_MS";
 
 /// Build the sandboxed engine shared by every plugin instance.
 ///
@@ -84,6 +153,421 @@ fn ensure_within_size_cap(wasm_path: &std::path::Path, len: u64) -> Result<(), S
         ));
     }
     Ok(())
+}
+
+/// Pre-scan limits. Kept as a struct so tests can exercise each limit with a
+/// tiny module instead of building an 8 MiB pathological one.
+#[cfg(feature = "wasm-runtime")]
+#[derive(Debug, Clone, Copy)]
+#[allow(clippy::struct_field_names)]
+struct PrescanLimits {
+    max_code_section_bytes: usize,
+    max_functions: usize,
+    max_operators: usize,
+    max_nesting_depth: usize,
+}
+
+#[cfg(feature = "wasm-runtime")]
+impl Default for PrescanLimits {
+    fn default() -> Self {
+        Self {
+            max_code_section_bytes: PLUGIN_MAX_CODE_SECTION_BYTES,
+            max_functions: PLUGIN_MAX_FUNCTIONS,
+            max_operators: PLUGIN_MAX_OPERATORS,
+            max_nesting_depth: PLUGIN_MAX_NESTING_DEPTH,
+        }
+    }
+}
+
+/// Linearly scan `bytes` and reject a module that asks the compiler for too
+/// much work, before any compiler sees it.
+///
+/// The scan enforces four independent limits:
+/// - the code section's byte length;
+/// - the number of declared functions;
+/// - the total number of operators across every function body;
+/// - the deepest `block`/`loop`/`if` nesting.
+///
+/// It also translates WAT input to the binary format first, so the text form
+/// cannot bypass the limits that the binary form is subject to. On success it
+/// returns the exact bytes that were scanned (an owned copy for WAT input), so
+/// the caller compiles the same bytes the scan approved.
+///
+/// This is a work bound, not a correctness check: it deliberately does not
+/// run wasmparser's validator. wasmtime still validates the module.
+#[cfg(feature = "wasm-runtime")]
+fn prescan_module<'a>(
+    name: &str,
+    bytes: &'a [u8],
+    limits: PrescanLimits,
+) -> Result<std::borrow::Cow<'a, [u8]>, String> {
+    let binary = if bytes.starts_with(b"\0asm") {
+        std::borrow::Cow::Borrowed(bytes)
+    } else {
+        if bytes.len() > PLUGIN_MAX_WAT_BYTES {
+            return Err(format!(
+                "WASM module '{name}' is not a binary module and its {} byte text form \
+                 exceeds the {PLUGIN_MAX_WAT_BYTES} byte plugin limit (PLUGIN_MAX_WAT_BYTES)",
+                bytes.len()
+            ));
+        }
+        wat::parse_bytes(bytes)
+            .map_err(|e| format!("failed to parse WASM text module '{name}': {e}"))?
+    };
+
+    let mut function_count = 0usize;
+    let mut operator_count = 0usize;
+    let mut code_section_bytes = 0usize;
+
+    for payload in wasmparser::Parser::new(0).parse_all(&binary) {
+        let payload = payload.map_err(|e| format!("failed to pre-scan WASM module '{name}': {e}"))?;
+        match payload {
+            wasmparser::Payload::FunctionSection(reader) => {
+                function_count = function_count.max(reader.count() as usize);
+                if function_count > limits.max_functions {
+                    return Err(format!(
+                        "WASM module '{name}' declares {function_count} functions, which exceeds \
+                         the {} function plugin limit (PLUGIN_MAX_FUNCTIONS)",
+                        limits.max_functions
+                    ));
+                }
+            }
+            wasmparser::Payload::CodeSectionStart { count, range, .. } => {
+                // The function section normally precedes the code section; the
+                // code section's own count is a second, independent view.
+                function_count = function_count.max(count as usize);
+                if function_count > limits.max_functions {
+                    return Err(format!(
+                        "WASM module '{name}' declares {function_count} functions, which exceeds \
+                         the {} function plugin limit (PLUGIN_MAX_FUNCTIONS)",
+                        limits.max_functions
+                    ));
+                }
+                code_section_bytes = code_section_bytes.max(range.end.saturating_sub(range.start));
+                if code_section_bytes > limits.max_code_section_bytes {
+                    return Err(format!(
+                        "WASM module '{name}' has a {code_section_bytes} byte code section, which \
+                         exceeds the {} byte plugin limit (PLUGIN_MAX_CODE_SECTION_BYTES)",
+                        limits.max_code_section_bytes
+                    ));
+                }
+            }
+            wasmparser::Payload::CodeSectionEntry(body) => {
+                let mut reader = body
+                    .get_operators_reader()
+                    .map_err(|e| format!("failed to pre-scan WASM module '{name}': {e}"))?;
+                let mut depth = 0usize;
+                while !reader.eof() {
+                    let operator = reader
+                        .read()
+                        .map_err(|e| format!("failed to pre-scan WASM module '{name}': {e}"))?;
+                    operator_count += 1;
+                    if operator_count > limits.max_operators {
+                        return Err(format!(
+                            "WASM module '{name}' contains more than {} operators, which exceeds \
+                             the operator plugin limit (PLUGIN_MAX_OPERATORS)",
+                            limits.max_operators
+                        ));
+                    }
+                    match operator {
+                        wasmparser::Operator::Block { .. }
+                        | wasmparser::Operator::Loop { .. }
+                        | wasmparser::Operator::If { .. } => {
+                            depth += 1;
+                            if depth > limits.max_nesting_depth {
+                                return Err(format!(
+                                    "WASM module '{name}' nests block/loop/if {depth} levels deep, \
+                                     which exceeds the {} level plugin limit \
+                                     (PLUGIN_MAX_NESTING_DEPTH)",
+                                    limits.max_nesting_depth
+                                ));
+                            }
+                        }
+                        // `else` stays in the same frame; `end` closes one.
+                        wasmparser::Operator::End => depth = depth.saturating_sub(1),
+                        _ => {}
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    Ok(binary)
+}
+
+/// Find the out-of-process compiler next to the current executable.
+///
+/// In debug builds `CODEREX_WASM_COMPILE_HELPER` overrides the path, which the
+/// tests use to point at the real helper, a deliberately slow one, or a
+/// nonexistent path (the fallback case).
+#[cfg(feature = "wasm-runtime")]
+fn compile_helper_path() -> Option<std::path::PathBuf> {
+    #[cfg(debug_assertions)]
+    if let Some(overridden) = std::env::var_os(WASM_COMPILE_HELPER_ENV) {
+        let path = std::path::PathBuf::from(overridden);
+        return path.is_file().then_some(path);
+    }
+
+    let current = std::env::current_exe().ok()?;
+    let candidate = current.parent()?.join(format!(
+        "{WASM_COMPILE_HELPER}{}",
+        std::env::consts::EXE_SUFFIX
+    ));
+    candidate.is_file().then_some(candidate)
+}
+
+/// Wall-clock timeout for the compiler child.
+#[cfg(feature = "wasm-runtime")]
+fn compile_timeout() -> std::time::Duration {
+    #[cfg(debug_assertions)]
+    if let Ok(raw) = std::env::var(WASM_COMPILE_TIMEOUT_ENV) {
+        if let Ok(millis) = raw.parse::<u64>() {
+            if millis > 0 {
+                return std::time::Duration::from_millis(millis);
+            }
+        }
+    }
+    WASM_COMPILE_TIMEOUT
+}
+
+/// Compile a module, preferring the out-of-process helper.
+///
+/// The pre-scan has already run on `binary` by the time this is called. When
+/// the helper exists, compilation happens in a child process that the parent
+/// can kill. When it does not, compilation falls back in-process under the
+/// pre-scan limits; that fallback is *not* CPU-bounded, which is why the
+/// fallback is logged loudly.
+#[cfg(feature = "wasm-runtime")]
+fn compile_module(
+    engine: &wasmtime::Engine,
+    wasm_path: &std::path::Path,
+    binary: &[u8],
+) -> Result<wasmtime::Module, String> {
+    let Some(helper) = compile_helper_path() else {
+        tracing::warn!(
+            module = %wasm_path.display(),
+            "WASM compile helper '{WASM_COMPILE_HELPER}' was not found next to the current \
+             executable; compiling in-process. Pre-scan limits apply, but in-process compilation \
+             has no CPU bound."
+        );
+        return wasmtime::Module::new(engine, binary)
+            .map_err(|e| format!("failed to load WASM module '{}': {e}", wasm_path.display()));
+    };
+
+    let serialized = run_compile_helper(&helper, binary)?;
+
+    // SAFETY: `serialized` is the `Module::serialize` output of our own helper
+    // binary, linked against the same wasmtime version and built with the same
+    // engine configuration (`sandboxed_engine`). The helper writes it into a
+    // private `tempfile` directory (mode 0700 on Unix) and the parent reads it
+    // only after the helper exits successfully. wasmtime's safety requirement
+    // is that the bytes are trusted precompiled code; the helper compiles an
+    // untrusted module, but the bytes it emits are produced by wasmtime itself.
+    unsafe { wasmtime::Module::deserialize(engine, &serialized) }.map_err(|e| {
+        format!(
+            "failed to deserialize compiled WASM module '{}': {e}",
+            wasm_path.display()
+        )
+    })
+}
+
+/// Run the helper in a killable child and return its serialized module.
+#[cfg(feature = "wasm-runtime")]
+fn run_compile_helper(
+    helper: &std::path::Path,
+    binary: &[u8],
+) -> Result<Vec<u8>, String> {
+    let dir = tempfile::tempdir()
+        .map_err(|e| format!("failed to create a temp dir for WASM compilation: {e}"))?;
+    let input_path = dir.path().join("input.wasm");
+    let output_path = dir.path().join("output.cwasm");
+    let stderr_path = dir.path().join("helper.stderr");
+
+    std::fs::write(&input_path, binary)
+        .map_err(|e| format!("failed to stage WASM input for compilation: {e}"))?;
+    let stderr = std::fs::File::create(&stderr_path)
+        .map_err(|e| format!("failed to create WASM compiler stderr file: {e}"))?;
+
+    let mut command = std::process::Command::new(helper);
+    command
+        .arg(&input_path)
+        .arg(&output_path)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::from(stderr));
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        // SAFETY: `pre_exec` runs between fork and exec in the child. The
+        // closure only calls `setrlimit`, which is async-signal-safe, and
+        // captures two integers.
+        unsafe {
+            command.pre_exec(|| {
+                apply_compile_rlimits()?;
+                Ok(())
+            });
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    let sandbox = {
+        use coderex_core::sandbox::{SandboxConfig, SandboxHandle};
+        let config = SandboxConfig {
+            max_cpu_seconds: Some(WASM_COMPILE_CPU_SECONDS),
+            max_memory_bytes: Some(WASM_COMPILE_MEMORY_BYTES),
+            ..SandboxConfig::default()
+        };
+        let handle = SandboxHandle::create(config)
+            .map_err(|e| format!("failed to create WASM compile job object: {e}"))?;
+        handle
+            .prepare(&mut command)
+            .map_err(|e| format!("failed to prepare WASM compile helper: {e}"))?;
+        handle
+    };
+
+    let mut child = command.spawn().map_err(|e| {
+        format!(
+            "failed to spawn WASM compile helper '{}': {e}",
+            helper.display()
+        )
+    })?;
+
+    #[cfg(target_os = "windows")]
+    sandbox.post_spawn(&child).map_err(|e| {
+        let _ = child.kill();
+        format!("failed to assign WASM compile helper to its job object: {e}")
+    })?;
+
+    let status = wait_for_compile_child(&mut child, compile_timeout())?;
+    if !status.success() {
+        let detail = std::fs::read_to_string(&stderr_path).unwrap_or_default();
+        let detail = detail.trim();
+        return Err(if detail.is_empty() {
+            format!("WASM compile helper '{}' failed with {status}", helper.display())
+        } else {
+            format!(
+                "WASM compile helper '{}' failed with {status}: {detail}",
+                helper.display()
+            )
+        });
+    }
+
+    let serialized = std::fs::read(&output_path).map_err(|e| {
+        format!(
+            "WASM compile helper '{}' exited successfully but produced no output: {e}",
+            helper.display()
+        )
+    })?;
+    if serialized.is_empty() {
+        return Err(format!(
+            "WASM compile helper '{}' produced an empty serialized module",
+            helper.display()
+        ));
+    }
+    Ok(serialized)
+}
+
+/// Install `RLIMIT_CPU` and `RLIMIT_AS` on the compiler child.
+///
+/// `RLIMIT_CPU` is mandatory: without it this process has no hard CPU bound.
+/// `RLIMIT_AS` is best-effort because some kernels reject finite address-space
+/// limits — Darwin does, returning `EINVAL` for both the soft and hard
+/// fields, even for the process's own child. On those platforms the child is
+/// still bounded by CPU time and by the parent's wall-clock kill; there is no
+/// memory ceiling. The failure cannot be logged here (`pre_exec` is not
+/// async-signal-safe), so the documentation carries the caveat.
+#[cfg(all(unix, feature = "wasm-runtime"))]
+fn apply_compile_rlimits() -> std::io::Result<()> {
+    use libc::{rlimit, setrlimit, RLIMIT_AS, RLIMIT_CPU};
+
+    let cpu = rlimit {
+        rlim_cur: WASM_COMPILE_CPU_SECONDS,
+        rlim_max: WASM_COMPILE_CPU_SECONDS,
+    };
+    // SAFETY: `setrlimit` is async-signal-safe and this runs in the forked
+    // child before exec.
+    if unsafe { setrlimit(RLIMIT_CPU, std::ptr::from_ref(&cpu)) } != 0 {
+        let error = std::io::Error::last_os_error();
+        return Err(std::io::Error::new(
+            error.kind(),
+            format!("setrlimit(RLIMIT_CPU) failed: {error}"),
+        ));
+    }
+
+    let memory = rlimit {
+        rlim_cur: WASM_COMPILE_MEMORY_BYTES,
+        rlim_max: WASM_COMPILE_MEMORY_BYTES,
+    };
+    // SAFETY: as above. Failure is deliberately ignored: see the doc comment.
+    let _ = unsafe { setrlimit(RLIMIT_AS, std::ptr::from_ref(&memory)) };
+
+    Ok(())
+}
+
+/// Wait for the compiler child, killing it when the wall-clock budget expires.
+#[cfg(feature = "wasm-runtime")]
+fn wait_for_compile_child(
+    child: &mut std::process::Child,
+    timeout: std::time::Duration,
+) -> Result<std::process::ExitStatus, String> {
+    let started = std::time::Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return Ok(status),
+            Ok(None) => {
+                if started.elapsed() >= timeout {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(format!(
+                        "WASM compilation exceeded the {} ms wall-clock limit; the helper was \
+                         killed",
+                        timeout.as_millis()
+                    ));
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            Err(e) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!("failed to wait for the WASM compile helper: {e}"));
+            }
+        }
+    }
+}
+
+/// Compile a WASM module and return wasmtime's serialized representation.
+///
+/// Internal entry point for the hidden `coderex-wasm-compile` helper binary;
+/// not part of the stable plugin API. The pre-scan runs here too so a directly
+/// invoked helper still refuses pathological input.
+#[cfg(feature = "wasm-runtime")]
+#[doc(hidden)]
+pub fn compile_to_serialized(bytes: &[u8]) -> Result<Vec<u8>, String> {
+    let scanned = prescan_module("<helper input>", bytes, PrescanLimits::default())?;
+    let engine = sandboxed_engine()?;
+    let module = wasmtime::Module::new(&engine, &*scanned)
+        .map_err(|e| format!("failed to compile WASM module: {e}"))?;
+    module
+        .serialize()
+        .map_err(|e| format!("failed to serialize compiled WASM module: {e}"))
+}
+
+/// Deserialize bytes produced by [`compile_to_serialized`].
+///
+/// Internal entry point used by the subprocess round-trip test; not part of
+/// the stable plugin API.
+#[cfg(feature = "wasm-runtime")]
+#[doc(hidden)]
+pub fn deserialize_compiled_module(bytes: &[u8]) -> Result<(), String> {
+    let engine = sandboxed_engine()?;
+    // SAFETY: see the safety comment in `compile_module`. This entry point is
+    // an internal test hook; it trusts the caller the same way the parent
+    // trusts its own helper's output.
+    unsafe { wasmtime::Module::deserialize(&engine, bytes) }
+        .map(|_| ())
+        .map_err(|e| format!("failed to deserialize compiled WASM module: {e}"))
 }
 
 /// A loaded WASM plugin instance.
@@ -144,8 +628,13 @@ impl PluginWasmInstance {
             .map_err(|e| format!("failed to read WASM module '{}': {e}", wasm_path.display()))?;
         ensure_within_size_cap(wasm_path, bytes.len() as u64)?;
 
-        let module = wasmtime::Module::new(&engine, &bytes)
-            .map_err(|e| format!("failed to load WASM module '{}': {e}", wasm_path.display()))?;
+        // The linear pre-scan is the floor: it runs before either compilation
+        // path, so even the in-process fallback refuses modules that demand
+        // excessive code size, function count, operator count, or nesting.
+        let name = wasm_path.display().to_string();
+        let scanned = prescan_module(&name, &bytes, PrescanLimits::default())?;
+
+        let module = compile_module(&engine, wasm_path, &scanned)?;
         Ok(Self {
             engine,
             module,
@@ -503,22 +992,25 @@ mod sandbox_tests {
         );
     }
 
-    /// A file exactly at the cap passes the size gate. It is still not a valid
-    /// module, so the error comes from wasmtime's parser, not from the cap.
+    /// A file exactly at the cap passes the file-size gate. It is still not a
+    /// valid module, so the pre-scan (or wasmtime's parser) rejects it — but
+    /// not the 16 MiB file cap.
     #[test]
-    fn module_at_size_cap_reaches_the_compiler() {
+    fn module_at_size_cap_reaches_the_prescan() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("at-cap.wasm");
         std::fs::write(&path, vec![0u8; PLUGIN_MAX_WASM_BYTES]).unwrap();
 
         let err = PluginWasmInstance::new(&path).unwrap_err();
         assert!(
-            !err.contains("exceeds"),
-            "a file at the cap must not be rejected by the size gate: {err}"
+            !err.contains("PLUGIN_MAX_WASM_BYTES"),
+            "a file at the cap must not be rejected by the file-size gate: {err}"
         );
         assert!(
-            err.contains("failed to load"),
-            "expected a parse error from wasmtime, got: {err}"
+            err.contains("pre-scan")
+                || err.contains("text form")
+                || err.contains("failed to load"),
+            "expected the pre-scan or wasmtime to reject the file, got: {err}"
         );
     }
 
@@ -683,5 +1175,111 @@ mod sandbox_tests {
             err.contains("instantiate"),
             "expected an unresolved-import error, got: {err}"
         );
+    }
+}
+
+/// Pre-scan tests. Each limit is exercised with a deliberately tiny cap so the
+/// test module stays small; the production caps are constants in this file.
+#[cfg(all(test, feature = "wasm-runtime"))]
+mod prescan_tests {
+    use super::*;
+
+    /// A normal module is accepted and translated to binary.
+    #[test]
+    fn normal_module_passes_prescan() {
+        let wat = br#"(module
+                        (memory (export "memory") 1)
+                        (func (export "f") nop))"#;
+        let scanned =
+            prescan_module("normal.wat", wat, PrescanLimits::default()).expect("normal module");
+        assert!(
+            scanned.starts_with(b"\0asm"),
+            "the scan must return binary WASM for WAT input"
+        );
+    }
+
+    /// A code section larger than the cap is rejected before compilation.
+    #[test]
+    fn oversized_code_section_is_rejected() {
+        let limits = PrescanLimits {
+            max_code_section_bytes: 8,
+            ..PrescanLimits::default()
+        };
+        let wat = br"(module (func nop nop nop nop nop nop nop nop nop nop nop nop nop nop nop nop))";
+
+        let err = prescan_module("wide.wat", wat, limits).unwrap_err();
+        assert!(
+            err.contains("code section") && err.contains("PLUGIN_MAX_CODE_SECTION_BYTES"),
+            "expected the code-section cap to name itself, got: {err}"
+        );
+        assert!(
+            err.contains("8 byte plugin limit"),
+            "expected the error to name the configured cap, got: {err}"
+        );
+    }
+
+    /// Too many declared functions is rejected.
+    #[test]
+    fn too_many_functions_is_rejected() {
+        let limits = PrescanLimits {
+            max_functions: 1,
+            ..PrescanLimits::default()
+        };
+        let wat = br"(module (func) (func))";
+
+        let err = prescan_module("many.wat", wat, limits).unwrap_err();
+        assert!(
+            err.contains("functions") && err.contains("PLUGIN_MAX_FUNCTIONS"),
+            "expected the function-count cap to name itself, got: {err}"
+        );
+    }
+
+    /// Too many operators across function bodies is rejected.
+    #[test]
+    fn too_many_operators_is_rejected() {
+        let limits = PrescanLimits {
+            max_operators: 2,
+            ..PrescanLimits::default()
+        };
+        let wat = br"(module (func nop nop nop))";
+
+        let err = prescan_module("busy.wat", wat, limits).unwrap_err();
+        assert!(
+            err.contains("operators") && err.contains("PLUGIN_MAX_OPERATORS"),
+            "expected the operator cap to name itself, got: {err}"
+        );
+    }
+
+    /// Excessive block/loop/if nesting is rejected.
+    #[test]
+    fn excessive_nesting_is_rejected() {
+        let limits = PrescanLimits {
+            max_nesting_depth: 2,
+            ..PrescanLimits::default()
+        };
+        let wat = br"(module (func block block block nop end end end))";
+
+        let err = prescan_module("deep.wat", wat, limits).unwrap_err();
+        assert!(
+            err.contains("nests block/loop/if") && err.contains("PLUGIN_MAX_NESTING_DEPTH"),
+            "expected the nesting cap to name itself, got: {err}"
+        );
+        assert!(
+            err.contains("3 levels deep"),
+            "expected the error to report the observed depth, got: {err}"
+        );
+    }
+
+    /// Nesting at exactly the cap is still accepted (the check is `>`).
+    #[test]
+    fn nesting_at_the_cap_is_accepted() {
+        let limits = PrescanLimits {
+            max_nesting_depth: 2,
+            ..PrescanLimits::default()
+        };
+        let wat = br"(module (func block block nop end end))";
+
+        prescan_module("at-cap.wat", wat, limits)
+            .expect("nesting at the cap must be accepted");
     }
 }
