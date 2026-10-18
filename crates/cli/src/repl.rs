@@ -2800,7 +2800,13 @@ impl ReplLoop {
 
                 Some((engine, result)) = async {
                     query_done_rx.as_mut().unwrap().await.ok()
-                }, if query_done_rx.is_some() => {
+                }, if query_done_rx.is_some()
+                    // Drain the turn's events before deciding its answer was
+                    // empty: a tool-only turn has no assistant text, and its
+                    // ToolCall rows may still be queued. Choosing this branch
+                    // first reported a healthy tool turn as "no visible
+                    // response".
+                    && event_rx.as_ref().is_none_or(|rx| rx.is_empty()) => {
                     self.engine = Some(engine);
                     self.running_query = None;
                     query_done_rx = None;
