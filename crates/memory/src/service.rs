@@ -56,7 +56,7 @@
 //! choice rather than a silent skip.
 
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use chrono::{DateTime, Utc};
 
@@ -241,6 +241,27 @@ pub struct MemoryService {
     team: Arc<TeamMemorySyncService>,
     org: Option<Arc<TeamMemorySyncService>>,
     classifier: Option<Arc<dyn MemoryWriteClassifier>>,
+    /// Serializes the check-and-write section of [`Self::write`] and
+    /// [`Self::delete`].
+    ///
+    /// Scope, stated honestly: this is a **process-local** lock. It makes
+    /// `current_version` and the store write that follows it atomic between
+    /// writers that share one service — which is the production case, since
+    /// tools, sub-agents and the REPL share one `Arc<MemoryService>`, and
+    /// [`Clone`] clones this `Arc` so clones are serialized too. It is not a
+    /// cross-process lock, and it does not replace the consistency guarantees
+    /// of the backing stores (another process writing the same files can
+    /// still race us).
+    ///
+    /// A `std::sync::Mutex` is appropriate because the guarded section is
+    /// entirely synchronous: classification is awaited *before* the lock is
+    /// taken, and no guard is ever held across an `.await`.
+    write_lock: Arc<Mutex<()>>,
+    /// Test-only hook run after the version check and before the store write.
+    /// Lets a test hold the first writer inside the critical section so a
+    /// second writer's behaviour can be observed deterministically.
+    #[cfg(test)]
+    write_hook: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
 impl std::fmt::Debug for MemoryService {
@@ -266,6 +287,9 @@ impl MemoryService {
             team,
             org: None,
             classifier: None,
+            write_lock: Arc::new(Mutex::new(())),
+            #[cfg(test)]
+            write_hook: None,
         }
     }
 
@@ -291,6 +315,13 @@ impl MemoryService {
     #[must_use]
     pub fn with_classifier(mut self, classifier: Arc<dyn MemoryWriteClassifier>) -> Self {
         self.classifier = Some(classifier);
+        self
+    }
+
+    /// Install the test-only hook fired inside the write critical section.
+    #[cfg(test)]
+    fn with_write_hook(mut self, hook: Arc<dyn Fn() + Send + Sync>) -> Self {
+        self.write_hook = Some(hook);
         self
     }
 
@@ -444,6 +475,12 @@ impl MemoryService {
                 })?;
         }
 
+        // Classify before locking: `classify` is the only await here, and a
+        // std lock guard must not be held across it. From this point on the
+        // section is synchronous, so holding the guard through the version
+        // check and the store write is safe.
+        let _guard = self.lock_writers();
+
         let found = self.current_version(store, &key)?;
         if let Some(expected) = if_version {
             if expected != found {
@@ -454,6 +491,11 @@ impl MemoryService {
                     found,
                 });
             }
+        }
+
+        #[cfg(test)]
+        if let Some(hook) = &self.write_hook {
+            hook();
         }
 
         match store {
@@ -496,6 +538,11 @@ impl MemoryService {
     ) -> Result<(), MemoryServiceError> {
         let key = normalize_key(key)?;
         check_store_key(store, &key)?;
+
+        // `delete` is synchronous, so the guard covers the whole
+        // check-then-act section directly.
+        let _guard = self.lock_writers();
+
         let found = self.current_version(store, &key)?;
         if found == 0 {
             return Err(MemoryServiceError::NotFound { store, key });
@@ -529,6 +576,17 @@ impl MemoryService {
                     .map_err(|error| MemoryServiceError::Io(error.to_string()))
             }
         }
+    }
+
+    /// Take the process-local writer lock.
+    ///
+    /// A poison error only means some writer panicked while holding it. The
+    /// guarded value is `()`, so there is no state to be inconsistent about;
+    /// recover the guard rather than making every later write panic too.
+    fn lock_writers(&self) -> MutexGuard<'_, ()> {
+        self.write_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     /// The current version of an entry, or `0` when it is not there.
@@ -706,6 +764,109 @@ mod tests {
         assert_eq!(
             service.read(MemoryStore::Project, "note").unwrap().content,
             "v2"
+        );
+    }
+
+    /// Without `write_lock`, both writers pass the same `if_version` check and
+    /// both write. The test-only hook sits after the check and before the
+    /// write; it makes the first writer wait until a second writer has also
+    /// reached that point, which deterministically forces the bad interleaving
+    /// (both read the version before either writes).
+    ///
+    /// With the lock, the second writer cannot reach the hook at all: the
+    /// first times out, writes, and releases the lock; the second then reads
+    /// the new version and is refused.
+    ///
+    /// Two OS threads with their own current-thread runtimes are used rather
+    /// than `tokio::join!`, because the hook blocks a thread and the two
+    /// writes must genuinely run in parallel for the no-lock case to be
+    /// reproducible.
+    #[test]
+    fn concurrent_writes_with_the_same_pin_have_exactly_one_winner() {
+        struct Gate {
+            arrivals: Mutex<usize>,
+            arrived: std::sync::Condvar,
+        }
+
+        impl Gate {
+            fn new() -> Self {
+                Self {
+                    arrivals: Mutex::new(0),
+                    arrived: std::sync::Condvar::new(),
+                }
+            }
+
+            fn block_until_two(&self) {
+                let mut arrivals = self.arrivals.lock().unwrap();
+                *arrivals += 1;
+                if *arrivals >= 2 {
+                    self.arrived.notify_all();
+                    return;
+                }
+                // The second writer cannot arrive while the first holds the
+                // service write lock, so this times out in the correct case.
+                let _ = self
+                    .arrived
+                    .wait_timeout_while(arrivals, std::time::Duration::from_millis(500), |n| *n < 2)
+                    .unwrap();
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let service = service_over(&dir.path().join("lt"), &dir.path().join("team"));
+
+        // Seed version 1 before the hook is installed.
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime
+            .block_on(service.write(MemoryStore::Project, "note", "seed", None))
+            .unwrap();
+
+        let gate = Arc::new(Gate::new());
+        let service = service.with_write_hook(Arc::new({
+            let gate = Arc::clone(&gate);
+            move || gate.block_until_two()
+        }));
+
+        let run = |content: &'static str| {
+            let service = service.clone();
+            std::thread::spawn(move || {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap()
+                    .block_on(service.write(MemoryStore::Project, "note", content, Some(1)))
+            })
+        };
+
+        let first = run("first");
+        let second = run("second");
+        let results = [first.join().unwrap(), second.join().unwrap()];
+
+        assert_eq!(
+            results.iter().filter(|result| result.is_ok()).count(),
+            1,
+            "exactly one pinned write may win: {results:?}"
+        );
+        assert_eq!(
+            results
+                .iter()
+                .filter(|result| matches!(
+                    **result,
+                    Err(MemoryServiceError::VersionMismatch { .. })
+                ))
+                .count(),
+            1,
+            "the loser must be refused with VersionMismatch: {results:?}"
+        );
+
+        let stored = service.read(MemoryStore::Project, "note").unwrap();
+        assert_eq!(stored.version, 2);
+        assert!(
+            stored.content == "first" || stored.content == "second",
+            "the losing write must not land: {stored:?}"
         );
     }
 
