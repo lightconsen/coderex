@@ -15,11 +15,16 @@
 
 #![warn(missing_docs)]
 
+mod channels;
 mod crash;
 mod scrubber;
 mod store;
 mod uploader;
 
+pub use channels::{
+    ChannelConfig, DATADOG_API_KEY_ENV, DATADOG_ENDPOINT_ENV, DATADOG_SITE_ENV, DD_API_KEY_ENV,
+    DEFAULT_DATADOG_SITE, OTLP_ENDPOINT_ENV, OTLP_HEADERS_ENV, TelemetryChannels,
+};
 pub use crash::{
     BacktraceSymbols, CRASH_VERBOSE_ENV, CrashReport, CrashReporter, DEFAULT_CRASH_RETENTION_DAYS,
     DEFAULT_PENDING_MAX_AGE_SECS, MAX_BACKTRACE_FRAMES, PanicClassification, PanicTemplate,

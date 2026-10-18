@@ -47,6 +47,14 @@ pub enum ConfigError {
         /// The configured maximum size in bytes.
         limit: u64,
     },
+    /// A managed-settings property list could not be parsed.
+    #[error("plist parse error in {path}: {message}")]
+    Plist {
+        /// Path to the property list.
+        path: PathBuf,
+        /// The underlying parser error.
+        message: String,
+    },
 }
 
 /// Maximum size of a single settings file (2 MiB).
@@ -147,6 +155,18 @@ pub struct TelemetrySubConfig {
     pub sample_rate: Option<f64>,
     /// Optional pinned root certificate PEM for TLS pinning.
     pub pinned_cert_pem: Option<String>,
+    /// OTLP/HTTP logs endpoint (e.g. `http://localhost:4318` or a full
+    /// `.../v1/logs` URL). Consumed by the telemetry channel configuration.
+    pub otlp_endpoint: Option<String>,
+    /// Additional OTLP request headers as `key=value,key2=value2`.
+    pub otlp_headers: Option<String>,
+    /// Datadog Logs API key. Prefer the environment variable so the key is
+    /// not persisted in a settings file.
+    pub datadog_api_key: Option<String>,
+    /// Datadog site (`datadoghq.com`, `datadoghq.eu`, `us3.datadoghq.com`, …).
+    pub datadog_site: Option<String>,
+    /// Full Datadog Logs intake URL, overriding the site-derived endpoint.
+    pub datadog_endpoint: Option<String>,
 }
 
 /// Per-model context-window overrides in settings.
@@ -495,6 +515,8 @@ pub struct ConfigService {
     user_config_path: PathBuf,
     project_config_path: Option<PathBuf>,
     managed_config_path: Option<PathBuf>,
+    managed_plist_path: Option<PathBuf>,
+    managed_registry_key: Option<String>,
 }
 
 impl ConfigService {
@@ -505,6 +527,8 @@ impl ConfigService {
             user_config_path,
             project_config_path,
             managed_config_path: None,
+            managed_plist_path: None,
+            managed_registry_key: None,
         }
     }
 
@@ -519,12 +543,100 @@ impl ConfigService {
         self
     }
 
-    /// Load managed settings from the configured file carrier.
+    /// Attach a managed-settings property list (the macOS MDM carrier).
     ///
-    /// Returns `Ok(None)` if no managed path is configured or the file is
-    /// missing. A checksum mismatch is treated as absent (fail closed) so a
-    /// tampered managed file cannot relax policy.
+    /// The plist is a dictionary of settings keys, normally installed by an
+    /// MDM profile at `/Library/Managed Preferences/<domain>.plist`. It is
+    /// merged as a managed source: after the managed JSON file and before the
+    /// Windows registry carrier (OS policy wins over the file). No checksum is
+    /// verified — the OS protects the location — but the document is still
+    /// size-capped, checked for unknown keys, migrated, and validated like any
+    /// other settings file.
+    #[must_use]
+    pub fn with_managed_settings_plist(mut self, path: PathBuf) -> Self {
+        self.managed_plist_path = Some(path);
+        self
+    }
+
+    /// Attach the default macOS managed-preferences plist for CodeRex
+    /// (`/Library/Managed Preferences/dev.coderex.plist`).
+    #[must_use]
+    pub fn with_default_macos_managed_plist(self) -> Self {
+        self.with_managed_settings_plist(crate::managed::default_managed_plist_path(
+            crate::managed::DEFAULT_MACOS_MANAGED_PLIST_DOMAIN,
+        ))
+    }
+
+    /// Attach the Windows HKLM registry carrier with an explicit key path.
+    ///
+    /// `key_path` is relative to `HKEY_LOCAL_MACHINE` (for example
+    /// `SOFTWARE\CodeRex`). The carrier is read only when compiled for
+    /// Windows; on other platforms it is a no-op.
+    #[must_use]
+    pub fn with_managed_settings_registry_key(mut self, key_path: impl Into<String>) -> Self {
+        self.managed_registry_key = Some(key_path.into());
+        self
+    }
+
+    /// Attach the default Windows HKLM carrier
+    /// (`HKLM\SOFTWARE\CodeRex`).
+    #[must_use]
+    pub fn with_default_windows_managed_registry(self) -> Self {
+        self.with_managed_settings_registry_key(crate::managed::WINDOWS_MANAGED_REGISTRY_KEY)
+    }
+
+    /// Load managed settings from every configured carrier.
+    ///
+    /// Returns `Ok(None)` if no managed carrier is configured or none is
+    /// present. Carrier precedence, lowest to highest:
+    ///
+    /// 1. managed JSON file ([`Self::with_managed_settings_path`])
+    /// 2. macOS property list ([`Self::with_managed_settings_plist`])
+    /// 3. Windows registry ([`Self::with_managed_settings_registry_key`])
+    ///
+    /// A checksum mismatch on the JSON file is treated as absent (fail closed)
+    /// so a tampered managed file cannot relax policy. OS carriers are
+    /// protected by the operating system and are skipped with a warning if they
+    /// cannot be read or parsed, without discarding a carrier that did load.
     pub fn load_managed_config(&self) -> Result<Option<Settings>, ConfigError> {
+        let mut merged = self.load_managed_file_config()?;
+
+        if let Some(path) = &self.managed_plist_path {
+            match crate::managed::load_managed_plist(path) {
+                Ok(Some(settings)) => {
+                    merged = Some(match merged {
+                        Some(current) => current.merge(&settings),
+                        None => settings,
+                    });
+                }
+                Ok(None) => {}
+                Err(e) => tracing::warn!("managed plist at {path:?} not loaded: {e}"),
+            }
+        }
+
+        if let Some(key_path) = &self.managed_registry_key {
+            #[cfg(windows)]
+            match crate::managed::load_managed_registry(key_path) {
+                Ok(Some(settings)) => {
+                    merged = Some(match merged {
+                        Some(current) => current.merge(&settings),
+                        None => settings,
+                    });
+                }
+                Ok(None) => {}
+                Err(e) => tracing::warn!("managed registry key HKLM\\{key_path} not loaded: {e}"),
+            }
+            #[cfg(not(windows))]
+            tracing::debug!(
+                "managed registry key HKLM\\{key_path} ignored — this build is not running on Windows"
+            );
+        }
+
+        Ok(merged)
+    }
+
+    /// Load managed settings from the configured JSON file carrier.
+    fn load_managed_file_config(&self) -> Result<Option<Settings>, ConfigError> {
         let Some(path) = &self.managed_config_path else {
             return Ok(None);
         };
@@ -657,7 +769,7 @@ fn enforce_telemetry_source_policy(settings: &mut Settings, source: &str) {
 ///
 /// The whole file is skipped rather than truncated: a partially-read settings
 /// file is worse than none, because the reader cannot tell which keys were cut.
-fn enforce_size_cap(path: &Path) -> Result<(), ConfigError> {
+pub(crate) fn enforce_size_cap(path: &Path) -> Result<(), ConfigError> {
     let size = std::fs::metadata(path)?.len();
     if size > MAX_SETTINGS_FILE_BYTES {
         tracing::warn!(
@@ -673,7 +785,10 @@ fn enforce_size_cap(path: &Path) -> Result<(), ConfigError> {
 }
 
 /// Reject a parsed settings object that carries a key we do not understand.
-fn check_unknown_fields(value: &serde_json::Value, source: &str) -> Result<(), ConfigError> {
+pub(crate) fn check_unknown_fields(
+    value: &serde_json::Value,
+    source: &str,
+) -> Result<(), ConfigError> {
     if let Some(obj) = value.as_object() {
         for key in obj.keys() {
             if !KNOWN_SETTINGS_FIELDS.contains(&key.as_str()) {
@@ -692,7 +807,10 @@ fn check_unknown_fields(value: &serde_json::Value, source: &str) -> Result<(), C
 /// effective mode falls back to the next layer — ultimately the built-in
 /// `"default"`, the most restrictive mode. Every other invalid value rejects
 /// the whole file.
-fn finalize_settings(mut settings: Settings, source: &str) -> Result<Settings, ConfigError> {
+pub(crate) fn finalize_settings(
+    mut settings: Settings,
+    source: &str,
+) -> Result<Settings, ConfigError> {
     migrate_settings(&mut settings, source);
 
     if let Some(mode) = settings.permission_mode.as_deref() {
@@ -1302,6 +1420,104 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let service = ConfigService::new(temp.path().join("user.json"), None);
         assert!(service.load_managed_config().unwrap().is_none());
+    }
+
+    // ── macOS plist carrier ──────────────────────────────────────────────
+
+    #[cfg(target_os = "macos")]
+    fn write_managed_plist(path: &Path, entries: &[(&str, plist::Value)]) {
+        let mut dict = plist::Dictionary::new();
+        for (key, value) in entries {
+            dict.insert((*key).into(), value.clone());
+        }
+        plist::Value::Dictionary(dict).to_file_xml(path).unwrap();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn managed_plist_is_applied_after_the_managed_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let managed_file = temp.path().join("managed_settings.json");
+        write_managed(
+            &managed_file,
+            serde_json::json!({ "model": "file-model", "max_budget_usd": 10.0 }),
+        );
+        let plist_path = temp.path().join("dev.coderex.plist");
+        write_managed_plist(
+            &plist_path,
+            &[
+                ("model", plist::Value::String("plist-model".to_string())),
+                ("telemetry_enabled", plist::Value::Boolean(true)),
+            ],
+        );
+
+        let service = ConfigService::new(temp.path().join("user.json"), None)
+            .with_managed_settings_path(managed_file)
+            .with_managed_settings_plist(plist_path);
+        let resolved = service.resolve().unwrap();
+
+        // The plist wins over the managed file for keys it sets...
+        assert_eq!(resolved.model.as_deref(), Some("plist-model"));
+        assert_eq!(resolved.telemetry_enabled, Some(true));
+        // ...and the file's other keys survive.
+        assert_eq!(resolved.max_budget_usd, Some(10.0));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn unreadable_managed_plist_does_not_discard_the_managed_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let managed_file = temp.path().join("managed_settings.json");
+        write_managed(&managed_file, serde_json::json!({ "model": "file-model" }));
+        let plist_path = temp.path().join("broken.plist");
+        std::fs::write(&plist_path, b"this is not a plist").unwrap();
+
+        let service = ConfigService::new(temp.path().join("user.json"), None)
+            .with_managed_settings_path(managed_file)
+            .with_managed_settings_plist(plist_path);
+        // The bad OS carrier is skipped; the valid carrier still applies.
+        assert_eq!(
+            service.resolve().unwrap().model.as_deref(),
+            Some("file-model")
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn managed_plist_can_enable_telemetry_and_security_modes() {
+        let temp = tempfile::tempdir().unwrap();
+        let plist_path = temp.path().join("dev.coderex.plist");
+        write_managed_plist(
+            &plist_path,
+            &[
+                ("telemetry_enabled", plist::Value::Boolean(true)),
+                (
+                    "permission_mode",
+                    plist::Value::String("bypass-permissions".to_string()),
+                ),
+            ],
+        );
+
+        let service = ConfigService::new(temp.path().join("user.json"), None)
+            .with_managed_settings_plist(plist_path);
+        let resolved = service.resolve().unwrap();
+        assert_eq!(resolved.telemetry_enabled, Some(true));
+        assert_eq!(
+            resolved.permission_mode.as_deref(),
+            Some("bypass-permissions")
+        );
+    }
+
+    #[test]
+    fn registry_carrier_is_inert_off_windows() {
+        let temp = tempfile::tempdir().unwrap();
+        let service = ConfigService::new(temp.path().join("user.json"), None)
+            .with_default_windows_managed_registry();
+        assert!(service.load_managed_config().unwrap().is_none());
+        assert_eq!(
+            service.resolve().unwrap().model.as_deref(),
+            Some("claude-sonnet-4-6")
+        );
     }
 
     #[test]
