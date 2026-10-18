@@ -2,6 +2,9 @@
 
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use tokio::sync::Notify;
 
 use crate::archive::{BridgeArchiveWriter, BridgeCleanupManager, UsageStats};
 use crate::epoch::{StaleEpoch, WriteFence};
@@ -98,6 +101,34 @@ pub enum BridgeEvent {
     SessionArchived { session_id: String },
 }
 
+/// A cloneable handle that asks a running [`Bridge`] to stop serving.
+///
+/// The handle is separate from the bridge so a signal handler or supervisor
+/// task can request shutdown while `serve_transport` holds `&mut Bridge`.
+#[derive(Debug, Clone)]
+pub struct BridgeStopHandle {
+    /// Set once shutdown has been requested.
+    requested: Arc<AtomicBool>,
+    /// Wakes the serve loop out of a blocking receive.
+    notify: Arc<Notify>,
+}
+
+impl BridgeStopHandle {
+    /// Request that the bridge stop serving.
+    pub fn stop(&self) {
+        self.requested.store(true, Ordering::SeqCst);
+        // notify_one leaves a permit behind if the loop is not waiting yet, so
+        // a stop requested between frames is not lost.
+        self.notify.notify_one();
+    }
+
+    /// Whether shutdown has been requested.
+    #[must_use]
+    pub fn is_stopped(&self) -> bool {
+        self.requested.load(Ordering::SeqCst)
+    }
+}
+
 /// The main bridge orchestrator.
 ///
 /// Owns and wires together all bridge modules:
@@ -143,6 +174,10 @@ pub struct Bridge {
     event_tx: tokio::sync::broadcast::Sender<BridgeEvent>,
     /// Whether the bridge is currently running.
     running: bool,
+    /// Shutdown request flag shared with [`BridgeStopHandle`].
+    stop_requested: Arc<AtomicBool>,
+    /// Wakes the serve loop when shutdown is requested.
+    stop_notify: Arc<Notify>,
 }
 
 impl std::fmt::Debug for Bridge {
@@ -196,7 +231,24 @@ impl Bridge {
             sessions: std::collections::HashMap::new(),
             event_tx,
             running: false,
+            stop_requested: Arc::new(AtomicBool::new(false)),
+            stop_notify: Arc::new(Notify::new()),
         }
+    }
+
+    /// Get a handle that can request shutdown from another task.
+    #[must_use]
+    pub fn stop_handle(&self) -> BridgeStopHandle {
+        BridgeStopHandle {
+            requested: Arc::clone(&self.stop_requested),
+            notify: Arc::clone(&self.stop_notify),
+        }
+    }
+
+    /// Request that [`Bridge::serve_transport`] stop after the frame it is
+    /// handling. Safe to call from a signal handler or supervisor task.
+    pub fn request_stop(&self) {
+        self.stop_handle().stop();
     }
 
     /// Subscribe to bridge events.
@@ -482,10 +534,19 @@ impl Bridge {
     /// reconnecting blind, and everything else is routed by type.
     pub async fn serve_transport(&mut self) -> Result<(), String> {
         self.running = true;
-        while self.running {
+        let stop_requested = Arc::clone(&self.stop_requested);
+        let stop_notify = Arc::clone(&self.stop_notify);
+        while self.running && !stop_requested.load(Ordering::SeqCst) {
+            let shutdown = stop_notify.notified();
             let received = {
                 let transport = self.transport.as_mut().ok_or("no transport configured")?;
-                transport.receive().await
+                tokio::select! {
+                    received = transport.receive() => Some(received),
+                    () = shutdown => None,
+                }
+            };
+            let Some(received) = received else {
+                break;
             };
             let message = match received {
                 Ok(message) => message,
@@ -984,6 +1045,74 @@ mod tests {
         // Connect should work (in-process doesn't need network)
         bridge.connect().await.unwrap();
         assert!(bridge.is_running());
+    }
+
+    #[tokio::test]
+    async fn serve_transport_stops_when_the_handle_requests_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (bridge_transport, mut remote) =
+            InProcessTransport::create_pair("bridge".into(), "remote".into());
+        bridge_transport_connect(&mut remote).await;
+
+        let mut bridge = Bridge::new(test_config(tmp.path()), Box::new(bridge_transport));
+        bridge.connect().await.unwrap();
+        let stop = bridge.stop_handle();
+        let serving = tokio::spawn(async move { bridge.serve_transport().await });
+
+        // Give the serve loop a moment to start waiting on the transport.
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        assert!(!stop.is_stopped());
+        stop.stop();
+        assert!(stop.is_stopped());
+
+        let result = tokio::time::timeout(std::time::Duration::from_secs(1), serving)
+            .await
+            .expect("serve_transport should stop promptly")
+            .unwrap();
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn serve_transport_still_answers_a_frame_before_stopping() {
+        use crate::transport::TransportMessage;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let (bridge_transport, mut remote) =
+            InProcessTransport::create_pair("bridge".into(), "remote".into());
+        bridge_transport_connect(&mut remote).await;
+
+        let mut bridge = Bridge::new(test_config(tmp.path()), Box::new(bridge_transport));
+        bridge.connect().await.unwrap();
+        let stop = bridge.stop_handle();
+        let serving = tokio::spawn(async move { bridge.serve_transport().await });
+
+        remote
+            .send(TransportMessage {
+                r#type: "heartbeat".into(),
+                correlation_id: Some("beat".into()),
+                payload: "{}".into(),
+                metadata: std::collections::HashMap::new(),
+            })
+            .await
+            .unwrap();
+
+        let reply = remote.receive().await.unwrap();
+        assert_eq!(reply.r#type, "heartbeat_ack");
+        assert_eq!(reply.correlation_id, Some("beat".into()));
+
+        stop.stop();
+        let result = tokio::time::timeout(std::time::Duration::from_secs(1), serving)
+            .await
+            .expect("serve_transport should stop promptly")
+            .unwrap();
+        assert!(result.is_ok());
+    }
+
+    /// Connect the remote half of an in-process pair, since only the bridge
+    /// half is connected by `serve_transport`.
+    async fn bridge_transport_connect(remote: &mut InProcessTransport) {
+        use crate::transport::Transport;
+        remote.connect().await.unwrap();
     }
 
     #[test]
