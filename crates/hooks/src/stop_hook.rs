@@ -159,6 +159,7 @@ mod tests {
             max_cpu_seconds: None,
             max_memory_mb: None,
             max_file_size_mb: None,
+            sandbox: None,
             tier: HookTier::Core,
         });
         let ctx = StopHookContext {

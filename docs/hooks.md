@@ -15,7 +15,11 @@ prints a JSON result on stdout; a `PreToolUse` hook can deny a tool, a
   also carries the injected [`HookActionRunner`], if the session supplied one.
 - **`HookConfig`** (`engine.rs`) — one hook: `event`, `type`, `command`,
   `http`, `prompt`, `model`, `mcp`, `env`, `cwd`, `timeout_ms`, `priority`,
-  `dry_run`, `stream`, the resource limits, and `tier`.
+  `dry_run`, `stream`, the resource limits, the OS `sandbox` policy, and
+  `tier`.
+- **`HookSandboxConfig`** (`sandbox.rs`) — per-hook filesystem/network
+  policy: `enabled`, `allow_network`, and extra read/write/exec paths. See
+  [OS sandbox for command hooks](#os-sandbox-for-command-hooks).
 - **`HookTier`** (`engine.rs`) — `Managed` / `Plugin` / `Core`. Decides chain
   order; see below.
 - **`HookType`** (`engine.rs`) — the `type` discriminator: `Command`, `Http`,
@@ -268,9 +272,11 @@ and the matching side cannot drift.
 - **Resource limits.** `max_cpu_seconds` (`RLIMIT_CPU`) and
   `max_file_size_mb` (`RLIMIT_FSIZE`) are installed in `pre_exec`, before the
   hook program runs, so `ulimit -f unlimited` inside the hook cannot raise
-  them. `max_memory_mb` (`RLIMIT_AS`) is Linux-only: macOS rejects that limit,
-  and OS-sandbox memory confinement there is a separate, not-yet-applied layer.
+  them. `max_memory_mb` (`RLIMIT_AS`) is Linux-only: macOS rejects that limit.
   Windows uses a Job Object through `coderex_core::sandbox`.
+- **OS sandbox.** A `command` hook is additionally confined with the same
+  primitives the shell tools use: `sandbox-exec` on macOS, `bubblewrap` on
+  Linux. See the next section.
 - **Streaming protocol.** With `stream: true`, stdout is line-delimited JSON.
   A line without a control `type` is the answer (the historical contract,
   unchanged). Before it a hook may emit `{"type":"log",...}`,
@@ -286,6 +292,97 @@ and the matching side cannot drift.
 - **Logging.** Every execution logs `hook_command`, `event`, `duration_ms`,
   `exit_code`, and `error` via `tracing`; protocol `log` and `event` lines are
   logged as they arrive.
+
+## OS sandbox for command hooks
+
+Every `command` hook runs inside the platform sandbox, in addition to its
+resource limits. The layer is `coderex_core::sandbox` — the same
+`SandboxHandle`, Seatbelt profile, and bubblewrap argument builder the Bash and
+PowerShell tools use — so there is one policy implementation, not two.
+
+### Default policy
+
+| Access | Default |
+|---|---|
+| Read | The hook's workspace (`cwd`, else the session's working directory), the temp directory, the user's home and `XDG_CONFIG_HOME`, system roots, and the absolute directories on `PATH` (with the prefix when the entry is a `bin`/`sbin` directory) |
+| Write | The workspace and the temp directory — **nothing else** |
+| Execute | System shells and tools under `/bin`, `/usr/bin`, `/usr/local/bin` (plus `/Library/Developer` on macOS and Homebrew/Toolchain `PATH` entries) |
+| Network | Denied |
+
+On macOS this is a `(deny default)` Seatbelt profile: reads of file contents
+outside the policy paths are refused (metadata and the root listing are
+allowed, as for the shell tools), writes outside the write set are refused,
+and `(deny network*)` is emitted. On Linux this is bubblewrap: the root is
+bound read-only, only the write set is re-bound writable, and `--unshare-net`
+denies the network.
+
+`HOME` is readable but not writable. That keeps hooks that read
+`~/.gitconfig` or a config directory working without granting them the home
+directory as a write target.
+
+### Per-hook configuration
+
+The `sandbox` key is optional. Additional paths **extend** the defaults; a
+missing key means the default policy.
+
+```json
+{
+  "event": "PreToolUse",
+  "command": "check-policy --input /srv/policy/rules.json",
+  "sandbox": {
+    "allow_network": false,
+    "allowed_read_paths": ["/srv/policy"],
+    "allowed_write_paths": ["/tmp/hook-output"],
+    "allowed_exec_paths": ["/srv/policy/bin"]
+  }
+}
+```
+
+- `enabled` (default `true`) — `false` disables the OS sandbox for this hook.
+  Resource limits still apply.
+- `allow_network` (default `false`) — permits network access.
+- `allowed_read_paths` / `allowed_write_paths` / `allowed_exec_paths` — extra
+  absolute paths. A relative path is refused at load, because it would resolve
+  against the workspace and confine nothing.
+- `"sandbox": false` and `"sandbox": true` are shorthand for
+  `{"enabled": false}` and `{"enabled": true}`.
+- An unknown key inside the object is a **load error**, not a silently ignored
+  option.
+
+`CODEREX_HOOK_SANDBOX=0` (or `false`/`no`) is the process-wide escape hatch:
+every command hook runs with resource limits but without OS confinement. As
+with `CODEREX_BWRAP`, only an explicit negative switches it off.
+
+### When the platform cannot confine
+
+The sandbox is not pretended. If the wrapper cannot be created — Windows has
+no path/network isolation, Linux has no `bwrap`, macOS has no `sandbox-exec` —
+then:
+
+- On a **gating event** (`PreToolUse`, `UserPromptSubmit`) the hook fails with
+  `HookError::SandboxUnavailable`, which is a failure and therefore a deny. A
+  configured gate that cannot be enforced must not read as an allow.
+- On any **other event** there is nowhere to deny, so the reason is logged at
+  `warn` and the hook runs with resource limits only.
+
+An explicit opt-out (`sandbox.enabled: false` or `CODEREX_HOOK_SANDBOX=0`) is
+not a failure: it is logged and the hook runs. This is the supported way to
+run hooks on a platform without confinement.
+
+### What is enforced, per platform
+
+| Platform | Filesystem | Network | Resource limits |
+|---|---|---|---|
+| macOS | **Kernel** — Seatbelt read/write paths | **Kernel** — `deny network*` | CPU/file-size; no `RLIMIT_AS` |
+| Linux with `bwrap` | **Kernel** — read-only root, writable policy paths | **Kernel** — network namespace | CPU/file-size/address space |
+| Linux without `bwrap` | **None** — gating hooks fail closed | None (no wrapper) | CPU/file-size/address space |
+| Windows | **None** — Job Objects limit resources/UI only; gating hooks fail closed | None | Job Object CPU/memory |
+| Other | **None** — gating hooks fail closed | None | — |
+
+The streaming protocol is unaffected: stdin/stdout/stderr are inherited
+through the wrapper, so `stream: true` hooks keep their line-delimited
+protocol, and the one-way contract still closes stdin after the input. The
+macOS profile file and the Windows Job Object are held until the child exits.
 
 ## Worker isolation
 
@@ -307,11 +404,12 @@ provides are implemented in process-appropriate form instead:
   stderr is drained concurrently, so a hook cannot deadlock the host on a full
   pipe or exhaust its memory.
 
-**Not applied:** OS-level filesystem and network confinement (bubblewrap on
-Linux, `sandbox-exec` on macOS, AppContainer on Windows). `coderex_core::sandbox`
-already provides those primitives for shell tools; extending them to hooks is a
-recorded policy decision, not an accidental gap. Until it is applied, a hook can
-read and write whatever the session process can.
+**OS confinement is applied** to `command` hooks: `sandbox-exec` on macOS and
+bubblewrap on Linux, reusing `coderex_core::sandbox` (see
+[OS sandbox for command hooks](#os-sandbox-for-command-hooks)). Windows has no
+filesystem isolation in the primitive CodeRex uses; there, a gating hook fails
+closed rather than running unconfined, and a non-gating hook warns. An explicit
+per-hook or environment opt-out is available.
 
 ## Current status
 
@@ -319,7 +417,8 @@ read and write whatever the session process can.
 API; all five hook kinds — `command` (stdin/stdout), `http` (POST), `prompt`
 and `agent` (one model query through an injected runner), and `mcp_tool` (one
 MCP call through the same runner); timeout with process kill; kernel-enforced
-CPU/file-size/address-space limits for `command` subprocesses; the
+CPU/file-size/address-space limits and OS filesystem/network confinement for
+`command` subprocesses (with per-hook policy and explicit opt-outs); the
 `stream: true` protocol (events, logs, host-answered requests, best-effort
 cancel, bounded output); dry-run; fail-closed failure classification and the
 deny-on-gate behaviour; inert-event warnings; structured logging.

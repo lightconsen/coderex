@@ -328,6 +328,20 @@ pub enum HookError {
     /// answer.
     #[error("hook action failed: {0}")]
     ActionFailed(String),
+    /// The OS sandbox could not be created for a hook that needs it.
+    ///
+    /// A gating hook is refused rather than run unconfined: a configured gate
+    /// that cannot be enforced must not read as an allow. Non-gating hooks
+    /// log the reason and run with resource limits only, so this error is the
+    /// gating path.
+    #[error("hook OS sandbox is unavailable: {0}")]
+    SandboxUnavailable(String),
+    /// A hook's `sandbox` configuration cannot be honoured.
+    ///
+    /// Refused at load time so a typo or a relative path is visible instead of
+    /// silently confining nothing.
+    #[error("invalid hook sandbox configuration: {0}")]
+    InvalidSandboxConfig(String),
 }
 
 #[cfg(test)]

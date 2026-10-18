@@ -17,6 +17,7 @@ pub use engine::{HookConfig, HookInput, HookMatcher, HookRegistry, HookTier, Hoo
 pub use events::{
     HookAction, HookError, HookEvent, HookPermissionDecision, HookResult, UnknownHookEvent,
 };
+pub use sandbox::{HOOK_SANDBOX_ENV, HookSandboxConfig};
 pub use stop_hook::{
     StopHookContext, StopHookDecision, execute_stop_hook, should_proceed_with_compact,
 };
