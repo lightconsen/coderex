@@ -28,8 +28,13 @@ chrono.workspace = true
 home.workspace = true
 sha2.workspace = true
 base64.workspace = true
-openssh.workspace = true
 rand = "0.8"
+
+# `openssh` is Unix-only (it reaches `std::os::unix`), so the SSH spawn path
+# is compiled only there. The Windows build refuses `SpawnMode::Ssh` with a
+# clear error instead of failing to compile the workspace.
+[target.'cfg(unix)'.dependencies]
+openssh.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

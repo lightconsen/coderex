@@ -1022,9 +1022,10 @@ impl Bridge {
     /// headless with `stream-json` and a positional prompt, `read_stdout`
     /// turns its `control_request` frame into this call, and an inbound
     /// `permission_response` is written back to the child's stdin. The
-    /// remaining gap is outside this repository: the gateway must forward
-    /// `permission_request`/`permission_response` between the bridge and the
-    /// remote host.
+    /// gateway-side half of relaying `permission_request`/`permission_response`
+    /// between the bridge and the remote host is
+    /// [`crate::gateway::PermissionFrameRelay`]; the gateway itself supplies
+    /// authentication, fan-out, and the human UI around it.
     pub fn request_permission(&mut self, session_id: &str, tool: &str, args: &str) -> String {
         let request_id = self.permission_router.create_request(
             session_id.to_string(),

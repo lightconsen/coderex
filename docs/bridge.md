@@ -68,6 +68,7 @@ Remote session orchestration for connecting to remote CodeRex instances or manag
 | `heartbeat.rs` | Heartbeat, HeartbeatLoop, WsReconnector, SequenceCursor | Connection health monitoring, exponential backoff reconnect, downstream resume point |
 | `epoch.rs` | WriteFence, StaleEpoch | Monotonic worker-epoch write fence |
 | `relay.rs` | RelayApprovalGate, RelayCallBody, RelayDecision, `forwardable_headers` | Relayed-call approval binding, header forwarding policy, gateway refusal shape |
+| `gateway.rs` | PermissionFrameRelay | Gateway-side relay of `permission_request`/`permission_response`, outstanding-request tracking |
 | `state.rs` | BridgeSessionStateMachine | 11-state session lifecycle with validated transitions |
 | `permission.rs` | BridgePermissionRouter | Session-scoped Allow/Deny permission routing |
 | `poller.rs` | BridgeWorkPoller, SpawnMode | Control plane registration, capacity-aware assignment queue |
@@ -131,7 +132,7 @@ route above and overridable with `--claim-path` / `CODEREX_BRIDGE_CLAIM_PATH`.
 
 - **`SingleSession`** / **`SameDir`** — Uses existing directory, prepares session data dir.
 - **`Worktree`** — `git worktree add` at `.coderex/worktrees/{session_id}`. Cleanup via `git worktree remove`.
-- **`Ssh`** — Connects to remote host via `openssh` crate, creates session directory, verifies `coderex` is available. Verifies host keys with `KnownHosts::Add`: unknown hosts are recorded on first contact and must match afterwards.
+- **`Ssh`** — Connects to remote host via `openssh` crate, creates session directory, verifies `coderex` is available. Verifies host keys with `KnownHosts::Add`: unknown hosts are recorded on first contact and must match afterwards. The `openssh` crate is Unix-only, so the dependency is `cfg(unix)` and Windows builds refuse `SpawnMode::Ssh` with a clear error instead of failing to compile.
 
 ### Delta Sync & Conflict Resolution
 
@@ -412,8 +413,17 @@ the transport immediately. When the gateway answers with `permission_response`,
 `BridgeEvent::PermissionResolved` tells the launcher to write a
 `control_response` line to the child's stdin; the turn then continues or
 records the denial. An unanswered request leaves the child waiting; shutdown
-drops the responders. The gateway is responsible for relaying these two frame
-kinds between the bridge and the human.
+drops the responders. The gateway-side half of relaying these two frame kinds
+is `PermissionFrameRelay` in `crates/bridge/src/gateway.rs`: it forwards a
+`permission_request` from the worker to the host connection, remembers its
+request id as pending, and forwards the matching `permission_response` back to
+the worker exactly once. An answer for an id that is not pending, or a replay
+of one already relayed, is dropped instead of forwarded; frames either side
+does not own are returned as `None` so the caller can pass them through
+unchanged. A gateway built on the relay still owns what surrounds it:
+authenticating the host connection, fanning frames out to the right human
+client, presenting the approval UI, and deciding what to do about a request
+that is never answered.
 
 The turn's final `result` frame supplies `UsageStats`:
 `usage.input_tokens`, `usage.output_tokens`,

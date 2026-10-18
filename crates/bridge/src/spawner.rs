@@ -143,6 +143,11 @@ impl BridgeSessionSpawner {
     ///
     /// Connects to the remote host using OpenSSH, creates the session
     /// directory, and verifies that `coderex` is available on the remote.
+    ///
+    /// The `openssh` crate is Unix-only, so the Windows build refuses SSH
+    /// spawning explicitly instead of failing to compile or pretending the
+    /// transport exists.
+    #[cfg(unix)]
     async fn spawn_ssh(
         &self,
         config: SpawnConfig,
@@ -184,14 +189,32 @@ impl BridgeSessionSpawner {
             worktree_created: false,
         })
     }
+
+    /// SSH spawning is not available on this platform.
+    ///
+    /// `openssh` is a Unix-only dependency; refusing here keeps the rest of
+    /// the bridge (and the whole workspace) compiling and buildable on
+    /// Windows while making the unsupported transport explicit.
+    #[cfg(not(unix))]
+    async fn spawn_ssh(
+        &self,
+        _config: SpawnConfig,
+        _host: &str,
+        _remote_path: &str,
+        _identity_file: Option<&str>,
+    ) -> Result<SpawnResult, String> {
+        Err("SSH session spawning is not supported on this platform".to_string())
+    }
 }
 
 /// The remote directory a session works in.
+#[cfg_attr(not(unix), allow(dead_code))]
 fn remote_session_dir(remote_path: &str, session_id: &str) -> String {
     format!("{remote_path}/{session_id}")
 }
 
 /// One command a remote session setup runs over SSH.
+#[cfg_attr(not(unix), allow(dead_code))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct RemoteCommand {
     program: String,
@@ -202,6 +225,7 @@ struct RemoteCommand {
 ///
 /// Kept separate from the connection so what the spawner sends can be checked
 /// without a live SSH server.
+#[cfg_attr(not(unix), allow(dead_code))]
 fn ssh_remote_commands(session_dir: &str) -> Vec<RemoteCommand> {
     vec![
         RemoteCommand {
@@ -223,11 +247,13 @@ fn ssh_remote_commands(session_dir: &str) -> Vec<RemoteCommand> {
 /// hijacked route, a poisoned DNS entry — then gets the session. `Add` is the
 /// policy `ssh` itself applies: an unknown host is recorded on first contact,
 /// and every connection after that has to match what was recorded.
+#[cfg(unix)]
 const fn host_key_policy() -> openssh::KnownHosts {
     openssh::KnownHosts::Add
 }
 
 /// Build the SSH session builder for a remote session.
+#[cfg(unix)]
 fn ssh_builder(identity_file: Option<&str>) -> Result<openssh::SessionBuilder, String> {
     let identity_file = resolve_identity_file(identity_file)?;
 
@@ -245,6 +271,7 @@ fn ssh_builder(identity_file: Option<&str>) -> Result<openssh::SessionBuilder, S
 /// A configured identity file is the key that gets used; naming one that is
 /// not there is an error rather than a silent fall back to the agent, which
 /// would put the session on a key the caller did not choose.
+#[cfg(unix)]
 fn resolve_identity_file(identity_file: Option<&str>) -> Result<Option<PathBuf>, String> {
     let Some(path) = identity_file else {
         return Ok(None);
@@ -258,6 +285,7 @@ fn resolve_identity_file(identity_file: Option<&str>) -> Result<Option<PathBuf>,
 }
 
 /// Expand a leading `~` to the home directory.
+#[cfg(unix)]
 fn expand_tilde(path: &str) -> Result<PathBuf, String> {
     let Some(rest) = path
         .strip_prefix("~/")
@@ -281,6 +309,7 @@ mod tests {
 
     use std::path::Path;
 
+    #[cfg(unix)]
     #[test]
     fn ssh_verifies_the_host_key() {
         let policy = host_key_policy();
@@ -294,6 +323,7 @@ mod tests {
         assert!(!matches!(policy, openssh::KnownHosts::Accept));
     }
 
+    #[cfg(unix)]
     #[test]
     fn ssh_builder_uses_a_named_identity_file() {
         let key = tempfile::NamedTempFile::new().unwrap();
@@ -304,6 +334,7 @@ mod tests {
         assert!(builder.is_ok(), "{builder:?}");
     }
 
+    #[cfg(unix)]
     #[test]
     fn ssh_builder_refuses_an_identity_file_that_is_not_there() {
         let err = resolve_identity_file(Some("/nonexistent/id_ed25519")).unwrap_err();
@@ -311,6 +342,7 @@ mod tests {
         assert!(err.contains("not found"), "{err}");
     }
 
+    #[cfg(unix)]
     #[test]
     fn ssh_builder_expands_a_leading_tilde() {
         let home = home::home_dir().unwrap();
@@ -322,12 +354,14 @@ mod tests {
         assert!(!err.contains(missing), "tilde was not expanded: {err}");
     }
 
+    #[cfg(unix)]
     #[test]
     fn ssh_builder_without_an_identity_file_falls_back_to_the_agent() {
         assert_eq!(resolve_identity_file(None).unwrap(), None);
         assert!(ssh_builder(None).is_ok());
     }
 
+    #[cfg(unix)]
     #[test]
     fn expand_tilde_leaves_other_paths_alone() {
         assert_eq!(expand_tilde("/tmp/key").unwrap(), PathBuf::from("/tmp/key"));
