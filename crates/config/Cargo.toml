@@ -47,8 +47,6 @@ plist = "1.10"
 
 [target.'cfg(windows)'.dependencies]
 winreg = "0.55"
-
-[target.'cfg(windows)'.dependencies]
 # Real DACL construction for the private token-file fallback. `std` has no ACL
 # API, and `icacls` is neither atomic nor locale-stable.
 windows-sys = { version = "0.59", features = [
