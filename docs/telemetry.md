@@ -269,7 +269,7 @@ that want to build the same row shape in-process.
 - `TelemetryHandle` with convenience methods (`session_start`, `tool_used`, `api_call`, `error`).
 - Background worker thread with batching and flush intervals.
 - **Graceful shutdown**: `TelemetryHandle::shutdown()` sends `FlushAndExit`, worker flushes final batch and acks.
-- **Uploader wired up**: `TelemetryHandle::new` accepts `Option<TelemetryConfig>`; constructs `TelemetryUploader` when enabled.
+- **Uploader runs in production**: the CLI keeps the uploader returned by `TelemetryHandle::new` alive in a spawned task (aborted on drop/session end) and records session start/end through the handle. The task is only started when consent is on, so an opted-out session opens no network path. Settings `telemetry.otlp_*` / `datadog_*` values are overlaid onto `ChannelConfig::from_env()` before the uploader is constructed.
 - **Circuit breaker**: 5-failure threshold, 60s cooldown, HalfOpen retry.
 - **Gzip upload compression**: `flate2` with 1KB skip threshold.
 - **Crash panic hook** writing JSON to pending directory.

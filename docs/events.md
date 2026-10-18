@@ -61,6 +61,22 @@ discriminant is spelled exactly as the reference spells it:
 | `System(SystemFrame)` | `system` | **`subtype`**, `session_id`, flattened subtype payload | e.g. `init`, `compact_boundary` |
 | `Result(ResultFrame)` | `result` | **`subtype`**, `is_error`, `duration_ms`, `num_turns`, `session_id`, optional `result` | **The turn-complete signal** |
 | `StreamEvent(StreamEventFrame)` | `stream_event` | raw API streaming event, `session_id` | Forwarded unmodified |
+| `ControlRequest(ControlRequestFrame)` | `control_request` | `request_id`, `request` (`subtype: can_use_tool`, `tool_name`, `input`, `reason`, `allow_session`) | Headless approval request; not a turn frame |
+| `ControlResponse(ControlResponseFrame)` | `control_response` | `response` (`subtype: success/error`, `request_id`, `behavior: allow/deny`, optional `message`) | **Input** direction: read from the child's stdin |
+
+### Headless tool approval
+
+With `--print --output-format stream-json` and a positional prompt (so stdin is
+free), the headless engine installs a `ConfirmationBus`. A permission `Ask`
+emits one `control_request` frame instead of becoming "no confirmation channel
+available". The host writes a `control_response` line to the child's stdin
+(`allow`, `allow_session`, or `deny`); the turn then continues or records the
+denial. Unknown stdin lines are ignored; EOF ends the reader; an unanswered
+request leaves the engine waiting, so a host must answer or terminate the
+child. `crates/cli/src/bridge_launcher.rs` uses exactly this channel: it
+forwards the request over the bridge transport as `permission_request` and
+writes the gateway's `permission_response` back as `control_response`. A
+control frame never counts as the turn's `result`.
 
 ### One frame, one line
 

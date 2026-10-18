@@ -414,13 +414,15 @@ Thread-safety (concurrent stores) and TF-IDF semantic search are always enabled 
 
 ### What Is Not Wired
 
-- **The memory tools are not registered.** The family exists and is tested, but the
-  `impl coderex_tools::Tool` adapter has to live in a crate that depends on both
-  `coderex-memory` and `coderex-tools`, and no such adapter has been added yet — see
-  the snippet above. Until then `memory_list`, `memory_read` and `memory_write` are not
-  visible to the model.
+- **The memory tools are registered.** `crates/cli/src/memory_tools.rs` adapts
+  the family to `coderex_tools::Tool`, and `crates/cli/src/repl.rs` registers it,
+  so `memory_list`, `memory_read` and `memory_write` are visible to the model.
+  The `org` store is only enabled when an org id is configured
+  (`CODEREX_ORG_ID`, else `org_id` in the orchestrator's
+  `remote_settings_cache.json`); without one, `org` reports `StoreUnavailable`
+  instead of silently resolving to another store.
 - **`SessionIndex` is unused outside this crate.** Nothing opens `sessions.db`; the
-  SQLite index is built and tested but no caller constructs it.
+  SQLite index is built and tested but no caller constructs it, deliberately.
 - **`DataDirectories` (`coderex-config`) is unused.** `project_dir`,
   `sessions_db_path` and `ensure_all` describe a home-directory layout that nothing
   adopts, since the workspace-local layout above is what the CLI uses.

@@ -56,12 +56,12 @@ Manages plugin lifecycle (discovery, loading, execution, unloading), marketplace
 - **Atomic install staging**: temp directory + validation + atomic rename + cleanup on failure.
 - **Install locks**: `DashMap<String, Arc<tokio::sync::Mutex<()>>>` prevents concurrent installs.
 - **Version compatibility**: SemVer comparison of `min_version` against app version on load and install.
-- **Signature verification**: Ed25519 signature check on plugin archives (optional, configured via public key).
+- **Signature verification**: Ed25519 check of the downloaded archive against a **detached** signature fetched from `<archive-url>.sig` (hex), optional and configured via `CODEREX_PLUGIN_PUBLIC_KEY`. The signature cannot live inside the archive it signs. With a key configured, sources that cannot carry a detached signature (local directory, git, git-subdir) fail closed unless an existing TOFU pin matches; without a key they install as `Unverified` with a warning.
 - **Manifest strictness**: `deny_unknown_fields` on `PluginManifest` and `UserConfigField`, plus a warning for accepted-but-unimplemented fields.
 - **Environment injection**: `userConfig` values and static `env` are resolved and substituted before the child is spawned.
 - **Trust on first use**: archive SHA-256 / git commit recorded in `.coderex-pins.json` and checked on later installs.
 - **Dependency resolution**: Kahn's topological sort with cycle detection for plugin load ordering.
-- **Error recovery**: Exponential-backoff retry for Error-state plugins (re-reads manifest, re-validates).
+- **Error recovery**: Exponential-backoff retry for Error-state plugins (re-reads manifest, re-validates). A successful retry reports `RestartRequired` (or invokes a registered restart handler); the CLI acts on that signal by calling `spawn_plugin` again, so recovery restores a runtime instead of only clearing the error state.
 - **MCP skills bridge**: Discovered MCP tools converted to `SkillMetadata` and stored in `SessionContext.mcp_skills`.
 - **Hybrid execution model**: Default tier = external process (JSON-RPC over stdio). Fast tier = WASM (compiled in-process, sandboxed, and loaded by `spawn_plugin`).
 - **Plugin command registration**: Dynamic `SlashCommand` registration via `Box::leak` for `&'static str` names/descriptions.
@@ -417,11 +417,13 @@ A configured signing key is the strong check, but a plugin installed with no key
 
 - **Archive installs** record the archive's SHA-256.
 - **Git installs** record the resolved commit.
-- **Directory installs** record nothing: a directory has no archive and no commit, and what protects it is that it is a path the user chose.
+- **Directory installs** record a deterministic content digest of the directory.
 
 On a later install of the same plugin name, the recorded pin must match, or the install is refused. A pin file that exists but cannot be parsed is an error rather than an empty store — silently forgetting the pins would turn the next install into a fresh first use. A pin that cannot be *written* after a successful install is a warning: the plugin is in place and correct, but the protection it would have had is missing.
 
-**Honest gaps:** this is trust-on-first-use, not a signature. There is no pin *file* a user can pre-seed to pin before the first install (the pins are created by the first install), and no way to pin a directory source. A `PluginSource::Archive { sha256 }` caller can pin explicitly for that install.
+When a signing key **is** configured, an unverifiable source (directory/git/git-subdir) is refused unless a matching pin already exists — a fresh install of an unsigned directory or git checkout does not proceed unverified. With no key configured, the old warn-and-install-unverified behavior remains.
+
+**Honest gaps:** the pin is trust-on-first-use, not a signature. There is no pin *file* a user can pre-seed to pin before the first install (the pins are created by the first install). A directory digest pins the bytes but is not a signed identity. A `PluginSource::Archive { sha256 }` caller can pin explicitly for that install. The detached signature must be served beside the archive as `<url>.sig`; there is no separate signature registry.
 
 **Why SHA-256 is implemented in-crate:** `sha256_hex` is the published algorithm, checked against the NIST vectors. The workspace has the `sha2` crate, but adding it to `crates/plugins/Cargo.toml` would change `Cargo.lock`, which is shared, so the function is vendored instead. It is integrity-only, never a signature; swap it for `sha2` as soon as this crate may add dependencies.
 

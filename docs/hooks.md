@@ -63,12 +63,18 @@ engine.set_hooks(registry.into_executor());
 `from_settings_json` assigns every hook the `Core` tier. Hooks from an
 administrator-controlled source must use `from_settings_json_with_tier(value,
 HookTier::Managed)` so they can run ahead of repository-controlled hooks.
+`from_settings_sources` loads several `(tier, document)` pairs into one
+registry, which is what the CLI uses.
 
-**Status:** wired. `crates/cli/src/repl.rs` calls `from_settings_json` and
-`into_executor` in `apply_cli_config`, so a configured hook actually fires. A
-session that wants the `prompt`, `agent`, and `mcp_tool` kinds must additionally
-call `set_action_runner` before `into_executor` (see the kinds section); without
-it those three kinds fail when they fire, which is a denial on a gating event.
+**Status:** wired. `Settings` carries the hook layers separately (`HookLayers`
+in `coderex-config`: core, managed, and plugin), so `crates/cli/src/repl.rs`
+loads managed hooks as `HookTier::Managed` and user/project hooks as
+`HookTier::Core` in `apply_cli_config`. Managed hooks are not also installed as
+Core. There is no plugin-manifest hook producer yet, so the `Plugin` tier is
+structurally present but has no source. A session that wants the `prompt`,
+`agent`, and `mcp_tool` kinds must additionally call `set_action_runner` before
+`into_executor` (see the kinds section); without it those three kinds fail when
+they fire, which is a denial on a gating event.
 
 ## Chain order: managed → plugin → core
 

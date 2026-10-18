@@ -59,9 +59,9 @@ main() → parse_args() → StartupOrchestrator::run()
 | `--dangerously-skip-permissions` | | Skip all permission prompts (sets `BypassPermissions` mode) |
 | `--allowed-tools TOOLS` | | Comma-separated list of allowed tools (restricts tool executor) |
 | `--model MODEL` | `-m` | Model to use (e.g., `claude-sonnet-4-6`, `claude-opus-4-6`) |
-| `--fallback-model MODEL` | | Fallback model if primary is unavailable |
-| `--system-prompt PROMPT` | | Custom system prompt (replaces default) |
-| `--append-system-prompt` | | Append to default system prompt instead of replacing |
+| `--fallback-model MODEL` | | Retry once with this model after a model-unavailable error. Headless only; interactive mode rejects the flag at startup rather than ignoring it |
+| `--system-prompt PROMPT` | | Custom system prompt (replaces default), in headless and interactive mode |
+| `--append-system-prompt` | | Append to the default system prompt instead of replacing it, in headless and interactive mode |
 | `--file FILE` | `-f` | Include a file in context (can be repeated) |
 | `--print` | `-p` | Non-interactive mode: read from stdin, print response, exit |
 | `--brief` | | Concise output (minimal formatting) |
@@ -90,7 +90,7 @@ main() → parse_args() → StartupOrchestrator::run()
 | `--json-schema SCHEMA` | | JSON schema for structured output (passed to `SubmitOptions`) |
 | `--replay-user-messages` | | Replay user messages from most recent session transcript |
 | `--include-partial-messages` | | Include partial assistant messages in context |
-| `--effort LEVEL` | | Reasoning effort: `low`, `medium`, `high` |
+| `--effort LEVEL` | | Accepted for CLI compatibility; this build rejects it at startup because no reasoning-effort field exists in the request layer. It is never silently ignored |
 | `--betas FLAGS` | | Comma-separated feature flags (`+name`, `-name`, or bare `name`) applied to the session |
 | `--chrome` | | Enable browser / web integration |
 | `--no-chrome` | | Disable browser / web integration (removes `ChromeClient` from dispatcher) |

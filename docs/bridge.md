@@ -391,11 +391,22 @@ coderex --print --output-format stream-json -- <prompt>
 ```
 
 with the prompt as one positional argument so no shell interprets it, and with
-the session's work directory as the child's current directory. Stdout and
-stderr are piped and drained by separate tasks, so neither pipe can block the
-other or the child. Each stdout line is forwarded to tracing (debug) and
-appended to the transcript; each stderr line is forwarded to tracing (warn) and
-written to `stderr.log`.
+the session's work directory as the child's current directory. Stdin is piped
+too: it is the return path for tool approvals. Stdout and stderr are piped and
+drained by separate tasks, so neither pipe can block the other or the child.
+Each stdout/stderr line is forwarded to the transport as a `session_output`
+frame, to tracing (debug/warn), and to the local transcript/`stderr.log`.
+
+**Tool approval.** The child emits `control_request`/`can_use_tool` frames
+(the headless protocol described in `docs/events.md`). The runner passes each
+one to the worker loop, which registers it with the bridge as
+`permission_request` (preserving the child's request id) and flushes it over
+the transport immediately. When the gateway answers with `permission_response`,
+`BridgeEvent::PermissionResolved` tells the launcher to write a
+`control_response` line to the child's stdin; the turn then continues or
+records the denial. An unanswered request leaves the child waiting; shutdown
+drops the responders. The gateway is responsible for relaying these two frame
+kinds between the bridge and the human.
 
 The turn's final `result` frame supplies `UsageStats`:
 `usage.input_tokens`, `usage.output_tokens`,
