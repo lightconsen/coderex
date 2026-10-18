@@ -2,6 +2,51 @@
 
 use bitflags::bitflags;
 use std::collections::HashMap;
+use std::fmt;
+
+/// Every feature flag name understood by [`FeatureFlags`].
+///
+/// Kept in one place so `--betas` can reject an unknown name with the full
+/// list rather than a shrug, and so the parser and the docs cannot drift.
+pub const KNOWN_FLAGS: &[&str] = &[
+    "streaming_tool_execution",
+    "tool_use_summaries",
+    "fast_mode",
+    "coordinator_mode",
+    "history_snip",
+    "agent_triggers",
+    "bridge_mode",
+    "daemon",
+    "voice_mode",
+    "buddy",
+    "workflow_scripts",
+    "web_browser_tool",
+    "context_collapse",
+    "terminal_panel",
+    "kairos",
+    "team_collaboration",
+    "auto_dream",
+];
+
+/// One or more feature flag names that this build does not know.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnknownFeatureFlags {
+    /// The names that were rejected, in the order they appeared.
+    pub names: Vec<String>,
+}
+
+impl fmt::Display for UnknownFeatureFlags {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "unknown feature flag(s): {} (known flags: {})",
+            self.names.join(", "),
+            KNOWN_FLAGS.join(", ")
+        )
+    }
+}
+
+impl std::error::Error for UnknownFeatureFlags {}
 
 /// All feature flags supported by CodeRex.
 #[derive(Debug, Clone, Default)]
@@ -76,9 +121,44 @@ impl FeatureFlags {
     ///
     /// Format: `+flag_name` enables, `-flag_name` disables. Bare names default to enable.
     /// Example: `"+streaming_tool_execution,-daemon"`
+    ///
+    /// Unknown names are logged and skipped. Use [`Self::parse_checked`] when
+    /// a person supplied the list and a typo must be reported rather than
+    /// ignored.
     #[must_use]
     pub fn parse(input: &str) -> Self {
         let mut flags = Self::default();
+        // The error is intentional here: `apply_comma_list` logs each unknown
+        // name, and `parse` keeps its infallible signature for callers that
+        // treat flags as best-effort configuration (the environment variable).
+        let _ = flags.apply_comma_list(input);
+        flags
+    }
+
+    /// Parse feature flags, returning the names that were not understood.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`UnknownFeatureFlags`] listing every unknown name. Known names
+    /// are still applied before the error is returned.
+    pub fn parse_checked(input: &str) -> Result<Self, UnknownFeatureFlags> {
+        let mut flags = Self::default();
+        flags.apply_comma_list(input)?;
+        Ok(flags)
+    }
+
+    /// Apply a comma-separated flag list on top of the current flags.
+    ///
+    /// Accepts `+name`, `-name`, and bare `name` (enable). Empty tokens are
+    /// ignored. If any name is unknown, the known ones are still applied and
+    /// every unknown name is returned.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`UnknownFeatureFlags`] when at least one token is not a flag
+    /// this build supports.
+    pub fn apply_comma_list(&mut self, input: &str) -> Result<(), UnknownFeatureFlags> {
+        let mut unknown = Vec::new();
         for token in input.split(',') {
             let token = token.trim();
             if token.is_empty() {
@@ -89,9 +169,15 @@ impl FeatureFlags {
                 Some('-') => (false, &token[1..]),
                 _ => (true, token),
             };
-            flags.apply_flag(name, enable);
+            if name.is_empty() || !self.apply_flag(name, enable) {
+                unknown.push(name.to_string());
+            }
         }
-        flags
+        if unknown.is_empty() {
+            Ok(())
+        } else {
+            Err(UnknownFeatureFlags { names: unknown })
+        }
     }
 
     /// Parse feature flags from the `CODEREX_FEATURE_FLAGS` environment variable.
@@ -185,7 +271,8 @@ impl FeatureFlags {
             .unwrap_or_default()
     }
 
-    fn apply_flag(&mut self, name: &str, enable: bool) {
+    /// Set one known flag. Returns `false` for a name this build does not know.
+    fn apply_flag(&mut self, name: &str, enable: bool) -> bool {
         match name {
             "streaming_tool_execution" => self.streaming_tool_execution = enable,
             "tool_use_summaries" => self.tool_use_summaries = enable,
@@ -204,8 +291,12 @@ impl FeatureFlags {
             "kairos" => self.kairos = enable,
             "team_collaboration" => self.team_collaboration = enable,
             "auto_dream" => self.auto_dream = enable,
-            _ => tracing::warn!("unknown feature flag: {name}"),
+            _ => {
+                tracing::warn!("unknown feature flag: {name}");
+                return false;
+            }
         }
+        true
     }
 }
 
@@ -344,6 +435,61 @@ mod tests {
     fn feature_flags_unknown_flag_no_panic() {
         let flags = FeatureFlags::parse("nonexistent_flag");
         assert!(!flags.daemon);
+    }
+
+    #[test]
+    fn checked_parse_reports_every_unknown_name() {
+        let error = FeatureFlags::parse_checked("+daemon,not_a_flag,-also_missing")
+            .expect_err("unknown flags must be reported");
+        assert_eq!(error.names, vec!["not_a_flag", "also_missing"]);
+        let rendered = error.to_string();
+        assert!(rendered.contains("not_a_flag"), "{rendered}");
+        assert!(rendered.contains("known flags:"), "{rendered}");
+        assert!(rendered.contains("daemon"), "{rendered}");
+    }
+
+    #[test]
+    fn checked_parse_accepts_plus_minus_and_bare_names() {
+        let flags = FeatureFlags::parse_checked("+daemon,-buddy,voice_mode")
+            .expect("all three spellings are valid");
+        assert!(flags.daemon);
+        assert!(!flags.buddy);
+        assert!(flags.voice_mode);
+    }
+
+    #[test]
+    fn apply_comma_list_overlays_existing_flags() {
+        let mut flags = FeatureFlags::default();
+        flags.daemon = true;
+        flags.buddy = true;
+
+        flags
+            .apply_comma_list("-daemon,+voice_mode")
+            .expect("known flags");
+        assert!(!flags.daemon, "a '-' token must disable");
+        assert!(flags.buddy, "untouched flags keep their value");
+        assert!(flags.voice_mode, "a '+' token must enable");
+    }
+
+    #[test]
+    fn apply_comma_list_applies_known_tokens_even_with_an_unknown_one() {
+        let mut flags = FeatureFlags::default();
+        let error = flags
+            .apply_comma_list("daemon,nope")
+            .expect_err("the typo must be reported");
+        assert_eq!(error.names, vec!["nope"]);
+        assert!(flags.daemon, "known tokens must not be dropped");
+    }
+
+    #[test]
+    fn known_flags_matches_the_fields() {
+        // Every advertised name must parse, and the advertised list must not
+        // name a flag that silently does nothing.
+        let parsed = FeatureFlags::parse_checked(&KNOWN_FLAGS.join(","))
+            .expect("the documented names must all be accepted");
+        assert!(parsed.capabilities().bits() > 0);
+        // 17 flags, matching the struct's fields.
+        assert_eq!(KNOWN_FLAGS.len(), 17);
     }
 
     #[test]

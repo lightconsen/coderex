@@ -94,8 +94,8 @@ pub struct Cli {
     #[arg(long, value_name = "ID")]
     pub fork_session: Option<String>,
 
-    /// Accepted, but this build does not fetch the PR — the flag is recorded
-    /// and nothing else happens.
+    /// Fetch a pull request's title, description, files, commits, and diff
+    /// with the GitHub CLI and prepend them to the initial prompt.
     #[arg(long, value_name = "URL")]
     pub from_pr: Option<String>,
 
@@ -171,9 +171,9 @@ pub struct Cli {
     #[arg(long, value_name = "LEVEL")]
     pub effort: Option<String>,
 
-    /// Accepted, but this build sends no beta headers — the flag is recorded
-    /// and nothing else happens.
-    #[arg(long)]
+    /// Comma-separated feature flags: `+name` enables, `-name` disables, a
+    /// bare `name` enables. Applied on top of CODEREX_FEATURE_FLAGS.
+    #[arg(long, value_name = "FLAGS")]
     pub betas: Vec<String>,
 
     /// Enable browser / web integration.
@@ -184,8 +184,8 @@ pub struct Cli {
     #[arg(long)]
     pub no_chrome: bool,
 
-    /// Accepted, but this build has no tmux integration — the flag is
-    /// recorded and nothing else happens.
+    /// Run inside tmux: re-launch in a new session when outside one, or set
+    /// the window/pane title when already inside.
     #[arg(long)]
     pub tmux: bool,
 
@@ -194,8 +194,9 @@ pub struct Cli {
     #[arg(long, value_name = "AGENT")]
     pub agent: Option<String>,
 
-    /// Accepted, but this build has no IDE integration — the flag is
-    /// recorded and nothing else happens.
+    /// Connect to a configured IDE MCP server and register its tools.
+    /// Requires `mcpServers.<name>`, `CODEREX_IDE_MCP_URL`, or
+    /// `CODEREX_IDE_MCP_COMMAND`; there is no bundled IDE.
     #[arg(long, value_name = "IDE")]
     pub ide: Option<String>,
 

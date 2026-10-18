@@ -122,6 +122,10 @@ pub struct SessionContext {
     pub fork_session: Option<String>,
     /// Load from PR.
     pub from_pr: Option<String>,
+    /// The rendered pull-request context fetched for `--from-pr`.
+    pub from_pr_context: Option<String>,
+    /// The live IDE MCP connection for `--ide`.
+    pub ide_connection: Option<crate::ide::IdeConnection>,
     /// Show setting sources.
     pub setting_sources: bool,
     /// Verbose mode.
@@ -251,6 +255,8 @@ impl StartupOrchestrator {
                 worktree: false,
                 fork_session: None,
                 from_pr: None,
+                from_pr_context: None,
+                ide_connection: None,
                 setting_sources: false,
                 verbose: false,
                 debug: false,
@@ -262,6 +268,11 @@ impl StartupOrchestrator {
 
     /// Run the full startup sequence.
     pub async fn run(&mut self, args: Cli) -> Result<()> {
+        // `--tmux` runs before any startup work. Outside tmux this replaces
+        // the process with a tmux session running the same binary; inside
+        // tmux it only sets the titles and returns.
+        crate::tmux::apply(args.tmux)?;
+
         // Store working directory early
         self.ctx.cwd = args.directory.clone().unwrap_or_else(|| {
             std::env::current_dir()
@@ -301,6 +312,19 @@ impl StartupOrchestrator {
         self.ctx.worktree = args.worktree;
         self.ctx.fork_session = args.fork_session.clone();
         self.ctx.from_pr = args.from_pr.clone();
+        // Fetch once, before the REPL exists: the headless path prepends the
+        // block to the prompt, the interactive path adds it as extra context,
+        // and either way a failure stops startup with `gh`'s message instead
+        // of pretending the PR was loaded.
+        if let Some(ref url) = args.from_pr {
+            let context = crate::from_pr::fetch(url)?;
+            tracing::info!(
+                url = %context.url,
+                bytes = context.block.len(),
+                "loaded pull-request context"
+            );
+            self.ctx.from_pr_context = Some(context.block);
+        }
         self.ctx.setting_sources = args.setting_sources;
         self.ctx.verbose = args.verbose;
         self.ctx.debug = args.debug;
@@ -331,6 +355,10 @@ impl StartupOrchestrator {
         self.run_phase(StartupPhase::ReconcileMarketplaces, &args)
             .await?;
         self.run_phase(StartupPhase::InitMcp, &args).await?;
+        // `--ide` connects to a configured IDE MCP server. It runs after the
+        // general MCP phase so an unreachable IDE server is reported as an
+        // IDE failure rather than hidden among optional servers.
+        self.phase_init_ide().await?;
         self.run_phase(StartupPhase::InitMemory, &args).await?;
         self.run_phase(StartupPhase::InitRemoteServices, &args)
             .await?;
@@ -1039,6 +1067,33 @@ impl StartupOrchestrator {
         Ok(())
     }
 
+    /// Connect `--ide` to its configured IDE MCP server.
+    ///
+    /// There is no bundled IDE, so "no configuration" is an error rather than
+    /// a no-op. This mirrors the reference CLI only in spirit: the flag names
+    /// an integration, so something must actually be integrated.
+    async fn phase_init_ide(&mut self) -> Result<()> {
+        let Some(ref ide) = self.ctx.ide else {
+            return Ok(());
+        };
+
+        let cwd = std::path::Path::new(&self.ctx.cwd);
+        let server = crate::ide::resolve_server(
+            ide,
+            self.ctx.settings.as_ref(),
+            cwd,
+            self.ctx.mcp_config_path.as_deref(),
+        )?;
+        let connection = crate::ide::connect(server).await?;
+        let status = connection.status_line();
+        tracing::info!("{status}");
+        // Reported on stderr so it is visible even when tracing is quiet. In
+        // headless mode stdout stays reserved for the answer.
+        eprintln!("{status}");
+        self.ctx.ide_connection = Some(connection);
+        Ok(())
+    }
+
     /// InitMemory: initialize memory subsystem (auto dream, team memory).
     async fn phase_init_memory(&mut self) -> Result<()> {
         let memory_dir = std::path::Path::new(&self.ctx.cwd).join(".coderex");
@@ -1166,6 +1221,10 @@ impl StartupOrchestrator {
         repl.with_worktree(self.ctx.worktree);
         repl.with_fork_session(self.ctx.fork_session.clone());
         repl.with_from_pr(self.ctx.from_pr.clone());
+        repl.with_pr_context(self.ctx.from_pr_context.clone());
+        if let Some(ref ide) = self.ctx.ide_connection {
+            repl.with_ide_connection(Arc::clone(&ide.manager), ide.status_line());
+        }
         repl.with_session_name(self.ctx.session_name.clone());
         repl.with_add_dir(self.ctx.add_dir.clone());
         repl.with_input_format(self.ctx.input_format.clone());
@@ -1228,34 +1287,7 @@ impl StartupOrchestrator {
             prompt.to_string()
         };
 
-        // Build final prompt: include --file contents, system prompt, user prompt
-        let mut final_prompt = String::new();
-
-        // Add system prompt if provided
-        if let Some(ref sp) = self.ctx.system_prompt {
-            final_prompt.push_str("System: ");
-            final_prompt.push_str(sp);
-            final_prompt.push('\n');
-            final_prompt.push('\n');
-        }
-
-        // Add file contents
-        for file_path in &self.ctx.file {
-            match std::fs::read_to_string(file_path) {
-                Ok(content) => {
-                    final_prompt.push_str(&format!(
-                        "--- {} ---\n{}\n\n",
-                        file_path.display(),
-                        content
-                    ));
-                }
-                Err(e) => {
-                    tracing::warn!("failed to read file {}: {e}", file_path.display());
-                }
-            }
-        }
-
-        final_prompt.push_str(&user_prompt);
+        let final_prompt = self.build_headless_prompt(&user_prompt);
 
         // `stream-json` is a protocol, not a formatted answer: the turn is
         // written to stdout as it happens, one JSON object per line, and the
@@ -1278,6 +1310,45 @@ impl StartupOrchestrator {
         let formatted = self.format_headless_output(&result);
         println!("{formatted}");
         Ok(())
+    }
+
+    /// Assemble the non-interactive prompt.
+    ///
+    /// Order matters: the pull-request block comes first so it is part of the
+    /// prompt before any instruction the user typed, then the system prompt,
+    /// included files, and finally the user's own words.
+    fn build_headless_prompt(&self, user_prompt: &str) -> String {
+        let mut final_prompt = String::new();
+
+        if let Some(ref context) = self.ctx.from_pr_context {
+            final_prompt.push_str(context);
+            final_prompt.push_str("\n\n");
+        }
+
+        if let Some(ref sp) = self.ctx.system_prompt {
+            final_prompt.push_str("System: ");
+            final_prompt.push_str(sp);
+            final_prompt.push('\n');
+            final_prompt.push('\n');
+        }
+
+        for file_path in &self.ctx.file {
+            match std::fs::read_to_string(file_path) {
+                Ok(content) => {
+                    final_prompt.push_str(&format!(
+                        "--- {} ---\n{}\n\n",
+                        file_path.display(),
+                        content
+                    ));
+                }
+                Err(e) => {
+                    tracing::warn!("failed to read file {}: {e}", file_path.display());
+                }
+            }
+        }
+
+        final_prompt.push_str(user_prompt);
+        final_prompt
     }
 
     /// Format headless output based on --output-format, --brief, --bare flags.
@@ -1970,6 +2041,55 @@ mod tests {
             messages[1].role,
             coderex_core::types::Role::Assistant
         ));
+    }
+
+    #[test]
+    fn pull_request_context_precedes_the_initial_prompt() {
+        let mut orch = StartupOrchestrator::new();
+        orch.ctx.from_pr_context = Some("<pr_context>the PR</pr_context>".into());
+        orch.ctx.system_prompt = Some("be terse".into());
+
+        let prompt = orch.build_headless_prompt("fix it");
+
+        let pr = prompt
+            .find("<pr_context>the PR</pr_context>")
+            .expect("the PR block must be in the prompt");
+        let system = prompt.find("System: be terse").expect("system prompt");
+        let user = prompt.rfind("fix it").expect("user prompt");
+        assert!(
+            pr < system && system < user,
+            "PR context must come first: {prompt}"
+        );
+    }
+
+    #[test]
+    fn no_pull_request_context_leaves_the_prompt_untouched() {
+        let orch = StartupOrchestrator::new();
+        assert_eq!(orch.build_headless_prompt("hello"), "hello");
+    }
+
+    #[tokio::test]
+    async fn ide_phase_without_configuration_fails_clearly() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut orch = StartupOrchestrator::new();
+        orch.ctx.cwd = temp.path().to_string_lossy().into_owned();
+        orch.ctx.ide = Some("vscode".into());
+
+        let error = orch
+            .phase_init_ide()
+            .await
+            .expect_err("--ide without configuration must fail");
+        assert!(
+            error.to_string().contains("no IDE MCP server is configured"),
+            "{error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn ide_phase_is_a_no_op_when_the_flag_is_absent() {
+        let mut orch = StartupOrchestrator::new();
+        orch.phase_init_ide().await.unwrap();
+        assert!(orch.ctx.ide_connection.is_none());
     }
 
     #[test]

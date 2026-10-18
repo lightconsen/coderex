@@ -750,6 +750,17 @@ pub struct ReplLoop {
     include_partial_messages: bool,
     /// Beta features enabled (--betas).
     betas: Vec<String>,
+    /// Feature flags resolved for this session: the environment plus
+    /// `--betas` overrides.
+    feature_flags: coderex_config::flags::FeatureFlags,
+    /// Capabilities derived from [`Self::feature_flags`].
+    capabilities: coderex_config::flags::CapabilitySet,
+    /// Pull-request context fetched for `--from-pr`.
+    pr_context: Option<String>,
+    /// Live IDE MCP connection for `--ide`, kept for the session.
+    ide_manager: Option<Arc<coderex_mcp::manager::McpManager>>,
+    /// Human-readable IDE connection status.
+    ide_status: Option<String>,
     /// Chrome integration enabled (--chrome / --no-chrome).
     chrome_enabled: bool,
     /// Agent to use (--agent).
@@ -900,6 +911,11 @@ impl ReplLoop {
             replay_user_messages: false,
             include_partial_messages: false,
             betas: Vec::new(),
+            feature_flags: coderex_config::flags::FeatureFlags::from_env(),
+            capabilities: coderex_config::flags::FeatureFlags::from_env().capabilities(),
+            pr_context: None,
+            ide_manager: None,
+            ide_status: None,
             chrome_enabled: true,
             agent: None,
             ide: None,
@@ -1160,6 +1176,11 @@ impl ReplLoop {
             replay_user_messages: false,
             include_partial_messages: false,
             betas: Vec::new(),
+            feature_flags: coderex_config::flags::FeatureFlags::from_env(),
+            capabilities: coderex_config::flags::FeatureFlags::from_env().capabilities(),
+            pr_context: None,
+            ide_manager: None,
+            ide_status: None,
             chrome_enabled: true,
             agent: None,
             ide: None,
@@ -1358,6 +1379,43 @@ impl ReplLoop {
         self.betas = betas;
     }
 
+    /// Attach pull-request context fetched for `--from-pr`.
+    pub fn with_pr_context(&mut self, context: Option<String>) {
+        self.pr_context = context;
+    }
+
+    /// The feature flags resolved for this session.
+    #[must_use]
+    pub fn feature_flags(&self) -> &coderex_config::flags::FeatureFlags {
+        &self.feature_flags
+    }
+
+    /// The capability set derived from the session's feature flags.
+    #[must_use]
+    pub fn capabilities(&self) -> coderex_config::flags::CapabilitySet {
+        self.capabilities
+    }
+
+    /// Wire a live IDE MCP connection into the session.
+    ///
+    /// Registers the server's tools into the dispatcher's registry and keeps
+    /// the manager alive so calls can resolve their connection later.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the MCP slot's lock is poisoned.
+    pub fn with_ide_connection(
+        &mut self,
+        manager: Arc<coderex_mcp::manager::McpManager>,
+        status: String,
+    ) {
+        if let Some(ref dispatcher) = self.dispatcher {
+            manager.register_tools_into(dispatcher.registry());
+        }
+        self.ide_manager = Some(manager);
+        self.ide_status = Some(status);
+    }
+
     pub fn with_chrome_enabled(&mut self, enabled: bool) {
         self.chrome_enabled = enabled;
     }
@@ -1522,14 +1580,67 @@ impl ReplLoop {
             }
         }
 
-        // 9–13. The flags with nothing behind them.
-        //
-        // Each of these used to push a sentence into the model's context
-        // saying the thing was on — "Enabled beta features: x", "IDE mode:
-        // y", "Active agent: z" — while none of it was true: the values were
-        // stored and never read again. Telling the model it has an IDE, a
-        // selected agent, or a beta turned on is worse than ignoring the flag,
-        // because the model then behaves as if it did.
+        // 9. Beta feature flags. `--betas` is a real overlay on the
+        // environment-provided flags: it resolves into this session's
+        // `FeatureFlags` and `CapabilitySet`. A typo is a startup failure, not
+        // a warning, because silently dropping `+daemon` looks identical to
+        // the flag not existing.
+        if !self.betas.is_empty() {
+            let raw = self.betas.join(",");
+            let mut flags = coderex_config::flags::FeatureFlags::from_env();
+            match flags.apply_comma_list(&raw) {
+                Ok(()) => {
+                    self.feature_flags = flags;
+                    self.capabilities = self.feature_flags.capabilities();
+                    tracing::info!(
+                        capabilities = ?self.capabilities,
+                        "--betas applied to the session capability set"
+                    );
+                }
+                Err(error) => {
+                    let message = format!("--betas: {error}");
+                    eprintln!("{message}");
+                    self.setup_error = Some(message);
+                    self.running = false;
+                }
+            }
+        }
+
+        // 10. Pull-request context. The orchestrator fetches this before the
+        // REPL exists; the fallback here keeps a direct `with_from_pr` caller
+        // honest, and a fetch failure stops startup rather than continuing
+        // without the context the flag promised.
+        if self.pr_context.is_none() {
+            if let Some(ref url) = self.from_pr {
+                match crate::from_pr::fetch(url) {
+                    Ok(context) => self.pr_context = Some(context.block),
+                    Err(error) => {
+                        let message = format!("--from-pr: {error:#}");
+                        eprintln!("{message}");
+                        self.setup_error = Some(message);
+                        self.running = false;
+                    }
+                }
+            }
+        }
+        if let Some(ref context) = self.pr_context {
+            self.session_effects.extra_context.push(context.clone());
+        }
+
+        // 11. IDE connection status. The tools themselves were registered by
+        // `with_ide_connection`; the connection failing is handled during
+        // startup, before the REPL is built.
+        if let Some(ref status) = self.ide_status {
+            tracing::info!("{status}");
+        }
+        if let Some(ref ide) = self.ide {
+            tracing::debug!("IDE mode requested: {ide}");
+        }
+        if self.tmux_enabled {
+            tracing::debug!("tmux session/title was applied before startup");
+        }
+
+        // 12. The one flag still accepted without behaviour (owned elsewhere).
         self.warn_about_unimplemented_flags();
 
         // 14. Debug file — log that it would be configured
@@ -1583,20 +1694,12 @@ impl ReplLoop {
     /// not have to guess whether `--ide` did anything.
     fn warn_about_unimplemented_flags(&self) {
         let mut unimplemented = Vec::new();
-        if self.from_pr.is_some() {
-            unimplemented.push("--from-pr");
-        }
+        // `--agent` belongs to the agent-selection work. The rest of this
+        // list has real behaviour now: `--betas` resolves flags, `--from-pr`
+        // fetches context, `--ide` connects to an MCP server, and `--tmux` is
+        // applied before the orchestrator starts.
         if self.agent.is_some() {
             unimplemented.push("--agent");
-        }
-        if self.ide.is_some() {
-            unimplemented.push("--ide");
-        }
-        if !self.betas.is_empty() {
-            unimplemented.push("--betas");
-        }
-        if self.tmux_enabled {
-            unimplemented.push("--tmux");
         }
 
         if unimplemented.is_empty() {
@@ -1984,6 +2087,13 @@ impl ReplLoop {
 
     /// Run the interactive REPL with full ratatui TUI.
     pub async fn run_tui(&mut self) -> Result<()> {
+        // A configuration failure that happened during `apply_cli_config`
+        // (`--betas` typo, `--from-pr` fetch, `--worktree`) must stop the
+        // interactive path too, not only the headless one.
+        if let Some(error) = self.setup_error.as_deref() {
+            return Err(anyhow::anyhow!("{error}"));
+        }
+
         use coderex_ui::input::{InputAction, InputBuffer};
         use coderex_ui::message_list::{Message, MessageRole};
         use coderex_ui::overlay::Overlay;
@@ -6751,6 +6861,92 @@ mod tests {
         if let Some(server) = repl.artifact_server.take() {
             server.shutdown().await;
         }
+    }
+
+    #[test]
+    fn cli_betas_update_the_session_flags_and_capabilities() {
+        let mut repl = ReplLoop::new("/tmp".into(), ModelId::sonnet());
+        repl.with_betas(vec![
+            "+daemon".into(),
+            "-buddy".into(),
+            "voice_mode".into(),
+        ]);
+
+        repl.apply_cli_config();
+
+        assert!(repl.setup_error.is_none(), "{:?}", repl.setup_error);
+        assert!(repl.feature_flags().daemon);
+        assert!(!repl.feature_flags().buddy);
+        assert!(repl.feature_flags().voice_mode);
+        assert!(
+            repl.capabilities()
+                .contains(coderex_config::flags::CapabilitySet::DAEMON),
+            "an enabled beta did not reach the session capability set"
+        );
+        assert!(
+            repl.capabilities()
+                .contains(coderex_config::flags::CapabilitySet::VOICE)
+        );
+    }
+
+    #[test]
+    fn an_unknown_beta_is_a_setup_error_not_a_silent_drop() {
+        let mut repl = ReplLoop::new("/tmp".into(), ModelId::sonnet());
+        repl.with_betas(vec!["+definitely_not_a_flag".into()]);
+
+        repl.apply_cli_config();
+
+        let error = repl
+            .setup_error
+            .as_deref()
+            .expect("an unknown beta must stop startup");
+        assert!(error.contains("--betas"), "{error}");
+        assert!(error.contains("definitely_not_a_flag"), "{error}");
+        assert!(!repl.running);
+    }
+
+    #[test]
+    fn fetched_pr_context_is_added_to_the_session_context() {
+        let mut repl = ReplLoop::new("/tmp".into(), ModelId::sonnet());
+        repl.with_pr_context(Some("<pr_context>the PR</pr_context>".into()));
+
+        repl.apply_cli_config();
+
+        assert!(
+            repl.session_effects
+                .extra_context
+                .iter()
+                .any(|context| context.contains("the PR")),
+            "the fetched PR block never reached the session context"
+        );
+    }
+
+    #[tokio::test]
+    async fn ide_connection_tools_join_the_registry() {
+        let api = ReadThenAnswerApi {
+            call: Arc::new(std::sync::Mutex::new(0)),
+            expected_contents: "unused",
+        };
+        let mut repl = ReplLoop::with_engine(Box::new(api), "/tmp".into(), ModelId::sonnet());
+
+        let manager = Arc::new(coderex_mcp::manager::McpManager::new());
+        manager.register_tool(coderex_mcp::proxy::McpToolInfo {
+            server: "ide".into(),
+            name: "executeCode".into(),
+            description: "Run code in the IDE".into(),
+            input_schema: serde_json::json!({"type": "object"}),
+        });
+
+        repl.with_ide_connection(Arc::clone(&manager), "connected".into());
+
+        let dispatcher = repl.dispatcher.take().unwrap();
+        assert!(
+            dispatcher
+                .registry()
+                .get_tool_arc("mcp__ide__executeCode")
+                .is_some(),
+            "an IDE tool did not reach the registry the model dispatches through"
+        );
     }
 
     #[tokio::test]
