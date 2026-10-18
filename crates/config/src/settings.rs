@@ -65,7 +65,7 @@ pub enum ConfigError {
 pub const MAX_SETTINGS_FILE_BYTES: u64 = 2 * 1024 * 1024;
 
 /// The set of keys a settings file may contain.
-const KNOWN_SETTINGS_FIELDS: [&str; 12] = [
+const KNOWN_SETTINGS_FIELDS: [&str; 13] = [
     "config_version",
     "model",
     "permission_mode",
@@ -74,6 +74,7 @@ const KNOWN_SETTINGS_FIELDS: [&str; 12] = [
     "telemetry",
     "hooks",
     "mcp_servers",
+    "mcpServers",
     "plugins",
     "marketplaces",
     "api_key",
@@ -283,6 +284,11 @@ pub struct Settings {
     #[serde(skip)]
     pub hook_layers: Option<HookLayers>,
     /// MCP server configurations.
+    ///
+    /// Both spellings are accepted: the settings file's snake_case key and the
+    /// `mcpServers` spelling used by `.mcp.json` and Claude-compatible
+    /// configuration.
+    #[serde(alias = "mcpServers")]
     pub mcp_servers: Option<serde_json::Value>,
     /// API key — may be a raw value or a `"keyring://..."` reference.
     pub api_key: Option<String>,
@@ -1323,9 +1329,7 @@ mod tests {
         #[cfg(target_os = "macos")]
         assert_eq!(
             service.managed_plist_path(),
-            Some(Path::new(
-                "/Library/Managed Preferences/dev.coderex.plist"
-            ))
+            Some(Path::new("/Library/Managed Preferences/dev.coderex.plist"))
         );
         #[cfg(windows)]
         assert_eq!(service.managed_registry_key(), Some(r"SOFTWARE\CodeRex"));
@@ -1379,11 +1383,7 @@ mod tests {
     fn plugin_host_config_skips_malformed_marketplaces() {
         let tmp = tempfile::tempdir().unwrap();
         let user_path = tmp.path().join("user.json");
-        std::fs::write(
-            &user_path,
-            r#"{"marketplaces": [{"name": "missing-url"}]}"#,
-        )
-        .unwrap();
+        std::fs::write(&user_path, r#"{"marketplaces": [{"name": "missing-url"}]}"#).unwrap();
         let service = ConfigService::new(user_path, None);
         assert!(service.load_plugin_host_config().marketplaces.is_empty());
     }
@@ -1451,6 +1451,18 @@ mod tests {
             matches!(result, Err(ConfigError::UnknownField { ref field }) if field == "unknown_key")
         );
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn mcp_servers_accepts_both_spellings() {
+        // `.mcp.json` and Claude-compatible settings use `mcpServers`; the
+        // settings struct historically only knew `mcp_servers`.
+        let camel: Settings =
+            serde_json::from_str(r#"{"mcpServers":{"x":{"command":"y"}}}"#).unwrap();
+        assert!(camel.mcp_servers.is_some());
+        let snake: Settings =
+            serde_json::from_str(r#"{"mcp_servers":{"x":{"command":"y"}}}"#).unwrap();
+        assert!(snake.mcp_servers.is_some());
     }
 
     #[test]

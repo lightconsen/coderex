@@ -27,6 +27,15 @@ pub const KNOWN_FLAGS: &[&str] = &[
     "kairos",
     "team_collaboration",
     "auto_dream",
+    // Commands whose availability is decided by a flag. They are separate
+    // from the runtime capabilities above: enabling one only makes its slash
+    // command executable, it does not change the engine's capabilities.
+    "ultraplan",
+    "thinkback",
+    "heapdump",
+    "mock_limits",
+    "ctx_viz",
+    "stickers",
 ];
 
 /// One or more feature flag names that this build does not know.
@@ -86,6 +95,18 @@ pub struct FeatureFlags {
     pub team_collaboration: bool,
     /// Enable auto dream mode.
     pub auto_dream: bool,
+    /// Enable the `/ultraplan` command.
+    pub ultraplan: bool,
+    /// Enable the `/thinkback` and `/thinkback-play` commands.
+    pub thinkback: bool,
+    /// Enable the `/heapdump` debug command.
+    pub heapdump: bool,
+    /// Enable the `/mock-limits` debug command.
+    pub mock_limits: bool,
+    /// Enable the `/ctx_viz` command.
+    pub ctx_viz: bool,
+    /// Enable the `/stickers` command.
+    pub stickers: bool,
     /// Enable experiment-supplied context-window overrides.
     ///
     /// The window values themselves live in [`Self::context_window_default`]
@@ -249,6 +270,52 @@ impl FeatureFlags {
         caps
     }
 
+    /// Every flag as a name → enabled map.
+    ///
+    /// The slash-command context carries flags as a map, because commands are
+    /// gated by the name they ask for rather than by a typed field. Keeping
+    /// this conversion here means a name added to [`KNOWN_FLAGS`] cannot be
+    /// silently missing at the call site.
+    #[must_use]
+    pub fn as_map(&self) -> HashMap<String, bool> {
+        KNOWN_FLAGS
+            .iter()
+            .map(|name| ((*name).to_string(), self.is_enabled(name)))
+            .collect()
+    }
+
+    /// Whether the named flag is on. Unknown names are off.
+    #[must_use]
+    pub fn is_enabled(&self, name: &str) -> bool {
+        match name {
+            "streaming_tool_execution" => self.streaming_tool_execution,
+            "tool_use_summaries" => self.tool_use_summaries,
+            "fast_mode" => self.fast_mode,
+            "coordinator_mode" => self.coordinator_mode,
+            "history_snip" => self.history_snip,
+            "agent_triggers" => self.agent_triggers,
+            "bridge_mode" => self.bridge_mode,
+            "daemon" => self.daemon,
+            "voice_mode" => self.voice_mode,
+            "buddy" => self.buddy,
+            "workflow_scripts" => self.workflow_scripts,
+            "web_browser_tool" => self.web_browser_tool,
+            "context_collapse" => self.context_collapse,
+            "terminal_panel" => self.terminal_panel,
+            "kairos" => self.kairos,
+            "team_collaboration" => self.team_collaboration,
+            "auto_dream" => self.auto_dream,
+            "ultraplan" => self.ultraplan,
+            "thinkback" => self.thinkback,
+            "heapdump" => self.heapdump,
+            "mock_limits" => self.mock_limits,
+            "ctx_viz" => self.ctx_viz,
+            "stickers" => self.stickers,
+            "context_window_overrides" => self.context_window_overrides,
+            _ => false,
+        }
+    }
+
     /// Convenience method to create flags from env and derive capabilities.
     #[must_use]
     pub fn from_flags_and_env() -> (Self, CapabilitySet) {
@@ -373,6 +440,12 @@ impl FeatureFlags {
             "kairos" => self.kairos = enable,
             "team_collaboration" => self.team_collaboration = enable,
             "auto_dream" => self.auto_dream = enable,
+            "ultraplan" => self.ultraplan = enable,
+            "thinkback" => self.thinkback = enable,
+            "heapdump" => self.heapdump = enable,
+            "mock_limits" => self.mock_limits = enable,
+            "ctx_viz" => self.ctx_viz = enable,
+            "stickers" => self.stickers = enable,
             "context_window_overrides" => self.context_window_overrides = enable,
             _ => {
                 tracing::warn!("unknown feature flag: {name}");
@@ -579,8 +652,9 @@ mod tests {
         let parsed = FeatureFlags::parse_checked(&KNOWN_FLAGS.join(","))
             .expect("the documented names must all be accepted");
         assert!(parsed.capabilities().bits() > 0);
-        // 17 flags, matching the struct's fields.
-        assert_eq!(KNOWN_FLAGS.len(), 17);
+        // 23 flags: 17 runtime capabilities/experiments plus the six
+        // command-availability gates.
+        assert_eq!(KNOWN_FLAGS.len(), 23);
     }
 
     #[test]
@@ -791,6 +865,29 @@ mod tests {
         let overrides = flags.experiment_context_windows();
         assert_eq!(overrides.resolve("my-gateway"), Some(128_000));
         assert_eq!(overrides.resolve("unknown"), Some(64_000));
+    }
+
+    #[test]
+    fn command_gate_flags_reach_the_command_context_map() {
+        // The slash-command context asks by name. These six used to be neither
+        // known flags nor present in the map, so their commands could never
+        // run even when a user asked for them.
+        let flags =
+            FeatureFlags::parse("+ultraplan,+thinkback,+heapdump,+mock_limits,+ctx_viz,+stickers");
+        let map = flags.as_map();
+        for name in [
+            "ultraplan",
+            "thinkback",
+            "heapdump",
+            "mock_limits",
+            "ctx_viz",
+            "stickers",
+        ] {
+            assert_eq!(map.get(name), Some(&true), "{name} was not enabled");
+            assert!(flags.is_enabled(name), "{name} was not enabled");
+        }
+        assert_eq!(map.get("voice_mode"), Some(&false));
+        assert!(!flags.is_enabled("not_a_flag"));
     }
 
     #[test]
