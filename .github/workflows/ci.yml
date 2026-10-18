@@ -52,22 +52,41 @@ jobs:
 
   # The Unix test job cannot execute the Windows-only sandbox tests: they are
   # `cfg(target_os = "windows")`, and the `build` matrix only compiles. This
-  # job runs the real AppContainer confinement tests on a Windows host.
+  # job runs the AppContainer confinement tests, the shell and hook sandbox
+  # paths, the managed-settings (HKLM) code, and the CLI library tests on a
+  # Windows host.
   #
-  # Advisory (`continue-on-error`) because the Windows runner's ring/rustls
-  # build has been the unstable part; promote it to required once it has a
-  # stable history.
+  # `--no-fail-fast` runs every remaining test binary in an invocation, and
+  # `if: always()` keeps a failing crate from hiding the crates after it.
+  #
+  # Advisory (`continue-on-error`): this job is the *first* runtime execution
+  # of the Win32 paths and has no stable passing history yet. A macOS host can
+  # cross-check compilation and link the test binaries for
+  # x86_64-pc-windows-gnu, but cannot create an AppContainer, attach a token,
+  # or spawn a confined process. The Unix-only test helpers in the CLI are
+  # cfg-gated, so all five lib-test targets link. Promote the job to required
+  # once it is consistently green.
   test-windows:
-    name: Test (Windows sandbox)
+    name: Test (Windows runtime)
     runs-on: windows-latest
     continue-on-error: true
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - name: Core sandbox tests
-        run: cargo test -p coderex-core sandbox -- --nocapture
-      - name: Tools tests
-        run: cargo test -p coderex-tools
+      - name: Core sandbox tests (AppContainer)
+        run: cargo test --no-fail-fast -p coderex-core sandbox -- --nocapture
+      - name: Tools shell sandbox tests
+        if: always()
+        run: cargo test --no-fail-fast -p coderex-tools sandbox -- --nocapture
+      - name: Hooks sandbox tests
+        if: always()
+        run: cargo test --no-fail-fast -p coderex-hooks sandbox -- --nocapture
+      - name: Config tests (Windows registry path)
+        if: always()
+        run: cargo test --no-fail-fast -p coderex-config -- --nocapture
+      - name: CLI library tests
+        if: always()
+        run: cargo test --no-fail-fast -p coderex-cli --lib -- --nocapture
 
   code-agent-benchmark:
     name: Code Agent Benchmark

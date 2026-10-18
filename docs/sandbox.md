@@ -289,16 +289,34 @@ start if it is missing.
   paths; only the Job Object applies to them.
 
 **Verification status.** The pure policy functions (ACL plan, capability set,
-command-line quoting) are compiled and unit-tested on macOS. The Win32 code and
-its integration in `sandbox.rs` were type-checked for
-`x86_64-pc-windows-gnu` with `cargo check` in an isolated scratch crate — the
-workspace's own cross-check stops in `ring`'s build script because no mingw C
-compiler is installed. The code has **not been linked or run on Windows**. Two
-Windows-gated tests are ready for a Windows CI host: one exercises the
-documented `STARTUPINFOEX` spawn, the other the suspended-token attach used by
-the shell tools; both check that a granted directory is writable and an
-ungranted sibling is not. Until they run, the Win32 path is reviewed and
-type-checked, not verified.
+command-line quoting) are compiled and unit-tested on macOS. With mingw-w64
+installed, the Windows-relevant crates type-check against a Windows ABI on this
+host:
+
+```text
+cargo check --workspace --target x86_64-pc-windows-gnu                      # passes
+cargo check --tests --target x86_64-pc-windows-gnu \
+  -p coderex-core -p coderex-tools -p coderex-hooks -p coderex-config   # passes
+cargo test --no-run --lib --target x86_64-pc-windows-gnu \
+  -p coderex-core -p coderex-tools -p coderex-hooks -p coderex-config -p coderex-cli
+                                                                        # links 5 test .exe
+```
+
+That compiles the `cfg(target_os = "windows")` code, the Windows-gated tests,
+and links the five test executables with the mingw linker. It does **not** run
+them: a macOS host cannot create an AppContainer, attach a container token, or
+spawn a confined process, so those runtime paths are still unverified locally.
+The `coderex-cli` lib-test target now compiles and links too: its test helpers
+in `crates/cli/src/ide.rs`, `from_pr.rs` and `tmux.rs` use Unix-only
+`PermissionsExt::set_mode` and `/bin/sh` scripts, so those test modules are
+`cfg(unix)`-gated. `cargo test --no-run --lib --target x86_64-pc-windows-gnu`
+links five test executables (core, tools, hooks, config, cli).
+
+`cargo check --workspace --target x86_64-pc-windows-gnu` also passes (the
+Unix-only `openssh` dependency in `coderex-bridge` is target-gated; the Windows
+build refuses the SSH spawn mode instead of failing to compile). Runtime
+verification is delegated to the advisory `test-windows` CI job (see the end of
+this document).
 
 ### Other platforms
 
@@ -509,11 +527,24 @@ cannot run on macOS. Linux hooks (Landlock write denial, and fail-closed when
 neither `bwrap` nor Landlock exists) are also covered by Linux-gated tests that
 cannot run on macOS.
 
-Windows behaviour is covered by Windows-gated tests, none of which has run yet:
-`sandbox_windows::tests::spawn_in_container_confines_a_real_process` (the
-documented `STARTUPINFOEX` spawn) and
-`sandbox::tests::windows_sandbox_confines_a_suspended_child` (the token-attach
-path the shell tools use). Both write inside a granted directory and assert an
-ungranted sibling stays unwritable, and both assert the fail-closed path when
-the AppContainer APIs are missing. The pure ACL/capability/quoting policy is
+Windows behaviour is exercised automatically by the `test-windows` job in
+`.github/workflows/ci.yml` (on `windows-latest` with the MSVC toolchain): it
+runs `sandbox_windows::tests::spawn_in_container_confines_a_real_process` (the
+documented `STARTUPINFOEX` spawn), `sandbox::tests::windows_sandbox_confines_a_suspended_child`
+(the token-attach path the shell tools use), the `coderex-tools` and
+`coderex-hooks` sandbox tests, the `coderex-config` tests (which compile the
+Windows registry reader), and `cargo test -p coderex-cli --lib`, all with
+`--no-fail-fast`. Both sandbox tests write inside a granted directory and assert
+an ungranted sibling stays unwritable; the suspended-child test also asserts the
+fail-closed path when the AppContainer APIs are missing. The job is **advisory**
+(`continue-on-error`) until it has a stable passing history, and every step
+after the first uses `if: always()` so one failing crate does not hide the
+others. The CLI lib-test target's Unix-only test helpers are `cfg(unix)`-gated,
+so its tests compile for Windows; the sandbox and registry steps are unaffected.
+The job has not been run from this macOS host, and further gaps remain even in
+CI: if
+`CreateAppContainerToken` is absent on the runner, the `STARTUPINFOEX` test
+prints a skip instead of proving confinement, and the HKLM reader is only
+compiled — no test writes or reads a real registry key (its pure
+value-conversion layer is what runs). The pure ACL/capability/quoting policy is
 tested on macOS.

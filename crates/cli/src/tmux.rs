@@ -50,9 +50,7 @@ pub fn apply(enabled: bool) -> Result<()> {
     }
 
     let Some(tmux) = find_executable("tmux") else {
-        bail!(
-            "--tmux requires the `tmux` executable on PATH; install tmux or omit --tmux"
-        );
+        bail!("--tmux requires the `tmux` executable on PATH; install tmux or omit --tmux");
     };
 
     let program = std::env::current_exe()
@@ -246,7 +244,7 @@ fn is_executable(path: &Path) -> bool {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 #[allow(unsafe_code)] // PATH mutation is unsafe in edition 2024; ENV_LOCK guards it.
 mod tests {
     use super::*;
@@ -318,10 +316,7 @@ mod tests {
         let tmux = dir.path().join("tmux");
         std::fs::write(
             &tmux,
-            format!(
-                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\n",
-                log.display()
-            ),
+            format!("#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\n", log.display()),
         )
         .unwrap();
         let mut perms = std::fs::metadata(&tmux).unwrap().permissions();

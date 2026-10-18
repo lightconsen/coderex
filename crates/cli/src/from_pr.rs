@@ -98,13 +98,7 @@ pub fn fetch(url: &str) -> Result<PullRequestContext> {
     let url = url.trim();
     validate_pr_url(url)?;
 
-    let view_json = run_gh(&[
-        "pr",
-        "view",
-        url,
-        "--json",
-        "title,body,files,commits",
-    ])?;
+    let view_json = run_gh(&["pr", "view", url, "--json", "title,body,files,commits"])?;
     let diff = run_gh(&["pr", "diff", url])?;
 
     let view: PrView = serde_json::from_str(&view_json)
@@ -304,7 +298,7 @@ fn truncate_chars(text: &str, max: usize) -> (String, bool) {
     (text[..cut].to_string(), true)
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 #[allow(unsafe_code)] // PATH mutation is unsafe in edition 2024; ENV_LOCK guards it.
 mod tests {
     use super::*;
@@ -419,10 +413,26 @@ exit 2
                 "{}",
                 context.block
             );
-            assert!(context.block.contains("+pub fn widget()"), "{}", context.block);
-            assert!(context.block.contains("Add widget support"), "{}", context.block);
-            assert!(context.block.starts_with("<pr_context"), "{}", context.block);
-            assert!(context.block.ends_with("</pr_context>"), "{}", context.block);
+            assert!(
+                context.block.contains("+pub fn widget()"),
+                "{}",
+                context.block
+            );
+            assert!(
+                context.block.contains("Add widget support"),
+                "{}",
+                context.block
+            );
+            assert!(
+                context.block.starts_with("<pr_context"),
+                "{}",
+                context.block
+            );
+            assert!(
+                context.block.ends_with("</pr_context>"),
+                "{}",
+                context.block
+            );
         });
     }
 

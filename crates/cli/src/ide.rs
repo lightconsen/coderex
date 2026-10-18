@@ -133,8 +133,7 @@ pub fn resolve_server(
         }
     }
 
-    let mcp_path =
-        mcp_config_path.map_or_else(|| cwd.join(".mcp.json"), Path::to_path_buf);
+    let mcp_path = mcp_config_path.map_or_else(|| cwd.join(".mcp.json"), Path::to_path_buf);
     if mcp_path.exists() {
         match McpConfig::load(&mcp_path) {
             Ok(config) => {
@@ -151,9 +150,8 @@ pub fn resolve_server(
             Err(error) => {
                 // A malformed file is a configuration error worth surfacing,
                 // not something to skip on the way to "no IDE configured".
-                return Err(error).with_context(|| {
-                    format!("could not read MCP config {}", mcp_path.display())
-                });
+                return Err(error)
+                    .with_context(|| format!("could not read MCP config {}", mcp_path.display()));
             }
         }
     }
@@ -266,7 +264,7 @@ pub fn stdio_server(name: impl Into<String>, command: impl Into<String>) -> IdeS
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use serde_json::json;
@@ -311,11 +309,16 @@ done
         let path = mock_stdio_server(dir.path(), true);
         let server = stdio_server("ide", path.to_string_lossy().into_owned());
 
-        let connection = connect(server).await.expect("mock IDE server should connect");
+        let connection = connect(server)
+            .await
+            .expect("mock IDE server should connect");
         assert_eq!(connection.name, "ide");
         assert_eq!(connection.transport, McpTransport::Stdio);
         assert!(
-            connection.tools.iter().any(|name| name.ends_with("executeCode")),
+            connection
+                .tools
+                .iter()
+                .any(|name| name.ends_with("executeCode")),
             "{:?}",
             connection.tools
         );
@@ -328,7 +331,10 @@ done
             connection.tools
         );
         let status = connection.status_line();
-        assert!(status.contains("Connected to IDE MCP server 'ide'"), "{status}");
+        assert!(
+            status.contains("Connected to IDE MCP server 'ide'"),
+            "{status}"
+        );
         assert!(status.contains("2 tool(s)"), "{status}");
     }
 
@@ -338,14 +344,18 @@ done
         let path = mock_stdio_server(dir.path(), false);
         let server = stdio_server("ide", path.to_string_lossy().into_owned());
 
-        let error = connect(server).await.expect_err("empty tool list must fail");
+        let error = connect(server)
+            .await
+            .expect_err("empty tool list must fail");
         assert!(error.to_string().contains("exposed no tools"), "{error}");
     }
 
     #[tokio::test]
     async fn an_unreachable_server_is_a_clear_failure() {
         let server = stdio_server("ide", "/definitely/not/a/real/mcp-server");
-        let error = connect(server).await.expect_err("missing command must fail");
+        let error = connect(server)
+            .await
+            .expect_err("missing command must fail");
         assert!(
             error.to_string().contains("could not be started"),
             "{error}"
@@ -410,6 +420,9 @@ done
 
         let error = resolve_server("ide", None, dir.path(), Some(&path))
             .expect_err("malformed config must fail");
-        assert!(error.to_string().contains("could not read MCP config"), "{error}");
+        assert!(
+            error.to_string().contains("could not read MCP config"),
+            "{error}"
+        );
     }
 }

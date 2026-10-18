@@ -89,16 +89,19 @@ pub fn stop_daemon() -> Result<String, String> {
         return Err("Stopping daemon is only supported on Unix systems".to_string());
     }
 
-    // Brief wait for graceful shutdown
-    std::thread::sleep(std::time::Duration::from_millis(500));
+    #[cfg(unix)]
+    {
+        // Brief wait for graceful shutdown
+        std::thread::sleep(std::time::Duration::from_millis(500));
 
-    if is_process_running(pid) {
-        Ok(format!(
-            "Sent SIGTERM to process {pid}. Server is shutting down..."
-        ))
-    } else {
-        let _ = remove_pid_file();
-        Ok(format!("Process {pid} has stopped. PID file cleaned."))
+        if is_process_running(pid) {
+            Ok(format!(
+                "Sent SIGTERM to process {pid}. Server is shutting down..."
+            ))
+        } else {
+            let _ = remove_pid_file();
+            Ok(format!("Process {pid} has stopped. PID file cleaned."))
+        }
     }
 }
 

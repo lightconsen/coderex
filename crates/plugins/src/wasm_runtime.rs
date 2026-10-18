@@ -363,7 +363,8 @@ fn prescan_module<'a>(
     let mut code_section_bytes = 0usize;
 
     for payload in wasmparser::Parser::new(0).parse_all(&binary) {
-        let payload = payload.map_err(|e| format!("failed to pre-scan WASM module '{name}': {e}"))?;
+        let payload =
+            payload.map_err(|e| format!("failed to pre-scan WASM module '{name}': {e}"))?;
         match payload {
             wasmparser::Payload::FunctionSection(reader) => {
                 function_count = function_count.max(reader.count() as usize);
@@ -478,7 +479,8 @@ fn helper_next_to_current_exe() -> Option<PathBuf> {
 /// When neither exists, this returns `None` and loading fails closed.
 #[cfg(feature = "wasm-runtime")]
 fn resolved_compiler_command() -> Option<WasmCompilerCommand> {
-    configured_compiler_command().or_else(|| helper_next_to_current_exe().map(WasmCompilerCommand::new))
+    configured_compiler_command()
+        .or_else(|| helper_next_to_current_exe().map(WasmCompilerCommand::new))
 }
 
 /// Wall-clock timeout for the compiler child.
@@ -538,7 +540,11 @@ fn default_cache_dir() -> PathBuf {
             return PathBuf::from(local).join("coderex").join("wasm");
         }
         if let Some(home) = home::home_dir() {
-            return home.join("AppData").join("Local").join("coderex").join("wasm");
+            return home
+                .join("AppData")
+                .join("Local")
+                .join("coderex")
+                .join("wasm");
         }
     }
     std::env::temp_dir().join("coderex-wasm")
@@ -595,7 +601,11 @@ fn module_sha256(bytes: &[u8]) -> [u8; 32] {
 
 /// `<root>/<engine hash>/<module hash>.cwasm`.
 #[cfg(feature = "wasm-runtime")]
-fn cache_entry_path(root: &std::path::Path, engine_hash: &[u8; 32], module_hash: &[u8; 32]) -> PathBuf {
+fn cache_entry_path(
+    root: &std::path::Path,
+    engine_hash: &[u8; 32],
+    module_hash: &[u8; 32],
+) -> PathBuf {
     root.join(hex::encode(engine_hash))
         .join(format!("{}.cwasm", hex::encode(module_hash)))
 }
@@ -908,6 +918,8 @@ fn run_compile_helper(
     let stderr = std::fs::File::create(&stderr_path)
         .map_err(|e| format!("failed to create WASM compiler stderr file: {e}"))?;
 
+    // Mutated only by the Linux/macOS sandbox wrappers below.
+    #[allow(unused_mut)]
     let mut program: OsString = command.program().as_os_str().to_os_string();
     let mut args: Vec<OsString> = command.args().to_vec();
     args.push(input_path.clone().into_os_string());
@@ -964,8 +976,7 @@ fn run_compile_helper(
     #[cfg(not(any(unix, windows)))]
     let killer = ChildKiller::Plain;
 
-    let status =
-        wait_for_compile_child(&mut child, compile_timeout(), |child| killer.kill(child))?;
+    let status = wait_for_compile_child(&mut child, compile_timeout(), |child| killer.kill(child))?;
     if !status.success() {
         let detail = std::fs::read_to_string(&stderr_path).unwrap_or_default();
         let detail = detail.trim();
@@ -1451,10 +1462,10 @@ mod windows_job {
     use std::os::windows::io::AsRawHandle;
     use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
     use windows_sys::Win32::System::JobObjects::{
-        AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
-        SetInformationJobObject, TerminateJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
-        JOB_OBJECT_LIMIT_JOB_MEMORY, JOB_OBJECT_LIMIT_JOB_TIME,
-        JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+        AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_JOB_MEMORY,
+        JOB_OBJECT_LIMIT_JOB_TIME, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+        JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
+        SetInformationJobObject, TerminateJobObject,
     };
 
     /// A job object holding the compiler and its descendants.
@@ -1501,8 +1512,7 @@ mod windows_job {
         /// compiler does not spawn any in normal operation.
         pub fn assign(&self, child: &std::process::Child) -> std::io::Result<()> {
             // SAFETY: both handles are valid for the duration of the call.
-            let ok =
-                unsafe { AssignProcessToJobObject(self.0, child.as_raw_handle() as HANDLE) };
+            let ok = unsafe { AssignProcessToJobObject(self.0, child.as_raw_handle() as HANDLE) };
             if ok == 0 {
                 return Err(std::io::Error::last_os_error());
             }
@@ -2328,9 +2338,7 @@ mod sandbox_tests {
             "a file at the cap must not be rejected by the file-size gate: {err}"
         );
         assert!(
-            err.contains("pre-scan")
-                || err.contains("text form")
-                || err.contains("failed to load"),
+            err.contains("pre-scan") || err.contains("text form") || err.contains("failed to load"),
             "expected the pre-scan or wasmtime to reject the file, got: {err}"
         );
     }
@@ -2345,10 +2353,7 @@ mod sandbox_tests {
             r#"(module (memory (export "memory") 1))"#,
         );
 
-        assert!(
-            load(&path).is_ok(),
-            "a module below the size cap must load"
-        );
+        assert!(load(&path).is_ok(), "a module below the size cap must load");
     }
 
     /// A plugin that spins forever must be stopped by the fuel budget rather
@@ -2526,7 +2531,8 @@ mod prescan_tests {
             max_code_section_bytes: 8,
             ..PrescanLimits::default()
         };
-        let wat = br"(module (func nop nop nop nop nop nop nop nop nop nop nop nop nop nop nop nop))";
+        let wat =
+            br"(module (func nop nop nop nop nop nop nop nop nop nop nop nop nop nop nop nop))";
 
         let err = prescan_module("wide.wat", wat, limits).unwrap_err();
         assert!(
@@ -2600,7 +2606,6 @@ mod prescan_tests {
         };
         let wat = br"(module (func block block nop end end))";
 
-        prescan_module("at-cap.wat", wat, limits)
-            .expect("nesting at the cap must be accepted");
+        prescan_module("at-cap.wat", wat, limits).expect("nesting at the cap must be accepted");
     }
 }
