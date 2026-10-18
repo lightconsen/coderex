@@ -4,6 +4,7 @@ pub mod cli;
 pub mod daemon;
 pub mod hook_actions;
 pub mod interactive_e2e;
+pub mod mcp_elicitation;
 pub mod memory_tools;
 pub mod orchestrator;
 pub mod recovery;

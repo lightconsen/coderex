@@ -2,6 +2,7 @@
 
 use crate::cli::Cli;
 use crate::daemon;
+use crate::mcp_elicitation::SessionElicitationHandler;
 use crate::session_resume;
 use anyhow::{Result, bail};
 #[cfg(feature = "enterprise")]
@@ -38,6 +39,13 @@ pub struct SessionContext {
     /// Live MCP servers and their discovered tools, kept for the session so
     /// the tools can be registered into the tool registry.
     pub mcp_manager: Option<Arc<coderex_mcp::manager::McpManager>>,
+    /// Answers questions MCP servers ask of the user, kept for the session.
+    pub mcp_elicitation: Option<Arc<SessionElicitationHandler>>,
+    /// True for `--print`, a piped prompt, or any session without a terminal.
+    ///
+    /// Server-initiated elicitation has nobody to ask in those modes, so the
+    /// installed handler declines instead of reaching for stdin.
+    pub non_interactive: bool,
     /// MCP-discovered skills registered during InitMcp.
     pub mcp_skills: Vec<coderex_plugins::skills::SkillMetadata>,
     /// Memory subsystem initialized.
@@ -203,6 +211,8 @@ impl StartupOrchestrator {
                 remote_barrier: None,
                 mcp_ready: false,
                 mcp_manager: None,
+                mcp_elicitation: None,
+                non_interactive: false,
                 mcp_skills: Vec::new(),
                 memory_ready: false,
                 remote_services_ready: false,
@@ -302,6 +312,11 @@ impl StartupOrchestrator {
         if let Some(ref fb) = args.fallback_model {
             self.ctx.fallback_model = Some(ModelId(fb.clone()));
         }
+        // Decided before the phases run because the MCP servers are started
+        // there: the handler they get has to know whether a person is there to
+        // answer it.
+        self.ctx.non_interactive =
+            args.print || !args.prompt.is_empty() || !std::io::stdin().is_terminal();
 
         self.run_phase(StartupPhase::Bootstrap, &args).await?;
         self.run_phase(StartupPhase::LoadSettings, &args).await?;
@@ -934,6 +949,15 @@ impl StartupOrchestrator {
         // Starts with whatever the McpAuth tool persisted, so a server signed
         // into in an earlier session is authenticated in this one.
         let manager = Arc::new(coderex_mcp::manager::McpManager::new_with_stored_credentials());
+
+        // A server may ask the person a question mid-tool-call. Install the
+        // session's answerer before any server is spawned; the TUI attaches
+        // its question channel when it starts, and a non-interactive session
+        // declines rather than reading a stdin that is not a keyboard.
+        let elicitation = SessionElicitationHandler::new(!self.ctx.non_interactive);
+        manager.set_inbound_handler(elicitation.inbound());
+        self.ctx.mcp_elicitation = Some(elicitation);
+
         let mut config_loaded = false;
 
         // Load from custom --mcp-config or default .mcp.json
@@ -1113,6 +1137,9 @@ impl StartupOrchestrator {
     fn configure_repl(&self, repl: &mut crate::repl::ReplLoop) {
         if let Some(ref manager) = self.ctx.mcp_manager {
             repl.with_mcp_manager(Arc::clone(manager));
+        }
+        if let Some(ref elicitation) = self.ctx.mcp_elicitation {
+            repl.with_mcp_elicitation_handler(Arc::clone(elicitation));
         }
         repl.with_skip_permissions(self.ctx.skip_permissions);
         let perm_mode = self

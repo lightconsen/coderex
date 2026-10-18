@@ -1,5 +1,6 @@
 //! REPL loop — interactive conversation with the QueryEngine.
 
+use crate::mcp_elicitation::{SessionElicitationHandler, TuiElicitationRequest};
 use crate::session_resume;
 use anyhow::Result;
 use coderex_agents::manager::AgentManager;
@@ -462,15 +463,6 @@ struct BackgroundTaskResult {
     content: String,
 }
 
-/// A clarification request emitted from the engine into the TUI.
-#[derive(Debug)]
-struct TuiElicitationRequest {
-    /// The question text already shown by the assistant.
-    prompt: String,
-    /// Channel to send the user's answer back to the engine.
-    response_tx: tokio::sync::oneshot::Sender<serde_json::Value>,
-}
-
 /// Elicitation handler for the full-screen TUI.
 ///
 /// This keeps clarification prompts inside the TUI state instead of writing
@@ -699,6 +691,11 @@ pub struct ReplLoop {
     /// built before the MCP servers are attached, and reads this when it later
     /// builds a child registry.
     mcp_manager: Arc<std::sync::RwLock<Option<Arc<coderex_mcp::manager::McpManager>>>>,
+    /// Session handler for questions MCP servers ask, when one was installed.
+    ///
+    /// The manager already holds the inbound half; the TUI needs the same
+    /// object to register its question channel, so the session keeps it too.
+    mcp_elicitation: Option<Arc<SessionElicitationHandler>>,
     /// The server artifacts are published to, kept alive for the session.
     ///
     /// Dropping it would leave the model publishing pages nobody can open.
@@ -864,6 +861,7 @@ impl ReplLoop {
             dispatcher: None,
             agent_manager: None,
             mcp_manager: Arc::new(std::sync::RwLock::new(None)),
+            mcp_elicitation: None,
             artifact_server: None,
             artifact_store_root: None,
             running_query: None,
@@ -1121,6 +1119,7 @@ impl ReplLoop {
             dispatcher: Some(dispatcher),
             agent_manager: Some(agent_manager),
             mcp_manager: mcp_slot,
+            mcp_elicitation: None,
             artifact_server: None,
             artifact_store_root: None,
             running_query: None,
@@ -1231,6 +1230,14 @@ impl ReplLoop {
             mcp_manager.register_tools_into(dispatcher.registry());
         }
         *self.mcp_manager.write().expect("MCP slot poisoned") = Some(mcp_manager);
+    }
+
+    /// Give the TUI a way to answer questions from MCP servers.
+    ///
+    /// The manager was handed the inbound translation layer during startup;
+    /// this is the other end, which `run_tui` attaches to the event loop.
+    pub fn with_mcp_elicitation_handler(&mut self, handler: Arc<SessionElicitationHandler>) {
+        self.mcp_elicitation = Some(handler);
     }
 
     /// Wire a plugin manager into this REPL loop.
@@ -2095,6 +2102,15 @@ impl ReplLoop {
         > = None;
         let mut elicit_rx: Option<tokio::sync::mpsc::Receiver<coderex_tools::ElicitRequest>> = None;
         let mut tui_elicit_rx: Option<tokio::sync::mpsc::Receiver<TuiElicitationRequest>> = None;
+        // Questions from MCP servers are session-level: they arrive while a
+        // tool is running but are not tied to the engine's per-turn channel.
+        // The sender lives in the session handler the manager already has.
+        let (mcp_elicit_tx, mut mcp_elicit_rx) =
+            tokio::sync::mpsc::channel::<TuiElicitationRequest>(4);
+        let mcp_elicitation_active = self.mcp_elicitation.is_some();
+        if let Some(ref handler) = self.mcp_elicitation {
+            handler.set_tui_sender(mcp_elicit_tx);
+        }
         let mut queued_prompts = std::collections::VecDeque::<String>::new();
         let mut pending_confirmation: Option<ConfirmationRequest> = None;
         let mut last_stream_snapshot = Instant::now();
@@ -2956,11 +2972,33 @@ impl ReplLoop {
                     self.pending_elicitation = Some(request.response_tx);
                 }
 
+                // A server is blocked inside its tool call until this is
+                // answered, so the turn stays running; only the prompt and
+                // the answer path change.
+                Some(request) = mcp_elicit_rx.recv(), if mcp_elicitation_active => {
+                    ui_state.messages.push(Message {
+                        role: MessageRole::System,
+                        content: format!("[MCP question] {}", request.prompt).into(),
+                        tool_name: None,
+                        streaming: false,
+                        folded: false,
+                    });
+                    ui_state
+                        .notifications
+                        .info("An MCP server is waiting for an answer");
+                    self.pending_elicitation = Some(request.response_tx);
+                }
+
                 else => break Ok(()),
             }
         };
 
         // Cleanup
+        if let Some(ref handler) = self.mcp_elicitation {
+            // The event loop is going away; later server questions must not
+            // wait on a channel nobody is reading.
+            handler.clear_tui_sender();
+        }
         let _ = terminal_ui.exit();
         let _ = disable_raw_mode();
         self.event_rx = event_rx;

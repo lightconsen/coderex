@@ -74,12 +74,81 @@ pub struct JsonRpcServerRequest {
 
 /// Answers requests the server makes of the client.
 ///
-/// Synchronous on purpose: a handler that can answer immediately is the only
-/// kind this transport can honour, and one that cannot answer must say so
-/// rather than leave the server waiting.
+/// Asynchronous because some of these requests are questions for a person —
+/// `elicitation/create` is the common one — and the server waits for the
+/// answer. A handler may await the UI; returning an error is how a handler
+/// that cannot answer tells the server so rather than leaving it waiting.
+#[async_trait::async_trait]
 pub trait InboundRequestHandler: Send + Sync + std::fmt::Debug {
     /// Answer one request, or say why it cannot be answered.
-    fn handle(&self, method: &str, params: Option<&Value>) -> Result<Value, JsonRpcError>;
+    async fn handle(&self, method: &str, params: Option<&Value>) -> Result<Value, JsonRpcError>;
+}
+
+/// A handler slot that can be filled (or emptied) while servers keep running.
+///
+/// The MCP manager installs one of these on every server it creates, and the
+/// session fills it once it knows how it can prompt. That ordering matters:
+/// servers are spawned during startup, before the interactive UI exists, but
+/// the request that needs the UI arrives later. When the slot is empty the
+/// handler behaves like an absent one and refuses with `-32601`.
+#[derive(Debug, Clone, Default)]
+pub struct SharedInboundHandler {
+    inner: std::sync::Arc<std::sync::RwLock<Option<std::sync::Arc<dyn InboundRequestHandler>>>>,
+}
+
+impl SharedInboundHandler {
+    /// An empty slot.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Put `handler` in the slot, replacing any previous one.
+    pub fn install(&self, handler: std::sync::Arc<dyn InboundRequestHandler>) {
+        if let Ok(mut slot) = self.inner.write() {
+            *slot = Some(handler);
+        }
+    }
+
+    /// Empty the slot, so later requests are refused with `-32601`.
+    pub fn clear(&self) {
+        if let Ok(mut slot) = self.inner.write() {
+            *slot = None;
+        }
+    }
+
+    /// Whether a handler is currently installed.
+    #[must_use]
+    pub fn has_handler(&self) -> bool {
+        self.inner
+            .read()
+            .map(|slot| slot.is_some())
+            .unwrap_or(false)
+    }
+}
+
+#[async_trait::async_trait]
+impl InboundRequestHandler for SharedInboundHandler {
+    async fn handle(&self, method: &str, params: Option<&Value>) -> Result<Value, JsonRpcError> {
+        // Clone out of the lock before awaiting: the handler may prompt the
+        // user, and holding a lock across that would block a later install.
+        let handler = self
+            .inner
+            .read()
+            .ok()
+            .and_then(|slot| slot.as_ref().map(std::sync::Arc::clone));
+
+        match handler {
+            Some(handler) => handler.handle(method, params).await,
+            None => Err(JsonRpcError {
+                code: METHOD_NOT_FOUND,
+                message: format!(
+                    "this client has no handler for '{method}'; nothing here can answer it"
+                ),
+                data: None,
+            }),
+        }
+    }
 }
 
 /// A JSON-RPC notification (no ID, no response expected).
@@ -429,7 +498,11 @@ impl JsonRpcChannel {
         request: &JsonRpcServerRequest,
     ) -> Result<(), String> {
         let answer = match &self.handler {
-            Some(handler) => handler.handle(&request.method, request.params.as_ref()),
+            Some(handler) => {
+                handler
+                    .handle(&request.method, request.params.as_ref())
+                    .await
+            }
             None => Err(JsonRpcError {
                 code: METHOD_NOT_FOUND,
                 message: format!(

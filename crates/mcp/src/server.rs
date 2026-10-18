@@ -81,8 +81,12 @@ pub struct McpServer {
     pub max_reconnects: usize,
     /// JSON-RPC stdio channel (present when running).
     channel: Option<Arc<Mutex<JsonRpcChannel>>>,
-    /// Answers requests this server makes of the client, when one was set.
-    inbound_handler: Option<Arc<dyn crate::channel::InboundRequestHandler>>,
+    /// Answers requests this server makes of the client.
+    ///
+    /// A shared slot rather than a plain field: the manager owns one slot for
+    /// every server, so a session can install its UI handler after the servers
+    /// have already been spawned, and a reconnecting server keeps it.
+    inbound_handler: crate::channel::SharedInboundHandler,
 }
 
 impl McpServer {
@@ -106,7 +110,7 @@ impl McpServer {
             reconnect_count: 0,
             max_reconnects: 3,
             channel: None,
-            inbound_handler: None,
+            inbound_handler: crate::channel::SharedInboundHandler::new(),
         }
     }
 
@@ -130,7 +134,7 @@ impl McpServer {
             reconnect_count: 0,
             max_reconnects: 3,
             channel: None,
-            inbound_handler: None,
+            inbound_handler: crate::channel::SharedInboundHandler::new(),
         }
     }
 
@@ -150,9 +154,10 @@ impl McpServer {
                 JsonRpcChannel::new_http(url, self.headers.clone())?
             }
         };
-        if let Some(ref handler) = self.inbound_handler {
-            channel.set_inbound_handler(Arc::clone(handler));
-        }
+        // Always install the shared slot. When it is empty it refuses server
+        // requests with `-32601`, which is the honest answer; when the session
+        // fills it later, this channel sees the change without being rebuilt.
+        channel.set_inbound_handler(Arc::new(self.inbound_handler.clone()));
         Ok(channel)
     }
 
@@ -163,7 +168,15 @@ impl McpServer {
     /// handler every such request is refused with a JSON-RPC error rather than
     /// ignored.
     pub fn set_inbound_handler(&mut self, handler: Arc<dyn crate::channel::InboundRequestHandler>) {
-        self.inbound_handler = Some(handler);
+        self.inbound_handler.install(handler);
+    }
+
+    /// Share `handler` with this server instead of using its own slot.
+    ///
+    /// The manager uses this so one install covers every server, including
+    /// ones that reconnect later.
+    pub(crate) fn share_inbound_handler(&mut self, handler: crate::channel::SharedInboundHandler) {
+        self.inbound_handler = handler;
     }
 
     /// Spawn the server process and initialize JSON-RPC channel.
