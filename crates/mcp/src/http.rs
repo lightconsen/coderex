@@ -5,9 +5,27 @@ use crate::channel::{
     JsonRpcServerRequest, METHOD_NOT_FOUND,
 };
 use reqwest::Url;
-use reqwest::header::{ACCEPT, CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue};
+use reqwest::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue};
 use serde_json::Value;
 use std::collections::HashMap;
+use std::sync::Arc;
+
+/// Supplies the credential for a remote request.
+///
+/// It is consulted before *every* HTTP request, not once at startup: a session
+/// can outlive its access token, and the provider is where a near-expiry token
+/// is refreshed. Returning `None` means "send no credential"; the channel then
+/// falls back to whatever static headers it was configured with, which is the
+/// same behaviour as a server that has never signed in.
+///
+/// The method is async because a refresh is a network round trip. An
+/// implementation must not hold a lock that another request needs while doing
+/// unrelated work.
+#[async_trait::async_trait]
+pub trait TokenProvider: Send + Sync + std::fmt::Debug {
+    /// The bearer token to attach, if one is available.
+    async fn access_token(&self) -> Option<String>;
+}
 
 /// A remote JSON-RPC channel. Requests always use POST; responses may be a
 /// single JSON document or an SSE stream containing JSON-RPC messages.
@@ -16,6 +34,8 @@ pub struct HttpChannel {
     client: reqwest::Client,
     url: Url,
     headers: HeaderMap,
+    /// Resolves the bearer token before each request, when installed.
+    token_provider: Option<Arc<dyn TokenProvider>>,
 }
 
 impl HttpChannel {
@@ -41,7 +61,35 @@ impl HttpChannel {
             client: reqwest::Client::new(),
             url,
             headers: header_map,
+            token_provider: None,
         })
+    }
+
+    /// Install the credential resolver used for every subsequent request.
+    pub fn set_token_provider(&mut self, provider: Arc<dyn TokenProvider>) {
+        self.token_provider = Some(provider);
+    }
+
+    /// Headers for one request, with a freshly resolved bearer token.
+    ///
+    /// A token from the provider replaces a configured `Authorization` header;
+    /// this is what lets a configured static token give way to a refreshed one.
+    /// If the provider has nothing, the configured headers go out unchanged.
+    async fn request_headers(&self) -> HeaderMap {
+        let mut headers = self.headers.clone();
+        if let Some(provider) = &self.token_provider {
+            if let Some(token) = provider.access_token().await {
+                match HeaderValue::from_str(&format!("Bearer {token}")) {
+                    Ok(value) => {
+                        headers.insert(AUTHORIZATION, value);
+                    }
+                    Err(error) => {
+                        tracing::warn!("MCP OAuth token cannot be sent as an HTTP header: {error}");
+                    }
+                }
+            }
+        }
+        headers
     }
 
     /// Send a request and wait for its response.
@@ -57,10 +105,11 @@ impl HttpChannel {
         request: &JsonRpcRequest,
         handler: Option<&dyn InboundRequestHandler>,
     ) -> Result<Value, String> {
+        let headers = self.request_headers().await;
         let response = self
             .client
             .post(self.url.clone())
-            .headers(self.headers.clone())
+            .headers(headers)
             .header(ACCEPT, "application/json, text/event-stream")
             .header(CONTENT_TYPE, "application/json")
             .json(request)
@@ -272,10 +321,11 @@ impl HttpChannel {
             },
         };
 
+        let headers = self.request_headers().await;
         let delivered = self
             .client
             .post(self.url.clone())
-            .headers(self.headers.clone())
+            .headers(headers)
             .header(CONTENT_TYPE, "application/json")
             .json(&response)
             .send()
@@ -302,10 +352,11 @@ impl HttpChannel {
         &self,
         notification: &JsonRpcNotification,
     ) -> Result<(), String> {
+        let headers = self.request_headers().await;
         let response = self
             .client
             .post(self.url.clone())
-            .headers(self.headers.clone())
+            .headers(headers)
             .header(CONTENT_TYPE, "application/json")
             .json(notification)
             .send()

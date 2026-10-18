@@ -83,6 +83,8 @@ pub struct McpServer {
     channel: Option<Arc<Mutex<JsonRpcChannel>>>,
     /// Answers requests this server makes of the client, when one was set.
     inbound_handler: Option<Arc<dyn crate::channel::InboundRequestHandler>>,
+    /// Resolves the bearer token before each remote request, when installed.
+    token_provider: Option<Arc<dyn crate::http::TokenProvider>>,
 }
 
 impl McpServer {
@@ -107,6 +109,7 @@ impl McpServer {
             max_reconnects: 3,
             channel: None,
             inbound_handler: None,
+            token_provider: None,
         }
     }
 
@@ -131,6 +134,7 @@ impl McpServer {
             max_reconnects: 3,
             channel: None,
             inbound_handler: None,
+            token_provider: None,
         }
     }
 
@@ -153,7 +157,25 @@ impl McpServer {
         if let Some(ref handler) = self.inbound_handler {
             channel.set_inbound_handler(Arc::clone(handler));
         }
+        if let Some(ref provider) = self.token_provider {
+            channel.set_token_provider(Arc::clone(provider));
+        }
         Ok(channel)
+    }
+
+    /// Resolve the credential for this server before every remote request.
+    ///
+    /// The provider is stored on the server rather than on a channel because
+    /// [`McpServer::spawn`] and [`McpServer::reconnect`] build a fresh channel;
+    /// a provider set on a pre-spawn handle would otherwise be dropped.
+    pub fn set_token_provider(&mut self, provider: Arc<dyn crate::http::TokenProvider>) {
+        self.token_provider = Some(provider);
+    }
+
+    /// The credential resolver installed on this server, if any.
+    #[must_use]
+    pub fn token_provider(&self) -> Option<&Arc<dyn crate::http::TokenProvider>> {
+        self.token_provider.as_ref()
     }
 
     /// Answer requests this server makes of the client.

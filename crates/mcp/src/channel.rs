@@ -172,6 +172,17 @@ impl JsonRpcChannel {
         self.handler = Some(handler);
     }
 
+    /// Resolve the credential before each HTTP request.
+    ///
+    /// Only the remote transport has a credential to resolve; on a stdio
+    /// channel this is a no-op, because a subprocess is authenticated by its
+    /// environment rather than by an HTTP header.
+    pub fn set_token_provider(&mut self, provider: std::sync::Arc<dyn crate::http::TokenProvider>) {
+        if let Some(http) = self.http.as_mut() {
+            http.set_token_provider(provider);
+        }
+    }
+
     /// Spawn the subprocess and capture stdio handles.
     pub async fn spawn(&mut self) -> Result<(), String> {
         if self.http.is_some() {

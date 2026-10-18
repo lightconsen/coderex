@@ -15,6 +15,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Weak};
 use thiserror::Error;
 
 /// Something went wrong while refreshing or reading a token.
@@ -55,6 +56,14 @@ pub enum OAuthError {
         #[source]
         source: std::io::Error,
     },
+    /// Neither authorization-server metadata document could be used.
+    #[error("no OAuth server metadata found for {server_url}: {detail}")]
+    Discovery {
+        /// The server URL that was looked up.
+        server_url: String,
+        /// Why every candidate document was rejected.
+        detail: String,
+    },
 }
 
 /// OAuth state for an MCP server connection.
@@ -86,10 +95,17 @@ pub struct McpOAuthState {
     ///
     /// Left unset by [`McpOAuthState::new`]; [`McpOAuthState::token_endpoint`]
     /// then derives the conventional `{server_url}/oauth/token`, which is the
-    /// endpoint the `McpAuth` tool exchanged its code at. Set it explicitly
-    /// when a server advertises its endpoints somewhere else.
+    /// endpoint the `McpAuth` tool exchanged its code at. [`OAuthManager::discover`]
+    /// fills this in from the server's RFC 8414 metadata when it is available.
     #[serde(default)]
     pub token_endpoint: Option<String>,
+    /// The authorization endpoint the `McpAuth` tool should send the user to.
+    ///
+    /// Like [`Self::token_endpoint`], this is empty until discovery finds it;
+    /// [`McpOAuthState::authorization_endpoint`] falls back to the conventional
+    /// `{server_url}/oauth/authorize` path.
+    #[serde(default)]
+    pub authorization_endpoint: Option<String>,
 }
 
 impl McpOAuthState {
@@ -105,6 +121,7 @@ impl McpOAuthState {
             expires_at: None,
             scopes: Vec::new(),
             token_endpoint: None,
+            authorization_endpoint: None,
         }
     }
 
@@ -153,6 +170,14 @@ impl McpOAuthState {
             .unwrap_or_else(|| format!("{}/oauth/token", self.server_url.trim_end_matches('/')))
     }
 
+    /// The endpoint a browser should be sent to for authorization.
+    #[must_use]
+    pub fn authorization_endpoint(&self) -> String {
+        self.authorization_endpoint
+            .clone()
+            .unwrap_or_else(|| format!("{}/oauth/authorize", self.server_url.trim_end_matches('/')))
+    }
+
     /// Update tokens from an OAuth flow.
     pub fn update_tokens(&mut self, access: String, refresh: Option<String>, expires_in: i64) {
         self.access_token = Some(access);
@@ -170,6 +195,108 @@ impl McpOAuthState {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct TokenStore {
     states: Vec<McpOAuthState>,
+}
+
+/// The endpoints an authorization server advertises (RFC 8414).
+///
+/// Both fields are optional in the document, but a document that advertises
+/// neither is not useful and is treated as a failed discovery.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OAuthDiscovery {
+    /// Where the user is sent to approve the client.
+    #[serde(default)]
+    pub authorization_endpoint: Option<String>,
+    /// Where an authorization code or refresh token is exchanged.
+    #[serde(default)]
+    pub token_endpoint: Option<String>,
+}
+
+impl OAuthDiscovery {
+    fn is_empty(&self) -> bool {
+        self.authorization_endpoint.is_none() && self.token_endpoint.is_none()
+    }
+}
+
+/// The `scheme://host[:port]` part of a server URL, or `None` for anything
+/// that is not a usable http(s) URL.
+fn origin_of(server_url: &str) -> Option<String> {
+    let url = reqwest::Url::parse(server_url).ok()?;
+    if !matches!(url.scheme(), "http" | "https") {
+        return None;
+    }
+    Some(url.origin().ascii_serialization())
+}
+
+async fn fetch_discovery(client: &reqwest::Client, url: &str) -> Result<OAuthDiscovery, String> {
+    let response = client
+        .get(url)
+        .header("accept", "application/json")
+        .send()
+        .await
+        .map_err(|error| error.to_string())?;
+    let status = response.status();
+    let body = response.text().await.map_err(|error| error.to_string())?;
+    if !status.is_success() {
+        return Err(format!("HTTP {status}"));
+    }
+    serde_json::from_str(&body).map_err(|error| format!("invalid JSON: {error}"))
+}
+
+/// Resolves the access token for one MCP server before each HTTP request.
+///
+/// It holds the same [`OAuthManager`] the rest of the manager uses, behind the
+/// manager's lock, so a refresh started by one request updates the state every
+/// other request sees. The lock is held only while the token is resolved.
+#[derive(Debug, Clone)]
+pub struct OAuthTokenProvider {
+    /// Weak so that installing providers does not make the manager's OAuth
+    /// state un-uniquely-owned; `McpManager::oauth_mut` still works after
+    /// startup. The manager outlives every server it starts.
+    oauth: Weak<tokio::sync::Mutex<OAuthManager>>,
+    server_url: String,
+    client: reqwest::Client,
+}
+
+impl OAuthTokenProvider {
+    /// Build a provider for `server_url` against a shared manager.
+    #[must_use]
+    pub fn new(
+        oauth: Arc<tokio::sync::Mutex<OAuthManager>>,
+        server_url: impl Into<String>,
+        client: reqwest::Client,
+    ) -> Self {
+        Self {
+            oauth: Arc::downgrade(&oauth),
+            server_url: server_url.into(),
+            client,
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::http::TokenProvider for OAuthTokenProvider {
+    async fn access_token(&self) -> Option<String> {
+        let Some(shared) = self.oauth.upgrade() else {
+            // The manager is gone; there is no token state left to consult.
+            return None;
+        };
+        let mut oauth = shared.lock().await;
+        match oauth
+            .refresh_if_needed(&self.server_url, &self.client)
+            .await
+        {
+            Ok(token) => token,
+            Err(error) => {
+                // Degrade to "no credential" rather than failing the request
+                // before it is sent: the server can answer 401 honestly.
+                tracing::warn!(
+                    server = %self.server_url,
+                    "MCP OAuth token could not be resolved, sending the request without one: {error}"
+                );
+                None
+            }
+        }
+    }
 }
 
 /// OAuth flow manager.
@@ -286,6 +413,76 @@ impl OAuthManager {
         self.states.iter().map(|s| s.server_url.as_str()).collect()
     }
 
+    /// Fetch the server's OAuth metadata and record the endpoints it advertises.
+    ///
+    /// RFC 8414 puts the document at `{origin}/.well-known/oauth-authorization-server`.
+    /// Some servers only publish OpenID Connect discovery, so
+    /// `{origin}/.well-known/openid-configuration` is tried when the first
+    /// document is missing or unusable. The origin — not the MCP endpoint path —
+    /// is used, because the metadata is about the authorization server.
+    ///
+    /// Discovered endpoints are written into the state for `server_url` (which
+    /// is created with the conventional client id if the server has not been
+    /// registered yet) and persisted, so the next process does not have to ask
+    /// again. Callers that cannot use `Result` — [`OAuthManager::refresh`] —
+    /// treat a failure as "no metadata" and fall back to the conventional paths.
+    pub async fn discover(
+        &mut self,
+        server_url: &str,
+        client: &reqwest::Client,
+    ) -> Result<OAuthDiscovery, OAuthError> {
+        let Some(origin) = origin_of(server_url) else {
+            return Err(OAuthError::Discovery {
+                server_url: server_url.to_string(),
+                detail: "the server URL has no usable http(s) origin".to_string(),
+            });
+        };
+
+        let mut attempts = Vec::new();
+        let mut found = None;
+        for path in [
+            ".well-known/oauth-authorization-server",
+            ".well-known/openid-configuration",
+        ] {
+            let url = format!("{origin}/{path}");
+            match fetch_discovery(client, &url).await {
+                Ok(discovery) if !discovery.is_empty() => {
+                    found = Some(discovery);
+                    break;
+                }
+                Ok(_) => attempts.push(format!("{url}: advertised no endpoints")),
+                Err(error) => attempts.push(format!("{url}: {error}")),
+            }
+        }
+
+        let Some(discovery) = found else {
+            return Err(OAuthError::Discovery {
+                server_url: server_url.to_string(),
+                detail: attempts.join("; "),
+            });
+        };
+
+        if self.get(server_url).is_none() {
+            self.register(McpOAuthState::new(server_url, "coderex-cli"));
+        }
+        let state = self
+            .get_mut(server_url)
+            .expect("the state was just registered");
+        if discovery.authorization_endpoint.is_some() {
+            state.authorization_endpoint = discovery.authorization_endpoint.clone();
+        }
+        if discovery.token_endpoint.is_some() {
+            state.token_endpoint = discovery.token_endpoint.clone();
+        }
+
+        self.save_tokens().map_err(|source| OAuthError::Store {
+            path: self.path.display().to_string(),
+            source,
+        })?;
+
+        Ok(discovery)
+    }
+
     /// Trade the stored refresh token for a fresh access token.
     ///
     /// This is a real `grant_type=refresh_token` exchange against the server's
@@ -302,6 +499,22 @@ impl OAuthManager {
         server_url: &str,
         client: &reqwest::Client,
     ) -> Result<String, OAuthError> {
+        if self.get(server_url).is_none() {
+            return Err(OAuthError::UnknownServer {
+                server_url: server_url.to_string(),
+            });
+        }
+
+        // A state that predates discovery (or was written by an older version)
+        // has no endpoint recorded. Ask the server once; if it does not
+        // advertise one, `token_endpoint()` keeps the conventional path.
+        if self
+            .get(server_url)
+            .is_some_and(|state| state.token_endpoint.is_none())
+        {
+            let _ = self.discover(server_url, client).await;
+        }
+
         let Some(state) = self.get(server_url) else {
             return Err(OAuthError::UnknownServer {
                 server_url: server_url.to_string(),
@@ -707,6 +920,204 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(token.as_deref(), Some("old_access"));
+    }
+
+    /// Read one complete HTTP request (head plus `Content-Length` body).
+    fn read_http_request(stream: &mut std::net::TcpStream) -> String {
+        let mut request = Vec::new();
+        let mut chunk = [0_u8; 4096];
+        loop {
+            let count = stream.read(&mut chunk).unwrap();
+            if count == 0 {
+                break;
+            }
+            request.extend_from_slice(&chunk[..count]);
+            let text = String::from_utf8_lossy(&request);
+            if let Some(head_end) = text.find("\r\n\r\n") {
+                let length = text
+                    .lines()
+                    .find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse::<usize>().ok())?
+                    })
+                    .unwrap_or(0);
+                if request.len() >= head_end + 4 + length {
+                    break;
+                }
+            }
+        }
+        String::from_utf8_lossy(&request).into_owned()
+    }
+
+    /// Serve a fixed sequence of responses, one connection each, and return
+    /// the requests that arrived. The response bodies are built after the
+    /// listener is bound so they can name its address.
+    fn spawn_http_sequence<F>(make_responses: F) -> (String, std::thread::JoinHandle<Vec<String>>)
+    where
+        F: FnOnce(&str) -> Vec<(u16, String)> + Send + 'static,
+    {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let base = format!("http://{address}");
+        let responses = make_responses(&base);
+        let handle = std::thread::spawn(move || {
+            let mut requests = Vec::new();
+            for (status, body) in responses {
+                let (mut stream, _) = listener.accept().unwrap();
+                requests.push(read_http_request(&mut stream));
+                let response = format!(
+                    "HTTP/1.1 {status} OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                stream.write_all(response.as_bytes()).unwrap();
+                stream.flush().unwrap();
+            }
+            requests
+        });
+        (base, handle)
+    }
+
+    #[tokio::test]
+    async fn discovery_reads_the_authorization_server_metadata_and_persists_it() {
+        let metadata = r#"{
+            "authorization_endpoint": "https://auth.example/authorize",
+            "token_endpoint": "https://auth.example/token"
+        }"#;
+        let (base, server) = spawn_http_sequence(move |_| vec![(200, metadata.to_string())]);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mcp_tokens.json");
+        let mut mgr = OAuthManager::with_path(&path);
+        let server_url = format!("{base}/mcp");
+        mgr.register(McpOAuthState::new(&server_url, "client1"));
+
+        let discovery = mgr
+            .discover(&server_url, &reqwest::Client::new())
+            .await
+            .unwrap();
+        assert_eq!(
+            discovery.authorization_endpoint.as_deref(),
+            Some("https://auth.example/authorize")
+        );
+        assert_eq!(
+            discovery.token_endpoint.as_deref(),
+            Some("https://auth.example/token")
+        );
+
+        let state = mgr.get(&server_url).unwrap();
+        assert_eq!(
+            state.authorization_endpoint(),
+            "https://auth.example/authorize"
+        );
+        assert_eq!(state.token_endpoint(), "https://auth.example/token");
+
+        // The cache has to survive the process, or every restart asks again.
+        let on_disk = std::fs::read_to_string(&path).unwrap();
+        assert!(on_disk.contains("https://auth.example/token"), "{on_disk}");
+        assert!(
+            on_disk.contains("https://auth.example/authorize"),
+            "{on_disk}"
+        );
+
+        // The origin was used, not the MCP endpoint path.
+        let requests = server.join().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert!(
+            requests[0].starts_with("GET /.well-known/oauth-authorization-server "),
+            "unexpected discovery request: {}",
+            requests[0]
+        );
+    }
+
+    #[tokio::test]
+    async fn discovery_falls_back_to_openid_configuration() {
+        let openid = r#"{
+            "issuer": "https://auth.example",
+            "authorization_endpoint": "https://openid.example/authorize",
+            "token_endpoint": "https://openid.example/token"
+        }"#;
+        let (base, server) =
+            spawn_http_sequence(move |_| vec![(404, String::new()), (200, openid.to_string())]);
+        let mut mgr = OAuthManager::with_path(tempfile::tempdir().unwrap().path().join("t.json"));
+        let server_url = format!("{base}/mcp");
+
+        let discovery = mgr
+            .discover(&server_url, &reqwest::Client::new())
+            .await
+            .unwrap();
+        assert_eq!(
+            discovery.token_endpoint.as_deref(),
+            Some("https://openid.example/token")
+        );
+
+        let requests = server.join().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert!(
+            requests[0].starts_with("GET /.well-known/oauth-authorization-server "),
+            "{}",
+            requests[0]
+        );
+        assert!(
+            requests[1].starts_with("GET /.well-known/openid-configuration "),
+            "{}",
+            requests[1]
+        );
+    }
+
+    #[tokio::test]
+    async fn refresh_uses_the_discovered_token_endpoint() {
+        let (base, server) = spawn_http_sequence(|base| {
+            vec![
+                (
+                    200,
+                    format!(
+                        r#"{{"authorization_endpoint":"{base}/authorize","token_endpoint":"{base}/custom/token"}}"#
+                    ),
+                ),
+                (
+                    200,
+                    r#"{"access_token":"discovered_access","expires_in":3600}"#.to_string(),
+                ),
+            ]
+        });
+        let mut mgr = OAuthManager::with_path(tempfile::tempdir().unwrap().path().join("t.json"));
+        let server_url = format!("{base}/mcp");
+        let mut state = McpOAuthState::new(&server_url, "client1");
+        state.access_token = Some("old".into());
+        state.refresh_token = Some("refresh_me".into());
+        state.expires_at = Some(chrono::Utc::now().timestamp() + 60);
+        mgr.register(state);
+
+        let token = mgr
+            .refresh(&server_url, &reqwest::Client::new())
+            .await
+            .unwrap();
+        assert_eq!(token, "discovered_access");
+
+        let requests = server.join().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert!(
+            requests[1].starts_with("POST /custom/token "),
+            "the conventional endpoint was used instead of the discovered one: {}",
+            requests[1]
+        );
+    }
+
+    #[tokio::test]
+    async fn discovery_failure_is_reported_rather_than_invented() {
+        let (base, server) =
+            spawn_http_sequence(|_| vec![(404, String::new()), (404, String::new())]);
+        let mut mgr = OAuthManager::with_path(tempfile::tempdir().unwrap().path().join("t.json"));
+
+        let error = mgr
+            .discover(&format!("{base}/mcp"), &reqwest::Client::new())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, OAuthError::Discovery { .. }),
+            "unexpected error: {error}"
+        );
+        server.join().unwrap();
     }
 
     #[test]

@@ -36,10 +36,11 @@ pub struct McpManager {
     cache_ttl: Duration,
     /// OAuth state.
     ///
-    /// Behind a lock because resolving a credential for a remote server may
-    /// refresh it over the network, and that has to be able to happen from the
-    /// `&self` methods that start servers.
-    oauth: tokio::sync::Mutex<OAuthManager>,
+    /// Shared, because each remote server's token provider resolves the
+    /// credential before every request and all of them must see the same
+    /// refreshed state. Behind a lock for the same reason: a near-expiry
+    /// refresh is a network round trip.
+    oauth: Arc<tokio::sync::Mutex<OAuthManager>>,
     /// Elicitation state.
     elicitation: ElicitationManager,
     /// Whether a refresh (re-discovery) is needed.
@@ -64,7 +65,7 @@ impl McpManager {
             resources: Mutex::new(McpResourceRegistry::new()),
             resource_cache: Mutex::new(HashMap::new()),
             cache_ttl: Duration::from_secs(60),
-            oauth: tokio::sync::Mutex::new(OAuthManager::new()),
+            oauth: Arc::new(tokio::sync::Mutex::new(OAuthManager::new())),
             elicitation: ElicitationManager::new(),
             needs_refresh: AtomicBool::new(false),
             health_cancel: Mutex::new(None),
@@ -84,7 +85,7 @@ impl McpManager {
         let mut manager = Self::new();
         match OAuthManager::load_tokens() {
             Ok(stored) => {
-                manager.oauth = tokio::sync::Mutex::new(stored);
+                manager.oauth = Arc::new(tokio::sync::Mutex::new(stored));
             }
             Err(error) => {
                 tracing::warn!("Could not read saved MCP tokens: {error}");
@@ -127,15 +128,17 @@ impl McpManager {
 
     /// Spawn all registered servers and discover tools/resources.
     ///
-    /// Remote servers get an `Authorization: Bearer` header built from the
-    /// stored OAuth token, if there is one. Resolving that token is where a
-    /// near-expiry token is refreshed, so a session that starts with a stale
-    /// token signs in again before it connects rather than failing on the first
-    /// request. Stdio servers are untouched: a subprocess is authenticated by
-    /// its environment, not by an HTTP header.
+    /// Every remote server gets a token provider, which resolves the stored
+    /// OAuth credential before *each* request rather than once here. That is
+    /// what lets a session outlive its access token: the channel asks again on
+    /// the next request, and a token inside the 5-minute expiry window is
+    /// refreshed first. The provider degrades to "no credential" when the
+    /// refresh fails, so the server can answer 401 instead of the request
+    /// never being sent. Stdio servers are untouched: a subprocess is
+    /// authenticated by its environment, not by an HTTP header.
     ///
-    /// The refresh is bounded by a timeout: startup waits on this, and a token
-    /// endpoint that never answers must not hold the session open.
+    /// The client's timeout also bounds a token refresh, so a token endpoint
+    /// that never answers cannot hold a request open indefinitely.
     pub async fn start_all(&self) {
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(10))
@@ -154,25 +157,11 @@ impl McpManager {
             .collect();
 
         for (name, url) in remote {
-            let credential = {
-                let mut oauth = self.oauth.lock().await;
-                oauth.refresh_if_needed(&url, &client).await
-            };
-            match credential {
-                Ok(Some(token)) => {
-                    if let Some(mut server) = self.servers.get_mut(&name) {
-                        server
-                            .headers
-                            .insert("Authorization".to_string(), format!("Bearer {token}"));
-                    }
-                }
-                Ok(None) => {}
-                Err(error) => {
-                    tracing::warn!(
-                        server = %name,
-                        "MCP OAuth credential could not be resolved, connecting without one: {error}"
-                    );
-                }
+            let provider: Arc<dyn crate::http::TokenProvider> = Arc::new(
+                crate::oauth::OAuthTokenProvider::new(Arc::clone(&self.oauth), url, client.clone()),
+            );
+            if let Some(mut server) = self.servers.get_mut(&name) {
+                server.set_token_provider(provider);
             }
         }
 
@@ -533,7 +522,9 @@ impl McpManager {
     /// running manager hands out [`McpManager::oauth`] instead.
     #[must_use]
     pub fn oauth_mut(&mut self) -> &mut OAuthManager {
-        self.oauth.get_mut()
+        Arc::get_mut(&mut self.oauth)
+            .expect("the OAuth manager has another strong owner")
+            .get_mut()
     }
 }
 
@@ -663,10 +654,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn start_all_attaches_the_stored_oauth_token_to_remote_servers() {
-        // Port 1 refuses connections: the spawn is expected to fail. What is
-        // being checked is the header the server was configured with, which is
-        // set before the connection is attempted.
+    async fn start_all_installs_a_token_provider_for_remote_servers() {
+        // Port 1 refuses connections: connecting is not what is being checked.
+        // The provider is installed before the connection is attempted, and it
+        // is what resolves the token — at request time, not startup time.
         let url = "http://127.0.0.1:1/mcp";
         let mut mgr = McpManager::new();
         let mut state = crate::oauth::McpOAuthState::new(url, "client1");
@@ -686,10 +677,14 @@ mod tests {
         mgr.start_all().await;
 
         let server = mgr.get_server("remote").unwrap();
-        assert_eq!(
-            server.headers.get("Authorization").map(String::as_str),
-            Some("Bearer token_abc")
+        assert!(
+            !server.headers.contains_key("Authorization"),
+            "the credential must not be frozen into a startup header"
         );
+        let provider = server
+            .token_provider()
+            .expect("a remote server needs a token provider");
+        assert_eq!(provider.access_token().await.as_deref(), Some("token_abc"));
     }
 
     #[tokio::test]
@@ -711,5 +706,9 @@ mod tests {
 
         let server = mgr.get_server("remote").unwrap();
         assert!(!server.headers.contains_key("Authorization"));
+        let provider = server
+            .token_provider()
+            .expect("a remote server needs a token provider");
+        assert!(provider.access_token().await.is_none());
     }
 }
