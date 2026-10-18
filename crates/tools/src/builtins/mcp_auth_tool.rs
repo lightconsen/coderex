@@ -15,10 +15,13 @@
 //! `code` and `state` are parsed and the state checked against the pending
 //! flow) or a bare `code` with the `code_verifier` from the first call.
 //!
-//! Endpoints come from the server's RFC 8414 metadata when it publishes any
-//! (`/.well-known/oauth-authorization-server`, then OpenID Connect discovery);
-//! otherwise the conventional `/oauth/authorize` and `/oauth/token` paths are
-//! used.
+//! Endpoints come from RFC 9728 Protected Resource Metadata (which may name an
+//! authorization server on a different origin), then that server's RFC 8414 /
+//! OpenID Connect metadata; otherwise the conventional `/oauth/authorize` and
+//! `/oauth/token` paths are used. When no client id is configured and the
+//! authorization server publishes a `registration_endpoint`, a client is
+//! registered dynamically (RFC 7591) and the returned credentials are
+//! persisted for the refresh path.
 
 use crate::context::{ToolError, ToolOutput};
 use crate::tool::{Tool, ToolContext, ToolDescriptor, ToolInput, ToolTier};
@@ -87,8 +90,8 @@ impl Tool for McpAuthTool {
 /// file instead of the user's real `~/.coderex/mcp_tokens.json`.
 async fn authenticate(input: ToolInput, token_path: &Path) -> Result<ToolOutput, ToolError> {
     let server_url = extract_string(&input.arguments, "server_url")?;
-    let client_id =
-        extract_string(&input.arguments, "client_id").unwrap_or_else(|_| "coderex-cli".into());
+    // The caller naming a client id is what suppresses dynamic registration.
+    let requested_client_id = extract_string(&input.arguments, "client_id").ok();
     let scope = extract_string(&input.arguments, "scope").unwrap_or_else(|_| "mcp".into());
 
     let client = reqwest::Client::builder()
@@ -98,7 +101,50 @@ async fn authenticate(input: ToolInput, token_path: &Path) -> Result<ToolOutput,
 
     let pending_path = pending_path(token_path);
     let pending = load_pending(&pending_path, &server_url);
-    let discovery = discover_endpoints(&client, &server_url, &client_id, token_path).await;
+    let discovery = discover_endpoints(
+        &client,
+        &server_url,
+        requested_client_id.as_deref().unwrap_or(""),
+        token_path,
+    )
+    .await;
+
+    // The authorization server may reject S256. Discovering that here is
+    // better than after the user has approved a flow that cannot complete.
+    discovery.require_s256(&server_url)?;
+
+    // A client id the caller named wins; otherwise a stored (possibly
+    // dynamically registered) one is reused. Registration happens only when
+    // neither exists.
+    let stored_entry = load_token_entry(token_path, &server_url);
+    let mut client_id = requested_client_id
+        .clone()
+        .or_else(|| stored_entry.as_ref().map(|entry| entry.client_id.clone()))
+        .filter(|id| !id.trim().is_empty());
+    let mut client_secret = stored_entry
+        .as_ref()
+        .and_then(|entry| entry.client_secret.clone());
+
+    if requested_client_id.is_none() && client_id.is_none() {
+        if let Some(registration_endpoint) = discovery.registration_endpoint.as_deref() {
+            let registration = register_client(
+                &client,
+                registration_endpoint,
+                &discovery,
+                token_path,
+                &server_url,
+            )
+            .await?;
+            client_id = Some(registration.client_id);
+            client_secret = registration.client_secret;
+        }
+    }
+    let client_id = client_id.unwrap_or_else(|| "coderex-cli".into());
+    let auth_method =
+        select_client_auth_method(&discovery.token_endpoint_auth_methods_supported, client_secret.is_some())
+            .unwrap_or("none")
+            .to_string();
+    let resource = discovery.resource(&server_url);
 
     let authorization_endpoint = [
         discovery.authorization_endpoint.clone(),
@@ -184,6 +230,7 @@ async fn authenticate(input: ToolInput, token_path: &Path) -> Result<ToolOutput,
             &scope,
             &state,
             &challenge,
+            &resource,
         )?;
         auth_url = Some(url.clone());
 
@@ -232,16 +279,30 @@ async fn authenticate(input: ToolInput, token_path: &Path) -> Result<ToolOutput,
         }
     };
 
-    // Exchange code for token
-    let resp = client
-        .post(&token_endpoint)
-        .form(&[
-            ("grant_type", "authorization_code"),
-            ("code", &code),
-            ("client_id", &client_id),
-            ("redirect_uri", LOCAL_REDIRECT_URI),
-            ("code_verifier", &verifier),
-        ])
+    // Exchange code for token. The client authentication method is the one the
+    // authorization server advertised: basic (header), post (form), or none
+    // for a public client that relies on PKCE.
+    let mut form = vec![
+        ("grant_type", "authorization_code".to_string()),
+        ("code", code.clone()),
+        ("redirect_uri", LOCAL_REDIRECT_URI.to_string()),
+        ("code_verifier", verifier.clone()),
+        ("resource", resource.clone()),
+    ];
+    if auth_method != "client_secret_basic" {
+        form.push(("client_id", client_id.clone()));
+    }
+    if auth_method == "client_secret_post" {
+        if let Some(secret) = &client_secret {
+            form.push(("client_secret", secret.clone()));
+        }
+    }
+    let mut request = client.post(&token_endpoint);
+    if auth_method == "client_secret_basic" {
+        request = request.basic_auth(&client_id, client_secret.as_deref());
+    }
+    let resp = request
+        .form(&form)
         .send()
         .await
         .map_err(|e| ToolError::InvalidInput {
@@ -278,15 +339,15 @@ async fn authenticate(input: ToolInput, token_path: &Path) -> Result<ToolOutput,
         .get("refresh_token")
         .and_then(|v| v.as_str())
         .map(String::from);
-    let persisted = persist_token_with_endpoints_at(
+    let persisted = persist_authenticated_at(
         token_path,
         &server_url,
         &client_id,
+        client_secret.as_deref(),
         access_token,
         expires_in,
         refresh_token.as_deref(),
-        discovery.token_endpoint.as_deref(),
-        discovery.authorization_endpoint.as_deref(),
+        &discovery,
     );
 
     // The flow is finished; a pending hand-off for this server is now stale.
@@ -464,10 +525,194 @@ fn parse_redirect_url(value: &str) -> Result<(String, Option<String>), String> {
 const DEFAULT_DISCOVERY_TTL_SECONDS: u64 = 3600;
 
 /// Endpoints advertised by the server's metadata documents.
-#[derive(Debug, Default)]
+///
+/// Mirrors the fields `coderex_mcp::oauth::OAuthDiscovery` carries. The
+/// authorization server metadata may come from a different origin than the
+/// MCP endpoint, named by the resource's `authorization_servers`.
+#[derive(Debug, Default, Clone)]
 struct DiscoveredEndpoints {
+    issuer: Option<String>,
     authorization_endpoint: Option<String>,
     token_endpoint: Option<String>,
+    registration_endpoint: Option<String>,
+    resource: Option<String>,
+    scopes_supported: Vec<String>,
+    token_endpoint_auth_methods_supported: Vec<String>,
+    grant_types_supported: Vec<String>,
+    code_challenge_methods_supported: Vec<String>,
+    protected_resource: Option<ProtectedResourceMetadata>,
+    resource_metadata_url: Option<String>,
+    resource_metadata_etag: Option<String>,
+    /// How long the protected resource document may be cached.
+    resource_metadata_ttl: u64,
+    /// The issuer cache entry, when this result came from a fetch.
+    issuer_entry: Option<IssuerMetadataEntry>,
+}
+
+impl DiscoveredEndpoints {
+    /// The RFC 8707 resource indicator to send.
+    fn resource(&self, server_url: &str) -> String {
+        self.resource
+            .clone()
+            .unwrap_or_else(|| server_url.to_string())
+    }
+
+    /// Refuse an authorization flow the server's PKCE policy cannot accept.
+    fn require_s256(&self, server_url: &str) -> Result<(), ToolError> {
+        if self.code_challenge_methods_supported.is_empty()
+            || self
+                .code_challenge_methods_supported
+                .iter()
+                .any(|method| method == "S256")
+        {
+            return Ok(());
+        }
+        Err(ToolError::InvalidInput {
+            message: format!(
+                "the authorization server for {server_url} does not support PKCE S256 \
+                 (code_challenge_methods_supported = {:?}); refusing to start a flow it \
+                 would reject",
+                self.code_challenge_methods_supported
+            ),
+        })
+    }
+
+    fn from_entry(entry: &TokenEntry) -> Self {
+        Self {
+            issuer: entry.issuer.clone(),
+            authorization_endpoint: entry.authorization_endpoint.clone(),
+            token_endpoint: entry.token_endpoint.clone(),
+            registration_endpoint: entry.registration_endpoint.clone(),
+            resource: entry.resource.clone(),
+            scopes_supported: entry.scopes_supported.clone(),
+            token_endpoint_auth_methods_supported: entry
+                .token_endpoint_auth_methods_supported
+                .clone(),
+            grant_types_supported: entry.grant_types_supported.clone(),
+            code_challenge_methods_supported: entry
+                .code_challenge_methods_supported
+                .clone(),
+            protected_resource: entry.protected_resource.clone(),
+            resource_metadata_url: entry.resource_metadata_url.clone(),
+            resource_metadata_etag: entry.resource_metadata_etag.clone(),
+            resource_metadata_ttl: 0,
+            issuer_entry: None,
+        }
+    }
+}
+
+/// RFC 9728 Protected Resource Metadata (mirrored from `coderex_mcp::oauth`).
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+struct ProtectedResourceMetadata {
+    #[serde(default)]
+    resource: Option<String>,
+    #[serde(default)]
+    authorization_servers: Vec<String>,
+    #[serde(default)]
+    scopes_supported: Vec<String>,
+}
+
+impl ProtectedResourceMetadata {
+    fn issuer(&self) -> Option<String> {
+        self.authorization_servers
+            .first()
+            .and_then(|issuer| normalize_issuer(issuer))
+    }
+}
+
+/// One cached authorization-server document, keyed by normalized issuer.
+///
+/// Mirrors `coderex_mcp::oauth::IssuerMetadataCache`; both crates write the
+/// same `issuer_metadata` map in the shared token store.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+struct IssuerMetadataEntry {
+    #[serde(default)]
+    issuer: Option<String>,
+    #[serde(default)]
+    authorization_endpoint: Option<String>,
+    #[serde(default)]
+    token_endpoint: Option<String>,
+    #[serde(default)]
+    registration_endpoint: Option<String>,
+    #[serde(default)]
+    scopes_supported: Vec<String>,
+    #[serde(default)]
+    token_endpoint_auth_methods_supported: Vec<String>,
+    #[serde(default)]
+    grant_types_supported: Vec<String>,
+    #[serde(default)]
+    code_challenge_methods_supported: Vec<String>,
+    #[serde(default)]
+    expires_at: Option<i64>,
+    #[serde(default)]
+    etag: Option<String>,
+    #[serde(default)]
+    source_url: Option<String>,
+}
+
+impl IssuerMetadataEntry {
+    fn is_fresh(&self, now: i64) -> bool {
+        self.expires_at.is_some_and(|expires_at| now < expires_at)
+    }
+
+    fn has_endpoints(&self) -> bool {
+        self.authorization_endpoint.is_some() || self.token_endpoint.is_some()
+    }
+
+    fn into_discovery(self) -> DiscoveredEndpoints {
+        DiscoveredEndpoints {
+            issuer: self.issuer,
+            authorization_endpoint: self.authorization_endpoint,
+            token_endpoint: self.token_endpoint,
+            registration_endpoint: self.registration_endpoint,
+            scopes_supported: self.scopes_supported,
+            token_endpoint_auth_methods_supported: self.token_endpoint_auth_methods_supported,
+            grant_types_supported: self.grant_types_supported,
+            code_challenge_methods_supported: self.code_challenge_methods_supported,
+            ..DiscoveredEndpoints::default()
+        }
+    }
+}
+
+/// Pick a client authentication method from what the server advertises.
+///
+/// Mirrors `coderex_mcp::oauth::select_client_auth_method`: basic wins when a
+/// secret is available (it keeps the secret out of logs and bodies), `none` is
+/// the public-client default, and `None` means no advertised method fits the
+/// credentials on hand.
+fn select_client_auth_method(
+    advertised: &[String],
+    has_secret: bool,
+) -> Option<&'static str> {
+    let offers = |method: &str| advertised.is_empty() || advertised.iter().any(|m| m == method);
+    if has_secret {
+        if offers("client_secret_basic") {
+            Some("client_secret_basic")
+        } else if offers("client_secret_post") {
+            Some("client_secret_post")
+        } else {
+            None
+        }
+    } else if offers("none") {
+        Some("none")
+    } else {
+        None
+    }
+}
+
+/// The RFC 9728 well-known URL: the path is inserted after the well-known
+/// segment, not appended to the resource URL.
+fn protected_resource_candidate(resource_url: &str) -> Option<String> {
+    let normalized = normalize_issuer(resource_url)?;
+    let url = url::Url::parse(&normalized).ok()?;
+    if !allows_plain_http(&url) {
+        return None;
+    }
+    let origin = url.origin().ascii_serialization();
+    let path = url.path().trim_end_matches('/');
+    Some(format!(
+        "{origin}/.well-known/oauth-protected-resource{path}"
+    ))
 }
 
 /// Normalize an issuer for discovery and comparison.
@@ -538,32 +783,57 @@ fn discovery_candidates(issuer: &str) -> Option<Vec<String>> {
 
 /// How long a metadata document may be reused, per `Cache-Control`.
 ///
-/// `max-age` is the only directive that matters here; anything else (including
-/// a missing header) falls back to one hour. `no-store` and `no-cache` mean
-/// "fetch again next time", which is a zero-second TTL.
+/// `max-age` wins; without it `Expires` (relative to `Date`) is used. A missing
+/// header falls back to one hour. `no-store` and `no-cache` mean "fetch again
+/// next time", which is a zero-second TTL.
 fn cache_max_age(headers: &reqwest::header::HeaderMap) -> u64 {
-    let Some(value) = headers
+    let mut max_age = None;
+    if let Some(value) = headers
         .get(reqwest::header::CACHE_CONTROL)
         .and_then(|value| value.to_str().ok())
-    else {
-        return DEFAULT_DISCOVERY_TTL_SECONDS;
-    };
-    for directive in value.split(',') {
-        let directive = directive.trim();
-        if directive.eq_ignore_ascii_case("no-store") || directive.eq_ignore_ascii_case("no-cache")
-        {
-            return 0;
-        }
-        let Some((name, raw)) = directive.split_once('=') else {
-            continue;
-        };
-        if name.trim().eq_ignore_ascii_case("max-age") {
-            if let Ok(seconds) = raw.trim().trim_matches('"').parse::<u64>() {
-                return seconds;
+    {
+        for directive in value.split(',') {
+            let directive = directive.trim();
+            if directive.eq_ignore_ascii_case("no-store")
+                || directive.eq_ignore_ascii_case("no-cache")
+            {
+                return 0;
+            }
+            let Some((name, raw)) = directive.split_once('=') else {
+                continue;
+            };
+            if name.trim().eq_ignore_ascii_case("max-age") {
+                if let Ok(seconds) = raw.trim().trim_matches('"').parse::<u64>() {
+                    max_age = Some(seconds);
+                }
             }
         }
     }
-    DEFAULT_DISCOVERY_TTL_SECONDS
+    if let Some(seconds) = max_age {
+        return seconds;
+    }
+
+    let Some(expires) = headers
+        .get(reqwest::header::EXPIRES)
+        .and_then(|value| value.to_str().ok())
+        .and_then(http_date_epoch)
+    else {
+        return DEFAULT_DISCOVERY_TTL_SECONDS;
+    };
+    let date = headers
+        .get(reqwest::header::DATE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(http_date_epoch)
+        .unwrap_or_else(|| chrono::Utc::now().timestamp());
+    u64::try_from(expires.saturating_sub(date)).unwrap_or(0)
+}
+
+/// Parse an HTTP date (RFC 1123 / RFC 850 / asctime shapes).
+fn http_date_epoch(value: &str) -> Option<i64> {
+    chrono::DateTime::parse_from_rfc2822(value)
+        .or_else(|_| chrono::DateTime::parse_from_rfc3339(value))
+        .ok()
+        .map(|date| date.timestamp())
 }
 
 /// Whether a fetched document describes the issuer we asked about.
@@ -585,7 +855,9 @@ fn issuer_matches(value: &serde_json::Value, requested: &str) -> bool {
 ///
 /// This is the read half of the cache that both `McpAuth` and
 /// `coderex_mcp::oauth::OAuthManager` share through the token store, so a
-/// second sign-in attempt does not re-probe metadata that is still valid.
+/// second sign-in attempt does not re-probe metadata that is still valid. An
+/// entry with no recorded issuer predates RFC 9728, so it is re-discovered
+/// rather than trusted.
 fn load_cached_discovery(token_path: &Path, server_url: &str) -> Option<DiscoveredEndpoints> {
     let store = load_token_store(token_path).ok()?;
     let entry = store
@@ -599,66 +871,127 @@ fn load_cached_discovery(token_path: &Path, server_url: &str) -> Option<Discover
     if entry.authorization_endpoint.is_none() && entry.token_endpoint.is_none() {
         return None;
     }
-    Some(DiscoveredEndpoints {
-        authorization_endpoint: entry.authorization_endpoint,
-        token_endpoint: entry.token_endpoint,
-    })
+    if entry.issuer.is_none() {
+        return None;
+    }
+    Some(DiscoveredEndpoints::from_entry(&entry))
 }
 
-/// Fetch RFC 8414 / OpenID Connect metadata, falling back to the conventional
-/// paths when nothing usable is published.
-///
-/// The issuer is `server_url` normalized (path kept). Candidates are tried in
-/// the order described by [`discovery_candidates`], and a document whose
-/// `issuer` does not match is rejected. A fresh cache entry is returned
-/// without a request.
-///
-/// Discovery is best-effort by design: an MCP server that publishes nothing
-/// still works at the conventional paths. Nothing here is fatal.
-async fn discover_endpoints(
+/// Fetch the Protected Resource Metadata document, reusing a cached copy and
+/// revalidating it with `If-None-Match` when it has an `ETag`.
+async fn fetch_protected_resource(
     client: &reqwest::Client,
     server_url: &str,
-    client_id: &str,
     token_path: &Path,
-) -> DiscoveredEndpoints {
-    if let Some(cached) = load_cached_discovery(token_path, server_url) {
-        tracing::debug!(server = %server_url, "Using cached MCP OAuth metadata");
-        return cached;
+) -> Option<(ProtectedResourceMetadata, String, Option<String>, u64)> {
+    let entry = load_token_entry(token_path, server_url);
+    let now = chrono::Utc::now().timestamp();
+    if let Some(entry) = &entry {
+        if let (Some(metadata), Some(expires_at)) =
+            (&entry.protected_resource, entry.resource_metadata_expires_at)
+        {
+            if now < expires_at {
+                if let Some(url) = entry.resource_metadata_url.clone() {
+                    return Some((metadata.clone(), url, entry.resource_metadata_etag.clone(), 0));
+                }
+            }
+        }
     }
 
-    let Some(normalized) = normalize_issuer(server_url) else {
-        return DiscoveredEndpoints::default();
-    };
-    let Some(candidates) = discovery_candidates(&normalized) else {
-        tracing::debug!(
-            server = %server_url,
-            "Discovery requires https outside localhost; using the conventional endpoints"
-        );
-        return DiscoveredEndpoints::default();
-    };
+    let url = protected_resource_candidate(server_url)?;
+    let etag = entry.as_ref().and_then(|entry| {
+        (entry.resource_metadata_url.as_deref() == Some(url.as_str()))
+            .then(|| entry.resource_metadata_etag.clone())
+            .flatten()
+    });
 
+    let mut request = client.get(&url).header("accept", "application/json");
+    if let Some(etag) = etag.as_deref() {
+        request = request.header(reqwest::header::IF_NONE_MATCH, etag);
+    }
+    let response = request.send().await.ok()?;
+    let status = response.status();
+    let max_age = cache_max_age(response.headers());
+    let response_etag = response
+        .headers()
+        .get(reqwest::header::ETAG)
+        .and_then(|value| value.to_str().ok())
+        .map(String::from)
+        .or(etag);
+    if status == reqwest::StatusCode::NOT_MODIFIED {
+        let entry = entry?;
+        let metadata = entry.protected_resource?;
+        return Some((metadata, url, response_etag, max_age));
+    }
+    if !status.is_success() {
+        return None;
+    }
+    let body = response.text().await.ok()?;
+    let metadata: ProtectedResourceMetadata = serde_json::from_str(&body).ok()?;
+    if metadata.authorization_servers.is_empty() && metadata.resource.is_none() {
+        return None;
+    }
+    Some((metadata, url, response_etag, max_age))
+}
+
+/// Fetch the authorization server's metadata, keyed by its normalized issuer.
+///
+/// Returns the parsed result and the cache entry to persist. A cached entry is
+/// reused when fresh, and revalidated with `If-None-Match` otherwise.
+async fn fetch_issuer_metadata(
+    client: &reqwest::Client,
+    issuer: &str,
+    cached: Option<&IssuerMetadataEntry>,
+) -> Option<(DiscoveredEndpoints, IssuerMetadataEntry)> {
+    let now = chrono::Utc::now().timestamp();
+    if let Some(cached) = cached {
+        if cached.is_fresh(now) && cached.has_endpoints() {
+            return Some((cached.clone().into_discovery(), cached.clone()));
+        }
+    }
+    let candidates = discovery_candidates(issuer)?;
     for candidate in candidates {
-        let Ok(response) = client
-            .get(&candidate)
-            .header("accept", "application/json")
-            .send()
-            .await
-        else {
+        let conditional = cached
+            .filter(|entry| entry.source_url.as_deref() == Some(candidate.as_str()))
+            .and_then(|entry| entry.etag.as_deref());
+        let mut request = client.get(&candidate).header("accept", "application/json");
+        if let Some(etag) = conditional {
+            request = request.header(reqwest::header::IF_NONE_MATCH, etag);
+        }
+        let Ok(response) = request.send().await else {
             continue;
         };
-        if !response.status().is_success() {
+        let status = response.status();
+        let max_age = cache_max_age(response.headers());
+        let etag = response
+            .headers()
+            .get(reqwest::header::ETAG)
+            .and_then(|value| value.to_str().ok())
+            .map(String::from)
+            .or_else(|| conditional.map(String::from));
+        if status == reqwest::StatusCode::NOT_MODIFIED {
+            let Some(cached) = cached else {
+                continue;
+            };
+            let mut entry = cached.clone();
+            entry.expires_at = Some(
+                now.saturating_add(i64::try_from(max_age).unwrap_or(i64::MAX)),
+            );
+            entry.etag = etag;
+            entry.source_url = Some(candidate);
+            return Some((entry.clone().into_discovery(), entry));
+        }
+        if !status.is_success() {
             continue;
         }
-        let max_age = cache_max_age(response.headers());
         let Ok(body) = response.text().await else {
             continue;
         };
         let Ok(value) = serde_json::from_str::<serde_json::Value>(&body) else {
             continue;
         };
-        if !issuer_matches(&value, &normalized) {
+        if !issuer_matches(&value, issuer) {
             tracing::debug!(
-                server = %server_url,
                 candidate = %candidate,
                 "Rejecting OAuth metadata for a different issuer"
             );
@@ -675,50 +1008,151 @@ async fn discover_endpoints(
         if authorization_endpoint.is_none() && token_endpoint.is_none() {
             continue;
         }
-        let scopes_supported: Vec<String> = value
-            .get("scopes_supported")
-            .and_then(|v| v.as_array())
-            .map(|scopes| {
-                scopes
-                    .iter()
-                    .filter_map(|scope| scope.as_str().map(String::from))
-                    .collect()
-            })
-            .unwrap_or_default();
-
-        tracing::debug!(server = %server_url, "Discovered MCP OAuth endpoints");
-
-        // Best-effort: a cache write must never stop a sign-in.
-        let _ = cache_discovery_at(
-            token_path,
-            server_url,
-            client_id,
-            authorization_endpoint.as_deref(),
-            token_endpoint.as_deref(),
-            &scopes_supported,
-            i64::try_from(max_age).unwrap_or(i64::MAX),
-        );
-
-        return DiscoveredEndpoints {
+        let strings = |field: &str| -> Vec<String> {
+            value
+                .get(field)
+                .and_then(|v| v.as_array())
+                .map(|values| {
+                    values
+                        .iter()
+                        .filter_map(|value| value.as_str().map(String::from))
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        let entry = IssuerMetadataEntry {
+            issuer: value
+                .get("issuer")
+                .and_then(|v| v.as_str())
+                .map(String::from)
+                .or_else(|| Some(issuer.to_string())),
             authorization_endpoint,
             token_endpoint,
+            registration_endpoint: value
+                .get("registration_endpoint")
+                .and_then(|v| v.as_str())
+                .map(String::from),
+            scopes_supported: strings("scopes_supported"),
+            token_endpoint_auth_methods_supported: strings(
+                "token_endpoint_auth_methods_supported",
+            ),
+            grant_types_supported: strings("grant_types_supported"),
+            code_challenge_methods_supported: strings(
+                "code_challenge_methods_supported",
+            ),
+            expires_at: Some(
+                now.saturating_add(i64::try_from(max_age).unwrap_or(i64::MAX)),
+            ),
+            etag,
+            source_url: Some(candidate),
         };
+        return Some((entry.clone().into_discovery(), entry));
     }
-
-    tracing::debug!(
-        server = %server_url,
-        "No OAuth metadata found; using the conventional endpoints"
-    );
-    DiscoveredEndpoints::default()
+    None
 }
 
-/// Build the authorization URL with the discovered endpoint and PKCE.
+/// Fetch RFC 9728 resource metadata, then RFC 8414 / OpenID Connect
+/// authorization-server metadata, falling back to the conventional paths when
+/// nothing usable is published.
+///
+/// The issuer is the resource's first `authorization_servers` entry when the
+/// resource publishes one, otherwise `server_url` normalized (path kept). A
+/// fresh cache is returned without a request.
+///
+/// Discovery is best-effort by design: an MCP server that publishes nothing
+/// still works at the conventional paths. Nothing here is fatal except a
+/// server that explicitly refuses S256, which [`DiscoveredEndpoints::require_s256`]
+/// reports to the caller.
+async fn discover_endpoints(
+    client: &reqwest::Client,
+    server_url: &str,
+    client_id: &str,
+    token_path: &Path,
+) -> DiscoveredEndpoints {
+    if let Some(cached) = load_cached_discovery(token_path, server_url) {
+        tracing::debug!(server = %server_url, "Using cached MCP OAuth metadata");
+        return cached;
+    }
+
+    let Some(normalized) = normalize_issuer(server_url) else {
+        return DiscoveredEndpoints::default();
+    };
+
+    // 1. RFC 9728: the resource may name an authorization server elsewhere.
+    let protected = fetch_protected_resource(client, server_url, token_path).await;
+    let (protected_metadata, protected_url, protected_etag, protected_ttl) = match protected {
+        Some((metadata, url, etag, ttl)) => (Some(metadata), Some(url), etag, ttl),
+        None => (None, None, None, 0),
+    };
+    let issuer = protected_metadata
+        .as_ref()
+        .and_then(ProtectedResourceMetadata::issuer)
+        .unwrap_or_else(|| normalized.clone());
+    let resource = protected_metadata
+        .as_ref()
+        .and_then(|metadata| metadata.resource.clone())
+        .unwrap_or_else(|| server_url.to_string());
+
+    // 2. RFC 8414 / OIDC metadata, cached by normalized issuer.
+    let cached_entry = load_token_store(token_path)
+        .ok()
+        .and_then(|store| store.issuer_metadata.get(&issuer).cloned());
+    let Some((mut discovery, issuer_entry)) =
+        fetch_issuer_metadata(client, &issuer, cached_entry.as_ref()).await
+    else {
+        tracing::debug!(
+            server = %server_url,
+            issuer = %issuer,
+            "No authorization server metadata; using the conventional endpoints"
+        );
+        return DiscoveredEndpoints {
+            issuer: Some(issuer),
+            resource: Some(resource),
+            protected_resource: protected_metadata.clone(),
+            resource_metadata_url: protected_url,
+            resource_metadata_etag: protected_etag,
+            resource_metadata_ttl: protected_ttl,
+            scopes_supported: protected_metadata
+                .as_ref()
+                .map(|metadata| metadata.scopes_supported.clone())
+                .unwrap_or_default(),
+            ..DiscoveredEndpoints::default()
+        };
+    };
+
+    // The cache key is the normalized issuer, not the raw document URL.
+    discovery.issuer = Some(issuer);
+    discovery.resource = Some(resource);
+    discovery.protected_resource = protected_metadata;
+    discovery.resource_metadata_url = protected_url;
+    discovery.resource_metadata_etag = protected_etag;
+    discovery.resource_metadata_ttl = protected_ttl;
+    if discovery.scopes_supported.is_empty() {
+        discovery.scopes_supported = discovery
+            .protected_resource
+            .as_ref()
+            .map(|metadata| metadata.scopes_supported.clone())
+            .unwrap_or_default();
+    }
+    discovery.issuer_entry = Some(issuer_entry);
+
+    tracing::debug!(server = %server_url, "Discovered MCP OAuth endpoints");
+
+    // Best-effort: a cache write must never stop a sign-in.
+    let _ = cache_discovery_record_at(token_path, server_url, client_id, &discovery);
+
+    discovery
+}
+
+/// Build the authorization URL with the discovered endpoint, PKCE and the
+/// RFC 8707 resource indicator.
 fn authorization_url(
     endpoint: &str,
     client_id: &str,
     scope: &str,
     state: &str,
     challenge: &str,
+    resource: &str,
 ) -> Result<String, ToolError> {
     let mut url = url::Url::parse(endpoint).map_err(|error| ToolError::InvalidInput {
         message: format!("authorization endpoint {endpoint} is not a URL: {error}"),
@@ -730,7 +1164,8 @@ fn authorization_url(
         .append_pair("scope", scope)
         .append_pair("state", state)
         .append_pair("code_challenge", challenge)
-        .append_pair("code_challenge_method", "S256");
+        .append_pair("code_challenge_method", "S256")
+        .append_pair("resource", resource);
     Ok(url.into())
 }
 
@@ -916,9 +1351,19 @@ pub fn persist_token_at(
 struct TokenStore {
     #[serde(default)]
     states: Vec<TokenEntry>,
+    /// Authorization-server metadata keyed by normalized issuer, mirroring
+    /// `coderex_mcp::oauth`'s `issuer_metadata` map. Two MCP servers behind the
+    /// same authorization server share the document.
+    #[serde(default)]
+    issuer_metadata: std::collections::BTreeMap<String, IssuerMetadataEntry>,
 }
 
 /// One server's persisted OAuth state.
+///
+/// This mirrors `coderex_mcp::oauth::McpOAuthState` field for field except for
+/// `Default`-able ordering; `crates/mcp/tests/mcp_integration.rs` reads a store
+/// written here through `OAuthManager`, so a field renamed or retyped on one
+/// side breaks a test rather than a sign-in.
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 struct TokenEntry {
     server_url: String,
@@ -941,6 +1386,57 @@ struct TokenEntry {
     scopes_supported: Vec<String>,
     #[serde(default)]
     discovery_expires_at: Option<i64>,
+    #[serde(default)]
+    issuer: Option<String>,
+    #[serde(default)]
+    resource: Option<String>,
+    #[serde(default)]
+    protected_resource: Option<ProtectedResourceMetadata>,
+    #[serde(default)]
+    resource_metadata_url: Option<String>,
+    #[serde(default)]
+    resource_metadata_expires_at: Option<i64>,
+    #[serde(default)]
+    resource_metadata_etag: Option<String>,
+    #[serde(default)]
+    registration_endpoint: Option<String>,
+    #[serde(default)]
+    token_endpoint_auth_method: Option<String>,
+    #[serde(default)]
+    token_endpoint_auth_methods_supported: Vec<String>,
+    #[serde(default)]
+    grant_types_supported: Vec<String>,
+    #[serde(default)]
+    code_challenge_methods_supported: Vec<String>,
+}
+
+impl TokenEntry {
+    fn blank(server_url: &str, client_id: &str) -> Self {
+        Self {
+            server_url: server_url.to_string(),
+            client_id: client_id.to_string(),
+            client_secret: None,
+            access_token: None,
+            refresh_token: None,
+            expires_at: None,
+            scopes: Vec::new(),
+            token_endpoint: None,
+            authorization_endpoint: None,
+            scopes_supported: Vec::new(),
+            discovery_expires_at: None,
+            issuer: None,
+            resource: None,
+            protected_resource: None,
+            resource_metadata_url: None,
+            resource_metadata_expires_at: None,
+            resource_metadata_etag: None,
+            registration_endpoint: None,
+            token_endpoint_auth_method: None,
+            token_endpoint_auth_methods_supported: Vec::new(),
+            grant_types_supported: Vec::new(),
+            code_challenge_methods_supported: Vec::new(),
+        }
+    }
 }
 
 fn load_token_store(path: &Path) -> Result<TokenStore, String> {
@@ -958,6 +1454,38 @@ fn save_token_store(path: &Path, store: &TokenStore) -> Result<(), String> {
     }
     let content = serde_json::to_string_pretty(store).map_err(|e| format!("serialize: {e}"))?;
     std::fs::write(path, content).map_err(|e| format!("write: {e}"))
+}
+
+/// The persisted entry for one server, if the store has one.
+fn load_token_entry(path: &Path, server_url: &str) -> Option<TokenEntry> {
+    load_token_store(path)
+        .ok()?
+        .states
+        .into_iter()
+        .find(|entry| entry.server_url == server_url)
+}
+
+/// Borrow the entry for `server_url`, adding a blank one when absent.
+fn entry_for<'a>(
+    store: &'a mut TokenStore,
+    server_url: &str,
+    client_id: &str,
+) -> &'a mut TokenEntry {
+    if let Some(index) = store
+        .states
+        .iter()
+        .position(|entry| entry.server_url == server_url)
+    {
+        &mut store.states[index]
+    } else {
+        store
+            .states
+            .push(TokenEntry::blank(server_url, client_id));
+        store
+            .states
+            .last_mut()
+            .expect("an entry was just pushed")
+    }
 }
 
 /// [`persist_token_at`], also recording the endpoints discovery found.
@@ -979,38 +1507,132 @@ pub fn persist_token_with_endpoints_at(
 ) -> Result<(), String> {
     let mut store = load_token_store(path)?;
     let expires_at = chrono::Utc::now().timestamp().saturating_add(expires_in);
-
-    if let Some(entry) = store
-        .states
-        .iter_mut()
-        .find(|entry| entry.server_url == server_url)
-    {
-        entry.client_id = client_id.to_string();
-        entry.access_token = Some(access_token.to_string());
-        entry.refresh_token = refresh_token.map(String::from);
-        entry.expires_at = Some(expires_at);
-        if let Some(endpoint) = token_endpoint {
-            entry.token_endpoint = Some(endpoint.to_string());
-        }
-        if let Some(endpoint) = authorization_endpoint {
-            entry.authorization_endpoint = Some(endpoint.to_string());
-        }
-    } else {
-        store.states.push(TokenEntry {
-            server_url: server_url.to_string(),
-            client_id: client_id.to_string(),
-            client_secret: None,
-            access_token: Some(access_token.to_string()),
-            refresh_token: refresh_token.map(String::from),
-            expires_at: Some(expires_at),
-            scopes: Vec::new(),
-            token_endpoint: token_endpoint.map(String::from),
-            authorization_endpoint: authorization_endpoint.map(String::from),
-            scopes_supported: Vec::new(),
-            discovery_expires_at: None,
-        });
+    let entry = entry_for(&mut store, server_url, client_id);
+    entry.client_id = client_id.to_string();
+    entry.access_token = Some(access_token.to_string());
+    entry.refresh_token = refresh_token.map(String::from);
+    entry.expires_at = Some(expires_at);
+    if let Some(endpoint) = token_endpoint {
+        entry.token_endpoint = Some(endpoint.to_string());
     }
+    if let Some(endpoint) = authorization_endpoint {
+        entry.authorization_endpoint = Some(endpoint.to_string());
+    }
+    save_token_store(path, &store)
+}
 
+/// Persist a completed sign-in together with everything discovery learned.
+///
+/// This is the write that lets `coderex_mcp::oauth` reuse the authorization
+/// server, endpoints, client credentials and resource indicator without
+/// discovering anything again. Fields discovery did not learn are left as they
+/// were rather than erased.
+#[allow(clippy::too_many_arguments)]
+fn persist_authenticated_at(
+    path: &Path,
+    server_url: &str,
+    client_id: &str,
+    client_secret: Option<&str>,
+    access_token: &str,
+    expires_in: i64,
+    refresh_token: Option<&str>,
+    discovery: &DiscoveredEndpoints,
+) -> Result<(), String> {
+    let mut store = load_token_store(path)?;
+    let now = chrono::Utc::now().timestamp();
+    let entry = entry_for(&mut store, server_url, client_id);
+    entry.client_id = client_id.to_string();
+    entry.client_secret = client_secret.map(String::from);
+    entry.access_token = Some(access_token.to_string());
+    entry.refresh_token = refresh_token.map(String::from);
+    entry.expires_at = Some(now.saturating_add(expires_in));
+    record_discovery_fields(entry, discovery, now);
+    if let Some(issuer) = &discovery.issuer {
+        if let Some(cache) = &discovery.issuer_entry {
+            store.issuer_metadata.insert(issuer.clone(), cache.clone());
+        }
+    }
+    save_token_store(path, &store)
+}
+
+/// Copy a discovery result into a persisted entry.
+fn record_discovery_fields(entry: &mut TokenEntry, discovery: &DiscoveredEndpoints, now: i64) {
+    if let Some(issuer) = &discovery.issuer {
+        entry.issuer = Some(issuer.clone());
+    }
+    if let Some(resource) = &discovery.resource {
+        entry.resource = Some(resource.clone());
+    }
+    if let Some(endpoint) = &discovery.authorization_endpoint {
+        entry.authorization_endpoint = Some(endpoint.clone());
+    }
+    if let Some(endpoint) = &discovery.token_endpoint {
+        entry.token_endpoint = Some(endpoint.clone());
+    }
+    if let Some(endpoint) = &discovery.registration_endpoint {
+        entry.registration_endpoint = Some(endpoint.clone());
+    }
+    if !discovery.scopes_supported.is_empty() {
+        entry.scopes_supported = discovery.scopes_supported.clone();
+    }
+    if !discovery.token_endpoint_auth_methods_supported.is_empty() {
+        entry.token_endpoint_auth_methods_supported =
+            discovery.token_endpoint_auth_methods_supported.clone();
+        entry.token_endpoint_auth_method = Some(
+            select_client_auth_method(
+                &entry.token_endpoint_auth_methods_supported,
+                entry.client_secret.is_some(),
+            )
+            .unwrap_or("none")
+            .to_string(),
+        );
+    }
+    if !discovery.grant_types_supported.is_empty() {
+        entry.grant_types_supported = discovery.grant_types_supported.clone();
+    }
+    if !discovery.code_challenge_methods_supported.is_empty() {
+        entry.code_challenge_methods_supported =
+            discovery.code_challenge_methods_supported.clone();
+    }
+    if let Some(metadata) = &discovery.protected_resource {
+        entry.protected_resource = Some(metadata.clone());
+    }
+    if let Some(url) = &discovery.resource_metadata_url {
+        entry.resource_metadata_url = Some(url.clone());
+    }
+    if let Some(etag) = &discovery.resource_metadata_etag {
+        entry.resource_metadata_etag = Some(etag.clone());
+    } else if discovery.resource_metadata_url.is_some() {
+        entry.resource_metadata_etag = None;
+    }
+    if discovery.resource_metadata_ttl > 0 {
+        entry.resource_metadata_expires_at = Some(
+            now.saturating_add(i64::try_from(discovery.resource_metadata_ttl).unwrap_or(i64::MAX)),
+        );
+    }
+    if let Some(cache) = &discovery.issuer_entry {
+        if let Some(expires_at) = cache.expires_at {
+            entry.discovery_expires_at = Some(expires_at);
+        }
+    }
+}
+
+/// Write the authorization-server cache entry and the per-server snapshot.
+fn cache_discovery_record_at(
+    path: &Path,
+    server_url: &str,
+    client_id: &str,
+    discovery: &DiscoveredEndpoints,
+) -> Result<(), String> {
+    let mut store = load_token_store(path)?;
+    let now = chrono::Utc::now().timestamp();
+    let entry = entry_for(&mut store, server_url, client_id);
+    record_discovery_fields(entry, discovery, now);
+    if let Some(issuer) = &discovery.issuer {
+        if let Some(cache) = &discovery.issuer_entry {
+            store.issuer_metadata.insert(issuer.clone(), cache.clone());
+        }
+    }
     save_token_store(path, &store)
 }
 
@@ -1033,37 +1655,142 @@ pub fn cache_discovery_at(
 ) -> Result<(), String> {
     let mut store = load_token_store(path)?;
     let discovery_expires_at = Some(chrono::Utc::now().timestamp().saturating_add(expires_in));
-
-    if let Some(entry) = store
-        .states
-        .iter_mut()
-        .find(|entry| entry.server_url == server_url)
-    {
+    let issuer = normalize_issuer(server_url);
+    let entry = entry_for(&mut store, server_url, client_id);
+    if let Some(issuer) = &issuer {
+        entry.issuer = Some(issuer.clone());
+    }
+    if let Some(endpoint) = authorization_endpoint {
+        entry.authorization_endpoint = Some(endpoint.to_string());
+    }
+    if let Some(endpoint) = token_endpoint {
+        entry.token_endpoint = Some(endpoint.to_string());
+    }
+    entry.scopes_supported = scopes_supported.to_vec();
+    entry.discovery_expires_at = discovery_expires_at;
+    // The authorization-server cache is keyed by the normalized issuer, the
+    // same key `coderex_mcp::oauth` uses, so a later discovery from either
+    // crate finds it.
+    if let Some(issuer) = issuer {
+        let cached = store.issuer_metadata.entry(issuer.clone()).or_default();
+        cached.issuer = Some(issuer.clone());
         if let Some(endpoint) = authorization_endpoint {
-            entry.authorization_endpoint = Some(endpoint.to_string());
+            cached.authorization_endpoint = Some(endpoint.to_string());
         }
         if let Some(endpoint) = token_endpoint {
-            entry.token_endpoint = Some(endpoint.to_string());
+            cached.token_endpoint = Some(endpoint.to_string());
         }
-        entry.scopes_supported = scopes_supported.to_vec();
-        entry.discovery_expires_at = discovery_expires_at;
+        if !scopes_supported.is_empty() {
+            cached.scopes_supported = scopes_supported.to_vec();
+        }
+        cached.expires_at = discovery_expires_at;
+        if cached.source_url.is_none() {
+            cached.source_url = discovery_candidates(&issuer)
+                .and_then(|candidates| candidates.into_iter().next());
+        }
+    }
+    save_token_store(path, &store)
+}
+
+/// A client registered dynamically with the authorization server.
+struct ClientRegistration {
+    client_id: String,
+    client_secret: Option<String>,
+}
+
+/// Register this client (RFC 7591) and persist what the server issued.
+///
+/// The request names the loopback redirect, both grants the sign-in and refresh
+/// paths use, and S256. It asks for a public client (`none`) unless the server
+/// refuses public clients, in which case it asks for the strongest secret-based
+/// method it advertises. The returned credentials are written to the shared
+/// store immediately, because the second half of a headless sign-in runs in a
+/// different invocation.
+async fn register_client(
+    client: &reqwest::Client,
+    endpoint: &str,
+    discovery: &DiscoveredEndpoints,
+    token_path: &Path,
+    server_url: &str,
+) -> Result<ClientRegistration, ToolError> {
+    let advertised = &discovery.token_endpoint_auth_methods_supported;
+    let method = if advertised.is_empty() || advertised.iter().any(|method| method == "none") {
+        "none"
+    } else if advertised
+        .iter()
+        .any(|method| method == "client_secret_basic")
+    {
+        "client_secret_basic"
+    } else if advertised
+        .iter()
+        .any(|method| method == "client_secret_post")
+    {
+        "client_secret_post"
     } else {
-        store.states.push(TokenEntry {
-            server_url: server_url.to_string(),
-            client_id: client_id.to_string(),
-            client_secret: None,
-            access_token: None,
-            refresh_token: None,
-            expires_at: None,
-            scopes: Vec::new(),
-            token_endpoint: token_endpoint.map(String::from),
-            authorization_endpoint: authorization_endpoint.map(String::from),
-            scopes_supported: scopes_supported.to_vec(),
-            discovery_expires_at,
+        "none"
+    };
+    let body = serde_json::json!({
+        "client_name": "CodeRex",
+        "redirect_uris": [LOCAL_REDIRECT_URI],
+        "grant_types": ["authorization_code", "refresh_token"],
+        "response_types": ["code"],
+        "token_endpoint_auth_method": method,
+        "code_challenge_method": "S256",
+    });
+    let response = client
+        .post(endpoint)
+        .header("accept", "application/json")
+        .json(&body)
+        .send()
+        .await
+        .map_err(|error| ToolError::InvalidInput {
+            message: format!("dynamic client registration at {endpoint} failed: {error}"),
+        })?;
+    let status = response.status();
+    let body = response.text().await.unwrap_or_default();
+    if !status.is_success() {
+        return Err(ToolError::InvalidInput {
+            message: format!(
+                "dynamic client registration at {endpoint} returned HTTP {status}: {body}"
+            ),
         });
     }
+    let payload: serde_json::Value =
+        serde_json::from_str(&body).map_err(|error| ToolError::InvalidInput {
+            message: format!("dynamic client registration returned invalid JSON: {error}"),
+        })?;
+    let client_id = payload
+        .get("client_id")
+        .and_then(|value| value.as_str())
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| ToolError::InvalidInput {
+            message: format!("dynamic client registration returned no client_id: {body}"),
+        })?
+        .to_string();
+    let client_secret = payload
+        .get("client_secret")
+        .and_then(|value| value.as_str())
+        .map(String::from);
 
-    save_token_store(path, &store)
+    let mut store = load_token_store(token_path).map_err(|error| ToolError::InvalidInput {
+        message: format!("the registered client could not be stored: {error}"),
+    })?;
+    let entry = entry_for(&mut store, server_url, &client_id);
+    entry.client_id = client_id.clone();
+    entry.client_secret.clone_from(&client_secret);
+    entry.token_endpoint_auth_method = Some(
+        select_client_auth_method(advertised, client_secret.is_some())
+            .unwrap_or("none")
+            .to_string(),
+    );
+    save_token_store(token_path, &store).map_err(|error| ToolError::InvalidInput {
+        message: format!("the registered client could not be stored: {error}"),
+    })?;
+
+    Ok(ClientRegistration {
+        client_id,
+        client_secret,
+    })
 }
 
 fn extract_string(args: &serde_json::Value, key: &str) -> Result<String, ToolError> {
@@ -1372,13 +2099,18 @@ mod tests {
         let (probes, exchange) = handle.join().unwrap();
         assert_eq!(
             probes.len(),
-            1,
+            2,
             "the fresh metadata cache was ignored: {probes:?}"
         );
         assert!(
-            probes[0].starts_with("GET /.well-known/oauth-authorization-server/realms/demo "),
-            "path insertion was not tried first: {}",
+            probes[0].starts_with("GET /.well-known/oauth-protected-resource/realms/demo "),
+            "the protected-resource probe did not come first: {}",
             probes[0]
+        );
+        assert!(
+            probes[1].starts_with("GET /.well-known/oauth-authorization-server/realms/demo "),
+            "path insertion was not tried first: {}",
+            probes[1]
         );
         assert!(
             exchange.starts_with("POST /realms/demo/protocol/openid-connect/token "),
@@ -1477,12 +2209,13 @@ mod tests {
         assert_eq!(parsed["authenticated"], true, "{parsed}");
 
         let (probes, exchange) = handle.join().unwrap();
-        assert!(!probes.is_empty());
+        assert!(probes.iter().any(|probe| probe
+            .starts_with("GET /.well-known/oauth-authorization-server ")), "{probes:?}");
         assert!(
             probes
                 .iter()
-                .all(|probe| probe.starts_with("GET /.well-known/oauth-authorization-server ")),
-            "{probes:?}"
+                .all(|probe| probe.starts_with("GET /.well-known/oauth-")),
+            "only metadata should be probed: {probes:?}"
         );
         assert!(
             exchange.starts_with("POST /custom/token "),
@@ -1495,6 +2228,502 @@ mod tests {
         assert_eq!(
             store["states"][0]["token_endpoint"],
             format!("{base}/custom/token")
+        );
+    }
+
+    /// RFC 9728: the resource metadata can name an authorization server on a
+    /// different origin. Discovery follows it, the authorization request and
+    /// the code exchange carry the RFC 8707 resource indicator, and the public
+    /// client (no secret) uses PKCE alone.
+    #[tokio::test]
+    async fn protected_resource_on_another_origin_drives_discovery() {
+        use std::net::TcpListener;
+
+        let as_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let as_base = format!("http://{}", as_listener.local_addr().unwrap());
+        let resource_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let resource_base = format!("http://{}", resource_listener.local_addr().unwrap());
+        let resource_url = format!("{resource_base}/mcp");
+
+        let metadata = format!(
+            r#"{{"issuer":"{as_base}","authorization_endpoint":"{as_base}/authorize","token_endpoint":"{as_base}/token","token_endpoint_auth_methods_supported":["none"],"grant_types_supported":["authorization_code","refresh_token"],"code_challenge_methods_supported":["S256"]}}"#
+        );
+        let resource_document = format!(
+            r#"{{"resource":"{resource_url}","authorization_servers":["{as_base}"],"scopes_supported":["read"]}}"#
+        );
+
+        let as_handle = std::thread::spawn(move || {
+            let mut metadata_requests = Vec::new();
+            loop {
+                let (mut stream, _) = as_listener.accept().unwrap();
+                let request = read_request(&mut stream);
+                if request.starts_with("POST ") {
+                    write_response(
+                        &mut stream,
+                        "200 OK",
+                        r#"{"access_token":"tok","refresh_token":"ref","expires_in":3600}"#,
+                    );
+                    return (metadata_requests, request);
+                }
+                metadata_requests.push(request);
+                write_response(&mut stream, "200 OK", &metadata);
+            }
+        });
+        let resource_handle = std::thread::spawn(move || {
+            let (mut stream, _) = resource_listener.accept().unwrap();
+            let request = read_request(&mut stream);
+            write_response(&mut stream, "200 OK", &resource_document);
+            request
+        });
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mcp_tokens.json");
+
+        let pending = authenticate(
+            ToolInput {
+                call_id: "1".into(),
+                name: "McpAuth".into(),
+                arguments: serde_json::json!({ "server_url": resource_url }),
+            },
+            &path,
+        )
+        .await
+        .unwrap();
+        let pending: serde_json::Value = serde_json::from_str(&pending.output).unwrap();
+        let auth_url = url::Url::parse(pending["auth_url"].as_str().unwrap()).unwrap();
+        assert_eq!(
+            auth_url.origin().ascii_serialization(),
+            as_base,
+            "the authorization server from the resource metadata was not used: {}",
+            pending["auth_url"]
+        );
+        let query: HashMap<String, String> = auth_url.query_pairs().into_owned().collect();
+        assert_eq!(query.get("client_id").map(String::as_str), Some("coderex-cli"));
+        assert_eq!(
+            query.get("code_challenge_method").map(String::as_str),
+            Some("S256")
+        );
+        assert_eq!(
+            query.get("resource").map(String::as_str),
+            Some(resource_url.as_str())
+        );
+
+        let verifier = pending["code_verifier"].as_str().unwrap().to_string();
+        authenticate(
+            ToolInput {
+                call_id: "2".into(),
+                name: "McpAuth".into(),
+                arguments: serde_json::json!({
+                    "server_url": resource_url,
+                    "code": "the_code",
+                    "code_verifier": verifier,
+                }),
+            },
+            &path,
+        )
+        .await
+        .unwrap();
+
+        let resource_request = resource_handle.join().unwrap();
+        assert!(
+            resource_request
+                .starts_with("GET /.well-known/oauth-protected-resource/mcp "),
+            "the path-inserted protected-resource document was not fetched: {resource_request}"
+        );
+
+        let (metadata_requests, exchange) = as_handle.join().unwrap();
+        assert_eq!(metadata_requests.len(), 1, "{metadata_requests:?}");
+        assert!(
+            metadata_requests[0].starts_with("GET /.well-known/oauth-authorization-server "),
+            "the authorization server's metadata was not fetched: {}",
+            metadata_requests[0]
+        );
+        assert!(exchange.starts_with("POST /token "), "{exchange}");
+        assert_eq!(
+            form_param(&exchange, "resource").as_deref(),
+            Some(resource_url.as_str())
+        );
+        assert_eq!(
+            form_param(&exchange, "client_id").as_deref(),
+            Some("coderex-cli")
+        );
+        assert_eq!(
+            form_param(&exchange, "code_verifier").as_deref(),
+            Some(verifier.as_str())
+        );
+        assert_eq!(form_param(&exchange, "client_secret"), None);
+        assert!(!exchange.to_ascii_lowercase().contains("\r\nauthorization:"));
+
+        let store: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let state = &store["states"][0];
+        assert_eq!(state["issuer"], as_base);
+        assert_eq!(state["resource"], resource_url);
+        assert_eq!(state["protected_resource"]["resource"], resource_url);
+        assert_eq!(
+            state["protected_resource"]["authorization_servers"],
+            serde_json::json!([as_base])
+        );
+        assert_eq!(state["client_id"], "coderex-cli");
+        assert!(state["client_secret"].is_null(), "{state}");
+        assert!(
+            store["issuer_metadata"].get(&as_base).is_some(),
+            "the authorization server cache was not keyed by the issuer: {store}"
+        );
+    }
+
+    /// RFC 7591: without a configured client id, discovery's
+    /// `registration_endpoint` is used, the issued credentials are persisted,
+    /// and both the code exchange and a later process use them — with
+    /// `client_secret_basic` when that is what the server advertises.
+    #[tokio::test]
+    async fn dynamic_registration_persists_a_client_used_for_basic_auth() {
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let metadata = format!(
+            r#"{{"issuer":"{base}","authorization_endpoint":"{base}/authorize","token_endpoint":"{base}/token","registration_endpoint":"{base}/register","token_endpoint_auth_methods_supported":["client_secret_basic"],"grant_types_supported":["authorization_code","refresh_token"],"code_challenge_methods_supported":["S256"]}}"#
+        );
+        let handle = std::thread::spawn(move || {
+            let mut registrations = Vec::new();
+            loop {
+                let (mut stream, _) = listener.accept().unwrap();
+                let request = read_request(&mut stream);
+                if request.starts_with("POST /register ") {
+                    registrations.push(request);
+                    write_response(
+                        &mut stream,
+                        "200 OK",
+                        r#"{"client_id":"dyn-client","client_secret":"dyn-secret"}"#,
+                    );
+                } else if request.starts_with("POST ") {
+                    write_response(
+                        &mut stream,
+                        "200 OK",
+                        r#"{"access_token":"tok","expires_in":3600}"#,
+                    );
+                    return (registrations, request);
+                } else {
+                    write_response(&mut stream, "200 OK", &metadata);
+                }
+            }
+        });
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mcp_tokens.json");
+
+        let pending = authenticate(
+            ToolInput {
+                call_id: "1".into(),
+                name: "McpAuth".into(),
+                arguments: serde_json::json!({ "server_url": base }),
+            },
+            &path,
+        )
+        .await
+        .unwrap();
+        let pending: serde_json::Value = serde_json::from_str(&pending.output).unwrap();
+
+        // Registration happens before the hand-off is returned, because the
+        // finishing call may run in another process.
+        let store: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(store["states"][0]["client_id"], "dyn-client", "{store}");
+        assert_eq!(store["states"][0]["client_secret"], "dyn-secret");
+        assert_eq!(
+            store["states"][0]["token_endpoint_auth_method"],
+            "client_secret_basic"
+        );
+
+        let verifier = pending["code_verifier"].as_str().unwrap().to_string();
+        authenticate(
+            ToolInput {
+                call_id: "2".into(),
+                name: "McpAuth".into(),
+                arguments: serde_json::json!({
+                    "server_url": base,
+                    "code": "the_code",
+                    "code_verifier": verifier,
+                }),
+            },
+            &path,
+        )
+        .await
+        .unwrap();
+
+        let (registrations, exchange) = handle.join().unwrap();
+        assert_eq!(registrations.len(), 1, "a stored client was registered again");
+        let body = registrations[0]
+            .split_once("\r\n\r\n")
+            .map(|(_, body)| body)
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_str(body).unwrap();
+        assert_eq!(body["client_name"], "CodeRex");
+        assert_eq!(
+            body["redirect_uris"],
+            serde_json::json!(["http://localhost:8765/callback"])
+        );
+        assert_eq!(
+            body["grant_types"],
+            serde_json::json!(["authorization_code", "refresh_token"])
+        );
+        assert_eq!(body["response_types"], serde_json::json!(["code"]));
+        assert_eq!(body["token_endpoint_auth_method"], "client_secret_basic");
+        assert_eq!(body["code_challenge_method"], "S256");
+
+        // The secret travels in the header, not the body.
+        use base64::Engine;
+        let credentials = base64::engine::general_purpose::STANDARD
+            .encode("dyn-client:dyn-secret");
+        assert!(
+            exchange
+                .to_ascii_lowercase()
+                .contains(&format!(
+                    "\r\nauthorization: basic {}",
+                    credentials.to_ascii_lowercase()
+                )),
+            "the registered client was not used for basic auth: {exchange}"
+        );
+        assert_eq!(form_param(&exchange, "client_id"), None);
+        assert_eq!(form_param(&exchange, "client_secret"), None);
+    }
+
+    /// `client_secret_post` is used for both the registration request and the
+    /// code exchange when that is the advertised method.
+    #[tokio::test]
+    async fn client_secret_post_is_used_when_advertised() {
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let metadata = format!(
+            r#"{{"issuer":"{base}","authorization_endpoint":"{base}/authorize","token_endpoint":"{base}/token","registration_endpoint":"{base}/register","token_endpoint_auth_methods_supported":["client_secret_post"],"grant_types_supported":["authorization_code","refresh_token"],"code_challenge_methods_supported":["S256"]}}"#
+        );
+        let handle = std::thread::spawn(move || {
+            let mut registrations = Vec::new();
+            loop {
+                let (mut stream, _) = listener.accept().unwrap();
+                let request = read_request(&mut stream);
+                if request.starts_with("POST /register ") {
+                    registrations.push(request);
+                    write_response(
+                        &mut stream,
+                        "200 OK",
+                        r#"{"client_id":"post-client","client_secret":"post-secret"}"#,
+                    );
+                } else if request.starts_with("POST ") {
+                    write_response(
+                        &mut stream,
+                        "200 OK",
+                        r#"{"access_token":"tok","expires_in":3600}"#,
+                    );
+                    return (registrations, request);
+                } else {
+                    write_response(&mut stream, "200 OK", &metadata);
+                }
+            }
+        });
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mcp_tokens.json");
+
+        let pending = authenticate(
+            ToolInput {
+                call_id: "1".into(),
+                name: "McpAuth".into(),
+                arguments: serde_json::json!({ "server_url": base }),
+            },
+            &path,
+        )
+        .await
+        .unwrap();
+        let pending: serde_json::Value = serde_json::from_str(&pending.output).unwrap();
+        let verifier = pending["code_verifier"].as_str().unwrap().to_string();
+        authenticate(
+            ToolInput {
+                call_id: "2".into(),
+                name: "McpAuth".into(),
+                arguments: serde_json::json!({
+                    "server_url": base,
+                    "code": "the_code",
+                    "code_verifier": verifier,
+                }),
+            },
+            &path,
+        )
+        .await
+        .unwrap();
+
+        let (registrations, exchange) = handle.join().unwrap();
+        let registration: serde_json::Value = serde_json::from_str(
+            registrations[0]
+                .split_once("\r\n\r\n")
+                .map(|(_, body)| body)
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            registration["token_endpoint_auth_method"],
+            "client_secret_post"
+        );
+        assert_eq!(form_param(&exchange, "client_id").as_deref(), Some("post-client"));
+        assert_eq!(
+            form_param(&exchange, "client_secret").as_deref(),
+            Some("post-secret")
+        );
+        assert!(!exchange.to_ascii_lowercase().contains("\r\nauthorization:"));
+    }
+
+    /// A server that does not offer S256 is refused before an authorization
+    /// flow is started, rather than after the user has approved one.
+    #[tokio::test]
+    async fn a_server_without_s256_is_refused() {
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let metadata = format!(
+            r#"{{"issuer":"{base}","authorization_endpoint":"{base}/authorize","token_endpoint":"{base}/token","code_challenge_methods_supported":["plain"]}}"#
+        );
+        let handle = std::thread::spawn(move || {
+            loop {
+                let (mut stream, _) = listener.accept().unwrap();
+                let request = read_request(&mut stream);
+                if request.starts_with("GET /.well-known/oauth-protected-resource") {
+                    write_response(&mut stream, "404 Not Found", "");
+                    continue;
+                }
+                write_response(&mut stream, "200 OK", &metadata);
+                return request;
+            }
+        });
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mcp_tokens.json");
+        let error = authenticate(
+            ToolInput {
+                call_id: "1".into(),
+                name: "McpAuth".into(),
+                arguments: serde_json::json!({ "server_url": base }),
+            },
+            &path,
+        )
+        .await
+        .unwrap_err();
+
+        let message = error.to_string();
+        assert!(
+            message.contains("does not support PKCE S256"),
+            "the refusal was not clear: {message}"
+        );
+        handle.join().unwrap();
+    }
+
+    /// An expired metadata document is revalidated with `If-None-Match`; a
+    /// `304 Not Modified` reuses it and refreshes the cache lifetime instead of
+    /// forcing another full fetch.
+    #[tokio::test]
+    async fn expired_metadata_is_revalidated_with_if_none_match() {
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let metadata = format!(
+            r#"{{"issuer":"{base}","authorization_endpoint":"{base}/authorize","token_endpoint":"{base}/token","token_endpoint_auth_methods_supported":["none"],"grant_types_supported":["authorization_code","refresh_token"],"code_challenge_methods_supported":["S256"]}}"#
+        );
+        let handle = std::thread::spawn(move || {
+            let mut metadata_requests = Vec::new();
+            loop {
+                let (mut stream, _) = listener.accept().unwrap();
+                let request = read_request(&mut stream);
+                if request.starts_with("POST ") {
+                    write_response(
+                        &mut stream,
+                        "200 OK",
+                        r#"{"access_token":"tok","expires_in":3600}"#,
+                    );
+                    return (metadata_requests, request);
+                }
+                if request.starts_with("GET /.well-known/oauth-protected-resource") {
+                    write_response(&mut stream, "404 Not Found", "");
+                    continue;
+                }
+                metadata_requests.push(request);
+                if metadata_requests.len() == 1 {
+                    write_response_with_headers(
+                        &mut stream,
+                        "200 OK",
+                        "ETag: \"v1\"\r\nCache-Control: max-age=0\r\n",
+                        &metadata,
+                    );
+                } else {
+                    write_response_with_headers(
+                        &mut stream,
+                        "304 Not Modified",
+                        "ETag: \"v1\"\r\nCache-Control: max-age=3600\r\n",
+                        "",
+                    );
+                }
+            }
+        });
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mcp_tokens.json");
+
+        let pending = authenticate(
+            ToolInput {
+                call_id: "1".into(),
+                name: "McpAuth".into(),
+                arguments: serde_json::json!({ "server_url": base }),
+            },
+            &path,
+        )
+        .await
+        .unwrap();
+        let pending: serde_json::Value = serde_json::from_str(&pending.output).unwrap();
+
+        let verifier = pending["code_verifier"].as_str().unwrap().to_string();
+        authenticate(
+            ToolInput {
+                call_id: "2".into(),
+                name: "McpAuth".into(),
+                arguments: serde_json::json!({
+                    "server_url": base,
+                    "code": "the_code",
+                    "code_verifier": verifier,
+                }),
+            },
+            &path,
+        )
+        .await
+        .unwrap();
+
+        let (metadata_requests, exchange) = handle.join().unwrap();
+        assert_eq!(metadata_requests.len(), 2, "{metadata_requests:?}");
+        assert!(
+            !metadata_requests[0]
+                .to_ascii_lowercase()
+                .contains("if-none-match"),
+            "the first fetch was conditional: {}",
+            metadata_requests[0]
+        );
+        assert!(
+            metadata_requests[1]
+                .to_ascii_lowercase()
+                .contains("if-none-match: \"v1\""),
+            "the expired document was not revalidated: {}",
+            metadata_requests[1]
+        );
+        assert!(exchange.starts_with("POST /token "), "{exchange}");
+
+        let store: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert!(
+            store["states"][0]["discovery_expires_at"]
+                .as_i64()
+                .is_some_and(|at| at > chrono::Utc::now().timestamp()),
+            "the 304 did not refresh the cache lifetime: {store}"
         );
     }
 
@@ -1687,13 +2916,30 @@ mod tests {
     }
 
     fn write_response(stream: &mut std::net::TcpStream, status: &str, body: &str) {
+        write_response_with_headers(stream, status, "", body);
+    }
+
+    fn write_response_with_headers(
+        stream: &mut std::net::TcpStream,
+        status: &str,
+        headers: &str,
+        body: &str,
+    ) {
         use std::io::Write;
         let response = format!(
-            "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            "HTTP/1.1 {status}\r\nContent-Type: application/json\r\n{headers}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
             body.len()
         );
         stream.write_all(response.as_bytes()).unwrap();
         stream.flush().unwrap();
+    }
+
+    /// A URL-encoded form field in a captured HTTP request.
+    fn form_param(request: &str, key: &str) -> Option<String> {
+        let body = request.split_once("\r\n\r\n").map_or("", |(_, body)| body);
+        url::form_urlencoded::parse(body.as_bytes())
+            .find(|(name, _)| name == key)
+            .map(|(_, value)| value.into_owned())
     }
 
     /// A token endpoint that also answers (with 404) the discovery probes a
