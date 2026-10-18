@@ -6,9 +6,18 @@ use crate::channel::{
 };
 use reqwest::Url;
 use reqwest::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue};
+use serde::Serialize;
 use serde_json::Value;
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
+use std::time::Duration;
+
+/// The header the MCP streamable-HTTP transport uses to name a session.
+const SESSION_ID_HEADER: &str = "mcp-session-id";
+/// The header that resumes an SSE stream where it left off.
+const LAST_EVENT_ID_HEADER: &str = "last-event-id";
+/// The `Accept` value a standalone server-to-client stream requires.
+const EVENT_STREAM_ACCEPT: &str = "text/event-stream";
 
 /// Supplies the credential for a remote request.
 ///
@@ -27,15 +36,207 @@ pub trait TokenProvider: Send + Sync + std::fmt::Debug {
     async fn access_token(&self) -> Option<String>;
 }
 
-/// A remote JSON-RPC channel. Requests always use POST; responses may be a
-/// single JSON document or an SSE stream containing JSON-RPC messages.
-#[derive(Debug)]
-pub struct HttpChannel {
+/// The configuration a remote request needs.
+///
+/// Cloneable and owned so the standalone GET stream can run in its own task
+/// while every POST uses the same session id and token provider. Cloning does
+/// not copy the credential or the session: those are resolved at request time
+/// from the shared state.
+#[derive(Debug, Clone)]
+struct RequestContext {
     client: reqwest::Client,
     url: Url,
     headers: HeaderMap,
     /// Resolves the bearer token before each request, when installed.
     token_provider: Option<Arc<dyn TokenProvider>>,
+    /// The server's session id, learned from an initialize response header.
+    session_id: Arc<RwLock<Option<String>>>,
+}
+
+impl RequestContext {
+    fn session_id(&self) -> Option<String> {
+        self.session_id
+            .read()
+            .ok()
+            .and_then(|slot| slot.clone())
+    }
+
+    fn clear_session_id(&self) {
+        if let Ok(mut slot) = self.session_id.write() {
+            *slot = None;
+        }
+    }
+
+    /// Remember a session id the server set on a response.
+    fn capture_session_id(&self, headers: &HeaderMap) {
+        let Some(value) = headers.get(SESSION_ID_HEADER) else {
+            return;
+        };
+        let Ok(value) = value.to_str() else {
+            tracing::warn!("MCP server sent a non-UTF-8 Mcp-Session-Id header");
+            return;
+        };
+        let value = value.trim();
+        if !value.is_empty() {
+            if let Ok(mut slot) = self.session_id.write() {
+                *slot = Some(value.to_string());
+            }
+        }
+    }
+
+    /// Headers for one request, with a freshly resolved bearer token and the
+    /// current session id.
+    ///
+    /// A token from the provider replaces a configured `Authorization` header;
+    /// this is what lets a configured static token give way to a refreshed one.
+    /// If the provider has nothing, the configured headers go out unchanged.
+    async fn request_headers(&self) -> HeaderMap {
+        let mut headers = self.headers.clone();
+        if let Some(provider) = &self.token_provider {
+            if let Some(token) = provider.access_token().await {
+                match HeaderValue::from_str(&format!("Bearer {token}")) {
+                    Ok(value) => {
+                        headers.insert(AUTHORIZATION, value);
+                    }
+                    Err(error) => {
+                        tracing::warn!("MCP OAuth token cannot be sent as an HTTP header: {error}");
+                    }
+                }
+            }
+        }
+        if let Some(session_id) = self.session_id() {
+            match HeaderValue::from_str(&session_id) {
+                Ok(value) => {
+                    headers.insert(HeaderName::from_static(SESSION_ID_HEADER), value);
+                }
+                Err(error) => {
+                    tracing::warn!("MCP session id cannot be sent as an HTTP header: {error}");
+                }
+            }
+        }
+        headers
+    }
+
+    /// POST one JSON-RPC message, remembering any session id the answer sets.
+    async fn post<T: Serialize>(
+        &self,
+        body: &T,
+        accept: &'static str,
+    ) -> Result<reqwest::Response, String> {
+        let headers = self.request_headers().await;
+        let response = self
+            .client
+            .post(self.url.clone())
+            .headers(headers)
+            .header(ACCEPT, accept)
+            .header(CONTENT_TYPE, "application/json")
+            .json(body)
+            .send()
+            .await
+            .map_err(|error| format!("MCP HTTP request failed: {error}"))?;
+        self.capture_session_id(response.headers());
+        Ok(response)
+    }
+
+    /// Answer a request the server made, over a new POST.
+    async fn answer_server_request(
+        &self,
+        request: &JsonRpcServerRequest,
+        handler: Option<&dyn InboundRequestHandler>,
+    ) -> Result<(), String> {
+        let answer = match handler {
+            Some(handler) => {
+                handler
+                    .handle(&request.method, request.params.as_ref())
+                    .await
+            }
+            None => Err(JsonRpcError {
+                code: METHOD_NOT_FOUND,
+                message: format!(
+                    "this client has no handler for '{}'; nothing here can answer it",
+                    request.method
+                ),
+                data: None,
+            }),
+        };
+
+        let response = match answer {
+            Ok(result) => JsonRpcResponse {
+                jsonrpc: "2.0".to_string(),
+                id: request.id,
+                result: Some(result),
+                error: None,
+            },
+            Err(error) => JsonRpcResponse {
+                jsonrpc: "2.0".to_string(),
+                id: request.id,
+                result: None,
+                error: Some(error),
+            },
+        };
+
+        let headers = self.request_headers().await;
+        let delivered = self
+            .client
+            .post(self.url.clone())
+            .headers(headers)
+            .header(CONTENT_TYPE, "application/json")
+            .json(&response)
+            .send()
+            .await
+            .map_err(|error| {
+                format!(
+                    "failed to answer the server's '{}' request: {error}",
+                    request.method
+                )
+            })?;
+
+        let status = delivered.status();
+        if !status.is_success() {
+            let body = delivered.text().await.unwrap_or_default();
+            return Err(format!(
+                "the server rejected the answer to '{}' with {status}: {body}",
+                request.method
+            ));
+        }
+        Ok(())
+    }
+
+    async fn send_notification(
+        &self,
+        notification: &JsonRpcNotification,
+    ) -> Result<(), String> {
+        let response = self
+            .post(notification, "application/json, text/event-stream")
+            .await?;
+        let status = response.status();
+        if status.is_success() {
+            Ok(())
+        } else {
+            let body = response.text().await.unwrap_or_default();
+            Err(format!(
+                "MCP HTTP server returned {status} for a notification: {body}"
+            ))
+        }
+    }
+}
+
+/// A remote JSON-RPC channel. Requests always use POST; responses may be a
+/// single JSON document or an SSE stream containing JSON-RPC messages.
+///
+/// After initialization the channel also opens the transport's standalone GET
+/// stream, so a server can push requests and notifications at any time rather
+/// than only while it is answering a POST.
+#[derive(Debug)]
+pub struct HttpChannel {
+    context: RequestContext,
+    /// The handler shared with the GET-stream task, per event.
+    ///
+    /// Shared rather than copied so a handler installed after the stream
+    /// started (the session's UI slot is one) is seen by later messages.
+    event_handler: Arc<RwLock<Option<Arc<dyn InboundRequestHandler>>>>,
+    /// The one background GET-stream task for this server, if it is running.
+    event_stream: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 impl HttpChannel {
@@ -58,38 +259,37 @@ impl HttpChannel {
         }
 
         Ok(Self {
-            client: reqwest::Client::new(),
-            url,
-            headers: header_map,
-            token_provider: None,
+            context: RequestContext {
+                client: reqwest::Client::new(),
+                url,
+                headers: header_map,
+                token_provider: None,
+                session_id: Arc::new(RwLock::new(None)),
+            },
+            event_handler: Arc::new(RwLock::new(None)),
+            event_stream: std::sync::Mutex::new(None),
         })
     }
 
     /// Install the credential resolver used for every subsequent request.
     pub fn set_token_provider(&mut self, provider: Arc<dyn TokenProvider>) {
-        self.token_provider = Some(provider);
+        self.context.token_provider = Some(provider);
     }
 
-    /// Headers for one request, with a freshly resolved bearer token.
+    /// Install the handler the GET stream uses for server requests.
     ///
-    /// A token from the provider replaces a configured `Authorization` header;
-    /// this is what lets a configured static token give way to a refreshed one.
-    /// If the provider has nothing, the configured headers go out unchanged.
-    async fn request_headers(&self) -> HeaderMap {
-        let mut headers = self.headers.clone();
-        if let Some(provider) = &self.token_provider {
-            if let Some(token) = provider.access_token().await {
-                match HeaderValue::from_str(&format!("Bearer {token}")) {
-                    Ok(value) => {
-                        headers.insert(AUTHORIZATION, value);
-                    }
-                    Err(error) => {
-                        tracing::warn!("MCP OAuth token cannot be sent as an HTTP header: {error}");
-                    }
-                }
-            }
+    /// The stream reads this slot per message, so a handler installed after
+    /// the stream started still answers later requests.
+    pub fn set_event_stream_handler(&self, handler: Arc<dyn InboundRequestHandler>) {
+        if let Ok(mut slot) = self.event_handler.write() {
+            *slot = Some(handler);
         }
-        headers
+    }
+
+    /// The session id the server assigned, once it has answered an initialize.
+    #[must_use]
+    pub fn session_id(&self) -> Option<String> {
+        self.context.session_id()
     }
 
     /// Send a request and wait for its response.
@@ -100,24 +300,102 @@ impl HttpChannel {
     /// arrive — with a separate POST, since the stream is still open and the
     /// server may be waiting — so a server that asks a question is never left
     /// waiting for an answer that is not coming.
+    ///
+    /// A session the server no longer recognises answers 404 or 405. When that
+    /// happens with a session id set, the id is dropped and the handshake is
+    /// run once more before the request is retried.
     pub async fn send_request(
         &self,
         request: &JsonRpcRequest,
         handler: Option<&dyn InboundRequestHandler>,
     ) -> Result<Value, String> {
-        let headers = self.request_headers().await;
-        let response = self
-            .client
-            .post(self.url.clone())
-            .headers(headers)
-            .header(ACCEPT, "application/json, text/event-stream")
-            .header(CONTENT_TYPE, "application/json")
-            .json(request)
-            .send()
-            .await
-            .map_err(|error| format!("MCP HTTP request failed: {error}"))?;
+        let mut reinitialized = false;
+        loop {
+            let response = self
+                .context
+                .post(request, "application/json, text/event-stream")
+                .await?;
+            let status = response.status();
 
+            let session_expired = matches!(status.as_u16(), 404 | 405)
+                && request.method != "initialize"
+                && self.context.session_id().is_some();
+            if session_expired {
+                let body = response.text().await.unwrap_or_default();
+                if reinitialized {
+                    return Err(format!(
+                        "MCP HTTP server returned {status} after re-initializing: {body}"
+                    ));
+                }
+                tracing::debug!(
+                    method = %request.method,
+                    status = %status,
+                    "the MCP session is no longer valid; clearing it and re-initializing"
+                );
+                self.context.clear_session_id();
+                self.reinitialize(handler).await?;
+                reinitialized = true;
+                continue;
+            }
+
+            if !status.is_success() {
+                let body = response.text().await.unwrap_or_default();
+                return Err(format!("MCP HTTP server returned {status}: {body}"));
+            }
+
+            return self.finish_response(response, request.id, handler).await;
+        }
+    }
+
+    /// Run the initialize/initialized handshake again on this channel.
+    ///
+    /// Used only to recover an expired session. The new session id is captured
+    /// from the response header like the first one was.
+    async fn reinitialize(
+        &self,
+        handler: Option<&dyn InboundRequestHandler>,
+    ) -> Result<(), String> {
+        let request = JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            // The request id space belongs to the channel; id 0 is never used
+            // for an application request, so it cannot collide with one.
+            id: 0,
+            method: "initialize".to_string(),
+            params: Some(serde_json::json!({
+                "protocolVersion": "2024-11-05",
+                "capabilities": {},
+                "clientInfo": {"name": "coderex", "version": "0.1.0"}
+            })),
+        };
+        let response = self
+            .context
+            .post(&request, "application/json, text/event-stream")
+            .await?;
         let status = response.status();
+        if !status.is_success() {
+            let body = response.text().await.unwrap_or_default();
+            return Err(format!(
+                "MCP HTTP re-initialize failed with {status}: {body}"
+            ));
+        }
+        self.finish_response(response, request.id, handler).await?;
+
+        self.context
+            .send_notification(&JsonRpcNotification {
+                jsonrpc: "2.0".to_string(),
+                method: "initialized".to_string(),
+                params: None,
+            })
+            .await
+    }
+
+    /// Read the response to one request, which may be JSON or SSE.
+    async fn finish_response(
+        &self,
+        response: reqwest::Response,
+        expected_id: u64,
+        handler: Option<&dyn InboundRequestHandler>,
+    ) -> Result<Value, String> {
         let content_type = response
             .headers()
             .get(CONTENT_TYPE)
@@ -125,13 +403,8 @@ impl HttpChannel {
             .unwrap_or("application/json")
             .to_string();
 
-        if !status.is_success() {
-            let body = response.text().await.unwrap_or_default();
-            return Err(format!("MCP HTTP server returned {status}: {body}"));
-        }
-
         if content_type.contains("text/event-stream") {
-            return self.read_sse_response(response, request.id, handler).await;
+            return self.read_sse_response(response, expected_id, handler).await;
         }
 
         let body = response
@@ -140,19 +413,17 @@ impl HttpChannel {
             .map_err(|error| format!("failed to read MCP HTTP response: {error}"))?;
         if body.trim().is_empty() {
             return Err(format!(
-                "MCP HTTP server returned an empty response to request {}",
-                request.id
+                "MCP HTTP server returned an empty response to request {expected_id}"
             ));
         }
 
         let value: Value = serde_json::from_str(&body)
             .map_err(|error| format!("failed to parse MCP HTTP response: {error}"))?;
-        self.route_message(&value, request.id, handler)
+        self.route_message(&value, expected_id, handler)
             .await?
             .ok_or_else(|| {
                 format!(
-                    "MCP HTTP response to request {} contained no response to it",
-                    request.id
+                    "MCP HTTP response to request {expected_id} contained no response to it"
                 )
             })
     }
@@ -243,7 +514,9 @@ impl HttpChannel {
             (true, true) => {
                 let request: JsonRpcServerRequest = serde_json::from_value(value.clone())
                     .map_err(|error| format!("failed to parse a server request: {error}"))?;
-                self.answer_server_request(&request, handler).await?;
+                self.context
+                    .answer_server_request(&request, handler)
+                    .await?;
                 Ok(None)
             }
             // A notification: no answer is expected.
@@ -286,93 +559,248 @@ impl HttpChannel {
         }
     }
 
-    /// Answer a request the server made, over a new POST.
-    async fn answer_server_request(
-        &self,
-        request: &JsonRpcServerRequest,
-        handler: Option<&dyn InboundRequestHandler>,
-    ) -> Result<(), String> {
-        let answer = match handler {
-            Some(handler) => {
-                handler
-                    .handle(&request.method, request.params.as_ref())
-                    .await
-            }
-            None => Err(JsonRpcError {
-                code: METHOD_NOT_FOUND,
-                message: format!(
-                    "this client has no handler for '{}'; nothing here can answer it",
-                    request.method
-                ),
-                data: None,
-            }),
-        };
-
-        let response = match answer {
-            Ok(result) => JsonRpcResponse {
-                jsonrpc: "2.0".to_string(),
-                id: request.id,
-                result: Some(result),
-                error: None,
-            },
-            Err(error) => JsonRpcResponse {
-                jsonrpc: "2.0".to_string(),
-                id: request.id,
-                result: None,
-                error: Some(error),
-            },
-        };
-
-        let headers = self.request_headers().await;
-        let delivered = self
-            .client
-            .post(self.url.clone())
-            .headers(headers)
-            .header(CONTENT_TYPE, "application/json")
-            .json(&response)
-            .send()
-            .await
-            .map_err(|error| {
-                format!(
-                    "failed to answer the server's '{}' request: {error}",
-                    request.method
-                )
-            })?;
-
-        let status = delivered.status();
-        if !status.is_success() {
-            let body = delivered.text().await.unwrap_or_default();
-            return Err(format!(
-                "the server rejected the answer to '{}' with {status}: {body}",
-                request.method
-            ));
-        }
-        Ok(())
-    }
-
     pub async fn send_notification(
         &self,
         notification: &JsonRpcNotification,
     ) -> Result<(), String> {
-        let headers = self.request_headers().await;
-        let response = self
-            .client
-            .post(self.url.clone())
-            .headers(headers)
-            .header(CONTENT_TYPE, "application/json")
-            .json(notification)
-            .send()
-            .await
-            .map_err(|error| format!("MCP HTTP notification failed: {error}"))?;
-        let status = response.status();
-        if status.is_success() {
-            Ok(())
-        } else {
-            let body = response.text().await.unwrap_or_default();
-            Err(format!(
-                "MCP HTTP server returned {status} for a notification: {body}"
-            ))
+        self.context.send_notification(notification).await
+    }
+
+    /// Start the standalone GET stream, replacing any previous one.
+    ///
+    /// One task per remote server. It shares the handler, session id, and
+    /// token provider with the POST path, so a request the server pushes is
+    /// answered exactly as one carried by a response stream is.
+    pub fn start_event_stream(&self) {
+        self.stop_event_stream();
+        let context = self.context.clone();
+        let handler = Arc::clone(&self.event_handler);
+        let task = tokio::spawn(async move {
+            run_event_stream(context, handler).await;
+        });
+        if let Ok(mut slot) = self.event_stream.lock() {
+            *slot = Some(task);
         }
+    }
+
+    /// Stop the GET stream, if one is running.
+    pub fn stop_event_stream(&self) {
+        if let Ok(mut slot) = self.event_stream.lock() {
+            if let Some(task) = slot.take() {
+                task.abort();
+            }
+        }
+    }
+
+    /// Whether the GET stream task is still running (for diagnostics/tests).
+    #[must_use]
+    pub fn event_stream_active(&self) -> bool {
+        self.event_stream
+            .lock()
+            .ok()
+            .and_then(|slot| slot.as_ref().map(|task| !task.is_finished()))
+            .unwrap_or(false)
+    }
+}
+
+impl Drop for HttpChannel {
+    fn drop(&mut self) {
+        self.stop_event_stream();
+    }
+}
+
+/// How one attempt at the standalone stream ended.
+enum StreamEnd {
+    /// The server answered 405: it has no standalone stream. Stop quietly.
+    Unsupported,
+    /// The stream closed normally; reconnect.
+    Closed,
+}
+
+/// Keep the standalone GET stream open, reconnecting with bounded backoff.
+///
+/// `Last-Event-ID` resumes from the last event that was processed. A 405 is
+/// not an error — it is how a server says the optional stream is unavailable —
+/// so it stops the task instead of retrying.
+async fn run_event_stream(
+    context: RequestContext,
+    handler: Arc<RwLock<Option<Arc<dyn InboundRequestHandler>>>>,
+) {
+    let mut last_event_id: Option<String> = None;
+    let mut backoff = Duration::from_millis(250);
+
+    loop {
+        match read_event_stream_once(&context, &handler, &mut last_event_id).await {
+            Ok(StreamEnd::Unsupported) => {
+                tracing::debug!(
+                    url = %context.url,
+                    "MCP server does not support a standalone GET stream (405); continuing without it"
+                );
+                return;
+            }
+            Ok(StreamEnd::Closed) => {
+                tracing::debug!(
+                    url = %context.url,
+                    last_event_id = ?last_event_id,
+                    "MCP server's GET stream closed; reconnecting"
+                );
+            }
+            Err(error) => {
+                tracing::warn!(url = %context.url, "MCP GET stream failed: {error}");
+            }
+        }
+
+        tokio::time::sleep(backoff).await;
+        backoff = (backoff * 2).min(Duration::from_secs(5));
+    }
+}
+
+/// Read one connection to the standalone stream until it ends.
+async fn read_event_stream_once(
+    context: &RequestContext,
+    handler: &Arc<RwLock<Option<Arc<dyn InboundRequestHandler>>>>,
+    last_event_id: &mut Option<String>,
+) -> Result<StreamEnd, String> {
+    let mut headers = context.request_headers().await;
+    headers.insert(ACCEPT, HeaderValue::from_static(EVENT_STREAM_ACCEPT));
+    if let Some(id) = last_event_id.as_deref() {
+        match HeaderValue::from_str(id) {
+            Ok(value) => {
+                headers.insert(HeaderName::from_static(LAST_EVENT_ID_HEADER), value);
+            }
+            Err(error) => {
+                tracing::warn!("MCP Last-Event-ID cannot be sent as an HTTP header: {error}");
+            }
+        }
+    }
+
+    let response = context
+        .client
+        .get(context.url.clone())
+        .headers(headers)
+        .send()
+        .await
+        .map_err(|error| format!("connecting to the GET stream failed: {error}"))?;
+
+    if response.status() == reqwest::StatusCode::METHOD_NOT_ALLOWED {
+        return Ok(StreamEnd::Unsupported);
+    }
+    if !response.status().is_success() {
+        return Err(format!("the GET stream returned {}", response.status()));
+    }
+
+    let mut response = response;
+    let mut buffer = Vec::new();
+    loop {
+        for event in take_events(&mut buffer) {
+            process_stream_event(context, handler, &event, last_event_id).await;
+        }
+
+        match response.chunk().await {
+            Ok(Some(chunk)) => buffer.extend_from_slice(&chunk),
+            Ok(None) => break,
+            Err(error) => return Err(format!("reading the GET stream failed: {error}")),
+        }
+    }
+
+    // The final event may not have its terminating blank line before the
+    // connection closed.
+    if !buffer.is_empty() {
+        let event = String::from_utf8_lossy(&buffer).into_owned();
+        process_stream_event(context, handler, &event, last_event_id).await;
+    }
+
+    Ok(StreamEnd::Closed)
+}
+
+/// Route one event from the standalone stream.
+///
+/// Server requests are answered over a POST (with the session id attached by
+/// [`RequestContext`]); notifications are logged. Responses have no requester
+/// on this stream, so they are only noted.
+async fn process_stream_event(
+    context: &RequestContext,
+    handler: &Arc<RwLock<Option<Arc<dyn InboundRequestHandler>>>>,
+    event: &str,
+    last_event_id: &mut Option<String>,
+) {
+    let event_id = sse_event_id(event);
+
+    let Some(data) = sse_event_data(event) else {
+        if let Some(id) = event_id {
+            *last_event_id = Some(id);
+        }
+        return;
+    };
+    if data.trim().is_empty() || data.trim() == "[DONE]" {
+        if let Some(id) = event_id {
+            *last_event_id = Some(id);
+        }
+        return;
+    }
+
+    // Keep-alives and other non-JSON payloads are skipped, as on a response
+    // stream.
+    let Ok(value) = serde_json::from_str::<Value>(&data) else {
+        if let Some(id) = event_id {
+            *last_event_id = Some(id);
+        }
+        return;
+    };
+
+    let has_method = value.get("method").is_some();
+    let has_id = value.get("id").is_some();
+
+    match (has_method, has_id) {
+        (true, true) => match serde_json::from_value::<JsonRpcServerRequest>(value.clone()) {
+            Ok(request) => {
+                // Clone the handler out of the lock before awaiting: the
+                // handler prompts a person, and holding the lock across that
+                // would block a later install.
+                let handler = handler
+                    .read()
+                    .ok()
+                    .and_then(|slot| slot.as_ref().map(Arc::clone));
+                if let Err(error) = context
+                    .answer_server_request(&request, handler.as_deref())
+                    .await
+                {
+                    tracing::warn!(
+                        method = %request.method,
+                        "could not answer a request from the GET stream: {error}"
+                    );
+                }
+            }
+            Err(error) => {
+                tracing::warn!("failed to parse a server request from the GET stream: {error}");
+            }
+        },
+        // A notification: no answer is expected.
+        (true, false) => {
+            tracing::debug!(
+                message = %value,
+                "notification from the server's GET stream"
+            );
+        }
+        // A response with no request waiting on this stream.
+        (false, true) => {
+            tracing::debug!(
+                message = %value,
+                "a response arrived on the GET stream with no request waiting on it"
+            );
+        }
+        (false, false) => {
+            tracing::warn!(
+                message = %value,
+                "a message on the GET stream is neither a response nor a request"
+            );
+        }
+    }
+
+    // Record the resume point only after the message has been handled, so a
+    // reconnect cannot skip a request that was not answered.
+    if let Some(id) = event_id {
+        *last_event_id = Some(id);
     }
 }
 
@@ -404,6 +832,23 @@ fn find_event_boundary(bytes: &[u8]) -> Option<(usize, usize)> {
             return Some((index, 2));
         }
         index += 1;
+    }
+    None
+}
+
+/// The `id:` field of one SSE event, if it has one.
+///
+/// The id is what a reconnect sends back as `Last-Event-ID` so the server can
+/// resume after the last message the client actually processed.
+fn sse_event_id(event: &str) -> Option<String> {
+    for line in event.split(['\n', '\r']) {
+        let Some(rest) = line.strip_prefix("id:") else {
+            continue;
+        };
+        let id = rest.strip_prefix(' ').unwrap_or(rest).trim();
+        if !id.is_empty() {
+            return Some(id.to_string());
+        }
     }
     None
 }

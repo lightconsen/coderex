@@ -228,4 +228,46 @@ mod tests {
         assert_eq!(answer["action"], "accept");
         assert_eq!(answer["content"]["environment"], "staging");
     }
+
+    /// Every property of a multi-field schema is put in front of the user and
+    /// the complete object is returned.
+    #[tokio::test]
+    async fn every_property_is_asked_through_the_tui() {
+        let handler = SessionElicitationHandler::new(false);
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        handler.set_tui_sender(tx);
+
+        let responder = tokio::spawn(async move {
+            for answer in ["staging", "yes"] {
+                let request = rx.recv().await.expect("the question reached the TUI");
+                let _ = request
+                    .response_tx
+                    .send(serde_json::json!({ "answer": answer }));
+            }
+        });
+
+        let answer = handler
+            .inbound()
+            .handle(
+                coderex_mcp::elicitation::ELICITATION_CREATE,
+                Some(&serde_json::json!({
+                    "message": "Configure the deployment",
+                    "requestedSchema": {
+                        "type": "object",
+                        "properties": {
+                            "environment": {"type": "string"},
+                            "enabled": {"type": "boolean"}
+                        },
+                        "required": ["environment", "enabled"]
+                    }
+                })),
+            )
+            .await
+            .expect("the session answered");
+
+        responder.await.unwrap();
+        assert_eq!(answer["action"], "accept");
+        assert_eq!(answer["content"]["environment"], "staging");
+        assert_eq!(answer["content"]["enabled"], true);
+    }
 }
