@@ -170,6 +170,7 @@ Terminal states: `Completed`, `Failed`. All transitions validated with error typ
 | `handle_relay_call()` | The relay endpoint: forwarding policy, then the approval gate |
 | `handle_transport_message()` | Route one inbound frame by type |
 | `serve_transport()` | The live receive loop; sequences, routes, answers |
+| `stop_handle()` / `request_stop()` | Gracefully stop the serve loop from another task |
 | `reconnect_with_resume()` | Reconnect after `stream_end` and ask for the gap |
 | `apply_session_write()` | Epoch-fenced write-back from a worker |
 | `resume_request()` | The `resume` frame for the last delivered sequence |
@@ -284,6 +285,65 @@ frames, sequences them, routes each by type, and answers:
 | `stream_end` | — | Reconnect via `reconnect_with_resume` and send `resume` |
 | anything else | `error` | Unknown message type |
 
+## Running the bridge
+
+The production entry point is the `bridge` subcommand:
+
+```sh
+coderex bridge \
+  --control-plane-url https://control.example.com \
+  --env-id builder-01
+```
+
+It resolves the configuration, builds the transport through
+`coderex_bridge::transport::default_factory()`, constructs a `Bridge`, connects
+the transport, and runs `Bridge::serve_transport()` until Ctrl+C (or SIGTERM on
+Unix). There is no fallback to a no-op or in-process transport: an unknown
+transport kind and a failed connection both exit non-zero with the reason.
+
+### Flags and environment
+
+| Flag | Environment | Default | Meaning |
+|------|-------------|---------|---------|
+| `--control-plane-url URL` | `CODEREX_BRIDGE_CONTROL_PLANE_URL` | required | Control-plane HTTP API base URL |
+| `--env-id ID` | `CODEREX_BRIDGE_ENV_ID` | required | Environment identifier registered with the control plane |
+| `--repo-root DIR` | `CODEREX_BRIDGE_REPO_ROOT` | current directory | Git repository the spawner works from |
+| `--worktree-base DIR` | `CODEREX_BRIDGE_WORKTREE_BASE` | `<repo>/.coderex/worktrees` | Where session worktrees are created |
+| `--session-base DIR` | `CODEREX_BRIDGE_SESSION_BASE` | `<repo>/.coderex/sessions` | Where session data is written |
+| `--archive-base DIR` | `CODEREX_BRIDGE_ARCHIVE_BASE` | `<repo>/.coderex/archives` | Where completed sessions are archived |
+| `--max-concurrent N` | `CODEREX_BRIDGE_MAX_CONCURRENT` | `5` | Maximum concurrent sessions |
+| `--transport KIND` | `CODEREX_BRIDGE_TRANSPORT` | `websocket` | `websocket`/`ws`, or `in-process` |
+| `--transport-url URL` | `CODEREX_BRIDGE_URL` | control-plane URL with `http`→`ws` / `https`→`wss` | Gateway WebSocket endpoint |
+| `--connection-id ID` | `CODEREX_BRIDGE_CONNECTION_ID` | environment ID | Connection label reported by the transport |
+| `--auth-token TOKEN` | `CODEREX_BRIDGE_TOKEN` | none | Bearer token for the transport `Authorization` header |
+| `--heartbeat-interval-secs N` | `CODEREX_BRIDGE_HEARTBEAT_INTERVAL_SECS` | `30` | Heartbeat interval |
+| `--heartbeat-timeout-secs N` | `CODEREX_BRIDGE_HEARTBEAT_TIMEOUT_SECS` | `10` | Per-heartbeat timeout |
+| `--heartbeat-degraded-threshold N` | `CODEREX_BRIDGE_HEARTBEAT_DEGRADED_THRESHOLD` | `2` | Missed beats before `Degraded` |
+| `--heartbeat-lost-threshold N` | `CODEREX_BRIDGE_HEARTBEAT_LOST_THRESHOLD` | `5` | Missed beats before `Lost` |
+
+The historical `CODEREX_BRIDGE_URL=ws://host:port` spelling is the transport
+URL, not the control-plane API URL. If the gateway does not share the control
+plane's host and path, set `--transport-url` (or `CODEREX_BRIDGE_URL`)
+explicitly.
+
+### Authentication
+
+The WebSocket transport sends `Authorization: Bearer <token>` when
+`--auth-token`/`CODEREX_BRIDGE_TOKEN` is set. The control-plane HTTP API
+(`BridgeWorkPoller::register`, assignments, capacity) has no token field in
+this build, so it is expected to be reachable from the worker's network
+position rather than authenticated per request. Tokens are never logged; pass
+them through the environment where possible.
+
+### Shutdown
+
+`Bridge::stop_handle()` returns a cloneable `BridgeStopHandle`; `stop()` sets
+the flag and wakes the serve loop out of its blocking receive, so a signal
+handler or supervisor can stop a bridge while `serve_transport` holds
+`&mut Bridge`. The subcommand installs a Ctrl+C/SIGTERM listener, calls the
+handle, waits for `serve_transport` to return, and disconnects the transport.
+Messages already being handled are completed before the loop exits.
+
 ## Data Flow
 
 ```
@@ -361,23 +421,26 @@ Control Plane                      Bridge                          Remote/Local
   carried as a sequence number plus `Last-Event-ID`; there is no SSE encoder in
   this workspace and the transport is WebSocket, so the two spellings of the
   resume point are what the gateway is given.
-- **A production driver for `Bridge::serve_transport`.** The loop is the live
-  request path — every relayed call, fenced write-back, and resume goes through
-  it — but nothing in the workspace constructs a `Bridge` to run it. `coderex
-  serve` starts `DaemonServer`; the CLI uses `coderex_bridge::transport` and
-  `TeleportManager` but never `Bridge`. So today the only caller is the
-  integration test, which drives a real `tokio-tungstenite` connection through
-  the loop. Wiring the loop into the CLI is a change to `crates/cli`, outside
-  this workstream's ownership; the endpoint itself is complete and tested
-  against the real protocol, and would come up unchanged the moment a `Bridge`
-  is run.
+- **Automatic control-plane registration in the launcher.** `coderex bridge`
+  constructs and serves the bridge, but does not call
+  `BridgeWorkPoller::register` or fetch assignments on its own. Registration
+  and assignment delivery are part of the surrounding deployment's control
+  plane; the launcher deliberately does not make a network call the operator
+  did not ask for. `Bridge::register()` remains available to a supervisor that
+  wants it.
+- **Per-request control-plane authentication.** `BridgeWorkPoller` has no
+  configured credential; the transport (`Authorization: Bearer ...`) is the
+  authenticated channel in this build.
+- **A gateway path convention.** The default transport URL rewrites the
+  control-plane scheme and keeps the same host and path. A gateway mounted on a
+  different path must be given `--transport-url` / `CODEREX_BRIDGE_URL`.
 
 ## Test Summary
 
 | Module | Test Count | Coverage |
 |--------|-----------|----------|
-| `transport` | 12 | InProcessTransport bidirectional messaging, timeouts, connection ID |
-| `ws_transport` | 7 | WebSocket connect, auth, token store CRUD, JSON roundtrip |
+| `transport` | 15 | InProcessTransport bidirectional messaging, timeouts, connection ID, configured factory |
+| `ws_transport` | 8 | WebSocket connect/reconnect, auth, token store CRUD, JSON roundtrip |
 | `heartbeat` | 19 | Healthy→Degraded→Lost transitions, backoff, recovery state, loop, sequence cursor |
 | `epoch` | 4 | Worker epoch write fence: newer epoch takes it, stale epoch refused |
 | `relay` | 13 | Approval binding, one-time consumption, forwarding policy, refusal shape |
@@ -388,7 +451,8 @@ Control Plane                      Bridge                          Remote/Local
 | `teleport` | 9 | Snapshot/restore, manifest, conflict handling |
 | `archive` | 9 | Versioning, list/load, metadata, process tracking, cleanup report |
 | `delta_sync` | 21 | Diff/apply, revision hash, JSON roundtrip, Lamport timestamps, conflict tracker, delta merge |
-| `orchestrator` | 17 | Connect/disconnect, spawn/complete lifecycle, permissions, events, recovery, relay endpoint, write fence, resume |
+| `orchestrator` | 19 | Connect/disconnect, spawn/complete lifecycle, permissions, events, recovery, relay endpoint, write fence, resume, stop handle |
+| `bridge_launcher` (cli) | 11 | Flag/env mapping, defaults, required-value errors, injectable transport, graceful shutdown |
 | `bridge_integration` (tests/) | 33 | Live relay call over WebSocket, refusal, stale epoch, resume cursor, end-to-end flows |
 | `control_plane` (server) | 15 | All 5 HTTP endpoints, state management, claim conflicts, 404 routing |
 | `filter` (server) | 7 | Remote/bridge shell whitelists, dangerous-command rejection |
@@ -396,7 +460,7 @@ Control Plane                      Bridge                          Remote/Local
 | `session` (server) | 25 | Auth, roles, command resolution, rate limiting, idle cleanup, protocol |
 | `server_integration` (server, tests/) | 24 | Full WS lifecycle, auth, roles, command whitelist over the protocol |
 
-**Total: 150 bridge unit + 33 bridge integration + 53 server unit + 24 server integration = 260 tests pass.**
+**Total: 156 bridge unit + 11 CLI launcher unit + 33 bridge integration + 53 server unit + 24 server integration = 277 tests pass.**
 
 ## Dependencies
 

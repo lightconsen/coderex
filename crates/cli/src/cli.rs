@@ -1,6 +1,6 @@
 //! CLI argument parsing with clap.
 
-use clap::{Parser, Subcommand};
+use clap::{Args, Parser, Subcommand};
 use std::path::PathBuf;
 
 #[derive(Parser, Debug)]
@@ -212,6 +212,7 @@ pub struct Cli {
 }
 
 #[derive(Subcommand, Debug)]
+#[allow(clippy::large_enum_variant)] // BridgeArgs carries the whole launch configuration.
 pub enum Command {
     /// Start the interactive REPL (default when no command is given).
     Repl,
@@ -249,6 +250,128 @@ pub enum Command {
     },
     /// Configure auto-mode settings.
     AutoMode,
+    /// Run the bridge worker that serves the remote relay transport.
+    Bridge(BridgeArgs),
+}
+
+/// Arguments for `coderex bridge`.
+///
+/// The control-plane URL and environment ID identify this worker to the
+/// gateway; every other value has a default and can be overridden by flag or
+/// environment variable.
+#[derive(Args, Debug, Clone)]
+pub struct BridgeArgs {
+    /// Control-plane base URL (HTTP API).
+    #[arg(
+        long,
+        value_name = "URL",
+        env = "CODEREX_BRIDGE_CONTROL_PLANE_URL",
+        required = true
+    )]
+    pub control_plane_url: Option<String>,
+
+    /// Environment identifier registered with the control plane.
+    #[arg(
+        long,
+        value_name = "ID",
+        env = "CODEREX_BRIDGE_ENV_ID",
+        required = true
+    )]
+    pub env_id: Option<String>,
+
+    /// Git repository root (defaults to the current directory).
+    #[arg(long, value_name = "DIR", env = "CODEREX_BRIDGE_REPO_ROOT")]
+    pub repo_root: Option<PathBuf>,
+
+    /// Base directory for session worktrees (defaults to
+    /// `<repo>/.coderex/worktrees`).
+    #[arg(long, value_name = "DIR", env = "CODEREX_BRIDGE_WORKTREE_BASE")]
+    pub worktree_base: Option<PathBuf>,
+
+    /// Base directory for session data (defaults to
+    /// `<repo>/.coderex/sessions`).
+    #[arg(long, value_name = "DIR", env = "CODEREX_BRIDGE_SESSION_BASE")]
+    pub session_base: Option<PathBuf>,
+
+    /// Base directory for archived sessions (defaults to
+    /// `<repo>/.coderex/archives`).
+    #[arg(long, value_name = "DIR", env = "CODEREX_BRIDGE_ARCHIVE_BASE")]
+    pub archive_base: Option<PathBuf>,
+
+    /// Maximum concurrent sessions.
+    #[arg(
+        long,
+        value_name = "N",
+        env = "CODEREX_BRIDGE_MAX_CONCURRENT",
+        default_value_t = 5
+    )]
+    pub max_concurrent: usize,
+
+    /// Transport kind: `websocket` (alias `ws`) or `in-process`.
+    #[arg(
+        long,
+        value_name = "KIND",
+        env = "CODEREX_BRIDGE_TRANSPORT",
+        default_value = "websocket"
+    )]
+    pub transport: String,
+
+    /// Transport endpoint. Defaults to the control-plane URL with the
+    /// `http`/`https` scheme rewritten to `ws`/`wss`.
+    ///
+    /// `CODEREX_BRIDGE_URL` keeps the historical `ws://host:port` spelling.
+    #[arg(long, value_name = "URL", env = "CODEREX_BRIDGE_URL")]
+    pub transport_url: Option<String>,
+
+    /// Connection identifier reported by the transport (defaults to the
+    /// environment ID).
+    #[arg(long, value_name = "ID", env = "CODEREX_BRIDGE_CONNECTION_ID")]
+    pub connection_id: Option<String>,
+
+    /// Bearer token sent in the transport `Authorization` header.
+    #[arg(
+        long,
+        value_name = "TOKEN",
+        env = "CODEREX_BRIDGE_TOKEN",
+        hide_env_values = true
+    )]
+    pub auth_token: Option<String>,
+
+    /// Heartbeat interval in seconds.
+    #[arg(
+        long,
+        value_name = "SECS",
+        env = "CODEREX_BRIDGE_HEARTBEAT_INTERVAL_SECS",
+        default_value_t = 30
+    )]
+    pub heartbeat_interval_secs: u64,
+
+    /// Heartbeat timeout in seconds.
+    #[arg(
+        long,
+        value_name = "SECS",
+        env = "CODEREX_BRIDGE_HEARTBEAT_TIMEOUT_SECS",
+        default_value_t = 10
+    )]
+    pub heartbeat_timeout_secs: u64,
+
+    /// Consecutive missed heartbeats before the status is degraded.
+    #[arg(
+        long,
+        value_name = "N",
+        env = "CODEREX_BRIDGE_HEARTBEAT_DEGRADED_THRESHOLD",
+        default_value_t = 2
+    )]
+    pub heartbeat_degraded_threshold: usize,
+
+    /// Consecutive missed heartbeats before the status is lost.
+    #[arg(
+        long,
+        value_name = "N",
+        env = "CODEREX_BRIDGE_HEARTBEAT_LOST_THRESHOLD",
+        default_value_t = 5
+    )]
+    pub heartbeat_lost_threshold: usize,
 }
 
 /// MCP management subcommands.

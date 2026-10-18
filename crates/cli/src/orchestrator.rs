@@ -432,6 +432,9 @@ impl StartupOrchestrator {
                 crate::cli::Command::Mcp { action } => self.run_mcp(action).await,
                 crate::cli::Command::Plugin { action } => self.run_plugin(action).await,
                 crate::cli::Command::AutoMode => self.run_auto_mode().await,
+                crate::cli::Command::Bridge(args) => {
+                    crate::bridge_launcher::run(args, std::path::Path::new(&self.ctx.cwd)).await
+                }
             }
         } else {
             // Interactive REPL
@@ -1264,7 +1267,7 @@ impl StartupOrchestrator {
         let streaming_protocol = self.ctx.output_format == "stream-json";
         if streaming_protocol {
             repl.with_protocol_sink(Some(coderex_events::MessageSink::new(
-                Box::new(std::io::stdout()) as Box<dyn std::io::Write + Send>
+                Box::new(std::io::stdout()) as Box<dyn std::io::Write + Send>,
             )));
         }
 

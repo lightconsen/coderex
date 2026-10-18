@@ -192,12 +192,54 @@ impl Transport for InProcessTransport {
     }
 }
 
+/// Options used to construct a transport from a [`TransportFactory`].
+#[derive(Debug, Clone)]
+pub struct TransportConfig {
+    /// Registered transport type, for example `websocket` or `in-process`.
+    pub kind: String,
+    /// Remote endpoint. For network transports this is the URL to connect to.
+    pub endpoint: String,
+    /// Connection identifier reported by the transport.
+    pub connection_id: String,
+    /// Optional bearer token, for transports that support it.
+    pub auth_token: Option<String>,
+}
+
+impl TransportConfig {
+    /// Create a transport config with the endpoint also used as the
+    /// connection ID.
+    #[must_use]
+    pub fn new(kind: impl Into<String>, endpoint: impl Into<String>) -> Self {
+        let endpoint = endpoint.into();
+        Self {
+            kind: kind.into(),
+            connection_id: endpoint.clone(),
+            endpoint,
+            auth_token: None,
+        }
+    }
+
+    /// Set the bearer token used by transports that authenticate.
+    #[must_use]
+    pub fn with_auth(mut self, token: impl Into<String>) -> Self {
+        self.auth_token = Some(token.into());
+        self
+    }
+
+    /// Override the connection identifier.
+    #[must_use]
+    pub fn with_connection_id(mut self, connection_id: impl Into<String>) -> Self {
+        self.connection_id = connection_id.into();
+        self
+    }
+}
+
 /// Transport factory for creating transport instances.
 ///
 /// Allows runtime selection of transport type (WebSocket, in-process, mock).
 pub struct TransportFactory {
     /// Registered transport constructors.
-    transports: HashMap<String, Box<dyn Fn(&str) -> Box<dyn Transport> + Send + Sync>>,
+    transports: HashMap<String, Box<dyn Fn(&TransportConfig) -> Box<dyn Transport> + Send + Sync>>,
 }
 
 impl Default for TransportFactory {
@@ -224,18 +266,30 @@ impl TransportFactory {
     }
 
     /// Register a transport type by name.
+    ///
+    /// The constructor receives the full [`TransportConfig`], so a transport
+    /// that needs an endpoint or credentials can read them from it.
     pub fn register<F>(&mut self, name: &str, factory: F)
     where
-        F: Fn(&str) -> Box<dyn Transport> + Send + Sync + 'static,
+        F: Fn(&TransportConfig) -> Box<dyn Transport> + Send + Sync + 'static,
     {
         self.transports.insert(name.to_string(), Box::new(factory));
     }
 
     /// Create a transport instance by name.
     ///
-    /// Returns None if no transport with the given name is registered.
+    /// The transport name doubles as its endpoint, which is all the built-in
+    /// in-process transport needs. Returns None if no transport with the
+    /// given name is registered.
     pub fn create(&self, name: &str, connection_id: &str) -> Option<Box<dyn Transport>> {
-        self.transports.get(name).map(|f| f(connection_id))
+        self.create_configured(&TransportConfig::new(name, connection_id))
+    }
+
+    /// Create a transport instance from a full configuration.
+    ///
+    /// Returns None if no transport with the configured kind is registered.
+    pub fn create_configured(&self, config: &TransportConfig) -> Option<Box<dyn Transport>> {
+        self.transports.get(&config.kind).map(|f| f(config))
     }
 
     /// List registered transport types.
@@ -244,13 +298,26 @@ impl TransportFactory {
     }
 }
 
+/// Construct a WebSocket transport from a factory config.
+fn websocket_transport(config: &TransportConfig) -> Box<dyn Transport> {
+    let mut ws_config = crate::ws_transport::WsTransportConfig::new(config.endpoint.clone());
+    ws_config.connection_id = config.connection_id.clone();
+    if let Some(ref token) = config.auth_token {
+        ws_config = ws_config.with_auth(token.clone());
+    }
+    Box::new(crate::ws_transport::WebSocketTransport::new(ws_config))
+}
+
 /// Create a factory with all built-in transports registered.
 #[must_use]
 pub fn default_factory() -> TransportFactory {
     let mut factory = TransportFactory::new();
-    factory.register("in-process", |id| {
-        Box::new(InProcessTransport::new(id.to_string()))
+    factory.register("in-process", |config: &TransportConfig| {
+        Box::new(InProcessTransport::new(config.connection_id.clone()))
     });
+    factory.register("websocket", websocket_transport);
+    // `ws` is the spelling the existing CODEREX_BRIDGE_URL examples use.
+    factory.register("ws", websocket_transport);
     factory
 }
 
@@ -331,6 +398,31 @@ mod tests {
         let factory = default_factory();
         let transport = factory.create("nonexistent", "test_conn");
         assert!(transport.is_none());
+    }
+
+    #[test]
+    fn default_factory_registers_the_websocket_transport() {
+        let factory = default_factory();
+        assert!(factory.registered_types().contains(&"websocket"));
+        assert!(factory.registered_types().contains(&"ws"));
+    }
+
+    #[test]
+    fn create_configured_passes_endpoint_and_auth_to_the_transport() {
+        let factory = default_factory();
+        let config = TransportConfig::new("websocket", "ws://127.0.0.1:9/bridge")
+            .with_auth("secret")
+            .with_connection_id("env-1");
+        let transport = factory.create_configured(&config).unwrap();
+        assert_eq!(transport.connection_id(), "env-1");
+        assert!(!transport.is_connected());
+    }
+
+    #[test]
+    fn create_configured_unknown_kind_returns_none() {
+        let factory = default_factory();
+        let config = TransportConfig::new("carrier-pigeon", "elsewhere");
+        assert!(factory.create_configured(&config).is_none());
     }
 
     #[test]

@@ -54,6 +54,8 @@ impl WsTransportConfig {
 pub struct WebSocketTransport {
     /// Connection identifier.
     connection_id: String,
+    /// Configuration used for the initial connection and for reconnects.
+    config: WsTransportConfig,
     /// Whether currently connected.
     connected: bool,
     /// Sender to the read loop (messages from WS -> internal).
@@ -87,7 +89,8 @@ impl WebSocketTransport {
         let (write_tx, _) = tokio::sync::mpsc::unbounded_channel::<TransportMessage>();
 
         Self {
-            connection_id: config.connection_id,
+            connection_id: config.connection_id.clone(),
+            config,
             connected: false,
             tx,
             rx,
@@ -100,7 +103,11 @@ impl WebSocketTransport {
 
     /// Connect to the remote WebSocket endpoint.
     pub async fn connect_ws(&mut self, config: WsTransportConfig) -> Result<(), TransportError> {
-        let url = &config.url;
+        let url = config.url.clone();
+        // Keep the configuration so `Transport::connect` can re-establish the
+        // same endpoint (with the same credentials) after a stream ends.
+        self.config = config.clone();
+        self.connection_id = config.connection_id.clone();
 
         // Build request with auth header
         let mut request = url
@@ -200,9 +207,8 @@ impl WebSocketTransport {
 #[async_trait::async_trait]
 impl Transport for WebSocketTransport {
     async fn connect(&mut self) -> Result<(), TransportError> {
-        Err(TransportError::ConnectionLost(
-            "use connect_ws() with WsTransportConfig".into(),
-        ))
+        let config = self.config.clone();
+        self.connect_ws(config).await
     }
 
     async fn disconnect(&mut self) -> Result<(), TransportError> {
@@ -360,6 +366,25 @@ mod tests {
         let mut transport = WebSocketTransport::new(config);
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(transport.disconnect()).unwrap();
+    }
+
+    #[tokio::test]
+    async fn connect_uses_the_configuration_given_at_construction() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let _ = tokio_tungstenite::accept_async(stream).await;
+        });
+
+        let config = WsTransportConfig::new(format!("ws://{addr}")).with_auth("token");
+        let mut transport = WebSocketTransport::new(config);
+
+        transport.connect().await.unwrap();
+        assert!(transport.is_connected());
+
+        server.abort();
+        transport.disconnect().await.unwrap();
     }
 
     #[test]
