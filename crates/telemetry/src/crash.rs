@@ -27,8 +27,10 @@
 
 use std::collections::BTreeMap;
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::SystemTime;
 
 use sha2::{Digest, Sha256};
 
@@ -86,6 +88,30 @@ pub const DEFAULT_PENDING_MAX_AGE_SECS: u64 = 7 * 24 * 60 * 60;
 ///
 /// This bounds the user-only raw copy kept for verbose diagnostics (30 days).
 pub const DEFAULT_CRASH_RETENTION_DAYS: i64 = 30;
+
+/// Process-global switch for panic-time crash capture.
+///
+/// Defaults to `false`: installing the hook is not enough to make an opted-out
+/// process write crash files. The host turns this on after settings resolve
+/// (see [`set_capture_enabled`]).
+static CAPTURE_ENABLED: AtomicBool = AtomicBool::new(false);
+
+/// Enable or disable panic-time crash capture for this process.
+///
+/// When disabled (the default), an installed panic hook calls the previous hook
+/// and writes nothing to the pending directory. Call this with `true` after the
+/// telemetry settings resolve to opt the session in; callers that run with
+/// telemetry disabled leave it off and can still prune old files with
+/// [`prune_pending`].
+pub fn set_capture_enabled(enabled: bool) {
+    CAPTURE_ENABLED.store(enabled, Ordering::Relaxed);
+}
+
+/// Whether panic-time crash capture is currently enabled.
+#[must_use]
+pub fn capture_enabled() -> bool {
+    CAPTURE_ENABLED.load(Ordering::Relaxed)
+}
 
 /// Whether free-form crash diagnostics are requested for this process.
 #[must_use]
@@ -322,10 +348,7 @@ fn extract_error_type(message: &str) -> Option<String> {
         return None;
     }
     let tail = rest[end..].trim_start();
-    if !(tail.is_empty()
-        || tail.starts_with('{')
-        || tail.starts_with('(')
-        || tail.starts_with('['))
+    if !(tail.is_empty() || tail.starts_with('{') || tail.starts_with('(') || tail.starts_with('['))
     {
         return None;
     }
@@ -518,7 +541,9 @@ fn frame_symbol(line: &str) -> Option<String> {
         return None;
     }
     // Older formats: `0x123456 - module::symbol`.
-    let symbol = rest.split_once(" - ").map_or(rest, |(_, symbol)| symbol.trim());
+    let symbol = rest
+        .split_once(" - ")
+        .map_or(rest, |(_, symbol)| symbol.trim());
     sanitize_symbol(symbol)
 }
 
@@ -529,7 +554,10 @@ fn sanitize_symbol(symbol: &str) -> Option<String> {
     }
     // Path punctuation means this is not a symbol (or is a symbol the runtime
     // failed to demangle); dropping it is safer than sending a path.
-    if symbol.chars().any(|ch| matches!(ch, '/' | '\\' | '@' | '~')) {
+    if symbol
+        .chars()
+        .any(|ch| matches!(ch, '/' | '\\' | '@' | '~'))
+    {
         return None;
     }
     let cleaned: String = symbol
@@ -799,6 +827,56 @@ fn write_private_file(path: &std::path::Path, contents: &[u8]) -> std::io::Resul
 /// Default maximum size for the pending crash directory (50 MB).
 const DEFAULT_MAX_PENDING_BYTES: u64 = 50 * 1024 * 1024;
 
+/// Whether `path` looks like a pending crash file.
+fn is_pending_crash_file(path: &Path) -> bool {
+    path.extension().and_then(|s| s.to_str()) == Some("json")
+}
+
+/// Remove pending crash files modified before `cutoff`.
+///
+/// A missing pending directory is not an error: it just means there is nothing
+/// to prune yet.
+fn prune_expired(pending_dir: &Path, cutoff: SystemTime) -> std::io::Result<usize> {
+    let entries = match std::fs::read_dir(pending_dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(error) => return Err(error),
+    };
+
+    let mut removed = 0;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !is_pending_crash_file(&path) {
+            continue;
+        }
+        let Ok(modified) = entry.metadata().and_then(|metadata| metadata.modified()) else {
+            continue;
+        };
+        if modified < cutoff && std::fs::remove_file(&path).is_ok() {
+            removed += 1;
+        }
+    }
+    Ok(removed)
+}
+
+/// Delete pending crash files older than `cutoff`, without a store or uploader.
+///
+/// This is safe to call on every startup — including the telemetry-disabled
+/// path — because it only touches the local pending directory and records or
+/// uploads nothing. Files modified at or after `cutoff` and non-`.json` entries
+/// are left alone. A missing directory yields `Ok(0)`.
+///
+/// Typical use:
+/// `prune_pending(&dir, SystemTime::now() - Duration::from_secs(DEFAULT_PENDING_MAX_AGE_SECS))`.
+///
+/// # Errors
+///
+/// Returns the directory-read error when the pending directory exists but
+/// cannot be listed. Per-file metadata or deletion failures are skipped.
+pub fn prune_pending(pending_dir: &Path, cutoff: SystemTime) -> std::io::Result<usize> {
+    prune_expired(pending_dir, cutoff)
+}
+
 /// Crash reporter that hooks into the panic handler.
 #[derive(Debug, Clone)]
 pub struct CrashReporter {
@@ -878,6 +956,14 @@ impl CrashReporter {
         let default_hook = std::panic::take_hook();
 
         std::panic::set_hook(Box::new(move |info| {
+            // The host enables capture only after the telemetry settings have
+            // resolved. While it is off, an installed hook is inert: run the
+            // previous hook and write no pending file.
+            if !capture_enabled() {
+                default_hook(info);
+                return;
+            }
+
             let panic_type = if info.payload().is::<&str>() {
                 "&str"
             } else if info.payload().is::<String>() {
@@ -1090,16 +1176,23 @@ impl CrashReporter {
 
     /// Delete pending files past their TTL, then enforce the byte budget.
     fn enforce_limits(&self) {
-        let now = std::time::SystemTime::now();
+        let now = SystemTime::now();
         let ttl = std::time::Duration::from_secs(DEFAULT_PENDING_MAX_AGE_SECS);
+        let cutoff = now.checked_sub(ttl).unwrap_or(SystemTime::UNIX_EPOCH);
 
-        let mut files: Vec<(std::path::PathBuf, u64, std::time::SystemTime)> =
+        // TTL first: an old raw local copy should go even when there is plenty
+        // of disk space. This is the same pruning logic exposed by
+        // [`prune_pending`], so the disabled-startup path and ingestion stay in
+        // sync.
+        let _ = prune_pending(&self.pending_dir, cutoff);
+
+        let mut files: Vec<(std::path::PathBuf, u64, SystemTime)> =
             match std::fs::read_dir(&self.pending_dir) {
                 Ok(entries) => entries
                     .flatten()
                     .filter_map(|entry| {
                         let path = entry.path();
-                        if path.extension().and_then(|s| s.to_str()) != Some("json") {
+                        if !is_pending_crash_file(&path) {
                             return None;
                         }
                         let metadata = entry.metadata().ok()?;
@@ -1109,21 +1202,6 @@ impl CrashReporter {
                     .collect(),
                 Err(_) => return,
             };
-
-        // TTL first: an old raw local copy should go even when there is plenty
-        // of disk space.
-        files.retain(|(path, _, modified)| {
-            let expired = now
-                .duration_since(*modified)
-                .map(|age| age > ttl)
-                .unwrap_or(false);
-            if expired {
-                let _ = std::fs::remove_file(path);
-                false
-            } else {
-                true
-            }
-        });
 
         let total_size: u64 = files.iter().map(|(_, size, _)| size).sum();
         if total_size <= self.max_pending_bytes {
@@ -1296,6 +1374,20 @@ mod tests {
     fn crash_dir(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!("coderex_crash_{}_{}", std::process::id(), name))
     }
+
+    fn pending_json_files(dir: &Path) -> usize {
+        std::fs::read_dir(dir)
+            .map(|entries| {
+                entries
+                    .flatten()
+                    .filter(|entry| is_pending_crash_file(&entry.path()))
+                    .count()
+            })
+            .unwrap_or(0)
+    }
+
+    /// Panic hooks are process-global; serialize the tests that install one.
+    static PANIC_HOOK_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     fn ingest_one(name: &str, report: &CrashReport, strict: bool, verbose: bool) -> PendingCrash {
         let dir = crash_dir(name);
@@ -1482,7 +1574,8 @@ mod tests {
 
     #[test]
     fn classifies_slice_ranges_with_safe_fields() {
-        let start = classify_panic_message("range start index 9 out of range for slice of length 4");
+        let start =
+            classify_panic_message("range start index 9 out of range for slice of length 4");
         assert_eq!(start.template, PanicTemplate::SliceRange);
         assert_eq!(
             start.fields.get("panic_range_start"),
@@ -1518,7 +1611,10 @@ mod tests {
                 "attempt to add with overflow",
                 PanicTemplate::ArithmeticOverflow,
             ),
-            ("attempt to divide by zero", PanicTemplate::ArithmeticOverflow),
+            (
+                "attempt to divide by zero",
+                PanicTemplate::ArithmeticOverflow,
+            ),
             (
                 "assertion failed: value > 0",
                 PanicTemplate::AssertionFailed,
@@ -1605,7 +1701,12 @@ mod tests {
         assert_eq!(symbols.frames.len(), MAX_BACKTRACE_FRAMES);
         assert_eq!(symbols.frame_count, MAX_BACKTRACE_FRAMES + 6);
         assert!(symbols.frames[0].contains("crate_0::"));
-        assert!(!symbols.frames.iter().any(|frame| frame.contains("crate_29::")));
+        assert!(
+            !symbols
+                .frames
+                .iter()
+                .any(|frame| frame.contains("crate_29::"))
+        );
     }
 
     #[test]
@@ -1659,8 +1760,18 @@ mod tests {
         let crash = ingest_one("verbose_raw_local", &report, false, true);
 
         assert!(crash.panic_info.contains("user said"));
-        assert!(crash.panic_info.contains("A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6"));
-        assert!(crash.backtrace.as_deref().unwrap().contains("/home/somebody"));
+        assert!(
+            crash
+                .panic_info
+                .contains("A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6")
+        );
+        assert!(
+            crash
+                .backtrace
+                .as_deref()
+                .unwrap()
+                .contains("/home/somebody")
+        );
         // Even the local copy keeps symbolized frames, so an upload needs no
         // re-parse of the raw text.
         assert!(crash.backtrace_symbols.unwrap().contains("QueryEngine"));
@@ -1676,11 +1787,7 @@ mod tests {
         );
         let crash = ingest_one("strict_over_verbose", &report, true, true);
         assert!(crash.backtrace.is_none(), "{:?}", crash.backtrace);
-        assert!(
-            is_structured(&crash.panic_info),
-            "{}",
-            crash.panic_info
-        );
+        assert!(is_structured(&crash.panic_info), "{}", crash.panic_info);
         assert!(crash.panic_info.contains("message=omitted"));
         assert!(!crash.panic_info.contains("user said"));
         assert!(crash.backtrace_symbols.is_none());
@@ -1722,10 +1829,7 @@ mod tests {
             Some(BACKTRACE),
         );
         let crash = ingest_one("classified_report", &report, false, false);
-        assert_eq!(
-            crash.panic_template.as_deref(),
-            Some("index_out_of_bounds")
-        );
+        assert_eq!(crash.panic_template.as_deref(), Some("index_out_of_bounds"));
         assert_eq!(
             crash.panic_fields.as_deref(),
             Some(r#"{"panic_container_len":3,"panic_index":7}"#)
@@ -1755,7 +1859,13 @@ mod tests {
         assert!(crash.panic_info.contains("message=omitted"));
         assert!(!crash.panic_info.contains("user said"));
         assert!(crash.backtrace.is_none());
-        assert!(crash.backtrace_symbols.as_deref().unwrap().contains("QueryEngine"));
+        assert!(
+            crash
+                .backtrace_symbols
+                .as_deref()
+                .unwrap()
+                .contains("QueryEngine")
+        );
         assert_eq!(crash.panic_template.as_deref(), Some("unknown"));
         assert!(crash.panic_message_len.unwrap() > 0);
     }
@@ -1778,7 +1888,13 @@ mod tests {
     fn verbose_mode_ingests_legacy_text_as_a_local_copy() {
         let crash = ingest_raw("legacy_verbose", legacy_raw_report(), false, true);
         assert!(crash.panic_info.contains("user said"));
-        assert!(crash.backtrace.as_deref().unwrap().contains("/home/somebody"));
+        assert!(
+            crash
+                .backtrace
+                .as_deref()
+                .unwrap()
+                .contains("/home/somebody")
+        );
     }
 
     /// A summary written by the default hook survives a later verbose
@@ -1830,6 +1946,112 @@ mod tests {
         assert_eq!(reporter.ingest_pending(&store).unwrap(), 0);
         assert!(!path.exists(), "an expired raw local copy must be removed");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The host installs the hook unconditionally, but an opted-out session
+    /// leaves capture disabled: a panic must write no pending file.
+    #[test]
+    fn capture_disabled_writes_no_pending_file() {
+        let _guard = PANIC_HOOK_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let dir = crash_dir("capture_disabled");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let previous = std::panic::take_hook();
+        set_capture_enabled(false);
+        CrashReporter::new(dir.clone())
+            .with_strict(false)
+            .with_verbose(false)
+            .install_hook();
+
+        let result = std::panic::catch_unwind(|| panic!("capture-disabled test panic"));
+        assert!(result.is_err());
+
+        std::panic::set_hook(previous);
+        assert_eq!(
+            pending_json_files(&dir),
+            0,
+            "capture is disabled, so the panic must not leave a pending file"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn capture_enabled_writes_a_pending_file() {
+        let _guard = PANIC_HOOK_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let dir = crash_dir("capture_enabled");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let previous = std::panic::take_hook();
+        set_capture_enabled(true);
+        CrashReporter::new(dir.clone())
+            .with_strict(false)
+            .with_verbose(false)
+            .install_hook();
+
+        let result = std::panic::catch_unwind(|| panic!("capture-enabled test panic"));
+        assert!(result.is_err());
+
+        std::panic::set_hook(previous);
+        set_capture_enabled(false);
+        assert_eq!(
+            pending_json_files(&dir),
+            1,
+            "an enabled capture must write exactly one pending file"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Pruning is available to the telemetry-disabled startup path: it needs
+    /// only the directory and a cutoff, and removes exactly the expired files.
+    #[test]
+    fn prune_pending_removes_only_files_older_than_the_cutoff() {
+        let dir = crash_dir("prune_explicit");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let now = SystemTime::now();
+        let ttl = std::time::Duration::from_secs(DEFAULT_PENDING_MAX_AGE_SECS);
+        let old = dir.join("crash_old.json");
+        let fresh = dir.join("crash_fresh.json");
+        let not_a_crash = dir.join("notes.txt");
+        for path in [&old, &fresh, &not_a_crash] {
+            std::fs::write(path, "{}").unwrap();
+        }
+        let day = std::time::Duration::from_secs(24 * 60 * 60);
+        let file = std::fs::OpenOptions::new().write(true).open(&old).unwrap();
+        file.set_modified(now - 10 * day).unwrap();
+        drop(file);
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&fresh)
+            .unwrap();
+        file.set_modified(now - day).unwrap();
+        drop(file);
+
+        let cutoff = now.checked_sub(ttl).unwrap();
+        assert_eq!(prune_pending(&dir, cutoff).unwrap(), 1);
+
+        assert!(!old.exists(), "a file past the TTL must be removed");
+        assert!(fresh.exists(), "a file within the TTL must be kept");
+        assert!(not_a_crash.exists(), "non-crash files must be ignored");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn prune_pending_missing_directory_is_not_an_error() {
+        let dir = crash_dir("prune_missing");
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(
+            prune_pending(&dir, SystemTime::now()).unwrap(),
+            0,
+            "a missing pending directory has nothing to prune"
+        );
     }
 
     #[test]

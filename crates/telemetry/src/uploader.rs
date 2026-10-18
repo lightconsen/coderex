@@ -404,6 +404,9 @@ impl TelemetryUploader {
     ///
     /// When telemetry is disabled this is a no-op: no first-party request and
     /// no export channel request is made, and no row is marked uploaded.
+    ///
+    /// Crash reports are uploaded even when there are no pending events, so an
+    /// eventless or fully sampled-out session does not strand them.
     pub async fn upload_pending(&self) -> Result<(), TelemetryError> {
         if !self.config.enabled {
             return Ok(());
@@ -413,7 +416,10 @@ impl TelemetryUploader {
 
         let events = store.pending_events(self.config.batch_size)?;
         if events.is_empty() {
-            return Ok(());
+            // No events does not mean no telemetry: a sampled-out or eventless
+            // session can still have pending crash reports. Upload those before
+            // returning so they are not stranded forever.
+            return self.upload_pending_crashes().await;
         }
 
         let ids: Vec<i64> = events.iter().map(|e| e.id).collect();
@@ -474,8 +480,10 @@ impl TelemetryUploader {
     }
 
     async fn upload_pending_crashes(&self) -> Result<(), TelemetryError> {
+        // The store owns a rusqlite `Connection`, which is `Send` but not
+        // `Sync`; it must be owned here rather than borrowed from the caller,
+        // or the future stops being `Send` and cannot be spawned.
         let store = self.open_store()?;
-
         let crashes = store.pending_crashes(self.config.batch_size)?;
         if crashes.is_empty() {
             return Ok(());
@@ -784,6 +792,48 @@ mod tests {
             1,
             "a disabled uploader must not mark the row uploaded"
         );
+    }
+
+    /// A session that recorded no events (for example every event was sampled
+    /// out) must still upload its pending crash reports. The empty-event early
+    /// return used to skip them forever.
+    #[tokio::test]
+    async fn pending_crash_is_uploaded_when_there_are_no_events() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/crashes"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+
+        let file = tempfile::NamedTempFile::new().unwrap();
+        {
+            let store = TelemetryStore::open(file.path()).unwrap();
+            store
+                .insert_crash("panicked at src/main.rs:1:1:\nboom", None)
+                .unwrap();
+            assert_eq!(store.event_count().unwrap(), 0);
+        }
+
+        let uploader = TelemetryUploader::new(
+            file.path().to_path_buf(),
+            TelemetryConfig {
+                endpoint: format!("{}/events", server.uri()),
+                crash_endpoint: Some(format!("{}/crashes", server.uri())),
+                ..Default::default()
+            },
+        );
+
+        uploader.upload_pending().await.unwrap();
+
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 1, "the crash request must be attempted");
+        assert_eq!(requests[0].url.path(), "/crashes");
+        let body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+        assert_eq!(body["crashes"].as_array().unwrap().len(), 1);
+
+        let store = TelemetryStore::open(file.path()).unwrap();
+        assert_eq!(store.pending_crashes(10).unwrap().len(), 0);
     }
 
     #[tokio::test]
@@ -1342,10 +1392,7 @@ mod tests {
         );
         let payload = build_crash_payload(&Scrubber::new(), &crash, false, false);
 
-        assert_eq!(
-            payload["redaction_status"],
-            serde_json::json!("symbolized")
-        );
+        assert_eq!(payload["redaction_status"], serde_json::json!("symbolized"));
         assert_eq!(
             payload["panic_template"],
             serde_json::json!("index_out_of_bounds")
@@ -1437,10 +1484,7 @@ mod tests {
             serde_json::json!(["coderex_core::engine::run"])
         );
         assert_eq!(payload["backtrace_frame_count"], serde_json::json!(9));
-        assert_eq!(
-            payload["redaction_status"],
-            serde_json::json!("symbolized")
-        );
+        assert_eq!(payload["redaction_status"], serde_json::json!("symbolized"));
     }
 
     /// The preview API returns exactly what the upload path builds — including
@@ -1482,7 +1526,10 @@ mod tests {
         assert!(preview.get("backtrace").is_none(), "{preview}");
         let rendered = preview.to_string();
         assert!(!rendered.contains("user said"), "{rendered}");
-        assert!(!rendered.contains("coderex_core::engine::run"), "{rendered}");
+        assert!(
+            !rendered.contains("coderex_core::engine::run"),
+            "{rendered}"
+        );
         // The strict allowlist must accept every key we produce.
         assert_ne!(
             preview["redaction_status"],
@@ -1522,10 +1569,7 @@ mod tests {
         assert!(!rendered.contains("user said"), "{rendered}");
         assert!(!rendered.contains("/home/bob"), "{rendered}");
         assert!(!rendered.contains("secret.rs"), "{rendered}");
-        assert_eq!(
-            payload["redaction_status"],
-            serde_json::json!("symbolized")
-        );
+        assert_eq!(payload["redaction_status"], serde_json::json!("symbolized"));
     }
 
     /// A panic location with an absolute path is made relative and the home

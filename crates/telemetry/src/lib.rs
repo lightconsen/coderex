@@ -29,8 +29,8 @@ pub use channels::{
 pub use crash::{
     BacktraceSymbols, CRASH_VERBOSE_ENV, CrashReport, CrashReporter, DEFAULT_CRASH_RETENTION_DAYS,
     DEFAULT_PENDING_MAX_AGE_SECS, MAX_BACKTRACE_FRAMES, PanicClassification, PanicTemplate,
-    classify_panic_message, crash_verbose, crash_verbose_with, symbolize_backtrace,
-    symbolize_backtrace_limited,
+    capture_enabled, classify_panic_message, crash_verbose, crash_verbose_with, prune_pending,
+    set_capture_enabled, symbolize_backtrace, symbolize_backtrace_limited,
 };
 pub use scrubber::Scrubber;
 pub use store::{PendingCrash, PendingEvent, TelemetryEvent, TelemetryStore};
