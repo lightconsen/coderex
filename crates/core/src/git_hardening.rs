@@ -7,11 +7,12 @@
 //! None of that is visible in a command line, and all of it matters the moment
 //! CodeRex runs `git` inside a checkout it did not create.
 //!
-//! The reference solves this by injecting a fixed config table into every git
-//! process it spawns, through `GIT_CONFIG_*` environment variables rather than
-//! by rewriting the command line — which is what makes it apply to the shell's
-//! own git calls too, not just to the ones the program makes. This port keeps
-//! the table and the mechanism.
+//! The reference solves this by injecting a fixed config table through
+//! `GIT_CONFIG_*` environment variables rather than by rewriting the command
+//! line. It injects them process-wide, so git calls made from its shell inherit
+//! them too. This port sets the same variables on each [`git_command()`] spawn
+//! instead: every git command CodeRex starts is hardened, but a user's own
+//! `git` run through the Bash tool is not covered.
 //!
 //! It is deliberately **not** a sandbox. It removes the ways a repository's
 //! config can decide what runs; it does not stop the program from running.
@@ -66,7 +67,8 @@ pub fn harden(command: &mut Command) {
 /// A hardened `git` command.
 ///
 /// Every place CodeRex runs `git` on its own behalf should start here; the
-/// hardening is only as good as the call sites that use it.
+/// hardening is only as good as the call sites that use it. There are currently
+/// 14 production call sites across the workspace (test modules excluded).
 #[must_use]
 pub fn git_command() -> Command {
     let mut command = Command::new("git");
@@ -126,12 +128,17 @@ mod tests {
             .collect();
 
         assert!(
-            envs.iter()
-                .any(|(key, value)| key == "GIT_CONFIG_COUNT" && value == &HARDENED_CONFIG.len().to_string())
+            envs.iter().any(|(key, value)| key == "GIT_CONFIG_COUNT"
+                && value == &HARDENED_CONFIG.len().to_string())
         );
-        assert!(envs.iter().any(|(key, value)| key == "GIT_CONFIG_KEY_0"
-            && value == "core.fsmonitor"));
-        assert!(envs.iter().any(|(key, value)| key == "GIT_CONFIG_VALUE_0" && value.is_empty()));
+        assert!(
+            envs.iter()
+                .any(|(key, value)| key == "GIT_CONFIG_KEY_0" && value == "core.fsmonitor")
+        );
+        assert!(
+            envs.iter()
+                .any(|(key, value)| key == "GIT_CONFIG_VALUE_0" && value.is_empty())
+        );
         // Every key has a slot.
         assert_eq!(
             envs.iter()
@@ -163,19 +170,23 @@ mod tests {
 
         let repo = dir.path().join("repo");
         std::fs::create_dir_all(&repo).unwrap();
-        assert!(Command::new("git")
-            .args(["init", "-q"])
-            .current_dir(&repo)
-            .status()
-            .unwrap()
-            .success());
-        assert!(Command::new("git")
-            .args(["config", "core.fsmonitor"])
-            .arg(&hook)
-            .current_dir(&repo)
-            .status()
-            .unwrap()
-            .success());
+        assert!(
+            Command::new("git")
+                .args(["init", "-q"])
+                .current_dir(&repo)
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(
+            Command::new("git")
+                .args(["config", "core.fsmonitor"])
+                .arg(&hook)
+                .current_dir(&repo)
+                .status()
+                .unwrap()
+                .success()
+        );
 
         // Control: without the hardening, the repository's hook runs.
         let _ = Command::new("git")

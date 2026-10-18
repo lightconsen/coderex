@@ -10,14 +10,12 @@ use coderex_core::engine::{
     QueryEngine, StructuredOutputValidator, SubmitOptions, ValidationResult,
 };
 use coderex_core::job_record::{JobKind, JobRecord, JobState, JobStore};
-use coderex_core::orchestrator::{
-    run_background_feature, run_forked_agent, BackgroundFeatureRequest, QueryResult,
-};
+use coderex_core::orchestrator::{BackgroundFeatureRequest, QueryResult, run_background_feature};
 use coderex_core::permission_engine::{BackgroundAgentDenyHook, PermissionEngine};
 use coderex_core::permissions::{PermissionChecker, PermissionMode};
 use coderex_core::sandbox::SandboxConfig;
 use coderex_core::state::SessionState;
-use coderex_core::task::{now_ms, TaskHandle, TaskKind, TaskManager};
+use coderex_core::task::{TaskHandle, TaskKind, TaskManager, now_ms};
 use coderex_core::tool_executor::ToolExecutor;
 use coderex_core::types::{
     AgentLifecycleEvent, EngineEvent, Message, MessageContent, ModelId, Role, ToolCall, ToolResult,
@@ -30,7 +28,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 use thiserror::Error;
-use tokio::sync::{broadcast, mpsc, watch, Mutex};
+use tokio::sync::{Mutex, broadcast, mpsc, watch};
 
 use crate::custom_agents::CustomAgentDef;
 use crate::types::AgentType;
@@ -243,7 +241,11 @@ impl ParentContextSnapshot {
     /// The cache-safety parameters implied by this snapshot.
     #[must_use]
     pub fn cache_safe_params(&self) -> CacheSafeParams {
-        CacheSafeParams::new(self.model.clone(), self.system_prompt.clone(), self.tool_names.clone())
+        CacheSafeParams::new(
+            self.model.clone(),
+            self.system_prompt.clone(),
+            self.tool_names.clone(),
+        )
     }
 
     /// Whether there is a conversation prefix worth reusing.
@@ -486,9 +488,7 @@ impl AgentSubscription {
     ///
     /// Events for other agents are skipped. Lags are reported by the
     /// underlying broadcast channel; the next call resumes after the gap.
-    pub async fn recv(
-        &mut self,
-    ) -> Result<AgentObservableEvent, broadcast::error::RecvError> {
+    pub async fn recv(&mut self) -> Result<AgentObservableEvent, broadcast::error::RecvError> {
         loop {
             let event = self.rx.recv().await?;
             if Self::matches(self.agent_id.as_deref(), &event) {
@@ -499,9 +499,7 @@ impl AgentSubscription {
 
     /// Try to receive the next event for this subscription's agent without
     /// waiting.
-    pub fn try_recv(
-        &mut self,
-    ) -> Result<AgentObservableEvent, broadcast::error::TryRecvError> {
+    pub fn try_recv(&mut self) -> Result<AgentObservableEvent, broadcast::error::TryRecvError> {
         loop {
             let event = self.rx.try_recv()?;
             if Self::matches(self.agent_id.as_deref(), &event) {
@@ -930,10 +928,8 @@ impl AgentManager {
             // written elsewhere would never be found.
             let store = JobStore::new(cwd);
             let id = job_record_id("agent", &task_id, started_at_ms);
-            let description = job_description(
-                &format!("{}: ", agent_type_name(&agent_type)),
-                prompt,
-            );
+            let description =
+                job_description(&format!("{}: ", agent_type_name(&agent_type)), prompt);
             let mut record = JobRecord::new(
                 id.clone(),
                 JobKind::Agent,
@@ -1385,37 +1381,7 @@ impl AgentManager {
         .await
     }
 
-    // ─── Forked / Background Agent Execution ─────────────────────────────────
-
-    /// Run a forked agent via this manager's API client.
-    ///
-    /// Requires `set_api_client` to have been called first.
-    pub async fn run_forked_agent(
-        &self,
-        system_prompt: &str,
-        user_prompt: &str,
-        parent_context: Option<&str>,
-        allowed_tools: Option<&[String]>,
-        model: &coderex_core::types::ModelId,
-        max_tokens: u32,
-        writable: bool,
-    ) -> Result<QueryResult, AgentError> {
-        let client = self.api_client.as_ref().ok_or_else(|| {
-            AgentError::SpawnFailed("API client not configured on AgentManager".into())
-        })?;
-        run_forked_agent(
-            client.as_ref(),
-            system_prompt,
-            user_prompt,
-            parent_context,
-            allowed_tools,
-            model,
-            max_tokens,
-            writable,
-        )
-        .await
-        .map_err(|e| AgentError::SpawnFailed(e.to_string()))
-    }
+    // ─── Background Agent Execution ──────────────────────────────────────────
 
     /// Run a background feature via this manager's API client.
     ///
@@ -2128,8 +2094,14 @@ fn message_from_blocks(role: Role, blocks: &[serde_json::Value]) -> Result<Messa
                     .ok_or_else(|| format!("tool_result block has no tool_use_id: {block}"))?;
                 let output = match block.get("content") {
                     Some(serde_json::Value::String(text)) => text.clone(),
-                    Some(serde_json::Value::Array(items)) => blocks_text(items)
-                        .unwrap_or_else(|| block.get("content").map(ToString::to_string).unwrap_or_default()),
+                    Some(serde_json::Value::Array(items)) => {
+                        blocks_text(items).unwrap_or_else(|| {
+                            block
+                                .get("content")
+                                .map(ToString::to_string)
+                                .unwrap_or_default()
+                        })
+                    }
                     Some(other) => other.to_string(),
                     None => String::new(),
                 };
@@ -2194,7 +2166,10 @@ const READ_ONLY_TOOLS: [&str; 3] = ["Read", "Grep", "Glob"];
 /// set; for an explicit whitelist, entries that are not read-only are
 /// dropped. The engine enforces the result through
 /// `SubmitOptions::allowed_tools_override`.
-fn effective_allowed_tools(allowed_tools: Option<Vec<String>>, writable: bool) -> Option<Vec<String>> {
+fn effective_allowed_tools(
+    allowed_tools: Option<Vec<String>>,
+    writable: bool,
+) -> Option<Vec<String>> {
     if writable {
         return allowed_tools;
     }
@@ -2203,10 +2178,19 @@ fn effective_allowed_tools(allowed_tools: Option<Vec<String>>, writable: bool) -
         Some(tools) => Some(
             tools
                 .into_iter()
-                .filter(|tool| READ_ONLY_TOOLS.iter().any(|allowed| allowed.eq_ignore_ascii_case(tool)))
+                .filter(|tool| {
+                    READ_ONLY_TOOLS
+                        .iter()
+                        .any(|allowed| allowed.eq_ignore_ascii_case(tool))
+                })
                 .collect(),
         ),
-        None => Some(READ_ONLY_TOOLS.iter().map(|tool| (*tool).to_string()).collect()),
+        None => Some(
+            READ_ONLY_TOOLS
+                .iter()
+                .map(|tool| (*tool).to_string())
+                .collect(),
+        ),
     }
 }
 
@@ -2878,9 +2862,7 @@ mod tests {
             use coderex_core::api_client::ApiResponse;
             use coderex_core::types::UsageSummary;
 
-            let call = self
-                .calls
-                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let call = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             let usage = UsageSummary {
                 input_tokens: 1,
                 output_tokens: 1,
@@ -2916,11 +2898,7 @@ mod tests {
             _max_tokens: u32,
             _tools: &[coderex_core::tool_executor::ToolInfo],
         ) -> std::pin::Pin<
-            Box<
-                dyn futures::Stream<Item = coderex_core::api_client::StreamEvent>
-                    + Send
-                    + 'static,
-            >,
+            Box<dyn futures::Stream<Item = coderex_core::api_client::StreamEvent> + Send + 'static>,
         > {
             Box::pin(futures::stream::iter([
                 coderex_core::api_client::StreamEvent::StreamEnd,
@@ -2972,11 +2950,7 @@ mod tests {
             _max_tokens: u32,
             _tools: &[coderex_core::tool_executor::ToolInfo],
         ) -> std::pin::Pin<
-            Box<
-                dyn futures::Stream<Item = coderex_core::api_client::StreamEvent>
-                    + Send
-                    + 'static,
-            >,
+            Box<dyn futures::Stream<Item = coderex_core::api_client::StreamEvent> + Send + 'static>,
         > {
             Box::pin(futures::stream::iter([
                 coderex_core::api_client::StreamEvent::StreamEnd,
@@ -3006,8 +2980,7 @@ mod tests {
             _tools: &[coderex_core::tool_executor::ToolInfo],
         ) -> Result<coderex_core::api_client::ApiResponse, coderex_core::api_client::ApiError>
         {
-            self.calls
-                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Err(coderex_core::api_client::ApiError::Auth(
                 "no credentials".into(),
             ))
@@ -3021,11 +2994,7 @@ mod tests {
             _max_tokens: u32,
             _tools: &[coderex_core::tool_executor::ToolInfo],
         ) -> std::pin::Pin<
-            Box<
-                dyn futures::Stream<Item = coderex_core::api_client::StreamEvent>
-                    + Send
-                    + 'static,
-            >,
+            Box<dyn futures::Stream<Item = coderex_core::api_client::StreamEvent> + Send + 'static>,
         > {
             Box::pin(futures::stream::empty())
         }
@@ -3307,7 +3276,9 @@ mod tests {
         }
 
         assert!(
-            events.iter().any(|event| matches!(event, AgentLifecycleEvent::Started)),
+            events
+                .iter()
+                .any(|event| matches!(event, AgentLifecycleEvent::Started)),
             "missing Started: {events:?}"
         );
         assert!(
@@ -3325,7 +3296,9 @@ mod tests {
             "missing TextDelta: {events:?}"
         );
         assert!(
-            events.iter().any(|event| matches!(event, AgentLifecycleEvent::Idle { .. })),
+            events
+                .iter()
+                .any(|event| matches!(event, AgentLifecycleEvent::Idle { .. })),
             "missing Idle: {events:?}"
         );
         assert!(
@@ -3348,5 +3321,4 @@ mod tests {
         assert!(json.contains("agent_1"));
         assert!(json.contains("hello"));
     }
-
 }

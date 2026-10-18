@@ -1164,6 +1164,20 @@ enum LoopStep {
     Break(TerminalReason),
 }
 
+/// Update the count of provider-paused turns that have run back to back.
+///
+/// `resumes` must count *consecutive* pauses: a `Resume` increments it, and
+/// every other reason resets it to zero. A counter that only ever increments
+/// would eventually stop resuming after a handful of unrelated turns, even
+/// though the cap is meant to bound one run of provider pauses.
+fn track_provider_resumes(reason: &TerminalReason, resumes: &mut u32) {
+    if matches!(reason, TerminalReason::Resume) {
+        *resumes += 1;
+    } else {
+        *resumes = 0;
+    }
+}
+
 /// Decide whether the loop runs another turn after `reason`.
 ///
 /// `last_message_is_tool_result` is the old rule for `Completed`: a turn that
@@ -1939,11 +1953,12 @@ impl QueryEngine {
                         .last()
                         .map(|m| matches!(m.role, crate::types::Role::Tool))
                         .unwrap_or(false);
-                    match next_loop_step(&reason, last_is_tool_result, provider_resumes) {
+                    let step = next_loop_step(&reason, last_is_tool_result, provider_resumes);
+                    // Update only after deciding the step: the cap is checked
+                    // against the number of resumes that have already run.
+                    track_provider_resumes(&reason, &mut provider_resumes);
+                    match step {
                         LoopStep::Continue => {
-                            if matches!(reason, TerminalReason::Resume) {
-                                provider_resumes += 1;
-                            }
                             turn_number += 1;
                         }
                         LoopStep::Break(reason) => {
@@ -2043,11 +2058,12 @@ impl QueryEngine {
                         .last()
                         .map(|m| matches!(m.role, crate::types::Role::Tool))
                         .unwrap_or(false);
-                    match next_loop_step(&reason, last_is_tool_result, provider_resumes) {
+                    let step = next_loop_step(&reason, last_is_tool_result, provider_resumes);
+                    // Update only after deciding the step: the cap is checked
+                    // against the number of resumes that have already run.
+                    track_provider_resumes(&reason, &mut provider_resumes);
+                    match step {
                         LoopStep::Continue => {
-                            if matches!(reason, TerminalReason::Resume) {
-                                provider_resumes += 1;
-                            }
                             turn_number += 1;
                         }
                         LoopStep::Break(reason) => {
@@ -3437,13 +3453,7 @@ impl QueryEngine {
         // prompt cache, and the TTL trigger measures idleness from here.
         self.last_request_at = Some(Instant::now());
         let response = match request_client
-            .create_message(
-                &system,
-                &messages,
-                &self.model,
-                self.max_tokens,
-                &tools,
-            )
+            .create_message(&system, &messages, &self.model, self.max_tokens, &tools)
             .await
         {
             Ok(resp) => resp,
@@ -3533,13 +3543,7 @@ impl QueryEngine {
                 .api_client
                 .with_request_context(self.build_request_context(self.current_turn, options));
             let mut stream = request_client
-                .create_message_streaming(
-                    &system,
-                    &messages,
-                    &self.model,
-                    self.max_tokens,
-                    &tools,
-                )
+                .create_message_streaming(&system, &messages, &self.model, self.max_tokens, &tools)
                 .await;
             self.last_request_at = Some(Instant::now());
 
@@ -6613,8 +6617,8 @@ mod tests {
     #[tokio::test]
     async fn elicitation_heuristic_triggers_in_execute_turn() {
         use std::sync::{
-            atomic::{AtomicUsize, Ordering},
             Arc,
+            atomic::{AtomicUsize, Ordering},
         };
 
         struct StatefulMock {
@@ -6906,6 +6910,23 @@ mod tests {
             next_loop_step(&TerminalReason::Completed, false, 0),
             LoopStep::Break(TerminalReason::Completed)
         ));
+    }
+
+    /// The provider-resume cap bounds consecutive pauses, not every pause in
+    /// the run: a normal turn between two pauses resets the count.
+    #[test]
+    fn provider_resumes_are_consecutive() {
+        let mut resumes = 0;
+        for _ in 0..3 {
+            track_provider_resumes(&TerminalReason::Resume, &mut resumes);
+        }
+        assert_eq!(resumes, 3);
+
+        track_provider_resumes(&TerminalReason::Completed, &mut resumes);
+        assert_eq!(resumes, 0, "a completed turn resets the pause count");
+
+        track_provider_resumes(&TerminalReason::Resume, &mut resumes);
+        assert_eq!(resumes, 1);
     }
 
     /// An error reason ends the run.
@@ -7543,9 +7564,11 @@ mod tests {
             .expect("a second backup");
 
         assert_ne!(first, second, "the first backup must survive a second");
-        assert!(std::fs::read_to_string(&first)
-            .unwrap()
-            .contains("the history"));
+        assert!(
+            std::fs::read_to_string(&first)
+                .unwrap()
+                .contains("the history")
+        );
     }
 
     /// There is nothing to back up before the first write.
@@ -7553,9 +7576,11 @@ mod tests {
     fn there_is_nothing_to_back_up_before_the_first_write() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("session.jsonl");
-        assert!(QueryEngine::write_transcript_backup(&path)
-            .unwrap()
-            .is_none());
+        assert!(
+            QueryEngine::write_transcript_backup(&path)
+                .unwrap()
+                .is_none()
+        );
     }
 
     /// Compacting a session with a transcript on disk leaves a backup holding
@@ -7625,17 +7650,21 @@ mod tests {
         turn.messages = vec![Message::user("hello")];
 
         // Never sent a request — no TTL to have elapsed.
-        assert!(engine
-            .maybe_compact_on_cache_ttl(&mut turn, &SubmitOptions::default(), 1)
-            .await
-            .is_none());
+        assert!(
+            engine
+                .maybe_compact_on_cache_ttl(&mut turn, &SubmitOptions::default(), 1)
+                .await
+                .is_none()
+        );
 
         // A request a moment ago leaves the cache warm.
         engine.last_request_at = Some(Instant::now());
-        assert!(engine
-            .maybe_compact_on_cache_ttl(&mut turn, &SubmitOptions::default(), 1)
-            .await
-            .is_none());
+        assert!(
+            engine
+                .maybe_compact_on_cache_ttl(&mut turn, &SubmitOptions::default(), 1)
+                .await
+                .is_none()
+        );
     }
 
     /// Once the token line is crossed the threshold path owns compaction, and
