@@ -1262,6 +1262,11 @@ impl ReplLoop {
     /// them out of plan mode, which is what we want: publishing is not a
     /// read-only planning action.
     pub async fn start_artifact_serving(&mut self) {
+        // Starting twice would leak the first listener and register the tool
+        // family twice; callers can ask unconditionally.
+        if self.artifact_server.is_some() {
+            return;
+        }
         let Some(dispatcher) = self.dispatcher.as_ref() else {
             return;
         };
@@ -1302,6 +1307,16 @@ impl ReplLoop {
         tracing::info!(origin = server.origin(), "artifacts are served locally");
 
         self.artifact_server = Some(server);
+    }
+
+    /// Stop the local artifact server, if one is running.
+    ///
+    /// The server owns a background task, so it is shut down explicitly rather
+    /// than left to whether the caller still holds the [`ReplLoop`].
+    pub async fn stop_artifact_serving(&mut self) {
+        if let Some(server) = self.artifact_server.take() {
+            server.shutdown().await;
+        }
     }
 
     /// Publish artifacts somewhere other than the default location.
@@ -2140,8 +2155,18 @@ impl ReplLoop {
     }
 
     /// Run the interactive REPL loop reading from stdin.
-    #[allow(clippy::unused_async)]
+    ///
+    /// Artifacts are served from a loopback origin here too, because a page
+    /// published in the plain (non-TUI) REPL is only useful if there is
+    /// something to open it. The server is shut down on every exit path.
     pub async fn run_interactive(&mut self) -> Result<()> {
+        self.start_artifact_serving().await;
+        let result = self.run_interactive_loop().await;
+        self.stop_artifact_serving().await;
+        result
+    }
+
+    async fn run_interactive_loop(&mut self) -> Result<()> {
         let stdin = std::io::stdin();
         let stdout = std::io::stdout();
         let mut stdout = stdout.lock();
@@ -3304,16 +3329,29 @@ impl ReplLoop {
         let _ = terminal_ui.exit();
         let _ = disable_raw_mode();
         self.event_rx = event_rx;
+        self.stop_artifact_serving().await;
 
         result
     }
 
     /// Run a single query in non-interactive (headless) mode.
+    ///
+    /// A headless session can publish artifacts just like an interactive one,
+    /// so the local origin is started before the turn and shut down after it.
+    /// A failure to serve is logged by [`Self::start_artifact_serving`] and
+    /// does not stop the turn.
     pub async fn run_headless(&mut self, prompt: &str) -> Result<String> {
         if let Some(error) = self.setup_error.as_deref() {
             return Err(anyhow::anyhow!("{error}"));
         }
 
+        self.start_artifact_serving().await;
+        let result = self.run_headless_turn(prompt).await;
+        self.stop_artifact_serving().await;
+        result
+    }
+
+    async fn run_headless_turn(&mut self, prompt: &str) -> Result<String> {
         if prompt.starts_with('/') {
             // Slash commands go through the same dispatch the interactive
             // non-TUI path uses. That dispatch owns the built-ins which change
@@ -7135,6 +7173,41 @@ mod tests {
         if let Some(server) = repl.artifact_server.take() {
             server.shutdown().await;
         }
+    }
+
+    #[tokio::test]
+    async fn headless_starts_artifacts_and_stops_the_server_when_the_turn_ends() {
+        let api = ReadThenAnswerApi {
+            call: Arc::new(std::sync::Mutex::new(0)),
+            expected_contents: "unused",
+        };
+        let mut repl = ReplLoop::with_engine(Box::new(api), "/tmp".into(), ModelId::sonnet());
+        let store = tempfile::tempdir().unwrap();
+        repl.with_artifact_store_root(store.path().to_path_buf());
+        let dispatcher = repl.dispatcher.clone().expect("engine has a dispatcher");
+
+        // A slash command completes a headless turn without an API call.
+        let output = repl.run_headless("/status").await.unwrap();
+        assert!(output.contains("System Status"));
+
+        for name in [
+            "Artifact",
+            "ArtifactData",
+            "ArtifactComments",
+            "ArtifactCheck",
+        ] {
+            assert!(
+                dispatcher.registry().get_tool_arc(name).is_some(),
+                "{name} was not registered in headless mode"
+            );
+        }
+
+        // The server is stopped on exit, and stopping again is harmless.
+        assert!(
+            repl.artifact_server.is_none(),
+            "the artifact server outlived the headless turn"
+        );
+        repl.stop_artifact_serving().await;
     }
 
     #[test]

@@ -200,6 +200,42 @@ a log line. The tri-state deliberately has no `clean` value:
 The keys are selected by the marker: `structured` and `symbolized` payloads contain neither
 `panic_info` nor `message`, and the raw `backtrace` key is never produced in any mode.
 
+### Previewing a crash without uploading
+
+`coderex telemetry preview-crash` reads one pending crash file, applies the
+same ingestion modes a real startup would apply, and prints the exact JSON the
+uploader would send:
+
+```bash
+# The newest file in ~/.coderex/crashes/pending
+coderex telemetry preview-crash
+
+# A specific pending file
+coderex telemetry preview-crash ~/.coderex/crashes/pending/crash_1729.json
+```
+
+The command does **not** ingest, delete, or upload anything. Pending files are
+written by the panic hook as `crash_<millis>.json`; the default selection is
+the newest `*.json` by modification time. `CLAUDE_CONFIG_DIR` (the config-home
+override) is honored, as it is for the uploader.
+
+Tuning the modes works the same way it does for a real upload:
+
+```bash
+CODEREX_CRASH_VERBOSE=1 coderex telemetry preview-crash   # adds scrubbed panic_info
+CODEREX_HIPAA=1 coderex telemetry preview-crash           # structured only
+```
+
+`CODEREX_HIPAA` wins over `CODEREX_CRASH_VERBOSE`. Verbose output only appears
+when the pending file actually captured the raw local copy (the panic hook
+wrote it while verbose was enabled); previewing a structured file with verbose
+on does not invent text. The printer uses the same
+`preview_crash_payload` path as the uploader, so the keys and the
+`redaction_status` marker match what a real upload would carry.
+
+`CrashReporter::pending_crash_from_report` exposes the conversion for callers
+that want to build the same row shape in-process.
+
 ### Architecture Patterns
 
 - **Producer-consumer**: `TelemetryHandle` (sender) → worker thread (receiver) → SQLite.
@@ -218,7 +254,7 @@ The keys are selected by the marker: `structured` and `symbolized` payloads cont
 
 ### Public API Surface
 
-- `TelemetryHandle`, `TelemetryEvent`, `TelemetryStore`, `TelemetryUploader`, `TelemetryConfig`, `CrashReporter`, `CrashReport`, `PendingEvent`, `PendingCrash`, `Scrubber`, `HIPAA_ENV`, `hipaa_enabled`, `CRASH_VERBOSE_ENV`, `crash_verbose`, `crash_verbose_with`, `PanicTemplate`, `PanicClassification`, `classify_panic_message`, `BacktraceSymbols`, `symbolize_backtrace`, `symbolize_backtrace_limited`, `MAX_BACKTRACE_FRAMES`, `DEFAULT_PENDING_MAX_AGE_SECS`, `DEFAULT_CRASH_RETENTION_DAYS`, `preview_crash_payload`, `preview_crash_payload_with`.
+- `TelemetryHandle`, `TelemetryEvent`, `TelemetryStore`, `TelemetryUploader`, `TelemetryConfig`, `CrashReporter`, `CrashReport`, `PendingEvent`, `PendingCrash`, `Scrubber`, `HIPAA_ENV`, `hipaa_enabled`, `CRASH_VERBOSE_ENV`, `crash_verbose`, `crash_verbose_with`, `PanicTemplate`, `PanicClassification`, `classify_panic_message`, `BacktraceSymbols`, `symbolize_backtrace`, `symbolize_backtrace_limited`, `MAX_BACKTRACE_FRAMES`, `DEFAULT_PENDING_MAX_AGE_SECS`, `DEFAULT_CRASH_RETENTION_DAYS`, `preview_crash_payload`, `preview_crash_payload_with`. `CrashReporter::pending_crash_from_report` builds the upload-row shape from a pending file (used by `coderex telemetry preview-crash`).
 
 ## Current Status
 

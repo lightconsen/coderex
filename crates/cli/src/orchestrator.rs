@@ -4,7 +4,7 @@ use crate::cli::Cli;
 use crate::daemon;
 use crate::mcp_elicitation::SessionElicitationHandler;
 use crate::session_resume;
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 #[cfg(feature = "enterprise")]
 use coderex_config::config_home;
 use coderex_config::{ConfigService, RuntimeOverrides, Settings};
@@ -468,6 +468,7 @@ impl StartupOrchestrator {
                 crate::cli::Command::Mcp { action } => self.run_mcp(action).await,
                 crate::cli::Command::Plugin { action } => self.run_plugin(action).await,
                 crate::cli::Command::AutoMode => self.run_auto_mode().await,
+                crate::cli::Command::Telemetry { action } => self.run_telemetry(action).await,
                 crate::cli::Command::Bridge(args) => {
                     crate::bridge_launcher::run(args, std::path::Path::new(&self.ctx.cwd)).await
                 }
@@ -1846,6 +1847,87 @@ impl StartupOrchestrator {
             println!("  Use /auto-dream enable inside the REPL to enable.");
         }
         Ok(())
+    }
+
+    /// Inspect telemetry state without uploading anything.
+    #[allow(clippy::unused_async)]
+    async fn run_telemetry(&self, action: Option<crate::cli::TelemetryAction>) -> Result<()> {
+        match action {
+            Some(crate::cli::TelemetryAction::PreviewCrash { file }) => self.preview_crash(file),
+            None => {
+                println!("Usage: coderex telemetry preview-crash [FILE]");
+                Ok(())
+            }
+        }
+    }
+
+    /// Print the exact wire payload the uploader would send for one crash.
+    ///
+    /// The pending file is read but not removed or ingested, and nothing is
+    /// uploaded. `CODEREX_CRASH_VERBOSE` / `CODEREX_HIPAA` are resolved by the
+    /// same code paths the uploader uses.
+    fn preview_crash(&self, file: Option<std::path::PathBuf>) -> Result<()> {
+        let pending_dir = coderex_config::config_home()
+            .join("crashes")
+            .join("pending");
+        let path = match file {
+            Some(path) => path,
+            None => Self::latest_pending_crash(&pending_dir)?.ok_or_else(|| {
+                anyhow::anyhow!("no pending crash reports in {}", pending_dir.display())
+            })?,
+        };
+
+        let bytes = std::fs::read(&path)
+            .with_context(|| format!("cannot read pending crash {}", path.display()))?;
+        let report: coderex_telemetry::CrashReport = serde_json::from_slice(&bytes)
+            .with_context(|| format!("cannot parse pending crash {}", path.display()))?;
+
+        // The reporter supplies the ingestion modes (verbose/strict), so the
+        // row shape matches what a real ingestion would have stored.
+        let reporter = coderex_telemetry::CrashReporter::new(pending_dir);
+        let pending = reporter.pending_crash_from_report(&report);
+        let payload = coderex_telemetry::preview_crash_payload(&pending);
+        println!("{}", serde_json::to_string_pretty(&payload)?);
+        Ok(())
+    }
+
+    /// The newest `*.json` pending crash, by modification time then name.
+    fn latest_pending_crash(dir: &std::path::Path) -> Result<Option<std::path::PathBuf>> {
+        let entries = match std::fs::read_dir(dir) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => {
+                return Err(anyhow::anyhow!(
+                    "cannot read crash pending directory {}: {error}",
+                    dir.display()
+                ));
+            }
+        };
+
+        let mut newest: Option<(std::time::SystemTime, std::path::PathBuf)> = None;
+        for entry in entries {
+            let entry = entry.with_context(|| {
+                format!("cannot read crash pending directory {}", dir.display())
+            })?;
+            let path = entry.path();
+            if path.extension().and_then(|extension| extension.to_str()) != Some("json") {
+                continue;
+            }
+            let modified = entry
+                .metadata()
+                .and_then(|metadata| metadata.modified())
+                .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+            let replace = match &newest {
+                Some((current, current_path)) => {
+                    modified > *current || (modified == *current && path > *current_path)
+                }
+                None => true,
+            };
+            if replace {
+                newest = Some((modified, path));
+            }
+        }
+        Ok(newest.map(|(_, path)| path))
     }
 
     #[allow(clippy::unused_async)]

@@ -254,8 +254,31 @@ pub enum Command {
     },
     /// Configure auto-mode settings.
     AutoMode,
+    /// Inspect telemetry locally without uploading anything.
+    Telemetry {
+        #[command(subcommand)]
+        action: Option<TelemetryAction>,
+    },
     /// Run the bridge worker that serves the remote relay transport.
     Bridge(BridgeArgs),
+}
+
+/// Telemetry inspection subcommands.
+///
+/// These read the same local state the uploader would read and print the wire
+/// payload, but they never send it anywhere.
+#[derive(Subcommand, Debug)]
+pub enum TelemetryAction {
+    /// Print the JSON that would be uploaded for a pending crash.
+    ///
+    /// Reads the newest `*.json` file in the pending crash directory, or the
+    /// file given as an argument. `CODEREX_CRASH_VERBOSE` and `CODEREX_HIPAA`
+    /// affect the payload exactly as they do for a real upload.
+    PreviewCrash {
+        /// A pending crash file to preview (defaults to the newest one).
+        #[arg(value_name = "FILE")]
+        file: Option<PathBuf>,
+    },
 }
 
 /// Arguments for `coderex bridge`.
@@ -466,4 +489,41 @@ pub fn install_wasm_compiler() -> std::io::Result<()> {
             .arg(INTERNAL_WASM_COMPILE_FLAG),
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn preview_file(cli: Cli) -> Option<PathBuf> {
+        match cli.command {
+            Some(Command::Telemetry {
+                action: Some(TelemetryAction::PreviewCrash { file }),
+            }) => file,
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn telemetry_preview_crash_defaults_to_the_newest_pending_file() {
+        let cli = Cli::try_parse_from(["coderex", "telemetry", "preview-crash"]).unwrap();
+        assert_eq!(preview_file(cli), None);
+    }
+
+    #[test]
+    fn telemetry_preview_crash_accepts_an_explicit_file() {
+        let cli =
+            Cli::try_parse_from(["coderex", "telemetry", "preview-crash", "/tmp/crash_1.json"])
+                .unwrap();
+        assert_eq!(preview_file(cli), Some(PathBuf::from("/tmp/crash_1.json")));
+    }
+
+    #[test]
+    fn telemetry_without_an_action_is_still_parseable() {
+        let cli = Cli::try_parse_from(["coderex", "telemetry"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::Telemetry { action: None })
+        ));
+    }
 }

@@ -4,6 +4,7 @@
 //! run-eval --flow smoke --approve-harness          # pin the harness
 //! run-eval --flow smoke --variant baseline         # measure the baseline
 //! run-eval --flow smoke --variant v1 --reps 3      # measure a change
+//! run-eval --flow-dir evals/flows/smoke --variant baseline  # a checked-in flow
 //! ```
 //!
 //! Everything else is in the flow: the command each case runs and what it must
@@ -39,6 +40,7 @@ fn main_result() -> Result<(), HarnessError> {
 
         match argument {
             "--flow" => options.flow = value()?,
+            "--flow-dir" => options.flow_dir = Some(std::path::PathBuf::from(value()?)),
             "--variant" => options.variant = Variant::parse(&value()?)?,
             "--model" => options.model = Some(value()?),
             "--repo" => options.repo = std::path::PathBuf::from(value()?),
@@ -73,13 +75,24 @@ fn main_result() -> Result<(), HarnessError> {
         index += 1;
     }
 
-    if show_help || options.flow.is_empty() {
+    if show_help || (options.flow.is_empty() && options.flow_dir.is_none()) {
         print_help();
         return Ok(());
     }
 
     if options.approve_harness {
-        println!("Approving the harness for flow '{}'.", options.flow);
+        println!(
+            "Approving the harness for flow '{}'.",
+            if options.flow.is_empty() {
+                options
+                    .flow_dir
+                    .as_ref()
+                    .map(|dir| dir.display().to_string())
+                    .unwrap_or_default()
+            } else {
+                options.flow.clone()
+            }
+        );
     }
 
     let outcome = tokio::runtime::Builder::new_multi_thread()
@@ -120,9 +133,10 @@ fn print_help() {
     println!(
         "run-eval — run a hill-climb flow\n\
          \n\
-         usage: run-eval --flow DIR --variant ID [options]\n\
+         usage: run-eval (--flow DIR | --flow-dir PATH) --variant ID [options]\n\
          \n\
          \x20 --flow DIR          the flow to run (under .coderex/hillclimb/)\n\
+         \x20 --flow-dir PATH     the flow's directory, wherever it is checked in\n\
          \x20 --variant ID        'baseline' or 'v<N>'\n\
          \x20 --model ID          passed to the command as {{model}}\n\
          \x20 --repo DIR          the repository the flow lives in (default: here)\n\

@@ -1003,6 +1003,39 @@ impl CrashReporter {
         Ok(count)
     }
 
+    /// Build the upload-row shape for a captured report without ingesting it.
+    ///
+    /// The modes resolved at construction ([`CODEREX_CRASH_VERBOSE`] and
+    /// [`CODEREX_HIPAA`](crate::HIPAA_ENV)) are applied exactly as
+    /// [`Self::ingest_pending`] would apply them: raw text is kept only when
+    /// verbose is on and strict mode is off, symbol frames are dropped in
+    /// strict mode, and the structured summary is scrubbed. The returned row
+    /// has `id` 0 (it has no database row) and carries the report's own
+    /// timestamp.
+    ///
+    /// This is the preview path for a pending file: pass the result to
+    /// [`crate::preview_crash_payload`].
+    ///
+    /// [`CODEREX_CRASH_VERBOSE`]: crate::CRASH_VERBOSE_ENV
+    #[must_use]
+    pub fn pending_crash_from_report(&self, report: &CrashReport) -> crate::PendingCrash {
+        let record = self.crash_record(report, &crate::Scrubber::new());
+        crate::PendingCrash {
+            id: 0,
+            panic_info: record.panic_info,
+            backtrace: record.backtrace,
+            created_at: report.timestamp.to_rfc3339(),
+            panic_template: record.panic_template,
+            panic_fields: record.panic_fields,
+            panic_message_len: record.panic_message_len,
+            panic_message_sha256: record.panic_message_sha256,
+            backtrace_symbols: record.backtrace_symbols,
+            backtrace_frame_count: record.backtrace_frame_count,
+            backtrace_symbols_len: record.backtrace_symbols_len,
+            backtrace_symbols_sha256: record.backtrace_symbols_sha256,
+        }
+    }
+
     /// Turn a captured report into a row, respecting the current mode.
     fn crash_record(&self, report: &CrashReport, scrubber: &crate::Scrubber) -> CrashRecord {
         let classification = classification_from_report(report);
@@ -1352,6 +1385,49 @@ mod tests {
         }
         report.panic_info = structured_summary(&report);
         report
+    }
+
+    #[test]
+    fn a_pending_file_can_be_previewed_with_the_ingestion_modes() {
+        let report = classified_report("called `Option::unwrap()` on a `None` value", None);
+        let reporter = CrashReporter::new(PathBuf::from("unused"))
+            .with_strict(false)
+            .with_verbose(false);
+        let pending = reporter.pending_crash_from_report(&report);
+
+        assert_eq!(pending.id, 0);
+        assert_eq!(pending.created_at, report.timestamp.to_rfc3339());
+        assert_eq!(
+            pending.panic_template.as_deref(),
+            Some(PanicTemplate::UnwrapNone.as_str())
+        );
+        assert!(pending.backtrace.is_none());
+
+        // The default preview is the structured wire form: no free-form text.
+        let preview = crate::preview_crash_payload_with(&pending, false, false);
+        assert_eq!(
+            preview["panic_template"],
+            PanicTemplate::UnwrapNone.as_str()
+        );
+        assert!(preview.get("panic_info").is_none());
+
+        // Verbose keeps the raw local copy and the preview exposes it scrubbed;
+        // strict wins and reduces it back to the structured summary.
+        let raw = report_with("panicked at src/main.rs:10:5:\\nboom", None);
+        let verbose = CrashReporter::new(PathBuf::from("unused"))
+            .with_strict(false)
+            .with_verbose(true)
+            .pending_crash_from_report(&raw);
+        let preview = crate::preview_crash_payload_with(&verbose, true, false);
+        assert!(preview["panic_info"].as_str().unwrap().contains("boom"));
+
+        let strict = CrashReporter::new(PathBuf::from("unused"))
+            .with_strict(true)
+            .with_verbose(true)
+            .pending_crash_from_report(&raw);
+        let preview = crate::preview_crash_payload_with(&strict, true, true);
+        assert!(preview.get("panic_info").is_none());
+        assert!(is_structured(&strict.panic_info));
     }
 
     // ── Panic templates ─────────────────────────────────────────────────

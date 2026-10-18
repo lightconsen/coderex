@@ -30,6 +30,12 @@ pub struct RunOptions {
     pub repo: PathBuf,
     /// The flow's name.
     pub flow: String,
+    /// An explicit flow directory.
+    ///
+    /// When set it replaces the usual
+    /// `<repo>/.coderex/hillclimb/<flow>` resolution, so a flow can be
+    /// checked in wherever it belongs (for example under `evals/`).
+    pub flow_dir: Option<PathBuf>,
     /// Which variant this run is for.
     pub variant: Variant,
     /// Override for the harness's repetition count.
@@ -55,6 +61,7 @@ impl RunOptions {
         Self {
             repo: repo.into(),
             flow: flow.into(),
+            flow_dir: None,
             variant,
             reps: None,
             concurrency: None,
@@ -141,8 +148,33 @@ struct State {
 /// Fails if the harness is unusable, was changed since it was approved, or the
 /// run itself could not be written down.
 pub async fn run(options: &RunOptions) -> Result<RunOutcome, HarnessError> {
-    let flow_dir = flow_dir(&options.repo, &options.flow);
+    let flow_dir = match &options.flow_dir {
+        Some(dir) => dir.clone(),
+        None if !options.flow.trim().is_empty() => flow_dir(&options.repo, &options.flow),
+        None => {
+            return Err(HarnessError::Invalid(
+                "a run needs --flow or --flow-dir".to_string(),
+            ));
+        }
+    };
+    // `{flow}` is substituted into a command that runs with the case's run
+    // directory as its cwd, so a relative flow path would not resolve there.
+    let flow_dir = if flow_dir.is_absolute() {
+        flow_dir
+    } else {
+        std::env::current_dir()
+            .map_err(|error| HarnessError::Run(error.to_string()))?
+            .join(flow_dir)
+    };
     let harness = Harness::load(&flow_dir)?;
+
+    // A flow given by directory does not have to repeat its name on the
+    // command line; the harness already declares one.
+    let flow_name = if options.flow.trim().is_empty() {
+        harness.name.clone()
+    } else {
+        options.flow.clone()
+    };
 
     let hash = Harness::hash(&flow_dir)?;
     check_harness(&flow_dir, &hash, options.approve_harness)?;
@@ -209,12 +241,12 @@ pub async fn run(options: &RunOptions) -> Result<RunOutcome, HarnessError> {
     }
 
     let all = read_records(&results_path)?;
-    let report = crate::report::render(&harness, &all, &hash, &options.flow);
+    let report = crate::report::render(&harness, &all, &hash, &flow_name);
     let report_path = flow_dir.join(REPORT_FILE);
     std::fs::write(&report_path, report).map_err(|error| HarnessError::Run(error.to_string()))?;
 
     Ok(RunOutcome {
-        flow: options.flow.clone(),
+        flow: flow_name,
         variant: variant_id,
         harness_sha256: hash,
         records,
@@ -558,6 +590,26 @@ mod tests {
 
         let html = std::fs::read_to_string(&outcome.report_path).unwrap();
         assert!(html.contains("smoke"), "{html}");
+    }
+
+    #[tokio::test]
+    async fn a_flow_can_live_outside_the_repository_layout() {
+        let dir = tempfile::tempdir().unwrap();
+        let flow = dir.path().join("checked-in-flow");
+        write_flow(
+            &flow,
+            "printf 'checked {id}\\n'",
+            r#"{"id": "c1", "expect": {"output_contains": ["checked c1"]}}"#,
+        );
+
+        let mut options = RunOptions::new(dir.path(), "", Variant::Baseline);
+        options.flow_dir = Some(flow.clone());
+        let outcome = run(&options).await.unwrap();
+
+        assert_eq!(outcome.flow, "smoke");
+        assert_eq!(outcome.passed(), 1);
+        assert!(flow.join(REPORT_FILE).is_file());
+        assert!(!dir.path().join(crate::HILLCLIMB_DIR).exists());
     }
 
     #[tokio::test]
