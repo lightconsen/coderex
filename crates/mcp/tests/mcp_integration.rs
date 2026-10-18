@@ -763,6 +763,139 @@ async fn discovery_cached_by_the_mcp_auth_tool_is_reused_by_the_oauth_manager() 
     assert_eq!(state.authorization_endpoint(), authorization);
 }
 
+/// The discovery cache written by `McpAuth` is keyed by the *normalized*
+/// issuer, the same key `OAuthManager` uses. Two spellings of one issuer
+/// (trailing slash, query) must not produce two cache entries.
+#[test]
+fn discovery_cached_by_the_tool_is_keyed_by_the_normalized_issuer() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("mcp_tokens.json");
+    let spelled = "http://127.0.0.1:1/realms/demo/";
+    let issuer = "http://127.0.0.1:1/realms/demo";
+    let token = "https://id.example/realms/demo/protocol/openid-connect/token";
+
+    coderex_tools::cache_discovery_at(
+        &path,
+        spelled,
+        "coderex-cli",
+        Some("https://id.example/realms/demo/protocol/openid-connect/auth"),
+        Some(token),
+        &["openid".to_string()],
+        3600,
+    )
+    .unwrap();
+
+    let raw: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    assert_eq!(raw["states"][0]["issuer"], issuer);
+    assert!(
+        raw["issuer_metadata"].get(issuer).is_some(),
+        "the shared cache is not keyed by the normalized issuer: {raw}"
+    );
+    assert!(raw["issuer_metadata"].get(spelled).is_none());
+
+    let loaded = OAuthManager::load_tokens_from(&path).unwrap();
+    let state = loaded.get(spelled).unwrap();
+    assert_eq!(state.issuer.as_deref(), Some(issuer));
+    assert_eq!(state.token_endpoint(), token);
+}
+
+/// The RFC 9728 / RFC 7591 fields the `McpAuth` tool writes have to survive
+/// its own read-modify-write and be readable by `OAuthManager`. The crates
+/// cannot share the type (`tools <- mcp`), so the on-disk shape is the
+/// contract; this pins both sides of it.
+#[test]
+fn the_discovery_fields_written_by_the_tool_survive_and_parse_in_the_manager() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("mcp_tokens.json");
+    let server = "https://mcp.example/mcp";
+    let issuer = "https://id.example/realms/demo";
+    let document = serde_json::json!({
+        "states": [{
+            "server_url": server,
+            "client_id": "dyn-client",
+            "client_secret": "dyn-secret",
+            "access_token": "old",
+            "refresh_token": "refresh",
+            "expires_at": 1,
+            "scopes": [],
+            "scopes_supported": ["read"],
+            "discovery_expires_at": 4_000_000_000_i64,
+            "token_endpoint": "https://id.example/realms/demo/token",
+            "authorization_endpoint": "https://id.example/realms/demo/auth",
+            "issuer": issuer,
+            "resource": server,
+            "protected_resource": {
+                "resource": server,
+                "authorization_servers": [issuer],
+                "scopes_supported": ["read"]
+            },
+            "resource_metadata_url": "https://mcp.example/.well-known/oauth-protected-resource/mcp",
+            "resource_metadata_expires_at": 4_000_000_000_i64,
+            "resource_metadata_etag": "\"v1\"",
+            "registration_endpoint": "https://id.example/realms/demo/register",
+            "token_endpoint_auth_method": "client_secret_basic",
+            "token_endpoint_auth_methods_supported": ["client_secret_basic"],
+            "grant_types_supported": ["authorization_code", "refresh_token"],
+            "code_challenge_methods_supported": ["S256"]
+        }],
+        "issuer_metadata": {
+            issuer: {
+                "issuer": issuer,
+                "token_endpoint": "https://id.example/realms/demo/token",
+                "authorization_endpoint": "https://id.example/realms/demo/auth",
+                "registration_endpoint": "https://id.example/realms/demo/register",
+                "scopes_supported": ["read"],
+                "token_endpoint_auth_methods_supported": ["client_secret_basic"],
+                "grant_types_supported": ["authorization_code", "refresh_token"],
+                "code_challenge_methods_supported": ["S256"],
+                "expires_at": 4_000_000_000_i64,
+                "etag": "\"v1\"",
+                "source_url": "https://id.example/.well-known/oauth-authorization-server/realms/demo"
+            }
+        }
+    });
+    std::fs::write(&path, document.to_string()).unwrap();
+
+    // The tool's read-modify-write path must not drop fields it does not set.
+    coderex_tools::persist_token_at(&path, server, "dyn-client", "new", 3600, Some("refresh"))
+        .unwrap();
+
+    let raw: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    assert!(
+        raw["issuer_metadata"].get(issuer).is_some(),
+        "the tool dropped the issuer cache: {raw}"
+    );
+    assert_eq!(raw["states"][0]["client_secret"], "dyn-secret");
+    assert_eq!(raw["states"][0]["resource_metadata_etag"], "\"v1\"");
+    assert_eq!(
+        raw["states"][0]["registration_endpoint"],
+        "https://id.example/realms/demo/register"
+    );
+
+    let loaded = OAuthManager::load_tokens_from(&path).unwrap();
+    let state = loaded.get(server).unwrap();
+    assert_eq!(state.client_secret.as_deref(), Some("dyn-secret"));
+    assert_eq!(state.issuer.as_deref(), Some(issuer));
+    assert_eq!(state.resource(), server);
+    assert_eq!(state.resource_metadata_etag.as_deref(), Some("\"v1\""));
+    assert_eq!(
+        state.token_endpoint_auth_method.as_deref(),
+        Some("client_secret_basic")
+    );
+    assert_eq!(state.registration_endpoint.as_deref(), Some("https://id.example/realms/demo/register"));
+    assert_eq!(state.grant_types_supported, vec!["authorization_code", "refresh_token"]);
+    assert_eq!(state.code_challenge_methods_supported, vec!["S256"]);
+    assert_eq!(
+        state
+            .protected_resource
+            .as_ref()
+            .and_then(|metadata| metadata.resource.as_deref()),
+        Some(server)
+    );
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 //  11.5 Connection Management — reconnect after failure
 // ═══════════════════════════════════════════════════════════════════════════
