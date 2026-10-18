@@ -2268,6 +2268,16 @@ impl QueryEngine {
         // Tool calls are whatever the model emitted during the stream. The
         // engine does not synthesise calls from text or from the user prompt.
 
+        // Loop detection must see every call the model made, including the
+        // ones already executed while the stream was open. Recording only the
+        // deferred set made a model that repeated an early-executed call look
+        // like a model that made no calls at all — and the loop ran forever.
+        let pending_for_loop: Vec<PendingToolCall> = early_calls
+            .iter()
+            .chain(tool_calls.iter())
+            .map(PendingToolCall::from)
+            .collect();
+
         if tool_calls.is_empty() {
             // No tool calls — turn complete
             turn.transition_to(TurnState::EvaluateContinuation);
@@ -2302,7 +2312,7 @@ impl QueryEngine {
                     let stop_reason = retried.stop_reason.clone();
                     turn.last_stop_reason = Some(stop_reason.clone());
                     if let Some(reason) = self
-                        .close_turn(turn, turn_number, &stop_reason, &usage, &[])
+                        .close_turn(turn, turn_number, &stop_reason, &usage, &pending_for_loop)
                         .await
                     {
                         return Ok(reason);
@@ -2313,7 +2323,7 @@ impl QueryEngine {
                 return Ok(TerminalReason::BudgetExhausted);
             }
             if let Some(reason) = self
-                .close_turn(turn, turn_number, &stop_reason, &usage, &[])
+                .close_turn(turn, turn_number, &stop_reason, &usage, &pending_for_loop)
                 .await
             {
                 return Ok(reason);
@@ -2324,7 +2334,6 @@ impl QueryEngine {
         // Phase 5: Execute tools
         self.persist_assistant_tool_calls(turn, &tool_calls);
         turn.pending_tool_calls = tool_calls.iter().map(PendingToolCall::from).collect();
-        let pending_for_loop = turn.pending_tool_calls.clone();
 
         turn.transition_to(TurnState::ExecuteTools);
         let tool_results = self.execute_tool_calls(turn, options).await?;
