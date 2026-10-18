@@ -8,7 +8,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// Checksum of memory content for incremental sync.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -53,6 +53,48 @@ pub struct TeamMemoryEntry {
     /// entries written before the field existed.
     #[serde(default)]
     pub version: u64,
+}
+
+/// Percent-encode a topic into a single, reversible file-name component.
+///
+/// Every byte outside `[A-Za-z0-9._-]` — including `/`, `\`, `:` and space, but
+/// also `%` itself — is written as `%XX`, so the encoding is injective:
+/// `backend/auth` becomes `backend%2Fauth` and `backend_auth` stays
+/// `backend_auth`. [`decode_topic`] recovers the original string, and the
+/// result never contains a path separator.
+#[must_use]
+pub fn encode_topic(topic: &str) -> String {
+    let mut encoded = String::with_capacity(topic.len());
+    for byte in topic.as_bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-') {
+            encoded.push(char::from(*byte));
+        } else {
+            use std::fmt::Write as _;
+            let _ = write!(encoded, "%{byte:02X}");
+        }
+    }
+    encoded
+}
+
+/// Decode a file-name component produced by [`encode_topic`].
+///
+/// Returns `None` when the component is not valid percent-encoded UTF-8.
+#[must_use]
+pub fn decode_topic(encoded: &str) -> Option<String> {
+    let bytes = encoded.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%' {
+            let hex = encoded.get(index + 1..index + 3)?;
+            decoded.push(u8::from_str_radix(hex, 16).ok()?);
+            index += 3;
+        } else {
+            decoded.push(bytes[index]);
+            index += 1;
+        }
+    }
+    String::from_utf8(decoded).ok()
 }
 
 /// Result of a sync operation.
@@ -187,8 +229,12 @@ impl TeamSyncTransport for RelayTransport {
     }
 }
 
-/// Memories are stored in `<repo_memory_dir>/<org_id>/<topic>.json`.
-/// Sync uses checksums to detect changes and only transfers deltas.
+/// Memories are stored in `<repo_memory_dir>/<org_id>/<encoded-topic>.json`,
+/// where the topic is percent-encoded by [`encode_topic`] so that every topic
+/// owns exactly one file: `backend/auth` and `backend_auth` no longer collide.
+/// Files written by the old lossy mapping are still read (only when the topic
+/// recorded inside them matches) and are migrated to the encoded name on the
+/// next write. Sync uses checksums to detect changes and only transfers deltas.
 #[derive(Debug)]
 pub struct TeamMemorySyncService {
     /// Base directory for team memories (typically `<repo>/.coderex/team-memory/`).
@@ -252,6 +298,10 @@ impl TeamMemorySyncService {
 
         let entry = if let Some(existing) = self.read_entry_raw(topic)? {
             TeamMemoryEntry {
+                // Re-state the topic: a legacy file reached through the
+                // fallback may have recorded a colliding topic, and the entry
+                // must be written back under the topic that was asked for.
+                topic: topic.to_string(),
                 content: content.to_string(),
                 checksum,
                 updated_at: now,
@@ -277,14 +327,9 @@ impl TeamMemorySyncService {
 
     /// Read a memory entry.
     pub fn read(&self, topic: &str) -> std::io::Result<Option<TeamMemoryEntry>> {
-        let path = self.entry_path(topic);
-        if !path.exists() {
-            return Ok(None);
-        }
-        let content = std::fs::read_to_string(&path)?;
-        let entry: TeamMemoryEntry = serde_json::from_str(&content)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-        Ok(if entry.tombstoned { None } else { Some(entry) })
+        Ok(self
+            .read_entry_raw(topic)?
+            .filter(|entry| !entry.tombstoned))
     }
 
     /// Delete a memory entry locally.
@@ -412,10 +457,37 @@ impl TeamMemorySyncService {
     /// Read entry including tombstoned ones.
     fn read_entry_raw(&self, topic: &str) -> std::io::Result<Option<TeamMemoryEntry>> {
         let path = self.entry_path(topic);
-        if !path.exists() {
-            return Ok(None);
+        if path.exists() {
+            // The file name is injective now, but a pre-encoding file can sit
+            // exactly where another topic's encoded name is (a legacy
+            // `backend_auth.json` is the current path for `backend_auth`). The
+            // topic recorded inside the entry decides whether it is ours.
+            if let Some(entry) = Self::read_entry_file(&path)? {
+                if entry.topic == topic {
+                    return Ok(Some(entry));
+                }
+            }
         }
-        let content = std::fs::read_to_string(&path)?;
+
+        // Files written before topics were percent-encoded used a lossy
+        // mapping (`/`, `\`, `:` and space all became `_`). Fall back to such
+        // a file, but accept it only when the topic stored *inside* it is
+        // exactly the one asked for: `backend_auth.json` may belong to
+        // `backend_auth`, and must not be served as `backend/auth`.
+        let legacy = self.legacy_entry_path(topic);
+        if legacy != path && legacy.exists() {
+            if let Some(entry) = Self::read_entry_file(&legacy)? {
+                if entry.topic == topic {
+                    return Ok(Some(entry));
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    /// Parse an entry from a file.
+    fn read_entry_file(path: &Path) -> std::io::Result<Option<TeamMemoryEntry>> {
+        let content = std::fs::read_to_string(path)?;
         serde_json::from_str(&content)
             .map(Some)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
@@ -425,11 +497,32 @@ impl TeamMemorySyncService {
     fn write_entry(&self, entry: &TeamMemoryEntry) -> std::io::Result<()> {
         let path = self.entry_path(&entry.topic);
         let serialized = serde_json::to_string_pretty(entry).map_err(std::io::Error::other)?;
-        std::fs::write(&path, serialized)
+        std::fs::write(&path, serialized)?;
+
+        // Once the encoded file is written, a legacy file for the same topic
+        // is a stale duplicate. Remove it only when its recorded topic matches
+        // — a legacy file belonging to a formerly-colliding topic is not ours.
+        let legacy = self.legacy_entry_path(&entry.topic);
+        if legacy != path && legacy.exists() {
+            if let Ok(Some(old)) = Self::read_entry_file(&legacy) {
+                if old.topic == entry.topic {
+                    let _ = std::fs::remove_file(&legacy);
+                }
+            }
+        }
+        Ok(())
     }
 
-    /// Convert topic to a safe filename.
+    /// Convert topic to a safe, collision-free filename.
     fn entry_path(&self, topic: &str) -> PathBuf {
+        self.effective_memory_dir()
+            .join(format!("{}.json", encode_topic(topic)))
+    }
+
+    /// Where the pre-encoding implementation stored a topic.
+    ///
+    /// Kept for reading files written by older versions; never written to.
+    fn legacy_entry_path(&self, topic: &str) -> PathBuf {
         let safe = topic.replace(['/', '\\', ':', ' '], "_");
         self.effective_memory_dir().join(format!("{safe}.json"))
     }
@@ -793,5 +886,140 @@ mod tests {
 
         let local = svc2.read("local-topic").unwrap().unwrap();
         assert_eq!(local.content, "local content");
+    }
+
+    // ─── Topic-to-file mapping ─────────────────────────────────────────────
+
+    #[test]
+    fn topic_encoding_is_reversible_and_collision_free() {
+        for topic in [
+            "backend/auth",
+            "backend_auth",
+            "backend\\auth",
+            "backend:auth",
+            "backend auth",
+            "100%",
+            "café",
+            "",
+            ".",
+            "..",
+        ] {
+            let encoded = encode_topic(topic);
+            assert_eq!(decode_topic(&encoded).as_deref(), Some(topic), "{topic:?}");
+            assert!(
+                !encoded.contains(['/', '\\', ':', ' ']),
+                "{topic:?} encoded to {encoded:?}, which is not a file-name component"
+            );
+        }
+
+        assert_ne!(encode_topic("backend/auth"), encode_topic("backend_auth"));
+        assert_ne!(encode_topic("a:b"), encode_topic("a_b"));
+        assert_ne!(encode_topic("a b"), encode_topic("a_b"));
+    }
+
+    #[test]
+    fn formerly_colliding_topics_are_distinct_files() {
+        let (svc, tmp) = temp_service();
+
+        // Before percent-encoding, every one of these mapped to
+        // `backend_auth.json`.
+        svc.upsert("backend/auth", "slash content").unwrap();
+        svc.upsert("backend_auth", "underscore content").unwrap();
+        svc.upsert("backend:auth", "colon content").unwrap();
+        svc.upsert("backend auth", "space content").unwrap();
+
+        assert_eq!(
+            svc.read("backend/auth").unwrap().unwrap().content,
+            "slash content"
+        );
+        assert_eq!(
+            svc.read("backend_auth").unwrap().unwrap().content,
+            "underscore content"
+        );
+        assert_eq!(
+            svc.read("backend:auth").unwrap().unwrap().content,
+            "colon content"
+        );
+        assert_eq!(
+            svc.read("backend auth").unwrap().unwrap().content,
+            "space content"
+        );
+
+        // `list` sees four entries, not one merged file.
+        assert_eq!(svc.list().unwrap().len(), 4);
+
+        // And they really are four files on disk.
+        let json_files: Vec<_> = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| entry.path().extension().and_then(|e| e.to_str()) == Some("json"))
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(json_files.len(), 4, "{json_files:?}");
+        assert!(json_files.contains(&"backend%2Fauth.json".to_string()));
+        assert!(json_files.contains(&"backend_auth.json".to_string()));
+    }
+
+    #[test]
+    fn a_legacy_file_is_read_but_not_served_for_a_colliding_topic() {
+        let (svc, tmp) = temp_service();
+        let now = Utc::now();
+        let legacy = TeamMemoryEntry {
+            topic: "backend/auth".to_string(),
+            content: "written by the old mapping".to_string(),
+            checksum: MemoryChecksum::from_content("written by the old mapping"),
+            created_at: now,
+            updated_at: now,
+            tombstoned: false,
+            version: 1,
+        };
+        std::fs::write(
+            tmp.path().join("backend_auth.json"),
+            serde_json::to_string(&legacy).unwrap(),
+        )
+        .unwrap();
+
+        // The old file is still readable under the topic it records ...
+        let read = svc.read("backend/auth").unwrap().unwrap();
+        assert_eq!(read.content, "written by the old mapping");
+        // ... but it is not mistaken for the formerly-colliding topic.
+        assert!(svc.read("backend_auth").unwrap().is_none());
+
+        // Writing migrates the entry to the encoded name and drops the stale
+        // legacy duplicate; the colliding topic remains untouched.
+        let written = svc.upsert("backend/auth", "new content").unwrap();
+        assert_eq!(written.topic, "backend/auth");
+        assert_eq!(
+            svc.read("backend/auth").unwrap().unwrap().content,
+            "new content"
+        );
+        assert!(tmp.path().join("backend%2Fauth.json").exists());
+        assert!(!tmp.path().join("backend_auth.json").exists());
+        assert!(svc.read("backend_auth").unwrap().is_none());
+    }
+
+    #[test]
+    fn a_legacy_file_for_a_flat_topic_still_reads() {
+        let (svc, tmp) = temp_service();
+        let now = Utc::now();
+        let legacy = TeamMemoryEntry {
+            topic: "architecture".to_string(),
+            content: "layered".to_string(),
+            checksum: MemoryChecksum::from_content("layered"),
+            created_at: now,
+            updated_at: now,
+            tombstoned: false,
+            version: 1,
+        };
+        // A flat topic encodes to itself, so this is also the current path.
+        std::fs::write(
+            tmp.path().join("architecture.json"),
+            serde_json::to_string(&legacy).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            svc.read("architecture").unwrap().unwrap().content,
+            "layered"
+        );
     }
 }

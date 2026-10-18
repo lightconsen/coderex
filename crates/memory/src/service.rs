@@ -19,6 +19,12 @@
 //! | `shared`    | [`TeamMemorySyncService`] | flat topic |
 //! | `org`       | a second, org-scoped [`TeamMemorySyncService`] | flat topic |
 //!
+//! The `org` row is only reachable after [`MemoryService::with_org`] attaches a
+//! second, org-scoped [`TeamMemorySyncService`]. The CLI does not call it yet
+//! (see that method's docs for the exact call), so in production `org`
+//! currently answers [`MemoryServiceError::StoreUnavailable`]. The store and
+//! the tools over it are complete and tested; only the wiring is outstanding.
+//!
 //! `personal` and `project` share one [`LongTermStore`] and are told apart by a
 //! key namespace. That is deliberate for a local-first tool: there is no
 //! hidden `~/.coderex` memory directory, and a "personal" memory is still
@@ -263,6 +269,37 @@ impl MemoryService {
     }
 
     /// Attach the org-scoped shared store, enabling the `org` store.
+    ///
+    /// # Status
+    ///
+    /// This method has no production caller yet. `crates/cli/src/repl.rs`
+    /// builds the service with `MemoryService::new(...).with_classifier(...)`
+    /// and stops there, so every `org` call currently answers
+    /// [`MemoryServiceError::StoreUnavailable`]. The store is not broken: it
+    /// is simply not wired. This crate's tests exercise the path below, and
+    /// the CLI workstream only has to add the two lines that construct and
+    /// attach the org store.
+    ///
+    /// # What the CLI must call
+    ///
+    /// ```ignore
+    /// // `memory_base` and `team_memory_service` are the values the REPL
+    /// // already builds; `org_id` is the org the session belongs to.
+    /// let org_store = Arc::new(TeamMemorySyncService::new_with_org(
+    ///     repo_id.clone(),
+    ///     memory_base.join("team"),
+    ///     org_id.clone(),
+    /// ));
+    ///
+    /// let memory_service = Arc::new(
+    ///     MemoryService::new(Arc::clone(&long_term_store), Arc::clone(&team_memory_service))
+    ///         .with_org(org_store)
+    ///         .with_classifier(Arc::new(ModelMemoryClassifier::new(api_client.clone_box()))),
+    /// );
+    /// ```
+    ///
+    /// The classifier is not optional for `org`: like `shared`, an org write
+    /// leaves the machine and is refused unless something classified it.
     #[must_use]
     pub fn with_org(mut self, org: Arc<TeamMemorySyncService>) -> Self {
         self.org = Some(org);
@@ -788,6 +825,59 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(refused, MemoryServiceError::Refused { .. }));
+    }
+
+    #[tokio::test]
+    async fn a_configured_org_store_is_usable_and_isolated_from_shared() {
+        let dir = tempfile::tempdir().unwrap();
+        let team = Arc::new(TeamMemorySyncService::new(
+            "default".to_string(),
+            dir.path().join("team"),
+        ));
+        let org = Arc::new(TeamMemorySyncService::new_with_org(
+            "default".to_string(),
+            dir.path().join("team"),
+            "acme".to_string(),
+        ));
+        let service = MemoryService::new(
+            Arc::new(LongTermStore::new(dir.path().join("long_term"))),
+            team,
+        )
+        .with_org(org)
+        .with_classifier(Arc::new(AllowAllClassifier));
+
+        let written = service
+            .write(MemoryStore::Org, "topic", "org content", None)
+            .await
+            .unwrap();
+        assert_eq!(written.store, MemoryStore::Org);
+        assert_eq!(written.key, "topic");
+        assert_eq!(written.version, 1);
+
+        assert_eq!(
+            service.read(MemoryStore::Org, "topic").unwrap().content,
+            "org content"
+        );
+        assert_eq!(service.list(MemoryStore::Org).unwrap().len(), 1);
+
+        // The shared store is a different directory and does not see it.
+        assert_eq!(
+            service.read(MemoryStore::Shared, "topic").unwrap_err(),
+            MemoryServiceError::NotFound {
+                store: MemoryStore::Shared,
+                key: "topic".into(),
+            }
+        );
+
+        // The org store honours `if_version` and delete like every other
+        // store, not just read/list.
+        let updated = service
+            .write(MemoryStore::Org, "topic", "org v2", Some(1))
+            .await
+            .unwrap();
+        assert_eq!(updated.version, 2);
+        service.delete(MemoryStore::Org, "topic", Some(2)).unwrap();
+        assert!(service.list(MemoryStore::Org).unwrap().is_empty());
     }
 
     #[tokio::test]

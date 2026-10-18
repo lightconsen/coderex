@@ -25,6 +25,11 @@
 //! message into the right variant, and [`TranscriptEntry::to_message`] turns
 //! it back, so the two forms round-trip through each other.
 //!
+//! These types are the **read-side** model. [`crate::transcript::TranscriptStore`]
+//! writes bare messages only and classifies every line — bare or tagged —
+//! through [`TranscriptEntry::from_message`] when it reads. There is no typed
+//! write path, because production does not have one.
+//!
 //! # What is deliberately left out
 //!
 //! Claude's transcript format has three much larger tables: nine visible

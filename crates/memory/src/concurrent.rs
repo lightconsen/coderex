@@ -65,14 +65,6 @@ impl ConcurrentTranscriptStore {
         store.read_all(session_id)
     }
 
-    /// Write a compact boundary marker (thread-safe).
-    pub fn write_compact_boundary(&self, session_id: &str) -> Result<(), TranscriptError> {
-        let lock = self.get_lock(session_id);
-        let _guard = lock.lock();
-        let store = TranscriptStore::new(self.base_path.clone());
-        store.write_compact_boundary(session_id)
-    }
-
     /// Rewrite the transcript with new messages (thread-safe).
     pub fn rewrite(&self, session_id: &str, messages: &[Message]) -> Result<(), TranscriptError> {
         let lock = self.get_lock(session_id);

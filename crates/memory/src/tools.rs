@@ -479,6 +479,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_configured_org_store_is_writable_and_listed() {
+        use crate::service::AllowAllClassifier;
+        use crate::team_memory::TeamMemorySyncService;
+
+        let dir = tempfile::tempdir().unwrap();
+        let org = Arc::new(TeamMemorySyncService::new_with_org(
+            "default".to_string(),
+            dir.path().join("team"),
+            "acme".to_string(),
+        ));
+        let service = service_over(&dir.path().join("long_term"), &dir.path().join("team"))
+            .with_org(org)
+            .with_classifier(Arc::new(AllowAllClassifier));
+        let tools = MemoryTools::new(Arc::new(service));
+
+        let written = tool(&tools, MEMORY_WRITE_TOOL)
+            .call(&json!({"store": "org", "key": "topic", "content": "org content"}))
+            .await
+            .unwrap();
+        assert!(written.contains("Wrote org 'topic'"), "{written}");
+
+        let read = tool(&tools, MEMORY_READ_TOOL)
+            .call(&json!({"store": "org", "key": "topic"}))
+            .await
+            .unwrap();
+        assert!(read.contains("org/topic"), "{read}");
+        assert!(read.contains("org content"), "{read}");
+
+        let listed = tool(&tools, MEMORY_LIST_TOOL)
+            .call(&json!({"store": "org"}))
+            .await
+            .unwrap();
+        assert!(listed.contains("org (1 memories)"), "{listed}");
+        assert!(!listed.contains("not configured"), "{listed}");
+    }
+
+    #[tokio::test]
     async fn listing_names_the_stores_and_their_keys() {
         let (tools, _dir) = family();
         tool(&tools, MEMORY_WRITE_TOOL)

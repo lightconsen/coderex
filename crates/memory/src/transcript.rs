@@ -5,6 +5,25 @@
 //! changed — while compaction boundaries and session headers carry a `"type"`
 //! tag. See [`crate::entry`] for the entry model and why it is not larger.
 //!
+//! # What this store writes, and what it reads
+//!
+//! This store writes **bare messages only**: [`TranscriptStore::append`] and
+//! [`TranscriptStore::rewrite`] serialize a [`Message`] directly. That is the
+//! format production persists — the engine represents a compaction boundary as
+//! a system message carrying [`COMPACT_BOUNDARY_MARKER`](crate::entry::COMPACT_BOUNDARY_MARKER),
+//! and it is written unchanged. There is deliberately no API here for writing
+//! tagged entries: production does not call one, and inventing a writer with
+//! no caller would describe a format nothing writes.
+//!
+//! The read side is deliberately wider than the write side.
+//! [`TranscriptStore::read_entries`] accepts both bare messages and tagged
+//! lines, and classifies every line through
+//! [`TranscriptEntry::from_message`](crate::entry::TranscriptEntry::from_message)
+//! (so a boundary is a boundary whether it was written as a bare system
+//! message or as a tagged entry). [`TranscriptStore::read_all`] then turns
+//! those entries back into messages. Classification on read is the single
+//! documented path for both forms.
+//!
 //! # The session-id sanitization rule
 //!
 //! The session id becomes the transcript's file name, so it is the one part of
@@ -109,28 +128,29 @@ impl TranscriptStore {
     }
 
     /// Append a message to a session's transcript.
+    ///
+    /// The line is the bare message, exactly what every existing transcript
+    /// contains. Compaction boundaries are written through this method as the
+    /// system messages the engine produces.
     pub fn append(&self, session_id: &str, message: &Message) -> Result<(), TranscriptError> {
-        self.append_entry(session_id, &TranscriptEntry::message(message.clone()))
-    }
-
-    /// Append a transcript entry to a session's transcript.
-    pub fn append_entry(
-        &self,
-        session_id: &str,
-        entry: &TranscriptEntry,
-    ) -> Result<(), TranscriptError> {
         let path = self.session_path(session_id)?;
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
         let mut file = OpenOptions::new().create(true).append(true).open(&path)?;
-        let line = serde_json::to_string(entry)?;
+        let line = serde_json::to_string(message)?;
         writeln!(file, "{line}")?;
         file.sync_all()?;
         Ok(())
     }
 
-    /// Read every entry from a session's transcript.
+    /// Read every entry from a session's transcript, classifying each line.
+    ///
+    /// Both forms are accepted: a bare [`Message`] line is classified through
+    /// [`TranscriptEntry::from_message`] (so a compaction boundary written as
+    /// a system message reads as [`crate::entry::EntryKind::CompactBoundary`]),
+    /// and a tagged line is decoded as its typed entry. This is the single
+    /// classification path; there is no separate reader for tagged files.
     ///
     /// Returns an empty vec if the file does not exist. Corrupted lines are
     /// skipped with a warning rather than failing the read.
@@ -205,20 +225,6 @@ impl TranscriptStore {
         Ok(messages)
     }
 
-    /// Write a compact boundary marker to the transcript.
-    ///
-    /// Appends a [`TranscriptEntry::CompactBoundary`] naming where context was
-    /// compacted.
-    pub fn write_compact_boundary(&self, session_id: &str) -> Result<(), TranscriptError> {
-        let entry = TranscriptEntry::compact_boundary(
-            "<coderex_compact_boundary>\n\
-            Context was compacted at this point.\n\
-            Earlier conversation history has been removed.\n\
-            </coderex_compact_boundary>",
-        );
-        self.append_entry(session_id, &entry)
-    }
-
     /// Rewrite the transcript, keeping only messages from a given index onward.
     ///
     /// Uses a temp file + atomic rename for crash safety.
@@ -258,9 +264,8 @@ impl TranscriptStore {
     ///
     /// Every line written is a bare message, exactly as before — a compaction
     /// boundary that is a system message in `messages` goes back out as the
-    /// same system message. The typed form is opt-in through
-    /// [`Self::append_entry`]; [`Self::read_entries`] classifies on the way in,
-    /// so a boundary is a boundary either way.
+    /// same system message. [`Self::read_entries`] classifies on the way in,
+    /// so a boundary is a boundary when it is read.
     pub fn rewrite(&self, session_id: &str, messages: &[Message]) -> Result<(), TranscriptError> {
         let path = self.session_path(session_id)?;
         if let Some(parent) = path.parent() {
@@ -630,10 +635,25 @@ mod tests {
     }
 
     #[test]
-    fn write_compact_boundary_appends_marker() {
+    fn a_boundary_message_round_trips_through_append_and_read() {
         let (store, _tmp) = temp_store();
         store.append("session_b", &Message::user("hello")).unwrap();
-        store.write_compact_boundary("session_b").unwrap();
+        // The engine's boundary is a plain system message; `append` writes it
+        // bare and `read_entries` classifies it on the way back in.
+        store
+            .append(
+                "session_b",
+                &Message::system(format!(
+                    "{}\nContext was compacted.\n{}",
+                    crate::entry::COMPACT_BOUNDARY_MARKER,
+                    crate::entry::COMPACT_BOUNDARY_CLOSE
+                )),
+            )
+            .unwrap();
+
+        let entries = store.read_entries("session_b").unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[1].kind(), crate::entry::EntryKind::CompactBoundary);
 
         let messages = store.read_all("session_b").unwrap();
         assert_eq!(messages.len(), 2);
@@ -950,7 +970,6 @@ mod tests {
         assert!(store.read_all_skip_first_prompt("../escape").is_err());
         assert!(store.read_entries("../escape").is_err());
         assert!(store.rewrite("../escape", &[Message::user("x")]).is_err());
-        assert!(store.write_compact_boundary("../escape").is_err());
         assert!(store.truncate_before("../escape", 0).is_err());
         assert!(store.session_modified_at("../escape").is_err());
         assert!(store.backup("../escape").is_err());
@@ -963,12 +982,21 @@ mod tests {
     // ─── Entry model ───────────────────────────────────────────────────────
 
     #[test]
-    fn a_boundary_written_by_the_store_reads_back_as_a_boundary_entry() {
+    fn a_boundary_written_as_a_message_reads_back_as_a_boundary_entry() {
         let (store, _tmp) = temp_store();
         store
             .append("sess_entries", &Message::user("hello"))
             .unwrap();
-        store.write_compact_boundary("sess_entries").unwrap();
+        store
+            .append(
+                "sess_entries",
+                &Message::system(format!(
+                    "{}\nremoved\n{}",
+                    crate::entry::COMPACT_BOUNDARY_MARKER,
+                    crate::entry::COMPACT_BOUNDARY_CLOSE
+                )),
+            )
+            .unwrap();
 
         let entries = store.read_entries("sess_entries").unwrap();
         assert_eq!(entries.len(), 2);
@@ -1009,14 +1037,55 @@ mod tests {
     }
 
     #[test]
+    fn raw_and_tagged_boundary_lines_are_classified_the_same_way() {
+        let (store, _tmp) = temp_store();
+        let path = store.session_path("sess_both_forms").unwrap();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let bare = serde_json::to_string(&Message::system(format!(
+            "{}\nwritten bare\n{}",
+            crate::entry::COMPACT_BOUNDARY_MARKER,
+            crate::entry::COMPACT_BOUNDARY_CLOSE
+        )))
+        .unwrap();
+        let tagged = serde_json::to_string(&crate::entry::TranscriptEntry::compact_boundary(
+            "written tagged",
+        ))
+        .unwrap();
+        std::fs::write(&path, format!("{bare}\n{tagged}\n")).unwrap();
+
+        let entries = store.read_entries("sess_both_forms").unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].kind(), crate::entry::EntryKind::CompactBoundary);
+        assert_eq!(entries[1].kind(), crate::entry::EntryKind::CompactBoundary);
+
+        // Both forms also survive the message-only view.
+        let messages = store.read_all("sess_both_forms").unwrap();
+        assert_eq!(messages.len(), 2);
+        for message in messages {
+            assert!(matches!(message.role, coderex_core::types::Role::System));
+        }
+    }
+
+    #[test]
     fn a_session_header_is_not_returned_as_a_message() {
         let (store, _tmp) = temp_store();
-        store
-            .append_entry(
-                "sess_header",
-                &crate::entry::TranscriptEntry::session_meta("sess_header", "/tmp/p", None),
-            )
-            .unwrap();
+        // Tagged lines are read, even though this store does not write them.
+        // Write one by hand to prove the read side accepts the form.
+        let path = store.session_path("sess_header").unwrap();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &path,
+            format!(
+                "{}\n",
+                serde_json::to_string(&crate::entry::TranscriptEntry::session_meta(
+                    "sess_header",
+                    "/tmp/p",
+                    None
+                ))
+                .unwrap()
+            ),
+        )
+        .unwrap();
         store
             .append("sess_header", &Message::user("hello"))
             .unwrap();
