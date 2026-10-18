@@ -6,13 +6,14 @@ use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
-use tokio::process::{ChildStderr, ChildStdin, Command};
+use tokio::process::{ChildStderr, ChildStdin};
 
 use crate::action::{
     AGENT_DEFAULT_MODEL, AGENT_DEFAULT_TIMEOUT_MS, ActionPrompt, HookActionRunner, McpToolHook,
     PROMPT_DEFAULT_TIMEOUT_MS, interpolate_tool_input, parse_answer, substitute_arguments,
 };
 use crate::events::{HookAction, HookError, HookEvent, HookResult};
+use crate::sandbox::HookSandboxConfig;
 use crate::stream::{HookMessage, HookRequestHandler, HookStreamEvent};
 use crate::{sandbox, stream};
 use coderex_core::hook_executor::{HookExecutor, HookFireResult};
@@ -221,6 +222,19 @@ pub struct HookConfig {
     /// Maximum output file size (MB) for the hook subprocess (None = unlimited).
     #[serde(default)]
     pub max_file_size_mb: Option<u64>,
+    /// OS-level filesystem and network confinement for this hook.
+    ///
+    /// `None` means the default policy: read the workspace, home/config and
+    /// system roots; write the workspace and temp directories; no network.
+    /// The sandbox is applied in addition to the resource limits above and
+    /// only to `command` hooks, since it is a subprocess concern.
+    ///
+    /// A per-hook policy can extend the paths, permit the network, or opt out
+    /// with `enabled: false`. On a platform that cannot enforce confinement a
+    /// gating hook fails closed unless it opts out; see
+    /// [`HOOK_SANDBOX_ENV`](crate::HOOK_SANDBOX_ENV).
+    #[serde(default)]
+    pub sandbox: Option<HookSandboxConfig>,
     /// Trust tier — assigned by the loader, never read from settings.
     ///
     /// `#[serde(skip)]` is deliberate: a settings file that writes `tier` must
@@ -370,6 +384,35 @@ pub struct RawHookConfig {
     /// Max file size MB.
     #[serde(default)]
     pub max_file_size_mb: Option<u64>,
+    /// OS sandbox policy, or `false` to opt this hook out.
+    #[serde(default)]
+    pub sandbox: Option<RawSandboxSetting>,
+}
+
+/// The two shapes the `sandbox` key accepts.
+///
+/// `false` is the short opt-out; an object is a policy. `true` means the
+/// default policy. Anything else — including an unknown key inside the object
+/// — is a load error rather than a silent fallback.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+pub enum RawSandboxSetting {
+    /// `"sandbox": false` (or `true`).
+    Toggle(bool),
+    /// `"sandbox": { ... }`.
+    Config(HookSandboxConfig),
+}
+
+impl RawSandboxSetting {
+    fn into_config(self) -> HookSandboxConfig {
+        match self {
+            Self::Toggle(enabled) => HookSandboxConfig {
+                enabled,
+                ..HookSandboxConfig::default()
+            },
+            Self::Config(config) => config,
+        }
+    }
 }
 
 /// The fields every hook kind shares, taken from its raw configuration.
@@ -396,6 +439,7 @@ fn from_raw(raw: &RawHookConfig, timeout_ms: u64) -> HookConfig {
         max_cpu_seconds: raw.max_cpu_seconds,
         max_memory_mb: raw.max_memory_mb,
         max_file_size_mb: raw.max_file_size_mb,
+        sandbox: raw.sandbox.clone().map(RawSandboxSetting::into_config),
         tier: HookTier::Core,
     }
 }
@@ -654,6 +698,9 @@ impl HookRegistry {
                     }
                 }
             };
+            if let Some(sandbox) = &config.sandbox {
+                sandbox.validate()?;
+            }
             config.tier = tier;
             hooks.push(config);
         }
@@ -996,10 +1043,22 @@ async fn execute_hook(
     let input_json = serde_json::to_string(input)?;
     let env = build_hook_env(hook, input);
 
-    let mut command = Command::new("sh");
+    // Confinement is decided before anything is spawned. A gating hook that
+    // cannot be confined is a failure (`SandboxUnavailable`), which `fire_hook`
+    // turns into a deny; a non-gating one is warned about and runs with
+    // resource limits only. The handle must stay alive until the child exits —
+    // it owns the macOS profile file and, on Windows, the Job Object.
+    let gating = input
+        .event
+        .parse::<HookEvent>()
+        .is_ok_and(HookEvent::is_gating);
+    let sandbox_handle = sandbox::enforce(sandbox::plan_for_hook(hook), gating)?;
+
+    let mut command = sandbox::sandboxed_command(&hook.command, sandbox_handle.as_ref());
+    if let Some(cwd) = &hook.cwd {
+        command.current_dir(cwd);
+    }
     command
-        .arg("-c")
-        .arg(&hook.command)
         .envs(&env)
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
@@ -1008,7 +1067,8 @@ async fn execute_hook(
         // running; the timeout future is dropped, not awaited.
         .kill_on_drop(true);
 
-    // Limits are installed before exec, so the hook cannot raise them.
+    // Limits are installed before exec, so the hook cannot raise them. On
+    // Unix they are inherited by the sandbox wrapper and the shell it execs.
     sandbox::apply_resource_limits(&mut command, hook);
 
     #[cfg(target_os = "windows")]
@@ -1563,6 +1623,7 @@ mod tests {
             max_cpu_seconds: None,
             max_memory_mb: None,
             max_file_size_mb: None,
+            sandbox: None,
         });
 
         let matches = registry.matches_for_event(&HookEvent::SessionStart);
@@ -1592,6 +1653,7 @@ mod tests {
             max_cpu_seconds: None,
             max_memory_mb: None,
             max_file_size_mb: None,
+            sandbox: None,
         });
 
         assert_eq!(
@@ -1724,6 +1786,7 @@ mod tests {
             max_cpu_seconds: None,
             max_memory_mb: None,
             max_file_size_mb: None,
+            sandbox: None,
         });
         registry.register(HookConfig {
             event: "*".to_string(),
@@ -1744,6 +1807,7 @@ mod tests {
             max_cpu_seconds: None,
             max_memory_mb: None,
             max_file_size_mb: None,
+            sandbox: None,
         });
 
         let matcher = HookMatcher::new(&registry);
@@ -1781,6 +1845,7 @@ mod tests {
             max_cpu_seconds: None,
             max_memory_mb: None,
             max_file_size_mb: None,
+            sandbox: None,
         };
         let input = HookInput {
             event: "SessionStart".to_string(),
@@ -1837,6 +1902,7 @@ mod tests {
             max_cpu_seconds: None,
             max_memory_mb: None,
             max_file_size_mb: None,
+            sandbox: None,
         };
         let input = HookInput {
             event: "SessionStart".to_string(),
@@ -1874,6 +1940,7 @@ mod tests {
             max_cpu_seconds: None,
             max_memory_mb: None,
             max_file_size_mb: None,
+            sandbox: None,
         };
         let input = HookInput {
             event: "SessionStart".to_string(),
@@ -1906,6 +1973,7 @@ mod tests {
             max_cpu_seconds: None,
             max_memory_mb: None,
             max_file_size_mb: None,
+            sandbox: None,
         };
         let input = HookInput {
             event: "Stop".to_string(),
@@ -1948,6 +2016,7 @@ mod tests {
             max_cpu_seconds: None,
             max_memory_mb: None,
             max_file_size_mb: Some(1),
+            sandbox: None,
         };
         let input = HookInput {
             event: "Test".to_string(),
@@ -1995,6 +2064,7 @@ mod tests {
             max_cpu_seconds: Some(1),
             max_memory_mb: None,
             max_file_size_mb: None,
+            sandbox: None,
         };
         let input = HookInput {
             event: "Test".to_string(),
@@ -2034,6 +2104,7 @@ mod tests {
             max_cpu_seconds: None,
             max_memory_mb: None,
             max_file_size_mb: None,
+            sandbox: None,
             tier,
         }
     }

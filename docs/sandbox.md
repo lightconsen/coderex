@@ -2,9 +2,10 @@
 
 This document describes the guarantees the sandbox makes today, per platform, and
 draws the line between what the kernel enforces and what is only an in-process
-check. The short version: **only macOS confines the filesystem.** Everywhere else
-the sandbox is a syscall allowlist, a resource budget, or nothing at all — and it
-says so at runtime rather than letting the caller assume otherwise.
+check. The short version: **macOS and Linux-with-bubblewrap confine the
+filesystem; Windows and Linux without bubblewrap do not.** Where they do not,
+the sandbox is a syscall allowlist, a resource budget, or nothing at all — and
+it says so at runtime rather than letting the caller assume otherwise.
 
 ## Where it is wired
 
@@ -16,6 +17,7 @@ says so at runtime rather than letting the caller assume otherwise.
 | **Shell wrapping lives in one place** — both shell tools use it | `sandboxed_shell` / `finish_spawn`, `crates/tools/src/sandbox_shell.rs` |
 | `Bash` applies the sandbox | `crates/tools/src/builtins/bash_tool.rs` |
 | `PowerShell` applies the sandbox too | `crates/tools/src/builtins/powershell_tool.rs` |
+| **Command hooks apply it** (policy, wrapper, opt-outs) | `crates/hooks/src/sandbox.rs`, called from `execute_hook` in `crates/hooks/src/engine.rs` |
 | MCP servers spawn outside it | `JsonRpcChannel::spawn`, `crates/mcp/src/channel.rs:176` |
 
 Sandboxing is on by default (`ExecutionConfig::sandbox_enabled = true`, the
@@ -137,6 +139,41 @@ only.
 `NoOpSandbox`: logs and does not restrict. `filesystem_isolation()` reports
 `None`.
 
+## Command hooks
+
+`command` hooks run through the same `SandboxHandle` as the shell tools;
+`crates/hooks/src/sandbox.rs` builds the policy and wraps the spawn. The
+policy is applied **in addition to** the hook's `RLIMIT_*`/Job Object limits,
+which remain installed before exec.
+
+Default policy for a hook:
+
+- **Read:** the workspace (the hook's `cwd`, else the session's working
+  directory), temp, the user's home and `XDG_CONFIG_HOME`, system roots, and
+  absolute `PATH` directories (plus their prefix for `bin`/`sbin` entries, so a
+  conda/Homebrew interpreter can read its standard library).
+- **Write:** the workspace and temp only.
+- **Execute:** system shell/tool directories, Homebrew, and the `PATH`
+  directories above.
+- **Network:** denied.
+
+A hook may extend these sets, permit the network, or opt out with
+`sandbox: false` / `sandbox.enabled: false`; `CODEREX_HOOK_SANDBOX=0` opts out
+process-wide. Additional paths are absolute or the load is refused; unknown
+sandbox keys are load errors. See `docs/hooks.md` for the settings shape.
+
+Enforcement matches the platform table above. On macOS the hook is wrapped in
+`sandbox-exec`; on Linux with `bwrap` it is wrapped in bubblewrap. Where there
+is no filesystem isolation — Windows, or Linux without `bwrap` — a gating hook
+(`PreToolUse`, `UserPromptSubmit`) fails closed with
+`HookError::SandboxUnavailable` rather than running unconfined, and a
+non-gating hook logs a warning and runs with resource limits only. An explicit
+opt-out is not a failure.
+
+The wrapper is transparent to the hook protocols: stdin/stdout/stderr are
+inherited, so both the one-way contract and `stream: true` line protocol work
+unchanged.
+
 ## Child-process hardening (all platforms)
 
 Two protections are applied by the spawning code itself, independently of any
@@ -254,6 +291,10 @@ does not go through the tool layer is not bound by them either.
   macOS, and a memory limit that is never observed to fire is a claim rather
   than a control.
 - Path checks for processes that do not go through the tool layer.
+- Filesystem or network confinement for a `command` hook on Windows, or on
+  Linux without `bwrap`. There, a gating hook is denied rather than run
+  unconfined; a non-gating one runs with a warning. `CODEREX_HOOK_SANDBOX=0`
+  and the per-hook `sandbox.enabled: false` opt out deliberately.
 
 ## Verifying the macOS guarantees
 
@@ -267,6 +308,14 @@ The Seatbelt behaviour is covered by tests that actually spawn `sandbox-exec`:
   paths, and network denial.
 - `crates/tools/src/builtins/bash_tool.rs` — the `Bash` tool end to end, including
   credential stripping and the safeSpawn refusal.
+- `crates/hooks/src/sandbox.rs` — command hooks end to end: a normal hook runs
+  and writes inside its workspace, a write under `$HOME` is refused, and
+  `unavailable_sandbox_fails_closed_on_a_gating_event` pins the deny path. The
+  macOS tests skip themselves when `/usr/bin/sandbox-exec` is absent; the
+  Linux write test skips unless `bwrap` is in force.
+
+Linux hooks (mount-namespace write denial, and fail-closed without `bwrap`) are
+covered by Linux-gated tests that cannot run on macOS.
 
 Linux behaviour (seccomp allowlist, `allow_network`, rlimits) is covered by
 Linux-gated tests that cannot run on macOS.

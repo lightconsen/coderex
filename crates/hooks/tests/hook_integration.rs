@@ -36,6 +36,7 @@ fn config(event: &str, command: &str) -> HookConfig {
         max_cpu_seconds: None,
         max_memory_mb: None,
         max_file_size_mb: None,
+        sandbox: None,
         tier: HookTier::Core,
     }
 }
@@ -59,6 +60,7 @@ fn config_with_env(event: &str, command: &str, env: HashMap<String, String>) -> 
         max_cpu_seconds: None,
         max_memory_mb: None,
         max_file_size_mb: None,
+        sandbox: None,
         tier: HookTier::Core,
     }
 }
@@ -703,6 +705,7 @@ fn http_config_with(
         max_cpu_seconds: None,
         max_memory_mb: None,
         max_file_size_mb: None,
+        sandbox: None,
         tier: HookTier::Core,
     }
 }
