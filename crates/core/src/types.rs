@@ -165,7 +165,7 @@ pub struct ToolResult {
 }
 
 /// Token usage summary for an API response.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UsageSummary {
     /// Number of input tokens.
     pub input_tokens: usize,

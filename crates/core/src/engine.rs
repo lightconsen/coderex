@@ -1188,6 +1188,7 @@ fn next_loop_step(
     if matches!(
         reason,
         TerminalReason::Completed
+            | TerminalReason::Error(_)
             | TerminalReason::TokenLimitStop
             | TerminalReason::LoopDetected { .. }
             | TerminalReason::ApiUnavailable { .. }
@@ -2122,7 +2123,20 @@ impl QueryEngine {
             .maybe_compact_on_threshold(turn, options, turn_number)
             .await
         {
-            return Ok(reason);
+            // A context that cannot be brought under the window ends the turn
+            // here, before a request. Close it like any other turn so the
+            // Stop/TurnEnd hooks, cost bookkeeping, and loop check run, and so
+            // the loop sees a terminal reason instead of re-running forever.
+            return Ok(self
+                .finish_turn(
+                    turn,
+                    turn_number,
+                    "context_blocked",
+                    &UsageSummary::default(),
+                    &[],
+                    reason,
+                )
+                .await);
         }
 
         // Phase 3: RunPreSubmitHooks → StartRequest
@@ -2392,7 +2406,19 @@ impl QueryEngine {
             .maybe_compact_on_threshold(turn, options, turn_number)
             .await
         {
-            return Ok(reason);
+            // See `execute_turn`: a blocked context closes the turn through
+            // the normal path so hooks and bookkeeping are not skipped and the
+            // loop terminates.
+            return Ok(self
+                .finish_turn(
+                    turn,
+                    turn_number,
+                    "context_blocked",
+                    &UsageSummary::default(),
+                    &[],
+                    reason,
+                )
+                .await);
         }
 
         // Phase 3: RunPreSubmitHooks → StartRequest → StreamAssistant
@@ -6882,6 +6908,29 @@ mod tests {
         ));
     }
 
+    /// An error reason ends the run.
+    ///
+    /// The loop used to have no `Error` arm, so it fell through to
+    /// `LoopStep::Continue`: a turn blocked on context re-ran forever because
+    /// `turn.reset()` cleared the state and `max_turns` defaults to 0.
+    #[test]
+    fn an_error_reason_breaks_the_turn_loop() {
+        assert!(matches!(
+            next_loop_step(
+                &TerminalReason::Error("context window is full".into()),
+                false,
+                0
+            ),
+            LoopStep::Break(TerminalReason::Error(_))
+        ));
+        // The `Completed`-on-a-tool-result rule must not rescue an error: the
+        // model has not seen the result only when there is a next request.
+        assert!(matches!(
+            next_loop_step(&TerminalReason::Error("bad request".into()), true, 0),
+            LoopStep::Break(TerminalReason::Error(_))
+        ));
+    }
+
     /// Answers with the next stop reason from a fixed list, one per request,
     /// and counts the requests.
     struct StopReasonSequenceMock {
@@ -7013,6 +7062,126 @@ mod tests {
         assert_eq!(
             calls.load(std::sync::atomic::Ordering::SeqCst),
             MAX_PROVIDER_RESUMES as usize + 1
+        );
+    }
+
+    /// Hook events recorded by [`RecordingHooks`].
+    type RecordedEvents = Arc<std::sync::Mutex<Vec<(String, HashMap<String, String>)>>>;
+
+    /// An engine on the conservative 32K unknown-model window whose compaction
+    /// retry budget is spent, so the blocked line is reported immediately
+    /// without attempting a compaction.
+    fn blocked_context_engine() -> (
+        QueryEngine,
+        Arc<std::sync::atomic::AtomicUsize>,
+        RecordedEvents,
+    ) {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let checker = PermissionChecker::new(PermissionMode::BypassPermissions);
+        let mut engine = QueryEngine::new(
+            Box::new(StopReasonSequenceMock {
+                reasons: vec!["end_turn".into()],
+                calls: Arc::clone(&calls),
+            }),
+            ModelId("unknown-small-window".into()),
+            SessionState::new(std::path::PathBuf::from("/tmp/test")),
+            PermissionEngine::new(checker),
+            tx,
+        );
+        // Ignore ambient context-window overrides so the 32K blocked line is
+        // fixed for the test.
+        engine.set_context_window_resolver(ContextWindowResolver::new(
+            crate::types::ContextWindowOverrides::default(),
+            crate::types::ContextWindowOverrides::default(),
+            crate::types::ContextWindowOverrides::default(),
+            crate::types::ContextWindowOverrides::default(),
+        ));
+        engine.compact_config.max_recovery_retries = 0;
+
+        let (hooks, recorded) = RecordingHooks::new();
+        engine.set_hooks(Box::new(hooks));
+        (engine, calls, recorded)
+    }
+
+    /// A turn blocked on context ends after one turn: before `Error` was a
+    /// breaking reason, the loop reset the turn and re-ran the same
+    /// un-sendable request forever.
+    #[tokio::test]
+    async fn a_context_blocked_turn_does_not_send_a_request_or_run_again() {
+        let (mut engine, calls, recorded) = blocked_context_engine();
+        // ~50K estimated tokens, past the 29K blocked line of a 32K window.
+        engine
+            .session
+            .messages
+            .push(Message::user("x".repeat(200_000)));
+
+        // Bounds the pre-fix fall-through at turn 2 instead of hanging: the
+        // old behaviour reported `MaxTurnsReached`, not the context error.
+        let options = SubmitOptions {
+            max_turns: 1,
+            ..SubmitOptions::default()
+        };
+
+        let reason = engine.submit("go".into(), options).await.unwrap();
+
+        assert!(
+            matches!(reason, TerminalReason::Error(_)),
+            "the blocked turn did not terminate with the context error: {reason:?}"
+        );
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "a blocked context was sent to the provider"
+        );
+
+        let stop_ran = {
+            let events = recorded
+                .lock()
+                .expect("the recording hook lock is not poisoned");
+            events.iter().any(|(name, _)| name == hook_events::STOP)
+        };
+        let turn_end_ran = {
+            let events = recorded
+                .lock()
+                .expect("the recording hook lock is not poisoned");
+            events.iter().any(|(name, _)| name == hook_events::TURN_END)
+        };
+        assert!(stop_ran, "Stop hooks did not run for the blocked turn");
+        assert!(
+            turn_end_ran,
+            "TurnEnd hooks did not run for the blocked turn"
+        );
+    }
+
+    /// The blocked turn leaves the runtime terminal rather than in a state the
+    /// loop can reset and run again.
+    #[tokio::test]
+    async fn a_context_blocked_turn_is_left_terminal() {
+        let (mut engine, calls, _recorded) = blocked_context_engine();
+        let mut turn = TurnRuntime::new(TokenBudget::with_defaults());
+        turn.messages.push(Message::user("x".repeat(200_000)));
+
+        let reason = engine
+            .execute_turn(&mut turn, &SubmitOptions::default(), 1)
+            .await
+            .expect("a blocked context returns a reason, not a fatal error");
+
+        assert!(matches!(reason, TerminalReason::Error(_)), "{reason:?}");
+        assert!(
+            turn.state.is_terminal(),
+            "the blocked turn was left in {:?}",
+            turn.state
+        );
+        assert!(
+            matches!(turn.terminal_reason, Some(TerminalReason::Error(_))),
+            "the blocked turn has no terminal reason: {:?}",
+            turn.terminal_reason
+        );
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "a blocked context was sent to the provider"
         );
     }
 
