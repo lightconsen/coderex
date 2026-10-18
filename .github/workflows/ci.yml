@@ -50,6 +50,25 @@ jobs:
       - uses: taiki-e/install-action@nextest
       - run: cargo nextest run --workspace
 
+  # The Unix test job cannot execute the Windows-only sandbox tests: they are
+  # `cfg(target_os = "windows")`, and the `build` matrix only compiles. This
+  # job runs the real AppContainer confinement tests on a Windows host.
+  #
+  # Advisory (`continue-on-error`) because the Windows runner's ring/rustls
+  # build has been the unstable part; promote it to required once it has a
+  # stable history.
+  test-windows:
+    name: Test (Windows sandbox)
+    runs-on: windows-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Core sandbox tests
+        run: cargo test -p coderex-core sandbox -- --nocapture
+      - name: Tools tests
+        run: cargo test -p coderex-tools
+
   code-agent-benchmark:
     name: Code Agent Benchmark
     runs-on: ubuntu-latest

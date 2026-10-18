@@ -418,7 +418,60 @@ pub fn bubblewrap_args(config: &SandboxConfig, cwd: &std::path::Path) -> Vec<Str
     args
 }
 
-// ─── macOS: best-effort memory ceiling ──────────────────────────────────────
+// ─── Memory ceiling: resource selection and best-effort attempt ─────────────
+
+/// The rlimit a memory ceiling targets, parameterised by platform.
+///
+/// Darwin rejects `RLIMIT_AS` and does not enforce `RLIMIT_RSS`, so
+/// `RLIMIT_DATA` is the only memory-shaped limit worth attempting there. Every
+/// other Unix uses the address-space limit. Pure, so both answers can be
+/// asserted on any host regardless of where the test runs; the production
+/// Darwin path calls it with `true`.
+#[cfg(unix)]
+#[must_use]
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub(crate) const fn memory_limit_resource(darwin: bool) -> libc::c_int {
+    if darwin {
+        libc::RLIMIT_DATA
+    } else {
+        libc::RLIMIT_AS
+    }
+}
+
+/// Apply `cur`/`max` to `resource`, returning the kernel's errno on rejection.
+///
+/// Split out from [`attempt_memory_limit`] so a test can force a rejection
+/// (`cur > max`) and observe the error without changing the calling process's
+/// real limits.
+#[cfg(unix)]
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn try_setrlimit(resource: libc::c_int, cur: libc::rlim_t, max: libc::rlim_t) -> Result<(), i32> {
+    let limit = libc::rlimit {
+        rlim_cur: cur,
+        rlim_max: max,
+    };
+    // SAFETY: setrlimit only reads the struct passed to it and either installs
+    // the limit or fails without changing the process.
+    if unsafe { libc::setrlimit(resource, &raw const limit) } == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error()
+            .raw_os_error()
+            .unwrap_or_default())
+    }
+}
+
+/// Attempt to install `bytes` as both the soft and hard memory ceiling.
+///
+/// Returns the kernel's errno when it refuses, so a rejection is observable
+/// instead of being silently folded into the caller's state. A rejection is
+/// not an error for spawning; see [`apply_darwin_memory_limit`].
+#[cfg(unix)]
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub(crate) fn attempt_memory_limit(darwin: bool, bytes: u64) -> Result<(), i32> {
+    let value = bytes as libc::rlim_t;
+    try_setrlimit(memory_limit_resource(darwin), value, value)
+}
 
 /// Try to install a Darwin memory ceiling in the **calling** process.
 ///
@@ -427,9 +480,9 @@ pub fn bubblewrap_args(config: &SandboxConfig, cwd: &std::path::Path) -> Vec<Str
 /// best-effort by design: modern Darwin (Monterey and later, including Sonoma
 /// and the macOS 15 line) returns `EINVAL` for every useful finite value, just
 /// as it does for `RLIMIT_AS`. The call therefore reports whether the kernel
-/// accepted the limit instead of turning an unsupported limit into a spawn
-/// failure. Callers install it from `pre_exec`, where it is inherited by the
-/// sandbox wrapper and the program it execs.
+/// accepted the limit (via [`attempt_memory_limit`]) instead of turning an
+/// unsupported limit into a spawn failure. Callers install it from `pre_exec`,
+/// where it is inherited by the sandbox wrapper and the program it execs.
 ///
 /// A `true` result is not a full address-space cap: `RLIMIT_DATA` bounds the
 /// data segment, not mappings the allocator creates with `mmap`. It is a
@@ -438,14 +491,7 @@ pub fn bubblewrap_args(config: &SandboxConfig, cwd: &std::path::Path) -> Vec<Str
 #[cfg(target_os = "macos")]
 #[must_use]
 pub fn apply_darwin_memory_limit(bytes: u64) -> bool {
-    let limit = libc::rlimit {
-        rlim_cur: bytes as libc::rlim_t,
-        rlim_max: bytes as libc::rlim_t,
-    };
-    // SAFETY: setrlimit only reads the struct passed to it. Failure (EINVAL on
-    // current Darwin) is deliberately ignored; the caller treats this as a
-    // best-effort ceiling rather than a condition of spawning.
-    unsafe { libc::setrlimit(libc::RLIMIT_DATA, &raw const limit) == 0 }
+    attempt_memory_limit(true, bytes).is_ok()
 }
 
 // ─── Linux: Landlock path confinement ───────────────────────────────────────
@@ -907,7 +953,8 @@ impl SandboxHandle {
     ///   filters in the child process before `execve`.
     /// - **macOS**: installs a best-effort `RLIMIT_DATA` ceiling when
     ///   [`SandboxConfig::max_memory_bytes`] is set. Modern Darwin rejects it;
-    ///   that is logged and does not fail the spawn. Use
+    ///   the rejection is ignored and does not fail the spawn (the child can
+    ///   observe the limit it actually inherited). Use
     ///   [`SandboxHandle::sandboxed_program`] to get the wrapper command.
     /// - **Windows**: starts the child suspended (`CREATE_SUSPENDED`) when a
     ///   security container is active. [`SandboxHandle::post_spawn`] must then
@@ -2841,22 +2888,63 @@ mod tests {
         assert_eq!(cgroup::current_cgroup_from_proc(""), None);
     }
 
-    // ─── macOS memory ceiling ───────────────────────────────────────────────
+    // ─── memory ceiling: resource selection and best-effort attempt ──────────
+
+    /// The resource choice is a pure function of the platform, so both
+    /// branches can be pinned on any Unix host.
+    #[test]
+    #[cfg(unix)]
+    fn memory_limit_resource_is_data_on_darwin_and_as_elsewhere() {
+        assert_eq!(memory_limit_resource(true), libc::RLIMIT_DATA);
+        assert_eq!(memory_limit_resource(false), libc::RLIMIT_AS);
+
+        // The platform's own answer matches the OS this test runs on.
+        let selected = memory_limit_resource(cfg!(target_os = "macos"));
+        if cfg!(target_os = "macos") {
+            assert_eq!(selected, libc::RLIMIT_DATA);
+        } else {
+            assert_eq!(selected, libc::RLIMIT_AS);
+        }
+    }
 
     /// The helper must never turn an unsupported kernel limit into a panic or
-    /// an error: modern Darwin rejects `RLIMIT_DATA` with EINVAL.
+    /// an error, and a rejection must remain observable to the caller.
     #[test]
     #[cfg(target_os = "macos")]
     fn darwin_memory_limit_is_best_effort() {
-        // This runs in the test process, so only call it with a value that
-        // cannot lower the process's own ceiling when accepted. Either answer
-        // is valid; the contract is that it returns rather than failing.
-        let accepted = apply_darwin_memory_limit(u64::MAX);
-        eprintln!("RLIMIT_DATA accepted by this kernel: {accepted}");
+        // `u64::MAX` (infinity) cannot lower this process's own ceiling when
+        // accepted, so running the attempt in the test process is safe either
+        // way. Modern Darwin refuses it; another kernel may accept it.
+        let attempt = attempt_memory_limit(true, u64::MAX);
+        assert_eq!(memory_limit_resource(true), libc::RLIMIT_DATA);
+        if let Err(errno) = attempt {
+            assert!(
+                matches!(errno, libc::EINVAL | libc::EPERM | libc::ENOTSUP),
+                "unexpected rejection errno {errno}: {}",
+                std::io::Error::from_raw_os_error(errno)
+            );
+        }
+        // The public bool API reports exactly what the attempt saw; it does
+        // not panic, abort, or hide a rejection.
+        assert_eq!(apply_darwin_memory_limit(u64::MAX), attempt.is_ok());
+
+        // A rejection is observable rather than swallowed: `cur > max` is an
+        // invalid request that changes nothing, but its errno comes back.
+        assert_eq!(
+            try_setrlimit(libc::RLIMIT_DATA, 1, 0),
+            Err(libc::EINVAL),
+            "an invalid limit must be reported, not silently accepted"
+        );
     }
 
-    /// `prepare` stays usable when the kernel rejects the memory limit: a
-    /// spawn that would otherwise succeed must not fail because of it.
+    /// A rejected ceiling must not abort the spawn, and the caller must be
+    /// able to observe that it was not applied.
+    ///
+    /// The limit is installed from `pre_exec`, so its real outcome can only be
+    /// observed in the child: `/bin/sh` reports the inherited `RLIMIT_DATA`.
+    /// On Darwin versions that reject the limit this is `unlimited`; where the
+    /// kernel honours it, it is the configured 64 MiB (`65536` KiB). Either
+    /// outcome is a successful spawn.
     #[test]
     #[cfg(target_os = "macos")]
     fn macos_prepare_with_a_rejected_memory_limit_still_spawns() {
@@ -2865,10 +2953,39 @@ mod tests {
             ..SandboxConfig::default()
         })
         .unwrap();
-        let mut cmd = std::process::Command::new("true");
+        let mut cmd = std::process::Command::new("/bin/sh");
+        cmd.arg("-c").arg("ulimit -d");
         handle.prepare(&mut cmd).expect("prepare must not fail");
-        let status = cmd.status().expect("spawn must not fail");
-        assert!(status.success(), "the child did not run: {status:?}");
+        let output = cmd.output().expect("spawn must not fail");
+        assert!(
+            output.status.success(),
+            "the child did not run: {:?}",
+            output.status
+        );
+
+        let inherited = String::from_utf8_lossy(&output.stdout);
+        let inherited = inherited.trim();
+        assert!(
+            inherited == "unlimited" || inherited == "65536",
+            "the child should report the limit it inherited, got {inherited:?}"
+        );
+        if inherited == "unlimited" {
+            // Pre-exec's attempt was rejected. Confirm the kernel really does
+            // refuse this value with a throwaway child, so a silent failure to
+            // install the hook is not mistaken for a rejected limit. The probe
+            // starts without the pre-exec hook, so it also cannot lower this
+            // test process's limits.
+            let probe = std::process::Command::new("/bin/sh")
+                .arg("-c")
+                .arg("ulimit -d 65536")
+                .stderr(std::process::Stdio::null())
+                .status()
+                .expect("the probe child must run");
+            assert!(
+                !probe.success(),
+                "the child inherited no limit although the kernel accepts it"
+            );
+        }
     }
 
     // ─── bubblewrap policy ──────────────────────────────────────────────────
@@ -3296,8 +3413,9 @@ mod tests {
     /// The path the shell tools use: create suspended, attach the AppContainer
     /// token, assign the Job Object, resume.
     ///
-    /// Runs on a Windows CI host. The container may write in the granted
-    /// directory and must not write in an ungranted sibling.
+    /// Runs in the `test-windows` CI job (advisory until that job has a stable
+    /// history). The container may write in the granted directory and must not
+    /// write in an ungranted sibling.
     #[test]
     #[cfg(target_os = "windows")]
     fn windows_sandbox_confines_a_suspended_child() {

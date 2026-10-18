@@ -22,18 +22,20 @@
 //!
 //! The documented Windows way to start a process in an AppContainer is a
 //! `STARTUPINFOEX` carrying `PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES` and
-//! `CreateProcessW(..., EXTENDED_STARTUPINFO_PRESENT, ...)`. That is what
-//! [`AppContainer::spawn`] does.
+//! `CreateProcessW(..., EXTENDED_STARTUPINFO_PRESENT, ...)`. It is implemented
+//! by [`AppContainer::spawn`], which is **test-only**: the stable-Rust
+//! `std::process::Command` cannot pass a process attribute list, so no
+//! production caller can use it. The Windows test calls it to exercise the
+//! documented primitive.
 //!
-//! Rust's stable `std::process::Command` cannot pass a process attribute list,
-//! and the workspace builds on stable Rust. The shell tools therefore create
-//! the child with `CREATE_SUSPENDED`, then [`AppContainer::restrict_suspended`]
-//! replaces its primary token with an AppContainer token before the first
-//! thread runs, and [`AppContainer::resume`] lets it go. The token is created
-//! with the undocumented-but-long-standing `CreateAppContainerToken` export
-//! from `kernelbase.dll`; the call is resolved dynamically and the sandbox
-//! reports itself unavailable when it is missing. This is the same mechanism
-//! Chromium used to attach a LowBox token to a suspended process.
+//! Production instead creates the child with `CREATE_SUSPENDED`, then
+//! [`AppContainer::restrict_suspended`] replaces its primary token with an
+//! AppContainer token before the first thread runs, and [`AppContainer::resume`]
+//! lets it go. The token is created with the undocumented-but-long-standing
+//! `CreateAppContainerToken` export from `kernelbase.dll`; the call is resolved
+//! dynamically and the sandbox reports itself unavailable when it is missing.
+//! This is the same mechanism Chromium used to attach a LowBox token to a
+//! suspended process.
 //!
 //! Both paths share the profile, SID, capability and ACL policy in this module.
 //!
@@ -46,11 +48,10 @@
 //!
 //! ## Verification status
 //!
-//! The Win32 code has **not been compiled or run** on the machine this was
-//! written on (macOS, no Windows toolchain). Only the pure policy functions
-//! have been executed, by the unit tests below. The Windows-gated tests that
-//! spawn a real process exist so a Windows CI host can verify the guarantees;
-//! until they run, the AppContainer path is reviewed-only.
+//! The Windows-gated tests that spawn a real process are run by the
+//! `test-windows` CI job. That job is currently advisory while it builds a
+//! stable history, so treat the AppContainer path as reviewed-only until it
+//! passes there consistently.
 
 #![allow(unsafe_code)]
 #![cfg_attr(not(target_os = "windows"), allow(dead_code))]
@@ -734,13 +735,15 @@ mod imp {
         /// `STARTUPINFOEX` + `PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES`
         /// path.
         ///
-        /// This is the primitive for callers that can create a process
-        /// themselves. `std::process::Command` cannot pass a process attribute
-        /// list on stable Rust, which is why the shell tools use
-        /// [`Self::restrict_suspended`] instead.
+        /// **Test-only alternative path.** Production (the shell tools and
+        /// hooks) spawns with `CREATE_SUSPENDED` and calls
+        /// [`Self::restrict_suspended`] instead, because
+        /// `std::process::Command` cannot pass a process attribute list on
+        /// stable Rust. This method exists so the Windows test can exercise
+        /// the documented primitive; nothing outside `cfg(test)` calls it.
         ///
         /// The environment is inherited from this process.
-        #[allow(dead_code)] // the documented path is exercised by the Windows tests
+        #[allow(dead_code)] // test-only: production uses `restrict_suspended`
         pub(crate) fn spawn(
             &self,
             program: &Path,
@@ -825,9 +828,9 @@ mod imp {
             })
         }
 
-        /// The profile SID, for tests and diagnostics.
+        /// The profile SID, for the Windows test and diagnostics.
         #[must_use]
-        #[allow(dead_code)] // used by the Windows integration tests
+        #[allow(dead_code)] // test-only: read by the Windows confinement tests
         pub(crate) fn sid(&self) -> PSID {
             self.sid
         }
@@ -843,7 +846,8 @@ mod imp {
         }
     }
 
-    /// A process started by [`AppContainer::spawn`].
+    /// A process started by the test-only [`AppContainer::spawn`] path.
+    #[allow(dead_code)] // test-only: constructed only by `spawn`
     pub(crate) struct ContainedChild {
         process: HANDLE,
         thread: HANDLE,
@@ -851,6 +855,7 @@ mod imp {
 
     impl ContainedChild {
         /// Wait for the process to exit and return its exit code.
+        #[allow(dead_code)] // test-only: only the Windows confinement test waits
         pub(crate) fn wait(&self) -> Result<u32, SandboxError> {
             // SAFETY: `process` is a live handle owned by this value.
             let wait = unsafe { WaitForSingleObject(self.process, u32::MAX) };
