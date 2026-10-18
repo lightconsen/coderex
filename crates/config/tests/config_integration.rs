@@ -171,6 +171,8 @@ fn settings_json_serde_roundtrip() {
         hooks: None,
         hook_layers: None,
         mcp_servers: None,
+        vim_mode: None,
+        statusline: None,
         api_key: Some("sk-test".into()),
         context_window: None,
     };

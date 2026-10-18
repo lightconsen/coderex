@@ -65,7 +65,13 @@ pub enum ConfigError {
 pub const MAX_SETTINGS_FILE_BYTES: u64 = 2 * 1024 * 1024;
 
 /// The set of keys a settings file may contain.
-const KNOWN_SETTINGS_FIELDS: [&str; 13] = [
+///
+/// `env` is accepted for backward compatibility only: releases before the
+/// remote-environment split wrote it into `settings.json`. It is deliberately
+/// *not* a [`Settings`] field, so serde ignores it and no settings file
+/// (including a repository-controlled one) can inject environment variables.
+/// Remote environment variables now live in `remote_env.json`.
+const KNOWN_SETTINGS_FIELDS: [&str; 16] = [
     "config_version",
     "model",
     "permission_mode",
@@ -79,6 +85,9 @@ const KNOWN_SETTINGS_FIELDS: [&str; 13] = [
     "marketplaces",
     "api_key",
     "context_window",
+    "vim_mode",
+    "statusline",
+    "env",
 ];
 
 /// Permission modes accepted in settings, most restrictive first.
@@ -215,6 +224,21 @@ impl ContextWindowSettings {
     }
 }
 
+/// Statusline preferences written by `/statusline-setup`.
+///
+/// Both fields are optional and omitted when unset, so a settings file that
+/// only configures, say, the theme round-trips without gaining a `format`
+/// key.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct StatuslineSettings {
+    /// Format template for the statusline.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub format: Option<String>,
+    /// Theme name for the statusline.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub theme: Option<String>,
+}
+
 /// A plugin marketplace configured in settings.
 ///
 /// Install and update paths register each entry with the plugin manager before
@@ -294,6 +318,12 @@ pub struct Settings {
     /// Per-model context-window overrides, with an optional default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_window: Option<ContextWindowSettings>,
+    /// Whether vim keybindings are enabled (written by `/vim`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vim_mode: Option<bool>,
+    /// Statusline preferences (written by `/statusline-setup`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub statusline: Option<StatuslineSettings>,
 }
 
 impl Settings {
@@ -318,6 +348,8 @@ impl Settings {
             mcp_servers: None,
             api_key: None,
             context_window: None,
+            vim_mode: None,
+            statusline: None,
         }
     }
 
@@ -453,6 +485,8 @@ impl Settings {
                 .context_window
                 .clone()
                 .or_else(|| self.context_window.clone()),
+            vim_mode: other.vim_mode.or(self.vim_mode),
+            statusline: other.statusline.clone().or_else(|| self.statusline.clone()),
         }
     }
 
@@ -475,6 +509,8 @@ impl Settings {
             "mcp_servers",
             "api_key",
             "context_window",
+            "vim_mode",
+            "statusline",
         ];
         let mut changes = Vec::new();
 
@@ -863,8 +899,9 @@ impl ConfigService {
         let mut merged = core.merge(&managed);
         merged.hook_layers = Some(HookLayers {
             core: core_hooks,
-            // See `HookLayers::plugin` — plugin manifests accept a `hooks`
-            // field but it is not implemented, so there is no producer.
+            // Filled by the orchestrator from `PluginManager::plugin_hooks()`
+            // after plugins load; settings resolution itself has no plugin
+            // manifest to read.
             plugin: None,
             managed: managed_hooks,
         });
@@ -1435,6 +1472,8 @@ mod tests {
             mcp_servers: None,
             api_key: None,
             context_window: None,
+            vim_mode: None,
+            statusline: None,
         };
         migrate_settings(&mut settings, "test");
         assert_eq!(settings.config_version, CURRENT_SCHEMA_VERSION);
@@ -1462,6 +1501,75 @@ mod tests {
         let snake: Settings =
             serde_json::from_str(r#"{"mcp_servers":{"x":{"command":"y"}}}"#).unwrap();
         assert!(snake.mcp_servers.is_some());
+    }
+
+    #[test]
+    fn vim_mode_and_statusline_parse_and_round_trip() {
+        let json = r#"{
+            "vim_mode": true,
+            "statusline": { "format": "[model] [vim]", "theme": "dark" }
+        }"#;
+        let settings: Settings = serde_json::from_str(json).unwrap();
+        assert_eq!(settings.vim_mode, Some(true));
+        let statusline = settings.statusline.as_ref().unwrap();
+        assert_eq!(statusline.format.as_deref(), Some("[model] [vim]"));
+        assert_eq!(statusline.theme.as_deref(), Some("dark"));
+
+        let serialized = serde_json::to_string(&settings).unwrap();
+        let reparsed: Settings = serde_json::from_str(&serialized).unwrap();
+        assert_eq!(reparsed.vim_mode, Some(true));
+        assert_eq!(reparsed.statusline, settings.statusline);
+    }
+
+    #[test]
+    fn statusline_omits_unset_fields_and_absent_section() {
+        let settings: Settings =
+            serde_json::from_str(r#"{"statusline":{"theme":"dark"}}"#).unwrap();
+        let statusline = settings.statusline.as_ref().unwrap();
+        assert_eq!(statusline.format, None);
+        assert_eq!(statusline.theme.as_deref(), Some("dark"));
+
+        let value = serde_json::to_value(&settings).unwrap();
+        assert_eq!(value["statusline"], serde_json::json!({ "theme": "dark" }));
+        assert!(value.get("vim_mode").is_none());
+
+        // An unset `statusline` is omitted entirely rather than written as null.
+        let empty = serde_json::to_value(Settings::default()).unwrap();
+        assert!(empty.get("statusline").is_none());
+        assert!(empty.get("vim_mode").is_none());
+    }
+
+    /// A file left behind by older `/vim`, `/remote-env`, and
+    /// `/statusline-setup` commands must load instead of being rejected as
+    /// unknown, which used to fall the whole user file back to defaults.
+    #[test]
+    fn settings_file_with_vim_env_and_statusline_is_accepted() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("settings.json");
+        std::fs::write(
+            &path,
+            r#"{
+                "model": "kept-model",
+                "vim_mode": true,
+                "env": { "FOO": "bar" },
+                "statusline": { "format": "[model]", "theme": "dark" }
+            }"#,
+        )
+        .unwrap();
+
+        let resolved = ConfigService::new(path.clone(), None).resolve().unwrap();
+        assert_eq!(resolved.model.as_deref(), Some("kept-model"));
+        assert_eq!(resolved.vim_mode, Some(true));
+        assert_eq!(
+            resolved.statusline.as_ref().unwrap().theme.as_deref(),
+            Some("dark")
+        );
+
+        // `env` is accepted for backward compatibility but is not a Settings
+        // field, so the post-load write-back drops it: a repository-controlled
+        // settings file can never inject environment variables.
+        let rewritten = std::fs::read_to_string(&path).unwrap();
+        assert!(!rewritten.contains("\"env\""));
     }
 
     #[test]

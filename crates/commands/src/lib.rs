@@ -23,6 +23,7 @@ mod stats_commands;
 
 // Re-export key types
 pub use history::CommandHistory;
+pub use integration_commands::load_remote_env;
 pub use macro_commands::MacroRegistry;
 pub use registry::{
     CommandArgs, CommandContext, CommandHandler, CommandRegistry, CommandResult, CommandType,

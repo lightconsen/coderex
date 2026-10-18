@@ -45,6 +45,46 @@ fn write_user_settings(
     Ok(())
 }
 
+/// Path of the dedicated remote-environment file.
+fn remote_env_path() -> std::path::PathBuf {
+    config_home().join("remote_env.json")
+}
+
+/// Load remote environment variables from `config_home()/remote_env.json`.
+///
+/// The file is a flat `{KEY: VALUE}` JSON object. A missing file yields an
+/// empty map; read and parse failures are logged and also yield an empty map.
+///
+/// This file is deliberately separate from `settings.json`: settings files may
+/// be repository-controlled, and must never be able to inject environment
+/// variables into a session.
+#[must_use]
+pub fn load_remote_env() -> std::collections::HashMap<String, String> {
+    let path = remote_env_path();
+    let content = match std::fs::read_to_string(&path) {
+        Ok(content) => content,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return std::collections::HashMap::new();
+        }
+        Err(e) => {
+            tracing::warn!("failed to read remote env file {path:?}: {e}");
+            return std::collections::HashMap::new();
+        }
+    };
+    serde_json::from_str(&content).unwrap_or_else(|e| {
+        tracing::warn!("failed to parse remote env file {path:?}: {e}");
+        std::collections::HashMap::new()
+    })
+}
+
+/// Write the dedicated remote-environment file.
+fn write_remote_env(env: &std::collections::HashMap<String, String>) -> Result<(), String> {
+    let home = config_home();
+    std::fs::create_dir_all(&home).map_err(|e| e.to_string())?;
+    let json = serde_json::to_string_pretty(env).map_err(|e| e.to_string())?;
+    std::fs::write(remote_env_path(), json).map_err(|e| e.to_string())
+}
+
 /// Register integration commands.
 pub fn register(registry: &mut CommandRegistry) {
     // /ide — IDE integration
@@ -185,7 +225,9 @@ chrome_get_content    — Extract page HTML as markdown"
             settings.insert("vim_mode".to_string(), serde_json::Value::Bool(new_state));
             let persist_msg = match write_user_settings(&settings) {
                 Ok(()) => "Saved to settings.json.".to_string(),
-                Err(e) => format!("Failed to save settings: {e}"),
+                Err(e) => {
+                    return CommandResult::error(format!("Failed to save vim mode: {e}"));
+                }
             };
             CommandResult::success(format!(
                 "Vim mode: {}\n{persist_msg}",
@@ -202,13 +244,16 @@ chrome_get_content    — Extract page HTML as markdown"
         true,
         true,
         true,
-        Arc::new(|ctx: &CommandContext, args: &[String]| {
+        Arc::new(|_ctx: &CommandContext, args: &[String]| {
             if args.is_empty() {
+                let env = load_remote_env();
                 let mut output = String::from("Environment Variables:\n");
-                if ctx.env.is_empty() {
+                if env.is_empty() {
                     output.push_str("  (none set)");
                 } else {
-                    for (k, v) in &ctx.env {
+                    let mut entries: Vec<_> = env.iter().collect();
+                    entries.sort_by_key(|(key, _)| key.as_str());
+                    for (k, v) in entries {
                         output.push_str(&format!("  {k}={v}\n"));
                     }
                 }
@@ -227,17 +272,19 @@ chrome_get_content    — Extract page HTML as markdown"
                     );
                 };
 
-                let mut settings = read_user_settings().unwrap_or_default();
-                let mut env_obj = settings
-                    .get("env")
-                    .and_then(|v| v.as_object().cloned())
-                    .unwrap_or_default();
-                env_obj.insert(key.clone(), serde_json::Value::String(value.clone()));
-                settings.insert("env".to_string(), serde_json::Value::Object(env_obj));
+                // Remote environment variables live in a dedicated file that
+                // never participates in settings merging: settings may come
+                // from a repository, which must not be able to inject env vars.
+                let mut env = load_remote_env();
+                env.insert(key.clone(), value.clone());
 
-                let persist_msg = match write_user_settings(&settings) {
-                    Ok(()) => "Saved to settings.json.".to_string(),
-                    Err(e) => format!("Failed to save settings: {e}"),
+                let persist_msg = match write_remote_env(&env) {
+                    Ok(()) => "Saved to remote_env.json.".to_string(),
+                    Err(e) => {
+                        return CommandResult::error(format!(
+                            "Failed to save remote environment: {e}"
+                        ));
+                    }
                 };
                 CommandResult::success(format!(
                     "Environment variable set: {key}={value}\n{persist_msg}"
@@ -317,7 +364,11 @@ chrome_get_content    — Extract page HTML as markdown"
             );
             let persist_msg = match write_user_settings(&settings) {
                 Ok(()) => "Saved to settings.json.".to_string(),
-                Err(e) => format!("Failed to save settings: {e}"),
+                Err(e) => {
+                    return CommandResult::error(format!(
+                        "Failed to save statusline settings: {e}"
+                    ));
+                }
             };
             CommandResult::success(format!(
                 "Statusline Setup\n────────────────\nFormat: {format}\nTheme: {}\n\n{persist_msg}",
@@ -417,12 +468,12 @@ mod tests {
         let result = reg.execute("vim", &ctx(), &[]);
         assert!(result.output.contains("enabled"));
         assert!(result.state_changed);
-        // Verify settings.json was written
+        // Verify settings.json was written and is a valid Settings document
         let settings_path = tmp.path().join("settings.json");
         assert!(settings_path.exists());
         let content = std::fs::read_to_string(&settings_path).unwrap();
-        assert!(content.contains("vim_mode"));
-        assert!(content.contains("true"));
+        let settings: coderex_config::Settings = serde_json::from_str(&content).unwrap();
+        assert_eq!(settings.vim_mode, Some(true));
     }
 
     #[test]
@@ -445,12 +496,14 @@ mod tests {
         let settings_path = tmp.path().join("settings.json");
         assert!(settings_path.exists());
         let content = std::fs::read_to_string(&settings_path).unwrap();
-        assert!(content.contains("vim_mode"));
-        assert!(content.contains("false"));
+        let settings: coderex_config::Settings = serde_json::from_str(&content).unwrap();
+        assert_eq!(settings.vim_mode, Some(false));
     }
 
     #[test]
     fn remote_env_empty() {
+        let tmp = tempfile::tempdir().unwrap();
+        set_test_config_home(tmp.path().to_path_buf());
         let reg = {
             let mut r = CommandRegistry::new();
             register(&mut r);
@@ -462,20 +515,21 @@ mod tests {
 
     #[test]
     fn remote_env_with_vars() {
-        let mut env = std::collections::HashMap::new();
-        env.insert("PATH".into(), "/usr/bin".into());
-        let c = CommandContext { env, ..ctx() };
+        let tmp = tempfile::tempdir().unwrap();
+        set_test_config_home(tmp.path().to_path_buf());
+        std::fs::write(tmp.path().join("remote_env.json"), r#"{"PATH":"/usr/bin"}"#).unwrap();
         let reg = {
             let mut r = CommandRegistry::new();
             register(&mut r);
             r
         };
-        let result = reg.execute("remote-env", &c, &[]);
-        assert!(result.output.contains("PATH"));
+        // The listing comes from the dedicated file, not from ctx.env.
+        let result = reg.execute("remote-env", &ctx(), &[]);
+        assert!(result.output.contains("PATH=/usr/bin"));
     }
 
     #[test]
-    fn remote_env_set_persists() {
+    fn remote_env_set_persists_to_dedicated_file() {
         let tmp = tempfile::tempdir().unwrap();
         set_test_config_home(tmp.path().to_path_buf());
         let reg = {
@@ -486,12 +540,67 @@ mod tests {
         let result = reg.execute("remote-env", &ctx(), &["FOO=bar".into()]);
         assert!(result.output.contains("FOO=bar"));
         assert!(result.state_changed);
-        // Verify settings.json was written
-        let settings_path = tmp.path().join("settings.json");
-        assert!(settings_path.exists());
-        let content = std::fs::read_to_string(&settings_path).unwrap();
-        assert!(content.contains("FOO"));
-        assert!(content.contains("bar"));
+
+        // Values go to remote_env.json...
+        let env_path = tmp.path().join("remote_env.json");
+        assert!(env_path.exists());
+        let content = std::fs::read_to_string(&env_path).unwrap();
+        assert_eq!(
+            serde_json::from_str::<std::collections::HashMap<String, String>>(&content).unwrap(),
+            std::collections::HashMap::from([("FOO".to_string(), "bar".to_string())])
+        );
+        assert_eq!(
+            load_remote_env().get("FOO").map(String::as_str),
+            Some("bar")
+        );
+
+        // ...and never into settings.json, which may be repository-controlled.
+        assert!(!tmp.path().join("settings.json").exists());
+    }
+
+    #[test]
+    fn remote_env_set_merges_existing_entries() {
+        let tmp = tempfile::tempdir().unwrap();
+        set_test_config_home(tmp.path().to_path_buf());
+        std::fs::write(tmp.path().join("remote_env.json"), r#"{"EXISTING":"keep"}"#).unwrap();
+        let reg = {
+            let mut r = CommandRegistry::new();
+            register(&mut r);
+            r
+        };
+        let result = reg.execute("remote-env", &ctx(), &["NEW=value".into()]);
+        assert!(result.state_changed);
+
+        let env = load_remote_env();
+        assert_eq!(env.get("EXISTING").map(String::as_str), Some("keep"));
+        assert_eq!(env.get("NEW").map(String::as_str), Some("value"));
+    }
+
+    #[test]
+    fn remote_env_supports_key_value_form() {
+        let tmp = tempfile::tempdir().unwrap();
+        set_test_config_home(tmp.path().to_path_buf());
+        let reg = {
+            let mut r = CommandRegistry::new();
+            register(&mut r);
+            r
+        };
+        let result = reg.execute("remote-env", &ctx(), &["KEY".into(), "some value".into()]);
+        assert!(result.state_changed);
+        assert_eq!(
+            load_remote_env().get("KEY").map(String::as_str),
+            Some("some value")
+        );
+    }
+
+    #[test]
+    fn load_remote_env_missing_or_invalid_is_empty() {
+        let tmp = tempfile::tempdir().unwrap();
+        set_test_config_home(tmp.path().to_path_buf());
+        assert!(load_remote_env().is_empty());
+
+        std::fs::write(tmp.path().join("remote_env.json"), "not json").unwrap();
+        assert!(load_remote_env().is_empty());
     }
 
     #[test]
@@ -518,11 +627,40 @@ mod tests {
         let result = reg.execute("statusline-setup", &ctx(), &[]);
         assert!(result.output.contains("Statusline Setup"));
         assert!(result.state_changed);
-        // Verify settings.json was written
+        // Verify settings.json was written with a real statusline section
         let settings_path = tmp.path().join("settings.json");
         assert!(settings_path.exists());
         let content = std::fs::read_to_string(&settings_path).unwrap();
-        assert!(content.contains("statusline"));
-        assert!(content.contains("format"));
+        let settings: coderex_config::Settings = serde_json::from_str(&content).unwrap();
+        let statusline = settings.statusline.as_ref().unwrap();
+        assert_eq!(
+            statusline.format.as_deref(),
+            Some("[model] [tokens] [cost] [permissions]")
+        );
+        assert_eq!(statusline.theme.as_deref(), Some(""));
+    }
+
+    #[test]
+    fn statusline_includes_vim_segment_when_enabled() {
+        let tmp = tempfile::tempdir().unwrap();
+        set_test_config_home(tmp.path().to_path_buf());
+        let c = CommandContext {
+            vim_mode: true,
+            theme: "dark".into(),
+            ..ctx()
+        };
+        let reg = {
+            let mut r = CommandRegistry::new();
+            register(&mut r);
+            r
+        };
+        let result = reg.execute("statusline-setup", &c, &[]);
+        assert!(result.state_changed);
+
+        let content = std::fs::read_to_string(tmp.path().join("settings.json")).unwrap();
+        let settings: coderex_config::Settings = serde_json::from_str(&content).unwrap();
+        let statusline = settings.statusline.as_ref().unwrap();
+        assert!(statusline.format.as_deref().unwrap().contains("[vim]"));
+        assert_eq!(statusline.theme.as_deref(), Some("dark"));
     }
 }
