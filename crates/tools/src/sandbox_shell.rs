@@ -110,8 +110,16 @@ pub fn sandboxed_shell(
 /// On Windows the child was created suspended by `prepare`. This attaches the
 /// AppContainer token, assigns the Job Object, and resumes it; any failure
 /// terminates the child, so a command is never reported as sandboxed after
-/// running outside the container. Elsewhere there is nothing left to do.
-/// Callers must hold the handle until the child exits.
+/// running outside the container.
+///
+/// On Linux the child is added to the cgroup prepared for its memory limit. A
+/// cgroup attachment failure after a successful spawn is logged rather than
+/// returned: the command is already running, and failing here would turn a
+/// missing hardening layer into a broken shell. It is not silently treated as
+/// bounded either — the warning says the child runs with `RLIMIT_AS` only.
+///
+/// Elsewhere there is nothing left to do. Callers must hold the handle until
+/// the child exits.
 ///
 /// # Errors
 ///
@@ -143,7 +151,27 @@ pub fn finish_spawn(
             }
         }
     }
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(target_os = "linux")]
+    {
+        if let Some(handle) = handle {
+            match child.id() {
+                Some(pid) => {
+                    if let Err(error) = handle.post_spawn_pid(pid) {
+                        tracing::warn!(
+                            %error,
+                            "could not add the shell to its memory cgroup; it runs with \
+                             RLIMIT_AS only"
+                        );
+                    }
+                }
+                None => tracing::warn!(
+                    "the shell exited before it could be added to its memory cgroup; \
+                     it ran with RLIMIT_AS only"
+                ),
+            }
+        }
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "linux")))]
     {
         let _ = (handle, child);
     }
@@ -194,7 +222,10 @@ mod tests {
         );
         let (mut cmd, handle) = sandboxed_shell(&ctx, "sh", &["-c", "echo sandboxed"]).unwrap();
 
-        assert!(handle.is_some(), "a configured policy should hand back a handle");
+        assert!(
+            handle.is_some(),
+            "a configured policy should hand back a handle"
+        );
         let output = cmd.output().await.unwrap();
         let stdout = String::from_utf8_lossy(&output.stdout);
         assert!(
@@ -218,6 +249,9 @@ mod tests {
 
         // `PATH` is process-wide, so this test asks the resolver directly rather
         // than mutating it under the other tests.
-        assert!(coderex_core::sandbox::resolves_inside_cwd("./sh", dir.path()));
+        assert!(coderex_core::sandbox::resolves_inside_cwd(
+            "./sh",
+            dir.path()
+        ));
     }
 }

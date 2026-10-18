@@ -9,8 +9,8 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{ChildStderr, ChildStdin};
 
 use crate::action::{
-    AGENT_DEFAULT_MODEL, AGENT_DEFAULT_TIMEOUT_MS, ActionPrompt, HookActionRunner, McpToolHook,
-    PROMPT_DEFAULT_TIMEOUT_MS, interpolate_tool_input, parse_answer, substitute_arguments,
+    interpolate_tool_input, parse_answer, substitute_arguments, ActionPrompt, HookActionRunner,
+    McpToolHook, AGENT_DEFAULT_MODEL, AGENT_DEFAULT_TIMEOUT_MS, PROMPT_DEFAULT_TIMEOUT_MS,
 };
 use crate::events::{HookAction, HookError, HookEvent, HookResult};
 use crate::sandbox::HookSandboxConfig;
@@ -1071,8 +1071,33 @@ async fn execute_hook(
     // Unix they are inherited by the sandbox wrapper and the shell it execs.
     sandbox::apply_resource_limits(&mut command, hook);
 
+    // On Linux without bubblewrap the filesystem backend is Landlock, which
+    // is entered from `pre_exec`; the wrapper path needs no preparation here.
+    // A gating hook that cannot install its confinement is denied. A
+    // non-gating hook has nowhere to deny, so it is warned about and runs with
+    // the resource limits installed above — the same policy `enforce` applies
+    // when no backend exists at all.
+    if let Some(handle) = &sandbox_handle {
+        if let Err(error) = handle.prepare(command.as_std_mut()) {
+            if gating {
+                return Err(HookError::SandboxUnavailable(format!(
+                    "could not install the hook sandbox: {error}"
+                )));
+            }
+            tracing::warn!(
+                %error,
+                "could not install the hook sandbox; the hook runs with resource limits only"
+            );
+        }
+    }
+
     #[cfg(target_os = "windows")]
     let job = sandbox::prepare_windows_limits(hook);
+
+    // A Linux memory limit is also a cgroup: created before spawn, attached
+    // immediately after. Kept alive until the child has been waited for.
+    #[cfg(target_os = "linux")]
+    let cgroup = sandbox::prepare_cgroup_limits(hook);
 
     let mut child = command
         .spawn()
@@ -1081,6 +1106,11 @@ async fn execute_hook(
     #[cfg(target_os = "windows")]
     if let Some(job) = &job {
         sandbox::assign_windows_limits(job, &child);
+    }
+
+    #[cfg(target_os = "linux")]
+    if let Some(cgroup) = &cgroup {
+        sandbox::attach_cgroup_limits(cgroup, &child);
     }
 
     let mut stdin = child.stdin.take();
@@ -1594,11 +1624,9 @@ mod tests {
     #[test]
     fn hook_registry_starts_empty() {
         let registry = HookRegistry::new();
-        assert!(
-            registry
-                .matches_for_event(&HookEvent::SessionStart)
-                .is_empty()
-        );
+        assert!(registry
+            .matches_for_event(&HookEvent::SessionStart)
+            .is_empty());
     }
 
     #[test]
@@ -1694,11 +1722,9 @@ mod tests {
     #[test]
     fn load_from_settings_null_returns_empty() {
         let registry = HookRegistry::load_from_settings(&serde_json::Value::Null).unwrap();
-        assert!(
-            registry
-                .matches_for_event(&HookEvent::SessionStart)
-                .is_empty()
-        );
+        assert!(registry
+            .matches_for_event(&HookEvent::SessionStart)
+            .is_empty());
     }
 
     #[test]
@@ -2408,11 +2434,9 @@ mod tests {
             "{}",
             prompts[0].prompt
         );
-        assert!(
-            prompts[0]
-                .prompt
-                .contains(r#"\"file_path\":\"/etc/hosts\""#)
-        );
+        assert!(prompts[0]
+            .prompt
+            .contains(r#"\"file_path\":\"/etc/hosts\""#));
     }
 
     /// `$ARGUMENTS` is how a prompt hook sees what it is gating: the hook input
