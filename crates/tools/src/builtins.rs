@@ -66,7 +66,10 @@ pub use glob_tool::GlobTool;
 pub use grep_tool::GrepTool;
 pub use list_dir_tool::ListDirTool;
 pub use lsp_tool::LspTool;
-pub use mcp_auth_tool::{McpAuthTool, default_token_path, persist_token_at};
+pub use mcp_auth_tool::{
+    McpAuthTool, cache_discovery_at, default_token_path, persist_token_at,
+    persist_token_with_endpoints_at,
+};
 pub use mcp_resource_tools::{ListMcpResourcesTool, ReadMcpResourceTool};
 pub use notebook_edit_tool::NotebookEditTool;
 pub use powershell_tool::PowerShellTool;
