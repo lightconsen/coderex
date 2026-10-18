@@ -73,7 +73,7 @@ main() → parse_args() → StartupOrchestrator::run()
 | `--resume ID` | `-r` | Resume a specific session by ID |
 | `--name NAME` | `-n` | Session name (sets `SessionState.title`) |
 | `--fork-session ID` | | Fork a session from an existing session ID (loads transcript messages) |
-| `--from-pr URL` | | Load context from a PR URL (added to prompt context) |
+| `--from-pr URL` | | Fetch a PR with `gh` and prepend its context to the initial prompt (see below) |
 | `--no-session-persistence` | | Disable session transcript saving (clears memory stores) |
 | `--disable-slash-commands` | | Disable slash commands in the REPL (clears `CommandRegistry`) |
 | `--max-budget-usd USD` | | Maximum budget for this session |
@@ -91,12 +91,12 @@ main() → parse_args() → StartupOrchestrator::run()
 | `--replay-user-messages` | | Replay user messages from most recent session transcript |
 | `--include-partial-messages` | | Include partial assistant messages in context |
 | `--effort LEVEL` | | Reasoning effort: `low`, `medium`, `high` |
-| `--betas FEATURE` | | Enable beta features (added to prompt context) |
+| `--betas FLAGS` | | Comma-separated feature flags (`+name`, `-name`, or bare `name`) applied to the session |
 | `--chrome` | | Enable browser / web integration |
 | `--no-chrome` | | Disable browser / web integration (removes `ChromeClient` from dispatcher) |
-| `--tmux` | | Enable tmux integration (added to prompt context) |
-| `--agent AGENT` | | Use a specific agent (added to prompt context) |
-| `--ide IDE` | | IDE integration mode (`vscode`, `jetbrains`, etc.) (added to prompt context) |
+| `--tmux` | | Run in tmux: re-launch in a new session outside tmux, set the title inside tmux |
+| `--agent AGENT` | | Use a specific agent (currently accepted but inert) |
+| `--ide IDE` | | Connect to a configured IDE MCP server and register its tools |
 | `--worktree` | `-w` | Worktree mode (detects git branch, sets `WorktreeState`) |
 
 ### Subcommands
@@ -129,6 +129,101 @@ coderex [OPTIONS] [COMMAND] [PROMPT...]
 
 A positional `PROMPT` argument runs in non-interactive mode (same as `--print`). Multiple words are joined into a single prompt.
 
+## Context and Integration Flags
+
+### `--betas FLAGS`
+
+A comma-separated list applied on top of `CODEREX_FEATURE_FLAGS`:
+
+- `+name` enables, `-name` disables, and a bare `name` enables.
+- The result is stored as the session's `FeatureFlags`, and its
+  `CapabilitySet` is derived from it.
+- Every name must be one this build knows: `streaming_tool_execution`,
+  `tool_use_summaries`, `fast_mode`, `coordinator_mode`, `history_snip`,
+  `agent_triggers`, `bridge_mode`, `daemon`, `voice_mode`, `buddy`,
+  `workflow_scripts`, `web_browser_tool`, `context_collapse`,
+  `terminal_panel`, `kairos`, `team_collaboration`, `auto_dream`.
+- An unknown name is a startup error listing the unknown names and the known
+  set; it is never dropped silently.
+
+### `--from-pr URL`
+
+Fetches pull-request context with the GitHub CLI and puts it at the front of
+the initial prompt (headless) or into the session's extra context
+(interactive).
+
+Requirements:
+
+- `gh` must be installed and on `PATH`.
+- `gh` must be authenticated, via `gh auth login` or `GH_TOKEN` in the
+  environment. The variable is inherited by the child process; CodeRex does
+  not read or rewrite it.
+- The URL must have the shape
+  `https://<host>/<owner>/<repo>/pull/<number>` (GitHub Enterprise hosts are
+  allowed).
+
+Commands run:
+
+```text
+gh pr view <url> --json title,body,files,commits
+gh pr diff <url>
+```
+
+The rendered `<pr_context>` block contains the title, description (max 4,000
+characters), a changed-file summary (max 200 files), commit subjects (max 100),
+and the diff (max 60,000 characters), with explicit truncation markers. A
+missing `gh`, auth failure, invalid URL, parse failure, or failed command
+stops startup with the CLI's message; CodeRex does not continue without the
+context.
+
+### `--tmux`
+
+- **Outside tmux** (`$TMUX` unset): requires `tmux` on `PATH` and an
+  interactive terminal. CodeRex starts `tmux new-session -s coderex-<pid>`
+  with the current executable and the original arguments minus `--tmux`.
+  The child gets `CODEREX_TMUX_ACTIVE=1`; together with `$TMUX` this prevents
+  a re-exec loop. When the tmux client exits, CodeRex exits with its status.
+- **Inside tmux** (`$TMUX` set, or `CODEREX_TMUX_ACTIVE` set): no nested
+  session is created. CodeRex renames the window to `coderex: <directory>`,
+  sets the pane title, and turns `automatic-rename` off.
+- If `tmux` is not available, `--tmux` fails with an actionable message.
+
+### `--ide IDE`
+
+CodeRex does not bundle an IDE. `--ide` connects to a configured IDE MCP
+server and registers the tools it exposes (`executeCode`, `getDiagnostics`,
+and anything else the server lists) into the same registry the model
+dispatches through. The connection status and discovered tool names are
+reported on stderr and in the log.
+
+Configuration is resolved in this order:
+
+1. `CODEREX_IDE_MCP_URL` — a remote HTTP/SSE MCP endpoint.
+2. `CODEREX_IDE_MCP_COMMAND` — a stdio MCP server command line, split on
+   whitespace (`"ide-mcp --stdio"`).
+3. `mcp_servers` (or `mcpServers`) in settings, looked up first under the
+   `--ide` value (for example `vscode`) and then under `ide`.
+4. `.mcp.json` in the working directory (or the `--mcp-config` file), with
+   the same name lookup.
+
+Example settings entry:
+
+```json
+{
+  "mcp_servers": {
+    "ide": {
+      "type": "stdio",
+      "command": "/usr/local/bin/ide-mcp",
+      "args": ["--stdio"]
+    }
+  }
+}
+```
+
+If no server is configured, the configured server cannot be started, or it
+answers `tools/list` with no tools, startup fails with a message naming the
+server and the configuration source. `--ide` is never a silent no-op.
+
 ## CLI Flag Application Architecture
 
 CLI flags are parsed by clap, stored in `SessionContext` during `StartupOrchestrator::run()`, and applied to the `ReplLoop` via `configure_repl()`. The `ReplLoop::apply_cli_config()` method performs the actual side effects:
@@ -141,12 +236,15 @@ CLI flags are parsed by clap, stored in `SessionContext` during `StartupOrchestr
 6. **Fork session** — `--fork-session` loads transcript messages into the engine session.
 7. **Replay messages** — `--replay-user-messages` loads user messages from the most recent transcript.
 8. **Add directories** — `--add-dir` reads directory listings into `session_effects.extra_context`.
-9. **Context flags** — `--from-pr`, `--agent`, `--ide`, `--betas`, `--tmux` inject into prompt context.
-10. **JSON schema** — `--json-schema` is parsed and passed to `SubmitOptions`.
-11. **Partial messages** — `--include-partial-messages` is passed to `SubmitOptions`.
-12. **Debug file** — `--debug-file` is handled in `phase_bootstrap()` by redirecting the tracing subscriber to a file appender.
-13. **Persistence** — `--no-session-persistence` clears `session_memory_store`, `long_term_store`, `auto_dream`, and `team_memory_service`.
-14. **Allowed tools** — `--allowed-tools` sets `session_effects.allowed_tools_override`.
+9. **Beta flags** — `--betas` parses `+name`/`-name`/`name` over `CODEREX_FEATURE_FLAGS`, stores the result as the session `FeatureFlags`, and derives the session `CapabilitySet`. Unknown names fail startup.
+10. **PR context** — `--from-pr` is fetched during orchestrator startup and prepended to the initial prompt (headless) or added to `session_effects.extra_context` (interactive).
+11. **IDE** — `--ide` connects to a configured IDE MCP server during startup and registers its discovered tools into the dispatcher registry.
+12. **tmux** — `--tmux` is applied before any startup phase; outside tmux it re-launches the binary in a new session.
+13. **JSON schema** — `--json-schema` is parsed and passed to `SubmitOptions`.
+14. **Partial messages** — `--include-partial-messages` is passed to `SubmitOptions`.
+15. **Debug file** — `--debug-file` is handled in `phase_bootstrap()` by redirecting the tracing subscriber to a file appender.
+16. **Persistence** — `--no-session-persistence` clears `session_memory_store`, `long_term_store`, `auto_dream`, and `team_memory_service`.
+17. **Allowed tools** — `--allowed-tools` sets `session_effects.allowed_tools_override`.
 
 ## Architecture Patterns
 
