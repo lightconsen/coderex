@@ -1,10 +1,9 @@
 use assert_cmd::cargo::cargo_bin;
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
-use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::path::Path;
 use std::process::{Child as ProcessChild, Command, Stdio};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -15,6 +14,14 @@ const COLS: u16 = 120;
 // though the session was healthy.
 const SCREEN_TIMEOUT: Duration = Duration::from_secs(30);
 const LIVE_TIMEOUT: Duration = Duration::from_secs(90);
+
+/// Only one PTY test at a time.
+///
+/// Each test drives a real terminal and a real binary. Running several in
+/// parallel made a resize/sigwinch test stop echoing input while the machine
+/// was busy — the session was healthy, just starved. Serialising the PTY tests
+/// costs wall-clock time and buys a deterministic suite.
+static PTY_TEST_LOCK: Mutex<()> = Mutex::new(());
 
 fn strip_ansi(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
@@ -51,30 +58,19 @@ fn squeeze_whitespace(text: &str) -> String {
     text.chars().filter(|c| !c.is_whitespace()).collect()
 }
 
-fn find_free_port() -> u16 {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind free port");
-    listener.local_addr().expect("local addr").port()
-}
-
-fn wait_for_server(port: u16) {
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while Instant::now() < deadline {
-        if TcpStream::connect(format!("127.0.0.1:{port}")).is_ok() {
-            return;
-        }
-        thread::sleep(Duration::from_millis(100));
-    }
-    panic!("static test server did not start on port {port}");
-}
-
 struct StaticServer {
     child: ProcessChild,
     port: u16,
 }
 
 impl StaticServer {
+    /// Start on an OS-assigned port and read the port the server announced.
+    ///
+    /// Selecting a "free" port and then spawning on it is a TOCTOU race with
+    /// every other test that starts a server; losing it made the CLI talk to
+    /// nothing and report "provider returned no visible response". `--port 0`
+    /// lets the server bind first.
     fn start() -> Self {
-        let port = find_free_port();
         let responses_path =
             Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/responses.json");
         assert!(
@@ -83,19 +79,40 @@ impl StaticServer {
             responses_path.display()
         );
 
-        let child = Command::new(cargo_bin("static-anthropic-server"))
+        let mut child = Command::new(cargo_bin("static-anthropic-server"))
             .args([
                 "--port",
-                &port.to_string(),
+                "0",
                 "--responses",
                 responses_path.to_str().expect("utf8 responses path"),
             ])
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stderr(Stdio::piped())
             .spawn()
             .expect("spawn static-anthropic-server");
 
-        wait_for_server(port);
+        let stderr = child.stderr.take().expect("server stderr");
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || {
+            let mut announced = false;
+            for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+                if !announced {
+                    if let Some(address) = line.split("listening on ").nth(1) {
+                        let _ = tx.send(address.trim().to_string());
+                        announced = true;
+                    }
+                }
+            }
+        });
+
+        let address = rx
+            .recv_timeout(Duration::from_secs(30))
+            .expect("static test server did not announce its address");
+        let port = address
+            .rsplit(':')
+            .next()
+            .and_then(|port| port.parse::<u16>().ok())
+            .unwrap_or_else(|| panic!("unexpected server address {address}"));
 
         Self { child, port }
     }
@@ -133,6 +150,8 @@ struct PtySession {
     /// permission mode the person running it happens to have configured, and a
     /// test run could change it.
     _config_home: tempfile::TempDir,
+    /// Held for the session's lifetime so only one PTY test runs at a time.
+    _serial: std::sync::MutexGuard<'static, ()>,
 }
 
 impl PtySession {
@@ -156,6 +175,9 @@ impl PtySession {
         persist_session: bool,
         args: &[&str],
     ) -> Self {
+        let serial = PTY_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let pty_system = native_pty_system();
         let pair = pty_system
             .openpty(PtySize {
@@ -234,6 +256,7 @@ impl PtySession {
             raw,
             reader_thread: Some(reader_thread),
             _config_home: config_home,
+            _serial: serial,
         }
     }
 
@@ -537,10 +560,17 @@ fn run_interaction_sequence(
 
     let raw = strip_ansi(&session.raw_text());
     for forbidden in forbidden_raw {
-        assert!(
-            !raw.contains(forbidden),
-            "interactive sequence emitted forbidden raw text {forbidden:?}"
-        );
+        if let Some(at) = raw.find(forbidden) {
+            let start = raw[..at].char_indices().rev().nth(300).map_or(0, |(i, _)| i);
+            let end = raw[at..]
+                .char_indices()
+                .nth(300)
+                .map_or(raw.len(), |(i, _)| at + i);
+            panic!(
+                "interactive sequence emitted forbidden raw text {forbidden:?}; context:\n{}",
+                &raw[start..end]
+            );
+        }
     }
     assert!(raw.contains("❯"));
 }
