@@ -9,10 +9,12 @@
 //! real bridge over an in-process transport without a network.
 
 use anyhow::{Context, Result};
+use coderex_bridge::archive::UsageStats;
 use coderex_bridge::heartbeat::HeartbeatConfig;
 use coderex_bridge::orchestrator::{Bridge, BridgeConfig, BridgeStopHandle};
 use coderex_bridge::poller::{ControlPlaneClient, HttpControlPlaneClient};
 use coderex_bridge::transport::{Transport, TransportConfig, default_factory};
+use std::collections::HashMap;
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -53,6 +55,83 @@ pub const DEFAULT_MAX_CONCURRENT: usize = 5;
 pub const DEFAULT_POLL_INTERVAL_SECS: u64 = 5;
 /// How many times registration is attempted before the worker exits.
 pub const REGISTRATION_ATTEMPTS: usize = 5;
+
+/// Runs a spawned assignment's prompt in its working directory.
+///
+/// The default implementation starts this executable headless. Tests inject a
+/// fake so a worker can be exercised without running an agent turn.
+#[async_trait::async_trait]
+pub trait SessionRunner: Send + Sync {
+    /// Run `prompt` for `session_id` with `work_dir` as the current directory.
+    ///
+    /// Returns `Ok(())` when the session finished successfully, or a short
+    /// error (including the exit status when one is available) otherwise.
+    async fn run(&self, session_id: &str, prompt: &str, work_dir: &Path) -> Result<(), String>;
+}
+
+/// Runs a session by invoking this executable in headless (`--print`) mode.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ProcessSessionRunner;
+
+/// Build the headless invocation for a session.
+///
+/// The prompt is passed as a single positional argument after `--`, so it
+/// reaches the child verbatim and no shell ever sees it.
+fn session_command(prompt: &str, work_dir: &Path) -> Result<tokio::process::Command, String> {
+    let executable = std::env::current_exe()
+        .map_err(|err| format!("cannot locate the coderex executable: {err}"))?;
+    let mut command = tokio::process::Command::new(executable);
+    command
+        .arg("--print")
+        .arg("--")
+        .arg(prompt)
+        .current_dir(work_dir)
+        // Dropping the future (shutdown, panic) kills the child instead of
+        // leaving an orphan agent turn behind.
+        .kill_on_drop(true);
+    Ok(command)
+}
+
+#[async_trait::async_trait]
+impl SessionRunner for ProcessSessionRunner {
+    async fn run(&self, _session_id: &str, prompt: &str, work_dir: &Path) -> Result<(), String> {
+        let output = session_command(prompt, work_dir)?
+            .output()
+            .await
+            .map_err(|err| format!("failed to start the session process: {err}"))?;
+
+        if output.status.success() {
+            return Ok(());
+        }
+
+        let status = output.status.code().map_or_else(
+            || "terminated by signal".to_string(),
+            |code| format!("exit code {code}"),
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let detail: String = stderr.trim().chars().take(200).collect();
+        if detail.is_empty() {
+            Err(status)
+        } else {
+            Err(format!("{status}: {detail}"))
+        }
+    }
+}
+
+/// A session that finished running, sent from its task back to the worker.
+#[derive(Debug)]
+struct SessionCompletion {
+    session_id: String,
+    outcome: Result<(), String>,
+}
+
+/// A session that was spawned and is ready to be run.
+#[derive(Debug)]
+struct SpawnedSession {
+    session_id: String,
+    work_dir: PathBuf,
+    prompt: String,
+}
 
 /// Errors raised while turning CLI arguments into a launch configuration.
 #[derive(Debug, thiserror::Error)]
@@ -299,18 +378,26 @@ where
     if let Some(ref token) = config.auth_token {
         control_plane = control_plane.with_auth(token.clone());
     }
-    run_with_control_plane(config, transport, Arc::new(control_plane), shutdown).await
+    run_with_control_plane(
+        config,
+        transport,
+        Arc::new(control_plane),
+        Arc::new(ProcessSessionRunner),
+        shutdown,
+    )
+    .await
 }
 
-/// Run a bridge over injected transport and control-plane implementations.
+/// Run a bridge over injected transport, control-plane, and session runners.
 ///
-/// The transport and control plane are supplied by the caller, so tests can
-/// exercise registration, assignment spawning, capacity reporting, and
-/// shutdown without a live server.
+/// The dependencies are supplied by the caller, so tests can exercise
+/// registration, assignment spawning, session execution, capacity reporting,
+/// and shutdown without a live server or a child process.
 pub async fn run_with_control_plane<F>(
     config: BridgeLaunchConfig,
     transport: Box<dyn Transport>,
     control_plane: Arc<dyn ControlPlaneClient>,
+    runner: Arc<dyn SessionRunner>,
     shutdown: F,
 ) -> Result<()>
 where
@@ -333,7 +420,7 @@ where
         shutdown_stop.stop();
     });
 
-    let result = run_worker(&mut bridge, &config, &stop).await;
+    let result = run_worker(&mut bridge, &config, &stop, runner).await;
 
     let _ = bridge.disconnect().await;
     shutdown_task.abort();
@@ -345,6 +432,7 @@ async fn run_worker(
     bridge: &mut Bridge,
     config: &BridgeLaunchConfig,
     stop: &BridgeStopHandle,
+    runner: Arc<dyn SessionRunner>,
 ) -> Result<()> {
     register_with_retry(bridge, stop)
         .await
@@ -363,6 +451,11 @@ async fn run_worker(
     // capacity report happen as soon as registration succeeds.
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
+    let (completion_tx, mut completion_rx) =
+        tokio::sync::mpsc::unbounded_channel::<SessionCompletion>();
+    let mut running: HashMap<String, tokio::task::JoinHandle<()>> = HashMap::new();
+    let mut serve_error = None;
+
     loop {
         if stop.is_stopped() {
             break;
@@ -370,21 +463,116 @@ async fn run_worker(
 
         tokio::select! {
             served = bridge.serve_transport() => {
-                served.map_err(|err| anyhow::anyhow!("bridge serve loop failed: {err}"))?;
-                tracing::info!("bridge transport serve loop ended");
+                if let Err(err) = served {
+                    serve_error = Some(err);
+                } else {
+                    tracing::info!("bridge transport serve loop ended");
+                }
                 break;
+            }
+            done = completion_rx.recv() => {
+                if let Some(done) = done {
+                    running.remove(&done.session_id);
+                    finish_session(bridge, done).await;
+                }
             }
             _ = ticker.tick() => {
                 if stop.is_stopped() {
                     break;
                 }
-                assignment_tick(bridge, stop).await;
+                let spawned = assignment_tick(bridge, stop).await;
+                if stop.is_stopped() {
+                    for session in spawned {
+                        bridge.fail_session(
+                            &session.session_id,
+                            "bridge shut down before the session started".into(),
+                        );
+                    }
+                } else {
+                    spawn_session_tasks(spawned, &runner, &completion_tx, &mut running);
+                }
             }
         }
     }
 
+    stop_running_sessions(bridge, &mut running).await;
     tracing::info!("bridge worker stopped");
-    Ok(())
+
+    serve_error.map_or_else(
+        || Ok(()),
+        |err| Err(anyhow::anyhow!("bridge serve loop failed: {err}")),
+    )
+}
+
+/// Start one task per spawned session and remember it for shutdown.
+fn spawn_session_tasks(
+    sessions: Vec<SpawnedSession>,
+    runner: &Arc<dyn SessionRunner>,
+    completion_tx: &tokio::sync::mpsc::UnboundedSender<SessionCompletion>,
+    running: &mut HashMap<String, tokio::task::JoinHandle<()>>,
+) {
+    for session in sessions {
+        let session_id = session.session_id.clone();
+        let completion_tx = completion_tx.clone();
+        let runner = Arc::clone(runner);
+        let handle = tokio::spawn(async move {
+            let outcome = runner
+                .run(&session.session_id, &session.prompt, &session.work_dir)
+                .await;
+            let _ = completion_tx.send(SessionCompletion {
+                session_id: session.session_id,
+                outcome,
+            });
+        });
+        running.insert(session_id, handle);
+    }
+}
+
+/// Apply a finished session's outcome and free its capacity slot.
+async fn finish_session(bridge: &mut Bridge, done: SessionCompletion) {
+    match done.outcome {
+        Ok(()) => {
+            if let Err(err) = bridge
+                .complete_session(&done.session_id, UsageStats::default())
+                .await
+            {
+                tracing::warn!(
+                    session_id = %done.session_id,
+                    error = %err,
+                    "failed to complete bridge session"
+                );
+                // `complete_session` frees the slot only after it succeeds.
+                bridge.fail_session(&done.session_id, err);
+            } else {
+                tracing::info!(session_id = %done.session_id, "bridge session completed");
+            }
+        }
+        Err(err) => {
+            tracing::warn!(
+                session_id = %done.session_id,
+                error = %err,
+                "bridge session failed"
+            );
+            bridge.fail_session(&done.session_id, err);
+        }
+    }
+}
+
+/// Cancel running sessions and release their slots.
+async fn stop_running_sessions(
+    bridge: &mut Bridge,
+    running: &mut HashMap<String, tokio::task::JoinHandle<()>>,
+) {
+    for (session_id, handle) in running.drain() {
+        handle.abort();
+        // Awaiting the aborted task drops its future, which kills a child
+        // process started with `kill_on_drop`.
+        let _ = handle.await;
+        bridge.fail_session(
+            &session_id,
+            "bridge shut down while the session was running".into(),
+        );
+    }
 }
 
 /// Fetch work, spawn whatever fits, and report capacity.
@@ -392,10 +580,12 @@ async fn run_worker(
 /// The fetch and capacity requests are cancel-safe against shutdown: a stop
 /// request does not wait for an in-flight HTTP call. Spawning is not
 /// interrupted, because a half-spawned session would leak a capacity slot.
-async fn assignment_tick(bridge: &mut Bridge, stop: &BridgeStopHandle) {
+async fn assignment_tick(bridge: &mut Bridge, stop: &BridgeStopHandle) -> Vec<SpawnedSession> {
+    let mut spawned = Vec::new();
+
     let fetched = tokio::select! {
         result = bridge.fetch_assignments() => result,
-        () = stop.wait() => return,
+        () = stop.wait() => return spawned,
     };
 
     match fetched {
@@ -406,11 +596,18 @@ async fn assignment_tick(bridge: &mut Bridge, stop: &BridgeStopHandle) {
 
     while let Some(assignment) = bridge.take_assignment() {
         match bridge.spawn_session(&assignment).await {
-            Ok(result) => tracing::info!(
-                session_id = %result.session_id,
-                work_dir = %result.work_dir.display(),
-                "spawned bridge session"
-            ),
+            Ok(result) => {
+                tracing::info!(
+                    session_id = %result.session_id,
+                    work_dir = %result.work_dir.display(),
+                    "spawned bridge session"
+                );
+                spawned.push(SpawnedSession {
+                    session_id: result.session_id,
+                    work_dir: result.work_dir,
+                    prompt: assignment.prompt,
+                });
+            }
             Err(err) => {
                 tracing::warn!(
                     session_id = %assignment.session_id,
@@ -424,16 +621,18 @@ async fn assignment_tick(bridge: &mut Bridge, stop: &BridgeStopHandle) {
     }
 
     if stop.is_stopped() {
-        return;
+        return spawned;
     }
 
     let reported = tokio::select! {
         result = bridge.report_capacity_to_server() => result,
-        () = stop.wait() => return,
+        () = stop.wait() => return spawned,
     };
     if let Err(err) = reported {
         tracing::warn!("failed to report bridge capacity: {err}");
     }
+
+    spawned
 }
 
 /// Register with bounded exponential backoff, giving up at shutdown.
@@ -563,6 +762,7 @@ mod tests {
     use coderex_bridge::poller::{CapacityReport, SpawnMode, WorkAssignment};
     use coderex_bridge::transport::InProcessTransport;
     use std::sync::Mutex;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::Duration;
     use tokio::sync::oneshot;
 
@@ -608,6 +808,95 @@ mod tests {
             prompt: "Fix the bug".into(),
             spawn_mode: SpawnMode::SingleSession,
         }
+    }
+
+    /// Runner that finishes immediately with a fixed outcome.
+    #[derive(Debug)]
+    struct FixedRunner {
+        outcome: Result<(), String>,
+        runs: Mutex<Vec<String>>,
+    }
+
+    impl FixedRunner {
+        fn succeeding() -> Self {
+            Self {
+                outcome: Ok(()),
+                runs: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn failing(message: &str) -> Self {
+            Self {
+                outcome: Err(message.to_string()),
+                runs: Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl SessionRunner for FixedRunner {
+        async fn run(
+            &self,
+            session_id: &str,
+            _prompt: &str,
+            _work_dir: &Path,
+        ) -> Result<(), String> {
+            self.runs.lock().unwrap().push(session_id.to_string());
+            self.outcome.clone()
+        }
+    }
+
+    /// Runner that never finishes on its own; shutdown must cancel it.
+    #[derive(Debug, Default)]
+    struct PendingRunner {
+        started: Arc<tokio::sync::Notify>,
+        cancelled: Arc<AtomicBool>,
+    }
+
+    struct CancelFlag(Arc<AtomicBool>);
+
+    impl Drop for CancelFlag {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl SessionRunner for PendingRunner {
+        async fn run(
+            &self,
+            _session_id: &str,
+            _prompt: &str,
+            _work_dir: &Path,
+        ) -> Result<(), String> {
+            let _cancel_flag = CancelFlag(Arc::clone(&self.cancelled));
+            self.started.notify_one();
+            std::future::pending::<()>().await;
+            Ok(())
+        }
+    }
+
+    /// Build a resolved config with fast polling for worker tests.
+    fn worker_config(tmp: &Path) -> BridgeLaunchConfig {
+        let mut args = args_with("http://cp.example.test", "env-test");
+        args.transport = "in-process".into();
+        args.repo_root = Some(tmp.to_path_buf());
+        args.session_base = Some(tmp.join("sessions"));
+        args.archive_base = Some(tmp.join("archives"));
+        let mut config = BridgeLaunchConfig::resolve(&args, tmp, |_| None).unwrap();
+        config.poll_interval = Duration::from_millis(10);
+        config
+    }
+
+    /// Wait until `check` returns true, or fail the test after two seconds.
+    async fn wait_until(mut check: impl FnMut() -> bool, what: &str) {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !check() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("timed out waiting for {what}"));
     }
 
     fn args_with(url: &str, env_id: &str) -> BridgeArgs {
@@ -851,6 +1140,7 @@ mod tests {
                 config,
                 Box::new(bridge_transport),
                 control_plane,
+                Arc::new(FixedRunner::succeeding()),
                 async move {
                     let _ = shutdown_rx.await;
                 },
@@ -912,6 +1202,7 @@ mod tests {
                 config,
                 Box::new(bridge_transport),
                 worker_control_plane,
+                Arc::new(PendingRunner::default()),
                 async move {
                     let _ = shutdown_rx.await;
                 },
@@ -974,6 +1265,226 @@ mod tests {
         );
     }
 
+    #[test]
+    fn process_runner_passes_the_prompt_as_one_headless_argument() {
+        let prompt = "hello --not-a-flag\nsecond line";
+        let command = session_command(prompt, Path::new(".")).unwrap();
+        let std_command = command.as_std();
+
+        assert_eq!(
+            std_command.get_program(),
+            std::env::current_exe().unwrap().as_os_str()
+        );
+        let args: Vec<String> = std_command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(args, vec!["--print", "--", prompt]);
+        assert_eq!(std_command.get_current_dir(), Some(Path::new(".")));
+
+        // The child parses the prompt as one positional argument, even when it
+        // looks like a flag or spans lines.
+        let parsed = Cli::try_parse_from(["coderex", "--print", "--", prompt]).unwrap();
+        assert!(parsed.print);
+        assert_eq!(parsed.prompt, vec![prompt.to_string()]);
+    }
+
+    #[tokio::test]
+    async fn successful_session_is_completed_and_frees_its_slot() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = worker_config(tmp.path());
+        let session_base = config.session_base.clone();
+        let archive_base = config.archive_base.clone();
+
+        let control_plane = Arc::new(FakeControlPlane::default());
+        control_plane
+            .assignments
+            .lock()
+            .unwrap()
+            .push(sample_assignment(&session_base));
+        let runner = Arc::new(FixedRunner::succeeding());
+        let worker_runner = Arc::clone(&runner);
+        let observed = Arc::clone(&control_plane);
+
+        let (bridge_transport, mut remote) =
+            InProcessTransport::create_pair("bridge-env".into(), "gateway".into());
+        remote.connect().await.unwrap();
+
+        let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+        let running = tokio::spawn(async move {
+            run_with_control_plane(
+                config,
+                Box::new(bridge_transport),
+                control_plane,
+                worker_runner,
+                async move {
+                    let _ = shutdown_rx.await;
+                },
+            )
+            .await
+        });
+
+        wait_until(|| !runner.runs.lock().unwrap().is_empty(), "the runner").await;
+        wait_until(
+            || {
+                observed
+                    .capacities
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|report| report.active_sessions == 1)
+            },
+            "the active capacity report",
+        )
+        .await;
+        // The next report after completion sees the freed slot.
+        wait_until(
+            || {
+                observed
+                    .capacities
+                    .lock()
+                    .unwrap()
+                    .last()
+                    .is_some_and(|report| report.active_sessions == 0)
+            },
+            "the slot to be freed",
+        )
+        .await;
+        assert!(
+            archive_base.join("s1/metadata.json").exists(),
+            "a successful session should be archived"
+        );
+
+        shutdown_tx.send(()).unwrap();
+        let result = tokio::time::timeout(Duration::from_secs(1), running)
+            .await
+            .expect("shutdown should stop the worker")
+            .unwrap();
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn failed_session_fails_and_frees_its_slot() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = worker_config(tmp.path());
+        let session_base = config.session_base.clone();
+        let archive_base = config.archive_base.clone();
+
+        let control_plane = Arc::new(FakeControlPlane::default());
+        control_plane
+            .assignments
+            .lock()
+            .unwrap()
+            .push(sample_assignment(&session_base));
+        let runner = Arc::new(FixedRunner::failing("exit code 7: boom"));
+        let worker_runner = Arc::clone(&runner);
+        let observed = Arc::clone(&control_plane);
+
+        let (bridge_transport, mut remote) =
+            InProcessTransport::create_pair("bridge-env".into(), "gateway".into());
+        remote.connect().await.unwrap();
+
+        let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+        let running = tokio::spawn(async move {
+            run_with_control_plane(
+                config,
+                Box::new(bridge_transport),
+                control_plane,
+                worker_runner,
+                async move {
+                    let _ = shutdown_rx.await;
+                },
+            )
+            .await
+        });
+
+        wait_until(|| !runner.runs.lock().unwrap().is_empty(), "the runner").await;
+        wait_until(
+            || {
+                observed
+                    .capacities
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|report| report.active_sessions == 1)
+            },
+            "the active capacity report",
+        )
+        .await;
+        wait_until(
+            || {
+                observed
+                    .capacities
+                    .lock()
+                    .unwrap()
+                    .last()
+                    .is_some_and(|report| report.active_sessions == 0)
+            },
+            "the failed slot to be freed",
+        )
+        .await;
+        assert!(
+            !archive_base.join("s1/metadata.json").exists(),
+            "a failed session should not be archived as completed"
+        );
+
+        shutdown_tx.send(()).unwrap();
+        let result = tokio::time::timeout(Duration::from_secs(1), running)
+            .await
+            .expect("shutdown should stop the worker")
+            .unwrap();
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn shutdown_cancels_a_running_session() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = worker_config(tmp.path());
+        let session_base = config.session_base.clone();
+
+        let control_plane = Arc::new(FakeControlPlane::default());
+        control_plane
+            .assignments
+            .lock()
+            .unwrap()
+            .push(sample_assignment(&session_base));
+        let runner = Arc::new(PendingRunner::default());
+        let worker_runner = Arc::clone(&runner);
+
+        let (bridge_transport, mut remote) =
+            InProcessTransport::create_pair("bridge-env".into(), "gateway".into());
+        remote.connect().await.unwrap();
+
+        let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+        let running = tokio::spawn(async move {
+            run_with_control_plane(
+                config,
+                Box::new(bridge_transport),
+                control_plane,
+                worker_runner,
+                async move {
+                    let _ = shutdown_rx.await;
+                },
+            )
+            .await
+        });
+
+        tokio::time::timeout(Duration::from_secs(2), runner.started.notified())
+            .await
+            .expect("the session runner should start");
+
+        shutdown_tx.send(()).unwrap();
+        let result = tokio::time::timeout(Duration::from_secs(1), running)
+            .await
+            .expect("shutdown should stop the worker promptly")
+            .unwrap();
+        assert!(result.is_ok());
+        assert!(
+            runner.cancelled.load(Ordering::SeqCst),
+            "shutdown should cancel the running session task"
+        );
+    }
+
     #[tokio::test]
     async fn launcher_reports_a_connect_failure() {
         use async_trait::async_trait;
@@ -1019,6 +1530,7 @@ mod tests {
             config,
             Box::new(RefusingTransport),
             Arc::new(FakeControlPlane::default()),
+            Arc::new(FixedRunner::succeeding()),
             async {},
         )
         .await
