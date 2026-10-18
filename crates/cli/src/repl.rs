@@ -1272,6 +1272,12 @@ fn org_memory_service(
     })
 }
 
+/// The result of `/macro`: either text to show, or commands to execute.
+enum MacroCommandOutcome {
+    Message(String),
+    Run(Vec<String>),
+}
+
 pub struct ReplLoop {
     /// Command registry.
     commands: CommandRegistry,
@@ -2584,6 +2590,21 @@ impl ReplLoop {
                                 ),
                             ));
                         }
+                        // A `command` hook running with `stream: true` can
+                        // ask the session a question. Without a handler every
+                        // request was answered `-32601`; this one answers the
+                        // read-only session facts and refuses the rest.
+                        let session_cwd = engine.session().cwd.clone();
+                        let session_id = engine.session().session_id.to_string();
+                        let session_model = engine.model().clone();
+                        registry.set_request_handler(Arc::new(
+                            crate::hook_actions::SessionHookRequestHandler::new(
+                                session_cwd,
+                                session_id,
+                                session_model,
+                                engine.permission_checker(),
+                            ),
+                        ));
                         engine.set_hooks(registry.into_executor());
                     }
                     Err(e) => tracing::warn!("hooks in settings were not loaded: {e}"),
@@ -2796,6 +2817,24 @@ impl ReplLoop {
     /// nothing to re-attach to; the honest half is to say what was interrupted
     /// instead of dropping it silently.
     fn adopt_background_jobs(&self, ui_state: &mut coderex_ui::state::UiState) {
+        for text in self.background_job_notifications() {
+            ui_state.messages.push(coderex_ui::message_list::Message {
+                role: coderex_ui::message_list::MessageRole::System,
+                content: text.into(),
+                tool_name: None,
+                streaming: false,
+                folded: false,
+            });
+        }
+    }
+
+    /// Settle jobs the previous session left behind and return what to tell
+    /// the user.
+    ///
+    /// Both entry paths adopt: a headless start used to skip this entirely, so
+    /// a record that still claimed to be running stayed that way and nobody
+    /// was told it had been interrupted.
+    fn background_job_notifications(&self) -> Vec<String> {
         let session_id = self
             .current_session_id()
             .unwrap_or_else(|| "unknown".to_string());
@@ -2808,19 +2847,14 @@ impl ReplLoop {
             Ok(adopted) => adopted,
             Err(error) => {
                 tracing::warn!("could not read the background job records: {error}");
-                return;
+                return Vec::new();
             }
         };
-
-        for notification in &adopted.notifications {
-            ui_state.messages.push(coderex_ui::message_list::Message {
-                role: coderex_ui::message_list::MessageRole::System,
-                content: notification.text.clone().into(),
-                tool_name: None,
-                streaming: false,
-                folded: false,
-            });
-        }
+        adopted
+            .notifications
+            .into_iter()
+            .map(|notification| notification.text)
+            .collect()
     }
 
     fn persist_interactive_snapshot(&self, ui_state: &coderex_ui::state::UiState) {
@@ -4159,6 +4193,13 @@ impl ReplLoop {
         }
 
         self.start_artifact_serving().await;
+        // Headless starts used to leave a previous session's stale "running"
+        // records alone. Settle them and report on stderr: stdout carries the
+        // answer (or the protocol stream) and must not gain a banner.
+        for notification in self.background_job_notifications() {
+            tracing::info!("{notification}");
+            eprintln!("{notification}");
+        }
         let result = self.run_headless_turn(prompt).await;
         self.stop_artifact_serving().await;
         result
@@ -5061,7 +5102,33 @@ impl ReplLoop {
                         if let Some(handle) = permission_reader.take() {
                             handle.abort();
                         }
-                        return "the query task ended without returning its engine".to_string();
+                        if permission_bus.is_some() {
+                            self.confirmation_bus = None;
+                        }
+                        // The turn never reached its normal closing path; a
+                        // stream-json consumer still needs exactly one
+                        // `result`, and the sink has to survive for the next
+                        // turn instead of being dropped with this task.
+                        let message = "the query task ended without returning its engine";
+                        if let Some(mut sink) = protocol.take() {
+                            let turn = sink.begin_turn(session_id.clone());
+                            let mut frame = coderex_events::ResultFrame::error(
+                                session_id.clone(),
+                                coderex_events::protocol::result_subtype::ERROR_DURING_EXECUTION,
+                                u64::try_from(turn_started.elapsed().as_millis())
+                                    .unwrap_or(u64::MAX),
+                                1,
+                            );
+                            frame.data.insert(
+                                "error".to_string(),
+                                serde_json::Value::String(message.to_string()),
+                            );
+                            if let Err(error) = turn.emit_turn_complete(frame) {
+                                tracing::warn!("could not close the protocol turn: {error}");
+                            }
+                            self.protocol_sink = Some(sink);
+                        }
+                        return message.to_string();
                     }
                 }
             }            }
@@ -5399,6 +5466,11 @@ impl ReplLoop {
             let cmd_name = parts[0].trim_start_matches('/');
             let args: Vec<String> = parts[1..].iter().map(|s| s.to_string()).collect();
 
+            // Record here rather than in `execute_and_display_command`: the
+            // built-ins below return before reaching it, so a history that
+            // only saw registry commands left out half of what people type.
+            self.command_history.append(cmd_name, &args);
+
             // Built-in REPL commands that bypass the registry. With slash
             // commands disabled none of these run either: they are still slash
             // commands, and executing them anyway made the flag only hide
@@ -5553,6 +5625,28 @@ impl ReplLoop {
                                     streaming: false,
                                     folded: false,
                                 });
+                            }
+                        }
+                        return;
+                    }
+                    "macro" => {
+                        match self.handle_macro_command(&args) {
+                            MacroCommandOutcome::Message(message) => {
+                                ui_state.messages.push(coderex_ui::message_list::Message {
+                                    role: coderex_ui::message_list::MessageRole::System,
+                                    content: message.into(),
+                                    tool_name: None,
+                                    streaming: false,
+                                    folded: false,
+                                });
+                            }
+                            MacroCommandOutcome::Run(commands) => {
+                                for command in commands {
+                                    // Recursive because a macro expands into
+                                    // the same command path; box the future.
+                                    Box::pin(self.execute_single_command(&command, &mut *ui_state))
+                                        .await;
+                                }
                             }
                         }
                         return;
@@ -5775,7 +5869,6 @@ impl ReplLoop {
         args: &[String],
         ui_state: &mut coderex_ui::state::UiState,
     ) {
-        self.command_history.append(cmd_name, args);
         let ctx = self.build_context();
         let result = self.commands.execute(cmd_name, &ctx, args);
         self.sync_command_state(cmd_name, &result);
@@ -5964,13 +6057,19 @@ impl ReplLoop {
         let cmd_name = parts[0].trim_start_matches('/');
         let args: Vec<String> = parts[1..].iter().map(|s| s.to_string()).collect();
 
+        // Record before dispatch: the built-in arms below return early, and a
+        // history that only recorded registry commands was missing them.
+        self.command_history.append(cmd_name, &args);
+
         // Check for macro expansion. A macro expands into slash commands, so
         // it follows the same switch as the built-ins below.
         if !self.no_slash_commands && self.macro_registry.has(cmd_name) {
             if let Some(commands) = self.macro_registry.get(cmd_name) {
                 let cmds: Vec<String> = commands.to_vec();
                 for macro_cmd in cmds {
-                    self.execute_single_command_non_tui(&macro_cmd, stdout)?;
+                    // The full entry path, so a macro segment can be a
+                    // built-in or a pipe, not only a registry command.
+                    Box::pin(self.execute_command(&macro_cmd, &mut *stdout)).await?;
                 }
                 return Ok(());
             }
@@ -6242,11 +6341,25 @@ impl ReplLoop {
                     }
                     return Ok(());
                 }
+                "macro" => {
+                    match self.handle_macro_command(&args) {
+                        MacroCommandOutcome::Message(message) => {
+                            writeln!(stdout, "{message}")?;
+                        }
+                        MacroCommandOutcome::Run(commands) => {
+                            for command in commands {
+                                // A macro expands into the same entry path;
+                                // box the future rather than duplicating it.
+                                Box::pin(self.execute_command(&command, &mut *stdout)).await?;
+                            }
+                        }
+                    }
+                    return Ok(());
+                }
                 _ => {}
             }
         }
 
-        self.command_history.append(cmd_name, &args);
         let ctx = self.build_context();
         let result = self.commands.execute(cmd_name, &ctx, &args);
         self.sync_command_state(cmd_name, &result);
@@ -6304,36 +6417,78 @@ impl ReplLoop {
         Ok(())
     }
 
-    /// Execute a single command string in non-TUI mode (from macro expansion).
-    fn execute_single_command_non_tui(
-        &mut self,
-        cmd_str: &str,
-        stdout: &mut impl Write,
-    ) -> std::io::Result<()> {
-        let trimmed = cmd_str.trim();
-        if trimmed.starts_with('/') {
-            let parts: Vec<&str> = trimmed.split_whitespace().collect();
-            let cmd_name = parts[0].trim_start_matches('/');
-            let args: Vec<String> = parts[1..].iter().map(|s| s.to_string()).collect();
-            self.command_history.append(cmd_name, &args);
-
-            if cmd_name == "clear" && self.commands.find("clear").is_some() {
-                let message = self.perform_session_clear();
-                writeln!(stdout, "{message}")?;
-                return Ok(());
+    /// What `/macro` asks the REPL to do.
+    ///
+    /// Defining and listing are pure bookkeeping; running expands into the
+    /// normal command path, which has to happen in the caller because it
+    /// needs the session (TUI state or an output stream).
+    fn handle_macro_command(&mut self, args: &[String]) -> MacroCommandOutcome {
+        const USAGE: &str = "Usage: /macro <list | define <name> <command[; command…]> | run <name> | delete <name>>";
+        match args.first().map(String::as_str) {
+            None | Some("list") => {
+                let names = self.macro_registry.list();
+                if names.is_empty() {
+                    MacroCommandOutcome::Message(
+                        "No macros defined. Use /macro define <name> <command>.".into(),
+                    )
+                } else {
+                    let mut output = String::from("Macros:");
+                    for name in names {
+                        output.push_str("\n  ");
+                        output.push_str(&name);
+                    }
+                    MacroCommandOutcome::Message(output)
+                }
             }
-
-            let ctx = self.build_context();
-            let result = self.commands.execute(cmd_name, &ctx, &args);
-            self.sync_command_state(cmd_name, &result);
-            writeln!(stdout, "{}", result.output)?;
-        } else {
-            writeln!(stdout, "[Macro] {trimmed}")?;
+            Some("define") => {
+                if args.len() < 3 {
+                    return MacroCommandOutcome::Message(USAGE.into());
+                }
+                let name = args[1].trim_start_matches('/');
+                if name.is_empty() {
+                    return MacroCommandOutcome::Message("A macro needs a name.".into());
+                }
+                let body = args[2..].join(" ");
+                let commands: Vec<String> = body
+                    .split(';')
+                    .map(str::trim)
+                    .filter(|command| !command.is_empty())
+                    .map(str::to_string)
+                    .collect();
+                if commands.is_empty() {
+                    return MacroCommandOutcome::Message(USAGE.into());
+                }
+                let count = commands.len();
+                self.macro_registry.define(name, commands);
+                MacroCommandOutcome::Message(format!(
+                    "Defined macro '{name}' with {count} command(s). Run it with /{name} or /macro run {name}."
+                ))
+            }
+            Some("delete") => {
+                let Some(name) = args.get(1) else {
+                    return MacroCommandOutcome::Message(USAGE.into());
+                };
+                if self.macro_registry.delete(name.trim_start_matches('/')) {
+                    MacroCommandOutcome::Message(format!("Deleted macro '{name}'."))
+                } else {
+                    MacroCommandOutcome::Message(format!("No macro named '{name}'."))
+                }
+            }
+            Some("run") => {
+                let Some(name) = args.get(1) else {
+                    return MacroCommandOutcome::Message(USAGE.into());
+                };
+                match self.macro_registry.get(name.trim_start_matches('/')) {
+                    Some(commands) => MacroCommandOutcome::Run(commands.to_vec()),
+                    None => MacroCommandOutcome::Message(format!("No macro named '{name}'.")),
+                }
+            }
+            Some(other) => MacroCommandOutcome::Message(format!(
+                "Unknown /macro subcommand '{other}'.\n{USAGE}"
+            )),
         }
-        Ok(())
     }
 
-    /// Handle /auto-dream command.
     fn handle_auto_dream_command(&mut self, args: &[String]) -> String {
         let dream = match &self.auto_dream {
             Some(d) => d,
@@ -6733,6 +6888,18 @@ impl ReplLoop {
         // every flag-gated command dead in production, even when the user
         // passed `--betas` or `CODEREX_FEATURE_FLAGS`.
         ctx.feature_flags = self.feature_flags.as_map();
+        ctx.recent_commands = self
+            .command_history
+            .list(1000)
+            .iter()
+            .map(|entry| {
+                if entry.args.is_empty() {
+                    format!("/{}", entry.cmd)
+                } else {
+                    format!("/{} {}", entry.cmd, entry.args.join(" "))
+                }
+            })
+            .collect();
         ctx.api_key_set = self.api_client.is_some();
         ctx.elapsed_secs = self
             .query_start_time
@@ -6830,6 +6997,60 @@ mod tests {
         assert!(ctx.is_feature_enabled("voice_mode"));
         assert!(ctx.is_feature_enabled("heapdump"));
         assert!(!ctx.is_feature_enabled("ultraplan"));
+    }
+
+    #[tokio::test]
+    async fn macro_command_defines_lists_runs_and_deletes() {
+        let mut repl = ReplLoop::new("/tmp".into(), ModelId::sonnet());
+
+        let mut out = Vec::new();
+        repl.execute_command("/macro define greet /version", &mut out)
+            .await
+            .unwrap();
+        assert!(String::from_utf8_lossy(&out).contains("Defined macro 'greet'"));
+
+        let mut out = Vec::new();
+        repl.execute_command("/macro list", &mut out).await.unwrap();
+        assert!(String::from_utf8_lossy(&out).contains("greet"));
+
+        let mut out = Vec::new();
+        repl.execute_command("/macro run greet", &mut out)
+            .await
+            .unwrap();
+        assert!(
+            String::from_utf8_lossy(&out).contains("CodeRex"),
+            "the macro did not run its command: {}",
+            String::from_utf8_lossy(&out)
+        );
+
+        let mut out = Vec::new();
+        repl.execute_command("/macro delete greet", &mut out)
+            .await
+            .unwrap();
+        assert!(String::from_utf8_lossy(&out).contains("Deleted macro 'greet'"));
+        assert!(!repl.macro_registry.has("greet"));
+    }
+
+    #[tokio::test]
+    async fn a_named_macro_can_run_a_builtin_command() {
+        // Macro expansion used to call the registry-only helper, so a macro
+        // whose segment was a built-in (here /exit) did nothing in headless
+        // mode. It now goes through the full entry path.
+        let mut repl = ReplLoop::new("/tmp".into(), ModelId::sonnet());
+        repl.macro_registry.define("bye", vec!["/exit".into()]);
+        let mut out = Vec::new();
+        repl.execute_command("/bye", &mut out).await.unwrap();
+        assert!(!repl.running, "the macro's built-in did not run");
+    }
+
+    #[test]
+    fn command_context_includes_recent_command_lines() {
+        let mut repl = ReplLoop::new("/tmp".into(), ModelId::sonnet());
+        repl.command_history.append("model", &["opus".into()]);
+        repl.command_history.append("diff", &[]);
+        let ctx = repl.build_context();
+        assert!(ctx.recent_commands.contains(&"/model opus".to_string()));
+        assert!(ctx.recent_commands.contains(&"/diff".to_string()));
     }
 
     #[tokio::test]

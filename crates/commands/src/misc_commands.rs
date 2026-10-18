@@ -380,28 +380,48 @@ pub fn register(registry: &mut CommandRegistry) {
         true,
         true,
         true,
-        Arc::new(|_ctx: &CommandContext, args: &[String]| {
-            if args.is_empty() {
-                CommandResult::success("No command history available.")
-            } else {
-                match args[0].as_str() {
-                    "search" => {
-                        if args.len() < 2 {
-                            CommandResult::error("Usage: /history search <query>")
-                        } else {
-                            CommandResult::success(format!(
-                                "Search for '{}' — use /history in the REPL to see results.",
-                                args[1..].join(" ")
-                            ))
-                        }
+        Arc::new(|ctx: &CommandContext, args: &[String]| {
+            if ctx.recent_commands.is_empty() {
+                return CommandResult::success("No command history available.");
+            }
+            let format_entries = |entries: &[&String]| {
+                entries
+                    .iter()
+                    .enumerate()
+                    .map(|(index, entry)| format!("{:>4}  {entry}", index + 1))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            };
+            match args.first().map(String::as_str) {
+                None => {
+                    let start = ctx.recent_commands.len().saturating_sub(20);
+                    let entries: Vec<&String> = ctx.recent_commands[start..].iter().collect();
+                    CommandResult::success(format_entries(&entries))
+                }
+                Some("search") => {
+                    if args.len() < 2 {
+                        return CommandResult::error("Usage: /history search <query>");
                     }
-                    _ => {
-                        let n: usize = args[0].parse().unwrap_or(20);
-                        CommandResult::success(format!(
-                            "Showing last {n} commands. Use /history in the REPL for full history."
-                        ))
+                    let query = args[1..].join(" ").to_lowercase();
+                    let matches: Vec<&String> = ctx
+                        .recent_commands
+                        .iter()
+                        .filter(|entry| entry.to_lowercase().contains(&query))
+                        .collect();
+                    if matches.is_empty() {
+                        CommandResult::success(format!("No commands match '{query}'."))
+                    } else {
+                        CommandResult::success(format_entries(&matches))
                     }
                 }
+                Some(raw) => match raw.parse::<usize>() {
+                    Ok(n) => {
+                        let start = ctx.recent_commands.len().saturating_sub(n);
+                        let entries: Vec<&String> = ctx.recent_commands[start..].iter().collect();
+                        CommandResult::success(format_entries(&entries))
+                    }
+                    Err(_) => CommandResult::error("Usage: /history [n] | /history search <query>"),
+                },
             }
         }),
     ));
@@ -629,6 +649,29 @@ mod tests {
         let result = reg.execute("backfill-sessions", &ctx(), &[]);
         assert!(result.output.contains("Backfilling"));
         assert!(result.state_changed);
+    }
+
+    #[test]
+    fn history_reads_the_recorded_commands() {
+        let reg = {
+            let mut r = CommandRegistry::new();
+            register(&mut r);
+            r
+        };
+        let mut context = ctx();
+        context.recent_commands = vec!["/model opus".into(), "/diff".into(), "/history 2".into()];
+
+        let all = reg.execute("history", &context, &[]);
+        assert!(all.output.contains("/model opus"));
+        assert!(all.output.contains("/diff"));
+
+        let last = reg.execute("history", &context, &["1".into()]);
+        assert!(last.output.contains("/history 2"));
+        assert!(!last.output.contains("/model opus"));
+
+        let searched = reg.execute("history", &context, &["search".into(), "diff".into()]);
+        assert!(searched.output.contains("/diff"));
+        assert!(!searched.output.contains("/model opus"));
     }
 
     #[test]

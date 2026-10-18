@@ -213,6 +213,12 @@ pub struct CommandContext {
     pub cost_summary: String,
     /// Pipe input from a previous command in a chain (e.g., `/diff | /commit`).
     pub pipe_input: Option<String>,
+    /// Recent command lines, oldest first, for `/history`.
+    ///
+    /// A snapshot rather than a handle: the REPL owns the history file and a
+    /// command handler runs synchronously, so copying the (bounded) list is
+    /// simpler than sharing a mutable registry across the boundary.
+    pub recent_commands: Vec<String>,
 }
 
 impl CommandContext {
@@ -245,6 +251,7 @@ impl CommandContext {
             version: String::new(),
             cost_summary: String::new(),
             pipe_input: None,
+            recent_commands: Vec::new(),
         }
     }
 
@@ -655,7 +662,11 @@ mod tests {
             .with_args(CommandArgs::Exactly(2)),
         );
 
-        for args in [vec![], vec!["a".into()], vec!["a".into(), "b".into(), "c".into()]] {
+        for args in [
+            vec![],
+            vec!["a".into()],
+            vec!["a".into(), "b".into(), "c".into()],
+        ] {
             let result = registry.execute("takes-exactly-two", &make_ctx(), &args);
             assert!(
                 result.output.contains("exactly 2"),
@@ -664,11 +675,7 @@ mod tests {
             );
         }
 
-        let right = registry.execute(
-            "takes-exactly-two",
-            &make_ctx(),
-            &["a".into(), "b".into()],
-        );
+        let right = registry.execute("takes-exactly-two", &make_ctx(), &["a".into(), "b".into()]);
         assert!(right.output.contains("ran"), "{}", right.output);
     }
 
@@ -688,7 +695,11 @@ mod tests {
             }),
         ));
 
-        let result = registry.execute("anything", &make_ctx(), &["a".into(), "b".into(), "c".into()]);
+        let result = registry.execute(
+            "anything",
+            &make_ctx(),
+            &["a".into(), "b".into(), "c".into()],
+        );
         assert!(result.output.contains("ran with 3"), "{}", result.output);
     }
 

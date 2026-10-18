@@ -13,8 +13,12 @@
 use std::sync::Arc;
 
 use coderex_core::api_client::ApiClient;
+use coderex_core::permissions::{PermissionChecker, PermissionMode};
 use coderex_core::types::ModelId;
-use coderex_hooks::{ActionPrompt, HookActionRunner, HookError};
+use coderex_hooks::{
+    ActionPrompt, HookActionRunner, HookError, HookRequestError, HookRequestHandler,
+    METHOD_NOT_FOUND,
+};
 
 /// System prompt for an `agent` hook.
 ///
@@ -73,7 +77,11 @@ pub struct SessionHookActionRunner {
 impl SessionHookActionRunner {
     /// Build the runner over the session's clients.
     #[must_use]
-    pub fn new(api: Box<dyn ApiClient>, tools: Arc<dyn HookToolCaller>, default_model: ModelId) -> Self {
+    pub fn new(
+        api: Box<dyn ApiClient>,
+        tools: Arc<dyn HookToolCaller>,
+        default_model: ModelId,
+    ) -> Self {
         Self {
             api,
             tools,
@@ -125,6 +133,97 @@ impl HookActionRunner for SessionHookActionRunner {
             .call(&name, input)
             .await
             .map_err(HookError::ActionFailed)
+    }
+}
+
+/// Answers the requests a streaming hook asks of the session while it runs.
+///
+/// A `command` hook configured with `stream: true` may emit
+/// `{"type":"request","id":N,"method":"..."}` and then wait for an answer on
+/// its stdin. This supplies the two read-only questions such a hook may ask:
+///
+/// - `"context"` — `{"cwd", "session_id", "model", "permission_mode"}`, where
+///   the mode is its display string (`"default"`, `"plan"`, ...).
+/// - `"permission_mode"` — just that mode string.
+///
+/// Every other method is refused with [`METHOD_NOT_FOUND`] (`-32601`) and a
+/// message naming it. The surface is deliberately read-only: it never exposes
+/// environment variables, credentials, or the settings document, and it never
+/// mutates session state.
+///
+/// The permission checker is the session's shared one, so a mode change made
+/// elsewhere is visible here immediately rather than being frozen at install
+/// time.
+pub struct SessionHookRequestHandler {
+    cwd: std::path::PathBuf,
+    session_id: String,
+    model: ModelId,
+    permission_checker: Arc<std::sync::Mutex<PermissionChecker>>,
+}
+
+impl SessionHookRequestHandler {
+    /// Build the handler over the session's facts.
+    ///
+    /// `permission_checker` must be the session's shared checker
+    /// (`Engine::permission_checker()`), not a snapshot: a copy would answer
+    /// with the mode as it was at install time.
+    #[must_use]
+    pub fn new(
+        cwd: impl Into<std::path::PathBuf>,
+        session_id: impl Into<String>,
+        model: ModelId,
+        permission_checker: Arc<std::sync::Mutex<PermissionChecker>>,
+    ) -> Self {
+        Self {
+            cwd: cwd.into(),
+            session_id: session_id.into(),
+            model,
+            permission_checker,
+        }
+    }
+
+    /// The mode the shared checker is in right now.
+    fn permission_mode(&self) -> PermissionMode {
+        // A poisoned lock is still readable; refusing to answer would leave
+        // the hook waiting for a fact the session can still provide.
+        self.permission_checker
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .mode()
+    }
+}
+
+impl std::fmt::Debug for SessionHookRequestHandler {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SessionHookRequestHandler")
+            .field("cwd", &self.cwd)
+            .field("session_id", &self.session_id)
+            .field("model", &self.model.0)
+            .finish_non_exhaustive()
+    }
+}
+
+impl HookRequestHandler for SessionHookRequestHandler {
+    fn handle(
+        &self,
+        method: &str,
+        _params: Option<&serde_json::Value>,
+    ) -> Result<serde_json::Value, HookRequestError> {
+        match method {
+            "context" => Ok(serde_json::json!({
+                "cwd": self.cwd.to_string_lossy(),
+                "session_id": self.session_id.as_str(),
+                "model": self.model.0.as_str(),
+                "permission_mode": self.permission_mode().to_string(),
+            })),
+            "permission_mode" => Ok(serde_json::Value::String(
+                self.permission_mode().to_string(),
+            )),
+            other => Err(HookRequestError {
+                code: METHOD_NOT_FOUND,
+                message: format!("the session does not provide '{other}'"),
+            }),
+        }
     }
 }
 
@@ -243,8 +342,15 @@ mod tests {
 
         assert_eq!(answer, "{\"action\":\"continue\"}");
         let seen = seen.lock().unwrap();
-        assert_eq!(seen[0].2, ModelId::sonnet(), "the session's model, not one invented here");
-        assert!(seen[0].1.contains("is this ok?"), "the prompt did not reach the model");
+        assert_eq!(
+            seen[0].2,
+            ModelId::sonnet(),
+            "the session's model, not one invented here"
+        );
+        assert!(
+            seen[0].1.contains("is this ok?"),
+            "the prompt did not reach the model"
+        );
     }
 
     /// A `prompt` hook may name a model, and that name wins.
@@ -321,5 +427,81 @@ mod tests {
             .await;
 
         assert!(matches!(result, Err(HookError::ActionFailed(_))));
+    }
+
+    fn request_handler(
+        mode: PermissionMode,
+    ) -> (
+        SessionHookRequestHandler,
+        Arc<std::sync::Mutex<PermissionChecker>>,
+    ) {
+        let checker = Arc::new(std::sync::Mutex::new(PermissionChecker::new(mode)));
+        let handler = SessionHookRequestHandler::new(
+            "/work/project",
+            "session-1",
+            ModelId("claude-sonnet-4-5".into()),
+            Arc::clone(&checker),
+        );
+        (handler, checker)
+    }
+
+    /// `context` reports exactly the four session facts — and nothing that
+    /// could leak the environment, credentials, or the settings document.
+    #[test]
+    fn context_reports_the_session_facts() {
+        let (handler, _) = request_handler(PermissionMode::Plan);
+
+        let answer = handler.handle("context", None).unwrap();
+
+        assert_eq!(answer["cwd"], "/work/project");
+        assert_eq!(answer["session_id"], "session-1");
+        assert_eq!(answer["model"], "claude-sonnet-4-5");
+        assert_eq!(answer["permission_mode"], "plan");
+        assert_eq!(
+            answer.as_object().unwrap().len(),
+            4,
+            "context must expose only the documented facts"
+        );
+    }
+
+    /// `permission_mode` answers the mode as its display string.
+    #[test]
+    fn permission_mode_reports_the_mode_string() {
+        let (handler, _) = request_handler(PermissionMode::AcceptEdits);
+
+        assert_eq!(
+            handler.handle("permission_mode", None).unwrap(),
+            serde_json::json!("accept-edits")
+        );
+    }
+
+    /// The handler holds the session's *shared* checker, so later mode changes
+    /// are visible without rebuilding it.
+    #[test]
+    fn permission_mode_reads_the_shared_checker() {
+        let (handler, checker) = request_handler(PermissionMode::Default);
+        assert_eq!(
+            handler.handle("permission_mode", None).unwrap(),
+            serde_json::json!("default")
+        );
+
+        checker.lock().unwrap().set_mode(PermissionMode::Plan);
+
+        assert_eq!(
+            handler.handle("permission_mode", None).unwrap(),
+            serde_json::json!("plan")
+        );
+    }
+
+    /// An unprovided method is refused, never ignored: the hook is waiting.
+    #[test]
+    fn an_unknown_method_is_method_not_found() {
+        let (handler, _) = request_handler(PermissionMode::Default);
+
+        let error = handler.handle("environment", None).unwrap_err();
+
+        assert_eq!(error.code, METHOD_NOT_FOUND);
+        assert_eq!(error.code, -32601);
+        assert_eq!(error.message, "the session does not provide 'environment'");
     }
 }
