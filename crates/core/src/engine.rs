@@ -1207,6 +1207,11 @@ pub struct QueryEngine {
     /// When the last provider request started, for the prompt-cache TTL
     /// trigger: every request refreshes the cache, so the clock starts there.
     last_request_at: Option<Instant>,
+    /// Maximum output tokens requested from the provider per request.
+    ///
+    /// Defaults to [`Self::DEFAULT_MAX_TOKENS`]; a session selected with
+    /// `--agent` may lower or raise it from the agent definition.
+    max_tokens: u32,
 }
 
 /// A denied tool call that should be summarized in the next turn.
@@ -1304,8 +1309,12 @@ impl QueryEngine {
             session_memory: None,
             compaction_backend: None,
             last_request_at: None,
+            max_tokens: Self::DEFAULT_MAX_TOKENS,
         }
     }
+
+    /// The default maximum output tokens per provider request.
+    pub const DEFAULT_MAX_TOKENS: u32 = 4096;
 
     /// Set the elicitation handler.
     /// Replace the client requests are sent through.
@@ -1314,6 +1323,31 @@ impl QueryEngine {
     /// that need a model which behaves a particular way mid-turn.
     pub fn set_api_client(&mut self, client: Box<dyn ApiClient>) {
         self.api_client = client;
+    }
+
+    /// Replace the model used for provider requests.
+    ///
+    /// Used when a named custom agent selected with `--agent` supplies its own
+    /// model, and by tests that need to observe the model a request carried.
+    pub fn set_model(&mut self, model: ModelId) {
+        self.model = model;
+    }
+
+    /// The model used for provider requests.
+    #[must_use]
+    pub fn model(&self) -> &ModelId {
+        &self.model
+    }
+
+    /// Set the maximum output tokens requested from the provider.
+    pub fn set_max_tokens(&mut self, max_tokens: u32) {
+        self.max_tokens = max_tokens;
+    }
+
+    /// The maximum output tokens requested from the provider.
+    #[must_use]
+    pub fn max_tokens(&self) -> u32 {
+        self.max_tokens
     }
 
     /// Replace the elicitation handler — how the engine asks the person a
@@ -3177,7 +3211,13 @@ impl QueryEngine {
         // prompt cache, and the TTL trigger measures idleness from here.
         self.last_request_at = Some(Instant::now());
         let response = match request_client
-            .create_message(&system, &messages, &self.model, 4096, &tools)
+            .create_message(
+                &system,
+                &messages,
+                &self.model,
+                self.max_tokens,
+                &tools,
+            )
             .await
         {
             Ok(resp) => resp,
@@ -3266,7 +3306,13 @@ impl QueryEngine {
                 .api_client
                 .with_request_context(self.build_request_context(self.current_turn, options));
             let mut stream = request_client
-                .create_message_streaming(&system, &messages, &self.model, 4096, &tools)
+                .create_message_streaming(
+                    &system,
+                    &messages,
+                    &self.model,
+                    self.max_tokens,
+                    &tools,
+                )
                 .await;
             self.last_request_at = Some(Instant::now());
 

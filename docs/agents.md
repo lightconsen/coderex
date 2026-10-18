@@ -103,8 +103,9 @@ Sub-agent system for spawning autonomous worker agents, dream agents (background
 #### Events & Observability
 
 - **`AgentObservableEvent`** — Broadcastable event: `agent_id` + `EngineEvent`.
+- **`AgentSubscription`** — Filtered receiver over the manager-wide broadcast. `recv()`/`try_recv()` drop events for other agents.
 - **`TeammateEvent`** — Agent lifecycle events: `Idle { agent_id, reason }`, `TaskCompleted { agent_id, subject, summary }`.
-- **`TeammateEventCallback`** — Callback type for teammate events.
+- **`TeammateEventCallback`** — Callback type for teammate events. The REPL installs one at session startup; it forwards each event as `EngineEvent::AgentEvent` (Completed/Idle) and logs it at info level, so the UI and headless logs share the existing event path.
 
 #### Helper Functions
 
@@ -127,10 +128,10 @@ Sub-agent system for spawning autonomous worker agents, dream agents (background
 - **Sandbox override** — Per-agent `SandboxConfig` injected into the tool executor factory.
 - **Token tracking** — `QueryEngine.total_usage()` captured after each attempt, persisted to companion `.meta.json` file alongside the output file.
 - **Custom agent definitions** — Users define agents in `~/.coderex/agents/{name}.json`; `spawn_named_agent(name, ...)` resolves the definition and delegates to `AgentType::Custom`, which merges the system prompt, tool whitelist, model, token limit and output schema into the spawn.
-- **Named agents from the CLI** — `coderex --agent <name>` resolves the same definitions at session start. The definition's system prompt replaces the default session prompt and its `allowed_tools` narrows the session; an explicit `--system-prompt` or `--allowed-tools` wins, and an unknown name fails before the REPL starts with the list of configured names. The `coderex agents` subcommand lists built-in and custom agents.
+- **Named agents from the CLI** — `coderex --agent <name>` resolves the same definitions at session start. The definition's system prompt replaces the default session prompt, its `allowed_tools` narrows the session, and its `model` / `max_tokens` are installed on the session `QueryEngine`. An explicit `--system-prompt`, `--allowed-tools` or `--model` wins (there is no CLI max-token flag, so the definition's limit always applies), and an unknown name fails before the REPL starts with the list of configured names. The `coderex agents` subcommand lists built-in and custom agents.
 - **Parent prefix wiring** — The REPL refreshes a [`ParentContextSnapshot`] immediately before each turn and the Agent tool's parent-context provider reads it when spawning. When the snapshot has messages, the tool sets `SpawnOptions::parent_prefix` and `parent_cache_safe_params` (derived from the same model/system-prompt/tool list) and reports `message_count = prefix.len()`, so `ForkedContext` knows where the parent prefix ends. Without a provider (managers used directly, tests) a spawn still works but starts a fresh prefix.
 - **Lifecycle producers** — `run_agent_task()` emits `AgentLifecycleEvent::Started`, `TextDelta` for each streamed text delta, `ToolCall { name, args }` for each tool invocation (the engine exposes the call summary, so `args` currently carries `{"summary": ...}` rather than the parsed arguments), `Idle { reason: "turn complete" }` after the event stream drains, and finally `Completed` or `Failed`. They travel as `EngineEvent::AgentEvent`, which the TUI already renders.
-- **External subscriptions** — `subscribe_to_agent()` returns a `tokio::sync::broadcast` receiver of `AgentObservableEvent` (the same engine events tagged with the agent id). The REPL creates one in `with_engine` and drains it on the TUI tick and in headless event draining (debug logs); the UI itself uses `EngineEvent::AgentEvent`, so the broadcast is the external-observer surface, not a second rendering path. `register_agent()` was removed: there is no transport for an externally managed agent in CodeRex (sub-agents are in-process `tokio` tasks), so it could only ever record a dangling id.
+- **External subscriptions** — `subscribe_to_agent(id)` returns an `AgentSubscription`, a wrapper over the manager-wide `tokio::sync::broadcast` channel that yields only events tagged with that agent id; `subscribe_all()` (and the `"all"` alias) keeps the unfiltered view. The REPL creates an unfiltered subscription in `with_engine` and drains it on the TUI tick and in headless event draining (debug logs); the UI itself uses `EngineEvent::AgentEvent`, so the broadcast is the external-observer surface, not a second rendering path. `register_agent()` was removed: there is no transport for an externally managed agent in CodeRex (sub-agents are in-process `tokio` tasks), so it could only ever record a dangling id.
 
 ## Current Status
 
@@ -153,11 +154,11 @@ All features are implemented. No known stubs.
 - **Sandbox integration** — Per-agent `SandboxConfig` override passed through tool executor factory.
 - **Token usage tracking** — Captured from `QueryEngine.total_usage()`, persisted to `.meta.json`, returned by `wait_for_completion()`.
 - **Observability** — Broadcast channel, NDJSON log files, parent event bus integration.
-- **Teammate events** — `TaskCompleted` and `Idle` events emitted with callback support.
+- **Teammate events** — `TaskCompleted` and `Idle` events emitted through the manager callback. The REPL is a production caller: it forwards them to `EngineEvent::AgentEvent` and logs each one, so they reach the UI and headless logs.
 - **Sub-agent lifecycle events** — `Started`, `TextDelta`, `ToolCall`, `Idle` and terminal `Completed`/`Failed` are emitted to the parent engine (see the lifecycle pattern above).
 - **Cache-aware forking** — `ForkedContext` reuses the parent's conversation prefix verbatim (`fork_messages()`, `prefix_fingerprint()`, `is_cache_safe()`), so a fork can hit the provider's prefix cache instead of paying for a fresh prefix. The REPL supplies the production prefix/cache-safe params through `ParentContextSnapshot`.
 - **Forked/background delegation** — `run_forked_agent()` and `run_background_feature()` via `coderex-core` orchestrator.
-- **Custom agent resolution** — `spawn_named_agent()` (and `--agent` for the session) resolves named custom agents from loaded definitions, merging allowed_tools, model, max_tokens, and output_schema.
+- **Custom agent resolution** — `spawn_named_agent()` resolves named custom agents from loaded definitions, merging allowed_tools, model, max_tokens, and output_schema. `--agent` resolves the same definition for the session and applies its model and max_tokens to the session engine, unless `--model` was explicit.
 - **Agent tool spawn options** — The Agent tool exposes `agent` (custom name, takes precedence over `subagent_type`), `writable` / `read_only`, and `retry_policy` / `max_retries`, and passes them into `SpawnOptions`. `writable: false` enforces the Read/Grep/Glob whitelist.
 - **Removed registration API** — `register_agent()` and `is_registered()` no longer exist: there is no external-agent transport, so they were dangling. See the pattern note above.
 
@@ -325,14 +326,19 @@ Messages are drained and appended to the agent's prompt context before each engi
 let mut rx = mgr.subscribe_to_agent(&agent_id).unwrap();
 while let Ok(event) = rx.recv().await {
     // event: AgentObservableEvent { agent_id, event: EngineEvent }
+    // Only events for `agent_id` are returned; other agents are filtered out.
 }
+
+// Or observe every agent.
+let mut all = mgr.subscribe_all().unwrap();
 ```
 
-The manager keeps one broadcast channel for all agents; the `agent_id`
-argument is accepted for call-site clarity and filtering is the subscriber's
-job (match on `event.agent_id`). A receiver is present only when the manager
-was created with an event broadcast. The REPL is the production subscriber;
-the TUI reads the same lifecycle through `EngineEvent::AgentEvent`.
+The manager keeps one broadcast channel for all agents. `subscribe_to_agent`
+wraps that receiver in an [`AgentSubscription`] that drops events belonging to
+other agents; `"all"` and `subscribe_all()` retain the manager-wide view. A
+receiver is present only when the manager was created with an event broadcast.
+The REPL is the production subscriber; the TUI reads the same lifecycle
+through `EngineEvent::AgentEvent`.
 
 ### Custom Agent Config (`~/.coderex/agents/my_agent.json`)
 
@@ -367,10 +373,11 @@ the configured names (or explains where to add a definition when none are
 configured) instead of silently falling back to a general-purpose agent.
 
 When a definition is used for the **session** (`coderex --agent <name>`), its
-`system_prompt` and `allowed_tools` are applied; `model` and `max_tokens` are
-used for spawned sub-agents, while the session model still comes from
-`--model`/configuration. Explicit `--system-prompt` or `--allowed-tools` win
-over the file.
+`system_prompt`, `allowed_tools`, `model` and `max_tokens` are applied to the
+session (the model and token limit via `QueryEngine::set_model` /
+`set_max_tokens`). Explicit `--system-prompt` or `--allowed-tools` win, and an
+explicit `--model` wins over the file. There is no CLI max-token flag, so the
+definition's `max_tokens` always applies.
 
 ### Parent Prefix / Cache-Safe Spawn
 

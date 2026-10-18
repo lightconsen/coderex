@@ -31,6 +31,11 @@ pub struct SessionContext {
     pub remote_settings: Option<RemoteManagedSettings>,
     /// Resolved model to use.
     pub model: Option<ModelId>,
+    /// True when `--model` was given on the command line.
+    ///
+    /// A named custom agent may supply a model, but an explicit CLI choice is
+    /// more specific and wins.
+    pub model_explicit: bool,
     /// Loading barrier for remote settings (if configured). Enterprise feature only.
     #[cfg(feature = "enterprise")]
     pub remote_barrier: Option<LoadingBarrier>,
@@ -211,6 +216,7 @@ impl StartupOrchestrator {
                 #[cfg(feature = "enterprise")]
                 remote_settings: None,
                 model: None,
+                model_explicit: false,
                 #[cfg(feature = "enterprise")]
                 remote_barrier: None,
                 mcp_ready: false,
@@ -274,6 +280,9 @@ impl StartupOrchestrator {
         crate::tmux::apply(args.tmux)?;
 
         // Store working directory early
+        // Recorded before settings resolution folds the CLI value into the
+        // effective model, so `--agent` can tell an explicit choice apart.
+        self.ctx.model_explicit = args.model.is_some();
         self.ctx.cwd = args.directory.clone().unwrap_or_else(|| {
             std::env::current_dir()
                 .unwrap_or_default()
@@ -1228,6 +1237,7 @@ impl StartupOrchestrator {
         repl.with_betas(self.ctx.betas.clone());
         repl.with_chrome_enabled(self.ctx.chrome && !self.ctx.no_chrome);
         repl.with_agent(self.ctx.agent.clone());
+        repl.with_explicit_model_override(self.ctx.model_explicit);
         repl.with_ide(self.ctx.ide.clone());
         repl.with_worktree(self.ctx.worktree);
         repl.with_fork_session(self.ctx.fork_session.clone());
