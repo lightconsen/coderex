@@ -17,10 +17,14 @@
 //!   over the target, so an existing (possibly world-readable) file is never
 //!   rewritten in place and there is no window where the contents are exposed.
 //! * On Windows the keychain is the primary protection. The file fallback is
-//!   created under the user's profile, whose inherited ACL is normally
-//!   user-only, and a best-effort `icacls` tightening is attempted; without a
-//!   native ACL API in `std` this cannot be guaranteed, so a Windows host
-//!   without a working keychain is a weaker configuration.
+//!   created under the user's profile and its DACL is replaced with an
+//!   explicit, protected DACL that grants only the current user's SID (read
+//!   from the process token) full access, so inherited entries from the
+//!   profile cannot widen it. The DACL is applied to the temporary file before
+//!   it is renamed over the target, and the result is read back and verified.
+//!   This path uses the native security APIs (`windows-sys`) and is compiled
+//!   but has not been executed on a Windows host in this tree; see the module
+//!   comments on [`tighten_to_owner_only`].
 //!
 //! A plaintext file left behind by an older version is migrated on the next
 //! successful keychain read or write: it is removed, or tightened to `0600` if
@@ -421,36 +425,257 @@ fn tighten_to_owner_only(path: &Path) {
     }
 }
 
-/// Best-effort owner-only ACL on Windows.
+/// The fixed part of a DACL that grants one SID full access.
 ///
-/// `std` has no ACL API, so the inherited user-profile ACL is the real
-/// guarantee here. `icacls` is used to remove inheritance and grant only the
-/// current user when it is available; failure is logged and does not fail the
-/// write, because the keychain is the preferred location and the document must
-/// still be persisted.
+/// The buffer is an `ACL` header followed by one `ACCESS_ALLOWED_ACE` whose
+/// `SidStart` field is the first four bytes of the SID, so the bytes after the
+/// ACL header are the ACE header, the access mask, and the SID. These constants
+/// mirror the C layouts (`ACL` is 8 bytes, `ACE_HEADER` plus `Mask` is 8) and
+/// are kept layout-free so the size arithmetic can be unit-tested on hosts
+/// that are not Windows.
+#[cfg(any(windows, test))]
+const ACL_HEADER_BYTES: u32 = 8;
+#[cfg(any(windows, test))]
+const ACCESS_ALLOWED_ACE_HEADER_BYTES: u32 = 8;
+
+/// How many bytes a DACL granting exactly `sid_len` bytes of SID needs.
+#[cfg(any(windows, test))]
+const fn user_only_dacl_size(sid_len: u32) -> u32 {
+    ACL_HEADER_BYTES + ACCESS_ALLOWED_ACE_HEADER_BYTES + sid_len
+}
+
+/// Enforce a user-only DACL on the token file.
+///
+/// The native security APIs are used because `std` has no ACL interface and
+/// `icacls` is both locale-sensitive and not atomic. The DACL is an explicit,
+/// protected DACL containing one `ACCESS_ALLOWED_ACE` for the SID of the user
+/// running the process. `PROTECTED_DACL_SECURITY_INFORMATION` detaches the
+/// DACL from the parent directory's inheritable entries, so the profile's
+/// inherited ACL cannot re-widen it. After setting it, the DACL is read back
+/// and verified to contain exactly that one ACE.
+///
+/// This is applied to the temporary file before the rename, so the target
+/// never exists with a wider ACL during a save.
+///
+/// Compile-gated and not executed by the test suite in this tree: it requires
+/// a Windows host. Failure is logged rather than propagated, matching the Unix
+/// path and keeping the credential persistable when the keychain is the
+/// primary store.
 #[cfg(windows)]
 fn tighten_to_owner_only(path: &Path) {
-    let Some(user) = std::env::var("USERNAME").ok().filter(|user| !user.is_empty()) else {
-        return;
+    if let Err(error) = windows_acl::restrict_to_current_user(path) {
+        tracing::warn!(
+            path = %path.display(),
+            "could not set a user-only DACL on the MCP token file: {error}"
+        );
+    }
+}
+
+/// Windows ACL construction over `windows-sys`.
+///
+/// The process token is queried for `TokenUser`; that SID is the only
+/// principal the resulting DACL grants. The DACL buffer is built in a
+/// `u64`-backed allocation so it is suitably aligned for the Win32 structures.
+#[cfg(windows)]
+#[allow(unsafe_code)] // Win32 security calls; every call site has a SAFETY note.
+mod windows_acl {
+    use super::user_only_dacl_size;
+    use std::io;
+    use std::os::windows::ffi::OsStrExt as _;
+    use std::path::Path;
+    use windows_sys::Win32::Foundation::{CloseHandle, LocalFree, ERROR_SUCCESS, GENERIC_ALL};
+    use windows_sys::Win32::Security::Authorization::{
+        GetNamedSecurityInfoW, SetNamedSecurityInfoW, SE_FILE_OBJECT,
     };
-    let grant = format!("{user}:F");
-    let outcome = std::process::Command::new("icacls")
-        .arg(path)
-        .arg("/inheritance:r")
-        .arg("/grant:r")
-        .arg(&grant)
-        .output();
-    match outcome {
-        Ok(output) if output.status.success() => {}
-        Ok(output) => tracing::warn!(
-            path = %path.display(),
-            status = %output.status,
-            "could not restrict the MCP token file ACL to the current user"
-        ),
-        Err(error) => tracing::warn!(
-            path = %path.display(),
-            "could not run icacls to restrict the MCP token file ACL: {error}"
-        ),
+    use windows_sys::Win32::Security::{
+        AddAccessAllowedAce, EqualSid, GetAce, GetAclInformation, GetLengthSid,
+        GetTokenInformation, InitializeAcl, TokenUser, ACCESS_ALLOWED_ACE, ACL, ACL_REVISION,
+        ACL_SIZE_INFORMATION, AclSizeInformation, DACL_SECURITY_INFORMATION,
+        PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID, TOKEN_QUERY, TOKEN_USER,
+    };
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+
+    /// Build and install the DACL, then verify it.
+    pub(super) fn restrict_to_current_user(path: &Path) -> io::Result<()> {
+        let wide: Vec<u16> = path
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+        let sid_buffer = current_user_sid()?;
+        // SAFETY: `sid_buffer` was filled by `GetTokenInformation(TokenUser)`;
+        // its first bytes are a `TOKEN_USER` whose `User.Sid` points inside the
+        // same allocation.
+        let sid = unsafe { sid_from_token_buffer(&sid_buffer) };
+        if sid.is_null() {
+            return Err(io::Error::other("the process token has no user SID"));
+        }
+        // SAFETY: `sid` points at a valid SID inside `sid_buffer`.
+        let sid_len = unsafe { GetLengthSid(sid) };
+        if sid_len == 0 {
+            return Err(io::Error::last_os_error());
+        }
+
+        let dacl_bytes = user_only_dacl_size(sid_len);
+        let mut dacl_buffer = vec![0_u64; (dacl_bytes as usize).div_ceil(8)];
+        // SAFETY: the allocation is at least `dacl_bytes` long (rounded up to
+        // a `u64` boundary) and sufficiently aligned for `ACL`.
+        let dacl = dacl_buffer.as_mut_ptr().cast::<ACL>();
+        if unsafe { InitializeAcl(dacl, dacl_bytes, ACL_REVISION) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: `dacl` has room for the ACE (the size was computed from the
+        // SID length), and `sid` is valid for the duration of the call.
+        if unsafe { AddAccessAllowedAce(dacl, ACL_REVISION, GENERIC_ALL, sid) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+
+        // A protected DACL: no inherited ACEs from the profile directory.
+        // SAFETY: `wide` is NUL-terminated and `dacl` is a valid ACL in a live
+        // buffer; the owner/group/SACL arguments are intentionally NULL.
+        let status = unsafe {
+            SetNamedSecurityInfoW(
+                wide.as_ptr(),
+                SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                dacl,
+                std::ptr::null(),
+            )
+        };
+        if status != ERROR_SUCCESS {
+            return Err(io::Error::from_raw_os_error(status as i32));
+        }
+
+        verify(&wide, sid)
+    }
+
+    /// Query the process token for the current user's SID.
+    ///
+    /// Returned as the raw `TOKEN_USER` buffer, whose allocation must outlive
+    /// any pointer to the SID inside it.
+    fn current_user_sid() -> io::Result<Vec<u64>> {
+        // SAFETY: pseudo-handle for the current process; the returned token
+        // handle is closed below on every path.
+        let mut token = std::ptr::null_mut();
+        if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let result = (|| {
+            let mut needed = 0_u32;
+            // The first call is expected to fail with ERROR_INSUFFICIENT_BUFFER
+            // and report the required size.
+            unsafe {
+                GetTokenInformation(token, TokenUser, std::ptr::null_mut(), 0, &mut needed);
+            }
+            if needed == 0 {
+                return Err(io::Error::last_os_error());
+            }
+            let mut buffer = vec![0_u64; (needed as usize).div_ceil(8)];
+            // SAFETY: the buffer is at least `needed` bytes and aligned.
+            let ok = unsafe {
+                GetTokenInformation(
+                    token,
+                    TokenUser,
+                    buffer.as_mut_ptr().cast(),
+                    needed,
+                    &mut needed,
+                )
+            };
+            if ok == 0 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(buffer)
+        })();
+        // SAFETY: `token` was opened successfully above and is not used after
+        // this point.
+        unsafe {
+            CloseHandle(token);
+        }
+        result
+    }
+
+    /// The SID in a `GetTokenInformation(TokenUser)` buffer.
+    ///
+    /// # Safety
+    ///
+    /// `buffer` must contain a `TOKEN_USER` at offset zero and stay alive for
+    /// as long as the returned pointer is used.
+    unsafe fn sid_from_token_buffer(buffer: &[u64]) -> PSID {
+        let token_user = unsafe { &*buffer.as_ptr().cast::<TOKEN_USER>() };
+        token_user.User.Sid
+    }
+
+    /// Read the DACL back and confirm it grants only `expected_sid`.
+    fn verify(wide: &[u16], expected_sid: PSID) -> io::Result<()> {
+        let mut dacl: *mut ACL = std::ptr::null_mut();
+        let mut descriptor: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
+        // SAFETY: `wide` is NUL-terminated; the out-pointers are valid. A
+        // successful call allocates `descriptor`, freed below.
+        let status = unsafe {
+            GetNamedSecurityInfoW(
+                wide.as_ptr(),
+                SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                &mut dacl,
+                std::ptr::null_mut(),
+                &mut descriptor,
+            )
+        };
+        if status != ERROR_SUCCESS {
+            return Err(io::Error::from_raw_os_error(status as i32));
+        }
+        // SAFETY: `dacl` points into `descriptor` and is non-NULL on success.
+        let verified = !dacl.is_null() && unsafe { dacl_grants_only(dacl, expected_sid) };
+        // SAFETY: `GetNamedSecurityInfoW` documents that the descriptor is
+        // freed with `LocalFree`.
+        unsafe {
+            LocalFree(descriptor);
+        }
+        if verified {
+            Ok(())
+        } else {
+            Err(io::Error::other(
+                "the token file DACL does not grant only the current user",
+            ))
+        }
+    }
+
+    /// Whether `dacl` has exactly one allow ACE, for `expected_sid`.
+    ///
+    /// # Safety
+    ///
+    /// `dacl` must be a valid ACL and `expected_sid` a valid SID.
+    unsafe fn dacl_grants_only(dacl: *const ACL, expected_sid: PSID) -> bool {
+        let mut info: ACL_SIZE_INFORMATION = unsafe { std::mem::zeroed() };
+        let ok = unsafe {
+            GetAclInformation(
+                dacl,
+                std::ptr::addr_of_mut!(info).cast(),
+                std::mem::size_of::<ACL_SIZE_INFORMATION>() as u32,
+                AclSizeInformation,
+            )
+        };
+        if ok == 0 || info.AceCount != 1 {
+            return false;
+        }
+
+        let mut ace: *mut core::ffi::c_void = std::ptr::null_mut();
+        if unsafe { GetAce(dacl, 0, &mut ace) } == 0 || ace.is_null() {
+            return false;
+        }
+        let ace = unsafe { &*ace.cast::<ACCESS_ALLOWED_ACE>() };
+        // `ACCESS_ALLOWED_ACE_TYPE` is 0; compare the byte-sized field.
+        const ACCESS_ALLOWED_ACE_TYPE: u8 = 0;
+        if ace.Header.AceType != ACCESS_ALLOWED_ACE_TYPE {
+            return false;
+        }
+        // `SidStart` is the first DWORD of the SID copied into the ACE.
+        let ace_sid: PSID = std::ptr::addr_of!(ace.SidStart).cast_mut().cast();
+        unsafe { EqualSid(ace_sid, expected_sid) != 0 }
     }
 }
 
@@ -624,5 +849,32 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let persistence = TokenPersistence::file_only(dir.path().join("absent.json"));
         assert!(persistence.load().unwrap().is_none());
+    }
+
+    /// The Windows DACL buffer must hold the ACL header, the allow-ACE header
+    /// and mask, and the whole SID. Real SIDs are multiples of four bytes, so
+    /// the size stays DWORD-aligned as `InitializeAcl` expects.
+    #[test]
+    fn a_user_only_dacl_is_sized_for_the_sid_and_word_aligned() {
+        for sid_len in [8_u32, 12, 16, 28, 32] {
+            let size = user_only_dacl_size(sid_len);
+            assert_eq!(size, 16 + sid_len);
+            assert_eq!(size % 4, 0, "size {size} is not DWORD-aligned");
+            assert!(
+                size > sid_len + 8,
+                "size {size} cannot also hold the ACL and ACE headers"
+            );
+        }
+    }
+
+    /// The `u64`-backed allocation used for the DACL rounds up without losing
+    /// any of the bytes `InitializeAcl` is told about.
+    #[test]
+    fn the_dacl_allocation_rounds_up_to_u64() {
+        for sid_len in [4_u32, 8, 12, 16, 28, 32] {
+            let bytes = user_only_dacl_size(sid_len) as usize;
+            let words = bytes.div_ceil(std::mem::size_of::<u64>());
+            assert!(words * std::mem::size_of::<u64>() >= bytes);
+        }
     }
 }

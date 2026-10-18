@@ -55,7 +55,8 @@ impl Tool for McpAuthTool {
                     "scope": { "type": "string", "description": "OAuth scope (default: mcp)" },
                     "redirect_url": { "type": "string", "description": "The full URL the browser was redirected to after approval. Its code and state are parsed and the state is verified against the pending flow." },
                     "code": { "type": "string", "description": "Authorization code, when finishing by hand after the browser callback did not arrive" },
-                    "code_verifier": { "type": "string", "description": "PKCE verifier returned by the earlier call that produced the auth_url (optional when a pending flow is on disk)" }
+                    "code_verifier": { "type": "string", "description": "PKCE verifier returned by the earlier call that produced the auth_url (optional when a pending flow is on disk)" },
+                    "headless": { "type": "boolean", "description": "Return the authorization URL immediately instead of opening a browser. Used by a headless session's re-authorization handler, which prints the URL for a person to open later." }
                 }
             }),
             output_schema: serde_json::json!({
@@ -248,6 +249,32 @@ async fn authenticate_with(
             &resource,
         )?;
         auth_url = Some(url.clone());
+
+        // A headless caller (the CLI's re-authorization handler when there is
+        // no terminal) cannot wait for a callback and should not launch a
+        // browser behind the user's back. Return the URL and hand-off state.
+        let headless = input
+            .arguments
+            .get("headless")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+        if headless {
+            let note = "Headless session: open auth_url in a browser to approve access.";
+            return Ok(pending_output(
+                &url,
+                &fresh_verifier,
+                &state,
+                &pending_note(
+                    &pending_path,
+                    &server_url,
+                    &state,
+                    &fresh_verifier,
+                    &authorization_endpoint,
+                    &token_endpoint,
+                    note,
+                ),
+            ));
+        }
 
         if let Err(error) = open_browser(&url) {
             let note = format!("Could not open a browser: {error}.");

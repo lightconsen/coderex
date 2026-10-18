@@ -10,8 +10,12 @@
 //! can sign in. This module can keep a session alive once that has happened.
 //!
 //! A refresh needs the server to have handed out a refresh token in the first
-//! place. Servers that do not issue one are not refreshable here, and
-//! [`OAuthManager::refresh`] says so rather than pretending.
+//! place. Servers that do not issue one are not refreshable by
+//! [`OAuthManager::refresh`]. Instead, a `401 invalid_token` can invoke the
+//! optional [`ReauthHandler`] the caller installed: the CLI supplies one that
+//! runs the same authorization flow interactively, or prints the authorization
+//! URL when there is no one to prompt. With no handler installed the error is
+//! [`OAuthError::ReauthRequired`], which tells the user to run `McpAuth`.
 
 use coderex_config::secret_store::TokenPersistence;
 use serde::{Deserialize, Serialize};
@@ -93,6 +97,35 @@ pub enum OAuthError {
         /// What went wrong.
         detail: String,
     },
+}
+
+/// Obtains a fresh credential when the server rejected the stored one and no
+/// refresh token can replace it.
+///
+/// This is the seam between this crate, which knows that a `401
+/// invalid_token` happened, and the part of the process that can actually
+/// sign in. `coderex-mcp` cannot run the authorization-code flow itself (the
+/// `McpAuth` tool lives in `coderex-tools`, and the CLI owns the interactive
+/// session), so the CLI installs an implementation on the manager before the
+/// servers start.
+///
+/// Implementations must write the new credential to the shared token store
+/// (the `coderex-config` secret store that [`OAuthManager`] reads) before
+/// returning `Ok(())`. The manager reloads that store and retries the rejected
+/// request with the stored access token. Returning an error means the flow
+/// could not complete; it is surfaced as [`OAuthError::ReauthRequired`].
+///
+/// The method is async because an interactive sign-in may need to wait for a
+/// person to approve the request in a browser.
+#[async_trait::async_trait]
+pub trait ReauthHandler: Send + Sync + std::fmt::Debug {
+    /// Sign in again for `server_url` and persist the result.
+    ///
+    /// # Errors
+    ///
+    /// Returns a human-readable reason when the flow could not complete. The
+    /// message is included in the resulting [`OAuthError::ReauthRequired`].
+    async fn reauthorize(&self, server_url: &str) -> Result<(), String>;
 }
 
 /// OAuth state for an MCP server connection.
@@ -1025,6 +1058,10 @@ pub struct OAuthManager {
     /// so tests and callers that chose a file cannot touch the developer's
     /// keychain.
     persistence: TokenPersistence,
+    /// The caller's interactive sign-in seam, if one is installed. It is only
+    /// consulted when a `401 invalid_token` cannot be recovered with a refresh
+    /// token.
+    reauth: Option<Arc<dyn ReauthHandler>>,
 }
 
 impl Default for OAuthManager {
@@ -1065,6 +1102,7 @@ impl OAuthManager {
             issuer_metadata: std::collections::BTreeMap::new(),
             path: path.into(),
             persistence,
+            reauth: None,
         }
     }
 
@@ -1101,6 +1139,7 @@ impl OAuthManager {
             issuer_metadata: store.issuer_metadata,
             path,
             persistence: persistence.clone(),
+            reauth: None,
         })
     }
 
@@ -1127,6 +1166,39 @@ impl OAuthManager {
         let content = serde_json::to_string_pretty(&store)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
         TokenPersistence::file_only(path).save(&content)
+    }
+
+    /// Install the sign-in seam consulted after a `401 invalid_token` that no
+    /// refresh token can recover.
+    ///
+    /// The handler is expected to persist the new credential in the same token
+    /// store this manager uses. Without one, such a `401` surfaces
+    /// [`OAuthError::ReauthRequired`].
+    pub fn set_reauth_handler(&mut self, handler: Arc<dyn ReauthHandler>) {
+        self.reauth = Some(handler);
+    }
+
+    /// Whether a re-authorization handler is installed.
+    #[must_use]
+    pub fn has_reauth_handler(&self) -> bool {
+        self.reauth.is_some()
+    }
+
+    /// Re-read the token document after an external sign-in wrote it.
+    ///
+    /// `McpAuth` (and the CLI handler that drives it) writes through the same
+    /// [`TokenPersistence`] this manager uses, but it holds no reference to
+    /// this in-memory state. Reloading is what makes the credential visible to
+    /// the retried request.
+    fn reload_tokens(&mut self) -> std::io::Result<()> {
+        let Some(content) = self.persistence.load()? else {
+            return Ok(());
+        };
+        let store: TokenStore = serde_json::from_str(&content)
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+        self.states = store.states;
+        self.issuer_metadata = store.issuer_metadata;
+        Ok(())
     }
 
     /// Default token file path: ~/.coderex/mcp_tokens.json
@@ -1664,10 +1736,10 @@ impl OAuthManager {
         }
 
         if !has_refresh_token {
-            return Err(OAuthError::ReauthRequired {
-                server_url: server_url.to_string(),
-                detail: "no refresh token is stored".to_string(),
-            });
+            // The server never gave us a refresh token, so the only way back
+            // is a fresh authorization. That is delegated to the caller's
+            // handler and attempted exactly once; there is no retry loop.
+            return self.reauthorize(server_url).await;
         }
 
         match self.refresh(server_url, client).await {
@@ -1677,6 +1749,48 @@ impl OAuthManager {
                 detail: error.to_string(),
             }),
         }
+    }
+
+    /// Run the installed [`ReauthHandler`] once and return the token it stored.
+    ///
+    /// The handler persists through the shared store; this reloads it into the
+    /// in-memory manager. If no handler is installed, or it cannot complete, or
+    /// it reports success without writing an access token, the result is a
+    /// [`OAuthError::ReauthRequired`] naming the reason. The refresh-token path
+    /// never reaches this method.
+    async fn reauthorize(&mut self, server_url: &str) -> Result<String, OAuthError> {
+        let Some(handler) = self.reauth.clone() else {
+            return Err(OAuthError::ReauthRequired {
+                server_url: server_url.to_string(),
+                detail: "no refresh token is stored and no re-authorization handler is \
+                         installed"
+                    .to_string(),
+            });
+        };
+
+        handler
+            .reauthorize(server_url)
+            .await
+            .map_err(|detail| OAuthError::ReauthRequired {
+                server_url: server_url.to_string(),
+                detail: format!("re-authorization did not complete: {detail}"),
+            })?;
+
+        self.reload_tokens()
+            .map_err(|error| OAuthError::ReauthRequired {
+                server_url: server_url.to_string(),
+                detail: format!(
+                    "re-authorization reported success but the token store could not be \
+                     read: {error}"
+                ),
+            })?;
+
+        self.get(server_url)
+            .and_then(|state| state.access_token.clone())
+            .ok_or_else(|| OAuthError::ReauthRequired {
+                server_url: server_url.to_string(),
+                detail: "re-authorization completed but no access token was stored".to_string(),
+            })
     }
 
     /// Trade the stored refresh token for a fresh access token.
@@ -1879,6 +1993,49 @@ mod tests {
     use super::*;
     use std::io::{Read, Write};
     use std::net::TcpListener;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// A sign-in seam whose behaviour the test chooses.
+    #[derive(Debug)]
+    enum FakeBehavior {
+        /// Write an access token to the shared store, as a real handler would.
+        Persist(String),
+        /// Report success without writing anything.
+        PersistNothing,
+        /// Fail with this reason.
+        Fail(String),
+    }
+
+    #[derive(Debug)]
+    struct FakeReauth {
+        calls: Arc<AtomicUsize>,
+        path: PathBuf,
+        behavior: FakeBehavior,
+    }
+
+    #[async_trait::async_trait]
+    impl ReauthHandler for FakeReauth {
+        async fn reauthorize(&self, server_url: &str) -> Result<(), String> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            match &self.behavior {
+                FakeBehavior::Persist(token) => {
+                    let store = serde_json::json!({
+                        "states": [{
+                            "server_url": server_url,
+                            "client_id": "client1",
+                            "access_token": token,
+                            "expires_at": chrono::Utc::now().timestamp() + 3600,
+                        }],
+                    });
+                    TokenPersistence::file_only(&self.path)
+                        .save(&store.to_string())
+                        .map_err(|error| error.to_string())
+                }
+                FakeBehavior::PersistNothing => Ok(()),
+                FakeBehavior::Fail(reason) => Err(reason.clone()),
+            }
+        }
+    }
 
     #[test]
     fn new_state_is_not_authenticated() {
@@ -3205,7 +3362,135 @@ mod tests {
             "unexpected error: {error}"
         );
         assert!(error.to_string().contains("McpAuth"), "{error}");
+        assert!(
+            error.to_string().contains("no re-authorization handler"),
+            "the error did not explain that no handler is installed: {error}"
+        );
         assert!(mgr.get(&base).unwrap().access_token.is_none());
+        server.join().unwrap();
+    }
+
+    /// With a handler installed, a refresh-token-less 401 signs in again and
+    /// returns the token the handler stored. The handler is called exactly
+    /// once.
+    #[tokio::test]
+    async fn invalid_token_without_a_refresh_token_invokes_the_handler_once() {
+        let (base, server) = spawn_http_sequence(|_| vec![(404, String::new())]);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mcp_tokens.json");
+        let mut mgr = OAuthManager::with_path(&path);
+        let calls = Arc::new(AtomicUsize::new(0));
+        mgr.set_reauth_handler(Arc::new(FakeReauth {
+            calls: Arc::clone(&calls),
+            path: path.clone(),
+            behavior: FakeBehavior::Persist("after-reauth".into()),
+        }));
+        let mut state = McpOAuthState::new(&base, "client1");
+        state.access_token = Some("rejected".into());
+        state.expires_at = Some(chrono::Utc::now().timestamp() + 3600);
+        state.discovery_expires_at = Some(chrono::Utc::now().timestamp() + 3600);
+        mgr.register(state);
+
+        let token = mgr
+            .handle_unauthorized(
+                &base,
+                &reqwest::Client::new(),
+                Some("Bearer error=\"invalid_token\""),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(token, "after-reauth");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "the re-authorization handler was not called exactly once"
+        );
+        assert_eq!(
+            mgr.get(&base).unwrap().access_token.as_deref(),
+            Some("after-reauth"),
+            "the stored token was not reloaded into the manager"
+        );
+        server.join().unwrap();
+    }
+
+    /// A handler that reports a failure surfaces a clear `ReauthRequired` and
+    /// is not called a second time.
+    #[tokio::test]
+    async fn a_failing_handler_surfaces_reauth_required_once() {
+        let (base, server) = spawn_http_sequence(|_| vec![(404, String::new())]);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mcp_tokens.json");
+        let mut mgr = OAuthManager::with_path(&path);
+        let calls = Arc::new(AtomicUsize::new(0));
+        mgr.set_reauth_handler(Arc::new(FakeReauth {
+            calls: Arc::clone(&calls),
+            path,
+            behavior: FakeBehavior::Fail("the user cancelled the sign-in".into()),
+        }));
+        let mut state = McpOAuthState::new(&base, "client1");
+        state.access_token = Some("rejected".into());
+        state.expires_at = Some(chrono::Utc::now().timestamp() + 3600);
+        mgr.register(state);
+
+        let error = mgr
+            .handle_unauthorized(
+                &base,
+                &reqwest::Client::new(),
+                Some("Bearer error=\"invalid_token\""),
+            )
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(error, OAuthError::ReauthRequired { .. }),
+            "unexpected error: {error}"
+        );
+        assert!(
+            error.to_string().contains("the user cancelled the sign-in"),
+            "the handler's reason was lost: {error}"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        server.join().unwrap();
+    }
+
+    /// A handler that says it succeeded but leaves no access token in the
+    /// store is a clear failure, not a retry with `None`.
+    #[tokio::test]
+    async fn a_handler_that_stores_no_token_is_reauth_required() {
+        let (base, server) = spawn_http_sequence(|_| vec![(404, String::new())]);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mcp_tokens.json");
+        let mut mgr = OAuthManager::with_path(&path);
+        let calls = Arc::new(AtomicUsize::new(0));
+        mgr.set_reauth_handler(Arc::new(FakeReauth {
+            calls: Arc::clone(&calls),
+            path,
+            behavior: FakeBehavior::PersistNothing,
+        }));
+        let mut state = McpOAuthState::new(&base, "client1");
+        state.access_token = Some("rejected".into());
+        state.expires_at = Some(chrono::Utc::now().timestamp() + 3600);
+        mgr.register(state);
+
+        let error = mgr
+            .handle_unauthorized(
+                &base,
+                &reqwest::Client::new(),
+                Some("Bearer error=\"invalid_token\""),
+            )
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(error, OAuthError::ReauthRequired { .. }),
+            "unexpected error: {error}"
+        );
+        assert!(
+            error.to_string().contains("no access token was stored"),
+            "{error}"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
         server.join().unwrap();
     }
 

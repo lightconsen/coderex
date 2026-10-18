@@ -3,7 +3,9 @@
 use coderex_mcp::channel::{InboundRequestHandler, JsonRpcChannel, JsonRpcError};
 use coderex_mcp::config::{McpConfig, McpServerConfig, McpTransport};
 use coderex_mcp::manager::McpManager;
-use coderex_mcp::oauth::{McpOAuthState, OAuthManager, OAuthTokenProvider};
+use coderex_mcp::oauth::{
+    McpOAuthState, OAuthManager, OAuthTokenProvider, ReauthHandler,
+};
 use coderex_mcp::{EventStreamRetryPolicy, EventStreamState, TokenProvider};
 use std::collections::HashMap;
 use std::io::{Read, Write};
@@ -553,6 +555,31 @@ fn counting_provider(recoveries: &Arc<AtomicUsize>) -> Arc<CountingProvider> {
     })
 }
 
+/// A re-authorization seam that persists a token the way the real `McpAuth`
+/// flow does: by writing the shared token store the manager reads back.
+#[derive(Debug)]
+struct FileReauth {
+    path: std::path::PathBuf,
+    token: &'static str,
+    calls: Arc<AtomicUsize>,
+}
+
+#[async_trait::async_trait]
+impl ReauthHandler for FileReauth {
+    async fn reauthorize(&self, server_url: &str) -> Result<(), String> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        let document = serde_json::json!({
+            "states": [{
+                "server_url": server_url,
+                "client_id": "client1",
+                "access_token": self.token,
+                "expires_at": chrono::Utc::now().timestamp() + 3600,
+            }],
+        });
+        std::fs::write(&self.path, document.to_string()).map_err(|error| error.to_string())
+    }
+}
+
 /// A 401 whose bearer challenge says `invalid_token` is recoverable: the
 /// provider is asked once, and the retried request carries the new token.
 #[tokio::test]
@@ -587,6 +614,63 @@ async fn an_invalid_token_401_refreshes_once_and_retries_with_the_new_token() {
         recoveries.load(Ordering::SeqCst),
         1,
         "the refresh token was spent more than once"
+    );
+
+    channel.terminate().await.unwrap();
+}
+
+/// A server that issued no refresh token still recovers when the CLI installed
+/// a re-authorization handler: the handler runs once, stores a token, and the
+/// request is retried with that token. The three requests are the original
+/// POST, the resource-metadata GET from the 401 policy, and the retry.
+#[tokio::test]
+async fn an_invalid_token_401_without_a_refresh_token_reauthorizes_and_retries() {
+    let (address, server) =
+        spawn_challenge_server(r#"Bearer error="invalid_token""#, 3, 1);
+    let server_url = format!("http://{address}/mcp");
+    let dir = tempfile::tempdir().unwrap();
+    let token_path = dir.path().join("mcp_tokens.json");
+
+    let mut oauth = OAuthManager::with_path(&token_path);
+    let mut state = McpOAuthState::new(&server_url, "client1");
+    state.access_token = Some("stale_access".into());
+    state.expires_at = Some(chrono::Utc::now().timestamp() + 3600);
+    oauth.register(state);
+    let calls = Arc::new(AtomicUsize::new(0));
+    oauth.set_reauth_handler(Arc::new(FileReauth {
+        path: token_path,
+        token: "reauth_access",
+        calls: Arc::clone(&calls),
+    }));
+    let oauth = Arc::new(tokio::sync::Mutex::new(oauth));
+
+    let mut channel = JsonRpcChannel::new_http(&server_url, HashMap::new()).unwrap();
+    channel.set_token_provider(Arc::new(OAuthTokenProvider::new(
+        Arc::clone(&oauth),
+        server_url.clone(),
+        reqwest::Client::new(),
+    )));
+    channel.spawn().await.unwrap();
+
+    channel.send_request("tools/list", None).await.unwrap();
+
+    let requests = server.join().unwrap();
+    assert_eq!(requests.len(), 3, "expected POST, metadata GET, retry POST");
+    assert_eq!(
+        authorization(&requests[0]).as_deref(),
+        Some("Bearer stale_access")
+    );
+    assert!(is_get(&requests[1]), "the 401 policy did not re-read metadata");
+    assert_eq!(
+        authorization(&requests[2]).as_deref(),
+        Some("Bearer reauth_access"),
+        "the retry did not carry the re-authorized token: {}",
+        requests[2]
+    );
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "the re-authorization handler was called more than once"
     );
 
     channel.terminate().await.unwrap();
