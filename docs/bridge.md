@@ -116,8 +116,12 @@ Terminal states: `Completed`, `Failed`. All transitions validated with error typ
 
 - `register()` — `POST /api/environments/register` with env_id, max_concurrent, capabilities.
 - `fetch_assignments()` — `GET /api/environments/{id}/assignments` — pulls pending work and enqueues.
+- `claim_assignment()` — `POST /api/environments/{id}/assignments/{assignment_id}/claim` — compare-and-set before a session runs. Returns `ClaimOutcome::Claimed` or `ClaimOutcome::Lost`; 404/409/422 are treated as lost (skip and free the slot), while any other failure fails the session and frees the slot.
 - `report_capacity_to_server()` — `POST /api/environments/{id}/capacity` — reports current load.
 - `take_assignment()` — Dequeues work only when `active_sessions < max_concurrent`.
+
+The claim route is a template (`{env_id}`, `{assignment_id}`), defaulting to the
+route above and overridable with `--claim-path` / `CODEREX_BRIDGE_CLAIM_PATH`.
 
 **`SpawnMode`** — Enum: `SingleSession`, `SameDir`, `Worktree`, `Ssh { host, remote_path, identity_file }`. With `as_str()` / `from_str()` for serialization.
 
@@ -163,8 +167,10 @@ Terminal states: `Completed`, `Failed`. All transitions validated with error typ
 | `connect()` / `disconnect()` | Transport lifecycle |
 | `register()` | Register with control plane |
 | `receive_assignment()` / `take_assignment()` | Work queue delegation |
+| `claim_assignment()` | Claim a taken assignment with the control plane |
+| `release_assignment_slot()` | Free the slot for an assignment that was lost before spawning |
 | `spawn_session()` | Spawn session via spawner, track in state machine |
-| `complete_session()` | Drive state to Archiving → CleaningUp, archive, cleanup |
+| `complete_session()` | Drive state to Archiving → CleaningUp, archive transcript and usage, cleanup |
 | `fail_session()` | Mark state Failed, free capacity |
 | `request_permission()` / `respond_to_permission()` | Permission routing with event emission |
 | `handle_relay_call()` | The relay endpoint: forwarding policy, then the approval gate |
@@ -304,13 +310,15 @@ runs two loops side by side until Ctrl+C (or SIGTERM on Unix):
 - **Transport loop** — `Bridge::serve_transport()` answers heartbeats and
   handles relay, write, and permission frames.
 - **Assignment loop** — every `--poll-interval-secs`, fetch assignments, take
-  as many as the remaining `--max-concurrent` slots allow, spawn them, and
-  report capacity. Each spawned assignment runs in its own Tokio task through
-  an injectable `SessionRunner`, so sessions execute concurrently while the
-  transport and poll loops stay responsive. A completion or failure is
-  delivered back to the worker, which archives the session
-  (`complete_session`) or records the failure (`fail_session`); both free the
-  capacity slot.
+  as many as the remaining `--max-concurrent` slots allow, claim each one with
+  the control plane, spawn the claimed ones, and report capacity. A lost claim
+  (already claimed or gone) is skipped and its slot released without recording
+  a session failure; a claim error fails the session and frees the slot. Each
+  spawned assignment runs in its own Tokio task through an injectable
+  `SessionRunner`, so sessions execute concurrently while the transport and
+  poll loops stay responsive. A completion or failure is delivered back to the
+  worker, which archives the session (`complete_session`) or records the
+  failure (`fail_session`); both free the capacity slot.
 
 There is no fallback to a no-op or in-process transport: an unknown transport
 kind and a failed connection both exit non-zero with the reason. Registration
@@ -337,6 +345,7 @@ ends the worker cleanly.
 | `--heartbeat-degraded-threshold N` | `CODEREX_BRIDGE_HEARTBEAT_DEGRADED_THRESHOLD` | `2` | Missed beats before `Degraded` |
 | `--heartbeat-lost-threshold N` | `CODEREX_BRIDGE_HEARTBEAT_LOST_THRESHOLD` | `5` | Missed beats before `Lost` |
 | `--poll-interval-secs N` | `CODEREX_BRIDGE_POLL_INTERVAL_SECS` | `5` | Seconds between assignment fetches and capacity reports |
+| `--claim-path PATH` | `CODEREX_BRIDGE_CLAIM_PATH` | `/api/environments/{env_id}/assignments/{assignment_id}/claim` | Claim route template; must contain `{assignment_id}` |
 
 The historical `CODEREX_BRIDGE_URL=ws://host:port` spelling is the transport
 URL, not the control-plane API URL. If the gateway does not share the control
@@ -362,29 +371,49 @@ handle; the same stop request cancels registration retries, ends assignment
 polling, wakes `serve_transport`, and then the worker disconnects the
 transport. Messages already being handled are completed before the loop exits.
 
-Shutdown also aborts every running session task and releases its slot. The
-default runner starts the session as a child process with `kill_on_drop`, so
-aborting the task kills the child rather than leaving an agent turn running
-after the worker has gone.
+Shutdown also stops every running session before releasing its slot. Each
+session task owns a `SessionStop`; the worker cancels all of them, then waits
+up to `SESSION_TASK_SHUTDOWN_GRACE` (6 s) for the tasks to finish. The default
+runner reacts by sending `SIGTERM` to the child on Unix (via the POSIX `kill`
+utility, because the workspace denies `unsafe`), or terminating it on Windows,
+waiting up to `SESSION_SHUTDOWN_GRACE` (5 s), and then killing it. A runner
+that ignores the signal is aborted when the worker's grace expires. Children
+are also spawned with `kill_on_drop`, so an aborted task cannot leave an
+orphan agent turn behind.
 
 ### Session execution
 
 Spawned assignments run through `SessionRunner`. The default
 `ProcessSessionRunner` invokes the current executable as
-`coderex --print -- <prompt>`, with the prompt as one positional argument so no
-shell interprets it, and with the session's work directory as the child's
-current directory. It waits for the child: exit status zero is success, and any
-other status (or a spawn error) is reported with the exit code and a short
-stderr excerpt.
+
+```sh
+coderex --print --output-format stream-json -- <prompt>
+```
+
+with the prompt as one positional argument so no shell interprets it, and with
+the session's work directory as the child's current directory. Stdout and
+stderr are piped and drained by separate tasks, so neither pipe can block the
+other or the child. Each stdout line is forwarded to tracing (debug) and
+appended to the transcript; each stderr line is forwarded to tracing (warn) and
+written to `stderr.log`.
+
+The turn's final `result` frame supplies `UsageStats`:
+`usage.input_tokens`, `usage.output_tokens`,
+`usage.cache_read_input_tokens` (or `cache_read_tokens`),
+`usage.cache_creation_input_tokens` (or `cache_creation_tokens`), and
+`total_cost_usd` (or `cost_usd`). The complete stdout transcript (one JSON
+object per line) is written to `<session-base>/<session-id>/transcript.jsonl`;
+`complete_session` archives the same transcript and the real usage. Exit status
+zero with no error `result` frame is success; a non-zero status, an `is_error`
+result, a spawn failure, or a pipe error is reported with the exit code and a
+short stderr excerpt.
 
 The child inherits the worker's environment, so provider credentials must be
-available there. The process boundary does not surface token counts, so
-successful sessions are archived with `UsageStats::default()`, and because the
-child's output is not forwarded over the transport, the archived transcript is
-empty in this build. A deployment that runs sessions differently (a container,
-an SSH command, or streaming child output back over the transport) injects its
-own `SessionRunner` through `run_with_control_plane`; neither the bridge crate
-nor the CLI parser needs to change.
+available there; no credentials from the worker's control-plane token are
+added. A deployment that runs sessions differently (a container, an SSH
+command, or live forwarding over the transport) injects its own
+`SessionRunner` through `run_with_control_plane`; neither the bridge crate nor
+the CLI parser needs to change.
 
 ## Data Flow
 
@@ -467,11 +496,11 @@ Control Plane                      Bridge                          Remote/Local
   `CODEREX_BRIDGE_TOKEN` is used for the gateway transport and the control-plane
   HTTP API. There is no second credential setting, so a deployment that issues
   different tokens for the two must front the control plane to translate them.
-- **Streaming a session's output over the bridge transport.** The default
-  runner captures the child's stdout/stderr to decide success and to include a
-  short stderr excerpt in failures; it does not forward the transcript through
+- **Live output over the bridge transport.** The default runner streams the
+  child's stdout/stderr to tracing, writes the transcript under the session
+  directory, and archives it on completion; it does not push each line through
   the gateway. A deployment that needs live output injects a runner that
-  writes it to the transport or another sink.
+  writes it to the transport as well.
 - **A gateway path convention.** The default transport URL rewrites the
   control-plane scheme and keeps the same host and path. A gateway mounted on a
   different path must be given `--transport-url` / `CODEREX_BRIDGE_URL`.
@@ -487,13 +516,13 @@ Control Plane                      Bridge                          Remote/Local
 | `relay` | 13 | Approval binding, one-time consumption, forwarding policy, refusal shape |
 | `state` | 14 | All 11 state transitions, terminal guards, failure, history |
 | `permission` | 6 | Create/respond/query/prune, Allow/Deny, session scoping |
-| `poller` | 8 | Capacity limits, assignment queue, register, URL config, injected control-plane client |
+| `poller` | 11 | Capacity limits, assignment queue, register, URL config, injected control-plane client, claim outcomes and path templates |
 | `spawner` | 12 | Worktree create/remove, single session, SSH variant, non-existent cleanup |
 | `teleport` | 9 | Snapshot/restore, manifest, conflict handling |
 | `archive` | 9 | Versioning, list/load, metadata, process tracking, cleanup report |
 | `delta_sync` | 21 | Diff/apply, revision hash, JSON roundtrip, Lamport timestamps, conflict tracker, delta merge |
 | `orchestrator` | 19 | Connect/disconnect, spawn/complete lifecycle, permissions, events, recovery, relay endpoint, write fence, resume, stop handle |
-| `bridge_launcher` (cli) | 16 | Flag/env mapping, defaults, required-value errors, injectable transport/control plane/runner, registration, assignment spawn, session completion/failure and slot release, capacity reporting, graceful shutdown and task cancellation |
+| `bridge_launcher` (cli) | 23 | Flag/env mapping, defaults, required-value errors, injectable transport/control plane/runner, registration, assignment claim success/lost/failure, spawn, session completion/failure and slot release, streaming stdout/stderr, usage and transcript capture, capacity reporting, graceful session shutdown and task cancellation |
 | `bridge_integration` (tests/) | 33 | Live relay call over WebSocket, refusal, stale epoch, resume cursor, end-to-end flows |
 | `control_plane` (server) | 15 | All 5 HTTP endpoints, state management, claim conflicts, 404 routing |
 | `filter` (server) | 7 | Remote/bridge shell whitelists, dangerous-command rejection |
@@ -501,7 +530,7 @@ Control Plane                      Bridge                          Remote/Local
 | `session` (server) | 25 | Auth, roles, command resolution, rate limiting, idle cleanup, protocol |
 | `server_integration` (server, tests/) | 24 | Full WS lifecycle, auth, roles, command whitelist over the protocol |
 
-**Total: 157 bridge unit + 16 CLI launcher unit + 33 bridge integration + 53 server unit + 24 server integration = 283 tests pass.**
+**Total: 160 bridge unit + 23 CLI launcher unit + 33 bridge integration + 53 server unit + 24 server integration = 293 tests pass.**
 
 ## Dependencies
 

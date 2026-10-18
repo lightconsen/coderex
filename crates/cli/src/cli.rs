@@ -385,6 +385,19 @@ pub struct BridgeArgs {
         default_value_t = 5
     )]
     pub poll_interval_secs: u64,
+
+    /// Path template for claiming an assignment before running it.
+    ///
+    /// `{env_id}` and `{assignment_id}` are substituted. The default matches
+    /// the bundled control-plane server; override it for a deployment with a
+    /// different claim route.
+    #[arg(
+        long,
+        value_name = "PATH",
+        env = "CODEREX_BRIDGE_CLAIM_PATH",
+        default_value = "/api/environments/{env_id}/assignments/{assignment_id}/claim"
+    )]
+    pub claim_path: Option<String>,
 }
 
 /// MCP management subcommands.

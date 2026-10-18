@@ -12,13 +12,20 @@ use anyhow::{Context, Result};
 use coderex_bridge::archive::UsageStats;
 use coderex_bridge::heartbeat::HeartbeatConfig;
 use coderex_bridge::orchestrator::{Bridge, BridgeConfig, BridgeStopHandle};
-use coderex_bridge::poller::{ControlPlaneClient, HttpControlPlaneClient};
+use coderex_bridge::poller::{
+    ClaimOutcome, ControlPlaneClient, DEFAULT_CLAIM_PATH_TEMPLATE, HttpControlPlaneClient,
+};
 use coderex_bridge::transport::{Transport, TransportConfig, default_factory};
+use serde_json::Value;
 use std::collections::HashMap;
 use std::future::Future;
 use std::path::{Path, PathBuf};
+use std::process::{ExitStatus, Stdio};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
+use tokio::io::{AsyncBufReadExt, AsyncRead, BufReader};
+use tokio::process::{Child, Command};
 
 use crate::cli::BridgeArgs;
 
@@ -46,6 +53,8 @@ pub const ENV_CONNECTION_ID: &str = "CODEREX_BRIDGE_CONNECTION_ID";
 pub const ENV_AUTH_TOKEN: &str = "CODEREX_BRIDGE_TOKEN";
 /// Environment variable setting the assignment poll interval, in seconds.
 pub const ENV_POLL_INTERVAL_SECS: &str = "CODEREX_BRIDGE_POLL_INTERVAL_SECS";
+/// Environment variable overriding the assignment claim path template.
+pub const ENV_CLAIM_PATH: &str = "CODEREX_BRIDGE_CLAIM_PATH";
 
 /// Default transport kind: the real gateway transport.
 pub const DEFAULT_TRANSPORT: &str = "websocket";
@@ -56,65 +65,449 @@ pub const DEFAULT_POLL_INTERVAL_SECS: u64 = 5;
 /// How many times registration is attempted before the worker exits.
 pub const REGISTRATION_ATTEMPTS: usize = 5;
 
+/// How long a session child gets to exit after a graceful termination request
+/// before the worker kills it.
+pub const SESSION_SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
+
+/// How long the worker waits for its session tasks to finish after cancelling
+/// them before aborting the remaining tasks.
+pub const SESSION_TASK_SHUTDOWN_GRACE: Duration = Duration::from_secs(6);
+
+/// A cancellation signal handed to a running session.
+///
+/// Each session task owns one; the worker cancels it on shutdown. The default
+/// runner turns that into `SIGTERM` (Unix) or process termination (Windows),
+/// then waits for the child to exit before killing it.
+#[derive(Debug, Clone)]
+pub struct SessionStop {
+    cancelled: Arc<AtomicBool>,
+    notify: Arc<tokio::sync::Notify>,
+}
+
+impl SessionStop {
+    /// Create a session stop signal that has not been cancelled.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            cancelled: Arc::new(AtomicBool::new(false)),
+            notify: Arc::new(tokio::sync::Notify::new()),
+        }
+    }
+
+    /// Ask the session to stop.
+    pub fn cancel(&self) {
+        self.cancelled.store(true, Ordering::SeqCst);
+        // As with `BridgeStopHandle`, a permit left behind means a cancel
+        // requested before the runner starts waiting is not lost.
+        self.notify.notify_one();
+    }
+
+    /// Whether a stop has been requested.
+    #[must_use]
+    pub fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::SeqCst)
+    }
+
+    /// Wait until a stop is requested.
+    pub async fn wait(&self) {
+        while !self.is_cancelled() {
+            self.notify.notified().await;
+        }
+    }
+}
+
+impl Default for SessionStop {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Everything a [`SessionRunner`] needs for one session.
+#[derive(Debug, Clone, Copy)]
+pub struct SessionContext<'a> {
+    /// Session ID assigned by the control plane.
+    pub session_id: &'a str,
+    /// Prompt to run.
+    pub prompt: &'a str,
+    /// Directory the child runs in.
+    pub work_dir: &'a Path,
+    /// Directory where the runner writes the transcript and stderr log.
+    pub session_dir: &'a Path,
+}
+
+/// What a successful session produced.
+#[derive(Debug, Clone, Default)]
+pub struct SessionOutput {
+    /// Complete child stdout transcript, one JSON frame per line.
+    pub transcript: String,
+    /// Usage reported by the turn's final `result` frame.
+    pub usage: UsageStats,
+}
+
 /// Runs a spawned assignment's prompt in its working directory.
 ///
 /// The default implementation starts this executable headless. Tests inject a
 /// fake so a worker can be exercised without running an agent turn.
 #[async_trait::async_trait]
 pub trait SessionRunner: Send + Sync {
-    /// Run `prompt` for `session_id` with `work_dir` as the current directory.
+    /// Run one session.
     ///
-    /// Returns `Ok(())` when the session finished successfully, or a short
-    /// error (including the exit status when one is available) otherwise.
-    async fn run(&self, session_id: &str, prompt: &str, work_dir: &Path) -> Result<(), String>;
+    /// Returns the captured transcript and usage when the session finished
+    /// successfully, or a short error (including the exit status when one is
+    /// available) otherwise. `stop` is cancelled when the bridge shuts down;
+    /// a runner should terminate its child gracefully in response.
+    async fn run(
+        &self,
+        context: &SessionContext<'_>,
+        stop: SessionStop,
+    ) -> Result<SessionOutput, String>;
 }
 
-/// Runs a session by invoking this executable in headless (`--print`) mode.
-#[derive(Debug, Clone, Copy, Default)]
-pub struct ProcessSessionRunner;
+/// Runs a session by invoking this executable in headless, streaming mode.
+#[derive(Debug, Clone)]
+pub struct ProcessSessionRunner {
+    /// Grace period between the termination request and the kill.
+    grace: Duration,
+}
+
+impl Default for ProcessSessionRunner {
+    fn default() -> Self {
+        Self {
+            grace: SESSION_SHUTDOWN_GRACE,
+        }
+    }
+}
+
+impl ProcessSessionRunner {
+    /// Create a runner with the default shutdown grace period.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Create a runner with an explicit shutdown grace period.
+    #[must_use]
+    pub fn with_grace(grace: Duration) -> Self {
+        Self { grace }
+    }
+}
 
 /// Build the headless invocation for a session.
 ///
-/// The prompt is passed as a single positional argument after `--`, so it
-/// reaches the child verbatim and no shell ever sees it.
-fn session_command(prompt: &str, work_dir: &Path) -> Result<tokio::process::Command, String> {
+/// `--output-format stream-json` makes the child write one JSON object per
+/// line, ending each turn with a single `result` frame. The prompt is passed
+/// as one positional argument after `--`, so it reaches the child verbatim and
+/// no shell ever sees it.
+fn session_command(prompt: &str, work_dir: &Path) -> Result<Command, String> {
     let executable = std::env::current_exe()
         .map_err(|err| format!("cannot locate the coderex executable: {err}"))?;
-    let mut command = tokio::process::Command::new(executable);
+    let mut command = Command::new(executable);
     command
         .arg("--print")
+        .arg("--output-format")
+        .arg("stream-json")
         .arg("--")
         .arg(prompt)
         .current_dir(work_dir)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
         // Dropping the future (shutdown, panic) kills the child instead of
-        // leaving an orphan agent turn behind.
+        // leaving an orphan agent turn behind. Normal shutdown asks NICELY
+        // first; see `terminate_child`.
         .kill_on_drop(true);
     Ok(command)
 }
 
 #[async_trait::async_trait]
 impl SessionRunner for ProcessSessionRunner {
-    async fn run(&self, _session_id: &str, prompt: &str, work_dir: &Path) -> Result<(), String> {
-        let output = session_command(prompt, work_dir)?
-            .output()
-            .await
+    async fn run(
+        &self,
+        context: &SessionContext<'_>,
+        stop: SessionStop,
+    ) -> Result<SessionOutput, String> {
+        let child = session_command(context.prompt, context.work_dir)?
+            .spawn()
             .map_err(|err| format!("failed to start the session process: {err}"))?;
+        run_child_streaming(
+            child,
+            context.session_id,
+            context.session_dir,
+            stop,
+            self.grace,
+        )
+        .await
+    }
+}
 
-        if output.status.success() {
-            return Ok(());
-        }
+/// Captured stdout for one session.
+#[derive(Debug, Default)]
+struct StreamCapture {
+    transcript: String,
+    usage: UsageStats,
+    /// Detail from the final `result` frame when the turn reported an error.
+    result_error: Option<String>,
+}
 
-        let status = output.status.code().map_or_else(
-            || "terminated by signal".to_string(),
-            |code| format!("exit code {code}"),
-        );
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let detail: String = stderr.trim().chars().take(200).collect();
-        if detail.is_empty() {
-            Err(status)
+/// Run a child with piped stdout/stderr, streaming both concurrently.
+///
+/// The two pipes are drained by separate tasks, so a full stderr pipe cannot
+/// block stdout (or the child). Stdout lines form the transcript and the final
+/// `result` frame supplies usage. On a stop request the child is asked to exit
+/// gracefully, given `grace`, and killed if it does not.
+async fn run_child_streaming(
+    mut child: Child,
+    session_id: &str,
+    session_dir: &Path,
+    stop: SessionStop,
+    grace: Duration,
+) -> Result<SessionOutput, String> {
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| "session process has no stdout pipe".to_string())?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| "session process has no stderr pipe".to_string())?;
+
+    let stdout_session = session_id.to_string();
+    let stderr_session = session_id.to_string();
+    let stdout_task = tokio::spawn(read_stdout(stdout, stdout_session));
+    let stderr_task = tokio::spawn(read_stderr(stderr, stderr_session));
+
+    let (status, cancelled) = tokio::select! {
+        status = child.wait() => (
+            status.map_err(|err| format!("failed to wait for the session process: {err}"))?,
+            false,
+        ),
+        () = stop.wait() => (
+            terminate_child(&mut child, grace).await?,
+            true,
+        ),
+    };
+
+    let capture = stdout_task
+        .await
+        .map_err(|err| format!("session stdout reader failed: {err}"))??;
+    let stderr_text = stderr_task
+        .await
+        .map_err(|err| format!("session stderr reader failed: {err}"))??;
+
+    // The transcript belongs to the session directory even when the turn
+    // failed or the worker is shutting down; keep the partial stream.
+    write_session_file(session_dir, "transcript.jsonl", &capture.transcript);
+    write_session_file(session_dir, "stderr.log", &stderr_text);
+
+    if cancelled {
+        return Err("session terminated during bridge shutdown".to_string());
+    }
+    if let Some(error) = capture.result_error {
+        return Err(error);
+    }
+    if !status.success() {
+        let status = exit_status_label(status);
+        let detail: String = stderr_text.trim().chars().take(200).collect();
+        return Err(if detail.is_empty() {
+            status
         } else {
-            Err(format!("{status}: {detail}"))
+            format!("{status}: {detail}")
+        });
+    }
+
+    Ok(SessionOutput {
+        transcript: capture.transcript,
+        usage: capture.usage,
+    })
+}
+
+/// Read stdout line by line, forwarding it to tracing and capturing frames.
+async fn read_stdout<R>(reader: R, session_id: String) -> Result<StreamCapture, String>
+where
+    R: AsyncRead + Unpin,
+{
+    let mut capture = StreamCapture::default();
+    let mut lines = BufReader::new(reader).lines();
+
+    while let Some(line) = lines
+        .next_line()
+        .await
+        .map_err(|err| format!("failed to read session stdout: {err}"))?
+    {
+        tracing::debug!(session_id = %session_id, stream = "stdout", "{}", line);
+        capture.transcript.push_str(&line);
+        capture.transcript.push('\n');
+
+        let Ok(frame) = serde_json::from_str::<Value>(&line) else {
+            continue;
+        };
+        if frame.get("type").and_then(Value::as_str) != Some("result") {
+            continue;
         }
+
+        capture.usage = usage_from_result(&frame);
+        if frame
+            .get("is_error")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        {
+            capture.result_error = Some(result_error_message(&frame));
+        }
+    }
+
+    Ok(capture)
+}
+
+/// Read stderr line by line, forwarding it to tracing and keeping the text.
+async fn read_stderr<R>(reader: R, session_id: String) -> Result<String, String>
+where
+    R: AsyncRead + Unpin,
+{
+    let mut text = String::new();
+    let mut lines = BufReader::new(reader).lines();
+
+    while let Some(line) = lines
+        .next_line()
+        .await
+        .map_err(|err| format!("failed to read session stderr: {err}"))?
+    {
+        tracing::warn!(session_id = %session_id, stream = "stderr", "{}", line);
+        text.push_str(&line);
+        text.push('\n');
+    }
+
+    Ok(text)
+}
+
+/// Extract usage from a stream-json `result` frame.
+///
+/// The protocol preserves provider fields it does not model, so both the
+/// Anthropic spelling (`cache_read_input_tokens`) and the shorter archive
+/// spelling (`cache_read_tokens`) are accepted.
+fn usage_from_result(frame: &Value) -> UsageStats {
+    let usage = frame.get("usage");
+    let tokens = |keys: &[&str]| -> usize {
+        usage
+            .and_then(|usage| keys.iter().find_map(|key| usage.get(*key)))
+            .and_then(Value::as_u64)
+            .unwrap_or(0) as usize
+    };
+
+    UsageStats {
+        input_tokens: tokens(&["input_tokens"]),
+        output_tokens: tokens(&["output_tokens"]),
+        cache_read_tokens: tokens(&["cache_read_input_tokens", "cache_read_tokens"]),
+        cache_creation_tokens: tokens(&["cache_creation_input_tokens", "cache_creation_tokens"]),
+        cost_usd: frame
+            .get("total_cost_usd")
+            .or_else(|| frame.get("cost_usd"))
+            .and_then(Value::as_f64)
+            .unwrap_or(0.0),
+    }
+}
+
+/// Build the failure detail from an error `result` frame.
+fn result_error_message(frame: &Value) -> String {
+    let subtype = frame
+        .get("subtype")
+        .and_then(Value::as_str)
+        .unwrap_or("error");
+    let detail = frame
+        .get("error")
+        .and_then(Value::as_str)
+        .or_else(|| frame.get("result").and_then(Value::as_str))
+        .unwrap_or("");
+    if detail.trim().is_empty() {
+        format!("session reported {subtype}")
+    } else {
+        format!("session reported {subtype}: {}", detail.trim())
+    }
+}
+
+/// Ask the child to exit, wait at most `grace`, then kill it.
+async fn terminate_child(child: &mut Child, grace: Duration) -> Result<ExitStatus, String> {
+    // The child may have exited between the stop signal and this point.
+    if let Some(status) = child
+        .try_wait()
+        .map_err(|err| format!("failed to inspect the session process: {err}"))?
+    {
+        return Ok(status);
+    }
+
+    #[cfg(unix)]
+    {
+        if let Some(pid) = child.id() {
+            // The workspace denies `unsafe`, so use the POSIX `kill` utility
+            // rather than `libc::kill`. `-TERM` is the graceful request; the
+            // bounded wait below still falls through to `start_kill`.
+            match Command::new("kill")
+                .arg("-TERM")
+                .arg(pid.to_string())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .await
+            {
+                Ok(status) if status.success() => {}
+                Ok(status) => tracing::warn!(
+                    pid,
+                    status = ?status.code(),
+                    "could not send SIGTERM to the session process"
+                ),
+                Err(err) => tracing::warn!(
+                    pid,
+                    error = %err,
+                    "could not run kill to terminate the session process"
+                ),
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        // Windows has no SIGTERM; TerminateProcess is the platform's
+        // termination request.
+        let _ = child.start_kill();
+    }
+
+    match tokio::time::timeout(grace, child.wait()).await {
+        Ok(status) => {
+            status.map_err(|err| format!("failed to wait for the session process: {err}"))
+        }
+        Err(_) => {
+            let _ = child.start_kill();
+            child
+                .wait()
+                .await
+                .map_err(|err| format!("failed to kill the session process: {err}"))
+        }
+    }
+}
+
+fn exit_status_label(status: ExitStatus) -> String {
+    status.code().map_or_else(
+        || "terminated by signal".to_string(),
+        |code| format!("exit code {code}"),
+    )
+}
+
+/// Write a session artifact, logging rather than failing when it cannot be
+/// written (the turn's outcome is more important than the local copy).
+fn write_session_file(session_dir: &Path, name: &str, contents: &str) {
+    if let Err(err) = std::fs::create_dir_all(session_dir) {
+        tracing::warn!(
+            dir = %session_dir.display(),
+            error = %err,
+            "cannot create session directory for {name}"
+        );
+        return;
+    }
+    if let Err(err) = std::fs::write(session_dir.join(name), contents) {
+        tracing::warn!(
+            dir = %session_dir.display(),
+            file = name,
+            error = %err,
+            "cannot write session artifact"
+        );
     }
 }
 
@@ -122,7 +515,7 @@ impl SessionRunner for ProcessSessionRunner {
 #[derive(Debug)]
 struct SessionCompletion {
     session_id: String,
-    outcome: Result<(), String>,
+    outcome: Result<SessionOutput, String>,
 }
 
 /// A session that was spawned and is ready to be run.
@@ -130,7 +523,15 @@ struct SessionCompletion {
 struct SpawnedSession {
     session_id: String,
     work_dir: PathBuf,
+    session_dir: PathBuf,
     prompt: String,
+}
+
+/// A running session task and the signal that asks it to stop.
+#[derive(Debug)]
+struct RunningSession {
+    handle: tokio::task::JoinHandle<()>,
+    stop: SessionStop,
 }
 
 /// Errors raised while turning CLI arguments into a launch configuration.
@@ -173,6 +574,8 @@ pub struct BridgeLaunchConfig {
     pub auth_token: Option<String>,
     /// How often to fetch assignments and report capacity.
     pub poll_interval: Duration,
+    /// Path template used to claim an assignment before running it.
+    pub claim_path: String,
 }
 
 impl BridgeLaunchConfig {
@@ -265,6 +668,13 @@ impl BridgeLaunchConfig {
         let connection_id = optional_string(args.connection_id.as_deref(), env(ENV_CONNECTION_ID))
             .unwrap_or_else(|| env_id.clone());
         let auth_token = optional_string(args.auth_token.as_deref(), env(ENV_AUTH_TOKEN));
+        let claim_path = optional_string(args.claim_path.as_deref(), env(ENV_CLAIM_PATH))
+            .unwrap_or_else(|| DEFAULT_CLAIM_PATH_TEMPLATE.to_string());
+        if !claim_path.contains("{assignment_id}") {
+            return Err(BridgeConfigError::Invalid(format!(
+                "--claim-path must contain {{assignment_id}}, got '{claim_path}'"
+            )));
+        }
 
         if is_websocket(&transport) && !is_websocket_url(&transport_url) {
             return Err(BridgeConfigError::Invalid(format!(
@@ -292,6 +702,7 @@ impl BridgeLaunchConfig {
             connection_id,
             auth_token,
             poll_interval: Duration::from_secs(args.poll_interval_secs),
+            claim_path,
         })
     }
 
@@ -374,7 +785,8 @@ pub async fn run_with_transport<F>(
 where
     F: Future<Output = ()> + Send + 'static,
 {
-    let mut control_plane = HttpControlPlaneClient::new(config.control_plane_url.clone());
+    let mut control_plane = HttpControlPlaneClient::new(config.control_plane_url.clone())
+        .with_claim_path(config.claim_path.clone());
     if let Some(ref token) = config.auth_token {
         control_plane = control_plane.with_auth(token.clone());
     }
@@ -382,7 +794,7 @@ where
         config,
         transport,
         Arc::new(control_plane),
-        Arc::new(ProcessSessionRunner),
+        Arc::new(ProcessSessionRunner::default()),
         shutdown,
     )
     .await
@@ -453,7 +865,7 @@ async fn run_worker(
 
     let (completion_tx, mut completion_rx) =
         tokio::sync::mpsc::unbounded_channel::<SessionCompletion>();
-    let mut running: HashMap<String, tokio::task::JoinHandle<()>> = HashMap::new();
+    let mut running: HashMap<String, RunningSession> = HashMap::new();
     let mut serve_error = None;
 
     loop {
@@ -480,7 +892,7 @@ async fn run_worker(
                 if stop.is_stopped() {
                     break;
                 }
-                let spawned = assignment_tick(bridge, stop).await;
+                let spawned = assignment_tick(bridge, stop, &config.session_base).await;
                 if stop.is_stopped() {
                     for session in spawned {
                         bridge.fail_session(
@@ -509,31 +921,37 @@ fn spawn_session_tasks(
     sessions: Vec<SpawnedSession>,
     runner: &Arc<dyn SessionRunner>,
     completion_tx: &tokio::sync::mpsc::UnboundedSender<SessionCompletion>,
-    running: &mut HashMap<String, tokio::task::JoinHandle<()>>,
+    running: &mut HashMap<String, RunningSession>,
 ) {
     for session in sessions {
         let session_id = session.session_id.clone();
         let completion_tx = completion_tx.clone();
         let runner = Arc::clone(runner);
+        let stop = SessionStop::new();
+        let task_stop = stop.clone();
         let handle = tokio::spawn(async move {
-            let outcome = runner
-                .run(&session.session_id, &session.prompt, &session.work_dir)
-                .await;
+            let context = SessionContext {
+                session_id: &session.session_id,
+                prompt: &session.prompt,
+                work_dir: &session.work_dir,
+                session_dir: &session.session_dir,
+            };
+            let outcome = runner.run(&context, task_stop).await;
             let _ = completion_tx.send(SessionCompletion {
                 session_id: session.session_id,
                 outcome,
             });
         });
-        running.insert(session_id, handle);
+        running.insert(session_id, RunningSession { handle, stop });
     }
 }
 
 /// Apply a finished session's outcome and free its capacity slot.
 async fn finish_session(bridge: &mut Bridge, done: SessionCompletion) {
     match done.outcome {
-        Ok(()) => {
+        Ok(output) => {
             if let Err(err) = bridge
-                .complete_session(&done.session_id, UsageStats::default())
+                .complete_session(&done.session_id, &output.transcript, output.usage)
                 .await
             {
                 tracing::warn!(
@@ -558,16 +976,30 @@ async fn finish_session(bridge: &mut Bridge, done: SessionCompletion) {
     }
 }
 
-/// Cancel running sessions and release their slots.
-async fn stop_running_sessions(
-    bridge: &mut Bridge,
-    running: &mut HashMap<String, tokio::task::JoinHandle<()>>,
-) {
-    for (session_id, handle) in running.drain() {
-        handle.abort();
-        // Awaiting the aborted task drops its future, which kills a child
-        // process started with `kill_on_drop`.
-        let _ = handle.await;
+/// Ask running sessions to stop, then release their slots.
+///
+/// Each runner gets a cancellation signal and a bounded grace period: the
+/// default runner sends `SIGTERM` (or terminates the child on Windows) and
+/// waits before killing it. A runner that ignores the signal is aborted when
+/// the grace period expires, and `kill_on_drop` prevents an orphan process.
+async fn stop_running_sessions(bridge: &mut Bridge, running: &mut HashMap<String, RunningSession>) {
+    for session in running.values() {
+        session.stop.cancel();
+    }
+
+    let deadline = tokio::time::Instant::now() + SESSION_TASK_SHUTDOWN_GRACE;
+    for (session_id, mut session) in running.drain() {
+        if tokio::time::timeout_at(deadline, &mut session.handle)
+            .await
+            .is_err()
+        {
+            tracing::warn!(
+                session_id = %session_id,
+                "session did not stop within the grace period; aborting its task"
+            );
+            session.handle.abort();
+            let _ = session.handle.await;
+        }
         bridge.fail_session(
             &session_id,
             "bridge shut down while the session was running".into(),
@@ -580,7 +1012,11 @@ async fn stop_running_sessions(
 /// The fetch and capacity requests are cancel-safe against shutdown: a stop
 /// request does not wait for an in-flight HTTP call. Spawning is not
 /// interrupted, because a half-spawned session would leak a capacity slot.
-async fn assignment_tick(bridge: &mut Bridge, stop: &BridgeStopHandle) -> Vec<SpawnedSession> {
+async fn assignment_tick(
+    bridge: &mut Bridge,
+    stop: &BridgeStopHandle,
+    session_base: &Path,
+) -> Vec<SpawnedSession> {
     let mut spawned = Vec::new();
 
     let fetched = tokio::select! {
@@ -595,6 +1031,35 @@ async fn assignment_tick(bridge: &mut Bridge, stop: &BridgeStopHandle) -> Vec<Sp
     }
 
     while let Some(assignment) = bridge.take_assignment() {
+        // Claim after taking the slot and before creating any resources. A
+        // claim is a compare-and-set: another worker may have won the race,
+        // in which case there is no session to run and the slot is released.
+        match bridge.claim_assignment(&assignment).await {
+            Ok(ClaimOutcome::Claimed) => {}
+            Ok(ClaimOutcome::Lost) => {
+                tracing::info!(
+                    assignment_id = %assignment.assignment_id,
+                    session_id = %assignment.session_id,
+                    "assignment was already claimed or no longer exists; skipping"
+                );
+                bridge.release_assignment_slot();
+                continue;
+            }
+            Err(err) => {
+                tracing::warn!(
+                    assignment_id = %assignment.assignment_id,
+                    session_id = %assignment.session_id,
+                    error = %err,
+                    "failed to claim bridge assignment"
+                );
+                bridge.fail_session(
+                    &assignment.session_id,
+                    format!("assignment claim failed: {err}"),
+                );
+                continue;
+            }
+        }
+
         match bridge.spawn_session(&assignment).await {
             Ok(result) => {
                 tracing::info!(
@@ -603,6 +1068,7 @@ async fn assignment_tick(bridge: &mut Bridge, stop: &BridgeStopHandle) -> Vec<Sp
                     "spawned bridge session"
                 );
                 spawned.push(SpawnedSession {
+                    session_dir: session_base.join(&result.session_id),
                     session_id: result.session_id,
                     work_dir: result.work_dir,
                     prompt: assignment.prompt,
@@ -773,6 +1239,19 @@ mod tests {
         assignments: Mutex<Vec<WorkAssignment>>,
         capacities: Mutex<Vec<CapacityReport>>,
         fetches: Mutex<usize>,
+        claims: Mutex<Vec<(String, String)>>,
+        /// Outcomes returned by successive claim calls; empty means `Claimed`.
+        claim_outcomes: Mutex<std::collections::VecDeque<Result<ClaimOutcome, String>>>,
+    }
+
+    impl FakeControlPlane {
+        fn queue_claim_outcomes(&self, outcomes: Vec<Result<ClaimOutcome, String>>) {
+            self.claim_outcomes.lock().unwrap().extend(outcomes);
+        }
+
+        fn claimed(&self) -> Vec<(String, String)> {
+            self.claims.lock().unwrap().clone()
+        }
     }
 
     #[async_trait::async_trait]
@@ -788,6 +1267,22 @@ mod tests {
         async fn fetch_assignments(&self, _env_id: &str) -> Result<Vec<WorkAssignment>, String> {
             *self.fetches.lock().unwrap() += 1;
             Ok(std::mem::take(&mut *self.assignments.lock().unwrap()))
+        }
+
+        async fn claim_assignment(
+            &self,
+            env_id: &str,
+            assignment_id: &str,
+        ) -> Result<ClaimOutcome, String> {
+            self.claims
+                .lock()
+                .unwrap()
+                .push((env_id.to_string(), assignment_id.to_string()));
+            self.claim_outcomes
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or(Ok(ClaimOutcome::Claimed))
         }
 
         async fn report_capacity(
@@ -837,12 +1332,17 @@ mod tests {
     impl SessionRunner for FixedRunner {
         async fn run(
             &self,
-            session_id: &str,
-            _prompt: &str,
-            _work_dir: &Path,
-        ) -> Result<(), String> {
-            self.runs.lock().unwrap().push(session_id.to_string());
-            self.outcome.clone()
+            context: &SessionContext<'_>,
+            _stop: SessionStop,
+        ) -> Result<SessionOutput, String> {
+            self.runs
+                .lock()
+                .unwrap()
+                .push(context.session_id.to_string());
+            self.outcome.clone().map(|()| SessionOutput {
+                transcript: "{\"type\":\"result\",\"subtype\":\"success\"}\n".into(),
+                usage: UsageStats::default(),
+            })
         }
     }
 
@@ -865,14 +1365,13 @@ mod tests {
     impl SessionRunner for PendingRunner {
         async fn run(
             &self,
-            _session_id: &str,
-            _prompt: &str,
-            _work_dir: &Path,
-        ) -> Result<(), String> {
+            _context: &SessionContext<'_>,
+            stop: SessionStop,
+        ) -> Result<SessionOutput, String> {
             let _cancel_flag = CancelFlag(Arc::clone(&self.cancelled));
             self.started.notify_one();
-            std::future::pending::<()>().await;
-            Ok(())
+            stop.wait().await;
+            Err("session cancelled by shutdown".into())
         }
     }
 
@@ -917,6 +1416,7 @@ mod tests {
             heartbeat_degraded_threshold: 2,
             heartbeat_lost_threshold: 5,
             poll_interval_secs: DEFAULT_POLL_INTERVAL_SECS,
+            claim_path: None,
         }
     }
 
@@ -943,6 +1443,7 @@ mod tests {
             heartbeat_degraded_threshold: 3,
             heartbeat_lost_threshold: 9,
             poll_interval_secs: 9,
+            claim_path: Some("/api/assignments/{assignment_id}/claim".into()),
         };
 
         let config = BridgeLaunchConfig::resolve(&args, tmp.path(), |_| None).unwrap();
@@ -962,6 +1463,7 @@ mod tests {
         assert_eq!(config.connection_id, "conn-1");
         assert_eq!(config.auth_token.as_deref(), Some("secret"));
         assert_eq!(config.poll_interval, Duration::from_secs(9));
+        assert_eq!(config.claim_path, "/api/assignments/{assignment_id}/claim");
     }
 
     #[test]
@@ -998,6 +1500,7 @@ mod tests {
         assert_eq!(config.transport_url, "ws://127.0.0.1:3000");
         assert_eq!(config.connection_id, "env-local");
         assert!(config.auth_token.is_none());
+        assert_eq!(config.claim_path, DEFAULT_CLAIM_PATH_TEMPLATE);
     }
 
     #[test]
@@ -1094,6 +1597,26 @@ mod tests {
                 .to_string()
                 .contains("--poll-interval-secs")
         );
+
+        let mut args = args_with("http://cp.example.test", "env-1");
+        args.claim_path = Some("/api/claims".into());
+        assert!(
+            BridgeLaunchConfig::resolve(&args, Path::new("."), |_| None)
+                .unwrap_err()
+                .to_string()
+                .contains("{assignment_id}")
+        );
+    }
+
+    #[test]
+    fn claim_path_can_come_from_the_environment() {
+        let mut args = args_with("http://cp.example.test", "env-1");
+        args.claim_path = None;
+        let config = BridgeLaunchConfig::resolve(&args, Path::new("."), |key| {
+            (key == ENV_CLAIM_PATH).then(|| "/api/assignments/{assignment_id}/claim".into())
+        })
+        .unwrap();
+        assert_eq!(config.claim_path, "/api/assignments/{assignment_id}/claim");
     }
 
     #[test]
@@ -1231,6 +1754,12 @@ mod tests {
         .await
         .expect("the fetched assignment should be spawned");
 
+        assert_eq!(
+            control_plane.claimed(),
+            vec![("env-test".to_string(), "a1".to_string())],
+            "the assignment should be claimed before it is spawned"
+        );
+
         tokio::time::timeout(Duration::from_secs(2), async {
             loop {
                 let reported = control_plane
@@ -1266,6 +1795,174 @@ mod tests {
     }
 
     #[test]
+    fn usage_from_result_accepts_both_api_spellings() {
+        let frame = serde_json::json!({
+            "type": "result",
+            "usage": {
+                "input_tokens": 10,
+                "output_tokens": 20,
+                "cache_read_input_tokens": 30,
+                "cache_creation_input_tokens": 40
+            },
+            "total_cost_usd": 0.25
+        });
+        let usage = usage_from_result(&frame);
+        assert_eq!(usage.input_tokens, 10);
+        assert_eq!(usage.output_tokens, 20);
+        assert_eq!(usage.cache_read_tokens, 30);
+        assert_eq!(usage.cache_creation_tokens, 40);
+        assert!((usage.cost_usd - 0.25).abs() < f64::EPSILON);
+
+        let short = serde_json::json!({
+            "usage": {
+                "input_tokens": 1,
+                "output_tokens": 2,
+                "cache_read_tokens": 3,
+                "cache_creation_tokens": 4
+            },
+            "cost_usd": 0.5
+        });
+        let usage = usage_from_result(&short);
+        assert_eq!(usage.cache_read_tokens, 3);
+        assert_eq!(usage.cache_creation_tokens, 4);
+        assert!((usage.cost_usd - 0.5).abs() < f64::EPSILON);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn process_runner_streams_output_and_reports_usage() {
+        let tmp = tempfile::tempdir().unwrap();
+        let session_dir = tmp.path().join("session");
+        let script = r#"printf '%s\n' '{"type":"system","subtype":"init","session_id":"s1"}' '{"type":"assistant","session_id":"s1"}' '{"type":"result","subtype":"success","is_error":false,"usage":{"input_tokens":11,"output_tokens":22,"cache_read_input_tokens":3,"cache_creation_input_tokens":4},"total_cost_usd":0.05}'; printf 'a warning\n' >&2"#;
+
+        let child = Command::new("sh")
+            .arg("-c")
+            .arg(script)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+
+        let output = run_child_streaming(
+            child,
+            "s1",
+            &session_dir,
+            SessionStop::new(),
+            Duration::from_secs(2),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(output.usage.input_tokens, 11);
+        assert_eq!(output.usage.output_tokens, 22);
+        assert_eq!(output.usage.cache_read_tokens, 3);
+        assert_eq!(output.usage.cache_creation_tokens, 4);
+        assert!((output.usage.cost_usd - 0.05).abs() < f64::EPSILON);
+        assert_eq!(output.transcript.lines().count(), 3);
+        assert!(output.transcript.contains("\"type\":\"result\""));
+
+        let transcript = std::fs::read_to_string(session_dir.join("transcript.jsonl")).unwrap();
+        assert_eq!(transcript, output.transcript);
+        let stderr = std::fs::read_to_string(session_dir.join("stderr.log")).unwrap();
+        assert!(stderr.contains("a warning"), "{stderr}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn shutdown_terminates_the_child_gracefully() {
+        let tmp = tempfile::tempdir().unwrap();
+        let marker = tmp.path().join("terminated");
+        let script =
+            "trap 'echo term > \"$1\"; exit 0' TERM; echo ready; while :; do sleep 0.05; done";
+        let child = Command::new("sh")
+            .arg("-c")
+            .arg(script)
+            .arg("sh")
+            .arg(&marker)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+
+        let session_dir = tmp.path().join("session");
+        let stop = SessionStop::new();
+        let task_stop = stop.clone();
+        let handle = tokio::spawn(async move {
+            run_child_streaming(child, "s1", &session_dir, task_stop, Duration::from_secs(2)).await
+        });
+
+        // Give `sh` time to install the trap, then ask it to stop.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        stop.cancel();
+
+        let result = tokio::time::timeout(Duration::from_secs(2), handle)
+            .await
+            .expect("the child should stop within the grace period")
+            .unwrap();
+        assert!(result.is_err(), "a cancelled session is not a success");
+        assert!(
+            marker.exists(),
+            "the child should have run its SIGTERM handler"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn shutdown_kills_a_child_that_ignores_sigterm() {
+        let tmp = tempfile::tempdir().unwrap();
+        let script = "trap '' TERM; echo ready; while :; do sleep 0.05; done";
+        let child = Command::new("sh")
+            .arg("-c")
+            .arg(script)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let pid = child.id().expect("child pid");
+
+        let session_dir = tmp.path().join("session");
+        let stop = SessionStop::new();
+        let task_stop = stop.clone();
+        let handle = tokio::spawn(async move {
+            run_child_streaming(
+                child,
+                "s1",
+                &session_dir,
+                task_stop,
+                Duration::from_millis(200),
+            )
+            .await
+        });
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        stop.cancel();
+
+        let result = tokio::time::timeout(Duration::from_secs(2), handle)
+            .await
+            .expect("the kill should be bounded")
+            .unwrap();
+        assert!(result.is_err());
+        // The child was reaped, so `kill -0` must report that it is gone.
+        let probe = std::process::Command::new("kill")
+            .arg("-0")
+            .arg(pid.to_string())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .expect("run kill -0");
+        assert!(
+            !probe.success(),
+            "the session child should not be left running"
+        );
+    }
+
+    #[test]
     fn process_runner_passes_the_prompt_as_one_headless_argument() {
         let prompt = "hello --not-a-flag\nsecond line";
         let command = session_command(prompt, Path::new(".")).unwrap();
@@ -1279,13 +1976,25 @@ mod tests {
             .get_args()
             .map(|arg| arg.to_string_lossy().into_owned())
             .collect();
-        assert_eq!(args, vec!["--print", "--", prompt]);
+        assert_eq!(
+            args,
+            vec!["--print", "--output-format", "stream-json", "--", prompt]
+        );
         assert_eq!(std_command.get_current_dir(), Some(Path::new(".")));
 
         // The child parses the prompt as one positional argument, even when it
-        // looks like a flag or spans lines.
-        let parsed = Cli::try_parse_from(["coderex", "--print", "--", prompt]).unwrap();
+        // looks like a flag or spans lines, and asks for the streaming protocol.
+        let parsed = Cli::try_parse_from([
+            "coderex",
+            "--print",
+            "--output-format",
+            "stream-json",
+            "--",
+            prompt,
+        ])
+        .unwrap();
         assert!(parsed.print);
+        assert_eq!(parsed.output_format, "stream-json");
         assert_eq!(parsed.prompt, vec![prompt.to_string()]);
     }
 
@@ -1427,6 +2136,160 @@ mod tests {
             !archive_base.join("s1/metadata.json").exists(),
             "a failed session should not be archived as completed"
         );
+
+        shutdown_tx.send(()).unwrap();
+        let result = tokio::time::timeout(Duration::from_secs(1), running)
+            .await
+            .expect("shutdown should stop the worker")
+            .unwrap();
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn lost_claim_skips_the_session_and_frees_the_slot() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut config = worker_config(tmp.path());
+        // With one slot, the second assignment can only run if the lost claim
+        // released the slot taken for the first.
+        config.max_concurrent = 1;
+        let session_base = config.session_base.clone();
+
+        let control_plane = Arc::new(FakeControlPlane::default());
+        control_plane.queue_claim_outcomes(vec![Ok(ClaimOutcome::Lost), Ok(ClaimOutcome::Claimed)]);
+        control_plane
+            .assignments
+            .lock()
+            .unwrap()
+            .push(sample_assignment(&session_base));
+        control_plane
+            .assignments
+            .lock()
+            .unwrap()
+            .push(WorkAssignment {
+                assignment_id: "a2".into(),
+                session_id: "s2".into(),
+                working_directory: session_base.display().to_string(),
+                prompt: "Second".into(),
+                spawn_mode: SpawnMode::SingleSession,
+            });
+
+        let runner = Arc::new(FixedRunner::succeeding());
+        let worker_runner = Arc::clone(&runner);
+        let observed = Arc::clone(&control_plane);
+
+        let (bridge_transport, mut remote) =
+            InProcessTransport::create_pair("bridge-env".into(), "gateway".into());
+        remote.connect().await.unwrap();
+
+        let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+        let running = tokio::spawn(async move {
+            run_with_control_plane(
+                config,
+                Box::new(bridge_transport),
+                control_plane,
+                worker_runner,
+                async move {
+                    let _ = shutdown_rx.await;
+                },
+            )
+            .await
+        });
+
+        wait_until(
+            || observed.claimed().len() >= 2,
+            "both assignments to be claimed",
+        )
+        .await;
+        wait_until(
+            || !runner.runs.lock().unwrap().is_empty(),
+            "the second session to run",
+        )
+        .await;
+
+        // The first assignment was skipped; only the second spawned.
+        assert_eq!(
+            observed.claimed(),
+            vec![
+                ("env-test".to_string(), "a1".to_string()),
+                ("env-test".to_string(), "a2".to_string())
+            ]
+        );
+        assert_eq!(runner.runs.lock().unwrap().as_slice(), &["s2".to_string()]);
+        assert!(!session_base.join("s1").exists());
+
+        shutdown_tx.send(()).unwrap();
+        let result = tokio::time::timeout(Duration::from_secs(1), running)
+            .await
+            .expect("shutdown should stop the worker")
+            .unwrap();
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn failed_claim_fails_the_session_and_frees_the_slot() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut config = worker_config(tmp.path());
+        config.max_concurrent = 1;
+        let session_base = config.session_base.clone();
+
+        let control_plane = Arc::new(FakeControlPlane::default());
+        control_plane.queue_claim_outcomes(vec![
+            Err("control plane unavailable".into()),
+            Ok(ClaimOutcome::Claimed),
+        ]);
+        control_plane
+            .assignments
+            .lock()
+            .unwrap()
+            .push(sample_assignment(&session_base));
+        control_plane
+            .assignments
+            .lock()
+            .unwrap()
+            .push(WorkAssignment {
+                assignment_id: "a2".into(),
+                session_id: "s2".into(),
+                working_directory: session_base.display().to_string(),
+                prompt: "Second".into(),
+                spawn_mode: SpawnMode::SingleSession,
+            });
+
+        let runner = Arc::new(FixedRunner::succeeding());
+        let worker_runner = Arc::clone(&runner);
+        let observed = Arc::clone(&control_plane);
+
+        let (bridge_transport, mut remote) =
+            InProcessTransport::create_pair("bridge-env".into(), "gateway".into());
+        remote.connect().await.unwrap();
+
+        let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+        let running = tokio::spawn(async move {
+            run_with_control_plane(
+                config,
+                Box::new(bridge_transport),
+                control_plane,
+                worker_runner,
+                async move {
+                    let _ = shutdown_rx.await;
+                },
+            )
+            .await
+        });
+
+        wait_until(
+            || observed.claimed().len() >= 2,
+            "both assignments to be claimed",
+        )
+        .await;
+        wait_until(
+            || !runner.runs.lock().unwrap().is_empty(),
+            "the second session to run",
+        )
+        .await;
+
+        // The failed claim spawned nothing and freed its slot for `s2`.
+        assert_eq!(runner.runs.lock().unwrap().as_slice(), &["s2".to_string()]);
+        assert!(!session_base.join("s1").exists());
 
         shutdown_tx.send(()).unwrap();
         let result = tokio::time::timeout(Duration::from_secs(1), running)

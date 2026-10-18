@@ -14,8 +14,8 @@ use crate::heartbeat::{
 };
 use crate::permission::{BridgePermissionRouter, PermissionResponse};
 use crate::poller::{
-    BridgeWorkPoller, CapacityReport, ControlPlaneClient, HttpControlPlaneClient, SpawnMode,
-    WorkAssignment,
+    BridgeWorkPoller, CapacityReport, ClaimOutcome, ControlPlaneClient, HttpControlPlaneClient,
+    SpawnMode, WorkAssignment,
 };
 use crate::relay::{ApprovedIntent, RelayApprovalGate, RelayCallBody, RelayDecision, RelayDenial};
 use crate::spawner::{BridgeSessionSpawner, SpawnConfig, SpawnResult};
@@ -693,6 +693,27 @@ impl Bridge {
         self.poller.take_assignment()
     }
 
+    /// Claim a taken assignment with the control plane.
+    ///
+    /// The worker calls this after [`Bridge::take_assignment`] and before
+    /// [`Bridge::spawn_session`]. `Ok(ClaimOutcome::Lost)` means another worker
+    /// won the race: skip the assignment and release its slot with
+    /// [`Bridge::release_assignment_slot`].
+    pub async fn claim_assignment(
+        &self,
+        assignment: &WorkAssignment,
+    ) -> Result<ClaimOutcome, String> {
+        self.poller.claim_assignment(assignment).await
+    }
+
+    /// Release the capacity slot reserved by an assignment that will not run.
+    ///
+    /// This is the skip path for a lost claim: no session was spawned, so it
+    /// is not a session failure.
+    pub fn release_assignment_slot(&mut self) {
+        self.poller.session_completed();
+    }
+
     /// Get the permission router's pending count for a session.
     #[must_use]
     pub fn pending_permission_count(&self, session_id: &str) -> usize {
@@ -745,6 +766,7 @@ impl Bridge {
     pub async fn complete_session(
         &mut self,
         session_id: &str,
+        transcript: &str,
         usage: UsageStats,
     ) -> Result<(), String> {
         // Drive session through required states: assigned → preparing → spawning → running → archiving
@@ -772,12 +794,7 @@ impl Bridge {
         // Archive the session
         let archive = self
             .archive_writer
-            .archive(
-                session_id,
-                "", // transcript content — would come from transport
-                usage,
-                "completed",
-            )
+            .archive(session_id, transcript, usage, "completed")
             .await?;
 
         self.emit(BridgeEvent::SessionArchived {
@@ -1283,7 +1300,10 @@ mod tests {
             cache_creation_tokens: 0,
             cost_usd: 0.01,
         };
-        bridge.complete_session("s1", usage).await.unwrap();
+        bridge
+            .complete_session("s1", "{\"type\":\"result\"}\n", usage)
+            .await
+            .unwrap();
 
         // Session is no longer tracked
         assert!(!bridge.sessions.contains_key("s1"));
