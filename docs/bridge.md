@@ -127,7 +127,7 @@ Terminal states: `Completed`, `Failed`. All transitions validated with error typ
 
 - **`SingleSession`** / **`SameDir`** — Uses existing directory, prepares session data dir.
 - **`Worktree`** — `git worktree add` at `.coderex/worktrees/{session_id}`. Cleanup via `git worktree remove`.
-- **`Ssh`** — Connects to remote host via `openssh` crate, creates session directory, verifies `coderex` is available. Uses `openssh::Session::connect()` with `KnownHosts::Accept`.
+- **`Ssh`** — Connects to remote host via `openssh` crate, creates session directory, verifies `coderex` is available. Verifies host keys with `KnownHosts::Add`: unknown hosts are recorded on first contact and must match afterwards.
 
 ### Delta Sync & Conflict Resolution
 
@@ -297,9 +297,20 @@ coderex bridge \
 
 It resolves the configuration, builds the transport through
 `coderex_bridge::transport::default_factory()`, constructs a `Bridge`, connects
-the transport, and runs `Bridge::serve_transport()` until Ctrl+C (or SIGTERM on
-Unix). There is no fallback to a no-op or in-process transport: an unknown
-transport kind and a failed connection both exit non-zero with the reason.
+the transport, and registers the environment with the control plane
+(`POST /api/environments/register`) using bounded exponential backoff. It then
+runs two loops side by side until Ctrl+C (or SIGTERM on Unix):
+
+- **Transport loop** — `Bridge::serve_transport()` answers heartbeats and
+  handles relay, write, and permission frames.
+- **Assignment loop** — every `--poll-interval-secs`, fetch assignments, take
+  as many as the remaining `--max-concurrent` slots allow, spawn them, and
+  report capacity. A completed or failed session frees its slot.
+
+There is no fallback to a no-op or in-process transport: an unknown transport
+kind and a failed connection both exit non-zero with the reason. Registration
+failure is reported after five attempts, and a shutdown during the retry wait
+ends the worker cleanly.
 
 ### Flags and environment
 
@@ -320,6 +331,7 @@ transport kind and a failed connection both exit non-zero with the reason.
 | `--heartbeat-timeout-secs N` | `CODEREX_BRIDGE_HEARTBEAT_TIMEOUT_SECS` | `10` | Per-heartbeat timeout |
 | `--heartbeat-degraded-threshold N` | `CODEREX_BRIDGE_HEARTBEAT_DEGRADED_THRESHOLD` | `2` | Missed beats before `Degraded` |
 | `--heartbeat-lost-threshold N` | `CODEREX_BRIDGE_HEARTBEAT_LOST_THRESHOLD` | `5` | Missed beats before `Lost` |
+| `--poll-interval-secs N` | `CODEREX_BRIDGE_POLL_INTERVAL_SECS` | `5` | Seconds between assignment fetches and capacity reports |
 
 The historical `CODEREX_BRIDGE_URL=ws://host:port` spelling is the transport
 URL, not the control-plane API URL. If the gateway does not share the control
@@ -329,20 +341,21 @@ explicitly.
 ### Authentication
 
 The WebSocket transport sends `Authorization: Bearer <token>` when
-`--auth-token`/`CODEREX_BRIDGE_TOKEN` is set. The control-plane HTTP API
-(`BridgeWorkPoller::register`, assignments, capacity) has no token field in
-this build, so it is expected to be reachable from the worker's network
-position rather than authenticated per request. Tokens are never logged; pass
-them through the environment where possible.
+`--auth-token`/`CODEREX_BRIDGE_TOKEN` is set. The same token is sent by
+`HttpControlPlaneClient` on registration, assignment, and capacity requests.
+The control plane may also be left unauthenticated when no token is configured;
+in that case it is expected to be reachable from the worker's network position.
+Tokens are never logged; pass them through the environment where possible.
 
 ### Shutdown
 
 `Bridge::stop_handle()` returns a cloneable `BridgeStopHandle`; `stop()` sets
 the flag and wakes the serve loop out of its blocking receive, so a signal
 handler or supervisor can stop a bridge while `serve_transport` holds
-`&mut Bridge`. The subcommand installs a Ctrl+C/SIGTERM listener, calls the
-handle, waits for `serve_transport` to return, and disconnects the transport.
-Messages already being handled are completed before the loop exits.
+`&mut Bridge`. The subcommand installs a Ctrl+C/SIGTERM listener and calls the
+handle; the same stop request cancels registration retries, ends assignment
+polling, wakes `serve_transport`, and then the worker disconnects the
+transport. Messages already being handled are completed before the loop exits.
 
 ## Data Flow
 
@@ -421,16 +434,16 @@ Control Plane                      Bridge                          Remote/Local
   carried as a sequence number plus `Last-Event-ID`; there is no SSE encoder in
   this workspace and the transport is WebSocket, so the two spellings of the
   resume point are what the gateway is given.
-- **Automatic control-plane registration in the launcher.** `coderex bridge`
-  constructs and serves the bridge, but does not call
-  `BridgeWorkPoller::register` or fetch assignments on its own. Registration
-  and assignment delivery are part of the surrounding deployment's control
-  plane; the launcher deliberately does not make a network call the operator
-  did not ask for. `Bridge::register()` remains available to a supervisor that
-  wants it.
-- **Per-request control-plane authentication.** `BridgeWorkPoller` has no
-  configured credential; the transport (`Authorization: Bearer ...`) is the
-  authenticated channel in this build.
+- **A separate control-plane credential.** The same `--auth-token` /
+  `CODEREX_BRIDGE_TOKEN` is used for the gateway transport and the control-plane
+  HTTP API. There is no second credential setting, so a deployment that issues
+  different tokens for the two must front the control plane to translate them.
+- **Running the assignment and releasing its slot automatically.** The
+  launcher spawns the work context and emits `SessionSpawned`, but this build
+  attaches no agent engine to execute the assignment prompt, so nothing calls
+  `complete_session()` afterwards. Successfully spawned sessions therefore
+  keep their capacity slot until a supervising component completes or fails
+  them. A spawn error calls `fail_session()` and frees the slot immediately.
 - **A gateway path convention.** The default transport URL rewrites the
   control-plane scheme and keeps the same host and path. A gateway mounted on a
   different path must be given `--transport-url` / `CODEREX_BRIDGE_URL`.
@@ -446,13 +459,13 @@ Control Plane                      Bridge                          Remote/Local
 | `relay` | 13 | Approval binding, one-time consumption, forwarding policy, refusal shape |
 | `state` | 14 | All 11 state transitions, terminal guards, failure, history |
 | `permission` | 6 | Create/respond/query/prune, Allow/Deny, session scoping |
-| `poller` | 7 | Capacity limits, assignment queue, register, URL config |
+| `poller` | 8 | Capacity limits, assignment queue, register, URL config, injected control-plane client |
 | `spawner` | 12 | Worktree create/remove, single session, SSH variant, non-existent cleanup |
 | `teleport` | 9 | Snapshot/restore, manifest, conflict handling |
 | `archive` | 9 | Versioning, list/load, metadata, process tracking, cleanup report |
 | `delta_sync` | 21 | Diff/apply, revision hash, JSON roundtrip, Lamport timestamps, conflict tracker, delta merge |
 | `orchestrator` | 19 | Connect/disconnect, spawn/complete lifecycle, permissions, events, recovery, relay endpoint, write fence, resume, stop handle |
-| `bridge_launcher` (cli) | 11 | Flag/env mapping, defaults, required-value errors, injectable transport, graceful shutdown |
+| `bridge_launcher` (cli) | 12 | Flag/env mapping, defaults, required-value errors, injectable transport/control plane, registration, assignment spawn, capacity reporting, graceful shutdown |
 | `bridge_integration` (tests/) | 33 | Live relay call over WebSocket, refusal, stale epoch, resume cursor, end-to-end flows |
 | `control_plane` (server) | 15 | All 5 HTTP endpoints, state management, claim conflicts, 404 routing |
 | `filter` (server) | 7 | Remote/bridge shell whitelists, dangerous-command rejection |
@@ -460,7 +473,7 @@ Control Plane                      Bridge                          Remote/Local
 | `session` (server) | 25 | Auth, roles, command resolution, rate limiting, idle cleanup, protocol |
 | `server_integration` (server, tests/) | 24 | Full WS lifecycle, auth, roles, command whitelist over the protocol |
 
-**Total: 156 bridge unit + 11 CLI launcher unit + 33 bridge integration + 53 server unit + 24 server integration = 277 tests pass.**
+**Total: 157 bridge unit + 12 CLI launcher unit + 33 bridge integration + 53 server unit + 24 server integration = 279 tests pass.**
 
 ## Dependencies
 

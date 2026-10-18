@@ -1,6 +1,7 @@
 //! Bridge work poller — environment registration and capacity reporting.
 
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 
 /// Work assignment from the control plane.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -84,6 +85,145 @@ struct RegisterRequest {
     capabilities: Vec<String>,
 }
 
+/// The control-plane calls a bridge worker needs.
+///
+/// Implemented over HTTP by [`HttpControlPlaneClient`]. Tests implement it
+/// directly so a worker can be exercised without a live control plane.
+#[async_trait::async_trait]
+pub trait ControlPlaneClient: Send + Sync + std::fmt::Debug {
+    /// Register this environment.
+    async fn register(&self, env_id: &str, max_concurrent: usize) -> Result<(), String>;
+
+    /// Fetch work assignments for this environment.
+    async fn fetch_assignments(&self, env_id: &str) -> Result<Vec<WorkAssignment>, String>;
+
+    /// Report current capacity for this environment.
+    async fn report_capacity(&self, env_id: &str, report: &CapacityReport) -> Result<(), String>;
+}
+
+/// HTTP implementation of [`ControlPlaneClient`].
+#[derive(Debug, Clone)]
+pub struct HttpControlPlaneClient {
+    /// Control-plane base URL, without a trailing slash.
+    base_url: String,
+    /// Optional bearer token sent with every control-plane request.
+    auth_token: Option<String>,
+}
+
+impl HttpControlPlaneClient {
+    /// Create a client for the given control-plane base URL.
+    #[must_use]
+    pub fn new(base_url: impl Into<String>) -> Self {
+        Self {
+            base_url: base_url.into().trim_end_matches('/').to_string(),
+            auth_token: None,
+        }
+    }
+
+    /// Send a bearer token with every request.
+    #[must_use]
+    pub fn with_auth(mut self, token: impl Into<String>) -> Self {
+        self.auth_token = Some(token.into());
+        self
+    }
+
+    fn request(&self, method: reqwest::Method, url: String) -> reqwest::RequestBuilder {
+        let request = reqwest::Client::new().request(method, url);
+        match self.auth_token {
+            Some(ref token) => request.bearer_auth(token),
+            None => request,
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl ControlPlaneClient for HttpControlPlaneClient {
+    async fn register(&self, env_id: &str, max_concurrent: usize) -> Result<(), String> {
+        let url = format!("{}/api/environments/register", self.base_url);
+        let body = RegisterRequest {
+            env_id: env_id.to_string(),
+            max_concurrent,
+            capabilities: vec![
+                "worktree".into(),
+                "single_session".into(),
+                "same_dir".into(),
+                "ssh".into(),
+            ],
+        };
+
+        let response = self
+            .request(reqwest::Method::POST, url)
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| format!("registration request failed: {e}"))?;
+
+        if response.status().is_success() {
+            Ok(())
+        } else {
+            let status = response.status();
+            let text = response.text().await.unwrap_or_default();
+            Err(format!("registration returned {status}: {text}"))
+        }
+    }
+
+    async fn fetch_assignments(&self, env_id: &str) -> Result<Vec<WorkAssignment>, String> {
+        let url = format!("{}/api/environments/{env_id}/assignments", self.base_url);
+        let response = self
+            .request(reqwest::Method::GET, url)
+            .send()
+            .await
+            .map_err(|e| format!("fetch assignments failed: {e}"))?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let text = response.text().await.unwrap_or_default();
+            return Err(format!("fetch assignments returned {status}: {text}"));
+        }
+
+        let parsed: AssignmentsResponse = response
+            .json()
+            .await
+            .map_err(|e| format!("failed to parse assignments: {e}"))?;
+
+        Ok(parsed
+            .assignments
+            .into_iter()
+            .map(|entry| WorkAssignment {
+                assignment_id: entry.assignment_id,
+                session_id: entry.session_id,
+                working_directory: entry.working_directory,
+                prompt: entry.prompt,
+                spawn_mode: SpawnMode::from_str(&entry.spawn_mode),
+            })
+            .collect())
+    }
+
+    async fn report_capacity(&self, env_id: &str, report: &CapacityReport) -> Result<(), String> {
+        let url = format!("{}/api/environments/{env_id}/capacity", self.base_url);
+        let body = serde_json::json!({
+            "active_sessions": report.active_sessions,
+            "max_concurrent": report.max_concurrent,
+            "available_slots": report.available_slots,
+        });
+
+        let response = self
+            .request(reqwest::Method::POST, url)
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| format!("report capacity failed: {e}"))?;
+
+        if response.status().is_success() {
+            Ok(())
+        } else {
+            let status = response.status();
+            let text = response.text().await.unwrap_or_default();
+            Err(format!("report capacity returned {status}: {text}"))
+        }
+    }
+}
+
 /// Polls or receives work assignments from the remote control plane.
 #[derive(Debug)]
 pub struct BridgeWorkPoller {
@@ -93,6 +233,8 @@ pub struct BridgeWorkPoller {
     pub max_concurrent: usize,
     /// Control plane base URL.
     pub control_plane_url: String,
+    /// Client used for registration, assignment fetch, and capacity reports.
+    client: Arc<dyn ControlPlaneClient>,
     /// Pending work assignments.
     pending: Vec<WorkAssignment>,
     /// Active session count.
@@ -121,22 +263,29 @@ impl BridgeWorkPoller {
     /// Create a new work poller.
     #[must_use]
     pub fn new(env_id: String, max_concurrent: usize) -> Self {
-        Self {
-            env_id,
-            max_concurrent,
-            control_plane_url: "http://localhost:3000".into(),
-            pending: Vec::new(),
-            active_sessions: 0,
-        }
+        Self::with_url(env_id, max_concurrent, "http://localhost:3000".to_string())
     }
 
     /// Create a new work poller with a custom control plane URL.
     #[must_use]
     pub fn with_url(env_id: String, max_concurrent: usize, control_plane_url: String) -> Self {
+        let client = Arc::new(HttpControlPlaneClient::new(control_plane_url.clone()));
+        Self::with_client(env_id, max_concurrent, control_plane_url, client)
+    }
+
+    /// Create a work poller backed by an injected control-plane client.
+    #[must_use]
+    pub fn with_client(
+        env_id: String,
+        max_concurrent: usize,
+        control_plane_url: String,
+        client: Arc<dyn ControlPlaneClient>,
+    ) -> Self {
         Self {
             env_id,
             max_concurrent,
             control_plane_url,
+            client,
             pending: Vec::new(),
             active_sessions: 0,
         }
@@ -144,32 +293,9 @@ impl BridgeWorkPoller {
 
     /// Register this environment with the control plane.
     pub async fn register(&self) -> Result<(), String> {
-        let client = reqwest::Client::new();
-        let url = format!("{}/api/environments/register", self.control_plane_url);
-        let body = RegisterRequest {
-            env_id: self.env_id.clone(),
-            max_concurrent: self.max_concurrent,
-            capabilities: vec![
-                "worktree".into(),
-                "single_session".into(),
-                "same_dir".into(),
-                "ssh".into(),
-            ],
-        };
-        let response = client
-            .post(&url)
-            .json(&body)
-            .send()
+        self.client
+            .register(&self.env_id, self.max_concurrent)
             .await
-            .map_err(|e| format!("registration request failed: {e}"))?;
-
-        if response.status().is_success() {
-            Ok(())
-        } else {
-            let status = response.status();
-            let text = response.text().await.unwrap_or_default();
-            Err(format!("registration returned {status}: {text}"))
-        }
     }
 
     /// Report current capacity.
@@ -224,73 +350,18 @@ impl BridgeWorkPoller {
     /// Calls `GET /api/environments/{env_id}/assignments` and
     /// enqueues any returned assignments.
     pub async fn fetch_assignments(&mut self) -> Result<usize, String> {
-        let client = reqwest::Client::new();
-        let url = format!(
-            "{}/api/environments/{}/assignments",
-            self.control_plane_url, self.env_id
-        );
-        let response = client
-            .get(&url)
-            .send()
-            .await
-            .map_err(|e| format!("fetch assignments failed: {e}"))?;
-
-        if response.status().is_success() {
-            let parsed: AssignmentsResponse = response
-                .json()
-                .await
-                .map_err(|e| format!("failed to parse assignments: {e}"))?;
-
-            let count = parsed.assignments.len();
-            for server_entry in parsed.assignments {
-                self.pending.push(WorkAssignment {
-                    assignment_id: server_entry.assignment_id,
-                    session_id: server_entry.session_id,
-                    working_directory: server_entry.working_directory,
-                    prompt: server_entry.prompt,
-                    spawn_mode: SpawnMode::from_str(&server_entry.spawn_mode),
-                });
-            }
-            Ok(count)
-        } else {
-            let status = response.status();
-            let text = response.text().await.unwrap_or_default();
-            Err(format!("fetch assignments returned {status}: {text}"))
-        }
+        let assignments = self.client.fetch_assignments(&self.env_id).await?;
+        let count = assignments.len();
+        self.pending.extend(assignments);
+        Ok(count)
     }
 
     /// Report current capacity to the control plane server.
     ///
     /// Calls `POST /api/environments/{env_id}/capacity`.
     pub async fn report_capacity_to_server(&self) -> Result<(), String> {
-        let client = reqwest::Client::new();
-        let url = format!(
-            "{}/api/environments/{}/capacity",
-            self.control_plane_url, self.env_id
-        );
         let report = self.report_capacity();
-
-        // Build JSON body matching the server's CapacityReport
-        let body = serde_json::json!({
-            "active_sessions": report.active_sessions,
-            "max_concurrent": report.max_concurrent,
-            "available_slots": report.available_slots,
-        });
-
-        let response = client
-            .post(&url)
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| format!("report capacity failed: {e}"))?;
-
-        if response.status().is_success() {
-            Ok(())
-        } else {
-            let status = response.status();
-            let text = response.text().await.unwrap_or_default();
-            Err(format!("report capacity returned {status}: {text}"))
-        }
+        self.client.report_capacity(&self.env_id, &report).await
     }
 }
 
@@ -308,6 +379,40 @@ mod tests {
         }
     }
 
+    #[derive(Debug, Default)]
+    struct FakeClient {
+        registrations: std::sync::Mutex<Vec<(String, usize)>>,
+        assignments: std::sync::Mutex<Vec<WorkAssignment>>,
+        capacities: std::sync::Mutex<Vec<(String, CapacityReport)>>,
+    }
+
+    #[async_trait::async_trait]
+    impl ControlPlaneClient for FakeClient {
+        async fn register(&self, env_id: &str, max_concurrent: usize) -> Result<(), String> {
+            self.registrations
+                .lock()
+                .unwrap()
+                .push((env_id.to_string(), max_concurrent));
+            Ok(())
+        }
+
+        async fn fetch_assignments(&self, _env_id: &str) -> Result<Vec<WorkAssignment>, String> {
+            Ok(std::mem::take(&mut *self.assignments.lock().unwrap()))
+        }
+
+        async fn report_capacity(
+            &self,
+            env_id: &str,
+            report: &CapacityReport,
+        ) -> Result<(), String> {
+            self.capacities
+                .lock()
+                .unwrap()
+                .push((env_id.to_string(), report.clone()));
+            Ok(())
+        }
+    }
+
     #[test]
     fn capacity_report() {
         let poller = BridgeWorkPoller::new("env1".into(), 5);
@@ -315,6 +420,38 @@ mod tests {
         assert_eq!(report.env_id, "env1");
         assert_eq!(report.max_concurrent, 5);
         assert_eq!(report.available_slots, 5);
+    }
+
+    #[tokio::test]
+    async fn injected_client_drives_register_fetch_and_capacity() {
+        let client = Arc::new(FakeClient::default());
+        client.assignments.lock().unwrap().push(sample_assignment());
+
+        let mut poller = BridgeWorkPoller::with_client(
+            "env1".into(),
+            2,
+            "http://unused.invalid".into(),
+            client.clone(),
+        );
+
+        poller.register().await.unwrap();
+        assert_eq!(
+            client.registrations.lock().unwrap().as_slice(),
+            &[("env1".to_string(), 2)]
+        );
+
+        assert_eq!(poller.fetch_assignments().await.unwrap(), 1);
+        assert!(poller.has_pending());
+
+        let taken = poller.take_assignment().unwrap();
+        assert_eq!(taken.session_id, "s1");
+
+        poller.report_capacity_to_server().await.unwrap();
+        let capacities = client.capacities.lock().unwrap();
+        assert_eq!(capacities.len(), 1);
+        assert_eq!(capacities[0].0, "env1");
+        assert_eq!(capacities[0].1.active_sessions, 1);
+        assert_eq!(capacities[0].1.available_slots, 1);
     }
 
     #[test]

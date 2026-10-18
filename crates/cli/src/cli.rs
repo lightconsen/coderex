@@ -372,6 +372,15 @@ pub struct BridgeArgs {
         default_value_t = 5
     )]
     pub heartbeat_lost_threshold: usize,
+
+    /// Interval between control-plane assignment polls, in seconds.
+    #[arg(
+        long,
+        value_name = "SECS",
+        env = "CODEREX_BRIDGE_POLL_INTERVAL_SECS",
+        default_value_t = 5
+    )]
+    pub poll_interval_secs: u64,
 }
 
 /// MCP management subcommands.

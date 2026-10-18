@@ -10,10 +10,13 @@
 
 use anyhow::{Context, Result};
 use coderex_bridge::heartbeat::HeartbeatConfig;
-use coderex_bridge::orchestrator::{Bridge, BridgeConfig};
+use coderex_bridge::orchestrator::{Bridge, BridgeConfig, BridgeStopHandle};
+use coderex_bridge::poller::{ControlPlaneClient, HttpControlPlaneClient};
 use coderex_bridge::transport::{Transport, TransportConfig, default_factory};
 use std::future::Future;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::Duration;
 
 use crate::cli::BridgeArgs;
 
@@ -39,11 +42,17 @@ pub const ENV_CONNECTION_ID: &str = "CODEREX_BRIDGE_CONNECTION_ID";
 /// Environment variable carrying the bearer token. Prefer a flag or an
 /// inherited environment over a shell history entry.
 pub const ENV_AUTH_TOKEN: &str = "CODEREX_BRIDGE_TOKEN";
+/// Environment variable setting the assignment poll interval, in seconds.
+pub const ENV_POLL_INTERVAL_SECS: &str = "CODEREX_BRIDGE_POLL_INTERVAL_SECS";
 
 /// Default transport kind: the real gateway transport.
 pub const DEFAULT_TRANSPORT: &str = "websocket";
 /// Default maximum concurrent sessions.
 pub const DEFAULT_MAX_CONCURRENT: usize = 5;
+/// Default interval between control-plane assignment polls.
+pub const DEFAULT_POLL_INTERVAL_SECS: u64 = 5;
+/// How many times registration is attempted before the worker exits.
+pub const REGISTRATION_ATTEMPTS: usize = 5;
 
 /// Errors raised while turning CLI arguments into a launch configuration.
 #[derive(Debug, thiserror::Error)]
@@ -83,6 +92,8 @@ pub struct BridgeLaunchConfig {
     pub connection_id: String,
     /// Optional bearer token.
     pub auth_token: Option<String>,
+    /// How often to fetch assignments and report capacity.
+    pub poll_interval: Duration,
 }
 
 impl BridgeLaunchConfig {
@@ -162,6 +173,11 @@ impl BridgeLaunchConfig {
                 args.heartbeat_lost_threshold, args.heartbeat_degraded_threshold
             )));
         }
+        if args.poll_interval_secs == 0 {
+            return Err(BridgeConfigError::Invalid(
+                "--poll-interval-secs must be at least 1".into(),
+            ));
+        }
 
         let transport = optional_string(Some(args.transport.as_str()), env(ENV_TRANSPORT))
             .unwrap_or_else(|| DEFAULT_TRANSPORT.to_string());
@@ -196,6 +212,7 @@ impl BridgeLaunchConfig {
             transport_url,
             connection_id,
             auth_token,
+            poll_interval: Duration::from_secs(args.poll_interval_secs),
         })
     }
 
@@ -268,7 +285,8 @@ pub async fn run(args: BridgeArgs, cwd: &Path) -> Result<()> {
 /// Run a bridge over an injected transport until `shutdown` resolves.
 ///
 /// This is the seam used by tests: the transport is supplied by the caller
-/// and no process-wide signal handler is installed.
+/// and no process-wide signal handler is installed. The control plane is the
+/// HTTP client built from `config.control_plane_url`.
 pub async fn run_with_transport<F>(
     config: BridgeLaunchConfig,
     transport: Box<dyn Transport>,
@@ -277,7 +295,28 @@ pub async fn run_with_transport<F>(
 where
     F: Future<Output = ()> + Send + 'static,
 {
-    let mut bridge = Bridge::new(config.bridge_config(), transport);
+    let mut control_plane = HttpControlPlaneClient::new(config.control_plane_url.clone());
+    if let Some(ref token) = config.auth_token {
+        control_plane = control_plane.with_auth(token.clone());
+    }
+    run_with_control_plane(config, transport, Arc::new(control_plane), shutdown).await
+}
+
+/// Run a bridge over injected transport and control-plane implementations.
+///
+/// The transport and control plane are supplied by the caller, so tests can
+/// exercise registration, assignment spawning, capacity reporting, and
+/// shutdown without a live server.
+pub async fn run_with_control_plane<F>(
+    config: BridgeLaunchConfig,
+    transport: Box<dyn Transport>,
+    control_plane: Arc<dyn ControlPlaneClient>,
+    shutdown: F,
+) -> Result<()>
+where
+    F: Future<Output = ()> + Send + 'static,
+{
+    let mut bridge = Bridge::with_control_plane(config.bridge_config(), transport, control_plane);
 
     bridge.connect().await.map_err(|err| {
         anyhow::anyhow!(
@@ -288,16 +327,160 @@ where
     })?;
 
     let stop = bridge.stop_handle();
+    let shutdown_stop = stop.clone();
     let shutdown_task = tokio::spawn(async move {
         shutdown.await;
-        stop.stop();
+        shutdown_stop.stop();
     });
 
-    let served = bridge.serve_transport().await;
+    let result = run_worker(&mut bridge, &config, &stop).await;
+
     let _ = bridge.disconnect().await;
     shutdown_task.abort();
+    result
+}
 
-    served.map_err(|e| anyhow::anyhow!("bridge serve loop failed: {e}"))
+/// Register, then run the assignment and transport loops until shutdown.
+async fn run_worker(
+    bridge: &mut Bridge,
+    config: &BridgeLaunchConfig,
+    stop: &BridgeStopHandle,
+) -> Result<()> {
+    register_with_retry(bridge, stop)
+        .await
+        .context("cannot start the bridge worker")?;
+
+    let initial_report = tokio::select! {
+        result = bridge.report_capacity_to_server() => result,
+        () = stop.wait() => return Ok(()),
+    };
+    if let Err(err) = initial_report {
+        tracing::warn!("initial capacity report failed: {err}");
+    }
+
+    let mut ticker = tokio::time::interval(config.poll_interval);
+    // The first tick completes immediately, so the first assignment fetch and
+    // capacity report happen as soon as registration succeeds.
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+    loop {
+        if stop.is_stopped() {
+            break;
+        }
+
+        tokio::select! {
+            served = bridge.serve_transport() => {
+                served.map_err(|err| anyhow::anyhow!("bridge serve loop failed: {err}"))?;
+                tracing::info!("bridge transport serve loop ended");
+                break;
+            }
+            _ = ticker.tick() => {
+                if stop.is_stopped() {
+                    break;
+                }
+                assignment_tick(bridge, stop).await;
+            }
+        }
+    }
+
+    tracing::info!("bridge worker stopped");
+    Ok(())
+}
+
+/// Fetch work, spawn whatever fits, and report capacity.
+///
+/// The fetch and capacity requests are cancel-safe against shutdown: a stop
+/// request does not wait for an in-flight HTTP call. Spawning is not
+/// interrupted, because a half-spawned session would leak a capacity slot.
+async fn assignment_tick(bridge: &mut Bridge, stop: &BridgeStopHandle) {
+    let fetched = tokio::select! {
+        result = bridge.fetch_assignments() => result,
+        () = stop.wait() => return,
+    };
+
+    match fetched {
+        Ok(0) => {}
+        Ok(count) => tracing::info!(count, "fetched bridge assignments"),
+        Err(err) => tracing::warn!("failed to fetch bridge assignments: {err}"),
+    }
+
+    while let Some(assignment) = bridge.take_assignment() {
+        match bridge.spawn_session(&assignment).await {
+            Ok(result) => tracing::info!(
+                session_id = %result.session_id,
+                work_dir = %result.work_dir.display(),
+                "spawned bridge session"
+            ),
+            Err(err) => {
+                tracing::warn!(
+                    session_id = %assignment.session_id,
+                    error = %err,
+                    "failed to spawn bridge session"
+                );
+                // Frees the capacity slot so the next assignment can be taken.
+                bridge.fail_session(&assignment.session_id, err);
+            }
+        }
+    }
+
+    if stop.is_stopped() {
+        return;
+    }
+
+    let reported = tokio::select! {
+        result = bridge.report_capacity_to_server() => result,
+        () = stop.wait() => return,
+    };
+    if let Err(err) = reported {
+        tracing::warn!("failed to report bridge capacity: {err}");
+    }
+}
+
+/// Register with bounded exponential backoff, giving up at shutdown.
+async fn register_with_retry(bridge: &Bridge, stop: &BridgeStopHandle) -> Result<()> {
+    let mut delay = Duration::from_millis(500);
+    let mut last_error = String::new();
+
+    for attempt in 1..=REGISTRATION_ATTEMPTS {
+        let registered = tokio::select! {
+            result = bridge.register() => result,
+            () = stop.wait() => {
+                return Err(anyhow::anyhow!(
+                    "control-plane registration cancelled by shutdown"
+                ));
+            }
+        };
+
+        match registered {
+            Ok(()) => {
+                tracing::info!(attempt, "bridge registered with the control plane");
+                return Ok(());
+            }
+            Err(err) => last_error = err,
+        }
+
+        if attempt < REGISTRATION_ATTEMPTS {
+            tracing::warn!(
+                attempt,
+                error = %last_error,
+                retry_in_ms = delay.as_millis(),
+                "bridge registration failed; retrying"
+            );
+            tokio::select! {
+                () = tokio::time::sleep(delay) => {}
+                () = stop.wait() => {
+                    return Err(anyhow::anyhow!(
+                        "control-plane registration cancelled by shutdown"
+                    ));
+                }
+            }
+            delay = (delay * 2).min(Duration::from_secs(10));
+        }
+    }
+
+    Err(anyhow::anyhow!(
+        "control-plane registration failed after {REGISTRATION_ATTEMPTS} attempts: {last_error}"
+    ))
 }
 
 /// Wait for Ctrl+C, or SIGTERM on Unix, to request a graceful bridge stop.
@@ -377,9 +560,55 @@ mod tests {
     use super::*;
     use crate::cli::Cli;
     use clap::Parser;
+    use coderex_bridge::poller::{CapacityReport, SpawnMode, WorkAssignment};
     use coderex_bridge::transport::InProcessTransport;
+    use std::sync::Mutex;
     use std::time::Duration;
     use tokio::sync::oneshot;
+
+    /// In-memory control plane used to exercise the worker without a server.
+    #[derive(Debug, Default)]
+    struct FakeControlPlane {
+        registrations: Mutex<Vec<(String, usize)>>,
+        assignments: Mutex<Vec<WorkAssignment>>,
+        capacities: Mutex<Vec<CapacityReport>>,
+        fetches: Mutex<usize>,
+    }
+
+    #[async_trait::async_trait]
+    impl ControlPlaneClient for FakeControlPlane {
+        async fn register(&self, env_id: &str, max_concurrent: usize) -> Result<(), String> {
+            self.registrations
+                .lock()
+                .unwrap()
+                .push((env_id.to_string(), max_concurrent));
+            Ok(())
+        }
+
+        async fn fetch_assignments(&self, _env_id: &str) -> Result<Vec<WorkAssignment>, String> {
+            *self.fetches.lock().unwrap() += 1;
+            Ok(std::mem::take(&mut *self.assignments.lock().unwrap()))
+        }
+
+        async fn report_capacity(
+            &self,
+            _env_id: &str,
+            report: &CapacityReport,
+        ) -> Result<(), String> {
+            self.capacities.lock().unwrap().push(report.clone());
+            Ok(())
+        }
+    }
+
+    fn sample_assignment(session_base: &Path) -> WorkAssignment {
+        WorkAssignment {
+            assignment_id: "a1".into(),
+            session_id: "s1".into(),
+            working_directory: session_base.display().to_string(),
+            prompt: "Fix the bug".into(),
+            spawn_mode: SpawnMode::SingleSession,
+        }
+    }
 
     fn args_with(url: &str, env_id: &str) -> BridgeArgs {
         BridgeArgs {
@@ -398,6 +627,7 @@ mod tests {
             heartbeat_timeout_secs: 10,
             heartbeat_degraded_threshold: 2,
             heartbeat_lost_threshold: 5,
+            poll_interval_secs: DEFAULT_POLL_INTERVAL_SECS,
         }
     }
 
@@ -423,6 +653,7 @@ mod tests {
             heartbeat_timeout_secs: 4,
             heartbeat_degraded_threshold: 3,
             heartbeat_lost_threshold: 9,
+            poll_interval_secs: 9,
         };
 
         let config = BridgeLaunchConfig::resolve(&args, tmp.path(), |_| None).unwrap();
@@ -441,6 +672,7 @@ mod tests {
         assert_eq!(config.transport_url, "wss://gateway.example.test/bridge");
         assert_eq!(config.connection_id, "conn-1");
         assert_eq!(config.auth_token.as_deref(), Some("secret"));
+        assert_eq!(config.poll_interval, Duration::from_secs(9));
     }
 
     #[test]
@@ -464,6 +696,7 @@ mod tests {
         assert_eq!(args.heartbeat_timeout_secs, 10);
         assert_eq!(args.heartbeat_degraded_threshold, 2);
         assert_eq!(args.heartbeat_lost_threshold, 5);
+        assert_eq!(args.poll_interval_secs, DEFAULT_POLL_INTERVAL_SECS);
 
         let cwd = std::env::current_dir().unwrap();
         let config = BridgeLaunchConfig::resolve(&args, &cwd, |_| None).unwrap();
@@ -563,6 +796,15 @@ mod tests {
                 .to_string()
                 .contains("--heartbeat-lost-threshold")
         );
+
+        let mut args = args_with("http://cp.example.test", "env-1");
+        args.poll_interval_secs = 0;
+        assert!(
+            BridgeLaunchConfig::resolve(&args, Path::new("."), |_| None)
+                .unwrap_err()
+                .to_string()
+                .contains("--poll-interval-secs")
+        );
     }
 
     #[test]
@@ -602,11 +844,17 @@ mod tests {
             InProcessTransport::create_pair("bridge-env".into(), "gateway".into());
         remote.connect().await.unwrap();
 
+        let control_plane = Arc::new(FakeControlPlane::default());
         let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
         let running = tokio::spawn(async move {
-            run_with_transport(config, Box::new(bridge_transport), async move {
-                let _ = shutdown_rx.await;
-            })
+            run_with_control_plane(
+                config,
+                Box::new(bridge_transport),
+                control_plane,
+                async move {
+                    let _ = shutdown_rx.await;
+                },
+            )
             .await
         });
 
@@ -633,6 +881,97 @@ mod tests {
             .expect("the bridge should shut down")
             .unwrap();
         assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn worker_registers_spawns_reports_capacity_and_stops() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut args = args_with("http://cp.example.test", "env-test");
+        args.transport = "in-process".into();
+        args.repo_root = Some(tmp.path().to_path_buf());
+        args.session_base = Some(tmp.path().join("sessions"));
+        let mut config = BridgeLaunchConfig::resolve(&args, tmp.path(), |_| None).unwrap();
+        config.poll_interval = Duration::from_millis(10);
+        let session_base = config.session_base.clone();
+
+        let control_plane = Arc::new(FakeControlPlane::default());
+        control_plane
+            .assignments
+            .lock()
+            .unwrap()
+            .push(sample_assignment(&session_base));
+
+        let (bridge_transport, mut remote) =
+            InProcessTransport::create_pair("bridge-env".into(), "gateway".into());
+        remote.connect().await.unwrap();
+
+        let worker_control_plane = Arc::clone(&control_plane);
+        let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+        let running = tokio::spawn(async move {
+            run_with_control_plane(
+                config,
+                Box::new(bridge_transport),
+                worker_control_plane,
+                async move {
+                    let _ = shutdown_rx.await;
+                },
+            )
+            .await
+        });
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while control_plane.registrations.lock().unwrap().is_empty() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the worker should register with the control plane");
+        assert_eq!(
+            control_plane.registrations.lock().unwrap().as_slice(),
+            &[("env-test".to_string(), DEFAULT_MAX_CONCURRENT)]
+        );
+
+        let session_dir = session_base.join("s1");
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !session_dir.exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the fetched assignment should be spawned");
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let reported = control_plane
+                    .capacities
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|report| report.active_sessions == 1);
+                if reported {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("capacity should report the active session");
+
+        shutdown_tx.send(()).unwrap();
+        let result = tokio::time::timeout(Duration::from_secs(1), running)
+            .await
+            .expect("shutdown should stop the worker")
+            .unwrap();
+        assert!(result.is_ok());
+
+        // Neither loop keeps running after shutdown.
+        let fetches_at_shutdown = *control_plane.fetches.lock().unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            *control_plane.fetches.lock().unwrap(),
+            fetches_at_shutdown,
+            "assignment polling should have stopped"
+        );
     }
 
     #[tokio::test]
@@ -676,10 +1015,15 @@ mod tests {
         args.repo_root = Some(tmp.path().to_path_buf());
         let config = BridgeLaunchConfig::resolve(&args, tmp.path(), |_| None).unwrap();
 
-        let error = run_with_transport(config, Box::new(RefusingTransport), async {})
-            .await
-            .unwrap_err()
-            .to_string();
+        let error = run_with_control_plane(
+            config,
+            Box::new(RefusingTransport),
+            Arc::new(FakeControlPlane::default()),
+            async {},
+        )
+        .await
+        .unwrap_err()
+        .to_string();
         assert!(error.contains("could not connect"), "{error}");
         assert!(error.contains("refused by test"), "{error}");
     }
