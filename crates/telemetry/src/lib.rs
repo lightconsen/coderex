@@ -20,7 +20,7 @@ mod scrubber;
 mod store;
 mod uploader;
 
-pub use crash::{CrashReport, CrashReporter};
+pub use crash::{CRASH_VERBOSE_ENV, CrashReport, CrashReporter, crash_verbose, crash_verbose_with};
 pub use scrubber::Scrubber;
 pub use store::{PendingCrash, PendingEvent, TelemetryEvent, TelemetryStore};
 pub use uploader::{

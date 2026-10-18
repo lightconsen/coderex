@@ -137,7 +137,7 @@ pub fn redact_model_fields(value: &mut serde_json::Value) {
 /// `redaction_status` is allowed so a payload that already carries an explicit
 /// redaction mark (for example a structured crash summary) validates instead
 /// of having its mark overwritten with `unredacted`.
-pub const STRICT_ALLOWED_FIELDS: [&str; 15] = [
+pub const STRICT_ALLOWED_FIELDS: [&str; 20] = [
     "type",
     "session_id",
     "tool_name",
@@ -153,6 +153,12 @@ pub const STRICT_ALLOWED_FIELDS: [&str; 15] = [
     "panic_info",
     "backtrace",
     "redaction_status",
+    // Structured crash metadata (the default crash payload).
+    "panic_type",
+    "thread_name",
+    "panic_location",
+    "os",
+    "version",
 ];
 
 /// Key inserted into a payload that strict mode could not validate.
@@ -316,6 +322,205 @@ fn scrub_high_entropy_tokens(text: &str) -> String {
     result
 }
 
+// ─── Numeric / financial detectors ──────────────────────────────────────────
+
+/// Replacement written over a Luhn-valid payment card number.
+pub const CREDIT_CARD_PLACEHOLDER: &str = "<CREDIT_CARD>";
+
+/// Replacement written over a US Social Security number.
+pub const SSN_PLACEHOLDER: &str = "<SSN>";
+
+/// Replacement written over a checksum-valid IBAN.
+pub const IBAN_PLACEHOLDER: &str = "<IBAN>";
+
+/// Whether a match is embedded in a path, symbol or `file:line` frame.
+///
+/// The numeric detectors are shape-only, so a card-like run inside a path or a
+/// line number must be left alone. A trailing `.` is treated as an extension
+/// only when an identifier character follows it; otherwise it is sentence
+/// punctuation.
+fn is_embedded_in_structured_value(text: &str, start: usize, end: usize) -> bool {
+    let path_char = |c: char| matches!(c, '/' | '\\' | '~' | '_' | '-');
+    if text[..start]
+        .chars()
+        .next_back()
+        .is_some_and(|c| path_char(c) || c == ':')
+    {
+        return true;
+    }
+    let next = text[end..].chars().next();
+    if next.is_some_and(|c| path_char(c) || c == ':') {
+        return true;
+    }
+    if next == Some('.') {
+        let after_dot = text[end + 1..].chars().next();
+        if after_dot.is_some_and(|c| c.is_ascii_alphanumeric()) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Luhn checksum over an ASCII digit string.
+fn luhn_valid(digits: &str) -> bool {
+    let mut sum = 0u32;
+    let mut double = false;
+    for byte in digits.bytes().rev() {
+        let mut value = u32::from(byte.saturating_sub(b'0'));
+        if double {
+            value *= 2;
+            if value > 9 {
+                value -= 9;
+            }
+        }
+        sum += value;
+        double = !double;
+    }
+    sum % 10 == 0
+}
+
+/// Replace payment card numbers that pass the Luhn checksum.
+///
+/// Conservative by design: 13–19 digits, no consecutive separators, and never
+/// a run embedded in a path (`/data/4111111111111111/report`), a filename
+/// (`card-4111111111111111.txt`) or a `file:line` frame. A number that fails
+/// Luhn is not a card and is left alone.
+fn scrub_credit_cards(text: &str) -> String {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    let re = RE.get_or_init(|| {
+        Regex::new(r"\b[0-9][0-9 -]{10,25}[0-9]\b").expect("credit-card regex is valid")
+    });
+
+    let mut result = String::with_capacity(text.len());
+    let mut last_end = 0;
+    for candidate in re.find_iter(text) {
+        let raw = candidate.as_str();
+        let digits: String = raw.chars().filter(char::is_ascii_digit).collect();
+        if !(13..=19).contains(&digits.len()) || digits.starts_with('0') {
+            continue;
+        }
+        if digits.chars().all(|c| c == digits.as_bytes()[0] as char) {
+            continue;
+        }
+        // At most one separator between digits.
+        let mut previous_separator = false;
+        let mut malformed = false;
+        for c in raw.chars() {
+            let separator = matches!(c, ' ' | '-');
+            if separator && previous_separator {
+                malformed = true;
+                break;
+            }
+            previous_separator = separator;
+        }
+        if malformed
+            || !luhn_valid(&digits)
+            || is_embedded_in_structured_value(text, candidate.start(), candidate.end())
+        {
+            continue;
+        }
+        result.push_str(&text[last_end..candidate.start()]);
+        result.push_str(CREDIT_CARD_PLACEHOLDER);
+        last_end = candidate.end();
+    }
+    result.push_str(&text[last_end..]);
+    result
+}
+
+/// Whether an SSN-shaped string has valid SSA field ranges.
+fn ssn_fields_valid(ssn: &str) -> bool {
+    let parts: Vec<&str> = ssn.split('-').collect();
+    if parts.len() != 3 {
+        return false;
+    }
+    let area: u32 = parts[0].parse().unwrap_or(0);
+    let group: u32 = parts[1].parse().unwrap_or(0);
+    let serial: u32 = parts[2].parse().unwrap_or(0);
+    area != 0 && area != 666 && area < 900 && group != 0 && serial != 0
+}
+
+/// Replace US Social Security numbers (`AAA-GG-SSSS`).
+///
+/// Rejects the SSA's never-issued ranges (`000`, `666`, `900+` area codes,
+/// group `00`, serial `0000`) and any match embedded in a path or frame.
+fn scrub_ssns(text: &str) -> String {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    let re = RE
+        .get_or_init(|| Regex::new(r"\b[0-9]{3}-[0-9]{2}-[0-9]{4}\b").expect("SSN regex is valid"));
+
+    let mut result = String::with_capacity(text.len());
+    let mut last_end = 0;
+    for candidate in re.find_iter(text) {
+        if !ssn_fields_valid(candidate.as_str())
+            || is_embedded_in_structured_value(text, candidate.start(), candidate.end())
+        {
+            continue;
+        }
+        result.push_str(&text[last_end..candidate.start()]);
+        result.push_str(SSN_PLACEHOLDER);
+        last_end = candidate.end();
+    }
+    result.push_str(&text[last_end..]);
+    result
+}
+
+/// Validate an IBAN with the ISO 13616 mod-97 checksum.
+///
+/// The candidate may contain single spaces between groups; they are removed
+/// before validation. Only 15–34 alphanumeric characters after the country and
+/// check digits are accepted, which keeps ordinary identifiers out.
+fn iban_valid(candidate: &str) -> bool {
+    let cleaned: String = candidate.chars().filter(|c| *c != ' ').collect();
+    if !(15..=34).contains(&cleaned.len())
+        || !cleaned.chars().all(|c| c.is_ascii_alphanumeric())
+        || !cleaned[..2].chars().all(|c| c.is_ascii_uppercase())
+        || !cleaned[2..4].chars().all(|c| c.is_ascii_digit())
+    {
+        return false;
+    }
+
+    // Move the first four characters to the end, then fold letters to 10..35
+    // and take the remainder mod 97 as we go.
+    let rearranged = format!("{}{}", &cleaned[4..], &cleaned[..4]);
+    let mut remainder: u32 = 0;
+    for byte in rearranged.bytes() {
+        if byte.is_ascii_digit() {
+            remainder = (remainder * 10 + u32::from(byte - b'0')) % 97;
+        } else {
+            let value = u32::from(byte - b'A') + 10;
+            remainder = (remainder * 100 + value) % 97;
+        }
+    }
+    remainder == 1
+}
+
+/// Replace checksum-valid IBANs.
+///
+/// The shape alone is not enough — an uppercase identifier can look like an
+/// IBAN — so the mod-97 checksum must pass. Matches embedded in paths or frames
+/// are left alone.
+fn scrub_ibans(text: &str) -> String {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    let re = RE.get_or_init(|| {
+        Regex::new(r"\b[A-Z]{2}[0-9]{2}(?: ?[A-Z0-9]{1,4}){3,8}\b").expect("IBAN regex is valid")
+    });
+
+    let mut result = String::with_capacity(text.len());
+    let mut last_end = 0;
+    for candidate in re.find_iter(text) {
+        if !iban_valid(candidate.as_str())
+            || is_embedded_in_structured_value(text, candidate.start(), candidate.end())
+        {
+            continue;
+        }
+        result.push_str(&text[last_end..candidate.start()]);
+        result.push_str(IBAN_PLACEHOLDER);
+        last_end = candidate.end();
+    }
+    result.push_str(&text[last_end..]);
+    result
+}
+
 /// Scrubber that regex-replaces sensitive patterns.
 #[derive(Debug, Clone)]
 pub struct Scrubber {
@@ -348,7 +553,14 @@ impl Scrubber {
             patterns.push((re, "<IP>".to_string()));
         }
 
-        // PEM private key blocks
+        // PEM private key blocks. The whole block goes first (the base64 body
+        // is the key material); the header-only pattern is a fallback for a
+        // truncated block that has no `END` line.
+        if let Ok(re) =
+            Regex::new(r"(?s)-----BEGIN [A-Z ]*PRIVATE KEY-----.*?-----END [A-Z ]*PRIVATE KEY-----")
+        {
+            patterns.push((re, "<PRIVATE_KEY>".to_string()));
+        }
         if let Ok(re) = Regex::new(r"-----BEGIN [A-Z ]*PRIVATE KEY-----") {
             patterns.push((re, "<PRIVATE_KEY>".to_string()));
         }
@@ -358,20 +570,22 @@ impl Scrubber {
             patterns.push((re, "<AUTH_TOKEN>".to_string()));
         }
 
-        // JSON Web Tokens (header.payload.signature)
-        if let Ok(re) =
-            Regex::new(r"\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b")
-        {
+        // JSON Web Tokens: an `eyJ` header and exactly three dot-separated
+        // base64url segments.
+        if let Ok(re) = Regex::new(r"\beyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\b") {
             patterns.push((re, "<JWT>".to_string()));
         }
 
-        // GitHub tokens (ghp_, gho_, ghu_, ghs_, ghr_)
+        // GitHub tokens (ghp_, gho_, ghu_, ghs_, ghr_) and fine-grained PATs.
         if let Ok(re) = Regex::new(r"\bgh[pousr]_[A-Za-z0-9]{20,}\b") {
             patterns.push((re, "<API_KEY>".to_string()));
         }
+        if let Ok(re) = Regex::new(r"\bgithub_pat_[A-Za-z0-9_]{20,}\b") {
+            patterns.push((re, "<API_KEY>".to_string()));
+        }
 
-        // AWS access key IDs
-        if let Ok(re) = Regex::new(r"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b") {
+        // AWS access key IDs: `AKIA` plus 16 alphanumerics.
+        if let Ok(re) = Regex::new(r"\bAKIA[A-Za-z0-9]{16}\b") {
             patterns.push((re, "<API_KEY>".to_string()));
         }
 
@@ -405,6 +619,11 @@ impl Scrubber {
         for (re, replacement) in &self.patterns {
             result = re.replace_all(&result, replacement.as_str()).to_string();
         }
+        // Checksum-validated detectors run after the shape-based patterns and
+        // before the generic high-entropy scan.
+        result = scrub_credit_cards(&result);
+        result = scrub_ssns(&result);
+        result = scrub_ibans(&result);
         scrub_high_entropy_tokens(&result)
     }
 
@@ -860,5 +1079,204 @@ mod tests {
         let scrubber = Scrubber::new();
         let scrubbed = scrubber.scrub("api_key=sk-abc123def456ghi789jkl012mno345");
         assert_eq!(scrubbed, "<API_KEY>");
+    }
+
+    // ── Credential families: true positives ──────────────────────────────
+
+    #[test]
+    fn jwt_with_three_segments_is_redacted() {
+        let scrubber = Scrubber::new();
+        let token = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0In0.c2lnbmF0dXJl";
+        let scrubbed = scrubber.scrub(&format!("Authorization: {token}"));
+        assert!(!scrubbed.contains(token), "{scrubbed}");
+        assert!(scrubbed.contains("<JWT>"), "{scrubbed}");
+    }
+
+    #[test]
+    fn pem_private_key_block_is_redacted_in_full() {
+        let scrubber = Scrubber::new();
+        let pem = "-----BEGIN RSA PRIVATE KEY-----\nMIIEowIBAAKCAQEAsecretbody\n-----END RSA PRIVATE KEY-----";
+        let scrubbed = scrubber.scrub(&format!("key follows:\n{pem}\ndone"));
+        assert!(
+            !scrubbed.contains("MIIEowIBAAKCAQEAsecretbody"),
+            "{scrubbed}"
+        );
+        assert_eq!(scrubbed, "key follows:\n<PRIVATE_KEY>\ndone");
+    }
+
+    #[test]
+    fn aws_access_key_id_is_redacted() {
+        let scrubber = Scrubber::new();
+        let scrubbed = scrubber.scrub("key AKIAIOSFODNN7EXAMPLE here");
+        assert!(!scrubbed.contains("AKIAIOSFODNN7EXAMPLE"), "{scrubbed}");
+        assert!(scrubbed.contains("<API_KEY>"), "{scrubbed}");
+    }
+
+    #[test]
+    fn github_tokens_are_redacted() {
+        let scrubber = Scrubber::new();
+        for token in [
+            "ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789",
+            "github_pat_11ABCDEFG0123456789_abcdefghijklmnopqrstuvwxyz",
+        ] {
+            let scrubbed = scrubber.scrub(&format!("token {token} used"));
+            assert!(!scrubbed.contains(token), "{scrubbed}");
+            assert!(scrubbed.contains("<API_KEY>"), "{scrubbed}");
+        }
+    }
+
+    #[test]
+    fn slack_tokens_are_redacted() {
+        let scrubber = Scrubber::new();
+        let scrubbed = scrubber.scrub("hook xoxb-1234567890-ABCDEFGHIJ sent");
+        assert!(
+            !scrubbed.contains("xoxb-1234567890-ABCDEFGHIJ"),
+            "{scrubbed}"
+        );
+        assert!(scrubbed.contains("<API_KEY>"), "{scrubbed}");
+    }
+
+    #[test]
+    fn bearer_values_are_redacted() {
+        let scrubber = Scrubber::new();
+        let scrubbed = scrubber.scrub("Authorization: Bearer abc123DEF456ghi789");
+        assert!(!scrubbed.contains("abc123DEF456ghi789"), "{scrubbed}");
+        assert!(scrubbed.contains("<AUTH_TOKEN>"), "{scrubbed}");
+    }
+
+    #[test]
+    fn luhn_valid_card_numbers_are_redacted() {
+        let scrubber = Scrubber::new();
+        for card in [
+            "4111111111111111",
+            "4111 1111 1111 1111",
+            "4111-1111-1111-1111",
+            "5500005555555559",
+        ] {
+            let scrubbed = scrubber.scrub(&format!("charged card {card} today"));
+            assert!(!scrubbed.contains(card), "{scrubbed}");
+            assert!(scrubbed.contains(CREDIT_CARD_PLACEHOLDER), "{scrubbed}");
+        }
+    }
+
+    #[test]
+    fn valid_us_ssns_are_redacted() {
+        let scrubber = Scrubber::new();
+        let scrubbed = scrubber.scrub("ssn 123-45-6789 on file");
+        assert!(!scrubbed.contains("123-45-6789"), "{scrubbed}");
+        assert!(scrubbed.contains(SSN_PLACEHOLDER), "{scrubbed}");
+    }
+
+    #[test]
+    fn valid_ibans_are_redacted() {
+        let scrubber = Scrubber::new();
+        for iban in ["GB82WEST12345698765432", "GB82 WEST 1234 5698 7654 32"] {
+            let scrubbed = scrubber.scrub(&format!("account {iban} active"));
+            assert!(!scrubbed.contains(iban), "{scrubbed}");
+            assert!(scrubbed.contains(IBAN_PLACEHOLDER), "{scrubbed}");
+        }
+    }
+
+    // ── Credential families: false positives ─────────────────────────────
+
+    #[test]
+    fn a_jwt_prefix_without_three_segments_survives() {
+        let scrubber = Scrubber::new();
+        let text = "the header eyJhbGciOiJIUzI1NiJ9 alone is not a JWT";
+        assert_eq!(scrubber.scrub(text), text);
+    }
+
+    #[test]
+    fn non_private_pem_headers_survive() {
+        let scrubber = Scrubber::new();
+        let text = "-----BEGIN CERTIFICATE----- is a public certificate";
+        assert_eq!(scrubber.scrub(text), text);
+    }
+
+    #[test]
+    fn short_or_non_akia_aws_lookalikes_survive() {
+        let scrubber = Scrubber::new();
+        for text in ["AKIA1234 is too short", "ASIAIOSFODNN7EXAMPLE is not AKIA"] {
+            assert_eq!(scrubber.scrub(text), text);
+        }
+    }
+
+    #[test]
+    fn short_github_lookalikes_survive() {
+        let scrubber = Scrubber::new();
+        for text in ["ghp_shorttoken", "github_pat_short"] {
+            assert_eq!(scrubber.scrub(text), text);
+        }
+    }
+
+    #[test]
+    fn short_slack_lookalikes_survive() {
+        let scrubber = Scrubber::new();
+        let text = "xoxb-short";
+        assert_eq!(scrubber.scrub(text), text);
+    }
+
+    #[test]
+    fn bearer_prose_survives() {
+        let scrubber = Scrubber::new();
+        let text = "a bearer of good news arrived";
+        assert_eq!(scrubber.scrub(text), text);
+    }
+
+    /// The card detector is checksum- and context-aware: a card-like run inside
+    /// a path, a filename, a URL or a file:line frame is not a payment card.
+    #[test]
+    fn card_like_runs_outside_payment_context_survive() {
+        let scrubber = Scrubber::new();
+        for text in [
+            "/data/4111111111111111/report.json",
+            "card-4111111111111111.txt",
+            "https://example.com/4111111111111111",
+            "src/open.rs:4111111111111111:12",
+        ] {
+            assert_eq!(scrubber.scrub(text), text, "{text}");
+        }
+    }
+
+    #[test]
+    fn numbers_failing_luhn_survive() {
+        let scrubber = Scrubber::new();
+        for text in ["order 1234567890123456 shipped", "id 0000000000000000"] {
+            assert_eq!(scrubber.scrub(text), text, "{text}");
+        }
+    }
+
+    #[test]
+    fn invalid_ssn_ranges_and_paths_survive() {
+        let scrubber = Scrubber::new();
+        for text in [
+            "placeholder 000-00-0000",
+            "reserved 666-12-3456",
+            "unassigned 900-12-3456",
+            "/tmp/123-45-6789.txt",
+        ] {
+            assert_eq!(scrubber.scrub(text), text, "{text}");
+        }
+    }
+
+    #[test]
+    fn ibans_failing_the_checksum_survive() {
+        let scrubber = Scrubber::new();
+        for text in [
+            "not an account GB00WEST12345698765432",
+            "identifier AB12CDEFGHIJKLMNOP",
+        ] {
+            assert_eq!(scrubber.scrub(text), text, "{text}");
+        }
+    }
+
+    /// The new detectors must not disturb diagnostics: paths, URLs, Rust
+    /// symbols, frames and ordinary prose stay readable.
+    #[test]
+    fn diagnostics_survive_the_financial_detectors() {
+        let scrubber = Scrubber::new();
+        let text = "at /home/somebody/project/src/main.rs:123:5 coderex_core::engine::run https://example.com/docs/reference";
+        let scrubbed = scrubber.scrub(text);
+        assert_eq!(scrubbed.replace("/home/<USER>", "/home/somebody"), text);
     }
 }

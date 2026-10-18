@@ -7,14 +7,49 @@
 
 use std::path::PathBuf;
 
-/// Prefix that identifies a strict-mode structured crash summary.
+/// Prefix that identifies a structured crash summary.
 ///
 /// A summary carrying this prefix contains only panic metadata (type, thread,
 /// location) — never the free-form panic payload or backtrace.
 pub(crate) const CRASH_SUMMARY_PREFIX: &str = "[strict-crash-summary]";
 
-/// Payload value written under `redaction_status` for a structured crash.
+/// Payload value written under `redaction_status` when only structured panic
+/// metadata is sent.
 pub(crate) const CRASH_STRUCTURED_MARKER: &str = "structured";
+
+/// Payload value written under `redaction_status` when free-form panic text is
+/// sent after pattern scrubbing.
+///
+/// This deliberately does *not* claim the payload is clean: the scrubber
+/// removes shapes, not meaning.
+pub(crate) const CRASH_PATTERN_MARKER: &str = "pattern";
+
+/// Environment variable that opts a crash report into free-form diagnostics.
+///
+/// Present with any value other than `0`/`false`/`no`/empty includes the panic
+/// message and backtrace, scrubbed and marked `redaction_status: "pattern"`.
+/// [`crate::hipaa_enabled`] (`CODEREX_HIPAA`) always wins: even when this is
+/// set, strict mode sends structured metadata only.
+pub const CRASH_VERBOSE_ENV: &str = "CODEREX_CRASH_VERBOSE";
+
+/// Whether free-form crash diagnostics are requested for this process.
+#[must_use]
+pub fn crash_verbose() -> bool {
+    crash_verbose_with(std::env::var(CRASH_VERBOSE_ENV).ok().as_deref())
+}
+
+/// Pure helper behind [`crash_verbose`]; testable without touching the process
+/// environment.
+#[must_use]
+pub fn crash_verbose_with(value: Option<&str>) -> bool {
+    value.is_some_and(|raw| {
+        let trimmed = raw.trim();
+        !(trimmed.is_empty()
+            || trimmed.eq_ignore_ascii_case("0")
+            || trimmed.eq_ignore_ascii_case("false")
+            || trimmed.eq_ignore_ascii_case("no"))
+    })
+}
 
 /// A captured crash report.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -58,6 +93,12 @@ fn one_line(value: &str, max_chars: usize) -> String {
         .collect()
 }
 
+/// Fold a metadata value to a single line and remove the `;` separator used by
+/// the summary format, so a hostile thread name cannot forge a field.
+fn structured_field(value: &str, max_chars: usize) -> String {
+    one_line(value, max_chars).replace(';', ",")
+}
+
 /// Extract `file:line:column` from the standard panic display prefix
 /// (`panicked at <location>:\n<message>`), without keeping the message.
 fn panic_location_from_text(text: &str) -> Option<String> {
@@ -81,18 +122,21 @@ pub(crate) fn structured_summary(report: &CrashReport) -> String {
     let location = report
         .panic_location
         .as_deref()
-        .map(|value| one_line(value, 200))
-        .or_else(|| panic_location_from_text(&report.panic_info))
+        .map(|value| structured_field(value, 200))
+        .or_else(|| {
+            panic_location_from_text(&report.panic_info)
+                .map(|location| structured_field(&location, 200))
+        })
         .unwrap_or_else(|| "unknown".to_string());
     let thread = report
         .thread_name
         .as_deref()
-        .map(|value| one_line(value, 100))
+        .map(|value| structured_field(value, 100))
         .unwrap_or_else(|| "unknown".to_string());
     let panic_type = report
         .panic_type
         .as_deref()
-        .map(|value| one_line(value, 50))
+        .map(|value| structured_field(value, 50))
         .unwrap_or_else(|| "unknown".to_string());
 
     format!(
@@ -100,20 +144,58 @@ pub(crate) fn structured_summary(report: &CrashReport) -> String {
     )
 }
 
-/// Produce a safe structured summary from whatever is stored in the crash row.
-///
-/// Ingest under strict mode already stores a summary; pass it through. A row
-/// ingested before strict mode was enabled holds free-form text for which the
-/// report metadata is gone, so only the location is recovered and the rest is
-/// marked unavailable. The free-form text itself is never included.
-pub(crate) fn structured_summary_from_stored(stored: &str) -> String {
-    if stored.starts_with(CRASH_SUMMARY_PREFIX) {
-        return stored.to_string();
+/// Structured panic metadata extracted from a stored crash row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CrashMetadata {
+    /// Panic payload type (`&str`, `String`, or `unknown`).
+    pub panic_type: String,
+    /// Name of the panicking thread, or `unknown`.
+    pub thread_name: String,
+    /// Panic source location (`file:line:column`), or `unknown`.
+    pub panic_location: String,
+}
+
+impl CrashMetadata {
+    /// Metadata recovered from a legacy free-form row: only the location is
+    /// present, because the panic type and thread were never stored.
+    fn legacy_from_text(text: &str) -> Self {
+        Self {
+            panic_type: "unknown".to_string(),
+            thread_name: "unknown".to_string(),
+            panic_location: panic_location_from_text(text).unwrap_or_else(|| "unknown".to_string()),
+        }
     }
-    let location = panic_location_from_text(stored).unwrap_or_else(|| "unknown".to_string());
-    format!(
-        "{CRASH_SUMMARY_PREFIX} type=unknown; thread=unknown; location={location}; message=omitted; backtrace=omitted"
-    )
+}
+
+/// Parse the structured metadata out of a stored crash row.
+///
+/// A row written by the structured path carries [`CRASH_SUMMARY_PREFIX`]. A
+/// legacy row ingested before structured capture was the default holds
+/// free-form text, for which only the panic location can be recovered; the
+/// free-form text itself is never returned.
+pub(crate) fn crash_metadata_from_stored(stored: &str) -> CrashMetadata {
+    if !stored.starts_with(CRASH_SUMMARY_PREFIX) {
+        return CrashMetadata::legacy_from_text(stored);
+    }
+
+    static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let re = RE.get_or_init(|| {
+        regex::Regex::new(r"type=([^;]*); thread=([^;]*); location=([^;]*)")
+            .expect("structured crash summary regex is valid")
+    });
+    match re.captures(stored) {
+        Some(caps) => CrashMetadata {
+            panic_type: structured_field(caps.get(1).map_or("", |m| m.as_str()), 50),
+            thread_name: structured_field(caps.get(2).map_or("", |m| m.as_str()), 100),
+            panic_location: structured_field(caps.get(3).map_or("", |m| m.as_str()), 200),
+        },
+        None => CrashMetadata::legacy_from_text(stored),
+    }
+}
+
+/// Whether a stored crash row already holds a structured summary.
+pub(crate) fn is_structured(stored: &str) -> bool {
+    stored.starts_with(CRASH_SUMMARY_PREFIX)
 }
 
 /// Default maximum size for the pending crash directory (50 MB).
@@ -127,17 +209,25 @@ pub struct CrashReporter {
     /// Strict (confidentiality) mode, resolved once at construction from
     /// [`crate::hipaa_enabled`] (`CODEREX_HIPAA`).
     strict: bool,
+    /// Verbose mode, resolved once at construction from
+    /// [`crash_verbose`] (`CODEREX_CRASH_VERBOSE`). Ignored when `strict` is
+    /// set: strict mode always wins.
+    verbose: bool,
 }
 
 impl CrashReporter {
     /// Create a new crash reporter.
     ///
-    /// Strict mode follows the process-wide [`crate::hipaa_enabled`] trigger.
+    /// Structured-only reporting is the default. [`crash_verbose`]
+    /// (`CODEREX_CRASH_VERBOSE`) opts into scrubbed free-form panic text, and
+    /// [`crate::hipaa_enabled`] (`CODEREX_HIPAA`) forces structured-only even
+    /// when verbose is set.
     pub fn new(pending_dir: PathBuf) -> Self {
         Self {
             pending_dir,
             max_pending_bytes: DEFAULT_MAX_PENDING_BYTES,
             strict: crate::hipaa_enabled(),
+            verbose: crash_verbose(),
         }
     }
 
@@ -157,17 +247,37 @@ impl CrashReporter {
         self
     }
 
+    /// Override verbose mode explicitly.
+    ///
+    /// Production callers use [`Self::new`], which resolves
+    /// `CODEREX_CRASH_VERBOSE`. Tests use this so they do not have to mutate
+    /// process-wide environment variables. Strict mode still wins.
+    pub fn with_verbose(mut self, verbose: bool) -> Self {
+        self.verbose = verbose;
+        self
+    }
+
+    /// Whether free-form panic text may be captured at all.
+    ///
+    /// The check happens where the panic payload exists (the hook) and again at
+    /// ingestion, rather than only at upload.
+    fn include_free_form(&self) -> bool {
+        self.verbose && !self.strict
+    }
+
     /// Install a panic hook that records crashes to the pending directory.
     ///
     /// The original panic hook is preserved and called after recording.
     ///
-    /// In strict mode the free-form panic payload and backtrace are never
-    /// written to the pending file: only panic type, thread and location are
-    /// recorded. This is the one place where the raw payload exists, so it is
-    /// also the earliest place to drop it.
+    /// By default the free-form panic payload and backtrace are never written
+    /// to the pending file: only panic type, thread and location are recorded.
+    /// This is the one place where the raw payload exists, so it is also the
+    /// earliest place to drop it. Only `CODEREX_CRASH_VERBOSE` (without strict
+    /// mode) captures the message and backtrace, and those are still scrubbed
+    /// before they are stored or sent.
     pub fn install_hook(&self) {
         let pending_dir = self.pending_dir.clone();
-        let strict = self.strict;
+        let include_free_form = self.include_free_form();
         let default_hook = std::panic::take_hook();
 
         std::panic::set_hook(Box::new(move |info| {
@@ -189,18 +299,18 @@ impl CrashReporter {
             let thread_name = std::thread::current().name().map(str::to_string);
 
             let mut report = CrashReport {
-                panic_info: format!("{info}"),
-                backtrace: if strict {
-                    None
-                } else {
-                    Some(format!("{:?}", std::backtrace::Backtrace::force_capture()))
-                },
+                panic_info: String::new(),
+                backtrace: None,
                 timestamp: chrono::Utc::now(),
                 panic_location,
                 thread_name,
                 panic_type: Some(panic_type.to_string()),
             };
-            if strict {
+            if include_free_form {
+                report.panic_info = format!("{info}");
+                report.backtrace =
+                    Some(format!("{:?}", std::backtrace::Backtrace::force_capture()));
+            } else {
                 report.panic_info = structured_summary(&report);
             }
 
@@ -227,15 +337,16 @@ impl CrashReporter {
     ) -> Result<usize, crate::TelemetryError> {
         self.enforce_size_limit();
 
-        // The same scrubber the event path uses, applied here too: a panic
-        // message is `format!("{info}")` of whatever the panic carried, and a
-        // backtrace is a list of paths. Both leave the machine — the store is
-        // uploaded from — so both are scrubbed before they are stored.
+        // The same scrubber the event path uses, applied here too: when
+        // verbose mode allows free-form text through, a panic message is
+        // whatever the panic carried and a backtrace is a list of paths. Both
+        // leave the machine — the store is uploaded from — so both are scrubbed
+        // before they are stored.
         //
         // Scrubbing removes patterns, not meaning: ordinary conversation text
-        // inside a panic message survives it. Strict mode therefore does not
-        // rely on the scrubber for crash text at all — it stores a structured
-        // summary and no backtrace.
+        // inside a panic message survives it. That is why the default (and
+        // strict) paths do not use free-form text at all: they store a
+        // structured summary and no backtrace.
         let scrubber = crate::Scrubber::new();
 
         let mut count = 0;
@@ -253,21 +364,34 @@ impl CrashReporter {
             match std::fs::read_to_string(&path) {
                 Ok(content) => {
                     if let Ok(report) = serde_json::from_str::<CrashReport>(&content) {
-                        let (panic_info, backtrace) = if self.strict {
-                            // Never store free-form panic text in strict mode.
-                            // The payload is structured and explicitly marked;
-                            // the message and backtrace are omitted. The
-                            // metadata-only summary still goes through the
-                            // scrubber as defence in depth.
-                            (scrubber.scrub(&structured_summary(&report)), None)
+                        let (panic_info, backtrace) = if self.include_free_form() {
+                            // Verbose (and not strict): free-form text is
+                            // allowed, but only after pattern scrubbing. A
+                            // pending file already written in structured form
+                            // has no free-form text to recover.
+                            if is_structured(&report.panic_info) {
+                                (scrubber.scrub(&report.panic_info), None)
+                            } else {
+                                (
+                                    scrubber.scrub(&report.panic_info),
+                                    report
+                                        .backtrace
+                                        .as_deref()
+                                        .map(|backtrace| scrubber.scrub(backtrace)),
+                                )
+                            }
                         } else {
-                            (
-                                scrubber.scrub(&report.panic_info),
-                                report
-                                    .backtrace
-                                    .as_deref()
-                                    .map(|backtrace| scrubber.scrub(backtrace)),
-                            )
+                            // Default and strict: never store free-form panic
+                            // text or a backtrace. A legacy row with raw text is
+                            // reduced to its panic location; the message is
+                            // dropped. The metadata-only summary still goes
+                            // through the scrubber as defence in depth.
+                            let summary = if is_structured(&report.panic_info) {
+                                report.panic_info.clone()
+                            } else {
+                                structured_summary(&report)
+                            };
+                            (scrubber.scrub(&summary), None)
                         };
                         if store
                             .insert_crash(&panic_info, backtrace.as_deref())
@@ -349,7 +473,12 @@ mod tests {
         std::env::temp_dir().join(format!("coderex_crash_{}_{}", std::process::id(), name))
     }
 
-    fn ingest_one(name: &str, report: &CrashReport, strict: bool) -> (String, Option<String>) {
+    fn ingest_one(
+        name: &str,
+        report: &CrashReport,
+        strict: bool,
+        verbose: bool,
+    ) -> (String, Option<String>) {
         let dir = crash_dir(name);
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
@@ -359,7 +488,33 @@ mod tests {
         )
         .unwrap();
 
-        let reporter = CrashReporter::new(dir.clone()).with_strict(strict);
+        let reporter = CrashReporter::new(dir.clone())
+            .with_strict(strict)
+            .with_verbose(verbose);
+        let store = crate::TelemetryStore::open(&dir.join("telemetry.db")).unwrap();
+        assert_eq!(reporter.ingest_pending(&store).unwrap(), 1);
+
+        let crashes = store.pending_crashes(10).unwrap();
+        assert_eq!(crashes.len(), 1);
+        let result = (crashes[0].panic_info.clone(), crashes[0].backtrace.clone());
+        let _ = std::fs::remove_dir_all(&dir);
+        result
+    }
+
+    fn ingest_raw(
+        name: &str,
+        raw: serde_json::Value,
+        strict: bool,
+        verbose: bool,
+    ) -> (String, Option<String>) {
+        let dir = crash_dir(name);
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("crash_1.json"), raw.to_string()).unwrap();
+
+        let reporter = CrashReporter::new(dir.clone())
+            .with_strict(strict)
+            .with_verbose(verbose);
         let store = crate::TelemetryStore::open(&dir.join("telemetry.db")).unwrap();
         assert_eq!(reporter.ingest_pending(&store).unwrap(), 1);
 
@@ -381,32 +536,34 @@ mod tests {
         }
     }
 
-    /// A crash message and its backtrace leave the machine, so they go through
-    /// the same scrubber the event path uses. They used to be stored — and
-    /// uploaded — exactly as the panic produced them.
+    /// The default is structured-only: even a report that was handed a
+    /// free-form message and a backtrace is reduced to metadata, and the
+    /// message and backtrace never reach the store.
     #[test]
-    fn an_ingested_crash_is_scrubbed() {
+    fn default_ingestion_stores_only_structured_metadata() {
         let report = report_with(
             "failed for user@example.com from 10.0.0.7 at /Users/somebody/project",
             Some("at /home/somebody/project/src/main.rs:12"),
         );
-        let (panic_info, backtrace) = ingest_one("scrubbed", &report, false);
-        let stored = format!("{}\n{}", panic_info, backtrace.unwrap_or_default());
-        assert!(!stored.contains("user@example.com"), "{stored}");
-        assert!(!stored.contains("10.0.0.7"), "{stored}");
-        assert!(!stored.contains("somebody"), "{stored}");
+        let (panic_info, backtrace) = ingest_one("structured_default", &report, false, false);
+        assert!(backtrace.is_none(), "the default must omit the backtrace");
+        assert!(panic_info.starts_with(CRASH_SUMMARY_PREFIX), "{panic_info}");
+        assert!(panic_info.contains("message=omitted"), "{panic_info}");
+        assert!(!panic_info.contains("user@example.com"), "{panic_info}");
+        assert!(!panic_info.contains("10.0.0.7"), "{panic_info}");
+        assert!(!panic_info.contains("somebody"), "{panic_info}");
     }
 
-    /// Non-strict mode keeps diagnostics but runs the high-entropy detector:
-    /// the secret goes, the prose stays. That residual prose is the honest
-    /// limitation — patterns, not meaning.
+    /// Verbose mode keeps diagnostics but runs the scanners: secrets go, the
+    /// prose stays. That residual prose is the honest limitation — patterns,
+    /// not meaning.
     #[test]
-    fn non_strict_mode_redacts_secrets_but_keeps_prose() {
+    fn verbose_mode_redacts_secrets_but_keeps_prose() {
         let report = report_with(
             "panicked at src/main.rs:10:5:\nuser said: here is the key A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6 and mail bob@example.com",
             None,
         );
-        let (panic_info, _) = ingest_one("non_strict", &report, false);
+        let (panic_info, _) = ingest_one("verbose_prose", &report, false, true);
         assert!(
             !panic_info.contains("A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6"),
             "{panic_info}"
@@ -415,19 +572,18 @@ mod tests {
         assert!(panic_info.contains("<SECRET>"), "{panic_info}");
         assert!(panic_info.contains("<EMAIL>"), "{panic_info}");
         // The detector has no semantic understanding: ordinary conversation
-        // text is not removed outside strict mode.
+        // text is not removed in verbose mode.
         assert!(panic_info.contains("user said"), "{panic_info}");
     }
 
     /// An ordinary backtrace is diagnostics, not a secret: paths, frames and
-    /// Rust symbols survive non-strict scrubbing (only the home user is
-    /// redacted, as before).
+    /// Rust symbols survive verbose scrubbing (only the home user is redacted).
     #[test]
-    fn non_strict_backtrace_keeps_paths_and_symbols() {
+    fn verbose_backtrace_keeps_paths_and_symbols() {
         let backtrace = "std::panicking::begin_panic_handler\n    at /rustc/abcdef0123456789abcdef0123456789/library/std/src/panicking.rs:123:5\ncoderex_core::engine::QueryEngine::submit\n    at /home/somebody/project/crates/core/src/engine.rs:42:9\nat file.rs:12:9";
         let report = report_with("panicked at src/main.rs:1:1:\nboom", Some(backtrace));
-        let (_, stored) = ingest_one("backtrace", &report, false);
-        let stored = stored.expect("non-strict mode keeps the backtrace");
+        let (_, stored) = ingest_one("verbose_backtrace", &report, false, true);
+        let stored = stored.expect("verbose mode keeps the backtrace");
         for expected in [
             "std::panicking::begin_panic_handler",
             "/rustc/abcdef0123456789abcdef0123456789/library/std/src/panicking.rs:123:5",
@@ -441,6 +597,34 @@ mod tests {
             );
         }
         assert!(!stored.contains("/home/somebody"), "{stored}");
+    }
+
+    /// `CODEREX_HIPAA` always wins over verbose: even with free-form capture
+    /// enabled, strict ingestion stores a structured summary and no backtrace.
+    #[test]
+    fn strict_wins_over_verbose() {
+        let report = report_with(
+            "panicked at src/main.rs:10:5:\nuser said something private",
+            Some("at /home/somebody/project/src/main.rs:10:5"),
+        );
+        let (panic_info, backtrace) = ingest_one("strict_over_verbose", &report, true, true);
+        assert!(backtrace.is_none(), "{backtrace:?}");
+        assert!(panic_info.starts_with(CRASH_SUMMARY_PREFIX), "{panic_info}");
+        assert!(panic_info.contains("message=omitted"), "{panic_info}");
+        assert!(!panic_info.contains("user said"), "{panic_info}");
+    }
+
+    #[test]
+    fn verbose_env_values_parse() {
+        assert!(crash_verbose_with(Some("1")));
+        assert!(crash_verbose_with(Some("true")));
+        assert!(crash_verbose_with(Some("YES")));
+        assert!(!crash_verbose_with(Some("0")));
+        assert!(!crash_verbose_with(Some("false")));
+        assert!(!crash_verbose_with(Some("no")));
+        assert!(!crash_verbose_with(Some("")));
+        assert!(!crash_verbose_with(None));
+        assert_eq!(CRASH_VERBOSE_ENV, "CODEREX_CRASH_VERBOSE");
     }
 
     /// Strict mode never stores free-form panic text or a backtrace. The panic
@@ -457,7 +641,7 @@ mod tests {
             thread_name: Some("main".into()),
             panic_type: Some("&str".into()),
         };
-        let (panic_info, backtrace) = ingest_one("strict", &report, true);
+        let (panic_info, backtrace) = ingest_one("strict", &report, true, false);
 
         assert!(backtrace.is_none(), "strict mode must omit the backtrace");
         assert!(panic_info.starts_with(CRASH_SUMMARY_PREFIX), "{panic_info}");
@@ -479,32 +663,72 @@ mod tests {
         }
     }
 
-    /// A legacy pending file written before strict mode was enabled has no
-    /// metadata fields and unscrubbed text. Strict ingestion recovers only the
-    /// location and drops everything else.
-    #[test]
-    fn strict_mode_handles_legacy_free_form_pending_file() {
-        let legacy = serde_json::json!({
+    fn legacy_raw_report() -> serde_json::Value {
+        serde_json::json!({
             "panic_info": "panicked at src/old.rs:7:2:\nuser said something private",
             "backtrace": "at /home/somebody/secret.rs:7:2",
             "timestamp": "2026-01-01T00:00:00Z"
-        });
-        let dir = crash_dir("legacy");
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("crash_1.json"), legacy.to_string()).unwrap();
+        })
+    }
 
-        let reporter = CrashReporter::new(dir.clone()).with_strict(true);
-        let store = crate::TelemetryStore::open(&dir.join("telemetry.db")).unwrap();
-        assert_eq!(reporter.ingest_pending(&store).unwrap(), 1);
-        let crashes = store.pending_crashes(10).unwrap();
-        let stored = &crashes[0].panic_info;
+    /// A legacy pending file has no metadata fields and unscrubbed text. The
+    /// default ingestion recovers only the location and drops everything else.
+    #[test]
+    fn default_mode_reduces_legacy_free_form_pending_file() {
+        let (stored, backtrace) = ingest_raw("legacy_default", legacy_raw_report(), false, false);
+        assert!(stored.starts_with(CRASH_SUMMARY_PREFIX), "{stored}");
+        assert!(stored.contains("location=src/old.rs:7:2"), "{stored}");
+        assert!(stored.contains("message=omitted"), "{stored}");
+        assert!(!stored.contains("user said"), "{stored}");
+        assert!(backtrace.is_none());
+    }
+
+    /// Strict mode behaves the same way for a legacy file, even with verbose
+    /// enabled.
+    #[test]
+    fn strict_mode_handles_legacy_free_form_pending_file() {
+        let (stored, backtrace) = ingest_raw("legacy_strict", legacy_raw_report(), true, true);
         assert!(stored.starts_with(CRASH_SUMMARY_PREFIX), "{stored}");
         assert!(stored.contains("location=src/old.rs:7:2"), "{stored}");
         assert!(!stored.contains("user said"), "{stored}");
-        assert!(crashes[0].backtrace.is_none());
+        assert!(backtrace.is_none());
+    }
 
-        let _ = std::fs::remove_dir_all(&dir);
+    /// Verbose mode is the only path that keeps a legacy file's free-form text,
+    /// and it scrubs it first.
+    #[test]
+    fn verbose_mode_ingests_legacy_text_after_scrubbing() {
+        let raw = serde_json::json!({
+            "panic_info": "panicked at src/old.rs:7:2:\nuser said mail bob@example.com",
+            "backtrace": "at /home/somebody/secret.rs:7:2",
+            "timestamp": "2026-01-01T00:00:00Z"
+        });
+        let (stored, backtrace) = ingest_raw("legacy_verbose", raw, false, true);
+        assert!(stored.contains("user said"), "{stored}");
+        assert!(!stored.contains("bob@example.com"), "{stored}");
+        assert!(stored.contains("<EMAIL>"), "{stored}");
+        let backtrace = backtrace.expect("verbose keeps the backtrace");
+        assert!(!backtrace.contains("/home/somebody"), "{backtrace}");
+    }
+
+    /// A summary written by the default hook survives a later verbose
+    /// ingestion unchanged: there is no free-form text to recover.
+    #[test]
+    fn verbose_ingestion_passes_through_a_structured_pending_file() {
+        let report = CrashReport {
+            panic_info: format!(
+                "{CRASH_SUMMARY_PREFIX} type=&str; thread=main; location=src/main.rs:1:1; message=omitted; backtrace=omitted"
+            ),
+            backtrace: None,
+            timestamp: chrono::Utc::now(),
+            panic_location: Some("src/main.rs:1:1".into()),
+            thread_name: Some("main".into()),
+            panic_type: Some("&str".into()),
+        };
+        let (stored, backtrace) = ingest_one("structured_verbose", &report, false, true);
+        assert!(stored.starts_with(CRASH_SUMMARY_PREFIX), "{stored}");
+        assert!(stored.contains("location=src/main.rs:1:1"), "{stored}");
+        assert!(backtrace.is_none());
     }
 
     #[test]
