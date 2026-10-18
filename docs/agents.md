@@ -41,10 +41,10 @@ Sub-agent system for spawning autonomous worker agents, dream agents (background
 │  └────────────────────────────────────────────────────────────┘  │
 │                                                                  │
 │  Helper Functions:                                               │
-│   • execute_via_agent()       — short-lived command execution    │
-│   • spawn_dream_agent()       — read-only background analysis    │
 │   • run_forked_agent()        — delegate to core orchestrator    │
 │   • run_background_feature()  — background AI feature via core   │
+│                                                                  │
+│  (execute_via_agent/spawn_dream_agent were removed: no caller.)  │
 └──────────────────────────────────────────────────────────────────┘
 ```
 
@@ -81,7 +81,9 @@ Sub-agent system for spawning autonomous worker agents, dream agents (background
   - `allowed_tools` — tool whitelist
   - `isolation` — worktree isolation mode
   - `cwd` — working directory
-  - `extra_env` — injected environment variables
+  - `extra_env` — **refused when non-empty.** Sub-agents run in-process, so there is no
+    child environment to inject; the only substitute (`std::env::set_var`) would leak into
+    the parent. The spawn returns a hard configuration error naming the keys.
   - `writable` — false enforces read-only tool enforcement
   - `max_tokens` / `max_duration_seconds` / `max_turns` — resource limits
   - `output_schema` — JSON schema for output validation
@@ -109,8 +111,10 @@ Sub-agent system for spawning autonomous worker agents, dream agents (background
 
 #### Helper Functions
 
-- **`execute_via_agent()`** — Spawn a short-lived agent with a command as prompt, wait for completion, return output.
-- **`spawn_dream_agent()`** — Spawn a read-only background agent (Read/Glob/Grep whitelist) to analyze sessions and produce summaries.
+- **`run_forked_agent()`** — Delegation helper on the core orchestrator. It is implemented and tested but has no production caller; the product path for delegation is the `Agent` tool.
+- **`run_background_feature()`** — Background AI feature execution through the core orchestrator.
+
+`execute_via_agent()` and `spawn_dream_agent()` were removed as dead APIs: nothing called them, and the background/dream paths go through `run_background_feature`.
 
 ## Architecture Patterns
 
@@ -133,9 +137,19 @@ Sub-agent system for spawning autonomous worker agents, dream agents (background
 - **Lifecycle producers** — `run_agent_task()` emits `AgentLifecycleEvent::Started`, `TextDelta` for each streamed text delta, `ToolCall { name, args }` for each tool invocation (the engine exposes the call summary, so `args` currently carries `{"summary": ...}` rather than the parsed arguments), `Idle { reason: "turn complete" }` after the event stream drains, and finally `Completed` or `Failed`. They travel as `EngineEvent::AgentEvent`, which the TUI already renders.
 - **External subscriptions** — `subscribe_to_agent(id)` returns an `AgentSubscription`, a wrapper over the manager-wide `tokio::sync::broadcast` channel that yields only events tagged with that agent id; `subscribe_all()` (and the `"all"` alias) keeps the unfiltered view. The REPL creates an unfiltered subscription in `with_engine` and drains it on the TUI tick and in headless event draining (debug logs); the UI itself uses `EngineEvent::AgentEvent`, so the broadcast is the external-observer surface, not a second rendering path. `register_agent()` was removed: there is no transport for an externally managed agent in CodeRex (sub-agents are in-process `tokio` tasks), so it could only ever record a dangling id.
 
+## Permission inheritance
+
+A sub-agent inherits the parent's **permission mode only**. The child builds a fresh
+`PermissionChecker` with that mode; the parent's rules, hooks, and rule exemptions are
+not carried over. The background-denial hook is added to every child, and only a child
+spawned with `run_in_background` carries an `agent_id` (so the hook is a no-op for
+foreground agents).
+
 ## Current Status
 
-All features are implemented. No known stubs.
+All wired features are implemented. No known stubs. Two documented boundaries remain:
+`run_forked_agent` has no production caller, and `extra_env` is rejected rather than
+silently ignored.
 
 ### What Works
 
@@ -143,8 +157,6 @@ All features are implemented. No known stubs.
 - **Custom agent loading** — Scans `~/.coderex/agents/*.json` on manager creation; merged options override spawn defaults.
 - **AgentManager** — Full lifecycle: spawn (built-in or named custom), send_message, complete, stop, list, running_count.
 - **Real engine execution** — `spawn_agent()` creates a `tokio::spawn` task running `run_agent_task()` with a full `QueryEngine`.
-- **`execute_via_agent()`** — Short-lived agent execution for command-style tasks.
-- **`spawn_dream_agent()`** — Read-only background analysis agent with Read/Glob/Grep whitelist.
 - **Context forking** — `ForkedContext` with session ID, cwd, message count, tool whitelist, environment snapshot, and — for cache-aware forks — the parent conversation prefix, fork point and cache-safe params.
 - **Messaging** — `send_message()` via `mpsc::UnboundedChannel`; messages drained and appended to prompt before each engine submission.
 - **Resource limits** — `max_tokens`, `max_duration_seconds`, `max_turns` enforced per attempt.

@@ -88,8 +88,22 @@ Without the prefix a shared raw name cannot address both servers, so the second 
 
 ## Gaps for Production
 
-- **MCP tool schema in prompts**: Discovered MCP tools are registered but not yet formatted into the system prompt sent to the LLM. The engine needs to serialize `McpToolInfo` into the tool definitions section of prompts.
-- **Resource read via cache**: The cache infrastructure exists but `resources/read` is not yet called through it. A full `read_resource(uri)` method that checks cache, falls back to server, and stores result is needed for complete integration.
+- **MCP tool schemas**: Discovered tools are registered into the same `ToolRegistry` as
+  built-ins (`register_tools_into`), so the engine's tool listing carries their descriptors
+  and input schemas. They are not copied into a separate system-prompt table — the registry
+  listing is the single source.
+- **Resource reads**: implemented. `McpManager::read_resource` /
+  `read_resource_any` issue `resources/read`, parse `contents[]` (text or base64 blob),
+  cache the result, and the CLI's `ReadMcpResource` tool calls them. `resources/updated`
+  still invalidates rather than eagerly re-reading.
+- **Servers from settings**: `mcp_servers` (also accepted as `mcpServers`) is parsed into
+  the same `McpConfig` shape as `.mcp.json`; settings are loaded first and the project
+  file can override a same-named server. Only explicit `.mcp.json`/`--mcp-config` was
+  loaded before.
+- **`coderex mcp add` is stdio-only**: it splits a command string and has no
+  `--url`/`--transport`/`--header` flags. Remote HTTP/SSE servers must be written into
+  `.mcp.json` by hand; `mcp list` prints only command/args, so a URL-based server appears
+  as a blank entry.
 
 ### IDE tool whitelist
 

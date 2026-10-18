@@ -23,10 +23,13 @@ This crate is the **external protocol**: out-of-process clients (IDEs, web/mobil
 
 - **WebSocket per client** — Each connection gets a dedicated session with auth, rate limiting, and message routing.
 - **Structured JSON protocol** — Request/response with correlation IDs, typed events, and streaming support.
-- **Session persistence** — SQLite storage with restore on server restart.
+- **Session persistence** — SQLite storage with restore on server restart. `coderex serve` persists to `config_home()/server-sessions.db` by default; `CODEREX_SERVER_PERSIST_PATH` selects another file and `CODEREX_SERVER_NO_PERSIST=1` disables it. A failure to open the store is non-fatal (the server warns and runs in memory).
 - **Command filtering** — Safety levels restrict available commands/tools.
 - **Health endpoint** — Optional HTTP `/health` on a separate port.
 
 ## Current Status
 
-The `coderex-server` crate is fully implemented with no stubs or gaps for production.
+The `coderex-server` crate has no stubs. Served engines now receive the resolved permission
+mode and the classifier/explanation/background-deny hooks plus rule exemptions, and session
+persistence is reachable from `coderex serve`. Remaining boundary: Windows runtime behaviour
+is not verified on this host.

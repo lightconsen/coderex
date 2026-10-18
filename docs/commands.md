@@ -17,7 +17,7 @@ Implements the `/` slash command system that users type in the REPL. Provides a 
 - **`CommandHistory`** (`history.rs`) — Ring buffer (max 1000) with JSONL file persistence (`~/.coderex/command_history.jsonl`). Tracks `{cmd, args, timestamp}` per entry. Supports `append`, `list(n)`, `search(query)`.
 - **`MacroRegistry`** (`macro_commands.rs`) — User-defined command sequences as `HashMap<String, Vec<String>>` with JSON persistence (`~/.coderex/macros.json`). Supports `define`, `delete`, `get`, `list`, `load`.
 
-### Command Inventory (~75 commands across 15 modules)
+### Command Inventory (77 commands across 13 registered modules)
 
 | Module | Commands | Purpose |
 |--------|----------|---------|
@@ -33,8 +33,8 @@ Implements the `/` slash command system that users type in the REPL. Provides a 
 | `git_commands` | `/commit`, `/commit-push-pr`, `/review`, `/security-review`, `/autofix-pr`, `/branch` | Git & code review |
 | `debug_commands` | `/debug-tool-call`, `/heapdump`, `/mock-limits`, `/perf-issue`, `/ant-trace`, `/break-cache`, `/reload-plugins` | Debugging tools |
 | `advanced_commands` | `/bridge`, `/bridge-kick`, `/teleport`, `/ultraplan`, `/insights`, `/thinkback`, `/thinkback-play`, `/statusline` | Advanced/feature-gated |
-| `misc_commands` | `/advisor`, `/btw`, `/good-claude`, `/stickers`, `/bughunter`, `/issue`, `/env`, `/diff`, `/oauth-refresh`, `/backfill-sessions`, `/history` | Miscellaneous |
-| `macro_commands` | `/macro define|run|list|delete` | User-defined command macros |
+| `misc_commands` | `/advisor`, `/btw`, `/good-claude`, `/stickers`, `/bughunter`, `/issue`, `/env`, `/diff`, `/oauth-refresh`, `/backfill-sessions`, `/history` | Miscellaneous. `/history` is currently a placeholder (see gaps). |
+| `macro_commands` | *(none registered)* | `MacroRegistry` loads/expands macros, but no `/macro` command is registered and `define()` has no production caller. Hand-edited `~/.coderex/macros.json` still expands. |
 
 ### Architecture Patterns
 
@@ -63,24 +63,30 @@ Implements the `/` slash command system that users type in the REPL. Provides a 
 - `/status` and `/doctor` show comprehensive system health (API key, MCP, git, model, feature flags).
 - `/memory` reads and searches long-term memory entries.
 - `/hooks`, `/mcp`, `/plugin`, `/skills`, `/tasks` list and manage subsystem state.
-- Feature-gated commands (`/teleport`, `/ultraplan`, `/thinkback`, `/voice`) check `CommandContext.feature_flags`.
+- Feature-gated commands (`/ultraplan`, `/thinkback`, `/thinkback-play`, `/voice`, `/ctx_viz`, `/heapdump`, `/mock-limits`, `/stickers`) check `CommandContext.feature_flags`, which the REPL now fills from the resolved `FeatureFlags` (env + `--betas`).
 - `/bridge` and `/bridge-kick` check `CODEREX_BRIDGE_URL` env var.
 - `/insights` aggregates project file counts, git info, and session token usage.
 - Command chaining via `|` operator (e.g., `/diff | /commit`) passes output between commands.
-- User-defined macros via `/macro define|run|list|delete` with JSON persistence.
-- Command history via `/history [n]` and `/history search <query>` with ring buffer + file persistence.
+- Command history is recorded and persisted (`CommandHistory`), but `/history` does not read it yet.
+- Macros from `~/.coderex/macros.json` expand before registry dispatch; there is no `/macro` command to define them from inside the REPL.
 - All commands have basic error handling with usage messages.
 
 ### Feature-Gated Commands
 
 Several commands require feature flags to be enabled in `CommandContext`:
-- `/teleport` — needs `teleport` flag
-- `/ultraplan` — needs `ultraplan` flag
-- `/thinkback` / `/thinkback-play` — needs `thinkback` flag
-- `/voice` — needs `voice_mode` flag
+- `/ultraplan` — needs `ultraplan`
+- `/thinkback` / `/thinkback-play` — needs `thinkback`
+- `/voice` — needs `voice_mode`
+- `/ctx_viz` — needs `ctx_viz`
+- `/heapdump` — needs `heapdump`
+- `/mock-limits` — needs `mock_limits`
+- `/stickers` — needs `stickers`
 
-These return an error message when the feature is not enabled.
+These return an error message when the feature is not enabled. The flag names are accepted by `CODEREX_FEATURE_FLAGS` and `--betas`.
 
-## Remaining Gaps and Suggestions
+## Remaining Gaps
 
-No known gaps. The command system is fully implemented with ~75 commands across 15 modules, including command history, argument validation, destructive confirmation, user-defined macros, scrollable output, and command piping.
+- **`/macro` is not registered.** `MacroRegistry` supports define/delete/get/list/load and expansion runs in both REPL paths, but `define()` has no production caller, so users must edit `macros.json` by hand.
+- **`/history` is a placeholder.** Command history is persisted, but the handler prints "No command history available." / "Use /history in the REPL for full history." rather than querying it.
+- **`CommandArgs` validation has no production declarers.** The enum and the pre-dispatch check are live, but no shipped command calls `.with_args(...)`; `/btw` and `/history` do ad-hoc checks instead.
+- **Remote/bridge availability filtering is only used by the server.** The local TUI does not consult the availability matrix.

@@ -75,7 +75,7 @@ main() → parse_args() → StartupOrchestrator::run()
 | `--fork-session ID` | | Fork a session from an existing session ID (loads transcript messages) |
 | `--from-pr URL` | | Fetch a PR with `gh` and prepend its context to the initial prompt (see below) |
 | `--no-session-persistence` | | Disable session transcript saving (clears memory stores) |
-| `--disable-slash-commands` | | Disable slash commands in the REPL (clears `CommandRegistry`) |
+| `--disable-slash-commands` | | Disable slash commands in the REPL: clears `CommandRegistry`, skips the REPL's built-in command branches in both interactive and headless paths, and stops macro expansion |
 | `--max-budget-usd USD` | | Maximum budget for this session |
 | `--api-key KEY` | | API key (overrides environment and config) |
 | `--no-telemetry` | | Disable telemetry for this session |
@@ -86,7 +86,7 @@ main() → parse_args() → StartupOrchestrator::run()
 | `--settings PATH` | | Settings file path (overrides default) |
 | `--setting-sources` | | Show where each setting value comes from |
 | `--input-format FORMAT` | | Input format: `text` (default) or `json` (parses `{"prompt":"..."}`) |
-| `--output-format FORMAT` | | Output format: `text` (default), `json`, `markdown` |
+| `--output-format FORMAT` | | Output format: `text` (default), `json`, `markdown`, `stream-json` (one protocol frame per line) |
 | `--json-schema SCHEMA` | | JSON schema for structured output (passed to `SubmitOptions`) |
 | `--replay-user-messages` | | Replay user messages from most recent session transcript |
 | `--include-partial-messages` | | Include partial assistant messages in context |
@@ -247,7 +247,7 @@ server and the configuration source. `--ide` is never a silent no-op.
 CLI flags are parsed by clap, stored in `SessionContext` during `StartupOrchestrator::run()`, and applied to the `ReplLoop` via `configure_repl()`. The `ReplLoop::apply_cli_config()` method performs the actual side effects:
 
 1. **Permission mode** — `--dangerously-skip-permissions` sets `PermissionMode::BypassPermissions` on the engine's `PermissionChecker`.
-2. **Slash commands** — `--disable-slash-commands` calls `CommandRegistry::clear()`.
+2. **Slash commands** — `--disable-slash-commands` calls `CommandRegistry::clear()`; the REPL additionally gates its built-in command branches and macro expansion on the same flag in both the TUI and headless paths.
 3. **Chrome** — `--no-chrome` calls `RegistryToolDispatcher::clear_chrome_client()`.
 4. **Session name** — `--name` sets `SessionState.title` on the engine.
 5. **Worktree** — `--worktree` detects the current git branch and sets `WorktreeState`.

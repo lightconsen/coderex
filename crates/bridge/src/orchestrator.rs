@@ -613,16 +613,16 @@ impl Bridge {
             // `approval` is accepted as an alias so a gateway that spells the
             // answer that way still reaches the same router and gate.
             PERMISSION_RESPONSE_TYPE | "approval" => {
-                let response: PermissionResponseFrame =
-                    match serde_json::from_str(&message.payload) {
-                        Ok(response) => response,
-                        Err(e) => {
-                            return Some(transport_error(
-                                &message,
-                                &format!("permission_response body: {e}"),
-                            ));
-                        }
-                    };
+                let response: PermissionResponseFrame = match serde_json::from_str(&message.payload)
+                {
+                    Ok(response) => response,
+                    Err(e) => {
+                        return Some(transport_error(
+                            &message,
+                            &format!("permission_response body: {e}"),
+                        ));
+                    }
+                };
                 let (request_id, response) = response.into_response();
                 let resolved = self.respond_to_permission(&request_id, response);
                 Some(transport_reply(
@@ -999,13 +999,13 @@ impl Bridge {
     /// Create a pending permission request and queue the frame that tells the
     /// gateway about it.
     ///
-    /// Producer gap: nothing on the production path calls this yet. The child
-    /// is started headless with `stream-json` output, and that protocol has no
-    /// permission-request frame, so `read_stdout` in `bridge_launcher` cannot
-    /// turn one into a request. When the child protocol grows such a frame,
-    /// parsing it there and calling this method is the missing half; the
-    /// response half (an inbound `permission_response` reaching the router and
-    /// the relay gate) is implemented here.
+    /// The production caller is `bridge_launcher`: the child is started
+    /// headless with `stream-json` and a positional prompt, `read_stdout`
+    /// turns its `control_request` frame into this call, and an inbound
+    /// `permission_response` is written back to the child's stdin. The
+    /// remaining gap is outside this repository: the gateway must forward
+    /// `permission_request`/`permission_response` between the bridge and the
+    /// remote host.
     pub fn request_permission(&mut self, session_id: &str, tool: &str, args: &str) -> String {
         let request_id = self.permission_router.create_request(
             session_id.to_string(),
@@ -1324,10 +1324,10 @@ mod tests {
         assert_eq!(payload["tool"], "Bash");
 
         // The answer arrives under the same id and reaches the router.
-        assert!(bridge.respond_to_permission(
-            "child-req-7",
-            PermissionResponse::Allow { always: false }
-        ));
+        assert!(
+            bridge
+                .respond_to_permission("child-req-7", PermissionResponse::Allow { always: false })
+        );
         assert!(matches!(
             bridge.get_permission_response("child-req-7"),
             Some(PermissionResponse::Allow { always: false })
@@ -1891,9 +1891,8 @@ mod tests {
         connects: usize,
         fail_connect: bool,
         sent: Vec<TransportMessage>,
-        script: std::collections::VecDeque<
-            Result<TransportMessage, crate::transport::TransportError>,
-        >,
+        script:
+            std::collections::VecDeque<Result<TransportMessage, crate::transport::TransportError>>,
     }
 
     /// A transport whose receive results are scripted, so a dropped socket can
@@ -1943,9 +1942,7 @@ mod tests {
             Ok(())
         }
 
-        async fn receive(
-            &mut self,
-        ) -> Result<TransportMessage, crate::transport::TransportError> {
+        async fn receive(&mut self) -> Result<TransportMessage, crate::transport::TransportError> {
             // Drop the guard before awaiting: the worker's future must be Send.
             let next = self.state.lock().unwrap().script.pop_front();
             match next {
