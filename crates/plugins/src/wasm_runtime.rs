@@ -12,6 +12,17 @@
 //!
 //! All pointer returns point to a null-terminated UTF-8 JSON string in guest
 //! memory. The host reads the string, then deallocates it.
+//!
+//! The host also provides one optional import:
+//! - `coderex.user_config(ptr: i32, capacity: i32) -> i32` — copy the resolved
+//!   `userConfig` options, as a JSON object, into guest memory. It returns the
+//!   full JSON length (call with `ptr = 0, capacity = 0` to query it), so a
+//!   guest can detect truncation when the return value is greater than the
+//!   capacity it passed. See [`PluginWasmInstance::new_with_options`] and
+//!   `docs/plugins.md`.
+//!
+//! A module that imports nothing is still instantiated with an empty import
+//! set; linking the one host function does not require any module to use it.
 
 // The compile subprocess needs `pre_exec` to install rlimits between fork and
 // exec, and wasmtime 20's `Module::deserialize` is an `unsafe fn` by design
@@ -20,9 +31,10 @@
 #![allow(unsafe_code)]
 
 use crate::runtime::{PluginCommandInfo, PluginSkillInfo};
+use std::collections::HashMap;
 use std::ffi::OsString;
 use std::path::PathBuf;
-use std::sync::{LazyLock, RwLock};
+use std::sync::{Arc, LazyLock, RwLock};
 
 // ─── Host-injected compiler command ─────────────────────────────────────────
 
@@ -188,8 +200,11 @@ pub const INTERNAL_WASM_COMPILE_FLAG: &str = "--internal-wasm-compile";
 #[cfg(feature = "wasm-runtime")]
 const WASM_COMPILE_CPU_SECONDS: u64 = 20;
 
-/// Address-space limit installed on the compiler child (`RLIMIT_AS` on Unix,
-/// job memory limit on Windows): 2 GiB.
+/// Memory limit installed on the compiler child (2 GiB).
+///
+/// On Linux this is an address-space limit (`RLIMIT_AS`); on Darwin it is a
+/// data-segment limit (`RLIMIT_DATA`), because Darwin rejects finite
+/// address-space limits. On Windows it is the Job Object's job memory limit.
 #[cfg(feature = "wasm-runtime")]
 const WASM_COMPILE_MEMORY_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 
@@ -248,9 +263,10 @@ const WASM_CACHE_HEADER_LEN: usize = 8 + 4 + 32 + 32 + 8;
 ///   (which wasmtime's store limiter deliberately does not bound) or use
 ///   atomics.
 ///
-/// No WASI (or any other host interface) is linked: instances are created with
-/// an empty import set, so a module that imports anything at all fails to
-/// instantiate. The plugin ABI is self-contained and needs no imports.
+/// No WASI is linked. The only host interface is the optional
+/// `coderex.user_config` import; a module that imports anything else still
+/// fails to instantiate, and a module that imports nothing instantiates
+/// unchanged. The plugin ABI needs no imports to work.
 ///
 /// Compilation itself is not bounded here: wasmtime 20 has no compile-time
 /// fuel or epoch setting. The only enforced compile-time control is the input
@@ -807,7 +823,7 @@ fn load_module(
     engine: &wasmtime::Engine,
     wasm_path: &std::path::Path,
     binary: &[u8],
-    compiler: Option<&WasmCompilerCommand>,
+    compiler: Option<WasmCompilerCommand>,
     cache_dir: &std::path::Path,
 ) -> Result<wasmtime::Module, String> {
     let engine_hash = engine_config_hash(engine);
@@ -831,7 +847,7 @@ fn load_module(
         ));
     };
 
-    let serialized = run_compile_helper(command, binary, cache_dir)?;
+    let serialized = run_compile_helper(&command, binary, cache_dir)?;
 
     // SAFETY: the bytes were produced by `Module::serialize` in our own
     // compiler process, running the same wasmtime version and the same
@@ -1111,22 +1127,93 @@ fn wrap_with_bubblewrap(
     true
 }
 
-/// Install `RLIMIT_CPU` and `RLIMIT_AS` on the compiler child.
+/// Which resource bound `apply_compile_rlimits` should install for memory.
+///
+/// Kept as an enum so the platform choice is visible to the unit tests instead
+/// of being buried in a `cfg`-selected `libc` constant.
+#[cfg(all(unix, feature = "wasm-runtime"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+// Exactly one variant is constructed on a given platform; the other is still
+// part of the plan type and is asserted by the tests' platform branch.
+#[allow(dead_code)]
+enum CompileMemoryRlimit {
+    /// `RLIMIT_AS` — total virtual address space (Linux and other Unix).
+    AddressSpace,
+    /// `RLIMIT_DATA` — the data segment (Darwin, which rejects `RLIMIT_AS`).
+    Data,
+}
+
+#[cfg(all(unix, feature = "wasm-runtime"))]
+impl CompileMemoryRlimit {
+    /// The `libc` resource constant to pass to `setrlimit`.
+    const fn resource(self) -> libc::c_int {
+        match self {
+            Self::AddressSpace => libc::RLIMIT_AS,
+            Self::Data => libc::RLIMIT_DATA,
+        }
+    }
+}
+
+/// The resource used for the compiler child's memory bound on this platform.
+///
+/// Darwin returns `EINVAL` for a finite `RLIMIT_AS`, so it gets `RLIMIT_DATA`
+/// instead. `RLIMIT_DATA` bounds the data segment, not the whole address
+/// space: it is a useful ceiling for an allocator-heavy compiler, but it is
+/// **not** a full address-space cap (mappings the process makes directly, its
+/// stack and its executable image are outside it). Other Unix platforms keep
+/// `RLIMIT_AS`.
+#[cfg(all(unix, feature = "wasm-runtime"))]
+const fn compile_memory_rlimit() -> CompileMemoryRlimit {
+    #[cfg(target_os = "macos")]
+    {
+        CompileMemoryRlimit::Data
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        CompileMemoryRlimit::AddressSpace
+    }
+}
+
+/// The CPU and memory limits installed on the compiler child.
+///
+/// Split out from `apply_compile_rlimits` so the values and the platform's
+/// memory-resource choice can be asserted by a unit test (`pre_exec` itself
+/// cannot be called from a test).
+#[cfg(all(unix, feature = "wasm-runtime"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CompileRlimitPlan {
+    cpu_seconds: u64,
+    memory_rlimit: CompileMemoryRlimit,
+    memory_bytes: u64,
+}
+
+#[cfg(all(unix, feature = "wasm-runtime"))]
+const fn compile_rlimit_plan() -> CompileRlimitPlan {
+    CompileRlimitPlan {
+        cpu_seconds: WASM_COMPILE_CPU_SECONDS,
+        memory_rlimit: compile_memory_rlimit(),
+        memory_bytes: WASM_COMPILE_MEMORY_BYTES,
+    }
+}
+
+/// Install the compiler child's CPU and memory limits.
 ///
 /// `RLIMIT_CPU` is mandatory: without it this process has no hard CPU bound.
-/// `RLIMIT_AS` is best-effort because some kernels reject finite address-space
-/// limits — Darwin does, returning `EINVAL` for both the soft and hard
-/// fields, even for the process's own child. On those platforms the child is
-/// still bounded by CPU time and by the parent's wall-clock kill; there is no
-/// memory ceiling. The failure cannot be logged here (`pre_exec` is not
-/// async-signal-safe), so the documentation carries the caveat.
+/// The memory limit is best-effort. On Linux it is `RLIMIT_AS`; on Darwin it
+/// is `RLIMIT_DATA`, because Darwin rejects finite address-space limits with
+/// `EINVAL`. `RLIMIT_DATA` is not a full address-space cap (see
+/// [`compile_memory_rlimit`]). A failure here cannot be logged (`pre_exec` is
+/// not async-signal-safe), so the documentation carries the caveat; the child
+/// is still bounded by CPU time and by the parent's wall-clock kill.
 #[cfg(all(unix, feature = "wasm-runtime"))]
 fn apply_compile_rlimits() -> std::io::Result<()> {
-    use libc::{rlimit, setrlimit, RLIMIT_AS, RLIMIT_CPU};
+    use libc::{RLIMIT_CPU, rlimit, setrlimit};
+
+    let plan = compile_rlimit_plan();
 
     let cpu = rlimit {
-        rlim_cur: WASM_COMPILE_CPU_SECONDS,
-        rlim_max: WASM_COMPILE_CPU_SECONDS,
+        rlim_cur: plan.cpu_seconds,
+        rlim_max: plan.cpu_seconds,
     };
     // SAFETY: `setrlimit` is async-signal-safe and this runs in the forked
     // child before exec.
@@ -1139,11 +1226,11 @@ fn apply_compile_rlimits() -> std::io::Result<()> {
     }
 
     let memory = rlimit {
-        rlim_cur: WASM_COMPILE_MEMORY_BYTES,
-        rlim_max: WASM_COMPILE_MEMORY_BYTES,
+        rlim_cur: plan.memory_bytes,
+        rlim_max: plan.memory_bytes,
     };
     // SAFETY: as above. Failure is deliberately ignored: see the doc comment.
-    let _ = unsafe { setrlimit(RLIMIT_AS, std::ptr::from_ref(&memory)) };
+    let _ = unsafe { setrlimit(plan.memory_rlimit.resource(), std::ptr::from_ref(&memory)) };
 
     Ok(())
 }
@@ -1444,6 +1531,84 @@ mod windows_job {
 #[cfg(all(windows, feature = "wasm-runtime"))]
 use windows_job::CompileJob;
 
+/// Module name of the `user_config` host import.
+#[cfg(feature = "wasm-runtime")]
+const USER_CONFIG_MODULE: &str = "coderex";
+
+/// Function name of the `user_config` host import.
+#[cfg(feature = "wasm-runtime")]
+const USER_CONFIG_FUNCTION: &str = "user_config";
+
+/// Per-call store data: the resource limiter plus the `userConfig` JSON.
+#[cfg(feature = "wasm-runtime")]
+struct StoreState {
+    limits: wasmtime::StoreLimits,
+    user_config: Arc<[u8]>,
+}
+
+/// The store type used by every plugin call.
+#[cfg(feature = "wasm-runtime")]
+type PluginStore = wasmtime::Store<StoreState>;
+
+/// Implement `coderex.user_config(ptr, capacity) -> required_len`.
+///
+/// The host copies the serialized options object into guest memory at `ptr`,
+/// writing at most `capacity` bytes, and returns the full JSON length. A guest
+/// can therefore:
+/// 1. call with `(0, 0)` to learn the length,
+/// 2. allocate a buffer of that size and call again,
+/// 3. treat `returned > capacity` as truncation.
+///
+/// Returns `-1` for a negative pointer/capacity, a missing `memory` export, or
+/// a write that would leave guest memory. `memory` is the module's exported
+/// linear memory, which the plugin ABI already requires.
+#[cfg(feature = "wasm-runtime")]
+fn write_user_config(
+    caller: &mut wasmtime::Caller<'_, StoreState>,
+    ptr: i32,
+    capacity: i32,
+) -> i32 {
+    if ptr < 0 || capacity < 0 {
+        return -1;
+    }
+
+    let json = Arc::clone(&caller.data().user_config);
+    let Ok(required) = i32::try_from(json.len()) else {
+        return -1;
+    };
+
+    // A zero-capacity call is the length query, and needs no memory export.
+    if capacity == 0 {
+        return required;
+    }
+
+    let Some(memory) = caller
+        .get_export("memory")
+        .and_then(wasmtime::Extern::into_memory)
+    else {
+        return -1;
+    };
+    let data = memory.data_mut(caller);
+    let Ok(offset) = usize::try_from(ptr) else {
+        return -1;
+    };
+    let Ok(capacity) = usize::try_from(capacity) else {
+        return -1;
+    };
+    if offset >= data.len() {
+        return -1;
+    }
+    let to_write = json.len().min(capacity);
+    let Some(end) = offset.checked_add(to_write) else {
+        return -1;
+    };
+    if end > data.len() {
+        return -1;
+    }
+    data[offset..end].copy_from_slice(&json[..to_write]);
+    required
+}
+
 /// A loaded WASM plugin instance.
 ///
 /// When the `wasm-runtime` feature is enabled, this compiles and instantiates
@@ -1455,6 +1620,11 @@ pub struct PluginWasmInstance {
     engine: wasmtime::Engine,
     #[cfg(feature = "wasm-runtime")]
     module: wasmtime::Module,
+    /// The resolved `userConfig` options as a JSON object, served to the guest
+    /// through the `coderex.user_config` import. Empty modules never see it;
+    /// modules that import the function do.
+    #[cfg(feature = "wasm-runtime")]
+    user_config: Arc<[u8]>,
     #[cfg(feature = "wasm-runtime")]
     initialized: bool,
     #[cfg(feature = "wasm-runtime")]
@@ -1486,7 +1656,7 @@ impl std::fmt::Debug for PluginWasmInstance {
 
 #[cfg(feature = "wasm-runtime")]
 impl PluginWasmInstance {
-    /// Load a WASM module from the given path.
+    /// Load a WASM module from the given path with no `userConfig` options.
     ///
     /// The file is rejected before compilation if it is larger than
     /// `PLUGIN_MAX_WASM_BYTES`. The metadata check avoids reading an oversized
@@ -1501,6 +1671,22 @@ impl PluginWasmInstance {
         Self::load_with(wasm_path, resolved_compiler_command(), None)
     }
 
+    /// Load a WASM module and make resolved `userConfig` options available to
+    /// it through the `coderex.user_config` import.
+    ///
+    /// `user_config` holds the same values a process plugin receives as
+    /// `CODEREX_PLUGIN_OPTION_<KEY>`: one entry per resolved option, with
+    /// absent optional options simply missing. The values are encoded as one
+    /// JSON object; a plugin receives them only if it imports and calls
+    /// `coderex.user_config`. A module with no imports loads and runs exactly
+    /// as before.
+    pub fn new_with_options(
+        wasm_path: &std::path::Path,
+        user_config: HashMap<String, String>,
+    ) -> Result<Self, String> {
+        Self::load_with_options(wasm_path, resolved_compiler_command(), None, user_config)
+    }
+
     /// Load with an explicit compiler command and cache directory.
     ///
     /// `compiler: None` disables compilation for this call, which makes the
@@ -1513,6 +1699,25 @@ impl PluginWasmInstance {
         compiler: Option<WasmCompilerCommand>,
         cache_dir: Option<PathBuf>,
     ) -> Result<Self, String> {
+        Self::load_with_options(wasm_path, compiler, cache_dir, HashMap::new())
+    }
+
+    /// [`PluginWasmInstance::new_with_options`] with explicit compiler and
+    /// cache-directory seams. Internal; used by tests.
+    #[doc(hidden)]
+    pub fn load_with_options(
+        wasm_path: &std::path::Path,
+        compiler: Option<WasmCompilerCommand>,
+        cache_dir: Option<PathBuf>,
+        user_config: HashMap<String, String>,
+    ) -> Result<Self, String> {
+        // BTreeMap gives the JSON a stable key order, so the same options
+        // always produce the same bytes (useful for tests and diagnostics).
+        let user_config: std::collections::BTreeMap<_, _> = user_config.into_iter().collect();
+        let user_config: Arc<[u8]> = serde_json::to_vec(&user_config)
+            .map_err(|e| format!("failed to serialize WASM userConfig: {e}"))?
+            .into();
+
         let engine = sandboxed_engine()?;
 
         let metadata = std::fs::metadata(wasm_path)
@@ -1529,16 +1734,11 @@ impl PluginWasmInstance {
         let scanned = prescan_module(&name, &bytes, PrescanLimits::default())?;
 
         let cache_dir = cache_dir.unwrap_or_else(resolved_cache_dir);
-        let module = load_module(
-            &engine,
-            wasm_path,
-            &scanned,
-            compiler.as_ref(),
-            &cache_dir,
-        )?;
+        let module = load_module(&engine, wasm_path, &scanned, compiler, &cache_dir)?;
         Ok(Self {
             engine,
             module,
+            user_config,
             initialized: false,
             commands: Vec::new(),
             skills: Vec::new(),
@@ -1549,16 +1749,41 @@ impl PluginWasmInstance {
     ///
     /// Every call gets its own store, so the fuel budget and memory ceiling are
     /// reset per call rather than accumulating across calls.
-    fn new_store(&self) -> Result<wasmtime::Store<wasmtime::StoreLimits>, String> {
+    fn new_store(&self) -> Result<PluginStore, String> {
         let limits = wasmtime::StoreLimitsBuilder::new()
             .memory_size(PLUGIN_MAX_MEMORY_BYTES)
             .build();
-        let mut store = wasmtime::Store::new(&self.engine, limits);
-        store.limiter(|limits| limits);
+        let mut store = wasmtime::Store::new(
+            &self.engine,
+            StoreState {
+                limits,
+                user_config: Arc::clone(&self.user_config),
+            },
+        );
+        store.limiter(|state| &mut state.limits);
         store
             .set_fuel(PLUGIN_FUEL)
             .map_err(|e| format!("failed to set WASM fuel: {e}"))?;
         Ok(store)
+    }
+
+    /// Build a linker with the one host interface a plugin may import.
+    ///
+    /// The function is defined unconditionally: a module that does not import
+    /// it is instantiated with an empty import set exactly as before. WASI is
+    /// still absent, so a module importing anything else fails to instantiate.
+    fn linker(&self) -> Result<wasmtime::Linker<StoreState>, String> {
+        let mut linker = wasmtime::Linker::new(&self.engine);
+        linker
+            .func_wrap(
+                USER_CONFIG_MODULE,
+                USER_CONFIG_FUNCTION,
+                |mut caller: wasmtime::Caller<'_, StoreState>, ptr: i32, capacity: i32| -> i32 {
+                    write_user_config(&mut caller, ptr, capacity)
+                },
+            )
+            .map_err(|e| format!("failed to define the WASM user_config import: {e}"))?;
+        Ok(linker)
     }
 
     /// Check if initialized.
@@ -1652,7 +1877,9 @@ impl PluginWasmInstance {
     ) -> Result<serde_json::Value, String> {
         tokio::task::block_in_place(|| {
             let mut store = self.new_store()?;
-            let instance = wasmtime::Instance::new(&mut store, &self.module, &[])
+            let linker = self.linker()?;
+            let instance = linker
+                .instantiate(&mut store, &self.module)
                 .map_err(|e| format!("failed to instantiate WASM module: {e}"))?;
 
             let memory = instance
@@ -1701,7 +1928,9 @@ impl PluginWasmInstance {
     ) -> Result<serde_json::Value, String> {
         tokio::task::block_in_place(|| {
             let mut store = self.new_store()?;
-            let instance = wasmtime::Instance::new(&mut store, &self.module, &[])
+            let linker = self.linker()?;
+            let instance = linker
+                .instantiate(&mut store, &self.module)
                 .map_err(|e| format!("failed to instantiate WASM module: {e}"))?;
 
             let memory = instance
@@ -1798,7 +2027,7 @@ impl PluginWasmInstance {
 #[cfg(feature = "wasm-runtime")]
 fn write_to_memory(
     memory: &wasmtime::Memory,
-    store: &mut wasmtime::Store<wasmtime::StoreLimits>,
+    store: &mut PluginStore,
     alloc: &wasmtime::TypedFunc<i32, i32>,
     data: &str,
 ) -> Result<(i32, i32), String> {
@@ -1818,7 +2047,7 @@ fn write_to_memory(
 #[cfg(feature = "wasm-runtime")]
 fn read_cstring(
     memory: &wasmtime::Memory,
-    store: &wasmtime::Store<wasmtime::StoreLimits>,
+    store: &wasmtime::Store<StoreState>,
     ptr: i32,
 ) -> Result<String, String> {
     if ptr == 0 {
@@ -1875,6 +2104,32 @@ mod tests {
         );
     }
 
+    /// The compiler child's limit plan is fixed: hard CPU seconds and a 2 GiB
+    /// memory bound. Darwin must select `RLIMIT_DATA` (it rejects a finite
+    /// `RLIMIT_AS`); every other Unix selects `RLIMIT_AS`. `pre_exec` cannot
+    /// be invoked from a test, so this asserts the plan it installs.
+    #[cfg(all(feature = "wasm-runtime", unix))]
+    #[test]
+    fn compile_rlimit_plan_matches_the_platform() {
+        let plan = compile_rlimit_plan();
+
+        assert_eq!(plan.cpu_seconds, WASM_COMPILE_CPU_SECONDS);
+        assert_eq!(plan.cpu_seconds, 20);
+        assert_eq!(plan.memory_bytes, WASM_COMPILE_MEMORY_BYTES);
+        assert_eq!(plan.memory_bytes, 2 * 1024 * 1024 * 1024);
+
+        #[cfg(target_os = "macos")]
+        {
+            assert_eq!(plan.memory_rlimit, CompileMemoryRlimit::Data);
+            assert_eq!(plan.memory_rlimit.resource(), libc::RLIMIT_DATA);
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            assert_eq!(plan.memory_rlimit, CompileMemoryRlimit::AddressSpace);
+            assert_eq!(plan.memory_rlimit.resource(), libc::RLIMIT_AS);
+        }
+    }
+
     /// Debug builds resolve the helper binary shipped next to the tests, which
     /// is what lets `cargo test -p coderex-plugins` exercise the real
     /// compiler without configuring a command explicitly.
@@ -1924,6 +2179,121 @@ mod sandbox_tests {
             Some(test_compiler()),
             Some(cache.path().to_path_buf()),
         )
+    }
+
+    /// Load with resolved `userConfig` options through the same seams.
+    fn load_with_options(
+        path: &Path,
+        options: &[(&str, &str)],
+    ) -> Result<PluginWasmInstance, String> {
+        let cache = tempfile::tempdir().expect("failed to create a test cache dir");
+        let options: std::collections::HashMap<String, String> = options
+            .iter()
+            .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
+            .collect();
+        PluginWasmInstance::load_with_options(
+            path,
+            Some(test_compiler()),
+            Some(cache.path().to_path_buf()),
+            options,
+        )
+    }
+
+    /// A module that imports `coderex.user_config` receives the resolved
+    /// options as one JSON object.
+    ///
+    /// `FILE_TOKEN` stands in for a sensitive value: at this layer the runtime
+    /// carries resolved values verbatim, so a sensitive option is present. The
+    /// absent optional option is the other half of the contract: it is simply
+    /// missing from the object rather than present as `null` or an empty
+    /// string.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn user_config_import_receives_resolved_options() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_module(
+            dir.path(),
+            "config.wasm",
+            r#"(module
+                 (import "coderex" "user_config"
+                   (func $user_config (param i32 i32) (result i32)))
+                 (memory (export "memory") 1)
+                 (func (export "alloc") (param i32) (result i32)
+                   i32.const 1024)
+                 (func (export "dealloc") (param i32 i32))
+                 (func (export "coderex_initialize") (param i32 i32) (result i32)
+                   (local $required i32)
+                   ;; Ask how long the JSON is without writing anything.
+                   i32.const 0
+                   i32.const 0
+                   call $user_config
+                   local.set $required
+                   ;; Then write it at 4096 (capacity 1024).
+                   local.get $required
+                   i32.const 0
+                   i32.gt_s
+                   if
+                     i32.const 4096
+                     i32.const 1024
+                     call $user_config
+                     drop
+                   end
+                   ;; Return the JSON; the host reads it as the result.
+                   i32.const 4096))"#,
+        );
+
+        let mut instance = load_with_options(
+            &path,
+            &[
+                ("FILE_TOKEN", "s3cret"),
+                ("REGION", "eu"),
+                // OPTIONAL is declared by the manifest but has no value: the
+                // host must not invent one.
+            ],
+        )
+        .expect("a module importing coderex.user_config must load");
+
+        let value = instance
+            .initialize()
+            .await
+            .expect("initialize must return the injected options JSON");
+
+        assert_eq!(value["FILE_TOKEN"], "s3cret");
+        assert_eq!(value["REGION"], "eu");
+        assert!(
+            value.get("OPTIONAL").is_none(),
+            "an unresolved optional option must be absent, got: {value}"
+        );
+        assert_eq!(
+            value.as_object().map(serde_json::Map::len),
+            Some(2),
+            "only the resolved options must be present, got: {value}"
+        );
+    }
+
+    /// Linking the one host function did not change the empty-import path: a
+    /// module that imports nothing still instantiates and runs.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn module_without_imports_still_runs() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_module(
+            dir.path(),
+            "no-imports.wasm",
+            r#"(module
+                 (memory (export "memory") 1)
+                 (data (i32.const 16) "\"ok\"\00")
+                 (func (export "alloc") (param i32) (result i32)
+                   i32.const 1024)
+                 (func (export "dealloc") (param i32 i32))
+                 (func (export "coderex_initialize") (param i32 i32) (result i32)
+                   i32.const 16))"#,
+        );
+
+        let mut instance = load(&path).expect("a module with no imports must load");
+        let value = instance
+            .initialize()
+            .await
+            .expect("a module with no imports must still initialize");
+        assert_eq!(value, serde_json::json!("ok"));
     }
 
     /// A file over the cap is refused by the size check, before wasmtime
