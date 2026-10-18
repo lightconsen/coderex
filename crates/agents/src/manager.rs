@@ -13,13 +13,15 @@ use coderex_core::job_record::{JobKind, JobRecord, JobState, JobStore};
 use coderex_core::orchestrator::{
     run_background_feature, run_forked_agent, BackgroundFeatureRequest, QueryResult,
 };
-use coderex_core::permission_engine::PermissionEngine;
+use coderex_core::permission_engine::{BackgroundAgentDenyHook, PermissionEngine};
 use coderex_core::permissions::{PermissionChecker, PermissionMode};
 use coderex_core::sandbox::SandboxConfig;
 use coderex_core::state::SessionState;
 use coderex_core::task::{now_ms, TaskHandle, TaskKind, TaskManager};
 use coderex_core::tool_executor::ToolExecutor;
-use coderex_core::types::{AgentLifecycleEvent, EngineEvent, ModelId};
+use coderex_core::types::{
+    AgentLifecycleEvent, EngineEvent, Message, MessageContent, ModelId, Role, ToolCall, ToolResult,
+};
 use coderex_core::wire_adapter::engine_event_to_wire;
 use coderex_core::worktree::{WorktreeConfig, WorktreeManager};
 use serde::{Deserialize, Serialize};
@@ -606,7 +608,11 @@ pub enum TeammateEvent {
 }
 
 /// Callback for receiving teammate events.
-pub type TeammateEventCallback = Box<dyn Fn(TeammateEvent) + Send + Sync + 'static>;
+///
+/// Shared (`Arc`) rather than owned so the manager can hand it to the spawned
+/// task that actually completes an agent; the task runs independently of the
+/// manager and cannot borrow it.
+pub type TeammateEventCallback = Arc<dyn Fn(TeammateEvent) + Send + Sync + 'static>;
 
 /// Factory used to build an isolated tool executor for one sub-agent.
 type ToolExecutorFactory =
@@ -705,7 +711,7 @@ impl AgentManager {
     where
         F: Fn(TeammateEvent) + Send + Sync + 'static,
     {
-        self.event_callback = Some(Box::new(callback));
+        self.event_callback = Some(Arc::new(callback));
     }
 
     /// Set the event sender for forwarding agent events to the parent engine.
@@ -762,14 +768,13 @@ impl AgentManager {
     }
 
     /// Subscribe to observable events from every agent.
+    ///
+    /// This is the manager-wide arm of [`Self::subscribe_to_agent`]; the
+    /// special id `"all"` is what turns the filter off, so both entry points
+    /// share one implementation.
     #[must_use]
     pub fn subscribe_all(&self) -> Option<AgentSubscription> {
-        self.agent_event_broadcast
-            .as_ref()
-            .map(|tx| AgentSubscription {
-                agent_id: None,
-                rx: tx.subscribe(),
-            })
+        self.subscribe_to_agent("all")
     }
 
     /// Wait for an agent to complete (synchronous execution).
@@ -820,9 +825,7 @@ impl AgentManager {
 
     /// Emit a teammate event (notifies callback if registered).
     fn emit_event(&self, event: TeammateEvent) {
-        if let Some(ref cb) = self.event_callback {
-            cb(event);
-        }
+        emit_teammate_event(&self.event_callback, event);
     }
 
     /// Emit an agent lifecycle event to the parent engine event stream.
@@ -1033,7 +1036,9 @@ impl AgentManager {
             let sandbox_config = options.sandbox.clone();
             let retry_policy = options.retry_policy.clone();
             let output_schema = options.output_schema.clone();
+            let run_in_background = options.run_in_background;
             let user_prompt = prompt.to_string();
+            let agent_subject = job_description("", prompt);
             let output_file_path = output_file.clone();
             let agent_id_for_task = agent_id.clone();
             let event_tx = self.event_tx.clone();
@@ -1044,6 +1049,12 @@ impl AgentManager {
             let task_manager_for_task = Arc::clone(&self.task_manager);
             let task_id_for_completion = agent_id.clone();
             let job_record = background_job.clone();
+            // The forked context and the teammate callback both belong to the
+            // manager, but completion happens in the spawned task. Clone them
+            // now: the task must be able to seed the child session and report
+            // its real completion without borrowing the manager.
+            let forked_context = instance.context.clone();
+            let event_callback = self.event_callback.clone();
 
             let handle = tokio::spawn(async move {
                 let result = run_agent_task(
@@ -1067,6 +1078,10 @@ impl AgentManager {
                     broadcast_tx,
                     retry_policy,
                     output_schema,
+                    run_in_background,
+                    forked_context,
+                    event_callback,
+                    agent_subject,
                     &mut msg_rx,
                 )
                 .await;
@@ -1124,6 +1139,17 @@ impl AgentManager {
             if let Some((store, id)) = &background_job {
                 let _ = store.settle(id, JobState::Done, now_ms(), None, None);
             }
+            // Test mode completes synchronously, but it must report through
+            // the same teammate surface a real completion does.
+            self.emit_event(TeammateEvent::Idle {
+                agent_id: agent_id.clone(),
+                reason: "turn complete".to_string(),
+            });
+            self.emit_event(TeammateEvent::TaskCompleted {
+                agent_id: agent_id.clone(),
+                subject: job_description("", prompt),
+                summary: placeholder,
+            });
         } else {
             let error = "AgentManager requires an API client to spawn agents. \
                  Configure one via set_api_client() before calling spawn_agent().";
@@ -1608,16 +1634,27 @@ async fn run_agent_task(
     broadcast_tx: Option<broadcast::Sender<AgentObservableEvent>>,
     retry_policy: Option<RetryPolicy>,
     output_schema: Option<serde_json::Value>,
+    run_in_background: bool,
+    forked_context: Option<ForkedContext>,
+    event_callback: Option<TeammateEventCallback>,
+    agent_subject: String,
     msg_rx: &mut mpsc::UnboundedReceiver<AgentMessage>,
 ) -> Result<AgentResult, AgentError> {
     // Notify parent that the agent started
     emit_lifecycle(&parent_event_tx, &agent_id, AgentLifecycleEvent::Started);
 
-    let max_retries = retry_policy.as_ref().map(|r| r.max_retries).unwrap_or(0);
-    let _on_failure = retry_policy
+    // `on_failure` decides whether a failed attempt is retried at all.
+    // `retry` re-runs the attempt up to `max_retries`; `escalate_to_parent`
+    // stops at the first failure and marks the result as escalated, even if
+    // `max_retries` is non-zero.
+    let on_failure = retry_policy
         .as_ref()
-        .map(|r| r.on_failure)
-        .unwrap_or(FailureAction::EscalateToParent);
+        .map_or(FailureAction::EscalateToParent, |r| r.on_failure);
+    let max_retries = if matches!(on_failure, FailureAction::Retry) {
+        retry_policy.as_ref().map_or(0, |r| r.max_retries)
+    } else {
+        0
+    };
     let escalation_prompt = retry_policy
         .as_ref()
         .and_then(|r| r.escalation_prompt.clone());
@@ -1629,11 +1666,16 @@ async fn run_agent_task(
         .join("agent_logs");
     let log_path = log_dir.join(format!("{agent_id}.jsonl"));
 
+    let fork_task = user_prompt.clone();
     let mut attempt_prompt = user_prompt;
     let mut final_output = String::new();
     let mut final_status = AgentStatus::Completed;
     let mut final_error: Option<String> = None;
     let mut total_token_usage: Option<u64> = None;
+    // Whether the child request's system prompt/model/tool set matches the
+    // parent's, i.e. whether the reused prefix can actually hit the provider
+    // cache. Recorded in the meta file so the decision is observable.
+    let mut cache_safe: Option<bool> = None;
 
     for attempt in 0..=max_retries {
         // Drain any messages sent by the parent before this attempt
@@ -1641,9 +1683,28 @@ async fn run_agent_task(
             attempt_prompt.push_str(&format!("\n\n[Message from parent]: {}", msg.content));
         }
 
-        let session = SessionState::new(working_directory.clone());
+        // Seed the child session with the parent's conversation prefix. The
+        // engine appends the task itself in `submit`, so this is exactly
+        // `ForkedContext::fork_messages(task)` at the provider layer.
+        let mut session = SessionState::new(working_directory.clone());
+        let mut seeded_prefix_messages = 0usize;
+        if let Some(ref fork) = forked_context {
+            match seed_session_from_fork(&mut session, fork, &fork_task) {
+                Ok(seeded) => seeded_prefix_messages = seeded,
+                Err(error) => tracing::warn!(
+                    agent_id = %agent_id,
+                    error = %error,
+                    "could not reuse the parent prefix; starting the child from a fresh prefix"
+                ),
+            }
+        }
+
         let checker = PermissionChecker::new(permission_mode);
-        let permission_engine = PermissionEngine::new(checker);
+        let mut permission_engine = PermissionEngine::new(checker);
+        // A background child runs with `agent_id = Some(..)`, which makes its
+        // permission requests background-agent requests. The hook is installed
+        // for every child because it is a no-op for an interactive run.
+        permission_engine.add_hook(Arc::new(BackgroundAgentDenyHook));
 
         let (event_tx, mut event_rx) = mpsc::unbounded_channel::<EngineEvent>();
 
@@ -1662,15 +1723,38 @@ async fn run_agent_task(
             engine.set_confirmation_bus(bus);
         }
 
+        let mut advertised_tool_names = Vec::new();
         if let Some(ref factory) = tool_factory {
-            engine.set_tool_executor(factory(working_directory.clone(), sandbox_config.clone()));
+            let executor = factory(working_directory.clone(), sandbox_config.clone());
+            advertised_tool_names = executor
+                .list_tools()
+                .into_iter()
+                .map(|tool| tool.name)
+                .collect();
+            engine.set_tool_executor(executor);
+        }
+
+        if let Some(ref fork) = forked_context {
+            if fork.reuses_parent_prefix() {
+                let safe = fork.is_cache_safe(&model.0, &system_prompt, &advertised_tool_names);
+                cache_safe = Some(safe);
+                tracing::debug!(
+                    agent_id = %agent_id,
+                    prefix_messages = seeded_prefix_messages,
+                    prefix_fingerprint = %fork.prefix_fingerprint(),
+                    cache_safe = safe,
+                    "seeded the child session from the parent prefix"
+                );
+            }
         }
 
         let mut options = SubmitOptions::default();
-        // The child must know it is a sub-agent: the permission engine's
-        // background-agent hook keys off this, and without it every child
-        // tool call looks interactive.
-        options.agent_id = Some(agent_id.clone());
+        // Only an agent the person is not watching is a background run. A
+        // synchronous sub-agent waits on its parent's turn, so its permission
+        // requests stay in the interactive path; tagging every child with an
+        // id made `permission_context_for` call them all background and the
+        // deny hook refused even read-only tools.
+        options.agent_id = run_in_background.then(|| agent_id.clone());
         options.custom_system_prompt = Some(system_prompt.clone());
         options.allowed_tools_override = effective_allowed_tools(allowed_tools.clone(), writable);
         options.max_turns = max_turns;
@@ -1766,6 +1850,15 @@ async fn run_agent_task(
                 reason: "turn complete".to_string(),
             },
         );
+        // The same real idle point feeds the manager-level teammate callback,
+        // so observers registered through `set_event_callback` see it too.
+        emit_teammate_event(
+            &event_callback,
+            TeammateEvent::Idle {
+                agent_id: agent_id.clone(),
+                reason: "turn complete".to_string(),
+            },
+        );
 
         match engine_result {
             Ok(Ok(_)) => {
@@ -1782,9 +1875,16 @@ async fn run_agent_task(
                                 attempt_prompt.push_str(&retry_note);
                                 continue;
                             }
-                            final_output = attempt_output;
+                            let err_msg = format!("validation failed: {error}");
+                            let (output, error) = final_failure_output(
+                                attempt_output,
+                                &err_msg,
+                                on_failure,
+                                max_retries,
+                            );
+                            final_output = output;
+                            final_error = Some(error);
                             final_status = AgentStatus::Failed;
-                            final_error = Some(format!("validation failed: {error}"));
                             break;
                         }
                     }
@@ -1806,9 +1906,11 @@ async fn run_agent_task(
                     attempt_prompt.push_str(&retry_note);
                     continue;
                 }
-                final_output = attempt_output;
+                let (output, error) =
+                    final_failure_output(attempt_output, &err_msg, on_failure, max_retries);
+                final_output = output;
+                final_error = Some(error);
                 final_status = AgentStatus::Failed;
-                final_error = Some(err_msg);
             }
             Err(_) => {
                 let err_msg = format!("agent timed out after {max_duration}s");
@@ -1822,9 +1924,11 @@ async fn run_agent_task(
                     attempt_prompt.push_str(&retry_note);
                     continue;
                 }
-                final_output = attempt_output;
+                let (output, error) =
+                    final_failure_output(attempt_output, &err_msg, on_failure, max_retries);
+                final_output = output;
+                final_error = Some(error);
                 final_status = AgentStatus::Failed;
-                final_error = Some(err_msg);
             }
         }
     }
@@ -1841,14 +1945,43 @@ async fn run_agent_task(
     };
     emit_lifecycle(&parent_event_tx, &agent_id, lifecycle);
 
+    // A normally completing agent is the production completion path: report
+    // it through the manager's teammate callback in addition to the parent
+    // engine event stream.
+    if status == AgentStatus::Completed {
+        emit_teammate_event(
+            &event_callback,
+            TeammateEvent::TaskCompleted {
+                agent_id: agent_id.clone(),
+                subject: agent_subject,
+                summary: final_output.clone(),
+            },
+        );
+    }
+
     // Write output to file
     let _ = tokio::fs::write(&output_file, &final_output).await;
 
-    // Write companion meta file with token usage and final status
+    // Write companion meta file with token usage, final status and the
+    // fork's cache decision. A reused prefix whose request parameters differ
+    // is still a valid conversation fork, but it is not a cache hit — saying
+    // so here keeps the distinction observable.
     let meta_path = output_file.with_extension("meta.json");
+    let fork_meta = forked_context.as_ref().map(|fork| {
+        serde_json::json!({
+            "reused": fork.reuses_parent_prefix(),
+            "prefix_messages": fork.fork_point,
+            "prefix_fingerprint": fork.prefix_fingerprint(),
+            "cache_safe": cache_safe.unwrap_or(false),
+        })
+    });
     let meta = serde_json::json!({
         "status": status,
         "token_usage": total_token_usage,
+        "error": error,
+        "escalated": matches!(on_failure, FailureAction::EscalateToParent)
+            && status == AgentStatus::Failed,
+        "fork": fork_meta,
     });
     let _ = tokio::fs::write(&meta_path, meta.to_string()).await;
 
@@ -1857,6 +1990,184 @@ async fn run_agent_task(
         status,
         token_usage: total_token_usage,
     })
+}
+
+/// Invoke a teammate callback, if one is registered.
+fn emit_teammate_event(callback: &Option<TeammateEventCallback>, event: TeammateEvent) {
+    if let Some(callback) = callback {
+        callback(event);
+    }
+}
+
+/// Build the terminal output and error text for a failed attempt.
+///
+/// The marker distinguishes the two advertised policies: `retry` used up its
+/// attempts, while `escalate_to_parent` stopped and leaves the decision to
+/// the caller.
+fn final_failure_output(
+    attempt_output: String,
+    error: &str,
+    on_failure: FailureAction,
+    max_retries: u32,
+) -> (String, String) {
+    let marker = match on_failure {
+        FailureAction::Retry => format!("[retries exhausted after {max_retries}] {error}"),
+        FailureAction::EscalateToParent => format!("[escalated to parent] {error}"),
+    };
+    if attempt_output.is_empty() {
+        (marker.clone(), marker)
+    } else {
+        (format!("{marker}\n\n{attempt_output}"), marker)
+    }
+}
+
+/// Seed a child session with a fork's parent prefix.
+///
+/// [`ForkedContext::fork_messages`] describes the child's full conversation:
+/// the parent prefix followed by the sub-agent's task. `QueryEngine::submit`
+/// appends the task itself, so the session is seeded with everything before
+/// that final entry. Returns the number of parent messages seeded.
+///
+/// A prefix that cannot be expressed as engine messages is rejected as a
+/// whole rather than partially seeded: reusing a truncated conversation would
+/// present a prefix that never existed.
+fn seed_session_from_fork(
+    session: &mut SessionState,
+    context: &ForkedContext,
+    task: &str,
+) -> Result<usize, String> {
+    if !context.reuses_parent_prefix() {
+        return Ok(0);
+    }
+
+    let forked = context.fork_messages(task);
+    let prefix_len = context.fork_point.min(forked.len());
+    let messages = messages_from_fork_prefix(&forked[..prefix_len])?;
+    let seeded = messages.len();
+    session.messages = messages;
+    Ok(seeded)
+}
+
+/// Convert a stored parent prefix into engine messages.
+fn messages_from_fork_prefix(values: &[serde_json::Value]) -> Result<Vec<Message>, String> {
+    values.iter().map(message_from_fork_value).collect()
+}
+
+/// Convert one stored prefix message.
+///
+/// Production snapshots serialize the engine's own [`Message`], which is the
+/// canonical form and is parsed first. API/provider-shaped JSON — the shape
+/// [`ForkedContext::fork_messages`] documents — is accepted as a fallback so a
+/// caller that captured provider messages can still fork.
+fn message_from_fork_value(value: &serde_json::Value) -> Result<Message, String> {
+    if let Ok(message) = serde_json::from_value::<Message>(value.clone()) {
+        return Ok(message);
+    }
+
+    let role = value
+        .get("role")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| format!("message has no string role: {value}"))?;
+    let role = role_from_name(role)?;
+    let content = value
+        .get("content")
+        .ok_or_else(|| format!("message has no content: {value}"))?;
+
+    match content {
+        serde_json::Value::String(text) => Ok(Message {
+            role,
+            content: MessageContent::Text(text.clone()),
+        }),
+        serde_json::Value::Array(blocks) => message_from_blocks(role, blocks),
+        other => Err(format!("unsupported message content: {other}")),
+    }
+}
+
+fn role_from_name(name: &str) -> Result<Role, String> {
+    match name.to_ascii_lowercase().as_str() {
+        "system" => Ok(Role::System),
+        "user" => Ok(Role::User),
+        "assistant" => Ok(Role::Assistant),
+        "tool" => Ok(Role::Tool),
+        other => Err(format!("unknown message role {other:?}")),
+    }
+}
+
+fn message_from_blocks(role: Role, blocks: &[serde_json::Value]) -> Result<Message, String> {
+    if let Some(text) = blocks_text(blocks) {
+        return Ok(Message {
+            role,
+            content: MessageContent::Text(text),
+        });
+    }
+
+    if let [block] = blocks {
+        match block.get("type").and_then(serde_json::Value::as_str) {
+            Some("tool_use") => {
+                let id = block
+                    .get("id")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or_else(|| format!("tool_use block has no id: {block}"))?;
+                let name = block
+                    .get("name")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or_else(|| format!("tool_use block has no name: {block}"))?;
+                return Ok(Message {
+                    role: Role::Assistant,
+                    content: MessageContent::ToolCall(ToolCall {
+                        id: id.to_string(),
+                        name: name.to_string(),
+                        input: block.get("input").cloned().unwrap_or_default(),
+                    }),
+                });
+            }
+            Some("tool_result") => {
+                let tool_call_id = block
+                    .get("tool_use_id")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or_else(|| format!("tool_result block has no tool_use_id: {block}"))?;
+                let output = match block.get("content") {
+                    Some(serde_json::Value::String(text)) => text.clone(),
+                    Some(serde_json::Value::Array(items)) => blocks_text(items)
+                        .unwrap_or_else(|| block.get("content").map(ToString::to_string).unwrap_or_default()),
+                    Some(other) => other.to_string(),
+                    None => String::new(),
+                };
+                let is_error = block
+                    .get("is_error")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false);
+                return Ok(Message {
+                    role: Role::Tool,
+                    content: MessageContent::ToolResult(ToolResult {
+                        tool_call_id: tool_call_id.to_string(),
+                        output,
+                        is_error,
+                    }),
+                });
+            }
+            _ => {}
+        }
+    }
+
+    Err(format!(
+        "cannot represent the message's content blocks as an engine message: {blocks:?}"
+    ))
+}
+
+/// Concatenate a block list made up entirely of text blocks.
+fn blocks_text(blocks: &[serde_json::Value]) -> Option<String> {
+    if blocks.is_empty() {
+        return None;
+    }
+    let mut text = String::new();
+    for block in blocks {
+        if block.get("type").and_then(serde_json::Value::as_str) != Some("text") {
+            return None;
+        }
+        text.push_str(block.get("text").and_then(serde_json::Value::as_str)?);
+    }
+    Some(text)
 }
 
 /// Send a lifecycle event to the parent engine, if one is attached.
@@ -1910,122 +2221,6 @@ fn agent_type_name(t: &AgentType) -> String {
         AgentType::StatuslineSetup => "statusline_setup".into(),
         AgentType::Custom { .. } => "custom".into(),
     }
-}
-
-// ─── AgentManager as command backend (10.5) ─────────────────────────────────
-
-/// Execute a command via a sub-agent instead of shell.
-///
-/// Spawns a short-lived agent with the command as its prompt,
-/// waits for completion, and returns the result.
-pub async fn execute_via_agent(
-    manager: &mut AgentManager,
-    command: &str,
-    parent_session_id: &str,
-    cwd: &str,
-) -> Result<String, AgentError> {
-    let options = SpawnOptions {
-        run_in_background: false,
-        cwd: Some(PathBuf::from(cwd)),
-        ..Default::default()
-    };
-
-    let agent_type = AgentType::Custom {
-        prompt: command.to_string(),
-    };
-
-    let instance = manager
-        .spawn_agent(agent_type, command, options, parent_session_id, cwd, 0)
-        .await?;
-
-    let task_id = instance.task_handle.id.clone();
-    let output_file = instance.output_file.clone();
-
-    // Wait for the agent task to complete
-    manager.wait_for_completion(&task_id).await?;
-
-    // Read output file if it exists
-    if let Some(ref path) = output_file {
-        if path.exists() {
-            return tokio::fs::read_to_string(path)
-                .await
-                .map_err(|_| AgentError::SpawnFailed("could not read output".into()));
-        }
-    }
-
-    Ok("agent completed (no output file)".into())
-}
-
-// ─── Dream agent spawning (19.2) ────────────────────────────────────────────
-
-/// Spawn a read-only dream agent to analyze sessions and produce a summary.
-///
-/// Forks a context-limited agent with the dream prompt, restricts it to
-/// read-only tools, and waits for the analysis output.
-///
-/// # Arguments
-/// * `manager` — The AgentManager to spawn the dream agent on.
-/// * `dream_prompt` — Instructions for the dream agent (session summaries + analysis tasks).
-/// * `parent_session_id` — Parent session for context fork.
-/// * `cwd` — Working directory / project root.
-/// * `session_summaries` — Recent session summaries to include in the prompt.
-///
-/// # Returns
-/// The dream agent's analysis output as a string.
-pub async fn spawn_dream_agent(
-    manager: &mut AgentManager,
-    dream_prompt: &str,
-    parent_session_id: &str,
-    cwd: &str,
-    session_summaries: &[&str],
-) -> Result<String, AgentError> {
-    // Read-only tool whitelist for dream agents
-    let allowed_tools = vec!["Read".into(), "Glob".into(), "Grep".into()];
-
-    let options = SpawnOptions {
-        run_in_background: true,
-        allowed_tools: Some(allowed_tools),
-        cwd: Some(PathBuf::from(cwd)),
-        ..Default::default()
-    };
-
-    let agent_type = AgentType::Custom {
-        prompt: format!(
-            "Dream agent: Analyze recent sessions and produce a structured summary.\n\n{}\n\nSession summaries:\n{}",
-            dream_prompt,
-            session_summaries
-                .iter()
-                .enumerate()
-                .map(|(i, s)| format!("## Session {}\n{}", i + 1, s))
-                .collect::<Vec<_>>()
-                .join("\n")
-        ),
-    };
-
-    let instance = manager
-        .spawn_agent(
-            agent_type,
-            dream_prompt,
-            options,
-            parent_session_id,
-            cwd,
-            session_summaries.len(),
-        )
-        .await?;
-
-    let output_file = instance.output_file.clone();
-
-    // Read output file if it exists (for no-API-client fallback it is written
-    // immediately; in production the background task writes it later).
-    if let Some(ref path) = output_file {
-        if path.exists() {
-            return tokio::fs::read_to_string(path)
-                .await
-                .map_err(|_| AgentError::SpawnFailed("could not read dream output".into()));
-        }
-    }
-
-    Ok("dream agent spawned (background task running)".into())
 }
 
 #[cfg(test)]
@@ -2407,21 +2602,6 @@ mod tests {
         assert!(mgr.list_agents().is_empty());
     }
 
-    #[tokio::test]
-    async fn execute_via_agent_runs_command() {
-        let tmp = tempfile::tempdir().unwrap();
-        let mut mgr = make_manager();
-        let output = super::execute_via_agent(
-            &mut mgr,
-            "explain this code",
-            "sess_1",
-            tmp.path().to_str().unwrap(),
-        )
-        .await
-        .unwrap();
-        assert!(output.contains("agent completed"));
-    }
-
     #[test]
     fn agent_type_name_maps() {
         assert_eq!(
@@ -2748,6 +2928,354 @@ mod tests {
         }
     }
 
+    /// A client that answers immediately and records each request's messages.
+    struct CapturingApi {
+        requests: Arc<std::sync::Mutex<Vec<Vec<serde_json::Value>>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl ApiClient for CapturingApi {
+        fn clone_box(&self) -> Box<dyn ApiClient> {
+            Box::new(Self {
+                requests: Arc::clone(&self.requests),
+            })
+        }
+
+        async fn create_message(
+            &self,
+            _system: &str,
+            messages: &[serde_json::Value],
+            _model: &ModelId,
+            _max_tokens: u32,
+            _tools: &[coderex_core::tool_executor::ToolInfo],
+        ) -> Result<coderex_core::api_client::ApiResponse, coderex_core::api_client::ApiError>
+        {
+            self.requests.lock().unwrap().push(messages.to_vec());
+            Ok(coderex_core::api_client::ApiResponse {
+                content: "done".into(),
+                tool_calls: Vec::new(),
+                usage: coderex_core::types::UsageSummary {
+                    input_tokens: 1,
+                    output_tokens: 1,
+                    cache_read_tokens: 0,
+                    cache_creation_tokens: 0,
+                },
+                stop_reason: "end_turn".into(),
+            })
+        }
+
+        async fn create_message_streaming(
+            &self,
+            _system: &str,
+            _messages: &[serde_json::Value],
+            _model: &ModelId,
+            _max_tokens: u32,
+            _tools: &[coderex_core::tool_executor::ToolInfo],
+        ) -> std::pin::Pin<
+            Box<
+                dyn futures::Stream<Item = coderex_core::api_client::StreamEvent>
+                    + Send
+                    + 'static,
+            >,
+        > {
+            Box::pin(futures::stream::iter([
+                coderex_core::api_client::StreamEvent::StreamEnd,
+            ]))
+        }
+    }
+
+    /// A client that always fails with a non-retryable error.
+    struct AlwaysFailApi {
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl ApiClient for AlwaysFailApi {
+        fn clone_box(&self) -> Box<dyn ApiClient> {
+            Box::new(Self {
+                calls: Arc::clone(&self.calls),
+            })
+        }
+
+        async fn create_message(
+            &self,
+            _system: &str,
+            _messages: &[serde_json::Value],
+            _model: &ModelId,
+            _max_tokens: u32,
+            _tools: &[coderex_core::tool_executor::ToolInfo],
+        ) -> Result<coderex_core::api_client::ApiResponse, coderex_core::api_client::ApiError>
+        {
+            self.calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Err(coderex_core::api_client::ApiError::Auth(
+                "no credentials".into(),
+            ))
+        }
+
+        async fn create_message_streaming(
+            &self,
+            _system: &str,
+            _messages: &[serde_json::Value],
+            _model: &ModelId,
+            _max_tokens: u32,
+            _tools: &[coderex_core::tool_executor::ToolInfo],
+        ) -> std::pin::Pin<
+            Box<
+                dyn futures::Stream<Item = coderex_core::api_client::StreamEvent>
+                    + Send
+                    + 'static,
+            >,
+        > {
+            Box::pin(futures::stream::empty())
+        }
+    }
+
+    async fn spawn_and_wait(
+        mgr: &mut AgentManager,
+        prompt: &str,
+        mut options: SpawnOptions,
+    ) -> (String, AgentResult, tempfile::TempDir) {
+        // Every `AgentManager` numbers its tasks from `task_0`, and the output
+        // path is derived from that id. Tests run concurrently, so a shared
+        // cwd would let one test read another test's output/meta file. Give
+        // each spawn its own directory and return it so callers can still
+        // inspect the artifacts.
+        let cwd = tempfile::tempdir().unwrap();
+        options.cwd = Some(cwd.path().to_path_buf());
+        let instance = mgr
+            .spawn_agent(
+                AgentType::GeneralPurpose,
+                prompt,
+                options,
+                "sess_test",
+                cwd.path().to_str().unwrap(),
+                0,
+            )
+            .await
+            .unwrap();
+        let agent_id = instance.task_handle.id.clone();
+        let result = mgr.wait_for_completion(&agent_id).await.unwrap();
+        (agent_id, result, cwd)
+    }
+
+    /// The child engine must carry the background/agent deny hook. Its
+    /// `agent_id` makes every permission request a background one, so a tool
+    /// call must be denied with the hook's reason instead of reaching the
+    /// (here absent) executor.
+    #[tokio::test]
+    async fn child_engine_denies_tool_calls_as_a_background_agent() {
+        let mut mgr = make_manager();
+        mgr.set_api_client(Box::new(ScriptedApi {
+            calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        }));
+        let mut events = mgr.subscribe_all().expect("broadcast channel");
+
+        let instance = mgr
+            .spawn_agent(
+                AgentType::GeneralPurpose,
+                "read the note",
+                SpawnOptions {
+                    run_in_background: true,
+                    ..SpawnOptions::default()
+                },
+                "sess_deny",
+                "/tmp",
+                0,
+            )
+            .await
+            .unwrap();
+        let agent_id = instance.task_handle.id.clone();
+        mgr.wait_for_completion(&agent_id).await.unwrap();
+
+        let mut denial = None;
+        while let Ok(observed) = events.try_recv() {
+            if let EngineEvent::ToolCallEnd { result, .. } = observed.event {
+                if result.is_error {
+                    denial = Some(result.output);
+                }
+            }
+        }
+
+        let denial = denial.expect("the denied tool call was never reported");
+        assert!(
+            denial.contains("denied in background agent mode"),
+            "expected the background-agent denial, got: {denial}"
+        );
+    }
+
+    /// The child request must carry the parent's prefix, not just store it on
+    /// the instance. `fork_messages` is the definition of that request: prefix
+    /// verbatim, then the task.
+    #[tokio::test]
+    async fn child_request_carries_the_parent_prefix() {
+        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut mgr = make_manager();
+        mgr.set_api_client(Box::new(CapturingApi {
+            requests: Arc::clone(&requests),
+        }));
+
+        let cwd = tempfile::tempdir().unwrap();
+        let prefix = parent_prefix();
+        let options = SpawnOptions {
+            parent_prefix: prefix.clone(),
+            parent_cache_safe_params: Some(CacheSafeParams::new(
+                "claude-test",
+                "parent system prompt",
+                vec!["Read".into()],
+            )),
+            ..Default::default()
+        };
+
+        let instance = mgr
+            .spawn_agent(
+                AgentType::GeneralPurpose,
+                "sub-task",
+                options,
+                "sess_prefix",
+                cwd.path().to_str().unwrap(),
+                prefix.len(),
+            )
+            .await
+            .unwrap();
+        let agent_id = instance.task_handle.id.clone();
+        let context = instance.context.clone().expect("forked context");
+        let output_file = instance.output_file.clone().expect("output file");
+        mgr.wait_for_completion(&agent_id).await.unwrap();
+
+        let requests = requests.lock().unwrap();
+        let first = requests.first().expect("the child never sent a request");
+        assert_eq!(
+            first,
+            &context.fork_messages("sub-task"),
+            "the child's first request did not start with the parent prefix"
+        );
+
+        // The fork's cache metadata is written for the production path, not
+        // just computed in tests. The child's own system prompt differs from
+        // the parent's, so the reuse is a conversation fork, not a cache hit.
+        let meta_path = output_file.with_extension("meta.json");
+        let meta: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(meta_path).unwrap()).unwrap();
+        assert_eq!(meta["fork"]["reused"], true);
+        assert_eq!(meta["fork"]["prefix_messages"], prefix.len());
+        assert_eq!(
+            meta["fork"]["prefix_fingerprint"],
+            context.prefix_fingerprint()
+        );
+        assert_eq!(meta["fork"]["cache_safe"], false);
+    }
+
+    /// `on_failure = retry` re-runs the attempt up to `max_retries`.
+    #[tokio::test]
+    async fn retry_policy_retry_reruns_until_max_retries() {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut mgr = make_manager();
+        mgr.set_api_client(Box::new(AlwaysFailApi {
+            calls: Arc::clone(&calls),
+        }));
+
+        let (_agent_id, result, _cwd) = spawn_and_wait(
+            &mut mgr,
+            "do work",
+            SpawnOptions {
+                retry_policy: Some(RetryPolicy {
+                    max_retries: 2,
+                    on_failure: FailureAction::Retry,
+                    escalation_prompt: Some("try again".into()),
+                }),
+                ..Default::default()
+            },
+        )
+        .await;
+
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 3);
+        assert_eq!(result.status, AgentStatus::Failed);
+        assert!(
+            result.output.contains("[retries exhausted after 2]"),
+            "missing the retry-exhausted marker: {}",
+            result.output
+        );
+    }
+
+    /// `on_failure = escalate_to_parent` stops at the first failure, even when
+    /// `max_retries` is non-zero, and marks the result as escalated.
+    #[tokio::test]
+    async fn retry_policy_escalate_stops_and_marks_the_result() {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut mgr = make_manager();
+        mgr.set_api_client(Box::new(AlwaysFailApi {
+            calls: Arc::clone(&calls),
+        }));
+
+        let (agent_id, result, _cwd) = spawn_and_wait(
+            &mut mgr,
+            "do work",
+            SpawnOptions {
+                retry_policy: Some(RetryPolicy {
+                    max_retries: 5,
+                    on_failure: FailureAction::EscalateToParent,
+                    escalation_prompt: None,
+                }),
+                ..Default::default()
+            },
+        )
+        .await;
+
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "escalation must not retry"
+        );
+        assert_eq!(result.status, AgentStatus::Failed);
+        assert!(
+            result.output.contains("[escalated to parent]"),
+            "missing the escalation marker: {}",
+            result.output
+        );
+
+        let output_file = mgr
+            .get_agent(&agent_id)
+            .and_then(|agent| agent.output_file.clone())
+            .expect("output file");
+        let meta: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(output_file.with_extension("meta.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(meta["escalated"], true);
+    }
+
+    /// A normally completing agent (the production task path, not
+    /// `complete_agent`) must notify the manager's teammate callback.
+    #[tokio::test]
+    async fn completing_agent_invokes_the_teammate_callback() {
+        let mut mgr = make_manager();
+        mgr.set_api_client(Box::new(ScriptedApi {
+            calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        }));
+
+        let seen: Arc<std::sync::Mutex<Vec<TeammateEvent>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = Arc::clone(&seen);
+        mgr.set_event_callback(move |event| sink.lock().unwrap().push(event));
+
+        let (_agent_id, result, _cwd) =
+            spawn_and_wait(&mut mgr, "read the note", SpawnOptions::default()).await;
+        assert_eq!(result.status, AgentStatus::Completed);
+
+        let seen = seen.lock().unwrap();
+        assert!(
+            seen.iter()
+                .any(|event| matches!(event, TeammateEvent::Idle { .. })),
+            "no Idle teammate event: {seen:?}"
+        );
+        assert!(
+            seen.iter()
+                .any(|event| matches!(event, TeammateEvent::TaskCompleted { .. })),
+            "no TaskCompleted teammate event: {seen:?}"
+        );
+    }
+
     #[tokio::test]
     async fn lifecycle_emits_tool_call_text_delta_and_idle() {
         let mut mgr = make_manager();
@@ -2821,30 +3349,4 @@ mod tests {
         assert!(json.contains("hello"));
     }
 
-    #[tokio::test]
-    async fn spawn_dream_agent_runs_with_readonly_tools() {
-        let tmp = tempfile::tempdir().unwrap();
-        let mut mgr = make_manager();
-        let dream_prompt = "Analyze recent sessions for patterns.";
-        let summaries = vec!["Session 1: Fixed auth bug", "Session 2: Added tests"];
-
-        let output = super::spawn_dream_agent(
-            &mut mgr,
-            dream_prompt,
-            "sess_parent",
-            tmp.path().to_str().unwrap(),
-            &summaries,
-        )
-        .await
-        .unwrap();
-
-        assert!(output.contains("completed"));
-        // Verify the agent was spawned with read-only tool whitelist
-        let agents = mgr.list_agents();
-        if let Some(agent) = agents.first() {
-            if let Some(ctx) = &agent.context {
-                assert_eq!(ctx.allowed_tools, vec!["Read", "Glob", "Grep"]);
-            }
-        }
-    }
 }
