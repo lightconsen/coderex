@@ -151,6 +151,20 @@ impl InboundRequestHandler for SharedInboundHandler {
     }
 }
 
+/// Receives notifications the server sends without waiting for an answer.
+///
+/// Most notifications are informational, but two change what the client
+/// knows: `notifications/tools/list_changed` means the tool list must be
+/// fetched again, and `notifications/resources/updated` means the content of a
+/// cached resource is stale. The manager installs a handler that acts on them
+/// rather than only logging them.
+#[async_trait::async_trait]
+pub trait ServerNotificationHandler: Send + Sync + std::fmt::Debug {
+    /// Handle one notification. Errors are logged by the caller; a
+    /// notification never blocks the stream.
+    async fn handle_notification(&self, method: &str, params: Option<&Value>);
+}
+
 /// A JSON-RPC notification (no ID, no response expected).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JsonRpcNotification {
@@ -185,6 +199,8 @@ pub struct JsonRpcChannel {
     initialized: bool,
     /// Answers requests the server makes of the client, when one was supplied.
     handler: Option<std::sync::Arc<dyn InboundRequestHandler>>,
+    /// Receives server notifications, when one was supplied.
+    notification_handler: Option<std::sync::Arc<dyn ServerNotificationHandler>>,
 }
 
 impl std::fmt::Debug for JsonRpcChannel {
@@ -217,6 +233,7 @@ impl JsonRpcChannel {
             env,
             initialized: false,
             handler: None,
+            notification_handler: None,
         }
     }
 
@@ -233,6 +250,7 @@ impl JsonRpcChannel {
             env: HashMap::new(),
             initialized: false,
             handler: None,
+            notification_handler: None,
         })
     }
 
@@ -244,6 +262,54 @@ impl JsonRpcChannel {
             http.set_event_stream_handler(std::sync::Arc::clone(&handler));
         }
         self.handler = Some(handler);
+    }
+
+    /// Receive notifications the server sends, on either transport.
+    pub fn set_notification_handler(
+        &mut self,
+        handler: std::sync::Arc<dyn ServerNotificationHandler>,
+    ) {
+        if let Some(http) = self.http.as_mut() {
+            // The GET-stream task and every POST response share the sink.
+            http.set_notification_handler(std::sync::Arc::clone(&handler));
+        }
+        self.notification_handler = Some(handler);
+    }
+
+    /// How hard the standalone GET stream retries before it degrades.
+    ///
+    /// A stdio channel has no such stream, so this is a no-op there.
+    pub fn set_event_stream_retry_policy(&mut self, policy: crate::http::EventStreamRetryPolicy) {
+        if let Some(http) = self.http.as_mut() {
+            http.set_event_stream_retry_policy(policy);
+        }
+    }
+
+    /// The standalone GET stream's state, if this is a remote channel.
+    #[must_use]
+    pub fn event_stream_state(&self) -> Option<crate::http::EventStreamState> {
+        self.http
+            .as_ref()
+            .map(crate::http::HttpChannel::event_stream_state)
+    }
+
+    /// Stop the standalone GET stream and wait for its task, if any.
+    pub async fn stop_event_stream(&mut self) {
+        if let Some(http) = self.http.as_mut() {
+            http.stop_event_stream().await;
+        }
+    }
+
+    /// Hand a notification to the installed sink.
+    async fn dispatch_notification(&self, method: &str, params: Option<&Value>) {
+        match &self.notification_handler {
+            Some(handler) => handler.handle_notification(method, params).await,
+            None => tracing::debug!(
+                server = %self.command,
+                method,
+                "ignoring a notification from the server"
+            ),
+        }
     }
 
     /// Resolve the credential before each HTTP request.
@@ -343,7 +409,9 @@ impl JsonRpcChannel {
     /// The remote session id, once the server has assigned one.
     #[must_use]
     pub fn session_id(&self) -> Option<String> {
-        self.http.as_ref().and_then(crate::http::HttpChannel::session_id)
+        self.http
+            .as_ref()
+            .and_then(crate::http::HttpChannel::session_id)
     }
 
     /// Whether the remote standalone GET stream is running.
@@ -485,13 +553,12 @@ impl JsonRpcChannel {
                     self.answer_server_request(&request).await?;
                     continue;
                 }
-                // A notification: no answer is expected.
+                // A notification: no answer is expected, but it can ask the
+                // manager to re-discover tools or invalidate a cached resource.
                 (true, false) => {
-                    tracing::debug!(
-                        server = %self.command,
-                        message = %trimmed,
-                        "ignoring a notification from the server"
-                    );
+                    let method = value.get("method").and_then(Value::as_str).unwrap_or("");
+                    self.dispatch_notification(method, value.get("params"))
+                        .await;
                     continue;
                 }
                 (false, true) => {}
@@ -626,8 +693,9 @@ impl JsonRpcChannel {
         if let Some(http) = self.http.take() {
             // Stop the standalone stream before dropping the channel; a
             // detached task would otherwise keep polling a server that the
-            // session has finished with.
-            http.stop_event_stream();
+            // session has finished with. Awaiting it means the response body
+            // is closed and the task is gone when shutdown returns.
+            http.stop_event_stream().await;
             self.initialized = false;
             return Ok(());
         }

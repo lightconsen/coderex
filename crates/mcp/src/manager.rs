@@ -21,17 +21,157 @@ struct CachedResource {
     cached_at: Instant,
 }
 
+/// The state a notification handler needs to act without borrowing the
+/// manager: a server pushes `tools/list_changed` from a stream task, which
+/// cannot name the manager that owns it.
+#[derive(Debug, Clone)]
+struct NotificationSink {
+    servers: Arc<DashMap<String, McpServer>>,
+    tools: Arc<Mutex<McpToolRegistry>>,
+    resource_cache: Arc<Mutex<HashMap<(String, String), CachedResource>>>,
+}
+
+impl NotificationSink {
+    /// Re-run `tools/list` for one server and replace that server's tools.
+    ///
+    /// The old list is dropped only after the new one arrives, and only if the
+    /// server answered: a transient failure must not empty the registry.
+    async fn refresh_tools(&self, server_name: &str) {
+        // Clone the server and drop the shard guard before awaiting: this
+        // handler runs on the stream's task, and a synchronous guard held
+        // across the request would deadlock the manager's discovery on a
+        // current-thread runtime.
+        let Some(mut server) = self
+            .servers
+            .get(server_name)
+            .map(|entry| entry.value().clone())
+        else {
+            tracing::debug!(
+                server = server_name,
+                "tools/list_changed for a server that is no longer registered"
+            );
+            return;
+        };
+        if server.status != ServerStatus::Running {
+            return;
+        }
+
+        let value = match server.discover_tools().await {
+            Ok(value) => value,
+            Err(error) => {
+                tracing::warn!(
+                    server = server_name,
+                    "re-discovering tools after tools/list_changed failed: {error}"
+                );
+                return;
+            }
+        };
+        let Some(tools) = value.get("tools").and_then(|tools| tools.as_array()) else {
+            return;
+        };
+
+        let mut registry = self
+            .tools
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let removed = registry.unregister_server(server_name);
+        for tool in tools {
+            let name = tool
+                .get("name")
+                .and_then(|name| name.as_str())
+                .unwrap_or("unknown")
+                .to_string();
+            let description = tool
+                .get("description")
+                .and_then(|description| description.as_str())
+                .unwrap_or("")
+                .to_string();
+            let input_schema = tool
+                .get("inputSchema")
+                .cloned()
+                .unwrap_or_else(|| serde_json::json!({}));
+            registry.register(McpToolInfo {
+                server: server_name.to_string(),
+                name,
+                description,
+                input_schema,
+            });
+        }
+        tracing::info!(
+            server = server_name,
+            count = tools.len(),
+            removed,
+            "Re-discovered MCP tools after tools/list_changed"
+        );
+    }
+
+    /// Drop cached content for one resource, or every resource of a server
+    /// when the notification names none.
+    fn invalidate_resource(&self, server_name: &str, uri: Option<&str>) {
+        let mut cache = self
+            .resource_cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match uri {
+            Some(uri) => {
+                cache.remove(&(server_name.to_string(), uri.to_string()));
+                tracing::debug!(server = server_name, uri, "invalidated a cached resource");
+            }
+            None => {
+                cache.retain(|(server, _), _| server != server_name);
+                tracing::debug!(
+                    server = server_name,
+                    "invalidated every cached resource for the server"
+                );
+            }
+        }
+    }
+}
+
+/// The notification sink as installed on one server.
+#[derive(Debug)]
+struct PerServerNotificationHandler {
+    server: String,
+    sink: NotificationSink,
+}
+
+#[async_trait::async_trait]
+impl crate::channel::ServerNotificationHandler for PerServerNotificationHandler {
+    async fn handle_notification(&self, method: &str, params: Option<&serde_json::Value>) {
+        match method {
+            "notifications/tools/list_changed" => {
+                self.sink.refresh_tools(&self.server).await;
+            }
+            "notifications/resources/updated" => {
+                let uri = params
+                    .and_then(|params| params.get("uri"))
+                    .and_then(serde_json::Value::as_str);
+                self.sink.invalidate_resource(&self.server, uri);
+            }
+            other => tracing::debug!(
+                server = %self.server,
+                method = other,
+                "server notification"
+            ),
+        }
+    }
+}
+
 /// Manager for all MCP servers, tools, and resources.
 #[derive(Debug)]
 pub struct McpManager {
     /// Server instances (shared for health monitor access).
     servers: Arc<DashMap<String, McpServer>>,
     /// Discovered tools.
-    tools: Mutex<McpToolRegistry>,
+    ///
+    /// Shared (like the resource state) because the per-server notification
+    /// handler re-discovers and updates them from the stream's task, where the
+    /// manager itself is not borrowed.
+    tools: Arc<Mutex<McpToolRegistry>>,
     /// Discovered resources.
-    resources: Mutex<McpResourceRegistry>,
+    resources: Arc<Mutex<McpResourceRegistry>>,
     /// Resource read cache: (server_id, uri) -> content.
-    resource_cache: Mutex<HashMap<(String, String), CachedResource>>,
+    resource_cache: Arc<Mutex<HashMap<(String, String), CachedResource>>>,
     /// Default cache TTL.
     cache_ttl: Duration,
     /// OAuth state.
@@ -50,7 +190,7 @@ pub struct McpManager {
     /// channel sees it.
     inbound_handler: crate::channel::SharedInboundHandler,
     /// Whether a refresh (re-discovery) is needed.
-    needs_refresh: AtomicBool,
+    needs_refresh: Arc<AtomicBool>,
     /// Health monitor cancellation sender.
     health_cancel: Mutex<Option<tokio::sync::watch::Sender<bool>>>,
 }
@@ -67,14 +207,14 @@ impl McpManager {
     pub fn new() -> Self {
         Self {
             servers: Arc::new(DashMap::new()),
-            tools: Mutex::new(McpToolRegistry::new()),
-            resources: Mutex::new(McpResourceRegistry::new()),
-            resource_cache: Mutex::new(HashMap::new()),
+            tools: Arc::new(Mutex::new(McpToolRegistry::new())),
+            resources: Arc::new(Mutex::new(McpResourceRegistry::new())),
+            resource_cache: Arc::new(Mutex::new(HashMap::new())),
             cache_ttl: Duration::from_secs(60),
             oauth: Arc::new(tokio::sync::Mutex::new(OAuthManager::new())),
             elicitation: ElicitationManager::new(),
             inbound_handler: crate::channel::SharedInboundHandler::new(),
-            needs_refresh: AtomicBool::new(false),
+            needs_refresh: Arc::new(AtomicBool::new(false)),
             health_cancel: Mutex::new(None),
         }
     }
@@ -101,8 +241,18 @@ impl McpManager {
         manager
     }
 
+    /// The state a per-server notification handler works from.
+    fn notification_sink(&self) -> NotificationSink {
+        NotificationSink {
+            servers: Arc::clone(&self.servers),
+            tools: Arc::clone(&self.tools),
+            resource_cache: Arc::clone(&self.resource_cache),
+        }
+    }
+
     /// Load servers from a configuration.
     pub fn load_config(&self, config: &McpConfig) {
+        let sink = self.notification_sink();
         for (name, server_config) in &config.mcp_servers {
             let mut server = match server_config.transport {
                 McpTransport::Stdio => McpServer::new(
@@ -129,6 +279,12 @@ impl McpManager {
                 }
             };
             server.share_inbound_handler(self.inbound_handler.clone());
+            // Re-discovery and cache invalidation must work from the stream
+            // task, so each server is told which server it is.
+            server.set_notification_handler(Arc::new(PerServerNotificationHandler {
+                server: name.clone(),
+                sink: sink.clone(),
+            }));
             self.servers.insert(name.clone(), server);
         }
         self.needs_refresh.store(true, Ordering::SeqCst);
@@ -173,9 +329,18 @@ impl McpManager {
             }
         }
 
-        for mut entry in self.servers.iter_mut() {
-            let server = entry.value_mut();
+        // Take each server out while it starts rather than holding a DashMap
+        // guard across `spawn().await`: a synchronous guard held across an
+        // await deadlocks anything else that reaches for the same entry on a
+        // current-thread runtime (the standalone stream's notification
+        // handler is one such caller).
+        let names: Vec<String> = self.servers.iter().map(|e| e.key().clone()).collect();
+        for name in names {
+            let Some((_, mut server)) = self.servers.remove(&name) else {
+                continue;
+            };
             let _ = server.spawn().await;
+            self.servers.insert(name, server);
         }
         self.discover_all().await;
     }
@@ -188,11 +353,17 @@ impl McpManager {
 
     /// Discover tools from all running servers.
     pub async fn discover_all_tools(&self) {
-        for mut entry in self.servers.iter_mut() {
-            let server = entry.value_mut();
-            if server.status != crate::server::ServerStatus::Running {
-                continue;
-            }
+        // `McpServer` is deliberately cloneable and its channel is shared, so
+        // discovery can run on a clone after the map lock is released. Holding
+        // a shard guard across the request would deadlock a concurrent
+        // notification handler.
+        let servers: Vec<McpServer> = self
+            .servers
+            .iter()
+            .filter(|entry| entry.value().status == crate::server::ServerStatus::Running)
+            .map(|entry| entry.value().clone())
+            .collect();
+        for mut server in servers {
             match server.discover_tools().await {
                 Ok(value) => {
                     if let Some(tools) = value.get("tools").and_then(|t| t.as_array()) {
@@ -235,11 +406,13 @@ impl McpManager {
 
     /// Discover resources from all running servers.
     pub async fn discover_all_resources(&self) {
-        for mut entry in self.servers.iter_mut() {
-            let server = entry.value_mut();
-            if server.status != crate::server::ServerStatus::Running {
-                continue;
-            }
+        let servers: Vec<McpServer> = self
+            .servers
+            .iter()
+            .filter(|entry| entry.value().status == crate::server::ServerStatus::Running)
+            .map(|entry| entry.value().clone())
+            .collect();
+        for mut server in servers {
             match server.discover_resources().await {
                 Ok(value) => {
                     if let Some(resources) = value.get("resources").and_then(|r| r.as_array()) {
@@ -288,9 +461,13 @@ impl McpManager {
     /// Stop all servers and cancel health monitor.
     pub async fn stop_all(&self) {
         self.cancel_health_monitor();
-        for mut entry in self.servers.iter_mut() {
-            let server = entry.value_mut();
+        let names: Vec<String> = self.servers.iter().map(|e| e.key().clone()).collect();
+        for name in names {
+            let Some((_, mut server)) = self.servers.remove(&name) else {
+                continue;
+            };
             server.stop().await;
+            self.servers.insert(name, server);
         }
     }
 
@@ -316,12 +493,12 @@ impl McpManager {
                     }
                 }
 
-                for entry in servers.iter() {
-                    let name = entry.key().clone();
-                    let server = entry.value();
-                    if server.status != ServerStatus::Running {
-                        continue;
-                    }
+                let running: Vec<(String, McpServer)> = servers
+                    .iter()
+                    .filter(|entry| entry.value().status == ServerStatus::Running)
+                    .map(|entry| (entry.key().clone(), entry.value().clone()))
+                    .collect();
+                for (name, server) in running {
                     if let Err(e) = server.health_check().await {
                         tracing::warn!(server = %name, "MCP health check failed: {e}");
                     }
@@ -714,6 +891,38 @@ mod tests {
             .token_provider()
             .expect("a remote server needs a token provider");
         assert_eq!(provider.access_token().await.as_deref(), Some("token_abc"));
+    }
+
+    /// `notifications/resources/updated` removes that resource from the cache
+    /// so the next read goes back to the server.
+    #[tokio::test]
+    async fn resources_updated_invalidates_the_cached_content() {
+        let mgr = McpManager::new();
+        let content = |uri: &str| crate::resources::McpResourceContent {
+            uri: uri.to_string(),
+            mime_type: "text/plain".to_string(),
+            text: Some("stale".to_string()),
+            blob: None,
+        };
+        mgr.cache_resource("remote", "file:///a", content("file:///a"));
+        mgr.cache_resource("remote", "file:///b", content("file:///b"));
+
+        let handler = PerServerNotificationHandler {
+            server: "remote".to_string(),
+            sink: mgr.notification_sink(),
+        };
+        crate::channel::ServerNotificationHandler::handle_notification(
+            &handler,
+            "notifications/resources/updated",
+            Some(&serde_json::json!({"uri": "file:///a"})),
+        )
+        .await;
+
+        assert!(
+            mgr.get_cached_resource("remote", "file:///a").is_none(),
+            "the updated resource must be invalidated"
+        );
+        assert!(mgr.get_cached_resource("remote", "file:///b").is_some());
     }
 
     #[tokio::test]

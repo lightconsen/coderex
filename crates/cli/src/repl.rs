@@ -259,7 +259,9 @@ fn protocol_frame(
     event: &EngineEvent,
     session_id: &str,
 ) -> Option<coderex_events::ProtocolMessage> {
-    use coderex_events::{protocol, AssistantFrame, MessageBody, ProtocolMessage, SystemFrame, UserFrame};
+    use coderex_events::{
+        AssistantFrame, MessageBody, ProtocolMessage, SystemFrame, UserFrame, protocol,
+    };
 
     Some(match event {
         // One frame per delta, as the reference streams them.
@@ -478,6 +480,16 @@ impl TuiElicitationHandler {
     }
 }
 
+/// How a form field's type reads in the transcript.
+fn field_type_label(field: &coderex_mcp::elicitation::FormField) -> &'static str {
+    match field.field_type {
+        coderex_mcp::elicitation::FormFieldType::String => "text",
+        coderex_mcp::elicitation::FormFieldType::Integer => "integer",
+        coderex_mcp::elicitation::FormFieldType::Number => "number",
+        coderex_mcp::elicitation::FormFieldType::Boolean => "true/false",
+    }
+}
+
 #[async_trait::async_trait]
 impl ElicitationHandler for TuiElicitationHandler {
     async fn request(
@@ -491,6 +503,7 @@ impl ElicitationHandler for TuiElicitationHandler {
         let (response_tx, response_rx) = tokio::sync::oneshot::channel();
         let request = TuiElicitationRequest {
             prompt: question.question.clone(),
+            form: None,
             response_tx,
         };
 
@@ -706,6 +719,11 @@ pub struct ReplLoop {
     running_query: Option<coderex_core::engine::InterruptHandle>,
     /// Pending elicitation response sender — when set, user input is treated as an answer.
     pending_elicitation: Option<tokio::sync::oneshot::Sender<serde_json::Value>>,
+    /// The multi-field form being filled, when the pending elicitation is one.
+    ///
+    /// Kept separately from `pending_elicitation` because the TUI edits it
+    /// with navigation keys rather than reading one line of free text.
+    pending_mcp_form: Option<crate::mcp_elicitation::McpFormState>,
     /// Confirmation bus for interactive permission requests.
     confirmation_bus: Option<ConfirmationBus>,
     /// Receiver for cron job fire events.
@@ -866,6 +884,7 @@ impl ReplLoop {
             artifact_store_root: None,
             running_query: None,
             pending_elicitation: None,
+            pending_mcp_form: None,
             confirmation_bus: None,
             cron_rx: None,
             teleport_manager: Some(coderex_bridge::teleport::TeleportManager::new()),
@@ -946,13 +965,15 @@ impl ReplLoop {
         // The model-facing memory family. A write to a shared store is decided
         // by the model rather than assumed safe, and the service refuses such a
         // write outright when no classifier is installed.
-        let memory_service = Arc::new(coderex_memory::service::MemoryService::new(
-            Arc::clone(&long_term_store),
-            Arc::clone(&team_memory_service),
-        )
-        .with_classifier(Arc::new(
-            crate::memory_tools::ModelMemoryClassifier::new(api_client.clone_box()),
-        )));
+        let memory_service = Arc::new(
+            coderex_memory::service::MemoryService::new(
+                Arc::clone(&long_term_store),
+                Arc::clone(&team_memory_service),
+            )
+            .with_classifier(Arc::new(
+                crate::memory_tools::ModelMemoryClassifier::new(api_client.clone_box()),
+            )),
+        );
         let memory_writable = Arc::new(std::sync::atomic::AtomicBool::new(true));
 
         let engine = QueryEngine::new(
@@ -1024,8 +1045,7 @@ impl ReplLoop {
             .with_root(coderex_workflow::default_root())
             .with_project_dir(std::path::Path::new(&cwd).join(".coderex/workflows")),
         ));
-        for tool in
-            crate::memory_tools::memory_tools(Arc::clone(&memory_service), &memory_writable)
+        for tool in crate::memory_tools::memory_tools(Arc::clone(&memory_service), &memory_writable)
         {
             registry.register(tool);
         }
@@ -1124,6 +1144,7 @@ impl ReplLoop {
             artifact_store_root: None,
             running_query: None,
             pending_elicitation: None,
+            pending_mcp_form: None,
             confirmation_bus: Some(confirmation_bus),
             cron_rx: Some(cron_rx),
             teleport_manager: Some(coderex_bridge::teleport::TeleportManager::new()),
@@ -1541,7 +1562,8 @@ impl ReplLoop {
                             registry.set_action_runner(Arc::new(
                                 crate::hook_actions::SessionHookActionRunner::new(
                                     api.clone_box(),
-                                    Arc::clone(dispatcher) as Arc<dyn crate::hook_actions::HookToolCaller>,
+                                    Arc::clone(dispatcher)
+                                        as Arc<dyn crate::hook_actions::HookToolCaller>,
                                     self.model.clone(),
                                 ),
                             ));
@@ -1758,15 +1780,13 @@ impl ReplLoop {
         };
 
         for notification in &adopted.notifications {
-            ui_state
-                .messages
-                .push(coderex_ui::message_list::Message {
-                    role: coderex_ui::message_list::MessageRole::System,
-                    content: notification.text.clone().into(),
-                    tool_name: None,
-                    streaming: false,
-                    folded: false,
-                });
+            ui_state.messages.push(coderex_ui::message_list::Message {
+                role: coderex_ui::message_list::MessageRole::System,
+                content: notification.text.clone().into(),
+                tool_name: None,
+                streaming: false,
+                folded: false,
+            });
         }
     }
 
@@ -2217,6 +2237,13 @@ impl ReplLoop {
                             let Some(key) = coderex_ui::input::key_press(key) else {
                                 continue;
                             };
+                            // A multi-field MCP form owns the keyboard while
+                            // it is open: navigation, editing, submit, cancel.
+                            if self.pending_mcp_form.is_some()
+                                && self.handle_mcp_form_key(&key, &mut ui_state)
+                            {
+                                continue;
+                            }
                             if key.code == KeyCode::Char('c')
                                 && key.modifiers.contains(KeyModifiers::CONTROL)
                             {
@@ -2813,6 +2840,7 @@ impl ReplLoop {
                     elicit_rx = None;
                     tui_elicit_rx = None;
                     self.pending_elicitation = None;
+                    self.pending_mcp_form = None;
                     pending_confirmation = None;
                     thinking = false;
                     phase.reset();
@@ -2989,9 +3017,50 @@ impl ReplLoop {
                         streaming: false,
                         folded: false,
                     });
-                    ui_state
-                        .notifications
-                        .info("An MCP server is waiting for an answer");
+
+                    if let Some(form) = request.form {
+                        // Show the whole form up front: every field, with
+                        // required markers and defaults, so the person can see
+                        // what the server is asking for before typing.
+                        for field in &form.fields {
+                            let marker = if field.required { "*" } else { " " };
+                            let mut line = format!(
+                                "  {marker} {} ({})",
+                                field.label(),
+                                field_type_label(field)
+                            );
+                            if let Some(default) = &field.default {
+                                line.push_str(&format!(" [default: {default}]"));
+                            }
+                            if let Some(description) = &field.description {
+                                line.push_str(&format!(" — {description}"));
+                            }
+                            ui_state.messages.push(Message {
+                                role: MessageRole::System,
+                                content: line.into(),
+                                tool_name: None,
+                                streaming: false,
+                                folded: false,
+                            });
+                        }
+                        ui_state.messages.push(Message {
+                            role: MessageRole::System,
+                            content:
+                                "Up/Down or Tab moves between fields; Enter submits; Esc cancels."
+                                    .into(),
+                            tool_name: None,
+                            streaming: false,
+                            folded: false,
+                        });
+                        let state = crate::mcp_elicitation::McpFormState::new(form);
+                        ui_state.notifications.info(state.focus_hint());
+                        self.pending_mcp_form = Some(state);
+                    } else {
+                        self.pending_mcp_form = None;
+                        ui_state
+                            .notifications
+                            .info("An MCP server is waiting for an answer");
+                    }
                     self.pending_elicitation = Some(request.response_tx);
                 }
 
@@ -3736,57 +3805,57 @@ impl ReplLoop {
         });
         let (engine, result) = loop {
             tokio::select! {
-                Some(event) = async {
-                    match live_events.as_mut() {
-                        Some(rx) => rx.recv().await,
-                        None => std::future::pending().await,
+            Some(event) = async {
+                match live_events.as_mut() {
+                    Some(rx) => rx.recv().await,
+                    None => std::future::pending().await,
+                }
+            }, if live_events.is_some() => {
+                if let Some(sink) = protocol.as_mut() {
+                    if let Some(frame) = protocol_frame(&event, &session_id) {
+                        if let Err(error) = sink.emit(&frame) {
+                            tracing::warn!("could not write a protocol frame: {error}");
+                        }
                     }
-                }, if live_events.is_some() => {
-                    if let Some(sink) = protocol.as_mut() {
-                        if let Some(frame) = protocol_frame(&event, &session_id) {
-                            if let Err(error) = sink.emit(&frame) {
-                                tracing::warn!("could not write a protocol frame: {error}");
+                }
+                if let EngineEvent::TextDelta(delta) = &event {
+                    output.push_str(delta);
+                }
+            }
+            Some(request) = elicit_rx.recv() => {
+                for (i, q) in request.questions.iter().enumerate() {
+                    if let Some(text) = q.get("question").and_then(|v| v.as_str()) {
+                        println!("  [{}] {}", i + 1, text);
+                    }
+                    if let Some(options) = q.get("options").and_then(|v| v.as_array()) {
+                        for opt in options {
+                            if let (Some(label), Some(desc)) = (
+                                opt.get("label").and_then(|v| v.as_str()),
+                                opt.get("description").and_then(|v| v.as_str()),
+                            ) {
+                                println!("     {} — {}", label, desc);
                             }
                         }
                     }
-                    if let EngineEvent::TextDelta(delta) = &event {
-                        output.push_str(delta);
+                }
+                print!("Your answer: ");
+                let _ = std::io::Write::flush(&mut std::io::stdout());
+                let mut line = String::new();
+                let _ = std::io::stdin().read_line(&mut line);
+                let answer = line.trim();
+                let answers = serde_json::json!({ "answer": answer });
+                let _ = request.response_tx.send(answers);
+            }
+            received = engine_rx.recv() => {
+                match received {
+                    Some(handoff) => break handoff,
+                    // The task is gone and took the engine with it. Say so
+                    // rather than waiting for a handoff that cannot come.
+                    None => {
+                        return "the query task ended without returning its engine".to_string();
                     }
                 }
-                Some(request) = elicit_rx.recv() => {
-                    for (i, q) in request.questions.iter().enumerate() {
-                        if let Some(text) = q.get("question").and_then(|v| v.as_str()) {
-                            println!("  [{}] {}", i + 1, text);
-                        }
-                        if let Some(options) = q.get("options").and_then(|v| v.as_array()) {
-                            for opt in options {
-                                if let (Some(label), Some(desc)) = (
-                                    opt.get("label").and_then(|v| v.as_str()),
-                                    opt.get("description").and_then(|v| v.as_str()),
-                                ) {
-                                    println!("     {} — {}", label, desc);
-                                }
-                            }
-                        }
-                    }
-                    print!("Your answer: ");
-                    let _ = std::io::Write::flush(&mut std::io::stdout());
-                    let mut line = String::new();
-                    let _ = std::io::stdin().read_line(&mut line);
-                    let answer = line.trim();
-                    let answers = serde_json::json!({ "answer": answer });
-                    let _ = request.response_tx.send(answers);
-                }
-                received = engine_rx.recv() => {
-                    match received {
-                        Some(handoff) => break handoff,
-                        // The task is gone and took the engine with it. Say so
-                        // rather than waiting for a handoff that cannot come.
-                        None => {
-                            return "the query task ended without returning its engine".to_string();
-                        }
-                    }
-                }            }
+            }            }
         };
 
         self.engine = Some(engine);
@@ -3948,6 +4017,103 @@ impl ReplLoop {
         }
     }
 
+    /// Edit, submit, or cancel the open multi-field MCP form.
+    ///
+    /// Returns whether the key was consumed. Every key is consumed while a
+    /// form is open, so a stray key cannot edit the main input line or change
+    /// the transcript underneath it.
+    fn handle_mcp_form_key(
+        &mut self,
+        key: &crossterm::event::KeyEvent,
+        ui_state: &mut coderex_ui::state::UiState,
+    ) -> bool {
+        use crossterm::event::{KeyCode, KeyModifiers};
+
+        if self.pending_mcp_form.is_none() {
+            return false;
+        }
+
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('c')
+                if key.code == KeyCode::Esc || key.modifiers.contains(KeyModifiers::CONTROL) =>
+            {
+                self.pending_mcp_form = None;
+                if let Some(tx) = self.pending_elicitation.take() {
+                    let _ = tx.send(serde_json::json!({ "cancelled": true }));
+                }
+                ui_state.messages.push(coderex_ui::message_list::Message {
+                    role: coderex_ui::message_list::MessageRole::System,
+                    content: "MCP form cancelled.".into(),
+                    tool_name: None,
+                    streaming: false,
+                    folded: false,
+                });
+            }
+            KeyCode::Tab | KeyCode::Down => {
+                if let Some(form) = self.pending_mcp_form.as_mut() {
+                    form.move_focus(1);
+                    ui_state.notifications.info(form.focus_hint());
+                }
+            }
+            KeyCode::BackTab | KeyCode::Up => {
+                if let Some(form) = self.pending_mcp_form.as_mut() {
+                    form.move_focus(-1);
+                    ui_state.notifications.info(form.focus_hint());
+                }
+            }
+            KeyCode::Enter => {
+                let mut form = self.pending_mcp_form.take().expect("form is open");
+                match form.submit() {
+                    Ok(content) => {
+                        if let Some(tx) = self.pending_elicitation.take() {
+                            let _ = tx.send(serde_json::json!({ "content": content }));
+                        }
+                        ui_state.messages.push(coderex_ui::message_list::Message {
+                            role: coderex_ui::message_list::MessageRole::System,
+                            content: "MCP form submitted.".into(),
+                            tool_name: None,
+                            streaming: false,
+                            folded: false,
+                        });
+                    }
+                    Err(message) => {
+                        // Do not send: the schema rejected the answer, and a
+                        // server must never receive an invalid `accept`.
+                        ui_state.messages.push(coderex_ui::message_list::Message {
+                            role: coderex_ui::message_list::MessageRole::System,
+                            content: format!("MCP form: {message}").into(),
+                            tool_name: None,
+                            streaming: false,
+                            folded: false,
+                        });
+                        self.pending_mcp_form = Some(form);
+                    }
+                }
+            }
+            KeyCode::Backspace => {
+                if let Some(form) = self.pending_mcp_form.as_mut() {
+                    form.backspace();
+                }
+            }
+            KeyCode::Delete => {
+                if let Some(form) = self.pending_mcp_form.as_mut() {
+                    form.clear_field();
+                }
+            }
+            KeyCode::Char(c)
+                if !key.modifiers.contains(KeyModifiers::CONTROL)
+                    && !key.modifiers.contains(KeyModifiers::ALT) =>
+            {
+                if let Some(form) = self.pending_mcp_form.as_mut() {
+                    form.insert_char(c);
+                }
+            }
+            // Left/Right/Home/End and anything else stay inside the form.
+            _ => {}
+        }
+        true
+    }
+
     /// Process a line of input in the TUI context.
     async fn process_tui_input(
         &mut self,
@@ -3967,6 +4133,12 @@ impl ReplLoop {
         ui_state.statusline.thinking_started = None;
         ui_state.statusline.spinner_frame = 0;
         ui_state.messages.scroll_to_bottom();
+
+        // A multi-field form is edited by the key handler, not by submitting
+        // the main input line.
+        if self.pending_mcp_form.is_some() {
+            return;
+        }
 
         // If there's a pending elicitation, treat this input as the answer.
         if let Some(tx) = self.pending_elicitation.take() {
@@ -4348,16 +4520,11 @@ impl ReplLoop {
         *elicit_rx = None;
         *tui_elicit_rx = None;
         self.pending_elicitation = None;
+        self.pending_mcp_form = None;
         clear_permission_overlay(ui_state);
-        if let Some(last) = ui_state
-            .messages
-            .messages
-            .iter_mut()
-            .rev()
-            .find(|msg| {
-                msg.role == coderex_ui::message_list::MessageRole::Assistant && msg.streaming
-            })
-        {
+        if let Some(last) = ui_state.messages.messages.iter_mut().rev().find(|msg| {
+            msg.role == coderex_ui::message_list::MessageRole::Assistant && msg.streaming
+        }) {
             last.streaming = false;
             let mut msg = last.content.to_string();
             msg.push_str(marker);
@@ -6125,7 +6292,7 @@ mod tests {
             ModelId::sonnet(),
         );
         repl.with_protocol_sink(Some(coderex_events::MessageSink::new(
-            Box::new(buffer.clone()) as Box<dyn std::io::Write + Send>
+            Box::new(buffer.clone()) as Box<dyn std::io::Write + Send>,
         )));
 
         repl.run_headless("Hello").await.unwrap();
@@ -6135,8 +6302,9 @@ mod tests {
 
         let mut results = 0;
         for line in &lines {
-            let parsed: serde_json::Value = serde_json::from_str(line)
-                .unwrap_or_else(|e| panic!("every line must be one JSON object, got {line:?}: {e}"));
+            let parsed: serde_json::Value = serde_json::from_str(line).unwrap_or_else(|e| {
+                panic!("every line must be one JSON object, got {line:?}: {e}")
+            });
             if parsed["type"] == "result" {
                 results += 1;
                 assert!(parsed["subtype"].is_string(), "a result carries a subtype");
@@ -6173,15 +6341,13 @@ mod tests {
         repl.running_query = Some(handle.clone());
 
         let mut ui_state = coderex_ui::state::UiState::new();
-        ui_state
-            .messages
-            .push(coderex_ui::message_list::Message {
-                role: coderex_ui::message_list::MessageRole::Assistant,
-                content: "answering…".into(),
-                tool_name: None,
-                streaming: true,
-                folded: false,
-            });
+        ui_state.messages.push(coderex_ui::message_list::Message {
+            role: coderex_ui::message_list::MessageRole::Assistant,
+            content: "answering…".into(),
+            tool_name: None,
+            streaming: true,
+            folded: false,
+        });
         let mut thinking = true;
         let mut phase = InteractivePhase::Thinking;
         let mut query_done = None;
@@ -6235,10 +6401,12 @@ mod tests {
             ui_state.activity_log.last().map(String::as_str),
             Some("Sub-agent agent-12 started")
         );
-        assert!(ui_state
-            .notifications
-            .latest()
-            .is_some_and(|note| note.message.contains("started")));
+        assert!(
+            ui_state
+                .notifications
+                .latest()
+                .is_some_and(|note| note.message.contains("started"))
+        );
 
         apply_agent_event(
             &mut ui_state,

@@ -2,22 +2,177 @@
 
 use crate::channel::{
     InboundRequestHandler, JsonRpcError, JsonRpcNotification, JsonRpcRequest, JsonRpcResponse,
-    JsonRpcServerRequest, METHOD_NOT_FOUND,
+    JsonRpcServerRequest, METHOD_NOT_FOUND, ServerNotificationHandler,
 };
 use reqwest::Url;
 use reqwest::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue};
 use serde::Serialize;
 use serde_json::Value;
-use std::collections::HashMap;
-use std::sync::{Arc, RwLock};
-use std::time::Duration;
+use std::collections::{HashMap, VecDeque};
+use std::sync::{Arc, Mutex, RwLock};
+use std::time::{Duration, Instant};
+use tokio_util::sync::CancellationToken;
 
 /// The header the MCP streamable-HTTP transport uses to name a session.
 const SESSION_ID_HEADER: &str = "mcp-session-id";
+/// The header that says which protocol revision a post-initialize request uses.
+const PROTOCOL_VERSION_HEADER: &str = "mcp-protocol-version";
+/// The revision this client asks for and assumes when a server echoes none.
+const DEFAULT_PROTOCOL_VERSION: &str = "2024-11-05";
 /// The header that resumes an SSE stream where it left off.
 const LAST_EVENT_ID_HEADER: &str = "last-event-id";
 /// The `Accept` value a standalone server-to-client stream requires.
 const EVENT_STREAM_ACCEPT: &str = "text/event-stream";
+/// How long a server request id is remembered after it was answered.
+const DEDUP_TTL: Duration = Duration::from_secs(300);
+/// The most answered request ids kept for retry detection.
+const DEDUP_CAPACITY: usize = 256;
+/// A single SSE event larger than this is not a JSON-RPC message; refusing it
+/// keeps a broken or hostile stream from growing the read buffer without end.
+const MAX_SSE_EVENT_BYTES: usize = 4 * 1024 * 1024;
+/// Messages the stream may hold while the handler is busy before it closes.
+const INBOUND_QUEUE_CAPACITY: usize = 64;
+
+/// The state of a remote server's standalone server-to-client stream.
+///
+/// This is surfaced to the session so "the server cannot push messages to us"
+/// is a visible fact rather than a task that retries forever in the
+/// background.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EventStreamState {
+    /// No stream is running (never started, or shut down).
+    Stopped,
+    /// The first connection is being made.
+    Starting,
+    /// The stream is connected and delivering messages.
+    Active,
+    /// The retry budget was exhausted. The stream has stopped retrying.
+    Degraded,
+    /// The server answered 405: it does not offer a standalone stream. This is
+    /// expected for many servers and is not an error.
+    Unsupported,
+}
+
+/// How hard the standalone stream tries before it gives up.
+#[derive(Debug, Clone, Copy)]
+pub struct EventStreamRetryPolicy {
+    /// Consecutive failed connections (without a delivered message) allowed.
+    pub max_attempts: usize,
+    /// The first delay between attempts; doubled on each failure.
+    pub base_delay: Duration,
+    /// The delay cap.
+    pub max_delay: Duration,
+    /// The longest the stream may keep retrying without progress.
+    pub max_duration: Duration,
+}
+
+impl Default for EventStreamRetryPolicy {
+    fn default() -> Self {
+        Self {
+            max_attempts: 5,
+            base_delay: Duration::from_millis(250),
+            max_delay: Duration::from_secs(5),
+            max_duration: Duration::from_secs(30),
+        }
+    }
+}
+
+/// The identity of a server request: a request id is only unique within one
+/// session, and a session can be re-initialized.
+type RequestKey = (String, u64);
+
+/// Whether a server request is being answered or was answered recently.
+#[derive(Debug, Clone, Copy)]
+enum DedupEntry {
+    /// A handler is running right now.
+    Pending,
+    /// The answer was delivered; a redelivery must not ask again.
+    Answered,
+}
+
+/// Recent server-request keys, used to answer each request exactly once even
+/// when the same message arrives on both the POST and the standalone stream.
+#[derive(Debug, Default)]
+struct RequestDedup {
+    inner: Mutex<DedupInner>,
+}
+
+#[derive(Debug, Default)]
+struct DedupInner {
+    entries: HashMap<RequestKey, (DedupEntry, Instant)>,
+    order: VecDeque<RequestKey>,
+}
+
+impl RequestDedup {
+    /// Claim `key` for this attempt. Returns false for a pending or recent
+    /// duplicate.
+    fn begin(&self, key: &RequestKey) -> bool {
+        let now = Instant::now();
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        while let Some(oldest) = inner.order.front() {
+            let expired = inner
+                .entries
+                .get(oldest)
+                .is_some_and(|(_, at)| now.duration_since(*at) > DEDUP_TTL);
+            if !expired {
+                break;
+            }
+            if let Some(key) = inner.order.pop_front() {
+                inner.entries.remove(&key);
+            }
+        }
+
+        if inner.entries.contains_key(key) {
+            return false;
+        }
+        while inner.entries.len() >= DEDUP_CAPACITY {
+            let Some(oldest) = inner.order.pop_front() else {
+                break;
+            };
+            inner.entries.remove(&oldest);
+        }
+        inner
+            .entries
+            .insert(key.clone(), (DedupEntry::Pending, now));
+        inner.order.push_back(key.clone());
+        true
+    }
+
+    /// Mark a claimed request as answered.
+    fn complete(&self, key: &RequestKey) {
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        inner
+            .entries
+            .insert(key.clone(), (DedupEntry::Answered, Instant::now()));
+    }
+
+    /// Release a claim whose answer could not be delivered, so a retry can
+    /// answer it.
+    fn fail(&self, key: &RequestKey) {
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        inner.entries.remove(key);
+        inner.order.retain(|entry| entry != key);
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .entries
+            .len()
+    }
+}
 
 /// Supplies the credential for a remote request.
 ///
@@ -51,18 +206,24 @@ struct RequestContext {
     token_provider: Option<Arc<dyn TokenProvider>>,
     /// The server's session id, learned from an initialize response header.
     session_id: Arc<RwLock<Option<String>>>,
+    /// The protocol revision the server negotiated in its initialize result.
+    protocol_version: Arc<RwLock<Option<String>>>,
+    /// Server requests already answered (or being answered) over either stream.
+    dedup: Arc<RequestDedup>,
 }
 
 impl RequestContext {
     fn session_id(&self) -> Option<String> {
-        self.session_id
-            .read()
-            .ok()
-            .and_then(|slot| slot.clone())
+        self.session_id.read().ok().and_then(|slot| slot.clone())
     }
 
-    fn clear_session_id(&self) {
+    /// Forget everything tied to the old session. A re-initialize negotiates
+    /// both values again.
+    fn clear_session(&self) {
         if let Ok(mut slot) = self.session_id.write() {
+            *slot = None;
+        }
+        if let Ok(mut slot) = self.protocol_version.write() {
             *slot = None;
         }
     }
@@ -84,8 +245,29 @@ impl RequestContext {
         }
     }
 
-    /// Headers for one request, with a freshly resolved bearer token and the
-    /// current session id.
+    /// Remember the protocol revision the initialize result negotiated.
+    fn capture_protocol_version(&self, result: &Value) {
+        let version = result
+            .get("protocolVersion")
+            .and_then(Value::as_str)
+            .unwrap_or(DEFAULT_PROTOCOL_VERSION)
+            .trim();
+        if !version.is_empty() {
+            if let Ok(mut slot) = self.protocol_version.write() {
+                *slot = Some(version.to_string());
+            }
+        }
+    }
+
+    fn protocol_version(&self) -> Option<String> {
+        self.protocol_version
+            .read()
+            .ok()
+            .and_then(|slot| slot.clone())
+    }
+
+    /// Headers for one request, with a freshly resolved bearer token, the
+    /// current session id, and the negotiated protocol revision.
     ///
     /// A token from the provider replaces a configured `Authorization` header;
     /// this is what lets a configured static token give way to a refreshed one.
@@ -111,6 +293,18 @@ impl RequestContext {
                 }
                 Err(error) => {
                     tracing::warn!("MCP session id cannot be sent as an HTTP header: {error}");
+                }
+            }
+        }
+        if let Some(version) = self.protocol_version() {
+            match HeaderValue::from_str(&version) {
+                Ok(value) => {
+                    headers.insert(HeaderName::from_static(PROTOCOL_VERSION_HEADER), value);
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        "MCP protocol version cannot be sent as an HTTP header: {error}"
+                    );
                 }
             }
         }
@@ -202,10 +396,43 @@ impl RequestContext {
         Ok(())
     }
 
-    async fn send_notification(
+    /// Answer a server request unless this exact request has already been
+    /// answered (or is being answered) for the current session.
+    ///
+    /// The same request can arrive twice — once carried by the POST response
+    /// stream and once by the standalone GET stream, or again after a
+    /// reconnect. The key is `(session_id, request_id)`; the handler is run
+    /// once and the duplicate is dropped.
+    async fn answer_once(
         &self,
-        notification: &JsonRpcNotification,
+        request: &JsonRpcServerRequest,
+        handler: Option<&dyn InboundRequestHandler>,
     ) -> Result<(), String> {
+        let key = (self.session_id().unwrap_or_default(), request.id);
+        if !self.dedup.begin(&key) {
+            tracing::debug!(
+                id = request.id,
+                method = %request.method,
+                "skipping a duplicate server request"
+            );
+            return Ok(());
+        }
+
+        match self.answer_server_request(request, handler).await {
+            Ok(()) => {
+                self.dedup.complete(&key);
+                Ok(())
+            }
+            Err(error) => {
+                // The answer was not delivered, so a retry must be allowed to
+                // try again rather than being mistaken for a duplicate.
+                self.dedup.fail(&key);
+                Err(error)
+            }
+        }
+    }
+
+    async fn send_notification(&self, notification: &JsonRpcNotification) -> Result<(), String> {
         let response = self
             .post(notification, "application/json, text/event-stream")
             .await?;
@@ -235,8 +462,22 @@ pub struct HttpChannel {
     /// Shared rather than copied so a handler installed after the stream
     /// started (the session's UI slot is one) is seen by later messages.
     event_handler: Arc<RwLock<Option<Arc<dyn InboundRequestHandler>>>>,
+    /// Notifications (`tools/list_changed`, `resources/updated`, …) from
+    /// either stream, delivered to the manager so it can act on them.
+    notification_handler: Arc<RwLock<Option<Arc<dyn ServerNotificationHandler>>>>,
     /// The one background GET-stream task for this server, if it is running.
-    event_stream: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
+    event_stream: Mutex<Option<EventStreamHandle>>,
+    /// The stream's current state, readable while the task runs.
+    event_state: Arc<RwLock<EventStreamState>>,
+    /// Retry settings for the standalone stream.
+    retry_policy: EventStreamRetryPolicy,
+}
+
+/// A running standalone-stream task together with its cancellation token.
+#[derive(Debug)]
+struct EventStreamHandle {
+    cancel: CancellationToken,
+    task: tokio::task::JoinHandle<()>,
 }
 
 impl HttpChannel {
@@ -265,10 +506,30 @@ impl HttpChannel {
                 headers: header_map,
                 token_provider: None,
                 session_id: Arc::new(RwLock::new(None)),
+                protocol_version: Arc::new(RwLock::new(None)),
+                dedup: Arc::new(RequestDedup::default()),
             },
             event_handler: Arc::new(RwLock::new(None)),
-            event_stream: std::sync::Mutex::new(None),
+            notification_handler: Arc::new(RwLock::new(None)),
+            event_stream: Mutex::new(None),
+            event_state: Arc::new(RwLock::new(EventStreamState::Stopped)),
+            retry_policy: EventStreamRetryPolicy::default(),
         })
+    }
+
+    /// Change how hard the standalone stream retries before it degrades.
+    ///
+    /// Exposed mainly so tests can exercise the cap without waiting out the
+    /// production policy.
+    pub fn set_event_stream_retry_policy(&mut self, policy: EventStreamRetryPolicy) {
+        self.retry_policy = policy;
+    }
+
+    /// Install the sink for server notifications.
+    pub fn set_notification_handler(&mut self, handler: Arc<dyn ServerNotificationHandler>) {
+        if let Ok(mut slot) = self.notification_handler.write() {
+            *slot = Some(handler);
+        }
     }
 
     /// Install the credential resolver used for every subsequent request.
@@ -317,7 +578,10 @@ impl HttpChannel {
                 .await?;
             let status = response.status();
 
-            let session_expired = matches!(status.as_u16(), 404 | 405)
+            // 404 is the streamable-HTTP signal that the session expired; 405
+            // is not: it belongs to the standalone GET stream and means the
+            // server offers no such stream.
+            let session_expired = status.as_u16() == 404
                 && request.method != "initialize"
                 && self.context.session_id().is_some();
             if session_expired {
@@ -332,8 +596,8 @@ impl HttpChannel {
                     status = %status,
                     "the MCP session is no longer valid; clearing it and re-initializing"
                 );
-                self.context.clear_session_id();
-                self.reinitialize(handler).await?;
+                self.context.clear_session();
+                reinitialize(&self.context, handler).await?;
                 reinitialized = true;
                 continue;
             }
@@ -343,219 +607,18 @@ impl HttpChannel {
                 return Err(format!("MCP HTTP server returned {status}: {body}"));
             }
 
-            return self.finish_response(response, request.id, handler).await;
-        }
-    }
-
-    /// Run the initialize/initialized handshake again on this channel.
-    ///
-    /// Used only to recover an expired session. The new session id is captured
-    /// from the response header like the first one was.
-    async fn reinitialize(
-        &self,
-        handler: Option<&dyn InboundRequestHandler>,
-    ) -> Result<(), String> {
-        let request = JsonRpcRequest {
-            jsonrpc: "2.0".to_string(),
-            // The request id space belongs to the channel; id 0 is never used
-            // for an application request, so it cannot collide with one.
-            id: 0,
-            method: "initialize".to_string(),
-            params: Some(serde_json::json!({
-                "protocolVersion": "2024-11-05",
-                "capabilities": {},
-                "clientInfo": {"name": "coderex", "version": "0.1.0"}
-            })),
-        };
-        let response = self
-            .context
-            .post(&request, "application/json, text/event-stream")
+            let result = finish_response(
+                &self.context,
+                &self.notification_handler,
+                response,
+                request.id,
+                handler,
+            )
             .await?;
-        let status = response.status();
-        if !status.is_success() {
-            let body = response.text().await.unwrap_or_default();
-            return Err(format!(
-                "MCP HTTP re-initialize failed with {status}: {body}"
-            ));
-        }
-        self.finish_response(response, request.id, handler).await?;
-
-        self.context
-            .send_notification(&JsonRpcNotification {
-                jsonrpc: "2.0".to_string(),
-                method: "initialized".to_string(),
-                params: None,
-            })
-            .await
-    }
-
-    /// Read the response to one request, which may be JSON or SSE.
-    async fn finish_response(
-        &self,
-        response: reqwest::Response,
-        expected_id: u64,
-        handler: Option<&dyn InboundRequestHandler>,
-    ) -> Result<Value, String> {
-        let content_type = response
-            .headers()
-            .get(CONTENT_TYPE)
-            .and_then(|value| value.to_str().ok())
-            .unwrap_or("application/json")
-            .to_string();
-
-        if content_type.contains("text/event-stream") {
-            return self.read_sse_response(response, expected_id, handler).await;
-        }
-
-        let body = response
-            .text()
-            .await
-            .map_err(|error| format!("failed to read MCP HTTP response: {error}"))?;
-        if body.trim().is_empty() {
-            return Err(format!(
-                "MCP HTTP server returned an empty response to request {expected_id}"
-            ));
-        }
-
-        let value: Value = serde_json::from_str(&body)
-            .map_err(|error| format!("failed to parse MCP HTTP response: {error}"))?;
-        self.route_message(&value, expected_id, handler)
-            .await?
-            .ok_or_else(|| {
-                format!(
-                    "MCP HTTP response to request {expected_id} contained no response to it"
-                )
-            })
-    }
-
-    /// Read an SSE response stream, answering server requests as they arrive.
-    ///
-    /// Read incrementally rather than buffering the whole body: a server that
-    /// asks a question mid-stream may hold its own response until the answer
-    /// arrives, so waiting for the end of the body would deadlock.
-    async fn read_sse_response(
-        &self,
-        mut response: reqwest::Response,
-        expected_id: u64,
-        handler: Option<&dyn InboundRequestHandler>,
-    ) -> Result<Value, String> {
-        // Bytes, not `String`: a network chunk may split a multi-byte UTF-8
-        // character, and decoding each chunk on its own would replace half of
-        // it with U+FFFD. Event boundaries are ASCII, so a complete event is
-        // always valid UTF-8 and the partial tail can stay undecoded.
-        let mut buffer = Vec::new();
-
-        loop {
-            for event in take_events(&mut buffer) {
-                if let Some(result) = self.route_sse_event(&event, expected_id, handler).await? {
-                    return Ok(result);
-                }
+            if request.method == "initialize" {
+                self.context.capture_protocol_version(&result);
             }
-
-            match response.chunk().await {
-                Ok(Some(chunk)) => buffer.extend_from_slice(&chunk),
-                Ok(None) => break,
-                Err(error) => return Err(format!("failed to read MCP SSE response: {error}")),
-            }
-        }
-
-        // A stream may end without the blank line that terminates its last
-        // event; the data that arrived is still a message.
-        if !buffer.is_empty() {
-            let event = String::from_utf8_lossy(&buffer).into_owned();
-            buffer.clear();
-            if let Some(result) = self.route_sse_event(&event, expected_id, handler).await? {
-                return Ok(result);
-            }
-        }
-
-        Err(format!(
-            "SSE stream ended before a response to request {expected_id}"
-        ))
-    }
-
-    /// Parse one SSE event and route the JSON-RPC message it carries.
-    async fn route_sse_event(
-        &self,
-        event: &str,
-        expected_id: u64,
-        handler: Option<&dyn InboundRequestHandler>,
-    ) -> Result<Option<Value>, String> {
-        let Some(data) = sse_event_data(event) else {
-            return Ok(None);
-        };
-        if data.trim() == "[DONE]" {
-            return Ok(None);
-        }
-
-        // Not every SSE `data:` field is a JSON-RPC message (servers may send
-        // keep-alives); skip what does not parse rather than failing the call.
-        let value: Value = match serde_json::from_str(&data) {
-            Ok(value) => value,
-            Err(_) => return Ok(None),
-        };
-        self.route_message(&value, expected_id, handler).await
-    }
-
-    /// Tell a response, a notification, and a server request apart by shape.
-    ///
-    /// Returns `Some(result)` only when the response to `expected_id` arrives.
-    async fn route_message(
-        &self,
-        value: &Value,
-        expected_id: u64,
-        handler: Option<&dyn InboundRequestHandler>,
-    ) -> Result<Option<Value>, String> {
-        let has_method = value.get("method").is_some();
-        let has_id = value.get("id").is_some();
-
-        match (has_method, has_id) {
-            // The server asking us to do something, and waiting for the answer.
-            (true, true) => {
-                let request: JsonRpcServerRequest = serde_json::from_value(value.clone())
-                    .map_err(|error| format!("failed to parse a server request: {error}"))?;
-                self.context
-                    .answer_server_request(&request, handler)
-                    .await?;
-                Ok(None)
-            }
-            // A notification: no answer is expected.
-            (true, false) => {
-                tracing::debug!(
-                    message = %value,
-                    "ignoring a notification from the server"
-                );
-                Ok(None)
-            }
-            (false, true) => {
-                let response: JsonRpcResponse = serde_json::from_value(value.clone())
-                    .map_err(|error| format!("failed to parse JSON-RPC response: {error}"))?;
-
-                if response.id != expected_id {
-                    // An answer to a request that is no longer being waited on.
-                    tracing::debug!(
-                        id = response.id,
-                        expected = expected_id,
-                        "a response arrived for a request nothing is waiting on"
-                    );
-                    return Ok(None);
-                }
-                if let Some(error) = response.error {
-                    return Err(format!(
-                        "JSON-RPC error (code {}): {}",
-                        error.code, error.message
-                    ));
-                }
-                Ok(Some(response.result.unwrap_or(Value::Null)))
-            }
-            // Neither shape: say so rather than read past it.
-            (false, false) => {
-                tracing::warn!(
-                    message = %value,
-                    "a message from the server is neither a response nor a request"
-                );
-                Ok(None)
-            }
+            return Ok(result);
         }
     }
 
@@ -566,104 +629,322 @@ impl HttpChannel {
         self.context.send_notification(notification).await
     }
 
+    /// The standalone stream's current state.
+    #[must_use]
+    pub fn event_stream_state(&self) -> EventStreamState {
+        self.event_state
+            .read()
+            .map(|state| *state)
+            .unwrap_or(EventStreamState::Stopped)
+    }
+
     /// Start the standalone GET stream, replacing any previous one.
     ///
     /// One task per remote server. It shares the handler, session id, and
     /// token provider with the POST path, so a request the server pushes is
     /// answered exactly as one carried by a response stream is.
     pub fn start_event_stream(&self) {
-        self.stop_event_stream();
+        self.stop_event_stream_now();
+        let cancel = CancellationToken::new();
+        set_stream_state(&self.event_state, EventStreamState::Starting);
         let context = self.context.clone();
         let handler = Arc::clone(&self.event_handler);
+        let notifications = Arc::clone(&self.notification_handler);
+        let state = Arc::clone(&self.event_state);
+        let policy = self.retry_policy;
+        let token = cancel.clone();
+        let task_state = Arc::clone(&state);
         let task = tokio::spawn(async move {
-            run_event_stream(context, handler).await;
+            let final_state =
+                run_event_stream(context, handler, notifications, policy, token, task_state).await;
+            set_stream_state(&state, final_state);
         });
         if let Ok(mut slot) = self.event_stream.lock() {
-            *slot = Some(task);
+            *slot = Some(EventStreamHandle { cancel, task });
         }
     }
 
-    /// Stop the GET stream, if one is running.
-    pub fn stop_event_stream(&self) {
+    /// Cancel the GET stream and await the task.
+    ///
+    /// Cancellation is observed at connection and chunk boundaries; the
+    /// timeout bounds the wait if the task is inside a user prompt, which is
+    /// not itself cancellable.
+    pub async fn stop_event_stream(&self) {
+        let handle = self
+            .event_stream
+            .lock()
+            .ok()
+            .and_then(|mut slot| slot.take());
+        if let Some(handle) = handle {
+            handle.cancel.cancel();
+            if tokio::time::timeout(Duration::from_secs(2), handle.task)
+                .await
+                .is_err()
+            {
+                tracing::debug!("the MCP GET stream did not stop in time; aborting it");
+            }
+        }
+        set_stream_state(&self.event_state, EventStreamState::Stopped);
+    }
+
+    /// Cancel the stream without awaiting it (used by `Drop` and by restart).
+    fn stop_event_stream_now(&self) {
         if let Ok(mut slot) = self.event_stream.lock() {
-            if let Some(task) = slot.take() {
-                task.abort();
+            if let Some(handle) = slot.take() {
+                handle.cancel.cancel();
             }
         }
     }
 
-    /// Whether the GET stream task is still running (for diagnostics/tests).
+    /// Whether the GET stream is currently connecting or connected.
     #[must_use]
     pub fn event_stream_active(&self) -> bool {
-        self.event_stream
-            .lock()
-            .ok()
-            .and_then(|slot| slot.as_ref().map(|task| !task.is_finished()))
-            .unwrap_or(false)
+        matches!(
+            self.event_stream_state(),
+            EventStreamState::Starting | EventStreamState::Active
+        )
     }
 }
 
 impl Drop for HttpChannel {
     fn drop(&mut self) {
-        self.stop_event_stream();
+        // A task cannot be awaited here, but it can be told to stop. Its
+        // chunk read selects on the token, so the task exits at the next
+        // boundary and drops the response body.
+        self.stop_event_stream_now();
     }
 }
 
 /// How one attempt at the standalone stream ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum StreamEnd {
     /// The server answered 405: it has no standalone stream. Stop quietly.
     Unsupported,
+    /// The server answered 404: the session expired; re-initialize once.
+    SessionExpired,
+    /// The inbound queue overflowed. Stop rather than buffer without bound.
+    Overflow,
+    /// The task was cancelled by shutdown.
+    Cancelled,
     /// The stream closed normally; reconnect.
     Closed,
+}
+
+/// The outcome of one connection attempt.
+#[derive(Debug)]
+struct StreamAttempt {
+    end: StreamEnd,
+    /// Messages processed, used to reset the retry budget after progress.
+    events: usize,
+}
+
+/// Make the negotiated protocol revision visible to the stream task, and
+/// re-run the initialize handshake after a 404.
+async fn reinitialize(
+    context: &RequestContext,
+    handler: Option<&dyn InboundRequestHandler>,
+) -> Result<(), String> {
+    let request = JsonRpcRequest {
+        jsonrpc: "2.0".to_string(),
+        // The request id space belongs to the channel; id 0 is never used for
+        // an application request, so it cannot collide with one.
+        id: 0,
+        method: "initialize".to_string(),
+        params: Some(serde_json::json!({
+            "protocolVersion": DEFAULT_PROTOCOL_VERSION,
+            "capabilities": {},
+            "clientInfo": {"name": "coderex", "version": "0.1.0"}
+        })),
+    };
+    let response = context
+        .post(&request, "application/json, text/event-stream")
+        .await?;
+    let status = response.status();
+    if !status.is_success() {
+        let body = response.text().await.unwrap_or_default();
+        return Err(format!(
+            "MCP HTTP re-initialize failed with {status}: {body}"
+        ));
+    }
+
+    // The old session's dedup keys are meaningless now. The new session id is
+    // captured by `post`; the protocol revision from the result.
+    let notifications: Arc<RwLock<Option<Arc<dyn ServerNotificationHandler>>>> =
+        Arc::new(RwLock::new(None));
+    let result = finish_response(context, &notifications, response, request.id, handler).await?;
+    context.capture_protocol_version(&result);
+
+    context
+        .send_notification(&JsonRpcNotification {
+            jsonrpc: "2.0".to_string(),
+            method: "initialized".to_string(),
+            params: None,
+        })
+        .await
+}
+
+fn set_stream_state(state: &Arc<RwLock<EventStreamState>>, value: EventStreamState) {
+    if let Ok(mut slot) = state.write() {
+        *slot = value;
+    }
 }
 
 /// Keep the standalone GET stream open, reconnecting with bounded backoff.
 ///
 /// `Last-Event-ID` resumes from the last event that was processed. A 405 is
 /// not an error — it is how a server says the optional stream is unavailable —
-/// so it stops the task instead of retrying.
+/// so it stops the task instead of retrying. A 404 means the session expired:
+/// the id is cleared, the handshake runs once more, and the stream reconnects.
+/// Exhausting the retry budget is a `Degraded` state, not an indefinite loop.
 async fn run_event_stream(
     context: RequestContext,
     handler: Arc<RwLock<Option<Arc<dyn InboundRequestHandler>>>>,
-) {
-    let mut last_event_id: Option<String> = None;
-    let mut backoff = Duration::from_millis(250);
+    notifications: Arc<RwLock<Option<Arc<dyn ServerNotificationHandler>>>>,
+    policy: EventStreamRetryPolicy,
+    cancel: CancellationToken,
+    state: Arc<RwLock<EventStreamState>>,
+) -> EventStreamState {
+    let last_event_id = Arc::new(Mutex::new(None::<String>));
+    let mut failures = 0_usize;
+    let mut last_progress = Instant::now();
+    let mut reinitialized = false;
 
     loop {
-        match read_event_stream_once(&context, &handler, &mut last_event_id).await {
-            Ok(StreamEnd::Unsupported) => {
-                tracing::debug!(
-                    url = %context.url,
-                    "MCP server does not support a standalone GET stream (405); continuing without it"
-                );
-                return;
-            }
-            Ok(StreamEnd::Closed) => {
-                tracing::debug!(
-                    url = %context.url,
-                    last_event_id = ?last_event_id,
-                    "MCP server's GET stream closed; reconnecting"
-                );
-            }
+        if cancel.is_cancelled() {
+            return EventStreamState::Stopped;
+        }
+        set_stream_state(&state, EventStreamState::Starting);
+
+        let attempt = read_event_stream_once(
+            &context,
+            &handler,
+            &notifications,
+            &last_event_id,
+            &cancel,
+            &state,
+        )
+        .await;
+
+        match attempt {
             Err(error) => {
                 tracing::warn!(url = %context.url, "MCP GET stream failed: {error}");
             }
+            Ok(attempt) => match attempt.end {
+                StreamEnd::Cancelled => return EventStreamState::Stopped,
+                StreamEnd::Unsupported => {
+                    tracing::debug!(
+                        url = %context.url,
+                        "MCP server does not support a standalone GET stream (405); continuing without it"
+                    );
+                    return EventStreamState::Unsupported;
+                }
+                StreamEnd::Overflow => {
+                    tracing::warn!(
+                        url = %context.url,
+                        "the MCP GET stream's inbound queue overflowed; closing it rather than buffering without bound"
+                    );
+                    return EventStreamState::Degraded;
+                }
+                StreamEnd::SessionExpired => {
+                    if reinitialized {
+                        tracing::warn!(
+                            url = %context.url,
+                            "the MCP session expired again after re-initializing; giving up on the GET stream"
+                        );
+                        return EventStreamState::Degraded;
+                    }
+                    tracing::debug!(
+                        url = %context.url,
+                        "the MCP session expired; clearing it and re-initializing once"
+                    );
+                    context.clear_session();
+                    let inbound = handler
+                        .read()
+                        .ok()
+                        .and_then(|slot| slot.as_ref().map(Arc::clone));
+                    match reinitialize(&context, inbound.as_deref()).await {
+                        Ok(()) => {
+                            reinitialized = true;
+                            failures = 0;
+                            last_progress = Instant::now();
+                            continue;
+                        }
+                        Err(error) => {
+                            tracing::warn!(
+                                url = %context.url,
+                                "re-initializing the MCP session failed: {error}"
+                            );
+                            return EventStreamState::Degraded;
+                        }
+                    }
+                }
+                StreamEnd::Closed => {
+                    tracing::debug!(
+                        url = %context.url,
+                        last_event_id = ?last_event_id.lock().ok().and_then(|id| id.clone()),
+                        "MCP server's GET stream closed; reconnecting"
+                    );
+                    if attempt.events > 0 {
+                        failures = 0;
+                        last_progress = Instant::now();
+                        // Progress resets the one-shot session recovery: a
+                        // later expiry is a new event, not a loop.
+                        reinitialized = false;
+                    }
+                }
+            },
         }
 
-        tokio::time::sleep(backoff).await;
-        backoff = (backoff * 2).min(Duration::from_secs(5));
+        failures += 1;
+        if failures >= policy.max_attempts || last_progress.elapsed() >= policy.max_duration {
+            tracing::warn!(
+                url = %context.url,
+                failures,
+                "the MCP GET stream is degraded; stopping retries"
+            );
+            return EventStreamState::Degraded;
+        }
+
+        let delay = jittered_delay(backoff_delay(&policy, failures));
+        tokio::select! {
+            () = cancel.cancelled() => return EventStreamState::Stopped,
+            () = tokio::time::sleep(delay) => {}
+        }
     }
+}
+
+/// The exponential part of the retry delay, capped by the policy.
+fn backoff_delay(policy: &EventStreamRetryPolicy, failures: usize) -> Duration {
+    let shift = failures.saturating_sub(1).min(16) as u32;
+    policy
+        .base_delay
+        .saturating_mul(1_u32 << shift)
+        .min(policy.max_delay)
+}
+
+/// Add up to 25% jitter so reconnecting clients do not synchronize.
+fn jittered_delay(base: Duration) -> Duration {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.subsec_nanos() as u64)
+        .unwrap_or(0);
+    let jitter = (base.as_millis() as u64 / 4).max(1);
+    base + Duration::from_millis(nanos % jitter)
 }
 
 /// Read one connection to the standalone stream until it ends.
 async fn read_event_stream_once(
     context: &RequestContext,
     handler: &Arc<RwLock<Option<Arc<dyn InboundRequestHandler>>>>,
-    last_event_id: &mut Option<String>,
-) -> Result<StreamEnd, String> {
+    notifications: &Arc<RwLock<Option<Arc<dyn ServerNotificationHandler>>>>,
+    last_event_id: &Arc<Mutex<Option<String>>>,
+    cancel: &CancellationToken,
+    state: &Arc<RwLock<EventStreamState>>,
+) -> Result<StreamAttempt, String> {
     let mut headers = context.request_headers().await;
     headers.insert(ACCEPT, HeaderValue::from_static(EVENT_STREAM_ACCEPT));
-    if let Some(id) = last_event_id.as_deref() {
+    let resume_from = last_event_id.lock().ok().and_then(|slot| slot.clone());
+    if let Some(id) = resume_from.as_deref() {
         match HeaderValue::from_str(id) {
             Ok(value) => {
                 headers.insert(HeaderName::from_static(LAST_EVENT_ID_HEADER), value);
@@ -674,43 +955,130 @@ async fn read_event_stream_once(
         }
     }
 
-    let response = context
-        .client
-        .get(context.url.clone())
-        .headers(headers)
-        .send()
-        .await
-        .map_err(|error| format!("connecting to the GET stream failed: {error}"))?;
+    let response = tokio::select! {
+        () = cancel.cancelled() => {
+            return Ok(StreamAttempt { end: StreamEnd::Cancelled, events: 0 });
+        }
+        response = context.client.get(context.url.clone()).headers(headers).send() => {
+            response.map_err(|error| format!("connecting to the GET stream failed: {error}"))?
+        }
+    };
 
-    if response.status() == reqwest::StatusCode::METHOD_NOT_ALLOWED {
-        return Ok(StreamEnd::Unsupported);
+    let status = response.status();
+    if status == reqwest::StatusCode::METHOD_NOT_ALLOWED {
+        return Ok(StreamAttempt {
+            end: StreamEnd::Unsupported,
+            events: 0,
+        });
     }
-    if !response.status().is_success() {
-        return Err(format!("the GET stream returned {}", response.status()));
+    if status == reqwest::StatusCode::NOT_FOUND {
+        return Ok(StreamAttempt {
+            end: StreamEnd::SessionExpired,
+            events: 0,
+        });
     }
+    if !status.is_success() {
+        return Err(format!("the GET stream returned {status}"));
+    }
+    set_stream_state(state, EventStreamState::Active);
+
+    // A bounded inbound queue: a server that pushes messages faster than the
+    // handler can process them makes the stream close (and degrade) instead of
+    // growing an in-memory buffer without limit.
+    let (tx, mut rx) =
+        tokio::sync::mpsc::channel::<(String, Option<String>)>(INBOUND_QUEUE_CAPACITY);
+    let worker_context = context.clone();
+    let worker_handler = Arc::clone(handler);
+    let worker_notifications = Arc::clone(notifications);
+    let worker_last_id = Arc::clone(last_event_id);
+    let worker = tokio::spawn(async move {
+        let mut processed = 0_usize;
+        while let Some((event, event_id)) = rx.recv().await {
+            let handled = process_stream_event(
+                &worker_context,
+                &worker_handler,
+                &worker_notifications,
+                &event,
+            )
+            .await;
+            if handled {
+                processed += 1;
+            }
+            if let Some(id) = event_id {
+                if let Ok(mut slot) = worker_last_id.lock() {
+                    *slot = Some(id);
+                }
+            }
+        }
+        processed
+    });
 
     let mut response = response;
     let mut buffer = Vec::new();
-    loop {
-        for event in take_events(&mut buffer) {
-            process_stream_event(context, handler, &event, last_event_id).await;
+    let mut overflow = false;
+
+    'read: loop {
+        let mut events = take_events(&mut buffer);
+        for event in events.drain(..) {
+            let event_id = sse_event_id(&event);
+            if tx.try_send((event, event_id)).is_err() {
+                overflow = true;
+                break 'read;
+            }
         }
 
-        match response.chunk().await {
-            Ok(Some(chunk)) => buffer.extend_from_slice(&chunk),
+        match tokio::select! {
+            () = cancel.cancelled() => {
+                drop(tx);
+                worker.abort();
+                return Ok(StreamAttempt { end: StreamEnd::Cancelled, events: 0 });
+            }
+            chunk = response.chunk() => chunk,
+        } {
+            Ok(Some(chunk)) => {
+                buffer.extend_from_slice(&chunk);
+                if buffer.len() > MAX_SSE_EVENT_BYTES {
+                    tracing::warn!(
+                        url = %context.url,
+                        "an MCP SSE event exceeded the size limit; closing the stream"
+                    );
+                    overflow = true;
+                    break;
+                }
+            }
             Ok(None) => break,
-            Err(error) => return Err(format!("reading the GET stream failed: {error}")),
+            Err(error) => {
+                drop(tx);
+                worker.abort();
+                return Err(format!("reading the GET stream failed: {error}"));
+            }
         }
     }
 
     // The final event may not have its terminating blank line before the
     // connection closed.
-    if !buffer.is_empty() {
+    if !overflow && !buffer.is_empty() {
         let event = String::from_utf8_lossy(&buffer).into_owned();
-        process_stream_event(context, handler, &event, last_event_id).await;
+        let event_id = sse_event_id(&event);
+        if tx.try_send((event, event_id)).is_err() {
+            overflow = true;
+        }
+    }
+    drop(tx);
+
+    if overflow {
+        worker.abort();
+        return Ok(StreamAttempt {
+            end: StreamEnd::Overflow,
+            events: 0,
+        });
     }
 
-    Ok(StreamEnd::Closed)
+    let events = worker.await.unwrap_or(0);
+    Ok(StreamAttempt {
+        end: StreamEnd::Closed,
+        events,
+    })
 }
 
 /// Route one event from the standalone stream.
@@ -721,31 +1089,20 @@ async fn read_event_stream_once(
 async fn process_stream_event(
     context: &RequestContext,
     handler: &Arc<RwLock<Option<Arc<dyn InboundRequestHandler>>>>,
+    notifications: &Arc<RwLock<Option<Arc<dyn ServerNotificationHandler>>>>,
     event: &str,
-    last_event_id: &mut Option<String>,
-) {
-    let event_id = sse_event_id(event);
-
+) -> bool {
     let Some(data) = sse_event_data(event) else {
-        if let Some(id) = event_id {
-            *last_event_id = Some(id);
-        }
-        return;
+        return false;
     };
     if data.trim().is_empty() || data.trim() == "[DONE]" {
-        if let Some(id) = event_id {
-            *last_event_id = Some(id);
-        }
-        return;
+        return false;
     }
 
     // Keep-alives and other non-JSON payloads are skipped, as on a response
     // stream.
     let Ok(value) = serde_json::from_str::<Value>(&data) else {
-        if let Some(id) = event_id {
-            *last_event_id = Some(id);
-        }
-        return;
+        return false;
     };
 
     let has_method = value.get("method").is_some();
@@ -761,10 +1118,7 @@ async fn process_stream_event(
                     .read()
                     .ok()
                     .and_then(|slot| slot.as_ref().map(Arc::clone));
-                if let Err(error) = context
-                    .answer_server_request(&request, handler.as_deref())
-                    .await
-                {
+                if let Err(error) = context.answer_once(&request, handler.as_deref()).await {
                     tracing::warn!(
                         method = %request.method,
                         "could not answer a request from the GET stream: {error}"
@@ -775,12 +1129,11 @@ async fn process_stream_event(
                 tracing::warn!("failed to parse a server request from the GET stream: {error}");
             }
         },
-        // A notification: no answer is expected.
+        // A notification: no answer is expected, but it can trigger a
+        // re-discovery or invalidate a cached resource.
         (true, false) => {
-            tracing::debug!(
-                message = %value,
-                "notification from the server's GET stream"
-            );
+            let method = value.get("method").and_then(Value::as_str).unwrap_or("");
+            dispatch_notification(notifications, method, value.get("params")).await;
         }
         // A response with no request waiting on this stream.
         (false, true) => {
@@ -797,10 +1150,205 @@ async fn process_stream_event(
         }
     }
 
-    // Record the resume point only after the message has been handled, so a
+    // The caller records the resume point only after this returns, so a
     // reconnect cannot skip a request that was not answered.
-    if let Some(id) = event_id {
-        *last_event_id = Some(id);
+    true
+}
+
+/// Hand a notification to the session's sink, or log it when there is none.
+async fn dispatch_notification(
+    notifications: &Arc<RwLock<Option<Arc<dyn ServerNotificationHandler>>>>,
+    method: &str,
+    params: Option<&Value>,
+) {
+    let handler = notifications
+        .read()
+        .ok()
+        .and_then(|slot| slot.as_ref().map(Arc::clone));
+    match handler {
+        Some(handler) => handler.handle_notification(method, params).await,
+        None => tracing::debug!(
+            method,
+            "notification from the server (no notification handler installed)"
+        ),
+    }
+}
+
+/// Read the response to one request, which may be JSON or SSE.
+async fn finish_response(
+    context: &RequestContext,
+    notifications: &Arc<RwLock<Option<Arc<dyn ServerNotificationHandler>>>>,
+    response: reqwest::Response,
+    expected_id: u64,
+    handler: Option<&dyn InboundRequestHandler>,
+) -> Result<Value, String> {
+    let content_type = response
+        .headers()
+        .get(CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("application/json")
+        .to_string();
+
+    if content_type.contains("text/event-stream") {
+        return read_sse_response(context, notifications, response, expected_id, handler).await;
+    }
+
+    let body = response
+        .text()
+        .await
+        .map_err(|error| format!("failed to read MCP HTTP response: {error}"))?;
+    if body.trim().is_empty() {
+        return Err(format!(
+            "MCP HTTP server returned an empty response to request {expected_id}"
+        ));
+    }
+
+    let value: Value = serde_json::from_str(&body)
+        .map_err(|error| format!("failed to parse MCP HTTP response: {error}"))?;
+    route_message(context, notifications, &value, expected_id, handler)
+        .await?
+        .ok_or_else(|| {
+            format!("MCP HTTP response to request {expected_id} contained no response to it")
+        })
+}
+
+/// Read an SSE response stream, answering server requests as they arrive.
+///
+/// Read incrementally rather than buffering the whole body: a server that
+/// asks a question mid-stream may hold its own response until the answer
+/// arrives, so waiting for the end of the body would deadlock.
+async fn read_sse_response(
+    context: &RequestContext,
+    notifications: &Arc<RwLock<Option<Arc<dyn ServerNotificationHandler>>>>,
+    mut response: reqwest::Response,
+    expected_id: u64,
+    handler: Option<&dyn InboundRequestHandler>,
+) -> Result<Value, String> {
+    // Bytes, not `String`: a network chunk may split a multi-byte UTF-8
+    // character, and decoding each chunk on its own would replace half of
+    // it with U+FFFD. Event boundaries are ASCII, so a complete event is
+    // always valid UTF-8 and the partial tail can stay undecoded.
+    let mut buffer = Vec::new();
+
+    loop {
+        for event in take_events(&mut buffer) {
+            if let Some(result) =
+                route_sse_event(context, notifications, &event, expected_id, handler).await?
+            {
+                return Ok(result);
+            }
+        }
+
+        match response.chunk().await {
+            Ok(Some(chunk)) => {
+                buffer.extend_from_slice(&chunk);
+                if buffer.len() > MAX_SSE_EVENT_BYTES {
+                    return Err("an MCP SSE response event exceeded the size limit".to_string());
+                }
+            }
+            Ok(None) => break,
+            Err(error) => return Err(format!("failed to read MCP SSE response: {error}")),
+        }
+    }
+
+    // A stream may end without the blank line that terminates its last
+    // event; the data that arrived is still a message.
+    if !buffer.is_empty() {
+        let event = String::from_utf8_lossy(&buffer).into_owned();
+        buffer.clear();
+        if let Some(result) =
+            route_sse_event(context, notifications, &event, expected_id, handler).await?
+        {
+            return Ok(result);
+        }
+    }
+
+    Err(format!(
+        "SSE stream ended before a response to request {expected_id}"
+    ))
+}
+
+/// Parse one SSE event and route the JSON-RPC message it carries.
+async fn route_sse_event(
+    context: &RequestContext,
+    notifications: &Arc<RwLock<Option<Arc<dyn ServerNotificationHandler>>>>,
+    event: &str,
+    expected_id: u64,
+    handler: Option<&dyn InboundRequestHandler>,
+) -> Result<Option<Value>, String> {
+    let Some(data) = sse_event_data(event) else {
+        return Ok(None);
+    };
+    if data.trim() == "[DONE]" {
+        return Ok(None);
+    }
+
+    // Not every SSE `data:` field is a JSON-RPC message (servers may send
+    // keep-alives); skip what does not parse rather than failing the call.
+    let value: Value = match serde_json::from_str(&data) {
+        Ok(value) => value,
+        Err(_) => return Ok(None),
+    };
+    route_message(context, notifications, &value, expected_id, handler).await
+}
+
+/// Tell a response, a notification, and a server request apart by shape.
+///
+/// Returns `Some(result)` only when the response to `expected_id` arrives.
+async fn route_message(
+    context: &RequestContext,
+    notifications: &Arc<RwLock<Option<Arc<dyn ServerNotificationHandler>>>>,
+    value: &Value,
+    expected_id: u64,
+    handler: Option<&dyn InboundRequestHandler>,
+) -> Result<Option<Value>, String> {
+    let has_method = value.get("method").is_some();
+    let has_id = value.get("id").is_some();
+
+    match (has_method, has_id) {
+        // The server asking us to do something, and waiting for the answer.
+        (true, true) => {
+            let request: JsonRpcServerRequest = serde_json::from_value(value.clone())
+                .map_err(|error| format!("failed to parse a server request: {error}"))?;
+            context.answer_once(&request, handler).await?;
+            Ok(None)
+        }
+        // A notification: no answer is expected, but it may ask us to refresh
+        // discovery or invalidate a cached resource.
+        (true, false) => {
+            let method = value.get("method").and_then(Value::as_str).unwrap_or("");
+            dispatch_notification(notifications, method, value.get("params")).await;
+            Ok(None)
+        }
+        (false, true) => {
+            let response: JsonRpcResponse = serde_json::from_value(value.clone())
+                .map_err(|error| format!("failed to parse JSON-RPC response: {error}"))?;
+
+            if response.id != expected_id {
+                // An answer to a request that is no longer being waited on.
+                tracing::debug!(
+                    id = response.id,
+                    expected = expected_id,
+                    "a response arrived for a request nothing is waiting on"
+                );
+                return Ok(None);
+            }
+            if let Some(error) = response.error {
+                return Err(format!(
+                    "JSON-RPC error (code {}): {}",
+                    error.code, error.message
+                ));
+            }
+            Ok(Some(response.result.unwrap_or(Value::Null)))
+        }
+        // Neither shape: say so rather than read past it.
+        (false, false) => {
+            tracing::warn!(
+                message = %value,
+                "a message from the server is neither a response nor a request"
+            );
+            Ok(None)
+        }
     }
 }
 

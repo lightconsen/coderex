@@ -4,6 +4,7 @@ use coderex_mcp::channel::{InboundRequestHandler, JsonRpcChannel, JsonRpcError};
 use coderex_mcp::config::{McpConfig, McpServerConfig, McpTransport};
 use coderex_mcp::manager::McpManager;
 use coderex_mcp::oauth::{McpOAuthState, OAuthManager, OAuthTokenProvider};
+use coderex_mcp::{EventStreamRetryPolicy, EventStreamState};
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
@@ -77,10 +78,14 @@ fn spawn_session_server() -> (SocketAddr, Arc<std::sync::Mutex<Vec<String>>>) {
             recorded.lock().unwrap().push(request.clone());
 
             if is_get(&request) {
-                write_response(&mut stream, "405 Method Not Allowed", "application/json", "");
+                write_response(
+                    &mut stream,
+                    "405 Method Not Allowed",
+                    "application/json",
+                    "",
+                );
             } else if request.contains("\"method\":\"initialize\"") {
-                let body =
-                    r#"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2024-11-05"}}"#;
+                let body = r#"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2024-11-05"}}"#;
                 let response = format!(
                     "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nMcp-Session-Id: session-alpha\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
                     body.len()
@@ -123,7 +128,12 @@ fn spawn_server() -> SocketAddr {
         for mut stream in listener.incoming().flatten() {
             let request = read_request(&mut stream);
             if is_get(&request) {
-                write_response(&mut stream, "405 Method Not Allowed", "application/json", "");
+                write_response(
+                    &mut stream,
+                    "405 Method Not Allowed",
+                    "application/json",
+                    "",
+                );
                 continue;
             }
             assert!(
@@ -205,7 +215,12 @@ fn spawn_asking_server() -> (SocketAddr, std::thread::JoinHandle<String>) {
             if is_get(&request) {
                 // The per-response path is what this server exercises; the
                 // standalone stream is refused quietly.
-                write_response(&mut stream, "405 Method Not Allowed", "application/json", "");
+                write_response(
+                    &mut stream,
+                    "405 Method Not Allowed",
+                    "application/json",
+                    "",
+                );
                 continue;
             }
 
@@ -520,9 +535,17 @@ async fn the_session_id_is_sent_on_every_later_request() {
             Some("session-alpha"),
             "{method} did not carry the session id: {request}"
         );
+        assert_eq!(
+            header_value(request, "mcp-protocol-version").as_deref(),
+            Some("2024-11-05"),
+            "{method} did not carry the negotiated protocol version: {request}"
+        );
     }
 
-    let get = recorded.iter().find(|request| is_get(request)).expect("GET");
+    let get = recorded
+        .iter()
+        .find(|request| is_get(request))
+        .expect("GET");
     assert_eq!(
         header_value(get, "mcp-session-id").as_deref(),
         Some("session-alpha"),
@@ -532,6 +555,11 @@ async fn the_session_id_is_sent_on_every_later_request() {
         header_value(get, "accept").as_deref(),
         Some("text/event-stream"),
         "the GET stream did not ask for SSE: {get}"
+    );
+    assert_eq!(
+        header_value(get, "mcp-protocol-version").as_deref(),
+        Some("2024-11-05"),
+        "the GET stream did not carry the negotiated protocol version: {get}"
     );
 
     channel.terminate().await.unwrap();
@@ -558,8 +586,13 @@ async fn a_get_405_stops_the_stream_without_failing_the_server() {
     })
     .await;
 
-    // The client observes the 405 and stops the task.
+    // The client observes the 405 and stops the task permanently.
     wait_until(|| !channel.event_stream_active()).await;
+    assert_eq!(
+        channel.event_stream_state(),
+        Some(EventStreamState::Unsupported),
+        "405 must be a quiet, permanent stop"
+    );
 
     let tools = channel.list_tools().await.unwrap();
     assert_eq!(tools["tools"][0]["name"], "remote_read");
@@ -585,7 +618,12 @@ async fn an_expired_session_is_cleared_and_reinitialized_once() {
             recorded.lock().unwrap().push(request.clone());
 
             if is_get(&request) {
-                write_response(&mut stream, "405 Method Not Allowed", "application/json", "");
+                write_response(
+                    &mut stream,
+                    "405 Method Not Allowed",
+                    "application/json",
+                    "",
+                );
             } else if request.contains("\"method\":\"initialize\"") {
                 initializes += 1;
                 let session = if initializes == 1 {
@@ -686,8 +724,7 @@ async fn a_question_on_the_get_stream_is_answered_over_post() {
                 stream.flush().unwrap();
                 open_streams.push(stream);
             } else if request.contains("\"method\":\"initialize\"") {
-                let body =
-                    r#"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2024-11-05"}}"#;
+                let body = r#"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2024-11-05"}}"#;
                 let response = format!(
                     "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nMcp-Session-Id: session-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
                     body.len()
@@ -734,7 +771,10 @@ async fn a_question_on_the_get_stream_is_answered_over_post() {
         "the answer did not carry the session id: {answer}"
     );
 
-    let get = recorded.iter().find(|request| is_get(request)).expect("GET");
+    let get = recorded
+        .iter()
+        .find(|request| is_get(request))
+        .expect("GET");
     assert_eq!(
         header_value(get, "mcp-session-id").as_deref(),
         Some("session-stream")
@@ -746,6 +786,391 @@ async fn a_question_on_the_get_stream_is_answered_over_post() {
 
     drop(recorded);
     channel.terminate().await.unwrap();
+}
+
+/// Records how many server requests it was asked to answer.
+#[derive(Debug, Default)]
+struct CountingHandler {
+    answers: std::sync::atomic::AtomicUsize,
+}
+
+#[async_trait::async_trait]
+impl InboundRequestHandler for CountingHandler {
+    async fn handle(
+        &self,
+        _method: &str,
+        _params: Option<&serde_json::Value>,
+    ) -> Result<serde_json::Value, JsonRpcError> {
+        self.answers
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(serde_json::json!({"action": "accept", "content": {}}))
+    }
+}
+
+/// The same server request id delivered once on the POST response stream and
+/// once on the standalone GET stream must be answered exactly once.
+#[tokio::test]
+async fn a_request_delivered_on_both_streams_is_answered_once() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let recorded = Arc::clone(&requests);
+
+    std::thread::spawn(move || {
+        let mut open_streams: Vec<TcpStream> = Vec::new();
+        for mut stream in listener.incoming().flatten() {
+            let request = read_request(&mut stream);
+            recorded.lock().unwrap().push(request.clone());
+
+            if is_get(&request) {
+                stream
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: keep-alive\r\n\r\nid: evt-dup\ndata: {\"jsonrpc\":\"2.0\",\"id\":77,\"method\":\"elicitation/create\",\"params\":{\"message\":\"once\"}}\n\n",
+                    )
+                    .unwrap();
+                stream.flush().unwrap();
+                open_streams.push(stream);
+            } else if request.contains("\"method\":\"initialize\"") {
+                let body = r#"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2024-11-05"}}"#;
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nMcp-Session-Id: session-dup\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                stream.write_all(response.as_bytes()).unwrap();
+            } else if request.contains("\"method\":\"initialized\"") {
+                write_response(&mut stream, "202 Accepted", "application/json", "");
+            } else if request.contains("\"method\":\"tools/list\"") {
+                // The duplicate arrives on the response stream too.
+                write_response(
+                    &mut stream,
+                    "200 OK",
+                    "text/event-stream",
+                    concat!(
+                        "data: {\"jsonrpc\":\"2.0\",\"id\":77,\"method\":\"elicitation/create\",\"params\":{\"message\":\"once\"}}\n\n",
+                        "data: {\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"tools\":[]}}\n\n"
+                    ),
+                );
+            } else if request.contains("\"id\":77") {
+                write_response(&mut stream, "202 Accepted", "application/json", "");
+            } else {
+                write_response(&mut stream, "200 OK", "application/json", "{}");
+            }
+        }
+    });
+
+    let handler = Arc::new(CountingHandler::default());
+    let mut channel =
+        JsonRpcChannel::new_http(&format!("http://{address}/mcp"), HashMap::new()).unwrap();
+    channel.set_inbound_handler(handler.clone());
+    channel.spawn().await.unwrap();
+    channel.initialize().await.unwrap();
+    channel.list_tools().await.unwrap();
+
+    let recorded_ref = Arc::clone(&requests);
+    wait_until(|| {
+        recorded_ref
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|request| request.contains("\"id\":77"))
+    })
+    .await;
+
+    // Give the second copy time to arrive and be (wrongly) answered.
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+    assert_eq!(
+        handler.answers.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "the handler must run once for a duplicated request id"
+    );
+    let recorded = requests.lock().unwrap();
+    let answers: Vec<&String> = recorded
+        .iter()
+        .filter(|request| {
+            !is_get(request)
+                && !request.contains("\"method\":\"tools/list\"")
+                && request.contains("\"id\":77")
+        })
+        .collect();
+    assert_eq!(
+        answers.len(),
+        1,
+        "the request must be answered exactly once: {answers:?}"
+    );
+
+    drop(recorded);
+    channel.terminate().await.unwrap();
+}
+
+/// A stream that keeps failing exhausts its retry budget and surfaces
+/// `Degraded` instead of retrying forever.
+#[tokio::test]
+async fn a_stream_that_keeps_failing_degrades_after_the_retry_cap() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let gets = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counted = Arc::clone(&gets);
+
+    std::thread::spawn(move || {
+        for mut stream in listener.incoming().flatten() {
+            let request = read_request(&mut stream);
+            if is_get(&request) {
+                counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                // A complete, empty event stream: the client sees EOF and
+                // reconnects until its budget runs out.
+                write_response(&mut stream, "200 OK", "text/event-stream", "");
+            } else if request.contains("\"method\":\"initialize\"") {
+                let body = r#"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2024-11-05"}}"#;
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nMcp-Session-Id: session-retry\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                stream.write_all(response.as_bytes()).unwrap();
+            } else {
+                write_response(&mut stream, "202 Accepted", "application/json", "");
+            }
+        }
+    });
+
+    let mut channel =
+        JsonRpcChannel::new_http(&format!("http://{address}/mcp"), HashMap::new()).unwrap();
+    channel.set_event_stream_retry_policy(EventStreamRetryPolicy {
+        max_attempts: 3,
+        base_delay: std::time::Duration::from_millis(10),
+        max_delay: std::time::Duration::from_millis(20),
+        max_duration: std::time::Duration::from_secs(10),
+    });
+    channel.spawn().await.unwrap();
+    channel.initialize().await.unwrap();
+
+    wait_until(|| channel.event_stream_state() == Some(EventStreamState::Degraded)).await;
+    assert!(
+        gets.load(std::sync::atomic::Ordering::SeqCst) >= 3,
+        "the stream should have made its bounded attempts"
+    );
+
+    channel.terminate().await.unwrap();
+}
+
+/// A 404 to the standalone GET means the session expired: the client clears
+/// it, re-initializes once, and reconnects under the new session.
+#[tokio::test]
+async fn a_get_404_reinitializes_once_and_resumes() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let recorded = Arc::clone(&requests);
+
+    std::thread::spawn(move || {
+        let mut open_streams: Vec<TcpStream> = Vec::new();
+        let mut initializes = 0_usize;
+        for mut stream in listener.incoming().flatten() {
+            let request = read_request(&mut stream);
+            recorded.lock().unwrap().push(request.clone());
+
+            if is_get(&request) {
+                let attempt = initializes;
+                if attempt == 1 {
+                    write_response(
+                        &mut stream,
+                        "404 Not Found",
+                        "application/json",
+                        r#"{"error":"unknown session"}"#,
+                    );
+                } else {
+                    stream
+                        .write_all(
+                            b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: keep-alive\r\n\r\n",
+                        )
+                        .unwrap();
+                    stream.flush().unwrap();
+                    open_streams.push(stream);
+                }
+            } else if request.contains("\"method\":\"initialize\"") {
+                initializes += 1;
+                let session = format!("session-{initializes}");
+                let id = if request.contains("\"id\":0") { 0 } else { 1 };
+                let body = format!(
+                    r#"{{"jsonrpc":"2.0","id":{id},"result":{{"protocolVersion":"2024-11-05"}}}}"#
+                );
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nMcp-Session-Id: {session}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                stream.write_all(response.as_bytes()).unwrap();
+            } else {
+                write_response(&mut stream, "202 Accepted", "application/json", "");
+            }
+        }
+    });
+
+    let mut channel =
+        JsonRpcChannel::new_http(&format!("http://{address}/mcp"), HashMap::new()).unwrap();
+    channel.set_event_stream_retry_policy(EventStreamRetryPolicy {
+        max_attempts: 3,
+        base_delay: std::time::Duration::from_millis(10),
+        max_delay: std::time::Duration::from_millis(20),
+        max_duration: std::time::Duration::from_secs(10),
+    });
+    channel.spawn().await.unwrap();
+    channel.initialize().await.unwrap();
+    assert_eq!(channel.session_id().as_deref(), Some("session-1"));
+
+    wait_until(|| channel.event_stream_state() == Some(EventStreamState::Active)).await;
+    assert_eq!(
+        channel.session_id().as_deref(),
+        Some("session-2"),
+        "the GET stream should have re-initialized the session"
+    );
+
+    let recorded = requests.lock().unwrap();
+    let initializes: Vec<&String> = recorded
+        .iter()
+        .filter(|request| request.contains("\"method\":\"initialize\""))
+        .collect();
+    assert_eq!(
+        initializes.len(),
+        2,
+        "the session must be re-initialized exactly once"
+    );
+    let gets: Vec<&String> = recorded.iter().filter(|request| is_get(request)).collect();
+    assert_eq!(
+        header_value(gets.last().unwrap(), "mcp-session-id").as_deref(),
+        Some("session-2"),
+        "the reconnected stream did not use the new session"
+    );
+
+    drop(recorded);
+    channel.terminate().await.unwrap();
+}
+
+/// The JSON-RPC id of a recorded POST request.
+fn jsonrpc_id(request: &str) -> u64 {
+    request
+        .split_once("\r\n\r\n")
+        .and_then(|(_, body)| serde_json::from_str::<serde_json::Value>(body).ok())
+        .and_then(|value| value.get("id").and_then(serde_json::Value::as_u64))
+        .unwrap_or(2)
+}
+
+/// Push `tools/list_changed` once on the open GET stream.
+fn send_tools_changed(open_stream: &mut Option<TcpStream>, ready: &mut bool) {
+    if !*ready {
+        return;
+    }
+    if let Some(stream) = open_stream.as_mut() {
+        let _ = stream.write_all(
+            b"data: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/tools/list_changed\"}\n\n",
+        );
+        let _ = stream.flush();
+        *ready = false;
+    }
+}
+
+/// `notifications/tools/list_changed` must trigger a real re-discovery, not
+/// just a log line.
+#[tokio::test]
+async fn tools_list_changed_triggers_rediscovery() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let list_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counted = Arc::clone(&list_calls);
+
+    std::thread::spawn(move || {
+        let mut open_stream: Option<TcpStream> = None;
+        let mut first_list_seen = false;
+        let mut stream_ready = false;
+
+        for mut stream in listener.incoming().flatten() {
+            let request = read_request(&mut stream);
+            if is_get(&request) {
+                stream
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: keep-alive\r\n\r\n",
+                    )
+                    .unwrap();
+                stream.flush().unwrap();
+                open_stream = Some(stream);
+                stream_ready = true;
+                if first_list_seen {
+                    send_tools_changed(&mut open_stream, &mut stream_ready);
+                }
+            } else if request.contains("\"method\":\"initialize\"") {
+                let body = r#"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2024-11-05"}}"#;
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nMcp-Session-Id: session-notify\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                stream.write_all(response.as_bytes()).unwrap();
+            } else if request.contains("\"method\":\"initialized\"") {
+                write_response(&mut stream, "202 Accepted", "application/json", "");
+            } else if request.contains("\"method\":\"tools/list\"") {
+                let call = counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let tools = if call == 0 {
+                    r#"[{"name":"one"}]"#
+                } else {
+                    r#"[{"name":"one"},{"name":"two"}]"#
+                };
+                // Echo the actual request id: the re-discovery is a later
+                // request than the initial discovery.
+                let id = jsonrpc_id(&request);
+                let body = format!(r#"{{"jsonrpc":"2.0","id":{id},"result":{{"tools":{tools}}}}}"#);
+                write_response(&mut stream, "200 OK", "application/json", &body);
+                if !first_list_seen {
+                    first_list_seen = true;
+                    send_tools_changed(&mut open_stream, &mut stream_ready);
+                }
+            } else if request.contains("\"method\":\"resources/list\"") {
+                write_response(
+                    &mut stream,
+                    "200 OK",
+                    "application/json",
+                    r#"{"jsonrpc":"2.0","id":3,"result":{"resources":[]}}"#,
+                );
+            } else {
+                write_response(&mut stream, "200 OK", "application/json", "{}");
+            }
+        }
+    });
+
+    let mut config = McpConfig::new();
+    config.add_server(
+        "remote",
+        McpServerConfig {
+            transport: McpTransport::Http,
+            url: Some(format!("http://{address}/mcp")),
+            ..Default::default()
+        },
+    );
+    let manager = McpManager::new();
+    manager.load_config(&config);
+    manager.start_all().await;
+
+    let tools = manager.list_tools();
+    assert!(
+        tools.contains(&"mcp__remote__one".to_string()),
+        "initial discovery failed: {tools:?}"
+    );
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while !manager
+        .list_tools()
+        .contains(&"mcp__remote__two".to_string())
+    {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "tools/list_changed did not trigger a re-discovery: {:?}",
+            manager.list_tools()
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert!(
+        list_calls.load(std::sync::atomic::Ordering::SeqCst) >= 2,
+        "the notification did not cause another tools/list"
+    );
+
+    manager.stop_all().await;
 }
 
 #[tokio::test]
