@@ -192,6 +192,13 @@ pub struct Bridge {
     /// transport is owned by the serve loop, so the frames wait here until
     /// [`Bridge::send_pending_permission_requests`] flushes them.
     pending_permission_requests: Vec<TransportMessage>,
+    /// Fenced state writes waiting to be sent to the gateway.
+    ///
+    /// Like permission requests, these are queued while a producer owns
+    /// `&mut Bridge` and flushed by [`Bridge::send_pending_session_writes`].
+    pending_session_writes: Vec<TransportMessage>,
+    /// Counter behind each session write's correlation id.
+    next_session_write_id: u64,
     /// Caller-supplied request ids mapped to the router's internal ids.
     ///
     /// A child process generates its own request ids. The router generates
@@ -288,6 +295,8 @@ impl Bridge {
             permission_router: BridgePermissionRouter::new(),
             relay_approvals: RelayApprovalGate::new(),
             pending_permission_requests: Vec::new(),
+            pending_session_writes: Vec::new(),
+            next_session_write_id: 0,
             permission_aliases: std::collections::HashMap::new(),
             known_permission_ids: std::collections::HashSet::new(),
             cursor: SequenceCursor::new(),
@@ -376,6 +385,16 @@ impl Bridge {
     #[must_use]
     pub fn capacity_report(&self) -> CapacityReport {
         self.poller.report_capacity()
+    }
+
+    /// The worker epoch registration assigned, or `0` before registration (or
+    /// when the control plane did not report one).
+    ///
+    /// A zero epoch means write-backs are disabled: the gateway could not
+    /// order this worker against the one it replaced.
+    #[must_use]
+    pub fn worker_epoch(&self) -> u64 {
+        self.poller.worker_epoch()
     }
 
     /// Submit a permission response for a pending request.
@@ -1093,6 +1112,67 @@ impl Bridge {
         Ok(())
     }
 
+    /// Queue a fenced state write for a session.
+    ///
+    /// The frame carries the epoch registration assigned in
+    /// [`WORKER_EPOCH_KEY`], which the gateway uses to reject a write from a
+    /// worker that has been replaced. An unregistered worker (epoch `0`) has
+    /// nothing to fence with, so the write is refused rather than sent under
+    /// a guessed epoch.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when registration has not assigned a non-zero worker
+    /// epoch. The caller decides whether that is fatal; the launcher logs it
+    /// once and keeps the worker running.
+    pub fn queue_session_write(&mut self, session_id: &str, state: &str) -> Result<(), String> {
+        let epoch = self.worker_epoch();
+        if epoch == 0 {
+            return Err(
+                "cannot queue a session_write before registration assigned a worker epoch"
+                    .to_string(),
+            );
+        }
+
+        let correlation_id = format!("session_write_{}", self.next_session_write_id);
+        self.next_session_write_id += 1;
+
+        self.pending_session_writes.push(TransportMessage {
+            r#type: SESSION_WRITE_TYPE.to_string(),
+            correlation_id: Some(correlation_id),
+            payload: serde_json::json!({
+                "session_id": session_id,
+                "state": state,
+            })
+            .to_string(),
+            metadata: std::collections::HashMap::from([(
+                WORKER_EPOCH_KEY.to_string(),
+                epoch.to_string(),
+            )]),
+        });
+        Ok(())
+    }
+
+    /// Take the session writes waiting to go out over the transport.
+    #[must_use]
+    pub fn take_pending_session_writes(&mut self) -> Vec<TransportMessage> {
+        std::mem::take(&mut self.pending_session_writes)
+    }
+
+    /// Send the queued `session_write` frames over the active transport.
+    ///
+    /// Head-first, like permission requests: a failed send leaves the frame
+    /// queued so the next flush can retry it instead of dropping the state
+    /// transition.
+    pub async fn send_pending_session_writes(&mut self) -> Result<(), String> {
+        while let Some(frame) = self.pending_session_writes.first().cloned() {
+            let transport = self.transport.as_mut().ok_or("no transport configured")?;
+            transport.send(frame).await.map_err(|e| e.to_string())?;
+            self.pending_session_writes.remove(0);
+        }
+        Ok(())
+    }
+
     /// Forward one line of a session's output over the transport.
     pub async fn forward_session_output(
         &mut self,
@@ -1291,6 +1371,95 @@ mod tests {
         let config = test_config(base);
         let (a, _b) = InProcessTransport::create_pair("bridge".into(), "remote".into());
         Bridge::new(config, Box::new(a))
+    }
+
+    /// Control plane that reports a fixed epoch, for the write-fence producer.
+    #[derive(Debug, Default)]
+    struct EpochControlPlane {
+        epoch: u64,
+    }
+
+    #[async_trait::async_trait]
+    impl ControlPlaneClient for EpochControlPlane {
+        async fn register(&self, _env_id: &str, _max_concurrent: usize) -> Result<u64, String> {
+            Ok(self.epoch)
+        }
+
+        async fn fetch_assignments(&self, _env_id: &str) -> Result<Vec<WorkAssignment>, String> {
+            Ok(Vec::new())
+        }
+
+        async fn claim_assignment(
+            &self,
+            _env_id: &str,
+            _assignment_id: &str,
+        ) -> Result<ClaimOutcome, String> {
+            Ok(ClaimOutcome::Claimed)
+        }
+
+        async fn report_capacity(
+            &self,
+            _env_id: &str,
+            _report: &CapacityReport,
+        ) -> Result<(), String> {
+            Ok(())
+        }
+    }
+
+    fn test_bridge_with_epoch(base: &std::path::Path, epoch: u64) -> Bridge {
+        let (a, _b) = InProcessTransport::create_pair("bridge".into(), "remote".into());
+        Bridge::with_control_plane(
+            test_config(base),
+            Box::new(a),
+            Arc::new(EpochControlPlane { epoch }),
+        )
+    }
+
+    #[tokio::test]
+    async fn a_queued_session_write_carries_the_registered_epoch_and_state() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut bridge = test_bridge_with_epoch(tmp.path(), 7);
+
+        // Before registration the worker has no epoch to fence with.
+        assert!(bridge.queue_session_write("sess_1", "running").is_err());
+        assert!(bridge.take_pending_session_writes().is_empty());
+
+        bridge.register().await.unwrap();
+        assert_eq!(bridge.worker_epoch(), 7);
+
+        bridge.queue_session_write("sess_1", "running").unwrap();
+
+        let frames = bridge.take_pending_session_writes();
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].r#type, SESSION_WRITE_TYPE);
+        assert_eq!(
+            frames[0].metadata.get(WORKER_EPOCH_KEY).map(String::as_str),
+            Some("7")
+        );
+        let payload: serde_json::Value = serde_json::from_str(&frames[0].payload).unwrap();
+        assert_eq!(payload["session_id"], "sess_1");
+        assert_eq!(payload["state"], "running");
+
+        // The frame survives the wire encoding unchanged.
+        let encoded = serde_json::to_string(&frames[0]).unwrap();
+        let decoded: TransportMessage = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded.r#type, SESSION_WRITE_TYPE);
+        assert_eq!(
+            decoded.metadata.get(WORKER_EPOCH_KEY).map(String::as_str),
+            Some("7")
+        );
+        assert_eq!(decoded.payload, frames[0].payload);
+    }
+
+    #[tokio::test]
+    async fn a_zero_epoch_refuses_session_writes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut bridge = test_bridge_with_epoch(tmp.path(), 0);
+
+        bridge.register().await.unwrap();
+        assert_eq!(bridge.worker_epoch(), 0);
+        assert!(bridge.queue_session_write("sess_1", "running").is_err());
+        assert!(bridge.take_pending_session_writes().is_empty());
     }
 
     fn relay_headers(id: &str, intent: &ApprovedIntent) -> impl Fn(&str) -> Option<String> {

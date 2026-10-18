@@ -173,11 +173,8 @@ pub struct ChildPermissionDecision {
 /// Stored in a slot because [`SessionRunner::run`] receives a shared reference
 /// to the context; the process runner takes the receiver once, at the start of
 /// the run.
-pub type PermissionDecisionSlot = Arc<
-    std::sync::Mutex<
-        Option<tokio::sync::mpsc::UnboundedReceiver<ChildPermissionDecision>>,
-    >,
->;
+pub type PermissionDecisionSlot =
+    Arc<std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<ChildPermissionDecision>>>>;
 
 /// Everything a [`SessionRunner`] needs for one session.
 #[derive(Debug, Clone)]
@@ -199,8 +196,7 @@ pub struct SessionContext<'a> {
     ///
     /// `None` when nobody is listening; the child then keeps waiting, which is
     /// the pre-existing behaviour for a runner used outside the worker loop.
-    pub permission_requests:
-        Option<tokio::sync::mpsc::UnboundedSender<ChildPermissionRequest>>,
+    pub permission_requests: Option<tokio::sync::mpsc::UnboundedSender<ChildPermissionRequest>>,
     /// Answers the launcher routed to this session.
     pub permission_decisions: Option<PermissionDecisionSlot>,
 }
@@ -304,11 +300,10 @@ impl SessionRunner for ProcessSessionRunner {
         // A shared reference cannot move the receiver out, so the launcher
         // leaves it in the slot and the one runner that owns the child takes
         // it here.
-        let decisions = context.permission_decisions.as_ref().and_then(|slot| {
-            slot.lock()
-                .ok()
-                .and_then(|mut slot| slot.take())
-        });
+        let decisions = context
+            .permission_decisions
+            .as_ref()
+            .and_then(|slot| slot.lock().ok().and_then(|mut slot| slot.take()));
         run_child_streaming(
             child,
             context.session_id,
@@ -1106,8 +1101,7 @@ async fn run_worker(
     // Lines a session's readers produce. The original sender stays alive for
     // the life of the worker so `recv` never reports "all senders dropped"
     // while sessions can still be spawned.
-    let (output_tx, mut output_rx) =
-        tokio::sync::mpsc::unbounded_channel::<SessionOutputLine>();
+    let (output_tx, mut output_rx) = tokio::sync::mpsc::unbounded_channel::<SessionOutputLine>();
     // Permission requests the children emit. The launcher owns the bridge
     // (and its transport), so the request has to travel back here before it
     // can become a `permission_request` frame.
@@ -1141,6 +1135,9 @@ async fn run_worker(
                 if let Some(done) = done {
                     running.remove(&done.session_id);
                     finish_session(bridge, done).await;
+                    // `finish_session` queued the terminal state; the serve
+                    // loop owns the transport, so flush while we have it.
+                    flush_session_writes(bridge).await;
                 }
             }
             line = output_rx.recv() => {
@@ -1238,6 +1235,9 @@ async fn run_worker(
                 if let Err(err) = bridge.send_pending_permission_requests().await {
                     tracing::warn!(error = %err, "could not send pending permission requests");
                 }
+                // State writes queued by a successful spawn wait for the
+                // same moment: the loop owns the transport here.
+                flush_session_writes(bridge).await;
             }
         }
     }
@@ -1360,9 +1360,34 @@ fn spawn_session_tasks(
     }
 }
 
+/// Queue a fenced state write for the control plane.
+///
+/// A worker registered without an epoch (the control plane did not report
+/// one) cannot produce a write the gateway can order; that is a deployment
+/// limitation, not a reason to stop the session, so it is warned about once
+/// and otherwise ignored.
+fn queue_session_state(bridge: &mut Bridge, session_id: &str, state: &str) {
+    if let Err(error) = bridge.queue_session_write(session_id, state) {
+        static WARNED_NO_EPOCH: AtomicBool = AtomicBool::new(false);
+        if !WARNED_NO_EPOCH.swap(true, Ordering::Relaxed) {
+            tracing::warn!(
+                error = %error,
+                "not sending session state writes: registration assigned no worker epoch"
+            );
+        }
+    }
+}
+
+/// Flush queued state writes over the transport.
+async fn flush_session_writes(bridge: &mut Bridge) {
+    if let Err(err) = bridge.send_pending_session_writes().await {
+        tracing::warn!(error = %err, "could not send pending session writes");
+    }
+}
+
 /// Apply a finished session's outcome and free its capacity slot.
 async fn finish_session(bridge: &mut Bridge, done: SessionCompletion) {
-    match done.outcome {
+    let final_state = match done.outcome {
         Ok(output) => {
             if let Err(err) = bridge
                 .complete_session(&done.session_id, &output.transcript, output.usage)
@@ -1375,8 +1400,10 @@ async fn finish_session(bridge: &mut Bridge, done: SessionCompletion) {
                 );
                 // `complete_session` frees the slot only after it succeeds.
                 bridge.fail_session(&done.session_id, err);
+                "failed"
             } else {
                 tracing::info!(session_id = %done.session_id, "bridge session completed");
+                "completed"
             }
         }
         Err(err) => {
@@ -1386,8 +1413,10 @@ async fn finish_session(bridge: &mut Bridge, done: SessionCompletion) {
                 "bridge session failed"
             );
             bridge.fail_session(&done.session_id, err);
+            "failed"
         }
-    }
+    };
+    queue_session_state(bridge, &done.session_id, final_state);
 }
 
 /// Ask running sessions to stop, then release their slots.
@@ -1481,6 +1510,10 @@ async fn assignment_tick(
                     work_dir = %result.work_dir.display(),
                     "spawned bridge session"
                 );
+                // Announce the transition the same way `finish_session`
+                // announces completion; the launcher flushes it when the
+                // tick returns.
+                queue_session_state(bridge, &result.session_id, "running");
                 spawned.push(SpawnedSession {
                     session_dir: session_base.join(&result.session_id),
                     session_id: result.session_id,
@@ -1532,7 +1565,11 @@ async fn register_with_retry(bridge: &Bridge, stop: &BridgeStopHandle) -> Result
 
         match registered {
             Ok(()) => {
-                tracing::info!(attempt, "bridge registered with the control plane");
+                tracing::info!(
+                    attempt,
+                    worker_epoch = bridge.worker_epoch(),
+                    "bridge registered with the control plane"
+                );
                 return Ok(());
             }
             Err(err) => last_error = err,
@@ -1654,6 +1691,8 @@ mod tests {
         capacities: Mutex<Vec<CapacityReport>>,
         fetches: Mutex<usize>,
         claims: Mutex<Vec<(String, String)>>,
+        /// Epoch returned by registration; `0` means "not reported".
+        worker_epoch: u64,
         /// Outcomes returned by successive claim calls; empty means `Claimed`.
         claim_outcomes: Mutex<std::collections::VecDeque<Result<ClaimOutcome, String>>>,
     }
@@ -1670,12 +1709,12 @@ mod tests {
 
     #[async_trait::async_trait]
     impl ControlPlaneClient for FakeControlPlane {
-        async fn register(&self, env_id: &str, max_concurrent: usize) -> Result<(), String> {
+        async fn register(&self, env_id: &str, max_concurrent: usize) -> Result<u64, String> {
             self.registrations
                 .lock()
                 .unwrap()
                 .push((env_id.to_string(), max_concurrent));
-            Ok(())
+            Ok(self.worker_epoch)
         }
 
         async fn fetch_assignments(&self, _env_id: &str) -> Result<Vec<WorkAssignment>, String> {
@@ -2151,7 +2190,10 @@ mod tests {
         config.poll_interval = Duration::from_millis(10);
         let session_base = config.session_base.clone();
 
-        let control_plane = Arc::new(FakeControlPlane::default());
+        let control_plane = Arc::new(FakeControlPlane {
+            worker_epoch: 42,
+            ..FakeControlPlane::default()
+        });
         control_plane
             .assignments
             .lock()
@@ -2220,6 +2262,22 @@ mod tests {
         })
         .await
         .expect("capacity should report the active session");
+
+        // The spawn produced a fenced write observable on the gateway side of
+        // the in-process transport.
+        let write = tokio::time::timeout(Duration::from_secs(2), remote.receive())
+            .await
+            .expect("the worker should send a session_write after spawning")
+            .unwrap();
+        assert_eq!(write.r#type, "session_write");
+        assert_eq!(
+            write.metadata.get("worker_epoch").map(String::as_str),
+            Some("42"),
+            "the write must carry the epoch registration returned"
+        );
+        let payload: serde_json::Value = serde_json::from_str(&write.payload).unwrap();
+        assert_eq!(payload["session_id"], "s1");
+        assert_eq!(payload["state"], "running");
 
         shutdown_tx.send(()).unwrap();
         let result = tokio::time::timeout(Duration::from_secs(1), running)

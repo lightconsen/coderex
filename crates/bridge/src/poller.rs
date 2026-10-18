@@ -2,6 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Work assignment from the control plane.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -149,7 +150,14 @@ struct RegisterRequest {
 #[async_trait::async_trait]
 pub trait ControlPlaneClient: Send + Sync + std::fmt::Debug {
     /// Register this environment.
-    async fn register(&self, env_id: &str, max_concurrent: usize) -> Result<(), String>;
+    ///
+    /// Returns the worker epoch the control plane assigned. The epoch fences
+    /// this worker's later write-backs: a stale worker cannot overwrite the
+    /// state of the one that replaced it. [`HttpControlPlaneClient`] reads
+    /// `worker_epoch` (or `workerEpoch`) from the registration response; `0`
+    /// means the control plane did not report an epoch, and write-backs are
+    /// disabled until one is known.
+    async fn register(&self, env_id: &str, max_concurrent: usize) -> Result<u64, String>;
 
     /// Fetch work assignments for this environment.
     async fn fetch_assignments(&self, env_id: &str) -> Result<Vec<WorkAssignment>, String>;
@@ -229,6 +237,30 @@ impl HttpControlPlaneClient {
     }
 }
 
+/// Pull the worker epoch out of a registration response body.
+///
+/// The reference server spells the field `worker_epoch`; `workerEpoch` is
+/// accepted for control planes that use the camelCase spelling. A body that
+/// is not JSON, or does not carry the field as a number or numeric string,
+/// means no epoch was assigned: the worker stays at `0` and write-backs are
+/// disabled rather than sent under a guessed epoch.
+fn worker_epoch_from_response(body: &str) -> u64 {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(body) else {
+        return 0;
+    };
+
+    ["worker_epoch", "workerEpoch"]
+        .iter()
+        .find_map(|key| {
+            value.get(*key).and_then(|epoch| {
+                epoch
+                    .as_u64()
+                    .or_else(|| epoch.as_str().and_then(|s| s.parse().ok()))
+            })
+        })
+        .unwrap_or(0)
+}
+
 /// Whether a claim response means "this assignment is not ours to run".
 ///
 /// The control-plane server answers 409 for an already-claimed (or missing)
@@ -241,7 +273,7 @@ fn claim_status_is_lost(status: reqwest::StatusCode) -> bool {
 
 #[async_trait::async_trait]
 impl ControlPlaneClient for HttpControlPlaneClient {
-    async fn register(&self, env_id: &str, max_concurrent: usize) -> Result<(), String> {
+    async fn register(&self, env_id: &str, max_concurrent: usize) -> Result<u64, String> {
         let url = format!("{}/api/environments/register", self.base_url);
         let body = RegisterRequest {
             env_id: env_id.to_string(),
@@ -262,7 +294,8 @@ impl ControlPlaneClient for HttpControlPlaneClient {
             .map_err(|e| format!("registration request failed: {e}"))?;
 
         if response.status().is_success() {
-            Ok(())
+            let body = response.text().await.unwrap_or_default();
+            Ok(worker_epoch_from_response(&body))
         } else {
             let status = response.status();
             let text = response.text().await.unwrap_or_default();
@@ -360,6 +393,9 @@ pub struct BridgeWorkPoller {
     pending: Vec<WorkAssignment>,
     /// Active session count.
     active_sessions: usize,
+    /// Epoch the control plane assigned at registration, or `0` when it did
+    /// not report one. Write-backs are fenced by this value.
+    worker_epoch: AtomicU64,
 }
 
 /// Server-side assignment entry (deserialized from control plane).
@@ -426,14 +462,27 @@ impl BridgeWorkPoller {
             client,
             pending: Vec::new(),
             active_sessions: 0,
+            worker_epoch: AtomicU64::new(0),
         }
     }
 
     /// Register this environment with the control plane.
+    ///
+    /// The epoch the control plane returns is remembered for write-backs.
     pub async fn register(&self) -> Result<(), String> {
-        self.client
+        let epoch = self
+            .client
             .register(&self.env_id, self.max_concurrent)
-            .await
+            .await?;
+        self.worker_epoch.store(epoch, Ordering::SeqCst);
+        Ok(())
+    }
+
+    /// The epoch registration assigned this worker, or `0` before
+    /// registration (or when the control plane did not report one).
+    #[must_use]
+    pub fn worker_epoch(&self) -> u64 {
+        self.worker_epoch.load(Ordering::SeqCst)
     }
 
     /// Report current capacity.
@@ -536,18 +585,20 @@ mod tests {
         assignments: std::sync::Mutex<Vec<WorkAssignment>>,
         capacities: std::sync::Mutex<Vec<(String, CapacityReport)>>,
         claims: std::sync::Mutex<Vec<(String, String)>>,
+        /// Epoch returned by registration.
+        worker_epoch: u64,
         /// Result returned by the next claim; `None` means `Claimed`.
         claim_outcome: std::sync::Mutex<Option<Result<ClaimOutcome, String>>>,
     }
 
     #[async_trait::async_trait]
     impl ControlPlaneClient for FakeClient {
-        async fn register(&self, env_id: &str, max_concurrent: usize) -> Result<(), String> {
+        async fn register(&self, env_id: &str, max_concurrent: usize) -> Result<u64, String> {
             self.registrations
                 .lock()
                 .unwrap()
                 .push((env_id.to_string(), max_concurrent));
-            Ok(())
+            Ok(self.worker_epoch)
         }
 
         async fn fetch_assignments(&self, _env_id: &str) -> Result<Vec<WorkAssignment>, String> {
@@ -631,6 +682,36 @@ mod tests {
         assert_eq!(capacities[0].0, "env1");
         assert_eq!(capacities[0].1.active_sessions, 1);
         assert_eq!(capacities[0].1.available_slots, 1);
+    }
+
+    #[tokio::test]
+    async fn registration_stores_the_epoch_the_control_plane_returns() {
+        let client = Arc::new(FakeClient {
+            worker_epoch: 11,
+            ..FakeClient::default()
+        });
+        let poller =
+            BridgeWorkPoller::with_client("env1".into(), 1, "http://unused.invalid".into(), client);
+
+        assert_eq!(
+            poller.worker_epoch(),
+            0,
+            "unregistered workers have no epoch"
+        );
+        poller.register().await.unwrap();
+        assert_eq!(poller.worker_epoch(), 11);
+    }
+
+    #[test]
+    fn registration_response_epoch_spellings_are_parsed() {
+        assert_eq!(worker_epoch_from_response(r#"{"worker_epoch":42}"#), 42);
+        assert_eq!(worker_epoch_from_response(r#"{"workerEpoch":7}"#), 7);
+        assert_eq!(worker_epoch_from_response(r#"{"worker_epoch":"9"}"#), 9);
+        // A server that reports no epoch, or no JSON at all, leaves the worker
+        // unregistered rather than guessing one.
+        assert_eq!(worker_epoch_from_response("{}"), 0);
+        assert_eq!(worker_epoch_from_response(""), 0);
+        assert_eq!(worker_epoch_from_response("not json"), 0);
     }
 
     #[tokio::test]
