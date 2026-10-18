@@ -163,18 +163,40 @@ All features are implemented. No known stubs.
 
 ## Background Job Records and Adoption (`coderex-core::job_record`)
 
-Background agents (and background shell commands and workflow runs) are
-**in-process `tokio` tasks**. When the process exits, the work is gone. There is
-no worker process outliving its supervisor, so there is nothing to re-attach:
-adoption here does not fake re-attachment. What it does is make the *record* of
-that work durable, and make sure the next session reports what it finds.
+Background agents are **in-process `tokio` tasks**, and background shell
+commands are child processes owned by this process. When the process exits, the
+work is gone. There is no worker process outliving its supervisor, so there is
+nothing to re-attach: adoption here does not fake re-attachment. What it does
+is make the *record* of that work durable, and make sure the next session
+reports what it finds.
+
+**Who writes records.** A record is written at spawn and settled when the work
+ends:
+
+| Producer | Written when | Settled |
+|---|---|---|
+| `AgentManager::spawn_agent` (`run_in_background: true`) | before the tokio task starts | `Done`/`Failed` when the task ends, `Interrupted` on `stop_agent` or manager drop |
+| `Bash` tool with `run_in_background: true` | after the child is spawned, before the tool returns | `Done`/`Failed` (with the exit code or timeout error) when the child exits |
+| `CronScheduler` (`durable` definitions only) | on `create` and when `load` re-schedules a saved definition | `Done` on one-shot fire or delete; recurring fires refresh the record |
+
+Synchronous agents and transient (non-durable) cron definitions write no
+record: there is no background work to adopt, and a non-durable definition dies
+with the process. Workflow runs are synchronous (`WorkflowTool` awaits each
+agent), so they have no producer.
+
+A record must never be left claiming `Running` after its work is over.
+`JobStore::settle()` only transitions a record that is still `Running`, so a
+late completion cannot overwrite an `Interrupted` written by cancellation or
+adoption.
 
 **The record.** `JobStore` writes one JSON file per job under
 `<cwd>/.coderex/jobs/<id>.json`, atomically (a sibling temp file renamed over
 the target, so concurrent readers never see a partial record). A `JobRecord`
 carries `id`, `kind` (`Agent` / `Shell` / `Workflow` / `Cron`), `description`,
-`cwd`, `session_id`, `pid`, `started_at_ms`, `updated_at_ms` and `state`
-(`Running` / `Interrupted` / `Done` / `Failed`).
+`cwd`, `session_id`, `pid`, `started_at_ms`, `updated_at_ms`, `state`
+(`Running` / `Interrupted` / `Done` / `Failed`), and — added for the write side
+with `serde(default)` so older records still decode — `ended_at_ms`,
+`exit_code` (real processes only) and `error` (failure detail).
 
 **No roster index.** The reference keeps a `roster.json` index beside its
 per-job `state.json` files because its daemon rescans a job tree of unknown
@@ -208,8 +230,13 @@ agent is surfaced into the conversation once — never left as a phantom
 `durable` definitions to `~/.coderex/scheduled_tasks.json` and reloads them at
 session start (`repl.rs` calls `load()` then `spawn_runner()`), which is what
 the reference's cron adoption does — dedupe against the session store and
-re-schedule. Adoption therefore classifies cron records as `resumable` for
-disclosure but does not re-register them, and there is no second cron store.
+re-schedule. When the scheduler is constructed with a cwd and session id
+(`with_job_records`), durable definitions are mirrored into the job store:
+`load()` refreshes each record to `Running` (re-scheduling is a new life for
+it), `create()` writes one, a recurring fire touches it, and a one-shot fire or
+a `delete()` settles it `Done`. Adoption therefore classifies cron records as
+`resumable` for disclosure but does not re-register them, and there is no
+second cron store.
 
 **Kill switch.** `CODEREX_DISABLE_ADOPT` (non-empty, not `0`/`false`/`no`)
 makes `adopt_for_session()` a no-op. As in the reference, there is **no
@@ -220,9 +247,13 @@ rather than asks — so this is a switch, not a dialog.
 the existing `TaskStore` / `CronScheduler` wiring):
 
 ```rust
-let store = coderex_core::JobStore::new(&cwd);
-let adopted = coderex_core::adopt_for_session(&store, coderex_core::task::now_ms(), &session_id)
-    .unwrap_or_default();
+let store = coderex_core::job_record::JobStore::new(&cwd);
+let adopted = coderex_core::job_record::adopt_for_session(
+    &store,
+    coderex_core::task::now_ms(),
+    &session_id,
+)
+.unwrap_or_default();
 for n in &adopted.notifications {
     ui_state.messages.push(Message {
         role: MessageRole::System,

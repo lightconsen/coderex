@@ -1026,6 +1026,9 @@ impl ReplLoop {
         let mcp_slot: Arc<std::sync::RwLock<Option<Arc<coderex_mcp::manager::McpManager>>>> =
             Arc::new(std::sync::RwLock::new(None));
         let mcp_for_subagents = Arc::clone(&mcp_slot);
+        // Background tools run inside a sub-agent's turn too, and a job record
+        // written there must still name the session that owns it.
+        let subagent_session_id = session_id.to_string();
         agent_manager.set_tool_executor_factory(move |cwd, sandbox| {
             let mut registry = ToolRegistry::new();
             register_builtin_tools(&mut registry);
@@ -1042,6 +1045,7 @@ impl ReplLoop {
             dispatcher.set_sandbox_override(sandbox);
             dispatcher.set_rate_limiter(Arc::new(RateLimiter::new()));
             dispatcher.set_chrome_client(ChromeClient::new());
+            dispatcher.set_session_id(subagent_session_id.clone());
             // The child registry intentionally has no nested AgentManager. A
             // synchronous parent holds its manager while waiting, so nesting
             // through that same manager could deadlock; the built-in Agent
@@ -1115,9 +1119,14 @@ impl ReplLoop {
         let _ = task_store.load();
         dispatcher.set_task_store(Arc::clone(&task_store));
 
-        // Shared cron scheduler with persistence
-        let cron_scheduler =
-            Arc::new(CronScheduler::new().with_storage(config_home.join("scheduled_tasks.json")));
+        // Shared cron scheduler with persistence. Durable definitions are
+        // mirrored into this session's job records, so the next session can
+        // adopt the ones that are genuinely resumable.
+        let cron_scheduler = Arc::new(
+            CronScheduler::new()
+                .with_storage(config_home.join("scheduled_tasks.json"))
+                .with_job_records(std::path::PathBuf::from(&cwd), session_id.to_string()),
+        );
         let _ = cron_scheduler.load();
         dispatcher.set_cron_scheduler(Arc::clone(&cron_scheduler));
 
@@ -1127,6 +1136,10 @@ impl ReplLoop {
 
         // Chrome DevTools client for browser automation tools
         dispatcher.set_chrome_client(ChromeClient::new());
+
+        // Tools that start durable background work attribute its record to
+        // this session, so a later session can tell it apart from its own.
+        dispatcher.set_session_id(session_id.to_string());
 
         let dispatcher = Arc::new(dispatcher);
         let primary_executor: Arc<dyn coderex_core::tool_executor::ToolExecutor + Send + Sync> =
@@ -2120,6 +2133,13 @@ impl ReplLoop {
             if let Some(ref mut rx) = self.cron_rx {
                 while let Ok((job_id, prompt)) = rx.try_recv() {
                     writeln!(stdout, "[Cron {job_id}] {prompt}")?;
+                    // The runner only yields; recording the fire (and retiring
+                    // a one-shot definition) is the consumer's job.
+                    if let Some(scheduler) =
+                        self.dispatcher.as_ref().and_then(|d| d.cron_scheduler())
+                    {
+                        scheduler.mark_fired(&job_id);
+                    }
                 }
             }
 
@@ -3119,6 +3139,11 @@ impl ReplLoop {
                         streaming: false,
                         folded: false,
                     });
+                    if let Some(scheduler) =
+                        self.dispatcher.as_ref().and_then(|d| d.cron_scheduler())
+                    {
+                        scheduler.mark_fired(&job_id);
+                    }
                 }
 
                 Some(request) = async {

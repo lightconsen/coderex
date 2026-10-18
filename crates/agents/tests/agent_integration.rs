@@ -5,13 +5,22 @@
 //! 6.5 SendMessage, 6.6 worktree isolation, 6.7 tool whitelist
 
 use std::collections::HashMap;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
 use coderex_agents::{
     AgentError, AgentManager, AgentResult, AgentStatus, AgentType, SpawnOptions, TeammateEvent,
     Thoroughness,
 };
+use coderex_core::api_client::{ApiClient, ApiError, ApiResponse, StreamEvent};
+use coderex_core::job_record::{JobKind, JobRecord, JobState, JobStore};
+use coderex_core::task::now_ms;
+use coderex_core::tool_executor::ToolInfo;
+use coderex_core::types::{ModelId, UsageSummary};
+use futures::Stream;
+use tokio::sync::Notify;
 
 fn test_manager() -> AgentManager {
     let mut mgr = AgentManager::standalone();
@@ -541,4 +550,219 @@ async fn agent_extra_env_is_refused() {
     // to inject into; the spawn is refused instead of silently dropping the
     // variables the caller asked for.
     assert!(matches!(result, Err(AgentError::Configuration(_))));
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  Durable job records for background agents
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// An API client whose first non-streaming call blocks until released, so a
+/// background agent is observably `Running` rather than completing instantly.
+struct BlockingApiClient {
+    started: Arc<Notify>,
+    release: Arc<Notify>,
+}
+
+impl BlockingApiClient {
+    fn new() -> Self {
+        Self {
+            started: Arc::new(Notify::new()),
+            release: Arc::new(Notify::new()),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl ApiClient for BlockingApiClient {
+    fn clone_box(&self) -> Box<dyn ApiClient> {
+        Box::new(Self {
+            started: Arc::clone(&self.started),
+            release: Arc::clone(&self.release),
+        })
+    }
+
+    async fn create_message(
+        &self,
+        _system: &str,
+        _messages: &[serde_json::Value],
+        _model: &ModelId,
+        _max_tokens: u32,
+        _tools: &[ToolInfo],
+    ) -> Result<ApiResponse, ApiError> {
+        self.started.notify_one();
+        self.release.notified().await;
+        Ok(ApiResponse {
+            content: "finished".into(),
+            tool_calls: Vec::new(),
+            usage: UsageSummary {
+                input_tokens: 0,
+                output_tokens: 0,
+                cache_read_tokens: 0,
+                cache_creation_tokens: 0,
+            },
+            stop_reason: "end_turn".into(),
+        })
+    }
+
+    async fn create_message_streaming(
+        &self,
+        _system: &str,
+        _messages: &[serde_json::Value],
+        _model: &ModelId,
+        _max_tokens: u32,
+        _tools: &[ToolInfo],
+    ) -> Pin<Box<dyn Stream<Item = StreamEvent> + Send + 'static>> {
+        // The engine's `submit` path is non-streaming; an empty stream is
+        // enough for this test client.
+        Box::pin(futures::stream::empty())
+    }
+}
+
+fn blocking_manager() -> (AgentManager, Arc<Notify>, Arc<Notify>) {
+    let client = BlockingApiClient::new();
+    let started = Arc::clone(&client.started);
+    let release = Arc::clone(&client.release);
+    let mut mgr = AgentManager::standalone();
+    mgr.set_api_client(Box::new(client));
+    (mgr, started, release)
+}
+
+async fn spawn_background_agent(mgr: &mut AgentManager, cwd: &std::path::Path) -> (
+    JobStore,
+    String,
+    String,
+) {
+    let instance = mgr
+        .spawn_agent(
+            AgentType::GeneralPurpose,
+            "background analysis",
+            SpawnOptions {
+                run_in_background: true,
+                ..Default::default()
+            },
+            "sess_job",
+            cwd.to_str().unwrap(),
+            0,
+        )
+        .await
+        .unwrap();
+    let (store, id) = instance
+        .job_record
+        .clone()
+        .expect("a background agent must be recorded");
+    let agent_id = instance.task_handle.id.clone();
+    (store, id, agent_id)
+}
+
+async fn wait_for_terminal(store: &JobStore, id: &str) -> JobRecord {
+    for _ in 0..400 {
+        if let Ok(Some(record)) = store.load(id) {
+            if record.state != JobState::Running {
+                return record;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("background agent record {id} never reached a terminal state");
+}
+
+#[tokio::test]
+async fn background_agent_record_running_then_done() {
+    let (mut mgr, started, release) = blocking_manager();
+    let tmp = tempfile::tempdir().unwrap();
+    let (store, id, _agent_id) = spawn_background_agent(&mut mgr, tmp.path()).await;
+
+    let running = store.load(&id).unwrap().expect("record written at spawn");
+    assert_eq!(running.state, JobState::Running);
+    assert_eq!(running.kind, JobKind::Agent);
+    assert_eq!(running.session_id.as_deref(), Some("sess_job"));
+    assert!(running.pid.is_some());
+    assert!(running.ended_at_ms.is_none());
+    assert!(running.description.contains("background analysis"));
+
+    started.notified().await;
+    release.notify_one();
+
+    let done = wait_for_terminal(&store, &id).await;
+    assert_eq!(done.state, JobState::Done);
+    assert!(done.ended_at_ms.is_some());
+    assert!(done.exit_code.is_none());
+    assert!(done.error.is_none());
+}
+
+#[tokio::test]
+async fn background_agent_stop_records_interrupted() {
+    let (mut mgr, started, release) = blocking_manager();
+    let tmp = tempfile::tempdir().unwrap();
+    let (store, id, agent_id) = spawn_background_agent(&mut mgr, tmp.path()).await;
+
+    started.notified().await;
+    mgr.stop_agent(&agent_id).await.unwrap();
+
+    let stopped = store.load(&id).unwrap().expect("record survives stop");
+    assert_eq!(stopped.state, JobState::Interrupted);
+    assert!(stopped.ended_at_ms.is_some());
+    assert!(
+        stopped.error.as_deref().unwrap().contains("stopped"),
+        "unexpected error: {:?}",
+        stopped.error
+    );
+
+    // The aborted task must not resurrect the record as Done.
+    release.notify_one();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(store.load(&id).unwrap().unwrap().state, JobState::Interrupted);
+}
+
+#[tokio::test]
+async fn background_agent_drop_records_interrupted() {
+    let (mut mgr, started, release) = blocking_manager();
+    let tmp = tempfile::tempdir().unwrap();
+    let (store, id, _agent_id) = spawn_background_agent(&mut mgr, tmp.path()).await;
+    started.notified().await;
+
+    drop(mgr);
+
+    let dropped = store.load(&id).unwrap().expect("record survives manager drop");
+    assert_eq!(dropped.state, JobState::Interrupted);
+    assert!(dropped.ended_at_ms.is_some());
+    assert!(
+        dropped.error.as_deref().unwrap().contains("manager dropped"),
+        "unexpected error: {:?}",
+        dropped.error
+    );
+
+    release.notify_one();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(store.load(&id).unwrap().unwrap().state, JobState::Interrupted);
+}
+
+#[tokio::test]
+async fn fresh_session_adopts_background_agent_as_interrupted() {
+    let (mut mgr, started, release) = blocking_manager();
+    let tmp = tempfile::tempdir().unwrap();
+    let (_store, id, _agent_id) = spawn_background_agent(&mut mgr, tmp.path()).await;
+    started.notified().await;
+
+    // A fresh store, exactly as the CLI builds one at startup.
+    let fresh = JobStore::new(tmp.path());
+    let adopted = coderex_core::job_record::adopt_for_session(&fresh, now_ms(), "sess_job")
+        .expect("adoption succeeds");
+
+    assert!(
+        adopted.outcome.interrupted.iter().any(|record| record.id == id),
+        "agent record was not classified interrupted: {:?}",
+        adopted.outcome
+    );
+    assert!(
+        adopted.notifications.iter().any(|note| note.job_id == id),
+        "no notification for the adopted agent record"
+    );
+
+    let reconciled = fresh.load(&id).unwrap().expect("record still on disk");
+    assert_eq!(reconciled.state, JobState::Interrupted);
+    assert!(reconciled.ended_at_ms.is_some());
+
+    release.notify_one();
+    drop(mgr);
 }

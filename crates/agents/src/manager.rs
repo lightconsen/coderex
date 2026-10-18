@@ -9,6 +9,7 @@ use coderex_core::elicitation::SdkElicitationHandler;
 use coderex_core::engine::{
     QueryEngine, StructuredOutputValidator, SubmitOptions, ValidationResult,
 };
+use coderex_core::job_record::{JobKind, JobRecord, JobState, JobStore};
 use coderex_core::orchestrator::{
     run_background_feature, run_forked_agent, BackgroundFeatureRequest, QueryResult,
 };
@@ -16,7 +17,7 @@ use coderex_core::permission_engine::PermissionEngine;
 use coderex_core::permissions::{PermissionChecker, PermissionMode};
 use coderex_core::sandbox::SandboxConfig;
 use coderex_core::state::SessionState;
-use coderex_core::task::{TaskHandle, TaskKind, TaskManager};
+use coderex_core::task::{now_ms, TaskHandle, TaskKind, TaskManager};
 use coderex_core::tool_executor::ToolExecutor;
 use coderex_core::types::{AgentLifecycleEvent, EngineEvent, ModelId};
 use coderex_core::wire_adapter::engine_event_to_wire;
@@ -493,6 +494,9 @@ pub struct AgentInstance {
     pub working_directory: PathBuf,
     /// Git worktree created for this agent, when isolation was requested.
     pub worktree_path: Option<PathBuf>,
+    /// Durable record for a background agent, when one was written. The
+    /// manager settles it on completion, cancellation and drop.
+    pub job_record: Option<(JobStore, String)>,
 }
 
 impl AgentInstance {
@@ -516,6 +520,7 @@ impl AgentInstance {
             task_join_handle: None,
             working_directory,
             worktree_path: None,
+            job_record: None,
         }
     }
 
@@ -592,6 +597,9 @@ pub struct AgentManager {
     custom_agents: HashMap<String, crate::custom_agents::CustomAgentDef>,
     /// When true, spawn_agent writes a placeholder instead of requiring an API client.
     test_mode: bool,
+    /// Durable records for background agents this manager has already
+    /// written. Kept so `Drop` can settle work the process is abandoning.
+    background_jobs: Vec<(JobStore, String)>,
 }
 
 impl std::fmt::Debug for AgentManager {
@@ -621,6 +629,7 @@ impl AgentManager {
             agent_event_broadcast: Some(agent_event_broadcast),
             custom_agents: crate::custom_agents::load_custom_agents(),
             test_mode: false,
+            background_jobs: Vec::new(),
         }
     }
 
@@ -835,6 +844,47 @@ impl AgentManager {
             .clone()
             .unwrap_or_else(|| base_directory.clone());
 
+        // A background agent gets a durable record before its task starts, so
+        // a process that dies at any point after this leaves something for the
+        // next session to find instead of an invisible job. Synchronous agents
+        // are not recorded: their call is already blocking the caller, and
+        // there is no background work to adopt.
+        let started_at_ms = now_ms();
+        let background_job = if options.run_in_background {
+            // The record lives in the session's store (the `cwd` argument),
+            // even when the agent itself runs in a worktree or an overridden
+            // directory. Adoption starts from the session's cwd, so a record
+            // written elsewhere would never be found.
+            let store = JobStore::new(cwd);
+            let id = job_record_id("agent", &task_id, started_at_ms);
+            let description = job_description(
+                &format!("{}: ", agent_type_name(&agent_type)),
+                prompt,
+            );
+            let mut record = JobRecord::new(
+                id.clone(),
+                JobKind::Agent,
+                description,
+                &working_directory,
+                Some(parent_session_id),
+                started_at_ms,
+            );
+            // In-process work: the owner process is the only pid there is.
+            record.pid = Some(std::process::id());
+            if let Err(error) = store.write(&record) {
+                tracing::warn!(
+                    job = %id,
+                    path = %store.root().display(),
+                    error = %error,
+                    "could not write the background agent job record"
+                );
+            }
+            self.background_jobs.push((store.clone(), id.clone()));
+            Some((store, id))
+        } else {
+            None
+        };
+
         // Create output file path. Keep agent artifacts out of the project
         // unless the caller explicitly chose a working directory override.
         // When isolation created a worktree (itself a checkout) the artifacts
@@ -886,6 +936,7 @@ impl AgentManager {
         instance.output_file = Some(output_file.clone());
         instance.working_directory = working_directory.clone();
         instance.worktree_path = worktree_path.clone();
+        instance.job_record = background_job.clone();
         let _ = instance.status_tx.send(AgentStatus::Running);
         instance.prompt = system_prompt.clone();
 
@@ -922,6 +973,7 @@ impl AgentManager {
             let status_tx = instance.status_tx.clone();
             let task_manager_for_task = Arc::clone(&self.task_manager);
             let task_id_for_completion = agent_id.clone();
+            let job_record = background_job.clone();
 
             let handle = tokio::spawn(async move {
                 let result = run_agent_task(
@@ -969,6 +1021,28 @@ impl AgentManager {
                             task_manager.mark_failed(&task_id_for_completion, error.to_string());
                     }
                 }
+
+                // The record must never be left claiming `Running` once the
+                // task is over. `settle` refuses to overwrite an already
+                // terminal record, so a cancellation that raced completion
+                // keeps its `Interrupted` state.
+                if let Some((store, id)) = &job_record {
+                    let (state, error) = match &result {
+                        Ok(agent_result) if agent_result.status == AgentStatus::Completed => {
+                            (JobState::Done, None)
+                        }
+                        Ok(_) => (JobState::Failed, Some("agent execution failed".to_string())),
+                        Err(error) => (JobState::Failed, Some(error.to_string())),
+                    };
+                    if let Err(write_error) = store.settle(id, state, now_ms(), None, error) {
+                        tracing::warn!(
+                            job = %id,
+                            path = %store.root().display(),
+                            error = %write_error,
+                            "could not settle the background agent job record"
+                        );
+                    }
+                }
             });
 
             instance.task_join_handle = Some(handle);
@@ -977,12 +1051,22 @@ impl AgentManager {
             let placeholder = format!("agent completed (test mode)\n\nAgent task: {prompt}");
             let _ = tokio::fs::write(&output_file, &placeholder).await;
             let _ = instance.status_tx.send(AgentStatus::Completed);
+            if let Some((store, id)) = &background_job {
+                let _ = store.settle(id, JobState::Done, now_ms(), None, None);
+            }
         } else {
-            return Err(AgentError::Configuration(
-                "AgentManager requires an API client to spawn agents. \
-                 Configure one via set_api_client() before calling spawn_agent()."
-                    .into(),
-            ));
+            let error = "AgentManager requires an API client to spawn agents. \
+                 Configure one via set_api_client() before calling spawn_agent().";
+            if let Some((store, id)) = &background_job {
+                let _ = store.settle(
+                    id,
+                    JobState::Failed,
+                    now_ms(),
+                    None,
+                    Some(error.to_string()),
+                );
+            }
+            return Err(AgentError::Configuration(error.into()));
         }
 
         self.agents.insert(agent_id.clone(), instance);
@@ -1047,6 +1131,9 @@ impl AgentManager {
         drop(task_manager);
 
         let _ = instance.status_tx.send(AgentStatus::Completed);
+        if let Some((store, id)) = &instance.job_record {
+            let _ = store.settle(id, JobState::Done, now_ms(), None, None);
+        }
 
         // Emit teammate event
         self.emit_event(TeammateEvent::TaskCompleted {
@@ -1084,6 +1171,29 @@ impl AgentManager {
         drop(task_manager);
 
         let _ = instance.status_tx.send(AgentStatus::Stopped);
+        // Cancellation is a lifecycle end: the record must not stay
+        // `Running`, or a later session would report work nobody is doing.
+        if let Some((store, id)) = &instance.job_record {
+            if let Err(error) = store.settle(
+                id,
+                JobState::Interrupted,
+                now_ms(),
+                None,
+                Some("agent stopped before completion".to_string()),
+            ) {
+                tracing::warn!(
+                    job = %id,
+                    path = %store.root().display(),
+                    error = %error,
+                    "could not settle the cancelled agent job record"
+                );
+            }
+        }
+        // Drop the actual task as well as its status. A stopped background
+        // agent must not keep running invisibly.
+        if let Some(handle) = instance.task_join_handle.take() {
+            handle.abort();
+        }
 
         Ok(())
     }
@@ -1225,6 +1335,63 @@ impl AgentManager {
             .await
             .map_err(|e| AgentError::SpawnFailed(e.to_string()))
     }
+}
+
+impl Drop for AgentManager {
+    fn drop(&mut self) {
+        // A manager going away means its tokio tasks are going away too. Mark
+        // any still-running background record interrupted so a later session
+        // reports the loss instead of finding a phantom `Running`.
+        for (store, id) in &self.background_jobs {
+            let _ = store.settle(
+                id,
+                JobState::Interrupted,
+                now_ms(),
+                None,
+                Some("agent manager dropped before the job finished".to_string()),
+            );
+        }
+    }
+}
+
+/// Build a job id that is safe as a file stem and does not collide with a
+/// previous session's `task_0`. Task ids restart at zero in every process, so
+/// the start timestamp is part of the id.
+fn job_record_id(prefix: &str, task_id: &str, started_at_ms: i64) -> String {
+    let sanitized: String = task_id
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let sanitized = if sanitized.is_empty() {
+        "job".to_string()
+    } else {
+        sanitized
+    };
+    format!("{prefix}-{sanitized}-{}", started_at_ms.max(0))
+}
+
+/// A bounded, human-readable description for a job record.
+fn job_description(prefix: &str, text: &str) -> String {
+    const LIMIT: usize = 200;
+    let mut out = String::with_capacity(prefix.len() + text.len().min(LIMIT) + 1);
+    out.push_str(prefix);
+    let mut chars = text.chars();
+    for _ in 0..LIMIT {
+        match chars.next() {
+            Some(c) => out.push(c),
+            None => return out,
+        }
+    }
+    if chars.next().is_some() {
+        out.push('…');
+    }
+    out
 }
 
 /// The only `SpawnOptions::isolation` value this manager can honor.

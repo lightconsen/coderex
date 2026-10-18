@@ -1,6 +1,8 @@
 //! CronScheduler — in-memory cron job scheduler with file persistence.
 
 use chrono::{Datelike, Local, Timelike};
+use coderex_core::job_record::{JobKind, JobRecord, JobState, JobStore};
+use coderex_core::task::now_ms;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
@@ -66,11 +68,23 @@ impl CronJob {
 
 static LOCAL_COUNTER: AtomicU64 = AtomicU64::new(1);
 
+/// Where durable cron definitions are mirrored as job records.
+#[derive(Debug, Clone)]
+struct JobContext {
+    store: JobStore,
+    cwd: PathBuf,
+    session_id: String,
+}
+
 /// In-memory cron job scheduler with optional file persistence.
 #[derive(Debug, Default)]
 pub struct CronScheduler {
     jobs: RwLock<HashMap<String, CronJob>>,
     storage_path: RwLock<Option<PathBuf>>,
+    /// Set by the session so durable definitions get a `JobRecord` under
+    /// `<cwd>/.coderex/jobs`. Without it, cron scheduling works as before and
+    /// writes no records.
+    job_context: RwLock<Option<JobContext>>,
 }
 
 impl CronScheduler {
@@ -83,6 +97,26 @@ impl CronScheduler {
     pub fn with_storage(self, path: PathBuf) -> Self {
         *self.storage_path.write().unwrap() = Some(path);
         self
+    }
+
+    /// Mirror durable definitions into the job store under `cwd`.
+    ///
+    /// Only durable jobs are recorded: a non-durable definition dies with the
+    /// process, so claiming it is resumable in the next session would be a
+    /// lie. The session id attributes the record for adoption.
+    pub fn with_job_records(self, cwd: PathBuf, session_id: impl Into<String>) -> Self {
+        self.set_job_records(cwd, session_id);
+        self
+    }
+
+    /// [`Self::with_job_records`] for a scheduler already shared behind an
+    /// `Arc`.
+    pub fn set_job_records(&self, cwd: PathBuf, session_id: impl Into<String>) {
+        *self.job_context.write().unwrap() = Some(JobContext {
+            store: JobStore::new(&cwd),
+            cwd,
+            session_id: session_id.into(),
+        });
     }
 
     /// Load durable jobs from disk if the storage file exists.
@@ -100,6 +134,10 @@ impl CronScheduler {
         let mut map = self.jobs.write().unwrap();
         for job in jobs {
             if job.durable {
+                // The definition survived the restart and is being scheduled
+                // again, so its record is Running and fresh — regardless of
+                // what the previous process left behind.
+                self.refresh_job_record(&job);
                 map.insert(job.id.clone(), job);
             }
         }
@@ -127,6 +165,7 @@ impl CronScheduler {
     pub fn create(&self, job: CronJob) -> String {
         let id = job.id.clone();
         if job.durable {
+            self.write_job_record(&job);
             self.jobs.write().unwrap().insert(id.clone(), job);
             let _ = self.save();
         } else {
@@ -136,10 +175,17 @@ impl CronScheduler {
     }
 
     /// Remove a job by ID.
+    ///
+    /// Deleting a durable definition is a cancellation: its record is settled
+    /// `Done` rather than removed, so it cannot be reported as running by a
+    /// later session.
     pub fn delete(&self, id: &str) -> bool {
         let removed = self.jobs.write().unwrap().remove(id).is_some();
         if removed {
             let _ = self.save();
+            if let Some(store) = self.record_store() {
+                let _ = store.settle(id, JobState::Done, now_ms(), None, None);
+            }
         }
         removed
     }
@@ -170,8 +216,10 @@ impl CronScheduler {
     pub fn mark_fired(&self, id: &str) {
         let now = Local::now().format("%Y-%m-%dT%H:%M:%S").to_string();
         let mut map = self.jobs.write().unwrap();
+        let mut recurring = true;
         if let Some(job) = map.get_mut(id) {
             job.last_fire = Some(now.clone());
+            recurring = job.recurring;
             // One-shot jobs are deleted after firing
             if !job.recurring {
                 map.remove(id);
@@ -179,11 +227,111 @@ impl CronScheduler {
         }
         drop(map);
         let _ = self.save();
+        self.record_fired(id, recurring);
     }
 
     /// Get the prompt for a job by ID.
     pub fn get_prompt(&self, id: &str) -> Option<String> {
         self.jobs.read().unwrap().get(id).map(|j| j.prompt.clone())
+    }
+
+    /// Clone the job-record context out from under its lock, so a caller can
+    /// do file IO without holding it.
+    fn job_context_parts(&self) -> Option<(JobStore, PathBuf, String)> {
+        self.job_context
+            .read()
+            .unwrap()
+            .as_ref()
+            .map(|ctx| (ctx.store.clone(), ctx.cwd.clone(), ctx.session_id.clone()))
+    }
+
+    fn record_store(&self) -> Option<JobStore> {
+        self.job_context_parts().map(|(store, _, _)| store)
+    }
+
+    /// Write the `Running` record for a durable definition.
+    fn write_job_record(&self, job: &CronJob) {
+        let Some((store, cwd, session_id)) = self.job_context_parts() else {
+            return;
+        };
+        let mut record = JobRecord::new(
+            job.id.clone(),
+            JobKind::Cron,
+            job_description(job),
+            cwd,
+            Some(session_id.as_str()),
+            now_ms(),
+        );
+        // The scheduler runs in-process; the owner is the only pid there is.
+        record.pid = Some(std::process::id());
+        if let Err(error) = store.write(&record) {
+            tracing::warn!(
+                job = %job.id,
+                path = %store.root().display(),
+                error = %error,
+                "could not write the cron job record"
+            );
+        }
+    }
+
+    /// Bring a durable definition loaded from disk back to `Running`.
+    ///
+    /// Loading is re-scheduling: the definition is live again, so whatever a
+    /// previous process left in the record (an old timestamp, or a terminal
+    /// state) must not make a later adopt treat it as stale or finished.
+    fn refresh_job_record(&self, job: &CronJob) {
+        let Some((store, cwd, session_id)) = self.job_context_parts() else {
+            return;
+        };
+        let now = now_ms();
+        let mut record = match store.load(&job.id) {
+            Ok(Some(record)) => record,
+            Ok(None) => JobRecord::new(
+                job.id.clone(),
+                JobKind::Cron,
+                String::new(),
+                &cwd,
+                Some(&session_id),
+                now,
+            ),
+            Err(error) => {
+                tracing::warn!(job = %job.id, error = %error, "could not read the cron job record");
+                return;
+            }
+        };
+        record.kind = JobKind::Cron;
+        record.description = job_description(job);
+        record.cwd = cwd;
+        record.session_id = Some(session_id);
+        record.pid = Some(std::process::id());
+        record.state = JobState::Running;
+        record.touch(now);
+        record.ended_at_ms = None;
+        record.exit_code = None;
+        record.error = None;
+        let _ = store.write(&record);
+    }
+
+    /// Update the record after a job fires.
+    ///
+    /// A recurring definition is still scheduled: touch it so it does not age
+    /// out of the adopt window. A one-shot definition is finished, so settle
+    /// it rather than leaving a record that claims to be running forever.
+    fn record_fired(&self, id: &str, recurring: bool) {
+        let Some(store) = self.record_store() else {
+            return;
+        };
+        let now = now_ms();
+        if recurring {
+            if let Ok(Some(mut record)) = store.load(id) {
+                if record.state == JobState::Running {
+                    record.touch(now);
+                    let _ = store.write(&record);
+                }
+            }
+        } else {
+            let _ = store.settle(id, JobState::Done, now, Some(0), None);
+        }
     }
 
     /// Spawn a background tokio task that polls jobs every 60 seconds.
@@ -214,6 +362,16 @@ impl CronScheduler {
 
         rx
     }
+}
+
+/// One-line description of a definition for its job record.
+fn job_description(job: &CronJob) -> String {
+    const LIMIT: usize = 200;
+    let mut prompt: String = job.prompt.chars().take(LIMIT).collect();
+    if job.prompt.chars().count() > LIMIT {
+        prompt.push('…');
+    }
+    format!("cron {}: {prompt}", job.cron)
 }
 
 /// Match a standard 5-field cron expression against the current local time.
@@ -368,5 +526,108 @@ mod tests {
         let job = CronJob::new("* * * * *".into(), "test".into(), true, false);
         sched.create(job);
         assert_eq!(sched.list().len(), 1);
+    }
+
+    fn scheduler_with_records(dir: &std::path::Path) -> (CronScheduler, JobStore) {
+        let store = JobStore::new(dir);
+        let sched = CronScheduler::new()
+            .with_storage(dir.join("scheduled_tasks.json"))
+            .with_job_records(dir.to_path_buf(), "session-alpha");
+        (sched, store)
+    }
+
+    #[test]
+    fn durable_create_writes_running_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let (sched, store) = scheduler_with_records(dir.path());
+        let job = CronJob::new("*/5 * * * *".into(), "check the build".into(), true, true);
+        let id = sched.create(job);
+
+        let record = store.load(&id).unwrap().expect("durable job is recorded");
+        assert_eq!(record.state, JobState::Running);
+        assert_eq!(record.kind, JobKind::Cron);
+        assert_eq!(record.session_id.as_deref(), Some("session-alpha"));
+        assert!(record.pid.is_some());
+        assert!(record.ended_at_ms.is_none());
+        assert!(record.description.contains("check the build"));
+    }
+
+    #[test]
+    fn non_durable_create_writes_no_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let (sched, store) = scheduler_with_records(dir.path());
+        let job = CronJob::new("* * * * *".into(), "session-only".into(), true, false);
+        let id = sched.create(job);
+        assert!(store.load(&id).unwrap().is_none());
+    }
+
+    #[test]
+    fn recurring_fire_keeps_record_running() {
+        let dir = tempfile::tempdir().unwrap();
+        let (sched, store) = scheduler_with_records(dir.path());
+        let job = CronJob::new("* * * * *".into(), "every minute".into(), true, true);
+        let id = sched.create(job);
+        let before = store.load(&id).unwrap().unwrap().updated_at_ms;
+
+        sched.mark_fired(&id);
+
+        let record = store.load(&id).unwrap().unwrap();
+        assert_eq!(record.state, JobState::Running);
+        assert!(record.ended_at_ms.is_none());
+        assert!(record.updated_at_ms >= before);
+        // The definition itself is still scheduled.
+        assert!(sched.get_prompt(&id).is_some());
+    }
+
+    #[test]
+    fn one_shot_fire_settles_record_done() {
+        let dir = tempfile::tempdir().unwrap();
+        let (sched, store) = scheduler_with_records(dir.path());
+        let job = CronJob::new("*/5 * * * *".into(), "run once".into(), false, true);
+        let id = sched.create(job);
+
+        sched.mark_fired(&id);
+
+        let record = store.load(&id).unwrap().unwrap();
+        assert_eq!(record.state, JobState::Done);
+        assert_eq!(record.exit_code, Some(0));
+        assert!(record.ended_at_ms.is_some());
+        // A one-shot job is removed from the schedule.
+        assert!(sched.get_prompt(&id).is_none());
+    }
+
+    #[test]
+    fn delete_settles_record_done() {
+        let dir = tempfile::tempdir().unwrap();
+        let (sched, store) = scheduler_with_records(dir.path());
+        let job = CronJob::new("* * * * *".into(), "cancel me".into(), true, true);
+        let id = sched.create(job);
+
+        assert!(sched.delete(&id));
+
+        let record = store.load(&id).unwrap().unwrap();
+        assert_eq!(record.state, JobState::Done);
+        assert!(record.ended_at_ms.is_some());
+    }
+
+    #[test]
+    fn load_refreshes_stale_record_to_running() {
+        let dir = tempfile::tempdir().unwrap();
+        let (sched, store) = scheduler_with_records(dir.path());
+        let job = CronJob::new("* * * * *".into(), "survivor".into(), true, true);
+        let id = sched.create(job);
+
+        // Simulate a previous process that stopped leaving a stale record.
+        let mut record = store.load(&id).unwrap().unwrap();
+        record.touch(1);
+        record.started_at_ms = 1;
+        store.write(&record).unwrap();
+
+        sched.load().unwrap();
+
+        let refreshed = store.load(&id).unwrap().unwrap();
+        assert_eq!(refreshed.state, JobState::Running);
+        assert!(refreshed.updated_at_ms > 1);
+        assert_eq!(refreshed.session_id.as_deref(), Some("session-alpha"));
     }
 }

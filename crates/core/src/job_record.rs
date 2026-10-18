@@ -177,6 +177,21 @@ pub struct JobRecord {
     pub updated_at_ms: i64,
     /// Current lifecycle state.
     pub state: JobState,
+    /// When the job reached a terminal state, in milliseconds since the Unix
+    /// epoch. `None` for a job that is still running (or whose end time was
+    /// never observed, as with a record marked interrupted after a crash).
+    ///
+    /// Added after the original on-disk record shape; `serde(default)` keeps
+    /// records written by older versions decodable.
+    #[serde(default)]
+    pub ended_at_ms: Option<i64>,
+    /// Exit code of the finished process, when the job had one. In-process
+    /// work (agents, cron definitions) leaves this `None`.
+    #[serde(default)]
+    pub exit_code: Option<i32>,
+    /// Failure detail, when the job failed.
+    #[serde(default)]
+    pub error: Option<String>,
 }
 
 impl JobRecord {
@@ -200,6 +215,9 @@ impl JobRecord {
             started_at_ms: now_ms,
             updated_at_ms: now_ms,
             state: JobState::Running,
+            ended_at_ms: None,
+            exit_code: None,
+            error: None,
         }
     }
 
@@ -213,6 +231,26 @@ impl JobRecord {
     /// Record the wall-clock time of the most recent change to this job.
     pub const fn touch(&mut self, now_ms: i64) {
         self.updated_at_ms = now_ms;
+    }
+
+    /// Move the job to a terminal state (`Done`, `Failed` or `Interrupted`)
+    /// and stamp its end time.
+    ///
+    /// This is the single lifecycle helper the producers use, so every record
+    /// that stops running carries the same end fields. `exit_code` is for a
+    /// real process; in-process work leaves it `None` and may supply `error`.
+    pub fn settle(
+        &mut self,
+        state: JobState,
+        now_ms: i64,
+        exit_code: Option<i32>,
+        error: Option<String>,
+    ) {
+        self.state = state;
+        self.updated_at_ms = now_ms;
+        self.ended_at_ms = Some(now_ms);
+        self.exit_code = exit_code;
+        self.error = error;
     }
 }
 
@@ -490,6 +528,31 @@ impl JobStore {
         self.write_bytes_atomic(&path, &bytes)
     }
 
+    /// Settle a record that is still `Running`.
+    ///
+    /// Producers call this on completion, failure or cancellation. A record
+    /// that is missing or already terminal is left alone (`Ok(false)`): a
+    /// late completion must not overwrite a cancellation, and a second
+    /// settle must not resurrect a finished job.
+    pub fn settle(
+        &self,
+        id: &str,
+        state: JobState,
+        now_ms: i64,
+        exit_code: Option<i32>,
+        error: Option<String>,
+    ) -> Result<bool, JobStoreError> {
+        let Some(mut record) = self.load(id)? else {
+            return Ok(false);
+        };
+        if record.state != JobState::Running {
+            return Ok(false);
+        }
+        record.settle(state, now_ms, exit_code, error);
+        self.write(&record)?;
+        Ok(true)
+    }
+
     /// Load one record. `Ok(None)` when it does not exist.
     pub fn load(&self, id: &str) -> Result<Option<JobRecord>, JobStoreError> {
         let path = self.path_for(id)?;
@@ -599,6 +662,9 @@ impl JobStore {
             let mut marked = record.clone();
             marked.state = JobState::Interrupted;
             marked.touch(now_ms);
+            // The job's real end is unknown (its process went away), so the
+            // reconciliation time is the best end stamp available.
+            marked.ended_at_ms.get_or_insert(now_ms);
             self.write(&marked)?;
             notifications.push(notification_for(record));
         }
@@ -912,5 +978,41 @@ mod tests {
         assert!(store.path_for("").is_err());
         assert!(store.path_for("task_1").is_ok());
         assert!(store.path_for("cron-2").is_ok());
+    }
+
+    // ─── Lifecycle fields ───────────────────────────────────────────────────
+
+    #[test]
+    fn settling_stamps_state_and_end_fields() {
+        let mut r = record("task_1", JobKind::Shell, Some("sess_a"), JobState::Running, NOW);
+        r.settle(JobState::Failed, NOW + 5, Some(7), Some("boom".into()));
+
+        assert_eq!(r.state, JobState::Failed);
+        assert_eq!(r.updated_at_ms, NOW + 5);
+        assert_eq!(r.ended_at_ms, Some(NOW + 5));
+        assert_eq!(r.exit_code, Some(7));
+        assert_eq!(r.error.as_deref(), Some("boom"));
+    }
+
+    /// Records written before the end fields existed must still decode; the
+    /// fields are additive and default to `None`.
+    #[test]
+    fn legacy_record_without_lifecycle_fields_decodes() {
+        let json = r#"{
+            "id": "task_1",
+            "kind": "shell",
+            "description": "old record",
+            "cwd": "/work",
+            "session_id": "sess_a",
+            "pid": null,
+            "started_at_ms": 1700000000000,
+            "updated_at_ms": 1700000001000,
+            "state": "done"
+        }"#;
+        let decoded: JobRecord = serde_json::from_str(json).unwrap();
+        assert_eq!(decoded.state, JobState::Done);
+        assert_eq!(decoded.ended_at_ms, None);
+        assert_eq!(decoded.exit_code, None);
+        assert_eq!(decoded.error, None);
     }
 }

@@ -11,6 +11,14 @@ use std::sync::Arc;
 /// Key type for shared state in `ToolContext.extra`.
 pub type SharedState = Box<dyn std::any::Any + Send + Sync>;
 
+/// Key in `ToolContext.extra` holding the owning session id as a `String`.
+///
+/// Tools that write durable job records use it so a record is attributed to
+/// the session that started the work. Absent (as in a bare test context), the
+/// record is written with no owner, which adoption treats as belonging to
+/// whoever is adopting.
+pub const JOB_SESSION_ID_KEY: &str = "job_session_id";
+
 /// How a tool should behave when interrupted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InterruptBehavior {
