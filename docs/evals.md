@@ -148,6 +148,68 @@ The `evals` job in `.github/workflows/ci.yml` builds the two binaries and runs
 the command above, then uploads `report.html` and `baseline/results.jsonl` as
 the `eval-report` artifact (on failure too).
 
+## The live-provider flow (opt-in)
+
+`evals/flows/live/` drives the real `coderex` binary against a real
+Anthropic-compatible provider. It is checked in beside the smoke flow, but it
+is never part of the default `eval-runner` or the offline `evals` job, and the
+smoke flow is unchanged.
+
+Run it with `scripts/test-live-eval.sh`:
+
+```bash
+ANTHROPIC_API_KEY=... \
+ANTHROPIC_BASE_URL=https://api.anthropic.com \
+ANTHROPIC_MODEL=claude-sonnet-4-5 \
+  scripts/test-live-eval.sh
+```
+
+Inputs (environment):
+
+| Variable | Required | Meaning |
+|----------|----------|---------|
+| `ANTHROPIC_API_KEY` | yes | The script refuses to run without it, before building or calling a provider. |
+| `ANTHROPIC_BASE_URL` | no | Anthropic-compatible endpoint. If unset, the CLI uses its own default; the script prints a note. |
+| `ANTHROPIC_MODEL` | no | Passed to the CLI as `--model`. If unset, the CLI's configured default is used. |
+| `CODEREX_BIN` | no | An already-built binary; otherwise the script builds `coderex` in debug mode. |
+
+The flow has two cases, each with `reps: 1` and `concurrency: 1`:
+
+- `live-text-turn` — a text-only prompt; output must contain `live-eval-ok`.
+- `live-read-tool-turn` — `run-case.sh` writes `live-eval.txt` in the case's
+  run directory, then the prompt asks the model to `Read` it; output must
+  contain `live-tool-ok`.
+
+`run-case.sh` invokes the same binary a person runs, with
+`--print --brief --dangerously-skip-permissions`, and inherits the provider
+environment. It sets `CODEREX_SKIP_ENV_SOURCE=1` so a developer's local
+`export_env.*.sh` cannot silently redirect the run.
+
+Outputs:
+
+| Path | Meaning |
+|------|---------|
+| `evals/flows/live/_state.json` | Approved harness hash (the script passes `--approve-harness`). |
+| `evals/flows/live/baseline/results.jsonl` | One record per case run, appended. |
+| `evals/flows/live/report.html` | Rendered pass/fail report. |
+
+The script exits non-zero when any case fails. Extra arguments are forwarded to
+`run-eval`, so `--case live-text-turn`, `--reps`, and `--timeout-s` work as
+usual.
+
+**This flow has not been run from this host.** No live provider credentials
+were configured during development, and adding the flow was verified only by
+building and inspecting it; the first real execution must come from a
+machine or workflow with credentials.
+
+In CI it is the `live-provider-eval` job (plus the
+`live-provider-eval-preflight` credential check) in
+`.github/workflows/ci.yml`. Both are `workflow_dispatch` only and are skipped
+on push and pull request; the preflight converts the presence of
+`ANTHROPIC_API_KEY` into an output so the live job does not fail merely
+because a repository has no secret. The job runs `scripts/test-live-eval.sh`
+and uploads `report.html` and `baseline/results.jsonl` as `live-eval-report`.
+
 ## Safety
 
 The thing being measured can write to the repository the flow lives in, so:

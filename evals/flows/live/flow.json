@@ -1,0 +1,30 @@
+{
+  "name": "live",
+  "description": "Opt-in real-provider flow: a text turn and a Read tool turn against the Anthropic-compatible endpoint configured by ANTHROPIC_API_KEY / ANTHROPIC_BASE_URL.",
+  "command": "sh \"{flow}/run-case.sh\" \"{prompt}\"",
+  "reps": 1,
+  "concurrency": 1,
+  "timeout_s": 180,
+  "cases": [
+    {
+      "id": "live-text-turn",
+      "description": "A real model answers a text-only turn.",
+      "prompt": "Reply with exactly the token live-eval-ok and nothing else.",
+      "expect": {
+        "exit_code": 0,
+        "output_contains": ["live-eval-ok"],
+        "output_not_contains": ["No QueryEngine", "provider returned no visible response"]
+      }
+    },
+    {
+      "id": "live-read-tool-turn",
+      "description": "A real model calls Read on a fixture file the case creates.",
+      "prompt": "Use the Read tool to read the file live-eval.txt in the current working directory. Then reply with exactly the contents of that file and nothing else.",
+      "expect": {
+        "exit_code": 0,
+        "output_contains": ["live-tool-ok"],
+        "output_not_contains": ["No QueryEngine", "provider returned no visible response"]
+      }
+    }
+  ]
+}

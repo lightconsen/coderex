@@ -316,9 +316,10 @@ links five test executables (core, tools, hooks, config, cli).
 
 `cargo check --workspace --target x86_64-pc-windows-gnu` also passes (the
 Unix-only `openssh` dependency in `coderex-bridge` is target-gated; the Windows
-build refuses the SSH spawn mode instead of failing to compile). Runtime
-verification is delegated to the advisory `test-windows` CI job (see the end of
-this document).
+build refuses the SSH spawn mode instead of failing to compile). CI now runs
+this cross-check and the test-binary link as a **required** `cross-check-windows`
+job; actual AppContainer/HKLM execution is delegated to the advisory
+`test-windows` job (see the end of this document).
 
 ### Other platforms
 
