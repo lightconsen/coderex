@@ -142,8 +142,12 @@ Configuration, per server:
 `enabled` and `allow_network` both default to `true`: MCP servers commonly
 exist to call a remote API, and turning the network off by default would break
 them. Path access is bounded to the working directory (configured `cwd`, else
-the session's), the server's own installation, the user's config directory and
-the package caches a launcher reads. Extra paths must be absolute and are
+the session's), the server's own installation, and the package caches a
+launcher reads. On Windows the user's whole profile is not granted (read
+grants are recursive, and walking it once per server start is too expensive);
+a server that needs another profile location names it in
+`allowed_read_paths`. Directories the platform plan already grants
+best-effort (system roots and `PATH`) are not repeated as required grants. Extra paths must be absolute and are
 validated at load time; a relative path is skipped with a warning rather than
 resolved against whatever directory the client happens to be in.
 

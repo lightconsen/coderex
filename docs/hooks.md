@@ -324,9 +324,19 @@ implementation, not two.
 Windows uses the same backend: `prepare` creates the child suspended and
 `finish_windows_spawn` attaches the AppContainer token, assigns the Job Object
 and resumes it. The hook command is run through `cmd.exe /D /S /C` (there is no
-`sh` and no wrapper program). `max_file_size_mb` has no Windows equivalent and
-is warned about; CPU and memory limits live in the Job Object because there is
-no `pre_exec`.
+`sh` and no wrapper program), and the command is passed to `cmd` verbatim
+(`raw_arg`) so quotes inside it survive. `max_file_size_mb` has no Windows
+equivalent and is warned about; CPU and memory limits live in the Job Object
+because there is no `pre_exec`.
+
+Two Windows policy differences follow from how the ACL plan works. `PATH` and
+system directories are granted best-effort by the plan itself, so the hook
+policy does not repeat them (a required grant on `C:\Windows` fails: the
+directory is owned by TrustedInstaller). The user's home directory is not
+granted either, because read grants are recursive and a profile walk is tens of
+thousands of files; a hook that needs a profile file names it in
+`sandbox.allowed_read_paths`. Temp comes from the sandbox's private directory
+rather than the shared `%TEMP%`.
 
 ### Default policy
 
