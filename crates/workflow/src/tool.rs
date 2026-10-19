@@ -8,6 +8,7 @@
 //! that can be read afterwards.
 
 use serde_json::{Value, json};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -54,6 +55,14 @@ pub struct WorkflowTool {
     enabled: bool,
     /// Where a `name` is looked up, beyond the user's workflow directory.
     project_dir: Option<PathBuf>,
+    /// Scripts contributed by plugins and other embedders, keyed by name.
+    ///
+    /// These are looked up before `project_dir` and the user's workflow
+    /// directory, so a host can supply a workflow without writing a file.
+    ///
+    /// Shared so a session can contribute scripts after the tool has been
+    /// registered (plugins load after the registry is built).
+    named_scripts: Arc<std::sync::RwLock<HashMap<String, String>>>,
 }
 
 impl std::fmt::Debug for WorkflowTool {
@@ -76,6 +85,7 @@ impl WorkflowTool {
             // and that is not something to discover by accident.
             enabled: false,
             project_dir: None,
+            named_scripts: Arc::new(std::sync::RwLock::new(HashMap::new())),
         }
     }
 
@@ -98,6 +108,57 @@ impl WorkflowTool {
     pub fn with_project_dir(mut self, dir: PathBuf) -> Self {
         self.project_dir = Some(dir);
         self
+    }
+
+    /// Register scripts that can be run by `name`, without a file on disk.
+    ///
+    /// A host (a plugin, an embedder) supplies a map from name to script
+    /// source. Registered names are looked up before the project and user
+    /// workflow directories; explicit `scriptPath` and `script` arguments
+    /// still take priority over a name.
+    ///
+    /// Invalid names — empty, longer than 64 characters, or containing
+    /// anything other than ASCII letters, digits, `-`, and `_` (so no path
+    /// separators) — are skipped with a warning rather than registered. The
+    /// rest of the map is still registered.
+    #[must_use]
+    pub fn with_named_scripts(self, scripts: HashMap<String, String>) -> Self {
+        self.named_scripts()
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .extend(scripts.into_iter().filter(|(name, _)| {
+                if is_workflow_name(name) {
+                    true
+                } else {
+                    tracing::warn!(
+                        name = %name,
+                        "ignoring a workflow script registered under an invalid name"
+                    );
+                    false
+                }
+            }));
+        self
+    }
+
+    /// The shared named-script map, for a host that registers scripts later.
+    #[must_use]
+    pub fn named_scripts(&self) -> Arc<std::sync::RwLock<HashMap<String, String>>> {
+        Arc::clone(&self.named_scripts)
+    }
+
+    /// Register one named script after construction.
+    pub fn register_named_script(&self, name: &str, script: impl Into<String>) {
+        if is_workflow_name(name) {
+            self.named_scripts
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert(name.to_string(), script.into());
+        } else {
+            tracing::warn!(
+                name = %name,
+                "ignoring a workflow script registered under an invalid name"
+            );
+        }
     }
 
     /// Where a run's script and journal are kept.
@@ -142,9 +203,10 @@ impl WorkflowTool {
             });
         }
 
-        let script = if let Some(inline) = string_argument(arguments, "script") {
-            inline
-        } else if let Some(path) = string_argument(arguments, "scriptPath") {
+        // Precedence: an explicit `scriptPath`, then an inline `script`, then a
+        // registered name, then a name on disk in the project or user
+        // directory. The first thing supplied wins.
+        let script = if let Some(path) = string_argument(arguments, "scriptPath") {
             let path = Path::new(&path);
             if path.extension().is_some_and(|extension| extension != "js") {
                 return Err(invalid(
@@ -153,8 +215,20 @@ impl WorkflowTool {
             }
             std::fs::read_to_string(path)
                 .map_err(|error| invalid(&format!("cannot read {}: {error}", path.display())))?
+        } else if let Some(inline) = string_argument(arguments, "script") {
+            inline
         } else if let Some(name) = string_argument(arguments, "name") {
-            self.find_named(&name)?
+            if let Some(script) = self
+                .named_scripts
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .get(&name)
+                .cloned()
+            {
+                script
+            } else {
+                self.find_named(&name)?
+            }
         } else {
             return Err(invalid(
                 "a workflow call needs `script`, `scriptPath`, `name`, or `resumeFromRunId`",
@@ -186,12 +260,7 @@ impl WorkflowTool {
 
     /// Read a script by name, from the project first and then the user.
     fn find_named(&self, name: &str) -> Result<String, ToolError> {
-        if name.is_empty()
-            || name.len() > 64
-            || !name
-                .chars()
-                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
-        {
+        if !is_workflow_name(name) {
             return Err(invalid(&format!("'{name}' is not a workflow name")));
         }
 
@@ -207,15 +276,41 @@ impl WorkflowTool {
             }
         }
 
-        Err(invalid(&format!(
+        let mut message = format!(
             "no workflow named '{name}' — looked in {}",
             candidates
                 .iter()
                 .map(|path| path.display().to_string())
                 .collect::<Vec<_>>()
                 .join(", ")
-        )))
+        );
+        {
+            let scripts = self
+                .named_scripts
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if !scripts.is_empty() {
+                // Sorted so the message does not depend on hash iteration order.
+                let mut names: Vec<&str> = scripts.keys().map(String::as_str).collect();
+                names.sort_unstable();
+                message.push_str(&format!("; registered names: {}", names.join(", ")));
+            }
+        }
+        Err(invalid(&message))
     }
+}
+
+/// Whether a string can be used as a workflow name.
+///
+/// Names are file stems, so they must be non-empty, no longer than 64
+/// characters, and must not contain path separators or any other character
+/// outside ASCII letters, digits, `-`, and `_`.
+fn is_workflow_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 64
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
 }
 
 /// What a call resolved to.
@@ -546,6 +641,160 @@ mod tests {
         let output = call(&tool, json!({"name": "review"})).await.unwrap();
         assert!(output.contains("handled project version"), "{output}");
         assert_eq!(*runner.calls.lock().unwrap(), 1);
+    }
+
+    fn named(scripts: &[(&str, &str)]) -> HashMap<String, String> {
+        scripts
+            .iter()
+            .map(|(name, script)| ((*name).to_string(), (*script).to_string()))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn a_registered_script_runs_by_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let (tool, runner) = tool(dir.path(), true);
+        let script = "export const meta = { name: 'from-plugin', description: 'contributed' }\n\
+                      return await agent('plugin version')";
+        let tool = tool.with_named_scripts(named(&[("from-plugin", script)]));
+
+        let output = call(&tool, json!({"name": "from-plugin"})).await.unwrap();
+
+        assert!(output.contains("handled plugin version"), "{output}");
+        assert!(output.contains("1 ran"), "{output}");
+        assert_eq!(*runner.calls.lock().unwrap(), 1);
+
+        // A registered script is written down like any other.
+        let run_id = output
+            .lines()
+            .find_map(|line| line.strip_prefix("run "))
+            .expect("a run id");
+        assert_eq!(
+            std::fs::read_to_string(tool.run_dir(run_id).join("script.js")).unwrap(),
+            script
+        );
+    }
+
+    #[tokio::test]
+    async fn an_explicit_script_wins_over_a_registered_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let (tool, runner) = tool(dir.path(), true);
+        let tool = tool.with_named_scripts(named(&[(
+            "chosen",
+            "export const meta = { name: 'a', description: 'b' }\nreturn await agent('plugin version')",
+        )]));
+
+        let output = call(
+            &tool,
+            json!({
+                "name": "chosen",
+                "script": "export const meta = { name: 'a', description: 'b' }\nreturn await agent('inline version')"
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert!(output.contains("handled inline version"), "{output}");
+        assert!(!output.contains("plugin version"), "{output}");
+        assert_eq!(*runner.calls.lock().unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn an_explicit_script_path_wins_over_a_script_and_a_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let path_script = "export const meta = { name: 'a', description: 'b' }\n\
+                           return await agent('path version')";
+        let script_path = dir.path().join("path.js");
+        std::fs::write(&script_path, path_script).unwrap();
+
+        let (tool, runner) = tool(dir.path(), true);
+        let tool = tool.with_named_scripts(named(&[(
+            "chosen",
+            "export const meta = { name: 'a', description: 'b' }\nreturn await agent('plugin version')",
+        )]));
+
+        let output = call(
+            &tool,
+            json!({
+                "name": "chosen",
+                "script": "export const meta = { name: 'a', description: 'b' }\nreturn await agent('inline version')",
+                "scriptPath": script_path.to_string_lossy(),
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert!(output.contains("handled path version"), "{output}");
+        assert_eq!(*runner.calls.lock().unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_registered_script_wins_over_a_project_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(
+            project.join("review.js"),
+            "export const meta = { name: 'review', description: 'from the project' }\n\
+             return await agent('project version')",
+        )
+        .unwrap();
+
+        let (tool, runner) = tool(dir.path(), true);
+        let tool = tool.with_project_dir(project).with_named_scripts(named(&[(
+            "review",
+            "export const meta = { name: 'review', description: 'from a plugin' }\n\
+                 return await agent('plugin version')",
+        )]));
+
+        let output = call(&tool, json!({"name": "review"})).await.unwrap();
+        assert!(output.contains("handled plugin version"), "{output}");
+        assert_eq!(*runner.calls.lock().unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn an_unknown_name_lists_the_registered_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let (tool, _) = tool(dir.path(), true);
+        let tool = tool.with_named_scripts(named(&[
+            ("zeta", "export const meta = {}"),
+            ("alpha", "export const meta = {}"),
+        ]));
+
+        let error = call(&tool, json!({"name": "missing"})).await.unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("no workflow named 'missing'"), "{message}");
+        assert!(
+            message.contains("registered names: alpha, zeta"),
+            "{message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn invalid_registered_names_are_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let (tool, _) = tool(dir.path(), true);
+        let long = "x".repeat(65);
+        let tool = tool.with_named_scripts(named(&[
+            ("", "export const meta = {}"),
+            ("../escape", "export const meta = {}"),
+            ("with/slash", "export const meta = {}"),
+            ("with\\backslash", "export const meta = {}"),
+            (long.as_str(), "export const meta = {}"),
+            ("good-name", "export const meta = {}"),
+        ]));
+
+        {
+            let scripts = tool.named_scripts.read().unwrap();
+            assert_eq!(scripts.len(), 1);
+            assert!(scripts.contains_key("good-name"));
+        }
+
+        // The refused names are not resolvable, and paths are still rejected.
+        let error = call(&tool, json!({"name": "with/slash"}))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("not a workflow name"), "{error}");
     }
 
     #[tokio::test]

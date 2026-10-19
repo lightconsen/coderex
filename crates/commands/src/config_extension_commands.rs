@@ -246,7 +246,7 @@ pub fn register(registry: &mut CommandRegistry) {
         true,
         true,
         true,
-        Arc::new(|_ctx: &CommandContext, args: &[String]| {
+        Arc::new(|ctx: &CommandContext, args: &[String]| {
             let home = config_home();
             let plugins_path = home.join("plugins");
             let installed = list_dir_items(&plugins_path);
@@ -270,7 +270,22 @@ pub fn register(registry: &mut CommandRegistry) {
                         let name = args.get(1).map(|s| s.as_str()).unwrap_or("<name>");
                         CommandResult::error(format!("Plugin installation requires marketplace access. Use: /plugin install {name}"))
                     }
-                    _ => CommandResult::error("Usage: /plugin [list|install <name>]"),
+                    "components" => {
+                        if ctx.plugin_components.is_empty() {
+                            return CommandResult::success("No plugin components loaded.");
+                        }
+                        let mut by_kind: std::collections::BTreeMap<&str, Vec<&str>> =
+                            std::collections::BTreeMap::new();
+                        for (kind, name) in &ctx.plugin_components {
+                            by_kind.entry(kind.as_str()).or_default().push(name.as_str());
+                        }
+                        let mut output = String::from("Plugin components:");
+                        for (kind, names) in by_kind {
+                            output.push_str(&format!("\n  {kind}: {}", names.join(", ")));
+                        }
+                        CommandResult::success(output)
+                    }
+                    _ => CommandResult::error("Usage: /plugin [list|components|install <name>]"),
                 }
             }
         }),

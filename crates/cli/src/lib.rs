@@ -12,6 +12,7 @@ pub mod mcp_elicitation;
 pub mod mcp_reauth;
 pub mod memory_tools;
 pub mod orchestrator;
+pub mod plugin_monitors;
 pub mod recovery;
 pub mod repl;
 pub mod session_resume;

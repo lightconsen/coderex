@@ -193,6 +193,8 @@ pub struct CommandContext {
     pub mcp_connected: bool,
     /// Names of the MCP servers attached to the session.
     pub mcp_servers: Vec<String>,
+    /// Components contributed by active plugins, as `(kind, name)`.
+    pub plugin_components: Vec<(String, String)>,
     /// Tool names refused because two servers exposed the same raw name.
     pub mcp_conflicts: Vec<String>,
     /// Active hooks.
@@ -245,6 +247,7 @@ impl CommandContext {
             has_plan: false,
             mcp_connected: false,
             mcp_servers: Vec::new(),
+            plugin_components: Vec::new(),
             mcp_conflicts: Vec::new(),
             active_hooks: 0,
             api_key_set: false,

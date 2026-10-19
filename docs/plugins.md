@@ -308,12 +308,19 @@ The manifest is parsed with `deny_unknown_fields`: a field that is not in the ta
 | `userConfig` | ✅ implemented | See "userConfig injection". |
 | `hooks` | ✅ implemented | Active plugins contribute their hooks to the `Plugin` tier. The value may be a bare array or `{"hooks":[...]}`; `PluginManager::plugin_hooks()` merges them in plugin-name order and logs malformed values. |
 | `agents` | ✅ implemented | Active plugins contribute definitions through `PluginManager::plugin_agents()`; the REPL registers them as custom agents. |
-| `outputStyles`, `themes`, `workflows`, `monitors` | 🟡 accepted, not implemented | No CodeRex counterpart yet. |
+| `outputStyles` | ✅ implemented | Name-keyed registry; `/style <name>` applies one as extra system instructions. |
+| `themes` | ✅ implemented | Name-keyed registry; `ThemeManager::register_json` makes them selectable via `/theme`. |
+| `workflows` | ✅ implemented | Named scripts registered with the Workflow tool. |
+| `monitors` | ✅ implemented | Persistent watch scripts armed with the session (`PluginMonitorSupervisor`). |
 | `mcpServers` | ✅ implemented | Active plugins contribute `{"mcpServers": {...}}` through `PluginManager::plugin_mcp_servers()`; the orchestrator loads them before `.mcp.json` (project file wins on name clashes). |
-| `lspServers`, `channels` | 🟡 accepted, not implemented | No CodeRex counterpart yet. |
-| `binaries`, `types`, `settings`, `experimental` | 🟡 accepted, not implemented | `binaries` carries per-binary SHA-256 pins in Claude; CodeRex pins archives and commits instead (see "Pinning"). |
+| `lspServers` | ✅ implemented | The first configured server is the default for the `LSP` tool. |
+| `channels` | ✅ implemented | Exposed to the session and listed by `/plugin components`; there is no channel product to connect them to. |
+| `binaries` | ✅ implemented | SHA-256-pinned HTTPS fetch into `<plugin>/bin/` (`fetch_plugin_binaries`); `CODEREX_PLUGIN_NO_BINARIES=1` skips the fetch. |
+| `types` | ✅ implemented | Validated `.d.ts` paths are exposed per plugin; there is no TypeScript authoring surface to consume them. |
+| `settings` | ✅ implemented (narrow) | Merged into the session for `model`, `vim_mode`, `statusline` and `context_window` only; permission mode, telemetry, hooks, MCP servers, API keys and `env` are never accepted from a plugin. |
+| `experimental` | ✅ implemented (raw) | Exposed per plugin; expansion (themes/monitors/outputStyles/…) is the caller's job. |
 
-Accepted-but-unimplemented fields are listed by `PluginManifest::unimplemented_fields()` and logged as a warning when the plugin loads, so "it parsed but does nothing" is visible rather than silent.
+All declared component fields now have a runtime surface. `PluginManifest::unimplemented_fields()` is empty and remains as the guard against a future field silently doing nothing.
 
 ## `userConfig` Injection
 

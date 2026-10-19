@@ -6,6 +6,7 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
+use std::io::Read as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -58,6 +59,57 @@ pub struct PluginHandle {
     /// Kept so [`PluginManager::plugin_mcp_servers`] can merge the servers an
     /// active plugin starts.
     pub mcp_servers: Option<Value>,
+    /// The manifest's `outputStyles` document, as written.
+    ///
+    /// Kept so [`PluginManager::plugin_output_styles`] can expose the styles
+    /// active plugins ship.
+    pub output_styles: Option<Value>,
+    /// The manifest's `themes` document, as written.
+    ///
+    /// Kept so [`PluginManager::plugin_themes`] can expose the themes active
+    /// plugins ship.
+    pub themes: Option<Value>,
+    /// The manifest's `workflows` document, as written.
+    ///
+    /// Kept so [`PluginManager::plugin_workflows`] can expose the workflows
+    /// active plugins ship.
+    pub workflows: Option<Value>,
+    /// The manifest's `monitors` document, as written.
+    ///
+    /// Kept so [`PluginManager::plugin_monitors`] can expose the monitors
+    /// active plugins ship.
+    pub monitors: Option<Value>,
+    /// The manifest's `lspServers` document, as written.
+    ///
+    /// Kept so [`PluginManager::plugin_lsp_servers`] can expose the language
+    /// servers active plugins start.
+    pub lsp_servers: Option<Value>,
+    /// The manifest's `channels` document, as written.
+    ///
+    /// Kept so [`PluginManager::plugin_channels`] can expose the channels
+    /// active plugins serve.
+    pub channels: Option<Value>,
+    /// The manifest's `binaries` document, as written.
+    ///
+    /// Kept so [`PluginManager::plugin_binaries`] can expose the pinned
+    /// binaries an active plugin declares, and
+    /// [`PluginManager::fetch_plugin_binaries`] can download them.
+    pub binaries: Option<Value>,
+    /// The manifest's `types` document, as written.
+    ///
+    /// Kept so [`PluginManager::plugin_types`] can expose the declaration
+    /// paths an active plugin ships.
+    pub types: Option<Value>,
+    /// The manifest's `settings` document, as written.
+    ///
+    /// Kept so [`PluginManager::plugin_settings`] can merge the settings an
+    /// active plugin contributes while it is enabled.
+    pub settings: Option<Value>,
+    /// The manifest's `experimental` document, as written.
+    ///
+    /// Kept so [`PluginManager::plugin_experimental`] can expose the raw
+    /// per-plugin value to callers that know how to expand it.
+    pub experimental: Option<Value>,
     /// Number of retry attempts for error recovery.
     pub retry_count: u32,
     /// Maximum retry attempts before giving up.
@@ -316,9 +368,9 @@ pub struct PluginManifest {
     )]
     pub mcp_servers: Option<Value>,
 
-    // ── Accepted, not implemented ────────────────────────────────────────
-    // Declared so a Claude-shaped manifest parses and so the fields are named
-    // in the warning `unimplemented_fields()` produces, rather than vanishing.
+    // ── Component sources ────────────────────────────────────────────────
+    // Retained on the manifest and copied into `PluginHandle`, so the
+    // `PluginManager::plugin_*` accessors can expose them to the host.
     /// Output styles shipped by the plugin.
     #[serde(
         rename = "outputStyles",
@@ -362,28 +414,14 @@ pub struct PluginManifest {
 impl PluginManifest {
     /// Fields this manifest declares that CodeRex accepts but does not act on.
     ///
-    /// These are the documented Claude manifest components with no CodeRex
-    /// counterpart yet. They parse (so the plugin still loads) but they have no
-    /// effect, which the caller reports rather than leaving the author to guess.
+    /// Every documented Claude component is now a real, validated component
+    /// source, so this is empty. The method is kept because callers log the
+    /// result at load time; if a future manifest field is accepted purely so a
+    /// Claude-shaped file parses, it belongs here and in
+    /// [`Self::warn_unimplemented_fields`] until a `plugin_*` accessor exists.
     #[must_use]
     pub fn unimplemented_fields(&self) -> Vec<&'static str> {
-        let mut fields = Vec::new();
-        let mut note = |present: bool, name: &'static str| {
-            if present {
-                fields.push(name);
-            }
-        };
-        note(self.output_styles.is_some(), "outputStyles");
-        note(self.themes.is_some(), "themes");
-        note(self.workflows.is_some(), "workflows");
-        note(self.monitors.is_some(), "monitors");
-        note(self.lsp_servers.is_some(), "lspServers");
-        note(self.channels.is_some(), "channels");
-        note(self.binaries.is_some(), "binaries");
-        note(self.types.is_some(), "types");
-        note(self.settings.is_some(), "settings");
-        note(self.experimental.is_some(), "experimental");
-        fields
+        Vec::new()
     }
 
     /// Log the declared-but-unimplemented fields, if any.
@@ -1235,6 +1273,819 @@ fn copy_dir_recursive(from: &std::path::Path, to: &std::path::Path) -> Result<()
 use crate::runtime::PluginProcess;
 use crate::wasm_runtime::PluginWasmInstance;
 
+/// Largest plugin component file the manager will read from disk (1 MiB).
+///
+/// Component paths in `plugin.json` are relative to the plugin directory. A
+/// declaration is data from the plugin, so reading it is bounded: an enormous
+/// (or endless) file must not be pulled into memory just because a manifest
+/// named it.
+pub const MAX_PLUGIN_COMPONENT_BYTES: u64 = 1024 * 1024;
+
+/// Largest single binary [`PluginManager::fetch_plugin_binaries`] will fetch.
+const MAX_PLUGIN_BINARY_BYTES: usize = 64 * 1024 * 1024;
+
+/// Whether a declared component path tries to leave its plugin directory.
+fn has_component_path_traversal(path: &str) -> bool {
+    // Split on both separators: a manifest written on Windows still has to be
+    // refused on Unix, and vice versa.
+    path.split(['/', '\\']).any(|segment| segment == "..")
+}
+
+/// Whether a declared component path is absolute on any supported platform.
+fn is_absolute_component_path(path: &str) -> bool {
+    if path.starts_with('/') || path.starts_with('\\') {
+        return true;
+    }
+    // A Windows drive (`C:\...`) is absolute even when parsed on Unix.
+    let bytes = path.as_bytes();
+    bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':'
+}
+
+/// Reject a component path that is absolute, empty, or traverses with `..`.
+fn validate_relative_component_path(path: &str) -> Result<(), String> {
+    if path.trim().is_empty() {
+        return Err("path is empty".to_string());
+    }
+    if is_absolute_component_path(path) {
+        return Err(format!("'{path}' must be relative to the plugin directory"));
+    }
+    if has_component_path_traversal(path) {
+        return Err(format!("'{path}' must not contain '..'"));
+    }
+    Ok(())
+}
+
+/// The extra constraint on a `types` declaration path.
+fn validate_types_path(path: &str) -> Result<(), String> {
+    validate_relative_component_path(path)?;
+    if !path.ends_with(".d.ts") {
+        return Err(format!("'{path}' must end in .d.ts"));
+    }
+    Ok(())
+}
+
+/// Read a declared component file, bounded to
+/// [`MAX_PLUGIN_COMPONENT_BYTES`].
+///
+/// The path is validated lexically first; when both paths can be resolved,
+/// the canonicalized target must still be inside the canonicalized plugin
+/// directory, so a symlink cannot turn a relative declaration into a read of
+/// an arbitrary file.
+fn read_component_text(plugin_dir: &Path, relative: &str) -> Result<String, String> {
+    validate_relative_component_path(relative)?;
+
+    let full = plugin_dir.join(relative);
+    if let (Ok(root), Ok(target)) = (plugin_dir.canonicalize(), full.canonicalize()) {
+        if !target.starts_with(&root) {
+            return Err(format!(
+                "'{relative}' resolves outside the plugin directory"
+            ));
+        }
+    }
+
+    let file = std::fs::File::open(&full)
+        .map_err(|e| format!("failed to open '{}': {e}", full.display()))?;
+    let metadata = file
+        .metadata()
+        .map_err(|e| format!("failed to stat '{}': {e}", full.display()))?;
+    if !metadata.is_file() {
+        return Err(format!("'{}' is not a file", full.display()));
+    }
+    if metadata.len() > MAX_PLUGIN_COMPONENT_BYTES {
+        return Err(format!(
+            "'{}' is {} bytes, larger than the {} byte component limit",
+            full.display(),
+            metadata.len(),
+            MAX_PLUGIN_COMPONENT_BYTES
+        ));
+    }
+
+    let mut bytes = Vec::new();
+    file.take(MAX_PLUGIN_COMPONENT_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|e| format!("failed to read '{}': {e}", full.display()))?;
+    if bytes.len() as u64 > MAX_PLUGIN_COMPONENT_BYTES {
+        return Err(format!(
+            "'{}' grew past the {} byte component limit",
+            full.display(),
+            MAX_PLUGIN_COMPONENT_BYTES
+        ));
+    }
+    String::from_utf8(bytes).map_err(|e| format!("'{}' is not valid UTF-8: {e}", full.display()))
+}
+
+/// A JSON value when the text parses, otherwise the text itself.
+fn parse_json_or_text(text: String) -> Value {
+    serde_json::from_str(&text).unwrap_or(Value::String(text))
+}
+
+/// Derive a component name from a path's file name.
+///
+/// `themes/dark.json` becomes `dark`; `types/index.d.ts` becomes `index`.
+/// Used only for the reference path-string shapes, which carry no name.
+fn component_name_from_path(path: &str) -> Option<String> {
+    let file = path.rsplit(['/', '\\']).next()?.trim();
+    if file.is_empty() {
+        return None;
+    }
+    let name = file
+        .strip_suffix(".d.ts")
+        .or_else(|| file.strip_suffix(".lsp.json"))
+        .or_else(|| file.strip_suffix(".json"))
+        .or_else(|| file.strip_suffix(".mjs"))
+        .or_else(|| file.strip_suffix(".cjs"))
+        .or_else(|| file.strip_suffix(".js"))
+        .or_else(|| file.strip_suffix(".ts"))
+        .unwrap_or(file);
+    if name.is_empty() {
+        None
+    } else {
+        Some(name.to_string())
+    }
+}
+
+/// Whether a string in a component declaration is meant as a path.
+///
+/// Inline scripts and inline styles are strings too, so only strings that
+/// look like file references are resolved. A newline is never a path.
+#[allow(clippy::case_sensitive_file_extension_comparisons)]
+fn looks_like_component_path(field: &str, value: &str) -> bool {
+    let value = value.trim();
+    if value.is_empty() || value.contains('\n') || value.contains('\r') {
+        return false;
+    }
+    if value.starts_with("./")
+        || value.starts_with("../")
+        || value.contains('/')
+        || value.contains('\\')
+    {
+        return true;
+    }
+    let lower = value.to_ascii_lowercase();
+    match field {
+        "types" => lower.ends_with(".d.ts"),
+        "workflows" => {
+            lower.ends_with(".js")
+                || lower.ends_with(".mjs")
+                || lower.ends_with(".cjs")
+                || lower.ends_with(".ts")
+        }
+        "lspServers" => lower.ends_with(".lsp.json") || lower.ends_with(".json"),
+        _ => lower.ends_with(".json"),
+    }
+}
+
+/// Resolve one value of a `themes`/`outputStyles` declaration.
+///
+/// A path is read and returned as JSON when it parses, otherwise as the file
+/// text. A non-path value is passed through as written.
+fn resolve_visual_value(
+    plugin: &str,
+    plugin_dir: &Path,
+    field: &str,
+    value: &Value,
+) -> Option<Value> {
+    let Value::String(text) = value else {
+        return Some(value.clone());
+    };
+    if !looks_like_component_path(field, text) {
+        return Some(value.clone());
+    }
+    match read_component_text(plugin_dir, text) {
+        Ok(content) => Some(parse_json_or_text(content)),
+        Err(e) => {
+            tracing::warn!(
+                plugin = %plugin,
+                component = field,
+                path = %text,
+                "cannot read plugin component; skipping: {e}"
+            );
+            None
+        }
+    }
+}
+
+/// Normalize a `themes` or `outputStyles` declaration into `(name, value)`.
+fn normalize_visual_component(
+    plugin: &str,
+    plugin_dir: &Path,
+    field: &str,
+    value: &Value,
+) -> Vec<(String, Value)> {
+    match value {
+        Value::Object(entries) => entries
+            .iter()
+            .filter_map(|(name, entry)| {
+                if name.trim().is_empty() {
+                    tracing::warn!(
+                        plugin = %plugin,
+                        component = field,
+                        "plugin component has an empty name; skipping"
+                    );
+                    return None;
+                }
+                resolve_visual_value(plugin, plugin_dir, field, entry)
+                    .map(|resolved| (name.clone(), resolved))
+            })
+            .collect(),
+        Value::Array(entries) => {
+            let mut collected = Vec::new();
+            for (index, entry) in entries.iter().enumerate() {
+                match entry {
+                    Value::Object(object) => {
+                        let Some(name) = object.get("name").and_then(Value::as_str) else {
+                            tracing::warn!(
+                                plugin = %plugin,
+                                component = field,
+                                index,
+                                "plugin component entry has no string `name`; skipping"
+                            );
+                            continue;
+                        };
+                        if name.trim().is_empty() {
+                            tracing::warn!(
+                                plugin = %plugin,
+                                component = field,
+                                index,
+                                "plugin component entry has an empty `name`; skipping"
+                            );
+                            continue;
+                        }
+                        collected.push((name.to_string(), entry.clone()));
+                    }
+                    Value::String(text) if looks_like_component_path(field, text) => {
+                        let Some(name) = component_name_from_path(text) else {
+                            tracing::warn!(
+                                plugin = %plugin,
+                                component = field,
+                                index,
+                                "cannot derive a component name from '{text}'; skipping"
+                            );
+                            continue;
+                        };
+                        if let Some(resolved) =
+                            resolve_visual_value(plugin, plugin_dir, field, entry)
+                        {
+                            collected.push((name, resolved));
+                        }
+                    }
+                    _ => tracing::warn!(
+                        plugin = %plugin,
+                        component = field,
+                        index,
+                        "plugin component entry is neither an object with `name` nor a path; \
+                         skipping"
+                    ),
+                }
+            }
+            collected
+        }
+        Value::String(text) => {
+            let Some(name) = component_name_from_path(text) else {
+                tracing::warn!(
+                    plugin = %plugin,
+                    component = field,
+                    "cannot derive a component name from '{text}'; skipping"
+                );
+                return Vec::new();
+            };
+            if !looks_like_component_path(field, text) {
+                tracing::warn!(
+                    plugin = %plugin,
+                    component = field,
+                    "single-string plugin component is not a path; skipping"
+                );
+                return Vec::new();
+            }
+            resolve_visual_value(plugin, plugin_dir, field, value)
+                .map(|resolved| vec![(name, resolved)])
+                .unwrap_or_default()
+        }
+        _ => {
+            tracing::warn!(
+                plugin = %plugin,
+                component = field,
+                "plugin component is neither an object nor an array; skipping"
+            );
+            Vec::new()
+        }
+    }
+}
+
+/// Resolve one value of a `workflows` or `monitors` declaration.
+///
+/// Workflows resolve to `{path, script}` so the caller gets both the
+/// declaration and the text. Monitors resolve to parsed JSON when the file is
+/// JSON, otherwise to the text. Inline values pass through as written.
+fn resolve_script_value(
+    plugin: &str,
+    plugin_dir: &Path,
+    field: &str,
+    value: &Value,
+) -> Option<Value> {
+    let Value::String(text) = value else {
+        return Some(value.clone());
+    };
+    if !looks_like_component_path(field, text) {
+        return Some(value.clone());
+    }
+    match read_component_text(plugin_dir, text) {
+        Ok(content) => {
+            if field == "workflows" {
+                Some(serde_json::json!({"path": text, "script": content}))
+            } else {
+                Some(parse_json_or_text(content))
+            }
+        }
+        Err(e) => {
+            tracing::warn!(
+                plugin = %plugin,
+                component = field,
+                path = %text,
+                "cannot read plugin component; skipping: {e}"
+            );
+            None
+        }
+    }
+}
+
+/// Normalize a `workflows` or `monitors` declaration into `(name, value)`.
+fn normalize_script_component(
+    plugin: &str,
+    plugin_dir: &Path,
+    field: &str,
+    value: &Value,
+) -> Vec<(String, Value)> {
+    match value {
+        Value::Object(entries) => entries
+            .iter()
+            .filter_map(|(name, entry)| {
+                if name.trim().is_empty() {
+                    tracing::warn!(
+                        plugin = %plugin,
+                        component = field,
+                        "plugin component has an empty name; skipping"
+                    );
+                    return None;
+                }
+                resolve_script_value(plugin, plugin_dir, field, entry)
+                    .map(|resolved| (name.clone(), resolved))
+            })
+            .collect(),
+        Value::Array(entries) => {
+            let mut collected = Vec::new();
+            for (index, entry) in entries.iter().enumerate() {
+                match entry {
+                    Value::Object(object) => {
+                        let Some(name) = object.get("name").and_then(Value::as_str) else {
+                            tracing::warn!(
+                                plugin = %plugin,
+                                component = field,
+                                index,
+                                "plugin component entry has no string `name`; skipping"
+                            );
+                            continue;
+                        };
+                        if name.trim().is_empty() {
+                            tracing::warn!(
+                                plugin = %plugin,
+                                component = field,
+                                index,
+                                "plugin component entry has an empty `name`; skipping"
+                            );
+                            continue;
+                        }
+                        collected.push((name.to_string(), entry.clone()));
+                    }
+                    Value::String(text) => {
+                        let Some(name) = component_name_from_path(text) else {
+                            tracing::warn!(
+                                plugin = %plugin,
+                                component = field,
+                                index,
+                                "cannot derive a component name from '{text}'; skipping"
+                            );
+                            continue;
+                        };
+                        if let Some(resolved) =
+                            resolve_script_value(plugin, plugin_dir, field, entry)
+                        {
+                            collected.push((name, resolved));
+                        }
+                    }
+                    _ => tracing::warn!(
+                        plugin = %plugin,
+                        component = field,
+                        index,
+                        "plugin component entry is neither an object with `name` nor a path; \
+                         skipping"
+                    ),
+                }
+            }
+            collected
+        }
+        Value::String(text) => {
+            let Some(name) = component_name_from_path(text) else {
+                tracing::warn!(
+                    plugin = %plugin,
+                    component = field,
+                    "cannot derive a component name from '{text}'; skipping"
+                );
+                return Vec::new();
+            };
+            if !looks_like_component_path(field, text) {
+                // An inline script has no name of its own; the plugin name is
+                // the only stable identifier.
+                return vec![(plugin.to_string(), value.clone())];
+            }
+            resolve_script_value(plugin, plugin_dir, field, value)
+                .map(|resolved| vec![(name, resolved)])
+                .unwrap_or_default()
+        }
+        _ => {
+            tracing::warn!(
+                plugin = %plugin,
+                component = field,
+                "plugin component is neither an object nor an array; skipping"
+            );
+            Vec::new()
+        }
+    }
+}
+
+/// Normalize an `lspServers` declaration into `(name, config)`.
+fn normalize_lsp_component(plugin: &str, plugin_dir: &Path, value: &Value) -> Vec<(String, Value)> {
+    let resolve_config = |name: &str, entry: &Value| -> Option<Value> {
+        match entry {
+            Value::Object(_) => Some(entry.clone()),
+            Value::String(text) if looks_like_component_path("lspServers", text) => {
+                match read_component_text(plugin_dir, text) {
+                    Ok(content) => match serde_json::from_str::<Value>(&content) {
+                        Ok(parsed) if parsed.is_object() => Some(parsed),
+                        Ok(_) => {
+                            tracing::warn!(
+                                plugin = %plugin,
+                                server = %name,
+                                path = %text,
+                                "LSP server file is not a JSON object; skipping"
+                            );
+                            None
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                plugin = %plugin,
+                                server = %name,
+                                path = %text,
+                                "LSP server file is not valid JSON; skipping: {e}"
+                            );
+                            None
+                        }
+                    },
+                    Err(e) => {
+                        tracing::warn!(
+                            plugin = %plugin,
+                            server = %name,
+                            path = %text,
+                            "cannot read LSP server file; skipping: {e}"
+                        );
+                        None
+                    }
+                }
+            }
+            _ => {
+                tracing::warn!(
+                    plugin = %plugin,
+                    server = %name,
+                    "plugin LSP server configuration is neither an object nor a path; skipping"
+                );
+                None
+            }
+        }
+    };
+
+    match value {
+        Value::Object(entries) => entries
+            .iter()
+            .filter_map(|(name, entry)| {
+                if name.trim().is_empty() {
+                    tracing::warn!(
+                        plugin = %plugin,
+                        "plugin LSP server has an empty name; skipping"
+                    );
+                    return None;
+                }
+                resolve_config(name, entry).map(|config| (name.clone(), config))
+            })
+            .collect(),
+        Value::Array(entries) => {
+            let mut collected = Vec::new();
+            for (index, entry) in entries.iter().enumerate() {
+                let Some(object) = entry.as_object() else {
+                    tracing::warn!(
+                        plugin = %plugin,
+                        index,
+                        "plugin LSP server entry is not an object; skipping"
+                    );
+                    continue;
+                };
+                let Some(name) = object.get("name").and_then(Value::as_str) else {
+                    tracing::warn!(
+                        plugin = %plugin,
+                        index,
+                        "plugin LSP server entry has no string `name`; skipping"
+                    );
+                    continue;
+                };
+                if name.trim().is_empty() {
+                    tracing::warn!(
+                        plugin = %plugin,
+                        index,
+                        "plugin LSP server entry has an empty `name`; skipping"
+                    );
+                    continue;
+                }
+                collected.push((name.to_string(), entry.clone()));
+            }
+            collected
+        }
+        Value::String(text) if looks_like_component_path("lspServers", text) => {
+            match read_component_text(plugin_dir, text) {
+                Ok(content) => match serde_json::from_str::<Value>(&content) {
+                    Ok(parsed) => {
+                        // A file may hold one server config or a map of
+                        // server name to config; a map merges by name.
+                        if let Value::Object(entries) = &parsed {
+                            if entries.len() > 1 && entries.values().all(Value::is_object) {
+                                return entries
+                                    .iter()
+                                    .map(|(name, config)| (name.clone(), config.clone()))
+                                    .collect();
+                            }
+                        }
+                        vec![(plugin.to_string(), parsed)]
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            plugin = %plugin,
+                            path = %text,
+                            "LSP server file is not valid JSON; skipping: {e}"
+                        );
+                        Vec::new()
+                    }
+                },
+                Err(e) => {
+                    tracing::warn!(
+                        plugin = %plugin,
+                        path = %text,
+                        "cannot read LSP server file; skipping: {e}"
+                    );
+                    Vec::new()
+                }
+            }
+        }
+        _ => {
+            tracing::warn!(
+                plugin = %plugin,
+                "plugin lspServers is neither an object, an array, nor a path; skipping"
+            );
+            Vec::new()
+        }
+    }
+}
+
+/// Normalize a `channels` declaration into `(name, entry)`.
+///
+/// Entries must carry a string `server`; the entry itself is kept as written.
+fn normalize_channel_component(plugin: &str, value: &Value) -> Vec<(String, Value)> {
+    match value {
+        Value::Object(entries) => entries
+            .iter()
+            .filter_map(|(name, entry)| {
+                if name.trim().is_empty() {
+                    tracing::warn!(
+                        plugin = %plugin,
+                        "plugin channel has an empty name; skipping"
+                    );
+                    return None;
+                }
+                let Some(server) = entry.get("server").and_then(Value::as_str) else {
+                    tracing::warn!(
+                        plugin = %plugin,
+                        channel = %name,
+                        "plugin channel entry has no string `server`; skipping"
+                    );
+                    return None;
+                };
+                if server.trim().is_empty() {
+                    tracing::warn!(
+                        plugin = %plugin,
+                        channel = %name,
+                        "plugin channel entry has an empty `server`; skipping"
+                    );
+                    return None;
+                }
+                Some((name.clone(), entry.clone()))
+            })
+            .collect(),
+        Value::Array(entries) => {
+            let mut collected = Vec::new();
+            for (index, entry) in entries.iter().enumerate() {
+                let Some(object) = entry.as_object() else {
+                    tracing::warn!(
+                        plugin = %plugin,
+                        index,
+                        "plugin channel entry is not an object; skipping"
+                    );
+                    continue;
+                };
+                let Some(server) = object.get("server").and_then(Value::as_str) else {
+                    tracing::warn!(
+                        plugin = %plugin,
+                        index,
+                        "plugin channel entry has no string `server`; skipping"
+                    );
+                    continue;
+                };
+                if server.trim().is_empty() {
+                    tracing::warn!(
+                        plugin = %plugin,
+                        index,
+                        "plugin channel entry has an empty `server`; skipping"
+                    );
+                    continue;
+                }
+                collected.push((server.to_string(), entry.clone()));
+            }
+            collected
+        }
+        _ => {
+            tracing::warn!(
+                plugin = %plugin,
+                "plugin channels is neither an object nor an array; skipping"
+            );
+            Vec::new()
+        }
+    }
+}
+
+/// Whether a string is a 64-character hexadecimal SHA-256 digest.
+fn is_sha256_hex(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+/// Whether a binary name is a plain file name inside `<plugin>/bin`.
+fn is_safe_binary_name(name: &str) -> bool {
+    !name.is_empty()
+        && name != "."
+        && name != ".."
+        && !name.contains('/')
+        && !name.contains('\\')
+        && !name.contains('\0')
+}
+
+/// Normalize a `binaries` declaration into `(name, entry)`.
+///
+/// Every entry needs a string `url` and a 64-hex `sha256`; an invalid entry is
+/// reported and skipped rather than fetched unverified.
+fn normalize_binary_component(plugin: &str, value: &Value) -> Vec<(String, Value)> {
+    let Value::Object(entries) = value else {
+        tracing::warn!(
+            plugin = %plugin,
+            "plugin binaries is not an object; skipping"
+        );
+        return Vec::new();
+    };
+
+    let mut collected = Vec::new();
+    for (name, entry) in entries {
+        if name.trim().is_empty() {
+            tracing::warn!(
+                plugin = %plugin,
+                "plugin binary has an empty name; skipping"
+            );
+            continue;
+        }
+        if !is_safe_binary_name(name) {
+            tracing::warn!(
+                plugin = %plugin,
+                binary = %name,
+                "plugin binary name is not a plain file name; skipping"
+            );
+            continue;
+        }
+        let Some(object) = entry.as_object() else {
+            tracing::warn!(
+                plugin = %plugin,
+                binary = %name,
+                "plugin binary entry is not an object; skipping"
+            );
+            continue;
+        };
+        let Some(url) = object.get("url").and_then(Value::as_str) else {
+            tracing::warn!(
+                plugin = %plugin,
+                binary = %name,
+                "plugin binary entry has no string `url`; skipping"
+            );
+            continue;
+        };
+        if url.trim().is_empty() {
+            tracing::warn!(
+                plugin = %plugin,
+                binary = %name,
+                "plugin binary entry has an empty `url`; skipping"
+            );
+            continue;
+        }
+        let Some(sha256) = object.get("sha256").and_then(Value::as_str) else {
+            tracing::warn!(
+                plugin = %plugin,
+                binary = %name,
+                "plugin binary entry has no string `sha256`; skipping"
+            );
+            continue;
+        };
+        if !is_sha256_hex(sha256) {
+            tracing::warn!(
+                plugin = %plugin,
+                binary = %name,
+                "plugin binary entry has a malformed SHA-256; skipping"
+            );
+            continue;
+        }
+        collected.push((name.clone(), entry.clone()));
+    }
+    collected
+}
+
+/// Validate a `types` declaration.
+///
+/// The accepted shapes are a path string, an array of path strings, or an
+/// object whose values are path strings. Every path must be relative, must not
+/// contain `..`, and must end in `.d.ts`.
+fn validate_types_declaration(value: &Value) -> Result<(), String> {
+    match value {
+        Value::String(path) => validate_types_path(path),
+        Value::Array(paths) => {
+            for path in paths {
+                let path = path
+                    .as_str()
+                    .ok_or_else(|| "every `types` entry must be a path string".to_string())?;
+                validate_types_path(path)?;
+            }
+            Ok(())
+        }
+        Value::Object(entries) => {
+            for (name, path) in entries {
+                let path = path
+                    .as_str()
+                    .ok_or_else(|| format!("`types` entry '{name}' must be a path string"))?;
+                validate_types_path(path)?;
+            }
+            Ok(())
+        }
+        _ => Err(
+            "`types` must be a path string, an array of paths, or an object of paths".to_string(),
+        ),
+    }
+}
+
+/// Insert a component into a merged map, refusing a duplicate name.
+///
+/// Components merge in plugin-name order, so "first wins" is deterministic: a
+/// later plugin cannot silently replace an earlier plugin's definition.
+fn insert_unique_component(
+    merged: &mut serde_json::Map<String, Value>,
+    plugin: &str,
+    field: &str,
+    name: String,
+    component: Value,
+) {
+    if name.trim().is_empty() {
+        tracing::warn!(
+            plugin = %plugin,
+            component = field,
+            "plugin component has an empty name; skipping"
+        );
+        return;
+    }
+    if merged.contains_key(&name) {
+        tracing::warn!(
+            plugin = %plugin,
+            component = field,
+            name = %name,
+            "duplicate plugin component name; refusing the later definition"
+        );
+        return;
+    }
+    merged.insert(name, component);
+}
+
+/// Whether a host is loopback, for the plain-HTTP exception below.
+fn is_loopback_host(host: Option<&str>) -> bool {
+    matches!(host, Some("localhost" | "127.0.0.1" | "[::1]" | "::1"))
+}
+
 /// Manages all loaded plugins and marketplace state.
 #[derive(Debug)]
 pub struct PluginManager {
@@ -1480,6 +2331,16 @@ impl PluginManager {
                 hooks: manifest.hooks.clone(),
                 agents: manifest.agents.clone(),
                 mcp_servers: manifest.mcp_servers.clone(),
+                output_styles: manifest.output_styles.clone(),
+                themes: manifest.themes.clone(),
+                workflows: manifest.workflows.clone(),
+                monitors: manifest.monitors.clone(),
+                lsp_servers: manifest.lsp_servers.clone(),
+                channels: manifest.channels.clone(),
+                binaries: manifest.binaries.clone(),
+                types: manifest.types.clone(),
+                settings: manifest.settings.clone(),
+                experimental: manifest.experimental.clone(),
                 retry_count: 0,
                 max_retries: 3,
                 verified: false,
@@ -1499,6 +2360,16 @@ impl PluginManager {
             hooks: manifest.hooks.clone(),
             agents: manifest.agents.clone(),
             mcp_servers: manifest.mcp_servers.clone(),
+            output_styles: manifest.output_styles.clone(),
+            themes: manifest.themes.clone(),
+            workflows: manifest.workflows.clone(),
+            monitors: manifest.monitors.clone(),
+            lsp_servers: manifest.lsp_servers.clone(),
+            channels: manifest.channels.clone(),
+            binaries: manifest.binaries.clone(),
+            types: manifest.types.clone(),
+            settings: manifest.settings.clone(),
+            experimental: manifest.experimental.clone(),
             retry_count: 0,
             max_retries: 3,
             // A plugin loaded from a directory has no archive to check, so
@@ -1804,6 +2675,16 @@ impl PluginManager {
                 hooks: h.hooks.clone(),
                 agents: h.agents.clone(),
                 mcp_servers: h.mcp_servers.clone(),
+                output_styles: h.output_styles.clone(),
+                themes: h.themes.clone(),
+                workflows: h.workflows.clone(),
+                monitors: h.monitors.clone(),
+                lsp_servers: h.lsp_servers.clone(),
+                channels: h.channels.clone(),
+                binaries: h.binaries.clone(),
+                types: h.types.clone(),
+                settings: h.settings.clone(),
+                experimental: h.experimental.clone(),
                 retry_count: h.retry_count,
                 max_retries: h.max_retries,
                 verified: h.verified,
@@ -2039,6 +2920,445 @@ impl PluginManager {
         } else {
             Some(serde_json::json!({ "mcpServers": merged }))
         }
+    }
+
+    /// The component value of every active plugin, in plugin-name order.
+    ///
+    /// The plugin directory is returned alongside the value because a
+    /// relative component path resolves against it. Ordering by plugin name,
+    /// not by `DashMap` iteration order, keeps every `plugin_*` accessor
+    /// deterministic.
+    fn active_plugin_values(
+        &self,
+        get: impl Fn(&PluginHandle) -> Option<Value>,
+    ) -> Vec<(String, PathBuf, Value)> {
+        let mut active: Vec<(String, PathBuf, Value)> = self
+            .plugins
+            .iter()
+            .filter(|entry| matches!(entry.value().state, PluginState::Active))
+            .filter_map(|entry| {
+                get(entry.value())
+                    .map(|value| (entry.key().clone(), entry.value().path.clone(), value))
+            })
+            .collect();
+        active.sort_by(|a, b| a.0.cmp(&b.0));
+        active
+    }
+
+    /// Merge normalized `(name, value)` pairs from active plugins.
+    ///
+    /// The first definition of a name wins; a later plugin declaring the same
+    /// name is warned about and refused. Returns `None` when nothing was
+    /// collected, so callers can distinguish "no plugin contributes" from an
+    /// empty object.
+    fn merge_named_components(
+        &self,
+        field: &str,
+        get: impl Fn(&PluginHandle) -> Option<Value>,
+        normalize: impl Fn(&str, &Path, &Value) -> Vec<(String, Value)>,
+    ) -> Option<Value> {
+        let mut merged = serde_json::Map::new();
+        for (plugin, plugin_dir, value) in self.active_plugin_values(get) {
+            for (name, component) in normalize(&plugin, &plugin_dir, &value) {
+                insert_unique_component(&mut merged, &plugin, field, name, component);
+            }
+        }
+        if merged.is_empty() {
+            None
+        } else {
+            Some(Value::Object(merged))
+        }
+    }
+
+    /// Merge the `settings` fragments contributed by active plugins.
+    ///
+    /// Only [`PluginState::Active`] plugins contribute. Each plugin's
+    /// `settings` must be an object; its top-level keys are merged in
+    /// plugin-name order, and the first plugin to declare a key wins — a later
+    /// plugin does not silently overwrite an earlier one, and the duplicate is
+    /// reported with a warning. A malformed document is skipped with a
+    /// warning.
+    ///
+    /// This deliberately returns the raw merged fragment, not an already
+    /// applied settings object. **Callers must apply the same restrictive
+    /// policy they apply to project/local settings**: a plugin may not raise
+    /// the permission mode, enable telemetry, or otherwise turn a
+    /// user-controlled restriction off. Plugin settings are untrusted input
+    /// from an installed package.
+    #[must_use]
+    pub fn plugin_settings(&self) -> Option<Value> {
+        self.merge_named_components(
+            "settings",
+            |handle| handle.settings.clone(),
+            |plugin, _plugin_dir, value| {
+                if let Value::Object(entries) = value {
+                    return entries
+                        .iter()
+                        .map(|(key, entry)| (key.clone(), entry.clone()))
+                        .collect();
+                }
+                tracing::warn!(
+                    plugin = %plugin,
+                    "plugin settings is not an object; skipping"
+                );
+                Vec::new()
+            },
+        )
+    }
+
+    /// Merge the `outputStyles` contributed by active plugins.
+    ///
+    /// Accepts an object mapping style names to their values, an array of
+    /// entries carrying a string `name`, or a path string. A relative path is
+    /// read against the plugin directory (bounded to
+    /// [`MAX_PLUGIN_COMPONENT_BYTES`]); the file becomes its parsed JSON value
+    /// when it parses, otherwise a JSON string of the file text. Results merge
+    /// in plugin-name order with the first definition of a name winning.
+    #[must_use]
+    pub fn plugin_output_styles(&self) -> Option<Value> {
+        self.merge_named_components(
+            "outputStyles",
+            |handle| handle.output_styles.clone(),
+            |plugin, plugin_dir, value| {
+                normalize_visual_component(plugin, plugin_dir, "outputStyles", value)
+            },
+        )
+    }
+
+    /// Merge the `themes` contributed by active plugins.
+    ///
+    /// Accepts the same shapes as [`Self::plugin_output_styles`]. A path is
+    /// read into its parsed JSON value when possible, otherwise into a JSON
+    /// string of the file text; validating that the value is a theme is the UI
+    /// crate's job. Merged in plugin-name order, first definition wins.
+    #[must_use]
+    pub fn plugin_themes(&self) -> Option<Value> {
+        self.merge_named_components(
+            "themes",
+            |handle| handle.themes.clone(),
+            |plugin, plugin_dir, value| {
+                normalize_visual_component(plugin, plugin_dir, "themes", value)
+            },
+        )
+    }
+
+    /// Merge the `workflows` contributed by active plugins.
+    ///
+    /// Accepts an object mapping workflow names to their values, an array of
+    /// entries carrying a string `name`, or a path string. A relative path to
+    /// a `.js` (or other script) file is read against the plugin directory and
+    /// returned as `{"path": ..., "script": ...}`; an inline value is returned
+    /// as written. Merged in plugin-name order, first definition wins.
+    #[must_use]
+    pub fn plugin_workflows(&self) -> Option<Value> {
+        self.merge_named_components(
+            "workflows",
+            |handle| handle.workflows.clone(),
+            |plugin, plugin_dir, value| {
+                normalize_script_component(plugin, plugin_dir, "workflows", value)
+            },
+        )
+    }
+
+    /// Merge the `monitors` contributed by active plugins.
+    ///
+    /// Accepts an object mapping monitor names to their values, an array of
+    /// entries carrying a string `name`, or a path string. A relative path is
+    /// read against the plugin directory; a JSON file becomes its parsed value
+    /// and any other file becomes a JSON string of its text.
+    ///
+    /// When a manifest omits `monitors`, the reference default
+    /// `<plugin>/monitors/monitors.json` is used instead, if it exists.
+    /// Merged in plugin-name order, first definition wins.
+    #[must_use]
+    pub fn plugin_monitors(&self) -> Option<Value> {
+        let mut active: Vec<(String, PathBuf, Option<Value>)> = self
+            .plugins
+            .iter()
+            .filter(|entry| matches!(entry.value().state, PluginState::Active))
+            .map(|entry| {
+                (
+                    entry.key().clone(),
+                    entry.value().path.clone(),
+                    entry.value().monitors.clone(),
+                )
+            })
+            .collect();
+        active.sort_by(|a, b| a.0.cmp(&b.0));
+
+        let mut merged = serde_json::Map::new();
+        for (plugin, plugin_dir, declared) in active {
+            let value = if let Some(value) = declared {
+                value
+            } else {
+                const DEFAULT_MONITORS: &str = "monitors/monitors.json";
+                if !plugin_dir.join(DEFAULT_MONITORS).is_file() {
+                    continue;
+                }
+                match read_component_text(&plugin_dir, DEFAULT_MONITORS) {
+                    Ok(text) => parse_json_or_text(text),
+                    Err(e) => {
+                        tracing::warn!(
+                            plugin = %plugin,
+                            component = "monitors",
+                            path = DEFAULT_MONITORS,
+                            "cannot read default monitors file; skipping: {e}"
+                        );
+                        continue;
+                    }
+                }
+            };
+            for (name, monitor) in
+                normalize_script_component(&plugin, &plugin_dir, "monitors", &value)
+            {
+                insert_unique_component(&mut merged, &plugin, "monitors", name, monitor);
+            }
+        }
+
+        if merged.is_empty() {
+            None
+        } else {
+            Some(Value::Object(merged))
+        }
+    }
+
+    /// Merge the `lspServers` contributed by active plugins.
+    ///
+    /// Accepts an object mapping server names to configuration objects, an
+    /// array of configuration objects carrying a string `name`, or a path
+    /// string. A path to a `.lsp.json` file is read against the plugin
+    /// directory and parsed; a file holding a map of server names to configs
+    /// is merged as that map, while a single server config is keyed by the
+    /// plugin name. Merged in plugin-name order, first definition wins.
+    #[must_use]
+    pub fn plugin_lsp_servers(&self) -> Option<Value> {
+        self.merge_named_components(
+            "lspServers",
+            |handle| handle.lsp_servers.clone(),
+            normalize_lsp_component,
+        )
+    }
+
+    /// Merge the `channels` contributed by active plugins.
+    ///
+    /// Entries are `{ "server": ..., "displayName": ..., "userConfig": ... }`.
+    /// An array is keyed by each entry's `server`; an object is keyed by its
+    /// map key. An entry without a string `server` is skipped with a warning,
+    /// and the entry is otherwise kept as written. Merged in plugin-name
+    /// order, first definition wins.
+    #[must_use]
+    pub fn plugin_channels(&self) -> Option<Value> {
+        self.merge_named_components(
+            "channels",
+            |handle| handle.channels.clone(),
+            |plugin, _plugin_dir, value| normalize_channel_component(plugin, value),
+        )
+    }
+
+    /// Merge the `binaries` declared by active plugins.
+    ///
+    /// The declaration is an object mapping each binary name to
+    /// `{"url": ..., "sha256": ...}`. Both fields are required, and `sha256`
+    /// must be a 64-character hexadecimal digest; an invalid entry is warned
+    /// about and skipped. Merged in plugin-name order, first definition wins.
+    ///
+    /// This only *describes* the binaries. Use
+    /// [`Self::fetch_plugin_binaries`] to download and verify them.
+    #[must_use]
+    pub fn plugin_binaries(&self) -> Option<Value> {
+        self.merge_named_components(
+            "binaries",
+            |handle| handle.binaries.clone(),
+            |plugin, _plugin_dir, value| normalize_binary_component(plugin, value),
+        )
+    }
+
+    /// Download, verify, and store the binaries declared by an active plugin.
+    ///
+    /// Every declared binary must pass [`Self::plugin_binaries`] validation.
+    /// Each is fetched over HTTPS (plain HTTP is accepted only for a loopback
+    /// host, so a local test server works; the SHA-256 pin still authenticates
+    /// the bytes), bounded to 64 MiB, and verified against its declared
+    /// SHA-256 *before* anything is written. Verified bytes are written to
+    /// `<plugin>/bin/<name>` and the paths are returned in name order.
+    ///
+    /// Redirects are refused: a redirect could move the download to a host the
+    /// manifest did not name. Executables are never run here.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the plugin is unknown or not active, declares no
+    /// valid binaries, names an unsupported or non-HTTPS URL, is redirected,
+    /// exceeds the size limit, or fails hash verification.
+    pub async fn fetch_plugin_binaries(&self, plugin: &str) -> Result<Vec<PathBuf>, String> {
+        // Clone what is needed and release the `DashMap` guard before the
+        // first await: holding a shard lock across I/O can deadlock other
+        // manager operations.
+        let (plugin_dir, binaries) = {
+            let entry = self
+                .plugins
+                .get(plugin)
+                .ok_or_else(|| format!("plugin '{plugin}' is not loaded"))?;
+            if !matches!(entry.value().state, PluginState::Active) {
+                return Err(format!("plugin '{plugin}' is not active"));
+            }
+            (entry.value().path.clone(), entry.value().binaries.clone())
+        };
+        let Some(binaries) = binaries else {
+            return Err(format!("plugin '{plugin}' declares no binaries"));
+        };
+
+        let mut entries = normalize_binary_component(plugin, &binaries);
+        if entries.is_empty() {
+            return Err(format!("plugin '{plugin}' declares no valid binaries"));
+        }
+        entries.sort_by(|a, b| a.0.cmp(&b.0));
+
+        let client = Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .timeout(std::time::Duration::from_secs(60))
+            .build()
+            .map_err(|e| format!("failed to build HTTP client: {e}"))?;
+
+        let bin_dir = plugin_dir.join("bin");
+        std::fs::create_dir_all(&bin_dir)
+            .map_err(|e| format!("failed to create {}: {e}", bin_dir.display()))?;
+
+        let mut fetched = Vec::new();
+        for (name, entry) in entries {
+            let url = entry.get("url").and_then(Value::as_str).unwrap_or_default();
+            let expected = entry
+                .get("sha256")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+
+            let parsed = reqwest::Url::parse(url)
+                .map_err(|e| format!("plugin binary '{name}' has an invalid URL '{url}': {e}"))?;
+            match parsed.scheme() {
+                "https" => {}
+                "http" if is_loopback_host(parsed.host_str()) => {
+                    // A loopback server is how tests and local development
+                    // serve bytes; the SHA-256 pin still authenticates them.
+                }
+                "http" => {
+                    return Err(format!(
+                        "refusing to fetch plugin binary '{name}' over non-HTTPS URL '{url}'"
+                    ));
+                }
+                scheme => {
+                    return Err(format!(
+                        "refusing to fetch plugin binary '{name}' from unsupported URL scheme \
+                         '{scheme}'"
+                    ));
+                }
+            }
+
+            let mut response = client
+                .get(url)
+                .send()
+                .await
+                .map_err(|e| format!("failed to download plugin binary '{name}': {e}"))?;
+            if response.status().is_redirection() {
+                return Err(format!(
+                    "refusing to follow redirect for plugin binary '{name}'"
+                ));
+            }
+            if !response.status().is_success() {
+                return Err(format!(
+                    "failed to download plugin binary '{name}': HTTP {}",
+                    response.status()
+                ));
+            }
+            if let Some(length) = response.content_length() {
+                if length > MAX_PLUGIN_BINARY_BYTES as u64 {
+                    return Err(format!(
+                        "plugin binary '{name}' is {length} bytes, larger than the \
+                         {MAX_PLUGIN_BINARY_BYTES} byte limit"
+                    ));
+                }
+            }
+
+            let mut bytes = Vec::new();
+            while let Some(chunk) = response
+                .chunk()
+                .await
+                .map_err(|e| format!("failed to read plugin binary '{name}': {e}"))?
+            {
+                if bytes.len() + chunk.len() > MAX_PLUGIN_BINARY_BYTES {
+                    return Err(format!(
+                        "plugin binary '{name}' exceeds the {MAX_PLUGIN_BINARY_BYTES} byte limit"
+                    ));
+                }
+                bytes.extend_from_slice(&chunk);
+            }
+
+            let digest = sha256_hex(&bytes);
+            if !expected.eq_ignore_ascii_case(&digest) {
+                return Err(format!(
+                    "plugin binary '{name}' does not match its declared SHA-256 (expected \
+                     {expected}, got {digest})"
+                ));
+            }
+
+            // Verification happened in memory; only now is anything written.
+            let destination = bin_dir.join(&name);
+            let temporary = bin_dir.join(format!(".{name}.partial"));
+            std::fs::write(&temporary, &bytes)
+                .map_err(|e| format!("failed to write {}: {e}", temporary.display()))?;
+            if destination.exists() {
+                std::fs::remove_file(&destination)
+                    .map_err(|e| format!("failed to replace {}: {e}", destination.display()))?;
+            }
+            std::fs::rename(&temporary, &destination).map_err(|e| {
+                let _ = std::fs::remove_file(&temporary);
+                format!("failed to finalize {}: {e}", destination.display())
+            })?;
+            fetched.push(destination);
+        }
+
+        Ok(fetched)
+    }
+
+    /// The `types` declarations of active plugins, keyed by plugin name.
+    ///
+    /// The value is kept as written. Every declared path must be relative, must
+    /// not contain `..`, and must end in `.d.ts`; a plugin with an invalid
+    /// declaration is warned about and skipped entirely. Paths are relative to
+    /// the plugin directory, which callers can obtain from
+    /// [`Self::get_plugin`].
+    #[must_use]
+    pub fn plugin_types(&self) -> Option<Value> {
+        self.merge_named_components(
+            "types",
+            |handle| handle.types.clone(),
+            |plugin, _plugin_dir, value| match validate_types_declaration(value) {
+                Ok(()) => vec![(plugin.to_string(), value.clone())],
+                Err(e) => {
+                    tracing::warn!(
+                        plugin = %plugin,
+                        "plugin types declaration is invalid; skipping: {e}"
+                    );
+                    Vec::new()
+                }
+            },
+        )
+    }
+
+    /// The raw `experimental` value of each active plugin, keyed by plugin
+    /// name.
+    ///
+    /// No shape is imposed and no key is expanded here: a caller that
+    /// understands a particular key may expand `themes`, `monitors`,
+    /// `outputStyles`, `syntaxHighlighting`, `evals`, or anything else the
+    /// plugin declared. Expanding `experimental` is the caller's job; this
+    /// accessor only exposes what was written. Merged in plugin-name order.
+    #[must_use]
+    pub fn plugin_experimental(&self) -> Option<Value> {
+        self.merge_named_components(
+            "experimental",
+            |handle| handle.experimental.clone(),
+            |plugin, _plugin_dir, value| vec![(plugin.to_string(), value.clone())],
+        )
     }
 
     /// Count loaded plugins.
@@ -2858,6 +4178,16 @@ impl PluginManager {
             hooks: manifest.hooks.clone(),
             agents: manifest.agents.clone(),
             mcp_servers: manifest.mcp_servers.clone(),
+            output_styles: manifest.output_styles.clone(),
+            themes: manifest.themes.clone(),
+            workflows: manifest.workflows.clone(),
+            monitors: manifest.monitors.clone(),
+            lsp_servers: manifest.lsp_servers.clone(),
+            channels: manifest.channels.clone(),
+            binaries: manifest.binaries.clone(),
+            types: manifest.types.clone(),
+            settings: manifest.settings.clone(),
+            experimental: manifest.experimental.clone(),
             retry_count: 0,
             max_retries: 3,
             verified,
@@ -2987,6 +4317,16 @@ impl PluginManager {
             hooks: None,
             agents: None,
             mcp_servers: None,
+            output_styles: None,
+            themes: None,
+            workflows: None,
+            monitors: None,
+            lsp_servers: None,
+            channels: None,
+            binaries: None,
+            types: None,
+            settings: None,
+            experimental: None,
             retry_count: 0,
             max_retries: 3,
             verified: false,
@@ -3169,6 +4509,16 @@ impl PluginManager {
             hooks: manifest.hooks.clone(),
             agents: manifest.agents.clone(),
             mcp_servers: manifest.mcp_servers.clone(),
+            output_styles: manifest.output_styles.clone(),
+            themes: manifest.themes.clone(),
+            workflows: manifest.workflows.clone(),
+            monitors: manifest.monitors.clone(),
+            lsp_servers: manifest.lsp_servers.clone(),
+            channels: manifest.channels.clone(),
+            binaries: manifest.binaries.clone(),
+            types: manifest.types.clone(),
+            settings: manifest.settings.clone(),
+            experimental: manifest.experimental.clone(),
             retry_count: 0,
             max_retries: 3,
             verified,
@@ -4509,10 +5859,10 @@ mod tests {
         assert_eq!(manifest.keywords, vec!["a", "b"]);
         assert_eq!(manifest.default_enabled, Some(true));
         assert!(manifest.user_config["API_KEY"].sensitive);
-        assert_eq!(
-            manifest.unimplemented_fields(),
-            vec!["experimental"],
-            "fields with no CodeRex behaviour must be named, not dropped"
+        assert!(
+            manifest.unimplemented_fields().is_empty(),
+            "every component is now implemented: {:?}",
+            manifest.unimplemented_fields()
         );
     }
 
@@ -4908,49 +6258,678 @@ mod tests {
         assert!(mgr.plugin_mcp_servers().is_none());
     }
 
-    /// `hooks`, `agents` and `mcpServers` now feed CodeRex, so they are no
-    /// longer reported as accepted-but-unimplemented; the remaining ten
-    /// fields still are.
+    /// Every documented component is now a real source, so nothing is
+    /// reported as accepted-but-unimplemented.
     #[test]
     fn implemented_fields_are_no_longer_reported_as_unimplemented() {
         let manifest = manifest_with_hooks("hooked", serde_json::json!([]));
-        assert!(
-            !manifest.unimplemented_fields().contains(&"hooks"),
-            "{:?}",
-            manifest.unimplemented_fields()
-        );
         assert!(manifest.unimplemented_fields().is_empty());
 
-        let with_other_fields: PluginManifest = serde_json::from_str(
-            r#"{"name":"n","hooks":[],"agents":{},"mcpServers":{},"experimental":true}"#,
+        let all_fields: PluginManifest = serde_json::from_str(
+            r#"{"name":"n","hooks":[],"agents":{},"mcpServers":{},"outputStyles":{},
+                "themes":{},"workflows":{},"monitors":{},"lspServers":{},"channels":{},
+                "binaries":{},"types":{},"settings":{},"experimental":true}"#,
         )
         .unwrap();
-        assert_eq!(
-            with_other_fields.unimplemented_fields(),
-            vec!["experimental"]
+        assert!(
+            all_fields.unimplemented_fields().is_empty(),
+            "{:?}",
+            all_fields.unimplemented_fields()
+        );
+    }
+
+    // ── plugin component sources ─────────────────────────────────────────
+
+    /// Load a manifest for `name` with `field` set, rooted at `dir`.
+    fn load_component(
+        mgr: &PluginManager,
+        dir: &Path,
+        name: &str,
+        field: &str,
+        value: serde_json::Value,
+    ) {
+        // The directory does not have to exist: tests that exercise path
+        // resolution create their files explicitly.
+        mgr.load_plugin(manifest_with_field(name, field, value), dir.join(name));
+    }
+
+    #[test]
+    fn plugin_settings_merge_first_wins_and_warn_duplicates() {
+        let mgr = PluginManager::new();
+        // Loaded out of order on purpose: plugin-name order decides.
+        load_component(
+            &mgr,
+            Path::new("/plugins"),
+            "zeta",
+            "settings",
+            serde_json::json!({"theme": "dark", "zeta-only": 1}),
+        );
+        load_component(
+            &mgr,
+            Path::new("/plugins"),
+            "alpha",
+            "settings",
+            serde_json::json!({"theme": "light", "alpha-only": true}),
+        );
+        load_component(
+            &mgr,
+            Path::new("/plugins"),
+            "broken",
+            "settings",
+            serde_json::json!("not settings"),
         );
 
-        let remaining: PluginManifest = serde_json::from_str(
-            r#"{"name":"n","outputStyles":{},"themes":{},"workflows":{},"monitors":{},
-                "lspServers":{},"channels":{},"binaries":{},"types":{},"settings":{},
-                "experimental":true}"#,
+        let log = WarningLog::default();
+        let merged = tracing::subscriber::with_default(log.clone(), || mgr.plugin_settings())
+            .expect("the valid settings fragments merge");
+
+        assert_eq!(
+            merged,
+            serde_json::json!({
+                "alpha-only": true,
+                "theme": "light",
+                "zeta-only": 1,
+            }),
+            "alpha sorts first, so its `theme` wins"
+        );
+        let warnings = log.warnings();
+        assert_eq!(warnings.len(), 2, "{warnings:?}");
+        assert!(
+            warnings
+                .iter()
+                .any(|warning| warning.contains("theme") && warning.contains("zeta")),
+            "no duplicate warning for `theme`: {warnings:?}"
+        );
+        assert!(
+            warnings.iter().any(|warning| warning.contains("broken")),
+            "no warning for malformed settings: {warnings:?}"
+        );
+    }
+
+    #[test]
+    fn plugin_output_styles_accept_maps_arrays_and_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = PluginManager::new();
+        load_component(
+            &mgr,
+            dir.path(),
+            "alpha",
+            "outputStyles",
+            serde_json::json!({"mapped": {"foreground": "red"}}),
+        );
+        load_component(
+            &mgr,
+            dir.path(),
+            "beta",
+            "outputStyles",
+            serde_json::json!([{"name": "listed", "foreground": "blue"}]),
+        );
+        // A path is read against the plugin directory.
+        let gamma = dir.path().join("gamma");
+        std::fs::create_dir_all(gamma.join("styles")).unwrap();
+        std::fs::write(
+            gamma.join("styles/from-file.json"),
+            r#"{"foreground":"green"}"#,
         )
         .unwrap();
-        assert_eq!(
-            remaining.unimplemented_fields(),
-            vec![
+        mgr.load_plugin(
+            manifest_with_field(
+                "gamma",
                 "outputStyles",
-                "themes",
-                "workflows",
-                "monitors",
-                "lspServers",
-                "channels",
-                "binaries",
-                "types",
-                "settings",
-                "experimental",
-            ]
+                serde_json::json!("styles/from-file.json"),
+            ),
+            gamma,
         );
+
+        let styles = mgr.plugin_output_styles().expect("styles contribute");
+        assert_eq!(
+            styles,
+            serde_json::json!({
+                "from-file": {"foreground": "green"},
+                "listed": {"name": "listed", "foreground": "blue"},
+                "mapped": {"foreground": "red"},
+            })
+        );
+    }
+
+    /// A later plugin cannot silently replace a name an earlier plugin
+    /// declared: component names merge in plugin-name order, first wins.
+    #[test]
+    fn named_components_refuse_duplicates_in_plugin_name_order() {
+        let mgr = PluginManager::new();
+        load_component(
+            &mgr,
+            Path::new("/plugins"),
+            "zeta",
+            "outputStyles",
+            serde_json::json!({"shared": {"from": "zeta"}}),
+        );
+        load_component(
+            &mgr,
+            Path::new("/plugins"),
+            "alpha",
+            "outputStyles",
+            serde_json::json!({"shared": {"from": "alpha"}}),
+        );
+
+        let log = WarningLog::default();
+        let styles = tracing::subscriber::with_default(log.clone(), || mgr.plugin_output_styles())
+            .expect("the first declaration contributes");
+        assert_eq!(styles, serde_json::json!({"shared": {"from": "alpha"}}));
+        let warnings = log.warnings();
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(
+            warnings[0].contains("zeta") && warnings[0].contains("shared"),
+            "{warnings:?}"
+        );
+    }
+
+    #[test]
+    fn plugin_themes_resolve_paths_and_reject_traversal() {
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = PluginManager::new();
+
+        // Object and array shapes.
+        load_component(
+            &mgr,
+            dir.path(),
+            "mapped",
+            "themes",
+            serde_json::json!({"mapped": {"background": "#fff"}}),
+        );
+        load_component(
+            &mgr,
+            dir.path(),
+            "listed",
+            "themes",
+            serde_json::json!([{"name": "listed", "background": "#eee"}]),
+        );
+
+        // A top-level path resolves against the plugin directory.
+        let path_plugin = dir.path().join("path-themes");
+        std::fs::create_dir_all(path_plugin.join("themes")).unwrap();
+        std::fs::write(
+            path_plugin.join("themes/dark.json"),
+            r##"{"background":"#000"}"##,
+        )
+        .unwrap();
+        mgr.load_plugin(
+            manifest_with_field(
+                "path-themes",
+                "themes",
+                serde_json::json!("themes/dark.json"),
+            ),
+            path_plugin,
+        );
+
+        let escape = dir.path().join("escape");
+        std::fs::create_dir_all(&escape).unwrap();
+        mgr.load_plugin(
+            manifest_with_field("escape", "themes", serde_json::json!("../outside.json")),
+            escape,
+        );
+        let absolute = dir.path().join("absolute");
+        std::fs::create_dir_all(&absolute).unwrap();
+        mgr.load_plugin(
+            manifest_with_field("absolute", "themes", serde_json::json!("/etc/passwd")),
+            absolute,
+        );
+
+        let log = WarningLog::default();
+        let themes = tracing::subscriber::with_default(log.clone(), || mgr.plugin_themes())
+            .expect("the valid themes contribute");
+
+        assert_eq!(
+            themes,
+            serde_json::json!({
+                "dark": {"background": "#000"},
+                "listed": {"name": "listed", "background": "#eee"},
+                "mapped": {"background": "#fff"},
+            })
+        );
+        let warnings = log.warnings();
+        assert!(
+            warnings.iter().any(|warning| warning.contains("escape")),
+            "{warnings:?}"
+        );
+        assert!(
+            warnings.iter().any(|warning| warning.contains("absolute")),
+            "{warnings:?}"
+        );
+    }
+
+    #[test]
+    fn plugin_workflows_resolve_scripts_and_keep_inline_values() {
+        let dir = tempfile::tempdir().unwrap();
+        let plugin = dir.path().join("flows");
+        std::fs::create_dir_all(plugin.join("workflows")).unwrap();
+        std::fs::write(plugin.join("workflows/deploy.js"), "console.log('deploy');").unwrap();
+
+        // A map with an inline value and a path value.
+        let mgr2 = PluginManager::new();
+        mgr2.load_plugin(
+            manifest_with_field(
+                "flows",
+                "workflows",
+                serde_json::json!({
+                    "inline": "console.log('inline');",
+                    "script": "workflows/deploy.js",
+                }),
+            ),
+            plugin.clone(),
+        );
+        // An array entry keeps the entry as written.
+        mgr2.load_plugin(
+            manifest_with_field(
+                "other",
+                "workflows",
+                serde_json::json!([{"name": "listed-flow", "script": "x"}]),
+            ),
+            dir.path().join("other"),
+        );
+
+        let flows = mgr2.plugin_workflows().expect("workflows contribute");
+        assert_eq!(
+            flows,
+            serde_json::json!({
+                "inline": "console.log('inline');",
+                "listed-flow": {"name": "listed-flow", "script": "x"},
+                "script": {
+                    "path": "workflows/deploy.js",
+                    "script": "console.log('deploy');",
+                },
+            })
+        );
+    }
+
+    #[test]
+    fn plugin_monitors_read_paths_and_the_default_file() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let path_plugin = dir.path().join("path-monitor");
+        std::fs::create_dir_all(path_plugin.join("monitors")).unwrap();
+        std::fs::write(
+            path_plugin.join("monitors/watch.js"),
+            "setInterval(() => {}, 1000);",
+        )
+        .unwrap();
+        let mgr = PluginManager::new();
+        mgr.load_plugin(
+            manifest_with_field(
+                "path-monitor",
+                "monitors",
+                serde_json::json!("monitors/watch.js"),
+            ),
+            path_plugin,
+        );
+
+        // Omitting `monitors` falls back to the reference default file.
+        let default_plugin = dir.path().join("default-monitor");
+        std::fs::create_dir_all(default_plugin.join("monitors")).unwrap();
+        std::fs::write(
+            default_plugin.join("monitors/monitors.json"),
+            r#"{"default-monitor":{"script":"watch.js"}}"#,
+        )
+        .unwrap();
+        mgr.load_plugin(
+            manifest_with_field("default-monitor", "hooks", serde_json::json!([])),
+            default_plugin,
+        );
+
+        let monitors = mgr.plugin_monitors().expect("monitors contribute");
+        assert_eq!(
+            monitors,
+            serde_json::json!({
+                "default-monitor": {"script": "watch.js"},
+                "watch": "setInterval(() => {}, 1000);",
+            })
+        );
+    }
+
+    #[test]
+    fn plugin_lsp_servers_accept_maps_arrays_and_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = PluginManager::new();
+
+        load_component(
+            &mgr,
+            dir.path(),
+            "alpha",
+            "lspServers",
+            serde_json::json!({"rust": {"command": "rust-analyzer"}}),
+        );
+        load_component(
+            &mgr,
+            dir.path(),
+            "beta",
+            "lspServers",
+            serde_json::json!([{"name": "typescript", "command": "tsserver"}]),
+        );
+
+        let path_plugin = dir.path().join("gamma");
+        std::fs::create_dir_all(path_plugin.join("lsp")).unwrap();
+        std::fs::write(
+            path_plugin.join("lsp/python.lsp.json"),
+            r#"{"command":"pylsp"}"#,
+        )
+        .unwrap();
+        mgr.load_plugin(
+            manifest_with_field(
+                "gamma",
+                "lspServers",
+                serde_json::json!("lsp/python.lsp.json"),
+            ),
+            path_plugin,
+        );
+
+        let servers = mgr.plugin_lsp_servers().expect("servers contribute");
+        assert_eq!(
+            servers,
+            serde_json::json!({
+                "gamma": {"command": "pylsp"},
+                "rust": {"command": "rust-analyzer"},
+                "typescript": {"name": "typescript", "command": "tsserver"},
+            })
+        );
+    }
+
+    #[test]
+    fn plugin_channels_require_a_server_and_keep_entries_as_written() {
+        let mgr = PluginManager::new();
+        load_component(
+            &mgr,
+            Path::new("/plugins"),
+            "alpha",
+            "channels",
+            serde_json::json!([
+                {"server": "slack", "displayName": "Slack", "userConfig": {"a": 1}},
+                {"displayName": "missing server"},
+            ]),
+        );
+        load_component(
+            &mgr,
+            Path::new("/plugins"),
+            "beta",
+            "channels",
+            serde_json::json!({"chat": {"server": "discord", "displayName": "Discord"}}),
+        );
+
+        let log = WarningLog::default();
+        let channels = tracing::subscriber::with_default(log.clone(), || mgr.plugin_channels())
+            .expect("the valid channels contribute");
+        assert_eq!(
+            channels,
+            serde_json::json!({
+                "chat": {"server": "discord", "displayName": "Discord"},
+                "slack": {
+                    "server": "slack",
+                    "displayName": "Slack",
+                    "userConfig": {"a": 1},
+                },
+            })
+        );
+        assert_eq!(log.warnings().len(), 1, "{:?}", log.warnings());
+    }
+
+    #[test]
+    fn plugin_binaries_require_url_and_a_64_hex_sha256() {
+        let valid = "a".repeat(64);
+        let mgr = PluginManager::new();
+        load_component(
+            &mgr,
+            Path::new("/plugins"),
+            "alpha",
+            "binaries",
+            serde_json::json!({
+                "good": {"url": "https://example.com/good", "sha256": valid},
+                "short-hash": {"url": "https://example.com/x", "sha256": "abc"},
+                "no-url": {"sha256": "b".repeat(64)},
+                "not-an-object": "nope",
+            }),
+        );
+
+        let log = WarningLog::default();
+        let binaries = tracing::subscriber::with_default(log.clone(), || mgr.plugin_binaries())
+            .expect("the valid binary contributes");
+        assert_eq!(
+            binaries,
+            serde_json::json!({
+                "good": {"url": "https://example.com/good", "sha256": valid},
+            })
+        );
+        assert_eq!(log.warnings().len(), 3, "{:?}", log.warnings());
+    }
+
+    #[test]
+    fn plugin_types_validate_relative_dts_paths_and_skip_bad_plugins() {
+        let mgr = PluginManager::new();
+        load_component(
+            &mgr,
+            Path::new("/plugins"),
+            "good-string",
+            "types",
+            serde_json::json!("types/index.d.ts"),
+        );
+        load_component(
+            &mgr,
+            Path::new("/plugins"),
+            "good-object",
+            "types",
+            serde_json::json!({"main": "dist/main.d.ts"}),
+        );
+        load_component(
+            &mgr,
+            Path::new("/plugins"),
+            "good-array",
+            "types",
+            serde_json::json!(["a.d.ts", "nested/b.d.ts"]),
+        );
+        load_component(
+            &mgr,
+            Path::new("/plugins"),
+            "wrong-extension",
+            "types",
+            serde_json::json!("types/index.ts"),
+        );
+        load_component(
+            &mgr,
+            Path::new("/plugins"),
+            "traversal",
+            "types",
+            serde_json::json!("../outside.d.ts"),
+        );
+        load_component(
+            &mgr,
+            Path::new("/plugins"),
+            "absolute",
+            "types",
+            serde_json::json!("/tmp/index.d.ts"),
+        );
+
+        let log = WarningLog::default();
+        let types = tracing::subscriber::with_default(log.clone(), || mgr.plugin_types())
+            .expect("valid declarations contribute");
+        assert_eq!(
+            types,
+            serde_json::json!({
+                "good-array": ["a.d.ts", "nested/b.d.ts"],
+                "good-object": {"main": "dist/main.d.ts"},
+                "good-string": "types/index.d.ts",
+            })
+        );
+        let warnings = log.warnings();
+        assert_eq!(warnings.len(), 3, "{warnings:?}");
+        for plugin in ["wrong-extension", "traversal", "absolute"] {
+            assert!(
+                warnings.iter().any(|warning| warning.contains(plugin)),
+                "no warning named {plugin}: {warnings:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn plugin_experimental_exposes_raw_values_keyed_by_plugin() {
+        let mgr = PluginManager::new();
+        load_component(
+            &mgr,
+            Path::new("/plugins"),
+            "zeta",
+            "experimental",
+            serde_json::json!(true),
+        );
+        load_component(
+            &mgr,
+            Path::new("/plugins"),
+            "alpha",
+            "experimental",
+            serde_json::json!({"themes": true, "evals": ["one"]}),
+        );
+
+        assert_eq!(
+            mgr.plugin_experimental().unwrap(),
+            serde_json::json!({
+                "alpha": {"themes": true, "evals": ["one"]},
+                "zeta": true,
+            })
+        );
+    }
+
+    #[test]
+    fn inactive_plugins_contribute_no_component_sources() {
+        let mgr = PluginManager::new();
+        let manifest: PluginManifest = serde_json::from_value(serde_json::json!({
+            "name": "inactive",
+            "outputStyles": {"style": {}},
+            "themes": {"theme": {}},
+            "workflows": {"flow": "x"},
+            "monitors": {"monitor": "x"},
+            "lspServers": {"lsp": {"command": "x"}},
+            "channels": [{"server": "slack"}],
+            "binaries": {"bin": {"url": "https://example.com/b", "sha256": "a".repeat(64)}},
+            "types": "index.d.ts",
+            "settings": {"key": true},
+            "experimental": {"themes": true},
+        }))
+        .unwrap();
+        mgr.load_plugin(manifest, PathBuf::from("/plugins/inactive"));
+        assert!(mgr.unload_plugin("inactive"));
+
+        assert!(mgr.plugin_settings().is_none());
+        assert!(mgr.plugin_output_styles().is_none());
+        assert!(mgr.plugin_themes().is_none());
+        assert!(mgr.plugin_workflows().is_none());
+        assert!(mgr.plugin_monitors().is_none());
+        assert!(mgr.plugin_lsp_servers().is_none());
+        assert!(mgr.plugin_channels().is_none());
+        assert!(mgr.plugin_binaries().is_none());
+        assert!(mgr.plugin_types().is_none());
+        assert!(mgr.plugin_experimental().is_none());
+    }
+
+    /// Serve one canned HTTP response on a loopback port and return its URL.
+    async fn serve_once(response: Vec<u8>) -> String {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+            let Ok((mut socket, _)) = listener.accept().await else {
+                return;
+            };
+            let mut request = [0u8; 4096];
+            let _ = socket.read(&mut request).await;
+            let _ = socket.write_all(&response).await;
+            let _ = socket.shutdown().await;
+        });
+        format!("http://{address}/binary")
+    }
+
+    fn http_response(status: &str, headers: &str, body: &[u8]) -> Vec<u8> {
+        let mut response = format!(
+            "HTTP/1.1 {status}\r\n{headers}Content-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        )
+        .into_bytes();
+        response.extend_from_slice(body);
+        response
+    }
+
+    async fn plugin_with_binary(dir: &Path, url: &str, sha256: &str) -> PluginManager {
+        let mgr = PluginManager::new();
+        let plugin_dir = dir.join("fetcher");
+        std::fs::create_dir_all(&plugin_dir).unwrap();
+        mgr.load_plugin(
+            manifest_with_field(
+                "fetcher",
+                "binaries",
+                serde_json::json!({"tool": {"url": url, "sha256": sha256}}),
+            ),
+            plugin_dir,
+        );
+        mgr
+    }
+
+    #[tokio::test]
+    async fn fetch_plugin_binaries_downloads_and_verifies() {
+        let body = b"#!/bin/sh\necho hello\n";
+        let url = serve_once(http_response("200 OK", "", body)).await;
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = plugin_with_binary(dir.path(), &url, &sha256_hex(body)).await;
+
+        let paths = mgr.fetch_plugin_binaries("fetcher").await.unwrap();
+        assert_eq!(paths.len(), 1);
+        assert_eq!(paths[0], dir.path().join("fetcher/bin/tool"));
+        assert_eq!(std::fs::read(&paths[0]).unwrap(), body);
+    }
+
+    #[tokio::test]
+    async fn fetch_plugin_binaries_rejects_a_bad_hash_before_writing() {
+        let body = b"payload";
+        let url = serve_once(http_response("200 OK", "", body)).await;
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = plugin_with_binary(dir.path(), &url, &"0".repeat(64)).await;
+
+        let err = mgr.fetch_plugin_binaries("fetcher").await.unwrap_err();
+        assert!(err.contains("SHA-256"), "{err}");
+        assert!(!dir.path().join("fetcher/bin/tool").exists());
+    }
+
+    #[tokio::test]
+    async fn fetch_plugin_binaries_refuses_redirects() {
+        let url = serve_once(http_response(
+            "302 Found",
+            "Location: http://127.0.0.1:1/elsewhere\r\n",
+            b"",
+        ))
+        .await;
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = plugin_with_binary(dir.path(), &url, &"a".repeat(64)).await;
+
+        let err = mgr.fetch_plugin_binaries("fetcher").await.unwrap_err();
+        assert!(err.contains("redirect"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn fetch_plugin_binaries_refuses_non_https_remote_urls() {
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = plugin_with_binary(dir.path(), "http://example.com/tool", &"a".repeat(64)).await;
+
+        let err = mgr.fetch_plugin_binaries("fetcher").await.unwrap_err();
+        assert!(err.contains("non-HTTPS"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn fetch_plugin_binaries_enforces_the_size_limit() {
+        let url = serve_once(
+            b"HTTP/1.1 200 OK\r\nContent-Length: 999999999\r\nConnection: close\r\n\r\n".to_vec(),
+        )
+        .await;
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = plugin_with_binary(dir.path(), &url, &"a".repeat(64)).await;
+
+        let err = mgr.fetch_plugin_binaries("fetcher").await.unwrap_err();
+        assert!(err.contains("larger than"), "{err}");
     }
 
     // ── userConfig injection ─────────────────────────────────────────────

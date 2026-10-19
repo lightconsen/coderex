@@ -5,7 +5,7 @@
 //! config files and switched at runtime.
 
 use ratatui::style::Color;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::mpsc;
 use std::thread;
@@ -440,6 +440,8 @@ pub struct ThemeManager {
     active: Theme,
     /// Available named themes.
     themes: HashMap<String, Theme>,
+    /// Names reserved by built-in themes; plugin registration may not shadow them.
+    builtin_names: HashSet<String>,
     /// Theme directory path.
     theme_dir: Option<PathBuf>,
 }
@@ -459,6 +461,10 @@ impl ThemeManager {
         let light = Theme::light();
         let hc = Theme::high_contrast();
         let tn = Theme::tokyo_night();
+        let builtin_names: HashSet<String> = [&dark, &light, &hc, &tn]
+            .iter()
+            .map(|t| t.name.clone())
+            .collect();
         themes.insert(dark.name.clone(), dark);
         themes.insert(light.name.clone(), light);
         themes.insert(hc.name.clone(), hc);
@@ -467,6 +473,7 @@ impl ThemeManager {
         Self {
             active: Theme::dark(),
             themes,
+            builtin_names,
             theme_dir: None,
         }
     }
@@ -544,6 +551,40 @@ impl ThemeManager {
     /// Register a custom theme.
     pub fn register(&mut self, theme: Theme) {
         self.themes.insert(theme.name.clone(), theme);
+    }
+
+    /// Register a plugin-provided theme from a JSON value under `name`.
+    ///
+    /// The JSON is validated with [`Theme::from_json`]. The registry name is
+    /// authoritative: any `name` field inside `json` is overwritten with
+    /// `name`, so plugins can namespace their themes (for example
+    /// `"github/coral-night"`) without editing the JSON payload.
+    ///
+    /// Built-in theme names are reserved and yield
+    /// `Err("theme '<name>' is built in")`. Registering an existing
+    /// non-built-in name replaces that theme.
+    pub fn register_json(&mut self, name: &str, json: &serde_json::Value) -> Result<(), String> {
+        if self.builtin_names.contains(name) {
+            return Err(format!("theme '{name}' is built in"));
+        }
+        let mut theme = Theme::from_json(&json.to_string())?;
+        theme.name = name.to_string();
+        self.themes.insert(name.to_string(), theme);
+        Ok(())
+    }
+
+    /// Names of all registered themes, sorted alphabetically.
+    #[must_use]
+    pub fn names(&self) -> Vec<String> {
+        let mut names: Vec<String> = self.themes.keys().cloned().collect();
+        names.sort();
+        names
+    }
+
+    /// Whether a theme with the given name is registered.
+    #[must_use]
+    pub fn contains(&self, name: &str) -> bool {
+        self.themes.contains_key(name)
     }
 
     /// Cycle to the next theme.
@@ -729,6 +770,104 @@ mod tests {
         };
         mgr.register(custom);
         assert!(mgr.get_theme("custom").is_some());
+    }
+
+    fn valid_theme_json() -> serde_json::Value {
+        serde_json::json!({
+            "name": "payload-name",
+            "background": "#112233",
+            "foreground": "#eeeeee",
+            "dim": "#666666",
+            "accent": "#abcdef",
+            "accent_secondary": "#00bcd4",
+            "statusbar_bg": "#333333",
+            "statusbar_fg": "#ffffff",
+            "error": "#e74c3c",
+            "warning": "#f39c12",
+            "success": "#2ecc71",
+            "border": "#444444",
+            "selection_bg": "#2a2a4a",
+            "selection_fg": "#ffffff",
+            "input_bg": "#111111",
+            "input_fg": "#eeeeee",
+            "overlay_bg": "#111111",
+            "overlay_border": "#666666",
+            "vim_normal": "#4a9eff",
+            "vim_insert": "#2ecc71",
+            "notif_info": "#4a9eff",
+            "notif_warning": "#f39c12",
+            "notif_error": "#e74c3c"
+        })
+    }
+
+    #[test]
+    fn register_json_registers_plugin_theme_by_name() {
+        let mut mgr = ThemeManager::new();
+        mgr.register_json("plugin/coral", &valid_theme_json())
+            .unwrap();
+
+        assert!(mgr.contains("plugin/coral"));
+        let theme = mgr.get_theme("plugin/coral").unwrap();
+        // The registry name wins over the JSON `name` field.
+        assert_eq!(theme.name, "plugin/coral");
+        // Colors from the plugin payload are preserved.
+        assert_eq!(theme.background, Color::Rgb(0x11, 0x22, 0x33));
+        assert_eq!(theme.accent, Color::Rgb(0xab, 0xcd, 0xef));
+        assert_eq!(theme.error, Color::Rgb(0xe7, 0x4c, 0x3c));
+
+        // Re-registering a non-built-in name replaces it.
+        let mut replacement = valid_theme_json();
+        replacement["background"] = serde_json::json!("#445566");
+        mgr.register_json("plugin/coral", &replacement).unwrap();
+        assert_eq!(
+            mgr.get_theme("plugin/coral").unwrap().background,
+            Color::Rgb(0x44, 0x55, 0x66)
+        );
+    }
+
+    #[test]
+    fn register_json_refuses_builtin_name() {
+        let mut mgr = ThemeManager::new();
+        let err = mgr.register_json("dark", &valid_theme_json()).unwrap_err();
+        assert_eq!(err, "theme 'dark' is built in");
+        // The built-in is untouched.
+        assert_eq!(mgr.get_theme("dark").unwrap().background, Color::Reset);
+    }
+
+    #[test]
+    fn register_json_rejects_invalid_json() {
+        let mut mgr = ThemeManager::new();
+        assert!(
+            mgr.register_json("bad", &serde_json::json!("nope"))
+                .is_err()
+        );
+        assert!(
+            mgr.register_json("bad", &serde_json::json!({"name": "partial"}))
+                .is_err()
+        );
+        assert!(!mgr.contains("bad"));
+    }
+
+    #[test]
+    fn names_are_sorted_and_contains_works() {
+        let mut mgr = ThemeManager::new();
+        mgr.register_json("zzz", &valid_theme_json()).unwrap();
+        mgr.register_json("aaa", &valid_theme_json()).unwrap();
+
+        assert_eq!(
+            mgr.names(),
+            vec![
+                "aaa",
+                "dark",
+                "high-contrast",
+                "light",
+                "tokyo-night",
+                "zzz"
+            ]
+        );
+        assert!(mgr.contains("aaa"));
+        assert!(mgr.contains("tokyo-night"));
+        assert!(!mgr.contains("missing"));
     }
 
     #[test]
