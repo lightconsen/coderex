@@ -1230,9 +1230,6 @@ async fn execute_hook(
         }
     }
 
-    #[cfg(target_os = "windows")]
-    let job = sandbox::prepare_windows_limits(hook);
-
     // A Linux memory limit is also a cgroup: created before spawn, attached
     // immediately after. Kept alive until the child has been waited for.
     #[cfg(target_os = "linux")]
@@ -1242,9 +1239,20 @@ async fn execute_hook(
         .spawn()
         .map_err(|e| HookError::SpawnFailed(e.to_string()))?;
 
+    // Windows finishes the spawn here: attach the AppContainer token, assign
+    // the Job Object and resume the suspended child. This is the same handle
+    // `prepare` used, so there is one job, not two.
     #[cfg(target_os = "windows")]
-    if let Some(job) = &job {
-        sandbox::assign_windows_limits(job, &child);
+    sandbox::finish_windows_spawn(sandbox_handle.as_ref(), &mut child).await?;
+
+    // Windows has no `RLIMIT_FSIZE`; saying nothing would make the accepted
+    // field look enforced.
+    #[cfg(target_os = "windows")]
+    if hook.max_file_size_mb.is_some() {
+        tracing::warn!(
+            "hook `max_file_size_mb` is not enforced on Windows; use the OS sandbox for \
+             file writes"
+        );
     }
 
     #[cfg(target_os = "linux")]

@@ -48,13 +48,12 @@
 //!   (and, from ABI 4, network bind/connect), with the seccomp table and
 //!   rlimits still installed. A gating hook fails closed only when neither
 //!   backend exists.
-//! - **Windows** — shell tools get AppContainer confinement, but the hook
-//!   engine spawns its own child and has no post-spawn step, so it cannot
-//!   attach the AppContainer token. Hook confinement is therefore reported as
-//!   unavailable: a gating hook fails closed unless it opts out, and a
-//!   non-gating one runs with the Job Object resource limits and a warning.
-//!   (An AppContainer child is created suspended; running hooks under it
-//!   without the attach step would leave every hook suspended forever.)
+//! - **Windows** — the hook is created suspended, and [`finish_windows_spawn`]
+//!   attaches the AppContainer token, assigns the Job Object and resumes it.
+//!   Paths, the network and resource limits are the same policy the shell
+//!   tools use; `max_file_size_mb` has no Windows equivalent and is warned
+//!   about. When the AppContainer runtime is missing, `SandboxHandle::create`
+//!   fails and a gating hook is denied.
 
 use crate::engine::HookConfig;
 use crate::events::HookError;
@@ -196,17 +195,11 @@ fn confinement_availability() -> Result<(), String> {
     }
     #[cfg(target_os = "windows")]
     {
-        // The Windows backend can build an AppContainer, but only by suspending
-        // the child, attaching the token after spawn, and resuming. The hook
-        // engine owns its spawn and never calls that post-spawn step, so it
-        // must not be told the hook is confined. Saying so is better than
-        // handing back a Job Object and calling it confinement.
-        Err(
-            "Windows hook confinement cannot be attached in this build: the hook spawn \
-             path has no AppContainer post-spawn step (Windows shell tools do use \
-             AppContainer confinement)"
-                .to_string(),
-        )
+        // The hook engine now finishes its own spawn (`finish_windows_spawn`),
+        // so the AppContainer token attach and job assignment happen on this
+        // path too. Whether the runtime exists is decided by
+        // `SandboxHandle::create`, which fails closed when it does not.
+        Ok(())
     }
     #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
     {
@@ -284,17 +277,27 @@ pub(crate) fn sandbox_config(hook: &HookConfig) -> SandboxConfig {
         }
     }
 
+    // On Unix the hook's own `max_*` fields are installed by
+    // `apply_resource_limits`; leaving these unset avoids two layers
+    // disagreeing about the same limit. Windows has no pre-exec hook, so the
+    // Job Object created from this config is the only place limits can live.
+    #[cfg(target_os = "windows")]
+    let (max_memory_bytes, max_cpu_seconds) = (
+        hook.max_memory_mb
+            .map(|megabytes| megabytes.saturating_mul(1024 * 1024)),
+        hook.max_cpu_seconds,
+    );
+    #[cfg(not(target_os = "windows"))]
+    let (max_memory_bytes, max_cpu_seconds) = (None, None);
+
     SandboxConfig {
         allowed_read_paths: read,
         allowed_write_paths: write,
         allowed_exec_paths: exec,
         additional_working_dirs: vec![workspace],
-        // The hook's own `max_*` fields are installed by
-        // `apply_resource_limits`; leaving these unset avoids two layers
-        // disagreeing about the same limit.
         max_open_files: None,
-        max_memory_bytes: None,
-        max_cpu_seconds: None,
+        max_memory_bytes,
+        max_cpu_seconds,
         allow_network: hook
             .sandbox
             .as_ref()
@@ -314,9 +317,32 @@ pub(crate) fn sandboxed_command(command: &str, sandbox: Option<&SandboxHandle>) 
         return wrapped;
     }
 
-    let mut direct = Command::new("sh");
-    direct.arg("-c").arg(command);
-    direct
+    // Windows has no `sh` and no wrapper program: the confinement comes from
+    // the AppContainer token and the Job Object, not from a command prefix.
+    // `cmd /D` skips AutoRun, `/S` makes the quoting rules predictable, and
+    // `/C` runs the command.
+    #[cfg(target_os = "windows")]
+    {
+        let shell = std::env::var_os("COMSPEC")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| {
+                std::path::PathBuf::from(
+                    std::env::var_os("SystemRoot").unwrap_or_else(|| "C:\\Windows".into()),
+                )
+                .join("System32")
+                .join("cmd.exe")
+            });
+        let mut direct = Command::new(shell);
+        direct.args(["/D", "/S", "/C"]).arg(command);
+        return direct;
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        let mut direct = Command::new("sh");
+        direct.arg("-c").arg(command);
+        direct
+    }
 }
 
 /// The directory a hook runs in: its configured `cwd`, else this process's.
@@ -478,7 +504,7 @@ impl HookSandboxConfig {
 /// macOS attempts `RLIMIT_DATA` as a **best-effort** ceiling and ignores the
 /// kernel's rejection (modern Darwin returns `EINVAL` for every useful finite
 /// value, as it does for `RLIMIT_AS` and `RLIMIT_RSS`). Windows uses a Job
-/// Object through [`coderex_core::sandbox`]; see [`prepare_windows_limits`].
+/// Object through [`coderex_core::sandbox`]; see [`finish_windows_spawn`].
 ///
 /// On Linux a cgroup with `memory.max` is applied after spawn in addition to
 /// these limits — see [`prepare_cgroup_limits`] and [`attach_cgroup_limits`].
@@ -639,67 +665,39 @@ pub(crate) fn attach_cgroup_limits(
     }
 }
 
-/// Build the Job Object that limits a hook on Windows, if any limit is set.
+/// Finish the Windows spawn: attach the AppContainer token, assign the Job
+/// Object, and resume the child.
 ///
-/// This deliberately uses `create_limits_only`: a full sandbox would create an
-/// AppContainer and `prepare` would suspend the child, but the hook engine has
-/// no post-spawn attach/resume step. Limits are all this handle is allowed to
-/// claim.
+/// The handle is the same one `enforce` produced and `prepare` suspended the
+/// child for. There is no second "limits-only" job any more: a process can
+/// only belong to one job without nesting, and creating a second one made the
+/// first assignment lose its limits.
 ///
-/// Returns `None` when nothing is configured or the job cannot be created (a
-/// warning is logged in the latter case): a missing hardening layer should not
-/// make every hook unrunnable. The caller keeps the handle alive until the
-/// child exits and assigns the child with [`assign_windows_limits`].
+/// Any failure terminates the child. A gating hook that cannot be confined is
+/// a refusal, not a hook that runs unconfined.
 #[cfg(target_os = "windows")]
-pub(crate) fn prepare_windows_limits(
-    config: &HookConfig,
-) -> Option<coderex_core::sandbox::SandboxHandle> {
-    if config.max_cpu_seconds.is_none() && config.max_memory_mb.is_none() {
-        return None;
-    }
-
-    let sandbox = coderex_core::sandbox::SandboxHandle::create_limits_only(
-        coderex_core::sandbox::SandboxConfig {
-            allowed_read_paths: Vec::new(),
-            allowed_write_paths: Vec::new(),
-            allowed_exec_paths: Vec::new(),
-            additional_working_dirs: Vec::new(),
-            max_open_files: None,
-            max_memory_bytes: config
-                .max_memory_mb
-                .map(|mb| mb.saturating_mul(1024 * 1024)),
-            max_cpu_seconds: config.max_cpu_seconds,
-            allow_network: true,
-        },
-    );
-
-    match sandbox {
-        Ok(sandbox) => Some(sandbox),
-        Err(error) => {
-            tracing::warn!(%error, "could not create the hook's Job Object; running without limits");
-            None
-        }
-    }
-}
-
-/// Put a spawned hook into its Job Object.
-///
-/// The handle was built with `create_limits_only`, so the child was never
-/// suspended and there is nothing to resume. The `post_spawn_raw` call is the
-/// same entry point the shell tools use; with no AppContainer in the handle it
-/// assigns the job and returns.
-#[cfg(target_os = "windows")]
-pub(crate) fn assign_windows_limits(
-    sandbox: &coderex_core::sandbox::SandboxHandle,
-    child: &tokio::process::Child,
-) {
+pub(crate) async fn finish_windows_spawn(
+    sandbox: Option<&coderex_core::sandbox::SandboxHandle>,
+    child: &mut tokio::process::Child,
+) -> Result<(), crate::HookError> {
+    let Some(sandbox) = sandbox else {
+        return Ok(());
+    };
     let Some(handle) = child.raw_handle() else {
-        tracing::warn!("the spawned hook has no process handle; Job Object limits are not applied");
-        return;
+        let _ = child.start_kill();
+        return Err(crate::HookError::SandboxUnavailable(
+            "the spawned hook has no process handle, so the AppContainer token and Job \
+             Object could not be attached"
+                .to_string(),
+        ));
     };
     if let Err(error) = sandbox.post_spawn_raw(handle) {
-        tracing::warn!(%error, "could not assign the hook to its Job Object");
+        let _ = child.start_kill();
+        return Err(crate::HookError::SandboxUnavailable(format!(
+            "could not attach the hook to its sandbox: {error}"
+        )));
     }
+    Ok(())
 }
 
 #[cfg(all(test, unix))]
@@ -874,6 +872,7 @@ mod policy_tests {
         }
     }
 
+    #[cfg(unix)]
     fn unique_dir(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!(
             "coderex-hook-sandbox-{name}-{}",
@@ -1295,22 +1294,66 @@ mod policy_tests {
         );
     }
 
-    /// The hook spawn path cannot attach the Windows AppContainer token, so a
-    /// gating hook fails closed unless it opts out; off a gate it runs with the
-    /// Job Object's resource limits and a warning.
+    /// A gating hook runs under the AppContainer, and its write confinement is
+    /// real: the workspace is writable, a sibling outside the policy is not.
     #[cfg(target_os = "windows")]
     #[tokio::test]
-    async fn windows_hooks_fail_closed_only_on_a_gate() {
-        let error = run_hook(hook_config())
-            .await
-            .expect_err("a gating hook must not run unconfined");
-        assert!(
-            matches!(error, HookError::SandboxUnavailable(_)),
-            "{error:?}"
+    async fn windows_hook_sandbox_confines_a_write() {
+        if !coderex_core::sandbox::app_container_available() {
+            assert!(
+                std::env::var("CODEREX_REQUIRE_APP_CONTAINER").as_deref() != Ok("1"),
+                "AppContainer is unavailable on this runner but \
+                 CODEREX_REQUIRE_APP_CONTAINER=1"
+            );
+            // The refusal is the contract when the runtime is missing.
+            let error = run_hook(hook_config())
+                .await
+                .expect_err("a gating hook must not run unconfined");
+            assert!(
+                matches!(error, HookError::SandboxUnavailable(_)),
+                "{error:?}"
+            );
+            return;
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let allowed = dir.path().join("workspace");
+        let denied = dir.path().join("outside");
+        std::fs::create_dir_all(&allowed).unwrap();
+        std::fs::create_dir_all(&denied).unwrap();
+
+        let mut config = hook_config();
+        config.cwd = Some(allowed.clone());
+        config.command = format!(
+            "echo ok> \"{}\" & echo bad> \"{}\"",
+            allowed.join("inside.txt").display(),
+            denied.join("outside.txt").display()
         );
 
-        let mut off_gate = hook_config();
-        off_gate.event = "PostToolUse".to_string();
-        assert!(run_hook(off_gate).await.is_ok());
+        let result = tokio::time::timeout(std::time::Duration::from_secs(20), run_hook(config))
+            .await
+            .expect("the hook never finished; was the suspended child resumed?");
+        assert!(result.is_ok(), "{result:?}");
+        assert!(
+            allowed.join("inside.txt").exists(),
+            "the hook could not write in its workspace"
+        );
+        assert!(
+            !denied.join("outside.txt").exists(),
+            "the hook wrote outside its policy"
+        );
+    }
+
+    /// The hook limits live in the sandbox config on Windows, because there is
+    /// no `pre_exec` to install rlimits.
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_hook_limits_are_in_the_sandbox_config() {
+        let mut config = hook_config();
+        config.max_cpu_seconds = Some(5);
+        config.max_memory_mb = Some(64);
+        let sandbox = sandbox_config(&config);
+        assert_eq!(sandbox.max_cpu_seconds, Some(5));
+        assert_eq!(sandbox.max_memory_bytes, Some(64 * 1024 * 1024));
     }
 }
