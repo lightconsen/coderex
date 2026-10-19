@@ -89,23 +89,48 @@ jobs:
   test-windows:
     name: Test (Windows runtime)
     runs-on: windows-latest
+    timeout-minutes: 45
     continue-on-error: true
+    env:
+      CODEREX_REQUIRE_APP_CONTAINER: '1'
+      CODEREX_REQUIRE_HKLM_TESTS: '1'
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - name: Core sandbox tests (AppContainer)
-        run: cargo test --no-fail-fast -p coderex-core sandbox -- --nocapture
+        timeout-minutes: 20
+        run: cargo test --no-fail-fast -p coderex-core --lib sandbox -- --nocapture
+      - name: Process tree tests (Job Objects)
+        if: always()
+        timeout-minutes: 10
+        run: cargo test --no-fail-fast -p coderex-core --lib process_tree -- --nocapture
       - name: Tools shell sandbox tests
         if: always()
+        timeout-minutes: 15
         run: cargo test --no-fail-fast -p coderex-tools sandbox -- --nocapture
       - name: Hooks sandbox tests
         if: always()
+        timeout-minutes: 10
         run: cargo test --no-fail-fast -p coderex-hooks sandbox -- --nocapture
+      - name: MCP sandbox tests
+        if: always()
+        timeout-minutes: 15
+        run: cargo test --no-fail-fast -p coderex-mcp --lib windows_ -- --nocapture
+      - name: Bridge cleanup tests
+        if: always()
+        timeout-minutes: 10
+        run: cargo test --no-fail-fast -p coderex-bridge archive -- --nocapture
+      - name: WASM compiler sandbox tests
+        if: always()
+        timeout-minutes: 20
+        run: cargo test --no-fail-fast -p coderex-plugins --test wasm_compile_subprocess -- --nocapture
       - name: Config tests (Windows registry path)
         if: always()
+        timeout-minutes: 10
         run: cargo test --no-fail-fast -p coderex-config -- --nocapture
       - name: CLI library tests
         if: always()
+        timeout-minutes: 20
         run: cargo test --no-fail-fast -p coderex-cli --lib -- --nocapture
 
   code-agent-benchmark:
