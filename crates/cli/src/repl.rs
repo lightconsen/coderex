@@ -8403,6 +8403,10 @@ mod tests {
         let marker = temp.path().join("hook-ran");
         let hooks = serde_json::json!([{
             "event": "UserPromptSubmit",
+            // The hook's sandbox workspace is its configured `cwd`; without
+            // one it is this process's directory, and the marker in the temp
+            // directory would be outside the policy on Windows.
+            "cwd": temp.path().to_string_lossy(),
             // The hook engine runs hooks through `sh -c` on Unix and
             // `cmd /C` on Windows, so the command has to be written for one.
             "command": platform_hook_command(
@@ -8531,6 +8535,7 @@ mod tests {
         let seen = temp.path().join("seen.json");
         let hooks = serde_json::json!([{
             "event": "UserPromptSubmit",
+            "cwd": temp.path().to_string_lossy(),
             "command": platform_hook_command(
                 &format!("cat > {}; echo '{{}}'", seen.display()),
                 &format!("more > \"{}\" & echo {{}}", seen.display()),

@@ -242,7 +242,11 @@ fn slow_helper_is_killed_with_no_orphan_tree() {
     let cache = tempfile::tempdir().unwrap();
     let child_pid_file = dir.path().join("child.pid");
 
-    set_env(TIMEOUT_ENV, "300");
+    // An AppContainer start plus wasmtime initialisation can take longer than
+    // the Unix 300 ms budget, which would kill the helper before its test hook
+    // records the descendant's pid. Three seconds is still well under the
+    // "prompt kill" assertion below.
+    set_env(TIMEOUT_ENV, "3000");
     set_env(SLEEP_ENV, "30000");
     set_env(CHILD_PID_ENV, &child_pid_file);
 
