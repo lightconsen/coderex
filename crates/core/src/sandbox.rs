@@ -3537,8 +3537,8 @@ mod tests {
         // "the policy path is wrong": `%TEMP%` points at the sandbox's private
         // directory, which it definitely granted.
         let script = format!(
-            "echo TEMP=%TEMP% & echo probe> \"%TEMP%\\coderex-probe.txt\" & \
-             echo inside> \"{}\" & echo outside> \"{}\"",
+            "echo TEMP=%TEMP% & echo probe> %TEMP%\\coderex-probe.txt & \
+             echo inside> {} & echo outside> {}",
             inside.display(),
             outside.display()
         );

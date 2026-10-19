@@ -1675,7 +1675,7 @@ mod tests {
                 std::env::var_os("SystemRoot").unwrap_or_else(|| OsString::from(r"C:\Windows"));
             let cmd = PathBuf::from(system_root).join("System32").join("cmd.exe");
             let script = format!(
-                "echo inside> \"{}\" & echo outside> \"{}\"",
+                "echo inside> {} & echo outside> {}",
                 allowed.join("inside.txt").display(),
                 denied.join("outside.txt").display()
             );

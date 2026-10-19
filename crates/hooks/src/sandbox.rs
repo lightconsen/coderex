@@ -323,6 +323,8 @@ pub(crate) fn sandboxed_command(command: &str, sandbox: Option<&SandboxHandle>) 
     // `/C` runs the command.
     #[cfg(target_os = "windows")]
     {
+        use std::os::windows::process::CommandExt as _;
+
         let shell = std::env::var_os("COMSPEC")
             .map(std::path::PathBuf::from)
             .unwrap_or_else(|| {
@@ -333,7 +335,13 @@ pub(crate) fn sandboxed_command(command: &str, sandbox: Option<&SandboxHandle>) 
                 .join("cmd.exe")
             });
         let mut direct = Command::new(shell);
-        direct.args(["/D", "/S", "/C"]).arg(command);
+        direct.args(["/D", "/S", "/C"]);
+        // `raw_arg`, not `arg`: Rust would quote the command and escape its
+        // inner quotes with backslashes, which cmd does not understand — a
+        // command containing `"C:\path with space\file"` then fails with
+        // "The filename, directory name, or volume label syntax is incorrect".
+        // cmd must receive the command text verbatim and parse it itself.
+        direct.as_std_mut().raw_arg(command);
         return direct;
     }
 

@@ -1067,8 +1067,11 @@ mod tests {
         std::fs::create_dir_all(&allowed).unwrap();
         std::fs::create_dir_all(&denied).unwrap();
 
+        // No inner quotes: the command is a single argv entry, and an
+        // escaped quote (`\"`) is literal to cmd. These paths contain no
+        // spaces, so plain names are valid.
         let script = format!(
-            "echo inside> \"{}\" & echo outside> \"{}\"",
+            "echo inside> {} & echo outside> {}",
             allowed.join("inside.txt").display(),
             denied.join("outside.txt").display()
         );

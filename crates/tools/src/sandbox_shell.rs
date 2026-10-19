@@ -259,13 +259,11 @@ mod tests {
         let child = cmd.spawn().expect("the shell should spawn");
         finish_spawn(handle.as_ref(), &child)
             .expect("the sandbox must finish the spawn before the child runs");
-        let output = tokio::time::timeout(
-            std::time::Duration::from_secs(20),
-            child.wait_with_output(),
-        )
-        .await
-        .expect("the shell never exited; finish_spawn may not have resumed it")
-        .expect("waiting for the shell failed");
+        let output =
+            tokio::time::timeout(std::time::Duration::from_secs(20), child.wait_with_output())
+                .await
+                .expect("the shell never exited; finish_spawn may not have resumed it")
+                .expect("waiting for the shell failed");
 
         let stdout = String::from_utf8_lossy(&output.stdout);
         assert!(
