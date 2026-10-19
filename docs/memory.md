@@ -62,7 +62,7 @@ directory the user opened.
 | Team memories | JSON files | `<cwd>/.coderex/memory/team/{topic}.json`, or `{org}/{topic}.json` when org-scoped |
 | Dream state | JSON | `<cwd>/.coderex/memory/.dream_state.json` |
 | Dream artifacts | Markdown | `<cwd>/.coderex/memory/dreams/{timestamp}.md` |
-| Session index | SQLite + FTS5 + TF-IDF | not wired into the CLI; `SessionIndex` is opened by the caller, and `coderex-config`'s `DataDirectories::sessions_db_path` is unused |
+| Session index | SQLite + FTS5 + TF-IDF | `<cwd>/.coderex/sessions.db`; `session_resume::index_saved_session` writes it after transcript/snapshot persistence, and `search_sessions`/`list_recent_sessions` read it (with a transcript fallback). The exact `repl.rs` call sites are documented in `session_resume.rs`. |
 
 The store roots are assembled in `crates/cli/src/repl.rs` (`memory_base` =
 `<cwd>/.coderex/memory`, then `session/`, `long_term/`, `team/`); the transcript
@@ -187,7 +187,27 @@ AES-256-GCM with per-session keys, files use `.jsonl.enc` extension, each line i
 - **`SessionMeta`** — Session metadata (id, project_path, ai_title, tag, pr_url, cost, tokens).
 - **`SessionIndexError`** — Error type for database operations.
 
-Key methods: `open`, `create`, `update_last_active`, `update_cost_and_tokens`, `list_recent`, `list_by_project`, `get`, `search` (FTS5), `index_content` (TF-IDF), `search_semantic` (TF-IDF cosine similarity).
+Key methods: `open`, `create`, `upsert_with_content` (atomic create-or-update plus
+FTS content), `update_last_active`, `update_cost_and_tokens`, `list_recent`,
+`list_by_project`, `get`, `search` (FTS5), `index_content` (TF-IDF),
+`search_semantic` (TF-IDF cosine similarity).
+
+**CLI wiring surface.** `crates/cli/src/session_resume.rs` opens the workspace
+index via `DataDirectories::new(<cwd>/.coderex).sessions_db_path()` and exposes
+(the REPL call sites are documented in the module header):
+
+- `index_saved_session(cwd, session_id, title, messages)` — called after
+  transcript and interactive-snapshot persistence; formats message text into the
+  FTS entry and upserts atomically, so re-indexing updates rather than duplicates.
+- `search_sessions(cwd, query, limit)` — FTS first, then a case-insensitive
+  substring scan of `<cwd>/.coderex/transcripts/*.jsonl` for sessions the index
+  does not know about.
+- `list_recent_sessions(cwd, limit)` — merges index rows with transcript-only
+  sessions, newest first.
+
+Both read paths log a warning and fall back to transcripts when the database is
+corrupt or locked; transcripts remain the source of truth for `/resume`, and the
+index is an accelerator and search surface.
 
 ### Long-Term Store (`long_term.rs`)
 
@@ -401,7 +421,8 @@ Thread-safety (concurrent stores) and TF-IDF semantic search are always enabled 
 - Transcript append, read, entry-typed read, skip_first_prompt, corruption handling, compact boundaries.
 - Session-id sanitization on every transcript method.
 - Transcript prune (archive to gzip + delete), backup/restore roundtrip.
-- Session index: create, get, list (recent, by project), FTS5 search, TF-IDF semantic search.
+- Session index: create, atomic create-or-update with content, get, list (recent, by project), FTS5 search, TF-IDF semantic search.
+- Session index CLI surface: `index_saved_session` after persistence, and `search_sessions` / `list_recent_sessions` for `/resume` search with transcript fallback; exact `repl.rs` call sites are documented in `session_resume.rs`.
 - Long-term memory: flat topics, hierarchical keys, prefix reads, case-insensitive search, sorted by access_count, `version` on every entry.
 - Session facts: in-memory storage with persist/load, category filtering.
 - Team memory: upsert, delete (tombstone), list, checksum-based delta sync, org-scoped isolation, relay-based testing.
@@ -421,8 +442,14 @@ Thread-safety (concurrent stores) and TF-IDF semantic search are always enabled 
   (`CODEREX_ORG_ID`, else `org_id` in the orchestrator's
   `remote_settings_cache.json`); without one, `org` reports `StoreUnavailable`
   instead of silently resolving to another store.
-- **`SessionIndex` is unused outside this crate.** Nothing opens `sessions.db`; the
-  SQLite index is built and tested but no caller constructs it, deliberately.
-- **`DataDirectories` (`coderex-config`) is unused.** `project_dir`,
-  `sessions_db_path` and `ensure_all` describe a home-directory layout that nothing
-  adopts, since the workspace-local layout above is what the CLI uses.
+- **`SessionIndex` is exposed as an accelerator, not a source of truth.**
+  `session_resume` owns the write (`index_saved_session`) and read
+  (`search_sessions` / `list_recent_sessions`) surface. The REPL indexes after
+  each persisted turn (`persist_interactive_snapshot`) and `/resume` resolves a
+  title fragment through the index (an ambiguous fragment lists candidates).
+  Exact-id resume still reads the transcript, and every index read tolerates a
+  corrupt or locked database by warning and scanning transcripts.
+- **`DataDirectories` (`coderex-config`) is only partly adopted.**
+  `sessions_db_path` is used for the workspace-local `<cwd>/.coderex/sessions.db`
+  by rooting a `DataDirectories` at `<cwd>/.coderex`; `project_dir` and
+  `ensure_all` still describe a home-directory layout that nothing uses.

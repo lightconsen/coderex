@@ -84,12 +84,41 @@ impl SessionIndex {
     }
 
     /// Create or update a session entry.
+    ///
+    /// Re-indexing an existing `session_id` updates the row (including the
+    /// full-text entry) instead of duplicating it. The update is atomic.
     pub fn create(&self, meta: &SessionMeta) -> Result<(), SessionIndexError> {
-        self.conn.execute(
-            "INSERT OR REPLACE INTO sessions (
+        self.upsert_with_content(meta, None)
+    }
+
+    /// Create or update a session entry atomically, with searchable content.
+    ///
+    /// The row keeps its original `created_at` when the session already
+    /// exists, while `last_active_at` and the metadata are replaced. The
+    /// optional `content` (typically the transcript text) joins the title and
+    /// tag in the FTS entry, so [`SessionIndex::search`] matches message
+    /// content as well as metadata. The metadata row and its FTS entry are
+    /// written in one transaction, so a re-index cannot leave the two out of
+    /// step.
+    pub fn upsert_with_content(
+        &self,
+        meta: &SessionMeta,
+        content: Option<&str>,
+    ) -> Result<(), SessionIndexError> {
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute(
+            "INSERT INTO sessions (
                 session_id, project_path, ai_title, tag, pr_url,
                 created_at, last_active_at, total_cost_usd, total_tokens
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+            ON CONFLICT(session_id) DO UPDATE SET
+                project_path = excluded.project_path,
+                ai_title = excluded.ai_title,
+                tag = excluded.tag,
+                pr_url = excluded.pr_url,
+                last_active_at = excluded.last_active_at,
+                total_cost_usd = excluded.total_cost_usd,
+                total_tokens = excluded.total_tokens",
             params![
                 meta.session_id,
                 meta.project_path,
@@ -102,7 +131,21 @@ impl SessionIndex {
                 meta.total_tokens,
             ],
         )?;
-        self.update_fts(meta)?;
+
+        tx.execute(
+            "DELETE FROM session_fts WHERE session_id = ?1",
+            [meta.session_id.as_str()],
+        )?;
+
+        let combined = searchable_text(meta, content);
+        if !combined.is_empty() {
+            tx.execute(
+                "INSERT INTO session_fts (session_id, content) VALUES (?1, ?2)",
+                [meta.session_id.as_str(), combined.as_str()],
+            )?;
+        }
+
+        tx.commit()?;
         Ok(())
     }
 
@@ -182,28 +225,6 @@ impl SessionIndex {
         )?;
         let rows = stmt.query_map(params![search_term, limit], row_to_meta)?;
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
-    }
-
-    /// Update the FTS index for a session.
-    fn update_fts(&self, meta: &SessionMeta) -> Result<(), SessionIndexError> {
-        let title = meta.ai_title.as_deref().unwrap_or("");
-        let tag = meta.tag.as_deref().unwrap_or("");
-        let combined = format!("{title} {tag}").trim().to_string();
-
-        // Delete old entry if exists
-        let _ = self.conn.execute(
-            "DELETE FROM session_fts WHERE session_id = ?1",
-            [meta.session_id.as_str()],
-        );
-
-        // Insert new entry (skip if no searchable content)
-        if !combined.is_empty() {
-            self.conn.execute(
-                "INSERT INTO session_fts (session_id, content) VALUES (?1, ?2)",
-                [meta.session_id.as_str(), combined.as_str()],
-            )?;
-        }
-        Ok(())
     }
 
     // ─── TF-IDF semantic search ─────────────────────────────────────────────
@@ -355,6 +376,25 @@ impl SessionIndex {
         results.truncate(limit);
         Ok(results)
     }
+}
+
+/// Combine the metadata and optional content into one FTS document.
+fn searchable_text(meta: &SessionMeta, content: Option<&str>) -> String {
+    let mut parts: Vec<&str> = Vec::new();
+    if let Some(title) = meta
+        .ai_title
+        .as_deref()
+        .filter(|title| !title.trim().is_empty())
+    {
+        parts.push(title);
+    }
+    if let Some(tag) = meta.tag.as_deref().filter(|tag| !tag.trim().is_empty()) {
+        parts.push(tag);
+    }
+    if let Some(content) = content.filter(|content| !content.trim().is_empty()) {
+        parts.push(content);
+    }
+    parts.join(" ").trim().to_string()
 }
 
 /// Tokenize text into lowercase alphanumeric tokens.
