@@ -119,8 +119,12 @@ impl ProcessTree {
         self.inner.attach_raw(handle)
     }
 
-    /// Put an already-running process into this tree by pid.
-    #[cfg(target_os = "windows")]
+    /// Put a just-spawned process into this tree by pid.
+    ///
+    /// This is the form `tokio::process` callers need: they do not have a
+    /// `std::process::Child`, only a pid. On Windows the process must have
+    /// been created by a [`Self::prepare`]d command: it is still suspended,
+    /// and this call assigns it to the job and resumes it.
     pub fn attach_pid(&self, pid: u32) -> io::Result<()> {
         self.inner.attach_pid(pid)
     }
@@ -165,18 +169,22 @@ mod imp {
     #[derive(Debug)]
     pub(super) struct Inner {
         target: Mutex<Target>,
+        /// Set by `prepare`; `attach_pid` then knows the pid leads a group.
+        prepared: std::sync::atomic::AtomicBool,
     }
 
     impl Inner {
         pub(super) fn create(_limits: JobLimits) -> io::Result<Self> {
             Ok(Self {
                 target: Mutex::new(Target::None),
+                prepared: std::sync::atomic::AtomicBool::new(false),
             })
         }
 
         pub(super) fn from_pid(pid: u32) -> Self {
             Self {
                 target: Mutex::new(Target::Pid(pid)),
+                prepared: std::sync::atomic::AtomicBool::new(false),
             }
         }
 
@@ -184,10 +192,20 @@ mod imp {
             // `process_group(0)` makes the child its own group leader, so
             // `kill(-pid, …)` names exactly the tree it started.
             cmd.process_group(0);
+            self.prepared
+                .store(true, std::sync::atomic::Ordering::SeqCst);
         }
 
         pub(super) fn attach(&self, child: &std::process::Child) -> io::Result<()> {
-            *lock(&self.target) = Target::Group(child.id());
+            self.attach_pid(child.id())
+        }
+
+        pub(super) fn attach_pid(&self, pid: u32) -> io::Result<()> {
+            *lock(&self.target) = if self.prepared.load(std::sync::atomic::Ordering::SeqCst) {
+                Target::Group(pid)
+            } else {
+                Target::Pid(pid)
+            };
             Ok(())
         }
 
@@ -236,22 +254,23 @@ mod imp {
     use super::JobLimits;
     use std::io;
     use std::os::windows::io::{AsRawHandle, RawHandle};
+    use std::os::windows::process::CommandExt;
     use std::process::Command;
     use std::sync::atomic::{AtomicBool, Ordering};
     use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
     use windows_sys::Win32::System::JobObjects::{
-        AssignProcessToJobObject, CreateJobObjectW, JobObjectBasicAccountingInformation,
-        JobObjectBasicUIRestrictions, JobObjectExtendedLimitInformation,
-        QueryInformationJobObject, SetInformationJobObject, TerminateJobObject,
+        AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_JOB_MEMORY,
+        JOB_OBJECT_LIMIT_JOB_TIME, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, JOB_OBJECT_UILIMIT_DESKTOP,
+        JOB_OBJECT_UILIMIT_EXITWINDOWS, JOB_OBJECT_UILIMIT_GLOBALATOMS, JOB_OBJECT_UILIMIT_HANDLES,
+        JOB_OBJECT_UILIMIT_READCLIPBOARD, JOB_OBJECT_UILIMIT_WRITECLIPBOARD,
         JOBOBJECT_BASIC_ACCOUNTING_INFORMATION, JOBOBJECT_BASIC_LIMIT_INFORMATION,
         JOBOBJECT_BASIC_UI_RESTRICTIONS, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
-        JOB_OBJECT_LIMIT_JOB_MEMORY, JOB_OBJECT_LIMIT_JOB_TIME, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
-        JOB_OBJECT_UILIMIT_DESKTOP, JOB_OBJECT_UILIMIT_EXITWINDOWS, JOB_OBJECT_UILIMIT_GLOBALATOMS,
-        JOB_OBJECT_UILIMIT_HANDLES, JOB_OBJECT_UILIMIT_READCLIPBOARD, JOB_OBJECT_UILIMIT_WRITECLIPBOARD,
+        JobObjectBasicAccountingInformation, JobObjectBasicUIRestrictions,
+        JobObjectExtendedLimitInformation, QueryInformationJobObject, SetInformationJobObject,
+        TerminateJobObject,
     };
-    use std::os::windows::process::CommandExt;
     use windows_sys::Win32::System::Threading::{
-        OpenProcess, CREATE_SUSPENDED, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SET_QUOTA,
+        CREATE_SUSPENDED, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SET_QUOTA,
         PROCESS_TERMINATE,
     };
 
@@ -365,10 +384,7 @@ mod imp {
                 if ok == 0 {
                     // Not fatal: the UI restrictions are hygiene, not the
                     // boundary. The job limits above are already in force.
-                    tracing::warn!(
-                        "job UI restrictions failed: {}",
-                        io::Error::last_os_error()
-                    );
+                    tracing::warn!("job UI restrictions failed: {}", io::Error::last_os_error());
                 }
             }
             Ok(())
@@ -425,17 +441,24 @@ mod imp {
             }
             // SAFETY: `process` is a live handle we own.
             let ok = unsafe { AssignProcessToJobObject(self.job, process) };
-            let error = if ok == 0 {
-                Some(io::Error::last_os_error())
+            let result = if ok == 0 {
+                Err(io::Error::last_os_error())
+            } else if self.suspended.swap(false, Ordering::SeqCst) {
+                // SAFETY: the process was created suspended by `prepare`.
+                let status = unsafe { NtResumeProcess(process) };
+                if status < 0 {
+                    Err(io::Error::other(format!(
+                        "NtResumeProcess failed: 0x{status:08X}"
+                    )))
+                } else {
+                    Ok(())
+                }
             } else {
-                None
+                Ok(())
             };
             // SAFETY: this is the only owner of the process handle.
             unsafe { CloseHandle(process) };
-            match error {
-                Some(error) => Err(error),
-                None => Ok(()),
-            }
+            result
         }
 
         pub(super) fn terminate(&self) -> bool {
@@ -551,6 +574,10 @@ mod imp {
         pub(super) fn prepare(&self, _cmd: &mut Command) {}
 
         pub(super) fn attach(&self, _child: &std::process::Child) -> io::Result<()> {
+            Ok(())
+        }
+
+        pub(super) fn attach_pid(&self, _pid: u32) -> io::Result<()> {
             Ok(())
         }
 
