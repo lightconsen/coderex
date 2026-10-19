@@ -307,8 +307,10 @@ The manifest is parsed with `deny_unknown_fields`: a field that is not in the ta
 | `min_version`, `commands`, `skills`, `dependencies`, `signature`, `runtime`, `entrypoint`, `env` | ✅ acted on | CodeRex execution fields (pre-existing). |
 | `userConfig` | ✅ implemented | See "userConfig injection". |
 | `hooks` | ✅ implemented | Active plugins contribute their hooks to the `Plugin` tier. The value may be a bare array or `{"hooks":[...]}`; `PluginManager::plugin_hooks()` merges them in plugin-name order and logs malformed values. |
-| `agents`, `outputStyles`, `themes`, `workflows`, `monitors` | 🟡 accepted, not implemented | No CodeRex counterpart yet. |
-| `mcpServers`, `lspServers`, `channels` | 🟡 accepted, not implemented | CodeRex's MCP servers are configured in settings; plugins cannot start their own. |
+| `agents` | ✅ implemented | Active plugins contribute definitions through `PluginManager::plugin_agents()`; the REPL registers them as custom agents. |
+| `outputStyles`, `themes`, `workflows`, `monitors` | 🟡 accepted, not implemented | No CodeRex counterpart yet. |
+| `mcpServers` | ✅ implemented | Active plugins contribute `{"mcpServers": {...}}` through `PluginManager::plugin_mcp_servers()`; the orchestrator loads them before `.mcp.json` (project file wins on name clashes). |
+| `lspServers`, `channels` | 🟡 accepted, not implemented | No CodeRex counterpart yet. |
 | `binaries`, `types`, `settings`, `experimental` | 🟡 accepted, not implemented | `binaries` carries per-binary SHA-256 pins in Claude; CodeRex pins archives and commits instead (see "Pinning"). |
 
 Accepted-but-unimplemented fields are listed by `PluginManifest::unimplemented_fields()` and logged as a warning when the plugin loads, so "it parsed but does nothing" is visible rather than silent.
@@ -474,7 +476,7 @@ During REPL construction:
 - Dependency resolution: topological sort with cycle detection via Kahn's algorithm.
 - Error recovery: `retry_failed_plugins()` attempts to re-read manifests for Error-state plugins up to `max_retries`.
 - Reconciliation: detect new, updated, removed plugins.
-- Auto-install new plugins from marketplace: `MarketplaceReconciler::with_auto_install()` exists and is unit-tested, but production reconciliation runs with `auto_install = false`; there is no CLI wiring for it yet.
+- Auto-install new plugins from marketplace: opt-in with `CODEREX_PLUGIN_AUTO_INSTALL=1`; off by default (installing third-party code is a user decision). Signature/pin checks still apply.
 - Skill loading from all 5 sources with conflict resolution.
 - Skill frontmatter parsing via `serde_yaml` with custom scalar/array deserializers.
 - Repo-specific skills from `.coderex/skills/`.
@@ -488,6 +490,7 @@ During REPL construction:
 
 ### Known Gaps
 
+- Accepted-but-inert components are now 10: `outputStyles`, `themes`, `workflows`, `monitors`, `lspServers`, `channels`, `binaries`, `types`, `settings`, `experimental`.
 - No keychain access in this crate, so sensitive options are host-supplied or environment-supplied; nothing prompts the user or writes answers back to settings (see "userConfig Injection").
 - `options`/`min`/`max`/`type` in `userConfig` are parsed and ignored: no validation.
 - Pin files are created by the first install; a user cannot pre-seed a pin before installing.

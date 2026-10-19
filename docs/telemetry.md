@@ -15,7 +15,7 @@ Privacy-first telemetry collection, local storage, and batch upload. Stores even
 ### Key Types (store.rs)
 
 - **`TelemetryStore`** — SQLite connection wrapper with schema management, size-based retention, and DB size queries.
-- **`TelemetryEvent`** — Enum: SessionStart, ToolUsed, ApiCall, Error (with chrono timestamps).
+- **`TelemetryEvent`** — Enum: SessionStart, ToolUsed, ApiCall, Error (with chrono timestamps). The CLI records `session_start`/`session_end` in the orchestrator, `tool_used` when a tool call ends, and `api_call`/`error` at the end of each turn.
 - **`PendingEvent` / `PendingCrash`** — Rows pending upload.
 
 ### Key Types (uploader.rs)

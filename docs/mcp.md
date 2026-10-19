@@ -29,7 +29,7 @@ Model Context Protocol (MCP) support — enables CodeRex to act as an MCP client
 
 Public names are `mcp__<server>__<tool>`, which is load-bearing: two servers may expose the same raw tool name, and the prefix is what keeps them apart. Setting `CLAUDE_AGENT_SDK_MCP_NO_PREFIX` (to anything but `0`/`false`) addresses tools by their raw server-side name instead — the raw name is what the server expects in `tools/call` either way.
 
-Without the prefix a shared raw name cannot address both servers, so the second registration is **refused** rather than allowed to take the name over (which would route its calls to the other server). The refusal is logged and recorded by `McpToolRegistry::conflicts()` (a programmatic accessor; there is no CLI surface for it yet); turn the prefix back on to reach that tool. `McpToolInfo::prefixed_name()` always gives the unambiguous spelling.
+Without the prefix a shared raw name cannot address both servers, so the second registration is **refused** rather than allowed to take the name over (which would route its calls to the other server). The refusal is logged and recorded by `McpToolRegistry::conflicts()` and surfaced by `/mcp` alongside the server list; turn the prefix back on to reach that tool. `McpToolInfo::prefixed_name()` always gives the unambiguous spelling.
 
 ### Hooked Into CLI
 
@@ -82,7 +82,7 @@ Without the prefix a shared raw name cannot address both servers, so the second 
 - **Servers without refresh tokens cannot be kept alive silently.** A server that hands back an access token with no refresh token cannot be refreshed by `OAuthManager`. On the next `401 invalid_token` the manager invokes the installed `ReauthHandler` once: an interactive CLI runs the authorization-code/PKCE flow again, while a headless run can only print the authorization URL and instructions and then surface `ReauthRequired`. Nothing retries forever, and there is no background sign-in.
 - **The Windows DACL path is unverified in this tree.** Keychain storage is preferred on every platform; when it is unavailable the fallback token file is created with mode `0600` on Unix. On Windows the temp file's DACL is replaced with a protected, user-only DACL through `SetNamedSecurityInfoW` and then read back with `GetNamedSecurityInfoW` before the rename. The code is compile-gated with `cfg(windows)` and its size arithmetic is unit-tested on every platform, but this tree has no Windows host, so the Win32 calls themselves have not been executed. Protected Resource Metadata fetching during discovery remains best-effort: an unreachable or rejected document falls back to the normalized MCP URL and the conventional paths.
 - **Nested/array/`oneOf` elicitation schemas are declined, not rendered.** They are outside MCP's restricted elicitation schema, so the client logs why and returns `decline` instead of asking for them as text. `$ref` and unknown field types are treated the same way. Property order relies on the JSON map preserving declaration order (`serde_json`'s `preserve_order`), which the client enables.
-- **A degraded standalone GET stream is not automatically restarted.** Once the retry cap is reached the stream stays `Degraded`; requests over POST still work, and the state is available through `McpServer::event_stream_state`, but no periodic probe re-opens the stream. `Last-Event-ID` is a resume hint, so a server that does not implement it may redeliver messages after a reconnect (the dedup cache absorbs this for elicitation requests only, not for notifications).
+- **A degraded standalone GET stream probes instead of dying.** After the retry cap the stream is `Degraded` (observable via `McpServer::event_stream_state`); a probe re-opens it after `CODEREX_MCP_STREAM_PROBE_SECS` (default 60, `0` disables). POST traffic continues to work while degraded. `Last-Event-ID` is a resume hint, so a server that does not implement it may redeliver messages after a reconnect (the dedup cache absorbs this for elicitation requests only, not for notifications).
 - **Resource notifications invalidate; they do not eagerly re-read.** `resources/updated` drops the cached entry so the next access fetches fresh content, but no background `resources/read` is issued.
 
 ## Gaps for Production
@@ -99,10 +99,13 @@ Without the prefix a shared raw name cannot address both servers, so the second 
   the same `McpConfig` shape as `.mcp.json`; settings are loaded first and the project
   file can override a same-named server. Only explicit `.mcp.json`/`--mcp-config` was
   loaded before.
-- **`coderex mcp add` is stdio-only**: it splits a command string and has no
-  `--url`/`--transport`/`--header` flags. Remote HTTP/SSE servers must be written into
-  `.mcp.json` by hand; `mcp list` prints only command/args, so a URL-based server appears
-  as a blank entry.
+- **`coderex mcp add` supports stdio and remote servers**: a positional command
+  registers a stdio server, `--url` registers an HTTP (default) or `--transport sse`
+  server, and repeated `--header KEY=VALUE` entries are preserved. `mcp list` prints
+  the command/args for stdio servers and the transport/URL for remote ones.
+- **MCP image content is described, not forwarded.** `ToolResult` carries text only,
+  so an image block becomes "mime type + decoded size" instead of an image the model
+  can see. Changing that requires a content-block tool result, not a local fix.
 
 ### IDE tool whitelist
 

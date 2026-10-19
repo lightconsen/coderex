@@ -61,7 +61,7 @@ main() → parse_args() → StartupOrchestrator::run()
 | `--model MODEL` | `-m` | Model to use (e.g., `claude-sonnet-4-6`, `claude-opus-4-6`) |
 | `--fallback-model MODEL` | | Retry the same request once with this model when the primary is unavailable; if that succeeds the session continues on the fallback. Works in interactive and headless mode; other errors never trigger it |
 | `--system-prompt PROMPT` | | Custom system prompt (replaces default), in headless and interactive mode |
-| `--append-system-prompt` | | Modifier for `--system-prompt`: append its text to the default prompt instead of replacing it. It takes no value of its own, so without `--system-prompt` it has no effect |
+| `--append-system-prompt TEXT` | | Append TEXT to the default system prompt instead of replacing it. Independent of `--system-prompt`; when both are given, the replacement is authoritative and TEXT is added as extra instructions |
 | `--file FILE` | `-f` | Include a file in context (can be repeated) |
 | `--print` | `-p` | Non-interactive mode: read from stdin, print response, exit |
 | `--brief` | | Concise output (minimal formatting) |
@@ -166,7 +166,7 @@ A comma-separated list applied on top of `CODEREX_FEATURE_FLAGS`:
 - Some names are accepted for configuration compatibility but have no effect in
   this build: `streaming_tool_execution`, `tool_use_summaries`, `fast_mode`,
   `coordinator_mode`, `history_snip`, `agent_triggers`, `bridge_mode`,
-  `daemon`, `buddy`, `web_browser_tool`, `context_collapse`, `terminal_panel`,
+  `daemon`, `buddy`, `context_collapse`, `terminal_panel`,
   `kairos`, `team_collaboration`, and `auto_dream`. Enabling any of them logs
   a warning at startup instead of implying behavior. `workflow_scripts`,
   `voice_mode`, and the six command-availability flags do have consumers.

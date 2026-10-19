@@ -24,7 +24,7 @@ Implements the tool trait system, registers built-in tools, and provides executi
 - **`SandboxConfig`** (`sandbox_policy.rs`) — Default per-tool sandbox policies injected by `RegistryToolDispatcher` when sandboxing is enabled.
 - **`ToolCache`** (`tool_cache.rs`) — Global LRU cache for read-only tool results using `moka`. Keys are `(tool_name, arguments_hash)`. `Read` tool entries are invalidated when the file's mtime changes.
 
-### Built-in Tools (45 baseline + 5 Chrome DevTools)
+### Built-in Tools (44 baseline + 5 Chrome DevTools + 1 WebFetch)
 
 #### Baseline Tools
 
@@ -32,7 +32,7 @@ Implements the tool trait system, registers built-in tools, and provides executi
 |------|----------|--------|
 | Read, Write, Edit, Glob, Grep, NotebookEdit | File I/O | Functional |
 | Bash, PowerShell | Shell execution | Functional (sandbox + allowlist + metacharacter rejection). **One of the two is registered, chosen by platform**: PowerShell on Windows, Bash everywhere else — see below. |
-| WebSearch, WebFetch | Web | Functional (rate limiting, domain whitelist, redirect validation) |
+| WebSearch | Web | Functional (rate limiting, domain whitelist, redirect validation) |
 | Skill | Skill loading | Functional (reads `.md` files) |
 | Brief | Session summary | Functional |
 | TaskCreate, TaskGet, TaskList, TaskUpdate, TaskStop, TaskOutput | Task management | Functional (JSONL persistence via `TaskStore`) |
@@ -56,15 +56,17 @@ Implements the tool trait system, registers built-in tools, and provides executi
 
 #### Feature-Gated Tools
 
-The only `FeatureGated` tools are the five Chrome DevTools tools, which are
-enabled (`is_enabled: true`) and controlled by the session's Chrome capability
-(`--no-chrome`). Thirteen placeholder tools (WebBrowser, TerminalCapture,
+The `FeatureGated` tools are the five Chrome DevTools tools (controlled by the
+session's Chrome capability, `--no-chrome`) and `WebFetch`, which is enabled only
+when the `web_browser_tool` feature flag is on (`--betas web_browser_tool` or
+`CODEREX_FEATURE_FLAGS`). `WebFetch` refuses loopback/private targets, does not
+follow redirects, caps the body at 1 MiB, and truncates text at `max_chars`. Thirteen placeholder tools (WebBrowser, TerminalCapture,
 CtxInspect, Monitor, WorkflowTool, SnipTool, VerifyPlanExecution,
 SuggestBackgroundPR, PushNotification, SendUserFile, SubscribePR, ListPeers,
 Tungsten) were removed: they were permanently `is_enabled: false`, no feature
 flag could turn them on, the dispatcher filtered them out of every listing, and
-their only behavior was a refusal string. `register_builtin_tools` now registers
-45 baseline tools plus 5 Chrome tools.
+their only behavior was a refusal string. `register_builtin_tools` now registers 44 baseline tools, 5 Chrome tools and
+`WebFetch` (gated).
 
 ### The result-size ladder
 
@@ -132,8 +134,9 @@ on Windows the `PowerShell` entry is the live one.
 
 ### What Works
 
-- **45 baseline tools** registered and functional.
-- **5 Chrome DevTools tools** registered as `FeatureGated`; they are available unless `--no-chrome` turns them off.
+- **44 baseline tools** registered and functional.
+- **5 Chrome DevTools tools** registered as `FeatureGated`; available unless `--no-chrome`.
+- **`WebFetch`** is `FeatureGated` by `web_browser_tool`.
 - Tool registry with deny rules, tier filtering, and concurrent access.
 - `ToolExecutor` batch execution with permission integration, output truncation, timeout, and concurrency control.
 - `RegistryToolDispatcher` bridges the core `ToolExecutor` trait to the concrete tool pipeline with full shared state injection.

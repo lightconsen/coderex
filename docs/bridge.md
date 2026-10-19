@@ -412,8 +412,9 @@ one to the worker loop, which registers it with the bridge as
 the transport immediately. When the gateway answers with `permission_response`,
 `BridgeEvent::PermissionResolved` tells the launcher to write a
 `control_response` line to the child's stdin; the turn then continues or
-records the denial. An unanswered request leaves the child waiting; shutdown
-drops the responders. The gateway-side half of relaying these two frame kinds
+records the denial. An unanswered request is denied after `CODEREX_BRIDGE_APPROVAL_TIMEOUT_SECS`
+(default 300; `0` disables the timeout) with a message saying the approval
+timed out — not that the user denied it. Shutdown drops the responders. The gateway-side half of relaying these two frame kinds
 is `PermissionFrameRelay` in `crates/bridge/src/gateway.rs`: it forwards a
 `permission_request` from the worker to the host connection, remembers its
 request id as pending, and forwards the matching `permission_response` back to
@@ -487,7 +488,7 @@ Control Plane                      Bridge                          Remote/Local
 
 - **Transport abstraction** — Pluggable `Transport` trait with `InProcessTransport` (channels) and `WebSocketTransport` (TLS WebSocket via `tokio-tungstenite`).
 - **Heartbeat with reconnect** — `HeartbeatLoop` runs async ping; `WsReconnector` provides exponential backoff (1s→30s, 10 max attempts), integrated into `serve_transport` / `reconnect_with_resume` (the old `handle_transport_disconnect` was removed).
-- **State machine lifecycle** — 10 states with validated transitions, terminal guards, history audit trail. Production currently drives `Assigned → Preparing → Spawning → Running → Archiving → CleaningUp`; `CreatingWorktree`, `AwaitingPermission`, `Completed` and `Failed` exist in the machine but are not entered by the launcher today.
+- **State machine lifecycle** — 10 states with validated transitions, terminal guards, history audit trail. Production drives `Assigned → Preparing → [CreatingWorktree] → Spawning → Running → [AwaitingPermission ⇄ Running] → Archiving → CleaningUp → Completed`, and any non-terminal state → `Failed` on a runner error. `CreatingWorktree` is entered only for worktree spawns.
 - **Multi-mode spawning** — Local worktree isolation, single-dir, same-dir, and SSH remote spawning via `openssh` crate.
 - **Capacity-aware polling** — Work assignments only dispensed when `active_sessions < max_concurrent`.
 - **Session-scoped permissions** — Permission requests tracked per session with Allow/Deny responses and prune lifecycle.

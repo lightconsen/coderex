@@ -58,7 +58,7 @@ Sub-agent system for spawning autonomous worker agents, dream agents (background
 ### Custom Agents (`custom_agents.rs`)
 
 - **`CustomAgentDef`** — User-defined agent loaded from `~/.coderex/agents/*.json` with fields: `name`, `system_prompt`, `allowed_tools`, `model`, `max_tokens`, `output_schema`.
-- **`load_custom_agents()`** — Scans `~/.coderex/agents/` and returns a name-to-definition map. Files that fail to read or parse are skipped rather than failing the session; parse failures are not currently logged.
+- **`load_custom_agents()`** — Scans `~/.coderex/agents/` and returns a name-to-definition map. Files that fail to read, parse, or validate are skipped with a warning naming the path and error; valid files still load.
 - **`load_custom_agents_from_dir(dir)`** — The same scan against an explicit directory, used by tests and embedders that keep definitions elsewhere.
 - **`get_custom_agent()`** — Lookup helper for a named custom agent.
 - Definitions are loaded when `AgentManager::standalone()` is created and can be replaced with `set_custom_agents()` / extended with `register_custom_agent()`. `custom_agent_names()` returns the sorted names used in unknown-name errors.
@@ -153,8 +153,8 @@ foreground agents).
 
 All wired features are implemented. No known stubs. Documented boundaries:
 `run_forked_agent` is reached only through background features (not the Agent
-tool), `extra_env` is rejected rather than silently ignored, and custom-agent
-files that fail to parse are skipped without a log line.
+tool), `extra_env` is rejected rather than silently ignored. Plugin manifests can contribute
+custom agent definitions (`agents`), which the REPL registers at startup.
 
 ### What Works
 

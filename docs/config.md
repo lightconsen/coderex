@@ -2,7 +2,7 @@
 
 ## Goal
 
-Three-level configuration system: defaults → user config (`~/.coderex/settings.json`) → project config (`.coderex/settings.json`), plus a managed/enterprise layer. Manages settings, feature flags, experiments, and enterprise policies.
+Configuration layers: defaults → user config (`~/.coderex/settings.json`) → project config (`.coderex/settings.json`) → local config (`.coderex/settings.local.json`), plus a managed/enterprise layer. Manages settings, feature flags, experiments, and enterprise policies.
 
 ## Design
 
@@ -31,6 +31,8 @@ Defaults (compiled)
 ~/.coderex/settings.json (user-level)
   ↓ override
 .coderex/settings.json (project-level)
+  ↓ override
+.coderex/settings.local.json (local, gitignored by convention; written by /init)
   ↓ override
 managed sources (managed_settings.json → macOS plist → Windows registry; see below)
   ↓ override

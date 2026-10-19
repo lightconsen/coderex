@@ -114,7 +114,7 @@ InitMemory -> InitRemoteServices -> Ready
 ### Tiered Tool Registry
 
 - **Baseline** — always on (Read, Write, Bash, Glob, Grep, etc.)
-- **FeatureGated** — gated by a session capability (the five Chrome DevTools tools; `--no-chrome` turns them off)
+- **FeatureGated** — the five Chrome DevTools tools (session capability, `--no-chrome`) and `WebFetch` (the `web_browser_tool` flag)
 - **DynamicMcp** — runtime-discovered from MCP servers
 
 Commands have an availability matrix (non-interactive / remote-safe / bridge-safe).
