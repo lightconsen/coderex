@@ -53,18 +53,33 @@ pub fn stdio_sandbox_config(
     let mut exec = Vec::new();
     if let Some(program) = resolve_program(command, &workspace) {
         if let Some(parent) = program.parent() {
-            exec.push(parent.to_path_buf());
-            read.push(parent.to_path_buf());
+            // On Windows the sandbox's own plan already grants the system
+            // roots and `PATH` directories — best-effort. Repeating them here
+            // would make the grant required, and a directory like
+            // `C:\Program Files\nodejs` cannot be rewritten by an ordinary
+            // user, which would turn "cannot tighten this DACL" into "the
+            // server does not start".
+            if !platform_covers(parent) {
+                exec.push(parent.to_path_buf());
+                read.push(parent.to_path_buf());
+            }
             // A toolchain usually lives at `<prefix>/bin`; the interpreter
             // needs its standard library under the prefix as well.
             if parent.file_name().is_some_and(|name| name == "bin") {
                 if let Some(prefix) = parent.parent() {
-                    read.push(prefix.to_path_buf());
+                    if !platform_covers(prefix) {
+                        read.push(prefix.to_path_buf());
+                    }
                 }
             }
         }
     }
     if let Some(home) = home_dir() {
+        // Read paths are granted recursively. On Windows, making the whole
+        // user profile reachable would walk it once per server start, so only
+        // the package caches below are granted there; a server that needs
+        // another profile location names it in `allowed_read_paths`.
+        #[cfg(not(target_os = "windows"))]
         read.push(home.clone());
         for cache in [
             home.join(".npm"),
@@ -94,6 +109,40 @@ pub fn stdio_sandbox_config(
         max_cpu_seconds: None,
         allow_network: sandbox.allow_network,
     })
+}
+
+/// Whether the platform sandbox covers `path` without an explicit grant.
+///
+/// On Windows that means a system root or a `PATH` directory: `acl_plan`
+/// grants both best-effort. Those directories are frequently owned by the
+/// system (TrustedInstaller), so a required grant would fail.
+fn platform_covers(path: &Path) -> bool {
+    #[cfg(target_os = "windows")]
+    {
+        let roots = [
+            "SystemRoot",
+            "ProgramFiles",
+            "ProgramFiles(x86)",
+            "ProgramW6432",
+        ]
+        .into_iter()
+        .filter_map(std::env::var_os)
+        .map(PathBuf::from);
+        let local_apps = std::env::var_os("LOCALAPPDATA")
+            .map(|local| PathBuf::from(local).join("Microsoft").join("WindowsApps"));
+        let roots = roots.chain(local_apps);
+        if roots.into_iter().any(|root| path.starts_with(root)) {
+            return true;
+        }
+        return std::env::var_os("PATH").is_some_and(|entries| {
+            std::env::split_paths(&entries).any(|dir| path.starts_with(dir))
+        });
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = path;
+        false
+    }
 }
 
 /// Canonicalize when possible, keeping the original path otherwise.

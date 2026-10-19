@@ -215,21 +215,38 @@ fn confinement_availability() -> Result<(), String> {
 /// The workspace is the hook's configured `cwd`, or this process's working
 /// directory. Reads additionally include the home/config directories and the
 /// system roots the shell and its tools need; writes include only the
-/// workspace and temp directories. Extra paths from
+/// workspace (and, outside Windows, the temp directory — Windows supplies a
+/// private one). Extra paths from
 /// [`HookSandboxConfig`] extend these sets rather than replacing them, so
 /// naming one extra path cannot accidentally *remove* the workspace.
 #[must_use]
 pub(crate) fn sandbox_config(hook: &HookConfig) -> SandboxConfig {
     let workspace = workspace_dir(hook);
+    #[cfg(not(target_os = "windows"))]
     let temp = canonicalize_lenient(&std::env::temp_dir());
 
-    let mut read = vec![workspace.clone(), temp.clone()];
-    let mut write = vec![workspace.clone(), temp];
+    let mut read = vec![workspace.clone()];
+    let mut write = vec![workspace.clone()];
+    // Windows gives the child a private, Low-labelled temp directory and
+    // exports it as TEMP/TMP/TMPDIR. Adding the user's shared temp tree here
+    // would lower *its* integrity label (letting every Low-integrity process
+    // write there) and make the recursive ACL walk traverse the whole tree.
+    #[cfg(not(target_os = "windows"))]
+    {
+        read.push(temp.clone());
+        write.push(temp);
+    }
     let mut exec = system_exec_paths();
 
     // Config and home are readable, never writable: a hook may need
     // `~/.gitconfig` or a config directory, and denying it would break
     // legitimate hooks without confining the write that matters.
+    //
+    // Windows is excluded: read paths are granted recursively, and walking a
+    // whole user profile (tens of thousands of files) turns every hook into a
+    // minutes-long ACL walk. A hook that needs a file under the profile names
+    // it in `sandbox.allowed_read_paths`.
+    #[cfg(not(target_os = "windows"))]
     if let Some(home) = home_dir() {
         push_unique(&mut read, home);
     }
@@ -241,6 +258,13 @@ pub(crate) fn sandbox_config(hook: &HookConfig) -> SandboxConfig {
     // They are made readable and executable, never writable. The hook command
     // is already arbitrary code from settings; the sandbox's job is to bound
     // what it can *change*, not to decide which interpreter exists.
+    //
+    // Windows is deliberately excluded: its `acl_plan` already grants the
+    // system roots and `PATH` directories **best-effort**, and adding them
+    // here would make the grant required. That fails on directories the user
+    // cannot rewrite (`C:\Windows` is owned by TrustedInstaller), which used
+    // to abort the whole hook sandbox with "Access is denied".
+    #[cfg(not(target_os = "windows"))]
     for dir in path_exec_dirs() {
         // A toolchain is usually `<prefix>/bin`; the interpreter needs to read
         // its own standard library under the prefix, not just the executable.
@@ -374,6 +398,7 @@ fn home_dir() -> Option<PathBuf> {
 /// A relative entry means "the current directory", which is not added: a
 /// repository must not gain execute permission over its own files simply by
 /// putting `.` on `PATH`.
+#[cfg(not(target_os = "windows"))]
 fn path_exec_dirs() -> Vec<PathBuf> {
     let Some(path) = std::env::var_os("PATH") else {
         return Vec::new();

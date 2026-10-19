@@ -926,6 +926,44 @@ mod imp {
         }
     }
 
+    /// Whether `dacl` already grants `permissions` to `sid` on the object
+    /// itself (an inherit-only ACE does not count).
+    fn dacl_grants(dacl: *const ACL, sid: PSID, permissions: u32) -> bool {
+        let mut size: ACL_SIZE_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: `dacl` is a live ACL and `size` is a valid out pointer.
+        let ok = unsafe {
+            GetAclInformation(
+                dacl,
+                std::ptr::from_mut(&mut size).cast(),
+                std::mem::size_of_val(&size) as u32,
+                AclSizeInformation,
+            )
+        };
+        if ok == 0 {
+            return false;
+        }
+        for index in 0..size.AceCount {
+            let mut ace: *mut c_void = ptr::null_mut();
+            // SAFETY: `index` is below the ACE count just read.
+            if unsafe { GetAce(dacl, index, &mut ace) } == 0 || ace.is_null() {
+                continue;
+            }
+            // SAFETY: the header precedes every ACE body.
+            let header = unsafe { &*(ace.cast::<ACE_HEADER>()) };
+            if header.AceType != ACCESS_ALLOWED_ACE_TYPE || header.AceFlags & INHERIT_ONLY_ACE != 0
+            {
+                continue;
+            }
+            let allowed = unsafe { &*(ace.cast::<ACCESS_ALLOWED_ACE>()) };
+            let ace_sid = std::ptr::from_ref(&allowed.SidStart).cast::<c_void>() as PSID;
+            // SAFETY: both are valid SIDs for the duration of the call.
+            if unsafe { EqualSid(ace_sid, sid) } != 0 && allowed.Mask & permissions == permissions {
+                return true;
+            }
+        }
+        false
+    }
+
     /// Apply one ACE to one path.
     fn set_grant(path: &Path, sid: PSID, access: AclAccess) -> Result<(), SandboxError> {
         let wide_path = wide_os(path.as_os_str());
@@ -964,6 +1002,16 @@ mod imp {
                 // DELETE
             }
         };
+
+        // Skip the write when the DACL already grants this. Security API
+        // calls are slow on managed machines (Defender hooks them), and a
+        // later sandbox in another process usually finds the grant an
+        // earlier one made.
+        if dacl_grants(old_dacl, sid, permissions) {
+            // SAFETY: the descriptor is owned by this function.
+            unsafe { LocalFree(descriptor as HLOCAL) };
+            return Ok(());
+        }
 
         let mut entry: EXPLICIT_ACCESS_W = unsafe { std::mem::zeroed() };
         entry.grfAccessPermissions = permissions;
@@ -1069,6 +1117,14 @@ mod imp {
     fn set_mandatory_label(path: &Path) -> Result<(), SandboxError> {
         // `SDDL_REVISION_1`; the SD is allocated by the Win32 call.
         const SDDL_REVISION_1: u32 = 1;
+        /// `SECURITY_MANDATORY_LOW_RID`.
+        const LOW_INTEGRITY_RID: u32 = 0x1000;
+
+        // Nothing to do when the path is already Low; this is the common case
+        // for every sandbox after the first one in a session.
+        if mandatory_label_rid(path) == Some(LOW_INTEGRITY_RID) {
+            return Ok(());
+        }
         let sddl = wide("S:(ML;;NW;;;LW)");
         let mut descriptor: PSECURITY_DESCRIPTOR = ptr::null_mut();
         // SAFETY: `sddl` is NUL-terminated, `descriptor` is a valid out
