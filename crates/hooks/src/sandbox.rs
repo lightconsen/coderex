@@ -922,18 +922,39 @@ mod policy_tests {
         let policy = sandbox_config(&hook);
 
         assert!(policy.allowed_write_paths.contains(&workspace));
-        assert!(
-            policy
-                .allowed_write_paths
-                .contains(&canonicalize_lenient(&std::env::temp_dir()))
-        );
         assert!(policy.allowed_read_paths.contains(&workspace));
         assert_eq!(policy.additional_working_dirs, vec![workspace]);
         assert!(!policy.allow_network, "network must be denied by default");
-        assert!(
-            !policy.allowed_exec_paths.is_empty(),
-            "a hook must be able to run system tools"
-        );
+
+        // Unix names temp and the system binaries explicitly. Windows gets a
+        // private temp directory from the sandbox and a best-effort grant of
+        // the system roots/`PATH` from the ACL plan, so its policy lists
+        // neither.
+        #[cfg(not(target_os = "windows"))]
+        {
+            assert!(
+                policy
+                    .allowed_write_paths
+                    .contains(&canonicalize_lenient(&std::env::temp_dir()))
+            );
+            assert!(
+                !policy.allowed_exec_paths.is_empty(),
+                "a hook must be able to run system tools"
+            );
+        }
+        #[cfg(target_os = "windows")]
+        {
+            assert!(
+                !policy
+                    .allowed_write_paths
+                    .contains(&canonicalize_lenient(&std::env::temp_dir())),
+                "the shared temp tree must not be lowered to Low integrity"
+            );
+            assert!(
+                policy.allowed_exec_paths.is_empty(),
+                "system and PATH grants are the ACL plan's job on Windows"
+            );
+        }
     }
 
     /// Per-hook paths extend the defaults rather than replacing them, so
