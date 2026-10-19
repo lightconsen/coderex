@@ -52,6 +52,7 @@ coderex-telemetry = { path = "../telemetry" }
 clap.workspace = true
 tokio.workspace = true
 chrono.workspace = true
+parking_lot.workspace = true
 tokio-util = { workspace = true }
 tracing.workspace = true
 tracing-subscriber.workspace = true

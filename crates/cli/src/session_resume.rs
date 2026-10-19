@@ -28,6 +28,7 @@ use anyhow::{Result, bail};
 use chrono::{DateTime, Utc};
 use coderex_config::dirs::DataDirectories;
 use coderex_core::types::{Message, MessageContent, Role};
+use coderex_memory::concurrent::SharedSessionIndex;
 use coderex_memory::session_index::{SessionIndex, SessionMeta};
 use coderex_memory::transcript::TranscriptStore;
 use serde::{Deserialize, Serialize};
@@ -143,6 +144,38 @@ const MAX_INDEXED_CONTENT_BYTES: usize = 256 * 1024;
 /// updates the existing row instead of adding a duplicate. A corrupt or
 /// locked database is reported as a warning and never fails the caller —
 /// the transcript is still the source of truth for `/resume`.
+/// One open index per workspace, reused across turns.
+///
+/// Opening SQLite on every persisted turn is avoidable work, and the wrapped
+/// `SharedSessionIndex` is exactly the sharing shape the memory crate exposes.
+fn cached_index(cwd: &str) -> Option<SharedSessionIndex> {
+    use std::collections::HashMap;
+    use std::sync::OnceLock;
+
+    static CACHE: OnceLock<std::sync::Mutex<HashMap<String, SharedSessionIndex>>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
+    let mut cache = cache
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(index) = cache.get(cwd) {
+        return Some(std::sync::Arc::clone(index));
+    }
+    match SessionIndex::open(&sessions_db_path(cwd)) {
+        Ok(index) => {
+            let index = std::sync::Arc::new(parking_lot::Mutex::new(index));
+            cache.insert(cwd.to_string(), std::sync::Arc::clone(&index));
+            Some(index)
+        }
+        Err(error) => {
+            tracing::warn!(
+                db = %sessions_db_path(cwd).display(),
+                "session index unavailable; transcripts remain authoritative: {error}"
+            );
+            None
+        }
+    }
+}
+
 pub fn index_saved_session(cwd: &str, session_id: &str, title: Option<&str>, messages: &[Message]) {
     if let Err(error) = try_index_saved_session(cwd, session_id, title, messages) {
         tracing::warn!(
@@ -159,7 +192,12 @@ fn try_index_saved_session(
     title: Option<&str>,
     messages: &[Message],
 ) -> Result<()> {
-    let index = SessionIndex::open(&sessions_db_path(cwd))?;
+    let index = cached_index(cwd).ok_or_else(|| {
+        anyhow::anyhow!(
+            "session index unavailable at {}",
+            sessions_db_path(cwd).display()
+        )
+    })?;
     let now = Utc::now();
     let title = title
         .map(str::trim)
@@ -177,7 +215,13 @@ fn try_index_saved_session(
         total_tokens: 0,
     };
     let content = messages_content(messages);
+    let index = index.lock();
     index.upsert_with_content(&meta, Some(&content))?;
+    // Also fill the TF-IDF table, so a search with no FTS hit can fall back
+    // to the semantic ranking instead of returning nothing.
+    if !content.is_empty() {
+        index.index_content(session_id, &content)?;
+    }
     Ok(())
 }
 
@@ -186,8 +230,20 @@ fn try_index_saved_session(
 /// `index_saved_session` writes the searchable row (and resets usage to
 /// zero), so call this after it. Best-effort, like every index write.
 pub fn index_session_usage(cwd: &str, session_id: &str, cost: f64, tokens: i64) {
-    let result = SessionIndex::open(&sessions_db_path(cwd))
-        .and_then(|index| index.update_cost_and_tokens(session_id, cost, tokens));
+    let result = match cached_index(cwd) {
+        Some(index) => index
+            .lock()
+            .update_cost_and_tokens(session_id, cost, tokens)
+            .map_err(|error| error.to_string()),
+        None => {
+            tracing::warn!(
+                session_id,
+                db = %sessions_db_path(cwd).display(),
+                "session usage was not indexed: no index"
+            );
+            return;
+        }
+    };
     if let Err(error) = result {
         tracing::warn!(
             session_id,
@@ -215,29 +271,34 @@ pub fn search_sessions(cwd: &str, query: &str, limit: usize) -> Vec<SessionMeta>
     }
 
     let fts = fts_query(query);
-    let mut results = if fts.is_empty() {
-        Vec::new()
-    } else {
-        match SessionIndex::open(&sessions_db_path(cwd)) {
-            Ok(index) => match index.search(&fts, limit) {
-                Ok(rows) => rows,
-                Err(error) => {
-                    tracing::warn!(
-                        db = %sessions_db_path(cwd).display(),
-                        "session index search failed; falling back to transcripts: {error}"
-                    );
-                    Vec::new()
-                }
-            },
-            Err(error) => {
-                tracing::warn!(
+    let mut results = Vec::new();
+    if !fts.is_empty() {
+        if let Some(index) = cached_index(cwd) {
+            let index = index.lock();
+            match index.search(&fts, limit) {
+                Ok(rows) => results = rows,
+                Err(error) => tracing::warn!(
                     db = %sessions_db_path(cwd).display(),
-                    "session index unavailable; falling back to transcripts: {error}"
-                );
-                Vec::new()
+                    "session index search failed; falling back to transcripts: {error}"
+                ),
+            }
+            // No keyword hit does not mean no match: the TF-IDF table is
+            // filled beside the FTS index, so use it before scanning files.
+            if results.is_empty() {
+                match index.search_semantic(query, limit) {
+                    Ok(ranked) if !ranked.is_empty() => {
+                        for (session_id, _score) in ranked {
+                            if let Ok(Some(meta)) = index.get(&session_id) {
+                                results.push(meta);
+                            }
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(error) => tracing::debug!(%error, "semantic session search failed"),
+                }
             }
         }
-    };
+    }
 
     for meta in search_transcripts(cwd, query) {
         if !results
@@ -263,8 +324,8 @@ pub fn list_recent_sessions(cwd: &str, limit: usize) -> Vec<SessionMeta> {
         return Vec::new();
     }
 
-    let mut sessions = match SessionIndex::open(&sessions_db_path(cwd)) {
-        Ok(index) => match index.list_by_project(cwd) {
+    let mut sessions = match cached_index(cwd) {
+        Some(index) => match index.lock().list_by_project(cwd) {
             Ok(rows) => rows,
             Err(error) => {
                 tracing::warn!(
@@ -274,13 +335,7 @@ pub fn list_recent_sessions(cwd: &str, limit: usize) -> Vec<SessionMeta> {
                 Vec::new()
             }
         },
-        Err(error) => {
-            tracing::warn!(
-                db = %sessions_db_path(cwd).display(),
-                "session index unavailable; falling back to transcripts: {error}"
-            );
-            Vec::new()
-        }
+        None => Vec::new(),
     };
 
     for meta in transcript_metas(cwd) {
@@ -610,6 +665,23 @@ mod tests {
         let index = SessionIndex::open(&sessions_db_path(&cwd)).unwrap();
         let stored = index.get("sess_auth").unwrap().unwrap();
         assert_eq!(stored.project_path, cwd);
+    }
+
+    /// FTS requires every query token to match. The TF-IDF table is the
+    /// fallback when only some do.
+    #[test]
+    fn a_partial_query_falls_back_to_semantic_search() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cwd = tmp.path().to_string_lossy().to_string();
+        let messages = vec![Message::user("alpha pipeline notes")];
+        index_saved_session(&cwd, "sess_alpha", Some("Alpha"), &messages);
+
+        // FTS would AND both tokens and miss; the semantic index shares one.
+        let hits = search_sessions(&cwd, "alpha beta", 10);
+        assert!(
+            hits.iter().any(|meta| meta.session_id == "sess_alpha"),
+            "{hits:?}"
+        );
     }
 
     #[test]

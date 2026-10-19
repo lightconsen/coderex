@@ -3344,6 +3344,90 @@ impl PluginManager {
         )
     }
 
+    /// Copy the validated `.d.ts` declarations of active plugins into
+    /// `root`, one directory per plugin.
+    ///
+    /// The reference writes plugin types into the plugin directory so a
+    /// TypeScript author has a stable include path. CodeRex plugins speak
+    /// JSON-RPC rather than loading TypeScript, but exporting the declared
+    /// files gives the declaration a real consumer (and `/plugin components`
+    /// can point at it). Missing or unreadable files are warnings; a failure
+    /// to create the root directory is an error.
+    ///
+    /// # Errors
+    ///
+    /// Returns the I/O error from creating `root`.
+    pub fn export_plugin_types(&self, root: &Path) -> Result<Vec<PathBuf>, String> {
+        std::fs::create_dir_all(root)
+            .map_err(|error| format!("cannot create {}: {error}", root.display()))?;
+
+        let mut active: Vec<(String, PathBuf, Value)> = self
+            .plugins
+            .iter()
+            .filter(|entry| matches!(entry.value().state, PluginState::Active))
+            .filter_map(|entry| {
+                entry
+                    .value()
+                    .types
+                    .clone()
+                    .map(|types| (entry.key().clone(), entry.value().path.clone(), types))
+            })
+            .collect();
+        active.sort_by(|a, b| a.0.cmp(&b.0));
+
+        let mut exported = Vec::new();
+        for (plugin, plugin_dir, types) in active {
+            let mut relative_paths = Vec::new();
+            match &types {
+                Value::String(path) => relative_paths.push(path.clone()),
+                Value::Array(paths) => relative_paths.extend(
+                    paths
+                        .iter()
+                        .filter_map(|path| path.as_str().map(str::to_string)),
+                ),
+                Value::Object(entries) => relative_paths.extend(
+                    entries
+                        .values()
+                        .filter_map(|path| path.as_str().map(str::to_string)),
+                ),
+                _ => {}
+            }
+            let plugin_root = root.join(&plugin);
+            for relative in relative_paths {
+                if let Err(error) = validate_types_path(&relative) {
+                    tracing::warn!(plugin = %plugin, path = %relative, %error, "types path is invalid");
+                    continue;
+                }
+                let content = match read_component_text(&plugin_dir, &relative) {
+                    Ok(content) => content,
+                    Err(error) => {
+                        tracing::warn!(plugin = %plugin, path = %relative, %error, "types file is unreadable");
+                        continue;
+                    }
+                };
+                if let Err(error) = std::fs::create_dir_all(&plugin_root) {
+                    tracing::warn!(plugin = %plugin, %error, "cannot create the types directory");
+                    continue;
+                }
+                let file_name = Path::new(&relative)
+                    .file_name()
+                    .map(|name| name.to_string_lossy().to_string())
+                    .unwrap_or_else(|| "types.d.ts".to_string());
+                let destination = plugin_root.join(file_name);
+                match std::fs::write(&destination, content) {
+                    Ok(()) => exported.push(destination),
+                    Err(error) => tracing::warn!(
+                        plugin = %plugin,
+                        path = %destination.display(),
+                        %error,
+                        "types file was not exported"
+                    ),
+                }
+            }
+        }
+        Ok(exported)
+    }
+
     /// The raw `experimental` value of each active plugin, keyed by plugin
     /// name.
     ///
@@ -6698,6 +6782,33 @@ mod tests {
             })
         );
         assert_eq!(log.warnings().len(), 3, "{:?}", log.warnings());
+    }
+
+    #[test]
+    fn types_are_exported_for_a_type_consumer() {
+        let plugin_dir = tempfile::tempdir().unwrap();
+        let plugin_root = plugin_dir.path().join("typed");
+        std::fs::create_dir_all(plugin_root.join("types")).unwrap();
+        std::fs::write(
+            plugin_root.join("types/index.d.ts"),
+            "declare module 'coderex' { export const x: number }",
+        )
+        .unwrap();
+
+        let mgr = PluginManager::new();
+        mgr.load_plugin(
+            manifest_with_field("typed", "types", serde_json::json!("types/index.d.ts")),
+            plugin_root.clone(),
+        );
+
+        let out = tempfile::tempdir().unwrap();
+        let exported = mgr.export_plugin_types(out.path()).unwrap();
+        assert_eq!(exported.len(), 1, "{exported:?}");
+        assert_eq!(
+            std::fs::read_to_string(&exported[0]).unwrap(),
+            "declare module 'coderex' { export const x: number }"
+        );
+        assert!(exported[0].starts_with(out.path().join("typed")));
     }
 
     #[test]

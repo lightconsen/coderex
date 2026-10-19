@@ -2554,6 +2554,13 @@ impl ReplLoop {
         &self.feature_flags
     }
 
+    /// The command context, for tests outside this module.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn command_context_for_test(&self) -> coderex_commands::CommandContext {
+        self.build_context()
+    }
+
     /// The hook documents split by source tier, as installed.
     #[cfg(test)]
     #[must_use]
@@ -5765,6 +5772,11 @@ impl ReplLoop {
         self.event_rx = live_events;
 
         self.record_turn_telemetry(&result);
+        if headless_mode {
+            // Persist per turn, not only when the run ends, so a long
+            // headless session is resumable even if the process is stopped.
+            self.persist_headless_session();
+        }
         self.drain_events(&mut output);
 
         // One result frame closes the turn: `emit_turn_complete` consumes the
@@ -8492,6 +8504,11 @@ mod tests {
     /// `custom_system_prompt`, which is almost always empty.
     #[tokio::test]
     async fn the_prompt_hook_is_given_the_prompt() {
+        // The hook runs through `sh` from PATH; a concurrent test that
+        // temporarily replaces PATH would break it.
+        let _guard = crate::ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let temp = tempfile::tempdir().unwrap();
         let seen = temp.path().join("seen.json");
         let hooks = serde_json::json!([{
@@ -8901,6 +8918,11 @@ mod tests {
     /// own checkout.
     #[tokio::test]
     async fn worktree_mode_creates_a_worktree_and_runs_there() {
+        // `git` is resolved through PATH, which other tests replace while
+        // they hold `ENV_LOCK`.
+        let _guard = crate::ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let repo = tempfile::tempdir().unwrap();
         for args in [
             vec!["init", "--quiet"],

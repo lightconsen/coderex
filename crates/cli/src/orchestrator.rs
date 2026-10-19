@@ -138,6 +138,8 @@ pub struct SessionContext {
     pub plugin_manager: Option<Arc<coderex_plugins::plugins::PluginManager>>,
     /// Host `userConfig` values from the `plugins` settings key.
     pub plugin_settings: Option<serde_json::Value>,
+    /// Where plugin `.d.ts` declarations were exported, when any were.
+    pub plugin_types_dir: Option<String>,
     /// Marketplaces configured in settings.
     pub marketplaces: Vec<coderex_config::MarketplaceSetting>,
     /// Telemetry handle (initialized during LoadSettings).
@@ -334,6 +336,7 @@ impl StartupOrchestrator {
                 cwd: String::new(),
                 plugin_manager: None,
                 plugin_settings: None,
+                plugin_types_dir: None,
                 marketplaces: Vec::new(),
                 telemetry_handle: None,
                 telemetry_uploader: None,
@@ -1245,6 +1248,26 @@ impl StartupOrchestrator {
         if let Some(value) = manager.plugin_settings() {
             self.apply_plugin_settings(&value);
         }
+        // Declared `.d.ts` files are exported so the declaration has a real
+        // consumer (a stable include path for plugin authors).
+        self.ctx.plugin_types_dir = match manager
+            .export_plugin_types(&coderex_config::config_home().join("plugin-types"))
+        {
+            Ok(paths) if paths.is_empty() => None,
+            Ok(paths) => {
+                tracing::info!(count = paths.len(), "plugin type declarations exported");
+                Some(
+                    coderex_config::config_home()
+                        .join("plugin-types")
+                        .display()
+                        .to_string(),
+                )
+            }
+            Err(error) => {
+                tracing::warn!(%error, "plugin type declarations were not exported");
+                None
+            }
+        };
         // Declared binaries are pinned by SHA-256; fetch them once, after the
         // plugins are active. Failures are warnings: a plugin can still work
         // without its helper.
@@ -1274,17 +1297,25 @@ impl StartupOrchestrator {
 
     /// Merge the allowlisted keys of a plugin `settings` document.
     ///
-    /// Deliberately narrow: `model`, `vim_mode`, `statusline` and
-    /// `context_window` are presentation/model choices. Permission mode,
-    /// telemetry, hooks, MCP servers, API keys and `env` are never taken from
-    /// a plugin. An existing user value wins.
+    /// The accepted set is exactly the settings a plugin can make safely:
+    /// `model`, `vim_mode`, `statusline` and `context_window` are
+    /// presentation/model choices, and `max_budget_usd` is accepted only when
+    /// it *lowers* the session's ceiling (or sets one where none existed).
+    /// Permission mode, telemetry, hooks, MCP servers, API keys and `env` are
+    /// never taken from a plugin. An existing user value wins.
     fn apply_plugin_settings(&mut self, value: &serde_json::Value) {
         let Some(object) = value.as_object() else {
             tracing::warn!("plugin settings are not an object; ignoring them");
             return;
         };
         let mut allowed = serde_json::Map::new();
-        for key in ["model", "vim_mode", "statusline", "context_window"] {
+        for key in [
+            "model",
+            "vim_mode",
+            "statusline",
+            "context_window",
+            "max_budget_usd",
+        ] {
             if let Some(value) = object.get(key) {
                 allowed.insert(key.to_string(), value.clone());
             }
@@ -1315,6 +1346,14 @@ impl StartupOrchestrator {
         }
         if settings.context_window.is_none() {
             settings.context_window = plugin_settings.context_window;
+        }
+        // A budget can only tighten: a plugin may cap spending, never raise
+        // the ceiling the user set.
+        if let Some(plugin_budget) = plugin_settings.max_budget_usd {
+            settings.max_budget_usd = Some(match settings.max_budget_usd {
+                Some(existing) => existing.min(plugin_budget),
+                None => plugin_budget,
+            });
         }
         if self.ctx.model.is_none() && !self.ctx.model_explicit {
             self.ctx.model = settings.model.clone().map(coderex_core::types::ModelId);
@@ -2004,8 +2043,49 @@ impl StartupOrchestrator {
                 .collect();
         let monitors = manager.plugin_monitors();
         let mut other = Vec::new();
+        // A channel names an MCP server. Make that reference real: warn when
+        // the named server is not configured, and surface the display name
+        // beside the server so `/plugin components` is useful.
+        if let Some(channels) = manager
+            .plugin_channels()
+            .and_then(|value| value.as_object().cloned())
+        {
+            let known: std::collections::HashSet<String> = manager
+                .plugin_mcp_servers()
+                .and_then(|value| value.get("mcpServers").cloned())
+                .and_then(|value| value.as_object().cloned())
+                .map(|servers| servers.into_iter().map(|(key, _)| key).collect())
+                .unwrap_or_default();
+            for (name, channel) in channels {
+                let server = channel
+                    .get("server")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default();
+                if server.is_empty() {
+                    tracing::warn!(channel = %name, "plugin channel names no server; skipping");
+                    continue;
+                }
+                if !known.contains(server) {
+                    tracing::warn!(
+                        channel = %name,
+                        server = %server,
+                        "plugin channel names an MCP server that is not configured"
+                    );
+                }
+                let display = channel
+                    .get("displayName")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or(&name);
+                other.push((
+                    "channel".to_string(),
+                    vec![format!("{display} -> {server}")],
+                ));
+            }
+        }
+        if let Some(dir) = self.ctx.plugin_types_dir.clone() {
+            other.push(("types-dir".to_string(), vec![dir]));
+        }
         for (kind, value) in [
-            ("channels", manager.plugin_channels()),
             ("binaries", manager.plugin_binaries()),
             ("types", manager.plugin_types()),
             ("experimental", manager.plugin_experimental()),
@@ -3101,6 +3181,65 @@ mod tests {
         let null =
             StartupOrchestrator::parse_settings_mcp_servers(&serde_json::Value::Null).unwrap();
         assert!(null.is_empty());
+    }
+
+    #[test]
+    fn a_plugin_budget_can_only_tighten_the_ceiling() {
+        let mut orch = StartupOrchestrator::new();
+        let mut settings = Settings::default();
+        settings.max_budget_usd = Some(10.0);
+        orch.ctx.settings = Some(settings);
+
+        orch.apply_plugin_settings(&serde_json::json!({"max_budget_usd": 5.0}));
+        assert_eq!(
+            orch.ctx.settings.as_ref().unwrap().max_budget_usd,
+            Some(5.0)
+        );
+
+        // A plugin cannot raise what the user set.
+        orch.apply_plugin_settings(&serde_json::json!({"max_budget_usd": 99.0}));
+        assert_eq!(
+            orch.ctx.settings.as_ref().unwrap().max_budget_usd,
+            Some(5.0)
+        );
+    }
+
+    #[test]
+    fn plugin_channels_are_validated_and_listed() {
+        let manager = coderex_plugins::plugins::PluginManager::new();
+        let manifest: coderex_plugins::plugins::PluginManifest =
+            serde_json::from_value(serde_json::json!({
+                "name": "chan",
+                "version": "1.0.0",
+                "mcpServers": {
+                    "chat": { "command": "chat-server" }
+                },
+                "channels": [
+                    { "server": "chat", "displayName": "Team chat" },
+                    { "server": "missing", "displayName": "Nowhere" }
+                ]
+            }))
+            .expect("the manifest should parse");
+        manager.load_plugin(manifest, std::path::PathBuf::from("/tmp/chan"));
+
+        let mut orch = StartupOrchestrator::new();
+        orch.ctx.plugin_manager = Some(Arc::new(manager));
+        let mut repl = crate::repl::ReplLoop::new("/tmp".into(), ModelId::sonnet());
+        orch.configure_plugin_components(&mut repl, orch.ctx.plugin_manager.as_ref().unwrap());
+
+        let components = repl.command_context_for_test().plugin_components;
+        assert!(
+            components
+                .iter()
+                .any(|(kind, name)| kind == "channel" && name.contains("Team chat -> chat")),
+            "{components:?}"
+        );
+        assert!(
+            components
+                .iter()
+                .any(|(kind, name)| kind == "channel" && name.contains("Nowhere -> missing")),
+            "a channel naming an unknown server is still listed: {components:?}"
+        );
     }
 
     #[test]
