@@ -314,10 +314,10 @@ The manifest is parsed with `deny_unknown_fields`: a field that is not in the ta
 | `monitors` | ✅ implemented | Persistent watch scripts armed with the session (`PluginMonitorSupervisor`). |
 | `mcpServers` | ✅ implemented | Active plugins contribute `{"mcpServers": {...}}` through `PluginManager::plugin_mcp_servers()`; the orchestrator loads them before `.mcp.json` (project file wins on name clashes). |
 | `lspServers` | ✅ implemented | The first configured server is the default for the `LSP` tool (the REPL fills the tool's shared default at startup). |
-| `channels` | ✅ implemented | Exposed to the session and listed by `/plugin components`; there is no channel product to connect them to. |
+| `channels` | ✅ implemented (data plane) | Each channel's `server` is validated against the configured MCP servers (`plugin_mcp_servers` plus the loaded set); an unknown server is warned about, and `/plugin components` lists `displayName -> server`. There is no channel transport product to connect them to. |
 | `binaries` | ✅ implemented | SHA-256-pinned HTTPS fetch into `<plugin>/bin/` (`fetch_plugin_binaries`); `CODEREX_PLUGIN_NO_BINARIES=1` skips the fetch. |
-| `types` | ✅ implemented | Validated `.d.ts` paths are exposed per plugin; there is no TypeScript authoring surface to consume them. |
-| `settings` | ✅ implemented (narrow) | Merged into the session for `model`, `vim_mode`, `statusline` and `context_window` only; permission mode, telemetry, hooks, MCP servers, API keys and `env` are never accepted from a plugin. |
+| `types` | ✅ implemented | Validated `.d.ts` files are exported at startup to `config_home()/plugin-types/<plugin>/` (`export_plugin_types`) so a plugin author has a stable include path; `/plugin components` lists the directory. CodeRex plugins themselves speak JSON-RPC, so nothing loads the declarations at runtime. |
+| `settings` | ✅ implemented (allowlisted) | The accepted keys are exactly those a plugin can safely set: `model`, `vim_mode`, `statusline`, `context_window`, and `max_budget_usd` (which may only lower the ceiling). Permission mode, telemetry, hooks, MCP servers, API keys and `env` are never accepted from a plugin, and an existing user value wins. |
 | `experimental` | ✅ implemented (raw) | Exposed per plugin; expansion (themes/monitors/outputStyles/…) is the caller's job. |
 
 All declared component fields now have a runtime surface. `PluginManifest::unimplemented_fields()` is empty and remains as the guard against a future field silently doing nothing.

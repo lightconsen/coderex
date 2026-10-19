@@ -445,8 +445,12 @@ Thread-safety (concurrent stores) and TF-IDF semantic search are always enabled 
 - **`SessionIndex` is exposed as an accelerator, not a source of truth.**
   `session_resume` owns the write (`index_saved_session`) and read
   (`search_sessions` / `list_recent_sessions`) surface. The REPL indexes after
-  each persisted turn (`persist_interactive_snapshot`) and `/resume` resolves a
-  title fragment through the index (an ambiguous fragment lists candidates).
+  each persisted turn (`persist_interactive_snapshot`) and after every headless
+  turn; `/resume` resolves a title fragment through the index (an ambiguous
+  fragment lists candidates). The index is opened once per workspace and shared
+  as a `SharedSessionIndex`; `index_content` fills the TF-IDF table, and a
+  query with no FTS hit falls back to `search_semantic` before scanning
+  transcripts.
   Exact-id resume still reads the transcript, and every index read tolerates a
   corrupt or locked database by warning and scanning transcripts.
 - **`DataDirectories` (`coderex-config`) is only partly adopted.**
