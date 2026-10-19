@@ -626,6 +626,7 @@ mod tests {
             tool_call_id: "tc_1".into(),
             output: "file content".into(),
             is_error: false,
+            images: Vec::new(),
         });
         store.append("session_rt", &original).unwrap();
 

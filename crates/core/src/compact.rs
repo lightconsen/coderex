@@ -191,6 +191,9 @@ pub fn micro_compact(messages: &[Message], params: MicroCompactParams) -> Compac
                     tool_call_id: tr.tool_call_id.clone(),
                     output: truncated,
                     is_error: tr.is_error,
+                    // Text truncation does not touch the image payloads, so
+                    // they keep traveling with the compacted result.
+                    images: tr.images.clone(),
                 }),
             };
         }
@@ -912,6 +915,7 @@ mod tests {
             tool_call_id: "tc_test".into(),
             output: output.to_string(),
             is_error: false,
+            images: Vec::new(),
         })
     }
 
@@ -932,6 +936,7 @@ mod tests {
                 tool_call_id: id.into(),
                 output: output.to_string(),
                 is_error: false,
+                images: Vec::new(),
             }),
         ]
     }

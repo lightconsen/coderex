@@ -38,6 +38,7 @@ impl ToolExecutor for PluginToolExecutor {
                         tool_call_id: tool_call_id.to_string(),
                         output: format!("Plugin tool '{tool_name}' not found"),
                         is_error: true,
+                        images: Vec::new(),
                     },
                 };
             }
@@ -62,6 +63,7 @@ impl ToolExecutor for PluginToolExecutor {
                     tool_call_id: tool_call_id.to_string(),
                     output,
                     is_error: false,
+                    images: Vec::new(),
                 },
             },
             Err(e) => ToolDispatchOutcome {
@@ -69,6 +71,7 @@ impl ToolExecutor for PluginToolExecutor {
                     tool_call_id: tool_call_id.to_string(),
                     output: format!("Plugin tool '{tool_name}' failed: {e}"),
                     is_error: true,
+                    images: Vec::new(),
                 },
             },
         }

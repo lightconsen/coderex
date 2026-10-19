@@ -330,6 +330,7 @@ impl CoreToolExecutor for RegistryToolDispatcher {
                         tool_call_id: tool_call_id.to_string(),
                         output: format!("tool '{tool_name}' not found in registry"),
                         is_error: true,
+                        images: Vec::new(),
                     },
                 };
             }
@@ -349,6 +350,7 @@ impl CoreToolExecutor for RegistryToolDispatcher {
                              (enable it with --betas {flag})"
                         ),
                         is_error: true,
+                        images: Vec::new(),
                     },
                 };
             }
@@ -361,6 +363,7 @@ impl CoreToolExecutor for RegistryToolDispatcher {
                     tool_call_id: tool_call_id.to_string(),
                     output: "Chrome tools are disabled for this session (--no-chrome)".into(),
                     is_error: true,
+                    images: Vec::new(),
                 },
             };
         }
@@ -378,6 +381,7 @@ impl CoreToolExecutor for RegistryToolDispatcher {
                     tool_call_id: tool_call_id.to_string(),
                     output: reason,
                     is_error: true,
+                    images: Vec::new(),
                 },
             };
         }
@@ -398,6 +402,7 @@ impl CoreToolExecutor for RegistryToolDispatcher {
                              context"
                         ),
                         is_error: true,
+                        images: Vec::new(),
                     },
                 };
             }
@@ -507,6 +512,7 @@ impl CoreToolExecutor for RegistryToolDispatcher {
                     tool_call_id: tool_call_id.to_string(),
                     output: output.output,
                     is_error: false,
+                    images: Vec::new(),
                 },
             },
             Err(err) => {
@@ -539,6 +545,7 @@ impl CoreToolExecutor for RegistryToolDispatcher {
                         tool_call_id: tool_call_id.to_string(),
                         output: message,
                         is_error: true,
+                        images: Vec::new(),
                     },
                 }
             }

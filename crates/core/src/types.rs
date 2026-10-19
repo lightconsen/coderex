@@ -153,8 +153,20 @@ fn summarize_tool_text(text: &str) -> String {
     }
 }
 
+/// An inline image carried by a tool result.
+///
+/// `data` is base64-encoded image bytes without a data-URI prefix, matching
+/// the shape providers expect for base64 image sources.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ImageBlock {
+    /// MIME type of the image, e.g. `image/png`.
+    pub media_type: String,
+    /// Base64-encoded image bytes, without a data-URI prefix.
+    pub data: String,
+}
+
 /// The result of a tool execution.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ToolResult {
     /// The tool call this result corresponds to.
     pub tool_call_id: String,
@@ -162,6 +174,22 @@ pub struct ToolResult {
     pub output: String,
     /// Whether the tool execution failed.
     pub is_error: bool,
+    /// Images returned by the tool, forwarded to the model as image blocks.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub images: Vec<ImageBlock>,
+}
+
+impl ToolResult {
+    /// Build a text-only tool result.
+    #[must_use]
+    pub fn text(tool_call_id: impl Into<String>, output: impl Into<String>) -> Self {
+        Self {
+            tool_call_id: tool_call_id.into(),
+            output: output.into(),
+            is_error: false,
+            images: Vec::new(),
+        }
+    }
 }
 
 /// Token usage summary for an API response.
@@ -824,6 +852,7 @@ mod tests {
             tool_call_id: "tc_1".into(),
             output: "file content".into(),
             is_error: false,
+            images: Vec::new(),
         };
         let msg = Message::tool(result.clone());
         let json = serde_json::to_string(&msg).unwrap();
@@ -858,6 +887,7 @@ mod tests {
             tool_call_id: "tc_xyz".into(),
             output: "success".into(),
             is_error: true,
+            images: Vec::new(),
         };
         let json = serde_json::to_string(&tr).unwrap();
         let decoded: ToolResult = serde_json::from_str(&json).unwrap();

@@ -6,7 +6,7 @@
 //! typo fails with the list of configured names instead of silently running
 //! the default agent.
 
-use coderex_agents::custom_agents::{load_custom_agents, CustomAgentDef};
+use coderex_agents::custom_agents::{CustomAgentDef, load_custom_agents};
 use std::collections::HashMap;
 use std::fmt;
 

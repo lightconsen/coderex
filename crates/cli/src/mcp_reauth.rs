@@ -142,8 +142,8 @@ mod tests {
 
     #[test]
     fn an_authentication_failure_without_a_url_still_reports_the_note() {
-        let error = classify_output(r#"{"authenticated":false,"note":"state mismatch"}"#)
-            .unwrap_err();
+        let error =
+            classify_output(r#"{"authenticated":false,"note":"state mismatch"}"#).unwrap_err();
         assert_eq!(error, "state mismatch");
     }
 

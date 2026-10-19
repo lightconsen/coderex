@@ -73,6 +73,7 @@ impl ToolExecutor for NoOpToolExecutor {
                     "tool '{tool_name}' is not registered in this engine; no tool executor was configured"
                 ),
                 is_error: true,
+                images: Vec::new(),
             },
         }
     }

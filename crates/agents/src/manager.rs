@@ -2115,6 +2115,7 @@ fn message_from_blocks(role: Role, blocks: &[serde_json::Value]) -> Result<Messa
                         tool_call_id: tool_call_id.to_string(),
                         output,
                         is_error,
+                        images: Vec::new(),
                     }),
                 });
             }

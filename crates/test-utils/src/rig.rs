@@ -219,6 +219,7 @@ impl ToolExecutor for StubOkToolExecutor {
                 tool_call_id: tool_call_id.to_string(),
                 output: format!("stub ok: {tool_name}"),
                 is_error: false,
+                images: Vec::new(),
             },
         }
     }

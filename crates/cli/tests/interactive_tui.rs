@@ -561,7 +561,11 @@ fn run_interaction_sequence(
     let raw = strip_ansi(&session.raw_text());
     for forbidden in forbidden_raw {
         if let Some(at) = raw.find(forbidden) {
-            let start = raw[..at].char_indices().rev().nth(300).map_or(0, |(i, _)| i);
+            let start = raw[..at]
+                .char_indices()
+                .rev()
+                .nth(300)
+                .map_or(0, |(i, _)| i);
             let end = raw[at..]
                 .char_indices()
                 .nth(300)

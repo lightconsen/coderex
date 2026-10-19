@@ -15,7 +15,7 @@
 //! {"type":"session_end"}
 //! ```
 
-use crate::types::{ToolResult, UsageSummary};
+use crate::types::{ImageBlock, ToolResult, UsageSummary};
 use serde::{Deserialize, Serialize};
 
 /// Events emitted by the engine over the wire.
@@ -184,6 +184,9 @@ pub struct WireToolResult {
     pub output: String,
     /// Whether the tool execution failed.
     pub is_error: bool,
+    /// Images returned by the tool.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub images: Vec<ImageBlock>,
 }
 
 impl From<ToolResult> for WireToolResult {
@@ -192,6 +195,7 @@ impl From<ToolResult> for WireToolResult {
             tool_call_id: r.tool_call_id,
             output: r.output,
             is_error: r.is_error,
+            images: r.images,
         }
     }
 }
@@ -202,6 +206,7 @@ impl From<WireToolResult> for ToolResult {
             tool_call_id: r.tool_call_id,
             output: r.output,
             is_error: r.is_error,
+            images: r.images,
         }
     }
 }

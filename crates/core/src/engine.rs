@@ -1415,9 +1415,30 @@ impl QueryEngine {
                     crate::types::MessageContent::ToolCall(tc) => serde_json::json!([
                         {"type": "tool_use", "id": &tc.id, "name": &tc.name, "input": &tc.input}
                     ]),
-                    crate::types::MessageContent::ToolResult(tr) => serde_json::json!([
-                        {"type": "tool_result", "tool_use_id": &tr.tool_call_id, "content": &tr.output}
-                    ]),
+                    crate::types::MessageContent::ToolResult(tr) if tr.images.is_empty() => {
+                        serde_json::json!([
+                            {"type": "tool_result", "tool_use_id": &tr.tool_call_id, "content": &tr.output}
+                        ])
+                    }
+                    crate::types::MessageContent::ToolResult(tr) => {
+                        let mut blocks: Vec<serde_json::Value> = Vec::new();
+                        if !tr.output.is_empty() {
+                            blocks.push(serde_json::json!({"type": "text", "text": &tr.output}));
+                        }
+                        for image in &tr.images {
+                            blocks.push(serde_json::json!({
+                                "type": "image",
+                                "source": {
+                                    "type": "base64",
+                                    "media_type": &image.media_type,
+                                    "data": &image.data,
+                                }
+                            }));
+                        }
+                        serde_json::json!([
+                            {"type": "tool_result", "tool_use_id": &tr.tool_call_id, "content": blocks}
+                        ])
+                    }
                 };
                 Some(serde_json::json!({"role": role_str, "content": content}))
             })
@@ -3849,6 +3870,7 @@ impl QueryEngine {
                                 tool_call_id: id,
                                 output: format!("tool execution failed: {e}"),
                                 is_error: true,
+                                images: Vec::new(),
                             });
                         }
                     }
@@ -3873,6 +3895,7 @@ impl QueryEngine {
                                 tool_call_id: id,
                                 output: format!("tool execution failed: {e}"),
                                 is_error: true,
+                                images: Vec::new(),
                             });
                         }
                     }
@@ -3997,6 +4020,7 @@ impl QueryEngine {
                         call.name
                     ),
                     is_error: true,
+                    images: Vec::new(),
                 };
                 let _ = self.event_tx.send(EngineEvent::ToolCallEnd {
                     id: call.id.clone(),
@@ -4023,6 +4047,7 @@ impl QueryEngine {
                 tool_call_id: call.id.clone(),
                 output: "tool execution stopped by hook".to_string(),
                 is_error: true,
+                images: Vec::new(),
             };
             let _ = self.event_tx.send(EngineEvent::ToolCallEnd {
                 id: call.id.clone(),
@@ -4094,6 +4119,7 @@ impl QueryEngine {
                         &call.name, &reason,
                     ),
                     is_error: true,
+                    images: Vec::new(),
                 };
                 let mut ctx = std::collections::HashMap::new();
                 ctx.insert("tool_call_id".to_string(), call.id.clone());
@@ -4126,6 +4152,7 @@ impl QueryEngine {
                     tool_call_id: call.id.clone(),
                     output: format!("tool '{}' denied: {reason}", call.name),
                     is_error: true,
+                    images: Vec::new(),
                 };
                 let mut ctx = std::collections::HashMap::new();
                 ctx.insert("tool_call_id".to_string(), call.id.clone());
@@ -4183,6 +4210,7 @@ impl QueryEngine {
                     tool_call_id: call.id.clone(),
                     output: "the turn was interrupted".to_string(),
                     is_error: true,
+                    images: Vec::new(),
                 })
                 .collect());
         }
@@ -4272,6 +4300,7 @@ impl QueryEngine {
                 &elevation.reason,
             ),
             is_error: true,
+            images: Vec::new(),
         };
         let _ = self.event_tx.send(EngineEvent::ToolCallEnd {
             id: elevation.tool_call_id,
@@ -4303,6 +4332,7 @@ impl QueryEngine {
                 tool_call_id: elevation.tool_call_id.clone(),
                 output: format!("tool '{}' elevation denied", elevation.tool_name),
                 is_error: true,
+                images: Vec::new(),
             };
             let _ = self.event_tx.send(EngineEvent::ToolCallEnd {
                 id: elevation.tool_call_id,
@@ -4337,6 +4367,7 @@ impl QueryEngine {
                 tool_call_id: elevation.tool_call_id.clone(),
                 output: "elevated tool execution stopped by hook".to_string(),
                 is_error: true,
+                images: Vec::new(),
             };
             let _ = self.event_tx.send(EngineEvent::ToolCallEnd {
                 id: elevation.tool_call_id,
@@ -4388,6 +4419,7 @@ impl QueryEngine {
                     tool_call_id: elevation.tool_call_id.clone(),
                     output: format!("tool '{}' elevated execution denied", elevation.tool_name),
                     is_error: true,
+                    images: Vec::new(),
                 }
             }
         };
@@ -4603,6 +4635,7 @@ mod tests {
                     tool_call_id: tool_call_id.to_string(),
                     output: format!("stub ok: {tool_name}"),
                     is_error: false,
+                    images: Vec::new(),
                 },
             }
         }
@@ -6050,6 +6083,7 @@ mod tests {
                         tool_call_id: tool_call_id.to_string(),
                         output: "the tool ran".to_string(),
                         is_error: false,
+                        images: Vec::new(),
                     },
                 }
             }
@@ -6906,6 +6940,7 @@ mod tests {
             tool_call_id: "tc_1".into(),
             output: "file body".into(),
             is_error: false,
+            images: Vec::new(),
         };
         let messages = QueryEngine::provider_messages(&[
             Message::user("Read src/lib.rs"),
@@ -6923,6 +6958,54 @@ mod tests {
         assert_eq!(messages[2]["role"], "user");
         assert_eq!(messages[2]["content"][0]["type"], "tool_result");
         assert_eq!(messages[2]["content"][0]["tool_use_id"], "tc_1");
+    }
+
+    #[test]
+    fn provider_messages_serialize_tool_result_images_as_image_blocks() {
+        let tool_result = ToolResult {
+            tool_call_id: "tc_img".into(),
+            output: "screenshot taken".into(),
+            is_error: false,
+            images: vec![crate::types::ImageBlock {
+                media_type: "image/png".into(),
+                data: "aGVsbG8=".into(),
+            }],
+        };
+        let messages = QueryEngine::provider_messages(&[Message::tool(tool_result)]);
+
+        let block = &messages[0]["content"][0];
+        assert_eq!(block["type"], "tool_result");
+        assert_eq!(block["tool_use_id"], "tc_img");
+        let content = block["content"]
+            .as_array()
+            .expect("image results must use content blocks");
+        assert_eq!(content.len(), 2);
+        assert_eq!(content[0]["type"], "text");
+        assert_eq!(content[0]["text"], "screenshot taken");
+        assert_eq!(content[1]["type"], "image");
+        assert_eq!(content[1]["source"]["type"], "base64");
+        assert_eq!(content[1]["source"]["media_type"], "image/png");
+        assert_eq!(content[1]["source"]["data"], "aGVsbG8=");
+    }
+
+    #[test]
+    fn provider_messages_omit_empty_text_before_image_blocks() {
+        let tool_result = ToolResult {
+            tool_call_id: "tc_img".into(),
+            output: String::new(),
+            is_error: false,
+            images: vec![crate::types::ImageBlock {
+                media_type: "image/jpeg".into(),
+                data: "aGVsbG8=".into(),
+            }],
+        };
+        let messages = QueryEngine::provider_messages(&[Message::tool(tool_result)]);
+
+        let content = messages[0]["content"][0]["content"]
+            .as_array()
+            .expect("image results must use content blocks");
+        assert_eq!(content.len(), 1);
+        assert_eq!(content[0]["type"], "image");
     }
 
     /// The context-size line is checked before a request, not only after an

@@ -91,6 +91,7 @@ impl ToolExecutor for EchoToolExecutor {
                 tool_call_id: tool_call_id.to_string(),
                 output: format!("executed {tool_name} with {input}"),
                 is_error: false,
+                images: Vec::new(),
             },
         }
     }
@@ -491,10 +492,7 @@ impl ApiClient for StreamingToolMock {
         _max_tokens: u32,
         _tools: &[ToolInfo],
     ) -> Pin<Box<dyn Stream<Item = StreamEvent> + Send + 'static>> {
-        let first = self
-            .calls
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
-            == 0;
+        let first = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0;
         let stream = async_stream::stream! {
             if first {
                 yield StreamEvent::ToolCallBlockStart {

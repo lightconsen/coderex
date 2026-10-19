@@ -7351,6 +7351,7 @@ mod tests {
                 tool_call_id: "call-1".into(),
                 output: "ok".into(),
                 is_error: false,
+                images: Vec::new(),
             },
         });
         handle.shutdown();
@@ -7446,6 +7447,7 @@ mod tests {
                     tool_call_id: tool_call_id.to_string(),
                     output: "ok".into(),
                     is_error: false,
+                    images: Vec::new(),
                 },
             }
         }
@@ -7470,6 +7472,7 @@ mod tests {
                     tool_call_id: tool_call_id.to_string(),
                     output: self.output.clone(),
                     is_error: self.is_error,
+                    images: Vec::new(),
                 },
             }
         }
@@ -8059,6 +8062,7 @@ mod tests {
                     tool_call_id: "call_1".into(),
                     output: "file contents".into(),
                     is_error: false,
+                    images: Vec::new(),
                 },
             },
             "s1",

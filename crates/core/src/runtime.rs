@@ -640,6 +640,7 @@ mod tests {
                 tool_call_id: "tc1".into(),
                 output: "ok".into(),
                 is_error: false,
+                images: Vec::new(),
             },
         });
         assert!(state.active_tool_calls.is_empty());

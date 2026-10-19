@@ -200,6 +200,7 @@ mod tests {
                 tool_call_id: "tc_1".into(),
                 output: "file content".into(),
                 is_error: false,
+                images: Vec::new(),
             },
         };
         let wire = engine_event_to_wire(&engine).unwrap();

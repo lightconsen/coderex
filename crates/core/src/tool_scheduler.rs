@@ -83,6 +83,7 @@ pub async fn run_tool_calls(
                         call.name
                     ),
                     is_error: true,
+                    images: Vec::new(),
                 };
                 let _ = event_tx.send(EngineEvent::ToolCallEnd {
                     id: call.id.clone(),
@@ -116,6 +117,7 @@ pub async fn run_tool_calls(
                 tool_call_id: call.id.clone(),
                 output: "tool execution stopped by hook".to_string(),
                 is_error: true,
+                images: Vec::new(),
             };
             let _ = event_tx.send(EngineEvent::ToolCallEnd {
                 id: call.id.clone(),
@@ -176,6 +178,7 @@ pub async fn run_tool_calls(
                         &call.name, &reason,
                     ),
                     is_error: true,
+                    images: Vec::new(),
                 };
                 let mut ctx = HashMap::new();
                 ctx.insert("tool_call_id".to_string(), call.id.clone());
@@ -207,6 +210,7 @@ pub async fn run_tool_calls(
                     tool_call_id: call.id.clone(),
                     output: format!("tool '{}' denied: {reason}", call.name),
                     is_error: true,
+                    images: Vec::new(),
                 };
                 let mut ctx = HashMap::new();
                 ctx.insert("tool_call_id".to_string(), call.id.clone());
@@ -258,6 +262,7 @@ pub async fn run_tool_calls(
                     tool_call_id: call.id.clone(),
                     output: format!("tool '{}' requires elevated permissions", call.name),
                     is_error: true,
+                    images: Vec::new(),
                 });
             }
         }
@@ -355,6 +360,7 @@ mod tests {
                     tool_call_id: tool_call_id.to_string(),
                     output: format!("executed {tool_name}"),
                     is_error: false,
+                    images: Vec::new(),
                 },
             }
         }

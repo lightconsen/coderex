@@ -241,6 +241,7 @@ mod tests {
                     tool_call_id: "t1".into(),
                     output: "file contents".into(),
                     is_error: false,
+                    images: Vec::new(),
                 }),
             },
             Message {
@@ -257,6 +258,7 @@ mod tests {
                     tool_call_id: "t2".into(),
                     output: "error: test failed".into(),
                     is_error: true,
+                    images: Vec::new(),
                 }),
             },
             Message::system("<coderex_compact_boundary>\nsummarized\n</coderex_compact_boundary>"),
@@ -301,6 +303,7 @@ mod tests {
                 tool_call_id: "gone".into(),
                 output: "failed".into(),
                 is_error: true,
+                images: Vec::new(),
             }),
         });
         let facts = SessionFacts::from_jsonl("sess_3", &text, None);

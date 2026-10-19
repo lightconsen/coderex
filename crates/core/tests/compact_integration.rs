@@ -39,6 +39,7 @@ fn make_tool_result(output: &str) -> Message {
         tool_call_id: "tc_test".into(),
         output: output.to_string(),
         is_error: false,
+        images: Vec::new(),
     })
 }
 
@@ -58,6 +59,7 @@ fn make_tool_exchange(id: &str, name: &str, output: &str) -> Vec<Message> {
             tool_call_id: id.into(),
             output: output.to_string(),
             is_error: false,
+            images: Vec::new(),
         }),
     ]
 }

@@ -12,8 +12,8 @@
 //! It fails closed — a query that fails, or an answer that is not an
 //! unambiguous yes, refuses the write.
 
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use coderex_core::api_client::ApiClient;
 use coderex_memory::service::{MemoryService, MemoryStore, MemoryWriteClassifier};
@@ -111,7 +111,8 @@ pub fn memory_tools(
         .all()
         .into_iter()
         .map(|tool| {
-            Arc::new(MemoryToolAdapter::new(tool, Arc::clone(writable))) as Arc<dyn Tool + Send + Sync>
+            Arc::new(MemoryToolAdapter::new(tool, Arc::clone(writable)))
+                as Arc<dyn Tool + Send + Sync>
         })
         .collect()
 }
@@ -159,7 +160,9 @@ impl MemoryWriteClassifier for ModelMemoryClassifier {
                 } else {
                     // Anything that is not an unambiguous yes is a no: an
                     // unparseable answer must not read as permission.
-                    Err(format!("the shared-memory classifier refused this: {answer}"))
+                    Err(format!(
+                        "the shared-memory classifier refused this: {answer}"
+                    ))
                 }
             }
             // A classifier that cannot be reached cannot grant permission.
@@ -290,7 +293,10 @@ mod tests {
             .classify(MemoryStore::Shared, "key", "content")
             .await;
 
-        assert!(result.is_err(), "an ambiguous answer must not allow a write");
+        assert!(
+            result.is_err(),
+            "an ambiguous answer must not allow a write"
+        );
     }
 
     /// A classifier that cannot be reached cannot grant permission.
@@ -333,10 +339,8 @@ mod tests {
             .iter()
             .find(|tool| tool.descriptor().name == "memory_write")
             .expect("memory_write is registered");
-        let ctx = coderex_tools::ToolContext::new(
-            coderex_tools::ExecutionContext::Normal,
-            temp.path(),
-        );
+        let ctx =
+            coderex_tools::ToolContext::new(coderex_tools::ExecutionContext::Normal, temp.path());
         let arguments = serde_json::json!({
             "store": "project",
             "key": "k",
