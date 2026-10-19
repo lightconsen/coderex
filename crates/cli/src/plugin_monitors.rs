@@ -30,67 +30,60 @@
 use std::borrow::Cow;
 use std::collections::HashSet;
 use std::path::Path;
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
+use coderex_core::process_tree::{JobLimits, ProcessTree};
 use serde_json::Value;
 use tokio::io::{AsyncBufReadExt as _, BufReader};
 use tokio::process::{Child, Command};
 use tokio::task::JoinHandle;
 
-/// Every live monitor child, so a signal handler can kill them.
+/// Every live monitor child's process tree, so a signal handler can kill it.
 ///
 /// `Drop` is not enough: SIGTERM takes `process::exit` and release builds use
 /// `panic = "abort"`, neither of which runs destructors. The registry is the
 /// only cleanup that survives those paths.
-static MONITOR_PIDS: Mutex<Vec<u32>> = Mutex::new(Vec::new());
+///
+/// The value is a [`ProcessTree`], not a pid: on Windows a pid only names the
+/// direct child, and `taskkill /T` is best-effort at reaching grandchildren.
+/// The tree's Job Object kills all of them without spawning a helper process
+/// from a signal handler.
+static MONITOR_TREES: Mutex<Vec<(u64, Arc<ProcessTree>)>> = Mutex::new(Vec::new());
 
-fn register_monitor(pid: u32) {
-    MONITOR_PIDS
+/// Ids are assigned monotonically so two monitors cannot unregister each
+/// other when a pid is reused.
+static NEXT_MONITOR_ID: AtomicU64 = AtomicU64::new(1);
+
+fn register_monitor(tree: Arc<ProcessTree>) -> u64 {
+    let id = NEXT_MONITOR_ID.fetch_add(1, Ordering::Relaxed);
+    MONITOR_TREES
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .push(pid);
+        .push((id, tree));
+    id
 }
 
-fn unregister_monitor(pid: u32) {
-    let mut pids = MONITOR_PIDS
+fn unregister_monitor(id: u64) {
+    let mut trees = MONITOR_TREES
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    pids.retain(|existing| *existing != pid);
+    trees.retain(|(existing, _)| *existing != id);
 }
 
-/// Kill every live plugin monitor.
+/// Kill every live plugin monitor and anything it started.
 ///
 /// Called from the SIGTERM handler and the panic hook, where no destructor
 /// will run. Idempotent; safe when no monitor is armed.
 pub fn terminate_all_monitors() {
-    let pids = std::mem::take(
-        &mut *MONITOR_PIDS
+    let trees = std::mem::take(
+        &mut *MONITOR_TREES
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner),
     );
-    for pid in pids {
-        kill_monitor(pid);
+    for (_, tree) in trees {
+        tree.terminate();
     }
-}
-
-#[cfg(unix)]
-#[allow(unsafe_code)] // `kill` is the only way to reach a group from a sync hook.
-fn kill_monitor(pid: u32) {
-    // Monitors are spawned in their own process group, so this reaches the
-    // shell and anything it started.
-    // SAFETY: `kill` is called with a pid this process spawned.
-    unsafe {
-        let _ = libc::kill(-(pid as i32), libc::SIGKILL);
-    }
-}
-
-#[cfg(not(unix))]
-fn kill_monitor(pid: u32) {
-    let _ = std::process::Command::new("taskkill")
-        .args(["/PID", &pid.to_string(), "/T", "/F"])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status();
 }
 
 /// Most monitors one session will arm.
@@ -391,6 +384,7 @@ fn parse_monitor(name: &str, value: &Value, cwd: &Path) -> Option<MonitorSpec> {
 
 /// Spawn one monitor and the task that owns it.
 fn spawn_monitor(spec: MonitorSpec, cwd: &Path) -> std::io::Result<MonitorTask> {
+    let tree = Arc::new(ProcessTree::create(JobLimits::default())?);
     let mut command = Command::new(&spec.program);
     command
         .args(&spec.args)
@@ -400,11 +394,9 @@ fn spawn_monitor(spec: MonitorSpec, cwd: &Path) -> std::io::Result<MonitorTask> 
         .stderr(std::process::Stdio::piped())
         // A task aborted at shutdown drops this child, and the drop kills it.
         .kill_on_drop(true);
-    #[cfg(unix)]
-    {
-        // Own group, so `terminate_all_monitors` can kill the whole tree.
-        command.process_group(0);
-    }
+    // Unix: own group. Windows: create suspended, so `attach_pid` runs before
+    // the monitor executes and nothing it starts can escape the job.
+    tree.prepare(command.as_std_mut());
 
     // The monitor is not a provider client. Remove the session's credentials
     // before layering the monitor's own environment on: an explicit entry is
@@ -413,14 +405,20 @@ fn spawn_monitor(spec: MonitorSpec, cwd: &Path) -> std::io::Result<MonitorTask> 
     command.envs(spec.env.iter().map(|(key, value)| (key, value)));
 
     let mut child = command.spawn()?;
-    let pid = child.id();
-    if let Some(pid) = pid {
-        register_monitor(pid);
+    let pid = child
+        .id()
+        .ok_or_else(|| std::io::Error::other("the monitor exited before it could be registered"))?;
+    if let Err(error) = tree.attach_pid(pid) {
+        let _ = child.start_kill();
+        return Err(std::io::Error::other(format!(
+            "could not place the monitor in its process tree: {error}"
+        )));
     }
+    let id = register_monitor(Arc::clone(&tree));
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
     let name = spec.name;
-    let task = tokio::spawn(pump(child, pid, stdout, stderr, name.clone()));
+    let task = tokio::spawn(pump(child, id, tree, stdout, stderr, name.clone()));
     Ok(MonitorTask { name, task })
 }
 
@@ -463,7 +461,8 @@ fn is_credential_prefix(key: &str) -> bool {
 /// child, and `kill_on_drop` kills (and the runtime reaps) the process.
 async fn pump(
     mut child: Child,
-    pid: Option<u32>,
+    id: u64,
+    tree: Arc<ProcessTree>,
     stdout: Option<tokio::process::ChildStdout>,
     stderr: Option<tokio::process::ChildStderr>,
     name: String,
@@ -478,9 +477,10 @@ async fn pump(
             tracing::warn!(monitor = %name, %error, "could not wait for plugin monitor");
         }
     }
-    if let Some(pid) = pid {
-        unregister_monitor(pid);
-    }
+    // The monitor exited on its own. Its remaining descendants (if any) are
+    // not ours to kill, so disarm before the tree is dropped.
+    tree.disarm();
+    unregister_monitor(id);
 }
 
 /// Drain one child stream, logging each line with the monitor's name.
@@ -852,7 +852,9 @@ mod tests {
         let _guard = serial();
         let dir = tempfile::tempdir().unwrap();
         let document = serde_json::json!({
-            "sleeper": { "command": "sleep", "args": ["60"] }
+            // Absolute path: another test in this binary replaces `PATH`, and a
+            // PATH lookup here would make this test depend on test order.
+            "sleeper": { "command": "/bin/sh", "args": ["-c", "sleep 60"] }
         });
         let supervisor = PluginMonitorSupervisor::start(&document, dir.path()).unwrap();
         assert_eq!(supervisor.running(), 1);

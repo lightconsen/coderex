@@ -1,8 +1,10 @@
 //! Bridge archive and cleanup — transcript archiving and worktree cleanup.
 
+use coderex_core::process_tree::ProcessTree;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 /// Current archive format version.
 ///
@@ -129,6 +131,17 @@ impl BridgeArchiveWriter {
     }
 }
 
+/// What cleanup knows about a session's process.
+///
+/// A [`ProcessTree`] can kill the whole tree. A bare pid is the older,
+/// weaker shape: on Unix it signals one process, and on Windows the pid is
+/// placed in a job before terminating so descendants go with it.
+#[derive(Debug)]
+enum TrackedProcess {
+    Tree(Arc<ProcessTree>),
+    Pid(u32),
+}
+
 /// Manages cleanup of bridge session resources including process termination.
 #[derive(Debug)]
 pub struct BridgeCleanupManager {
@@ -138,8 +151,8 @@ pub struct BridgeCleanupManager {
     pub session_base: PathBuf,
     /// Whether to confirm stopWork after cleanup.
     pub confirm_stop_work: bool,
-    /// Tracked process IDs for active sessions.
-    process_map: HashMap<String, u32>,
+    /// Tracked processes for active sessions.
+    process_map: HashMap<String, TrackedProcess>,
 }
 
 impl BridgeCleanupManager {
@@ -155,8 +168,19 @@ impl BridgeCleanupManager {
     }
 
     /// Register a session's process for tracking.
+    ///
+    /// Prefer [`Self::track_tree`] where the spawn site has one: a pid alone
+    /// cannot reach descendants on Unix and only reaches them best-effort on
+    /// Windows.
     pub fn track_process(&mut self, session_id: &str, pid: u32) {
-        self.process_map.insert(session_id.to_string(), pid);
+        self.process_map
+            .insert(session_id.to_string(), TrackedProcess::Pid(pid));
+    }
+
+    /// Register a session's process tree for tracking.
+    pub fn track_tree(&mut self, session_id: &str, tree: Arc<ProcessTree>) {
+        self.process_map
+            .insert(session_id.to_string(), TrackedProcess::Tree(tree));
     }
 
     /// Unregister a session's process.
@@ -174,8 +198,8 @@ impl BridgeCleanupManager {
         };
 
         // Terminate session process if tracked
-        if let Some(pid) = self.process_map.remove(session_id) {
-            report.process_terminated = self.terminate_process(pid);
+        if let Some(tracked) = self.process_map.remove(session_id) {
+            report.process_terminated = Self::terminate_process(&tracked);
         }
 
         // Remove worktree
@@ -197,23 +221,23 @@ impl BridgeCleanupManager {
         Ok(report)
     }
 
-    /// Terminate a process by PID.
-    fn terminate_process(&self, pid: u32) -> bool {
-        // Use platform-appropriate process termination
-        #[cfg(unix)]
-        {
-            let _ = std::process::Command::new("kill")
-                .arg(pid.to_string())
-                .output();
-            true
-        }
-
-        #[cfg(not(unix))]
-        {
-            let _ = std::process::Command::new("taskkill")
-                .args(["/F", "/PID", &pid.to_string()])
-                .output();
-            true
+    /// Terminate a tracked process.
+    ///
+    /// Returns whether the kill was actually issued. It used to always return
+    /// `true`, so `CleanupReport::process_terminated` reported success even
+    /// when `kill`/`taskkill` failed.
+    fn terminate_process(tracked: &TrackedProcess) -> bool {
+        match tracked {
+            TrackedProcess::Tree(tree) => tree.terminate(),
+            TrackedProcess::Pid(pid) => {
+                let Ok(tree) = ProcessTree::from_pid(*pid) else {
+                    return false;
+                };
+                if tree.attach_pid(*pid).is_err() {
+                    return false;
+                }
+                tree.terminate()
+            }
         }
     }
 
@@ -324,6 +348,52 @@ mod tests {
 
         mgr.untrack_process("s1");
         assert_eq!(mgr.tracked_process_count(), 0);
+    }
+
+    /// Cleanup kills a tracked tree, not just its direct child.
+    ///
+    /// The Windows arm is the one that matters: it used to run
+    /// `taskkill /F /PID` without `/T`, leaving descendants behind.
+    #[test]
+    fn cleanup_terminates_a_tracked_process_tree() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut mgr = BridgeCleanupManager::new(dir.path().to_path_buf(), dir.path().to_path_buf());
+        let tree = Arc::new(ProcessTree::create(Default::default()).unwrap());
+
+        #[cfg(unix)]
+        let mut cmd = {
+            let mut cmd = std::process::Command::new("sh");
+            cmd.args(["-c", "sleep 60"]);
+            cmd
+        };
+        #[cfg(target_os = "windows")]
+        let mut cmd = {
+            let mut cmd = std::process::Command::new("cmd.exe");
+            cmd.args(["/C", "ping -n 60 127.0.0.1 > nul"]);
+            cmd
+        };
+        #[cfg(not(any(unix, target_os = "windows")))]
+        let mut cmd = std::process::Command::new("true");
+
+        tree.prepare(&mut cmd);
+        let mut child = cmd.spawn().expect("the test child should spawn");
+        tree.attach(&child).expect("the child should join its tree");
+        mgr.track_tree("s1", Arc::clone(&tree));
+
+        let report = mgr.cleanup("s1").unwrap();
+        assert!(report.process_terminated, "the kill should be issued");
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            if child.try_wait().unwrap().is_some() {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the tracked process survived cleanup"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
     }
 
     #[test]
