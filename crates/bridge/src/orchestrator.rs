@@ -910,12 +910,31 @@ impl Bridge {
             },
         };
 
+        // Drive the state machine up to the point where the process can be
+        // started. `CreatingWorktree` is entered before the spawner runs only
+        // when that mode actually creates one; the session is registered once
+        // the spawn succeeded, keeping its full transition history.
+        let mut state_machine = BridgeSessionStateMachine::new(session_id.clone());
+        state_machine
+            .transition(BridgeSessionState::Preparing)
+            .map_err(|e| format!("state transition failed: {e}"))?;
+        let creates_worktree = matches!(assignment.spawn_mode, SpawnMode::Worktree);
+        if creates_worktree {
+            state_machine
+                .transition(BridgeSessionState::CreatingWorktree)
+                .map_err(|e| format!("state transition failed: {e}"))?;
+        }
+
         let result = self.spawner.spawn(config).await?;
+
+        state_machine
+            .transition(BridgeSessionState::Spawning)
+            .map_err(|e| format!("state transition failed: {e}"))?;
 
         self.sessions.insert(
             session_id.clone(),
             ManagedSession {
-                state_machine: BridgeSessionStateMachine::new(session_id.clone()),
+                state_machine,
                 work_dir: result.work_dir.clone(),
                 worktree_created: result.worktree_created,
             },
@@ -936,22 +955,10 @@ impl Bridge {
         transcript: &str,
         usage: UsageStats,
     ) -> Result<(), String> {
-        // Drive session through required states: assigned → preparing → spawning → running → archiving
+        // Drive the session to Running through the validated graph, then
+        // archive, clean up, and finish at Completed.
         if let Some(session) = self.sessions.get_mut(session_id) {
-            if matches!(session.state_machine.current, BridgeSessionState::Assigned) {
-                session
-                    .state_machine
-                    .transition(BridgeSessionState::Preparing)
-                    .map_err(|e| format!("state transition failed: {e}"))?;
-                session
-                    .state_machine
-                    .transition(BridgeSessionState::Spawning)
-                    .map_err(|e| format!("state transition failed: {e}"))?;
-                session
-                    .state_machine
-                    .transition(BridgeSessionState::Running)
-                    .map_err(|e| format!("state transition failed: {e}"))?;
-            }
+            drive_to_running(&mut session.state_machine, session.worktree_created)?;
             session
                 .state_machine
                 .transition(BridgeSessionState::Archiving)
@@ -979,6 +986,15 @@ impl Bridge {
         // Clean up resources
         let _report = self.cleanup_manager.cleanup(session_id)?;
 
+        // The machine requires CleaningUp → Completed before the session is
+        // dropped from tracking.
+        if let Some(session) = self.sessions.get_mut(session_id) {
+            session
+                .state_machine
+                .transition(BridgeSessionState::Completed)
+                .map_err(|e| format!("state transition failed: {e}"))?;
+        }
+
         // Clean up worktree if created
         if let Some(session) = self.sessions.remove(session_id) {
             if session.worktree_created {
@@ -986,8 +1002,7 @@ impl Bridge {
             }
         }
 
-        // Mark session completed in state machine (before removal)
-        // Already removed above, but we emit the event
+        // The session was transitioned through Completed above.
         self.emit(BridgeEvent::SessionCompleted {
             session_id: session_id.to_string(),
         });
@@ -1001,16 +1016,115 @@ impl Bridge {
         Ok(())
     }
 
-    /// Fail a session.
+    /// Fail a session through the validated transition graph.
+    ///
+    /// Every non-terminal state has an edge to `Failed`; a session already in
+    /// a terminal state keeps the state it reached first.
     pub fn fail_session(&mut self, session_id: &str, reason: String) {
         if let Some(session) = self.sessions.get_mut(session_id) {
-            session.state_machine.fail(reason.clone());
+            if !session.state_machine.is_terminal() {
+                let _ = session
+                    .state_machine
+                    .transition(BridgeSessionState::Failed(reason.clone()));
+            }
         }
         self.emit(BridgeEvent::SessionFailed {
             session_id: session_id.to_string(),
             reason,
         });
         self.poller.session_completed();
+    }
+
+    /// Record that the spawned child is now the running session.
+    ///
+    /// The launcher calls this once the spawner has prepared the session and
+    /// the runner is about to start, completing the `Spawning → Running` edge.
+    pub fn mark_session_running(&mut self, session_id: &str) -> Result<(), String> {
+        let session = self
+            .sessions
+            .get_mut(session_id)
+            .ok_or_else(|| format!("unknown session '{session_id}'"))?;
+        if matches!(session.state_machine.current, BridgeSessionState::Running) {
+            return Ok(());
+        }
+        session
+            .state_machine
+            .transition(BridgeSessionState::Running)
+            .map_err(|e| format!("state transition failed: {e}"))
+    }
+
+    /// Enter `AwaitingPermission` because a child request is pending.
+    ///
+    /// Several requests can be outstanding at once; the state only changes on
+    /// the first one, and [`Self::end_awaiting_permission`] is what leaves it.
+    pub fn begin_awaiting_permission(&mut self, session_id: &str) -> Result<(), String> {
+        let session = self
+            .sessions
+            .get_mut(session_id)
+            .ok_or_else(|| format!("unknown session '{session_id}'"))?;
+        if matches!(
+            session.state_machine.current,
+            BridgeSessionState::AwaitingPermission
+        ) {
+            return Ok(());
+        }
+        session
+            .state_machine
+            .transition(BridgeSessionState::AwaitingPermission)
+            .map_err(|e| format!("state transition failed: {e}"))
+    }
+
+    /// Return to `Running` once no child permission requests remain pending.
+    ///
+    /// A session that already failed is left alone: the answer arriving after
+    /// the child died must not resurrect it.
+    pub fn end_awaiting_permission(&mut self, session_id: &str) -> Result<(), String> {
+        let session = self
+            .sessions
+            .get_mut(session_id)
+            .ok_or_else(|| format!("unknown session '{session_id}'"))?;
+        if session.state_machine.is_terminal()
+            || !matches!(
+                session.state_machine.current,
+                BridgeSessionState::AwaitingPermission
+            )
+        {
+            return Ok(());
+        }
+        session
+            .state_machine
+            .transition(BridgeSessionState::Running)
+            .map_err(|e| format!("state transition failed: {e}"))
+    }
+
+    /// Resolve a permission request as denied because its approval wait
+    /// elapsed.
+    ///
+    /// Returns `false` when an answer already resolved the request (the
+    /// bounded wait and a gateway response raced). Once this returns `true`
+    /// the router's first-answer-wins rule makes every later response for the
+    /// same id a no-op, so a late gateway answer cannot revive a dead request.
+    pub fn expire_permission(&mut self, request_id: &str) -> bool {
+        let router_id = self
+            .permission_aliases
+            .get(request_id)
+            .cloned()
+            .unwrap_or_else(|| request_id.to_string());
+
+        if self.permission_router.is_resolved(&router_id) {
+            return false;
+        }
+
+        let resolved = self
+            .permission_router
+            .respond(&router_id, PermissionResponse::Deny);
+        if resolved {
+            self.emit(BridgeEvent::PermissionResolved {
+                request_id: request_id.to_string(),
+                allowed: false,
+            });
+        }
+        resolved
     }
 
     /// ─── Internal: Request permission for a tool call ───
@@ -1252,6 +1366,44 @@ impl Bridge {
         }
         state
     }
+}
+
+/// Walk a session to `Running` through the transitions the machine permits.
+///
+/// Sessions normally arrive here already running (the launcher marks them
+/// when it starts the child); this also covers a session completed without
+/// that call and a session that was waiting for permission when it finished.
+fn drive_to_running(
+    machine: &mut BridgeSessionStateMachine,
+    worktree_created: bool,
+) -> Result<(), String> {
+    if machine.is_terminal() {
+        return Err(format!(
+            "cannot drive terminal session '{}' to running",
+            machine.session_id
+        ));
+    }
+
+    while !matches!(machine.current, BridgeSessionState::Running) {
+        let next = match &machine.current {
+            BridgeSessionState::Assigned => BridgeSessionState::Preparing,
+            BridgeSessionState::Preparing if worktree_created => {
+                BridgeSessionState::CreatingWorktree
+            }
+            BridgeSessionState::Preparing => BridgeSessionState::Spawning,
+            BridgeSessionState::CreatingWorktree => BridgeSessionState::Spawning,
+            BridgeSessionState::Spawning => BridgeSessionState::Running,
+            BridgeSessionState::AwaitingPermission => BridgeSessionState::Running,
+            BridgeSessionState::Running => break,
+            other => {
+                return Err(format!("cannot reach running from session state '{other}'"));
+            }
+        };
+        machine
+            .transition(next)
+            .map_err(|e| format!("state transition failed: {e}"))?;
+    }
+    Ok(())
 }
 
 /// Build the frame that asks the gateway to show a pending permission.
@@ -1948,6 +2100,203 @@ mod tests {
         let payload: serde_json::Value = serde_json::from_str(&reply.payload).unwrap();
         assert_eq!(payload["resolved"], false);
         assert_eq!(bridge.outstanding_relay_approvals(), 0);
+    }
+
+    fn init_git_repo(path: &std::path::Path) {
+        let git = |args: &[&str]| {
+            coderex_core::git_hardening::git_command()
+                .args(args)
+                .current_dir(path)
+                .output()
+                .expect("git command failed");
+        };
+        git(&["init", "--quiet"]);
+        std::fs::write(path.join("README"), "root").unwrap();
+        git(&["add", "README"]);
+        coderex_core::git_hardening::git_command()
+            .args(["commit", "--quiet", "-m", "init"])
+            .env("GIT_AUTHOR_NAME", "test")
+            .env("GIT_AUTHOR_EMAIL", "test@test.com")
+            .env("GIT_COMMITTER_NAME", "test")
+            .env("GIT_COMMITTER_EMAIL", "test@test.com")
+            .current_dir(path)
+            .output()
+            .expect("git commit failed");
+    }
+
+    fn session_history(bridge: &Bridge, session_id: &str) -> Vec<BridgeSessionState> {
+        bridge
+            .sessions
+            .get(session_id)
+            .expect("session is tracked")
+            .state_machine
+            .history
+            .clone()
+    }
+
+    #[tokio::test]
+    async fn spawn_session_records_preparing_and_spawning_without_a_worktree() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("sessions")).unwrap();
+        let mut bridge = Bridge::new(
+            test_config(tmp.path()),
+            Box::new(InProcessTransport::create_pair("b".into(), "r".into()).0),
+        );
+        bridge.connect().await.unwrap();
+
+        let assignment = WorkAssignment {
+            assignment_id: "a1".into(),
+            session_id: "s1".into(),
+            working_directory: tmp.path().join("work").to_str().unwrap().into(),
+            prompt: "test".into(),
+            spawn_mode: SpawnMode::SingleSession,
+        };
+        bridge.spawn_session(&assignment).await.unwrap();
+
+        assert_eq!(
+            session_history(&bridge, "s1"),
+            vec![
+                BridgeSessionState::Assigned,
+                BridgeSessionState::Preparing,
+                BridgeSessionState::Spawning,
+            ],
+            "a directory session must not enter CreatingWorktree"
+        );
+    }
+
+    #[tokio::test]
+    async fn spawn_session_records_creating_worktree_when_one_is_created() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        let worktrees = tmp.path().join("worktrees");
+        let sessions = tmp.path().join("sessions");
+        std::fs::create_dir_all(&repo).unwrap();
+        std::fs::create_dir_all(&worktrees).unwrap();
+        std::fs::create_dir_all(&sessions).unwrap();
+        init_git_repo(&repo);
+
+        let mut config = test_config(tmp.path());
+        config.repo_root = repo;
+        config.worktree_base = worktrees;
+        config.session_base = sessions;
+        let mut bridge = Bridge::new(
+            config,
+            Box::new(InProcessTransport::create_pair("b".into(), "r".into()).0),
+        );
+        bridge.connect().await.unwrap();
+
+        let assignment = WorkAssignment {
+            assignment_id: "a1".into(),
+            session_id: "wt".into(),
+            working_directory: tmp.path().to_str().unwrap().into(),
+            prompt: "test".into(),
+            spawn_mode: SpawnMode::Worktree,
+        };
+        let result = bridge.spawn_session(&assignment).await.unwrap();
+
+        assert!(result.worktree_created);
+        assert_eq!(
+            session_history(&bridge, "wt"),
+            vec![
+                BridgeSessionState::Assigned,
+                BridgeSessionState::Preparing,
+                BridgeSessionState::CreatingWorktree,
+                BridgeSessionState::Spawning,
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_permission_wait_is_a_round_trip_through_awaiting_permission() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("sessions")).unwrap();
+        let mut bridge = test_bridge(tmp.path());
+        let assignment = WorkAssignment {
+            assignment_id: "a1".into(),
+            session_id: "s1".into(),
+            working_directory: tmp.path().join("work").to_str().unwrap().into(),
+            prompt: "test".into(),
+            spawn_mode: SpawnMode::SingleSession,
+        };
+        bridge.spawn_session(&assignment).await.unwrap();
+        bridge.mark_session_running("s1").unwrap();
+
+        bridge.begin_awaiting_permission("s1").unwrap();
+        assert_eq!(
+            bridge.session_state("s1"),
+            Some(&BridgeSessionState::AwaitingPermission)
+        );
+
+        bridge.end_awaiting_permission("s1").unwrap();
+        assert_eq!(
+            session_history(&bridge, "s1"),
+            vec![
+                BridgeSessionState::Assigned,
+                BridgeSessionState::Preparing,
+                BridgeSessionState::Spawning,
+                BridgeSessionState::Running,
+                BridgeSessionState::AwaitingPermission,
+                BridgeSessionState::Running,
+            ]
+        );
+
+        // An early move is still refused: only a running session can wait.
+        bridge.begin_awaiting_permission("s1").unwrap();
+        assert!(
+            bridge
+                .sessions
+                .get_mut("s1")
+                .unwrap()
+                .state_machine
+                .transition(BridgeSessionState::Archiving)
+                .is_err(),
+            "a waiting session must return to Running before archiving"
+        );
+    }
+
+    #[tokio::test]
+    async fn fail_session_enters_failed_through_the_validated_graph() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("sessions")).unwrap();
+        let mut bridge = test_bridge(tmp.path());
+        let assignment = WorkAssignment {
+            assignment_id: "a1".into(),
+            session_id: "s1".into(),
+            working_directory: tmp.path().join("work").to_str().unwrap().into(),
+            prompt: "test".into(),
+            spawn_mode: SpawnMode::SingleSession,
+        };
+        bridge.spawn_session(&assignment).await.unwrap();
+        bridge.mark_session_running("s1").unwrap();
+
+        bridge.fail_session("s1", "child exited 1".into());
+
+        assert!(matches!(
+            bridge.sessions.get("s1").unwrap().state_machine.current,
+            BridgeSessionState::Failed(ref reason) if reason == "child exited 1"
+        ));
+    }
+
+    #[tokio::test]
+    async fn an_expired_permission_is_denied_and_a_late_answer_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut bridge = test_bridge(tmp.path());
+        let request_id = bridge.request_permission("s1", "Bash", "rm -rf /tmp/x");
+
+        assert!(bridge.expire_permission(&request_id));
+        assert!(matches!(
+            bridge.get_permission_response(&request_id),
+            Some(PermissionResponse::Deny)
+        ));
+        // The timeout already answered; a gateway answer that arrives later
+        // must not overwrite it.
+        assert!(
+            !bridge.respond_to_permission(&request_id, PermissionResponse::Allow { always: true })
+        );
+        assert!(matches!(
+            bridge.get_permission_response(&request_id),
+            Some(PermissionResponse::Deny)
+        ));
     }
 
     /// A socket that drops is retried, and the resume frame carries the point

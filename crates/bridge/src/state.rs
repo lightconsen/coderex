@@ -33,13 +33,16 @@ impl BridgeSessionState {
     pub fn can_transition_to(&self, target: &Self) -> bool {
         matches!(
             (self, target),
-            // Assigned → Preparing
+            // Assigned → Preparing | Failed
             (Self::Assigned, Self::Preparing)
-            // Preparing → CreatingWorktree | Spawning
+            | (Self::Assigned, Self::Failed(_))
+            // Preparing → CreatingWorktree | Spawning | Failed
             | (Self::Preparing, Self::CreatingWorktree)
             | (Self::Preparing, Self::Spawning)
-            // CreatingWorktree → Spawning
+            | (Self::Preparing, Self::Failed(_))
+            // CreatingWorktree → Spawning | Failed
             | (Self::CreatingWorktree, Self::Spawning)
+            | (Self::CreatingWorktree, Self::Failed(_))
             // Spawning → Running | Failed
             | (Self::Spawning, Self::Running)
             | (Self::Spawning, Self::Failed(_))
@@ -280,6 +283,81 @@ mod tests {
 
         let result = sm.transition(BridgeSessionState::Assigned);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn early_states_can_fail_through_the_validated_api() {
+        for target in [
+            BridgeSessionState::Assigned,
+            BridgeSessionState::Preparing,
+            BridgeSessionState::CreatingWorktree,
+        ] {
+            let mut sm = BridgeSessionStateMachine::new("s-fail".into());
+            match target {
+                BridgeSessionState::Preparing => {
+                    sm.transition(BridgeSessionState::Preparing).unwrap();
+                }
+                BridgeSessionState::CreatingWorktree => {
+                    sm.transition(BridgeSessionState::Preparing).unwrap();
+                    sm.transition(BridgeSessionState::CreatingWorktree).unwrap();
+                }
+                _ => {}
+            }
+            sm.transition(BridgeSessionState::Failed("spawn failed".into()))
+                .unwrap();
+            assert!(sm.is_terminal());
+        }
+    }
+
+    #[test]
+    fn state_machine_full_lifecycle_with_permission_wait() {
+        let mut sm = BridgeSessionStateMachine::new("s4".into());
+
+        sm.transition(BridgeSessionState::Preparing).unwrap();
+        sm.transition(BridgeSessionState::CreatingWorktree).unwrap();
+        sm.transition(BridgeSessionState::Spawning).unwrap();
+        sm.transition(BridgeSessionState::Running).unwrap();
+        sm.transition(BridgeSessionState::AwaitingPermission)
+            .unwrap();
+        sm.transition(BridgeSessionState::Running).unwrap();
+        sm.transition(BridgeSessionState::Archiving).unwrap();
+        sm.transition(BridgeSessionState::CleaningUp).unwrap();
+        sm.transition(BridgeSessionState::Completed).unwrap();
+
+        assert_eq!(
+            sm.history,
+            vec![
+                BridgeSessionState::Assigned,
+                BridgeSessionState::Preparing,
+                BridgeSessionState::CreatingWorktree,
+                BridgeSessionState::Spawning,
+                BridgeSessionState::Running,
+                BridgeSessionState::AwaitingPermission,
+                BridgeSessionState::Running,
+                BridgeSessionState::Archiving,
+                BridgeSessionState::CleaningUp,
+                BridgeSessionState::Completed,
+            ]
+        );
+        assert!(sm.is_terminal());
+    }
+
+    #[test]
+    fn permission_and_terminal_moves_stay_refused() {
+        // Archiving and cleaning up are the only routes into the terminal
+        // states; a running session must not jump straight there.
+        assert!(!BridgeSessionState::Running.can_transition_to(&BridgeSessionState::Completed));
+        assert!(!BridgeSessionState::Archiving.can_transition_to(&BridgeSessionState::Completed));
+        assert!(!BridgeSessionState::Spawning.can_transition_to(&BridgeSessionState::Completed));
+        // Only a running session can start waiting for permission.
+        assert!(
+            !BridgeSessionState::Preparing
+                .can_transition_to(&BridgeSessionState::AwaitingPermission)
+        );
+        assert!(
+            !BridgeSessionState::AwaitingPermission
+                .can_transition_to(&BridgeSessionState::Archiving)
+        );
     }
 
     #[test]

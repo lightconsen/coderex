@@ -81,9 +81,16 @@ impl BridgePermissionRouter {
         self.pending.get(request_id)
     }
 
-    /// Submit a response to a permission request.
+    /// Submit the first response to a permission request.
+    ///
+    /// The first answer wins. A late answer (for example, one that arrives
+    /// after the launcher's bounded approval wait already denied the request)
+    /// is refused rather than overwriting the decision the child was given.
     pub fn respond(&mut self, request_id: &str, response: PermissionResponse) -> bool {
         if let Some(req) = self.pending.get_mut(request_id) {
+            if req.resolved {
+                return false;
+            }
             req.resolved = true;
             self.responses.insert(request_id.to_string(), response);
             true
@@ -177,6 +184,21 @@ mod tests {
         let mut router = BridgePermissionRouter::new();
         let id = router.create_request("s1".into(), "Bash".into(), "rm".into());
         router.respond(&id, PermissionResponse::Deny);
+        assert!(matches!(
+            router.get_response(&id),
+            Some(PermissionResponse::Deny)
+        ));
+    }
+
+    #[test]
+    fn a_late_response_cannot_overwrite_the_first_one() {
+        let mut router = BridgePermissionRouter::new();
+        let id = router.create_request("s1".into(), "Bash".into(), "ls".into());
+
+        assert!(router.respond(&id, PermissionResponse::Deny));
+        // A gateway answer that arrives after the approval timed out is
+        // refused: the child has already been told no.
+        assert!(!router.respond(&id, PermissionResponse::Allow { always: true }));
         assert!(matches!(
             router.get_response(&id),
             Some(PermissionResponse::Deny)

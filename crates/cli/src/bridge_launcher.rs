@@ -56,6 +56,9 @@ pub const ENV_AUTH_TOKEN: &str = "CODEREX_BRIDGE_TOKEN";
 pub const ENV_POLL_INTERVAL_SECS: &str = "CODEREX_BRIDGE_POLL_INTERVAL_SECS";
 /// Environment variable overriding the assignment claim path template.
 pub const ENV_CLAIM_PATH: &str = "CODEREX_BRIDGE_CLAIM_PATH";
+/// Environment variable bounding how long a child's permission request may
+/// wait for an answer, in seconds. `0` disables the bound.
+pub const ENV_APPROVAL_TIMEOUT_SECS: &str = "CODEREX_BRIDGE_APPROVAL_TIMEOUT_SECS";
 
 /// Default transport kind: the real gateway transport.
 pub const DEFAULT_TRANSPORT: &str = "websocket";
@@ -63,6 +66,12 @@ pub const DEFAULT_TRANSPORT: &str = "websocket";
 pub const DEFAULT_MAX_CONCURRENT: usize = 5;
 /// Default interval between control-plane assignment polls.
 pub const DEFAULT_POLL_INTERVAL_SECS: u64 = 5;
+/// Default bound on a child's permission request, in seconds.
+///
+/// Five minutes is long enough for a person to notice and answer an approval
+/// on a remote session, and short enough that a gateway that dropped the
+/// question does not leave the child blocked forever.
+pub const DEFAULT_APPROVAL_TIMEOUT_SECS: u64 = 300;
 /// How many times registration is attempted before the worker exits.
 pub const REGISTRATION_ATTEMPTS: usize = 5;
 
@@ -764,7 +773,260 @@ struct RunningSession {
 /// A child permission request waiting for the person's answer.
 #[derive(Debug)]
 struct PendingChildPermission {
+    /// Session whose child is blocked.
+    session_id: String,
+    /// Where the child's answer goes.
     decisions: tokio::sync::mpsc::UnboundedSender<ChildPermissionDecision>,
+    /// Dropped when the request resolves. The bounded wait owns the receiver,
+    /// so dropping this ends the wait without a timeout firing.
+    _answered: tokio::sync::oneshot::Sender<()>,
+}
+
+/// Tracks the child permission requests the launcher has not answered yet.
+///
+/// It owns the bridge-side registration (`request_permission_with_id`) and the
+/// session-state edges in and out of `AwaitingPermission`, so the run loop and
+/// the timeout tests drive exactly the same code.
+#[derive(Debug)]
+struct PermissionTracker {
+    /// Requests registered with the bridge and still waiting.
+    pending: HashMap<String, PendingChildPermission>,
+    /// How many requests each session has outstanding. The session stays in
+    /// `AwaitingPermission` until the last one resolves.
+    session_counts: HashMap<String, usize>,
+    /// Bound on each wait; `None` preserves the unbounded historical behaviour.
+    timeout: Option<Duration>,
+    /// Deadline notifications: a request id whose bounded wait expired.
+    timeout_tx: tokio::sync::mpsc::UnboundedSender<String>,
+}
+
+impl PermissionTracker {
+    fn new(
+        timeout: Option<Duration>,
+        timeout_tx: tokio::sync::mpsc::UnboundedSender<String>,
+    ) -> Self {
+        Self {
+            pending: HashMap::new(),
+            session_counts: HashMap::new(),
+            timeout,
+            timeout_tx,
+        }
+    }
+
+    /// Number of requests still waiting for an answer.
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.pending.len()
+    }
+
+    /// Register a child request with the bridge and start its bounded wait.
+    async fn register(
+        &mut self,
+        bridge: &mut Bridge,
+        running: &HashMap<String, RunningSession>,
+        request: ChildPermissionRequest,
+    ) {
+        if self.pending.contains_key(&request.request_id) {
+            tracing::warn!(
+                session_id = %request.session_id,
+                request_id = %request.request_id,
+                "ignoring a child permission request id that is already pending"
+            );
+            return;
+        }
+
+        let Some(decisions) = running
+            .get(&request.session_id)
+            .map(|session| session.permission_tx.clone())
+        else {
+            // The session finished while its last frame was in the pipe;
+            // nobody can act on the answer, and there is no child left to
+            // receive it.
+            tracing::warn!(
+                session_id = %request.session_id,
+                request_id = %request.request_id,
+                "ignoring a permission request from a session that is no longer running"
+            );
+            return;
+        };
+
+        let args = request.input.to_string();
+        match bridge.request_permission_with_id(
+            &request.request_id,
+            &request.session_id,
+            &request.tool_name,
+            &args,
+        ) {
+            Ok(request_id) => {
+                let (answered, answered_rx) = tokio::sync::oneshot::channel();
+                self.pending.insert(
+                    request_id.clone(),
+                    PendingChildPermission {
+                        session_id: request.session_id.clone(),
+                        decisions,
+                        _answered: answered,
+                    },
+                );
+
+                if let Some(timeout) = self.timeout {
+                    let timeout_tx = self.timeout_tx.clone();
+                    let timed_out_id = request_id.clone();
+                    tokio::spawn(async move {
+                        // An answer drops the sender and completes this wait
+                        // early; only an elapsed deadline means the request
+                        // went unanswered.
+                        if tokio::time::timeout(timeout, answered_rx).await.is_err() {
+                            let _ = timeout_tx.send(timed_out_id);
+                        }
+                    });
+                }
+
+                let first = {
+                    let count = self
+                        .session_counts
+                        .entry(request.session_id.clone())
+                        .or_insert(0);
+                    *count += 1;
+                    *count == 1
+                };
+                if first {
+                    if let Err(error) = bridge.begin_awaiting_permission(&request.session_id) {
+                        tracing::warn!(
+                            session_id = %request.session_id,
+                            error = %error,
+                            "could not record the session as awaiting permission"
+                        );
+                    }
+                }
+
+                // Route the answer before the frame is flushed: the person
+                // can answer as soon as it appears in the gateway.
+                if let Err(error) = bridge.send_pending_permission_requests().await {
+                    tracing::warn!(error = %error, "could not send a permission request");
+                }
+            }
+            Err(error) => tracing::warn!(
+                session_id = %request.session_id,
+                error = %error,
+                "ignoring a child permission request with a known id"
+            ),
+        }
+    }
+
+    /// Deliver the router's answer to the child and leave `AwaitingPermission`
+    /// when this was the session's last outstanding request.
+    fn deliver(&mut self, bridge: &mut Bridge, request_id: &str) {
+        let Some(entry) = self.pending.remove(request_id) else {
+            // The timeout path already answered this request.
+            return;
+        };
+        self.release_session(bridge, &entry.session_id);
+
+        let (allow, allow_session, message) = match bridge.get_permission_response(request_id) {
+            Some(PermissionResponse::Allow { always }) => (
+                true,
+                *always,
+                if *always {
+                    "approved for the session"
+                } else {
+                    "approved"
+                },
+            ),
+            // A response the router no longer has (for example after a
+            // restart) is treated as a denial: silence must not become
+            // consent.
+            Some(PermissionResponse::Deny) | None => (false, false, "denied"),
+        };
+
+        if entry
+            .decisions
+            .send(ChildPermissionDecision {
+                request_id: request_id.to_string(),
+                allow,
+                allow_session: allow_session && allow,
+                message: message.to_string(),
+            })
+            .is_err()
+        {
+            tracing::warn!("session ended before its permission decision could be delivered");
+        }
+    }
+
+    /// Apply an elapsed bounded wait.
+    fn expire(&mut self, bridge: &mut Bridge, request_id: &str) {
+        if !self.pending.contains_key(request_id) {
+            // Already answered; the timer raced the answer.
+            return;
+        }
+
+        // The gateway may have resolved the router in a serve-loop turn that
+        // has not reached the event branch yet. That answer wins.
+        if bridge.is_permission_resolved(request_id) {
+            self.deliver(bridge, request_id);
+            return;
+        }
+
+        let Some(entry) = self.pending.remove(request_id) else {
+            return;
+        };
+        self.release_session(bridge, &entry.session_id);
+
+        let message = match self.timeout {
+            Some(timeout) => format!(
+                "approval timed out after {timeout:?}; no decision was received, so the \
+                 tool was not run"
+            ),
+            None => "approval timed out; no decision was received".to_string(),
+        };
+        tracing::warn!(
+            session_id = %entry.session_id,
+            request_id = %request_id,
+            "permission approval timed out; denying the request"
+        );
+
+        // Resolve the bridge-side router as Deny. The first answer wins, so a
+        // gateway response that arrives after this cannot revive the request.
+        let _ = bridge.expire_permission(request_id);
+
+        if entry
+            .decisions
+            .send(ChildPermissionDecision {
+                request_id: request_id.to_string(),
+                allow: false,
+                allow_session: false,
+                message,
+            })
+            .is_err()
+        {
+            tracing::warn!("session ended before its timeout denial could be delivered");
+        }
+    }
+
+    /// Drop everything tracked for a finished session.
+    fn forget_session(&mut self, session_id: &str) {
+        self.pending.retain(|_, p| p.session_id != session_id);
+        self.session_counts.remove(session_id);
+    }
+
+    /// Decrement the session's outstanding count and return it to `Running`
+    /// when nothing is left pending.
+    fn release_session(&mut self, bridge: &mut Bridge, session_id: &str) {
+        let Some(count) = self.session_counts.get_mut(session_id) else {
+            return;
+        };
+        if *count > 1 {
+            *count -= 1;
+            return;
+        }
+        self.session_counts.remove(session_id);
+        if let Err(error) = bridge.end_awaiting_permission(session_id) {
+            tracing::warn!(
+                session_id = %session_id,
+                error = %error,
+                "could not return the session to running after its permission"
+            );
+        }
+    }
 }
 
 /// Errors raised while turning CLI arguments into a launch configuration.
@@ -809,6 +1071,12 @@ pub struct BridgeLaunchConfig {
     pub poll_interval: Duration,
     /// Path template used to claim an assignment before running it.
     pub claim_path: String,
+    /// How long a child's permission request may wait for an answer.
+    ///
+    /// `None` means no bound: the request waits until it is answered or the
+    /// child exits, which is the historical behaviour selected explicitly
+    /// with `CODEREX_BRIDGE_APPROVAL_TIMEOUT_SECS=0`.
+    pub approval_timeout: Option<Duration>,
 }
 
 impl BridgeLaunchConfig {
@@ -909,6 +1177,22 @@ impl BridgeLaunchConfig {
             )));
         }
 
+        // A bound of zero is the explicit opt-out; any other value has to be
+        // a whole number of seconds.
+        let approval_timeout = match env(ENV_APPROVAL_TIMEOUT_SECS) {
+            None => Some(Duration::from_secs(DEFAULT_APPROVAL_TIMEOUT_SECS)),
+            Some(raw) => match raw.trim().parse::<u64>() {
+                Ok(0) => None,
+                Ok(secs) => Some(Duration::from_secs(secs)),
+                Err(_) => {
+                    return Err(BridgeConfigError::Invalid(format!(
+                        "${ENV_APPROVAL_TIMEOUT_SECS} must be a whole number of seconds \
+                         (0 disables the bound), got '{raw}'"
+                    )));
+                }
+            },
+        };
+
         if is_websocket(&transport) && !is_websocket_url(&transport_url) {
             return Err(BridgeConfigError::Invalid(format!(
                 "transport '{transport}' needs a ws:// or wss:// URL, got '{transport_url}' \
@@ -936,6 +1220,7 @@ impl BridgeLaunchConfig {
             auth_token,
             poll_interval: Duration::from_secs(args.poll_interval_secs),
             claim_path,
+            approval_timeout,
         })
     }
 
@@ -1107,7 +1392,11 @@ async fn run_worker(
     // can become a `permission_request` frame.
     let (permission_request_tx, mut permission_request_rx) =
         tokio::sync::mpsc::unbounded_channel::<ChildPermissionRequest>();
-    let mut pending_child_permissions: HashMap<String, PendingChildPermission> = HashMap::new();
+    // Expired bounded waits report their request id here; the tracker decides
+    // whether the answer or the deadline won.
+    let (permission_timeout_tx, mut permission_timeout_rx) =
+        tokio::sync::mpsc::unbounded_channel::<String>();
+    let mut permissions = PermissionTracker::new(config.approval_timeout, permission_timeout_tx);
     // Subscribed once: `respond_to_permission` broadcasts the resolution, and
     // the serve loop may complete at any point in the select.
     let mut bridge_events = bridge.subscribe();
@@ -1134,6 +1423,7 @@ async fn run_worker(
             done = completion_rx.recv() => {
                 if let Some(done) = done {
                     running.remove(&done.session_id);
+                    permissions.forget_session(&done.session_id);
                     finish_session(bridge, done).await;
                     // `finish_session` queued the terminal state; the serve
                     // loop owns the transport, so flush while we have it.
@@ -1156,56 +1446,20 @@ async fn run_worker(
             }
             request = permission_request_rx.recv() => {
                 if let Some(request) = request {
-                    handle_child_permission_request(
-                        bridge,
-                        &running,
-                        &mut pending_child_permissions,
-                        request,
-                    )
-                    .await;
+                    permissions.register(bridge, &running, request).await;
+                }
+            }
+            request_id = permission_timeout_rx.recv() => {
+                if let Some(request_id) = request_id {
+                    permissions.expire(bridge, &request_id);
                 }
             }
             event = bridge_events.recv() => {
                 // Every event other than a resolution is informational here;
                 // lagging is fine because the resolution is also visible in
                 // the router (`get_permission_response`).
-                if let Ok(BridgeEvent::PermissionResolved {
-                    request_id,
-                    allowed,
-                }) = event
-                {
-                    if let Some(pending) = pending_child_permissions.remove(&request_id) {
-                        let (allow_session, message) =
-                            match bridge.get_permission_response(&request_id) {
-                                Some(PermissionResponse::Allow { always }) => (
-                                    *always,
-                                    if *always {
-                                        "approved for the session"
-                                    } else {
-                                        "approved"
-                                    },
-                                ),
-                                Some(PermissionResponse::Deny) => (false, "denied"),
-                                None => (
-                                    false,
-                                    if allowed { "approved" } else { "denied" },
-                                ),
-                            };
-                        if pending
-                            .decisions
-                            .send(ChildPermissionDecision {
-                                request_id,
-                                allow: allowed,
-                                allow_session: allow_session && allowed,
-                                message: message.to_string(),
-                            })
-                            .is_err()
-                        {
-                            tracing::warn!(
-                                "session ended before its permission decision could be delivered"
-                            );
-                        }
-                    }
+                if let Ok(BridgeEvent::PermissionResolved { request_id, .. }) = event {
+                    permissions.deliver(bridge, &request_id);
                 }
             }
             _ = ticker.tick() => {
@@ -1249,64 +1503,6 @@ async fn run_worker(
         || Ok(()),
         |err| Err(anyhow::anyhow!("bridge serve loop failed: {err}")),
     )
-}
-
-/// Register a child's approval request with the bridge and wait for its
-/// answer.
-///
-/// The request is queued under the child's id and flushed immediately: the
-/// child is blocked on stdin, so waiting for the poll tick would add its whole
-/// interval to every approval.
-async fn handle_child_permission_request(
-    bridge: &mut Bridge,
-    running: &HashMap<String, RunningSession>,
-    pending: &mut HashMap<String, PendingChildPermission>,
-    request: ChildPermissionRequest,
-) {
-    if pending.contains_key(&request.request_id) {
-        tracing::warn!(
-            session_id = %request.session_id,
-            request_id = %request.request_id,
-            "ignoring a child permission request id that is already pending"
-        );
-        return;
-    }
-
-    let Some(decisions) = running
-        .get(&request.session_id)
-        .map(|session| session.permission_tx.clone())
-    else {
-        // The session finished while its last frame was in the pipe; nobody
-        // can act on the answer, and there is no child left to receive it.
-        tracing::warn!(
-            session_id = %request.session_id,
-            request_id = %request.request_id,
-            "ignoring a permission request from a session that is no longer running"
-        );
-        return;
-    };
-
-    let args = request.input.to_string();
-    match bridge.request_permission_with_id(
-        &request.request_id,
-        &request.session_id,
-        &request.tool_name,
-        &args,
-    ) {
-        Ok(request_id) => {
-            // Route the answer before the frame is flushed: the person can
-            // answer as soon as it appears in the gateway.
-            pending.insert(request_id, PendingChildPermission { decisions });
-            if let Err(error) = bridge.send_pending_permission_requests().await {
-                tracing::warn!(error = %error, "could not send a permission request");
-            }
-        }
-        Err(error) => tracing::warn!(
-            session_id = %request.session_id,
-            error = %error,
-            "ignoring a child permission request with a known id"
-        ),
-    }
 }
 
 /// Start one task per spawned session and remember it for shutdown.
@@ -1510,6 +1706,17 @@ async fn assignment_tick(
                     work_dir = %result.work_dir.display(),
                     "spawned bridge session"
                 );
+                // The runner is about to start this session's child, so the
+                // spawn edge is complete. Drive the validated state machine
+                // from Spawning to Running before any permission request can
+                // arrive from the child.
+                if let Err(error) = bridge.mark_session_running(&result.session_id) {
+                    tracing::warn!(
+                        session_id = %result.session_id,
+                        error = %error,
+                        "could not record the session as running"
+                    );
+                }
                 // Announce the transition the same way `finish_session`
                 // announces completion; the launcher flushes it when the
                 // tick returns.
@@ -1677,6 +1884,7 @@ mod tests {
     use crate::cli::Cli;
     use clap::Parser;
     use coderex_bridge::poller::{CapacityReport, SpawnMode, WorkAssignment};
+    use coderex_bridge::state::BridgeSessionState;
     use coderex_bridge::transport::InProcessTransport;
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -2012,6 +2220,38 @@ mod tests {
         assert_eq!(config.repo_root, repo);
         assert_eq!(config.transport_url, "ws://gateway.example.test:9000");
         assert_eq!(config.auth_token.as_deref(), Some("token-from-env"));
+    }
+
+    #[test]
+    fn approval_timeout_defaults_to_five_minutes_and_is_env_overridable() {
+        let tmp = tempfile::tempdir().unwrap();
+        let args = args_with("http://cp.example.test", "env-test");
+
+        let default = BridgeLaunchConfig::resolve(&args, tmp.path(), |_| None).unwrap();
+        assert_eq!(
+            default.approval_timeout,
+            Some(Duration::from_secs(DEFAULT_APPROVAL_TIMEOUT_SECS))
+        );
+
+        let configured = BridgeLaunchConfig::resolve(&args, tmp.path(), |key| {
+            (key == ENV_APPROVAL_TIMEOUT_SECS).then(|| "45".to_string())
+        })
+        .unwrap();
+        assert_eq!(configured.approval_timeout, Some(Duration::from_secs(45)));
+
+        // Zero is the explicit request for the old, unbounded behaviour.
+        let disabled = BridgeLaunchConfig::resolve(&args, tmp.path(), |key| {
+            (key == ENV_APPROVAL_TIMEOUT_SECS).then(|| "0".to_string())
+        })
+        .unwrap();
+        assert_eq!(disabled.approval_timeout, None);
+
+        let invalid = BridgeLaunchConfig::resolve(&args, tmp.path(), |key| {
+            (key == ENV_APPROVAL_TIMEOUT_SECS).then(|| "soon".to_string())
+        })
+        .unwrap_err()
+        .to_string();
+        assert!(invalid.contains(ENV_APPROVAL_TIMEOUT_SECS), "{invalid}");
     }
 
     #[test]
@@ -3084,5 +3324,265 @@ printf 'ECHO:%s\n' "$line""#;
         .to_string();
         assert!(error.contains("could not connect"), "{error}");
         assert!(error.contains("refused by test"), "{error}");
+    }
+
+    // ─── Permission timeouts and the missing lifecycle states ───
+
+    async fn permission_test_bridge(tmp: &Path, epoch: u64) -> Bridge {
+        let mut config = worker_config(tmp).bridge_config();
+        config.archive_base = tmp.join("archives");
+        let (transport, _remote) =
+            InProcessTransport::create_pair("bridge-perm".into(), "gateway-perm".into());
+        let mut bridge = Bridge::with_control_plane(
+            config,
+            Box::new(transport),
+            Arc::new(FakeControlPlane {
+                worker_epoch: epoch,
+                ..FakeControlPlane::default()
+            }),
+        );
+        bridge.connect().await.unwrap();
+        if epoch != 0 {
+            bridge.register().await.unwrap();
+        }
+        bridge
+    }
+
+    async fn spawn_permission_session(bridge: &mut Bridge, tmp: &Path) {
+        std::fs::create_dir_all(tmp.join("sessions")).unwrap();
+        let assignment = sample_assignment(&tmp.join("sessions"));
+        bridge.spawn_session(&assignment).await.unwrap();
+        bridge.mark_session_running("s1").unwrap();
+    }
+
+    fn running_permission_session() -> (
+        HashMap<String, RunningSession>,
+        tokio::sync::mpsc::UnboundedReceiver<ChildPermissionDecision>,
+    ) {
+        let (permission_tx, decisions) =
+            tokio::sync::mpsc::unbounded_channel::<ChildPermissionDecision>();
+        let mut running = HashMap::new();
+        running.insert(
+            "s1".to_string(),
+            RunningSession {
+                handle: tokio::spawn(async {}),
+                stop: SessionStop::new(),
+                permission_tx,
+            },
+        );
+        (running, decisions)
+    }
+
+    fn child_request(request_id: &str) -> ChildPermissionRequest {
+        ChildPermissionRequest {
+            session_id: "s1".into(),
+            request_id: request_id.into(),
+            tool_name: "Bash".into(),
+            input: serde_json::json!({ "command": "rm -rf /tmp/x" }),
+            reason: "needs approval".into(),
+            allow_session: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn an_unanswered_child_permission_times_out_and_denies() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut bridge = permission_test_bridge(tmp.path(), 0).await;
+        spawn_permission_session(&mut bridge, tmp.path()).await;
+        let (running, mut decisions) = running_permission_session();
+
+        let (timeout_tx, mut timeout_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        let mut tracker = PermissionTracker::new(Some(Duration::from_millis(50)), timeout_tx);
+
+        tracker
+            .register(&mut bridge, &running, child_request("child-req-timeout"))
+            .await;
+        assert_eq!(tracker.len(), 1);
+        assert_eq!(
+            bridge.session_state("s1"),
+            Some(&BridgeSessionState::AwaitingPermission)
+        );
+
+        let request_id = tokio::time::timeout(Duration::from_secs(2), timeout_rx.recv())
+            .await
+            .expect("the bounded wait should expire")
+            .expect("the timeout channel should stay open");
+        assert_eq!(request_id, "child-req-timeout");
+
+        tracker.expire(&mut bridge, &request_id);
+
+        let decision = decisions
+            .recv()
+            .await
+            .expect("the child should receive a decision");
+        assert!(!decision.allow);
+        assert!(
+            decision.message.contains("timed out"),
+            "the message must report the timeout, not a denial by the user: {}",
+            decision.message
+        );
+        assert_eq!(tracker.len(), 0, "the pending map is empty");
+        assert_eq!(
+            bridge.session_state("s1"),
+            Some(&BridgeSessionState::Running),
+            "the session leaves AwaitingPermission after its last request"
+        );
+        assert!(matches!(
+            bridge.get_permission_response("child-req-timeout"),
+            Some(PermissionResponse::Deny)
+        ));
+
+        // A gateway answer that arrives after the deadline cannot resolve the
+        // dead request or overwrite the denial the child already received.
+        assert!(!bridge.respond_to_permission(
+            "child-req-timeout",
+            PermissionResponse::Allow { always: true }
+        ));
+        assert!(matches!(
+            bridge.get_permission_response("child-req-timeout"),
+            Some(PermissionResponse::Deny)
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_timely_child_permission_answer_beats_the_deadline() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut bridge = permission_test_bridge(tmp.path(), 0).await;
+        spawn_permission_session(&mut bridge, tmp.path()).await;
+        let (running, mut decisions) = running_permission_session();
+
+        let (timeout_tx, mut timeout_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        let mut tracker = PermissionTracker::new(Some(Duration::from_millis(50)), timeout_tx);
+
+        tracker
+            .register(&mut bridge, &running, child_request("child-req-answered"))
+            .await;
+        assert_eq!(tracker.len(), 1);
+
+        assert!(bridge.respond_to_permission(
+            "child-req-answered",
+            PermissionResponse::Allow { always: true }
+        ));
+        tracker.deliver(&mut bridge, "child-req-answered");
+
+        let decision = decisions
+            .recv()
+            .await
+            .expect("the child should receive the answer");
+        assert!(decision.allow);
+        assert!(decision.allow_session);
+        assert_eq!(tracker.len(), 0);
+        assert_eq!(
+            bridge.session_state("s1"),
+            Some(&BridgeSessionState::Running)
+        );
+
+        // Dropping the pending entry stops the bounded wait: no timeout fires
+        // after the answer.
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        assert!(
+            timeout_rx.try_recv().is_err(),
+            "an answered request must not report a timeout"
+        );
+    }
+
+    #[tokio::test]
+    async fn launcher_drives_each_missing_state_and_refuses_invalid_moves() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut bridge = permission_test_bridge(tmp.path(), 0).await;
+        spawn_permission_session(&mut bridge, tmp.path()).await;
+
+        // The spawner's sequence for a directory session: Preparing then
+        // Spawning, never CreatingWorktree.
+        assert_eq!(
+            bridge.sessions.get("s1").unwrap().state_machine.history,
+            vec![
+                BridgeSessionState::Assigned,
+                BridgeSessionState::Preparing,
+                BridgeSessionState::Spawning,
+                BridgeSessionState::Running,
+            ]
+        );
+
+        let (running, mut decisions) = running_permission_session();
+        let (timeout_tx, _timeout_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        let mut tracker = PermissionTracker::new(None, timeout_tx);
+        tracker
+            .register(&mut bridge, &running, child_request("child-req-state"))
+            .await;
+        assert_eq!(
+            bridge.session_state("s1"),
+            Some(&BridgeSessionState::AwaitingPermission)
+        );
+
+        // A waiting session cannot skip the return to Running.
+        assert!(
+            bridge
+                .sessions
+                .get_mut("s1")
+                .unwrap()
+                .state_machine
+                .transition(BridgeSessionState::Archiving)
+                .is_err()
+        );
+
+        assert!(bridge.respond_to_permission("child-req-state", PermissionResponse::Deny));
+        tracker.deliver(&mut bridge, "child-req-state");
+        assert!(decisions.recv().await.is_some());
+        assert_eq!(
+            bridge.session_state("s1"),
+            Some(&BridgeSessionState::Running)
+        );
+
+        // A failed runner leaves the session in Failed.
+        finish_session(
+            &mut bridge,
+            SessionCompletion {
+                session_id: "s1".into(),
+                outcome: Err("child exited 1".into()),
+            },
+        )
+        .await;
+        assert!(matches!(
+            bridge.sessions.get("s1").unwrap().state_machine.current,
+            BridgeSessionState::Failed(ref reason) if reason == "child exited 1"
+        ));
+    }
+
+    #[tokio::test]
+    async fn finish_session_reports_completed_for_a_successful_outcome() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut bridge = permission_test_bridge(tmp.path(), 9).await;
+        spawn_permission_session(&mut bridge, tmp.path()).await;
+
+        finish_session(
+            &mut bridge,
+            SessionCompletion {
+                session_id: "s1".into(),
+                outcome: Ok(SessionOutput {
+                    transcript: "{\"type\":\"result\",\"subtype\":\"success\"}\n".into(),
+                    usage: UsageStats::default(),
+                }),
+            },
+        )
+        .await;
+
+        assert!(
+            !bridge.sessions.contains_key("s1"),
+            "a completed session is removed from tracking"
+        );
+        let frames = bridge.take_pending_session_writes();
+        let states: Vec<String> = frames
+            .iter()
+            .map(|frame| {
+                let payload: Value = serde_json::from_str(&frame.payload).unwrap();
+                payload["state"].as_str().unwrap().to_string()
+            })
+            .collect();
+        assert_eq!(
+            states,
+            vec!["completed".to_string()],
+            "the final write is Completed, not Failed"
+        );
     }
 }
