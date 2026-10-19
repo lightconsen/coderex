@@ -14,7 +14,7 @@ Implements the tool trait system, registers built-in tools, and provides executi
 - **`ToolContext`** (`tool.rs:84`) — Runtime context: `execution_context` (Normal, AsyncAgent, CoordinatorMode, InProcessTeam, PlanMode, ReplOnly, HeadlessSdk, RemoteBridge), `cwd`, and `extra` shared state map (`Arc<HashMap<String, SharedState>>`).
 - **`ToolInput`** (`tool.rs:37`) — `call_id`, `name`, JSON `arguments`.
 - **`ToolOutput`** (`context.rs:66`) — `output: String` and `is_display: bool`.
-- **`ToolResult.images`** (`core/types.rs`) — base64 `ImageBlock`s returned by a tool; the provider request serializes them as `image` content blocks after the text result (MCP image content uses this path).
+- **`ToolResult.images`** (`core/types.rs`) — base64 `ImageBlock`s returned by a tool; `ToolOutput.images` carries them out of a tool, the dispatcher forwards them, and the provider request serializes them as `image` content blocks after the text result. MCP image content and `Read` of a PNG/JPEG/GIF/WebP use this path; stream-json frames carry them as well.
 - **`ToolError`** (`context.rs:28`) — `NotFound`, `Timeout`, `Io`, `InvalidInput`, `PermissionDenied`, `RateLimited`.
 - **`ToolRegistry`** (`registry.rs`) — `DashMap`-backed concurrent registry with deny rules and tier filtering.
 - **`ToolExecutor`** (`executor.rs`) — Concrete executor with concurrency control, per-tool serialization locks, timeout enforcement, and output truncation.

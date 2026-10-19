@@ -63,14 +63,14 @@ coderex --agent explore "find all API route definitions"
 
 ## Architecture
 
-CodeRex is organized as a Rust workspace with 16 crates:
+CodeRex is organized as a Rust workspace with 19 crates (plus the `evals` harness):
 
 | Crate | Responsibility |
 |-------|--------------|
 | `cli` | Binary entry point, startup orchestrator, REPL, server |
 | `core` | QueryEngine, turn state machine, permission engine, API client |
-| `tools` | Tool trait, registry, executor, 45+ built-in tools |
-| `commands` | Slash command registry, 50+ commands |
+| `tools` | Tool trait, registry, executor, 44 baseline + 6 feature-gated tools |
+| `commands` | Slash command registry, 77 commands |
 | `ui` | ratatui terminal UI, statusline, Vim mode, themes |
 | `memory` | Transcript storage, session index, long-term memory |
 | `agents` | Sub-agent manager, spawn/fork/send message |
@@ -80,8 +80,11 @@ CodeRex is organized as a Rust workspace with 16 crates:
 | `server` | WebSocket daemon, session auth, idle cleanup |
 | `hooks` | Hook event system (22+ events), sync/async execution |
 | `config` | Settings loading/merging, feature flags, enterprise |
-| `events` | In-process broadcast event bus for a session (not the external protocol) |
+| `events` | Line-delimited stream-json protocol frames and session control messages (there is no in-process bus) |
 | `telemetry` | Crash reporting and usage analytics |
+| `artifacts` | Local artifact store, ArtifactDB and the artifact tool family |
+| `insights` | Session insight extraction, aggregation and offline HTML report |
+| `workflow` | Deterministic JavaScript workflow runtime and the Workflow tool |
 | `test-utils` | Test rigs, snapshot helpers, wire client |
 
 ### Data Flow

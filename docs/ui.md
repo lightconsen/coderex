@@ -85,7 +85,7 @@ CODEREX_KEYBOARD_PROTOCOL=legacy         # force the terminal default
 
 **Not implemented — ⚪, deliberately.** The Kitty graphics protocol (with its image ids) is the one item in the UI checklist CodeRex does not take.
 
-Reasoning: the message list is text-only and tool results are text, so there is no content path that would produce an image to draw. Rendering inline images would mean a new dependency (`ratatui-image` plus an image decoder) that must not be added here, a new message variant, a capability handshake, and a fallback for every terminal that does not speak the protocol — in exchange for a feature with no producer and no consumer. If images are ever needed, the honest path is `ratatui-image` gated on `TerminalProfile::kind` (kitty / WezTerm / Ghostty for Kitty graphics, iTerm2 for its own inline-image protocol, sixel elsewhere), degrading to the existing ASCII art.
+Reasoning: tool results can now carry `ImageBlock`s (MCP images, image reads), but the message list and its renderer are still text-only, so there is no place to draw them. Rendering inline images would mean a new dependency (`ratatui-image` plus an image decoder), a message/render variant, a capability handshake, and a fallback for every terminal that does not speak the protocol. The image data exists; the UI consumer does not. If images are ever needed, the honest path is `ratatui-image` gated on `TerminalProfile::kind` (kitty / WezTerm / Ghostty for Kitty graphics, iTerm2 for its own inline-image protocol, sixel elsewhere), degrading to the existing ASCII art.
 
 No image capability detection was added either: a detection method with nothing to consume it would be exactly the kind of flag that does nothing.
 

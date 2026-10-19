@@ -75,7 +75,7 @@ Without the prefix a shared raw name cannot address both servers, so the second 
 - Tool registration: discovered tools are `McpTool` entries in the shared `ToolRegistry` (`register_tools_into`); there is no separate MCP executor.
 - Health monitor: Background task checks all servers every 30s.
 - Startup wiring: `StartupOrchestrator` phase loads config, starts servers, discovers tools/resources, sets `mcp_ready`.
-- 208 tests: 140 unit tests plus 23 socket-level HTTP/SSE tests and 45 integration tests covering channel, server, proxy, config, OAuth, re-authorization, typed elicitation, notification handling, manager, result adapter, and tool executor.
+- 220 tests: 151 unit tests plus 24 socket-level HTTP/SSE tests and 45 integration tests covering channel, server, proxy, config, OAuth, re-authorization, typed elicitation, notification handling, manager, result adapter, and tool executor.
 
 ### What Is Stubbed/Partial
 
@@ -103,9 +103,11 @@ Without the prefix a shared raw name cannot address both servers, so the second 
   registers a stdio server, `--url` registers an HTTP (default) or `--transport sse`
   server, and repeated `--header KEY=VALUE` entries are preserved. `mcp list` prints
   the command/args for stdio servers and the transport/URL for remote ones.
-- **MCP image content is forwarded.** `ToolResult.images` carries base64 image
-  blocks; the engine serializes them as `image` content blocks beside the text
-  result. Images over 5 MiB decoded are skipped with a text note, and a text
+- **MCP image content is forwarded.** `McpResultAdapter` fills
+  `ToolResult.images`, `McpTool` carries them through `ToolOutput`, and the
+  engine serializes them as `image` content blocks beside the text result
+  (stream-json frames carry them too). Base64 is normalized and malformed data
+  is omitted with a note; images over 5 MiB decoded are skipped. A text
   placeholder (`[image: image/png, N bytes]`) is kept in `output` for text-only
   consumers.
 
