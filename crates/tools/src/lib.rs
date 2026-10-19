@@ -42,3 +42,17 @@ pub use tool::{
     ToolCapabilities, ToolContext, ToolDescriptor, ToolInput, ToolTier,
 };
 pub use tool_cache::{ToolCache, ToolCacheConfig};
+
+/// The feature flag a tool needs to be offered.
+///
+/// Feature-gated tools are hidden from the listing and refused on execution
+/// while their flag is off. A gated tool that names no flag keeps the generic
+/// gate ("any feature flag is on"), which is how the Chrome family behaves —
+/// it is a session capability rather than a beta flag.
+#[must_use]
+pub fn required_feature_flag(tool_name: &str) -> Option<&'static str> {
+    match tool_name {
+        "WebFetch" => Some("web_browser_tool"),
+        _ => None,
+    }
+}

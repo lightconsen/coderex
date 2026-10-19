@@ -20,6 +20,7 @@ use crate::tool::{
     Backgrounding, JOB_SESSION_ID_KEY, RuleContentField, SharedState, ToolCapabilities,
     ToolContext, ToolInput,
 };
+use coderex_config::FeatureFlags;
 use coderex_core::tool_executor::{ToolDispatchOutcome, ToolExecutor as CoreToolExecutor};
 use coderex_core::types::ToolResult;
 use serde_json::Value;
@@ -43,13 +44,15 @@ pub struct RegistryToolDispatcher {
     /// move.
     cwd: Arc<parking_lot::RwLock<PathBuf>>,
     sandbox_enabled: bool,
-    /// Whether this session's feature flags are on, which decides whether a
-    /// gated tool is offered at all. Off until a session says otherwise: a
-    /// tool registered to be withheld should be withheld by default.
+    /// This session's resolved feature flags, which decide whether a gated
+    /// tool is offered at all. Empty until a session says otherwise: a tool
+    /// registered to be withheld should be withheld by default.
     ///
     /// Shared across clones because `--betas` is resolved after the dispatcher
-    /// (and the agent manager's clone of it) already exists.
-    feature_flags_enabled: Arc<std::sync::atomic::AtomicBool>,
+    /// (and the agent manager's clone of it) already exists. Each tool can
+    /// name the flag it needs (see [`crate::required_feature_flag`]); the
+    /// generic gate is "any known flag is on".
+    feature_flags: Arc<parking_lot::RwLock<FeatureFlags>>,
     sandbox_override: Option<coderex_core::sandbox::SandboxConfig>,
     task_store: Option<Arc<TaskStore>>,
     /// The session's todo list, held for the life of this dispatcher and
@@ -79,10 +82,35 @@ impl RegistryToolDispatcher {
             .collect()
     }
 
+    /// Give the dispatcher the session's resolved feature flags.
+    ///
+    /// This is the setter the CLI should call once `--betas` (and any other
+    /// flag source) has been resolved: gated tools whose flag is off are not
+    /// listed and are refused when called.
+    pub fn set_feature_flags(&self, flags: FeatureFlags) {
+        *self.feature_flags.write() = flags;
+    }
+
     /// Tell the dispatcher whether the session's feature flags are on.
+    ///
+    /// Compatibility setter for callers that only know "some flags are on",
+    /// not which ones. `true` synthesises a flag set with every known flag
+    /// enabled — the old behaviour, where any flag made every gated tool
+    /// available. New callers should use [`Self::set_feature_flags`].
     pub fn set_feature_flags_enabled(&self, enabled: bool) {
-        self.feature_flags_enabled
-            .store(enabled, std::sync::atomic::Ordering::Relaxed);
+        let mut flags = FeatureFlags::default();
+        if enabled {
+            // `apply_comma_list` logs (and skips) a name it does not know;
+            // `KNOWN_FLAGS` is by construction all names it does know.
+            let _ = flags.apply_comma_list(&coderex_config::flags::KNOWN_FLAGS.join(","));
+        }
+        self.set_feature_flags(flags);
+    }
+
+    /// The session's current feature flags.
+    #[must_use]
+    pub fn feature_flags(&self) -> FeatureFlags {
+        self.feature_flags.read().clone()
     }
 
     /// Move the working directory tools run in.
@@ -123,7 +151,7 @@ impl RegistryToolDispatcher {
             context,
             cwd: Arc::new(parking_lot::RwLock::new(cwd)),
             sandbox_enabled,
-            feature_flags_enabled: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            feature_flags: Arc::new(parking_lot::RwLock::new(FeatureFlags::default())),
             sandbox_override: None,
             task_store: None,
             todo_store: Arc::new(TodoStore::new()),
@@ -224,9 +252,10 @@ impl CoreToolExecutor for RegistryToolDispatcher {
         // is every registered tool, including disabled ones; a tool the model
         // is shown but cannot use is an invitation to waste a turn discovering
         // that.
-        let feature_flags_enabled = self
-            .feature_flags_enabled
-            .load(std::sync::atomic::Ordering::Relaxed);
+        let flags = self.feature_flags();
+        // The registry's generic gate only knows "flags are on"; the resolved
+        // set below adds each tool's own required flag on top of it.
+        let feature_flags_enabled = flags_any_enabled(&flags);
         let available: std::collections::HashSet<String> = self
             .registry
             .available_tool_names(self.context, feature_flags_enabled)
@@ -254,6 +283,14 @@ impl CoreToolExecutor for RegistryToolDispatcher {
             .filter(|d| {
                 if !d.is_enabled {
                     return false;
+                }
+                // A tool that names its flag is offered only when that flag
+                // is in the resolved set — "some other flag is on" is not
+                // enough. Tools that name none keep the generic gate below.
+                if let Some(flag) = crate::required_feature_flag(&d.name) {
+                    if !flags.is_enabled(flag) {
+                        return false;
+                    }
                 }
                 if d.name.starts_with("chrome_") {
                     return chrome_enabled && chrome_available.contains(&d.name);
@@ -297,6 +334,25 @@ impl CoreToolExecutor for RegistryToolDispatcher {
                 };
             }
         };
+
+        // The listing and the execute path must agree: a tool whose own flag
+        // is off is not offered, and calling it anyway is refused with the
+        // flag that would turn it on.
+        let flags = self.feature_flags();
+        if let Some(flag) = crate::required_feature_flag(tool_name) {
+            if !flags.is_enabled(flag) {
+                return ToolDispatchOutcome {
+                    result: ToolResult {
+                        tool_call_id: tool_call_id.to_string(),
+                        output: format!(
+                            "tool '{tool_name}' is not enabled: the '{flag}' feature flag is off \
+                             (enable it with --betas {flag})"
+                        ),
+                        is_error: true,
+                    },
+                };
+            }
+        }
 
         let is_chrome = tool_name.starts_with("chrome_");
         if is_chrome && !self.chrome_enabled() {
@@ -488,6 +544,16 @@ impl CoreToolExecutor for RegistryToolDispatcher {
             }
         }
     }
+}
+
+/// Whether the resolved flag set contains any known flag.
+///
+/// This is the generic "feature flags are on" gate the registry understands;
+/// individual tools layer their own named flag on top.
+fn flags_any_enabled(flags: &FeatureFlags) -> bool {
+    coderex_config::flags::KNOWN_FLAGS
+        .iter()
+        .any(|name| flags.is_enabled(name))
 }
 
 /// The schema the model is shown, with promises the tool does not keep removed.
@@ -1355,5 +1421,120 @@ mod tests {
             "{}",
             outcome.result.output
         );
+    }
+
+    fn dispatcher_with_webfetch_and_echo() -> RegistryToolDispatcher {
+        let mut registry = ToolRegistry::new();
+        registry.register(Arc::new(crate::builtins::WebFetchTool::new()));
+        registry.register(Arc::new(EchoTool));
+        RegistryToolDispatcher::new(
+            Arc::new(registry),
+            Arc::new(InnerExecutor::new(ExecutionConfig::default())),
+            ExecutionContext::Normal,
+            PathBuf::from("/tmp"),
+        )
+    }
+
+    /// WebFetch names its own flag. With no flags it is not offered; another
+    /// flag does not stand in for it; `web_browser_tool` does.
+    #[test]
+    fn webfetch_listing_follows_the_web_browser_tool_flag() {
+        let dispatcher = dispatcher_with_webfetch_and_echo();
+
+        let listed = dispatcher.listed_names();
+        assert!(!listed.contains(&"WebFetch".into()), "{listed:?}");
+
+        // Some other beta flag is not enough: gating is per tool.
+        dispatcher.set_feature_flags(FeatureFlags {
+            fast_mode: true,
+            ..FeatureFlags::default()
+        });
+        let listed = dispatcher.listed_names();
+        assert!(!listed.contains(&"WebFetch".into()), "{listed:?}");
+
+        dispatcher.set_feature_flags(FeatureFlags {
+            web_browser_tool: true,
+            ..FeatureFlags::default()
+        });
+        let listed = dispatcher.listed_names();
+        assert!(listed.contains(&"WebFetch".into()), "{listed:?}");
+    }
+
+    /// The compatibility setter keeps the old "flags are on" behaviour, and
+    /// turns WebFetch on with the rest.
+    #[test]
+    fn the_compatibility_setter_enables_the_gated_tools() {
+        let dispatcher = dispatcher_with_webfetch_and_echo();
+        assert!(!dispatcher.listed_names().contains(&"WebFetch".into()));
+
+        dispatcher.set_feature_flags_enabled(true);
+        assert!(dispatcher.listed_names().contains(&"WebFetch".into()));
+
+        dispatcher.set_feature_flags_enabled(false);
+        assert!(!dispatcher.listed_names().contains(&"WebFetch".into()));
+    }
+
+    /// Calling a gated tool whose flag is off is refused, with the flag named.
+    #[tokio::test]
+    async fn webfetch_execution_refuses_when_the_flag_is_off() {
+        let dispatcher = dispatcher_with_webfetch_and_echo();
+
+        let outcome = dispatcher
+            .execute("id-1", "WebFetch", &serde_json::json!({"url": "not-a-url"}))
+            .await;
+        assert!(outcome.result.is_error, "{:?}", outcome.result);
+        assert!(
+            outcome.result.output.contains("not enabled"),
+            "{}",
+            outcome.result.output
+        );
+        assert!(
+            outcome.result.output.contains("web_browser_tool"),
+            "{}",
+            outcome.result.output
+        );
+
+        // With the flag on the gate lets the call through; this input then
+        // fails validation, not the feature gate.
+        dispatcher.set_feature_flags(FeatureFlags {
+            web_browser_tool: true,
+            ..FeatureFlags::default()
+        });
+        let outcome = dispatcher
+            .execute("id-2", "WebFetch", &serde_json::json!({"url": "not-a-url"}))
+            .await;
+        assert!(outcome.result.is_error, "{:?}", outcome.result);
+        assert!(
+            !outcome.result.output.contains("not enabled"),
+            "{}",
+            outcome.result.output
+        );
+        assert!(
+            outcome.result.output.contains("invalid input"),
+            "{}",
+            outcome.result.output
+        );
+    }
+
+    /// Turning a gated tool on or off leaves baseline tools alone.
+    #[tokio::test]
+    async fn baseline_tools_are_unaffected_by_the_webfetch_flag() {
+        let dispatcher = dispatcher_with_webfetch_and_echo();
+
+        for flags in [
+            FeatureFlags::default(),
+            FeatureFlags {
+                web_browser_tool: true,
+                ..FeatureFlags::default()
+            },
+        ] {
+            dispatcher.set_feature_flags(flags);
+            assert!(dispatcher.listed_names().contains(&"echo".into()));
+            let outcome = dispatcher
+                .execute("id", "echo", &serde_json::json!({"message": "hi"}))
+                .await;
+            assert!(!outcome.result.is_error, "{:?}", outcome.result);
+            assert_eq!(outcome.result.output, "hi");
+        }
     }
 }

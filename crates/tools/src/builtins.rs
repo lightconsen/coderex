@@ -236,10 +236,11 @@ pub fn register_shell_tool(reg: &mut crate::registry::ToolRegistry) {
 
 /// Register all built-in tools into the given registry.
 ///
-/// This registers 45 baseline tools plus the 5 feature-gated Chrome DevTools
-/// tools, for 50 registrations in total. The platform registers one shell tool,
-/// so `Bash` and `PowerShell` are alternatives rather than two slots. No stub
-/// tools are registered: every tool here is one the model can actually use.
+/// This registers 44 baseline tools plus 6 feature-gated tools — the 5 Chrome
+/// DevTools tools and `WebFetch` — for 50 registrations in total. The platform
+/// registers one shell tool, so `Bash` and `PowerShell` are alternatives rather
+/// than two slots. No stub tools are registered: every tool here is one the
+/// model can actually use.
 pub fn register_builtin_tools(reg: &mut crate::registry::ToolRegistry) {
     use std::sync::Arc;
     reg.register(Arc::new(ReadTool));
@@ -611,9 +612,10 @@ mod tests {
         );
     }
 
-    /// The registry carries 45 baseline tools and the 5 Chrome DevTools tools
-    /// (50 in total). Nothing is registered that the model cannot use: the
-    /// former feature-gated stubs are gone, and every descriptor is enabled.
+    /// The registry carries 44 baseline tools and 6 feature-gated tools — the
+    /// 5 Chrome DevTools tools and `WebFetch` (50 in total). Nothing is
+    /// registered that the model cannot use: the former feature-gated stubs
+    /// are gone, and every descriptor is enabled.
     #[test]
     fn the_registry_has_no_refusing_stubs() {
         let mut registry = crate::registry::ToolRegistry::new();
@@ -626,7 +628,7 @@ mod tests {
                 .iter()
                 .filter(|d| matches!(d.tier, ToolTier::Baseline))
                 .count(),
-            45,
+            44,
             "unexpected baseline tool count"
         );
         assert_eq!(
@@ -634,8 +636,8 @@ mod tests {
                 .iter()
                 .filter(|d| matches!(d.tier, ToolTier::FeatureGated))
                 .count(),
-            5,
-            "the only feature-gated tools are the Chrome DevTools tools"
+            6,
+            "the feature-gated tools are the Chrome DevTools tools and WebFetch"
         );
         assert!(
             descriptors.iter().all(|d| d.is_enabled),
