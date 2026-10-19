@@ -28,8 +28,9 @@ pub struct CustomAgentDef {
 
 /// Load all custom agent definitions from `~/.coderex/agents/*.json`.
 ///
-/// Returns a map of agent name to definition. Silently ignores unreadable
-/// or malformed files.
+/// Returns a map of agent name to definition. An unreadable or malformed
+/// file is skipped with a warning naming its path and the error, so a typo
+/// in a definition does not make the agent vanish without explanation.
 #[must_use]
 pub fn load_custom_agents() -> HashMap<String, CustomAgentDef> {
     match home::home_dir() {
@@ -43,6 +44,9 @@ pub fn load_custom_agents() -> HashMap<String, CustomAgentDef> {
 /// This is the testable form of [`load_custom_agents`]: callers that manage
 /// their own configuration directory (tests, embedders, project-local agent
 /// sets) do not have to pretend to be `$HOME`.
+///
+/// Files that cannot be read, do not parse, or fail validation are skipped
+/// with a warning naming the path; the remaining files still load.
 #[must_use]
 pub fn load_custom_agents_from_dir(agents_dir: &Path) -> HashMap<String, CustomAgentDef> {
     let mut agents = HashMap::new();
@@ -60,18 +64,56 @@ pub fn load_custom_agents_from_dir(agents_dir: &Path) -> HashMap<String, CustomA
 
         let contents = match std::fs::read_to_string(&path) {
             Ok(c) => c,
-            Err(_) => continue,
+            Err(error) => {
+                tracing::warn!(
+                    path = %path.display(),
+                    %error,
+                    "skipping custom agent file: cannot read it"
+                );
+                continue;
+            }
         };
 
         let def: CustomAgentDef = match serde_json::from_str(&contents) {
             Ok(d) => d,
-            Err(_) => continue,
+            Err(error) => {
+                tracing::warn!(
+                    path = %path.display(),
+                    %error,
+                    "skipping custom agent file: not a valid custom agent definition"
+                );
+                continue;
+            }
         };
+
+        if let Err(error) = validate_custom_agent(&def) {
+            tracing::warn!(
+                path = %path.display(),
+                %error,
+                "skipping custom agent file: invalid definition"
+            );
+            continue;
+        }
 
         agents.insert(def.name.clone(), def);
     }
 
     agents
+}
+
+/// Reject a definition that parses but cannot be used.
+///
+/// A definition with no name cannot be selected, and one with no system
+/// prompt silently behaves like a generic agent. Both are reported rather
+/// than dropped so the author can fix the file.
+fn validate_custom_agent(def: &CustomAgentDef) -> Result<(), String> {
+    if def.name.trim().is_empty() {
+        return Err("the definition has an empty `name`".into());
+    }
+    if def.system_prompt.trim().is_empty() {
+        return Err(format!("agent '{}' has an empty `system_prompt`", def.name));
+    }
+    Ok(())
 }
 
 /// Resolve a custom agent definition by name.
@@ -117,7 +159,8 @@ mod tests {
 
     #[test]
     fn missing_directory_loads_nothing() {
-        let loaded = load_custom_agents_from_dir(std::path::Path::new("/definitely/not/a/real/dir"));
+        let loaded =
+            load_custom_agents_from_dir(std::path::Path::new("/definitely/not/a/real/dir"));
         assert!(loaded.is_empty());
     }
 
@@ -127,6 +170,109 @@ mod tests {
         std::fs::write(tmp.path().join("broken.json"), "{ not json").unwrap();
         std::fs::write(tmp.path().join("ignored.txt"), "not an agent").unwrap();
         assert!(load_custom_agents_from_dir(tmp.path()).is_empty());
+    }
+
+    /// Test subscriber that records warning events on the current thread.
+    /// Mirrors the pattern the plugins crate uses for the same purpose.
+    #[derive(Clone, Default)]
+    struct WarningLog(std::sync::Arc<std::sync::Mutex<Vec<String>>>);
+
+    impl WarningLog {
+        fn warnings(&self) -> Vec<String> {
+            self.0.lock().unwrap().clone()
+        }
+    }
+
+    impl tracing::Subscriber for WarningLog {
+        fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
+            *metadata.level() <= tracing::Level::WARN
+        }
+
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+
+        fn enter(&self, _: &tracing::span::Id) {}
+
+        fn exit(&self, _: &tracing::span::Id) {}
+
+        fn event(&self, event: &tracing::Event<'_>) {
+            struct Visitor<'a>(&'a mut Vec<String>);
+
+            impl tracing::field::Visit for Visitor<'_> {
+                fn record_debug(
+                    &mut self,
+                    field: &tracing::field::Field,
+                    value: &dyn std::fmt::Debug,
+                ) {
+                    self.0.push(format!("{}={value:?}", field.name()));
+                }
+            }
+
+            let mut fields = Vec::new();
+            event.record(&mut Visitor(&mut fields));
+            self.0.lock().unwrap().push(fields.join(" "));
+        }
+    }
+
+    /// A file that cannot be read or parsed, and a definition that parses but
+    /// is invalid, are each reported by path; the valid file still loads.
+    #[test]
+    fn bad_files_warn_and_valid_definitions_still_load() {
+        let tmp = tempfile::tempdir().unwrap();
+
+        let valid = CustomAgentDef {
+            name: "valid_agent".into(),
+            system_prompt: "prompt".into(),
+            allowed_tools: vec![],
+            model: None,
+            max_tokens: None,
+            output_schema: None,
+        };
+        std::fs::write(
+            tmp.path().join("valid.json"),
+            serde_json::to_string(&valid).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(tmp.path().join("broken.json"), "{ not json").unwrap();
+        std::fs::write(
+            tmp.path().join("empty-name.json"),
+            serde_json::json!({"name": "  ", "system_prompt": "prompt"}).to_string(),
+        )
+        .unwrap();
+        std::fs::write(
+            tmp.path().join("empty-prompt.json"),
+            serde_json::json!({"name": "no_prompt", "system_prompt": ""}).to_string(),
+        )
+        .unwrap();
+        // Reading a directory as a file fails, which exercises the read path.
+        std::fs::create_dir(tmp.path().join("unreadable.json")).unwrap();
+
+        let log = WarningLog::default();
+        let loaded = tracing::subscriber::with_default(log.clone(), || {
+            load_custom_agents_from_dir(tmp.path())
+        });
+
+        assert_eq!(loaded.len(), 1);
+        assert!(loaded.contains_key("valid_agent"));
+
+        let warnings = log.warnings();
+        assert_eq!(warnings.len(), 4, "{warnings:?}");
+        for file in [
+            "broken.json",
+            "empty-name.json",
+            "empty-prompt.json",
+            "unreadable.json",
+        ] {
+            assert!(
+                warnings.iter().any(|warning| warning.contains(file)),
+                "no warning named {file}: {warnings:?}"
+            );
+        }
     }
 
     #[test]

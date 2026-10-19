@@ -48,6 +48,16 @@ pub struct PluginHandle {
     /// Kept so [`PluginManager::plugin_hooks`] can contribute the plugin's
     /// hooks to the Plugin hook tier.
     pub hooks: Option<Value>,
+    /// The manifest's `agents` document, as written.
+    ///
+    /// Kept so [`PluginManager::plugin_agents`] can expose the definitions an
+    /// active plugin ships.
+    pub agents: Option<Value>,
+    /// The manifest's `mcpServers` document, as written.
+    ///
+    /// Kept so [`PluginManager::plugin_mcp_servers`] can merge the servers an
+    /// active plugin starts.
+    pub mcp_servers: Option<Value>,
     /// Number of retry attempts for error recovery.
     pub retry_count: u32,
     /// Maximum retry attempts before giving up.
@@ -284,13 +294,31 @@ pub struct PluginManifest {
     /// into the document the hooks loader accepts.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hooks: Option<Value>,
+    /// Agent definitions shipped by the plugin.
+    ///
+    /// Both documented shapes are accepted: an object mapping each agent name
+    /// to its definition (`{"agents": {"name": { ... }}}`) and an array of
+    /// definitions that carry their own `name` (`{"agents": [{"name": ...}]}`).
+    /// [`PluginManager::plugin_agents`] normalizes both into pairs; an entry
+    /// with no usable name is reported and refused, not dropped silently.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agents: Option<Value>,
+    /// MCP servers the plugin contributes.
+    ///
+    /// The declared shape is an object mapping server names to their launch
+    /// configuration. [`PluginManager::plugin_mcp_servers`] merges the
+    /// servers of all active plugins; a duplicate server name is refused with
+    /// a warning rather than one plugin silently replacing another.
+    #[serde(
+        rename = "mcpServers",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub mcp_servers: Option<Value>,
 
     // ── Accepted, not implemented ────────────────────────────────────────
     // Declared so a Claude-shaped manifest parses and so the fields are named
     // in the warning `unimplemented_fields()` produces, rather than vanishing.
-    /// Agent definitions shipped by the plugin.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub agents: Option<Value>,
     /// Output styles shipped by the plugin.
     #[serde(
         rename = "outputStyles",
@@ -307,13 +335,6 @@ pub struct PluginManifest {
     /// Background monitor scripts.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub monitors: Option<Value>,
-    /// MCP servers the plugin starts.
-    #[serde(
-        rename = "mcpServers",
-        default,
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub mcp_servers: Option<Value>,
     /// LSP servers the plugin starts.
     #[serde(
         rename = "lspServers",
@@ -352,12 +373,10 @@ impl PluginManifest {
                 fields.push(name);
             }
         };
-        note(self.agents.is_some(), "agents");
         note(self.output_styles.is_some(), "outputStyles");
         note(self.themes.is_some(), "themes");
         note(self.workflows.is_some(), "workflows");
         note(self.monitors.is_some(), "monitors");
-        note(self.mcp_servers.is_some(), "mcpServers");
         note(self.lsp_servers.is_some(), "lspServers");
         note(self.channels.is_some(), "channels");
         note(self.binaries.is_some(), "binaries");
@@ -1459,6 +1478,8 @@ impl PluginManager {
                 commands: Vec::new(),
                 skills: Vec::new(),
                 hooks: manifest.hooks.clone(),
+                agents: manifest.agents.clone(),
+                mcp_servers: manifest.mcp_servers.clone(),
                 retry_count: 0,
                 max_retries: 3,
                 verified: false,
@@ -1476,6 +1497,8 @@ impl PluginManager {
             commands: manifest.commands.clone(),
             skills: manifest.skills.clone(),
             hooks: manifest.hooks.clone(),
+            agents: manifest.agents.clone(),
+            mcp_servers: manifest.mcp_servers.clone(),
             retry_count: 0,
             max_retries: 3,
             // A plugin loaded from a directory has no archive to check, so
@@ -1779,6 +1802,8 @@ impl PluginManager {
                 commands: h.commands.clone(),
                 skills: h.skills.clone(),
                 hooks: h.hooks.clone(),
+                agents: h.agents.clone(),
+                mcp_servers: h.mcp_servers.clone(),
                 retry_count: h.retry_count,
                 max_retries: h.max_retries,
                 verified: h.verified,
@@ -1848,6 +1873,171 @@ impl PluginManager {
             None
         } else {
             Some(serde_json::json!({ "hooks": collected }))
+        }
+    }
+
+    /// Collect the agent definitions contributed by active plugins.
+    ///
+    /// Only [`PluginState::Active`] plugins contribute. Each manifest's
+    /// `agents` may be an object mapping the declared name to its definition
+    /// (`{"agents": {"reviewer": { ... }}}`) or an array of definitions that
+    /// carry their own `name` (`{"agents": [{"name": "reviewer", ...}]}`).
+    /// Both are normalized into `(name, definition)` pairs, ordered by plugin
+    /// name and then by their order in the manifest, so the result does not
+    /// depend on map iteration order. An object entry is returned as its value;
+    /// an array entry is returned as written, including its `name` field.
+    ///
+    /// A malformed document or entry — no usable name, or a definition that
+    /// is not an object — is skipped with a warning naming the plugin, rather
+    /// than being dropped silently.
+    #[must_use]
+    pub fn plugin_agents(&self) -> Vec<(String, Value)> {
+        let mut active: Vec<(String, Value)> = self
+            .plugins
+            .iter()
+            .filter(|entry| matches!(entry.value().state, PluginState::Active))
+            .filter_map(|entry| {
+                entry
+                    .value()
+                    .agents
+                    .clone()
+                    .map(|agents| (entry.key().clone(), agents))
+            })
+            .collect();
+        active.sort_by(|a, b| a.0.cmp(&b.0));
+
+        let mut collected = Vec::new();
+        for (plugin, agents) in active {
+            match agents {
+                Value::Object(definitions) => {
+                    for (name, definition) in definitions {
+                        if name.trim().is_empty() {
+                            tracing::warn!(
+                                plugin = %plugin,
+                                "plugin agent has an empty name; skipping"
+                            );
+                            continue;
+                        }
+                        if !definition.is_object() {
+                            tracing::warn!(
+                                plugin = %plugin,
+                                agent = %name,
+                                "plugin agent definition is not an object; skipping"
+                            );
+                            continue;
+                        }
+                        collected.push((name, definition));
+                    }
+                }
+                Value::Array(entries) => {
+                    for (index, entry) in entries.into_iter().enumerate() {
+                        let Some(object) = entry.as_object() else {
+                            tracing::warn!(
+                                plugin = %plugin,
+                                index,
+                                "plugin agent entry is not an object; skipping"
+                            );
+                            continue;
+                        };
+                        let Some(name) = object.get("name").and_then(Value::as_str) else {
+                            tracing::warn!(
+                                plugin = %plugin,
+                                index,
+                                "plugin agent entry has no string `name`; skipping"
+                            );
+                            continue;
+                        };
+                        if name.trim().is_empty() {
+                            tracing::warn!(
+                                plugin = %plugin,
+                                index,
+                                "plugin agent entry has an empty `name`; skipping"
+                            );
+                            continue;
+                        }
+                        let name = name.to_string();
+                        collected.push((name, entry));
+                    }
+                }
+                _ => tracing::warn!(
+                    plugin = %plugin,
+                    "plugin agents is neither an object nor an array; skipping"
+                ),
+            }
+        }
+
+        collected
+    }
+
+    /// Merge the MCP servers contributed by active plugins.
+    ///
+    /// Only [`PluginState::Active`] plugins contribute. The declared shape is
+    /// an object mapping server names to their launch configuration; the
+    /// servers are merged in plugin-name order so the result does not depend
+    /// on map iteration order. The first definition of a server name wins: a
+    /// later plugin declaring the same name is refused with a warning rather
+    /// than silently replacing the earlier definition. A malformed document
+    /// or entry is likewise skipped with a warning.
+    ///
+    /// Returns `Some({"mcpServers": { ... }})` when at least one server was
+    /// collected, otherwise `None`.
+    #[must_use]
+    pub fn plugin_mcp_servers(&self) -> Option<Value> {
+        let mut active: Vec<(String, Value)> = self
+            .plugins
+            .iter()
+            .filter(|entry| matches!(entry.value().state, PluginState::Active))
+            .filter_map(|entry| {
+                entry
+                    .value()
+                    .mcp_servers
+                    .clone()
+                    .map(|servers| (entry.key().clone(), servers))
+            })
+            .collect();
+        active.sort_by(|a, b| a.0.cmp(&b.0));
+
+        let mut merged = serde_json::Map::new();
+        for (plugin, servers) in active {
+            let Value::Object(servers) = servers else {
+                tracing::warn!(
+                    plugin = %plugin,
+                    "plugin mcpServers is not an object; skipping"
+                );
+                continue;
+            };
+            for (name, config) in servers {
+                if name.trim().is_empty() {
+                    tracing::warn!(
+                        plugin = %plugin,
+                        "plugin MCP server has an empty name; skipping"
+                    );
+                    continue;
+                }
+                if !config.is_object() {
+                    tracing::warn!(
+                        plugin = %plugin,
+                        server = %name,
+                        "plugin MCP server configuration is not an object; skipping"
+                    );
+                    continue;
+                }
+                if merged.contains_key(&name) {
+                    tracing::warn!(
+                        plugin = %plugin,
+                        server = %name,
+                        "duplicate MCP server name; refusing the later definition"
+                    );
+                    continue;
+                }
+                merged.insert(name, config);
+            }
+        }
+
+        if merged.is_empty() {
+            None
+        } else {
+            Some(serde_json::json!({ "mcpServers": merged }))
         }
     }
 
@@ -2666,6 +2856,8 @@ impl PluginManager {
             commands: manifest.commands.clone(),
             skills: manifest.skills.clone(),
             hooks: manifest.hooks.clone(),
+            agents: manifest.agents.clone(),
+            mcp_servers: manifest.mcp_servers.clone(),
             retry_count: 0,
             max_retries: 3,
             verified,
@@ -2793,6 +2985,8 @@ impl PluginManager {
             commands: Vec::new(),
             skills: Vec::new(),
             hooks: None,
+            agents: None,
+            mcp_servers: None,
             retry_count: 0,
             max_retries: 3,
             verified: false,
@@ -2973,6 +3167,8 @@ impl PluginManager {
             commands: manifest.commands,
             skills: manifest.skills,
             hooks: manifest.hooks.clone(),
+            agents: manifest.agents.clone(),
+            mcp_servers: manifest.mcp_servers.clone(),
             retry_count: 0,
             max_retries: 3,
             verified,
@@ -3486,11 +3682,29 @@ pub struct MarketplaceReconciler {
     /// How often to reconcile (in seconds).
     pub interval_secs: u64,
     /// Whether auto-install is enabled.
+    ///
+    /// Prefer [`MarketplaceReconciler::with_auto_install_enabled`] and
+    /// [`MarketplaceReconciler::auto_install_enabled`] over touching this
+    /// field directly.
     pub auto_install: bool,
 }
 
 impl MarketplaceReconciler {
-    /// Create a new reconciler.
+    /// Create a new reconciler with auto-install **off**.
+    ///
+    /// Auto-install is opt-in because it changes the machine without the user
+    /// asking. A host that wants it (for example the CLI, when a settings or
+    /// environment switch is set) should build the reconciler with
+    /// [`Self::with_auto_install_enabled`] instead of calling this and mutating
+    /// the public field:
+    ///
+    /// ```
+    /// # use coderex_plugins::plugins::MarketplaceReconciler;
+    /// let enabled_by_user = std::env::var("CODEREX_PLUGIN_AUTO_INSTALL").is_ok();
+    /// let reconciler =
+    ///     MarketplaceReconciler::with_auto_install_enabled(300, enabled_by_user);
+    /// assert_eq!(reconciler.auto_install_enabled(), enabled_by_user);
+    /// ```
     #[must_use]
     pub fn new(interval_secs: u64) -> Self {
         Self {
@@ -3499,16 +3713,40 @@ impl MarketplaceReconciler {
         }
     }
 
-    /// Create a new reconciler with auto-install enabled.
+    /// Create a new reconciler with auto-install set explicitly.
+    ///
+    /// `enabled` is normally the value of the host's own switch — a settings
+    /// key or an environment variable — so the decision is visible at the call
+    /// site. With it off, [`Self::reconcile`] only reports new marketplace
+    /// listings; with it on and an install directory, it also installs each
+    /// new listing.
     #[must_use]
-    pub fn with_auto_install(interval_secs: u64) -> Self {
+    pub fn with_auto_install_enabled(interval_secs: u64, enabled: bool) -> Self {
         Self {
             interval_secs,
-            auto_install: true,
+            auto_install: enabled,
         }
     }
 
+    /// Create a new reconciler with auto-install enabled.
+    ///
+    /// Shorthand for [`Self::with_auto_install_enabled`] with `enabled: true`.
+    #[must_use]
+    pub fn with_auto_install(interval_secs: u64) -> Self {
+        Self::with_auto_install_enabled(interval_secs, true)
+    }
+
+    /// Whether reconciliation installs newly listed marketplace plugins.
+    #[must_use]
+    pub fn auto_install_enabled(&self) -> bool {
+        self.auto_install
+    }
+
     /// Run one reconciliation cycle.
+    ///
+    /// New listings are installed only when [`Self::auto_install_enabled`] is
+    /// true **and** an install directory was supplied; otherwise the report is
+    /// returned without touching the filesystem.
     pub async fn reconcile(
         &self,
         manager: &PluginManager,
@@ -3721,7 +3959,111 @@ mod tests {
     fn reconciler_with_auto_install() {
         let reconciler = MarketplaceReconciler::with_auto_install(600);
         assert!(reconciler.auto_install);
+        assert!(reconciler.auto_install_enabled());
         assert_eq!(reconciler.interval_secs, 600);
+
+        let off = MarketplaceReconciler::with_auto_install_enabled(600, false);
+        assert!(!off.auto_install_enabled());
+        let on = MarketplaceReconciler::with_auto_install_enabled(600, true);
+        assert!(on.auto_install_enabled());
+    }
+
+    /// Serve `body` as the marketplace listing on a local HTTP socket.
+    ///
+    /// The production registration path requires HTTPS; tests insert the
+    /// connection directly so the decision under test is the reconciler's,
+    /// not TLS.
+    async fn serve_listing(body: String) -> (String, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let body = body.clone();
+                tokio::spawn(async move {
+                    let mut buffer = [0u8; 2048];
+                    let _ = tokio::io::AsyncReadExt::read(&mut socket, &mut buffer).await;
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n\
+                         content-length: {}\r\nconnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ =
+                        tokio::io::AsyncWriteExt::write_all(&mut socket, response.as_bytes()).await;
+                });
+            }
+        });
+        (format!("http://{addr}"), handle)
+    }
+
+    fn register_test_marketplace(mgr: &PluginManager, base_url: String) {
+        mgr.marketplaces.insert(
+            "test-marketplace".into(),
+            MarketplaceConnection {
+                name: "test-marketplace".into(),
+                base_url,
+                client: Client::new(),
+                list_endpoint: "/api/plugins".into(),
+                download_endpoint: "/api/plugins/{name}/download".into(),
+            },
+        );
+    }
+
+    /// A new marketplace listing is installed during reconciliation only when
+    /// auto-install is enabled.
+    #[tokio::test]
+    async fn auto_install_runs_for_a_new_listing_only_when_enabled() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("source-plugin");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::write(
+            source.join("plugin.json"),
+            serde_json::json!({"name": "new-plugin", "version": "1.0.0"}).to_string(),
+        )
+        .unwrap();
+
+        let listing = serde_json::to_string(&vec![MarketplacePlugin {
+            name: "new-plugin".into(),
+            version: "1.0.0".into(),
+            // A local directory is a valid install source, so this test needs
+            // no archive server to exercise the install itself.
+            url: source.display().to_string(),
+            description: "a new listing".into(),
+        }])
+        .unwrap();
+        let (base_url, server) = serve_listing(listing).await;
+
+        let disabled_dir = tmp.path().join("installed-disabled");
+        let disabled_mgr = PluginManager::new();
+        register_test_marketplace(&disabled_mgr, base_url.clone());
+        let disabled = MarketplaceReconciler::new(300);
+        assert!(!disabled.auto_install_enabled());
+        let report = disabled
+            .reconcile(&disabled_mgr, Some(&disabled_dir))
+            .await
+            .unwrap();
+        assert_eq!(report.new_count, 1);
+        assert!(
+            !disabled_dir.join("new-plugin").exists(),
+            "auto-install was off but the listing was installed"
+        );
+
+        let enabled_dir = tmp.path().join("installed-enabled");
+        let enabled_mgr = PluginManager::new();
+        register_test_marketplace(&enabled_mgr, base_url);
+        let enabled = MarketplaceReconciler::with_auto_install_enabled(300, true);
+        assert!(enabled.auto_install_enabled());
+        let report = enabled
+            .reconcile(&enabled_mgr, Some(&enabled_dir))
+            .await
+            .unwrap();
+        assert_eq!(report.new_count, 1);
+        assert!(
+            enabled_dir.join("new-plugin").join("plugin.json").exists(),
+            "auto-install was on but the listing was not installed"
+        );
+
+        server.abort();
     }
 
     #[test]
@@ -4169,7 +4511,7 @@ mod tests {
         assert!(manifest.user_config["API_KEY"].sensitive);
         assert_eq!(
             manifest.unimplemented_fields(),
-            vec!["mcpServers", "experimental"],
+            vec!["experimental"],
             "fields with no CodeRex behaviour must be named, not dropped"
         );
     }
@@ -4371,10 +4713,206 @@ mod tests {
         );
     }
 
-    /// `hooks` now feeds the Plugin hook tier, so it is no longer reported as
-    /// accepted-but-unimplemented; the remaining twelve fields still are.
+    // ── plugin agents and MCP servers ────────────────────────────────────
+
+    fn manifest_with_field(name: &str, field: &str, value: serde_json::Value) -> PluginManifest {
+        let mut manifest = serde_json::json!({
+            "name": name,
+            "version": "1.0.0",
+        });
+        manifest[field] = value;
+        serde_json::from_value(manifest).unwrap()
+    }
+
+    /// Both documented `agents` shapes are normalized, and plugins contribute
+    /// in name order rather than map iteration order.
     #[test]
-    fn hooks_is_no_longer_reported_as_unimplemented() {
+    fn plugin_agents_supports_mapping_and_array_shapes_in_name_order() {
+        let mgr = PluginManager::new();
+        // Loaded out of order on purpose: zeta first.
+        mgr.load_plugin(
+            manifest_with_field(
+                "zeta",
+                "agents",
+                serde_json::json!([{"name": "aardvark", "system_prompt": "a"}]),
+            ),
+            PathBuf::from("/plugins/zeta"),
+        );
+        mgr.load_plugin(
+            manifest_with_field(
+                "alpha",
+                "agents",
+                serde_json::json!({
+                    "zebra": {"system_prompt": "z"},
+                    "browser": {"prompt": "b"},
+                }),
+            ),
+            PathBuf::from("/plugins/alpha"),
+        );
+
+        let agents = mgr.plugin_agents();
+        let names: Vec<&str> = agents.iter().map(|(name, _)| name.as_str()).collect();
+        assert_eq!(names, vec!["browser", "zebra", "aardvark"]);
+        assert_eq!(agents[0].1, serde_json::json!({"prompt": "b"}));
+        // An array entry is returned as written, including its `name`.
+        assert_eq!(
+            agents[2].1,
+            serde_json::json!({"name": "aardvark", "system_prompt": "a"})
+        );
+    }
+
+    /// A malformed `agents` document or entry is skipped with a warning, and
+    /// does not take the valid definitions with it.
+    #[test]
+    fn malformed_plugin_agents_are_skipped_with_a_warning() {
+        let mgr = PluginManager::new();
+        mgr.load_plugin(
+            manifest_with_field(
+                "alpha",
+                "agents",
+                serde_json::json!({
+                    "": {"system_prompt": "empty"},
+                    "not-object": "string",
+                    "good": {"system_prompt": "ok"},
+                }),
+            ),
+            PathBuf::from("/plugins/alpha"),
+        );
+        mgr.load_plugin(
+            manifest_with_field(
+                "beta",
+                "agents",
+                serde_json::json!([
+                    {"system_prompt": "anonymous"},
+                    "not an object",
+                    {"name": "array-good", "system_prompt": "ok"},
+                ]),
+            ),
+            PathBuf::from("/plugins/beta"),
+        );
+        mgr.load_plugin(
+            manifest_with_field("gamma", "agents", serde_json::json!("not agents")),
+            PathBuf::from("/plugins/gamma"),
+        );
+
+        let log = WarningLog::default();
+        let agents = tracing::subscriber::with_default(log.clone(), || mgr.plugin_agents());
+        let names: Vec<&str> = agents.iter().map(|(name, _)| name.as_str()).collect();
+        // Plugins contribute in name order: alpha before beta.
+        assert_eq!(names, vec!["good", "array-good"]);
+
+        let warnings = log.warnings();
+        assert_eq!(warnings.len(), 5, "{warnings:?}");
+        for plugin in ["alpha", "beta", "gamma"] {
+            assert!(
+                warnings.iter().any(|warning| warning.contains(plugin)),
+                "no warning named {plugin}: {warnings:?}"
+            );
+        }
+    }
+
+    /// Servers merge deterministically, and a duplicate name is refused rather
+    /// than letting a later plugin silently replace the earlier definition.
+    #[test]
+    fn plugin_mcp_servers_merges_in_name_order_and_refuses_duplicates() {
+        let mgr = PluginManager::new();
+        mgr.load_plugin(
+            manifest_with_field(
+                "zeta",
+                "mcpServers",
+                serde_json::json!({
+                    "shared": {"command": "zeta"},
+                    "zeta-only": {"command": "z"},
+                }),
+            ),
+            PathBuf::from("/plugins/zeta"),
+        );
+        mgr.load_plugin(
+            manifest_with_field(
+                "alpha",
+                "mcpServers",
+                serde_json::json!({
+                    "alpha-only": {"command": "a"},
+                    "shared": {"command": "alpha"},
+                }),
+            ),
+            PathBuf::from("/plugins/alpha"),
+        );
+
+        let log = WarningLog::default();
+        let merged = tracing::subscriber::with_default(log.clone(), || mgr.plugin_mcp_servers())
+            .expect("servers from both plugins are collected");
+        assert_eq!(
+            merged,
+            serde_json::json!({
+                "mcpServers": {
+                    "alpha-only": {"command": "a"},
+                    "shared": {"command": "alpha"},
+                    "zeta-only": {"command": "z"},
+                }
+            })
+        );
+
+        let warnings = log.warnings();
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains("shared"), "{warnings:?}");
+        assert!(warnings[0].contains("zeta"), "{warnings:?}");
+    }
+
+    /// A malformed MCP document or entry is skipped with a warning; the other
+    /// plugins' servers still merge.
+    #[test]
+    fn malformed_plugin_mcp_servers_are_skipped_with_a_warning() {
+        let mgr = PluginManager::new();
+        mgr.load_plugin(
+            manifest_with_field(
+                "alpha",
+                "mcpServers",
+                serde_json::json!({
+                    "string-config": "not an object",
+                    "ok": {"command": "a"},
+                }),
+            ),
+            PathBuf::from("/plugins/alpha"),
+        );
+        mgr.load_plugin(
+            manifest_with_field("beta", "mcpServers", serde_json::json!("not servers")),
+            PathBuf::from("/plugins/beta"),
+        );
+
+        let log = WarningLog::default();
+        let merged = tracing::subscriber::with_default(log.clone(), || mgr.plugin_mcp_servers())
+            .expect("the valid server still contributes");
+        assert_eq!(
+            merged,
+            serde_json::json!({"mcpServers": {"ok": {"command": "a"}}})
+        );
+        assert_eq!(log.warnings().len(), 2, "{:?}", log.warnings());
+    }
+
+    /// Inactive plugins contribute neither agents nor MCP servers.
+    #[test]
+    fn inactive_plugins_contribute_no_agents_or_mcp_servers() {
+        let mgr = PluginManager::new();
+        let manifest = manifest_with_field(
+            "inactive",
+            "agents",
+            serde_json::json!({"reviewer": {"system_prompt": "r"}}),
+        );
+        let mut manifest = manifest;
+        manifest.mcp_servers = Some(serde_json::json!({"server": {"command": "s"}}));
+        mgr.load_plugin(manifest, PathBuf::from("/plugins/inactive"));
+        assert!(mgr.unload_plugin("inactive"));
+
+        assert!(mgr.plugin_agents().is_empty());
+        assert!(mgr.plugin_mcp_servers().is_none());
+    }
+
+    /// `hooks`, `agents` and `mcpServers` now feed CodeRex, so they are no
+    /// longer reported as accepted-but-unimplemented; the remaining ten
+    /// fields still are.
+    #[test]
+    fn implemented_fields_are_no_longer_reported_as_unimplemented() {
         let manifest = manifest_with_hooks("hooked", serde_json::json!([]));
         assert!(
             !manifest.unimplemented_fields().contains(&"hooks"),
@@ -4383,12 +4921,35 @@ mod tests {
         );
         assert!(manifest.unimplemented_fields().is_empty());
 
-        let with_other_fields: PluginManifest =
-            serde_json::from_str(r#"{"name":"n","hooks":[],"mcpServers":{},"experimental":true}"#)
-                .unwrap();
+        let with_other_fields: PluginManifest = serde_json::from_str(
+            r#"{"name":"n","hooks":[],"agents":{},"mcpServers":{},"experimental":true}"#,
+        )
+        .unwrap();
         assert_eq!(
             with_other_fields.unimplemented_fields(),
-            vec!["mcpServers", "experimental"]
+            vec!["experimental"]
+        );
+
+        let remaining: PluginManifest = serde_json::from_str(
+            r#"{"name":"n","outputStyles":{},"themes":{},"workflows":{},"monitors":{},
+                "lspServers":{},"channels":{},"binaries":{},"types":{},"settings":{},
+                "experimental":true}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            remaining.unimplemented_fields(),
+            vec![
+                "outputStyles",
+                "themes",
+                "workflows",
+                "monitors",
+                "lspServers",
+                "channels",
+                "binaries",
+                "types",
+                "settings",
+                "experimental",
+            ]
         );
     }
 
