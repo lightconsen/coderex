@@ -22,5 +22,6 @@ pub mod oauth;
 pub mod proxy;
 pub mod resources;
 pub mod result_adapter;
+pub mod sandbox;
 pub mod server;
 pub mod tool;

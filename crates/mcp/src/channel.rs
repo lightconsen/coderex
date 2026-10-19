@@ -195,6 +195,13 @@ pub struct JsonRpcChannel {
     args: Vec<String>,
     /// Environment variables.
     env: HashMap<String, String>,
+    /// Working directory for the server, when configured.
+    cwd: Option<std::path::PathBuf>,
+    /// Sandbox policy for the server, when one applies.
+    sandbox_config: Option<coderex_core::sandbox::SandboxConfig>,
+    /// The sandbox handle. It owns the child's Job Object (Windows), so it
+    /// must live exactly as long as the process.
+    sandbox: Option<coderex_core::sandbox::SandboxHandle>,
     /// Whether the channel is initialized.
     initialized: bool,
     /// Answers requests the server makes of the client, when one was supplied.
@@ -231,6 +238,9 @@ impl JsonRpcChannel {
             command: command.into(),
             args,
             env,
+            cwd: None,
+            sandbox_config: None,
+            sandbox: None,
             initialized: false,
             handler: None,
             notification_handler: None,
@@ -248,6 +258,9 @@ impl JsonRpcChannel {
             command: String::new(),
             args: Vec::new(),
             env: HashMap::new(),
+            cwd: None,
+            sandbox_config: None,
+            sandbox: None,
             initialized: false,
             handler: None,
             notification_handler: None,
@@ -268,10 +281,26 @@ impl JsonRpcChannel {
             command: String::new(),
             args: Vec::new(),
             env: HashMap::new(),
+            cwd: None,
+            sandbox_config: None,
+            sandbox: None,
             initialized: false,
             handler: None,
             notification_handler: None,
         })
+    }
+
+    /// Configure the working directory and the sandbox for a stdio server.
+    ///
+    /// A `None` policy runs the server unwrapped. The channel keeps the
+    /// resulting handle for the process's lifetime.
+    pub fn set_sandbox(
+        &mut self,
+        cwd: Option<std::path::PathBuf>,
+        config: Option<coderex_core::sandbox::SandboxConfig>,
+    ) {
+        self.cwd = cwd;
+        self.sandbox_config = config;
     }
 
     /// Answer requests the server makes of the client.
@@ -389,14 +418,58 @@ impl JsonRpcChannel {
             }
         }
         cmd.envs(&self.env);
+        if let Some(cwd) = &self.cwd {
+            cmd.current_dir(cwd);
+        }
         cmd.stdin(Stdio::piped());
         cmd.stdout(Stdio::piped());
         cmd.stderr(Stdio::piped());
         cmd.kill_on_drop(true);
 
+        // On Windows the server is confined by an AppContainer token plus a
+        // Job Object. `prepare` creates it suspended, and `post_spawn_raw`
+        // attaches the token, assigns the job and resumes it. A failure is a
+        // refusal: a server that was meant to be confined does not run
+        // unconfined.
+        #[cfg(target_os = "windows")]
+        let sandbox = match self.sandbox_config.as_ref() {
+            Some(config) => {
+                let handle = coderex_core::sandbox::SandboxHandle::create(config.clone())
+                    .map_err(|e| format!("could not sandbox '{}': {e}", self.command))?;
+                handle
+                    .prepare(cmd.as_std_mut())
+                    .map_err(|e| format!("could not prepare '{}': {e}", self.command))?;
+                Some(handle)
+            }
+            None => None,
+        };
+
         let mut process = cmd
             .spawn()
             .map_err(|e| format!("failed to spawn '{}': {e}", self.command))?;
+
+        #[cfg(target_os = "windows")]
+        if let Some(handle) = &sandbox {
+            let Some(raw) = process.raw_handle() else {
+                let _ = process.kill().await;
+                return Err(format!(
+                    "the spawned MCP server '{}' has no process handle, so it could not be \
+                     confined; refusing to run it",
+                    self.command
+                ));
+            };
+            if let Err(error) = handle.post_spawn_raw(raw) {
+                let _ = process.kill().await;
+                return Err(format!(
+                    "could not confine the MCP server '{}': {error}",
+                    self.command
+                ));
+            }
+        }
+        #[cfg(target_os = "windows")]
+        {
+            self.sandbox = sandbox;
+        }
 
         let stdin = process
             .stdin
@@ -763,12 +836,19 @@ impl JsonRpcChannel {
         }
 
         if let Some(ref mut process) = self.process {
+            // Kill the whole tree first: a server that spawns children (a
+            // launcher that runs the real server) would otherwise leave them
+            // behind.
+            if let Some(handle) = self.sandbox.take() {
+                let _ = handle.terminate();
+            }
             process
                 .kill()
                 .await
                 .map_err(|e| format!("failed to kill process: {e}"))?;
             let _ = process.wait().await;
         }
+        self.sandbox = None;
         self.process = None;
         self.stdin = None;
         self.stdout = None;
@@ -965,5 +1045,63 @@ mod tests {
             error.contains("resolves inside the working directory"),
             "unexpected error: {error}"
         );
+    }
+
+    /// A stdio server runs inside the AppContainer: it can write in its
+    /// workspace and nowhere else.
+    #[cfg(target_os = "windows")]
+    #[tokio::test]
+    async fn windows_stdio_channel_is_sandboxed() {
+        if !coderex_core::sandbox::app_container_available() {
+            assert!(
+                std::env::var("CODEREX_REQUIRE_APP_CONTAINER").as_deref() != Ok("1"),
+                "AppContainer is unavailable on this runner but \
+                 CODEREX_REQUIRE_APP_CONTAINER=1"
+            );
+            return;
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let allowed = dir.path().join("workspace");
+        let denied = dir.path().join("outside");
+        std::fs::create_dir_all(&allowed).unwrap();
+        std::fs::create_dir_all(&denied).unwrap();
+
+        let script = format!(
+            "echo inside> \"{}\" & echo outside> \"{}\"",
+            allowed.join("inside.txt").display(),
+            denied.join("outside.txt").display()
+        );
+        let mut channel =
+            JsonRpcChannel::new("cmd.exe", vec!["/C".to_string(), script], HashMap::new());
+        channel.set_sandbox(
+            Some(allowed.clone()),
+            Some(coderex_core::sandbox::SandboxConfig {
+                allowed_read_paths: vec![allowed.clone()],
+                allowed_write_paths: vec![allowed.clone()],
+                allowed_exec_paths: Vec::new(),
+                additional_working_dirs: vec![allowed.clone()],
+                ..coderex_core::sandbox::SandboxConfig::default()
+            }),
+        );
+
+        tokio::time::timeout(std::time::Duration::from_secs(20), channel.spawn())
+            .await
+            .expect("the sandboxed server never started; was the child resumed?")
+            .expect("the server should spawn");
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !allowed.join("inside.txt").exists() && std::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert!(
+            allowed.join("inside.txt").exists(),
+            "the server could not write in its workspace"
+        );
+        assert!(
+            !denied.join("outside.txt").exists(),
+            "the server wrote outside its policy"
+        );
+        let _ = channel.terminate().await;
     }
 }

@@ -41,6 +41,68 @@ pub struct McpServerConfig {
     /// Environment variables for the server process.
     #[serde(default)]
     pub env: HashMap<String, String>,
+    /// Working directory for a stdio server. Defaults to the session's cwd.
+    #[serde(default)]
+    pub cwd: Option<PathBuf>,
+    /// Confinement for a stdio server.
+    #[serde(default)]
+    pub sandbox: McpSandboxConfig,
+}
+
+/// Sandbox policy for a stdio MCP server.
+///
+/// Enabled by default on Windows, where the AppContainer backend is available;
+/// servers that need to reach the network keep it (the reference product's
+/// servers do), and path access is bounded to the workspace, the server's own
+/// installation and the usual package caches.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct McpSandboxConfig {
+    /// Whether to confine the server. `CODEREX_MCP_SANDBOX=0` also disables it.
+    pub enabled: bool,
+    /// Whether the server may open network connections.
+    pub allow_network: bool,
+    /// Extra paths the server may read (must be absolute).
+    pub allowed_read_paths: Vec<PathBuf>,
+    /// Extra paths the server may write (must be absolute).
+    pub allowed_write_paths: Vec<PathBuf>,
+    /// Extra paths the server may execute (must be absolute).
+    pub allowed_exec_paths: Vec<PathBuf>,
+}
+
+impl Default for McpSandboxConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            allow_network: true,
+            allowed_read_paths: Vec::new(),
+            allowed_write_paths: Vec::new(),
+            allowed_exec_paths: Vec::new(),
+        }
+    }
+}
+
+impl McpSandboxConfig {
+    /// Reject extra paths that are not absolute.
+    ///
+    /// A relative path would be resolved against whatever directory the client
+    /// happens to be in, which is not a policy the configuration author chose.
+    pub fn validate(&self) -> Result<(), String> {
+        for path in self
+            .allowed_read_paths
+            .iter()
+            .chain(&self.allowed_write_paths)
+            .chain(&self.allowed_exec_paths)
+        {
+            if !path.is_absolute() {
+                return Err(format!(
+                    "MCP sandbox path '{}' must be absolute",
+                    path.display()
+                ));
+            }
+        }
+        Ok(())
+    }
 }
 
 /// The full MCP configuration file structure.
@@ -142,6 +204,8 @@ impl McpConfig {
                 command: String::new(),
                 args: Vec::new(),
                 env: HashMap::new(),
+                cwd: None,
+                sandbox: McpSandboxConfig::default(),
             },
         );
         Ok(())
@@ -172,6 +236,8 @@ impl McpConfig {
                 command: executable.to_string(),
                 args: parts.map(String::from).collect(),
                 env: HashMap::new(),
+                cwd: None,
+                sandbox: McpSandboxConfig::default(),
             },
         );
         Ok(())

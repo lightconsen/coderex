@@ -73,6 +73,10 @@ pub struct McpServer {
     pub url: Option<String>,
     /// Additional HTTP headers for remote transports.
     pub headers: HashMap<String, String>,
+    /// Working directory for a stdio server, when configured.
+    pub cwd: Option<std::path::PathBuf>,
+    /// Confinement policy for a stdio server.
+    pub sandbox: crate::config::McpSandboxConfig,
     /// Current status.
     pub status: ServerStatus,
     /// Number of reconnection attempts.
@@ -116,6 +120,8 @@ impl McpServer {
             transport: McpTransport::Stdio,
             url: None,
             headers: HashMap::new(),
+            cwd: None,
+            sandbox: crate::config::McpSandboxConfig::default(),
             status: ServerStatus::Stopped,
             reconnect_count: 0,
             max_reconnects: 3,
@@ -143,6 +149,8 @@ impl McpServer {
             transport,
             url: Some(url.into()),
             headers,
+            cwd: None,
+            sandbox: crate::config::McpSandboxConfig::default(),
             status: ServerStatus::Stopped,
             reconnect_count: 0,
             max_reconnects: 3,
@@ -161,7 +169,17 @@ impl McpServer {
         // would be dropped on the floor.
         let mut channel = match self.transport {
             McpTransport::Stdio => {
-                JsonRpcChannel::new(self.command.clone(), self.args.clone(), self.env.clone())
+                let mut channel =
+                    JsonRpcChannel::new(self.command.clone(), self.args.clone(), self.env.clone());
+                let cwd = self
+                    .cwd
+                    .clone()
+                    .or_else(|| std::env::current_dir().ok())
+                    .unwrap_or_default();
+                let policy =
+                    crate::sandbox::stdio_sandbox_config(&self.command, &self.sandbox, &cwd);
+                channel.set_sandbox(self.cwd.clone(), policy);
+                channel
             }
             McpTransport::Sse => {
                 let url = self.url.as_deref().ok_or_else(|| {

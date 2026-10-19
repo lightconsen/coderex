@@ -255,12 +255,21 @@ impl McpManager {
         let sink = self.notification_sink();
         for (name, server_config) in &config.mcp_servers {
             let mut server = match server_config.transport {
-                McpTransport::Stdio => McpServer::new(
-                    name.clone(),
-                    server_config.command.clone(),
-                    server_config.args.clone(),
-                    server_config.env.clone(),
-                ),
+                McpTransport::Stdio => {
+                    if let Err(error) = server_config.sandbox.validate() {
+                        tracing::warn!(server = %name, %error, "Skipping MCP server");
+                        continue;
+                    }
+                    let mut server = McpServer::new(
+                        name.clone(),
+                        server_config.command.clone(),
+                        server_config.args.clone(),
+                        server_config.env.clone(),
+                    );
+                    server.cwd = server_config.cwd.clone();
+                    server.sandbox = server_config.sandbox.clone();
+                    server
+                }
                 // Both remote transports keep their own identity here: the
                 // channel branches on the transport, so `Sse` gets the classic
                 // GET-stream + POST-endpoint flow while `Http` gets streamable
