@@ -56,9 +56,15 @@ fi
 cd "$REPO_ROOT"
 
 cargo build -p coderex-cli --bin coderex
+# Approve the harness only on the first run. After that the pinned hash is
+# enforced, so a changed flow is refused instead of silently re-approved.
+approve=()
+if [ ! -f "$REPO_ROOT/evals/flows/live/_state.json" ]; then
+    approve=(--approve-harness)
+fi
 cargo run -p coderex-evals --bin run-eval -- \
     --flow-dir "$REPO_ROOT/evals/flows/live" \
     --variant baseline \
-    --approve-harness \
+    ${approve[@]+"${approve[@]}"} \
     --force \
     "$@"
