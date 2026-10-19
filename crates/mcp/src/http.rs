@@ -42,6 +42,47 @@ const INBOUND_QUEUE_CAPACITY: usize = 64;
 /// stream. Without a bound, a server that drops the message would leave the
 /// caller waiting forever.
 const LEGACY_SSE_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
+/// How often a degraded standalone stream probes for recovery.
+///
+/// The value is seconds. The default is
+/// [`DEFAULT_STREAM_PROBE_INTERVAL`]; `0` disables recovery (the task stays
+/// `Degraded`, as it did before the probe existed).
+pub const MCP_STREAM_PROBE_ENV: &str = "CODEREX_MCP_STREAM_PROBE_SECS";
+/// The probe interval used when [`MCP_STREAM_PROBE_ENV`] is unset.
+pub const DEFAULT_STREAM_PROBE_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Read the degraded-stream probe interval from the environment.
+///
+/// `None` means recovery is disabled. A malformed value is logged and treated
+/// as the default rather than as "disabled", so a typo cannot permanently
+/// silence recovery.
+fn stream_probe_interval_from_env() -> Option<Duration> {
+    let value = match std::env::var(MCP_STREAM_PROBE_ENV) {
+        Ok(value) => value,
+        Err(std::env::VarError::NotPresent) => return Some(DEFAULT_STREAM_PROBE_INTERVAL),
+        Err(error) => {
+            tracing::warn!(
+                variable = MCP_STREAM_PROBE_ENV,
+                "could not read the MCP stream probe interval: {error}; using the default"
+            );
+            return Some(DEFAULT_STREAM_PROBE_INTERVAL);
+        }
+    };
+
+    match value.trim().parse::<u64>() {
+        Ok(0) => None,
+        Ok(seconds) => Some(Duration::from_secs(seconds)),
+        Err(error) => {
+            tracing::warn!(
+                variable = MCP_STREAM_PROBE_ENV,
+                value = %value,
+                "invalid MCP stream probe interval: {error}; using the default"
+            );
+            Some(DEFAULT_STREAM_PROBE_INTERVAL)
+        }
+    }
+}
+
 /// The two remote transports this module speaks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RemoteMode {
@@ -94,7 +135,10 @@ pub enum EventStreamState {
     Starting,
     /// The stream is connected and delivering messages.
     Active,
-    /// The retry budget was exhausted. The stream has stopped retrying.
+    /// The retry budget was exhausted. When a probe interval is configured
+    /// (see [`MCP_STREAM_PROBE_ENV`]) the task waits that interval and then
+    /// makes one reconnect, returning to [`Self::Active`] if it succeeds.
+    /// With the probe disabled the stream stays here until it is restarted.
     Degraded,
     /// The server answered 405: it does not offer a standalone stream. This is
     /// expected for many servers and is not an error.
@@ -654,6 +698,9 @@ pub struct HttpChannel {
     event_state: Arc<RwLock<EventStreamState>>,
     /// Retry settings for the standalone stream.
     retry_policy: EventStreamRetryPolicy,
+    /// How often a degraded stream tries one reconnect before waiting again.
+    /// `None` leaves it `Degraded` until the process restarts.
+    stream_probe_interval: Option<Duration>,
     /// Legacy SSE responses waiting for their JSON-RPC id on the event stream.
     pending: Arc<Mutex<HashMap<u64, oneshot::Sender<Result<Value, String>>>>>,
     /// Keeps the legacy message-endpoint watch channel open while no request
@@ -720,6 +767,7 @@ impl HttpChannel {
             event_stream: Mutex::new(None),
             event_state: Arc::new(RwLock::new(EventStreamState::Stopped)),
             retry_policy: EventStreamRetryPolicy::default(),
+            stream_probe_interval: stream_probe_interval_from_env(),
             pending: Arc::new(Mutex::new(HashMap::new())),
             _message_url_receiver: message_url_receiver,
         })
@@ -737,6 +785,16 @@ impl HttpChannel {
     /// production policy.
     pub fn set_event_stream_retry_policy(&mut self, policy: EventStreamRetryPolicy) {
         self.retry_policy = policy;
+    }
+
+    /// Change how often a degraded standalone stream probes for recovery.
+    ///
+    /// `None` disables the probe; the stream stays `Degraded` until it is
+    /// restarted. The value is read by the task when it enters the degraded
+    /// state, so setting it before [`Self::start_event_stream`] is what
+    /// matters. The default comes from [`MCP_STREAM_PROBE_ENV`].
+    pub fn set_event_stream_probe_interval(&mut self, interval: Option<Duration>) {
+        self.stream_probe_interval = interval;
     }
 
     /// Install the sink for server notifications.
@@ -1041,6 +1099,7 @@ impl HttpChannel {
         let notifications = Arc::clone(&self.notification_handler);
         let state = Arc::clone(&self.event_state);
         let policy = self.retry_policy;
+        let probe_interval = self.stream_probe_interval;
         let token = cancel.clone();
         let task_state = Arc::clone(&state);
         let mode = self.mode;
@@ -1048,8 +1107,16 @@ impl HttpChannel {
         let task = tokio::spawn(async move {
             let final_state = match mode {
                 RemoteMode::StreamableHttp => {
-                    run_event_stream(context, handler, notifications, policy, token, task_state)
-                        .await
+                    run_event_stream(
+                        context,
+                        handler,
+                        notifications,
+                        policy,
+                        probe_interval,
+                        token,
+                        task_state,
+                    )
+                    .await
                 }
                 RemoteMode::LegacySse => {
                     run_legacy_event_stream(
@@ -1058,6 +1125,7 @@ impl HttpChannel {
                         notifications,
                         pending,
                         policy,
+                        probe_interval,
                         token,
                         task_state,
                     )
@@ -1258,18 +1326,56 @@ fn set_stream_state(state: &Arc<RwLock<EventStreamState>>, value: EventStreamSta
     }
 }
 
+/// What a standalone stream does after it enters `Degraded`.
+enum ProbeOutcome {
+    /// The probe wait elapsed: try one reconnect, then degrade again on a
+    /// failure.
+    Rearm,
+    /// No probe is configured: leave the stream `Degraded`.
+    Stop,
+    /// Shutdown cancelled the probe wait.
+    Cancelled,
+}
+
+/// Enter `Degraded` and wait one probe interval before a single reconnect.
+///
+/// The interval is the rate limit. A server that stays down is probed once per
+/// interval rather than in a loop, so this never busy-spins. With the probe
+/// disabled the state is entered only by the caller's `Stop` result.
+async fn degrade_and_rearm(
+    state: &Arc<RwLock<EventStreamState>>,
+    probe_interval: Option<Duration>,
+    cancel: &CancellationToken,
+) -> ProbeOutcome {
+    let Some(interval) = probe_interval else {
+        return ProbeOutcome::Stop;
+    };
+
+    // Make the degradation observable for the whole wait, not just an instant:
+    // a reader (the session, `/mcp`, a test) can see that the stream is down.
+    set_stream_state(state, EventStreamState::Degraded);
+    tokio::select! {
+        () = cancel.cancelled() => ProbeOutcome::Cancelled,
+        () = tokio::time::sleep(interval) => ProbeOutcome::Rearm,
+    }
+}
+
 /// Keep the standalone GET stream open, reconnecting with bounded backoff.
 ///
 /// `Last-Event-ID` resumes from the last event that was processed. A 405 is
 /// not an error — it is how a server says the optional stream is unavailable —
 /// so it stops the task instead of retrying. A 404 means the session expired:
 /// the id is cleared, the handshake runs once more, and the stream reconnects.
-/// Exhausting the retry budget is a `Degraded` state, not an indefinite loop.
+/// Exhausting the retry budget enters `Degraded`. With a probe interval
+/// configured (see [`MCP_STREAM_PROBE_ENV`]) the task then waits that interval
+/// and makes one reconnect, repeating slowly; an interval of `0` leaves the
+/// stream `Degraded` until it is restarted.
 async fn run_event_stream(
     context: RequestContext,
     handler: Arc<RwLock<Option<Arc<dyn InboundRequestHandler>>>>,
     notifications: Arc<RwLock<Option<Arc<dyn ServerNotificationHandler>>>>,
     policy: EventStreamRetryPolicy,
+    probe_interval: Option<Duration>,
     cancel: CancellationToken,
     state: Arc<RwLock<EventStreamState>>,
 ) -> EventStreamState {
@@ -1312,7 +1418,16 @@ async fn run_event_stream(
                         url = %context.url,
                         "the MCP GET stream's inbound queue overflowed; closing it rather than buffering without bound"
                     );
-                    return EventStreamState::Degraded;
+                    match degrade_and_rearm(&state, probe_interval, &cancel).await {
+                        ProbeOutcome::Cancelled => return EventStreamState::Stopped,
+                        ProbeOutcome::Stop => return EventStreamState::Degraded,
+                        ProbeOutcome::Rearm => {
+                            failures = policy.max_attempts.saturating_sub(1);
+                            last_progress = Instant::now();
+                            reinitialized = false;
+                            continue;
+                        }
+                    }
                 }
                 StreamEnd::SessionExpired => {
                     if reinitialized {
@@ -1320,7 +1435,16 @@ async fn run_event_stream(
                             url = %context.url,
                             "the MCP session expired again after re-initializing; giving up on the GET stream"
                         );
-                        return EventStreamState::Degraded;
+                        match degrade_and_rearm(&state, probe_interval, &cancel).await {
+                            ProbeOutcome::Cancelled => return EventStreamState::Stopped,
+                            ProbeOutcome::Stop => return EventStreamState::Degraded,
+                            ProbeOutcome::Rearm => {
+                                failures = policy.max_attempts.saturating_sub(1);
+                                last_progress = Instant::now();
+                                reinitialized = false;
+                                continue;
+                            }
+                        }
                     }
                     tracing::debug!(
                         url = %context.url,
@@ -1343,7 +1467,16 @@ async fn run_event_stream(
                                 url = %context.url,
                                 "re-initializing the MCP session failed: {error}"
                             );
-                            return EventStreamState::Degraded;
+                            match degrade_and_rearm(&state, probe_interval, &cancel).await {
+                                ProbeOutcome::Cancelled => return EventStreamState::Stopped,
+                                ProbeOutcome::Stop => return EventStreamState::Degraded,
+                                ProbeOutcome::Rearm => {
+                                    failures = policy.max_attempts.saturating_sub(1);
+                                    last_progress = Instant::now();
+                                    reinitialized = false;
+                                    continue;
+                                }
+                            }
                         }
                     }
                 }
@@ -1369,9 +1502,21 @@ async fn run_event_stream(
             tracing::warn!(
                 url = %context.url,
                 failures,
-                "the MCP GET stream is degraded; stopping retries"
+                probe_interval = ?probe_interval,
+                "the MCP GET stream is degraded"
             );
-            return EventStreamState::Degraded;
+            match degrade_and_rearm(&state, probe_interval, &cancel).await {
+                ProbeOutcome::Cancelled => return EventStreamState::Stopped,
+                ProbeOutcome::Stop => return EventStreamState::Degraded,
+                ProbeOutcome::Rearm => {
+                    // One reconnect per probe: a failure lands on the cap
+                    // again instead of spending a full retry budget.
+                    failures = policy.max_attempts.saturating_sub(1);
+                    last_progress = Instant::now();
+                    reinitialized = false;
+                    continue;
+                }
+            }
         }
 
         let delay = jittered_delay(backoff_delay(&policy, failures));
@@ -1396,6 +1541,7 @@ async fn run_legacy_event_stream(
     notifications: Arc<RwLock<Option<Arc<dyn ServerNotificationHandler>>>>,
     pending: Arc<Mutex<HashMap<u64, oneshot::Sender<Result<Value, String>>>>>,
     policy: EventStreamRetryPolicy,
+    probe_interval: Option<Duration>,
     cancel: CancellationToken,
     state: Arc<RwLock<EventStreamState>>,
 ) -> EventStreamState {
@@ -1436,7 +1582,15 @@ async fn run_legacy_event_stream(
                         url = %context.url,
                         "the MCP SSE inbound queue overflowed; closing it rather than buffering without bound"
                     );
-                    return EventStreamState::Degraded;
+                    match degrade_and_rearm(&state, probe_interval, &cancel).await {
+                        ProbeOutcome::Cancelled => return EventStreamState::Stopped,
+                        ProbeOutcome::Stop => return EventStreamState::Degraded,
+                        ProbeOutcome::Rearm => {
+                            failures = policy.max_attempts.saturating_sub(1);
+                            last_progress = Instant::now();
+                            continue;
+                        }
+                    }
                 }
                 StreamEnd::SessionExpired => {
                     // The legacy reader does not use this: a 404 to the GET is
@@ -1460,9 +1614,20 @@ async fn run_legacy_event_stream(
             tracing::warn!(
                 url = %context.url,
                 failures,
-                "the MCP SSE stream is degraded; stopping retries"
+                probe_interval = ?probe_interval,
+                "the MCP SSE stream is degraded"
             );
-            return EventStreamState::Degraded;
+            match degrade_and_rearm(&state, probe_interval, &cancel).await {
+                ProbeOutcome::Cancelled => return EventStreamState::Stopped,
+                ProbeOutcome::Stop => return EventStreamState::Degraded,
+                ProbeOutcome::Rearm => {
+                    // One reconnect per probe: a failure lands on the cap
+                    // again instead of spending a full retry budget.
+                    failures = policy.max_attempts.saturating_sub(1);
+                    last_progress = Instant::now();
+                    continue;
+                }
+            }
         }
 
         let delay = jittered_delay(backoff_delay(&policy, failures));
@@ -1515,8 +1680,7 @@ async fn read_legacy_event_stream_once(
     // `(event type, data)` pairs; the worker learns the endpoint URL and
     // routes messages without blocking the socket read while a person answers
     // an elicitation.
-    let (tx, mut rx) =
-        tokio::sync::mpsc::channel::<(String, String)>(INBOUND_QUEUE_CAPACITY);
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<(String, String)>(INBOUND_QUEUE_CAPACITY);
     let worker_context = context.clone();
     let worker_handler = Arc::clone(handler);
     let worker_notifications = Arc::clone(notifications);
@@ -1698,9 +1862,7 @@ async fn process_legacy_message(
             let response: JsonRpcResponse = match serde_json::from_value(value.clone()) {
                 Ok(response) => response,
                 Err(error) => {
-                    tracing::warn!(
-                        "failed to parse a response from the MCP SSE stream: {error}"
-                    );
+                    tracing::warn!("failed to parse a response from the MCP SSE stream: {error}");
                     return false;
                 }
             };
@@ -1766,15 +1928,15 @@ async fn read_event_stream_once(
 ) -> Result<StreamAttempt, String> {
     let accept = HeaderValue::from_static(EVENT_STREAM_ACCEPT);
     let resume_from = last_event_id.lock().ok().and_then(|slot| slot.clone());
-    let resume_value = resume_from.as_deref().and_then(|id| {
-        match HeaderValue::from_str(id) {
+    let resume_value = resume_from
+        .as_deref()
+        .and_then(|id| match HeaderValue::from_str(id) {
             Ok(value) => Some(value),
             Err(error) => {
                 tracing::warn!("MCP Last-Event-ID cannot be sent as an HTTP header: {error}");
                 None
             }
-        }
-    });
+        });
 
     let response = tokio::select! {
         () = cancel.cancelled() => {

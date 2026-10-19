@@ -546,6 +546,33 @@ impl McpManager {
         self.tools.lock().unwrap().register(info);
     }
 
+    /// Public tool names that could not be registered because another server
+    /// already exposed the same name.
+    ///
+    /// This can only happen when the `mcp__<server>__<tool>` prefix is
+    /// disabled (see [`crate::proxy::set_mcp_prefix_enabled`]); in the default
+    /// prefixed mode every name is unique and the result is empty. Names are
+    /// sorted and deduplicated so the list is stable between calls.
+    ///
+    /// The CLI can surface this — for example from `/mcp` — to tell the user
+    /// that a tool exists but is unreachable without turning the prefix back
+    /// on or renaming it on its server.
+    #[must_use]
+    pub fn tool_conflicts(&self) -> Vec<String> {
+        let registry = self
+            .tools
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut names: Vec<String> = registry
+            .conflicts()
+            .iter()
+            .map(|conflict| conflict.name.clone())
+            .collect();
+        names.sort();
+        names.dedup();
+        names
+    }
+
     /// Register a discovered resource in the registry.
     pub fn register_resource(&self, resource: McpResource) {
         self.resources.lock().unwrap().register(resource);
@@ -991,6 +1018,39 @@ mod tests {
             mgr.list_resources()
                 .contains(&"file:///tmp/test.txt".to_string())
         );
+    }
+
+    #[test]
+    fn tool_conflicts_are_sorted_and_deduplicated() {
+        use crate::proxy::{clear_mcp_prefix_override, set_mcp_prefix_enabled};
+
+        let mgr = McpManager::new();
+        assert!(mgr.tool_conflicts().is_empty());
+
+        // Without the server prefix two servers cannot both register a raw
+        // name; the later registration is recorded as a conflict.
+        set_mcp_prefix_enabled(false);
+        let tool = |server: &str, name: &str| McpToolInfo {
+            server: server.into(),
+            name: name.into(),
+            description: String::new(),
+            input_schema: serde_json::json!({}),
+        };
+        mgr.register_tool(tool("one", "zeta"));
+        mgr.register_tool(tool("two", "zeta"));
+        mgr.register_tool(tool("three", "alpha"));
+        mgr.register_tool(tool("four", "alpha"));
+        // A third server offering an already-conflicting name must not make
+        // the same name appear twice in the surfaced list.
+        mgr.register_tool(tool("five", "zeta"));
+
+        assert_eq!(
+            mgr.tool_conflicts(),
+            vec!["alpha".to_string(), "zeta".to_string()],
+            "conflict names must be deduplicated and in deterministic order"
+        );
+
+        clear_mcp_prefix_override();
     }
 
     #[test]

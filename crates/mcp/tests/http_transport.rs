@@ -1224,6 +1224,81 @@ async fn a_stream_that_keeps_failing_degrades_after_the_retry_cap() {
     channel.terminate().await.unwrap();
 }
 
+/// Reaching the retry cap is not permanent: the stream enters `Degraded`,
+/// waits one probe interval, and makes another GET. A successful probe puts
+/// the stream back into `Active` (the "running" state).
+#[tokio::test]
+async fn a_degraded_stream_probes_and_recovers_to_active() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let gets = Arc::new(AtomicUsize::new(0));
+    let counted = Arc::clone(&gets);
+
+    std::thread::spawn(move || {
+        // Hold recovered streams open, or the client would see EOF and
+        // treat the probe as another failure.
+        let mut held: Vec<TcpStream> = Vec::new();
+        for mut stream in listener.incoming().flatten() {
+            let request = read_request(&mut stream);
+            if is_get(&request) {
+                let attempt = counted.fetch_add(1, Ordering::SeqCst) + 1;
+                if attempt <= 2 {
+                    // A complete, empty event stream: the client sees EOF and
+                    // spends its retry budget.
+                    write_response(&mut stream, "200 OK", "text/event-stream", "");
+                } else {
+                    // The probe's GET connects and stays open.
+                    stream
+                        .write_all(
+                            b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: keep-alive\r\n\r\n",
+                        )
+                        .unwrap();
+                    stream.flush().unwrap();
+                    held.push(stream);
+                }
+            } else if request.contains("\"method\":\"initialize\"") {
+                let body = r#"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2024-11-05"}}"#;
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nMcp-Session-Id: session-probe\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                stream.write_all(response.as_bytes()).unwrap();
+            } else {
+                write_response(&mut stream, "202 Accepted", "application/json", "");
+            }
+        }
+    });
+
+    let mut channel =
+        JsonRpcChannel::new_http(&format!("http://{address}/mcp"), HashMap::new()).unwrap();
+    channel.set_event_stream_retry_policy(EventStreamRetryPolicy {
+        max_attempts: 2,
+        base_delay: std::time::Duration::from_millis(10),
+        max_delay: std::time::Duration::from_millis(20),
+        max_duration: std::time::Duration::from_secs(10),
+    });
+    // Short enough to keep the test fast, long enough for the 10 ms poll in
+    // `wait_until` to observe the `Degraded` state.
+    channel.set_event_stream_probe_interval(Some(std::time::Duration::from_millis(100)));
+    channel.spawn().await.unwrap();
+    channel.initialize().await.unwrap();
+
+    wait_until(|| channel.event_stream_state() == Some(EventStreamState::Degraded)).await;
+    let attempts_before_probe = gets.load(Ordering::SeqCst);
+    assert!(
+        attempts_before_probe >= 2,
+        "the stream should have exhausted its retry budget first"
+    );
+
+    wait_until(|| channel.event_stream_state() == Some(EventStreamState::Active)).await;
+    assert!(
+        gets.load(Ordering::SeqCst) > attempts_before_probe,
+        "the probe did not make another GET"
+    );
+
+    channel.terminate().await.unwrap();
+}
+
 /// A 404 to the standalone GET means the session expired: the client clears
 /// it, re-initializes once, and reconnects under the new session.
 #[tokio::test]

@@ -305,6 +305,16 @@ impl JsonRpcChannel {
         }
     }
 
+    /// How often a degraded standalone GET stream probes for recovery.
+    ///
+    /// `None` leaves a degraded stream stopped. A stdio channel has no such
+    /// stream, so this is a no-op there.
+    pub fn set_event_stream_probe_interval(&mut self, interval: Option<std::time::Duration>) {
+        if let Some(http) = self.http.as_mut() {
+            http.set_event_stream_probe_interval(interval);
+        }
+    }
+
     /// The standalone GET stream's state, if this is a remote channel.
     #[must_use]
     pub fn event_stream_state(&self) -> Option<crate::http::EventStreamState> {

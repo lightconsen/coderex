@@ -95,6 +95,88 @@ impl McpConfig {
         self.mcp_servers.insert(name.into(), config);
     }
 
+    /// Add a remote (HTTP or SSE) server.
+    ///
+    /// `transport` must be [`McpTransport::Http`] or [`McpTransport::Sse`];
+    /// `url` must be a non-empty `http` or `https` URL. `headers` are sent on
+    /// every request the server receives and are stored verbatim, so a caller
+    /// can pass an `Authorization` value straight through.
+    ///
+    /// This is the constructor behind `coderex mcp add --url … --transport …`;
+    /// unlike [`Self::add_server`] it validates the input and reports a message
+    /// suitable for the CLI.
+    pub fn add_remote_server(
+        &mut self,
+        name: impl Into<String>,
+        url: impl Into<String>,
+        transport: McpTransport,
+        headers: HashMap<String, String>,
+    ) -> Result<(), String> {
+        if transport == McpTransport::Stdio {
+            return Err(
+                "a remote MCP server requires the 'http' or 'sse' transport, not 'stdio'"
+                    .to_string(),
+            );
+        }
+
+        let url = url.into();
+        let url = url.trim();
+        if url.is_empty() {
+            return Err("a remote MCP server requires a non-empty URL".to_string());
+        }
+        let parsed =
+            url::Url::parse(url).map_err(|error| format!("invalid MCP server URL: {error}"))?;
+        if !matches!(parsed.scheme(), "http" | "https") {
+            return Err(format!(
+                "unsupported MCP server URL scheme '{}'; expected http or https",
+                parsed.scheme()
+            ));
+        }
+
+        self.mcp_servers.insert(
+            name.into(),
+            McpServerConfig {
+                transport,
+                url: Some(url.to_string()),
+                headers,
+                command: String::new(),
+                args: Vec::new(),
+                env: HashMap::new(),
+            },
+        );
+        Ok(())
+    }
+
+    /// Add a stdio server from a command line.
+    ///
+    /// The command is split on whitespace: the first token is the executable
+    /// and the rest become arguments. An empty (or all-whitespace) command is
+    /// rejected. This is the constructor behind `coderex mcp add` without
+    /// `--url`.
+    pub fn add_stdio_server(
+        &mut self,
+        name: impl Into<String>,
+        command: &str,
+    ) -> Result<(), String> {
+        let mut parts = command.split_whitespace();
+        let executable = parts
+            .next()
+            .ok_or_else(|| "a stdio MCP server requires a non-empty command".to_string())?;
+
+        self.mcp_servers.insert(
+            name.into(),
+            McpServerConfig {
+                transport: McpTransport::Stdio,
+                url: None,
+                headers: HashMap::new(),
+                command: executable.to_string(),
+                args: parts.map(String::from).collect(),
+                env: HashMap::new(),
+            },
+        );
+        Ok(())
+    }
+
     /// Remove a server configuration.
     pub fn remove_server(&mut self, name: &str) -> Option<McpServerConfig> {
         self.mcp_servers.remove(name)
@@ -255,6 +337,129 @@ mod tests {
             config.get_server("defaulted").unwrap().transport,
             McpTransport::Stdio
         );
+    }
+
+    #[test]
+    fn add_remote_server_preserves_url_transport_and_headers() {
+        let mut config = McpConfig::new();
+        let headers = HashMap::from([
+            ("Authorization".to_string(), "Bearer test".to_string()),
+            ("X-Tenant".to_string(), "acme".to_string()),
+        ]);
+
+        config
+            .add_remote_server(
+                "remote",
+                "https://example.com/mcp",
+                McpTransport::Http,
+                headers.clone(),
+            )
+            .unwrap();
+
+        let server = config.get_server("remote").unwrap();
+        assert_eq!(server.transport, McpTransport::Http);
+        assert_eq!(server.url.as_deref(), Some("https://example.com/mcp"));
+        assert_eq!(server.headers, headers, "headers must be stored verbatim");
+        assert!(server.command.is_empty());
+        assert!(server.args.is_empty());
+    }
+
+    #[test]
+    fn add_remote_server_accepts_sse() {
+        let mut config = McpConfig::new();
+        config
+            .add_remote_server(
+                "legacy",
+                "http://localhost:8080/sse",
+                McpTransport::Sse,
+                HashMap::new(),
+            )
+            .unwrap();
+        assert_eq!(
+            config.get_server("legacy").unwrap().transport,
+            McpTransport::Sse
+        );
+    }
+
+    #[test]
+    fn add_remote_server_rejects_url_with_stdio_transport() {
+        let mut config = McpConfig::new();
+        let error = config
+            .add_remote_server(
+                "bad",
+                "http://localhost/mcp",
+                McpTransport::Stdio,
+                HashMap::new(),
+            )
+            .unwrap_err();
+        assert!(error.contains("stdio"), "unexpected error: {error}");
+        assert!(
+            config.get_server("bad").is_none(),
+            "a rejected server must not be added"
+        );
+    }
+
+    #[test]
+    fn add_remote_server_rejects_a_missing_or_empty_url() {
+        for url in ["", "   "] {
+            for transport in [McpTransport::Http, McpTransport::Sse] {
+                let mut config = McpConfig::new();
+                let error = config
+                    .add_remote_server("bad", url, transport, HashMap::new())
+                    .unwrap_err();
+                assert!(error.contains("non-empty URL"), "unexpected error: {error}");
+                assert!(config.get_server("bad").is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn add_remote_server_rejects_non_http_schemes() {
+        for url in ["ftp://example.com/mcp", "file:///tmp/socket"] {
+            let mut config = McpConfig::new();
+            let error = config
+                .add_remote_server("bad", url, McpTransport::Http, HashMap::new())
+                .unwrap_err();
+            assert!(error.contains("scheme"), "unexpected error: {error}");
+        }
+    }
+
+    #[test]
+    fn add_stdio_server_splits_the_command() {
+        let mut config = McpConfig::new();
+        config
+            .add_stdio_server(
+                "filesystem",
+                "npx -y @modelcontextprotocol/server-filesystem /tmp",
+            )
+            .unwrap();
+
+        let server = config.get_server("filesystem").unwrap();
+        assert_eq!(server.transport, McpTransport::Stdio);
+        assert_eq!(server.command, "npx");
+        assert_eq!(
+            server.args,
+            vec![
+                "-y".to_string(),
+                "@modelcontextprotocol/server-filesystem".to_string(),
+                "/tmp".to_string()
+            ]
+        );
+        assert!(server.url.is_none(), "stdio must not carry a URL");
+        assert!(server.headers.is_empty());
+    }
+
+    #[test]
+    fn add_stdio_server_rejects_an_empty_command() {
+        for command in ["", "   ", "\t\n"] {
+            let mut config = McpConfig::new();
+            let error = config.add_stdio_server("bad", command).unwrap_err();
+            assert!(
+                error.contains("non-empty command"),
+                "unexpected error: {error}"
+            );
+            assert!(config.get_server("bad").is_none());
+        }
     }
 
     #[test]
