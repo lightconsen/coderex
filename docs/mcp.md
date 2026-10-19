@@ -103,9 +103,11 @@ Without the prefix a shared raw name cannot address both servers, so the second 
   registers a stdio server, `--url` registers an HTTP (default) or `--transport sse`
   server, and repeated `--header KEY=VALUE` entries are preserved. `mcp list` prints
   the command/args for stdio servers and the transport/URL for remote ones.
-- **MCP image content is described, not forwarded.** `ToolResult` carries text only,
-  so an image block becomes "mime type + decoded size" instead of an image the model
-  can see. Changing that requires a content-block tool result, not a local fix.
+- **MCP image content is forwarded.** `ToolResult.images` carries base64 image
+  blocks; the engine serializes them as `image` content blocks beside the text
+  result. Images over 5 MiB decoded are skipped with a text note, and a text
+  placeholder (`[image: image/png, N bytes]`) is kept in `output` for text-only
+  consumers.
 
 ### IDE tool whitelist
 
