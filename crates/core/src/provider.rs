@@ -189,7 +189,7 @@ impl ResolvedProviderProfile {
                 api_style: ProviderApiStyle::OpenAiChat,
                 capabilities: Self::generic_capabilities(),
             },
-            ("groq", _) | ("openai", _) | ("custom", _) => Self {
+            ("groq" | "openai" | "custom", _) => Self {
                 name,
                 api_style: style,
                 capabilities: ProviderCapabilities {

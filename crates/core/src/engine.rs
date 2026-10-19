@@ -3971,7 +3971,7 @@ impl QueryEngine {
                     partial_len: stream_text.delivered().len(),
                     will_retry: false,
                 });
-            } else if matches!(stop_reason.as_deref(), Some("max_tokens") | Some("length")) {
+            } else if matches!(stop_reason.as_deref(), Some("max_tokens" | "length")) {
                 // Legitimate provider-completed truncation: not an error and
                 // not retryable (re-requesting would loop and double cost).
                 let _ = self.event_tx.send(EngineEvent::StreamInterrupted {

@@ -446,13 +446,24 @@ pub fn bubblewrap_args(config: &SandboxConfig, cwd: &std::path::Path) -> Vec<Str
 #[cfg(unix)]
 #[must_use]
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
-pub(crate) const fn memory_limit_resource(darwin: bool) -> libc::c_int {
+pub(crate) const fn memory_limit_resource(darwin: bool) -> RlimitResource {
     if darwin {
-        libc::RLIMIT_DATA
+        libc::RLIMIT_DATA as RlimitResource
     } else {
-        libc::RLIMIT_AS
+        libc::RLIMIT_AS as RlimitResource
     }
 }
+
+/// The type `setrlimit` accepts for its resource argument.
+///
+/// It is `c_int` on macOS/BSD and `u32` (`__rlimit_resource_t`) on Linux; the
+/// helper used to return `c_int` unconditionally, which meant the Linux build
+/// never compiled — the pipeline's clippy job caught it.
+#[cfg(target_os = "linux")]
+pub(crate) type RlimitResource = libc::__rlimit_resource_t;
+/// See [`RlimitResource`].
+#[cfg(not(target_os = "linux"))]
+pub(crate) type RlimitResource = libc::c_int;
 
 /// Apply `cur`/`max` to `resource`, returning the kernel's errno on rejection.
 ///
@@ -461,7 +472,11 @@ pub(crate) const fn memory_limit_resource(darwin: bool) -> libc::c_int {
 /// real limits.
 #[cfg(unix)]
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
-fn try_setrlimit(resource: libc::c_int, cur: libc::rlim_t, max: libc::rlim_t) -> Result<(), i32> {
+fn try_setrlimit(
+    resource: RlimitResource,
+    cur: libc::rlim_t,
+    max: libc::rlim_t,
+) -> Result<(), i32> {
     let limit = libc::rlimit {
         rlim_cur: cur,
         rlim_max: max,
