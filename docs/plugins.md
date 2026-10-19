@@ -213,10 +213,12 @@ falls back to compiling untrusted code in-process.
 
 **Killing the tree.** The child is spawned in its own process group
 (`process_group(0)`), and a timeout sends `SIGKILL` to the whole group before
-reaping the direct child. On Windows the child is assigned to a Job Object with
-`JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`; timeout calls `TerminateJobObject`, and
-closing the handle kills anything left. No helper descendant survives a
-timeout.
+reaping the direct child. On Windows the compiler runs under the shared
+`SandboxHandle` (the same one the shell tools use): a suspended child, an
+AppContainer token attached after spawn, and an anonymous Job Object with
+`JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`. A timeout calls `TerminateJobObject` via
+`SandboxHandle::terminate`, and closing the handle kills anything left. No
+helper descendant survives a timeout.
 
 The parent also installs:
 
@@ -234,7 +236,7 @@ wrap the compiler as well as the process-group/job kill:
 |---|---|---|
 | macOS | `sandbox-exec(1)` profile from `coderex_core::sandbox` | reads to system roots plus the staging directory and compiler binary; writes to the staging directory only; network denied |
 | Linux with `bwrap` | bubblewrap mount/network namespace | read-only root, staging directory the only writable path, network namespace unshared |
-| Windows | Job Object | CPU/memory and kill-on-close; **not** filesystem or network paths |
+| Windows | AppContainer + Job Object (`SandboxHandle`) | reads to system roots, the staging directory and the compiler directory; writes to the staging directory; execute of the compiler; network denied; CPU/memory and kill-on-close |
 
 The Linux seccomp allowlist is deliberately not applied: it is written for
 shells and would reject wasmtime's syscalls. Bubblewrap is skipped when the
@@ -278,8 +280,9 @@ this document does not claim a sandbox that was not applied.
   `pre_exec`); the child still has the hard CPU limit, the wall-clock kill and
   the sandbox-exec profile. Other Unix platforms use `RLIMIT_AS`, subject to
   the same best-effort handling.
-- Windows Job Object code is written against `windows-sys` but is not exercised
-  on this (macOS) host; it has not been run on Windows.
+- The Windows compiler sandbox uses `coderex_core::sandbox`; its Win32 calls are
+  exercised by the `test_windows` CI job (`wasm_compile_subprocess`), not by a
+  macOS host.
 - The compiler child inherits this process's environment. It is the same
   binary/trust domain as the host, so credentials are not scrubbed from it (in
   contrast to third-party tool processes).

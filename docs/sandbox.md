@@ -208,8 +208,8 @@ Two layers, both applied to a shell child:
    (`CodeRex.Sandbox`, or `CodeRex.Sandbox.Network` when the policy allows the
    network) gives the child a container SID instead of the user's SID. The SID
    is granted read/execute on the configured read and execute paths and
-   read/write on the configured write paths, the working directories and the
-   temp directory. No capability is placed in the token unless
+   read/write on the configured write paths and the working directories. No
+   capability is placed in the token unless
    `allow_network` is set, so without the `internetClient` capability the
    container has **no network access**.
 2. **Job Object** — CPU time and memory limits, plus UI restrictions (no
@@ -226,8 +226,15 @@ container SID gets:
 | Configured read paths, execute paths, and every `PATH` directory | read + execute |
 | System roots (`%SystemRoot%`, `System32`, `SysWOW64`, `Program Files*`, WindowsApps) | read + execute, best-effort |
 | Configured write paths, additional working dirs | read + write |
-| `%TEMP%` | read + write, not recursive |
+| A per-sandbox private temp directory | read + write |
 | Ancestors of every granted path | traverse only, not inheritable |
+
+The user's shared `%TEMP%` is deliberately **not** granted. Lowering its
+integrity label (see below) to make it writable would let every Low-integrity
+process on the machine write there. Each sandbox instead creates
+`%LOCALAPPDATA%\coderex\sandbox-tmp\<pid>-<n>`, grants it like any other write
+path, and exports it to the child as `TEMP`/`TMP`/`TMPDIR`.
+
 
 Ancestor traverse is required because an AppContainer token has no
 `SeChangeNotifyPrivilege` and therefore cannot bypass traverse checking.
@@ -244,10 +251,24 @@ profile, so the cost is paid once per profile per process, not on every shell
 invocation.
 
 Changing a DACL requires `WRITE_DAC` on the object. The user normally has it
-for their own workspace and `%TEMP%`; system roots are marked best-effort
-because Windows system directories normally already grant
-`ALL APPLICATION PACKAGES`, and a user cannot rewrite their ACLs. A failure is
-logged and the path simply stays unreachable to the container (fail closed).
+for their own workspace; system roots are marked best-effort because Windows
+system directories normally already grant `ALL APPLICATION PACKAGES`, and a
+user cannot rewrite their ACLs.
+
+A Modify ACE is not enough on its own. An AppContainer token runs at **Low
+integrity**, and the default `SYSTEM_MANDATORY_LABEL_NO_WRITE_UP` policy
+refuses writes to anything labelled Medium or higher regardless of the DACL.
+Every write path is therefore also given a Low mandatory label
+(`SetFileSecurityW(..., LABEL_SECURITY_INFORMATION, ...)` with SDDL
+`S:(ML;;NW;;;LW)`); directories mark the label inheritable and the recursive
+walk applies it to files that already exist. A failed label on a policy write
+path refuses the sandbox (`IsolationUnavailable`); ancestor and system grants
+stay best-effort. This is the defect the Windows runtime job reported as
+"the granted workspace was not writable".
+
+Verbatim paths (`\\?\C:\...`, which `canonicalize` returns on Windows) are
+folded back before granting, so one path does not get two ACEs, one of them on
+a path Win32 does not treat as the same object.
 
 #### Creating the process
 
@@ -281,14 +302,19 @@ start if it is missing.
 - The ACL grant only helps where the process can change the DACL. A workspace
   owned by another user may be unreadable to the container even though it is in
   the policy.
-- Command hooks do **not** get AppContainer confinement: the hook engine owns
-  its spawn and has no post-spawn attach step, so a handle given to it uses
-  `create_limits_only` (Job Object only). Gating hooks fail closed instead of
-  claiming confinement. See `docs/hooks.md`.
-- MCP servers spawn through `JsonRpcChannel::spawn` and get **only** the
-  safeSpawn path check and credential scrubbing — no Job Object, AppContainer,
-  or other resource confinement. The WASM compiler helper gets its own rlimit
-  and (where available) sandbox-exec/bwrap wrappers.
+- Command hooks **do** get AppContainer confinement: the hook engine calls
+  `finish_windows_spawn` after its own spawn, which attaches the token,
+  assigns the same Job Object and resumes the child. `max_file_size_mb` has no
+  Windows equivalent and is warned about. See `docs/hooks.md`.
+- Stdio MCP servers are confined by the same backend when `sandbox.enabled`
+  (the default) is on; see `docs/mcp.md`.
+- The WASM compiler helper runs under the same handle (AppContainer plus a
+  kill-on-close Job Object) instead of a private Job Object.
+
+The Job Object is **anonymous and kill-on-close** (`ProcessTree`). Dropping
+the handle terminates every process still in the job, including descendants; a
+`taskkill /T` subprocess is no longer used anywhere for tree cleanup. Callers
+must keep the handle alive for the child's lifetime.
 
 **Verification status.** The pure policy functions (ACL plan, capability set,
 command-line quoting) are compiled and unit-tested on macOS. With mingw-w64

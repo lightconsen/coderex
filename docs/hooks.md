@@ -321,12 +321,12 @@ addition to its resource limits. The layer is `coderex_core::sandbox` — the sa
 ruleset the Bash and PowerShell tools use — so there is one policy
 implementation, not two.
 
-Windows is the exception. Shell tools get AppContainer confinement by creating
-the child suspended and attaching the token after spawn; the hook engine owns
-its spawn and has no such step. It is given a limits-only handle whose
-`prepare` does not suspend anything, and confinement is reported as
-unavailable rather than claimed. See [When the platform cannot
-confine](#when-the-platform-cannot-confine).
+Windows uses the same backend: `prepare` creates the child suspended and
+`finish_windows_spawn` attaches the AppContainer token, assigns the Job Object
+and resumes it. The hook command is run through `cmd.exe /D /S /C` (there is no
+`sh` and no wrapper program). `max_file_size_mb` has no Windows equivalent and
+is warned about; CPU and memory limits live in the Job Object because there is
+no `pre_exec`.
 
 ### Default policy
 
@@ -389,8 +389,8 @@ with `CODEREX_BWRAP`, only an explicit negative switches it off.
 
 ### When the platform cannot confine
 
-The sandbox is not pretended. If no backend can confine — the Windows hook
-spawn path cannot attach the AppContainer token, Linux has neither `bwrap` nor
+The sandbox is not pretended. If no backend can confine — Windows has no
+AppContainer runtime, Linux has neither `bwrap` nor
 Landlock (or Landlock is switched off with `CODEREX_LANDLOCK=0`), macOS has no
 `sandbox-exec` — then:
 
@@ -412,7 +412,7 @@ run hooks on a platform without confinement.
 | Linux with `bwrap` | **Kernel** — read-only root, writable policy paths | **Kernel** — network namespace | CPU/file-size/address space; cgroup v2 memory when the tree is writable |
 | Linux without `bwrap`, with Landlock | **Kernel** — Landlock read/write/execute path rules | **Kernel** — Landlock ABI 4+; seccomp table on older ABIs | CPU/file-size/address space; cgroup v2 memory when the tree is writable |
 | Linux with neither | **None** — gating hooks fail closed | None (seccomp `EPERM` for denied syscalls only) | CPU/file-size/address space; cgroup v2 memory when the tree is writable |
-| Windows | **None for hooks** — the AppContainer token cannot be attached on this spawn path; gating hooks fail closed | None | Job Object CPU/memory |
+| Windows | **Kernel** — AppContainer DACL + Low mandatory integrity labels; a failed attach terminates the child and a gating hook fails closed | **Kernel** — no `internetClient` capability unless the hook allows it | Job Object CPU/memory; no file-size limit |
 | Other | **None** — gating hooks fail closed | None | — |
 
 The streaming protocol is unaffected: stdin/stdout/stderr are inherited
@@ -452,12 +452,10 @@ provides are implemented in process-appropriate form instead:
 
 **OS confinement is applied** to `command` hooks: `sandbox-exec` on macOS and
 bubblewrap-or-Landlock on Linux, reusing `coderex_core::sandbox` (see
-[OS sandbox for command hooks](#os-sandbox-for-command-hooks)). Windows shell
-tools get AppContainer confinement, but the hook engine spawns its own child
-and has no post-spawn token-attach step; a handle built for a hook is
-limits-only (`create_limits_only`), never a suspended child. A gating hook
-therefore fails closed rather than running unconfined, and a non-gating hook
-warns while still getting the Job Object's CPU/memory limits. An explicit
+[OS sandbox for command hooks](#os-sandbox-for-command-hooks)). On Windows the
+hook is created suspended and finished like a shell command, so it gets the
+same AppContainer and Job Object. A gating hook whose confinement cannot be
+attached fails closed rather than running unconfined. An explicit
 per-hook or environment opt-out is available.
 
 ## Current status

@@ -111,6 +111,48 @@ Without the prefix a shared raw name cannot address both servers, so the second 
   placeholder (`[image: image/png, N bytes]`) is kept in `output` for text-only
   consumers.
 
+### Stdio server sandbox
+
+A stdio server is a program named by repository-writable configuration, so it
+runs under the platform sandbox where one exists (Windows AppContainer today;
+the policy is compiled everywhere and `stdio_sandbox_config` is unit-tested on
+the host).
+
+Configuration, per server:
+
+```json
+{
+  "mcpServers": {
+    "github": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-github"],
+      "cwd": ".",
+      "sandbox": {
+        "enabled": true,
+        "allow_network": true,
+        "allowed_read_paths": [],
+        "allowed_write_paths": [],
+        "allowed_exec_paths": []
+      }
+    }
+  }
+}
+```
+
+`enabled` and `allow_network` both default to `true`: MCP servers commonly
+exist to call a remote API, and turning the network off by default would break
+them. Path access is bounded to the working directory (configured `cwd`, else
+the session's), the server's own installation, the user's config directory and
+the package caches a launcher reads. Extra paths must be absolute and are
+validated at load time; a relative path is skipped with a warning rather than
+resolved against whatever directory the client happens to be in.
+
+`CODEREX_MCP_SANDBOX=0` (or `false`/`no`) disables sandboxing for every server.
+On Windows a missing AppContainer runtime is a **refusal**: the server does not
+start, rather than starting unconfined. The channel keeps the sandbox handle
+for the process lifetime, and `terminate` kills the whole tree before the
+direct child.
+
 ### IDE tool whitelist
 
 The reference allows two IDE tools (`mcp__ide__executeCode`, `mcp__ide__getDiagnostics`) to be used without a prompt. `--ide` in CodeRex connects to a configured IDE MCP endpoint and registers its tools like any other server, but there is no bundled IDE product, no fixed `ide` server, and no automatic allow rule for those names. Users who want them prompt-free add an explicit `mcp__ide__*` rule; CodeRex does not ship a product-specific allowlist.
