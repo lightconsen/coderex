@@ -539,6 +539,9 @@ impl StartupOrchestrator {
                             let _ = crate::daemon::remove_pid_file();
                             // Save recovery snapshot before exit
                             let _ = crate::recovery::remove(&cwd);
+                            // `process::exit` runs no destructors, so plugin
+                            // monitors are killed explicitly.
+                            crate::plugin_monitors::terminate_all_monitors();
                             std::process::exit(0);
                         }
                         _ = sighup.recv() => {

@@ -30,11 +30,68 @@
 use std::borrow::Cow;
 use std::collections::HashSet;
 use std::path::Path;
+use std::sync::Mutex;
 
 use serde_json::Value;
 use tokio::io::{AsyncBufReadExt as _, BufReader};
 use tokio::process::{Child, Command};
 use tokio::task::JoinHandle;
+
+/// Every live monitor child, so a signal handler can kill them.
+///
+/// `Drop` is not enough: SIGTERM takes `process::exit` and release builds use
+/// `panic = "abort"`, neither of which runs destructors. The registry is the
+/// only cleanup that survives those paths.
+static MONITOR_PIDS: Mutex<Vec<u32>> = Mutex::new(Vec::new());
+
+fn register_monitor(pid: u32) {
+    MONITOR_PIDS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .push(pid);
+}
+
+fn unregister_monitor(pid: u32) {
+    let mut pids = MONITOR_PIDS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    pids.retain(|existing| *existing != pid);
+}
+
+/// Kill every live plugin monitor.
+///
+/// Called from the SIGTERM handler and the panic hook, where no destructor
+/// will run. Idempotent; safe when no monitor is armed.
+pub fn terminate_all_monitors() {
+    let pids = std::mem::take(
+        &mut *MONITOR_PIDS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner),
+    );
+    for pid in pids {
+        kill_monitor(pid);
+    }
+}
+
+#[cfg(unix)]
+#[allow(unsafe_code)] // `kill` is the only way to reach a group from a sync hook.
+fn kill_monitor(pid: u32) {
+    // Monitors are spawned in their own process group, so this reaches the
+    // shell and anything it started.
+    // SAFETY: `kill` is called with a pid this process spawned.
+    unsafe {
+        let _ = libc::kill(-(pid as i32), libc::SIGKILL);
+    }
+}
+
+#[cfg(not(unix))]
+fn kill_monitor(pid: u32) {
+    let _ = std::process::Command::new("taskkill")
+        .args(["/PID", &pid.to_string(), "/T", "/F"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+}
 
 /// Most monitors one session will arm.
 ///
@@ -343,6 +400,11 @@ fn spawn_monitor(spec: MonitorSpec, cwd: &Path) -> std::io::Result<MonitorTask> 
         .stderr(std::process::Stdio::piped())
         // A task aborted at shutdown drops this child, and the drop kills it.
         .kill_on_drop(true);
+    #[cfg(unix)]
+    {
+        // Own group, so `terminate_all_monitors` can kill the whole tree.
+        command.process_group(0);
+    }
 
     // The monitor is not a provider client. Remove the session's credentials
     // before layering the monitor's own environment on: an explicit entry is
@@ -351,10 +413,14 @@ fn spawn_monitor(spec: MonitorSpec, cwd: &Path) -> std::io::Result<MonitorTask> 
     command.envs(spec.env.iter().map(|(key, value)| (key, value)));
 
     let mut child = command.spawn()?;
+    let pid = child.id();
+    if let Some(pid) = pid {
+        register_monitor(pid);
+    }
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
     let name = spec.name;
-    let task = tokio::spawn(pump(child, stdout, stderr, name.clone()));
+    let task = tokio::spawn(pump(child, pid, stdout, stderr, name.clone()));
     Ok(MonitorTask { name, task })
 }
 
@@ -397,6 +463,7 @@ fn is_credential_prefix(key: &str) -> bool {
 /// child, and `kill_on_drop` kills (and the runtime reaps) the process.
 async fn pump(
     mut child: Child,
+    pid: Option<u32>,
     stdout: Option<tokio::process::ChildStdout>,
     stderr: Option<tokio::process::ChildStderr>,
     name: String,
@@ -410,6 +477,9 @@ async fn pump(
         Err(error) => {
             tracing::warn!(monitor = %name, %error, "could not wait for plugin monitor");
         }
+    }
+    if let Some(pid) = pid {
+        unregister_monitor(pid);
     }
 }
 
@@ -488,7 +558,18 @@ const fn json_kind(value: &Value) -> &'static str {
 mod tests {
     use super::*;
     use serde_json::json;
+    use std::sync::{Mutex, MutexGuard};
     use std::time::Duration;
+
+    /// Tests share one global PID registry, so a test that kills every
+    /// monitor must not run concurrently with the others.
+    static TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    fn serial() -> MutexGuard<'static, ()> {
+        TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
 
     /// Wait until `path` exists.
     ///
@@ -529,6 +610,7 @@ mod tests {
     #[tokio::test]
     #[cfg(unix)]
     async fn starts_an_echoing_monitor_and_reports_it_running() {
+        let _guard = serial();
         let dir = tempfile::tempdir().expect("tempdir");
         let monitors = json!({
             "echoer": {
@@ -548,6 +630,7 @@ mod tests {
     #[tokio::test]
     #[cfg(unix)]
     async fn resolves_a_relative_script_against_the_working_directory() {
+        let _guard = serial();
         use std::os::unix::fs::PermissionsExt as _;
 
         let dir = tempfile::tempdir().expect("tempdir");
@@ -575,6 +658,7 @@ mod tests {
 
     #[tokio::test]
     async fn skips_invalid_entries() {
+        let _guard = serial();
         let dir = tempfile::tempdir().expect("tempdir");
         let monitors = json!({
             "not-an-object": "nope",
@@ -594,6 +678,7 @@ mod tests {
 
     #[tokio::test]
     async fn array_entries_must_carry_a_name() {
+        let _guard = serial();
         let dir = tempfile::tempdir().expect("tempdir");
         let monitors = json!([
             { "command": "true" },
@@ -608,6 +693,7 @@ mod tests {
 
     #[tokio::test]
     async fn rejects_a_document_that_is_not_an_object_or_array() {
+        let _guard = serial();
         let dir = tempfile::tempdir().expect("tempdir");
         let error = PluginMonitorSupervisor::start(&json!("nope"), dir.path())
             .expect_err("a string is not a monitor document");
@@ -620,6 +706,7 @@ mod tests {
     #[tokio::test]
     #[cfg(unix)]
     async fn stop_kills_the_child() {
+        let _guard = serial();
         let dir = tempfile::tempdir().expect("tempdir");
         let pid_file = dir.path().join("pid");
         let monitors = json!({
@@ -670,6 +757,7 @@ mod tests {
     #[cfg(unix)]
     #[allow(unsafe_code)] // SAFETY: the environment mutation is serialised by ENV_LOCK.
     async fn removes_credential_variables_from_the_child_environment() {
+        let _guard = serial();
         const SCRUBBED: [(&str, &str); 4] = [
             ("ANTHROPIC_API_KEY", "test-anthropic-key"),
             ("ANTHROPIC_CUSTOM_SECRET", "test-anthropic-custom"),
@@ -754,5 +842,31 @@ mod tests {
         );
 
         supervisor.stop().await;
+    }
+
+    /// A signal handler cannot run destructors, so the registry is the only
+    /// cleanup. `terminate_all_monitors` must kill a child without `stop()`.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn terminate_all_kills_monitors_without_drop() {
+        let _guard = serial();
+        let dir = tempfile::tempdir().unwrap();
+        let document = serde_json::json!({
+            "sleeper": { "command": "sleep", "args": ["60"] }
+        });
+        let supervisor = PluginMonitorSupervisor::start(&document, dir.path()).unwrap();
+        assert_eq!(supervisor.running(), 1);
+
+        terminate_all_monitors();
+
+        let mut running = supervisor.running();
+        for _ in 0..100 {
+            if running == 0 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            running = supervisor.running();
+        }
+        assert_eq!(running, 0, "the monitor survived terminate_all_monitors");
     }
 }

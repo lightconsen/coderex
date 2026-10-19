@@ -43,4 +43,13 @@ pub fn install_panic_hook() {
         .join("pending");
     let reporter = coderex_telemetry::CrashReporter::new(pending_dir);
     reporter.install_hook();
+
+    // Release builds use `panic = "abort"`, so no destructor runs after a
+    // panic. Wrap the telemetry hook to kill plugin monitors first; the
+    // telemetry hook still runs afterwards.
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        crate::plugin_monitors::terminate_all_monitors();
+        previous(info);
+    }));
 }
