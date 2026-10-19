@@ -62,7 +62,9 @@ Implements the `/` slash command system that users type in the REPL. Provides a 
 - `/theme` lists and changes themes with available theme detection.
 - `/status` and `/doctor` show comprehensive system health (API key, MCP, git, model, feature flags).
 - `/memory` reads and searches long-term memory entries.
-- `/hooks`, `/mcp`, `/plugin`, `/skills`, `/tasks` list and manage subsystem state.
+- `/hooks`, `/mcp`, `/plugin`, `/skills`, `/tasks` list and manage subsystem state. `/plugin components` lists the themes, output styles, workflows, monitors, LSP servers, channels, binaries, types and experimental data contributed by active plugins.
+- `/style [name]` lists or applies a plugin output style as additional system instructions.
+- `/resume [id|title fragment]` accepts an exact session id; anything else is resolved through the session index, and an ambiguous fragment lists the candidates instead of guessing.
 - Feature-gated commands (`/ultraplan`, `/thinkback`, `/thinkback-play`, `/voice`, `/ctx_viz`, `/heapdump`, `/mock-limits`, `/stickers`) check `CommandContext.feature_flags`, which the REPL now fills from the resolved `FeatureFlags` (env + `--betas`).
 - `/bridge` and `/bridge-kick` check `CODEREX_BRIDGE_URL` env var.
 - `/insights` aggregates project file counts, git info, and session token usage.

@@ -1235,6 +1235,31 @@ impl StartupOrchestrator {
         tracing::info!("plugins initialized: {loaded} loaded, {spawned} spawned");
 
         let manager = Arc::new(manager);
+        // Plugin `settings` are raw, repository-writable input. Only the
+        // non-security keys are taken, and only where the session has no
+        // value yet, so a plugin cannot raise a permission mode, turn on
+        // telemetry, or replace an explicitly configured model.
+        if let Some(value) = manager.plugin_settings() {
+            self.apply_plugin_settings(&value);
+        }
+        // Declared binaries are pinned by SHA-256; fetch them once, after the
+        // plugins are active. Failures are warnings: a plugin can still work
+        // without its helper.
+        if !Self::env_flag("CODEREX_PLUGIN_NO_BINARIES") {
+            for name in manager.list_plugins() {
+                match manager.fetch_plugin_binaries(&name).await {
+                    Ok(paths) if !paths.is_empty() => {
+                        tracing::info!(plugin = %name, count = paths.len(), "plugin binaries ready");
+                    }
+                    Ok(_) => {}
+                    Err(error) => tracing::warn!(
+                        plugin = %name,
+                        %error,
+                        "plugin binaries were not fetched"
+                    ),
+                }
+            }
+        }
         // Error-state plugins are retried while the session runs. The loop
         // holds a Weak reference and exits when the manager is dropped; the
         // handle is detached deliberately.
@@ -1242,6 +1267,56 @@ impl StartupOrchestrator {
             Self::spawn_plugin_restart_loop(&manager, std::time::Duration::from_secs(1));
         self.ctx.plugin_manager = Some(manager);
         Ok(())
+    }
+
+    /// Merge the allowlisted keys of a plugin `settings` document.
+    ///
+    /// Deliberately narrow: `model`, `vim_mode`, `statusline` and
+    /// `context_window` are presentation/model choices. Permission mode,
+    /// telemetry, hooks, MCP servers, API keys and `env` are never taken from
+    /// a plugin. An existing user value wins.
+    fn apply_plugin_settings(&mut self, value: &serde_json::Value) {
+        let Some(object) = value.as_object() else {
+            tracing::warn!("plugin settings are not an object; ignoring them");
+            return;
+        };
+        let mut allowed = serde_json::Map::new();
+        for key in ["model", "vim_mode", "statusline", "context_window"] {
+            if let Some(value) = object.get(key) {
+                allowed.insert(key.to_string(), value.clone());
+            }
+        }
+        if allowed.len() != object.len() {
+            tracing::warn!(
+                ignored = ?object.keys().filter(|key| !allowed.contains_key(*key)).collect::<Vec<_>>(),
+                "plugin settings contain keys CodeRex does not accept from plugins"
+            );
+        }
+        let plugin_settings: Settings =
+            match serde_json::from_value(serde_json::Value::Object(allowed)) {
+                Ok(settings) => settings,
+                Err(error) => {
+                    tracing::warn!(%error, "plugin settings could not be parsed");
+                    return;
+                }
+            };
+        let mut settings = self.ctx.settings.clone().unwrap_or_default();
+        if settings.model.is_none() {
+            settings.model = plugin_settings.model;
+        }
+        if settings.vim_mode.is_none() {
+            settings.vim_mode = plugin_settings.vim_mode;
+        }
+        if settings.statusline.is_none() {
+            settings.statusline = plugin_settings.statusline;
+        }
+        if settings.context_window.is_none() {
+            settings.context_window = plugin_settings.context_window;
+        }
+        if self.ctx.model.is_none() && !self.ctx.model_explicit {
+            self.ctx.model = settings.model.clone().map(coderex_core::types::ModelId);
+        }
+        self.ctx.settings = Some(settings);
     }
 
     /// The settings service used to read host-only plugin configuration.
@@ -1860,6 +1935,7 @@ impl StartupOrchestrator {
         repl.with_agent(self.ctx.agent.clone());
         if let Some(ref manager) = self.ctx.plugin_manager {
             repl.with_plugin_agents(manager.plugin_agents());
+            self.configure_plugin_components(repl, manager);
         }
         repl.with_explicit_model_override(self.ctx.model_explicit);
         repl.with_ide(self.ctx.ide.clone());
@@ -1882,6 +1958,70 @@ impl StartupOrchestrator {
             repl.with_context_window_settings(settings.context_window_overrides());
         }
         repl.apply_cli_config();
+    }
+
+    /// Hand the REPL the components active plugins contribute.
+    ///
+    /// The plugin crate normalizes each manifest shape into a name-keyed map;
+    /// this turns those maps into the forms the session consumes and keeps a
+    /// flat list of the remaining components so `/plugin` can show them.
+    fn configure_plugin_components(
+        &self,
+        repl: &mut crate::repl::ReplLoop,
+        manager: &Arc<coderex_plugins::plugins::PluginManager>,
+    ) {
+        let entries = |value: Option<serde_json::Value>| -> Vec<(String, serde_json::Value)> {
+            value
+                .and_then(|value| value.as_object().cloned())
+                .map(|object| object.into_iter().collect())
+                .unwrap_or_default()
+        };
+        let themes = entries(manager.plugin_themes());
+        let output_styles = entries(manager.plugin_output_styles());
+        let lsp_servers = entries(manager.plugin_lsp_servers());
+        let workflows: std::collections::HashMap<String, String> =
+            entries(manager.plugin_workflows())
+                .into_iter()
+                .filter_map(|(name, value)| {
+                    let script = match value {
+                        serde_json::Value::String(script) => script,
+                        serde_json::Value::Object(mut object) => object
+                            .remove("script")
+                            .and_then(|script| script.as_str().map(str::to_string))
+                            .or_else(|| {
+                                object
+                                    .get("path")
+                                    .and_then(|path| path.as_str())
+                                    .and_then(|path| std::fs::read_to_string(path).ok())
+                            })?,
+                        _ => return None,
+                    };
+                    Some((name, script))
+                })
+                .collect();
+        let monitors = manager.plugin_monitors();
+        let mut other = Vec::new();
+        for (kind, value) in [
+            ("channels", manager.plugin_channels()),
+            ("binaries", manager.plugin_binaries()),
+            ("types", manager.plugin_types()),
+            ("experimental", manager.plugin_experimental()),
+        ] {
+            if let Some(object) = value.and_then(|value| value.as_object().cloned()) {
+                other.push((
+                    kind.to_string(),
+                    object.into_iter().map(|(key, _)| key).collect(),
+                ));
+            }
+        }
+        repl.with_plugin_components(
+            themes,
+            output_styles,
+            workflows,
+            monitors,
+            lsp_servers,
+            other,
+        );
     }
 
     /// Context delivered to the interactive loop's extra-context channel.

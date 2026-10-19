@@ -467,6 +467,82 @@ impl coderex_tools::Tool for ListMcpResourcesWithState {
     }
 }
 
+/// Defaults the `LSP` tool uses when a call does not name a server.
+///
+/// Plugin manifests can declare `lspServers`; the first configured server
+/// becomes the default so the model does not have to know a command line.
+#[derive(Debug, Clone)]
+struct PluginLspDefaults {
+    command: String,
+    args: Vec<String>,
+    root_uri: Option<String>,
+}
+
+struct LspWithPluginDefaults {
+    original: Arc<dyn coderex_tools::Tool>,
+    defaults: Arc<std::sync::RwLock<Option<PluginLspDefaults>>>,
+}
+
+#[async_trait::async_trait]
+impl coderex_tools::Tool for LspWithPluginDefaults {
+    fn descriptor(&self) -> coderex_tools::ToolDescriptor {
+        self.original.descriptor()
+    }
+
+    fn capabilities(&self) -> coderex_tools::ToolCapabilities {
+        self.original.capabilities()
+    }
+
+    fn rule_exemptions_for(&self, input: &serde_json::Value) -> coderex_tools::ToolRuleExemptions {
+        self.original.rule_exemptions_for(input)
+    }
+
+    async fn execute(
+        &self,
+        input: coderex_tools::ToolInput,
+        ctx: coderex_tools::ToolContext<'_>,
+    ) -> Result<coderex_tools::ToolOutput, coderex_tools::ToolError> {
+        let mut arguments = input.arguments.clone();
+        let defaults = self
+            .defaults
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        if let (Some(defaults), Some(object)) = (defaults, arguments.as_object_mut()) {
+            object
+                .entry("server_command")
+                .or_insert_with(|| serde_json::Value::String(defaults.command.clone()));
+            if !defaults.args.is_empty() {
+                object.entry("server_args").or_insert_with(|| {
+                    serde_json::Value::Array(
+                        defaults
+                            .args
+                            .iter()
+                            .cloned()
+                            .map(serde_json::Value::String)
+                            .collect(),
+                    )
+                });
+            }
+            if let Some(root) = defaults.root_uri.clone() {
+                object
+                    .entry("root_uri")
+                    .or_insert_with(|| serde_json::Value::String(root));
+            }
+        }
+        self.original
+            .execute(
+                coderex_tools::ToolInput {
+                    call_id: input.call_id,
+                    name: input.name,
+                    arguments,
+                },
+                ctx,
+            )
+            .await
+    }
+}
+
 struct ReadMcpResourceWithState {
     original: Arc<dyn coderex_tools::Tool>,
     state: Arc<McpResourceToolState>,
@@ -1190,6 +1266,14 @@ impl BetaGatedWorkflowTool {
         }
     }
 
+    /// The shared named-script map, so plugin workflows can be added after
+    /// the registry is built.
+    fn named_script_map(
+        &self,
+    ) -> Arc<std::sync::RwLock<std::collections::HashMap<String, String>>> {
+        self.inner.named_scripts()
+    }
+
     fn enabled_flag(&self) -> Arc<std::sync::atomic::AtomicBool> {
         Arc::clone(&self.enabled)
     }
@@ -1303,6 +1387,22 @@ pub struct ReplLoop {
     telemetry: Option<coderex_telemetry::TelemetryHandle>,
     /// Agent definitions contributed by active plugins.
     plugin_agents: Vec<(String, serde_json::Value)>,
+    /// Named workflow scripts contributed by plugins (shared with the tool).
+    plugin_workflows: Option<Arc<std::sync::RwLock<std::collections::HashMap<String, String>>>>,
+    /// Plugin themes, as `(name, theme JSON)`.
+    plugin_themes: Vec<(String, serde_json::Value)>,
+    /// Plugin output styles, as `(name, style document)`.
+    plugin_output_styles: Vec<(String, serde_json::Value)>,
+    /// Plugin monitor declarations, started with the session.
+    plugin_monitors: Option<serde_json::Value>,
+    /// The running monitor supervisor, when any monitor was armed.
+    monitor_supervisor: Option<crate::plugin_monitors::PluginMonitorSupervisor>,
+    /// Plugin LSP server configurations, as `(name, config)`.
+    plugin_lsp_servers: Vec<(String, serde_json::Value)>,
+    /// Default the `LSP` tool applies when a call names no server.
+    lsp_defaults: Arc<std::sync::RwLock<Option<PluginLspDefaults>>>,
+    /// Plugin channels, types, binaries and experimental data, for `/plugin`.
+    plugin_other_components: Vec<(String, Vec<String>)>,
     /// In-flight tool calls, keyed by call id, for duration/success events.
     tool_starts: std::collections::HashMap<String, (String, std::time::Instant)>,
     /// Session usage at the end of the previous turn, for per-turn deltas.
@@ -1600,6 +1700,14 @@ impl ReplLoop {
             fallback_model: None,
             telemetry: None,
             plugin_agents: Vec::new(),
+            plugin_workflows: None,
+            plugin_themes: Vec::new(),
+            plugin_output_styles: Vec::new(),
+            plugin_monitors: None,
+            monitor_supervisor: None,
+            plugin_lsp_servers: Vec::new(),
+            lsp_defaults: Arc::new(std::sync::RwLock::new(None)),
+            plugin_other_components: Vec::new(),
             tool_starts: std::collections::HashMap::new(),
             last_usage: coderex_core::types::UsageSummary::default(),
             max_tokens: QueryEngine::DEFAULT_MAX_TOKENS,
@@ -1873,6 +1981,8 @@ impl ReplLoop {
         // turns the tool from "not enabled" into callable. `--betas` is
         // applied after this registry exists, so the wrapper shares the bit
         // with `apply_cli_config` rather than freezing it here.
+        let lsp_defaults: Arc<std::sync::RwLock<Option<PluginLspDefaults>>> =
+            Arc::new(std::sync::RwLock::new(None));
         let workflows_enabled = coderex_config::flags::FeatureFlags::from_env().workflow_scripts;
         let workflow_tool = BetaGatedWorkflowTool::new(
             coderex_workflow::WorkflowTool::new(Arc::new(WorkflowAgentRunner {
@@ -1885,7 +1995,18 @@ impl ReplLoop {
         );
         workflow_tool.set_enabled(workflows_enabled);
         let workflow_enabled = workflow_tool.enabled_flag();
+        // Plugin workflows are registered after this point (plugins load in a
+        // later startup phase), so the session keeps the shared map.
+        let workflow_scripts = workflow_tool.named_script_map();
         registry.register(Arc::new(workflow_tool));
+        // The LSP default comes from plugin `lspServers`, which load later, so
+        // the wrapper reads a shared handle per call.
+        if let Some(original) = registry.get_tool_arc("LSP") {
+            registry.register(Arc::new(LspWithPluginDefaults {
+                original,
+                defaults: Arc::clone(&lsp_defaults),
+            }));
+        }
         for tool in crate::memory_tools::memory_tools(Arc::clone(&memory_service), &memory_writable)
         {
             registry.register(tool);
@@ -1960,6 +2081,14 @@ impl ReplLoop {
             fallback_model: None,
             telemetry: None,
             plugin_agents: Vec::new(),
+            plugin_workflows: Some(workflow_scripts),
+            plugin_themes: Vec::new(),
+            plugin_output_styles: Vec::new(),
+            plugin_monitors: None,
+            monitor_supervisor: None,
+            plugin_lsp_servers: Vec::new(),
+            lsp_defaults,
+            plugin_other_components: Vec::new(),
             tool_starts: std::collections::HashMap::new(),
             last_usage: coderex_core::types::UsageSummary::default(),
             max_tokens: QueryEngine::DEFAULT_MAX_TOKENS,
@@ -2295,6 +2424,34 @@ impl ReplLoop {
     /// Agent definitions contributed by active plugins.
     pub fn with_plugin_agents(&mut self, agents: Vec<(String, serde_json::Value)>) {
         self.plugin_agents = agents;
+    }
+
+    /// Components contributed by active plugins.
+    ///
+    /// Each map is name-keyed; the caller has already normalized the manifest
+    /// shapes (see `PluginManager::plugin_*`).
+    pub fn with_plugin_components(
+        &mut self,
+        themes: Vec<(String, serde_json::Value)>,
+        output_styles: Vec<(String, serde_json::Value)>,
+        workflows: std::collections::HashMap<String, String>,
+        monitors: Option<serde_json::Value>,
+        lsp_servers: Vec<(String, serde_json::Value)>,
+        other: Vec<(String, Vec<String>)>,
+    ) {
+        self.plugin_themes = themes;
+        self.plugin_output_styles = output_styles;
+        if let Some(map) = self.plugin_workflows.as_ref() {
+            let mut map = map
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            for (name, script) in workflows {
+                map.insert(name, script);
+            }
+        }
+        self.plugin_monitors = monitors;
+        self.plugin_lsp_servers = lsp_servers;
+        self.plugin_other_components = other;
     }
 
     pub fn with_startup_preferences(
@@ -3057,6 +3214,14 @@ impl ReplLoop {
         if let Err(err) = session_resume::save_snapshot(&self.cwd, &session_id, &snapshot) {
             tracing::warn!("Failed to persist interactive snapshot for {session_id}: {err}");
         }
+        // The SQLite index is a search accelerator over the transcript, not a
+        // second source of truth: a failure only warns.
+        session_resume::index_saved_session(
+            &self.cwd,
+            &session_id,
+            session.title.as_deref(),
+            &session.messages,
+        );
     }
 
     fn clear_interactive_snapshot(&self, session_id: Option<&str>) {
@@ -3107,12 +3272,41 @@ impl ReplLoop {
         requested_session: Option<&str>,
         ui_state: &mut coderex_ui::state::UiState,
     ) -> std::result::Result<String, String> {
-        let session_id = requested_session
-            .map(ToString::to_string)
-            .or_else(|| session_resume::latest_session_id(&self.cwd))
-            .ok_or_else(|| {
+        let session_id = match requested_session {
+            // A title fragment resolves through the index; an exact id keeps
+            // the transcript path.
+            Some(requested)
+                if !session_resume::transcript_dir(&self.cwd)
+                    .join(format!("{requested}.jsonl"))
+                    .exists() =>
+            {
+                let matches = session_resume::search_sessions(&self.cwd, requested, 5);
+                match matches.as_slice() {
+                    [one] => one.session_id.clone(),
+                    [] => requested.to_string(),
+                    many => {
+                        let listed = many
+                            .iter()
+                            .map(|meta| {
+                                format!(
+                                    "  {}  {}",
+                                    meta.session_id,
+                                    meta.ai_title.as_deref().unwrap_or("(untitled)")
+                                )
+                            })
+                            .collect::<Vec<_>>()
+                            .join("\n");
+                        return Err(format!(
+                            "'{requested}' matches several sessions:\n{listed}\nUse the exact id."
+                        ));
+                    }
+                }
+            }
+            Some(requested) => requested.to_string(),
+            None => session_resume::latest_session_id(&self.cwd).ok_or_else(|| {
                 "No previous sessions found in .coderex/transcripts for this workspace.".to_string()
-            })?;
+            })?,
+        };
         let (messages, snapshot) = self.load_session_state(&session_id, true)?;
         self.restore_session_into_ui(ui_state, &messages, snapshot.as_ref());
 
@@ -3211,6 +3405,21 @@ impl ReplLoop {
         terminal_ui.enter()?;
 
         let mut ui_state = UiState::new();
+        self.apply_startup_theme(&mut ui_state);
+        // Plugin monitors are persistent watch scripts: arm them with the
+        // session and let the supervisor stop them when the loop ends.
+        if let Some(monitors) = self.plugin_monitors.clone() {
+            match crate::plugin_monitors::PluginMonitorSupervisor::start(
+                &monitors,
+                std::path::Path::new(&self.cwd),
+            ) {
+                Ok(supervisor) => {
+                    tracing::info!(count = supervisor.running(), "plugin monitors armed");
+                    self.monitor_supervisor = Some(supervisor);
+                }
+                Err(error) => tracing::warn!(%error, "plugin monitors were not started"),
+            }
+        }
         let mut confirmation_rx = if let Some(bus) = self.confirmation_bus.clone() {
             if let Some(engine) = self.engine.as_mut() {
                 engine.set_confirmation_bus(bus.clone());
@@ -4383,7 +4592,19 @@ impl ReplLoop {
             tracing::info!("{notification}");
             eprintln!("{notification}");
         }
+        if let Some(monitors) = self.plugin_monitors.clone() {
+            match crate::plugin_monitors::PluginMonitorSupervisor::start(
+                &monitors,
+                std::path::Path::new(&self.cwd),
+            ) {
+                Ok(supervisor) => self.monitor_supervisor = Some(supervisor),
+                Err(error) => tracing::warn!(%error, "plugin monitors were not started"),
+            }
+        }
         let result = self.run_headless_turn(prompt).await;
+        if let Some(mut supervisor) = self.monitor_supervisor.take() {
+            supervisor.stop().await;
+        }
         self.stop_artifact_serving().await;
         result
     }
@@ -5163,12 +5384,27 @@ impl ReplLoop {
     }
 
     fn apply_tui_theme(&self, ui_state: &mut coderex_ui::state::UiState, theme_name: &str) -> bool {
-        let manager = coderex_ui::themes::ThemeManager::new();
+        let mut manager = coderex_ui::themes::ThemeManager::new();
+        // Plugin themes are part of the session's registry, so `/theme` can
+        // select them like a built-in.
+        for (name, value) in &self.plugin_themes {
+            if let Err(error) = manager.register_json(name, value) {
+                tracing::warn!(theme = %name, %error, "plugin theme was not registered");
+            }
+        }
         if let Some(theme) = manager.get_theme(theme_name) {
             ui_state.theme = theme.clone();
             true
         } else {
             false
+        }
+    }
+
+    /// Apply the persisted statusline theme at startup, including plugins.
+    fn apply_startup_theme(&self, ui_state: &mut coderex_ui::state::UiState) {
+        let name = self.current_theme.clone();
+        if !self.apply_tui_theme(ui_state, &name) && name != "dark" {
+            tracing::warn!(theme = %name, "configured theme was not found");
         }
     }
 
@@ -5891,6 +6127,17 @@ impl ReplLoop {
                         }
                         return;
                     }
+                    "style" => {
+                        let message = self.handle_output_style_command(&args);
+                        ui_state.messages.push(coderex_ui::message_list::Message {
+                            role: coderex_ui::message_list::MessageRole::System,
+                            content: message.into(),
+                            tool_name: None,
+                            streaming: false,
+                            folded: false,
+                        });
+                        return;
+                    }
                     "macro" => {
                         match self.handle_macro_command(&args) {
                             MacroCommandOutcome::Message(message) => {
@@ -6465,10 +6712,33 @@ impl ReplLoop {
                     return Ok(());
                 }
                 "resume" => {
+                    // A title fragment resolves through the index; an exact
+                    // id goes straight to the transcript.
                     let session_id = if args.is_empty() {
                         session_resume::latest_session_id(&self.cwd).unwrap_or_default()
-                    } else {
+                    } else if session_resume::transcript_dir(&self.cwd)
+                        .join(format!("{}.jsonl", args[0]))
+                        .exists()
+                    {
                         args[0].clone()
+                    } else {
+                        let matches = session_resume::search_sessions(&self.cwd, &args[0], 5);
+                        match matches.as_slice() {
+                            [one] => one.session_id.clone(),
+                            [] => args[0].clone(),
+                            many => {
+                                writeln!(stdout, "'{}' matches several sessions:", args[0])?;
+                                for meta in many {
+                                    writeln!(
+                                        stdout,
+                                        "  {}  {}",
+                                        meta.session_id,
+                                        meta.ai_title.as_deref().unwrap_or("(untitled)")
+                                    )?;
+                                }
+                                return Ok(());
+                            }
+                        }
                     };
                     if session_id.is_empty() {
                         writeln!(stdout, "No previous sessions found.")?;
@@ -6604,6 +6874,11 @@ impl ReplLoop {
                     }
                     return Ok(());
                 }
+                "style" => {
+                    let message = self.handle_output_style_command(&args);
+                    writeln!(stdout, "{message}")?;
+                    return Ok(());
+                }
                 "macro" => {
                     match self.handle_macro_command(&args) {
                         MacroCommandOutcome::Message(message) => {
@@ -6678,6 +6953,57 @@ impl ReplLoop {
             pipe_input = Some(result.output);
         }
         Ok(())
+    }
+
+    /// `/style [name]` — list or apply a plugin output style.
+    ///
+    /// An output style is assigned to `append_system_prompt`, so the style's
+    /// instructions are added to the base prompt rather than replacing it.
+    /// Values may be a string or an object with `prompt`/`content`/`text`.
+    fn handle_output_style_command(&mut self, args: &[String]) -> String {
+        if args.is_empty() {
+            if self.plugin_output_styles.is_empty() {
+                return "No output styles available.".to_string();
+            }
+            let names: Vec<&str> = self
+                .plugin_output_styles
+                .iter()
+                .map(|(name, _)| name.as_str())
+                .collect();
+            return format!(
+                "Output styles: {}\nUse /style <name> to apply one.",
+                names.join(", ")
+            );
+        }
+        let name = args[0].as_str();
+        let Some((_, value)) = self
+            .plugin_output_styles
+            .iter()
+            .find(|(style, _)| style == name)
+        else {
+            let names: Vec<&str> = self
+                .plugin_output_styles
+                .iter()
+                .map(|(style, _)| style.as_str())
+                .collect();
+            return format!(
+                "No output style named '{name}'. Available: {}",
+                names.join(", ")
+            );
+        };
+        let prompt = value.as_str().map(str::to_string).or_else(|| {
+            for key in ["prompt", "content", "text"] {
+                if let Some(text) = value.get(key).and_then(serde_json::Value::as_str) {
+                    return Some(text.to_string());
+                }
+            }
+            None
+        });
+        let Some(prompt) = prompt else {
+            return format!("Output style '{name}' has no prompt text.");
+        };
+        self.session_effects.append_system_prompt = Some(prompt);
+        format!("Output style '{name}' applied to the system prompt.")
     }
 
     /// What `/macro` asks the REPL to do.
@@ -7173,6 +7499,27 @@ impl ReplLoop {
         ctx.mcp_connected = mcp_connected;
         ctx.mcp_servers = mcp_servers;
         ctx.mcp_conflicts = mcp_conflicts;
+        let mut components: Vec<(String, String)> = Vec::new();
+        for (name, _) in &self.plugin_themes {
+            components.push(("theme".into(), name.clone()));
+        }
+        for (name, _) in &self.plugin_output_styles {
+            components.push(("output-style".into(), name.clone()));
+        }
+        for (name, _) in &self.plugin_lsp_servers {
+            components.push(("lsp-server".into(), name.clone()));
+        }
+        if let Some(monitors) = self.plugin_monitors.as_ref().and_then(|m| m.as_object()) {
+            for name in monitors.keys() {
+                components.push(("monitor".into(), name.clone()));
+            }
+        }
+        for (kind, names) in &self.plugin_other_components {
+            for name in names {
+                components.push((kind.clone(), name.clone()));
+            }
+        }
+        ctx.plugin_components = components;
         // Remote environment variables live in their own file, never in
         // settings (a repository-controlled settings file must not be able to
         // inject environment variables).
