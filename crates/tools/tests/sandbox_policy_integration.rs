@@ -84,6 +84,9 @@ fn sandbox_policy_paths_include_cwd() {
     );
 }
 
+// Windows derives its exec access from the system roots and `PATH` inside
+// `acl_plan`, so the policy list is deliberately empty there.
+#[cfg(not(windows))]
 #[test]
 fn sandbox_policy_bash_has_system_exec_paths() {
     let tmp = tempfile::tempdir().unwrap();

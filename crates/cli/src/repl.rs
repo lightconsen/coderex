@@ -8380,6 +8380,19 @@ mod tests {
         assert!(phase.status_label().is_none());
     }
 
+    /// Pick the hook command for this platform.
+    ///
+    /// The hook engine runs commands through `sh -c` on Unix and `cmd /C` on
+    /// Windows, so a test command has to be written for the shell it will
+    /// actually meet.
+    fn platform_hook_command(unix: &str, windows: &str) -> String {
+        if cfg!(windows) {
+            windows.to_string()
+        } else {
+            unix.to_string()
+        }
+    }
+
     /// A `hooks` block in settings used to be parsed, validated, and then
     /// dropped: the engine kept the no-op executor it is constructed with, so a
     /// configured hook never ran. This pins the install, not the registry —
@@ -8390,7 +8403,12 @@ mod tests {
         let marker = temp.path().join("hook-ran");
         let hooks = serde_json::json!([{
             "event": "UserPromptSubmit",
-            "command": format!("touch {} && echo '{{}}'", marker.display()),
+            // The hook engine runs hooks through `sh -c` on Unix and
+            // `cmd /C` on Windows, so the command has to be written for one.
+            "command": platform_hook_command(
+                &format!("touch {} && echo '{{}}'", marker.display()),
+                &format!("echo hook-ran> \"{}\" & echo {{}}", marker.display()),
+            ),
         }]);
 
         let api = CountingApi::new();
@@ -8513,7 +8531,10 @@ mod tests {
         let seen = temp.path().join("seen.json");
         let hooks = serde_json::json!([{
             "event": "UserPromptSubmit",
-            "command": format!("cat > {}; echo '{{}}'", seen.display()),
+            "command": platform_hook_command(
+                &format!("cat > {}; echo '{{}}'", seen.display()),
+                &format!("more > \"{}\" & echo {{}}", seen.display()),
+            ),
         }]);
 
         let mut repl = ReplLoop::with_engine(
@@ -9593,8 +9614,10 @@ mod tests {
             registry.get_tool_arc("mcp__mock__ping").is_some(),
             "MCP tool did not reach the registry the model dispatches through"
         );
+        // `Read` is a baseline tool on every platform; the shell is `Bash` on
+        // Unix and `PowerShell` on Windows, so it must not be named here.
         assert!(
-            registry.get_tool_arc("Bash").is_some(),
+            registry.get_tool_arc("Read").is_some(),
             "built-in tools disappeared"
         );
     }

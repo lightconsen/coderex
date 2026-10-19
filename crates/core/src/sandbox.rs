@@ -284,6 +284,22 @@ pub fn filesystem_isolation() -> FilesystemIsolation {
     }
 }
 
+/// Whether the Windows AppContainer runtime is present.
+///
+/// Always `false` off Windows. Callers use it to decide whether a missing
+/// confinement layer is a refusal or an environment they should report.
+#[must_use]
+pub fn app_container_available() -> bool {
+    #[cfg(target_os = "windows")]
+    {
+        crate::sandbox_windows::app_container_available()
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        false
+    }
+}
+
 /// Whether `bwrap` is on `PATH`.
 #[must_use]
 #[cfg(target_os = "linux")]
@@ -628,11 +644,7 @@ pub fn landlock_abi_version() -> Option<u32> {
             LANDLOCK_CREATE_RULESET_VERSION,
         )
     };
-    if ret < 0 {
-        None
-    } else {
-        Some(ret as u32)
-    }
+    if ret < 0 { None } else { Some(ret as u32) }
 }
 
 /// The Landlock ABI version — `None` outside Linux.
@@ -1790,7 +1802,7 @@ mod linux_impl {
         // ─── rlimits ─────────────────────────────────────────────────────────
 
         fn apply_rlimits(config: &SandboxConfig) -> Result<(), std::io::Error> {
-            use libc::{prlimit, rlimit, RLIMIT_AS, RLIMIT_CPU, RLIMIT_NOFILE};
+            use libc::{RLIMIT_AS, RLIMIT_CPU, RLIMIT_NOFILE, prlimit, rlimit};
 
             if let Some(max_files) = config.max_open_files {
                 let rl = rlimit {
@@ -2178,13 +2190,13 @@ use macos_impl::MacOsSandbox;
 mod windows_impl {
     use super::{SandboxConfig, SandboxError};
     use crate::process_tree::{JobLimits, ProcessTree};
-    use crate::sandbox_windows::{app_container_available, AppContainer};
+    use crate::sandbox_windows::{AppContainer, app_container_available};
     use std::os::windows::io::RawHandle;
     use std::os::windows::process::CommandExt;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
     use windows_sys::Win32::Foundation::HANDLE;
-    use windows_sys::Win32::System::Threading::{TerminateProcess, CREATE_SUSPENDED};
+    use windows_sys::Win32::System::Threading::{CREATE_SUSPENDED, TerminateProcess};
 
     /// Windows sandbox: an AppContainer for paths/network plus a Job Object for
     /// resource and UI limits.
@@ -2893,7 +2905,7 @@ mod tests {
     #[test]
     #[cfg(target_os = "linux")]
     fn landlock_file_rules_omit_directory_only_rights() {
-        use linux_impl::{access_for, AccessKind};
+        use linux_impl::{AccessKind, access_for};
 
         const READ_DIR: u64 = 1 << 3;
         const MAKE_REG: u64 = 1 << 8;
@@ -3521,8 +3533,12 @@ mod tests {
 
         let inside = allowed.join("inside.txt");
         let outside = denied.join("outside.txt");
+        // The temp probe separates "the container cannot write anywhere" from
+        // "the policy path is wrong": `%TEMP%` points at the sandbox's private
+        // directory, which it definitely granted.
         let script = format!(
-            "echo inside> \"{}\" & echo outside> \"{}\"",
+            "echo TEMP=%TEMP% & echo probe> \"%TEMP%\\coderex-probe.txt\" & \
+             echo inside> \"{}\" & echo outside> \"{}\"",
             inside.display(),
             outside.display()
         );
@@ -3530,26 +3546,79 @@ mod tests {
         cmd.arg("/C")
             .arg(script)
             .current_dir(&allowed)
-            .stdin(std::process::Stdio::null());
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
         handle.prepare(&mut cmd).unwrap();
         let child = cmd.spawn().unwrap();
         handle.post_spawn(&child).unwrap();
         let output = child.wait_with_output().unwrap();
 
         // The runtime job can only be debugged from its logs, so the failure
-        // carries what the DACL and the mandatory label actually look like.
+        // carries what the DACL and the mandatory label actually look like,
+        // what the container's token looks like, and what the command said.
         let detail = match &handle.inner {
             PlatformSandbox::Windows(sandbox) => sandbox.diagnose(&allowed),
             _ => String::new(),
         };
+        let acl = std::process::Command::new("icacls")
+            .arg(&allowed)
+            .output()
+            .map_or_else(
+                |error| format!("<icacls failed: {error}>"),
+                |out| String::from_utf8_lossy(&out.stdout).into_owned(),
+            );
+        let groups = run_in_container(&handle, "whoami /groups");
+        let probe = String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .find_map(|line| line.strip_prefix("TEMP=").map(str::to_string))
+            .map_or_else(
+                || "<the command never printed TEMP>".to_string(),
+                |dir| {
+                    let path = std::path::Path::new(&dir).join("coderex-probe.txt");
+                    format!("{} exists={}", path.display(), path.exists())
+                },
+            );
         assert!(
             inside.exists(),
-            "the granted workspace was not writable (exit={:?}); {detail}",
-            output.status.code()
+            "the granted workspace was not writable (exit={:?})\n{detail}\n\
+             temp probe: {probe}\ncommand stderr: {}\ncommand stdout: {}\n\
+             icacls:\n{acl}\ncontainer identity:\n{groups}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stderr),
+            String::from_utf8_lossy(&output.stdout)
         );
         assert!(!outside.exists(), "a path outside the policy was writable");
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Run `command` inside the sandbox and return its combined output.
+    #[cfg(target_os = "windows")]
+    fn run_in_container(handle: &SandboxHandle, command: &str) -> String {
+        let mut cmd = std::process::Command::new("cmd.exe");
+        cmd.arg("/C")
+            .arg(command)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        let Ok(()) = handle.prepare(&mut cmd) else {
+            return "<prepare failed>".to_string();
+        };
+        let Ok(child) = cmd.spawn() else {
+            return "<spawn failed>".to_string();
+        };
+        if let Err(error) = handle.post_spawn(&child) {
+            return format!("<post_spawn failed: {error}>");
+        }
+        match child.wait_with_output() {
+            Ok(output) => format!(
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            ),
+            Err(error) => format!("<wait failed: {error}>"),
+        }
     }
 }
 

@@ -368,8 +368,8 @@ mod tests {
     #[cfg(windows)]
     impl ScratchKey {
         fn new(hive: winreg::HKEY, root: &str) -> std::io::Result<Self> {
-            use winreg::enums::{KEY_ALL_ACCESS, KEY_READ};
             use winreg::RegKey;
+            use winreg::enums::{KEY_ALL_ACCESS, KEY_READ};
 
             let path = format!(
                 r"{root}\Tests\coderex-{}-{}",
@@ -383,8 +383,8 @@ mod tests {
         }
 
         fn key(&self) -> winreg::RegKey {
-            use winreg::enums::{KEY_ALL_ACCESS, KEY_READ};
             use winreg::RegKey;
+            use winreg::enums::{KEY_ALL_ACCESS, KEY_READ};
 
             RegKey::predef(self.hive)
                 .open_subkey_with_flags(&self.path, KEY_ALL_ACCESS | KEY_READ)

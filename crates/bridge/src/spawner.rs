@@ -523,6 +523,9 @@ mod tests {
         );
     }
 
+    // `resolve_identity_file` is Unix-only: `SpawnMode::Ssh` reports an error
+    // on Windows instead of spawning.
+    #[cfg(unix)]
     #[test]
     fn a_named_identity_file_is_part_of_the_ssh_configuration() {
         let key = tempfile::NamedTempFile::new().unwrap();

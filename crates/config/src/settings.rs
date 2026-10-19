@@ -2063,18 +2063,24 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let managed_path = temp.path().join("managed_settings.json");
 
-        // The checksum is fixed-length, so measuring the empty document gives
-        // the wrapper overhead to subtract from the cap.
-        let overhead = serde_json::to_string(&crate::dirs::ManagedSettings::new(
-            serde_json::json!({ "model": "managed-model", "api_key": "" }),
-        ))
-        .unwrap()
-        .len();
-        let padding = "a".repeat(usize::try_from(MAX_SETTINGS_FILE_BYTES).unwrap() - overhead);
-        write_managed(
-            &managed_path,
-            serde_json::json!({ "model": "managed-model", "api_key": padding }),
-        );
+        // Measure one wrapper value and grow *that same value*: the
+        // `fetched_at` timestamp serializes with variable sub-second
+        // precision, so a second `ManagedSettings::new` could be a few bytes
+        // longer and push the file over the cap (which it did on Windows).
+        // The checksum is fixed-length, so rewriting it does not change the
+        // size.
+        let cap = usize::try_from(MAX_SETTINGS_FILE_BYTES).unwrap();
+        let mut managed = crate::dirs::ManagedSettings::new(serde_json::json!({
+            "model": "managed-model",
+            "api_key": "",
+        }));
+        let overhead = serde_json::to_string(&managed).unwrap().len();
+        managed.settings = serde_json::json!({
+            "model": "managed-model",
+            "api_key": "a".repeat(cap - overhead),
+        });
+        managed.checksum = crate::dirs::ManagedSettings::compute_checksum(&managed.settings);
+        std::fs::write(&managed_path, serde_json::to_string(&managed).unwrap()).unwrap();
         assert_eq!(
             std::fs::metadata(&managed_path).unwrap().len(),
             MAX_SETTINGS_FILE_BYTES
@@ -2174,6 +2180,9 @@ mod tests {
         );
     }
 
+    // Off Windows the registry carrier must be a no-op; on Windows it is the
+    // real carrier (see `managed.rs` for the tests that read a scratch key).
+    #[cfg(not(windows))]
     #[test]
     fn registry_carrier_is_inert_off_windows() {
         let temp = tempfile::tempdir().unwrap();

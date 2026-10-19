@@ -302,34 +302,34 @@ pub(crate) fn build_command_line(program: &str, args: &[String]) -> String {
 
 #[cfg(target_os = "windows")]
 mod imp {
-    use super::{acl_plan, capability_names, AclAccess};
+    use super::{AclAccess, acl_plan, capability_names};
     use crate::sandbox::{SandboxConfig, SandboxError};
-    use std::ffi::{c_void, OsStr, OsString};
+    use std::ffi::{OsStr, OsString, c_void};
     use std::os::windows::ffi::OsStrExt;
     use std::path::{Path, PathBuf};
     use std::ptr;
     use std::sync::{Mutex, OnceLock};
 
     use windows_sys::Win32::Foundation::{
-        CloseHandle, LocalFree, ERROR_ALREADY_EXISTS, HANDLE, HLOCAL, WAIT_OBJECT_0,
+        CloseHandle, ERROR_ALREADY_EXISTS, HANDLE, HLOCAL, LocalFree, WAIT_OBJECT_0,
     };
     use windows_sys::Win32::Security::Authorization::{
-        ConvertStringSecurityDescriptorToSecurityDescriptorW, GetNamedSecurityInfoW,
-        SetEntriesInAclW, SetNamedSecurityInfoW, EXPLICIT_ACCESS_W, GRANT_ACCESS,
-        NO_MULTIPLE_TRUSTEE, SE_FILE_OBJECT, TRUSTEE_IS_SID, TRUSTEE_IS_UNKNOWN, TRUSTEE_W,
-    };
-    use windows_sys::Win32::Security::{
-        SetFileSecurityW, DACL_SECURITY_INFORMATION, LABEL_SECURITY_INFORMATION,
+        ConvertStringSecurityDescriptorToSecurityDescriptorW, EXPLICIT_ACCESS_W, GRANT_ACCESS,
+        GetNamedSecurityInfoW, NO_MULTIPLE_TRUSTEE, SE_FILE_OBJECT, SetEntriesInAclW,
+        SetNamedSecurityInfoW, TRUSTEE_IS_SID, TRUSTEE_IS_UNKNOWN, TRUSTEE_W,
     };
     use windows_sys::Win32::Security::Isolation::{
         CreateAppContainerProfile, DeriveAppContainerSidFromAppContainerName,
     };
     use windows_sys::Win32::Security::{
+        ACCESS_ALLOWED_ACE, ACE_HEADER, ACL, ACL_SIZE_INFORMATION, AclSizeInformation,
         CreateWellKnownSid, EqualSid, FreeSid, GetAce, GetAclInformation, GetSidSubAuthority,
-        GetSidSubAuthorityCount, WinCapabilityInternetClientSid, ACCESS_ALLOWED_ACE, ACE_HEADER,
-        ACL, ACL_SIZE_INFORMATION, AclSizeInformation, PSECURITY_DESCRIPTOR, PSID,
-        SECURITY_CAPABILITIES, SECURITY_MAX_SID_SIZE, SID_AND_ATTRIBUTES,
-        SYSTEM_MANDATORY_LABEL_ACE,
+        GetSidSubAuthorityCount, PSECURITY_DESCRIPTOR, PSID, SECURITY_CAPABILITIES,
+        SECURITY_MAX_SID_SIZE, SID_AND_ATTRIBUTES, SYSTEM_MANDATORY_LABEL_ACE,
+        WinCapabilityInternetClientSid,
+    };
+    use windows_sys::Win32::Security::{
+        DACL_SECURITY_INFORMATION, LABEL_SECURITY_INFORMATION, SetFileSecurityW,
     };
     use windows_sys::Win32::Security::{TOKEN_DUPLICATE, TOKEN_QUERY};
     use windows_sys::Win32::Storage::FileSystem::{
@@ -339,11 +339,11 @@ mod imp {
         GetModuleHandleW, GetProcAddress, LoadLibraryW,
     };
     use windows_sys::Win32::System::Threading::{
-        CreateProcessW, DeleteProcThreadAttributeList, GetCurrentProcess, GetExitCodeProcess,
-        InitializeProcThreadAttributeList, OpenProcessToken, UpdateProcThreadAttribute,
-        WaitForSingleObject, CREATE_UNICODE_ENVIRONMENT, EXTENDED_STARTUPINFO_PRESENT,
-        LPPROC_THREAD_ATTRIBUTE_LIST, PROCESS_INFORMATION,
-        PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES, STARTUPINFOEXW,
+        CREATE_UNICODE_ENVIRONMENT, CreateProcessW, DeleteProcThreadAttributeList,
+        EXTENDED_STARTUPINFO_PRESENT, GetCurrentProcess, GetExitCodeProcess,
+        InitializeProcThreadAttributeList, LPPROC_THREAD_ATTRIBUTE_LIST, OpenProcessToken,
+        PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES, PROCESS_INFORMATION, STARTUPINFOEXW,
+        UpdateProcThreadAttribute, WaitForSingleObject,
     };
 
     /// `SE_GROUP_ENABLED`; windows-sys keeps it behind another feature.
@@ -1091,13 +1091,8 @@ mod imp {
         // SAFETY: the path is NUL-terminated and `descriptor` is a live SD
         // returned by the call above. `LABEL_SECURITY_INFORMATION` selects the
         // SACL, so the DACL is untouched.
-        let ok = unsafe {
-            SetFileSecurityW(
-                wide_path.as_ptr(),
-                LABEL_SECURITY_INFORMATION,
-                descriptor,
-            )
-        };
+        let ok =
+            unsafe { SetFileSecurityW(wide_path.as_ptr(), LABEL_SECURITY_INFORMATION, descriptor) };
         let error = if ok == 0 {
             Some(std::io::Error::last_os_error())
         } else {
@@ -1115,6 +1110,8 @@ mod imp {
     const ACCESS_ALLOWED_ACE_TYPE: u8 = 0;
     /// `SYSTEM_MANDATORY_LABEL_ACE_TYPE`; likewise not exported.
     const SYSTEM_MANDATORY_LABEL_ACE_TYPE: u8 = 0x11;
+    /// `INHERIT_ONLY_ACE`: the ACE applies to children only, not the object.
+    const INHERIT_ONLY_ACE: u8 = 0x08;
 
     /// Describe what the container SID can do on `path`, for test failures.
     ///
@@ -1128,32 +1125,69 @@ mod imp {
     #[must_use]
     #[allow(dead_code)] // called from the Windows runtime tests
     pub(crate) fn diagnose_path(path: &Path, sid: PSID) -> String {
-        let mask = ace_for(path, sid, DACL_SECURITY_INFORMATION);
+        let scan = ace_for(path, sid, DACL_SECURITY_INFORMATION);
         let label = mandatory_label_rid(path);
+        // Traverse is `FILE_TRAVERSE | FILE_READ_ATTRIBUTES`; printing the
+        // mask (not just presence) distinguishes an ancestor we granted from
+        // an unrelated ACE naming the same SID.
+        const FILE_TRAVERSE: u32 = 0x20;
         let ancestors: Vec<String> = path
             .ancestors()
             .skip(1)
             .filter(|ancestor| !ancestor.as_os_str().is_empty())
             .map(|ancestor| {
-                let present = ace_for(ancestor, sid, DACL_SECURITY_INFORMATION).is_some();
-                format!("{}={}", ancestor.display(), if present { "ace" } else { "none" })
+                let scan = ace_for(ancestor, sid, DACL_SECURITY_INFORMATION);
+                match scan.allow {
+                    Some((mask, flags)) => format!(
+                        "{}={mask:#010X} flags={flags:#04X}{}{}",
+                        ancestor.display(),
+                        if mask & FILE_TRAVERSE != 0 {
+                            ""
+                        } else {
+                            " (no-traverse)"
+                        },
+                        if flags & INHERIT_ONLY_ACE != 0 {
+                            " (inherit-only)"
+                        } else {
+                            ""
+                        }
+                    ),
+                    None => format!("{}=none", ancestor.display()),
+                }
             })
             .collect();
-        let write_bit = mask.is_some_and(|mask| mask & FILE_GENERIC_WRITE != 0);
+        let write_bit = scan.allow.is_some_and(|(mask, flags)| {
+            mask & FILE_GENERIC_WRITE != 0 && flags & INHERIT_ONLY_ACE == 0
+        });
 
         format!(
-            "path={} exists={} container_ace={:?} has_write={} label_rid={:?} ancestors=[{}]",
+            "path={} exists={} allow={:?} deny={:?} has_write={} label_rid={:?} ancestors=[{}]",
             path.display(),
             path.exists(),
-            mask.map(|mask| format!("0x{mask:08X}")),
+            scan.allow
+                .map(|(mask, flags)| format!("0x{mask:08X}/flags=0x{flags:02X}")),
+            scan.deny
+                .map(|(mask, flags)| format!("0x{mask:08X}/flags=0x{flags:02X}")),
             write_bit,
             label,
             ancestors.join(", ")
         )
     }
 
-    /// The mask of the first access-allowed ACE naming `sid`, if any.
-    fn ace_for(path: &Path, sid: PSID, information: u32) -> Option<u32> {
+    /// What the DACL says about one SID: the first allow ACE and the first
+    /// deny ACE, with their flags. `INHERIT_ONLY_ACE` (0x08) matters: such an
+    /// ACE does not apply to the object itself.
+    #[derive(Debug, Clone, Copy)]
+    struct AceScan {
+        allow: Option<(u32, u8)>,
+        deny: Option<(u32, u8)>,
+    }
+
+    /// `ACCESS_DENIED_ACE_TYPE`; windows-sys does not export the constant.
+    const ACCESS_DENIED_ACE_TYPE: u8 = 1;
+
+    /// Scan the DACL for ACEs naming `sid`.
+    fn ace_for(path: &Path, sid: PSID, information: u32) -> AceScan {
         let wide_path = wide_os(path.as_os_str());
         let mut dacl: *mut ACL = ptr::null_mut();
         let mut descriptor: PSECURITY_DESCRIPTOR = ptr::null_mut();
@@ -1167,8 +1201,16 @@ mod imp {
                 information,
                 ptr::null_mut(),
                 ptr::null_mut(),
-                if information == DACL_SECURITY_INFORMATION { &mut dacl } else { ptr::null_mut() },
-                if information == DACL_SECURITY_INFORMATION { ptr::null_mut() } else { &mut dacl },
+                if information == DACL_SECURITY_INFORMATION {
+                    &mut dacl
+                } else {
+                    ptr::null_mut()
+                },
+                if information == DACL_SECURITY_INFORMATION {
+                    ptr::null_mut()
+                } else {
+                    &mut dacl
+                },
                 &mut descriptor,
             )
         };
@@ -1177,7 +1219,10 @@ mod imp {
                 // SAFETY: the descriptor is owned by this function.
                 unsafe { LocalFree(descriptor as HLOCAL) };
             }
-            return None;
+            return AceScan {
+                allow: None,
+                deny: None,
+            };
         }
 
         let mut size: ACL_SIZE_INFORMATION = unsafe { std::mem::zeroed() };
@@ -1190,7 +1235,10 @@ mod imp {
                 AclSizeInformation,
             )
         };
-        let mut found = None;
+        let mut scan = AceScan {
+            allow: None,
+            deny: None,
+        };
         if ok != 0 {
             for index in 0..size.AceCount {
                 let mut ace: *mut c_void = ptr::null_mut();
@@ -1201,15 +1249,23 @@ mod imp {
                 // SAFETY: an access-allowed ACE begins with its header; the
                 // SID starts at `SidStart` for both shapes inspected here.
                 let header = unsafe { &*(ace.cast::<ACE_HEADER>()) };
-                if header.AceType != ACCESS_ALLOWED_ACE_TYPE {
+                if header.AceType != ACCESS_ALLOWED_ACE_TYPE
+                    && header.AceType != ACCESS_DENIED_ACE_TYPE
+                {
                     continue;
                 }
                 let allowed = unsafe { &*(ace.cast::<ACCESS_ALLOWED_ACE>()) };
                 let ace_sid = std::ptr::from_ref(&allowed.SidStart).cast::<c_void>() as PSID;
                 // SAFETY: both are valid SIDs for the duration of the call.
                 if unsafe { EqualSid(ace_sid, sid) } != 0 {
-                    found = Some(allowed.Mask);
-                    break;
+                    let entry = (allowed.Mask, header.AceFlags);
+                    if header.AceType == ACCESS_ALLOWED_ACE_TYPE {
+                        if scan.allow.is_none() {
+                            scan.allow = Some(entry);
+                        }
+                    } else if scan.deny.is_none() {
+                        scan.deny = Some(entry);
+                    }
                 }
             }
         }
@@ -1217,7 +1273,7 @@ mod imp {
         // SAFETY: the descriptor is owned by this function; the ACL points
         // into it.
         unsafe { LocalFree(descriptor as HLOCAL) };
-        found
+        scan
     }
 
     /// The mandatory integrity label RID (0x1000 Low, 0x2000 Medium, …).
@@ -1483,7 +1539,9 @@ mod tests {
         let grant = grant_for(&plan, "C:/work/project");
         assert_eq!(grant.access, AclAccess::Modify);
         assert!(
-            !plan.iter().any(|g| g.path.to_string_lossy().starts_with(r"\\?\")),
+            !plan
+                .iter()
+                .any(|g| g.path.to_string_lossy().starts_with(r"\\?\")),
             "verbatim paths must not survive into the plan"
         );
     }
@@ -1630,9 +1688,16 @@ mod tests {
                 .expect("the container should spawn cmd.exe");
             let _ = child.wait();
 
+            let acl = std::process::Command::new("icacls")
+                .arg(&allowed)
+                .output()
+                .map_or_else(
+                    |error| format!("<icacls failed: {error}>"),
+                    |out| String::from_utf8_lossy(&out.stdout).into_owned(),
+                );
             assert!(
                 allowed.join("inside.txt").exists(),
-                "the granted workspace was not writable; {}",
+                "the granted workspace was not writable; {}\nicacls:\n{acl}",
                 diagnose_path(&allowed, container.sid())
             );
             assert!(
