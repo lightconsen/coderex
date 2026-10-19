@@ -86,7 +86,7 @@ pub fn register(registry: &mut CommandRegistry) {
         Arc::new(|ctx: &CommandContext, _args: &[String]| {
             let cwd = std::path::Path::new(&ctx.cwd);
             let claude_md = cwd.join("CLAUDE.md");
-            let settings_local = cwd.join("CLAUDE.local.json");
+            let settings_local = cwd.join(".coderex/settings.local.json");
 
             if claude_md.exists() {
                 return CommandResult::success(format!(
@@ -102,15 +102,22 @@ pub fn register(registry: &mut CommandRegistry) {
                 return CommandResult::error(format!("Failed to create CLAUDE.md: {e}"));
             }
 
-            // Write empty settings.local.json if it doesn't exist
+            // Write an empty local settings file if it doesn't exist. The
+            // `.coderex/` directory may be absent, and `ConfigService` reads
+            // this path after the project file.
             if !settings_local.exists() {
+                if let Err(e) = std::fs::create_dir_all(cwd.join(".coderex")) {
+                    return CommandResult::error(format!("Failed to create .coderex/: {e}"));
+                }
                 if let Err(e) = std::fs::write(&settings_local, "{}\n") {
-                    return CommandResult::error(format!("Failed to create settings.local.json: {e}"));
+                    return CommandResult::error(format!(
+                        "Failed to create .coderex/settings.local.json: {e}"
+                    ));
                 }
             }
 
             CommandResult::success(format!(
-                "Project initialized in {}\nCreated: CLAUDE.md (project instructions template)\nCreated: CLAUDE.local.json (local settings)",
+                "Project initialized in {}\nCreated: CLAUDE.md (project instructions template)\nCreated: .coderex/settings.local.json (local settings)",
                 ctx.cwd
             ))
             .with_state_change(true)
@@ -350,8 +357,13 @@ mod tests {
         };
         let result = reg.execute("init", &c, &[]);
         assert!(result.output.contains("CLAUDE.md"));
+        assert!(result.output.contains(".coderex/settings.local.json"));
         assert!(result.state_changed);
         assert!(tmp.path().join("CLAUDE.md").exists());
+        assert!(tmp.path().join(".coderex/settings.local.json").exists());
+        // The legacy path was never read by `ConfigService`; `/init` must not
+        // keep writing a settings file nobody loads.
+        assert!(!tmp.path().join("CLAUDE.local.json").exists());
     }
 
     #[test]

@@ -1296,6 +1296,17 @@ pub struct ReplLoop {
     commands: CommandRegistry,
     /// Current model.
     model: ModelId,
+    /// Telemetry handle when the session opted in.
+    ///
+    /// Used to record `tool_used`, `api_call` and `error` events; session
+    /// start/end are owned by the orchestrator.
+    telemetry: Option<coderex_telemetry::TelemetryHandle>,
+    /// Agent definitions contributed by active plugins.
+    plugin_agents: Vec<(String, serde_json::Value)>,
+    /// In-flight tool calls, keyed by call id, for duration/success events.
+    tool_starts: std::collections::HashMap<String, (String, std::time::Instant)>,
+    /// Session usage at the end of the previous turn, for per-turn deltas.
+    last_usage: coderex_core::types::UsageSummary,
     /// Model to retry with once when the primary model is unavailable
     /// (`--fallback-model`).
     fallback_model: Option<ModelId>,
@@ -1587,6 +1598,10 @@ impl ReplLoop {
             commands,
             model,
             fallback_model: None,
+            telemetry: None,
+            plugin_agents: Vec::new(),
+            tool_starts: std::collections::HashMap::new(),
+            last_usage: coderex_core::types::UsageSummary::default(),
             max_tokens: QueryEngine::DEFAULT_MAX_TOKENS,
             explicit_model_override: false,
             cwd,
@@ -1891,10 +1906,7 @@ impl ReplLoop {
         // Whether this session turned feature flags on decides whether a
         // gated tool is offered at all — the tool listing the model sees is
         // filtered by it.
-        dispatcher.set_feature_flags_enabled(
-            coderex_config::flags::FeatureFlags::from_env().capabilities()
-                != coderex_config::flags::CapabilitySet::empty(),
-        );
+        dispatcher.set_feature_flags(coderex_config::flags::FeatureFlags::from_env());
 
         // Shared task store with persistence
         let config_home = coderex_config::config_home();
@@ -1946,6 +1958,10 @@ impl ReplLoop {
             commands,
             model,
             fallback_model: None,
+            telemetry: None,
+            plugin_agents: Vec::new(),
+            tool_starts: std::collections::HashMap::new(),
+            last_usage: coderex_core::types::UsageSummary::default(),
             max_tokens: QueryEngine::DEFAULT_MAX_TOKENS,
             explicit_model_override: false,
             cwd,
@@ -2271,6 +2287,16 @@ impl ReplLoop {
     /// `/vim` and `/statusline-setup` write these keys; without reading them
     /// back at startup the commands claimed to persist a preference that was
     /// never applied.
+    /// Attach the session's telemetry handle (only when the user opted in).
+    pub fn with_telemetry_handle(&mut self, handle: Option<coderex_telemetry::TelemetryHandle>) {
+        self.telemetry = handle;
+    }
+
+    /// Agent definitions contributed by active plugins.
+    pub fn with_plugin_agents(&mut self, agents: Vec<(String, serde_json::Value)>) {
+        self.plugin_agents = agents;
+    }
+
     pub fn with_startup_preferences(
         &mut self,
         vim_mode: Option<bool>,
@@ -2294,8 +2320,23 @@ impl ReplLoop {
     }
 
     /// Append text to the system prompt (`--append-system-prompt`).
+    ///
+    /// Independent of [`with_system_prompt`](Self::with_system_prompt): both
+    /// may be set, in which case the replacement supplies the base prompt and
+    /// this text is applied on top of it.
     pub fn with_append_system_prompt(&mut self, prompt: Option<String>) {
         self.session_effects.append_system_prompt = prompt;
+    }
+
+    /// Test accessor for the two system-prompt effects.
+    ///
+    /// Returns `(replacement, appended)`.
+    #[cfg(test)]
+    pub(crate) fn system_prompt_effects_for_test(&self) -> (Option<&str>, Option<&str>) {
+        (
+            self.session_effects.override_system_prompt.as_deref(),
+            self.session_effects.append_system_prompt.as_deref(),
+        )
     }
 
     /// Attach pull-request context fetched for `--from-pr`.
@@ -2419,6 +2460,7 @@ impl ReplLoop {
         // recorded and ignored. Explicit flags win: they are more specific
         // than the agent file.
         self.apply_agent_selection();
+        self.apply_plugin_agents();
 
         // 1. Permission mode
         if self.skip_permissions {
@@ -2579,7 +2621,7 @@ impl ReplLoop {
             std::sync::atomic::Ordering::Relaxed,
         );
         if let Some(dispatcher) = &self.dispatcher {
-            dispatcher.set_feature_flags_enabled(!self.capabilities.is_empty());
+            dispatcher.set_feature_flags(self.feature_flags.clone());
         }
 
         // 9b. Context-window overrides. The engine already honors the
@@ -2724,6 +2766,42 @@ impl ReplLoop {
     /// still a whitelist (it denies every tool), so it wins too. Resolution
     /// should already have succeeded in the orchestrator; a failure here is
     /// logged rather than silently running the default agent.
+    /// Register agent definitions contributed by active plugins.
+    fn apply_plugin_agents(&mut self) {
+        if self.plugin_agents.is_empty() {
+            return;
+        }
+        let Some(manager) = self.agent_manager.as_ref() else {
+            return;
+        };
+        for (name, value) in &self.plugin_agents {
+            let mut value = value.clone();
+            if value
+                .get("name")
+                .and_then(serde_json::Value::as_str)
+                .is_none()
+            {
+                if let Some(object) = value.as_object_mut() {
+                    object.insert("name".to_string(), serde_json::Value::String(name.clone()));
+                }
+            }
+            match serde_json::from_value::<coderex_agents::CustomAgentDef>(value) {
+                Ok(definition) => match manager.try_lock() {
+                    Ok(mut manager) => manager.register_custom_agent(definition),
+                    Err(_) => tracing::warn!(
+                        agent = %name,
+                        "plugin agent definition skipped: the agent manager is busy"
+                    ),
+                },
+                Err(error) => tracing::warn!(
+                    agent = %name,
+                    %error,
+                    "plugin agent definition is not a valid custom agent"
+                ),
+            }
+        }
+    }
+
     fn apply_agent_selection(&mut self) {
         let Some(name) = self.agent.clone() else {
             return;
@@ -3895,6 +3973,7 @@ impl ReplLoop {
                 Some(engine_event) = async {
                     event_rx.as_mut().unwrap().recv().await
                 }, if event_rx.is_some() => {
+                    self.record_engine_event_telemetry(&engine_event);
                     match engine_event {
                         EngineEvent::TextDelta(delta) => {
                             phase.note_text_delta();
@@ -4037,6 +4116,7 @@ impl ReplLoop {
                     elicit_rx = None;
                     tui_elicit_rx = None;
                     self.pending_elicitation = None;
+                    self.record_turn_telemetry(&result);
                     self.pending_mcp_form = None;
                     pending_confirmation = None;
                     thinking = false;
@@ -4333,14 +4413,88 @@ impl ReplLoop {
     /// Drain pending events from the event channel, appending text deltas to
     /// the output.
     fn drain_events(&mut self, output: &mut String) {
-        if let Some(ref mut rx) = self.event_rx {
-            while let Ok(event) = rx.try_recv() {
-                if let EngineEvent::TextDelta(delta) = event {
-                    output.push_str(&delta);
-                }
+        // Collect first: recording needs `&mut self`, while the receiver
+        // borrows `self.event_rx`.
+        let events: Vec<EngineEvent> = self
+            .event_rx
+            .as_mut()
+            .map(|rx| std::iter::from_fn(|| rx.try_recv().ok()).collect())
+            .unwrap_or_default();
+        for event in events {
+            self.record_engine_event_telemetry(&event);
+            if let EngineEvent::TextDelta(delta) = event {
+                output.push_str(&delta);
             }
         }
         self.drain_agent_observable_events();
+    }
+
+    /// Record a tool event for telemetry, when the session opted in.
+    fn record_engine_event_telemetry(&mut self, event: &EngineEvent) {
+        let Some(handle) = self.telemetry.as_ref() else {
+            return;
+        };
+        match event {
+            EngineEvent::ToolCallStart { id, name, .. } => {
+                self.tool_starts
+                    .insert(id.clone(), (name.clone(), std::time::Instant::now()));
+            }
+            EngineEvent::ToolCallEnd { id, result } => {
+                if let Some((tool_name, started)) = self.tool_starts.remove(id) {
+                    handle.record(coderex_telemetry::TelemetryEvent::ToolUsed {
+                        tool_name,
+                        success: !result.is_error,
+                        duration_ms: u64::try_from(started.elapsed().as_millis())
+                            .unwrap_or(u64::MAX),
+                        timestamp: chrono::Utc::now(),
+                    });
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Record per-turn API usage and terminal errors.
+    fn record_turn_telemetry(&mut self, result: &Result<TerminalReason, String>) {
+        let Some(ref handle) = self.telemetry else {
+            return;
+        };
+        if let Some(engine) = self.engine.as_ref() {
+            let usage = engine.total_usage();
+            let tokens_in = usage
+                .input_tokens
+                .saturating_sub(self.last_usage.input_tokens);
+            let tokens_out = usage
+                .output_tokens
+                .saturating_sub(self.last_usage.output_tokens);
+            if tokens_in > 0 || tokens_out > 0 {
+                let provider = if self.model.0.starts_with("claude") {
+                    "anthropic"
+                } else {
+                    "custom"
+                };
+                handle.record(coderex_telemetry::TelemetryEvent::ApiCall {
+                    provider: provider.to_string(),
+                    model: self.model.0.clone(),
+                    tokens_in: u32::try_from(tokens_in).unwrap_or(u32::MAX),
+                    tokens_out: u32::try_from(tokens_out).unwrap_or(u32::MAX),
+                    timestamp: chrono::Utc::now(),
+                });
+            }
+            self.last_usage = usage;
+        }
+
+        let (error_type, message) = match result {
+            Ok(TerminalReason::Error(message)) => ("turn_error", message.clone()),
+            Ok(TerminalReason::ApiUnavailable { message }) => ("api_unavailable", message.clone()),
+            Err(message) => ("fatal", message.clone()),
+            _ => return,
+        };
+        handle.record(coderex_telemetry::TelemetryEvent::Error {
+            error_type: error_type.to_string(),
+            message,
+            timestamp: chrono::Utc::now(),
+        });
     }
 
     /// Drain the agent manager's broadcast of sub-agent events.
@@ -5260,6 +5414,7 @@ impl ReplLoop {
         self.engine = Some(engine);
         self.event_rx = live_events;
 
+        self.record_turn_telemetry(&result);
         self.drain_events(&mut output);
 
         // One result frame closes the turn: `emit_turn_complete` consumes the
@@ -6952,18 +7107,18 @@ impl ReplLoop {
         }
     }
 
-    /// Whether at least one configured MCP server is running.
-    fn mcp_connected(&self) -> bool {
+    /// Connection state and server/conflict lists for the command context.
+    fn mcp_state(&self) -> (bool, Vec<String>, Vec<String>) {
         let slot = self
             .mcp_manager
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        slot.as_ref().is_some_and(|manager| {
-            manager
-                .list_servers()
-                .iter()
-                .any(|name| manager.is_running(name))
-        })
+        let Some(manager) = slot.as_ref() else {
+            return (false, Vec::new(), Vec::new());
+        };
+        let servers = manager.list_servers();
+        let connected = servers.iter().any(|name| manager.is_running(name));
+        (connected, servers, manager.tool_conflicts())
     }
 
     fn build_context(&self) -> CommandContext {
@@ -7014,7 +7169,10 @@ impl ReplLoop {
         // `/doctor`, `/config` always said "disconnected" and `/hooks`
         // always said zero.
         ctx.active_hooks = self.active_hooks;
-        ctx.mcp_connected = self.mcp_connected();
+        let (mcp_connected, mcp_servers, mcp_conflicts) = self.mcp_state();
+        ctx.mcp_connected = mcp_connected;
+        ctx.mcp_servers = mcp_servers;
+        ctx.mcp_conflicts = mcp_conflicts;
         // Remote environment variables live in their own file, never in
         // settings (a repository-controlled settings file must not be able to
         // inject environment variables).
@@ -7172,6 +7330,37 @@ mod tests {
         let mut out = Vec::new();
         repl.execute_command("/bye", &mut out).await.unwrap();
         assert!(!repl.running, "the macro's built-in did not run");
+    }
+
+    #[test]
+    fn tool_events_are_recorded_in_telemetry() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let store = coderex_telemetry::TelemetryStore::open(file.path()).unwrap();
+        let (handle, _uploader) = coderex_telemetry::TelemetryHandle::new(store, None);
+
+        let mut repl = ReplLoop::new("/tmp".into(), ModelId::sonnet());
+        repl.with_telemetry_handle(Some(handle.clone()));
+        repl.record_engine_event_telemetry(&EngineEvent::ToolCallStart {
+            id: "call-1".into(),
+            name: "Read".into(),
+            summary: "read a file".into(),
+        });
+        repl.record_engine_event_telemetry(&EngineEvent::ToolCallEnd {
+            id: "call-1".into(),
+            result: ToolResult {
+                tool_call_id: "call-1".into(),
+                output: "ok".into(),
+                is_error: false,
+            },
+        });
+        handle.shutdown();
+
+        let store = coderex_telemetry::TelemetryStore::open(file.path()).unwrap();
+        let events = store.pending_events(10).unwrap();
+        assert!(
+            events.iter().any(|event| event.event_type == "tool_used"),
+            "tool_used was not recorded: {events:?}"
+        );
     }
 
     #[test]

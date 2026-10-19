@@ -45,9 +45,12 @@ pub struct Cli {
     #[arg(long, value_name = "PROMPT")]
     pub system_prompt: Option<String>,
 
-    /// Append to the default system prompt instead of replacing it.
-    #[arg(long)]
-    pub append_system_prompt: bool,
+    /// Append text to the default system prompt.
+    ///
+    /// Independent of `--system-prompt`: `--system-prompt` replaces the base
+    /// prompt, while this text is always additive. Both may be given together.
+    #[arg(long, value_name = "TEXT")]
+    pub append_system_prompt: Option<String>,
 
     /// Include a file in context.
     #[arg(short = 'f', long, value_name = "FILE")]
@@ -428,8 +431,23 @@ pub struct BridgeArgs {
 pub enum McpAction {
     /// List configured MCP servers.
     List,
-    /// Add an MCP server.
-    Add { name: String, command: String },
+    /// Add an MCP server (stdio command or remote URL).
+    Add {
+        /// Name to register the server under.
+        name: String,
+        /// Command to run for a stdio server (mutually exclusive with `--url`).
+        #[arg(value_name = "COMMAND", conflicts_with = "url")]
+        command: Option<String>,
+        /// Endpoint for a remote server.
+        #[arg(long, value_name = "URL")]
+        url: Option<String>,
+        /// Transport for a remote server: `http` (default), `streamable-http`, or `sse`.
+        #[arg(long, value_name = "TRANSPORT")]
+        transport: Option<String>,
+        /// Extra HTTP header for a remote server, as `KEY=VALUE`. Repeatable.
+        #[arg(long = "header", value_name = "KEY=VALUE")]
+        header: Vec<String>,
+    },
     /// Remove an MCP server.
     Remove { name: String },
     /// Test connection to an MCP server.
@@ -538,5 +556,39 @@ mod tests {
             cli.command,
             Some(Command::Telemetry { action: None })
         ));
+    }
+
+    #[test]
+    fn append_system_prompt_takes_a_value() {
+        let cli = Cli::try_parse_from(["coderex", "--append-system-prompt", "be terse"]).unwrap();
+        assert_eq!(cli.append_system_prompt.as_deref(), Some("be terse"));
+        assert!(cli.system_prompt.is_none());
+    }
+
+    #[test]
+    fn append_system_prompt_without_a_value_is_a_parse_error() {
+        assert!(Cli::try_parse_from(["coderex", "--append-system-prompt"]).is_err());
+    }
+
+    #[test]
+    fn system_prompt_and_append_system_prompt_compose() {
+        let cli = Cli::try_parse_from([
+            "coderex",
+            "--system-prompt",
+            "replace the base",
+            "--append-system-prompt",
+            "add this",
+        ])
+        .unwrap();
+        assert_eq!(cli.system_prompt.as_deref(), Some("replace the base"));
+        assert_eq!(cli.append_system_prompt.as_deref(), Some("add this"));
+    }
+
+    #[test]
+    fn append_system_prompt_is_independent_of_the_replacement_prompt() {
+        let cli =
+            Cli::try_parse_from(["coderex", "--append-system-prompt", "only additive"]).unwrap();
+        assert!(cli.system_prompt.is_none());
+        assert_eq!(cli.append_system_prompt.as_deref(), Some("only additive"));
     }
 }

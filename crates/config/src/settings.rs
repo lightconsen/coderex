@@ -573,8 +573,11 @@ pub struct RuntimeOverrides {
     pub api_key: Option<String>,
     /// Custom system prompt override.
     pub system_prompt: Option<String>,
-    /// Append to system prompt instead of replacing.
-    pub append_system_prompt: bool,
+    /// Text appended to the default system prompt.
+    ///
+    /// Independent of [`system_prompt`](Self::system_prompt): the replacement
+    /// prompt supplies the base, and this text is still appended to it.
+    pub append_system_prompt: Option<String>,
     /// Allowed tools list.
     pub allowed_tools: Option<Vec<String>>,
     /// Fallback model.
@@ -615,7 +618,7 @@ impl RuntimeOverrides {
     pub fn session_overrides(&self) -> SessionOverrides {
         SessionOverrides {
             system_prompt: self.system_prompt.clone(),
-            append_system_prompt: self.append_system_prompt,
+            append_system_prompt: self.append_system_prompt.clone(),
             fallback_model: self.fallback_model.clone(),
             effort: self.effort.clone(),
             allowed_tools: self.allowed_tools.clone(),
@@ -642,8 +645,8 @@ pub struct PluginHostSettings {
 pub struct SessionOverrides {
     /// Custom system prompt.
     pub system_prompt: Option<String>,
-    /// Append to the default system prompt instead of replacing it.
-    pub append_system_prompt: bool,
+    /// Text appended to the system prompt.
+    pub append_system_prompt: Option<String>,
     /// Fallback model.
     pub fallback_model: Option<String>,
     /// Reasoning effort level.
@@ -658,6 +661,7 @@ pub struct SessionOverrides {
 pub struct ConfigService {
     user_config_path: PathBuf,
     project_config_path: Option<PathBuf>,
+    local_config_path: Option<PathBuf>,
     managed_config_path: Option<PathBuf>,
     managed_plist_path: Option<PathBuf>,
     managed_registry_key: Option<String>,
@@ -670,10 +674,29 @@ impl ConfigService {
         Self {
             user_config_path,
             project_config_path,
+            local_config_path: None,
             managed_config_path: None,
             managed_plist_path: None,
             managed_registry_key: None,
         }
+    }
+
+    /// Attach a project-local settings file (`.coderex/settings.local.json`).
+    ///
+    /// The local file is merged after the project file and before managed
+    /// policy, so it can override project settings without escaping the
+    /// repository-controlled source policy: like `project`, a `local` file
+    /// cannot enable `auto`/`bypass-permissions` or telemetry.
+    #[must_use]
+    pub fn with_local_config_path(mut self, path: PathBuf) -> Self {
+        self.local_config_path = Some(path);
+        self
+    }
+
+    /// The project-local settings file path, if one is configured.
+    #[must_use]
+    pub fn local_config_path(&self) -> Option<&Path> {
+        self.local_config_path.as_deref()
     }
 
     /// Attach a managed-settings file (the "file" enterprise carrier).
@@ -863,10 +886,21 @@ impl ConfigService {
         Ok(None)
     }
 
+    /// Load project-local config from `.coderex/settings.local.json`.
+    ///
+    /// Returns `Ok(None)` if no local config path is configured or the file
+    /// does not exist.
+    pub fn load_local_config(&self) -> Result<Option<Settings>, ConfigError> {
+        if let Some(path) = &self.local_config_path {
+            return load_settings_file(path, "local");
+        }
+        Ok(None)
+    }
+
     /// Resolve the final merged settings, migrate if needed, and validate.
     ///
-    /// Merge order: built-in defaults → user config → project config → managed
-    /// config. Runtime overrides are applied separately via
+    /// Merge order: built-in defaults → user config → project config → local
+    /// config → managed config. Runtime overrides are applied separately via
     /// `RuntimeOverrides::apply`.
     pub fn resolve(&self) -> Result<Settings, ConfigError> {
         let defaults = Settings::defaults();
@@ -883,6 +917,12 @@ impl ConfigService {
             .unwrap_or(None)
             .unwrap_or_default();
 
+        let local = self
+            .load_local_config()
+            .inspect_err(|e| tracing::debug!("local config not loaded: {e}"))
+            .unwrap_or(None)
+            .unwrap_or_default();
+
         let managed = self
             .load_managed_config()
             .inspect_err(|e| tracing::debug!("managed config not loaded: {e}"))
@@ -892,7 +932,7 @@ impl ConfigService {
         // Keep the pre-managed view so the hooks it contains can be installed
         // at the core tier. Built-in defaults have no hooks today, but they are
         // included so this remains correct if that ever changes.
-        let core = defaults.merge(&user).merge(&project);
+        let core = defaults.merge(&user).merge(&project).merge(&local);
         let core_hooks = core.hooks.clone();
         let managed_hooks = managed.hooks.clone();
 
@@ -922,17 +962,21 @@ impl ConfigService {
     }
 
     /// Load plugin host configuration (`plugins`, `marketplaces`) from the
-    /// user and project settings files.
+    /// user, project, and local settings files.
     ///
-    /// Project values override user values, matching the normal settings
-    /// precedence. Files that fail to parse are skipped with a debug log, just
-    /// like [`Self::resolve`] does, so a broken plugin block cannot prevent the
-    /// session from starting. Managed carriers are not consulted here; their
-    /// settings are policy values and plugin hosting is a user/project choice.
+    /// Precedence matches [`Self::resolve`]: local values override project
+    /// values, which override user values. Files that fail to parse are
+    /// skipped with a debug log, just like [`Self::resolve`] does, so a broken
+    /// plugin block cannot prevent the session from starting. Managed carriers
+    /// are not consulted here; their settings are policy values and plugin
+    /// hosting is a user/project choice.
     pub fn load_plugin_host_config(&self) -> PluginHostSettings {
         let mut config = PluginHostSettings::default();
         Self::merge_plugin_host_file(&mut config, &self.user_config_path);
         if let Some(path) = &self.project_config_path {
+            Self::merge_plugin_host_file(&mut config, path);
+        }
+        if let Some(path) = &self.local_config_path {
             Self::merge_plugin_host_file(&mut config, path);
         }
         config
@@ -1335,7 +1379,7 @@ mod tests {
     fn runtime_overrides_expose_session_scoped_values() {
         let overrides = RuntimeOverrides {
             system_prompt: Some("be terse".into()),
-            append_system_prompt: true,
+            append_system_prompt: Some("add this".into()),
             fallback_model: Some("claude-haiku-4-5-20251001".into()),
             effort: Some("high".into()),
             allowed_tools: Some(vec!["Read".into()]),
@@ -1343,7 +1387,7 @@ mod tests {
         };
         let session = overrides.session_overrides();
         assert_eq!(session.system_prompt.as_deref(), Some("be terse"));
-        assert!(session.append_system_prompt);
+        assert_eq!(session.append_system_prompt.as_deref(), Some("add this"));
         assert_eq!(
             session.fallback_model.as_deref(),
             Some("claude-haiku-4-5-20251001")
@@ -1353,9 +1397,20 @@ mod tests {
     }
 
     #[test]
-    fn append_system_prompt_flag_is_off_by_default() {
+    fn append_system_prompt_is_absent_by_default_and_carries_its_text() {
         let session = RuntimeOverrides::default().session_overrides();
-        assert!(!session.append_system_prompt);
+        assert!(session.append_system_prompt.is_none());
+
+        // The replacement prompt and the additive text are independent, so
+        // both survive `session_overrides`.
+        let session = RuntimeOverrides {
+            system_prompt: Some("replace".into()),
+            append_system_prompt: Some("append".into()),
+            ..Default::default()
+        }
+        .session_overrides();
+        assert_eq!(session.system_prompt.as_deref(), Some("replace"));
+        assert_eq!(session.append_system_prompt.as_deref(), Some("append"));
     }
 
     #[test]
@@ -1693,6 +1748,98 @@ mod tests {
         std::fs::write(&user_path, r#"{"telemetry_enabled":true}"#).unwrap();
         let service = ConfigService::new(user_path, None);
         assert_eq!(service.resolve().unwrap().telemetry_enabled, Some(true));
+    }
+
+    // ── Local settings source (`/init`) ─────────────────────────────────
+
+    #[test]
+    fn local_settings_override_project_settings() {
+        let temp = tempfile::tempdir().unwrap();
+        let user_path = temp.path().join("user.json");
+        let project_path = temp.path().join("project.json");
+        let local_path = temp.path().join("settings.local.json");
+        std::fs::write(
+            &user_path,
+            r#"{"model":"user-model","max_budget_usd":30.0}"#,
+        )
+        .unwrap();
+        std::fs::write(&project_path, r#"{"max_budget_usd":20.0}"#).unwrap();
+        std::fs::write(&local_path, r#"{"model":"local-model"}"#).unwrap();
+
+        let service = ConfigService::new(user_path, Some(project_path))
+            .with_local_config_path(local_path.clone());
+        assert_eq!(service.local_config_path(), Some(local_path.as_path()));
+
+        let resolved = service.resolve().unwrap();
+        assert_eq!(resolved.model.as_deref(), Some("local-model"));
+        // The local layer only sets `model`; the project budget still applies.
+        assert_eq!(resolved.max_budget_usd, Some(20.0));
+    }
+
+    /// A local file is repository-controlled exactly like the project file:
+    /// it may not enable the security-sensitive permission modes or telemetry.
+    #[test]
+    fn local_settings_cannot_relax_security_or_enable_telemetry() {
+        for mode in ["auto", "bypass-permissions"] {
+            let temp = tempfile::tempdir().unwrap();
+            let local_path = temp.path().join("settings.local.json");
+            std::fs::write(
+                &local_path,
+                format!(r#"{{"permission_mode":"{mode}","telemetry_enabled":true}}"#),
+            )
+            .unwrap();
+
+            let service = ConfigService::new(temp.path().join("user.json"), None)
+                .with_local_config_path(local_path);
+            let resolved = service.resolve().unwrap();
+
+            assert_eq!(resolved.permission_mode.as_deref(), Some("default"));
+            assert_eq!(resolved.telemetry_enabled, None);
+        }
+    }
+
+    /// `/init` used to write `CLAUDE.local.json`, which no config loader read.
+    /// That legacy path must stay inert: only the configured local source is
+    /// consulted.
+    #[test]
+    fn legacy_claude_local_json_is_not_loaded() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            temp.path().join("CLAUDE.local.json"),
+            r#"{"model":"legacy-model"}"#,
+        )
+        .unwrap();
+
+        let service = ConfigService::new(temp.path().join("user.json"), None)
+            .with_local_config_path(temp.path().join(".coderex/settings.local.json"));
+
+        assert_eq!(
+            service.resolve().unwrap().model,
+            Some("claude-sonnet-4-6".into())
+        );
+    }
+
+    #[test]
+    fn local_settings_override_project_in_plugin_host_config() {
+        let temp = tempfile::tempdir().unwrap();
+        let user_path = temp.path().join("user.json");
+        let project_path = temp.path().join("project.json");
+        let local_path = temp.path().join("settings.local.json");
+        std::fs::write(
+            &project_path,
+            r#"{"plugins":{"demo":{"options":{"token":"project"}}}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            &local_path,
+            r#"{"plugins":{"demo":{"options":{"token":"local"}}}}"#,
+        )
+        .unwrap();
+
+        let service =
+            ConfigService::new(user_path, Some(project_path)).with_local_config_path(local_path);
+        let plugins = service.load_plugin_host_config().plugins.unwrap();
+        assert_eq!(plugins["demo"]["options"]["token"].as_str(), Some("local"));
     }
 
     // ── Size cap ─────────────────────────────────────────────────────────

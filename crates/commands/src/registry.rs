@@ -191,6 +191,10 @@ pub struct CommandContext {
     pub has_plan: bool,
     /// Whether MCP is connected.
     pub mcp_connected: bool,
+    /// Names of the MCP servers attached to the session.
+    pub mcp_servers: Vec<String>,
+    /// Tool names refused because two servers exposed the same raw name.
+    pub mcp_conflicts: Vec<String>,
     /// Active hooks.
     pub active_hooks: usize,
     /// API key configured.
@@ -240,6 +244,8 @@ impl CommandContext {
             elapsed_secs: 0,
             has_plan: false,
             mcp_connected: false,
+            mcp_servers: Vec::new(),
+            mcp_conflicts: Vec::new(),
             active_hooks: 0,
             api_key_set: false,
             feature_flags: HashMap::new(),

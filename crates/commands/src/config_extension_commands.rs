@@ -199,7 +199,22 @@ pub fn register(registry: &mut CommandRegistry) {
         true,
         Arc::new(|ctx: &CommandContext, args: &[String]| {
             if ctx.mcp_connected {
-                CommandResult::success("MCP: Connected")
+                let mut output = String::from("MCP: Connected");
+                if !ctx.mcp_servers.is_empty() {
+                    output.push_str("\nServers:");
+                    for server in &ctx.mcp_servers {
+                        output.push_str("\n  ");
+                        output.push_str(server);
+                    }
+                }
+                if !ctx.mcp_conflicts.is_empty() {
+                    output.push_str("\nRefused tool names (duplicate across servers):");
+                    for conflict in &ctx.mcp_conflicts {
+                        output.push_str("\n  ");
+                        output.push_str(conflict);
+                    }
+                }
+                CommandResult::success(output)
             } else if args.is_empty() {
                 // Read MCP config if available
                 let settings_path = config_home().join("settings.json");

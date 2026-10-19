@@ -98,7 +98,8 @@ impl Drop for TelemetrySessionGuard {
 /// Resolved settings and state passed between startup phases.
 #[derive(Debug, Default)]
 pub struct SessionContext {
-    /// Resolved settings after all merges (defaults → user → project → remote).
+    /// Resolved settings after all merges
+    /// (defaults → user → project → local → remote).
     pub settings: Option<Settings>,
     /// Remote managed settings (if fetched). Enterprise feature only.
     #[cfg(feature = "enterprise")]
@@ -155,8 +156,11 @@ pub struct SessionContext {
     pub file: Vec<std::path::PathBuf>,
     /// Custom system prompt.
     pub system_prompt: Option<String>,
-    /// Append to default system prompt.
-    pub append_system_prompt: bool,
+    /// Text appended to the default system prompt.
+    ///
+    /// Independent of [`system_prompt`](Self::system_prompt): when both are
+    /// set, the replacement supplies the base and this text still applies.
+    pub append_system_prompt: Option<String>,
     /// Whether session persistence is disabled.
     pub no_persistence: bool,
     /// Whether slash commands are disabled.
@@ -339,7 +343,7 @@ impl StartupOrchestrator {
                 add_dir: Vec::new(),
                 file: Vec::new(),
                 system_prompt: None,
-                append_system_prompt: false,
+                append_system_prompt: None,
                 no_persistence: false,
                 no_slash_commands: false,
                 output_format: "text".into(),
@@ -408,7 +412,7 @@ impl StartupOrchestrator {
         self.ctx.add_dir = args.add_dir.clone();
         self.ctx.file = args.file.clone();
         self.ctx.system_prompt = args.system_prompt.clone();
-        self.ctx.append_system_prompt = args.append_system_prompt;
+        self.ctx.append_system_prompt = args.append_system_prompt.clone();
         self.ctx.no_persistence = args.no_session_persistence;
         self.ctx.no_slash_commands = args.disable_slash_commands;
         self.ctx.output_format = args.output_format.clone();
@@ -700,6 +704,7 @@ impl StartupOrchestrator {
         // `--settings`/environment file path keeps precedence, and the OS
         // policy carrier is added only when it was not explicitly configured.
         let config_service = ConfigService::new(user_path.clone(), project_path.clone())
+            .with_local_config_path(Self::local_config_path(&self.ctx.cwd))
             .with_managed_settings_path(managed_path)
             .with_platform_managed_settings();
         // Explicit environment overrides for the platform carriers exist for
@@ -742,7 +747,7 @@ impl StartupOrchestrator {
             telemetry_enabled: if args.no_telemetry { Some(false) } else { None },
             api_key: args.api_key.clone(),
             system_prompt: args.system_prompt.clone(),
-            append_system_prompt: args.append_system_prompt,
+            append_system_prompt: args.append_system_prompt.clone(),
             allowed_tools: args
                 .allowed_tools
                 .as_ref()
@@ -1247,6 +1252,7 @@ impl StartupOrchestrator {
             .clone()
             .unwrap_or_else(|| coderex_config::config_home().join("settings.json"));
         ConfigService::new(user_path, Self::find_project_config(&self.ctx.cwd))
+            .with_local_config_path(Self::local_config_path(&self.ctx.cwd))
     }
 
     /// Retry failed plugins and actually restart the ones that recover.
@@ -1346,7 +1352,10 @@ impl StartupOrchestrator {
     /// ReconcileMarketplaces: sync marketplace state.
     async fn phase_reconcile_marketplaces(&self) -> Result<()> {
         let manager = plugin_manager_with_signing_key();
-        let reconciler = coderex_plugins::plugins::MarketplaceReconciler::new(300);
+        let reconciler = coderex_plugins::plugins::MarketplaceReconciler::with_auto_install_enabled(
+            300,
+            Self::plugin_auto_install_enabled(),
+        );
 
         let marketplaces = Self::configured_marketplaces(&self.ctx.marketplaces);
         Self::register_marketplaces(&manager, &marketplaces);
@@ -1403,6 +1412,30 @@ impl StartupOrchestrator {
         self.ctx.mcp_elicitation = Some(elicitation);
 
         let mut config_loaded = false;
+
+        // Servers contributed by active plugins. Loaded first so the project
+        // `.mcp.json` and settings can override a same-named server.
+        if let Some(plugin_servers) = self
+            .ctx
+            .plugin_manager
+            .as_ref()
+            .and_then(|manager| manager.plugin_mcp_servers())
+        {
+            match serde_json::from_value::<coderex_mcp::config::McpConfig>(plugin_servers) {
+                Ok(config) if !config.is_empty() => {
+                    tracing::info!(
+                        "MCP config loaded: {} servers from plugins",
+                        config.server_names().len()
+                    );
+                    manager.load_config(&config);
+                    config_loaded = true;
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    tracing::warn!("MCP servers from plugins were not loaded: {error}");
+                }
+            }
+        }
 
         // Servers defined inline in settings are the same shape as
         // `.mcp.json`: either the bare `{name: {...}}` map or wrapped in
@@ -1573,6 +1606,14 @@ impl StartupOrchestrator {
             self.ctx.remote_services_ready,
         );
         Ok(())
+    }
+
+    /// The project-local settings file read after the project file.
+    ///
+    /// `/init` writes this path. It is not searched in ancestors: local
+    /// settings belong to the directory the session was started in.
+    fn local_config_path(cwd: &str) -> std::path::PathBuf {
+        std::path::Path::new(cwd).join(".coderex/settings.local.json")
     }
 
     /// Find project config in CWD or nearest ancestor.
@@ -1788,6 +1829,7 @@ impl StartupOrchestrator {
         repl.with_hook_layers(hook_layers);
         repl.with_max_turns(self.ctx.max_turns);
         repl.with_fallback_model(self.ctx.fallback_model.clone());
+        repl.with_telemetry_handle(self.ctx.telemetry_handle.clone());
         // `/vim` and `/statusline-setup` persist these; apply them at startup.
         let vim_mode = self
             .ctx
@@ -1805,19 +1847,20 @@ impl StartupOrchestrator {
         repl.with_include_partial_messages(self.ctx.include_partial_messages);
         repl.with_betas(self.ctx.betas.clone());
         // `--system-prompt` replaces the base prompt; `--append-system-prompt`
-        // adds to it. Both were parsed and then dropped on the interactive
-        // path — the REPL applied neither. The headless path already folds the
-        // value into the prompt (`build_headless_prompt`), so applying it here
-        // as well would send it twice.
+        // adds to it. They are independent: when both are given, the
+        // replacement stays authoritative for the base and the append text is
+        // applied as an extra instruction on top of it. The headless path
+        // folds both into the user prompt (`build_headless_prompt`), so
+        // applying them here as well would send them twice.
         if interactive {
-            if self.ctx.append_system_prompt {
-                repl.with_append_system_prompt(self.ctx.system_prompt.clone());
-            } else {
-                repl.with_system_prompt(self.ctx.system_prompt.clone());
-            }
+            repl.with_system_prompt(self.ctx.system_prompt.clone());
+            repl.with_append_system_prompt(self.ctx.append_system_prompt.clone());
         }
         repl.with_chrome_enabled(self.ctx.chrome && !self.ctx.no_chrome);
         repl.with_agent(self.ctx.agent.clone());
+        if let Some(ref manager) = self.ctx.plugin_manager {
+            repl.with_plugin_agents(manager.plugin_agents());
+        }
         repl.with_explicit_model_override(self.ctx.model_explicit);
         repl.with_ide(self.ctx.ide.clone());
         repl.with_worktree(self.ctx.worktree);
@@ -1969,18 +2012,21 @@ impl StartupOrchestrator {
             final_prompt.push_str("\n\n");
         }
 
+        // Headless turns carry the prompt flags in the user prompt instead of
+        // the engine's system prompt (the interactive path is the one that
+        // sets `SessionEffects`). The two flags are independent and may both
+        // appear: `--system-prompt` supplies the replacement base and
+        // `--append-system-prompt` is labelled as additive on top of it.
         if let Some(ref sp) = self.ctx.system_prompt {
-            // `--append-system-prompt` means "add this to the engine's own
-            // system prompt", not "replace it". Headless turns carry it in the
-            // prompt instead of the engine's system prompt (the interactive
-            // path is the one that sets `SessionEffects`), so label the block
-            // so the model treats it as additive rather than authoritative.
-            if self.ctx.append_system_prompt {
-                final_prompt.push_str("Additional system instructions: ");
-            } else {
-                final_prompt.push_str("System: ");
-            }
+            final_prompt.push_str("System: ");
             final_prompt.push_str(sp);
+            final_prompt.push('\n');
+            final_prompt.push('\n');
+        }
+
+        if let Some(ref append) = self.ctx.append_system_prompt {
+            final_prompt.push_str("Additional system instructions: ");
+            final_prompt.push_str(append);
             final_prompt.push('\n');
             final_prompt.push('\n');
         }
@@ -2147,6 +2193,14 @@ impl StartupOrchestrator {
         })
     }
 
+    /// Whether marketplace reconciliation may install new plugins.
+    ///
+    /// Off by default: installing third-party code automatically is a
+    /// decision the user makes, not a side effect of opening the session.
+    fn plugin_auto_install_enabled() -> bool {
+        Self::env_flag("CODEREX_PLUGIN_AUTO_INSTALL")
+    }
+
     /// Parse the `mcp_servers` settings value.
     ///
     /// Accepts both spellings the ecosystem uses: the bare
@@ -2227,10 +2281,7 @@ impl StartupOrchestrator {
                 ExecutionContext::Normal,
                 std::path::PathBuf::from(&cwd),
             );
-            dispatcher.set_feature_flags_enabled(
-                coderex_config::flags::FeatureFlags::from_env().capabilities()
-                    != coderex_config::flags::CapabilitySet::empty(),
-            );
+            dispatcher.set_feature_flags(coderex_config::flags::FeatureFlags::from_env());
             dispatcher.set_task_store(task_store);
             dispatcher.set_cron_scheduler(cron_scheduler);
             dispatcher.set_rate_limiter(std::sync::Arc::new(RateLimiter::new()));
@@ -2424,7 +2475,15 @@ impl StartupOrchestrator {
                                 println!("  (none)");
                             } else {
                                 for (name, srv) in &config.mcp_servers {
-                                    println!("  {name}: {} {}", srv.command, srv.args.join(" "));
+                                    if let Some(url) = &srv.url {
+                                        println!("  {name}: {:?} {url}", srv.transport);
+                                    } else {
+                                        println!(
+                                            "  {name}: {} {}",
+                                            srv.command,
+                                            srv.args.join(" ")
+                                        );
+                                    }
                                 }
                             }
                         }
@@ -2434,28 +2493,48 @@ impl StartupOrchestrator {
                     println!("  No MCP config found at {mcp_path:?}");
                 }
             }
-            Some(crate::cli::McpAction::Add { name, command }) => {
+            Some(crate::cli::McpAction::Add {
+                name,
+                command,
+                url,
+                transport,
+                header,
+            }) => {
                 let mut config = if mcp_path.exists() {
                     coderex_mcp::config::McpConfig::load(&mcp_path)
                         .unwrap_or_else(|_| coderex_mcp::config::McpConfig::new())
                 } else {
                     coderex_mcp::config::McpConfig::new()
                 };
-                let parts: Vec<&str> = command.split_whitespace().collect();
-                let cmd = parts.first().map_or(command.clone(), |s| s.to_string());
-                let args: Vec<String> = parts.iter().skip(1).map(|s| s.to_string()).collect();
-                config.add_server(
-                    name.clone(),
-                    coderex_mcp::config::McpServerConfig {
-                        command: cmd,
-                        args,
-                        env: std::collections::HashMap::new(),
-                        ..Default::default()
+                let added = if let Some(url) = url {
+                    let transport = match transport.as_deref().unwrap_or("http") {
+                        "http" | "streamable-http" => coderex_mcp::config::McpTransport::Http,
+                        "sse" => coderex_mcp::config::McpTransport::Sse,
+                        other => {
+                            println!("Error: unsupported transport '{other}' (use http or sse)");
+                            return Ok(());
+                        }
+                    };
+                    let mut headers = std::collections::HashMap::new();
+                    for entry in &header {
+                        let Some((key, value)) = entry.split_once('=') else {
+                            println!("Error: --header expects KEY=VALUE, got '{entry}'");
+                            return Ok(());
+                        };
+                        headers.insert(key.trim().to_string(), value.trim().to_string());
+                    }
+                    config.add_remote_server(name.clone(), url, transport, headers)
+                } else if let Some(command) = command {
+                    config.add_stdio_server(name.clone(), &command)
+                } else {
+                    Err("give a command or --url".to_string())
+                };
+                match added {
+                    Ok(()) => match config.save(&mcp_path) {
+                        Ok(()) => println!("Added MCP server '{name}' to {mcp_path:?}"),
+                        Err(e) => println!("Error saving config: {e}"),
                     },
-                );
-                match config.save(&mcp_path) {
-                    Ok(()) => println!("Added MCP server '{name}' to {mcp_path:?}"),
-                    Err(e) => println!("Error saving config: {e}"),
+                    Err(e) => println!("Error: {e}"),
                 }
             }
             Some(crate::cli::McpAction::Remove { name }) => {
@@ -2638,7 +2717,11 @@ impl StartupOrchestrator {
             Some(crate::cli::PluginAction::Update) => {
                 println!("Updating plugins...");
                 let manager = plugin_manager_with_signing_key();
-                let reconciler = coderex_plugins::plugins::MarketplaceReconciler::new(300);
+                let reconciler =
+                    coderex_plugins::plugins::MarketplaceReconciler::with_auto_install_enabled(
+                        300,
+                        Self::plugin_auto_install_enabled(),
+                    );
                 match reconciler.reconcile(&manager, Some(&install_dir)).await {
                     Ok(report) => {
                         println!(
@@ -2958,7 +3041,7 @@ mod tests {
             model: None,
             fallback_model: None,
             system_prompt: None,
-            append_system_prompt: false,
+            append_system_prompt: None,
             file: Vec::new(),
             print: false,
             brief: false,
@@ -3260,11 +3343,67 @@ mod tests {
     #[test]
     fn append_system_prompt_is_labelled_as_additive() {
         let mut orch = StartupOrchestrator::new();
-        orch.ctx.system_prompt = Some("be terse".into());
-        orch.ctx.append_system_prompt = true;
+        orch.ctx.append_system_prompt = Some("be terse".into());
         let prompt = orch.build_headless_prompt("hello");
         assert!(prompt.contains("Additional system instructions: be terse"));
         assert!(!prompt.contains("System: be terse"));
+    }
+
+    #[test]
+    fn headless_prompt_carries_both_prompt_flags() {
+        let mut orch = StartupOrchestrator::new();
+        orch.ctx.system_prompt = Some("replace the base".into());
+        orch.ctx.append_system_prompt = Some("add this".into());
+
+        let prompt = orch.build_headless_prompt("hello");
+
+        assert!(
+            prompt.contains("System: replace the base"),
+            "the replacement prompt must be a labelled block: {prompt}"
+        );
+        assert!(
+            prompt.contains("Additional system instructions: add this"),
+            "the append text must be a labelled block: {prompt}"
+        );
+        let system = prompt.find("System: replace the base").unwrap();
+        let append = prompt
+            .find("Additional system instructions: add this")
+            .unwrap();
+        let user = prompt.rfind("hello").unwrap();
+        assert!(
+            system < append && append < user,
+            "prompt blocks must precede the user prompt: {prompt}"
+        );
+    }
+
+    #[test]
+    fn interactive_mode_applies_both_prompt_flags_independently() {
+        let mut orch = StartupOrchestrator::new();
+        orch.ctx.system_prompt = Some("replace the base".into());
+        orch.ctx.append_system_prompt = Some("add this".into());
+
+        let mut repl = crate::repl::ReplLoop::new("/tmp".into(), ModelId::sonnet());
+        orch.configure_repl(&mut repl, true);
+
+        let (replacement, appended) = repl.system_prompt_effects_for_test();
+        assert_eq!(replacement, Some("replace the base"));
+        assert_eq!(appended, Some("add this"));
+    }
+
+    #[test]
+    fn interactive_mode_applies_an_append_prompt_on_its_own() {
+        let mut orch = StartupOrchestrator::new();
+        orch.ctx.append_system_prompt = Some("only additive".into());
+
+        let mut repl = crate::repl::ReplLoop::new("/tmp".into(), ModelId::sonnet());
+        orch.configure_repl(&mut repl, true);
+
+        let (replacement, appended) = repl.system_prompt_effects_for_test();
+        assert!(
+            replacement.is_none(),
+            "an append flag alone must not replace the base prompt"
+        );
+        assert_eq!(appended, Some("only additive"));
     }
 
     #[test]
