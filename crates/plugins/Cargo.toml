@@ -39,9 +39,6 @@ wat = { version = "1", optional = true }
 [target.'cfg(unix)'.dependencies]
 libc.workspace = true
 
-[target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_System_JobObjects"] }
-
 [features]
 default = ["process-runtime", "wasm-runtime"]
 process-runtime = []

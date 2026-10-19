@@ -952,9 +952,54 @@ fn run_compile_helper(
         }
     }
 
+    // Windows: the compiler is confined by the shared AppContainer sandbox,
+    // which also owns the kill-on-close Job Object. `prepare` creates the
+    // child suspended; `post_spawn` attaches the token, assigns the job and
+    // resumes it.
     #[cfg(target_os = "windows")]
-    let job = CompileJob::create(WASM_COMPILE_CPU_SECONDS, WASM_COMPILE_MEMORY_BYTES)
-        .map_err(|e| format!("failed to create the WASM compile job object: {e}"))?;
+    let sandbox = {
+        use coderex_core::sandbox::{SandboxConfig, SandboxHandle};
+
+        let compiler = std::fs::canonicalize(command.program())
+            .unwrap_or_else(|_| command.program().to_path_buf());
+        let mut read = vec![work_dir.clone(), compiler.clone()];
+        let mut exec = vec![compiler.clone()];
+        if let Some(parent) = compiler.parent() {
+            read.push(parent.to_path_buf());
+            exec.push(parent.to_path_buf());
+        }
+        let mut write = vec![work_dir.clone()];
+        // Debug test hooks write observation files outside the staging
+        // directory. Name those directories explicitly rather than disabling
+        // the sandbox for the test.
+        #[cfg(debug_assertions)]
+        for key in [
+            "CODEREX_WASM_COMPILE_TEST_COUNT_FILE",
+            "CODEREX_WASM_COMPILE_TEST_CHILD_PID_FILE",
+        ] {
+            if let Some(path) = std::env::var_os(key) {
+                if let Some(parent) = std::path::Path::new(&path).parent() {
+                    write.push(parent.to_path_buf());
+                }
+            }
+        }
+
+        let handle = SandboxHandle::create(SandboxConfig {
+            allowed_read_paths: read,
+            allowed_write_paths: write,
+            allowed_exec_paths: exec,
+            additional_working_dirs: vec![work_dir.clone()],
+            max_open_files: None,
+            max_memory_bytes: Some(WASM_COMPILE_MEMORY_BYTES),
+            max_cpu_seconds: Some(WASM_COMPILE_CPU_SECONDS),
+            allow_network: false,
+        })
+        .map_err(|e| format!("failed to create the WASM compile sandbox: {e}"))?;
+        handle
+            .prepare(&mut child_command)
+            .map_err(|e| format!("failed to prepare the WASM compile sandbox: {e}"))?;
+        handle
+    };
 
     let mut child = child_command.spawn().map_err(|e| {
         format!(
@@ -964,15 +1009,15 @@ fn run_compile_helper(
     })?;
 
     #[cfg(target_os = "windows")]
-    job.assign(&child).map_err(|e| {
+    sandbox.post_spawn(&child).map_err(|e| {
         let _ = child.kill();
-        format!("failed to assign the WASM compiler to its job object: {e}")
+        format!("failed to confine the WASM compiler: {e}")
     })?;
 
     #[cfg(unix)]
     let killer = ChildKiller::Group;
     #[cfg(target_os = "windows")]
-    let killer = ChildKiller::Job(&job);
+    let killer = ChildKiller::Sandbox(&sandbox);
     #[cfg(not(any(unix, windows)))]
     let killer = ChildKiller::Plain;
 
@@ -1274,16 +1319,16 @@ impl ChildKiller {
 
 #[cfg(all(windows, feature = "wasm-runtime"))]
 enum ChildKiller<'a> {
-    /// The child and every descendant live in this Job Object.
-    Job(&'a CompileJob),
+    /// The child and every descendant live in this sandbox's Job Object.
+    Sandbox(&'a coderex_core::sandbox::SandboxHandle),
 }
 
 #[cfg(all(windows, feature = "wasm-runtime"))]
 impl ChildKiller<'_> {
     fn kill(&self, child: &mut std::process::Child) {
         match self {
-            Self::Job(job) => {
-                job.terminate();
+            Self::Sandbox(sandbox) => {
+                let _ = sandbox.terminate();
                 let _ = child.kill();
             }
         }
@@ -1444,6 +1489,21 @@ mod compiler_test_hooks {
             }
         }
 
+        #[cfg(target_os = "windows")]
+        if let Ok(path) = std::env::var("CODEREX_WASM_COMPILE_TEST_CHILD_PID_FILE") {
+            if let Ok(child) = std::process::Command::new("cmd.exe")
+                .args(["/C", "ping -n 60 127.0.0.1 > nul"])
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+            {
+                let _ = std::fs::write(path, child.id().to_string());
+                // Dropping `Child` does not kill it; it runs until the job is
+                // terminated or its own `ping` ends.
+            }
+        }
+
         if let Ok(raw) = std::env::var("CODEREX_WASM_COMPILE_TEST_SLEEP_MS") {
             if let Ok(millis) = raw.parse::<u64>() {
                 std::thread::sleep(std::time::Duration::from_millis(millis));
@@ -1451,95 +1511,6 @@ mod compiler_test_hooks {
         }
     }
 }
-
-/// Windows Job Object used to bound and kill the compiler tree.
-///
-/// `KILL_ON_JOB_CLOSE` is the important flag: the runtime also calls
-/// `TerminateJobObject` on timeout, and closing the handle kills any
-/// descendant that is somehow still alive, so no orphan survives the load.
-#[cfg(all(windows, feature = "wasm-runtime"))]
-mod windows_job {
-    use std::os::windows::io::AsRawHandle;
-    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
-    use windows_sys::Win32::System::JobObjects::{
-        AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_JOB_MEMORY,
-        JOB_OBJECT_LIMIT_JOB_TIME, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
-        JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
-        SetInformationJobObject, TerminateJobObject,
-    };
-
-    /// A job object holding the compiler and its descendants.
-    pub struct CompileJob(HANDLE);
-
-    impl CompileJob {
-        pub fn create(cpu_seconds: u64, memory_bytes: u64) -> std::io::Result<Self> {
-            // SAFETY: null attributes/name ask for an anonymous, default
-            // security job object.
-            let handle = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
-            if handle.is_null() {
-                return Err(std::io::Error::last_os_error());
-            }
-
-            // SAFETY: the structure is zero-initialized and every field that
-            // is read is set below.
-            let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = unsafe { std::mem::zeroed() };
-            info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
-                | JOB_OBJECT_LIMIT_JOB_TIME
-                | JOB_OBJECT_LIMIT_JOB_MEMORY;
-            info.BasicLimitInformation.PerJobUserTimeLimit = (cpu_seconds * 10_000_000) as i64;
-            info.JobMemoryLimit = memory_bytes as usize;
-
-            // SAFETY: `info` outlives the call and the size is its own.
-            let ok = unsafe {
-                SetInformationJobObject(
-                    handle,
-                    JobObjectExtendedLimitInformation,
-                    std::ptr::from_ref(&info).cast(),
-                    std::mem::size_of_val(&info) as u32,
-                )
-            };
-            if ok == 0 {
-                let error = std::io::Error::last_os_error();
-                // SAFETY: `handle` was created above and is not used again.
-                unsafe { CloseHandle(handle) };
-                return Err(error);
-            }
-            Ok(Self(handle))
-        }
-
-        /// Put an already-spawned child (and its future descendants) in the
-        /// job. Descendants created before this call are not covered; the
-        /// compiler does not spawn any in normal operation.
-        pub fn assign(&self, child: &std::process::Child) -> std::io::Result<()> {
-            // SAFETY: both handles are valid for the duration of the call.
-            let ok = unsafe { AssignProcessToJobObject(self.0, child.as_raw_handle() as HANDLE) };
-            if ok == 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-            Ok(())
-        }
-
-        /// Kill every process in the job.
-        pub fn terminate(&self) {
-            // SAFETY: the handle is valid until this value is dropped.
-            unsafe {
-                TerminateJobObject(self.0, 1);
-            }
-        }
-    }
-
-    impl Drop for CompileJob {
-        fn drop(&mut self) {
-            // `KILL_ON_JOB_CLOSE` turns this close into a kill for any process
-            // still in the job.
-            // SAFETY: this is the only owner of the handle.
-            unsafe { CloseHandle(self.0) };
-        }
-    }
-}
-
-#[cfg(all(windows, feature = "wasm-runtime"))]
-use windows_job::CompileJob;
 
 /// Module name of the `user_config` host import.
 #[cfg(feature = "wasm-runtime")]

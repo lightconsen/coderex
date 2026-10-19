@@ -114,10 +114,7 @@ fn injected_command_forwards_leading_args() {
     let script = dir.path().join("compile.sh");
     std::fs::write(
         &script,
-        format!(
-            "#!/bin/sh\nshift\nexec '{}' \"$@\"\n",
-            helper_binary()
-        ),
+        format!("#!/bin/sh\nshift\nexec '{}' \"$@\"\n", helper_binary()),
     )
     .unwrap();
     std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -231,6 +228,74 @@ fn slow_helper_is_killed_with_no_orphan_tree() {
     );
 }
 
+/// The Windows arm of the orphan test: the compiler and its descendant are in
+/// one Job Object, and terminating the job (the timeout path) takes both.
+///
+/// The sandbox stays on. The runtime adds the pid file's directory to the
+/// policy instead of opting out, so this exercises the confined path.
+#[cfg(all(debug_assertions, windows))]
+#[test]
+fn slow_helper_is_killed_with_no_orphan_tree() {
+    let _guard = env_guard();
+    let dir = tempfile::tempdir().unwrap();
+    let input = write_module(dir.path(), "plugin.wat", NORMAL_MODULE);
+    let cache = tempfile::tempdir().unwrap();
+    let child_pid_file = dir.path().join("child.pid");
+
+    set_env(TIMEOUT_ENV, "300");
+    set_env(SLEEP_ENV, "30000");
+    set_env(CHILD_PID_ENV, &child_pid_file);
+
+    let started = std::time::Instant::now();
+    let err = load_with(&input, Some(helper_command()), cache.path())
+        .expect_err("a helper that sleeps must not make the parent wait forever");
+    let elapsed = started.elapsed();
+
+    remove_env(TIMEOUT_ENV);
+    remove_env(SLEEP_ENV);
+    remove_env(CHILD_PID_ENV);
+
+    assert!(
+        err.contains("wall-clock") && err.contains("killed"),
+        "expected a killed-on-timeout error, got: {err}"
+    );
+    assert!(
+        elapsed < std::time::Duration::from_secs(5),
+        "the parent should have killed the helper promptly, took {elapsed:?}"
+    );
+
+    let pid: u32 = std::fs::read_to_string(&child_pid_file)
+        .expect("the helper did not record its child's pid")
+        .trim()
+        .parse()
+        .expect("bad child pid");
+    assert!(
+        wait_until_process_gone_windows(pid, std::time::Duration::from_secs(5)),
+        "descendant pid {pid} survived the timeout kill"
+    );
+}
+
+/// Poll until `Get-Process -Id` can no longer find the pid.
+#[cfg(all(debug_assertions, windows))]
+fn wait_until_process_gone_windows(pid: u32, budget: std::time::Duration) -> bool {
+    let deadline = std::time::Instant::now() + budget;
+    let script = format!(
+        "if (Get-Process -Id {pid} -ErrorAction SilentlyContinue) {{ exit 0 }} else {{ exit 1 }}"
+    );
+    while std::time::Instant::now() < deadline {
+        let status = std::process::Command::new("powershell")
+            .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+        if matches!(status, Ok(status) if !status.success()) {
+            return true;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    false
+}
+
 /// Poll `kill(pid, 0)` until the process is gone or the budget expires.
 #[cfg(all(debug_assertions, unix))]
 fn wait_until_process_gone(pid: i32, budget: std::time::Duration) -> bool {
@@ -262,10 +327,8 @@ fn second_load_hits_the_aot_cache() {
     // macOS sandbox would not let the helper write; the cache behaviour under
     // test does not depend on the sandbox.
     set_env(NO_SANDBOX_ENV, "1");
-    load_with(&input, Some(helper_command()), cache.path())
-        .expect("the first load must compile");
-    load_with(&input, Some(helper_command()), cache.path())
-        .expect("the second load must succeed");
+    load_with(&input, Some(helper_command()), cache.path()).expect("the first load must compile");
+    load_with(&input, Some(helper_command()), cache.path()).expect("the second load must succeed");
     remove_env(COUNT_ENV);
     remove_env(NO_SANDBOX_ENV);
 
