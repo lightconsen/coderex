@@ -126,14 +126,18 @@ pub(crate) struct AclGrant {
 /// supplies fixed ones.
 ///
 /// Ordering is fixed (system roots, `PATH`, execute, read, write, working
-/// directories, temp) and duplicates are merged so the same path receives at
-/// most one ACE and the strongest access wins.
+/// directories) and duplicates are merged so the same path receives at most
+/// one ACE and the strongest access wins.
+///
+/// There is deliberately **no blanket grant of the user's temp tree**: that
+/// would hand every sandbox a shared, world-writable-by-low-integrity
+/// directory. The Windows sandbox creates a private temp directory and names
+/// it in `allowed_write_paths` instead.
 #[must_use]
 pub(crate) fn acl_plan(
     config: &SandboxConfig,
     system_roots: &[PathBuf],
     search_paths: &[PathBuf],
-    temp_dir: &std::path::Path,
 ) -> Vec<AclGrant> {
     let mut grants: Vec<AclGrant> = Vec::new();
 
@@ -155,12 +159,6 @@ pub(crate) fn acl_plan(
     for path in &config.additional_working_dirs {
         push_path(&mut grants, path, AclAccess::Modify, true, false);
     }
-    // A shell needs somewhere to write temporary files even when the caller
-    // did not name the temp directory in the policy. This grant is *not*
-    // recursive: the user's temp tree can be large, and pre-existing files
-    // there are not something the sandbox has to read. Children created after
-    // the grant inherit it.
-    push_path(&mut grants, temp_dir, AclAccess::Modify, false, false);
 
     grants
 }
@@ -180,14 +178,34 @@ fn push_path(
         if ancestor.as_os_str().is_empty() {
             continue;
         }
+        // Ancestors get traverse rights only, and are always best-effort: a
+        // user cannot rewrite the DACL of `C:\` or another user's directory,
+        // and failing the whole sandbox because of that would be wrong.
         push_grant(
             grants,
             ancestor.to_path_buf(),
             AclAccess::Traverse,
             false,
-            best_effort,
+            true,
         );
     }
+}
+
+/// Strip a verbatim (`\\?\`) prefix from a path.
+///
+/// `std::fs::canonicalize` returns verbatim paths on Windows, and a DACL call
+/// on `\\?\C:\` is not the same object as one on `C:\`: the grants would be
+/// duplicated (one of them ineffective) and the verbatim root would be granted
+/// in a way that can never succeed.
+fn normalize_path(path: PathBuf) -> PathBuf {
+    let text = path.as_os_str().to_string_lossy();
+    if let Some(rest) = text.strip_prefix(r"\\?\UNC\") {
+        return PathBuf::from(format!(r"\\{rest}"));
+    }
+    if let Some(rest) = text.strip_prefix(r"\\?\") {
+        return PathBuf::from(rest);
+    }
+    path
 }
 
 /// Merge a grant into the plan, keeping one entry per path.
@@ -198,6 +216,7 @@ fn push_grant(
     recursive: bool,
     best_effort: bool,
 ) {
+    let path = normalize_path(path);
     if let Some(existing) = grants.iter_mut().find(|grant| grant.path == path) {
         if access.rank() > existing.access.rank() {
             existing.access = access;
@@ -295,16 +314,22 @@ mod imp {
         CloseHandle, LocalFree, ERROR_ALREADY_EXISTS, HANDLE, HLOCAL, WAIT_OBJECT_0,
     };
     use windows_sys::Win32::Security::Authorization::{
-        GetNamedSecurityInfoW, SetEntriesInAclW, SetNamedSecurityInfoW, EXPLICIT_ACCESS_W,
-        GRANT_ACCESS, NO_MULTIPLE_TRUSTEE, SE_FILE_OBJECT, TRUSTEE_IS_SID, TRUSTEE_IS_UNKNOWN,
-        TRUSTEE_W,
+        ConvertStringSecurityDescriptorToSecurityDescriptorW, GetNamedSecurityInfoW,
+        SetEntriesInAclW, SetNamedSecurityInfoW, EXPLICIT_ACCESS_W, GRANT_ACCESS,
+        NO_MULTIPLE_TRUSTEE, SE_FILE_OBJECT, TRUSTEE_IS_SID, TRUSTEE_IS_UNKNOWN, TRUSTEE_W,
+    };
+    use windows_sys::Win32::Security::{
+        SetFileSecurityW, DACL_SECURITY_INFORMATION, LABEL_SECURITY_INFORMATION,
     };
     use windows_sys::Win32::Security::Isolation::{
         CreateAppContainerProfile, DeriveAppContainerSidFromAppContainerName,
     };
     use windows_sys::Win32::Security::{
-        CreateWellKnownSid, FreeSid, WinCapabilityInternetClientSid, ACL, PSECURITY_DESCRIPTOR,
-        PSID, SECURITY_CAPABILITIES, SECURITY_MAX_SID_SIZE, SID_AND_ATTRIBUTES,
+        CreateWellKnownSid, EqualSid, FreeSid, GetAce, GetAclInformation, GetSidSubAuthority,
+        GetSidSubAuthorityCount, WinCapabilityInternetClientSid, ACCESS_ALLOWED_ACE, ACE_HEADER,
+        ACL, ACL_SIZE_INFORMATION, AclSizeInformation, PSECURITY_DESCRIPTOR, PSID,
+        SECURITY_CAPABILITIES, SECURITY_MAX_SID_SIZE, SID_AND_ATTRIBUTES,
+        SYSTEM_MANDATORY_LABEL_ACE,
     };
     use windows_sys::Win32::Security::{TOKEN_DUPLICATE, TOKEN_QUERY};
     use windows_sys::Win32::Storage::FileSystem::{
@@ -573,7 +598,7 @@ mod imp {
                 sid,
                 capabilities,
             };
-            container.apply_acl_plan(config);
+            container.apply_acl_plan(config)?;
             Ok(container)
         }
 
@@ -589,15 +614,23 @@ mod imp {
 
         /// Grant the container SID access to the policy paths.
         ///
-        /// Failures are logged rather than returned: a DACL that cannot be
-        /// changed makes a path unreadable to the container, which fails
-        /// closed, and failing every shell command because one file in a large
-        /// workspace is owned by someone else would be worse than a warning.
-        fn apply_acl_plan(&self, config: &SandboxConfig) {
+        /// A policy path the caller named is **required**: if its DACL or its
+        /// mandatory integrity label cannot be set, the sandbox is refused
+        /// rather than handed out with a boundary that silently does not hold.
+        /// Ancestors and the system/`PATH` roots are best-effort, because a
+        /// user cannot rewrite `C:\`'s DACL and failing the whole sandbox over
+        /// that would be wrong.
+        ///
+        /// Write grants also lower the path's mandatory integrity label. An
+        /// AppContainer token runs at Low integrity, so a Modify ACE alone is
+        /// not enough: the default `NO_WRITE_UP` policy on a Medium-integrity
+        /// directory blocks the write regardless of the DACL. That is the bug
+        /// the Windows runtime job caught as "the granted workspace was not
+        /// writable".
+        fn apply_acl_plan(&self, config: &SandboxConfig) -> Result<(), SandboxError> {
             let system_roots = system_roots();
             let search_paths = search_path_dirs();
-            let temp_dir = std::env::temp_dir();
-            let plan = acl_plan(config, &system_roots, &search_paths, &temp_dir);
+            let plan = acl_plan(config, &system_roots, &search_paths);
 
             let applied = GRANTED_ROOTS.get_or_init(|| Mutex::new(Vec::new()));
             let mut applied = applied
@@ -607,9 +640,7 @@ mod imp {
             for grant in &plan {
                 // Keyed by profile: the two stable profiles have different
                 // SIDs, so a path granted to one must still be granted to the
-                // other. `recursive` is part of the key too: a path first seen
-                // as the non-recursive temp root may later be named explicitly
-                // as a policy write path, and must then get the walk.
+                // other.
                 let key = (
                     self.profile,
                     grant.path.clone(),
@@ -629,7 +660,15 @@ mod imp {
                     continue;
                 }
 
-                if let Err(error) = set_grant(&grant.path, self.sid, grant.access) {
+                let result = set_grant(&grant.path, self.sid, grant.access).and_then(|()| {
+                    if grant.access == AclAccess::Modify {
+                        set_mandatory_label(&grant.path)
+                    } else {
+                        Ok(())
+                    }
+                });
+
+                if let Err(error) = result {
                     if grant.best_effort {
                         tracing::debug!(
                             path = %grant.path.display(),
@@ -638,11 +677,10 @@ mod imp {
                              reachable through ALL APPLICATION PACKAGES"
                         );
                     } else {
-                        tracing::warn!(
-                            path = %grant.path.display(),
-                            %error,
-                            "sandbox: could not grant the AppContainer access to a policy path"
-                        );
+                        return Err(SandboxError::IsolationUnavailable(format!(
+                            "could not grant the AppContainer access to {}: {error}",
+                            grant.path.display()
+                        )));
                     }
                 } else {
                     tracing::debug!(
@@ -657,6 +695,7 @@ mod imp {
                 }
                 applied.push(key);
             }
+            Ok(())
         }
 
         /// Replace the primary token of a suspended child with an AppContainer
@@ -897,7 +936,7 @@ mod imp {
             GetNamedSecurityInfoW(
                 wide_path.as_ptr(),
                 SE_FILE_OBJECT,
-                windows_sys::Win32::Security::DACL_SECURITY_INFORMATION,
+                DACL_SECURITY_INFORMATION,
                 ptr::null_mut(),
                 ptr::null_mut(),
                 &mut old_dacl,
@@ -952,7 +991,7 @@ mod imp {
             SetNamedSecurityInfoW(
                 wide_path.as_ptr().cast_mut(),
                 SE_FILE_OBJECT,
-                windows_sys::Win32::Security::DACL_SECURITY_INFORMATION,
+                DACL_SECURITY_INFORMATION,
                 ptr::null_mut(),
                 ptr::null_mut(),
                 new_dacl,
@@ -997,7 +1036,14 @@ mod imp {
             if entry.file_type().is_symlink() {
                 continue;
             }
-            if let Err(error) = set_grant(entry.path(), sid, access) {
+            let result = set_grant(entry.path(), sid, access).and_then(|()| {
+                if access == AclAccess::Modify {
+                    set_mandatory_label(entry.path())
+                } else {
+                    Ok(())
+                }
+            });
+            if let Err(error) = result {
                 tracing::debug!(
                     path = %entry.path().display(),
                     %error,
@@ -1005,6 +1051,242 @@ mod imp {
                 );
             }
         }
+    }
+
+    /// Lower a path's mandatory integrity label to Low.
+    ///
+    /// An AppContainer token runs at Low integrity and the default
+    /// `SYSTEM_MANDATORY_LABEL_NO_WRITE_UP` policy refuses writes to anything
+    /// labelled Medium or higher. A `Modify` ACE for the container SID is
+    /// therefore not sufficient for a write path: the DACL says yes and the
+    /// integrity policy still says no. This is what the Windows runtime job
+    /// reported as "the granted workspace was not writable".
+    ///
+    /// The SDDL is `S:(ML;;NW;;;LW)`: a SACL with one mandatory-label ACE,
+    /// `no-write-up`, Low integrity. Directories mark their ACE inheritable so
+    /// files created later are Low as well; the recursive walk handles files
+    /// that already exist.
+    fn set_mandatory_label(path: &Path) -> Result<(), SandboxError> {
+        // `SDDL_REVISION_1`; the SD is allocated by the Win32 call.
+        const SDDL_REVISION_1: u32 = 1;
+        let sddl = wide("S:(ML;;NW;;;LW)");
+        let mut descriptor: PSECURITY_DESCRIPTOR = ptr::null_mut();
+        // SAFETY: `sddl` is NUL-terminated, `descriptor` is a valid out
+        // pointer, and the size pointer may be null.
+        let ok = unsafe {
+            ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                sddl.as_ptr(),
+                SDDL_REVISION_1,
+                &mut descriptor,
+                ptr::null_mut(),
+            )
+        };
+        if ok == 0 {
+            return Err(last_error(
+                "ConvertStringSecurityDescriptorToSecurityDescriptorW",
+            ));
+        }
+
+        let wide_path = wide_os(path.as_os_str());
+        // SAFETY: the path is NUL-terminated and `descriptor` is a live SD
+        // returned by the call above. `LABEL_SECURITY_INFORMATION` selects the
+        // SACL, so the DACL is untouched.
+        let ok = unsafe {
+            SetFileSecurityW(
+                wide_path.as_ptr(),
+                LABEL_SECURITY_INFORMATION,
+                descriptor,
+            )
+        };
+        let error = if ok == 0 {
+            Some(std::io::Error::last_os_error())
+        } else {
+            None
+        };
+        // SAFETY: `descriptor` is owned by this function (LocalAlloc).
+        unsafe { LocalFree(descriptor as HLOCAL) };
+        match error {
+            Some(_) => Err(last_error("SetFileSecurityW")),
+            None => Ok(()),
+        }
+    }
+
+    /// `ACCESS_ALLOWED_ACE_TYPE`; windows-sys does not export the constant.
+    const ACCESS_ALLOWED_ACE_TYPE: u8 = 0;
+    /// `SYSTEM_MANDATORY_LABEL_ACE_TYPE`; likewise not exported.
+    const SYSTEM_MANDATORY_LABEL_ACE_TYPE: u8 = 0x11;
+
+    /// Describe what the container SID can do on `path`, for test failures.
+    ///
+    /// The Windows runtime job can only be debugged from its logs, so the
+    /// confinement tests put this string in their panic message. It separates
+    /// the two failure modes:
+    ///
+    /// - no ACE (or a `set_grant` error): the DACL was never applied;
+    /// - ACE present but the integrity label is Medium/absent: the AppContainer
+    ///   is blocked by Mandatory Integrity Control, not by the DACL.
+    #[must_use]
+    #[allow(dead_code)] // called from the Windows runtime tests
+    pub(crate) fn diagnose_path(path: &Path, sid: PSID) -> String {
+        let mask = ace_for(path, sid, DACL_SECURITY_INFORMATION);
+        let label = mandatory_label_rid(path);
+        let ancestors: Vec<String> = path
+            .ancestors()
+            .skip(1)
+            .filter(|ancestor| !ancestor.as_os_str().is_empty())
+            .map(|ancestor| {
+                let present = ace_for(ancestor, sid, DACL_SECURITY_INFORMATION).is_some();
+                format!("{}={}", ancestor.display(), if present { "ace" } else { "none" })
+            })
+            .collect();
+        let write_bit = mask.is_some_and(|mask| mask & FILE_GENERIC_WRITE != 0);
+
+        format!(
+            "path={} exists={} container_ace={:?} has_write={} label_rid={:?} ancestors=[{}]",
+            path.display(),
+            path.exists(),
+            mask.map(|mask| format!("0x{mask:08X}")),
+            write_bit,
+            label,
+            ancestors.join(", ")
+        )
+    }
+
+    /// The mask of the first access-allowed ACE naming `sid`, if any.
+    fn ace_for(path: &Path, sid: PSID, information: u32) -> Option<u32> {
+        let wide_path = wide_os(path.as_os_str());
+        let mut dacl: *mut ACL = ptr::null_mut();
+        let mut descriptor: PSECURITY_DESCRIPTOR = ptr::null_mut();
+        // SAFETY: the path is NUL-terminated; `dacl` and `descriptor` are
+        // valid out pointers. The DACL argument is reused for the SACL when
+        // `information` asks for a label.
+        let error = unsafe {
+            GetNamedSecurityInfoW(
+                wide_path.as_ptr(),
+                SE_FILE_OBJECT,
+                information,
+                ptr::null_mut(),
+                ptr::null_mut(),
+                if information == DACL_SECURITY_INFORMATION { &mut dacl } else { ptr::null_mut() },
+                if information == DACL_SECURITY_INFORMATION { ptr::null_mut() } else { &mut dacl },
+                &mut descriptor,
+            )
+        };
+        if error != windows_sys::Win32::Foundation::ERROR_SUCCESS || dacl.is_null() {
+            if !descriptor.is_null() {
+                // SAFETY: the descriptor is owned by this function.
+                unsafe { LocalFree(descriptor as HLOCAL) };
+            }
+            return None;
+        }
+
+        let mut size: ACL_SIZE_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: `dacl` is a live ACL and `size` is a valid out pointer.
+        let ok = unsafe {
+            GetAclInformation(
+                dacl,
+                std::ptr::from_mut(&mut size).cast(),
+                std::mem::size_of_val(&size) as u32,
+                AclSizeInformation,
+            )
+        };
+        let mut found = None;
+        if ok != 0 {
+            for index in 0..size.AceCount {
+                let mut ace: *mut c_void = ptr::null_mut();
+                // SAFETY: `index` is below the ACE count just read.
+                if unsafe { GetAce(dacl, index, &mut ace) } == 0 || ace.is_null() {
+                    continue;
+                }
+                // SAFETY: an access-allowed ACE begins with its header; the
+                // SID starts at `SidStart` for both shapes inspected here.
+                let header = unsafe { &*(ace.cast::<ACE_HEADER>()) };
+                if header.AceType != ACCESS_ALLOWED_ACE_TYPE {
+                    continue;
+                }
+                let allowed = unsafe { &*(ace.cast::<ACCESS_ALLOWED_ACE>()) };
+                let ace_sid = std::ptr::from_ref(&allowed.SidStart).cast::<c_void>() as PSID;
+                // SAFETY: both are valid SIDs for the duration of the call.
+                if unsafe { EqualSid(ace_sid, sid) } != 0 {
+                    found = Some(allowed.Mask);
+                    break;
+                }
+            }
+        }
+
+        // SAFETY: the descriptor is owned by this function; the ACL points
+        // into it.
+        unsafe { LocalFree(descriptor as HLOCAL) };
+        found
+    }
+
+    /// The mandatory integrity label RID (0x1000 Low, 0x2000 Medium, …).
+    fn mandatory_label_rid(path: &Path) -> Option<u32> {
+        let wide_path = wide_os(path.as_os_str());
+        let mut sacl: *mut ACL = ptr::null_mut();
+        let mut descriptor: PSECURITY_DESCRIPTOR = ptr::null_mut();
+        // SAFETY: the path is NUL-terminated and the out pointers are valid.
+        let error = unsafe {
+            GetNamedSecurityInfoW(
+                wide_path.as_ptr(),
+                SE_FILE_OBJECT,
+                LABEL_SECURITY_INFORMATION,
+                ptr::null_mut(),
+                ptr::null_mut(),
+                ptr::null_mut(),
+                &mut sacl,
+                &mut descriptor,
+            )
+        };
+        if error != windows_sys::Win32::Foundation::ERROR_SUCCESS || sacl.is_null() {
+            if !descriptor.is_null() {
+                // SAFETY: the descriptor is owned by this function.
+                unsafe { LocalFree(descriptor as HLOCAL) };
+            }
+            return None;
+        }
+
+        let mut size: ACL_SIZE_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: `sacl` is a live ACL and `size` is a valid out pointer.
+        let ok = unsafe {
+            GetAclInformation(
+                sacl,
+                std::ptr::from_mut(&mut size).cast(),
+                std::mem::size_of_val(&size) as u32,
+                AclSizeInformation,
+            )
+        };
+        let mut found = None;
+        if ok != 0 {
+            for index in 0..size.AceCount {
+                let mut ace: *mut c_void = ptr::null_mut();
+                // SAFETY: `index` is below the ACE count just read.
+                if unsafe { GetAce(sacl, index, &mut ace) } == 0 || ace.is_null() {
+                    continue;
+                }
+                // SAFETY: the header precedes every ACE body.
+                let header = unsafe { &*(ace.cast::<ACE_HEADER>()) };
+                if header.AceType != SYSTEM_MANDATORY_LABEL_ACE_TYPE {
+                    continue;
+                }
+                let label = unsafe { &*(ace.cast::<SYSTEM_MANDATORY_LABEL_ACE>()) };
+                let label_sid = std::ptr::from_ref(&label.SidStart).cast::<c_void>() as PSID;
+                // SAFETY: the SID is part of the ACE; a label SID always has
+                // at least one subauthority.
+                let count = unsafe { *GetSidSubAuthorityCount(label_sid) };
+                if count == 0 {
+                    continue;
+                }
+                // SAFETY: `count - 1` is a valid subauthority index.
+                let rid = unsafe { *GetSidSubAuthority(label_sid, u32::from(count - 1)) };
+                found = Some(rid);
+                break;
+            }
+        }
+
+        // SAFETY: the descriptor is owned by this function.
+        unsafe { LocalFree(descriptor as HLOCAL) };
+        found
     }
 
     /// The system roots a shell and its loader need.
@@ -1093,6 +1375,12 @@ pub(crate) const fn app_container_available() -> bool {
 #[cfg(target_os = "windows")]
 pub(crate) use imp::app_container_available;
 
+/// Describe a path's DACL and mandatory label for a failure message.
+///
+/// Windows only: the values it reports do not exist elsewhere.
+#[cfg(target_os = "windows")]
+pub(crate) use imp::diagnose_path;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1118,7 +1406,6 @@ mod tests {
                 PathBuf::from("C:/tools/bin"),
                 PathBuf::from("C:/Windows/System32/WindowsPowerShell/v1.0"),
             ],
-            std::path::Path::new("C:/Users/me/AppData/Local/Temp"),
         )
     }
 
@@ -1158,21 +1445,54 @@ mod tests {
         assert!(!grant.best_effort, "a policy path must be granted");
     }
 
-    /// The temp tree can be huge and pre-existing files are not needed.
+    /// The user's whole temp tree is never granted: a sandbox gets a private
+    /// temp directory named in its own policy instead.
     #[test]
-    fn acl_plan_does_not_walk_the_whole_temp_tree() {
+    fn acl_plan_does_not_grant_the_user_temp_tree() {
         let plan = plan();
-        let grant = grant_for(&plan, "C:/Users/me/AppData/Local/Temp");
+        assert!(
+            !plan
+                .iter()
+                .any(|grant| grant.path == std::path::Path::new("C:/Users/me/AppData/Local/Temp")),
+            "the shared temp tree must not be granted"
+        );
+    }
+
+    /// Ancestors are traverse-only and best-effort, so a user who cannot
+    /// rewrite `C:\`'s DACL does not lose the whole sandbox.
+    #[test]
+    fn acl_plan_treats_ancestors_as_best_effort() {
+        let plan = plan();
+        for path in ["C:/work", "C:/tools"] {
+            let grant = grant_for(&plan, path);
+            assert_eq!(grant.access, AclAccess::Traverse);
+            assert!(
+                grant.best_effort,
+                "{path} is an ancestor; failing to grant it must not abort the sandbox"
+            );
+        }
+    }
+
+    /// `canonicalize` produces verbatim paths; the plan must fold them back so
+    /// one path does not get two ACEs (one of them on `\\?\C:\`).
+    #[test]
+    fn acl_plan_normalizes_verbatim_paths() {
+        let mut config = config();
+        config.allowed_write_paths = vec![PathBuf::from(r"\\?\C:\work\project")];
+        let plan = acl_plan(&config, &[], &[]);
+        let grant = grant_for(&plan, "C:/work/project");
         assert_eq!(grant.access, AclAccess::Modify);
-        assert!(!grant.recursive);
-        assert!(!grant.best_effort);
+        assert!(
+            !plan.iter().any(|g| g.path.to_string_lossy().starts_with(r"\\?\")),
+            "verbatim paths must not survive into the plan"
+        );
     }
 
     /// An AppContainer token has no bypass-traverse privilege.
     #[test]
     fn acl_plan_grants_traverse_on_ancestors() {
         let plan = plan();
-        for path in ["C:/work", "C:/Users/me/AppData/Local"] {
+        for path in ["C:/work", "C:/tools"] {
             let grant = grant_for(&plan, path);
             assert_eq!(grant.access, AclAccess::Traverse);
             assert!(!grant.recursive, "traverse must not widen the subtree");
@@ -1268,6 +1588,11 @@ mod tests {
         #[test]
         fn spawn_in_container_confines_a_real_process() {
             if !app_container_available() {
+                assert!(
+                    std::env::var("CODEREX_REQUIRE_APP_CONTAINER").as_deref() != Ok("1"),
+                    "AppContainer is unavailable on this runner but \
+                     CODEREX_REQUIRE_APP_CONTAINER=1"
+                );
                 eprintln!("skipping: AppContainer APIs are not available");
                 return;
             }
@@ -1307,7 +1632,8 @@ mod tests {
 
             assert!(
                 allowed.join("inside.txt").exists(),
-                "the granted workspace was not writable"
+                "the granted workspace was not writable; {}",
+                diagnose_path(&allowed, container.sid())
             );
             assert!(
                 !denied.join("outside.txt").exists(),

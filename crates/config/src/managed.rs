@@ -346,4 +346,138 @@ mod tests {
     fn registry_key_constant_matches_the_documented_location() {
         assert_eq!(WINDOWS_MANAGED_REGISTRY_KEY, r"SOFTWARE\CodeRex");
     }
+
+    // ── Windows registry carrier (real HKLM) ─────────────────────────────
+    //
+    // The step used to check only that the constant and the carrier selection
+    // were right; `load_managed_registry` itself was never called. These tests
+    // write a throwaway key under HKLM and delete it again on drop.
+
+    /// Whether CI requires the registry tests to really run.
+    #[cfg(windows)]
+    fn require_hklm_tests() -> bool {
+        std::env::var("CODEREX_REQUIRE_HKLM_TESTS").as_deref() == Ok("1")
+    }
+
+    #[cfg(windows)]
+    struct ScratchKey {
+        path: String,
+        hive: winreg::HKEY,
+    }
+
+    #[cfg(windows)]
+    impl ScratchKey {
+        fn new(hive: winreg::HKEY, root: &str) -> std::io::Result<Self> {
+            use winreg::enums::{KEY_ALL_ACCESS, KEY_READ};
+            use winreg::RegKey;
+
+            let path = format!(
+                r"{root}\Tests\coderex-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |elapsed| elapsed.as_nanos())
+            );
+            RegKey::predef(hive).create_subkey_with_flags(&path, KEY_ALL_ACCESS | KEY_READ)?;
+            Ok(Self { path, hive })
+        }
+
+        fn key(&self) -> winreg::RegKey {
+            use winreg::enums::{KEY_ALL_ACCESS, KEY_READ};
+            use winreg::RegKey;
+
+            RegKey::predef(self.hive)
+                .open_subkey_with_flags(&self.path, KEY_ALL_ACCESS | KEY_READ)
+                .expect("the scratch key was just created")
+        }
+    }
+
+    #[cfg(windows)]
+    impl Drop for ScratchKey {
+        fn drop(&mut self) {
+            use winreg::RegKey;
+
+            let _ = RegKey::predef(self.hive).delete_subkey_all(&self.path);
+        }
+    }
+
+    /// Read a real key under HKLM: every supported value type crosses into
+    /// `Settings`, including the DWORD and QWORD shapes.
+    #[cfg(windows)]
+    #[test]
+    fn registry_carrier_reads_hklm() {
+        use winreg::enums::HKEY_LOCAL_MACHINE;
+
+        let scratch = match ScratchKey::new(HKEY_LOCAL_MACHINE, r"SOFTWARE\CodeRex") {
+            Ok(scratch) => scratch,
+            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+                assert!(
+                    !require_hklm_tests(),
+                    "HKLM is not writable on this runner but CODEREX_REQUIRE_HKLM_TESTS=1"
+                );
+                eprintln!("skipping: this process cannot write HKLM ({error})");
+                return;
+            }
+            Err(error) => panic!("could not create the HKLM scratch key: {error}"),
+        };
+
+        let key = scratch.key();
+        key.set_value("model", &"managed-model").unwrap();
+        key.set_value("telemetry_enabled", &0u32).unwrap();
+        key.set_value("config_version", &7u64).unwrap();
+        key.set_value("max_budget_usd", &"12.5").unwrap();
+
+        let settings = load_managed_registry(&scratch.path)
+            .expect("the carrier should read the key")
+            .expect("the key exists");
+        assert_eq!(settings.model.as_deref(), Some("managed-model"));
+        assert_eq!(settings.telemetry_enabled, Some(false));
+        assert_eq!(settings.config_version, 7);
+        assert_eq!(settings.max_budget_usd, Some(12.5));
+    }
+
+    /// The carrier reads HKLM, not the user's hive: the same relative path
+    /// under HKCU must not be found.
+    #[cfg(windows)]
+    #[test]
+    fn registry_carrier_ignores_hkcu() {
+        use winreg::enums::HKEY_CURRENT_USER;
+
+        let scratch = ScratchKey::new(HKEY_CURRENT_USER, r"SOFTWARE\CodeRex")
+            .expect("HKCU is always writable");
+        scratch.key().set_value("model", &"user-model").unwrap();
+
+        let found = load_managed_registry(&scratch.path).expect("HKLM lookup should succeed");
+        assert!(
+            found.is_none(),
+            "an HKCU value must not be read as managed settings"
+        );
+    }
+
+    /// A value the settings schema does not know is rejected, not silently
+    /// dropped.
+    #[cfg(windows)]
+    #[test]
+    fn registry_carrier_rejects_an_unknown_value() {
+        use winreg::enums::HKEY_LOCAL_MACHINE;
+
+        let scratch = match ScratchKey::new(HKEY_LOCAL_MACHINE, r"SOFTWARE\CodeRex") {
+            Ok(scratch) => scratch,
+            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+                assert!(
+                    !require_hklm_tests(),
+                    "HKLM is not writable on this runner but CODEREX_REQUIRE_HKLM_TESTS=1"
+                );
+                eprintln!("skipping: this process cannot write HKLM ({error})");
+                return;
+            }
+            Err(error) => panic!("could not create the HKLM scratch key: {error}"),
+        };
+
+        scratch.key().set_value("not_a_setting", &"x").unwrap();
+        assert!(matches!(
+            load_managed_registry(&scratch.path),
+            Err(ConfigError::UnknownField { .. })
+        ));
+    }
 }

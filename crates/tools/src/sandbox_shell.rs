@@ -193,12 +193,30 @@ mod tests {
         ToolContext::new(crate::context::ExecutionContext::Normal, dir).with_extra(extra)
     }
 
+    /// The shell that exists on this host, and the arguments that make it run
+    /// `script`. Windows has no extensionless `sh` on `PATH`.
+    fn shell_invocation(script: &str) -> (String, Vec<String>) {
+        if cfg!(windows) {
+            (
+                "cmd.exe".to_string(),
+                vec!["/C".to_string(), script.to_string()],
+            )
+        } else {
+            ("sh".to_string(), vec!["-c".to_string(), script.to_string()])
+        }
+    }
+
+    fn args_of(args: &[String]) -> Vec<&str> {
+        args.iter().map(String::as_str).collect()
+    }
+
     /// No policy means no wrapper and no handle — the pre-sandbox behaviour.
     #[tokio::test]
     async fn without_a_policy_the_shell_runs_unwrapped() {
         let dir = std::env::temp_dir();
         let ctx = ctx_with_policy(&dir, None);
-        let (mut cmd, handle) = sandboxed_shell(&ctx, "sh", &["-c", "echo hi"]).unwrap();
+        let (shell, args) = shell_invocation("echo hi");
+        let (mut cmd, handle) = sandboxed_shell(&ctx, &shell, &args_of(&args)).unwrap();
 
         assert!(handle.is_none());
         let output = cmd.output().await.unwrap();
@@ -208,25 +226,47 @@ mod tests {
 
     /// A policy with a working directory: the wrapper (or, without one, the
     /// shell) is handed the shell as a program *or* as an argument, never both.
+    ///
+    /// The child must be spawned explicitly and passed through
+    /// [`finish_spawn`]. On Windows `prepare` creates it `CREATE_SUSPENDED`,
+    /// and a test that called `output()` directly would wait forever on a
+    /// child that is never resumed — which is exactly what the Windows runtime
+    /// job reported before this test was written this way.
     #[tokio::test]
     async fn a_policy_runs_the_shell_exactly_once() {
-        let dir = std::env::temp_dir();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().to_path_buf();
         let ctx = ctx_with_policy(
-            &dir,
+            &path,
             Some(SandboxConfig {
-                allowed_read_paths: vec![dir.clone()],
-                allowed_write_paths: vec![dir.clone()],
-                additional_working_dirs: vec![dir.clone()],
+                allowed_read_paths: vec![path.clone()],
+                allowed_write_paths: vec![path.clone()],
+                additional_working_dirs: vec![path.clone()],
                 ..SandboxConfig::default()
             }),
         );
-        let (mut cmd, handle) = sandboxed_shell(&ctx, "sh", &["-c", "echo sandboxed"]).unwrap();
+        let (shell, args) = shell_invocation("echo sandboxed");
+        let (mut cmd, handle) = sandboxed_shell(&ctx, &shell, &args_of(&args)).unwrap();
 
         assert!(
             handle.is_some(),
             "a configured policy should hand back a handle"
         );
-        let output = cmd.output().await.unwrap();
+        // `spawn` inherits stdio by default; `wait_with_output` only returns
+        // what was piped, and this test asserts on the shell's output.
+        cmd.stdout(std::process::Stdio::piped());
+        cmd.stderr(std::process::Stdio::piped());
+        let child = cmd.spawn().expect("the shell should spawn");
+        finish_spawn(handle.as_ref(), &child)
+            .expect("the sandbox must finish the spawn before the child runs");
+        let output = tokio::time::timeout(
+            std::time::Duration::from_secs(20),
+            child.wait_with_output(),
+        )
+        .await
+        .expect("the shell never exited; finish_spawn may not have resumed it")
+        .expect("waiting for the shell failed");
+
         let stdout = String::from_utf8_lossy(&output.stdout);
         assert!(
             stdout.contains("sandboxed"),

@@ -1003,6 +1003,19 @@ impl SandboxHandle {
         self.inner.post_spawn_raw(handle)
     }
 
+    /// Kill every process still owned by the sandbox.
+    ///
+    /// - **Windows**: `TerminateJobObject` on the sandbox's Job Object, so the
+    ///   child and any descendants it started die together. Dropping the
+    ///   handle does the same thing through `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`;
+    ///   this method is for callers that want to stop the child now and keep
+    ///   the handle.
+    /// - **Other platforms**: a no-op. Unix callers that need a tree kill own
+    ///   the process group (`coderex_core::process_tree::ProcessTree`).
+    pub fn terminate(&self) -> Result<(), SandboxError> {
+        self.inner.terminate()
+    }
+
     /// The program to run a command under, when a wrapper is in force.
     ///
     /// macOS returns `("sandbox-exec", ["-f", profile_path])`; Linux returns
@@ -1113,6 +1126,17 @@ impl PlatformSandbox {
     fn post_spawn_raw(&self, handle: std::os::windows::io::RawHandle) -> Result<(), SandboxError> {
         match self {
             Self::Windows(s) => s.post_spawn_raw(handle),
+            _ => Ok(()),
+        }
+    }
+
+    fn terminate(&self) -> Result<(), SandboxError> {
+        match self {
+            #[cfg(target_os = "windows")]
+            Self::Windows(s) => s.terminate(),
+            // Unix callers own the process group themselves (`ProcessTree`);
+            // there is no sandbox-owned tree to kill here.
+            #[allow(unreachable_patterns)]
             _ => Ok(()),
         }
     }
@@ -2153,22 +2177,13 @@ use macos_impl::MacOsSandbox;
 #[cfg(target_os = "windows")]
 mod windows_impl {
     use super::{SandboxConfig, SandboxError};
+    use crate::process_tree::{JobLimits, ProcessTree};
     use crate::sandbox_windows::{app_container_available, AppContainer};
-    use std::ffi::OsStr;
-    use std::os::windows::ffi::OsStrExt;
     use std::os::windows::io::RawHandle;
     use std::os::windows::process::CommandExt;
-    use std::ptr;
-    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
-    use windows_sys::Win32::System::JobObjects::{
-        AssignProcessToJobObject, CreateJobObjectW, JobObjectBasicUIRestrictions,
-        JobObjectExtendedLimitInformation, SetInformationJobObject,
-        JOBOBJECT_BASIC_LIMIT_INFORMATION, JOBOBJECT_BASIC_UI_RESTRICTIONS,
-        JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JOB_OBJECT_LIMIT_JOB_MEMORY,
-        JOB_OBJECT_LIMIT_JOB_TIME, JOB_OBJECT_UILIMIT_DESKTOP, JOB_OBJECT_UILIMIT_EXITWINDOWS,
-        JOB_OBJECT_UILIMIT_GLOBALATOMS, JOB_OBJECT_UILIMIT_HANDLES,
-        JOB_OBJECT_UILIMIT_READCLIPBOARD, JOB_OBJECT_UILIMIT_WRITECLIPBOARD,
-    };
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use windows_sys::Win32::Foundation::HANDLE;
     use windows_sys::Win32::System::Threading::{TerminateProcess, CREATE_SUSPENDED};
 
     /// Windows sandbox: an AppContainer for paths/network plus a Job Object for
@@ -2179,13 +2194,26 @@ mod windows_impl {
     /// and cannot run the post-spawn token attach. A handle built by the normal
     /// [`Self::create`] always has a container; if one cannot be made, creation
     /// fails rather than silently degrading to limits-only.
+    ///
+    /// The Job Object is a [`ProcessTree`], so it is anonymous (not the shared
+    /// named job this used to open) and carries
+    /// `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`: **dropping the sandbox kills every
+    /// process still in the job**, including descendants. Callers keep the
+    /// handle alive for the child's lifetime.
     pub struct WindowsSandbox {
-        job_handle: HANDLE,
-        config: SandboxConfig,
+        job: ProcessTree,
         container: Option<AppContainer>,
+        /// A private directory the container may write in, with a Low
+        /// integrity label, exported to the child as `TEMP`/`TMP`/`TMPDIR`.
+        ///
+        /// The user's shared temp tree is deliberately not granted: lowering
+        /// its label would let every Low-integrity process on the machine
+        /// write there, and leaving its label alone means the container cannot
+        /// write there at all.
+        temp_dir: Option<PathBuf>,
     }
 
-    // SAFETY: `job_handle` is a kernel handle with no thread affinity, and
+    // SAFETY: `job` is a kernel handle with no thread affinity, and
     // `AppContainer` is `Send + Sync` (its SID is immutable). Moving the
     // sandbox between threads does not alias anything.
     unsafe impl Send for WindowsSandbox {}
@@ -2195,7 +2223,7 @@ mod windows_impl {
 
     impl WindowsSandbox {
         /// Create a fully confined child: AppContainer plus Job Object.
-        pub fn create(config: SandboxConfig) -> Result<Self, SandboxError> {
+        pub fn create(mut config: SandboxConfig) -> Result<Self, SandboxError> {
             if !app_container_available() {
                 return Err(SandboxError::IsolationUnavailable(
                     "AppContainer APIs are unavailable on this Windows installation; \
@@ -2203,8 +2231,24 @@ mod windows_impl {
                         .into(),
                 ));
             }
-            let container = AppContainer::create(&config)?;
-            Self::with_container(config, Some(container))
+            // A shell needs somewhere to write temporary files. Give it a
+            // private, Low-labelled directory rather than opening up the
+            // user's shared temp tree.
+            let temp_dir = create_private_temp_dir()?;
+            if let Some(dir) = &temp_dir {
+                config.allowed_write_paths.push(dir.clone());
+                config.additional_working_dirs.push(dir.clone());
+            }
+            let container = match AppContainer::create(&config) {
+                Ok(container) => container,
+                Err(error) => {
+                    if let Some(dir) = &temp_dir {
+                        let _ = std::fs::remove_dir_all(dir);
+                    }
+                    return Err(error);
+                }
+            };
+            Self::with_container(config, Some(container), temp_dir)
         }
 
         /// Create a handle that applies only the Job Object limits.
@@ -2214,35 +2258,33 @@ mod windows_impl {
         /// pretends to confine paths. It exists for hooks, which still fail
         /// closed when they need a security boundary (see `hooks::sandbox`).
         pub fn create_limits_only(config: SandboxConfig) -> Result<Self, SandboxError> {
-            Self::with_container(config, None)
+            Self::with_container(config, None, None)
         }
 
         fn with_container(
             config: SandboxConfig,
             container: Option<AppContainer>,
+            temp_dir: Option<PathBuf>,
         ) -> Result<Self, SandboxError> {
-            let job_name_wide: Vec<u16> = OsStr::new("CodeRexSandboxJob")
-                .encode_wide()
-                .chain(Some(0))
-                .collect();
-            let job_handle = unsafe { CreateJobObjectW(ptr::null_mut(), job_name_wide.as_ptr()) };
-            if job_handle.is_null() {
-                return Err(SandboxError::CreationError(format!(
-                    "CreateJobObject failed: {}",
-                    std::io::Error::last_os_error()
-                )));
-            }
+            // One anonymous job per sandbox. It used to be the named
+            // `CodeRexSandboxJob`, which every handle in the process (and any
+            // other process on the machine) shared: the last `SetInformation`
+            // won, and terminating one sandbox killed every other one's child.
+            let job = ProcessTree::create(JobLimits {
+                max_cpu_seconds: config.max_cpu_seconds,
+                max_memory_bytes: config.max_memory_bytes,
+                kill_on_drop: true,
+                ui_restrictions: true,
+            })
+            .map_err(|error| {
+                SandboxError::CreationError(format!("CreateJobObject failed: {error}"))
+            })?;
 
-            let mut sandbox = Self {
-                job_handle,
-                config,
+            Ok(Self {
+                job,
                 container,
-            };
-            if let Err(error) = sandbox.apply_limits() {
-                unsafe { CloseHandle(job_handle) };
-                return Err(error);
-            }
-            Ok(sandbox)
+                temp_dir,
+            })
         }
 
         /// Ask `std::process::Command` to stop the child before its first
@@ -2251,73 +2293,40 @@ mod windows_impl {
             if self.container.is_some() {
                 cmd.creation_flags(CREATE_SUSPENDED);
             }
+            // Point the child at the writable temp directory. The inherited
+            // values name the user's temp tree, which the container cannot
+            // write in by design.
+            if let Some(dir) = &self.temp_dir {
+                cmd.env("TEMP", dir).env("TMP", dir).env("TMPDIR", dir);
+            }
             Ok(())
         }
 
-        fn apply_limits(&mut self) -> Result<(), SandboxError> {
-            unsafe {
-                let mut basic: JOBOBJECT_BASIC_LIMIT_INFORMATION = std::mem::zeroed();
-                let mut limit_flags: u32 = 0;
-
-                if let Some(max_cpu) = self.config.max_cpu_seconds {
-                    // 100-nanosecond ticks; windows-sys exposes the field as a
-                    // plain `i64` rather than a `LARGE_INTEGER`.
-                    basic.PerJobUserTimeLimit = (max_cpu * 10_000_000) as i64;
-                    limit_flags |= JOB_OBJECT_LIMIT_JOB_TIME;
-                }
-
-                // Memory is a flag on the extended structure rather than one
-                // that was set above, so a memory-only configuration must
-                // enter here too; otherwise it silently applies no limit.
-                let has_limits = limit_flags != 0 || self.config.max_memory_bytes.is_some();
-                if has_limits {
-                    basic.LimitFlags = limit_flags;
-                    let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
-                    info.BasicLimitInformation = basic;
-
-                    if let Some(max_mem) = self.config.max_memory_bytes {
-                        info.JobMemoryLimit = max_mem as usize;
-                        info.BasicLimitInformation.LimitFlags |= JOB_OBJECT_LIMIT_JOB_MEMORY;
-                    }
-
-                    let ret = SetInformationJobObject(
-                        self.job_handle,
-                        JobObjectExtendedLimitInformation,
-                        &info as *const _ as *const _,
-                        std::mem::size_of_val(&info) as u32,
-                    );
-                    if ret == 0 {
-                        return Err(SandboxError::RlimitError(format!(
-                            "SetInformationJobObject(extended) failed: {}",
-                            std::io::Error::last_os_error()
-                        )));
-                    }
-                }
-
-                let mut ui: JOBOBJECT_BASIC_UI_RESTRICTIONS = std::mem::zeroed();
-                ui.UIRestrictionsClass = JOB_OBJECT_UILIMIT_DESKTOP
-                    | JOB_OBJECT_UILIMIT_EXITWINDOWS
-                    | JOB_OBJECT_UILIMIT_GLOBALATOMS
-                    | JOB_OBJECT_UILIMIT_HANDLES
-                    | JOB_OBJECT_UILIMIT_READCLIPBOARD
-                    | JOB_OBJECT_UILIMIT_WRITECLIPBOARD;
-
-                let ret = SetInformationJobObject(
-                    self.job_handle,
-                    JobObjectBasicUIRestrictions,
-                    &ui as *const _ as *const _,
-                    std::mem::size_of_val(&ui) as u32,
-                );
-                if ret == 0 {
-                    tracing::warn!(
-                        "UI restrictions failed (non-critical): {}",
-                        std::io::Error::last_os_error()
-                    );
-                }
+        /// Describe the container's access to `path`, for test failures.
+        ///
+        /// The Windows runtime job can only be debugged from its logs, so a
+        /// failing confinement assertion includes this string: it separates a
+        /// DACL that was never applied from a Low-integrity token blocked by a
+        /// Medium-integrity label.
+        pub fn diagnose(&self, path: &std::path::Path) -> String {
+            match &self.container {
+                Some(container) => crate::sandbox_windows::diagnose_path(path, container.sid()),
+                None => "no AppContainer (limits-only sandbox)".to_string(),
             }
+        }
 
-            tracing::debug!("Windows Job Object limits applied");
-            Ok(())
+        /// Kill every process still in the sandbox's job.
+        ///
+        /// This is the tree kill `Drop` performs as well, exposed so a caller
+        /// can stop a long-running child without waiting for its own teardown.
+        pub fn terminate(&self) -> Result<(), SandboxError> {
+            if self.job.terminate() {
+                Ok(())
+            } else {
+                Err(SandboxError::CreationError(
+                    "TerminateJobObject failed or the job was already empty".to_string(),
+                ))
+            }
         }
 
         pub fn post_spawn(&self, child: &std::process::Child) -> Result<(), SandboxError> {
@@ -2367,11 +2376,9 @@ mod windows_impl {
 
             self.attach_container(handle)?;
 
-            let ret = unsafe { AssignProcessToJobObject(self.job_handle, handle) };
-            if ret == 0 {
+            if let Err(error) = self.job.attach_raw(process) {
                 let error = SandboxError::CreationError(format!(
-                    "AssignProcessToJobObject failed: {}",
-                    std::io::Error::last_os_error()
+                    "AssignProcessToJobObject failed: {error}"
                 ));
                 // A process still suspended never ran, so terminating it is
                 // simply a refusal. A limits-only process is already running;
@@ -2388,10 +2395,40 @@ mod windows_impl {
         }
     }
 
+    /// Create a unique private temp directory for one sandbox.
+    fn create_private_temp_dir() -> Result<Option<PathBuf>, SandboxError> {
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let base = std::env::var_os("LOCALAPPDATA")
+            .map(PathBuf::from)
+            .unwrap_or_else(std::env::temp_dir)
+            .join("coderex")
+            .join("sandbox-tmp");
+        let unique = format!(
+            "{}-{}-{}",
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::Relaxed),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |elapsed| elapsed.as_nanos())
+        );
+        let dir = base.join(unique);
+        std::fs::create_dir_all(&dir).map_err(|error| {
+            SandboxError::CreationError(format!(
+                "could not create the sandbox temp directory {}: {error}",
+                dir.display()
+            ))
+        })?;
+        Ok(Some(dir))
+    }
+
     impl Drop for WindowsSandbox {
         fn drop(&mut self) {
-            if !self.job_handle.is_null() {
-                unsafe { CloseHandle(self.job_handle) };
+            // Kill the job first so nothing is still writing into the temp
+            // directory while it is removed. `ProcessTree` would do this on
+            // its own drop; doing it here just puts the order right.
+            let _ = self.job.terminate();
+            if let Some(dir) = self.temp_dir.take() {
+                let _ = std::fs::remove_dir_all(dir);
             }
         }
     }
@@ -2440,6 +2477,15 @@ impl SandboxBackend for NoOpSandbox {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Whether the CI job requires a real AppContainer runtime.
+    ///
+    /// Without this, a runner image that lost the runtime would turn the
+    /// confinement tests green by skipping them.
+    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+    fn require_app_container() -> bool {
+        std::env::var("CODEREX_REQUIRE_APP_CONTAINER").as_deref() == Ok("1")
+    }
 
     #[test]
     fn sandbox_config_defaults() {
@@ -2637,9 +2683,13 @@ mod tests {
 
     #[test]
     fn path_search_prefers_the_first_match_like_execvp() {
-        // A directory that shadows `sh` must not be reported when the real
-        // shell is found earlier in PATH — the loader would not run it either.
-        let resolved = resolve_program("sh", &std::env::temp_dir()).unwrap();
+        // A directory that shadows the shell must not be reported when the
+        // real one is found earlier in PATH — the loader would not run it
+        // either. Windows has no extensionless `sh`; `cmd.exe` is the program
+        // that exists there.
+        let program = if cfg!(windows) { "cmd.exe" } else { "sh" };
+        let resolved = resolve_program(program, &std::env::temp_dir())
+            .unwrap_or_else(|| panic!("{program} should be found on PATH"));
         assert!(!resolved.starts_with(std::env::temp_dir()));
     }
 
@@ -2747,7 +2797,19 @@ mod tests {
                 FilesystemIsolation::None
             }
         );
-        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        // Windows reports what the AppContainer runtime can actually do, the
+        // same runtime question as Linux. The arm used to fall through to
+        // `None` even when the container was available.
+        #[cfg(target_os = "windows")]
+        assert_eq!(
+            filesystem_isolation(),
+            if crate::sandbox_windows::app_container_available() {
+                FilesystemIsolation::Kernel
+            } else {
+                FilesystemIsolation::None
+            }
+        );
+        #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
         assert_eq!(filesystem_isolation(), FilesystemIsolation::None);
     }
 
@@ -3420,6 +3482,13 @@ mod tests {
     #[cfg(target_os = "windows")]
     fn windows_sandbox_confines_a_suspended_child() {
         if !crate::sandbox_windows::app_container_available() {
+            // The CI job sets this so an image without the AppContainer
+            // runtime fails instead of silently passing without coverage.
+            assert!(
+                !require_app_container(),
+                "AppContainer is unavailable on this runner but \
+                 CODEREX_REQUIRE_APP_CONTAINER=1"
+            );
             // The backend refuses to run unconfined; that refusal is the
             // contract, so assert it rather than skipping silently.
             assert!(matches!(
@@ -3465,9 +3534,19 @@ mod tests {
         handle.prepare(&mut cmd).unwrap();
         let child = cmd.spawn().unwrap();
         handle.post_spawn(&child).unwrap();
-        let _ = child.wait_with_output();
+        let output = child.wait_with_output().unwrap();
 
-        assert!(inside.exists(), "the granted workspace was not writable");
+        // The runtime job can only be debugged from its logs, so the failure
+        // carries what the DACL and the mandatory label actually look like.
+        let detail = match &handle.inner {
+            PlatformSandbox::Windows(sandbox) => sandbox.diagnose(&allowed),
+            _ => String::new(),
+        };
+        assert!(
+            inside.exists(),
+            "the granted workspace was not writable (exit={:?}); {detail}",
+            output.status.code()
+        );
         assert!(!outside.exists(), "a path outside the policy was writable");
 
         let _ = std::fs::remove_dir_all(&root);
