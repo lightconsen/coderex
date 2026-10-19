@@ -775,7 +775,13 @@ mod tests {
     #[test]
     fn foreign_record_is_not_adopted() {
         let records = vec![
-            record("a", JobKind::Cron, Some("sess_other"), JobState::Running, NOW),
+            record(
+                "a",
+                JobKind::Cron,
+                Some("sess_other"),
+                JobState::Running,
+                NOW,
+            ),
             record(
                 "b",
                 JobKind::Shell,
@@ -873,7 +879,13 @@ mod tests {
     fn terminal_records_are_exempt_from_ageing() {
         let long_ago = NOW - (STALE_THRESHOLD_MS * 100);
         let records = vec![
-            record("done", JobKind::Shell, Some("sess_a"), JobState::Done, long_ago),
+            record(
+                "done",
+                JobKind::Shell,
+                Some("sess_a"),
+                JobState::Done,
+                long_ago,
+            ),
             record(
                 "failed",
                 JobKind::Cron,
@@ -931,7 +943,13 @@ mod tests {
 
     #[test]
     fn interrupted_notification_names_the_job() {
-        let mut r = record("task_9", JobKind::Agent, Some("sess_a"), JobState::Running, NOW);
+        let mut r = record(
+            "task_9",
+            JobKind::Agent,
+            Some("sess_a"),
+            JobState::Running,
+            NOW,
+        );
         r.description = "read the logs".into();
         let out = adopt(&[r], NOW, "sess_a");
         let notes = out.notifications();
@@ -984,7 +1002,13 @@ mod tests {
 
     #[test]
     fn settling_stamps_state_and_end_fields() {
-        let mut r = record("task_1", JobKind::Shell, Some("sess_a"), JobState::Running, NOW);
+        let mut r = record(
+            "task_1",
+            JobKind::Shell,
+            Some("sess_a"),
+            JobState::Running,
+            NOW,
+        );
         r.settle(JobState::Failed, NOW + 5, Some(7), Some("boom".into()));
 
         assert_eq!(r.state, JobState::Failed);

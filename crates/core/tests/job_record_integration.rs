@@ -55,7 +55,10 @@ fn write_load_list_remove_roundtrip() {
     // One file per job, named after the id.
     let mut files = json_files(store.root());
     files.sort();
-    assert_eq!(files, vec!["cron-2.json".to_string(), "task_1.json".to_string()]);
+    assert_eq!(
+        files,
+        vec!["cron-2.json".to_string(), "task_1.json".to_string()]
+    );
 
     let loaded = store.load("task_1").unwrap().unwrap();
     assert_eq!(loaded, a);
@@ -70,7 +73,10 @@ fn write_load_list_remove_roundtrip() {
     assert_eq!(listed[1], a);
 
     assert!(store.remove("task_1").unwrap());
-    assert!(!store.remove("task_1").unwrap(), "removing twice is a no-op");
+    assert!(
+        !store.remove("task_1").unwrap(),
+        "removing twice is a no-op"
+    );
     assert_eq!(store.list().unwrap().len(), 1);
 }
 
@@ -229,7 +235,11 @@ fn interrupted_record_is_reported_and_stops_claiming_running() {
     assert_eq!(result.outcome.interrupted.len(), 1);
     assert_eq!(result.notifications.len(), 1);
     assert_eq!(result.notifications[0].job_id, "task_7");
-    assert!(result.notifications[0].text.contains("could not be resumed"));
+    assert!(
+        result.notifications[0]
+            .text
+            .contains("could not be resumed")
+    );
 
     // Never leave a phantom `running` behind.
     let on_disk = store.load("task_7").unwrap().unwrap();
@@ -309,7 +319,12 @@ fn resumable_cron_definitions_are_classified_but_not_duplicated() {
     let tmp = tempfile::tempdir().unwrap();
     let store = JobStore::new(tmp.path());
     store
-        .write(&record("cron-1", JobKind::Cron, JobState::Running, NOW - 100))
+        .write(&record(
+            "cron-1",
+            JobKind::Cron,
+            JobState::Running,
+            NOW - 100,
+        ))
         .unwrap();
 
     let result = adopt_and_reconcile(&store, NOW, "sess_a").unwrap();
@@ -366,15 +381,17 @@ fn settle_stamps_end_fields_and_is_idempotent_for_terminal_states() {
     let running = record("shell-1", JobKind::Shell, JobState::Running, NOW);
     store.write(&running).unwrap();
 
-    assert!(store
-        .settle(
-            "shell-1",
-            JobState::Failed,
-            NOW + 500,
-            Some(7),
-            Some("command exited with status 7".into()),
-        )
-        .unwrap());
+    assert!(
+        store
+            .settle(
+                "shell-1",
+                JobState::Failed,
+                NOW + 500,
+                Some(7),
+                Some("command exited with status 7".into()),
+            )
+            .unwrap()
+    );
 
     let failed = store.load("shell-1").unwrap().unwrap();
     assert_eq!(failed.state, JobState::Failed);
@@ -388,9 +405,11 @@ fn settle_stamps_end_fields_and_is_idempotent_for_terminal_states() {
 
     // Cancellation/adoption may have won the race; a late completion must not
     // rewrite the record.
-    assert!(!store
-        .settle("shell-1", JobState::Done, NOW + 900, Some(0), None)
-        .unwrap());
+    assert!(
+        !store
+            .settle("shell-1", JobState::Done, NOW + 900, Some(0), None)
+            .unwrap()
+    );
     assert_eq!(store.load("shell-1").unwrap().unwrap(), failed);
 }
 
@@ -398,9 +417,11 @@ fn settle_stamps_end_fields_and_is_idempotent_for_terminal_states() {
 fn settle_missing_job_is_a_no_op() {
     let tmp = tempfile::tempdir().unwrap();
     let store = JobStore::new(tmp.path());
-    assert!(!store
-        .settle("absent", JobState::Done, NOW, None, None)
-        .unwrap());
+    assert!(
+        !store
+            .settle("absent", JobState::Done, NOW, None, None)
+            .unwrap()
+    );
 }
 
 #[test]

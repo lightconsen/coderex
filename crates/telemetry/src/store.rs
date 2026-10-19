@@ -689,7 +689,10 @@ mod tests {
         assert_eq!(row.backtrace_symbols, record.backtrace_symbols);
         assert_eq!(row.backtrace_frame_count, Some(1));
         assert_eq!(row.backtrace_symbols_len, Some(10));
-        assert_eq!(row.backtrace_symbols_sha256, record.backtrace_symbols_sha256);
+        assert_eq!(
+            row.backtrace_symbols_sha256,
+            record.backtrace_symbols_sha256
+        );
     }
 
     /// A database created before the structured taxonomy is migrated in place;
@@ -712,7 +715,11 @@ mod tests {
             conn.execute(
                 "INSERT INTO crash_reports (panic_info, backtrace, created_at)
                  VALUES (?1, ?2, ?3)",
-                params!["legacy text", "legacy backtrace", "2020-01-01T00:00:00+00:00"],
+                params![
+                    "legacy text",
+                    "legacy backtrace",
+                    "2020-01-01T00:00:00+00:00"
+                ],
             )
             .unwrap();
         }

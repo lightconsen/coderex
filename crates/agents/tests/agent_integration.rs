@@ -627,11 +627,10 @@ fn blocking_manager() -> (AgentManager, Arc<Notify>, Arc<Notify>) {
     (mgr, started, release)
 }
 
-async fn spawn_background_agent(mgr: &mut AgentManager, cwd: &std::path::Path) -> (
-    JobStore,
-    String,
-    String,
-) {
+async fn spawn_background_agent(
+    mgr: &mut AgentManager,
+    cwd: &std::path::Path,
+) -> (JobStore, String, String) {
     let instance = mgr
         .spawn_agent(
             AgentType::GeneralPurpose,
@@ -711,7 +710,10 @@ async fn background_agent_stop_records_interrupted() {
     // The aborted task must not resurrect the record as Done.
     release.notify_one();
     tokio::time::sleep(Duration::from_millis(50)).await;
-    assert_eq!(store.load(&id).unwrap().unwrap().state, JobState::Interrupted);
+    assert_eq!(
+        store.load(&id).unwrap().unwrap().state,
+        JobState::Interrupted
+    );
 }
 
 #[tokio::test]
@@ -723,18 +725,28 @@ async fn background_agent_drop_records_interrupted() {
 
     drop(mgr);
 
-    let dropped = store.load(&id).unwrap().expect("record survives manager drop");
+    let dropped = store
+        .load(&id)
+        .unwrap()
+        .expect("record survives manager drop");
     assert_eq!(dropped.state, JobState::Interrupted);
     assert!(dropped.ended_at_ms.is_some());
     assert!(
-        dropped.error.as_deref().unwrap().contains("manager dropped"),
+        dropped
+            .error
+            .as_deref()
+            .unwrap()
+            .contains("manager dropped"),
         "unexpected error: {:?}",
         dropped.error
     );
 
     release.notify_one();
     tokio::time::sleep(Duration::from_millis(50)).await;
-    assert_eq!(store.load(&id).unwrap().unwrap().state, JobState::Interrupted);
+    assert_eq!(
+        store.load(&id).unwrap().unwrap().state,
+        JobState::Interrupted
+    );
 }
 
 #[tokio::test]
@@ -750,7 +762,11 @@ async fn fresh_session_adopts_background_agent_as_interrupted() {
         .expect("adoption succeeds");
 
     assert!(
-        adopted.outcome.interrupted.iter().any(|record| record.id == id),
+        adopted
+            .outcome
+            .interrupted
+            .iter()
+            .any(|record| record.id == id),
         "agent record was not classified interrupted: {:?}",
         adopted.outcome
     );

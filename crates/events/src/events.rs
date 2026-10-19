@@ -556,7 +556,11 @@ mod tests {
             .await
             .create("Read".into(), serde_json::json!({}), None, 1)
             .unwrap();
-        session.elicitations.lock().await.create("Confirm?".into(), 1);
+        session
+            .elicitations
+            .lock()
+            .await
+            .create("Confirm?".into(), 1);
 
         // Nothing has timed out yet.
         assert_eq!(session.check_timeouts().await, ResolvedTimeouts::default());

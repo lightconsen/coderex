@@ -82,7 +82,9 @@ pub enum OAuthError {
         supported: Vec<String>,
     },
     /// The server rejected the credential and no stored refresh token can replace it.
-    #[error("{server_url} rejected the access token and it cannot be replaced here: {detail}; run McpAuth to sign in again")]
+    #[error(
+        "{server_url} rejected the access token and it cannot be replaced here: {detail}; run McpAuth to sign in again"
+    )]
     ReauthRequired {
         /// The server URL whose credential failed.
         server_url: String,
@@ -464,13 +466,17 @@ impl IssuerMetadataCache {
                 .token_endpoint_auth_methods_supported
                 .clone(),
             grant_types_supported: self.grant_types_supported.clone(),
-            code_challenge_methods_supported: self
-                .code_challenge_methods_supported
-                .clone(),
+            code_challenge_methods_supported: self.code_challenge_methods_supported.clone(),
         }
     }
 
-    fn record(&mut self, discovery: &OAuthDiscovery, max_age: u64, etag: Option<String>, source_url: &str) {
+    fn record(
+        &mut self,
+        discovery: &OAuthDiscovery,
+        max_age: u64,
+        etag: Option<String>,
+        source_url: &str,
+    ) {
         self.issuer.clone_from(&discovery.issuer);
         self.authorization_endpoint
             .clone_from(&discovery.authorization_endpoint);
@@ -580,10 +586,7 @@ impl OAuthDiscovery {
 /// `None` when the server advertises methods but none fits the credentials we
 /// have (for example it requires `client_secret_basic` while nothing has issued
 /// a secret). The caller then has to register or sign in again.
-fn select_client_auth_method(
-    advertised: &[String],
-    has_secret: bool,
-) -> Option<&'static str> {
+fn select_client_auth_method(advertised: &[String], has_secret: bool) -> Option<&'static str> {
     let offers = |method: &str| advertised.is_empty() || advertised.iter().any(|m| m == method);
     if has_secret {
         if offers("client_secret_basic") {
@@ -911,7 +914,9 @@ fn protected_resource_candidate(resource_url: &str) -> Result<String, String> {
     }
     let origin = url.origin().ascii_serialization();
     let path = url.path().trim_end_matches('/');
-    Ok(format!("{origin}/.well-known/oauth-protected-resource{path}"))
+    Ok(format!(
+        "{origin}/.well-known/oauth-protected-resource{path}"
+    ))
 }
 
 struct FetchedResourceMetadata {
@@ -1274,7 +1279,10 @@ impl OAuthManager {
         server_url: &str,
         client: &reqwest::Client,
     ) -> Result<OAuthDiscovery, OAuthError> {
-        if let Some(cached) = self.get(server_url).and_then(McpOAuthState::cached_discovery) {
+        if let Some(cached) = self
+            .get(server_url)
+            .and_then(McpOAuthState::cached_discovery)
+        {
             return Ok(cached);
         }
 
@@ -1286,7 +1294,10 @@ impl OAuthManager {
         // RFC 9728: the resource may name an authorization server on a
         // different origin. Metadata that cannot be fetched is not fatal: the
         // resource URL is still the conventional issuer, as before.
-        let protected = match self.protected_resource_metadata(server_url, client, None).await {
+        let protected = match self
+            .protected_resource_metadata(server_url, client, None)
+            .await
+        {
             Ok(metadata) => Some(metadata),
             Err(error) => {
                 tracing::debug!(
@@ -1307,7 +1318,10 @@ impl OAuthManager {
             Some(cache) if cache.is_fresh(now) && !cache.to_discovery().is_empty() => {
                 (cache.to_discovery(), cache)
             }
-            cached => self.fetch_issuer_metadata(&issuer, cached.as_ref(), client).await?,
+            cached => {
+                self.fetch_issuer_metadata(&issuer, cached.as_ref(), client)
+                    .await?
+            }
         };
         let max_age = match cache.expires_at {
             Some(expires_at) => u64::try_from(expires_at.saturating_sub(now)).unwrap_or(0),
@@ -1369,11 +1383,10 @@ impl OAuthManager {
         cached: Option<&IssuerMetadataCache>,
         client: &reqwest::Client,
     ) -> Result<(OAuthDiscovery, IssuerMetadataCache), OAuthError> {
-        let candidates =
-            discovery_candidates(issuer).map_err(|detail| OAuthError::Discovery {
-                server_url: issuer.to_string(),
-                detail,
-            })?;
+        let candidates = discovery_candidates(issuer).map_err(|detail| OAuthError::Discovery {
+            server_url: issuer.to_string(),
+            detail,
+        })?;
 
         let mut attempts = Vec::new();
         for url in candidates {
@@ -1388,8 +1401,7 @@ impl OAuthManager {
                     };
                     let mut entry = cached.clone();
                     let ttl = i64::try_from(fetched.max_age).unwrap_or(i64::MAX);
-                    entry.expires_at =
-                        Some(chrono::Utc::now().timestamp().saturating_add(ttl));
+                    entry.expires_at = Some(chrono::Utc::now().timestamp().saturating_add(ttl));
                     entry.etag = fetched.etag;
                     entry.source_url = Some(url);
                     return Ok((entry.to_discovery(), entry));
@@ -1405,12 +1417,7 @@ impl OAuthManager {
                 }
                 Ok(fetched) => {
                     let mut entry = IssuerMetadataCache::default();
-                    entry.record(
-                        &fetched.discovery,
-                        fetched.max_age,
-                        fetched.etag,
-                        &url,
-                    );
+                    entry.record(&fetched.discovery, fetched.max_age, fetched.etag, &url);
                     return Ok((fetched.discovery, entry));
                 }
                 Err(error) => attempts.push(format!("{url}: {error}")),
@@ -1443,9 +1450,10 @@ impl OAuthManager {
         let cached = self.get(server_url).cloned();
         if resource_metadata_url.is_none() {
             if let Some(state) = &cached {
-                if let (Some(metadata), Some(expires_at)) =
-                    (&state.protected_resource, state.resource_metadata_expires_at)
-                {
+                if let (Some(metadata), Some(expires_at)) = (
+                    &state.protected_resource,
+                    state.resource_metadata_expires_at,
+                ) {
                     if now < expires_at {
                         return Ok(metadata.clone());
                     }
@@ -1500,8 +1508,7 @@ impl OAuthManager {
         if let Some(state) = self.get_mut(server_url) {
             state.protected_resource = Some(metadata.clone());
             state.resource_metadata_url = Some(url);
-            state.resource_metadata_expires_at =
-                Some(now.saturating_add(ttl));
+            state.resource_metadata_expires_at = Some(now.saturating_add(ttl));
             state.resource_metadata_etag = fetched.etag;
             state.resource = Some(
                 metadata
@@ -1553,9 +1560,7 @@ impl OAuthManager {
         // for the strongest secret-based method it advertises, so the response
         // carries a secret we can use.
         let advertised = state.token_endpoint_auth_methods_supported.clone();
-        let method = if advertised.is_empty()
-            || advertised.iter().any(|method| method == "none")
-        {
+        let method = if advertised.is_empty() || advertised.iter().any(|method| method == "none") {
             "none"
         } else if advertised
             .iter()
@@ -2545,8 +2550,7 @@ mod tests {
             requests[0]
         );
         assert!(
-            requests[1]
-                .starts_with("GET /.well-known/oauth-authorization-server/realms/demo "),
+            requests[1].starts_with("GET /.well-known/oauth-authorization-server/realms/demo "),
             "unexpected discovery request: {}",
             requests[1]
         );
@@ -2627,8 +2631,7 @@ mod tests {
             requests[0]
         );
         assert!(
-            requests[1]
-                .starts_with("GET /.well-known/oauth-authorization-server/realms/demo "),
+            requests[1].starts_with("GET /.well-known/oauth-authorization-server/realms/demo "),
             "{}",
             requests[1]
         );
@@ -2771,8 +2774,7 @@ mod tests {
             requests[0]
         );
         assert!(
-            requests[1]
-                .starts_with("GET /.well-known/oauth-authorization-server/mcp "),
+            requests[1].starts_with("GET /.well-known/oauth-authorization-server/mcp "),
             "{}",
             requests[1]
         );
@@ -2823,7 +2825,10 @@ mod tests {
             Some("https://auth.example/rm")
         );
         assert_eq!(mixed.error.as_deref(), Some("insufficient_scope"));
-        assert_eq!(parse_www_authenticate("Basic realm=\"x\""), BearerChallenge::default());
+        assert_eq!(
+            parse_www_authenticate("Basic realm=\"x\""),
+            BearerChallenge::default()
+        );
     }
 
     #[test]
@@ -2858,7 +2863,10 @@ mod tests {
     #[test]
     fn client_auth_method_selection_prefers_the_strongest_fit() {
         assert_eq!(
-            select_client_auth_method(&["client_secret_post".into(), "client_secret_basic".into()], true),
+            select_client_auth_method(
+                &["client_secret_post".into(), "client_secret_basic".into()],
+                true
+            ),
             Some("client_secret_basic")
         );
         assert_eq!(
@@ -2986,9 +2994,7 @@ mod tests {
         let mut mgr = OAuthManager::with_path(&path);
         mgr.register(McpOAuthState::new(&base, ""));
 
-        mgr.discover(&base, &reqwest::Client::new())
-            .await
-            .unwrap();
+        mgr.discover(&base, &reqwest::Client::new()).await.unwrap();
 
         let requests = server.join().unwrap();
         assert_eq!(requests.len(), 3);
@@ -3034,9 +3040,7 @@ mod tests {
         let mut mgr =
             OAuthManager::with_path(tempfile::tempdir().unwrap().path().join("mcp_tokens.json"));
         mgr.register(McpOAuthState::new(&base, "existing"));
-        mgr.discover(&base, &reqwest::Client::new())
-            .await
-            .unwrap();
+        mgr.discover(&base, &reqwest::Client::new()).await.unwrap();
         let requests = server.join().unwrap();
         assert_eq!(requests.len(), 2);
         assert!(
@@ -3049,10 +3053,8 @@ mod tests {
     /// `client_secret_basic` puts the credentials in the Authorization header.
     #[tokio::test]
     async fn refresh_uses_client_secret_basic_when_selected() {
-        let (endpoint, server) = spawn_token_endpoint(
-            200,
-            r#"{"access_token":"basic_access","expires_in":3600}"#,
-        );
+        let (endpoint, server) =
+            spawn_token_endpoint(200, r#"{"access_token":"basic_access","expires_in":3600}"#);
         let dir = tempfile::tempdir().unwrap();
         let mut mgr = OAuthManager::with_path(dir.path().join("mcp_tokens.json"));
         let mut state = state_against(&endpoint, Some("refresh_me"), 60);
@@ -3076,17 +3078,18 @@ mod tests {
             !request.contains("client_secret="),
             "the secret was also sent in the body: {request}"
         );
-        assert!(request.contains("resource=http%3A%2F%2Fmcp.example"), "{request}");
+        assert!(
+            request.contains("resource=http%3A%2F%2Fmcp.example"),
+            "{request}"
+        );
     }
 
     /// `client_secret_post` puts them in the form, and a public client sends
     /// no secret at all.
     #[tokio::test]
     async fn refresh_uses_client_secret_post_or_none() {
-        let (endpoint, server) = spawn_token_endpoint(
-            200,
-            r#"{"access_token":"post_access","expires_in":3600}"#,
-        );
+        let (endpoint, server) =
+            spawn_token_endpoint(200, r#"{"access_token":"post_access","expires_in":3600}"#);
         let mut mgr =
             OAuthManager::with_path(tempfile::tempdir().unwrap().path().join("mcp_tokens.json"));
         let mut state = state_against(&endpoint, Some("refresh_me"), 60);
@@ -3101,10 +3104,8 @@ mod tests {
         assert!(request.contains("client_secret=s3cret"), "{request}");
         assert!(!request.contains("authorization: Basic"), "{request}");
 
-        let (endpoint, server) = spawn_token_endpoint(
-            200,
-            r#"{"access_token":"public_access","expires_in":3600}"#,
-        );
+        let (endpoint, server) =
+            spawn_token_endpoint(200, r#"{"access_token":"public_access","expires_in":3600}"#);
         let mut mgr =
             OAuthManager::with_path(tempfile::tempdir().unwrap().path().join("mcp_tokens.json"));
         let mut state = state_against(&endpoint, Some("refresh_me"), 60);
@@ -3207,10 +3208,7 @@ mod tests {
         state.discovery_expires_at = Some(chrono::Utc::now().timestamp() - 1);
         mgr.register(state);
 
-        let token = mgr
-            .refresh(&base, &reqwest::Client::new())
-            .await
-            .unwrap();
+        let token = mgr.refresh(&base, &reqwest::Client::new()).await.unwrap();
         assert_eq!(token, "fresh_access");
 
         let requests = server.join().unwrap();
@@ -3250,9 +3248,7 @@ mod tests {
             move |_: &str| {
                 vec![HttpReply::new(
                     200,
-                    format!(
-                        r#"{{"resource":"{resource}","authorization_servers":["{issuer}"]}}"#
-                    ),
+                    format!(r#"{{"resource":"{resource}","authorization_servers":["{issuer}"]}}"#),
                 )]
             }
         };
@@ -3265,9 +3261,7 @@ mod tests {
             OAuthManager::with_path(tempfile::tempdir().unwrap().path().join("mcp_tokens.json"));
         let first = format!("{resource_one}/mcp");
         let second = format!("{resource_two}/mcp");
-        mgr.discover(&first, &reqwest::Client::new())
-            .await
-            .unwrap();
+        mgr.discover(&first, &reqwest::Client::new()).await.unwrap();
         let discovery = mgr
             .discover(&second, &reqwest::Client::new())
             .await
@@ -3316,7 +3310,11 @@ mod tests {
             "Bearer error=\"invalid_token\", resource_metadata=\"{prm_base}/.well-known/oauth-protected-resource\""
         );
         let token = mgr
-            .handle_unauthorized("http://mcp.example", &reqwest::Client::new(), Some(&challenge))
+            .handle_unauthorized(
+                "http://mcp.example",
+                &reqwest::Client::new(),
+                Some(&challenge),
+            )
             .await
             .unwrap();
         assert_eq!(token, "renewed");
@@ -3516,7 +3514,10 @@ mod tests {
             .unwrap_err();
         assert!(matches!(error, OAuthError::ReauthRequired { .. }));
         assert_eq!(
-            mgr.get("http://mcp.example").unwrap().access_token.as_deref(),
+            mgr.get("http://mcp.example")
+                .unwrap()
+                .access_token
+                .as_deref(),
             Some("token"),
             "a non-token error cleared the credential"
         );

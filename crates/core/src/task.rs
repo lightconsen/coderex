@@ -759,10 +759,25 @@ mod tests {
             .label(),
             "agent"
         );
-        assert_eq!(TaskKind::Dream { description: String::new() }.label(), "dream");
-        assert_eq!(TaskKind::LocalShell { command: String::new() }.label(), "shell");
         assert_eq!(
-            TaskKind::InProcessTeammate { name: String::new() }.label(),
+            TaskKind::Dream {
+                description: String::new()
+            }
+            .label(),
+            "dream"
+        );
+        assert_eq!(
+            TaskKind::LocalShell {
+                command: String::new()
+            }
+            .label(),
+            "shell"
+        );
+        assert_eq!(
+            TaskKind::InProcessTeammate {
+                name: String::new()
+            }
+            .label(),
             "teammate"
         );
     }

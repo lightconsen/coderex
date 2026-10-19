@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::pin::Pin;
 use thiserror::Error;
-use tokio::time::{sleep, Duration};
+use tokio::time::{Duration, sleep};
 use uuid::Uuid;
 
 /// Errors from API operations.
@@ -732,7 +732,7 @@ impl AnthropicApiClient {
         body: &[u8],
         request_id: &str,
     ) -> reqwest::RequestBuilder {
-        use crate::providers::cloud::{sign_v4, signing_service, AuthStyle, AwsCredentials};
+        use crate::providers::cloud::{AuthStyle, AwsCredentials, sign_v4, signing_service};
 
         let Some(cloud) = &self.config.cloud else {
             return if self.is_anthropic_api() {

@@ -36,8 +36,8 @@
 use std::fs::OpenOptions;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 /// Service name used for keychain entries.
 pub const KEYCHAIN_SERVICE: &str = "coderex";
@@ -406,9 +406,10 @@ fn write_file(path: &Path, content: &str) -> io::Result<()> {
 
 fn temp_name(path: &Path) -> String {
     static COUNTER: AtomicU64 = AtomicU64::new(0);
-    let name = path
-        .file_name()
-        .map_or_else(|| "tokens".to_string(), |name| name.to_string_lossy().into_owned());
+    let name = path.file_name().map_or_else(
+        || "tokens".to_string(),
+        |name| name.to_string_lossy().into_owned(),
+    );
     let sequence = COUNTER.fetch_add(1, Ordering::Relaxed);
     format!(".{name}.tmp-{}-{sequence}", std::process::id())
 }
@@ -483,15 +484,15 @@ mod windows_acl {
     use std::io;
     use std::os::windows::ffi::OsStrExt as _;
     use std::path::Path;
-    use windows_sys::Win32::Foundation::{CloseHandle, LocalFree, ERROR_SUCCESS, GENERIC_ALL};
+    use windows_sys::Win32::Foundation::{CloseHandle, ERROR_SUCCESS, GENERIC_ALL, LocalFree};
     use windows_sys::Win32::Security::Authorization::{
-        GetNamedSecurityInfoW, SetNamedSecurityInfoW, SE_FILE_OBJECT,
+        GetNamedSecurityInfoW, SE_FILE_OBJECT, SetNamedSecurityInfoW,
     };
     use windows_sys::Win32::Security::{
-        AddAccessAllowedAce, EqualSid, GetAce, GetAclInformation, GetLengthSid,
-        GetTokenInformation, InitializeAcl, TokenUser, ACCESS_ALLOWED_ACE, ACL, ACL_REVISION,
-        ACL_SIZE_INFORMATION, AclSizeInformation, DACL_SECURITY_INFORMATION,
-        PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID, TOKEN_QUERY, TOKEN_USER,
+        ACCESS_ALLOWED_ACE, ACL, ACL_REVISION, ACL_SIZE_INFORMATION, AclSizeInformation,
+        AddAccessAllowedAce, DACL_SECURITY_INFORMATION, EqualSid, GetAce, GetAclInformation,
+        GetLengthSid, GetTokenInformation, InitializeAcl, PROTECTED_DACL_SECURITY_INFORMATION,
+        PSECURITY_DESCRIPTOR, PSID, TOKEN_QUERY, TOKEN_USER, TokenUser,
     };
     use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
@@ -826,8 +827,10 @@ mod tests {
     fn a_failing_backend_falls_back_to_a_private_file_and_warns_once() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("mcp_tokens.json");
-        let persistence =
-            TokenPersistence::with_backend(&path, Arc::new(BrokenBackend) as Arc<dyn SecretBackend>);
+        let persistence = TokenPersistence::with_backend(
+            &path,
+            Arc::new(BrokenBackend) as Arc<dyn SecretBackend>,
+        );
 
         persistence.save("first").unwrap();
         assert_eq!(persistence.fallback_warning_count(), 1);
