@@ -531,7 +531,10 @@ neither `bwrap` nor Landlock exists) are also covered by Linux-gated tests that
 cannot run on macOS.
 
 Windows behaviour is exercised automatically by the `test-windows` job in
-`.github/workflows/ci.yml` (on `windows-latest` with the MSVC toolchain): it
+`.github/workflows/ci.yml` and the `test_windows` job in `azure-pipelines.yml`
+(on `windows-latest` with the MSVC toolchain); the repository's `origin` is
+Azure DevOps, so the Azure pipeline is the one that actually runs unless the
+repository is also mirrored to GitHub. It
 runs `sandbox_windows::tests::spawn_in_container_confines_a_real_process` (the
 documented `STARTUPINFOEX` spawn), `sandbox::tests::windows_sandbox_confines_a_suspended_child`
 (the token-attach path the shell tools use), the `coderex-tools` and

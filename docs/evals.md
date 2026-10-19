@@ -204,8 +204,9 @@ machine or workflow with credentials.
 
 In CI it is the `live-provider-eval` job (plus the
 `live-provider-eval-preflight` credential check) in
-`.github/workflows/ci.yml`. Both are `workflow_dispatch` only and are skipped
-on push and pull request; the preflight converts the presence of
+`.github/workflows/ci.yml`, mirrored as `live_eval` in
+`azure-pipelines.yml` (queued with `runLiveEval: true`). Both are manual and
+are skipped on push and pull request; the preflight converts the presence of
 `ANTHROPIC_API_KEY` into an output so the live job does not fail merely
 because a repository has no secret. The job runs `scripts/test-live-eval.sh`
 and uploads `report.html` and `baseline/results.jsonl` as `live-eval-report`.
