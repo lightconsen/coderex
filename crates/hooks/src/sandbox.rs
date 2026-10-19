@@ -1324,8 +1324,11 @@ mod policy_tests {
 
         let mut config = hook_config();
         config.cwd = Some(allowed.clone());
+        // The final `echo {}` is the hook's answer: a command hook that
+        // prints nothing is a failure, so the write probes must still leave a
+        // parseable result on stdout.
         config.command = format!(
-            "echo ok> \"{}\" & echo bad> \"{}\"",
+            "echo ok> \"{}\" & echo bad> \"{}\" & echo {{}}",
             allowed.join("inside.txt").display(),
             denied.join("outside.txt").display()
         );
