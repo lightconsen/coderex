@@ -29,6 +29,7 @@ pub mod orchestrator;
 pub mod permission_engine;
 pub mod permission_manager;
 pub mod permissions;
+pub mod process_tree;
 pub mod prompt;
 pub mod prompts;
 pub mod provider;
