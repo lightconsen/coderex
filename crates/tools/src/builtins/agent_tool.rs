@@ -11,8 +11,7 @@ use std::sync::Arc;
 /// Provider for the parent conversation snapshot used to build a cache-safe
 /// fork. Called once per spawn, so it always sees the conversation as it is at
 /// that moment.
-pub type ParentContextProvider =
-    dyn Fn() -> Option<ParentContextSnapshot> + Send + Sync + 'static;
+pub type ParentContextProvider = dyn Fn() -> Option<ParentContextSnapshot> + Send + Sync + 'static;
 
 /// Spawn a sub-agent running coderex with the given prompt.
 pub struct AgentTool {
@@ -304,6 +303,7 @@ impl Tool for AgentTool {
                     })
                     .to_string(),
                     is_display: true,
+                    images: Vec::new(),
                 });
             }
 
@@ -324,6 +324,7 @@ impl Tool for AgentTool {
                 })
                 .to_string(),
                 is_display: true,
+                images: Vec::new(),
             });
         }
 
@@ -349,11 +350,10 @@ fn parse_retry_policy(
     args: &serde_json::Value,
 ) -> Result<Option<coderex_agents::RetryPolicy>, ToolError> {
     if let Some(value) = args.get("retry_policy") {
-        let policy = serde_json::from_value(value.clone()).map_err(|error| {
-            ToolError::InvalidInput {
+        let policy =
+            serde_json::from_value(value.clone()).map_err(|error| ToolError::InvalidInput {
                 message: format!("invalid retry_policy: {error}"),
-            }
-        })?;
+            })?;
         return Ok(Some(policy));
     }
 
@@ -574,7 +574,11 @@ mod tests {
         let agents = manager.list_agents();
         let agent = agents.first().expect("agent not spawned");
         assert!(!agent.options.writable);
-        let policy = agent.options.retry_policy.as_ref().expect("retry policy lost");
+        let policy = agent
+            .options
+            .retry_policy
+            .as_ref()
+            .expect("retry policy lost");
         assert_eq!(policy.max_retries, 3);
         assert_eq!(policy.on_failure, coderex_agents::FailureAction::Retry);
         assert_eq!(policy.escalation_prompt.as_deref(), Some("try again"));

@@ -15,9 +15,6 @@ use tokio::sync::mpsc;
 /// Key used to store the cron scheduler in `ToolContext.extra`.
 pub const CRON_SCHEDULER_KEY: &str = "cron_scheduler";
 
-#[allow(dead_code)]
-const JOB_FILE: &str = ".coderex/scheduled_tasks.json";
-
 /// A scheduled cron job.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CronJob {

@@ -152,6 +152,7 @@ mod tests {
         ToolOutput {
             output: text.to_string(),
             is_display: true,
+            images: Vec::new(),
         }
     }
 

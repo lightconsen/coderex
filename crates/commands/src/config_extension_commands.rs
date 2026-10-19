@@ -88,7 +88,8 @@ pub fn register(registry: &mut CommandRegistry) {
                 if args.is_empty() {
                     let home = config_home();
                     let themes_path = home.join("themes");
-                    let available = list_dir_items(&themes_path);
+                    let mut available = list_dir_items(&themes_path);
+                    available.extend(ctx.plugin_themes.iter().cloned());
                     let mut output = format!("Current theme: {}", ctx.theme);
                     if !available.is_empty() {
                         output.push_str(&format!(
@@ -114,11 +115,24 @@ pub fn register(registry: &mut CommandRegistry) {
                         || new_theme == "dark"
                         || new_theme == "high-contrast"
                         || new_theme == "tokyo-night"
+                        || ctx.plugin_themes.iter().any(|name| name == new_theme)
                     {
+                        // `statusline.theme` is the key startup reads (and a
+                        // known settings field). Writing a top-level `theme`
+                        // made the next startup reject the whole file as an
+                        // unknown field.
                         let mut settings = read_user_settings().unwrap_or_default();
-                        settings.insert(
+                        let mut statusline = settings
+                            .get("statusline")
+                            .and_then(|value| value.as_object().cloned())
+                            .unwrap_or_default();
+                        statusline.insert(
                             "theme".to_string(),
                             serde_json::Value::String(new_theme.clone()),
+                        );
+                        settings.insert(
+                            "statusline".to_string(),
+                            serde_json::Value::Object(statusline),
                         );
                         let _ = write_user_settings(&settings);
                         CommandResult::success(format!(
@@ -126,7 +140,8 @@ pub fn register(registry: &mut CommandRegistry) {
                         ))
                         .with_state_change(true)
                     } else {
-                        let available = list_dir_items(&themes_path);
+                        let mut available = list_dir_items(&themes_path);
+                        available.extend(ctx.plugin_themes.iter().cloned());
                         let hint = if !available.is_empty() {
                             format!(
                                 "\nAvailable themes:\n{}",

@@ -49,6 +49,7 @@ impl Tool for ConfigTool {
                 Ok(ToolOutput {
                     output: serde_json::json!({ "config": { k: v } }).to_string(),
                     is_display: true,
+                    images: Vec::new(),
                 })
             }
             (Some(k), None) => {
@@ -56,6 +57,7 @@ impl Tool for ConfigTool {
                 Ok(ToolOutput {
                     output: serde_json::json!({ "config": { k: null } }).to_string(),
                     is_display: true,
+                    images: Vec::new(),
                 })
             }
             (None, _) => {
@@ -63,6 +65,7 @@ impl Tool for ConfigTool {
                 Ok(ToolOutput {
                     output: serde_json::json!({ "config": {} }).to_string(),
                     is_display: true,
+                    images: Vec::new(),
                 })
             }
         }

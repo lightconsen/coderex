@@ -149,6 +149,7 @@ impl Tool for EchoTool {
         Ok(ToolOutput {
             output: echoed,
             is_display: true,
+            images: Vec::new(),
         })
     }
 }
@@ -189,6 +190,7 @@ impl Tool for NoOpTool {
         Ok(ToolOutput {
             output: String::new(),
             is_display: false,
+            images: Vec::new(),
         })
     }
 }

@@ -101,6 +101,7 @@ impl Tool for GlobTool {
         Ok(ToolOutput {
             output,
             is_display: true,
+            images: Vec::new(),
         })
     }
 }

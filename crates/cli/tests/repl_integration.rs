@@ -44,6 +44,31 @@ async fn repl_loop_with_engine_creates_valid_instance() {
     );
 }
 
+/// A headless turn now leaves a transcript behind, so `--print` sessions can
+/// be resumed and found by `/resume`.
+#[tokio::test]
+async fn headless_turn_persists_a_resumable_transcript() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cwd = tmp.path().to_str().unwrap().to_string();
+    let mock = MockApiClient::new(vec![mock_response("persisted answer")]);
+    let mut repl = ReplLoop::with_engine(Box::new(mock), cwd.clone(), ModelId::sonnet());
+
+    repl.run_headless("hello").await.unwrap();
+
+    let dir = coderex_cli::session_resume::transcript_dir(&cwd);
+    let entries: Vec<_> = std::fs::read_dir(&dir)
+        .expect("the transcript directory should exist")
+        .filter_map(Result::ok)
+        .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "jsonl"))
+        .collect();
+    assert_eq!(entries.len(), 1, "exactly one transcript should be written");
+    let content = std::fs::read_to_string(entries[0].path()).unwrap();
+    assert!(
+        content.contains("persisted answer"),
+        "the transcript should carry the turn: {content}"
+    );
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 //  14.2 Headless Execution — Slash Commands
 // ═══════════════════════════════════════════════════════════════════════════

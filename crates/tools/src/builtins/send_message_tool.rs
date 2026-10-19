@@ -49,6 +49,7 @@ impl Tool for SendMessageTool {
         Ok(ToolOutput {
             output: "true".to_string(),
             is_display: true,
+            images: Vec::new(),
         })
     }
 }

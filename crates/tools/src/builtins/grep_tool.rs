@@ -169,6 +169,7 @@ impl Tool for GrepTool {
         Ok(ToolOutput {
             output,
             is_display: true,
+            images: Vec::new(),
         })
     }
 }

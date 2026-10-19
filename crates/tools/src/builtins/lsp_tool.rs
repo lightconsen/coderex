@@ -337,6 +337,7 @@ impl LspTool {
         Ok(ToolOutput {
             output,
             is_display: true,
+            images: Vec::new(),
         })
     }
 
@@ -356,6 +357,7 @@ impl LspTool {
             return Ok(ToolOutput {
                 output: "No hover information available".into(),
                 is_display: true,
+                images: Vec::new(),
             });
         }
 
@@ -381,6 +383,7 @@ impl LspTool {
         Ok(ToolOutput {
             output: text,
             is_display: true,
+            images: Vec::new(),
         })
     }
 
@@ -424,6 +427,7 @@ impl LspTool {
         Ok(ToolOutput {
             output,
             is_display: true,
+            images: Vec::new(),
         })
     }
 
@@ -460,6 +464,7 @@ impl LspTool {
         Ok(ToolOutput {
             output,
             is_display: true,
+            images: Vec::new(),
         })
     }
 }

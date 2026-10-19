@@ -81,6 +81,7 @@ impl Tool for RemoteTriggerTool {
                 })
                 .to_string(),
                 is_display: true,
+                images: Vec::new(),
             })
         } else {
             Err(ToolError::InvalidInput {

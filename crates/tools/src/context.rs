@@ -82,4 +82,21 @@ pub struct ToolOutput {
     pub output: String,
     /// Whether this output should be displayed to the user.
     pub is_display: bool,
+    /// Images the tool returned, forwarded to the model as image blocks.
+    ///
+    /// Most tools leave this empty; MCP image content and an image read use
+    /// it so the model sees the image instead of base64 text.
+    pub images: Vec<coderex_core::types::ImageBlock>,
+}
+
+impl ToolOutput {
+    /// Text-only output.
+    #[must_use]
+    pub fn text(output: impl Into<String>, is_display: bool) -> Self {
+        Self {
+            output: output.into(),
+            is_display,
+            images: Vec::new(),
+        }
+    }
 }

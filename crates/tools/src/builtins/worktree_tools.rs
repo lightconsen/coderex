@@ -72,6 +72,7 @@ impl Tool for EnterWorktreeTool {
         Ok(ToolOutput {
             output: path,
             is_display: true,
+            images: Vec::new(),
         })
     }
 }
@@ -111,6 +112,7 @@ impl Tool for ExitWorktreeTool {
         Ok(ToolOutput {
             output: "exited".into(),
             is_display: true,
+            images: Vec::new(),
         })
     }
 }

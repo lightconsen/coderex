@@ -105,7 +105,8 @@ impl ProtocolMessage {
     /// guard, not a runtime path.
     #[must_use]
     pub fn to_line(&self) -> String {
-        let mut line = serde_json::to_string(self).expect("protocol frames are always serializable");
+        let mut line =
+            serde_json::to_string(self).expect("protocol frames are always serializable");
         debug_assert!(
             !line.contains('\n') && !line.contains('\r'),
             "serializer emitted a raw newline; the protocol requires one line per frame"
@@ -389,9 +390,7 @@ impl ControlRequestFrame {
         match message {
             ProtocolMessage::ControlRequest(frame) => {
                 if frame.request.subtype != CAN_USE_TOOL_SUBTYPE {
-                    return Err(ControlFrameError::UnexpectedSubtype(
-                        frame.request.subtype,
-                    ));
+                    return Err(ControlFrameError::UnexpectedSubtype(frame.request.subtype));
                 }
                 Ok(frame)
             }
@@ -668,6 +667,44 @@ pub fn tool_result_block(tool_use_id: impl Into<String>, content: impl Into<Stri
     })
 }
 
+/// A `tool_result` block that carries images beside its text.
+///
+/// `images` is `(media_type, base64 data)` per image. With no images this is
+/// exactly [`tool_result_block`]; with images the `content` becomes the same
+/// text-plus-image array the provider receives, so a stream-json consumer can
+/// render what the model saw.
+#[must_use]
+pub fn tool_result_block_with_images(
+    tool_use_id: impl Into<String>,
+    content: impl Into<String>,
+    images: &[(String, String)],
+) -> Value {
+    let tool_use_id = tool_use_id.into();
+    let content = content.into();
+    if images.is_empty() {
+        return tool_result_block(tool_use_id, content);
+    }
+    let mut blocks = Vec::with_capacity(images.len() + 1);
+    if !content.is_empty() {
+        blocks.push(serde_json::json!({ "type": "text", "text": content }));
+    }
+    for (media_type, data) in images {
+        blocks.push(serde_json::json!({
+            "type": "image",
+            "source": {
+                "type": "base64",
+                "media_type": media_type,
+                "data": data,
+            },
+        }));
+    }
+    serde_json::json!({
+        "type": "tool_result",
+        "tool_use_id": tool_use_id,
+        "content": blocks,
+    })
+}
+
 // ── Sink ────────────────────────────────────────────────────────────────
 
 /// Writes protocol frames to an output stream, one line per frame.
@@ -797,11 +834,7 @@ impl<W: Write> Drop for Turn<'_, W> {
             u64::try_from(self.started.elapsed().as_millis()).unwrap_or(u64::MAX),
             1,
         );
-        if self
-            .sink
-            .write(&ProtocolMessage::Result(frame))
-            .is_err()
-        {
+        if self.sink.write(&ProtocolMessage::Result(frame)).is_err() {
             tracing::warn!(
                 "turn ended without a result and the fallback result could not be written"
             );
@@ -827,6 +860,24 @@ mod tests {
     use std::io::BufWriter;
     use std::rc::Rc;
 
+    #[test]
+    fn a_tool_result_carries_images_only_when_present() {
+        let plain = tool_result_block_with_images("t1", "text", &[]);
+        assert_eq!(plain["content"], "text");
+
+        let with_image = tool_result_block_with_images(
+            "t1",
+            "text",
+            &[("image/png".to_string(), "AAAA".to_string())],
+        );
+        let blocks = with_image["content"].as_array().expect("content array");
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks[0]["type"], "text");
+        assert_eq!(blocks[1]["type"], "image");
+        assert_eq!(blocks[1]["source"]["media_type"], "image/png");
+        assert_eq!(blocks[1]["source"]["data"], "AAAA");
+    }
+
     fn assistant_line(session: &str, text: &str) -> ProtocolMessage {
         ProtocolMessage::Assistant(AssistantFrame {
             message: MessageBody::assistant(vec![text_block(text)]),
@@ -850,17 +901,16 @@ mod tests {
 
         // The newline survives as data, escaped inside the JSON string.
         let parsed: Value = serde_json::from_str(line.trim_end()).unwrap();
-        assert_eq!(parsed["message"]["content"][0]["text"], "first\nsecond\r\nthird");
+        assert_eq!(
+            parsed["message"]["content"][0]["text"],
+            "first\nsecond\r\nthird"
+        );
     }
 
     #[test]
     fn discriminants_are_spelled_as_the_reference_spells_them() {
         let frames = vec![
-            (
-                assistant_line("s1", "hi"),
-                "assistant",
-                None::<&str>,
-            ),
+            (assistant_line("s1", "hi"), "assistant", None::<&str>),
             (
                 ProtocolMessage::User(UserFrame {
                     message: MessageBody::user(vec![tool_result_block("t1", "ok")]),
@@ -951,7 +1001,8 @@ mod tests {
         ];
 
         for frame in frames {
-            let decoded: ProtocolMessage = serde_json::from_str(frame.to_line().trim_end()).unwrap();
+            let decoded: ProtocolMessage =
+                serde_json::from_str(frame.to_line().trim_end()).unwrap();
             assert_eq!(decoded, frame, "round-trip must preserve the frame");
         }
     }
@@ -990,9 +1041,7 @@ mod tests {
         let out = String::from_utf8(sink.into_inner()).unwrap();
         let results = out
             .lines()
-            .filter(|line| {
-                serde_json::from_str::<Value>(line).unwrap()["type"] == "result"
-            })
+            .filter(|line| serde_json::from_str::<Value>(line).unwrap()["type"] == "result")
             .count();
         assert_eq!(results, 1, "a turn must end with exactly one result frame");
     }
@@ -1104,7 +1153,10 @@ mod tests {
         assert_eq!(value["request"]["reason"], "Bash needs approval");
         assert_eq!(value["request"]["allow_session"], true);
 
-        assert_eq!(ControlRequestFrame::parse_line(line.trim_end()).unwrap(), frame);
+        assert_eq!(
+            ControlRequestFrame::parse_line(line.trim_end()).unwrap(),
+            frame
+        );
     }
 
     #[test]
@@ -1147,7 +1199,10 @@ mod tests {
         // A host may also spell the session-wide answer as its own behavior.
         let line = r#"{"type":"control_response","response":{"subtype":"success","request_id":"r","response":{"behavior":"allow_session"}}}"#;
         assert_eq!(
-            ControlResponseFrame::parse_line(line).unwrap().decision().unwrap(),
+            ControlResponseFrame::parse_line(line)
+                .unwrap()
+                .decision()
+                .unwrap(),
             ControlDecision::AllowSession
         );
         assert!(matches!(
@@ -1165,14 +1220,17 @@ mod tests {
         // A different frame kind.
         assert!(matches!(
             ControlRequestFrame::parse_line(&assistant_line("s1", "hi").to_line()),
-            Err(ControlFrameError::WrongType { expected: "control_request", .. })
+            Err(ControlFrameError::WrongType {
+                expected: "control_request",
+                ..
+            })
         ));
 
         // Missing required field.
-        assert!(ControlRequestFrame::parse_line(
-            r#"{"type":"control_request","request_id":"r"}"#
-        )
-        .is_err());
+        assert!(
+            ControlRequestFrame::parse_line(r#"{"type":"control_request","request_id":"r"}"#)
+                .is_err()
+        );
 
         // Unknown request subtype.
         assert!(matches!(

@@ -181,6 +181,22 @@ fn try_index_saved_session(
     Ok(())
 }
 
+/// Record a session's accumulated cost and token count in the index.
+///
+/// `index_saved_session` writes the searchable row (and resets usage to
+/// zero), so call this after it. Best-effort, like every index write.
+pub fn index_session_usage(cwd: &str, session_id: &str, cost: f64, tokens: i64) {
+    let result = SessionIndex::open(&sessions_db_path(cwd))
+        .and_then(|index| index.update_cost_and_tokens(session_id, cost, tokens));
+    if let Err(error) = result {
+        tracing::warn!(
+            session_id,
+            db = %sessions_db_path(cwd).display(),
+            "session usage was not indexed: {error}"
+        );
+    }
+}
+
 /// Search indexed sessions, newest first.
 ///
 /// The SQLite FTS index is consulted first. Sessions it does not know about

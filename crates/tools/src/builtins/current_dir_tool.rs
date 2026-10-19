@@ -40,6 +40,7 @@ impl Tool for CurrentDirTool {
         Ok(ToolOutput {
             output: ctx.cwd.to_string_lossy().to_string(),
             is_display: true,
+            images: Vec::new(),
         })
     }
 }

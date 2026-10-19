@@ -106,6 +106,7 @@ impl Tool for EditTool {
         Ok(ToolOutput {
             output: format!("Replaced {count} occurrence(s) of old_string in {path}"),
             is_display: true,
+            images: Vec::new(),
         })
     }
 }

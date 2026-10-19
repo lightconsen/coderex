@@ -64,6 +64,7 @@ impl Tool for SkillTool {
                         return Ok(ToolOutput {
                             output,
                             is_display: true,
+                            images: Vec::new(),
                         });
                     }
                     Err(e) => {

@@ -195,6 +195,8 @@ pub struct CommandContext {
     pub mcp_servers: Vec<String>,
     /// Components contributed by active plugins, as `(kind, name)`.
     pub plugin_components: Vec<(String, String)>,
+    /// Theme names contributed by active plugins.
+    pub plugin_themes: Vec<String>,
     /// Tool names refused because two servers exposed the same raw name.
     pub mcp_conflicts: Vec<String>,
     /// Active hooks.
@@ -248,6 +250,7 @@ impl CommandContext {
             mcp_connected: false,
             mcp_servers: Vec::new(),
             plugin_components: Vec::new(),
+            plugin_themes: Vec::new(),
             mcp_conflicts: Vec::new(),
             active_hooks: 0,
             api_key_set: false,

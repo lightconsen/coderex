@@ -66,6 +66,7 @@ impl Tool for StructuredOutputTool {
         Ok(ToolOutput {
             output: out,
             is_display: true,
+            images: Vec::new(),
         })
     }
 }

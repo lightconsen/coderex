@@ -126,6 +126,7 @@ impl Tool for PowerShellTool {
         Ok(ToolOutput {
             output,
             is_display: true,
+            images: Vec::new(),
         })
     }
 }

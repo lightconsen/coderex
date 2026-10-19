@@ -57,6 +57,7 @@ impl Tool for BriefTool {
         Ok(ToolOutput {
             output: summary,
             is_display: true,
+            images: Vec::new(),
         })
     }
 }

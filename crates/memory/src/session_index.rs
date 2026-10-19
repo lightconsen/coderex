@@ -214,7 +214,13 @@ impl SessionIndex {
     ///
     /// Returns matching sessions ordered by last_active_at.
     pub fn search(&self, query: &str, limit: usize) -> Result<Vec<SessionMeta>, SessionIndexError> {
-        let search_term = format!("{}*", query);
+        // Prefix-match every token, not just the last: FTS treats `a b*` as a
+        // prefix query only for `b`, so a multi-word search was asymmetric.
+        let search_term = query
+            .split_whitespace()
+            .map(|token| format!("{}*", token.trim_end_matches('*')))
+            .collect::<Vec<_>>()
+            .join(" ");
         let mut stmt = self.conn.prepare(
             "SELECT s.* FROM sessions s
              WHERE s.session_id IN (

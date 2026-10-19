@@ -385,35 +385,6 @@ impl LongTermStore {
         }
         Ok(())
     }
-
-    /// Recursively collect all hierarchical keys.
-    #[allow(dead_code)]
-    fn collect_keys(
-        &self,
-        dir: &Path,
-        current: &mut Vec<String>,
-        keys: &mut Vec<MemoryKey>,
-    ) -> std::io::Result<()> {
-        if !dir.exists() {
-            return Ok(());
-        }
-        for entry in std::fs::read_dir(dir)? {
-            let entry = entry?;
-            let path = entry.path();
-            let name = entry.file_name().to_string_lossy().to_string();
-            if path.is_dir() {
-                current.push(name);
-                self.collect_keys(&path, current, keys)?;
-                current.pop();
-            } else if name.ends_with(".json") {
-                let stem = name.strip_suffix(".json").unwrap_or(&name);
-                let mut segments = current.clone();
-                segments.push(stem.to_string());
-                keys.push(MemoryKey::from_segments(segments));
-            }
-        }
-        Ok(())
-    }
 }
 
 #[cfg(test)]

@@ -425,6 +425,7 @@ impl Tool for WorkflowTool {
         Ok(ToolOutput {
             output: report,
             is_display: true,
+            images: Vec::new(),
         })
     }
 }

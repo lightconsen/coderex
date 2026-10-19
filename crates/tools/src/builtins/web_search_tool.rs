@@ -106,6 +106,7 @@ impl Tool for WebSearchTool {
         Ok(ToolOutput {
             output,
             is_display: true,
+            images: Vec::new(),
         })
     }
 }

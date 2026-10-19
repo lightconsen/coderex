@@ -94,6 +94,7 @@ impl Tool for AskUserQuestionTool {
         Ok(ToolOutput {
             output: serde_json::json!({ "answers": answers }).to_string(),
             is_display: true,
+            images: Vec::new(),
         })
     }
 }

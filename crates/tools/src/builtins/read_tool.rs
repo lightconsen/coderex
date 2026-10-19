@@ -19,6 +19,9 @@ const DEFAULT_LINE_LIMIT: usize = 2000;
 /// Maximum number of characters to display before truncation.
 const MAX_DISPLAY_CHARS: usize = 10000;
 
+/// Largest image forwarded to the model as an image block (5 MiB decoded).
+const MAX_FORWARDED_IMAGE_BYTES: usize = 5 * 1024 * 1024;
+
 /// Read file contents — text, images as base64, or PDF text extraction.
 #[derive(Debug)]
 pub struct ReadTool;
@@ -113,11 +116,13 @@ impl Tool for ReadTool {
                     excerpt.len() - MAX_DISPLAY_CHARS
                 ),
                 is_display: true,
+                images: Vec::new(),
             })
         } else {
             Ok(ToolOutput {
                 output: excerpt,
                 is_display: true,
+                images: Vec::new(),
             })
         }
     }
@@ -172,11 +177,41 @@ fn read_image(path: &PathBuf, ext: &str) -> Result<ToolOutput, ToolError> {
         _ => "application/octet-stream",
     };
 
+    // The provider accepts these formats as image blocks. SVG/BMP/ICO have no
+    // supported media type there, so they stay inline text.
+    let forwardable = matches!(
+        mime,
+        "image/png" | "image/jpeg" | "image/gif" | "image/webp"
+    );
+    if forwardable && bytes.len() <= MAX_FORWARDED_IMAGE_BYTES {
+        let b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &bytes);
+        return Ok(ToolOutput {
+            output: format!("[image: {mime}, {} bytes]", bytes.len()),
+            is_display: true,
+            images: vec![coderex_core::types::ImageBlock {
+                media_type: mime.to_string(),
+                data: b64,
+            }],
+        });
+    }
+    if forwardable {
+        return Ok(ToolOutput {
+            output: format!(
+                "[image: {mime}, {} bytes] not forwarded: exceeds the {} MiB image limit",
+                bytes.len(),
+                MAX_FORWARDED_IMAGE_BYTES / (1024 * 1024)
+            ),
+            is_display: true,
+            images: Vec::new(),
+        });
+    }
+
     let b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &bytes);
 
     Ok(ToolOutput {
         output: format!("<image>data:{mime};base64,{b64}</image>"),
         is_display: true,
+        images: Vec::new(),
     })
 }
 
@@ -266,8 +301,13 @@ mod tests {
             .execute(test_input("img.png"), test_ctx(tmp.path()))
             .await
             .unwrap();
-        assert!(output.output.starts_with("<image>data:image/png;base64,"));
-        assert!(output.output.ends_with("</image>"));
+        assert_eq!(output.images.len(), 1, "the image was not forwarded");
+        assert_eq!(output.images[0].media_type, "image/png");
+        assert!(
+            output.output.starts_with("[image: image/png,"),
+            "{}",
+            output.output
+        );
     }
 
     #[tokio::test]

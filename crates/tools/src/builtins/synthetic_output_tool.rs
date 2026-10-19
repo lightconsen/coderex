@@ -54,6 +54,7 @@ impl Tool for SyntheticOutputTool {
         Ok(ToolOutput {
             output: formatted,
             is_display: true,
+            images: Vec::new(),
         })
     }
 }

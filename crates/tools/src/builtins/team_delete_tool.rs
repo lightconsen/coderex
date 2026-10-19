@@ -61,6 +61,7 @@ impl Tool for TeamDeleteTool {
         Ok(ToolOutput {
             output: format!("deleted {team_id}"),
             is_display: true,
+            images: Vec::new(),
         })
     }
 }

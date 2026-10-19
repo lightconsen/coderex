@@ -451,6 +451,7 @@ mod tests {
             Ok(ToolOutput {
                 output: String::new(),
                 is_display: false,
+                images: Vec::new(),
             })
         }
     }
@@ -575,7 +576,9 @@ mod tests {
             .await
             .unwrap();
         match result {
-            PermissionResult::Deny { reason } => assert!(reason.contains("no writes here"), "{reason}"),
+            PermissionResult::Deny { reason } => {
+                assert!(reason.contains("no writes here"), "{reason}")
+            }
             other => panic!("deny must win over the exemption, got {other:?}"),
         }
     }

@@ -71,6 +71,7 @@ impl Tool for TaskCreateTool {
         Ok(ToolOutput {
             output: id,
             is_display: true,
+            images: Vec::new(),
         })
     }
 }

@@ -156,10 +156,12 @@ async fn authenticate_with(
         }
     }
     let client_id = client_id.unwrap_or_else(|| "coderex-cli".into());
-    let auth_method =
-        select_client_auth_method(&discovery.token_endpoint_auth_methods_supported, client_secret.is_some())
-            .unwrap_or("none")
-            .to_string();
+    let auth_method = select_client_auth_method(
+        &discovery.token_endpoint_auth_methods_supported,
+        client_secret.is_some(),
+    )
+    .unwrap_or("none")
+    .to_string();
     let resource = discovery.resource(&server_url);
 
     let authorization_endpoint = [
@@ -415,6 +417,7 @@ async fn authenticate_with(
     Ok(ToolOutput {
         output: output.to_string(),
         is_display: true,
+        images: Vec::new(),
     })
 }
 
@@ -467,6 +470,7 @@ fn pending_output(auth_url: &str, code_verifier: &str, state: &str, note: &str) 
         })
         .to_string(),
         is_display: true,
+        images: Vec::new(),
     }
 }
 
@@ -631,9 +635,7 @@ impl DiscoveredEndpoints {
                 .token_endpoint_auth_methods_supported
                 .clone(),
             grant_types_supported: entry.grant_types_supported.clone(),
-            code_challenge_methods_supported: entry
-                .code_challenge_methods_supported
-                .clone(),
+            code_challenge_methods_supported: entry.code_challenge_methods_supported.clone(),
             protected_resource: entry.protected_resource.clone(),
             resource_metadata_url: entry.resource_metadata_url.clone(),
             resource_metadata_etag: entry.resource_metadata_etag.clone(),
@@ -722,10 +724,7 @@ impl IssuerMetadataEntry {
 /// secret is available (it keeps the secret out of logs and bodies), `none` is
 /// the public-client default, and `None` means no advertised method fits the
 /// credentials on hand.
-fn select_client_auth_method(
-    advertised: &[String],
-    has_secret: bool,
-) -> Option<&'static str> {
+fn select_client_auth_method(advertised: &[String], has_secret: bool) -> Option<&'static str> {
     let offers = |method: &str| advertised.is_empty() || advertised.iter().any(|m| m == method);
     if has_secret {
         if offers("client_secret_basic") {
@@ -932,12 +931,18 @@ async fn fetch_protected_resource(
     let entry = load_token_entry(persistence, server_url);
     let now = chrono::Utc::now().timestamp();
     if let Some(entry) = &entry {
-        if let (Some(metadata), Some(expires_at)) =
-            (&entry.protected_resource, entry.resource_metadata_expires_at)
-        {
+        if let (Some(metadata), Some(expires_at)) = (
+            &entry.protected_resource,
+            entry.resource_metadata_expires_at,
+        ) {
             if now < expires_at {
                 if let Some(url) = entry.resource_metadata_url.clone() {
-                    return Some((metadata.clone(), url, entry.resource_metadata_etag.clone(), 0));
+                    return Some((
+                        metadata.clone(),
+                        url,
+                        entry.resource_metadata_etag.clone(),
+                        0,
+                    ));
                 }
             }
         }
@@ -1019,9 +1024,7 @@ async fn fetch_issuer_metadata(
                 continue;
             };
             let mut entry = cached.clone();
-            entry.expires_at = Some(
-                now.saturating_add(i64::try_from(max_age).unwrap_or(i64::MAX)),
-            );
+            entry.expires_at = Some(now.saturating_add(i64::try_from(max_age).unwrap_or(i64::MAX)));
             entry.etag = etag;
             entry.source_url = Some(candidate);
             return Some((entry.clone().into_discovery(), entry));
@@ -1078,16 +1081,10 @@ async fn fetch_issuer_metadata(
                 .and_then(|v| v.as_str())
                 .map(String::from),
             scopes_supported: strings("scopes_supported"),
-            token_endpoint_auth_methods_supported: strings(
-                "token_endpoint_auth_methods_supported",
-            ),
+            token_endpoint_auth_methods_supported: strings("token_endpoint_auth_methods_supported"),
             grant_types_supported: strings("grant_types_supported"),
-            code_challenge_methods_supported: strings(
-                "code_challenge_methods_supported",
-            ),
-            expires_at: Some(
-                now.saturating_add(i64::try_from(max_age).unwrap_or(i64::MAX)),
-            ),
+            code_challenge_methods_supported: strings("code_challenge_methods_supported"),
+            expires_at: Some(now.saturating_add(i64::try_from(max_age).unwrap_or(i64::MAX))),
             etag,
             source_url: Some(candidate),
         };
@@ -1498,7 +1495,9 @@ fn load_token_store(persistence: &TokenPersistence) -> Result<TokenStore, String
 
 fn save_token_store(persistence: &TokenPersistence, store: &TokenStore) -> Result<(), String> {
     let content = serde_json::to_string_pretty(store).map_err(|e| format!("serialize: {e}"))?;
-    persistence.save(&content).map_err(|e| format!("write: {e}"))
+    persistence
+        .save(&content)
+        .map_err(|e| format!("write: {e}"))
 }
 
 /// The persisted entry for one server, if the store has one.
@@ -1523,13 +1522,8 @@ fn entry_for<'a>(
     {
         &mut store.states[index]
     } else {
-        store
-            .states
-            .push(TokenEntry::blank(server_url, client_id));
-        store
-            .states
-            .last_mut()
-            .expect("an entry was just pushed")
+        store.states.push(TokenEntry::blank(server_url, client_id));
+        store.states.last_mut().expect("an entry was just pushed")
     }
 }
 
@@ -1659,8 +1653,7 @@ fn record_discovery_fields(entry: &mut TokenEntry, discovery: &DiscoveredEndpoin
         entry.grant_types_supported = discovery.grant_types_supported.clone();
     }
     if !discovery.code_challenge_methods_supported.is_empty() {
-        entry.code_challenge_methods_supported =
-            discovery.code_challenge_methods_supported.clone();
+        entry.code_challenge_methods_supported = discovery.code_challenge_methods_supported.clone();
     }
     if let Some(metadata) = &discovery.protected_resource {
         entry.protected_resource = Some(metadata.clone());
@@ -1773,8 +1766,8 @@ fn cache_discovery(
         }
         cached.expires_at = discovery_expires_at;
         if cached.source_url.is_none() {
-            cached.source_url = discovery_candidates(&issuer)
-                .and_then(|candidates| candidates.into_iter().next());
+            cached.source_url =
+                discovery_candidates(&issuer).and_then(|candidates| candidates.into_iter().next());
         }
     }
     save_token_store(persistence, &store)
@@ -2297,8 +2290,12 @@ mod tests {
         assert_eq!(parsed["authenticated"], true, "{parsed}");
 
         let (probes, exchange) = handle.join().unwrap();
-        assert!(probes.iter().any(|probe| probe
-            .starts_with("GET /.well-known/oauth-authorization-server ")), "{probes:?}");
+        assert!(
+            probes
+                .iter()
+                .any(|probe| probe.starts_with("GET /.well-known/oauth-authorization-server ")),
+            "{probes:?}"
+        );
         assert!(
             probes
                 .iter()
@@ -2386,7 +2383,10 @@ mod tests {
             pending["auth_url"]
         );
         let query: HashMap<String, String> = auth_url.query_pairs().into_owned().collect();
-        assert_eq!(query.get("client_id").map(String::as_str), Some("coderex-cli"));
+        assert_eq!(
+            query.get("client_id").map(String::as_str),
+            Some("coderex-cli")
+        );
         assert_eq!(
             query.get("code_challenge_method").map(String::as_str),
             Some("S256")
@@ -2414,8 +2414,7 @@ mod tests {
 
         let resource_request = resource_handle.join().unwrap();
         assert!(
-            resource_request
-                .starts_with("GET /.well-known/oauth-protected-resource/mcp "),
+            resource_request.starts_with("GET /.well-known/oauth-protected-resource/mcp "),
             "the path-inserted protected-resource document was not fetched: {resource_request}"
         );
 
@@ -2541,7 +2540,11 @@ mod tests {
         .unwrap();
 
         let (registrations, exchange) = handle.join().unwrap();
-        assert_eq!(registrations.len(), 1, "a stored client was registered again");
+        assert_eq!(
+            registrations.len(),
+            1,
+            "a stored client was registered again"
+        );
         let body = registrations[0]
             .split_once("\r\n\r\n")
             .map(|(_, body)| body)
@@ -2562,15 +2565,12 @@ mod tests {
 
         // The secret travels in the header, not the body.
         use base64::Engine;
-        let credentials = base64::engine::general_purpose::STANDARD
-            .encode("dyn-client:dyn-secret");
+        let credentials = base64::engine::general_purpose::STANDARD.encode("dyn-client:dyn-secret");
         assert!(
-            exchange
-                .to_ascii_lowercase()
-                .contains(&format!(
-                    "\r\nauthorization: basic {}",
-                    credentials.to_ascii_lowercase()
-                )),
+            exchange.to_ascii_lowercase().contains(&format!(
+                "\r\nauthorization: basic {}",
+                credentials.to_ascii_lowercase()
+            )),
             "the registered client was not used for basic auth: {exchange}"
         );
         assert_eq!(form_param(&exchange, "client_id"), None);
@@ -2655,7 +2655,10 @@ mod tests {
             registration["token_endpoint_auth_method"],
             "client_secret_post"
         );
-        assert_eq!(form_param(&exchange, "client_id").as_deref(), Some("post-client"));
+        assert_eq!(
+            form_param(&exchange, "client_id").as_deref(),
+            Some("post-client")
+        );
         assert_eq!(
             form_param(&exchange, "client_secret").as_deref(),
             Some("post-secret")

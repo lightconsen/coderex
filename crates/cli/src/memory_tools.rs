@@ -94,6 +94,7 @@ impl Tool for MemoryToolAdapter {
             .map(|output| ToolOutput {
                 output,
                 is_display: true,
+                images: Vec::new(),
             })
             .map_err(|error| ToolError::InvalidInput {
                 message: error.to_string(),

@@ -512,7 +512,7 @@ impl CoreToolExecutor for RegistryToolDispatcher {
                     tool_call_id: tool_call_id.to_string(),
                     output: output.output,
                     is_error: false,
-                    images: Vec::new(),
+                    images: output.images,
                 },
             },
             Err(err) => {
@@ -732,6 +732,7 @@ mod tests {
             Ok(ToolOutput {
                 output: String::new(),
                 is_display: false,
+                images: Vec::new(),
             })
         }
     }
@@ -766,6 +767,42 @@ mod tests {
             Ok(ToolOutput {
                 output: "tool is disabled".into(),
                 is_display: true,
+                images: Vec::new(),
+            })
+        }
+    }
+
+    /// A tool that returns an image, as an MCP image result does.
+    struct ImageTool;
+
+    #[async_trait::async_trait]
+    impl Tool for ImageTool {
+        fn descriptor(&self) -> ToolDescriptor {
+            ToolDescriptor {
+                name: "image_tool".into(),
+                tier: ToolTier::Baseline,
+                input_schema: serde_json::json!({"type": "object", "properties": {}}),
+                output_schema: serde_json::json!({}),
+                requires_approval: false,
+                is_enabled: true,
+                is_read_only: true,
+                is_concurrency_safe: true,
+                interrupt_behavior: InterruptBehavior::RunToCompletion,
+            }
+        }
+
+        async fn execute(
+            &self,
+            _input: ToolInput,
+            _ctx: ToolContext<'_>,
+        ) -> Result<ToolOutput, ToolError> {
+            Ok(ToolOutput {
+                output: "[image: image/png, 4 bytes decoded]".into(),
+                is_display: false,
+                images: vec![coderex_core::types::ImageBlock {
+                    media_type: "image/png".into(),
+                    data: "AAAA".into(),
+                }],
             })
         }
     }
@@ -774,6 +811,27 @@ mod tests {
         let mut registry = ToolRegistry::new();
         registry.register(Arc::new(EchoTool));
         Arc::new(registry)
+    }
+
+    /// Images returned by a tool survive the dispatcher: this is the path an
+    /// MCP image result takes to the provider.
+    #[tokio::test]
+    async fn tool_images_reach_the_tool_result() {
+        let mut registry = ToolRegistry::new();
+        registry.register(Arc::new(ImageTool));
+        let dispatcher = RegistryToolDispatcher::new(
+            Arc::new(registry),
+            Arc::new(InnerExecutor::new(ExecutionConfig::default())),
+            ExecutionContext::Normal,
+            PathBuf::from("/tmp"),
+        );
+        let outcome = dispatcher
+            .execute("call-1", "image_tool", &serde_json::json!({}))
+            .await;
+        assert!(!outcome.result.is_error, "{:?}", outcome.result);
+        assert_eq!(outcome.result.images.len(), 1);
+        assert_eq!(outcome.result.images[0].media_type, "image/png");
+        assert_eq!(outcome.result.images[0].data, "AAAA");
     }
 
     /// What the model is told about is what it can call: a disabled tool is not
@@ -1228,6 +1286,7 @@ mod tests {
             Ok(crate::context::ToolOutput {
                 output: "ran".into(),
                 is_display: false,
+                images: Vec::new(),
             })
         }
     }

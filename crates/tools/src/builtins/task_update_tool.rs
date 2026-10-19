@@ -67,6 +67,7 @@ impl Tool for TaskUpdateTool {
         Ok(ToolOutput {
             output: if ok { "true" } else { "false" }.to_string(),
             is_display: true,
+            images: Vec::new(),
         })
     }
 }

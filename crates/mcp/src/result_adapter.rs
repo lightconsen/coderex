@@ -121,7 +121,10 @@ fn push_image(mime: &str, data: &str, images: &mut Vec<ImageBlock>) -> String {
     if data.is_empty() {
         return format!("[image: {mime}, no data]");
     }
-    let bytes = decoded_len(data);
+    let Some(data) = normalize_base64(data) else {
+        return format!("[image: {mime}, invalid base64; omitted]");
+    };
+    let bytes = decoded_len(&data);
     if bytes > MAX_IMAGE_BYTES {
         return format!(
             "[image: {mime}, {} decoded] image skipped: exceeds the {} MiB limit",
@@ -131,9 +134,49 @@ fn push_image(mime: &str, data: &str, images: &mut Vec<ImageBlock>) -> String {
     }
     images.push(ImageBlock {
         media_type: mime.to_string(),
-        data: data.to_string(),
+        data,
     });
     format!("[image: {mime}, {bytes} bytes decoded]")
+}
+
+/// Normalize a base64 payload, or say it is not one.
+///
+/// Strips a `data:…;base64,` prefix and whitespace, converts the URL-safe
+/// alphabet to the standard one, and checks the shape. A provider rejects a
+/// `tool_result` whose image data is not valid base64, so a malformed payload
+/// is reported in text instead of being forwarded.
+fn normalize_base64(data: &str) -> Option<String> {
+    let data = data.trim();
+    let data = data
+        .strip_prefix("data:")
+        .and_then(|rest| rest.split_once(";base64,").map(|(_, payload)| payload))
+        .unwrap_or(data);
+    let mut cleaned: String = data
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .map(|c| match c {
+            '-' => '+',
+            '_' => '/',
+            other => other,
+        })
+        .collect();
+    if cleaned.is_empty() {
+        return None;
+    }
+    if !cleaned
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '+' || c == '/' || c == '=')
+    {
+        return None;
+    }
+    let without_padding = cleaned.trim_end_matches('=');
+    if without_padding.len() % 4 == 1 {
+        return None;
+    }
+    while !cleaned.len().is_multiple_of(4) {
+        cleaned.push('=');
+    }
+    Some(cleaned)
 }
 
 /// How many bytes a base64 payload decodes to.
@@ -254,6 +297,29 @@ mod tests {
             "no base64 was inlined: {}",
             tr.output
         );
+    }
+
+    #[test]
+    fn image_base64_is_normalized_and_malformed_data_is_omitted() {
+        let data_uri = serde_json::json!({
+            "content": [{
+                "type": "image",
+                "data": "data:image/png;base64,QUJD",
+                "mimeType": "image/png"
+            }],
+            "isError": false
+        });
+        let tr = McpResultAdapter::adapt("call-1", &data_uri);
+        assert_eq!(tr.images.len(), 1);
+        assert_eq!(tr.images[0].data, "QUJD", "the data URI prefix is stripped");
+
+        let malformed = serde_json::json!({
+            "content": [{"type": "image", "data": "not base64!!", "mimeType": "image/png"}],
+            "isError": false
+        });
+        let tr = McpResultAdapter::adapt("call-2", &malformed);
+        assert!(tr.images.is_empty());
+        assert!(tr.output.contains("invalid base64"), "{}", tr.output);
     }
 
     #[test]

@@ -43,6 +43,7 @@ impl Tool for ReplTool {
         Ok(ToolOutput {
             output: "REPL commands are handled by the session interface".to_string(),
             is_display: true,
+            images: Vec::new(),
         })
     }
 }

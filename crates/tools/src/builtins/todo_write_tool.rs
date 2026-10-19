@@ -86,6 +86,7 @@ impl Tool for TodoWriteTool {
         Ok(ToolOutput {
             output: format!("Wrote {count} todo(s)"),
             is_display: true,
+            images: Vec::new(),
         })
     }
 }

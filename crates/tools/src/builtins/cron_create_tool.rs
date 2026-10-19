@@ -68,6 +68,7 @@ impl Tool for CronCreateTool {
         Ok(ToolOutput {
             output: id,
             is_display: true,
+            images: Vec::new(),
         })
     }
 }

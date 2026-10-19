@@ -2,7 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::Notify;
 use tokio::time::Duration;
 
@@ -52,12 +52,6 @@ pub struct Heartbeat {
     total_beats: u64,
     /// Last successful beat timestamp (epoch seconds).
     last_success: Option<i64>,
-    /// Whether the heartbeat is actively running.
-    #[allow(dead_code)]
-    running: AtomicBool,
-    /// Beat counter (atomic for cross-thread access).
-    #[allow(dead_code)]
-    beat_count: AtomicU64,
 }
 
 impl Heartbeat {
@@ -69,8 +63,6 @@ impl Heartbeat {
             consecutive_failures: 0,
             total_beats: 0,
             last_success: None,
-            running: AtomicBool::new(false),
-            beat_count: AtomicU64::new(0),
         }
     }
 

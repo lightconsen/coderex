@@ -93,6 +93,7 @@ impl Tool for McpTool {
         Ok(ToolOutput {
             output: adapted.output,
             is_display: false,
+            images: adapted.images,
         })
     }
 }

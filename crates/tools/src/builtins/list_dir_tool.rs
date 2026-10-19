@@ -89,6 +89,7 @@ impl Tool for ListDirTool {
         Ok(ToolOutput {
             output: entries.join("\n"),
             is_display: true,
+            images: Vec::new(),
         })
     }
 }

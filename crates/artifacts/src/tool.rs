@@ -159,9 +159,15 @@ fn actions_of(family: Family) -> &'static [&'static str] {
 fn is_mutating(family: Family, action: &str) -> bool {
     match family {
         Family::Artifact => {
-            matches!(action, "publish" | "delete" | "upload_asset" | "delete_asset")
+            matches!(
+                action,
+                "publish" | "delete" | "upload_asset" | "delete_asset"
+            )
         }
-        Family::Data => matches!(action, "set" | "update" | "delete" | "str_replace" | "batch"),
+        Family::Data => matches!(
+            action,
+            "set" | "update" | "delete" | "str_replace" | "batch"
+        ),
         Family::Comments => matches!(action, "add" | "reply" | "resolve"),
         Family::Check => false,
     }
@@ -838,6 +844,7 @@ impl Tool for ArtifactTool {
         Ok(ToolOutput {
             output,
             is_display: true,
+            images: Vec::new(),
         })
     }
 }

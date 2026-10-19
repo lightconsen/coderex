@@ -53,6 +53,7 @@ impl Tool for CronDeleteTool {
         Ok(ToolOutput {
             output: if deleted { "true" } else { "false" }.to_string(),
             is_display: true,
+            images: Vec::new(),
         })
     }
 }

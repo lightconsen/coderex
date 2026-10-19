@@ -240,6 +240,7 @@ mod tests {
             Ok(ToolOutput {
                 output: self.name.to_string(),
                 is_display: false,
+                images: Vec::new(),
             })
         }
     }
@@ -346,6 +347,7 @@ mod tests {
             Ok(ToolOutput {
                 output: self.output.clone(),
                 is_display: false,
+                images: Vec::new(),
             })
         }
     }

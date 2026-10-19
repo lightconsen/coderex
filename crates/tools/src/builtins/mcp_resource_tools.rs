@@ -82,6 +82,7 @@ impl Tool for ListMcpResourcesTool {
         Ok(ToolOutput {
             output: serde_json::to_string_pretty(&json).unwrap_or_else(|_| "[]".into()),
             is_display: true,
+            images: Vec::new(),
         })
     }
 }
@@ -132,6 +133,7 @@ impl Tool for ReadMcpResourceTool {
         Ok(ToolOutput {
             output: content,
             is_display: true,
+            images: Vec::new(),
         })
     }
 }

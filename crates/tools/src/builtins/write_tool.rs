@@ -82,6 +82,7 @@ impl Tool for WriteTool {
         Ok(ToolOutput {
             output: format!("Wrote {bytes} bytes to {path}"),
             is_display: true,
+            images: Vec::new(),
         })
     }
 }

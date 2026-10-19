@@ -98,6 +98,7 @@ impl Tool for ChromeListTabsTool {
         Ok(ToolOutput {
             output: format!("Open tabs:\n{json}"),
             is_display: true,
+            images: Vec::new(),
         })
     }
 }
@@ -158,6 +159,7 @@ impl Tool for ChromeNavigateTool {
         Ok(ToolOutput {
             output: format!("Navigated to: {url}\nDebugger: {ws_url}"),
             is_display: true,
+            images: Vec::new(),
         })
     }
 }
@@ -217,6 +219,7 @@ impl Tool for ChromeExecuteJsTool {
         Ok(ToolOutput {
             output,
             is_display: true,
+            images: Vec::new(),
         })
     }
 }
@@ -273,6 +276,7 @@ impl Tool for ChromeScreenshotTool {
                 b64.len()
             ),
             is_display: false,
+            images: Vec::new(),
         })
     }
 }
@@ -329,6 +333,7 @@ impl Tool for ChromeGetContentTool {
         Ok(ToolOutput {
             output: text,
             is_display: true,
+            images: Vec::new(),
         })
     }
 }

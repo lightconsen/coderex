@@ -310,6 +310,7 @@ impl coderex_tools::Tool for TeamCreateWithState {
         Ok(coderex_tools::ToolOutput {
             output: team_id,
             is_display: true,
+            images: Vec::new(),
         })
     }
 }
@@ -351,6 +352,7 @@ impl coderex_tools::Tool for TeamDeleteWithState {
         Ok(coderex_tools::ToolOutput {
             output: format!("deleted {team_id}"),
             is_display: true,
+            images: Vec::new(),
         })
     }
 }
@@ -390,6 +392,7 @@ impl coderex_tools::Tool for EnterWorktreeWithState {
         Ok(coderex_tools::ToolOutput {
             output: path,
             is_display: true,
+            images: Vec::new(),
         })
     }
 }
@@ -424,6 +427,7 @@ impl coderex_tools::Tool for ExitWorktreeWithState {
         Ok(coderex_tools::ToolOutput {
             output: "exited".into(),
             is_display: true,
+            images: Vec::new(),
         })
     }
 }
@@ -463,6 +467,7 @@ impl coderex_tools::Tool for ListMcpResourcesWithState {
         Ok(coderex_tools::ToolOutput {
             output: serde_json::to_string_pretty(&resources).unwrap_or_else(|_| "[]".into()),
             is_display: true,
+            images: Vec::new(),
         })
     }
 }
@@ -582,6 +587,7 @@ impl coderex_tools::Tool for ReadMcpResourceWithState {
         Ok(coderex_tools::ToolOutput {
             output: content,
             is_display: true,
+            images: Vec::new(),
         })
     }
 }
@@ -842,7 +848,17 @@ fn protocol_frame(
         EngineEvent::ToolCallEnd { id, result } => ProtocolMessage::User(UserFrame {
             // The tool result is a user-side message in the protocol: it is
             // what the model is sent back, and the host needs to see it there.
-            message: MessageBody::user(vec![protocol::tool_result_block(id, &result.output)]),
+            // Images travel with it, or a stream-json consumer would see less
+            // than the model did.
+            message: MessageBody::user(vec![protocol::tool_result_block_with_images(
+                id,
+                &result.output,
+                &result
+                    .images
+                    .iter()
+                    .map(|image| (image.media_type.clone(), image.data.clone()))
+                    .collect::<Vec<_>>(),
+            )]),
             parent_tool_use_id: None,
             session_id: session_id.to_string(),
         }),
@@ -2450,6 +2466,37 @@ impl ReplLoop {
             }
         }
         self.plugin_monitors = monitors;
+        // The first configured server becomes the LSP tool's default. The
+        // reference shape is `{command, args?, root_uri?}`; an `.lsp.json`
+        // path was already read into this map by the plugin crate.
+        let first_server = lsp_servers.iter().find_map(|(_, config)| {
+            let command = config.get("command")?.as_str()?.to_string();
+            let args = config
+                .get("args")
+                .and_then(serde_json::Value::as_array)
+                .map(|args| {
+                    args.iter()
+                        .filter_map(|arg| arg.as_str().map(str::to_string))
+                        .collect()
+                })
+                .unwrap_or_default();
+            let root_uri = config
+                .get("root_uri")
+                .or_else(|| config.get("rootUri"))
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string);
+            Some(PluginLspDefaults {
+                command,
+                args,
+                root_uri,
+            })
+        });
+        if first_server.is_some() {
+            *self
+                .lsp_defaults
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = first_server;
+        }
         self.plugin_lsp_servers = lsp_servers;
         self.plugin_other_components = other;
     }
@@ -3222,6 +3269,18 @@ impl ReplLoop {
             session.title.as_deref(),
             &session.messages,
         );
+        session_resume::index_session_usage(
+            &self.cwd,
+            &session_id,
+            session.cost_usd,
+            i64::try_from(
+                session.usage.input_tokens
+                    + session.usage.output_tokens
+                    + session.usage.cache_read_tokens
+                    + session.usage.cache_creation_tokens,
+            )
+            .unwrap_or(i64::MAX),
+        );
     }
 
     fn clear_interactive_snapshot(&self, session_id: Option<&str>) {
@@ -3267,14 +3326,17 @@ impl ReplLoop {
         }
     }
 
-    fn resume_tui_session(
-        &mut self,
+    /// Resolve a `/resume` argument to a session id.
+    ///
+    /// An exact transcript id wins; anything else is a title/content fragment
+    /// resolved through the session index. One match is used, no match falls
+    /// through (so the caller reports "no transcript"), and several matches
+    /// list the candidates instead of guessing.
+    fn resolve_resume_session_id(
+        &self,
         requested_session: Option<&str>,
-        ui_state: &mut coderex_ui::state::UiState,
     ) -> std::result::Result<String, String> {
-        let session_id = match requested_session {
-            // A title fragment resolves through the index; an exact id keeps
-            // the transcript path.
+        match requested_session {
             Some(requested)
                 if !session_resume::transcript_dir(&self.cwd)
                     .join(format!("{requested}.jsonl"))
@@ -3282,8 +3344,8 @@ impl ReplLoop {
             {
                 let matches = session_resume::search_sessions(&self.cwd, requested, 5);
                 match matches.as_slice() {
-                    [one] => one.session_id.clone(),
-                    [] => requested.to_string(),
+                    [one] => Ok(one.session_id.clone()),
+                    [] => Ok(requested.to_string()),
                     many => {
                         let listed = many
                             .iter()
@@ -3296,17 +3358,25 @@ impl ReplLoop {
                             })
                             .collect::<Vec<_>>()
                             .join("\n");
-                        return Err(format!(
+                        Err(format!(
                             "'{requested}' matches several sessions:\n{listed}\nUse the exact id."
-                        ));
+                        ))
                     }
                 }
             }
-            Some(requested) => requested.to_string(),
+            Some(requested) => Ok(requested.to_string()),
             None => session_resume::latest_session_id(&self.cwd).ok_or_else(|| {
                 "No previous sessions found in .coderex/transcripts for this workspace.".to_string()
-            })?,
-        };
+            }),
+        }
+    }
+
+    fn resume_tui_session(
+        &mut self,
+        requested_session: Option<&str>,
+        ui_state: &mut coderex_ui::state::UiState,
+    ) -> std::result::Result<String, String> {
+        let session_id = self.resolve_resume_session_id(requested_session)?;
         let (messages, snapshot) = self.load_session_state(&session_id, true)?;
         self.restore_session_into_ui(ui_state, &messages, snapshot.as_ref());
 
@@ -4602,11 +4672,55 @@ impl ReplLoop {
             }
         }
         let result = self.run_headless_turn(prompt).await;
+        // Headless runs used to leave no transcript behind, so `--print`
+        // sessions could not be resumed or found by `/resume`. Persist what
+        // the turn produced; slash-command-only runs are covered too.
+        self.persist_headless_session();
         if let Some(mut supervisor) = self.monitor_supervisor.take() {
             supervisor.stop().await;
         }
         self.stop_artifact_serving().await;
         result
+    }
+
+    /// Write the transcript and index entry for a headless session.
+    fn persist_headless_session(&self) {
+        if self.no_persistence {
+            return;
+        }
+        let Some(engine) = self.engine.as_ref() else {
+            return;
+        };
+        let session = engine.session();
+        if session.messages.is_empty() {
+            return;
+        }
+        let session_id = session.session_id.to_string();
+        let store = coderex_memory::transcript::TranscriptStore::new(
+            session_resume::transcript_dir(&self.cwd),
+        );
+        if let Err(error) = store.rewrite(&session_id, &session.messages) {
+            tracing::warn!(%error, "headless transcript was not written");
+            return;
+        }
+        session_resume::index_saved_session(
+            &self.cwd,
+            &session_id,
+            session.title.as_deref(),
+            &session.messages,
+        );
+        session_resume::index_session_usage(
+            &self.cwd,
+            &session_id,
+            session.cost_usd,
+            i64::try_from(
+                session.usage.input_tokens
+                    + session.usage.output_tokens
+                    + session.usage.cache_read_tokens
+                    + session.usage.cache_creation_tokens,
+            )
+            .unwrap_or(i64::MAX),
+        );
     }
 
     async fn run_headless_turn(&mut self, prompt: &str) -> Result<String> {
@@ -6712,34 +6826,16 @@ impl ReplLoop {
                     return Ok(());
                 }
                 "resume" => {
-                    // A title fragment resolves through the index; an exact
-                    // id goes straight to the transcript.
-                    let session_id = if args.is_empty() {
-                        session_resume::latest_session_id(&self.cwd).unwrap_or_default()
-                    } else if session_resume::transcript_dir(&self.cwd)
-                        .join(format!("{}.jsonl", args[0]))
-                        .exists()
-                    {
-                        args[0].clone()
-                    } else {
-                        let matches = session_resume::search_sessions(&self.cwd, &args[0], 5);
-                        match matches.as_slice() {
-                            [one] => one.session_id.clone(),
-                            [] => args[0].clone(),
-                            many => {
-                                writeln!(stdout, "'{}' matches several sessions:", args[0])?;
-                                for meta in many {
-                                    writeln!(
-                                        stdout,
-                                        "  {}  {}",
-                                        meta.session_id,
-                                        meta.ai_title.as_deref().unwrap_or("(untitled)")
-                                    )?;
-                                }
+                    // Same resolution as the TUI: exact id, unique fragment,
+                    // ambiguous (list candidates), or none.
+                    let session_id =
+                        match self.resolve_resume_session_id(args.first().map(String::as_str)) {
+                            Ok(session_id) => session_id,
+                            Err(message) => {
+                                writeln!(stdout, "{message}")?;
                                 return Ok(());
                             }
-                        }
-                    };
+                        };
                     if session_id.is_empty() {
                         writeln!(stdout, "No previous sessions found.")?;
                     } else {
@@ -7520,6 +7616,11 @@ impl ReplLoop {
             }
         }
         ctx.plugin_components = components;
+        ctx.plugin_themes = self
+            .plugin_themes
+            .iter()
+            .map(|(name, _)| name.clone())
+            .collect();
         // Remote environment variables live in their own file, never in
         // settings (a repository-controlled settings file must not be able to
         // inject environment variables).
@@ -7729,6 +7830,47 @@ mod tests {
         assert!(
             !ctx.mcp_connected,
             "a session with no MCP manager must report disconnected"
+        );
+    }
+
+    #[test]
+    fn resume_resolution_handles_exact_unique_ambiguous_and_missing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cwd = tmp.path().to_string_lossy().into_owned();
+        let repl = ReplLoop::new(cwd.clone(), ModelId::sonnet());
+
+        // An exact id needs only the transcript file.
+        let transcripts = session_resume::transcript_dir(&cwd);
+        std::fs::create_dir_all(&transcripts).unwrap();
+        std::fs::write(transcripts.join("sess-exact.jsonl"), "").unwrap();
+        assert_eq!(
+            repl.resolve_resume_session_id(Some("sess-exact")).unwrap(),
+            "sess-exact"
+        );
+
+        // A fragment resolves through the index.
+        session_resume::index_saved_session(&cwd, "sess-a", Some("deploy pipeline"), &[]);
+        assert_eq!(
+            repl.resolve_resume_session_id(Some("deploy")).unwrap(),
+            "sess-a"
+        );
+
+        // Two matches are listed, not guessed.
+        session_resume::index_saved_session(&cwd, "sess-b", Some("deploy rollback"), &[]);
+        let error = repl
+            .resolve_resume_session_id(Some("deploy"))
+            .expect_err("an ambiguous fragment must be refused");
+        assert!(error.contains("matches several"), "{error}");
+        assert!(
+            error.contains("sess-a") && error.contains("sess-b"),
+            "{error}"
+        );
+
+        // No match falls through to the transcript-load error path.
+        assert_eq!(
+            repl.resolve_resume_session_id(Some("nothing-matches"))
+                .unwrap(),
+            "nothing-matches"
         );
     }
 

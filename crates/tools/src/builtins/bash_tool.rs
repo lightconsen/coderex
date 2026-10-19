@@ -11,14 +11,13 @@ use std::time::Duration;
 
 use crate::context::{ToolError, ToolOutput};
 use crate::tool::{
-    Backgrounding, Tool, ToolContext, ToolDescriptor, ToolInput, ToolTier, JOB_SESSION_ID_KEY,
+    Backgrounding, JOB_SESSION_ID_KEY, Tool, ToolContext, ToolDescriptor, ToolInput, ToolTier,
 };
 use async_trait::async_trait;
 use coderex_core::job_record::{JobKind, JobRecord, JobState, JobStore};
 use coderex_core::shell_security::BashAst;
 use coderex_core::task::now_ms;
 use tokio::process::Command;
-
 
 /// Build the shell command under the session's sandbox policy.
 ///
@@ -123,11 +122,9 @@ impl BashTool {
             // The handle keeps the platform sandbox alive for the child's
             // whole lifetime (a macOS profile, a Windows Job Object).
             let _sandbox_keepalive = sandbox_handle;
-            let result = tokio::time::timeout(
-                Duration::from_secs(timeout_secs),
-                child.wait_with_output(),
-            )
-            .await;
+            let result =
+                tokio::time::timeout(Duration::from_secs(timeout_secs), child.wait_with_output())
+                    .await;
 
             let (state, exit_code, error, bytes) = match result {
                 Ok(Ok(output)) => {
@@ -147,9 +144,7 @@ impl BashTool {
                     };
                     (state, Some(code), error, bytes)
                 }
-                Ok(Err(error)) => {
-                    (JobState::Failed, None, Some(error.to_string()), Vec::new())
-                }
+                Ok(Err(error)) => (JobState::Failed, None, Some(error.to_string()), Vec::new()),
                 Err(_) => (
                     JobState::Failed,
                     None,
@@ -174,6 +169,7 @@ impl BashTool {
             })
             .to_string(),
             is_display: true,
+            images: Vec::new(),
         })
     }
 
@@ -344,6 +340,7 @@ impl Tool for BashTool {
         Ok(ToolOutput {
             output,
             is_display: true,
+            images: Vec::new(),
         })
     }
 }
@@ -675,7 +672,8 @@ mod tests {
         let planted = dir.join("coderex_planted_tool");
         std::fs::write(&planted, b"#!/bin/sh\necho planted\n").unwrap();
 
-        let error = crate::sandbox_shell::guard_program_origin("./coderex_planted_tool", &dir).unwrap_err();
+        let error =
+            crate::sandbox_shell::guard_program_origin("./coderex_planted_tool", &dir).unwrap_err();
         assert!(
             error
                 .to_string()
@@ -704,10 +702,7 @@ mod tests {
         }
     }
 
-    async fn wait_for_terminal(
-        store: &JobStore,
-        id: &str,
-    ) -> coderex_core::job_record::JobRecord {
+    async fn wait_for_terminal(store: &JobStore, id: &str) -> coderex_core::job_record::JobRecord {
         for _ in 0..200 {
             if let Ok(Some(record)) = store.load(id) {
                 if record.state != JobState::Running {
@@ -753,8 +748,9 @@ mod tests {
         assert!(done.ended_at_ms.is_some());
         assert!(done.ended_at_ms.unwrap() >= done.started_at_ms);
 
-        let captured = std::fs::read_to_string(dir.path().join(".coderex/jobs").join(format!("{id}.out")))
-            .unwrap();
+        let captured =
+            std::fs::read_to_string(dir.path().join(".coderex/jobs").join(format!("{id}.out")))
+                .unwrap();
         assert!(captured.contains("background-done"));
     }
 

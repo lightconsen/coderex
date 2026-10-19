@@ -59,6 +59,7 @@ impl Tool for TaskGetTool {
         Ok(ToolOutput {
             output,
             is_display: true,
+            images: Vec::new(),
         })
     }
 }

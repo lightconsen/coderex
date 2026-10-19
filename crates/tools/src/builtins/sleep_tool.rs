@@ -68,6 +68,7 @@ impl Tool for SleepTool {
         Ok(ToolOutput {
             output: format!("Slept for {duration_secs:.1}s"),
             is_display: true,
+            images: Vec::new(),
         })
     }
 }

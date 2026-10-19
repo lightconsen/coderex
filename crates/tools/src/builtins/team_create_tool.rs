@@ -76,6 +76,7 @@ impl Tool for TeamCreateTool {
         Ok(ToolOutput {
             output: team_id,
             is_display: true,
+            images: Vec::new(),
         })
     }
 }

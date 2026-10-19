@@ -195,6 +195,7 @@ impl Tool for WebFetchTool {
                      content type '{content_type}' is not text; refusing to return the body"
                 ),
                 is_display: true,
+                images: Vec::new(),
             });
         }
 
@@ -242,6 +243,7 @@ impl Tool for WebFetchTool {
         Ok(ToolOutput {
             output,
             is_display: true,
+            images: Vec::new(),
         })
     }
 }

@@ -109,6 +109,7 @@ impl Tool for TaskOutputTool {
         Ok(ToolOutput {
             output: truncated,
             is_display: true,
+            images: Vec::new(),
         })
     }
 }

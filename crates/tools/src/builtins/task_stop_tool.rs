@@ -56,6 +56,7 @@ impl Tool for TaskStopTool {
             return Ok(ToolOutput {
                 output: "false".to_string(),
                 is_display: true,
+                images: Vec::new(),
             });
         }
 
@@ -64,6 +65,7 @@ impl Tool for TaskStopTool {
         Ok(ToolOutput {
             output: if ok { "true" } else { "false" }.to_string(),
             is_display: true,
+            images: Vec::new(),
         })
     }
 }
