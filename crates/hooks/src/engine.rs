@@ -1741,6 +1741,17 @@ async fn execute_hook(
     // A hook that did not exit cleanly did not answer, even if it printed a
     // result first: the exit status is part of the answer.
     if exit_code != 0 {
+        // The exit status alone does not say *why* (a sandbox refusal, a
+        // missing interpreter, a failing command), so keep a bounded stderr
+        // excerpt with it.
+        let excerpt: String = stderr.chars().take(512).collect();
+        tracing::warn!(
+            hook = hook.label(),
+            event = input.event,
+            exit_code,
+            stderr = %excerpt.trim(),
+            "hook exited non-zero"
+        );
         return Err(HookError::ExecutionFailed(exit_code));
     }
 
