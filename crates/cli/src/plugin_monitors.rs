@@ -66,7 +66,7 @@ impl MonitorOwnership {
             // The cgroup reaches a `setsid()` descendant that the process
             // group does not; either kill counts as one.
             let cgroup = self.cgroup.as_ref().is_some_and(CgroupMemoryLimit::kill);
-            return self.tree.terminate() || cgroup;
+            self.tree.terminate() || cgroup
         }
         #[cfg(not(target_os = "linux"))]
         {
