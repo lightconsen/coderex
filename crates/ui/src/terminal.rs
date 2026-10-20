@@ -1022,6 +1022,24 @@ fn render_input(
             Style::default().fg(theme.dim),
         ));
     }
+    // Vim's mode line. The input line is single-row, so the badge is appended
+    // after the text rather than replacing the prompt: the prompt width stays
+    // two cells and the cursor math below is unchanged. `visual_anchor` is set
+    // the instant `v`/`V` is pressed, so the badge appears before any motion,
+    // matching Vim.
+    if input.visual_anchor.is_some() {
+        let label = if input.visual_linewise {
+            "-- VISUAL LINE --"
+        } else {
+            "-- VISUAL --"
+        };
+        spans.push(Span::styled(
+            format!("  {label}"),
+            Style::default()
+                .fg(theme.accent)
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
     let line = Line::from(spans);
     let paragraph = Paragraph::new(line);
     frame.render_widget(paragraph, area);
@@ -1482,6 +1500,49 @@ mod layout_tests {
             rows[input_y as usize].contains('❯'),
             "input line is not visible in compact mode (row {input_y}):\n{}",
             rows.join("\n")
+        );
+    }
+
+    /// A Visual selection must be visible in the TUI, not only in the buffer's
+    /// internal state: the input line carries the mode badge.
+    #[test]
+    fn input_line_shows_the_visual_mode_indicator() {
+        let mut state = UiState::default();
+        state.input.text = "hello".into();
+        state.input.cursor = 5;
+        state.input.start_visual(false);
+        let buffer = render_to_buffer(80, 12, &mut state);
+        let input_y = chunks_for(12, 0, false, false, false)[INPUT_IDX].y;
+        let row = row_text(&buffer, input_y);
+        assert!(
+            row.contains("-- VISUAL --"),
+            "characterwise Visual badge missing (row {input_y}): {row:?}"
+        );
+        assert!(
+            !row.contains("VISUAL LINE"),
+            "linewise badge shown for a characterwise selection: {row:?}"
+        );
+
+        // Linewise Visual mode gets its own label.
+        let mut state = UiState::default();
+        state.input.text = "hello".into();
+        state.input.cursor = 5;
+        state.input.start_visual(true);
+        let buffer = render_to_buffer(80, 12, &mut state);
+        let row = row_text(&buffer, input_y);
+        assert!(
+            row.contains("-- VISUAL LINE --"),
+            "linewise Visual badge missing (row {input_y}): {row:?}"
+        );
+
+        // With no selection there is no badge.
+        let mut state = UiState::default();
+        state.input.text = "hello".into();
+        let buffer = render_to_buffer(80, 12, &mut state);
+        let row = row_text(&buffer, input_y);
+        assert!(
+            !row.contains("VISUAL"),
+            "badge shown without a selection: {row:?}"
         );
     }
 

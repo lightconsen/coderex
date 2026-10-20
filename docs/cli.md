@@ -184,11 +184,18 @@ A comma-separated list applied on top of `CODEREX_FEATURE_FLAGS`:
   set; it is never dropped silently.
 - Some names are accepted for configuration compatibility but have no effect in
   this build: `streaming_tool_execution`, `tool_use_summaries`, `fast_mode`,
-  `coordinator_mode`, `history_snip`, `agent_triggers`, `bridge_mode`,
-  `daemon`, `buddy`, `context_collapse`, `terminal_panel`,
-  `kairos`, `team_collaboration`, and `auto_dream`. Enabling any of them logs
-  a warning at startup instead of implying behavior. `workflow_scripts`,
-  `voice_mode`, and the six command-availability flags do have consumers.
+  `coordinator_mode`, `history_snip`, `bridge_mode`, `daemon`, `buddy`,
+  `context_collapse`, `terminal_panel`, `kairos`, and `team_collaboration`.
+  Enabling any of them logs a warning at startup instead of implying behavior.
+  Several of these describe behavior that lives in `core::engine` (streaming
+  tool execution, tool-use summaries, compact-strategy selection), which this
+  build does not wire to a flag; the rest have no product at all.
+- These names do have consumers: `web_browser_tool` (gates the `WebFetch`
+  tool), `agent_triggers` (gates the agent-kind hook path — with it off a
+  configured `agent` hook is dropped at startup with a warning), `auto_dream`
+  (gates the auto-dream manager — with it off `/auto-dream` reports as
+  uninitialized), `workflow_scripts`, `voice_mode`, and the six
+  command-availability flags.
 
 ### `--from-pr URL`
 

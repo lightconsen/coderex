@@ -21,6 +21,7 @@ use coderex_core::types::{
     AgentLifecycleEvent, EngineEvent, Message, MessageContent, ModelId, Role, ToolCall, ToolResult,
 };
 use coderex_core::wire_adapter::engine_event_to_wire;
+use coderex_core::wire_protocol::{WireEvent, decode_event};
 use coderex_core::worktree::{WorktreeConfig, WorktreeManager};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -1453,6 +1454,70 @@ fn job_description(prefix: &str, text: &str) -> String {
 /// The only `SpawnOptions::isolation` value this manager can honor.
 const ISOLATION_WORKTREE: &str = "worktree";
 
+// ─── Agent Event Logs ────────────────────────────────────────────────────────
+
+/// Directory where per-agent NDJSON event logs are written.
+///
+/// The writer in [`run_agent_task`] and the reader [`read_agent_log`] share
+/// this one definition, so a log written by a session is always found by a
+/// reader in a later one.
+#[must_use]
+pub fn agent_log_dir() -> PathBuf {
+    home::home_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".coderex")
+        .join("agent_logs")
+}
+
+/// Path to one agent's NDJSON event log.
+#[must_use]
+pub fn agent_log_path(agent_id: &str) -> PathBuf {
+    agent_log_dir().join(format!("{agent_id}.jsonl"))
+}
+
+/// Read and decode an agent's NDJSON event log.
+///
+/// Events are returned in the order they were written. A missing file is an
+/// empty log — an agent that produced no events — rather than an error, so a
+/// caller can ask about any id without first checking whether it ran.
+pub fn read_agent_log(agent_id: &str) -> Result<Vec<WireEvent>, AgentError> {
+    read_agent_log_at(&agent_log_path(agent_id))
+}
+
+/// Read and decode an NDJSON event log from an explicit path.
+///
+/// Blank lines are skipped. A line that is not a valid event is a hard error:
+/// a truncated or corrupt log must be reported, not silently shortened, or a
+/// reader would believe it had seen the whole run.
+pub fn read_agent_log_at(path: &Path) -> Result<Vec<WireEvent>, AgentError> {
+    let content = match std::fs::read_to_string(path) {
+        Ok(content) => content,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => {
+            return Err(AgentError::Configuration(format!(
+                "could not read agent log {}: {error}",
+                path.display()
+            )));
+        }
+    };
+
+    let mut events = Vec::new();
+    for (index, line) in content.lines().enumerate() {
+        match decode_event(line) {
+            None => {}
+            Some(Ok(event)) => events.push(event),
+            Some(Err(error)) => {
+                return Err(AgentError::Configuration(format!(
+                    "malformed agent log line {} in {}: {error}",
+                    index + 1,
+                    path.display()
+                )));
+            }
+        }
+    }
+    Ok(events)
+}
+
 /// Reject spawn options this manager cannot honor.
 ///
 /// Both checks guard against the same failure mode: a request that is
@@ -1460,6 +1525,16 @@ const ISOLATION_WORKTREE: &str = "worktree";
 /// isolation believes the agent cannot touch their checkout; a caller that
 /// asked for environment variables believes the agent has them. Running the
 /// agent anyway, without either, is worse than refusing to spawn it.
+///
+/// `extra_env` is refused because there is nowhere honest to put it. A
+/// sub-agent runs in this process, so it has no child environment of its own.
+/// The two surfaces a per-call variable could ride on do not exist in this
+/// build: `ToolContext` (the object every tool call receives) carries
+/// `execution_context`, `cwd`, `extra` and `elicit_tx` but no environment map,
+/// and `SessionState` carries no environment either. The only working
+/// alternative is `std::env::set_var`, which is process-wide: it would leak
+/// into the parent and every other agent, the exact opposite of the
+/// isolation the caller asked for. So the request is refused, not faked.
 fn validate_spawn_options(options: &SpawnOptions) -> Result<(), AgentError> {
     if let Some(ref mode) = options.isolation {
         if !mode.eq_ignore_ascii_case(ISOLATION_WORKTREE) {
@@ -1476,9 +1551,10 @@ fn validate_spawn_options(options: &SpawnOptions) -> Result<(), AgentError> {
         keys.sort_unstable();
         return Err(AgentError::Configuration(format!(
             "extra_env is not supported for sub-agents (requested keys: {keys:?}); sub-agents run \
-             in the parent process, so there is no child environment to inject into, and setting \
-             process-wide variables would leak into the parent and other agents; refusing the \
-             spawn instead of ignoring the request"
+             in the parent process, so there is no child environment to inject into. Neither \
+             `ToolContext` nor `SessionState` carries a per-call environment, and setting \
+             process-wide variables with `std::env::set_var` would leak into the parent and other \
+             agents; refusing the spawn instead of ignoring the request"
         )));
     }
 
@@ -1626,12 +1702,10 @@ async fn run_agent_task(
         .as_ref()
         .and_then(|r| r.escalation_prompt.clone());
 
-    // Set up agent log file
-    let log_dir = home::home_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".coderex")
-        .join("agent_logs");
-    let log_path = log_dir.join(format!("{agent_id}.jsonl"));
+    // Set up agent log file. The directory and path come from the same
+    // helpers `read_agent_log` uses, so the writer and reader cannot drift.
+    let log_dir = agent_log_dir();
+    let log_path = agent_log_path(&agent_id);
 
     let fork_task = user_prompt.clone();
     let mut attempt_prompt = user_prompt;
@@ -2302,6 +2376,74 @@ mod tests {
         assert_eq!(all.recv().await.unwrap().agent_id, "agent-2");
     }
 
+    // ─── Agent event log reader ─────────────────────────────────────────────
+
+    /// The writer in `run_agent_task` and `read_agent_log` must agree on the
+    /// location, or a log written by one session is invisible to the next.
+    #[test]
+    fn agent_log_path_is_under_the_shared_log_dir() {
+        let path = agent_log_path("agent-7");
+        assert_eq!(path.file_name().unwrap(), "agent-7.jsonl");
+        assert_eq!(path.parent().unwrap(), agent_log_dir());
+    }
+
+    #[test]
+    fn read_agent_log_reads_written_events_in_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("agent-1.jsonl");
+        let first = WireEvent::TextDelta {
+            delta: "one".to_string(),
+        };
+        let second = WireEvent::Notification {
+            message: "two".to_string(),
+        };
+        let mut body = coderex_core::wire_protocol::encode_event(&first);
+        body.push_str(&coderex_core::wire_protocol::encode_event(&second));
+        std::fs::write(&path, body).unwrap();
+
+        let events = read_agent_log_at(&path).unwrap();
+        assert_eq!(events, vec![first, second]);
+    }
+
+    #[test]
+    fn read_agent_log_of_a_missing_agent_is_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("never-ran.jsonl");
+        assert!(read_agent_log_at(&path).unwrap().is_empty());
+    }
+
+    #[test]
+    fn read_agent_log_skips_blank_lines() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("agent-2.jsonl");
+        let event = WireEvent::TextDelta {
+            delta: "kept".to_string(),
+        };
+        let body = format!(
+            "\n{}\n\n",
+            coderex_core::wire_protocol::encode_event(&event).trim_end()
+        );
+        std::fs::write(&path, body).unwrap();
+
+        assert_eq!(read_agent_log_at(&path).unwrap(), vec![event]);
+    }
+
+    #[test]
+    fn read_agent_log_rejects_a_corrupt_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("agent-3.jsonl");
+        let good = coderex_core::wire_protocol::encode_event(&WireEvent::TextDelta {
+            delta: "ok".to_string(),
+        });
+        std::fs::write(&path, format!("{good}{{not json}}\n")).unwrap();
+
+        let error = read_agent_log_at(&path).unwrap_err();
+        assert!(
+            matches!(error, AgentError::Configuration(ref msg) if msg.contains("line 2")),
+            "corrupt log should name the bad line: {error:?}"
+        );
+    }
+
     #[tokio::test]
     async fn spawn_agent_creates_instance() {
         let mut mgr = make_manager();
@@ -2587,6 +2729,9 @@ mod tests {
 
         assert!(matches!(result, Err(AgentError::Configuration(_))));
         assert!(mgr.list_agents().is_empty());
+        // Refusing must not be done by leaking the variable into this process
+        // as a side effect of "trying": the parent environment is untouched.
+        assert!(std::env::var("SECRET").is_err());
     }
 
     #[test]

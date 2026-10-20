@@ -47,22 +47,37 @@ pub const KNOWN_FLAGS: &[&str] = &[
 /// parse error. Nothing in this build reads them, so [`FeatureFlags`] stores
 /// their parsed state but no behavior depends on it. See
 /// [`FeatureFlags::inert_flags`].
+///
+/// A name leaves this list only when a product path reads it. `web_browser_tool`
+/// gates the `WebFetch` tool (see `coderex_tools::required_feature_flag`),
+/// `agent_triggers` gates the agent-kind hook path, and `auto_dream` gates the
+/// auto-dream manager; all three now do something, so they are no longer here.
+///
+/// The remainder stay inert for one of two honest reasons:
+///
+/// - The behavior lives in `core::engine` (streaming tool execution, tool-use
+///   summaries, compact strategy selection), which is owned by another
+///   workstream in this build: `streaming_tool_execution`, `tool_use_summaries`,
+///   `history_snip`, `context_collapse`, `coordinator_mode`.
+/// - There is no product in this build at all: `fast_mode` (no separate fast
+///   model is wired), `bridge_mode` (the bridge worker is a subcommand, not a
+///   flag), `daemon` (the server is the `serve` subcommand), `buddy` (the
+///   module is behind the compile-time `buddy` cargo feature, which is off),
+///   `terminal_panel`, `kairos`, and `team_collaboration` (the engine accepts a
+///   team context but never reads it).
 const INERT_FLAGS: &[&str] = &[
     "streaming_tool_execution",
     "tool_use_summaries",
     "fast_mode",
     "coordinator_mode",
     "history_snip",
-    "agent_triggers",
     "bridge_mode",
     "daemon",
     "buddy",
-    "web_browser_tool",
     "context_collapse",
     "terminal_panel",
     "kairos",
     "team_collaboration",
-    "auto_dream",
 ];
 
 /// One or more feature flag names that this build does not know.
@@ -305,6 +320,7 @@ impl FeatureFlags {
     /// changes no behavior. They are reported here so tooling and tests can
     /// distinguish a flag that is merely stored from one that does something,
     /// without removing the names from configuration files that mention them.
+    /// See [`INERT_FLAGS`] for why each remaining name is still inert.
     #[must_use]
     pub fn inert_flags(&self) -> Vec<&'static str> {
         INERT_FLAGS
@@ -977,6 +993,45 @@ mod tests {
             flags.inert_flags().is_empty(),
             "flags with consumers were reported as inert: {:?}",
             flags.inert_flags()
+        );
+    }
+
+    #[test]
+    fn flags_with_a_product_path_are_not_inert() {
+        // `web_browser_tool` gates the WebFetch tool, `agent_triggers` gates
+        // the agent-kind hook path, and `auto_dream` gates the auto-dream
+        // manager. Each is read by production code, so none may be reported as
+        // inert.
+        let flags = FeatureFlags::parse("web_browser_tool,agent_triggers,auto_dream");
+        assert!(
+            flags.inert_flags().is_empty(),
+            "effective flags were reported as inert: {:?}",
+            flags.inert_flags()
+        );
+    }
+
+    #[test]
+    fn inert_flags_is_exactly_the_documented_remainder() {
+        // Every known flag enabled: the inert report must be exactly the
+        // compatibility-only names, in `KNOWN_FLAGS` order, and nothing else.
+        let flags = FeatureFlags::parse_checked(&KNOWN_FLAGS.join(","))
+            .expect("the documented names must all be accepted");
+        assert_eq!(
+            flags.inert_flags(),
+            vec![
+                "streaming_tool_execution",
+                "tool_use_summaries",
+                "fast_mode",
+                "coordinator_mode",
+                "history_snip",
+                "bridge_mode",
+                "daemon",
+                "buddy",
+                "context_collapse",
+                "terminal_panel",
+                "kairos",
+                "team_collaboration",
+            ]
         );
     }
 }

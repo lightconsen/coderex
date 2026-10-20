@@ -23,12 +23,16 @@ pub enum VimMode {
 }
 
 /// An action produced by a Vim normal- or Visual-mode key event.
+///
+/// A variant carrying a `usize` is a counted motion or operator: the number is
+/// the count prefix (`3w`, `5x`), and it is always at least `1`. The UI layer
+/// repeats the action that many times.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum VimAction {
-    /// Move cursor left.
-    Left,
-    /// Move cursor right.
-    Right,
+    /// Move cursor left, `count` times.
+    Left(usize),
+    /// Move cursor right, `count` times.
+    Right(usize),
     /// Move cursor up (e.g., in message list).
     Up,
     /// Move cursor down (e.g., in message list).
@@ -53,14 +57,14 @@ pub enum VimAction {
     DeleteToEnd,
     /// Delete entire line (input buffer).
     DeleteLine,
-    /// Delete word from cursor.
-    DeleteWord,
-    /// Delete character under cursor.
-    DeleteChar,
+    /// Delete word from cursor, `count` times.
+    DeleteWord(usize),
+    /// Delete character under cursor, `count` times.
+    DeleteChar(usize),
     /// Yank (copy) the entire line content.
     YankLine,
-    /// Paste from yank register at cursor.
-    Paste,
+    /// Paste from yank register at cursor, `count` times.
+    Paste(usize),
     /// Enter insert mode (before cursor).
     Insert,
     /// Enter insert mode at end of line.
@@ -97,16 +101,39 @@ pub enum VimAction {
     EnterVisualLine,
     /// Leave Visual mode without changing the buffer.
     ExitVisual,
-    /// Move to the start of the next word (Visual `w`).
-    WordForward,
-    /// Move to the start of the previous word (Visual `b`).
-    WordBackward,
-    /// Move to the end of the current or next word (Visual `e`).
-    WordEnd,
+    /// Move to the start of the next word, `count` times.
+    WordForward(usize),
+    /// Move to the start of the previous word, `count` times.
+    WordBackward(usize),
+    /// Move to the end of the current or next word, `count` times.
+    WordEnd(usize),
     /// Yank the Visual selection and leave Visual mode.
     YankSelection,
     /// Delete the Visual selection and leave Visual mode.
     DeleteSelection,
+    /// Replace the Visual selection with the yank register and leave Visual
+    /// mode (Visual `p`).
+    PasteOverSelection,
+    /// Delete the Visual selection and enter insert mode (Visual `c`/`s`).
+    ChangeSelection,
+    /// Open a line below and enter insert mode (`o`). The input buffer is a
+    /// single line, so the cursor lands at the end of the current line.
+    OpenLineBelow,
+    /// Open a line above and enter insert mode (`O`). Single-line, so the
+    /// cursor lands at the start of the current line.
+    OpenLineAbove,
+    /// Change the whole line and enter insert mode (`cc`, `S`).
+    ChangeLine,
+    /// Change from the cursor to the end of the current word (`cw`).
+    ChangeWord,
+    /// Change from the cursor to the end of the line (`C`, `c$`).
+    ChangeToEnd,
+    /// Delete `count` characters under the cursor and enter insert mode (`s`).
+    Substitute(usize),
+    /// Indent the current line by `count` levels (`>`).
+    Indent(usize),
+    /// Outdent the current line by `count` levels (`<`).
+    Outdent(usize),
     /// Ignore this key.
     Ignore,
 }
@@ -135,6 +162,8 @@ pub enum VimOperator {
     Delete,
     /// Yank (copy) operation.
     Yank,
+    /// Change operation.
+    Change,
 }
 
 impl Default for VimState {
@@ -209,22 +238,15 @@ impl VimState {
             };
         }
 
-        // Check if we're building a count prefix
-        if let KeyCode::Char(c) = event.code {
-            if let Some(digit) = c.to_digit(10) {
-                // Digits 1-9 start/extend count prefix
-                if self.pending_op.is_none() || digit != 0 {
-                    let current = self.count.unwrap_or(0);
-                    self.count = Some(current * 10 + digit as usize);
-                    return VimAction::Ignore;
-                }
-            }
+        if self.accumulate_count(event.code) {
+            return VimAction::Ignore;
         }
+        let count = self.count.unwrap_or(1);
 
         let action = match event.code {
             // Navigation
-            KeyCode::Char('h') | KeyCode::Left => VimAction::Left,
-            KeyCode::Char('l') | KeyCode::Right => VimAction::Right,
+            KeyCode::Char('h') | KeyCode::Left => VimAction::Left(count),
+            KeyCode::Char('l') | KeyCode::Right => VimAction::Right(count),
             KeyCode::Char('j') | KeyCode::Down => VimAction::Down,
             KeyCode::Char('k') | KeyCode::Up => VimAction::Up,
             KeyCode::Char('0') | KeyCode::Home => VimAction::JumpToStart,
@@ -250,6 +272,10 @@ impl VimState {
             KeyCode::Char('A') => VimAction::InsertAtEnd,
             KeyCode::Char('i') => VimAction::Insert,
             KeyCode::Char('a') => VimAction::Append,
+            // `o`/`O` open a line; the input buffer is a single line, so they
+            // land at its end/start and enter insert mode.
+            KeyCode::Char('o') => VimAction::OpenLineBelow,
+            KeyCode::Char('O') => VimAction::OpenLineAbove,
 
             // Visual mode entry
             KeyCode::Char('v') => {
@@ -278,13 +304,42 @@ impl VimState {
                 }
             }
             KeyCode::Char('D') => VimAction::DeleteToEnd,
-            KeyCode::Char('x') | KeyCode::Backspace => VimAction::DeleteChar,
+            KeyCode::Char('x') | KeyCode::Backspace => VimAction::DeleteChar(count),
             KeyCode::Char('X') => {
                 self.pending_op = None;
                 self.count = None;
-                VimAction::DeleteChar // simplified backspace-delete
+                VimAction::DeleteChar(count) // simplified backspace-delete
             }
-            KeyCode::Char('w') => VimAction::DeleteWord,
+            KeyCode::Char('w') => {
+                // `cw` changes the word; plain `w` deletes it (this codebase's
+                // long-standing simplification of the motion).
+                if self.pending_op == Some(VimOperator::Change) {
+                    VimAction::ChangeWord
+                } else {
+                    VimAction::DeleteWord(count)
+                }
+            }
+            // `s` substitutes characters; `S` changes the whole line.
+            KeyCode::Char('s') => VimAction::Substitute(count),
+            KeyCode::Char('S') => VimAction::ChangeLine,
+
+            // Change operator
+            KeyCode::Char('c') => {
+                if self.pending_op == Some(VimOperator::Change) {
+                    // cc — change the whole line.
+                    self.pending_op = None;
+                    self.count = None;
+                    VimAction::ChangeLine
+                } else {
+                    self.pending_op = Some(VimOperator::Change);
+                    VimAction::Ignore
+                }
+            }
+            KeyCode::Char('C') => VimAction::ChangeToEnd,
+
+            // Indent / outdent (`>>` / `<<` on a single line).
+            KeyCode::Char('>') => VimAction::Indent(count),
+            KeyCode::Char('<') => VimAction::Outdent(count),
 
             // Yank
             KeyCode::Char('y') => {
@@ -299,7 +354,7 @@ impl VimState {
             }
 
             // Paste
-            KeyCode::Char('p' | 'P') => VimAction::Paste, // simplified
+            KeyCode::Char('p' | 'P') => VimAction::Paste(count),
 
             // Undo
             KeyCode::Char('u') => VimAction::Undo,
@@ -340,6 +395,27 @@ impl VimState {
         action
     }
 
+    /// Fold a digit into the count prefix. Returns `true` when the key was a
+    /// count digit and was consumed.
+    ///
+    /// A leading `0` (no count yet) is *not* a count — it is the "start of
+    /// line" motion — so it falls through to the caller's match. `0` after a
+    /// count (`10`) is a digit.
+    fn accumulate_count(&mut self, code: KeyCode) -> bool {
+        let KeyCode::Char(c) = code else {
+            return false;
+        };
+        let Some(digit) = c.to_digit(10) else {
+            return false;
+        };
+        if self.count.is_some() || digit != 0 {
+            let current = self.count.unwrap_or(0);
+            self.count = Some(current * 10 + digit as usize);
+            return true;
+        }
+        false
+    }
+
     /// Handle keys in Visual or Visual-line mode.
     ///
     /// Motions are returned as actions; the UI layer applies them to the input
@@ -360,7 +436,11 @@ impl VimState {
         }
 
         let linewise = self.mode == VimMode::VisualLine;
-        match event.code {
+        if self.accumulate_count(event.code) {
+            return VimAction::Ignore;
+        }
+        let count = self.count.unwrap_or(1);
+        let action = match event.code {
             KeyCode::Esc => {
                 self.leave_visual();
                 VimAction::ExitVisual
@@ -388,13 +468,13 @@ impl VimState {
 
             // Motions. On a single-line buffer j/k have nowhere to go; the UI
             // layer treats them as no-ops rather than walking history.
-            KeyCode::Char('h') | KeyCode::Left => VimAction::Left,
-            KeyCode::Char('l') | KeyCode::Right => VimAction::Right,
+            KeyCode::Char('h') | KeyCode::Left => VimAction::Left(count),
+            KeyCode::Char('l') | KeyCode::Right => VimAction::Right(count),
             KeyCode::Char('j') | KeyCode::Down => VimAction::Down,
             KeyCode::Char('k') | KeyCode::Up => VimAction::Up,
-            KeyCode::Char('w') => VimAction::WordForward,
-            KeyCode::Char('b') => VimAction::WordBackward,
-            KeyCode::Char('e') => VimAction::WordEnd,
+            KeyCode::Char('w') => VimAction::WordForward(count),
+            KeyCode::Char('b') => VimAction::WordBackward(count),
+            KeyCode::Char('e') => VimAction::WordEnd(count),
             KeyCode::Char('0') | KeyCode::Home => VimAction::JumpToStart,
             KeyCode::Char('$') | KeyCode::End => VimAction::JumpToEnd,
             KeyCode::Char('g') => VimAction::JumpTop,
@@ -409,9 +489,36 @@ impl VimState {
                 self.leave_visual();
                 VimAction::DeleteSelection
             }
+            // `p` replaces the selection with the register.
+            KeyCode::Char('p' | 'P') => {
+                self.leave_visual();
+                VimAction::PasteOverSelection
+            }
+            // `c`/`s` delete the selection and enter insert mode.
+            KeyCode::Char('c' | 's') => {
+                self.leave_visual();
+                VimAction::ChangeSelection
+            }
+            // Indenting a selection of a single line is indenting the line.
+            KeyCode::Char('>') => {
+                self.leave_visual();
+                VimAction::Indent(count)
+            }
+            KeyCode::Char('<') => {
+                self.leave_visual();
+                VimAction::Outdent(count)
+            }
 
             _ => VimAction::Ignore,
+        };
+
+        // A count is consumed by the action it preceded, exactly as in normal
+        // mode. Leaving it set would make the next digit extend it: `3w` then
+        // `2l` would read as `32l`, not `3w` followed by `2l`.
+        if !matches!(action, VimAction::Ignore) {
+            self.count = None;
         }
+        action
     }
 
     /// Return to normal mode and drop any pending count/operator state.
@@ -506,10 +613,10 @@ mod tests {
     #[test]
     fn h_j_k_l_navigation() {
         let mut state = VimState::new();
-        assert_eq!(state.handle_key(key('h')), VimAction::Left);
+        assert_eq!(state.handle_key(key('h')), VimAction::Left(1));
         assert_eq!(state.handle_key(key('j')), VimAction::Down);
         assert_eq!(state.handle_key(key('k')), VimAction::Up);
-        assert_eq!(state.handle_key(key('l')), VimAction::Right);
+        assert_eq!(state.handle_key(key('l')), VimAction::Right(1));
     }
 
     #[test]
@@ -562,7 +669,7 @@ mod tests {
     fn paste_puts_yanked_text() {
         let mut state = VimState::new();
         state.yank("hello world");
-        assert_eq!(state.handle_key(key('p')), VimAction::Paste);
+        assert_eq!(state.handle_key(key('p')), VimAction::Paste(1));
         assert_eq!(state.yanked(), "hello world");
     }
 
@@ -599,7 +706,7 @@ mod tests {
     #[test]
     fn x_deletes_char() {
         let mut state = VimState::new();
-        assert_eq!(state.handle_key(key('x')), VimAction::DeleteChar);
+        assert_eq!(state.handle_key(key('x')), VimAction::DeleteChar(1));
     }
 
     #[test]
@@ -631,6 +738,118 @@ mod tests {
         assert_eq!(state.handle_key(key('j')), VimAction::Down);
         // count cleared after action
         assert!(state.count.is_none());
+    }
+
+    /// The count must reach the action, not just sit in `VimState`: a motion
+    /// the UI can only apply once would silently drop it.
+    #[test]
+    fn count_prefix_is_carried_into_the_action() {
+        let mut state = VimState::new();
+        assert_eq!(state.handle_key(key('3')), VimAction::Ignore);
+        assert_eq!(state.handle_key(key('l')), VimAction::Right(3));
+
+        // Multi-digit counts build up.
+        assert_eq!(state.handle_key(key('1')), VimAction::Ignore);
+        assert_eq!(state.handle_key(key('2')), VimAction::Ignore);
+        assert_eq!(state.count, Some(12));
+        assert_eq!(state.handle_key(key('x')), VimAction::DeleteChar(12));
+
+        // Counted word motions and paste too.
+        assert_eq!(state.handle_key(key('2')), VimAction::Ignore);
+        assert_eq!(state.handle_key(key('w')), VimAction::DeleteWord(2));
+        assert_eq!(state.handle_key(key('4')), VimAction::Ignore);
+        assert_eq!(state.handle_key(key('p')), VimAction::Paste(4));
+    }
+
+    /// A leading `0` is the start-of-line motion, not a count of zero. `10` is
+    /// still a count because the `0` follows a digit.
+    #[test]
+    fn leading_zero_is_a_motion_not_a_count() {
+        let mut state = VimState::new();
+        assert_eq!(state.handle_key(key('0')), VimAction::JumpToStart);
+
+        assert_eq!(state.handle_key(key('1')), VimAction::Ignore);
+        assert_eq!(state.handle_key(key('0')), VimAction::Ignore);
+        assert_eq!(state.count, Some(10));
+        assert_eq!(state.handle_key(key('l')), VimAction::Right(10));
+    }
+
+    #[test]
+    fn open_line_below_and_above() {
+        let mut state = VimState::new();
+        assert_eq!(state.handle_key(key('o')), VimAction::OpenLineBelow);
+        assert_eq!(state.handle_key(key('O')), VimAction::OpenLineAbove);
+    }
+
+    #[test]
+    fn change_operator_cc_cw_and_change_to_end() {
+        let mut state = VimState::new();
+        // `cc` changes the line.
+        assert_eq!(state.handle_key(key('c')), VimAction::Ignore);
+        assert_eq!(state.pending_op, Some(VimOperator::Change));
+        assert_eq!(state.handle_key(key('c')), VimAction::ChangeLine);
+        assert!(state.pending_op.is_none());
+
+        // `cw` changes the word.
+        assert_eq!(state.handle_key(key('c')), VimAction::Ignore);
+        assert_eq!(state.handle_key(key('w')), VimAction::ChangeWord);
+
+        // `C` changes to the end of the line directly.
+        assert_eq!(state.handle_key(key('C')), VimAction::ChangeToEnd);
+    }
+
+    #[test]
+    fn substitute_s_and_change_line() {
+        let mut state = VimState::new();
+        assert_eq!(state.handle_key(key('s')), VimAction::Substitute(1));
+        assert_eq!(state.handle_key(key('3')), VimAction::Ignore);
+        assert_eq!(state.handle_key(key('s')), VimAction::Substitute(3));
+        assert_eq!(state.handle_key(key('S')), VimAction::ChangeLine);
+    }
+
+    #[test]
+    fn indent_and_outdent_carry_the_count() {
+        let mut state = VimState::new();
+        assert_eq!(state.handle_key(key('>')), VimAction::Indent(1));
+        assert_eq!(state.handle_key(key('<')), VimAction::Outdent(1));
+        assert_eq!(state.handle_key(key('2')), VimAction::Ignore);
+        assert_eq!(state.handle_key(key('>')), VimAction::Indent(2));
+    }
+
+    #[test]
+    fn visual_paste_over_and_change() {
+        let mut paste = visual_state();
+        assert_eq!(paste.handle_key(key('p')), VimAction::PasteOverSelection);
+        assert_eq!(paste.mode, VimMode::Normal);
+
+        let mut change = visual_state();
+        assert_eq!(change.handle_key(key('c')), VimAction::ChangeSelection);
+        assert_eq!(change.mode, VimMode::Normal);
+
+        let mut substitute = visual_state();
+        assert_eq!(substitute.handle_key(key('s')), VimAction::ChangeSelection);
+        assert_eq!(substitute.mode, VimMode::Normal);
+    }
+
+    #[test]
+    fn visual_indent_leaves_visual_mode() {
+        let mut state = visual_state();
+        assert_eq!(state.handle_key(key('>')), VimAction::Indent(1));
+        assert_eq!(state.mode, VimMode::Normal);
+
+        let mut state = visual_state();
+        assert_eq!(state.handle_key(key('<')), VimAction::Outdent(1));
+        assert_eq!(state.mode, VimMode::Normal);
+    }
+
+    #[test]
+    fn visual_motions_carry_the_count() {
+        let mut state = visual_state();
+        assert_eq!(state.handle_key(key('3')), VimAction::Ignore);
+        assert_eq!(state.handle_key(key('w')), VimAction::WordForward(3));
+        assert_eq!(state.handle_key(key('2')), VimAction::Ignore);
+        assert_eq!(state.handle_key(key('l')), VimAction::Right(2));
+        assert!(state.is_visual());
     }
 
     #[test]
@@ -673,11 +892,11 @@ mod tests {
         let mut state = VimState::new();
         assert_eq!(
             state.handle_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE)),
-            VimAction::Left
+            VimAction::Left(1)
         );
         assert_eq!(
             state.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE)),
-            VimAction::Right
+            VimAction::Right(1)
         );
         assert_eq!(
             state.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE)),
@@ -754,13 +973,13 @@ mod tests {
     #[test]
     fn visual_motions() {
         let mut state = visual_state();
-        assert_eq!(state.handle_key(key('h')), VimAction::Left);
-        assert_eq!(state.handle_key(key('l')), VimAction::Right);
+        assert_eq!(state.handle_key(key('h')), VimAction::Left(1));
+        assert_eq!(state.handle_key(key('l')), VimAction::Right(1));
         assert_eq!(state.handle_key(key('j')), VimAction::Down);
         assert_eq!(state.handle_key(key('k')), VimAction::Up);
-        assert_eq!(state.handle_key(key('w')), VimAction::WordForward);
-        assert_eq!(state.handle_key(key('b')), VimAction::WordBackward);
-        assert_eq!(state.handle_key(key('e')), VimAction::WordEnd);
+        assert_eq!(state.handle_key(key('w')), VimAction::WordForward(1));
+        assert_eq!(state.handle_key(key('b')), VimAction::WordBackward(1));
+        assert_eq!(state.handle_key(key('e')), VimAction::WordEnd(1));
         assert_eq!(state.handle_key(key('0')), VimAction::JumpToStart);
         assert_eq!(state.handle_key(key('$')), VimAction::JumpToEnd);
         assert_eq!(state.handle_key(key('g')), VimAction::JumpTop);
@@ -774,10 +993,10 @@ mod tests {
     #[test]
     fn visual_w_is_a_motion_not_delete_word() {
         let mut normal = VimState::new();
-        assert_eq!(normal.handle_key(key('w')), VimAction::DeleteWord);
+        assert_eq!(normal.handle_key(key('w')), VimAction::DeleteWord(1));
 
         let mut visual = visual_state();
-        assert_eq!(visual.handle_key(key('w')), VimAction::WordForward);
+        assert_eq!(visual.handle_key(key('w')), VimAction::WordForward(1));
     }
 
     #[test]
@@ -812,7 +1031,7 @@ mod tests {
         assert_eq!(insert.handle_key(key('v')), VimAction::Insert);
 
         let mut normal = VimState::new();
-        assert_eq!(normal.handle_key(key('x')), VimAction::DeleteChar);
+        assert_eq!(normal.handle_key(key('x')), VimAction::DeleteChar(1));
         assert_eq!(normal.handle_key(key('y')), VimAction::Ignore);
         assert_eq!(normal.handle_key(key('y')), VimAction::YankLine);
     }

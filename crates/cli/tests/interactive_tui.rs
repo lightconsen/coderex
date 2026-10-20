@@ -640,6 +640,31 @@ fn piped_commands_work_in_the_tui() {
     );
 }
 
+/// Entering Visual mode must be visible in the TUI, not just in the buffer's
+/// internal selection state.
+#[test]
+fn vim_visual_mode_shows_the_indicator_in_tui() {
+    let dir = setup_project_dir();
+    let mut session = session_without_engine(dir.path());
+    session.wait_for_text("CodeRex v", SCREEN_TIMEOUT);
+    session.send_line("/vim");
+    session.wait_for_text("Vim mode: enabled", SCREEN_TIMEOUT);
+    // Enabling Vim mode keeps the prompt in Insert mode, exactly as Vim does:
+    // Esc returns to Normal, and `v` there starts a characterwise selection
+    // that the input line has to show.
+    session.esc();
+    // crossterm parses an ESC that is followed immediately by a character as
+    // Alt+char, so leave a gap between the two keystrokes.
+    thread::sleep(Duration::from_millis(500));
+    session.send_text("v");
+    let screen = session.wait_for_text("VISUAL", SCREEN_TIMEOUT);
+    drop(session);
+    assert!(
+        screen.contains("VISUAL"),
+        "the Visual mode badge was not rendered:\n{screen}"
+    );
+}
+
 #[test]
 fn help_command_renders_in_tui() {
     let dir = setup_project_dir();

@@ -1385,6 +1385,46 @@ fn count_configured_hooks(value: &serde_json::Value) -> usize {
         .map_or(0, Vec::len)
 }
 
+/// Drop `type: "agent"` hook entries from a settings hooks document.
+///
+/// Returns the filtered document and how many entries were removed. Both shapes
+/// [`coderex_hooks`] accepts are handled — a bare hooks array and an object
+/// with a `hooks` array — so the caller can gate the agent-kind path without
+/// knowing which shape each source used. A document of any other shape is
+/// returned unchanged and reported as zero skipped, so the hooks crate still
+/// produces the structural error itself.
+fn strip_agent_hooks(value: &serde_json::Value) -> (serde_json::Value, usize) {
+    fn is_agent(entry: &serde_json::Value) -> bool {
+        entry.get("type").and_then(serde_json::Value::as_str) == Some("agent")
+    }
+    fn keep(entries: &[serde_json::Value]) -> (Vec<serde_json::Value>, usize) {
+        let kept: Vec<serde_json::Value> = entries
+            .iter()
+            .filter(|entry| !is_agent(entry))
+            .cloned()
+            .collect();
+        let skipped = entries.len() - kept.len();
+        (kept, skipped)
+    }
+
+    match value {
+        serde_json::Value::Array(entries) => {
+            let (kept, skipped) = keep(entries);
+            (serde_json::Value::Array(kept), skipped)
+        }
+        serde_json::Value::Object(map) => {
+            let Some(serde_json::Value::Array(entries)) = map.get("hooks") else {
+                return (value.clone(), 0);
+            };
+            let (kept, skipped) = keep(entries);
+            let mut filtered = map.clone();
+            filtered.insert("hooks".into(), serde_json::Value::Array(kept));
+            (serde_json::Value::Object(filtered), skipped)
+        }
+        _ => (value.clone(), 0),
+    }
+}
+
 /// The result of `/macro`: either text to show, or commands to execute.
 enum MacroCommandOutcome {
     Message(String),
@@ -2854,6 +2894,14 @@ impl ReplLoop {
             engine.set_context_window_resolver(resolver);
         }
 
+        // 9c. Auto-dream. The manager is built at construction, before `--betas`
+        // is resolved, so the flag is applied here. With `auto_dream` off there
+        // is no dream manager and `/auto-dream` reports as much instead of
+        // starting a background consolidation the user did not ask for.
+        if !self.feature_flags.auto_dream {
+            self.auto_dream = None;
+        }
+
         // 10. Pull-request context. The orchestrator fetches this before the
         // REPL exists; the fallback here keeps a direct `with_from_pr` caller
         // honest, and a fetch failure stops startup rather than continuing
@@ -2888,8 +2936,10 @@ impl ReplLoop {
             tracing::debug!("tmux session/title was applied before startup");
         }
 
-        // 12. Every accepted flag now has behavior; there is no list of
-        // accepted-but-unimplemented flags to warn about.
+        // 12. Every flag with a product path has been applied above (workflow,
+        // dispatcher, auto-dream, and the dispatcher's own tool gates). The
+        // compatibility-only names were already warned about in step 9; there
+        // is nothing else to install here.
 
         // 14. Debug file — log that it would be configured
         if let Some(ref debug_path) = self.debug_file {
@@ -2913,20 +2963,46 @@ impl ReplLoop {
         // `hook_layers` is the resolved split. `hooks_settings` alone is the
         // compatibility path for a hand-built `Settings` (and for callers of
         // `with_hooks`), where the merged value is treated as core.
-        let mut hook_sources: Vec<(coderex_hooks::HookTier, &serde_json::Value)> = Vec::new();
+        let mut hook_sources: Vec<(coderex_hooks::HookTier, serde_json::Value)> = Vec::new();
         if let Some(layers) = self.hook_layers.as_ref() {
             if let Some(value) = &layers.managed {
-                hook_sources.push((coderex_hooks::HookTier::Managed, value));
+                hook_sources.push((coderex_hooks::HookTier::Managed, value.clone()));
             }
             if let Some(value) = &layers.plugin {
-                hook_sources.push((coderex_hooks::HookTier::Plugin, value));
+                hook_sources.push((coderex_hooks::HookTier::Plugin, value.clone()));
             }
             if let Some(value) = &layers.core {
-                hook_sources.push((coderex_hooks::HookTier::Core, value));
+                hook_sources.push((coderex_hooks::HookTier::Core, value.clone()));
             }
         } else if let Some(hooks) = &self.hooks_settings {
-            hook_sources.push((coderex_hooks::HookTier::Core, hooks));
+            hook_sources.push((coderex_hooks::HookTier::Core, hooks.clone()));
         }
+
+        // 15a. `agent_triggers` gates the agent-kind hook path. An `agent` hook
+        // is an agentic verifier the session runs with its own model, which is
+        // exactly the "agent trigger" the flag names. With the flag off those
+        // entries are dropped before the registry sees them, so a configured
+        // agent hook cannot run; the other four kinds are untouched. Saying so
+        // out loud keeps a silently-dropped hook from looking like one that ran.
+        let mut skipped_agent_hooks = 0;
+        if !self.feature_flags.agent_triggers {
+            for (_, value) in &mut hook_sources {
+                let (filtered, skipped) = strip_agent_hooks(value);
+                *value = filtered;
+                skipped_agent_hooks += skipped;
+            }
+        }
+        if skipped_agent_hooks > 0 {
+            tracing::warn!(
+                count = skipped_agent_hooks,
+                "agent hooks skipped: the 'agent_triggers' feature flag is off"
+            );
+            eprintln!(
+                "warning: skipped {skipped_agent_hooks} agent hook(s): the 'agent_triggers' \
+                 feature flag is off (enable it with --betas agent_triggers)"
+            );
+        }
+
         let mut installed_hook_count = 0;
         if !hook_sources.is_empty() {
             let hook_count: usize = hook_sources
@@ -2934,7 +3010,9 @@ impl ReplLoop {
                 .map(|(_, value)| count_configured_hooks(value))
                 .sum();
             if let Some(ref mut engine) = self.engine {
-                match coderex_hooks::HookRegistry::from_settings_sources(hook_sources) {
+                match coderex_hooks::HookRegistry::from_settings_sources(
+                    hook_sources.iter().map(|(tier, value)| (*tier, value)),
+                ) {
                     Ok(registry) => {
                         // Three kinds — `prompt`, `agent`, `mcp_tool` — need a
                         // model client and the tool registry, which the hooks
@@ -4029,11 +4107,15 @@ impl ReplLoop {
                                         vim.mode = VimMode::Insert;
                                     }
                                 }
-                                VimAction::Left => {
-                                    ui_state.input.apply(&InputAction::CursorLeft);
+                                VimAction::Left(count) => {
+                                    for _ in 0..count {
+                                        ui_state.input.apply(&InputAction::CursorLeft);
+                                    }
                                 }
-                                VimAction::Right => {
-                                    ui_state.input.apply(&InputAction::CursorRight);
+                                VimAction::Right(count) => {
+                                    for _ in 0..count {
+                                        ui_state.input.apply(&InputAction::CursorRight);
+                                    }
                                 }
                                 VimAction::Up => {
                                     // A Visual selection must not be replaced
@@ -4061,22 +4143,28 @@ impl ReplLoop {
                                     ui_state.input.text.clear();
                                     ui_state.input.cursor = 0;
                                 }
-                                VimAction::DeleteWord => {
-                                    ui_state.input.apply(&InputAction::DeleteWord);
+                                VimAction::DeleteWord(count) => {
+                                    for _ in 0..count {
+                                        ui_state.input.apply(&InputAction::DeleteWord);
+                                    }
                                 }
-                                VimAction::DeleteChar => {
-                                    ui_state.input.apply(&InputAction::Delete);
+                                VimAction::DeleteChar(count) => {
+                                    for _ in 0..count {
+                                        ui_state.input.apply(&InputAction::Delete);
+                                    }
                                 }
                                 VimAction::YankLine => {
                                     vim.yank(&ui_state.input.text);
                                 }
-                                VimAction::Paste => {
+                                VimAction::Paste(count) => {
                                     let yanked = vim.yanked().to_string();
                                     // The register is text from this buffer today,
                                     // but paste is still an insertion path: never
                                     // let it carry a control character in.
-                                    for c in yanked.chars().filter(|c| !c.is_control()) {
-                                        ui_state.input.apply(&InputAction::InsertChar(c));
+                                    for _ in 0..count {
+                                        for c in yanked.chars().filter(|c| !c.is_control()) {
+                                            ui_state.input.apply(&InputAction::InsertChar(c));
+                                        }
                                     }
                                 }
                                 VimAction::Undo => {
@@ -4192,13 +4280,17 @@ impl ReplLoop {
                                         vim.mode = VimMode::Insert;
                                     }
                                 }
-                                VimAction::InsertAtEnd => {
+                                // `O`/`o` open a line in Vim; the input buffer
+                                // is single-line, so they enter insert at the
+                                // start/end of that one line, exactly like
+                                // `I`/`A` do here.
+                                VimAction::InsertAtEnd | VimAction::OpenLineBelow => {
                                     if self.vim_mode_enabled {
                                         ui_state.input.cursor = ui_state.input.text.len();
                                         vim.mode = VimMode::Insert;
                                     }
                                 }
-                                VimAction::InsertAtStart => {
+                                VimAction::InsertAtStart | VimAction::OpenLineAbove => {
                                     if self.vim_mode_enabled {
                                         ui_state.input.cursor = 0;
                                         vim.mode = VimMode::Insert;
@@ -4225,14 +4317,20 @@ impl ReplLoop {
                                             anchor.min(ui_state.input.cursor);
                                     }
                                 }
-                                VimAction::WordForward => {
-                                    ui_state.input.word_forward();
+                                VimAction::WordForward(count) => {
+                                    for _ in 0..count {
+                                        ui_state.input.word_forward();
+                                    }
                                 }
-                                VimAction::WordBackward => {
-                                    ui_state.input.word_backward();
+                                VimAction::WordBackward(count) => {
+                                    for _ in 0..count {
+                                        ui_state.input.word_backward();
+                                    }
                                 }
-                                VimAction::WordEnd => {
-                                    ui_state.input.word_end();
+                                VimAction::WordEnd(count) => {
+                                    for _ in 0..count {
+                                        ui_state.input.word_end();
+                                    }
                                 }
                                 VimAction::YankSelection => {
                                     if let Some(text) = ui_state.input.yank_selection() {
@@ -4243,6 +4341,58 @@ impl ReplLoop {
                                     if let Some(text) = ui_state.input.delete_selection() {
                                         vim.yank(&text);
                                     }
+                                }
+                                VimAction::PasteOverSelection => {
+                                    let yanked: String = vim
+                                        .yanked()
+                                        .chars()
+                                        .filter(|c| !c.is_control())
+                                        .collect();
+                                    if let Some(replaced) = ui_state.input.replace_selection(&yanked)
+                                    {
+                                        vim.yank(&replaced);
+                                    }
+                                }
+                                VimAction::ChangeSelection => {
+                                    if let Some(text) = ui_state.input.delete_selection() {
+                                        vim.yank(&text);
+                                    }
+                                    if self.vim_mode_enabled {
+                                        vim.mode = VimMode::Insert;
+                                    }
+                                }
+                                VimAction::ChangeLine => {
+                                    ui_state.input.text.clear();
+                                    ui_state.input.cursor = 0;
+                                    if self.vim_mode_enabled {
+                                        vim.mode = VimMode::Insert;
+                                    }
+                                }
+                                VimAction::ChangeWord => {
+                                    ui_state.input.delete_word_end();
+                                    if self.vim_mode_enabled {
+                                        vim.mode = VimMode::Insert;
+                                    }
+                                }
+                                VimAction::ChangeToEnd => {
+                                    ui_state.input.apply(&InputAction::KillToEnd);
+                                    if self.vim_mode_enabled {
+                                        vim.mode = VimMode::Insert;
+                                    }
+                                }
+                                VimAction::Substitute(count) => {
+                                    for _ in 0..count {
+                                        ui_state.input.apply(&InputAction::Delete);
+                                    }
+                                    if self.vim_mode_enabled {
+                                        vim.mode = VimMode::Insert;
+                                    }
+                                }
+                                VimAction::Indent(count) => {
+                                    ui_state.input.indent(count);
+                                }
+                                VimAction::Outdent(count) => {
+                                    ui_state.input.outdent(count);
                                 }
                             }
 
@@ -4879,45 +5029,21 @@ impl ReplLoop {
         }
     }
 
-    fn normalize_headless_read_output(&self, prompt: &str, mut output: String) -> String {
-        let Some(path) = Self::extract_read_path(prompt) else {
-            return output;
-        };
-        let resolved = self.resolve_read_path_for_fallback(&path);
-        let Ok(content) = std::fs::read_to_string(&resolved) else {
-            return output;
-        };
-        let trimmed = content.trim();
-        if trimmed.is_empty() {
-            return output;
+    /// Format a headless turn's final output.
+    ///
+    /// Headless output is exactly what the model produced. A turn that did not
+    /// complete normally gets a status line appended so the reason is not lost,
+    /// but nothing here reads a file named in the prompt or rewrites the
+    /// model's bytes: a prompt that says "read src/lib.rs" must not turn into
+    /// file content the model never emitted.
+    fn headless_final_output(output: String, reason: &TerminalReason) -> String {
+        if output.is_empty() {
+            format!("Query completed ({reason:?})")
+        } else if !matches!(reason, TerminalReason::Completed) {
+            format!("{output}\nQuery completed ({reason:?})")
+        } else {
+            output
         }
-
-        while let Some(first) = output.find(trimmed) {
-            let search_start = first + trimmed.len();
-            let Some(second_rel) = output[search_start..].find(trimmed) else {
-                break;
-            };
-            let second = search_start + second_rel;
-            output.replace_range(second..second + trimmed.len(), "");
-        }
-
-        if let Some(first) = output.find(trimmed) {
-            let prefix = &output[..first];
-            let lowered = prefix.to_ascii_lowercase();
-            let looks_like_planning_prefix = lowered.contains("i'll read")
-                || lowered.contains("let me")
-                || lowered.contains("<function_calls>")
-                || lowered.contains("<antthinking>")
-                || lowered.contains("<invoke name=")
-                || lowered.contains("tool:")
-                || lowered.contains("path:")
-                || lowered.contains("read the file");
-            if looks_like_planning_prefix {
-                output = output[first..].to_string();
-            }
-        }
-
-        output
     }
 
     /// Build a QueryRequest for the main agent from current session effects.
@@ -5537,40 +5663,6 @@ impl ReplLoop {
         }
     }
 
-    fn extract_read_path(prompt: &str) -> Option<String> {
-        let mut parts = prompt.split_whitespace();
-        let first = parts.next()?;
-        if !first.eq_ignore_ascii_case("read") {
-            return None;
-        }
-        let raw = parts.next()?;
-        let cleaned = raw
-            .trim_matches(|c: char| matches!(c, '`' | '"' | '\'' | ',' | ';' | ':' | ')' | '('))
-            .to_string();
-        if cleaned.is_empty() || (!cleaned.contains('/') && !cleaned.contains('.')) {
-            return None;
-        }
-        Some(cleaned)
-    }
-
-    fn resolve_read_path_for_fallback(&self, file_path: &str) -> std::path::PathBuf {
-        let path = std::path::PathBuf::from(file_path);
-        if path.is_absolute() {
-            if path.exists() {
-                return path;
-            }
-            if let Ok(trimmed) = path.strip_prefix("/") {
-                let candidate = std::path::PathBuf::from(&self.cwd).join(trimmed);
-                if candidate.exists() {
-                    return candidate;
-                }
-            }
-            path
-        } else {
-            std::path::PathBuf::from(&self.cwd).join(path)
-        }
-    }
-
     async fn submit_prompt(&mut self, prompt: &str, headless_mode: bool) -> String {
         let (elicit_tx, mut elicit_rx) =
             tokio::sync::mpsc::channel::<coderex_tools::ElicitRequest>(4);
@@ -5854,30 +5946,7 @@ impl ReplLoop {
                     "The AI service is temporarily unavailable. Your conversation context is preserved. Please try again later.\n({message})"
                 )
             }
-            Ok(reason) => {
-                let mut final_output = if output.is_empty() {
-                    format!("Query completed ({reason:?})")
-                } else if !matches!(reason, TerminalReason::Completed) {
-                    format!("{output}\nQuery completed ({reason:?})")
-                } else {
-                    output
-                };
-
-                if headless_mode {
-                    let lower = final_output.to_lowercase();
-                    if !lower.contains("pub fn") && !lower.contains("fn ") {
-                        if let Some(path) = Self::extract_read_path(prompt) {
-                            let resolved = self.resolve_read_path_for_fallback(&path);
-                            if let Ok(content) = std::fs::read_to_string(&resolved) {
-                                final_output.push_str("\n\n");
-                                final_output.push_str(&content);
-                            }
-                        }
-                    }
-                    final_output = self.normalize_headless_read_output(prompt, final_output);
-                }
-                final_output
-            }
+            Ok(reason) => Self::headless_final_output(output, &reason),
             Err(e) => format!("Query failed: {e}"),
         }
     }
@@ -6833,6 +6902,11 @@ impl ReplLoop {
                     writeln!(stdout, "{msg}")?;
                     return Ok(());
                 }
+                "agents" => {
+                    let msg = self.handle_agents_command(&args).await;
+                    writeln!(stdout, "{msg}")?;
+                    return Ok(());
+                }
                 "clear" => {
                     let message = self.perform_session_clear();
                     writeln!(stdout, "{message}")?;
@@ -7547,6 +7621,97 @@ impl ReplLoop {
         }
     }
 
+    /// Handle `/agents` — inspect sub-agents and their event logs.
+    ///
+    /// Three subcommands, all backed by the real [`AgentManager`]:
+    /// - `list` — the agents this session has spawned and their status.
+    /// - `logs <id> [count]` — read the agent's NDJSON event log, the same
+    ///   file the manager writes while the agent runs. Reading it is the
+    ///   production consumer of that log.
+    /// - `follow <id|all>` — point the session's observable subscription at a
+    ///   single agent (or back at all of them). This is the production user of
+    ///   the per-agent filter that used to be exercised only by tests.
+    async fn handle_agents_command(&mut self, args: &[String]) -> String {
+        let Some(manager) = self.agent_manager.as_ref().map(Arc::clone) else {
+            return "Agent manager not initialized.".into();
+        };
+
+        match args.first().map(String::as_str) {
+            None | Some("list") => {
+                let manager = manager.lock().await;
+                let agents = manager.list_agents();
+                if agents.is_empty() {
+                    return "No agents have been spawned in this session.".into();
+                }
+                let mut lines = vec![format!("{} agent(s):", agents.len())];
+                for agent in agents {
+                    lines.push(format!(
+                        "  {} [{}] {}",
+                        agent.task_handle.id,
+                        format!("{:?}", agent.status()).to_lowercase(),
+                        agent.prompt.lines().next().unwrap_or("").trim()
+                    ));
+                }
+                // `lines` owns its strings; the borrow of the agent list ends
+                // with the loop, so release the manager lock before returning.
+                drop(manager);
+                lines.join("\n")
+            }
+            Some("logs") => {
+                let Some(agent_id) = args.get(1) else {
+                    return "Usage: /agents logs <agent-id> [count]".into();
+                };
+                let count = match args.get(2) {
+                    Some(raw) => match raw.parse::<usize>() {
+                        Ok(n) if n > 0 => n,
+                        _ => return format!("Invalid count {raw:?}; expected a positive integer."),
+                    },
+                    None => 20,
+                };
+                match coderex_agents::read_agent_log(agent_id) {
+                    Err(error) => format!("Could not read the log for {agent_id}: {error}"),
+                    Ok(events) if events.is_empty() => {
+                        format!("No logged events for {agent_id}.")
+                    }
+                    Ok(events) => {
+                        let total = events.len();
+                        let shown = events.iter().rev().take(count).rev();
+                        let mut lines = vec![format!(
+                            "{total} event(s) for {agent_id} (showing last {}):",
+                            total.min(count)
+                        )];
+                        for event in shown {
+                            lines.push(format!("  {event:?}"));
+                        }
+                        lines.join("\n")
+                    }
+                }
+            }
+            Some("follow") => {
+                let Some(target) = args.get(1) else {
+                    return "Usage: /agents follow <agent-id|all>".into();
+                };
+                let manager = manager.lock().await;
+                let subscription = manager.subscribe_to_agent(target);
+                drop(manager);
+                match subscription {
+                    Some(rx) => {
+                        self.agent_observable_rx = Some(rx);
+                        if target == "all" {
+                            "Following observable events from all agents.".into()
+                        } else {
+                            format!("Following observable events from agent {target}.")
+                        }
+                    }
+                    None => "The agent manager has no event channel to subscribe to.".into(),
+                }
+            }
+            Some(other) => {
+                format!("Unknown /agents subcommand {other:?}. Usage: /agents <list|logs|follow>")
+            }
+        }
+    }
+
     /// Connection state and server/conflict lists for the command context.
     fn mcp_state(&self) -> (bool, Vec<String>, Vec<String>) {
         let slot = self
@@ -7801,6 +7966,73 @@ mod tests {
         let mut out = Vec::new();
         repl.execute_command("/bye", &mut out).await.unwrap();
         assert!(!repl.running, "the macro's built-in did not run");
+    }
+
+    #[tokio::test]
+    async fn agents_command_lists_follows_and_reads_logs() {
+        let mut repl = ReplLoop::with_engine(
+            Box::new(CountingApi::new()),
+            "/tmp".into(),
+            ModelId::sonnet(),
+        );
+
+        // With nothing spawned, `list` says so rather than printing an empty table.
+        let mut out = Vec::new();
+        repl.execute_command("/agents list", &mut out)
+            .await
+            .unwrap();
+        assert!(
+            String::from_utf8_lossy(&out).contains("No agents have been spawned"),
+            "{}",
+            String::from_utf8_lossy(&out)
+        );
+
+        // `follow <id>` swaps the manager-wide subscription for a filtered one.
+        let mut out = Vec::new();
+        repl.execute_command("/agents follow agent-42", &mut out)
+            .await
+            .unwrap();
+        assert!(String::from_utf8_lossy(&out).contains("agent-42"));
+        assert_eq!(
+            repl.agent_observable_rx.as_ref().unwrap().agent_id(),
+            Some("agent-42"),
+            "the production subscription should be filtered to the followed agent"
+        );
+
+        // `follow all` restores the manager-wide subscription.
+        let mut out = Vec::new();
+        repl.execute_command("/agents follow all", &mut out)
+            .await
+            .unwrap();
+        assert!(
+            repl.agent_observable_rx
+                .as_ref()
+                .unwrap()
+                .agent_id()
+                .is_none(),
+            "`all` should clear the per-agent filter"
+        );
+
+        // A log for an agent that never ran is empty, not an error.
+        let mut out = Vec::new();
+        repl.execute_command("/agents logs repl-test-never-ran", &mut out)
+            .await
+            .unwrap();
+        assert!(
+            String::from_utf8_lossy(&out).contains("No logged events"),
+            "{}",
+            String::from_utf8_lossy(&out)
+        );
+
+        let mut out = Vec::new();
+        repl.execute_command("/agents logs", &mut out)
+            .await
+            .unwrap();
+        assert!(String::from_utf8_lossy(&out).contains("Usage: /agents logs"));
+
+        let mut out = Vec::new();
+        repl.execute_command("/agents wat", &mut out).await.unwrap();
+        assert!(String::from_utf8_lossy(&out).contains("Unknown /agents subcommand"));
     }
 
     #[test]
@@ -8295,25 +8527,48 @@ mod tests {
         assert!(result.contains("System Status") || result.contains("Available"));
     }
 
+    /// Headless output must be exactly what the model produced. The old path
+    /// read the file named in the prompt and either appended its content or
+    /// rewrote the model's bytes to strip a duplicate of it; a prompt naming a
+    /// file could therefore print file content the model never emitted.
     #[test]
-    fn normalize_headless_read_output_deduplicates_repeated_file_content() {
-        let dir = tempfile::tempdir().unwrap();
-        let src = dir.path().join("src");
-        std::fs::create_dir_all(&src).unwrap();
-        let file = src.join("lib.rs");
-        let content = "pub fn add(a: i32, b: i32) -> i32 {\n    a + b\n}\n";
-        std::fs::write(&file, content).unwrap();
-
-        let loop_obj = ReplLoop::new(dir.path().to_string_lossy().to_string(), ModelId::sonnet());
-        let raw = format!(
-            "I'll read the file first.\n<function_calls>...\n{content}Functions:\n- add\n{content}"
+    fn headless_output_is_the_model_output_verbatim() {
+        let output = "The answer is 4.".to_string();
+        let formatted = ReplLoop::headless_final_output(output.clone(), &TerminalReason::Completed);
+        assert_eq!(
+            formatted, output,
+            "a completed turn must return the model's bytes unchanged"
         );
-        let normalized =
-            loop_obj.normalize_headless_read_output("Read src/lib.rs and summarize it", raw);
+    }
 
-        assert_eq!(normalized.matches(content.trim()).count(), 1);
-        assert!(normalized.contains("Functions:\n- add"));
-        assert!(normalized.starts_with("pub fn add"));
+    /// A prompt that names a file must not turn into that file's content.
+    #[test]
+    fn headless_output_never_reads_the_prompt_named_file() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("lib.rs"), "pub fn secret() {}").unwrap();
+
+        // The formatter takes no prompt and touches no filesystem, so the only
+        // thing it can return is the model's output.
+        let model_output = "I summarized src/lib.rs without printing it.".to_string();
+        let formatted =
+            ReplLoop::headless_final_output(model_output.clone(), &TerminalReason::Completed);
+        assert_eq!(formatted, model_output);
+        assert!(
+            !formatted.contains("pub fn secret"),
+            "file content leaked into headless output: {formatted}"
+        );
+    }
+
+    /// A non-completed turn still carries the reason, so the caller is not left
+    /// guessing why the run stopped.
+    #[test]
+    fn headless_output_annotates_abnormal_termination() {
+        let formatted = ReplLoop::headless_final_output(
+            "partial answer".to_string(),
+            &TerminalReason::MaxTurnsReached,
+        );
+        assert!(formatted.starts_with("partial answer"));
+        assert!(formatted.contains("MaxTurnsReached"));
     }
 
     #[test]
@@ -9472,6 +9727,109 @@ mod tests {
             repl.capabilities()
                 .contains(coderex_config::flags::CapabilitySet::VOICE)
         );
+    }
+
+    #[test]
+    fn strip_agent_hooks_drops_only_agent_entries_from_an_object() {
+        let doc = serde_json::json!({"hooks": [
+            {"event": "PreToolUse", "type": "command", "command": "true"},
+            {"event": "PreToolUse", "type": "agent", "prompt": "verify"},
+            {"event": "Stop"}
+        ]});
+        let (filtered, skipped) = strip_agent_hooks(&doc);
+        assert_eq!(skipped, 1, "only the agent entry is removed");
+        assert_eq!(filtered["hooks"].as_array().unwrap().len(), 2);
+        // The command hook and the type-less (command) hook both survive.
+        assert_eq!(filtered["hooks"][0]["type"], "command");
+        assert_eq!(filtered["hooks"][1]["event"], "Stop");
+    }
+
+    #[test]
+    fn strip_agent_hooks_handles_a_bare_array() {
+        let doc = serde_json::json!([
+            {"event": "PreToolUse", "type": "agent", "prompt": "verify"},
+            {"event": "PreToolUse", "type": "command", "command": "true"}
+        ]);
+        let (filtered, skipped) = strip_agent_hooks(&doc);
+        assert_eq!(skipped, 1);
+        assert_eq!(filtered.as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn strip_agent_hooks_leaves_other_shapes_untouched() {
+        // A document that is neither a hooks array nor an object with one is
+        // not this function's to repair; it is returned as-is so the hooks
+        // crate still reports the structural error.
+        let doc = serde_json::json!({"not_hooks": true});
+        let (filtered, skipped) = strip_agent_hooks(&doc);
+        assert_eq!(skipped, 0);
+        assert_eq!(filtered, doc);
+    }
+
+    /// The auto-dream manager is built before `--betas` is resolved, so the
+    /// `auto_dream` flag is applied at startup: with it off there is no
+    /// manager and `/auto-dream` reports as much.
+    #[tokio::test]
+    async fn auto_dream_flag_gates_the_dream_manager() {
+        let mut off = ReplLoop::with_engine(
+            Box::new(CountingApi::new()),
+            "/tmp".into(),
+            ModelId::sonnet(),
+        );
+        off.apply_cli_config();
+        assert!(
+            off.auto_dream.is_none(),
+            "auto_dream is off by default and must leave no manager behind"
+        );
+        assert_eq!(
+            off.handle_auto_dream_command(&[]),
+            "Auto-dream is not initialized."
+        );
+
+        let mut on = ReplLoop::with_engine(
+            Box::new(CountingApi::new()),
+            "/tmp".into(),
+            ModelId::sonnet(),
+        );
+        on.with_betas(vec!["+auto_dream".into()]);
+        on.apply_cli_config();
+        assert!(
+            on.auto_dream.is_some(),
+            "enabling auto_dream must keep the dream manager"
+        );
+    }
+
+    /// `agent_triggers` gates the agent-kind hook path: with it off a
+    /// configured `agent` hook is dropped before the registry sees it, and the
+    /// remaining kinds still install.
+    #[tokio::test]
+    async fn agent_triggers_flag_gates_agent_hooks() {
+        let hooks = serde_json::json!({"hooks": [
+            {"event": "PreToolUse", "type": "command", "command": "true"},
+            {"event": "PreToolUse", "type": "agent", "prompt": "verify"}
+        ]});
+
+        let mut off = ReplLoop::with_engine(
+            Box::new(CountingApi::new()),
+            "/tmp".into(),
+            ModelId::sonnet(),
+        );
+        off.with_hooks(Some(hooks.clone()));
+        off.apply_cli_config();
+        assert_eq!(
+            off.active_hooks, 1,
+            "the agent hook must be dropped while the flag is off"
+        );
+
+        let mut on = ReplLoop::with_engine(
+            Box::new(CountingApi::new()),
+            "/tmp".into(),
+            ModelId::sonnet(),
+        );
+        on.with_hooks(Some(hooks));
+        on.with_betas(vec!["+agent_triggers".into()]);
+        on.apply_cli_config();
+        assert_eq!(on.active_hooks, 2, "both hooks install once the flag is on");
     }
 
     /// `--betas` arrives after the tool registry is shared. The Workflow tool

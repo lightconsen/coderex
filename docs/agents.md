@@ -82,8 +82,12 @@ Sub-agent system for spawning autonomous worker agents, dream agents (background
   - `isolation` — worktree isolation mode
   - `cwd` — working directory
   - `extra_env` — **refused when non-empty.** Sub-agents run in-process, so there is no
-    child environment to inject; the only substitute (`std::env::set_var`) would leak into
-    the parent. The spawn returns a hard configuration error naming the keys.
+    child environment to inject. `ToolContext` carries `execution_context`, `cwd`, `extra`
+    and an elicitation sender but no per-call environment, and `SessionState` has no env
+    field either; the only substitute (`std::env::set_var`) is process-wide and would leak
+    into the parent and into every other agent. The spawn returns a hard configuration
+    error naming the keys rather than pretending to apply them. This remains impossible
+    until the tool-execution context grows a per-call environment.
   - `writable` — false enforces read-only tool enforcement
   - `max_tokens` / `max_duration_seconds` / `max_turns` — resource limits
   - `output_schema` — JSON schema for output validation
@@ -133,13 +137,20 @@ Sub-agent system for spawning autonomous worker agents, dream agents (background
   1. Broadcast channel (`subscribe_to_agent()`) for real-time streaming
   2. NDJSON log files at `~/.coderex/agent_logs/{agent_id}.jsonl`
   3. Parent engine event bus (`EngineEvent::AgentEvent`)
+- **Reading the logs back** — `read_agent_log(agent_id)` / `read_agent_log_at(path)`
+  parse a log into `WireEvent`s (blank lines are skipped, a malformed line is an
+  error naming the one-based line number, and a missing log is an empty list).
+  This is the production reader the write side never had: the REPL exposes it as
+  `/agents logs <id> [count]`, and `/agents follow <id|all>` subscribes to the
+  live broadcast. `subscribe_to_agent` is therefore a production path, not a
+  test-only one; `subscribe_all()` / `"all"` keeps the unfiltered view.
 - **Sandbox override** — Per-agent `SandboxConfig` injected into the tool executor factory.
 - **Token tracking** — `QueryEngine.total_usage()` captured after each attempt, persisted to companion `.meta.json` file alongside the output file.
 - **Custom agent definitions** — Users define agents in `~/.coderex/agents/{name}.json`; `spawn_named_agent(name, ...)` resolves the definition and delegates to `AgentType::Custom`, which merges the system prompt, tool whitelist, model, token limit and output schema into the spawn.
 - **Named agents from the CLI** — `coderex --agent <name>` resolves the same definitions at session start. The definition's system prompt replaces the default session prompt, its `allowed_tools` narrows the session, and its `model` / `max_tokens` are installed on the session `QueryEngine`. An explicit `--system-prompt`, `--allowed-tools` or `--model` wins (there is no CLI max-token flag, so the definition's limit always applies), and an unknown name fails before the REPL starts with the list of configured names. The `coderex agents` subcommand lists built-in and custom agents.
 - **Parent prefix wiring** — The REPL refreshes a [`ParentContextSnapshot`] immediately before each turn and the Agent tool's parent-context provider reads it when spawning. When the snapshot has messages, the tool sets `SpawnOptions::parent_prefix` and `parent_cache_safe_params` (derived from the same model/system-prompt/tool list) and reports `message_count = prefix.len()`, so `ForkedContext` knows where the parent prefix ends. Without a provider (managers used directly, tests) a spawn still works but starts a fresh prefix.
 - **Lifecycle producers** — `run_agent_task()` emits `AgentLifecycleEvent::Started`, `TextDelta` for each streamed text delta, `ToolCall { name, args }` for each tool invocation (the engine exposes the call summary, so `args` currently carries `{"summary": ...}` rather than the parsed arguments), `Idle { reason: "turn complete" }` after the event stream drains, and finally `Completed` or `Failed`. They travel as `EngineEvent::AgentEvent`, which the TUI already renders.
-- **External subscriptions** — `subscribe_to_agent(id)` returns an `AgentSubscription`, a wrapper over the manager-wide `tokio::sync::broadcast` channel that yields only events tagged with that agent id; `subscribe_all()` (and the `"all"` alias) keeps the unfiltered view. The REPL creates an unfiltered subscription in `with_engine` and drains it on the TUI tick and in headless event draining (debug logs); the UI itself uses `EngineEvent::AgentEvent`, so the broadcast is the external-observer surface, not a second rendering path. `register_agent()` was removed: there is no transport for an externally managed agent in CodeRex (sub-agents are in-process `tokio` tasks), so it could only ever record a dangling id.
+- **External subscriptions** — `subscribe_to_agent(id)` returns an `AgentSubscription`, a wrapper over the manager-wide `tokio::sync::broadcast` channel that yields only events tagged with that agent id; `subscribe_all()` (and the `"all"` alias) keeps the unfiltered view. The REPL creates an unfiltered subscription in `with_engine` and drains it on the TUI tick and in headless event draining (debug logs); `/agents follow <id|all>` installs either a filtered or an unfiltered subscription as the session's observable, so per-agent filtering is a production path rather than a test-only capability. The UI itself uses `EngineEvent::AgentEvent`, so the broadcast is the external-observer surface, not a second rendering path. `register_agent()` was removed: there is no transport for an externally managed agent in CodeRex (sub-agents are in-process `tokio` tasks), so it could only ever record a dangling id.
 
 ## Permission inheritance
 
@@ -354,7 +365,9 @@ The manager keeps one broadcast channel for all agents. `subscribe_to_agent`
 wraps that receiver in an [`AgentSubscription`] that drops events belonging to
 other agents; `"all"` and `subscribe_all()` retain the manager-wide view. A
 receiver is present only when the manager was created with an event broadcast.
-The REPL is the production subscriber; the TUI reads the same lifecycle
+The REPL is the production subscriber: `/agents follow <id|all>` selects the
+filtered or unfiltered receiver, and `/agents logs <id> [count]` replays the
+stored NDJSON log through `read_agent_log`. The TUI reads the same lifecycle
 through `EngineEvent::AgentEvent`.
 
 ### Custom Agent Config (`~/.coderex/agents/my_agent.json`)

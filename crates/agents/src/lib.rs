@@ -11,5 +11,6 @@ pub use manager::{
     AgentError, AgentInstance, AgentManager, AgentMessage, AgentObservableEvent, AgentResult,
     AgentStatus, AgentSubscription, CacheSafeParams, FailureAction, ForkedContext,
     ParentContextSnapshot, RetryPolicy, SpawnOptions, TeammateEvent, TeammateEventCallback,
+    agent_log_dir, agent_log_path, read_agent_log, read_agent_log_at,
 };
 pub use types::{AgentType, Thoroughness};

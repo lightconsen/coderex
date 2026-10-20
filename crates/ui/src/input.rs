@@ -561,7 +561,95 @@ impl InputBuffer {
         self.cursor = end;
         self.suggestion = None;
     }
+
+    /// Delete from the cursor to the end of the current word run, and return
+    /// the deleted text (Vim `cw`).
+    ///
+    /// Unlike [`Self::word_end`], this does not skip leading whitespace: `cw`
+    /// on whitespace deletes the whitespace run, and on a word deletes the
+    /// word. The cursor stays where the deletion began, ready for insert mode.
+    pub fn delete_word_end(&mut self) -> String {
+        if self.cursor >= self.text.len() {
+            return String::new();
+        }
+        let class = self.text[self.cursor..].chars().next().map(char_class);
+        let mut end = self.cursor;
+        for (offset, c) in self.text[self.cursor..].char_indices() {
+            if Some(char_class(c)) != class {
+                break;
+            }
+            end = self.cursor + offset + c.len_utf8();
+        }
+        let deleted: String = self.text.drain(self.cursor..end).collect();
+        self.history_pos = 0;
+        self.suggestion = None;
+        deleted
+    }
+
+    /// Replace the Visual selection with `replacement`, and return the text
+    /// that was replaced (Vim Visual `p`).
+    ///
+    /// Control characters are dropped from `replacement`: like every other
+    /// insertion path, paste-over must not break the single-line invariant.
+    /// Returns `None` when there is no selection.
+    pub fn replace_selection(&mut self, replacement: &str) -> Option<String> {
+        let (start, end) = self.selection_range()?;
+        let replaced: String = self.text.drain(start..end).collect();
+        let sanitized: String = replacement.chars().filter(|c| !c.is_control()).collect();
+        self.text.insert_str(start, &sanitized);
+        self.cursor = start + sanitized.len();
+        self.history_pos = 0;
+        self.suggestion = None;
+        self.clear_visual_selection();
+        Some(replaced)
+    }
+
+    /// Add `levels` indentation steps to the start of the line (Vim `>`).
+    ///
+    /// One step is [`INDENT_WIDTH`] spaces. The cursor keeps its position
+    /// relative to the text by moving right past the inserted spaces.
+    pub fn indent(&mut self, levels: usize) {
+        if levels == 0 {
+            return;
+        }
+        let prefix = " ".repeat(INDENT_WIDTH * levels);
+        self.text.insert_str(0, &prefix);
+        self.cursor += prefix.len();
+        self.suggestion = None;
+    }
+
+    /// Remove up to `levels` indentation steps from the start of the line
+    /// (Vim `<`). One tab counts as one step; otherwise up to [`INDENT_WIDTH`]
+    /// leading spaces per step. A line with no leading whitespace is unchanged.
+    pub fn outdent(&mut self, levels: usize) {
+        let mut removed = 0;
+        for _ in 0..levels {
+            if self.text.starts_with('\t') {
+                self.text.remove(0);
+                removed += 1;
+                continue;
+            }
+            let spaces = self
+                .text
+                .chars()
+                .take_while(|c| *c == ' ')
+                .take(INDENT_WIDTH)
+                .count();
+            if spaces == 0 {
+                break;
+            }
+            self.text.drain(..spaces);
+            removed += spaces;
+        }
+        if removed > 0 {
+            self.cursor = self.cursor.saturating_sub(removed);
+            self.suggestion = None;
+        }
+    }
 }
+
+/// Spaces added per indentation step by [`InputBuffer::indent`].
+pub const INDENT_WIDTH: usize = 4;
 
 /// Vim's notion of a word character, simplified: letters, digits, underscore.
 fn is_word_char(c: char) -> bool {
@@ -1031,6 +1119,89 @@ mod tests {
         buf.word_end();
         assert_eq!(buf.cursor, 4); // past 中, before the space
         assert!(buf.text.is_char_boundary(buf.cursor));
+    }
+
+    #[test]
+    fn delete_word_end_deletes_the_word_run() {
+        let mut buf = buffer_with("hello world");
+        buf.cursor = 0;
+        assert_eq!(buf.delete_word_end(), "hello");
+        assert_eq!(buf.text, " world");
+        assert_eq!(buf.cursor, 0);
+
+        // On whitespace, `cw` deletes the whitespace run.
+        buf.cursor = 0;
+        assert_eq!(buf.delete_word_end(), " ");
+        assert_eq!(buf.text, "world");
+
+        // At end of buffer there is nothing to delete.
+        buf.cursor = buf.text.len();
+        assert_eq!(buf.delete_word_end(), "");
+    }
+
+    #[test]
+    fn delete_word_end_handles_multibyte() {
+        let mut buf = buffer_with("你好 world");
+        buf.cursor = 0;
+        assert_eq!(buf.delete_word_end(), "你好");
+        assert_eq!(buf.text, " world");
+        assert!(buf.text.is_char_boundary(buf.cursor));
+    }
+
+    #[test]
+    fn replace_selection_swaps_the_range() {
+        let mut buf = buffer_with("hello world");
+        buf.cursor = 0;
+        buf.start_visual(false);
+        buf.cursor = 5;
+        assert_eq!(buf.replace_selection("goodbye").as_deref(), Some("hello"));
+        assert_eq!(buf.text, "goodbye world");
+        assert_eq!(buf.cursor, 7);
+        assert_eq!(buf.visual_anchor, None);
+    }
+
+    #[test]
+    fn replace_selection_drops_control_characters() {
+        let mut buf = buffer_with("hello");
+        buf.cursor = 0;
+        buf.start_visual(false);
+        buf.cursor = 5;
+        assert!(buf.replace_selection("a\nb\tc").is_some());
+        assert_eq!(buf.text, "abc");
+        assert!(buf.text.chars().all(|c| !c.is_control()));
+    }
+
+    #[test]
+    fn replace_selection_without_a_selection_is_none() {
+        let mut buf = buffer_with("hello");
+        assert_eq!(buf.replace_selection("x"), None);
+        assert_eq!(buf.text, "hello");
+    }
+
+    #[test]
+    fn indent_and_outdent_the_line() {
+        let mut buf = buffer_with("code");
+        buf.indent(1);
+        assert_eq!(buf.text, "    code");
+        assert_eq!(buf.cursor, 8, "cursor keeps its place relative to the text");
+
+        buf.indent(2);
+        assert_eq!(buf.text, "            code");
+
+        buf.outdent(1);
+        assert_eq!(buf.text, "        code");
+        buf.outdent(10);
+        assert_eq!(buf.text, "code");
+        // Outdenting past zero is a no-op, not an underflow.
+        buf.outdent(1);
+        assert_eq!(buf.text, "code");
+    }
+
+    #[test]
+    fn outdent_removes_a_tab_as_one_step() {
+        let mut buf = buffer_with("\tcode");
+        buf.outdent(1);
+        assert_eq!(buf.text, "code");
     }
 
     #[test]
