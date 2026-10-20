@@ -343,7 +343,7 @@ mod imp {
         EXTENDED_STARTUPINFO_PRESENT, GetCurrentProcess, GetExitCodeProcess,
         InitializeProcThreadAttributeList, LPPROC_THREAD_ATTRIBUTE_LIST, OpenProcessToken,
         PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES, PROCESS_INFORMATION, STARTUPINFOEXW,
-        UpdateProcThreadAttribute, WaitForSingleObject,
+        TerminateProcess, UpdateProcThreadAttribute, WaitForSingleObject,
     };
 
     /// `SE_GROUP_ENABLED`; windows-sys keeps it behind another feature.
@@ -552,53 +552,64 @@ mod imp {
             let description_wide =
                 wide("Filesystem and network isolation for CodeRex subprocesses");
 
-            let mut sid: PSID = ptr::null_mut();
             // Two builds in one process (the runtime tests, or a session that
             // allows the network for one server and not another) can ask for
             // the same stable profile concurrently. The Win32 profile store
             // answers a simultaneous create with E_UNEXPECTED rather than
             // ERROR_ALREADY_EXISTS, so the calls are serialized here and a
             // failed create always falls back to deriving the existing SID.
-            static PROFILE_LOCK: Mutex<()> = Mutex::new(());
-            let _profile_guard = PROFILE_LOCK
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            //
+            // Only the create/derive sequence is under the lock. The ACL plan
+            // below is the slow, filesystem-heavy part (it writes a DACL and a
+            // mandatory label for every system root, `PATH` entry and workspace
+            // file), so holding this lock across it would serialize every
+            // sandbox creation in the process behind the slowest one.
+            let sid = {
+                static PROFILE_LOCK: Mutex<()> = Mutex::new(());
+                let _profile_guard = PROFILE_LOCK
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
 
-            // SAFETY: every pointer is a live, NUL-terminated UTF-16 string and
-            // `sid` is a valid out pointer. A zero-length capability list is
-            // passed as null.
-            let hr = unsafe {
-                CreateAppContainerProfile(
-                    profile_wide.as_ptr(),
-                    display_wide.as_ptr(),
-                    description_wide.as_ptr(),
-                    capabilities.as_ptr(),
-                    capabilities.len(),
-                    &mut sid,
-                )
-            };
-            if hr < 0 {
-                // The profile from an earlier CodeRex process is reused, which
-                // is exactly what the stable DACL design needs.
-                let derived = unsafe {
-                    DeriveAppContainerSidFromAppContainerName(profile_wide.as_ptr(), &mut sid)
+                let mut sid: PSID = ptr::null_mut();
+                // SAFETY: every pointer is a live, NUL-terminated UTF-16 string
+                // and `sid` is a valid out pointer. A zero-length capability
+                // list is passed as null.
+                let hr = unsafe {
+                    CreateAppContainerProfile(
+                        profile_wide.as_ptr(),
+                        display_wide.as_ptr(),
+                        description_wide.as_ptr(),
+                        capabilities.as_ptr(),
+                        capabilities.len(),
+                        &mut sid,
+                    )
                 };
-                if derived < 0 {
-                    let already = (hr as u32 & 0xffff_0000) == 0x8007_0000
-                        && (hr as u32 & 0xffff) == ERROR_ALREADY_EXISTS;
-                    let detail = if already {
-                        format!("DeriveAppContainerSidFromAppContainerName failed: 0x{derived:08X}")
-                    } else {
-                        format!("CreateAppContainerProfile failed: 0x{hr:08X}")
+                if hr < 0 {
+                    // The profile from an earlier CodeRex process is reused,
+                    // which is exactly what the stable DACL design needs.
+                    let derived = unsafe {
+                        DeriveAppContainerSidFromAppContainerName(profile_wide.as_ptr(), &mut sid)
                     };
-                    return Err(SandboxError::CreationError(detail));
+                    if derived < 0 {
+                        let already = (hr as u32 & 0xffff_0000) == 0x8007_0000
+                            && (hr as u32 & 0xffff) == ERROR_ALREADY_EXISTS;
+                        let detail = if already {
+                            format!(
+                                "DeriveAppContainerSidFromAppContainerName failed: 0x{derived:08X}"
+                            )
+                        } else {
+                            format!("CreateAppContainerProfile failed: 0x{hr:08X}")
+                        };
+                        return Err(SandboxError::CreationError(detail));
+                    }
                 }
-            }
-            if sid.is_null() {
-                return Err(SandboxError::CreationError(
-                    "AppContainer profile returned a null SID".into(),
-                ));
-            }
+                if sid.is_null() {
+                    return Err(SandboxError::CreationError(
+                        "AppContainer profile returned a null SID".into(),
+                    ));
+                }
+                sid
+            };
 
             let container = Self {
                 profile,
@@ -847,6 +858,16 @@ mod imp {
             startup.lpAttributeList = list;
 
             let mut process_info: PROCESS_INFORMATION = unsafe { std::mem::zeroed() };
+            // `bInheritHandles` is FALSE on purpose. With TRUE, every
+            // inheritable handle in this process leaks into the container
+            // child, including handles another thread is creating for its own
+            // spawn: Rust's std holds a process-wide lock around `CreateProcess`
+            // exactly to stop that, and this raw call does not take it. A
+            // leaked write end of another caller's pipe outlives this child and
+            // blocks that caller's read until the child exits. The security
+            // capabilities travel in the attribute list, so no handle has to be
+            // inherited for the container to work.
+            //
             // SAFETY: all pointers are live for the duration of the call; the
             // command line is mutable because CreateProcessW may modify it.
             let ok = unsafe {
@@ -855,7 +876,7 @@ mod imp {
                     command_line.as_mut_ptr(),
                     ptr::null(),
                     ptr::null(),
-                    1,
+                    0,
                     EXTENDED_STARTUPINFO_PRESENT | CREATE_UNICODE_ENVIRONMENT,
                     ptr::null(),
                     cwd_wide.as_ref().map_or(ptr::null(), |wide| wide.as_ptr()),
@@ -908,6 +929,13 @@ mod imp {
             // SAFETY: `process` is a live handle owned by this value.
             let wait = unsafe { WaitForSingleObject(self.process, 30_000) };
             if wait == WAIT_TIMEOUT {
+                // Do not leave a stuck contained process behind: it can hold
+                // inherited handles and outlive the test that started it, and
+                // the job timeout would then hide which test actually hung.
+                // SAFETY: `process` is a live handle owned by this value.
+                unsafe { TerminateProcess(self.process, 1) };
+                // Let the termination land before `Drop` closes the handle.
+                unsafe { WaitForSingleObject(self.process, 5_000) };
                 return Err(SandboxError::CreationError(
                     "the contained process did not exit within 30 seconds".into(),
                 ));

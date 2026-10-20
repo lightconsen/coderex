@@ -528,6 +528,304 @@ pub fn apply_darwin_memory_limit(bytes: u64) -> bool {
     attempt_memory_limit(true, bytes).is_ok()
 }
 
+// ─── macOS: resident-memory watchdog ────────────────────────────────────────
+
+/// How often the macOS watchdog samples the child's resident footprint.
+///
+/// 50 ms is a compromise: fast enough that a runaway allocator is stopped
+/// before it can grow far past the ceiling, cheap enough that a well-behaved
+/// child is sampled twenty times a second for the whole of its life. The
+/// sample is a single `proc_pidinfo` call, not a subprocess.
+// The watchdog itself is macOS-only; other hosts still unit-test the pure
+// decision logic, so there the constant is only referenced from tests.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub(crate) const MEMORY_WATCHDOG_POLL_MILLIS: u64 = 50;
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub(crate) const MEMORY_WATCHDOG_POLL: std::time::Duration =
+    std::time::Duration::from_millis(MEMORY_WATCHDOG_POLL_MILLIS);
+
+/// The pure decision at the heart of the macOS memory watchdog: is a sampled
+/// footprint over the configured ceiling?
+///
+/// Split out so it can be unit-tested on every host, not only the one with the
+/// `libproc` backend. A footprint exactly *at* the limit is not over it — the
+/// limit is a ceiling, and killing a child that never exceeded it would be
+/// wrong.
+// Called by the macOS watchdog; other hosts exercise it from the tests only.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+#[must_use]
+pub(crate) const fn memory_watchdog_over_limit(footprint_bytes: u64, limit_bytes: u64) -> bool {
+    footprint_bytes > limit_bytes
+}
+
+/// Whether a freshly sampled process is still the one the watchdog started.
+///
+/// The pid alone is not enough: Darwin recycles pids, and a recycled pid would
+/// let the watchdog `SIGKILL` an unrelated process. The start time
+/// (`pbi_start_tvsec`/`pbi_start_tvusec`, folded into microseconds) recorded at
+/// spawn is compared against the value read now; a mismatch means the original
+/// child has exited and the pid now names something else.
+// Called by the macOS watchdog; other hosts exercise it from the tests only.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+#[must_use]
+pub(crate) const fn memory_watchdog_same_process(expected_start: u64, observed_start: u64) -> bool {
+    expected_start == observed_start
+}
+
+/// Fold `proc_bsdinfo`'s start time into a single microsecond value.
+///
+/// Pure, so the folding is asserted on every host rather than only where the
+/// struct exists.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+#[must_use]
+pub(crate) const fn memory_watchdog_start_micros(tv_sec: u64, tv_usec: u64) -> u64 {
+    tv_sec.saturating_mul(1_000_000).saturating_add(tv_usec)
+}
+
+/// The macOS supervisor that turns the best-effort `RLIMIT_DATA` attempt into a
+/// real hard cap.
+///
+/// `SandboxConfig::max_memory_bytes` cannot be enforced by the kernel on modern
+/// Darwin: `RLIMIT_AS` and `RLIMIT_DATA` are both rejected with `EINVAL` (see
+/// [`apply_darwin_memory_limit`]). The watchdog closes that gap in user space —
+/// a thread samples the child's resident footprint through `libproc` and sends
+/// `SIGKILL` once it exceeds the ceiling, and when the child leads its own
+/// process group it kills the whole group so descendants die with it. The
+/// `RLIMIT_*` attempt is kept as a secondary layer: on the kernels that honour
+/// it, the child never reaches the watchdog's threshold in the first place.
+#[cfg(target_os = "macos")]
+mod memory_watchdog {
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    use super::{
+        MEMORY_WATCHDOG_POLL, MEMORY_WATCHDOG_POLL_MILLIS, memory_watchdog_over_limit,
+        memory_watchdog_same_process, memory_watchdog_start_micros,
+    };
+
+    /// A running watchdog for one child. Dropping it stops the sampling thread.
+    pub(super) struct MemoryWatchdog {
+        stop: Arc<AtomicBool>,
+        thread: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl MemoryWatchdog {
+        /// Start watching the child whose pid is written to `read_fd`.
+        ///
+        /// `read_fd` is the parent's end of a pipe whose write end the child
+        /// holds; the child writes its own pid there from `pre_exec`, before
+        /// `execve`. Reading the pid from the child rather than taking it from
+        /// `Child::id()` keeps the watchdog correct for the callers that spawn
+        /// through `std::process::Command` and only hand the pid back later.
+        ///
+        /// The thread is best-effort: if it cannot be spawned the watchdog is
+        /// inert, and the caller keeps the documented `RLIMIT_*` fallback.
+        pub(super) fn spawn(read_fd: OwnedFd, limit_bytes: u64) -> Self {
+            let stop = Arc::new(AtomicBool::new(false));
+            let thread_stop = Arc::clone(&stop);
+            let thread = std::thread::Builder::new()
+                .name("coderex-mem-watchdog".into())
+                .spawn(move || watch(read_fd, limit_bytes, &thread_stop))
+                .ok();
+            Self { stop, thread }
+        }
+    }
+
+    impl Drop for MemoryWatchdog {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::Relaxed);
+            // The thread wakes within one poll interval and returns; joining
+            // keeps a finished child's watchdog from outliving the handle.
+            if let Some(thread) = self.thread.take() {
+                let _ = thread.join();
+            }
+        }
+    }
+
+    /// Create the pid pipe, with the child's write end marked close-on-exec.
+    ///
+    /// Close-on-exec is what makes the handoff one-shot: the child writes its
+    /// pid from `pre_exec` (before `execve`) and the descriptor is gone by the
+    /// time the sandbox wrapper runs, so nothing the child later spawns
+    /// inherits it. Returns `None` when the pipe cannot be made; the caller
+    /// then keeps only the `RLIMIT_*` fallback.
+    pub(super) fn watchdog_pipe() -> Option<(OwnedFd, OwnedFd)> {
+        let mut fds = [0 as RawFd; 2];
+        // SAFETY: `fds` is a two-element array, the size `pipe` expects.
+        if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
+            return None;
+        }
+        // SAFETY: both descriptors were just returned by `pipe` and are owned
+        // here.
+        let read = unsafe { OwnedFd::from_raw_fd(fds[0]) };
+        let write = unsafe { OwnedFd::from_raw_fd(fds[1]) };
+        // SAFETY: `write` is a live descriptor.
+        let flags = unsafe { libc::fcntl(write.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) };
+        if flags == -1 {
+            return None;
+        }
+        Some((read, write))
+    }
+
+    // Owning the descriptor is the point: it keeps the pipe's read end open
+    // for as long as the thread runs, even though the body only reads from it.
+    #[allow(clippy::needless_pass_by_value)]
+    fn watch(read_fd: OwnedFd, limit_bytes: u64, stop: &AtomicBool) {
+        let Some(pid) = read_child_pid(&read_fd, stop) else {
+            return;
+        };
+        let Some(start) = process_start_micros(pid) else {
+            return;
+        };
+        loop {
+            if stop.load(Ordering::Relaxed) {
+                return;
+            }
+            std::thread::sleep(MEMORY_WATCHDOG_POLL);
+            match (process_start_micros(pid), resident_footprint(pid)) {
+                // The pid is gone, or it now names a different process: the
+                // original child has exited and there is nothing to kill.
+                (Some(now), _) if !memory_watchdog_same_process(start, now) => return,
+                (None, _) => return,
+                (Some(_), Some(footprint))
+                    if memory_watchdog_over_limit(footprint, limit_bytes) =>
+                {
+                    kill_child(pid);
+                    return;
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// Read the pid the child wrote from `pre_exec`.
+    ///
+    /// The read is polled with a timeout rather than left blocking: a spawn
+    /// that fails leaves no child to write, and the thread has to notice the
+    /// watchdog being stopped so `Drop`'s join cannot hang. A `poll` returning
+    /// readable with a zero-length read means every write end is closed (the
+    /// child exited without writing), which ends the wait.
+    fn read_child_pid(read_fd: &OwnedFd, stop: &AtomicBool) -> Option<libc::pid_t> {
+        let mut buf = [0u8; std::mem::size_of::<libc::pid_t>()];
+        let mut read = 0;
+        while read < buf.len() {
+            if stop.load(Ordering::Relaxed) {
+                return None;
+            }
+            let mut poll_fd = libc::pollfd {
+                fd: read_fd.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            // SAFETY: `poll_fd` is one initialised `pollfd`; `poll` reads it
+            // and writes only `revents`.
+            let ready = unsafe {
+                libc::poll(
+                    std::ptr::from_mut(&mut poll_fd),
+                    1,
+                    libc::c_int::try_from(MEMORY_WATCHDOG_POLL_MILLIS).unwrap_or(libc::c_int::MAX),
+                )
+            };
+            if ready == 0 {
+                continue;
+            }
+            if ready < 0 {
+                return None;
+            }
+            // SAFETY: `read_fd` is a live descriptor and `buf[read..]` is a
+            // valid destination of the given length.
+            let n = unsafe {
+                libc::read(
+                    read_fd.as_raw_fd(),
+                    buf[read..].as_mut_ptr().cast(),
+                    buf.len() - read,
+                )
+            };
+            if n <= 0 {
+                return None;
+            }
+            read += usize::try_from(n).unwrap_or(0);
+        }
+        Some(libc::pid_t::from_ne_bytes(buf))
+    }
+
+    /// `pbi_start_tvsec`/`pbi_start_tvusec` for `pid`, or `None` if it is gone.
+    fn process_start_micros(pid: libc::pid_t) -> Option<u64> {
+        let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+        let size = libc::c_int::try_from(std::mem::size_of::<libc::proc_bsdinfo>())
+            .unwrap_or(libc::c_int::MAX);
+        // SAFETY: `info` is a correctly sized out buffer for
+        // `PROC_PIDTBSDINFO`; `proc_pidinfo` only writes within `size` bytes.
+        let written = unsafe {
+            libc::proc_pidinfo(
+                pid,
+                libc::PROC_PIDTBSDINFO,
+                0,
+                std::ptr::from_mut(&mut info).cast(),
+                size,
+            )
+        };
+        if written != size {
+            return None;
+        }
+        Some(memory_watchdog_start_micros(
+            info.pbi_start_tvsec,
+            info.pbi_start_tvusec,
+        ))
+    }
+
+    /// The child's resident size in bytes, or `None` if it is gone.
+    ///
+    /// `PROC_PIDTASKINFO`'s `pti_resident_size` is used rather than
+    /// `proc_pid_rusage`'s `ri_phys_footprint`: the task-info struct is a fixed
+    /// size the kernel either fills completely or refuses, whereas the rusage
+    /// buffer is a union sized by the caller and easy to under-size. Resident
+    /// size is the quantity a `RLIMIT_RSS`-style ceiling is defined against.
+    fn resident_footprint(pid: libc::pid_t) -> Option<u64> {
+        let mut info: libc::proc_taskinfo = unsafe { std::mem::zeroed() };
+        let size = libc::c_int::try_from(std::mem::size_of::<libc::proc_taskinfo>())
+            .unwrap_or(libc::c_int::MAX);
+        // SAFETY: as above, for `PROC_PIDTASKINFO`.
+        let written = unsafe {
+            libc::proc_pidinfo(
+                pid,
+                libc::PROC_PIDTASKINFO,
+                0,
+                std::ptr::from_mut(&mut info).cast(),
+                size,
+            )
+        };
+        if written != size {
+            return None;
+        }
+        Some(info.pti_resident_size)
+    }
+
+    /// `SIGKILL` the child, and its process group when it leads one.
+    ///
+    /// A child started with `process_group(0)` (the WASM compiler) is its own
+    /// group leader, so killing `-pid` takes its descendants too. A child that
+    /// shares this process's group must **not** be killed that way — `-pid`
+    /// would name a group this process belongs to — so the group is only
+    /// targeted when `getpgid(pid) == pid`. That check is also what makes the
+    /// group kill "where applicable" rather than assumed.
+    fn kill_child(pid: libc::pid_t) {
+        // SAFETY: `getpgid` and `kill` take plain integers; the pid was just
+        // verified to be the child.
+        unsafe {
+            if libc::getpgid(pid) == pid {
+                libc::kill(-pid, libc::SIGKILL);
+            } else {
+                libc::kill(pid, libc::SIGKILL);
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+use memory_watchdog::MemoryWatchdog;
+
 // ─── Linux: Landlock path confinement ───────────────────────────────────────
 
 /// The environment variable that switches the Landlock fallback off.
@@ -720,6 +1018,78 @@ pub const fn landlock_in_force() -> bool {
     false
 }
 
+/// A Landlock ruleset built in the parent, for a child to install itself.
+///
+/// [`SandboxHandle::prepare`] on Linux builds a ruleset like this one and then
+/// *also* installs the shell seccomp table. That table is written for shells
+/// and rejects syscalls a WASM runtime needs, so a caller that wants path
+/// confinement without the syscall allowlist — the WASM compiler helper — uses
+/// this type directly:
+///
+/// 1. [`landlock_ruleset`] before spawning, with the paths the child may touch.
+/// 2. Capture [`LandlockRuleset::raw_fd`] in a `pre_exec` closure and call
+///    [`landlock_restrict`] there, before `execve`.
+/// 3. Keep the value alive until the child has spawned; the descriptor is
+///    close-on-exec, so it does not leak past the child's `execve`.
+///
+/// The ruleset is built from the same [`landlock_plan`] the shell fallback uses,
+/// so the two paths confine the same way. Nothing here applies seccomp.
+#[cfg(target_os = "linux")]
+#[derive(Debug)]
+pub struct LandlockRuleset {
+    fd: std::os::fd::OwnedFd,
+}
+
+#[cfg(target_os = "linux")]
+impl LandlockRuleset {
+    /// The raw descriptor, for capture by a `pre_exec` closure.
+    #[must_use]
+    pub fn raw_fd(&self) -> std::os::fd::RawFd {
+        use std::os::fd::AsRawFd;
+        self.fd.as_raw_fd()
+    }
+}
+
+/// Build a Landlock ruleset for `config`, or `None` when Landlock is absent or
+/// the ruleset cannot be created.
+///
+/// A `None` return is a fallback, not a failure: the caller keeps whatever other
+/// confinement it has (rlimits, the process-group kill) and says so.
+#[cfg(target_os = "linux")]
+#[must_use]
+pub fn landlock_ruleset(config: &SandboxConfig) -> Option<LandlockRuleset> {
+    let abi = landlock_abi_version()?;
+    if abi < 1 {
+        return None;
+    }
+    let plan = landlock_plan(config, abi);
+    match linux_impl::build_landlock_ruleset(&plan) {
+        Ok(fd) => Some(LandlockRuleset { fd }),
+        Err(error) => {
+            tracing::warn!(
+                %error,
+                "landlock: could not build the ruleset; continuing without path confinement"
+            );
+            None
+        }
+    }
+}
+
+/// Install a ruleset built by [`landlock_ruleset`] in the calling process.
+///
+/// Only async-signal-safe calls (`prctl`, `landlock_restrict_self`), so it is
+/// meant for a `pre_exec` closure: the child restricts itself after `fork` and
+/// before `execve`, and the restriction is inherited by everything it runs.
+///
+/// # Errors
+///
+/// Returns the kernel's error when `no_new_privs` cannot be set or the ruleset
+/// cannot be enforced.
+#[cfg(target_os = "linux")]
+pub fn landlock_restrict(ruleset_fd: std::os::fd::RawFd) -> std::io::Result<()> {
+    linux_impl::restrict_self(ruleset_fd)
+}
+
 // ─── Linux: cgroup v2 limits ────────────────────────────────────────────────
 
 /// A live cgroup v2 group carrying a memory and/or process ceiling.
@@ -782,7 +1152,28 @@ pub mod cgroup {
                     "no memory or process limit was configured".to_string(),
                 ));
             }
+            Self::create_group(memory_max_bytes, pids_max)
+        }
 
+        /// Create a group with no resource limits, purely to own a process
+        /// tree so [`Self::kill`] can stop all of it at once.
+        ///
+        /// A process that calls `setsid()` leaves the process group a plain
+        /// group kill signals; a cgroup is not escaped that way. This is how
+        /// the plugin monitor supervisor keeps whole-tree ownership on Linux
+        /// without imposing a resource ceiling a monitor did not ask for.
+        ///
+        /// # Errors
+        ///
+        /// As [`Self::create`].
+        pub fn create_owning() -> Result<Self, SandboxError> {
+            Self::create_group(None, None)
+        }
+
+        fn create_group(
+            memory_max_bytes: Option<u64>,
+            pids_max: Option<u64>,
+        ) -> Result<Self, SandboxError> {
             let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
             let name = cgroup_name(std::process::id(), id);
             let mut reasons = Vec::new();
@@ -840,6 +1231,34 @@ pub mod cgroup {
         #[must_use]
         pub fn path(&self) -> &Path {
             &self.dir
+        }
+
+        /// `SIGKILL` every process in the group. Returns whether a kill was
+        /// issued.
+        ///
+        /// `cgroup.kill` (Linux 5.14+) stops the whole group with a single
+        /// write and is the preferred path. Older kernels fall back to
+        /// signalling each pid in `cgroup.procs`: that reads a file, so it is
+        /// not async-signal-safe in the strict sense, but it is bounded,
+        /// allocation-light and spawns nothing — which is what a
+        /// signal-handler/panic-hook caller needs.
+        pub fn kill(&self) -> bool {
+            if std::fs::write(self.dir.join("cgroup.kill"), "1").is_ok() {
+                return true;
+            }
+            let Ok(procs) = std::fs::read_to_string(self.dir.join("cgroup.procs")) else {
+                return false;
+            };
+            let mut issued = false;
+            for line in procs.lines() {
+                if let Ok(pid) = line.trim().parse::<libc::pid_t>() {
+                    // SAFETY: signalling a pid read from this group's own
+                    // `cgroup.procs`; a failure means it already exited.
+                    unsafe { libc::kill(pid, libc::SIGKILL) };
+                    issued = true;
+                }
+            }
+            issued
         }
     }
 
@@ -1072,6 +1491,10 @@ impl SandboxHandle {
 
 // ─── Platform Dispatch ──────────────────────────────────────────────────────
 
+// Exactly one of these exists per sandbox, next to a live child process and an
+// OS-level policy; the variant size difference is irrelevant, and boxing the
+// Unix variants would only add indirection to every `prepare`/`post_spawn`.
+#[allow(clippy::large_enum_variant)]
 enum PlatformSandbox {
     #[cfg(target_os = "linux")]
     Linux(LinuxSandbox),
@@ -1537,7 +1960,9 @@ mod linux_impl {
     /// closed as soon as each rule is in place. A path that cannot be opened is
     /// skipped with a warning: a policy path that does not exist yet has no
     /// inode to grant, exactly as `bwrap` cannot bind a missing source.
-    fn build_landlock_ruleset(plan: &super::LandlockPlan) -> Result<OwnedFd, std::io::Error> {
+    pub(super) fn build_landlock_ruleset(
+        plan: &super::LandlockPlan,
+    ) -> Result<OwnedFd, std::io::Error> {
         let handled_access_net = if plan.handle_network {
             LANDLOCK_ACCESS_NET_BIND_TCP | LANDLOCK_ACCESS_NET_CONNECT_TCP
         } else {
@@ -1648,7 +2073,7 @@ mod linux_impl {
     }
 
     /// Enter the ruleset in the calling (child) process.
-    fn restrict_self(ruleset: i32) -> Result<(), std::io::Error> {
+    pub(super) fn restrict_self(ruleset: i32) -> Result<(), std::io::Error> {
         // Landlock requires no_new_privs before it will restrict a process.
         // SAFETY: prctl with this option has no pointer arguments.
         let ret = unsafe { libc::prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) };
@@ -2035,15 +2460,24 @@ use linux_impl::LinuxSandbox;
 
 #[cfg(target_os = "macos")]
 mod macos_impl {
-    use super::{SandboxConfig, SandboxError};
+    use super::{MemoryWatchdog, SandboxConfig, SandboxError};
     use std::fs;
+    use std::os::fd::AsRawFd;
     use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
+    use std::sync::Mutex;
 
     /// macOS sandbox using sandbox-exec.
     pub struct MacOsSandbox {
         config: SandboxConfig,
         profile_path: Option<PathBuf>,
+        /// The resident-memory watchdog for the child this handle prepared.
+        ///
+        /// `prepare` takes `&self` (the trait is shared with the other
+        /// backends), so the handle is behind a mutex. It is `None` until
+        /// `prepare` runs and is replaced if a caller prepares more than one
+        /// command; `Drop` stops whichever thread is running.
+        watchdog: Mutex<Option<MemoryWatchdog>>,
     }
 
     impl MacOsSandbox {
@@ -2054,6 +2488,7 @@ mod macos_impl {
             let mut sandbox = Self {
                 config,
                 profile_path: None,
+                watchdog: Mutex::new(None),
             };
             let profile = sandbox.generate_profile();
             let thread_id = format!("{:?}", std::thread::current().id());
@@ -2086,28 +2521,81 @@ mod macos_impl {
             ("sandbox-exec", vec!["-f".to_string(), profile])
         }
 
-        /// Install the best-effort memory ceiling, if one is configured.
+        /// Install the memory ceiling, if one is configured.
         ///
-        /// Modern Darwin rejects `RLIMIT_DATA` with `EINVAL`, so the result is
-        /// deliberately ignored: an unsupported limit must not turn a spawn
-        /// into a failure. Where the kernel honours it, the limit is in place
-        /// before the wrapper and the program it execs.
+        /// Two layers. The `pre_exec` closure installs the best-effort
+        /// `RLIMIT_DATA` ceiling: modern Darwin rejects it with `EINVAL`, and
+        /// the rejection is deliberately ignored rather than failing the
+        /// spawn. Because that rejection is the common case, a real hard cap is
+        /// provided by [`MemoryWatchdog`]: the same `pre_exec` writes the
+        /// child's pid down a close-on-exec pipe, and a supervisor thread
+        /// `SIGKILL`s the child once its resident footprint passes the ceiling.
+        /// The watchdog is stored on this handle, so it stops when the handle
+        /// (and therefore the child) is dropped.
+        ///
+        /// Where the kernel *does* honour `RLIMIT_DATA` the child never reaches
+        /// the watchdog's threshold, so the two layers do not conflict.
         // The result is always `Ok`: Darwin's rejection of the limit is
         // deliberately ignored. The signature matches the other backends.
         #[allow(clippy::unnecessary_wraps)]
         pub fn prepare(&self, cmd: &mut std::process::Command) -> Result<(), SandboxError> {
             use std::os::unix::process::CommandExt;
 
-            if let Some(bytes) = self.config.max_memory_bytes {
-                // SAFETY: pre_exec runs in the child between fork and exec and
-                // only calls setrlimit, which is async-signal-safe.
+            let Some(bytes) = self.config.max_memory_bytes else {
+                return Ok(());
+            };
+
+            // A fresh watchdog replaces any previous one; the old thread stops
+            // on drop, before the new child exists. The guard is released
+            // immediately rather than held across the setup below.
+            *self
+                .watchdog
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+
+            let Some((read_fd, write_fd)) = super::memory_watchdog::watchdog_pipe() else {
+                // No pipe: keep only the best-effort rlimit layer rather than
+                // failing a spawn the caller can still make.
+                // SAFETY: as below; only `setrlimit` runs in the child.
                 unsafe {
                     cmd.pre_exec(move || {
                         let _ = super::apply_darwin_memory_limit(bytes);
                         Ok(())
                     });
                 }
+                return Ok(());
+            };
+
+            // The write end is moved into the closure so it stays open until
+            // the `Command` drops the closure after `spawn`; the child writes
+            // its pid there from `pre_exec`.
+            // SAFETY: `pre_exec` runs in the child between fork and exec. The
+            // closure calls only `setrlimit`, `getpid` and `write`, which are
+            // async-signal-safe, and it touches no shared state.
+            unsafe {
+                cmd.pre_exec(move || {
+                    let _ = super::apply_darwin_memory_limit(bytes);
+                    let pid = libc::getpid();
+                    let buf = pid.to_ne_bytes();
+                    let fd = write_fd.as_raw_fd();
+                    let mut written = 0;
+                    while written < buf.len() {
+                        let n =
+                            libc::write(fd, buf[written..].as_ptr().cast(), buf.len() - written);
+                        if n <= 0 {
+                            break;
+                        }
+                        written += usize::try_from(n).unwrap_or(0);
+                    }
+                    Ok(())
+                });
             }
+
+            *self
+                .watchdog
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                Some(MemoryWatchdog::spawn(read_fd, bytes));
             Ok(())
         }
 
@@ -3057,6 +3545,147 @@ mod tests {
         );
     }
 
+    // ─── macOS memory watchdog ──────────────────────────────────────────────
+
+    /// The ceiling is strict: exactly at the limit is not over it.
+    #[test]
+    fn memory_watchdog_threshold_is_strict() {
+        assert!(!memory_watchdog_over_limit(0, 1024));
+        assert!(!memory_watchdog_over_limit(1024, 1024));
+        assert!(memory_watchdog_over_limit(1025, 1024));
+        // A zero ceiling kills anything that has allocated at all.
+        assert!(memory_watchdog_over_limit(1, 0));
+        assert!(!memory_watchdog_over_limit(0, 0));
+    }
+
+    /// A recycled pid must not be mistaken for the child: the start-time guard
+    /// is what stops the watchdog killing an unrelated process.
+    #[test]
+    fn memory_watchdog_start_time_guard_rejects_a_recycled_pid() {
+        assert!(memory_watchdog_same_process(1_000_000, 1_000_000));
+        assert!(!memory_watchdog_same_process(1_000_000, 1_000_001));
+        // A different second is a different process even when the microseconds
+        // happen to match.
+        assert!(!memory_watchdog_same_process(
+            memory_watchdog_start_micros(10, 500),
+            memory_watchdog_start_micros(11, 500)
+        ));
+    }
+
+    /// The two fields fold into one comparable microsecond value.
+    #[test]
+    fn memory_watchdog_start_time_folds_seconds_and_microseconds() {
+        assert_eq!(memory_watchdog_start_micros(0, 0), 0);
+        assert_eq!(memory_watchdog_start_micros(1, 0), 1_000_000);
+        assert_eq!(memory_watchdog_start_micros(1, 250), 1_000_250);
+        // Saturating, so a nonsense field cannot wrap the comparison.
+        assert_eq!(memory_watchdog_start_micros(u64::MAX, 0), u64::MAX);
+    }
+
+    /// Bytes the re-executed helper allocates, read from the environment.
+    #[cfg(target_os = "macos")]
+    const WATCHDOG_ALLOC_ENV: &str = "CODEREX_WATCHDOG_TEST_ALLOC";
+
+    /// Re-executed helper: allocate and touch `WATCHDOG_ALLOC_ENV` bytes, then
+    /// sleep. It is an ordinary test so `current_exe()` can run it by name;
+    /// with the variable unset (a plain `cargo test` run) it returns at once.
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn watchdog_allocation_helper() {
+        let Some(bytes) = std::env::var(WATCHDOG_ALLOC_ENV)
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+        else {
+            return;
+        };
+        let mut buffer = vec![0u8; bytes];
+        // Touch every page so the allocation is resident, not merely reserved:
+        // the watchdog samples the resident footprint, not the address space.
+        let mut index = 0;
+        while index < buffer.len() {
+            buffer[index] = 1;
+            index += 4096;
+        }
+        std::hint::black_box(&buffer);
+        std::thread::sleep(std::time::Duration::from_secs(30));
+    }
+
+    /// Spawn the helper with `alloc_bytes` resident.
+    #[cfg(target_os = "macos")]
+    fn spawn_allocation_helper(alloc_bytes: usize) -> std::process::Child {
+        let exe = std::env::current_exe().expect("the test binary path");
+        let mut cmd = std::process::Command::new(exe);
+        cmd.arg("--exact")
+            .arg("sandbox::tests::watchdog_allocation_helper")
+            .arg("--nocapture")
+            .env(WATCHDOG_ALLOC_ENV, alloc_bytes.to_string())
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        cmd.spawn().expect("the helper should spawn")
+    }
+
+    /// Start a watchdog on `child` and return it alongside the child.
+    #[cfg(target_os = "macos")]
+    fn watch_child(
+        child: &std::process::Child,
+        limit_bytes: u64,
+    ) -> super::memory_watchdog::MemoryWatchdog {
+        use std::io::Write;
+        let (read_fd, write_fd) =
+            super::memory_watchdog::watchdog_pipe().expect("a pid pipe should be creatable");
+        let mut write = std::fs::File::from(write_fd);
+        write
+            .write_all(&child.id().to_ne_bytes())
+            .expect("the pid should be written");
+        drop(write);
+        super::memory_watchdog::MemoryWatchdog::spawn(read_fd, limit_bytes)
+    }
+
+    /// A child whose resident footprint passes the ceiling is killed.
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn macos_watchdog_kills_a_child_over_the_limit() {
+        let limit = 64 * 1024 * 1024;
+        let mut child = spawn_allocation_helper(256 * 1024 * 1024);
+        let watchdog = watch_child(&child, limit);
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        let status = loop {
+            if let Some(status) = child.try_wait().expect("try_wait should succeed") {
+                break status;
+            }
+            if std::time::Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("the watchdog did not kill a child over {limit} bytes");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        };
+        drop(watchdog);
+        assert!(
+            !status.success(),
+            "a child killed by the watchdog must not report success"
+        );
+    }
+
+    /// A child that stays under the ceiling is left running.
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn macos_watchdog_leaves_a_child_under_the_limit_alone() {
+        let limit = 512 * 1024 * 1024;
+        let mut child = spawn_allocation_helper(16 * 1024 * 1024);
+        let watchdog = watch_child(&child, limit);
+
+        // Long enough for many sampling intervals at the watchdog's 50 ms poll.
+        std::thread::sleep(std::time::Duration::from_secs(2));
+        let alive = child.try_wait().expect("try_wait should succeed").is_none();
+        let _ = child.kill();
+        let _ = child.wait();
+        drop(watchdog);
+        assert!(alive, "the watchdog killed a child under the limit");
+    }
+
     /// A rejected ceiling must not abort the spawn, and the caller must be
     /// able to observe that it was not applied.
     ///
@@ -3575,7 +4204,19 @@ mod tests {
             max_cpu_seconds: Some(30),
             ..SandboxConfig::default()
         };
+        // Phase checkpoints. The Windows runtime job can only be debugged from
+        // its log, and a hang in this test used to consume the whole step
+        // timeout without saying which operation stalled.
+        let started = std::time::Instant::now();
+        let phase = |name: &str| {
+            eprintln!(
+                "[sandbox] {:.3}s phase: {name}",
+                started.elapsed().as_secs_f64()
+            )
+        };
+        phase("creating the sandbox handle (profile + ACL plan)");
         let handle = SandboxHandle::create(config).unwrap();
+        phase("sandbox handle ready");
 
         let inside = allowed.join("inside.txt");
         let outside = denied.join("outside.txt");
@@ -3595,25 +4236,30 @@ mod tests {
             .stdout(std::process::Stdio::inherit())
             .stderr(std::process::Stdio::inherit());
         handle.prepare(&mut cmd).unwrap();
+        phase("spawning the contained child");
         let mut child = cmd.spawn().unwrap();
+        phase("child spawned; attaching the AppContainer token and Job Object");
         handle.post_spawn(&child).unwrap();
+        phase("post_spawn done; waiting for the child (30s bound)");
         let status = wait_bounded(&mut child, std::time::Duration::from_secs(30));
+        phase(&format!(
+            "child wait returned {:?}",
+            status.map(|status| status.code())
+        ));
 
         // The runtime job can only be debugged from its logs, so the failure
         // carries what the DACL and the mandatory label actually look like,
         // what the container's token looks like, and what the command said.
+        phase("collecting diagnostics");
         let detail = match &handle.inner {
             PlatformSandbox::Windows(sandbox) => sandbox.diagnose(&allowed),
             _ => String::new(),
         };
-        let acl = std::process::Command::new("icacls")
-            .arg(&allowed)
-            .output()
-            .map_or_else(
-                |error| format!("<icacls failed: {error}>"),
-                |out| String::from_utf8_lossy(&out.stdout).into_owned(),
-            );
+        let mut icacls = std::process::Command::new("icacls");
+        icacls.arg(&allowed);
+        let acl = output_bounded(icacls, std::time::Duration::from_secs(10));
         let groups = run_in_container(&handle, &allowed, "whoami /groups");
+        phase("diagnostics collected");
         assert!(
             inside.exists(),
             "the granted workspace was not writable (exit={:?})\n{detail}\n\
@@ -3643,6 +4289,43 @@ mod tests {
             }
             std::thread::sleep(std::time::Duration::from_millis(100));
         }
+    }
+
+    /// Run `command`, capturing stdout/stderr into a file, and give up after
+    /// `limit`.
+    ///
+    /// `Command::output` has no timeout. A stuck diagnostic tool would then
+    /// consume the whole CI job timeout instead of failing the test with a
+    /// message naming the step that hung.
+    #[cfg(target_os = "windows")]
+    fn output_bounded(mut command: std::process::Command, limit: std::time::Duration) -> String {
+        let path = std::env::temp_dir().join(format!(
+            "coderex-diagnostic-{}-{}.txt",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |elapsed| elapsed.as_nanos())
+        ));
+        let Ok(file) = std::fs::File::create(&path) else {
+            return "<could not create the diagnostic file>".to_string();
+        };
+        let diagnostics_file = file.try_clone().expect("the file was just created");
+        command
+            .stdin(std::process::Stdio::null())
+            // A file, not a pipe: a contained helper cannot hold it open past
+            // the command's own exit.
+            .stdout(std::process::Stdio::from(file))
+            .stderr(std::process::Stdio::from(diagnostics_file));
+        let Ok(mut child) = command.spawn() else {
+            return "<spawn failed>".to_string();
+        };
+        let text = if wait_bounded(&mut child, limit).is_some() {
+            std::fs::read_to_string(&path).unwrap_or_default()
+        } else {
+            "<the diagnostic command timed out>".to_string()
+        };
+        let _ = std::fs::remove_file(&path);
+        text
     }
 
     /// Run `command` inside the sandbox and return its combined output.
@@ -3677,7 +4360,7 @@ mod tests {
         if let Err(error) = handle.post_spawn(&child) {
             return format!("<post_spawn failed: {error}>");
         }
-        let text = if wait_bounded(&mut child, std::time::Duration::from_secs(15)).is_some() {
+        let text = if wait_bounded(&mut child, std::time::Duration::from_secs(10)).is_some() {
             std::fs::read_to_string(&path).unwrap_or_default()
         } else {
             "<the diagnostic command timed out>".to_string()

@@ -32,6 +32,14 @@
 //! the job, and a descendant started before the attach is not either. Both
 //! callers here attach immediately after `spawn` (and Windows suspends the
 //! child until then), so the window is closed in practice.
+//!
+//! A Unix descendant that calls `setsid()` leaves the process group, so the
+//! group kill misses it. On macOS [`ProcessTree::terminate`] additionally walks
+//! the libproc parent/child chain and kills the descendants it finds, which
+//! covers the common case but not one whose intermediate parent has already
+//! exited (see the note on `kill_descendants`). On Linux the process group is
+//! the fallback and a caller that needs a `setsid()`-proof boundary puts the
+//! child in a cgroup instead.
 
 #![allow(unsafe_code)]
 #![cfg_attr(not(any(unix, target_os = "windows")), allow(dead_code))]
@@ -226,6 +234,12 @@ mod imp {
                     let Ok(pid) = libc::pid_t::try_from(pid) else {
                         return false;
                     };
+                    // macOS has no process group that survives a `setsid()`, so
+                    // a daemonised descendant is not in the group the kill below
+                    // names. Walk the libproc parent/child chain first, while
+                    // the parent still exists to hold the chain together.
+                    #[cfg(target_os = "macos")]
+                    kill_descendants(pid);
                     // SAFETY: the child leads its own group and has not exec'd
                     // anything that changes that, so `-pid` names exactly the
                     // spawned tree. A dead group makes the call fail harmlessly.
@@ -251,6 +265,80 @@ mod imp {
         #[allow(clippy::unused_self)]
         pub(super) const fn active_processes(&self) -> Option<u32> {
             None
+        }
+    }
+
+    /// SIGKILL every descendant of `root`, deepest first.
+    ///
+    /// The group kill in [`Inner::terminate`] misses a process that called
+    /// `setsid()` (it is in a different group) — the classic way a monitor
+    /// daemonises itself out of reach. libproc reports the parent/child chain
+    /// directly, so the descendants are collected *before* the group kill (a
+    /// dead parent re-parents its children to `launchd`, which erases the
+    /// chain) and signalled leaf-first, so no child is orphaned by its parent
+    /// being killed first.
+    ///
+    /// # Best effort
+    ///
+    /// A process that double-forks, calls `setsid()`, and has its intermediate
+    /// parent exit before this walk runs has already been re-parented to
+    /// `launchd`; it is no longer reachable through `proc_listchildpids`.
+    /// Closing that window needs an EndpointSecurity client, which this host
+    /// does not have. This reaches the common `setsid()` escape, not every
+    /// possible one.
+    #[cfg(target_os = "macos")]
+    fn kill_descendants(root: libc::pid_t) {
+        for pid in descendants_of(root) {
+            // SAFETY: signalling a pid read from libproc. A failure means the
+            // process exited between the read and the kill, which is fine.
+            unsafe { libc::kill(pid, libc::SIGKILL) };
+        }
+    }
+
+    /// Every live descendant of `root`, deepest first, excluding `root`.
+    #[cfg(target_os = "macos")]
+    fn descendants_of(root: libc::pid_t) -> Vec<libc::pid_t> {
+        let mut found = Vec::new();
+        let mut frontier = vec![root];
+        while let Some(parent) = frontier.pop() {
+            for child in children_of(parent) {
+                // `root` cannot be its own descendant; the guard also stops a
+                // malformed chain from looping.
+                if child != root && !found.contains(&child) {
+                    found.push(child);
+                    frontier.push(child);
+                }
+            }
+        }
+        // Depth-first discovery lists a parent before its own children, so the
+        // reverse lists children before parents.
+        found.reverse();
+        found
+    }
+
+    /// The direct children of `parent`, or an empty vector if it has none or
+    /// has exited.
+    #[cfg(target_os = "macos")]
+    fn children_of(parent: libc::pid_t) -> Vec<libc::pid_t> {
+        const INITIAL: usize = 64;
+        let mut buffer: Vec<libc::pid_t> = vec![0; INITIAL];
+        loop {
+            let bytes = libc::c_int::try_from(buffer.len() * std::mem::size_of::<libc::pid_t>())
+                .unwrap_or(libc::c_int::MAX);
+            // SAFETY: `buffer` is a valid writable slice and `bytes` is exactly
+            // its length in bytes, so libproc writes within it.
+            let count =
+                unsafe { libc::proc_listchildpids(parent, buffer.as_mut_ptr().cast(), bytes) };
+            if count <= 0 {
+                return Vec::new();
+            }
+            let count = usize::try_from(count).unwrap_or(0);
+            if count < buffer.len() {
+                buffer.truncate(count);
+                return buffer;
+            }
+            // The buffer filled exactly: the real child count may be larger.
+            buffer = vec![0; buffer.len() * 2];
         }
     }
 

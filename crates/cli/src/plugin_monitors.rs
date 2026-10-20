@@ -34,33 +34,75 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use coderex_core::process_tree::{JobLimits, ProcessTree};
+#[cfg(target_os = "linux")]
+use coderex_core::sandbox::CgroupMemoryLimit;
 use serde_json::Value;
 use tokio::io::{AsyncBufReadExt as _, BufReader};
 use tokio::process::{Child, Command};
 use tokio::task::JoinHandle;
 
-/// Every live monitor child's process tree, so a signal handler can kill it.
+/// Whole-tree ownership for one monitor.
+///
+/// A [`ProcessTree`] is the primary owner: a Windows Job Object or a Unix
+/// process group. A monitor that calls `setsid()` leaves the process group,
+/// so on Linux the monitor is additionally placed in a cgroup v2 group —
+/// killing the group stops the whole tree however the monitor rearranged its
+/// process groups. On macOS there is no cgroup; the descendant walk in
+/// [`ProcessTree::terminate`] reaches the `setsid()` child instead (best
+/// effort, see that module).
+#[derive(Debug)]
+struct MonitorOwnership {
+    tree: Arc<ProcessTree>,
+    #[cfg(target_os = "linux")]
+    cgroup: Option<CgroupMemoryLimit>,
+}
+
+impl MonitorOwnership {
+    /// Kill the monitor and everything it started. Returns whether a kill was
+    /// issued.
+    fn terminate(&self) -> bool {
+        #[cfg(target_os = "linux")]
+        {
+            // The cgroup reaches a `setsid()` descendant that the process
+            // group does not; either kill counts as one.
+            let cgroup = self.cgroup.as_ref().is_some_and(CgroupMemoryLimit::kill);
+            return self.tree.terminate() || cgroup;
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            self.tree.terminate()
+        }
+    }
+
+    /// Stop owning the tree: the monitor exited on its own, so its remaining
+    /// descendants are not ours to kill.
+    fn disarm(&self) {
+        self.tree.disarm();
+    }
+}
+
+/// Every live monitor's ownership, so a signal handler can kill it.
 ///
 /// `Drop` is not enough: SIGTERM takes `process::exit` and release builds use
 /// `panic = "abort"`, neither of which runs destructors. The registry is the
 /// only cleanup that survives those paths.
 ///
-/// The value is a [`ProcessTree`], not a pid: on Windows a pid only names the
-/// direct child, and `taskkill /T` is best-effort at reaching grandchildren.
-/// The tree's Job Object kills all of them without spawning a helper process
-/// from a signal handler.
-static MONITOR_TREES: Mutex<Vec<(u64, Arc<ProcessTree>)>> = Mutex::new(Vec::new());
+/// The value is a [`MonitorOwnership`], not a pid: on Windows a pid only names
+/// the direct child, and `taskkill /T` is best-effort at reaching
+/// grandchildren. The Job Object kills all of them without spawning a helper
+/// process from a signal handler.
+static MONITOR_TREES: Mutex<Vec<(u64, Arc<MonitorOwnership>)>> = Mutex::new(Vec::new());
 
 /// Ids are assigned monotonically so two monitors cannot unregister each
 /// other when a pid is reused.
 static NEXT_MONITOR_ID: AtomicU64 = AtomicU64::new(1);
 
-fn register_monitor(tree: Arc<ProcessTree>) -> u64 {
+fn register_monitor(ownership: Arc<MonitorOwnership>) -> u64 {
     let id = NEXT_MONITOR_ID.fetch_add(1, Ordering::Relaxed);
     MONITOR_TREES
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .push((id, tree));
+        .push((id, ownership));
     id
 }
 
@@ -75,14 +117,19 @@ fn unregister_monitor(id: u64) {
 ///
 /// Called from the SIGTERM handler and the panic hook, where no destructor
 /// will run. Idempotent; safe when no monitor is armed.
+///
+/// Everything here is bounded and allocation-light and spawns no process: a
+/// Windows `TerminateJobObject`, a Unix `kill`, and — on Linux — a write to
+/// `cgroup.kill` or a read of `cgroup.procs`. That is what a signal handler
+/// can afford.
 pub fn terminate_all_monitors() {
-    let trees = std::mem::take(
+    let monitors = std::mem::take(
         &mut *MONITOR_TREES
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner),
     );
-    for (_, tree) in trees {
-        tree.terminate();
+    for (_, ownership) in monitors {
+        ownership.terminate();
     }
 }
 
@@ -108,11 +155,13 @@ pub struct PluginMonitorSupervisor {
     monitors: Vec<MonitorTask>,
 }
 
-/// One armed monitor: its name, for logging, and the task that owns the child.
+/// One armed monitor: its name, for logging, the task that owns the child, and
+/// the whole-tree ownership that outlives it.
 #[derive(Debug)]
 struct MonitorTask {
     name: String,
     task: JoinHandle<()>,
+    ownership: Arc<MonitorOwnership>,
 }
 
 /// One validated monitor definition, before it is spawned.
@@ -189,14 +238,18 @@ impl PluginMonitorSupervisor {
             .count()
     }
 
-    /// Abort and wait for every monitor.
+    /// Kill, abort and wait for every monitor.
     ///
     /// Idempotent: a second call, or a call after the monitors exited on
     /// their own, does nothing. Aborting a task drops its child, which
-    /// `kill_on_drop(true)` turns into a `SIGKILL` on Unix.
+    /// `kill_on_drop(true)` turns into a `SIGKILL` on Unix; that only reaches
+    /// the direct child, so the whole tree is terminated *first*, while the
+    /// parent still exists to hold the libproc child chain together and the
+    /// descendants are still in the cgroup.
     pub async fn stop(&mut self) {
         let monitors = std::mem::take(&mut self.monitors);
         for monitor in &monitors {
+            monitor.ownership.terminate();
             monitor.task.abort();
         }
         for monitor in monitors {
@@ -216,11 +269,15 @@ impl PluginMonitorSupervisor {
 }
 
 impl Drop for PluginMonitorSupervisor {
-    /// Abort the monitor tasks that [`stop`](Self::stop) did not already take.
+    /// Kill and abort the monitor tasks that [`stop`](Self::stop) did not
+    /// already take.
     ///
-    /// The child is killed by `kill_on_drop` when the aborted task drops it.
+    /// The whole tree is terminated before the abort, so a monitor's
+    /// descendants die too — not just the direct child that `kill_on_drop`
+    /// reaches.
     fn drop(&mut self) {
         for monitor in &self.monitors {
+            monitor.ownership.terminate();
             monitor.task.abort();
         }
     }
@@ -404,6 +461,24 @@ fn spawn_monitor(spec: MonitorSpec, cwd: &Path) -> std::io::Result<MonitorTask> 
     scrub_credentials(&mut command, &spec.env);
     command.envs(spec.env.iter().map(|(key, value)| (key, value)));
 
+    // Linux: a cgroup owns the whole monitor tree, so a monitor that calls
+    // `setsid()` is still stopped as a unit. Created before the spawn so the
+    // group exists by the time the pid does; only the attach needs the pid.
+    // Failure is not fatal — the process tree is still the primary owner, and
+    // a monitor the host cannot put in a cgroup must still run.
+    #[cfg(target_os = "linux")]
+    let cgroup = match CgroupMemoryLimit::create_owning() {
+        Ok(cgroup) => Some(cgroup),
+        Err(error) => {
+            tracing::debug!(
+                monitor = %spec.name,
+                %error,
+                "no cgroup v2 group for the plugin monitor; its process tree is the only owner"
+            );
+            None
+        }
+    };
+
     let mut child = command.spawn()?;
     let pid = child
         .id()
@@ -414,12 +489,40 @@ fn spawn_monitor(spec: MonitorSpec, cwd: &Path) -> std::io::Result<MonitorTask> 
             "could not place the monitor in its process tree: {error}"
         )));
     }
-    let id = register_monitor(Arc::clone(&tree));
+    #[cfg(target_os = "linux")]
+    if let Some(cgroup) = &cgroup {
+        if let Err(error) = cgroup.attach(pid) {
+            tracing::debug!(
+                monitor = %spec.name,
+                %error,
+                "could not add the plugin monitor to its cgroup; a `setsid()` escape \
+                 would not be caught"
+            );
+        }
+    }
+
+    let ownership = Arc::new(MonitorOwnership {
+        tree,
+        #[cfg(target_os = "linux")]
+        cgroup,
+    });
+    let id = register_monitor(Arc::clone(&ownership));
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
     let name = spec.name;
-    let task = tokio::spawn(pump(child, id, tree, stdout, stderr, name.clone()));
-    Ok(MonitorTask { name, task })
+    let task = tokio::spawn(pump(
+        child,
+        id,
+        Arc::clone(&ownership),
+        stdout,
+        stderr,
+        name.clone(),
+    ));
+    Ok(MonitorTask {
+        name,
+        task,
+        ownership,
+    })
 }
 
 /// Remove this session's credential variables from `command`'s environment.
@@ -462,7 +565,7 @@ fn is_credential_prefix(key: &str) -> bool {
 async fn pump(
     mut child: Child,
     id: u64,
-    tree: Arc<ProcessTree>,
+    ownership: Arc<MonitorOwnership>,
     stdout: Option<tokio::process::ChildStdout>,
     stderr: Option<tokio::process::ChildStderr>,
     name: String,
@@ -479,7 +582,7 @@ async fn pump(
     }
     // The monitor exited on its own. Its remaining descendants (if any) are
     // not ours to kill, so disarm before the tree is dropped.
-    tree.disarm();
+    ownership.disarm();
     unregister_monitor(id);
 }
 
@@ -847,6 +950,62 @@ mod tests {
         );
 
         supervisor.stop().await;
+    }
+
+    /// A monitor that moves its work into a new process group — the shell's
+    /// `setsid()`, via `set -m` and a background job — leaves the group a plain
+    /// group kill signals. Whole-tree ownership must still take it down: the
+    /// macOS descendant walk reaches it through libproc, and the Linux cgroup
+    /// holds it regardless of process group.
+    #[tokio::test]
+    #[cfg(unix)]
+    #[allow(clippy::await_holding_lock)] // TEST_LOCK serialises monitor tests; held across awaits on purpose.
+    async fn a_monitor_that_leaves_its_process_group_is_still_killed() {
+        let _guard = serial();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pid_file = dir.path().join("escaped.pid");
+        // `set -m` turns on job control, so the background job is its own
+        // process group. `wait` keeps the monitor alive so the libproc
+        // parent/child chain still names the escaped child. The path reaches
+        // the inner shell through the environment, so no shell quoting is
+        // needed for it.
+        let script = "set -m\n/bin/sh -c 'echo $$ > \"$CODEREX_MONITOR_ESCAPE_PID\"; exec /bin/sleep 60' &\nwait\n";
+        let monitors = json!({
+            "escapes": {
+                "command": "/bin/sh",
+                "args": ["-c", script],
+                "env": { "CODEREX_MONITOR_ESCAPE_PID": pid_file.to_string_lossy() }
+            }
+        });
+
+        let mut supervisor =
+            PluginMonitorSupervisor::start(&monitors, dir.path()).expect("start monitors");
+        wait_for_file(&pid_file).await;
+        let escaped: i32 = std::fs::read_to_string(&pid_file)
+            .expect("read pid file")
+            .trim()
+            .parse()
+            .expect("parse pid");
+
+        supervisor.stop().await;
+        assert_eq!(supervisor.running(), 0);
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let alive = std::process::Command::new("sh")
+                .arg("-c")
+                .arg(format!("kill -0 {escaped} 2>/dev/null"))
+                .status()
+                .is_ok_and(|status| status.success());
+            if !alive {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the monitor's escaped descendant {escaped} survived stop"
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
     }
 
     /// A signal handler cannot run destructors, so the registry is the only

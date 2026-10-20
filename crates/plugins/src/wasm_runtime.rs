@@ -243,17 +243,33 @@ const WASM_CACHE_MAX_BYTES: u64 = 256 * 1024 * 1024;
 /// Version of the on-disk cache entry envelope.
 ///
 /// A different value invalidates every existing entry (they are deleted when
-/// read). It changes only with this file's format, not with wasmtime.
+/// read). It changes only with this file's format, not with wasmtime. Version 2
+/// added the authentication tag below.
 #[cfg(feature = "wasm-runtime")]
-const WASM_CACHE_FORMAT_VERSION: u32 = 1;
+const WASM_CACHE_FORMAT_VERSION: u32 = 2;
 
 /// Magic bytes at the start of every cache entry.
 #[cfg(feature = "wasm-runtime")]
 const WASM_CACHE_MAGIC: &[u8; 8] = b"CRXCWASM";
 
-/// `magic + version + engine hash + module hash + payload length`.
+/// Length of the HMAC-SHA-256 authentication tag.
 #[cfg(feature = "wasm-runtime")]
-const WASM_CACHE_HEADER_LEN: usize = 8 + 4 + 32 + 32 + 8;
+const WASM_CACHE_TAG_LEN: usize = 32;
+
+/// `magic + version + engine hash + module hash + payload length + tag`.
+#[cfg(feature = "wasm-runtime")]
+const WASM_CACHE_HEADER_LEN: usize = 8 + 4 + 32 + 32 + 8 + WASM_CACHE_TAG_LEN;
+
+/// Environment override for the AOT cache key (hex-encoded 32 bytes).
+///
+/// Honoured in every build so a deployment can pin the key rather than rely on
+/// the generated one, and so tests can supply a fixed key.
+#[cfg(feature = "wasm-runtime")]
+const WASM_CACHE_KEY_ENV: &str = "CODEREX_WASM_CACHE_KEY";
+
+/// The file the generated cache key is stored in, under the user config dir.
+#[cfg(feature = "wasm-runtime")]
+const WASM_CACHE_KEY_FILE: &str = "wasm-cache.key";
 
 /// Build the sandboxed engine shared by every plugin instance.
 ///
@@ -514,40 +530,81 @@ fn resolved_cache_dir() -> PathBuf {
     default_cache_dir()
 }
 
-/// The platform's per-user cache directory for compiled WASM modules.
+/// The platform's per-user cache root, without the `wasm` leaf.
+///
+/// `None` on a host with no home directory and no cache environment, which is
+/// the only case where the caller falls back to the system temp tree.
 #[cfg(feature = "wasm-runtime")]
-fn default_cache_dir() -> PathBuf {
+fn user_cache_root() -> Option<PathBuf> {
     #[cfg(target_os = "macos")]
     {
         if let Some(home) = home::home_dir() {
-            return home.join("Library/Caches/coderex/wasm");
+            return Some(home.join("Library/Caches/coderex"));
         }
     }
     #[cfg(all(unix, not(target_os = "macos")))]
     {
         if let Some(xdg) = std::env::var_os("XDG_CACHE_HOME") {
             if !xdg.is_empty() {
-                return PathBuf::from(xdg).join("coderex/wasm");
+                return Some(PathBuf::from(xdg).join("coderex"));
             }
         }
         if let Some(home) = home::home_dir() {
-            return home.join(".cache/coderex/wasm");
+            return Some(home.join(".cache/coderex"));
         }
     }
     #[cfg(target_os = "windows")]
     {
         if let Some(local) = std::env::var_os("LOCALAPPDATA") {
-            return PathBuf::from(local).join("coderex").join("wasm");
+            return Some(PathBuf::from(local).join("coderex"));
         }
         if let Some(home) = home::home_dir() {
-            return home
-                .join("AppData")
-                .join("Local")
-                .join("coderex")
-                .join("wasm");
+            return Some(home.join("AppData").join("Local").join("coderex"));
         }
     }
-    std::env::temp_dir().join("coderex-wasm")
+    None
+}
+
+/// The platform's per-user cache directory for compiled WASM modules.
+#[cfg(feature = "wasm-runtime")]
+fn default_cache_dir() -> PathBuf {
+    user_cache_root().map_or_else(
+        || std::env::temp_dir().join("coderex-wasm"),
+        |root| root.join("wasm"),
+    )
+}
+
+/// The directory compilations are staged in.
+///
+/// Normally `<cache_root>/staging`. On Linux, when the cache root is itself
+/// under the system temp directory (the last-resort [`default_cache_dir`]),
+/// bubblewrap would replace `/tmp` with a fresh tmpfs and the writable bind for
+/// the staging path would resolve against that empty filesystem, so
+/// [`wrap_with_bubblewrap`] had to give up. Staging under the user's cache
+/// directory instead keeps the path outside the replaced tree, so bubblewrap
+/// can run. Other platforms have no such replacement and always use the cache
+/// root.
+#[cfg(feature = "wasm-runtime")]
+fn staging_root(cache_root: &std::path::Path) -> PathBuf {
+    #[cfg(target_os = "linux")]
+    {
+        let resolved =
+            std::fs::canonicalize(cache_root).unwrap_or_else(|_| cache_root.to_path_buf());
+        let system_temp =
+            std::fs::canonicalize(std::env::temp_dir()).unwrap_or_else(|_| std::env::temp_dir());
+        if resolved.starts_with(&system_temp) {
+            if let Some(root) = user_cache_root() {
+                let fallback = root.join("wasm-staging");
+                // Only relocate to a root that actually exists after creating
+                // it; a read-only or missing home keeps the old behaviour
+                // rather than failing the compilation.
+                if std::fs::create_dir_all(&fallback).is_ok() {
+                    return fallback;
+                }
+            }
+        }
+    }
+    cache_root.join("staging")
 }
 
 // ─── AOT cache ──────────────────────────────────────────────────────────────
@@ -610,30 +667,216 @@ fn cache_entry_path(
         .join(format!("{}.cwasm", hex::encode(module_hash)))
 }
 
-/// Wrap serialized module bytes in the self-describing cache envelope.
+/// The key the AOT cache is authenticated with, or `None` when none can be
+/// obtained.
 ///
-/// The envelope makes the two checks the runtime needs explicit at read time:
-/// the entry was produced by a compatible engine, and it belongs to the module
-/// file whose bytes produced `module_hash`.
+/// The cache lives in a per-user directory and is read back into the runtime,
+/// so a poisoned entry is a code-execution path: `Module::deserialize` trusts
+/// the bytes it is handed. The entry already carries the engine hash and the
+/// module's SHA-256, which catch an accident but not a deliberate rewrite —
+/// both fields are attacker-controlled in that case. The HMAC binds the entry
+/// to a key that is not stored with it.
+///
+/// The key is, in order: `CODEREX_WASM_CACHE_KEY` (hex), a generated key in the
+/// user's config directory, or a generated key beside the cache. A host where
+/// none can be written disables the cache rather than caching unauthenticated
+/// bytes.
 #[cfg(feature = "wasm-runtime")]
-fn encode_cache_entry(engine_hash: &[u8; 32], module_hash: &[u8; 32], payload: &[u8]) -> Vec<u8> {
+fn cache_hmac_key(cache_root: &std::path::Path) -> Option<[u8; 32]> {
+    if let Some(value) = std::env::var_os(WASM_CACHE_KEY_ENV) {
+        let value = value.to_string_lossy();
+        let bytes = hex::decode(value.trim()).ok()?;
+        return <[u8; 32]>::try_from(bytes.as_slice()).ok();
+    }
+    let path = cache_key_path(cache_root);
+    load_or_create_cache_key(&path).map_or_else(
+        || {
+            tracing::warn!(
+                path = %path.display(),
+                "could not load or create the WASM AOT cache key; the cache is disabled"
+            );
+            None
+        },
+        Some,
+    )
+}
+
+/// Where the generated key lives: the user config directory when there is one,
+/// otherwise beside the cache.
+///
+/// The config directory is preferred because the cache directory may be the
+/// world-writable system temp tree (the last-resort [`default_cache_dir`]), and
+/// a key stored beside a cache anyone can write protects nothing.
+#[cfg(feature = "wasm-runtime")]
+fn cache_key_path(cache_root: &std::path::Path) -> PathBuf {
+    config_root().map_or_else(
+        || cache_root.join(format!(".{WASM_CACHE_KEY_FILE}")),
+        |root| root.join(WASM_CACHE_KEY_FILE),
+    )
+}
+
+/// The per-user configuration directory, or `None` when there is no home.
+#[cfg(feature = "wasm-runtime")]
+fn config_root() -> Option<PathBuf> {
+    #[cfg(target_os = "macos")]
+    {
+        if let Some(home) = home::home_dir() {
+            return Some(home.join("Library/Application Support/coderex"));
+        }
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        if let Some(xdg) = std::env::var_os("XDG_CONFIG_HOME") {
+            if !xdg.is_empty() {
+                return Some(PathBuf::from(xdg).join("coderex"));
+            }
+        }
+        if let Some(home) = home::home_dir() {
+            return Some(home.join(".config/coderex"));
+        }
+    }
+    #[cfg(target_os = "windows")]
+    {
+        if let Some(appdata) = std::env::var_os("APPDATA") {
+            return Some(PathBuf::from(appdata).join("coderex"));
+        }
+        if let Some(home) = home::home_dir() {
+            return Some(home.join("AppData").join("Roaming").join("coderex"));
+        }
+    }
+    None
+}
+
+/// Read the key file, creating it with a fresh random key when it is absent.
+///
+/// The create is `create_new` and the file is written before any reader can see
+/// a partial key, so a concurrent process either wins the create or reads a
+/// complete file. Unix readers get mode `0600`.
+#[cfg(feature = "wasm-runtime")]
+fn load_or_create_cache_key(path: &std::path::Path) -> Option<[u8; 32]> {
+    use rand_core::RngCore as _;
+
+    if let Ok(existing) = std::fs::read(path) {
+        if let Ok(key) = <[u8; 32]>::try_from(existing.as_slice()) {
+            return Some(key);
+        }
+        tracing::warn!(
+            path = %path.display(),
+            "the WASM AOT cache key file is malformed; regenerating it"
+        );
+    }
+
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).ok()?;
+    }
+    let mut key = [0u8; 32];
+    rand_core::OsRng.fill_bytes(&mut key);
+
+    match write_new_key(path, &key) {
+        Ok(()) => Some(key),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            // Another process created it first; use theirs.
+            std::fs::read(path)
+                .ok()
+                .and_then(|bytes| <[u8; 32]>::try_from(bytes.as_slice()).ok())
+        }
+        Err(error) => {
+            tracing::warn!(
+                path = %path.display(),
+                %error,
+                "could not write the WASM AOT cache key"
+            );
+            None
+        }
+    }
+}
+
+/// Create `path` with `0600` (Unix) and write the key.
+#[cfg(all(feature = "wasm-runtime", unix))]
+fn write_new_key(path: &std::path::Path, key: &[u8; 32]) -> std::io::Result<()> {
+    use std::io::Write as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
+
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)?;
+    file.write_all(key)?;
+    file.sync_all()
+}
+
+/// Create `path` and write the key.
+#[cfg(all(feature = "wasm-runtime", not(unix)))]
+fn write_new_key(path: &std::path::Path, key: &[u8; 32]) -> std::io::Result<()> {
+    use std::io::Write as _;
+
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)?;
+    file.write_all(key)?;
+    file.sync_all()
+}
+
+/// The HMAC-SHA-256 tag over every field of the envelope except the tag itself.
+#[cfg(feature = "wasm-runtime")]
+fn cache_entry_mac(
+    key: &[u8; 32],
+    engine_hash: &[u8; 32],
+    module_hash: &[u8; 32],
+    payload: &[u8],
+) -> [u8; 32] {
+    use hmac::{Hmac, Mac as _};
+    use sha2::Sha256;
+
+    let mut mac = Hmac::<Sha256>::new_from_slice(key).expect("HMAC accepts any key length");
+    mac.update(WASM_CACHE_MAGIC);
+    mac.update(&WASM_CACHE_FORMAT_VERSION.to_le_bytes());
+    mac.update(engine_hash);
+    mac.update(module_hash);
+    mac.update(&(payload.len() as u64).to_le_bytes());
+    mac.update(payload);
+    mac.finalize().into_bytes().into()
+}
+
+/// Wrap serialized module bytes in the self-describing, authenticated cache
+/// envelope.
+///
+/// The envelope makes the checks the runtime needs explicit at read time: the
+/// entry was produced by a compatible engine, it belongs to the module file
+/// whose bytes produced `module_hash`, and it was written by a process holding
+/// `key`.
+#[cfg(feature = "wasm-runtime")]
+fn encode_cache_entry(
+    engine_hash: &[u8; 32],
+    module_hash: &[u8; 32],
+    payload: &[u8],
+    key: &[u8; 32],
+) -> Vec<u8> {
     let mut entry = Vec::with_capacity(WASM_CACHE_HEADER_LEN + payload.len());
     entry.extend_from_slice(WASM_CACHE_MAGIC);
     entry.extend_from_slice(&WASM_CACHE_FORMAT_VERSION.to_le_bytes());
     entry.extend_from_slice(engine_hash);
     entry.extend_from_slice(module_hash);
     entry.extend_from_slice(&(payload.len() as u64).to_le_bytes());
+    entry.extend_from_slice(&cache_entry_mac(key, engine_hash, module_hash, payload));
     entry.extend_from_slice(payload);
     entry
 }
 
-/// Verify an envelope and return its serialized module bytes.
+/// Verify an envelope — including its authentication tag — and return its
+/// serialized module bytes.
 #[cfg(feature = "wasm-runtime")]
 fn decode_cache_entry<'a>(
     entry: &'a [u8],
     engine_hash: &[u8; 32],
     module_hash: &[u8; 32],
+    key: &[u8; 32],
 ) -> Result<&'a [u8], String> {
+    use hmac::{Hmac, Mac as _};
+    use sha2::Sha256;
+
     if entry.len() < WASM_CACHE_HEADER_LEN {
         return Err("cache entry is truncated".into());
     }
@@ -663,6 +906,15 @@ fn decode_cache_entry<'a>(
             payload.len()
         ));
     }
+
+    // Constant-time comparison: the tag is a MAC, so a byte-by-byte compare
+    // that returned early would leak the expected tag.
+    let mut mac = Hmac::<Sha256>::new_from_slice(key).expect("HMAC accepts any key length");
+    mac.update(&entry[..84]);
+    mac.update(payload);
+    mac.verify_slice(&entry[84..WASM_CACHE_HEADER_LEN])
+        .map_err(|_| "cache entry authentication failed".to_string())?;
+
     Ok(payload)
 }
 
@@ -675,6 +927,7 @@ fn read_cached_module(
     module_hash: &[u8; 32],
     cache_path: &std::path::Path,
     wasm_path: &std::path::Path,
+    key: &[u8; 32],
 ) -> Option<wasmtime::Module> {
     let entry = match std::fs::read(cache_path) {
         Ok(entry) => entry,
@@ -687,7 +940,7 @@ fn read_cached_module(
             return None;
         }
     };
-    let payload = match decode_cache_entry(&entry, engine_hash, module_hash) {
+    let payload = match decode_cache_entry(&entry, engine_hash, module_hash, key) {
         Ok(payload) => payload,
         Err(e) => {
             tracing::warn!(
@@ -701,9 +954,9 @@ fn read_cached_module(
 
     // SAFETY: the envelope verified that this payload is the `Module::serialize`
     // output of an engine with the same precompile-compatibility hash, for the
-    // exact module bytes being loaded. The cache lives in the user's private
-    // cache directory; a same-user process that tampers with it is already
-    // inside this process's trust boundary.
+    // exact module bytes being loaded, and that it carries a valid HMAC under a
+    // key that is not stored with the entry. `Module::deserialize` is only safe
+    // on bytes the process itself trusts; the tag is what establishes that.
     match unsafe { wasmtime::Module::deserialize(engine, payload) } {
         Ok(module) => {
             tracing::debug!(
@@ -731,6 +984,7 @@ fn store_cached_module(
     engine_hash: &[u8; 32],
     module_hash: &[u8; 32],
     payload: &[u8],
+    key: &[u8; 32],
 ) -> std::io::Result<()> {
     use std::io::Write as _;
 
@@ -739,7 +993,7 @@ fn store_cached_module(
         .ok_or_else(|| std::io::Error::other("cache entry has no parent directory"))?;
     std::fs::create_dir_all(parent)?;
 
-    let entry = encode_cache_entry(engine_hash, module_hash, payload);
+    let entry = encode_cache_entry(engine_hash, module_hash, payload, key);
     let tmp = parent.join(format!(
         ".{}.{}.tmp",
         hex::encode(module_hash),
@@ -843,10 +1097,22 @@ fn load_module(
     let module_hash = module_sha256(binary);
     let cache_path = cache_entry_path(cache_dir, &engine_hash, &module_hash);
 
-    if let Some(module) =
-        read_cached_module(engine, &engine_hash, &module_hash, &cache_path, wasm_path)
-    {
-        return Ok(module);
+    // No key means no authenticated cache: entries could not be verified on the
+    // way back in, so none are written either. Compilation still works, just
+    // without the AOT cache.
+    let cache_key = cache_hmac_key(cache_dir);
+
+    if let Some(key) = &cache_key {
+        if let Some(module) = read_cached_module(
+            engine,
+            &engine_hash,
+            &module_hash,
+            &cache_path,
+            wasm_path,
+            key,
+        ) {
+            return Ok(module);
+        }
     }
 
     let Some(command) = compiler else {
@@ -874,11 +1140,15 @@ fn load_module(
         )
     })?;
 
-    if let Err(e) = store_cached_module(&cache_path, &engine_hash, &module_hash, &serialized) {
-        tracing::warn!(
-            cache = %cache_path.display(),
-            "failed to store the WASM AOT cache entry: {e}"
-        );
+    if let Some(key) = &cache_key {
+        if let Err(e) =
+            store_cached_module(&cache_path, &engine_hash, &module_hash, &serialized, key)
+        {
+            tracing::warn!(
+                cache = %cache_path.display(),
+                "failed to store the WASM AOT cache entry: {e}"
+            );
+        }
     }
     Ok(module)
 }
@@ -902,7 +1172,9 @@ fn run_compile_helper(
     // Stage under the cache root rather than the system temp directory:
     // bubblewrap replaces `/tmp` with a fresh tmpfs, which would make a bind
     // mount of a staging path under `/tmp` resolve against the empty tmpfs.
-    let staging_root = cache_root.join("staging");
+    // `staging_root` picks a non-temp root when the cache itself is the
+    // last-resort temp directory.
+    let staging_root = staging_root(cache_root);
     std::fs::create_dir_all(&staging_root)
         .map_err(|e| format!("failed to create the WASM compile staging directory: {e}"))?;
     let dir = tempfile::Builder::new()
@@ -929,9 +1201,10 @@ fn run_compile_helper(
     args.push(output_path.clone().into_os_string());
 
     #[cfg(target_os = "linux")]
-    let _wrapper = wrap_with_bubblewrap(&mut program, &mut args, &work_dir);
+    let used_bwrap = wrap_with_bubblewrap(&mut program, &mut args, &work_dir);
     #[cfg(target_os = "macos")]
-    let _sandbox = wrap_with_macos_sandbox(&mut program, &mut args, &work_dir, command.program());
+    let macos_sandbox =
+        wrap_with_macos_sandbox(&mut program, &mut args, &work_dir, command.program());
 
     let mut child_command = std::process::Command::new(&program);
     child_command
@@ -939,6 +1212,38 @@ fn run_compile_helper(
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::from(stderr));
+
+    // The compiler is a separate process that runs untrusted module bytes
+    // through wasmtime and never talks to a provider. It has no use for this
+    // session's provider credentials, so they are removed from its inherited
+    // environment rather than handed down.
+    for key in coderex_core::sandbox::credential_scrub_keys() {
+        child_command.env_remove(key);
+    }
+
+    // macOS: `sandbox-exec` wraps the command, and `prepare` adds the
+    // best-effort rlimit plus the resident-memory watchdog from the core
+    // sandbox. The handle is kept alive below so the watchdog stops only once
+    // the compiler has exited.
+    #[cfg(target_os = "macos")]
+    if let Some(handle) = &macos_sandbox {
+        handle
+            .prepare(&mut child_command)
+            .map_err(|e| format!("failed to prepare the WASM compile sandbox: {e}"))?;
+    }
+
+    // Linux: when bubblewrap is not in force, confine the compiler's paths with
+    // Landlock instead. The core seccomp allowlist is deliberately *not*
+    // installed: it is written for shells and rejects syscalls wasmtime needs,
+    // so adding it would break every compilation. Path confinement needs no
+    // syscall table. The guard keeps the ruleset descriptor open until the child
+    // has forked.
+    #[cfg(target_os = "linux")]
+    let _landlock = if used_bwrap {
+        None
+    } else {
+        wrap_with_landlock(&mut child_command, &work_dir, command.program())
+    };
 
     #[cfg(unix)]
     {
@@ -1064,6 +1369,11 @@ fn run_compile_helper(
 /// access. It is inherited by the compiler's descendants. When sandbox-exec is
 /// unavailable or profile creation fails, the command runs with rlimits and
 /// the process-group kill only, and the caller's documentation says so.
+///
+/// The returned handle is not yet prepared: the caller passes it to
+/// `prepare`, which installs the best-effort rlimit and the resident-memory
+/// watchdog on the command. The handle is kept alive for the compilation so the
+/// watchdog stops only once the compiler has exited.
 #[cfg(all(target_os = "macos", feature = "wasm-runtime"))]
 fn wrap_with_macos_sandbox(
     program: &mut OsString,
@@ -1071,7 +1381,7 @@ fn wrap_with_macos_sandbox(
     work_dir: &std::path::Path,
     compiler: &std::path::Path,
 ) -> Option<coderex_core::sandbox::SandboxHandle> {
-    use coderex_core::sandbox::{SandboxConfig, SandboxHandle};
+    use coderex_core::sandbox::SandboxHandle;
 
     // Test hook: the leading-argument forwarding test uses a shell script
     // wrapper, which the compiler profile intentionally does not execute.
@@ -1088,29 +1398,7 @@ fn wrap_with_macos_sandbox(
         return None;
     }
 
-    let compiler = std::fs::canonicalize(compiler).unwrap_or_else(|_| compiler.to_path_buf());
-    let mut allowed_read_paths = vec![work_dir.to_path_buf(), compiler.clone()];
-    if let Some(parent) = compiler.parent() {
-        allowed_read_paths.push(parent.to_path_buf());
-    }
-    let mut allowed_exec_paths = vec![compiler];
-    // Debug builds add the orchestrator's child-spawn test hook (`sleep`).
-    #[cfg(debug_assertions)]
-    {
-        allowed_exec_paths.push(PathBuf::from("/bin/sleep"));
-        allowed_exec_paths.push(PathBuf::from("/usr/bin/sleep"));
-    }
-
-    let config = SandboxConfig {
-        allowed_read_paths,
-        allowed_write_paths: vec![work_dir.to_path_buf()],
-        allowed_exec_paths,
-        additional_working_dirs: vec![work_dir.to_path_buf()],
-        max_cpu_seconds: Some(WASM_COMPILE_CPU_SECONDS),
-        max_memory_bytes: Some(WASM_COMPILE_MEMORY_BYTES),
-        allow_network: false,
-        ..SandboxConfig::default()
-    };
+    let config = compile_sandbox_config(work_dir, compiler);
 
     let handle = match SandboxHandle::create(config) {
         Ok(handle) => handle,
@@ -1184,6 +1472,99 @@ fn wrap_with_bubblewrap(
     *program = OsString::from(wrapper);
     *args = wrapped;
     true
+}
+
+/// The sandbox policy the compiler helper runs under, shared by the Landlock
+/// fallback and its plan test.
+///
+/// The compiler reads its own binary and the staging directory and writes only
+/// the staging directory. `landlock_plan` adds the system read/exec roots the
+/// dynamic loader needs, so the plan is complete without naming them here.
+///
+/// Pure, so the plan it produces can be asserted on every host; only the Linux
+/// fallback that consumes it is platform-gated.
+#[cfg(feature = "wasm-runtime")]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn compile_sandbox_config(
+    work_dir: &std::path::Path,
+    compiler: &std::path::Path,
+) -> coderex_core::sandbox::SandboxConfig {
+    use coderex_core::sandbox::SandboxConfig;
+
+    let compiler = std::fs::canonicalize(compiler).unwrap_or_else(|_| compiler.to_path_buf());
+    let mut allowed_read_paths = vec![work_dir.to_path_buf(), compiler.clone()];
+    if let Some(parent) = compiler.parent() {
+        allowed_read_paths.push(parent.to_path_buf());
+    }
+    let mut allowed_exec_paths = vec![compiler];
+    // Debug builds add the orchestrator's child-spawn test hook (`sleep`).
+    #[cfg(debug_assertions)]
+    {
+        allowed_exec_paths.push(PathBuf::from("/bin/sleep"));
+        allowed_exec_paths.push(PathBuf::from("/usr/bin/sleep"));
+    }
+
+    SandboxConfig {
+        allowed_read_paths,
+        allowed_write_paths: vec![work_dir.to_path_buf()],
+        allowed_exec_paths,
+        additional_working_dirs: vec![work_dir.to_path_buf()],
+        max_cpu_seconds: Some(WASM_COMPILE_CPU_SECONDS),
+        max_memory_bytes: Some(WASM_COMPILE_MEMORY_BYTES),
+        allow_network: false,
+        ..SandboxConfig::default()
+    }
+}
+
+/// Confine the compiler's paths with Landlock when bubblewrap is not in force.
+///
+/// This is the Linux fallback that keeps path confinement even without
+/// `bwrap`: the compiler may read the staging directory and its own binary and
+/// write only the staging directory. It deliberately does **not** install the
+/// core seccomp table — that table is written for shells and rejects syscalls
+/// wasmtime needs — so the confinement is paths only, exactly like the
+/// bubblewrap path which also runs without the syscall table. rlimits and the
+/// process-group kill still apply through the caller's `pre_exec`.
+///
+/// Returns `None` (and leaves the command alone) when Landlock is unavailable
+/// or the ruleset cannot be built; the caller then has rlimits and the
+/// process-group kill only, which is the same fallback as before.
+#[cfg(all(target_os = "linux", feature = "wasm-runtime"))]
+fn wrap_with_landlock(
+    child_command: &mut std::process::Command,
+    work_dir: &std::path::Path,
+    compiler: &std::path::Path,
+) -> Option<coderex_core::sandbox::LandlockRuleset> {
+    use coderex_core::sandbox::{LandlockRuleset, landlock_restrict, landlock_ruleset};
+    use std::os::unix::process::CommandExt;
+
+    let config = compile_sandbox_config(work_dir, compiler);
+    let ruleset = match landlock_ruleset(&config) {
+        Some(ruleset) => ruleset,
+        None => {
+            tracing::warn!(
+                "Landlock is unavailable for WASM compilation; compiling with rlimits and the \
+                 process-group kill but no filesystem sandbox"
+            );
+            return None;
+        }
+    };
+    let ruleset_fd = ruleset.raw_fd();
+
+    // SAFETY: `pre_exec` runs in the child between fork and exec. The closure
+    // calls only `prctl` and `landlock_restrict_self`, which are
+    // async-signal-safe, and captures one descriptor.
+    unsafe {
+        child_command.pre_exec(move || {
+            landlock_restrict(ruleset_fd).map_err(|error| {
+                std::io::Error::new(
+                    error.kind(),
+                    format!("could not install the WASM compile Landlock ruleset: {error}"),
+                )
+            })
+        });
+    }
+    Some(ruleset)
 }
 
 /// Which resource bound `apply_compile_rlimits` should install for memory.
@@ -2136,6 +2517,158 @@ mod tests {
                 .is_some_and(|name| name.to_string_lossy().starts_with(WASM_COMPILE_HELPER)),
             "unexpected helper path: {}",
             helper.display()
+        );
+    }
+
+    /// The compiler's Landlock plan grants writes to the staging directory and
+    /// nowhere else, and grants the compiler itself execute. Pure: the plan is
+    /// built on every host, so the policy is pinned even where Landlock is
+    /// absent.
+    #[test]
+    fn compile_sandbox_plan_grants_only_staging_for_writes() {
+        let work_dir = PathBuf::from("/tmp/coderex-plan/staging/compile-1");
+        let compiler = PathBuf::from("/usr/local/bin/coderex");
+        let config = compile_sandbox_config(&work_dir, &compiler);
+        let plan = coderex_core::sandbox::landlock_plan(&config, 4);
+
+        // Writes: the staging directory and `/dev/null` (redirection), nothing
+        // else. The compiler binary's directory is a read/exec path, not a
+        // writable one.
+        assert!(
+            plan.write_paths.contains(&work_dir),
+            "the staging directory must be writable: {:?}",
+            plan.write_paths
+        );
+        assert!(
+            plan.write_paths
+                .iter()
+                .all(|path| path == &work_dir || path == std::path::Path::new("/dev/null")),
+            "only staging and /dev/null may be writable: {:?}",
+            plan.write_paths
+        );
+
+        // Reads include the staging directory and the compiler, plus the system
+        // roots the loader needs.
+        assert!(plan.read_paths.contains(&work_dir));
+        assert!(plan.read_paths.contains(&compiler));
+        assert!(
+            plan.read_paths
+                .iter()
+                .any(|path| path == std::path::Path::new("/usr")),
+            "the loader's system roots must be readable"
+        );
+
+        // Exec: the compiler, plus the system exec roots.
+        assert!(plan.exec_paths.contains(&compiler));
+        assert!(
+            plan.exec_paths
+                .iter()
+                .any(|path| path == std::path::Path::new("/bin"))
+        );
+
+        // The compiler is not allowed the network, so ABI 4 handles the network
+        // rights and adds no rules — both TCP rights are denied.
+        assert!(plan.handle_network);
+        assert!(!config.allow_network);
+    }
+
+    /// Staging stays under the cache root when that root is an ordinary
+    /// directory, which is the common case on every platform.
+    #[test]
+    fn staging_stays_under_a_normal_cache_root() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        // A path that is deliberately *not* under the system temp tree: the
+        // test asserts the non-relocating branch, and the system temp dir is
+        // exactly the case the relocation exists for.
+        let root = dir.path().join("cache");
+        std::fs::create_dir_all(&root).expect("the cache root");
+        let system_temp = std::fs::canonicalize(std::env::temp_dir()).unwrap_or_default();
+        if std::fs::canonicalize(&root)
+            .unwrap_or_else(|_| root.clone())
+            .starts_with(&system_temp)
+        {
+            // Running with TMPDIR pointing somewhere unexpected; the branch
+            // under test cannot be reached from here.
+            return;
+        }
+        assert_eq!(staging_root(&root), root.join("staging"));
+    }
+
+    /// A staging root under the system temp tree moves to a non-temp root, so
+    /// bubblewrap's `/tmp` tmpfs cannot make the writable bind vanish.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn staging_moves_out_of_the_system_temp_tree() {
+        let system_temp = std::env::temp_dir();
+        let root = system_temp.join("coderex-staging-test");
+        let staged = staging_root(&root);
+        assert!(
+            !staged.starts_with(std::fs::canonicalize(&system_temp).unwrap_or(system_temp)),
+            "staging must not stay under the system temp tree: {}",
+            staged.display()
+        );
+    }
+
+    /// The cache envelope round-trips under the key it was written with.
+    #[test]
+    fn cache_entry_round_trips_under_its_key() {
+        let key = [7u8; 32];
+        let engine = [1u8; 32];
+        let module = [2u8; 32];
+        let payload = b"serialized module bytes";
+        let entry = encode_cache_entry(&engine, &module, payload, &key);
+        assert_eq!(entry.len(), WASM_CACHE_HEADER_LEN + payload.len());
+        let decoded = decode_cache_entry(&entry, &engine, &module, &key).expect("must verify");
+        assert_eq!(decoded, payload);
+    }
+
+    /// A different key does not verify: this is what stops a cache directory
+    /// another user can write from being a code-execution path.
+    #[test]
+    fn cache_entry_rejects_a_wrong_key() {
+        let engine = [1u8; 32];
+        let module = [2u8; 32];
+        let entry = encode_cache_entry(&engine, &module, b"payload", &[7u8; 32]);
+        let error = decode_cache_entry(&entry, &engine, &module, &[8u8; 32])
+            .expect_err("a foreign key must not verify");
+        assert!(
+            error.contains("authentication"),
+            "unexpected error: {error}"
+        );
+    }
+
+    /// A tampered payload fails the tag check even though the header still
+    /// names the same engine and module.
+    #[test]
+    fn cache_entry_rejects_a_tampered_payload() {
+        let key = [7u8; 32];
+        let engine = [1u8; 32];
+        let module = [2u8; 32];
+        let mut entry = encode_cache_entry(&engine, &module, b"payload", &key);
+        let last = entry.len() - 1;
+        entry[last] ^= 0xff;
+        let error = decode_cache_entry(&entry, &engine, &module, &key)
+            .expect_err("a tampered payload must not verify");
+        assert!(
+            error.contains("authentication"),
+            "unexpected error: {error}"
+        );
+    }
+
+    /// A tampered tag fails too, including a tag that flips the length field it
+    /// covers.
+    #[test]
+    fn cache_entry_rejects_a_tampered_header() {
+        let key = [7u8; 32];
+        let engine = [1u8; 32];
+        let module = [2u8; 32];
+        let mut entry = encode_cache_entry(&engine, &module, b"payload", &key);
+        entry[84] ^= 0xff;
+        let error = decode_cache_entry(&entry, &engine, &module, &key)
+            .expect_err("a tampered tag must not verify");
+        assert!(
+            error.contains("authentication"),
+            "unexpected error: {error}"
         );
     }
 }
