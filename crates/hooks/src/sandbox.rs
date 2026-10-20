@@ -649,7 +649,7 @@ fn apply_unix_limits(command: &mut Command, config: &HookConfig) {
 /// writable or does not delegate the memory controller is reported and the
 /// hook falls back to `RLIMIT_AS` — never silently counted as cgroup-limited.
 #[cfg(target_os = "linux")]
-pub(crate) fn prepare_cgroup_limits(
+pub fn prepare_cgroup_limits(
     config: &HookConfig,
 ) -> Option<coderex_core::sandbox::CgroupMemoryLimit> {
     let bytes = config
@@ -678,7 +678,7 @@ pub(crate) fn prepare_cgroup_limits(
 /// the spawn: it is logged, and the hook is explicitly said to be running with
 /// the rlimit rather than the cgroup limit.
 #[cfg(target_os = "linux")]
-pub(crate) fn attach_cgroup_limits(
+pub fn attach_cgroup_limits(
     limit: &coderex_core::sandbox::CgroupMemoryLimit,
     child: &tokio::process::Child,
 ) {

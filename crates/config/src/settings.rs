@@ -759,6 +759,9 @@ impl ConfigService {
     /// carrier. A carrier already configured explicitly is left untouched, so
     /// an explicit path always wins over the platform default.
     #[must_use]
+    // On platforms with no managed-settings carrier this is just `self`, so
+    // `mut` and the const-able body have nothing to do.
+    #[allow(unused_mut, clippy::missing_const_for_fn)]
     pub fn with_platform_managed_settings(mut self) -> Self {
         #[cfg(target_os = "macos")]
         if self.managed_plist_path.is_none() {

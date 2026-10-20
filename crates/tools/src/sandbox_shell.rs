@@ -121,7 +121,10 @@ pub fn sandboxed_shell(
 // The Windows implementation propagates a failure to attach the AppContainer
 // token; other targets have nothing to report, so the `Result` is kept.
 #[allow(clippy::unnecessary_wraps)]
-pub const fn finish_spawn(
+// Windows and Linux do real work here; on macOS every arm is a no-op, which
+// is why clippy offers `const`. One signature serves all platforms.
+#[allow(clippy::missing_const_for_fn)]
+pub fn finish_spawn(
     handle: Option<&SandboxHandle>,
     child: &tokio::process::Child,
 ) -> Result<(), ToolError> {
@@ -150,20 +153,19 @@ pub const fn finish_spawn(
     #[cfg(target_os = "linux")]
     {
         if let Some(handle) = handle {
-            match child.id() {
-                Some(pid) => {
-                    if let Err(error) = handle.post_spawn_pid(pid) {
-                        tracing::warn!(
-                            %error,
-                            "could not add the shell to its memory cgroup; it runs with \
-                             RLIMIT_AS only"
-                        );
-                    }
+            if let Some(pid) = child.id() {
+                if let Err(error) = handle.post_spawn_pid(pid) {
+                    tracing::warn!(
+                        %error,
+                        "could not add the shell to its memory cgroup; it runs with \
+                         RLIMIT_AS only"
+                    );
                 }
-                None => tracing::warn!(
+            } else {
+                tracing::warn!(
                     "the shell exited before it could be added to its memory cgroup; \
                      it ran with RLIMIT_AS only"
-                ),
+                );
             }
         }
     }

@@ -289,7 +289,10 @@ pub fn filesystem_isolation() -> FilesystemIsolation {
 /// Always `false` off Windows. Callers use it to decide whether a missing
 /// confinement layer is a refusal or an environment they should report.
 #[must_use]
-pub const fn app_container_available() -> bool {
+// Windows calls a runtime API; on the other platforms it is a constant. The
+// signature is shared, so it cannot be `const` everywhere.
+#[allow(clippy::missing_const_for_fn)]
+pub fn app_container_available() -> bool {
     #[cfg(target_os = "windows")]
     {
         crate::sandbox_windows::app_container_available()
@@ -661,7 +664,11 @@ pub fn landlock_abi_version() -> Option<u32> {
             LANDLOCK_CREATE_RULESET_VERSION,
         )
     };
-    if ret < 0 { None } else { Some(ret as u32) }
+    if ret < 0 {
+        None
+    } else {
+        u32::try_from(ret).ok()
+    }
 }
 
 /// The Landlock ABI version — `None` outside Linux.
@@ -1165,9 +1172,10 @@ impl PlatformSandbox {
         }
     }
 
-    // Windows can fail; the other arms are no-ops.
-    #[allow(clippy::unnecessary_wraps)]
-    const fn terminate(&self) -> Result<(), SandboxError> {
+    // Windows can fail; the other arms are no-ops, which is why clippy offers
+    // to make this `const`. A single signature has to serve both.
+    #[allow(clippy::unnecessary_wraps, clippy::missing_const_for_fn)]
+    fn terminate(&self) -> Result<(), SandboxError> {
         match self {
             #[cfg(target_os = "windows")]
             Self::Windows(s) => s.terminate(),
@@ -1436,7 +1444,7 @@ mod linux_impl {
     /// Anything *not* listed here is unrestricted by Landlock, which is why
     /// `IOCTL_DEV` (ABI 5) is deliberately left out: confining it would break
     /// ordinary terminal handling unless every device path were granted.
-    pub(super) fn handled_fs_access(abi: u32) -> u64 {
+    pub(super) const fn handled_fs_access(abi: u32) -> u64 {
         let mut access = LANDLOCK_ACCESS_FS_EXECUTE
             | LANDLOCK_ACCESS_FS_WRITE_FILE
             | LANDLOCK_ACCESS_FS_READ_FILE
@@ -1459,7 +1467,7 @@ mod linux_impl {
         access
     }
 
-    fn read_access() -> u64 {
+    const fn read_access() -> u64 {
         LANDLOCK_ACCESS_FS_READ_FILE | LANDLOCK_ACCESS_FS_READ_DIR
     }
 
@@ -1477,7 +1485,7 @@ mod linux_impl {
     /// rights (`READ_DIR`, `MAKE_*`, `REMOVE_*`, `REFER`): the kernel rejects
     /// such a rule with `EINVAL`. This matters for `/dev/null` and for any
     /// configured path that names a single binary.
-    pub(super) fn access_for(kind: AccessKind, is_dir: bool, abi: u32) -> u64 {
+    pub(super) const fn access_for(kind: AccessKind, is_dir: bool, abi: u32) -> u64 {
         match (kind, is_dir) {
             (AccessKind::Read, true) => read_access(),
             (AccessKind::Read, false) => LANDLOCK_ACCESS_FS_READ_FILE,
@@ -1493,7 +1501,7 @@ mod linux_impl {
         }
     }
 
-    pub(super) fn write_access(abi: u32) -> u64 {
+    pub(super) const fn write_access(abi: u32) -> u64 {
         let mut access = LANDLOCK_ACCESS_FS_WRITE_FILE
             | LANDLOCK_ACCESS_FS_REMOVE_DIR
             | LANDLOCK_ACCESS_FS_REMOVE_FILE
@@ -1518,7 +1526,7 @@ mod linux_impl {
         access
     }
 
-    fn exec_access() -> u64 {
+    const fn exec_access() -> u64 {
         LANDLOCK_ACCESS_FS_EXECUTE
     }
 
@@ -1563,7 +1571,10 @@ mod linux_impl {
         }
         // SAFETY: a non-negative return from landlock_create_ruleset is a new
         // owned file descriptor.
-        let ruleset = unsafe { OwnedFd::from_raw_fd(ret as i32) };
+        let ruleset_fd = i32::try_from(ret)
+            .map_err(|_| std::io::Error::other("ruleset descriptor out of range"))?;
+        // SAFETY: landlock_create_ruleset returned an owned descriptor.
+        let ruleset = unsafe { OwnedFd::from_raw_fd(ruleset_fd) };
         set_cloexec(ruleset.as_raw_fd());
 
         for (paths, kind) in [
@@ -1612,7 +1623,7 @@ mod linux_impl {
                     libc::syscall(
                         libc::SYS_landlock_add_rule,
                         ruleset.as_raw_fd(),
-                        LANDLOCK_RULE_PATH_BENEATH as libc::c_ulong,
+                        libc::c_ulong::from(LANDLOCK_RULE_PATH_BENEATH),
                         &raw const rule,
                         0u32,
                     )
@@ -1669,6 +1680,9 @@ mod linux_impl {
     }
 
     impl LinuxSandbox {
+        // On Linux every setup step falls back rather than failing; the
+        // `Result` matches the other platform backends.
+        #[allow(clippy::unnecessary_wraps)]
         pub fn create(config: SandboxConfig) -> Result<Self, SandboxError> {
             let use_bwrap = super::bubblewrap_in_force();
             let use_landlock = super::landlock_in_force();
@@ -1818,10 +1832,9 @@ mod linux_impl {
 
         /// Attach a spawned child to the memory cgroup, when one exists.
         pub fn post_spawn_pid(&self, pid: u32) -> Result<(), SandboxError> {
-            match &self.cgroup {
-                Some(cgroup) => cgroup.attach(pid),
-                None => Ok(()),
-            }
+            self.cgroup
+                .as_ref()
+                .map_or(Ok(()), |cgroup| cgroup.attach(pid))
         }
 
         // ─── rlimits ─────────────────────────────────────────────────────────
@@ -1834,7 +1847,7 @@ mod linux_impl {
                     rlim_cur: max_files,
                     rlim_max: max_files,
                 };
-                let ret = unsafe { prlimit(0, RLIMIT_NOFILE, &rl, std::ptr::null_mut()) };
+                let ret = unsafe { prlimit(0, RLIMIT_NOFILE, &raw const rl, std::ptr::null_mut()) };
                 if ret != 0 {
                     return Err(std::io::Error::last_os_error());
                 }
@@ -1845,7 +1858,7 @@ mod linux_impl {
                     rlim_cur: max_mem,
                     rlim_max: max_mem,
                 };
-                let ret = unsafe { prlimit(0, RLIMIT_AS, &rl, std::ptr::null_mut()) };
+                let ret = unsafe { prlimit(0, RLIMIT_AS, &raw const rl, std::ptr::null_mut()) };
                 if ret != 0 {
                     return Err(std::io::Error::last_os_error());
                 }
@@ -1856,7 +1869,7 @@ mod linux_impl {
                     rlim_cur: max_cpu,
                     rlim_max: max_cpu,
                 };
-                let ret = unsafe { prlimit(0, RLIMIT_CPU, &rl, std::ptr::null_mut()) };
+                let ret = unsafe { prlimit(0, RLIMIT_CPU, &raw const rl, std::ptr::null_mut()) };
                 if ret != 0 {
                     return Err(std::io::Error::last_os_error());
                 }
@@ -1903,47 +1916,45 @@ mod linux_impl {
             // wrapped process at its first syscall.
             const ALLOWED: &[i64] = super::seccomp_arch::ALLOWED;
 
-            // The vector is filled in two places — the arch prologue before the
-            // syscall list is built, and the syscall pairs after it — so it is
-            // declared where the prologue starts.
-            let mut filter: Vec<sock_filter> = Vec::new();
-
-            // Load `seccomp_data.arch`, which is at offset **4** — the struct is
-            // `{ nr: i32, arch: u32, ip: u64, args: [u64; 6] }`. These two
-            // offsets were the other way round, so the filter compared the
-            // syscall *number* against the architecture token, never matched,
-            // and killed every process at its first syscall.
-            filter.push(sock_filter {
-                code: BPF_LD + BPF_W + BPF_ABS,
-                jt: 0,
-                jf: 0,
-                k: 4,
-            });
-            // If the arch matches, skip the kill and continue; if it does not,
-            // fall through to it. `jt`/`jf` are offsets from the *next*
-            // instruction, so matching has to jump over the kill — with the
-            // offsets swapped this killed every process on the very
-            // architecture the table was built for.
-            filter.push(sock_filter {
-                code: BPF_JMP + BPF_JEQ + BPF_K,
-                jt: 1,
-                jf: 0,
-                k: super::seccomp_arch::AUDIT_ARCH,
-            });
-            filter.push(sock_filter {
-                code: BPF_RET + BPF_K,
-                jt: 0,
-                jf: 0,
-                k: SECCOMP_RET_KILL,
-            });
-
-            // Load `seccomp_data.nr`, the syscall number, at offset 0.
-            filter.push(sock_filter {
-                code: BPF_LD + BPF_W + BPF_ABS,
-                jt: 0,
-                jf: 0,
-                k: 0,
-            });
+            // The vector is filled in two places — the arch prologue before
+            // the syscall list is built, and the syscall pairs after it — so
+            // start it with the prologue.
+            let mut filter: Vec<sock_filter> = vec![
+                // Load `seccomp_data.arch`, which is at offset **4** — the
+                // struct is `{ nr: i32, arch: u32, ip: u64, args: [u64; 6] }`.
+                // The two offsets used to be the other way round, so the
+                // filter compared the syscall *number* against the
+                // architecture token, never matched, and killed every process
+                // at its first syscall.
+                sock_filter {
+                    code: BPF_LD + BPF_W + BPF_ABS,
+                    jt: 0,
+                    jf: 0,
+                    k: 4,
+                },
+                // If the arch matches, skip the kill; otherwise fall through
+                // to it. `jt`/`jf` are offsets from the *next* instruction,
+                // so matching has to jump over the kill.
+                sock_filter {
+                    code: BPF_JMP + BPF_JEQ + BPF_K,
+                    jt: 1,
+                    jf: 0,
+                    k: super::seccomp_arch::AUDIT_ARCH,
+                },
+                sock_filter {
+                    code: BPF_RET + BPF_K,
+                    jt: 0,
+                    jf: 0,
+                    k: SECCOMP_RET_KILL,
+                },
+                // Load `seccomp_data.nr`, the syscall number, at offset 0.
+                sock_filter {
+                    code: BPF_LD + BPF_W + BPF_ABS,
+                    jt: 0,
+                    jf: 0,
+                    k: 0,
+                },
+            ];
 
             // Network syscalls are absent from the base list, and the default
             // action is to kill — so without this the sandbox would block
@@ -1959,7 +1970,7 @@ mod linux_impl {
                     code: BPF_JMP + BPF_JEQ + BPF_K,
                     jt: 0,
                     jf: 1,
-                    k: nr as u32,
+                    k: u32::try_from(nr).unwrap_or(u32::MAX),
                 });
                 filter.push(sock_filter {
                     code: BPF_RET + BPF_K,
@@ -1988,7 +1999,7 @@ mod linux_impl {
             });
 
             let prog = sock_fprog {
-                len: filter.len() as u16,
+                len: u16::try_from(filter.len()).expect("seccomp filter length fits in u16"),
                 filter: filter.as_ptr(),
             };
 
@@ -2003,7 +2014,7 @@ mod linux_impl {
                 libc::prctl(
                     PR_SET_SECCOMP,
                     SECCOMP_MODE_FILTER as libc::c_ulong,
-                    &prog as *const _ as libc::c_ulong,
+                    (&raw const prog) as libc::c_ulong,
                     0,
                     0,
                 )
@@ -2036,6 +2047,9 @@ mod macos_impl {
     }
 
     impl MacOsSandbox {
+        // On Linux every setup step falls back rather than failing; the
+        // `Result` matches the other platform backends.
+        #[allow(clippy::unnecessary_wraps)]
         pub fn create(config: SandboxConfig) -> Result<Self, SandboxError> {
             let mut sandbox = Self {
                 config,

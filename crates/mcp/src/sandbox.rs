@@ -116,7 +116,10 @@ pub fn stdio_sandbox_config(
 /// On Windows that means a system root or a `PATH` directory: `acl_plan`
 /// grants both best-effort. Those directories are frequently owned by the
 /// system (TrustedInstaller), so a required grant would fail.
-const fn platform_covers(path: &Path) -> bool {
+// Windows reads the environment; elsewhere it is a constant `false`, which is
+// why clippy offers `const` for this build only.
+#[allow(clippy::missing_const_for_fn)]
+fn platform_covers(path: &Path) -> bool {
     #[cfg(target_os = "windows")]
     {
         let roots = [
