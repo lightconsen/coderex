@@ -6,7 +6,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// A user-defined custom agent loaded from a JSON config file.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -24,6 +24,31 @@ pub struct CustomAgentDef {
     pub max_tokens: Option<u32>,
     /// JSON schema for validating agent output (optional).
     pub output_schema: Option<serde_json::Value>,
+}
+
+/// Why one custom agent file was skipped.
+///
+/// Returned by [`load_custom_agents_from_dir_with_warnings`] so callers (and
+/// tests) can see the decision without depending on tracing's per-callsite
+/// interest cache, which makes a warning disappear when another test in the
+/// same binary evaluates the callsite first with no subscriber installed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentLoadWarning {
+    /// The file that was skipped.
+    pub path: PathBuf,
+    /// Why it was skipped.
+    pub reason: String,
+}
+
+impl std::fmt::Display for AgentLoadWarning {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "skipping custom agent file: {} path={}",
+            self.reason,
+            self.path.display()
+        )
+    }
 }
 
 /// Load all custom agent definitions from `~/.coderex/agents/*.json`.
@@ -46,12 +71,27 @@ pub fn load_custom_agents() -> HashMap<String, CustomAgentDef> {
 ///
 /// Files that cannot be read, do not parse, or fail validation are skipped
 /// with a warning naming the path; the remaining files still load.
-#[must_use]
 pub fn load_custom_agents_from_dir(agents_dir: &Path) -> HashMap<String, CustomAgentDef> {
+    let (agents, warnings) = load_custom_agents_from_dir_with_warnings(agents_dir);
+    for warning in &warnings {
+        tracing::warn!("{warning}");
+    }
+    agents
+}
+
+/// Load custom agent definitions and return why any file was skipped.
+///
+/// This is the testable form: see [`AgentLoadWarning`]. It is also the form
+/// an embedding caller should use when it wants to show the skips itself.
+#[must_use]
+pub fn load_custom_agents_from_dir_with_warnings(
+    agents_dir: &Path,
+) -> (HashMap<String, CustomAgentDef>, Vec<AgentLoadWarning>) {
     let mut agents = HashMap::new();
+    let mut warnings = Vec::new();
 
     let Ok(entries) = std::fs::read_dir(agents_dir) else {
-        return agents;
+        return (agents, warnings);
     };
 
     for entry in entries.flatten() {
@@ -63,11 +103,10 @@ pub fn load_custom_agents_from_dir(agents_dir: &Path) -> HashMap<String, CustomA
         let contents = match std::fs::read_to_string(&path) {
             Ok(c) => c,
             Err(error) => {
-                tracing::warn!(
-                    path = %path.display(),
-                    %error,
-                    "skipping custom agent file: cannot read it"
-                );
+                warnings.push(AgentLoadWarning {
+                    path,
+                    reason: format!("cannot read it: {error}"),
+                });
                 continue;
             }
         };
@@ -75,28 +114,26 @@ pub fn load_custom_agents_from_dir(agents_dir: &Path) -> HashMap<String, CustomA
         let def: CustomAgentDef = match serde_json::from_str(&contents) {
             Ok(d) => d,
             Err(error) => {
-                tracing::warn!(
-                    path = %path.display(),
-                    %error,
-                    "skipping custom agent file: not a valid custom agent definition"
-                );
+                warnings.push(AgentLoadWarning {
+                    path,
+                    reason: format!("not a valid custom agent definition: {error}"),
+                });
                 continue;
             }
         };
 
         if let Err(error) = validate_custom_agent(&def) {
-            tracing::warn!(
-                path = %path.display(),
-                %error,
-                "skipping custom agent file: invalid definition"
-            );
+            warnings.push(AgentLoadWarning {
+                path,
+                reason: format!("invalid definition: {error}"),
+            });
             continue;
         }
 
         agents.insert(def.name.clone(), def);
     }
 
-    agents
+    (agents, warnings)
 }
 
 /// Reject a definition that parses but cannot be used.
@@ -170,53 +207,6 @@ mod tests {
         assert!(load_custom_agents_from_dir(tmp.path()).is_empty());
     }
 
-    /// Test subscriber that records warning events on the current thread.
-    /// Mirrors the pattern the plugins crate uses for the same purpose.
-    #[derive(Clone, Default)]
-    struct WarningLog(std::sync::Arc<std::sync::Mutex<Vec<String>>>);
-
-    impl WarningLog {
-        fn warnings(&self) -> Vec<String> {
-            self.0.lock().unwrap().clone()
-        }
-    }
-
-    impl tracing::Subscriber for WarningLog {
-        fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
-            *metadata.level() <= tracing::Level::WARN
-        }
-
-        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
-            tracing::span::Id::from_u64(1)
-        }
-
-        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
-
-        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
-
-        fn enter(&self, _: &tracing::span::Id) {}
-
-        fn exit(&self, _: &tracing::span::Id) {}
-
-        fn event(&self, event: &tracing::Event<'_>) {
-            struct Visitor<'a>(&'a mut Vec<String>);
-
-            impl tracing::field::Visit for Visitor<'_> {
-                fn record_debug(
-                    &mut self,
-                    field: &tracing::field::Field,
-                    value: &dyn std::fmt::Debug,
-                ) {
-                    self.0.push(format!("{}={value:?}", field.name()));
-                }
-            }
-
-            let mut fields = Vec::new();
-            event.record(&mut Visitor(&mut fields));
-            self.0.lock().unwrap().push(fields.join(" "));
-        }
-    }
-
     /// A file that cannot be read or parsed, and a definition that parses but
     /// is invalid, are each reported by path; the valid file still loads.
     #[test]
@@ -250,15 +240,11 @@ mod tests {
         // Reading a directory as a file fails, which exercises the read path.
         std::fs::create_dir(tmp.path().join("unreadable.json")).unwrap();
 
-        let log = WarningLog::default();
-        let loaded = tracing::subscriber::with_default(log.clone(), || {
-            load_custom_agents_from_dir(tmp.path())
-        });
+        let (loaded, warnings) = load_custom_agents_from_dir_with_warnings(tmp.path());
 
         assert_eq!(loaded.len(), 1);
         assert!(loaded.contains_key("valid_agent"));
 
-        let warnings = log.warnings();
         assert_eq!(warnings.len(), 4, "{warnings:?}");
         for file in [
             "broken.json",
@@ -267,7 +253,9 @@ mod tests {
             "unreadable.json",
         ] {
             assert!(
-                warnings.iter().any(|warning| warning.contains(file)),
+                warnings
+                    .iter()
+                    .any(|warning| warning.path.to_string_lossy().ends_with(file)),
                 "no warning named {file}: {warnings:?}"
             );
         }
