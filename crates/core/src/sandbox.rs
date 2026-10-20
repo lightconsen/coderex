@@ -3579,12 +3579,8 @@ mod tests {
 
         let inside = allowed.join("inside.txt");
         let outside = denied.join("outside.txt");
-        // The temp probe separates "the container cannot write anywhere" from
-        // "the policy path is wrong": `%TEMP%` points at the sandbox's private
-        // directory, which it definitely granted.
         let script = format!(
-            "echo TEMP=%TEMP% & echo probe> %TEMP%\\coderex-probe.txt & \
-             echo inside> {} & echo outside> {}",
+            "echo inside> {} & echo outside> {}",
             inside.display(),
             outside.display()
         );
@@ -3618,20 +3614,10 @@ mod tests {
                 |out| String::from_utf8_lossy(&out.stdout).into_owned(),
             );
         let groups = run_in_container(&handle, &allowed, "whoami /groups");
-        let probe = String::from_utf8_lossy(&output.stdout)
-            .lines()
-            .find_map(|line| line.strip_prefix("TEMP=").map(str::to_string))
-            .map_or_else(
-                || "<the command never printed TEMP>".to_string(),
-                |dir| {
-                    let path = std::path::Path::new(&dir).join("coderex-probe.txt");
-                    format!("{} exists={}", path.display(), path.exists())
-                },
-            );
         assert!(
             inside.exists(),
             "the granted workspace was not writable (exit={:?})\n{detail}\n\
-             temp probe: {probe}\nicacls:\n{acl}\ncontainer identity:\n{groups}",
+             icacls:\n{acl}\ncontainer identity:\n{groups}",
             status.map(|s| s.code())
         );
         assert!(!outside.exists(), "a path outside the policy was writable");
