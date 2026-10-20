@@ -553,6 +553,17 @@ mod imp {
                 wide("Filesystem and network isolation for CodeRex subprocesses");
 
             let mut sid: PSID = ptr::null_mut();
+            // Two builds in one process (the runtime tests, or a session that
+            // allows the network for one server and not another) can ask for
+            // the same stable profile concurrently. The Win32 profile store
+            // answers a simultaneous create with E_UNEXPECTED rather than
+            // ERROR_ALREADY_EXISTS, so the calls are serialized here and a
+            // failed create always falls back to deriving the existing SID.
+            static PROFILE_LOCK: Mutex<()> = Mutex::new(());
+            let _profile_guard = PROFILE_LOCK
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+
             // SAFETY: every pointer is a live, NUL-terminated UTF-16 string and
             // `sid` is a valid out pointer. A zero-length capability list is
             // passed as null.
@@ -567,24 +578,20 @@ mod imp {
                 )
             };
             if hr < 0 {
-                // HRESULT_FROM_WIN32(ERROR_ALREADY_EXISTS): the profile from an
-                // earlier CodeRex process is reused, which is exactly what the
-                // stable DACL design needs.
-                if (hr as u32 & 0xffff_0000) == 0x8007_0000
-                    && (hr as u32 & 0xffff) == ERROR_ALREADY_EXISTS
-                {
-                    let hr = unsafe {
-                        DeriveAppContainerSidFromAppContainerName(profile_wide.as_ptr(), &mut sid)
+                // The profile from an earlier CodeRex process is reused, which
+                // is exactly what the stable DACL design needs.
+                let derived = unsafe {
+                    DeriveAppContainerSidFromAppContainerName(profile_wide.as_ptr(), &mut sid)
+                };
+                if derived < 0 {
+                    let already = (hr as u32 & 0xffff_0000) == 0x8007_0000
+                        && (hr as u32 & 0xffff) == ERROR_ALREADY_EXISTS;
+                    let detail = if already {
+                        format!("DeriveAppContainerSidFromAppContainerName failed: 0x{derived:08X}")
+                    } else {
+                        format!("CreateAppContainerProfile failed: 0x{hr:08X}")
                     };
-                    if hr < 0 {
-                        return Err(SandboxError::CreationError(format!(
-                            "DeriveAppContainerSidFromAppContainerName failed: 0x{hr:08X}"
-                        )));
-                    }
-                } else {
-                    return Err(SandboxError::CreationError(format!(
-                        "CreateAppContainerProfile failed: 0x{hr:08X}"
-                    )));
+                    return Err(SandboxError::CreationError(detail));
                 }
             }
             if sid.is_null() {
@@ -1735,13 +1742,17 @@ mod tests {
                 allowed.join("inside.txt").display(),
                 denied.join("outside.txt").display()
             );
-            let child = container
-                .spawn(
-                    &cmd,
-                    &[OsString::from("/C"), OsString::from(script)],
-                    Some(&allowed),
-                )
-                .expect("the container should spawn cmd.exe");
+            let child = match container.spawn(
+                &cmd,
+                &[OsString::from("/C"), OsString::from(script)],
+                Some(&allowed),
+            ) {
+                Ok(child) => child,
+                Err(error) => panic!(
+                    "the container should spawn cmd.exe ({error}); {}",
+                    diagnose_path(&cmd, container.sid())
+                ),
+            };
             let _ = child.wait();
 
             let acl = std::process::Command::new("icacls")
