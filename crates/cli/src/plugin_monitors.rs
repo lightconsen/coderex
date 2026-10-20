@@ -609,13 +609,15 @@ mod tests {
 
     #[tokio::test]
     #[cfg(unix)]
+    #[allow(clippy::await_holding_lock)] // TEST_LOCK serialises monitor tests; held across awaits on purpose.
     async fn starts_an_echoing_monitor_and_reports_it_running() {
         let _guard = serial();
         let dir = tempfile::tempdir().expect("tempdir");
         let monitors = json!({
             "echoer": {
-                "command": "sh",
-                "args": ["-c", "echo monitor-ready; exec sleep 60"]
+                // Absolute paths: another test in this binary replaces PATH.
+                "command": "/bin/sh",
+                "args": ["-c", "echo monitor-ready; exec /bin/sleep 60"]
             }
         });
 
@@ -629,9 +631,10 @@ mod tests {
 
     #[tokio::test]
     #[cfg(unix)]
+    #[allow(clippy::await_holding_lock)] // TEST_LOCK serialises monitor tests; held across awaits on purpose.
     async fn resolves_a_relative_script_against_the_working_directory() {
-        let _guard = serial();
         use std::os::unix::fs::PermissionsExt as _;
+        let _guard = serial();
 
         let dir = tempfile::tempdir().expect("tempdir");
         let script = dir.path().join("monitor.sh");
@@ -705,16 +708,17 @@ mod tests {
 
     #[tokio::test]
     #[cfg(unix)]
+    #[allow(clippy::await_holding_lock)] // TEST_LOCK serialises monitor tests; held across awaits on purpose.
     async fn stop_kills_the_child() {
         let _guard = serial();
         let dir = tempfile::tempdir().expect("tempdir");
         let pid_file = dir.path().join("pid");
         let monitors = json!({
             "sleeper": {
-                "command": "sh",
+                "command": "/bin/sh",
                 "args": [
                     "-c",
-                    "echo $$ > \"$1\"; exec sleep 60",
+                    "echo $$ > \"$1\"; exec /bin/sleep 60",
                     "sh",
                     pid_file.to_string_lossy()
                 ]
@@ -756,8 +760,8 @@ mod tests {
     #[tokio::test]
     #[cfg(unix)]
     #[allow(unsafe_code)] // SAFETY: the environment mutation is serialised by ENV_LOCK.
+    #[allow(clippy::await_holding_lock)] // TEST_LOCK serialises monitor tests; held across awaits on purpose.
     async fn removes_credential_variables_from_the_child_environment() {
-        let _guard = serial();
         const SCRUBBED: [(&str, &str); 4] = [
             ("ANTHROPIC_API_KEY", "test-anthropic-key"),
             ("ANTHROPIC_CUSTOM_SECRET", "test-anthropic-custom"),
@@ -766,6 +770,7 @@ mod tests {
         ];
         const KEPT: (&str, &str) = ("CODEREX_MONITOR_TEST_KEEP", "kept");
 
+        let _guard = serial();
         let dir = tempfile::tempdir().expect("tempdir");
         let env_file = dir.path().join("env.txt");
 
@@ -792,7 +797,7 @@ mod tests {
 
         let monitors = json!({
             "env-dumper": {
-                "command": "sh",
+                "command": "/bin/sh",
                 "args": [
                     "-c",
                     "env > \"$1\"",
@@ -848,6 +853,7 @@ mod tests {
     /// cleanup. `terminate_all_monitors` must kill a child without `stop()`.
     #[cfg(unix)]
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // TEST_LOCK serialises monitor tests; held across awaits on purpose.
     async fn terminate_all_kills_monitors_without_drop() {
         let _guard = serial();
         let dir = tempfile::tempdir().unwrap();
