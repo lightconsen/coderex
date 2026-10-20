@@ -1535,19 +1535,16 @@ fn wrap_with_landlock(
     work_dir: &std::path::Path,
     compiler: &std::path::Path,
 ) -> Option<coderex_core::sandbox::LandlockRuleset> {
-    use coderex_core::sandbox::{LandlockRuleset, landlock_restrict, landlock_ruleset};
+    use coderex_core::sandbox::{landlock_restrict, landlock_ruleset};
     use std::os::unix::process::CommandExt;
 
     let config = compile_sandbox_config(work_dir, compiler);
-    let ruleset = match landlock_ruleset(&config) {
-        Some(ruleset) => ruleset,
-        None => {
-            tracing::warn!(
-                "Landlock is unavailable for WASM compilation; compiling with rlimits and the \
-                 process-group kill but no filesystem sandbox"
-            );
-            return None;
-        }
+    let Some(ruleset) = landlock_ruleset(&config) else {
+        tracing::warn!(
+            "Landlock is unavailable for WASM compilation; compiling with rlimits and the \
+             process-group kill but no filesystem sandbox"
+        );
+        return None;
     };
     let ruleset_fd = ruleset.raw_fd();
 

@@ -360,11 +360,17 @@ impl TokenPersistence {
 }
 
 #[cfg(feature = "keyring")]
+// On macOS this is a unit variant; on Linux and Windows it constructs a
+// backend that needs an allocation, so the shared signature is not `const`.
+#[allow(clippy::missing_const_for_fn)]
 fn default_backend() -> Backend {
     Backend::Secret(Arc::new(KeychainBackend))
 }
 
 #[cfg(not(feature = "keyring"))]
+// On macOS this is a unit variant; on Linux and Windows it constructs a
+// backend that needs an allocation, so the shared signature is not `const`.
+#[allow(clippy::missing_const_for_fn)]
 fn default_backend() -> Backend {
     Backend::FileOnly
 }
