@@ -168,6 +168,29 @@ environment variables directly (see [`docs/telemetry.md`](telemetry.md#channels)
 embedders that construct `coderex_telemetry::ChannelConfig` can pass these
 settings explicitly with `TelemetryUploader::with_channels`.
 
+### Secret store (MCP tokens)
+
+`secret_store.rs` persists the MCP OAuth tokens both `OAuthManager` and the
+`McpAuth` tool read. The OS keychain (service `coderex`, one account per store
+path) is preferred; `CODEREX_DISABLE_KEYCHAIN` forces the private-file fallback
+at `~/.coderex/mcp_tokens.json`, which is what CI uses.
+
+The fallback file is written atomically from a sibling temp file:
+
+- **Unix** — the temp file is created with mode `0600` and renamed over the
+  target, so the credential is never world-readable, including on overwrite.
+- **Windows** — the temp file's DACL is replaced with an explicit, protected
+  DACL that grants only the process token's user SID full access, then read
+  back and verified to contain exactly that one ACE. If the DACL cannot be
+  applied and verified the write **fails closed**: the temp file is discarded
+  and no token file is written, rather than renaming a credential into place
+  under an inherited ACL. This path is compile-gated to Windows and has not
+  been executed on a Windows host in this tree.
+
+A plaintext file left by an older version is migrated on the next successful
+keychain read or write: it is removed, or tightened to owner-only if removal
+fails.
+
 ### Tests
 
 `cargo test -p coderex-config` covers:

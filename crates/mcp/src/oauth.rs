@@ -736,6 +736,27 @@ fn allows_plain_http(url: &reqwest::Url) -> bool {
     }
 }
 
+/// The two well-known URLs whose path is derived from the issuer.
+///
+/// RFC 8414 inserts `/.well-known/oauth-authorization-server` *before* the
+/// issuer's path; OpenID Connect appends `/.well-known/openid-configuration`
+/// *after* it. A document served from one of these belongs to the issuer by
+/// construction, which is what lets a document that omits `issuer` still be
+/// bound to the exact configured issuer. The origin-level documents (used as
+/// fallbacks by [`discovery_candidates`]) are not issuer-scoped: when the
+/// issuer has a path, an origin-level URL describes a different issuer.
+fn issuer_scoped_urls(issuer: &str) -> Result<[String; 2], String> {
+    let normalized = normalize_issuer(issuer)
+        .ok_or_else(|| format!("{issuer} is not a usable http(s) issuer"))?;
+    let url = reqwest::Url::parse(&normalized).map_err(|error| error.to_string())?;
+    let origin = url.origin().ascii_serialization();
+    let path = url.path().trim_end_matches('/');
+    Ok([
+        format!("{origin}/.well-known/oauth-authorization-server{path}"),
+        format!("{origin}{path}/.well-known/openid-configuration"),
+    ])
+}
+
 /// The metadata documents to try, in precedence order.
 ///
 /// RFC 8414 inserts `/.well-known/oauth-authorization-server` *before* the
@@ -754,11 +775,11 @@ fn discovery_candidates(issuer: &str) -> Result<Vec<String>, String> {
         ));
     }
     let origin = url.origin().ascii_serialization();
-    let path = url.path().trim_end_matches('/');
+    let [scoped_8414, scoped_oidc] = issuer_scoped_urls(issuer)?;
     let candidates = [
-        format!("{origin}/.well-known/oauth-authorization-server{path}"),
+        scoped_8414,
         format!("{origin}/.well-known/oauth-authorization-server"),
-        format!("{origin}{path}/.well-known/openid-configuration"),
+        scoped_oidc,
         format!("{origin}/.well-known/openid-configuration"),
     ];
 
@@ -828,18 +849,41 @@ fn http_date_epoch(value: &str) -> Option<i64> {
         .map(|date| date.timestamp())
 }
 
-/// Whether a fetched document describes the issuer we asked about.
+/// Whether a fetched document may be used for the issuer we asked about, and
+/// why not when it may not.
 ///
-/// The comparison is normalized exact match: a trailing slash or a query
-/// string does not make a different issuer, but a different host or path does.
-/// A document with no `issuer` is accepted for compatibility with servers that
-/// publish only endpoint fields; RFC 8414 requires the field, so servers that
-/// follow the RFC are still checked.
-fn issuer_matches(discovery: &OAuthDiscovery, requested: &str) -> bool {
-    discovery
-        .issuer
-        .as_deref()
-        .is_none_or(|advertised| normalize_issuer(advertised).as_deref() == Some(requested))
+/// RFC 8414 §3.3 (and RFC 9728 for Protected Resource Metadata) requires the
+/// document's `issuer` to equal the issuer the well-known URL was derived from;
+/// a mismatch means the document describes a different authorization server and
+/// must not be used. The comparison is a normalized exact match: a trailing
+/// slash or a query string does not make a different issuer, but a different
+/// host or path does.
+///
+/// When the document omits `issuer` it cannot be checked against that rule, so
+/// it is bound to the exact configured issuer only when it was served from one
+/// of the issuer's own well-known URLs ([`issuer_scoped_urls`]), where the URL
+/// itself ties the document to that issuer. An origin-level document that names
+/// no issuer cannot be bound and is rejected with a clear reason rather than
+/// accepted silently.
+fn issuer_binding(
+    discovery: &OAuthDiscovery,
+    requested: &str,
+    candidate_url: &str,
+    issuer_scoped: bool,
+) -> Result<(), String> {
+    match discovery.issuer.as_deref() {
+        Some(advertised) => {
+            if normalize_issuer(advertised).as_deref() == Some(requested) {
+                Ok(())
+            } else {
+                Err(format!("issuer {advertised:?} does not match {requested}"))
+            }
+        }
+        None if issuer_scoped => Ok(()),
+        None => Err(format!(
+            "the document has no issuer and {candidate_url} is not bound to {requested}"
+        )),
+    }
 }
 
 struct FetchedDiscovery {
@@ -1257,8 +1301,11 @@ impl OAuthManager {
     ///    origin.
     ///
     /// A document whose `issuer` does not match the normalized issuer is
-    /// rejected and the next candidate is tried. HTTPS is required, except for
-    /// loopback hosts (plain HTTP is allowed there for local development).
+    /// rejected and the next candidate is tried. A document that omits `issuer`
+    /// is accepted only when it was served from the issuer's own well-known URL
+    /// (where the URL binds it to that issuer); an origin-level document with
+    /// no `issuer` cannot be bound and is rejected. HTTPS is required, except
+    /// for loopback hosts (plain HTTP is allowed there for local development).
     ///
     /// Discovered endpoints and `scopes_supported` are written into the state
     /// for `server_url` (created with the conventional client id if the server
@@ -1382,9 +1429,14 @@ impl OAuthManager {
             server_url: issuer.to_string(),
             detail,
         })?;
+        let scoped = issuer_scoped_urls(issuer).map_err(|detail| OAuthError::Discovery {
+            server_url: issuer.to_string(),
+            detail,
+        })?;
 
         let mut attempts = Vec::new();
         for url in candidates {
+            let issuer_scoped = url == scoped[0] || url == scoped[1];
             let conditional = cached
                 .filter(|cache| cache.source_url.as_deref() == Some(url.as_str()))
                 .and_then(|cache| cache.etag.as_deref());
@@ -1404,16 +1456,15 @@ impl OAuthManager {
                 Ok(fetched) if fetched.discovery.is_empty() => {
                     attempts.push(format!("{url}: advertised no endpoints"));
                 }
-                Ok(fetched) if !issuer_matches(&fetched.discovery, issuer) => {
-                    attempts.push(format!(
-                        "{url}: issuer {:?} does not match {issuer}",
-                        fetched.discovery.issuer
-                    ));
-                }
                 Ok(fetched) => {
-                    let mut entry = IssuerMetadataCache::default();
-                    entry.record(&fetched.discovery, fetched.max_age, fetched.etag, &url);
-                    return Ok((fetched.discovery, entry));
+                    match issuer_binding(&fetched.discovery, issuer, &url, issuer_scoped) {
+                        Ok(()) => {
+                            let mut entry = IssuerMetadataCache::default();
+                            entry.record(&fetched.discovery, fetched.max_age, fetched.etag, &url);
+                            return Ok((fetched.discovery, entry));
+                        }
+                        Err(reason) => attempts.push(format!("{url}: {reason}")),
+                    }
                 }
                 Err(error) => attempts.push(format!("{url}: {error}")),
             }
@@ -1944,13 +1995,21 @@ impl OAuthManager {
     ///
     /// This is the call site for [`McpOAuthState::is_near_expiry`]. Returns
     /// `Ok(None)` when there is no usable token — no state, or an expired one
-    /// with no refresh token — so the caller can connect unauthenticated and
-    /// let the server reject it, rather than pretending it has a credential.
+    /// with no refresh token and no installed [`ReauthHandler`] — so the caller
+    /// can connect unauthenticated and let the server reject it, rather than
+    /// pretending it has a credential.
     ///
     /// A failed refresh falls back to the current token while that token is
     /// still valid, so a token endpoint that is briefly down does not break a
     /// working session. Once the token has actually expired, the error is
     /// returned.
+    ///
+    /// A server that issued no refresh token cannot be refreshed. When such a
+    /// credential has actually expired, the installed [`ReauthHandler`] is run
+    /// once to sign in again, so the seam that keeps a session alive on a `401`
+    /// also covers the proactive expiry path instead of requiring a manual
+    /// `McpAuth`. With no handler installed the caller is told to send no
+    /// credential, and the server's `401` surfaces the honest error.
     pub async fn refresh_if_needed(
         &mut self,
         server_url: &str,
@@ -1965,14 +2024,20 @@ impl OAuthManager {
         }
 
         let still_valid = state.is_authenticated() && state.access_token.is_some();
+        let has_refresh_token = state.refresh_token.is_some();
 
-        if state.refresh_token.is_none() {
-            return Ok(still_valid.then(|| {
-                state
-                    .access_token
-                    .clone()
-                    .expect("still_valid checked the token was there")
-            }));
+        if !has_refresh_token {
+            if still_valid {
+                return Ok(self.get(server_url).and_then(|s| s.access_token.clone()));
+            }
+            // The credential expired and no refresh token can replace it: the
+            // only way back is a fresh authorization. Run the installed handler
+            // exactly once; with none installed, send no credential and let the
+            // server's 401 report that a sign-in is required.
+            if self.reauth.is_some() {
+                return self.reauthorize(server_url).await.map(Some);
+            }
+            return Ok(None);
         }
 
         match self.refresh(server_url, client).await {
@@ -2589,6 +2654,122 @@ mod tests {
             "{}",
             requests[2]
         );
+    }
+
+    /// RFC 8414 lets a document omit `issuer`. Served from the issuer's own
+    /// well-known URL the URL itself binds the document to the configured
+    /// issuer, so it is used rather than rejected.
+    #[tokio::test]
+    async fn discovery_accepts_an_issuer_less_document_at_the_issuer_scoped_url() {
+        let (base, server) = spawn_http_sequence(|_base| {
+            vec![
+                // No protected resource metadata published here.
+                (404, String::new()),
+                // The RFC 8414 path-insertion URL, with no `issuer` field.
+                (
+                    200,
+                    r#"{"authorization_endpoint":"https://auth.example/authorize","token_endpoint":"https://auth.example/token"}"#
+                        .to_string(),
+                ),
+            ]
+        });
+        let mut mgr = OAuthManager::with_path(tempfile::tempdir().unwrap().path().join("t.json"));
+        let server_url = format!("{base}/realms/demo");
+
+        let discovery = mgr
+            .discover(&server_url, &reqwest::Client::new())
+            .await
+            .expect("an issuer-less document at the issuer's own URL is usable");
+        assert_eq!(
+            discovery.token_endpoint.as_deref(),
+            Some("https://auth.example/token")
+        );
+
+        let requests = server.join().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert!(
+            requests[1].starts_with("GET /.well-known/oauth-authorization-server/realms/demo "),
+            "{}",
+            requests[1]
+        );
+    }
+
+    /// An origin-level document is not issuer-scoped, so with no `issuer` to
+    /// bind it, it cannot be trusted for an issuer that has a path. It is
+    /// rejected and discovery continues to the next candidate.
+    #[tokio::test]
+    async fn discovery_rejects_an_issuer_less_origin_document_and_continues() {
+        let (base, server) = spawn_http_sequence(|base| {
+            vec![
+                (404, String::new()),
+                (404, String::new()),
+                // Origin-level RFC 8414 document with no `issuer`.
+                (
+                    200,
+                    r#"{"authorization_endpoint":"https://evil.example/authorize","token_endpoint":"https://evil.example/token"}"#
+                        .to_string(),
+                ),
+                // The OpenID document at the issuer's own path names it.
+                (
+                    200,
+                    format!(
+                        r#"{{"issuer":"{base}/realms/demo","authorization_endpoint":"https://good.example/authorize","token_endpoint":"https://good.example/token"}}"#
+                    ),
+                ),
+            ]
+        });
+        let mut mgr = OAuthManager::with_path(tempfile::tempdir().unwrap().path().join("t.json"));
+        let server_url = format!("{base}/realms/demo");
+
+        let discovery = mgr
+            .discover(&server_url, &reqwest::Client::new())
+            .await
+            .unwrap();
+        assert_eq!(
+            discovery.token_endpoint.as_deref(),
+            Some("https://good.example/token"),
+            "the unbound document was accepted"
+        );
+
+        let requests = server.join().unwrap();
+        assert_eq!(requests.len(), 4);
+        assert!(
+            requests[2].starts_with("GET /.well-known/oauth-authorization-server "),
+            "{}",
+            requests[2]
+        );
+        assert!(
+            requests[3].starts_with("GET /realms/demo/.well-known/openid-configuration "),
+            "{}",
+            requests[3]
+        );
+    }
+
+    /// When every candidate is issuer-less and origin-level, discovery fails
+    /// with a reason that says why, rather than silently accepting a document
+    /// that could describe any server on that origin.
+    #[tokio::test]
+    async fn discovery_reports_an_unbindable_issuer_less_document() {
+        let body = r#"{"authorization_endpoint":"https://evil.example/authorize","token_endpoint":"https://evil.example/token"}"#.to_string();
+        let (base, server) = spawn_http_sequence(move |_base| {
+            vec![
+                (404, String::new()),
+                (404, String::new()),
+                (200, body.clone()),
+                (404, String::new()),
+                (200, body.clone()),
+            ]
+        });
+        let mut mgr = OAuthManager::with_path(tempfile::tempdir().unwrap().path().join("t.json"));
+        let server_url = format!("{base}/realms/demo");
+
+        let error = mgr
+            .discover(&server_url, &reqwest::Client::new())
+            .await
+            .expect_err("an unbound document must not be used");
+        let message = error.to_string();
+        assert!(message.contains("has no issuer"), "{message}");
+        assert_eq!(server.join().unwrap().len(), 5);
     }
 
     #[tokio::test]

@@ -22,9 +22,12 @@
 //!   from the process token) full access, so inherited entries from the
 //!   profile cannot widen it. The DACL is applied to the temporary file before
 //!   it is renamed over the target, and the result is read back and verified.
-//!   This path uses the native security APIs (`windows-sys`) and is compiled
-//!   but has not been executed on a Windows host in this tree; see the module
-//!   comments on [`tighten_to_owner_only`].
+//!   If that protected DACL cannot be applied and verified, the save fails
+//!   closed: the temporary file is discarded and no token file is written,
+//!   rather than persisting a credential under an inherited ACL. This path uses
+//!   the native security APIs (`windows-sys`) and is compiled but has not been
+//!   executed on a Windows host in this tree; see the module comments on
+//!   [`tighten_to_owner_only`].
 //!
 //! A plaintext file left behind by an older version is migrated on the next
 //! successful keychain read or write: it is removed, or tightened to `0600` if
@@ -343,7 +346,14 @@ impl TokenPersistence {
                     "could not remove the plaintext MCP token file after storing \
                      the credential in the keychain; tightening it instead: {error}"
                 );
-                tighten_to_owner_only(&self.path);
+                if let Err(error) = tighten_to_owner_only(&self.path) {
+                    tracing::error!(
+                        path = %self.path.display(),
+                        "the leftover plaintext MCP token file could not be \
+                         removed or tightened to a user-only DACL; it may remain \
+                         readable by other principals: {error}"
+                    );
+                }
             }
         }
     }
@@ -391,7 +401,12 @@ fn write_file(path: &Path, content: &str) -> io::Result<()> {
         file.write_all(content.as_bytes())?;
         file.sync_all()?;
         #[cfg(windows)]
-        tighten_to_owner_only(&temp);
+        // Fail closed: the fallback token file must never be renamed into place
+        // with an inherited (possibly wider) DACL. If the protected user-only
+        // DACL cannot be applied and verified, the `?` propagates and the temp
+        // file is removed below, so the save fails instead of leaving a weakly
+        // protected credential on disk.
+        tighten_to_owner_only(&temp)?;
         // Renaming replaces the old file wholesale, so an existing
         // world-readable file never receives the new contents in place.
         std::fs::rename(&temp, path)?;
@@ -415,15 +430,15 @@ fn temp_name(path: &Path) -> String {
 }
 
 /// Make the file owner-readable/writable only.
+///
+/// On Unix the file is already created with mode `0600`, so this only repairs a
+/// file that lost it; the error is reported to the caller, which decides
+/// whether it matters. The Windows path, where a new file inherits the
+/// directory's ACL, fails closed instead.
 #[cfg(unix)]
-fn tighten_to_owner_only(path: &Path) {
+fn tighten_to_owner_only(path: &Path) -> io::Result<()> {
     use std::os::unix::fs::PermissionsExt as _;
-    if let Err(error) = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)) {
-        tracing::warn!(
-            path = %path.display(),
-            "could not set owner-only permissions on the MCP token file: {error}"
-        );
-    }
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
 }
 
 /// The fixed part of a DACL that grants one SID full access.
@@ -459,16 +474,22 @@ const fn user_only_dacl_size(sid_len: u32) -> u32 {
 /// never exists with a wider ACL during a save.
 ///
 /// Compile-gated and not executed by the test suite in this tree: it requires
-/// a Windows host. Failure is logged rather than propagated, matching the Unix
-/// path and keeping the credential persistable when the keychain is the
-/// primary store.
+/// a Windows host. Unlike the Unix path this fails closed: if the protected
+/// user-only DACL cannot be applied and verified, the error is logged and
+/// propagated so [`write_file`] refuses to rename the file into place rather
+/// than leaving a credential with an inherited, possibly wider DACL.
 #[cfg(windows)]
-fn tighten_to_owner_only(path: &Path) {
-    if let Err(error) = windows_acl::restrict_to_current_user(path) {
-        tracing::warn!(
-            path = %path.display(),
-            "could not set a user-only DACL on the MCP token file: {error}"
-        );
+fn tighten_to_owner_only(path: &Path) -> io::Result<()> {
+    match windows_acl::restrict_to_current_user(path) {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            tracing::error!(
+                path = %path.display(),
+                "refusing to write the MCP token file without a protected \
+                 user-only DACL: {error}"
+            );
+            Err(error)
+        }
     }
 }
 

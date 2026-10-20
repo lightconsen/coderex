@@ -1,6 +1,8 @@
 //! End-to-end checks for remote MCP HTTP/SSE transport.
 
-use coderex_mcp::channel::{InboundRequestHandler, JsonRpcChannel, JsonRpcError};
+use coderex_mcp::channel::{
+    InboundRequestHandler, JsonRpcChannel, JsonRpcError, ServerNotificationHandler,
+};
 use coderex_mcp::config::{McpConfig, McpServerConfig, McpTransport};
 use coderex_mcp::manager::McpManager;
 use coderex_mcp::oauth::{McpOAuthState, OAuthManager, OAuthTokenProvider, ReauthHandler};
@@ -474,6 +476,57 @@ async fn an_expiring_token_is_refreshed_before_the_second_request() {
     assert!(
         token_request.contains("refresh_token=refresh_me"),
         "{token_request}"
+    );
+
+    channel.terminate().await.unwrap();
+}
+
+/// An expired token with no refresh token to replace it must hand off to the
+/// installed re-authorization seam exactly once, and use the token it stored,
+/// instead of failing until the person runs `McpAuth` by hand.
+#[tokio::test]
+async fn an_expired_token_without_a_refresh_token_reauthorizes_once() {
+    let (mcp_address, mcp_server) = spawn_rpc_server(1);
+    let server_url = format!("http://{mcp_address}/mcp");
+
+    let dir = tempfile::tempdir().unwrap();
+    let store = dir.path().join("mcp_tokens.json");
+    let calls = Arc::new(AtomicUsize::new(0));
+
+    let mut oauth = OAuthManager::with_path(store.clone());
+    let mut state = McpOAuthState::new(&server_url, "client1");
+    state.access_token = Some("stale_access".into());
+    // Expired, and deliberately no refresh token.
+    state.expires_at = Some(chrono::Utc::now().timestamp() - 10);
+    oauth.register(state);
+    oauth.set_reauth_handler(Arc::new(FileReauth {
+        path: store.clone(),
+        token: "reauth_access",
+        calls: Arc::clone(&calls),
+    }));
+    let oauth = Arc::new(tokio::sync::Mutex::new(oauth));
+
+    let mut channel = JsonRpcChannel::new_http(&server_url, HashMap::new()).unwrap();
+    channel.set_token_provider(Arc::new(OAuthTokenProvider::new(
+        &oauth,
+        server_url.clone(),
+        reqwest::Client::new(),
+    )));
+    channel.spawn().await.unwrap();
+    channel.send_request("tools/list", None).await.unwrap();
+
+    let requests = mcp_server.join().unwrap();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(
+        authorization(&requests[0]).as_deref(),
+        Some("Bearer reauth_access"),
+        "the request did not carry the re-authorized token: {}",
+        requests[0]
+    );
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "the re-authorization handler must run exactly once"
     );
 
     channel.terminate().await.unwrap();
@@ -1168,6 +1221,196 @@ async fn a_request_delivered_on_both_streams_is_answered_once() {
         answers.len(),
         1,
         "the request must be answered exactly once: {answers:?}"
+    );
+
+    drop(recorded);
+    channel.terminate().await.unwrap();
+}
+
+/// Counts the server notifications it was handed.
+#[derive(Debug, Default)]
+struct CountingNotifications {
+    seen: AtomicUsize,
+}
+
+#[async_trait::async_trait]
+impl ServerNotificationHandler for CountingNotifications {
+    async fn handle_notification(&self, _method: &str, _params: Option<&serde_json::Value>) {
+        self.seen.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+/// The same notification event id delivered once on the standalone GET stream
+/// and once on a POST response stream must be dispatched exactly once. A
+/// notification has no id to dedup on, so the event id is the key.
+#[tokio::test]
+async fn a_notification_delivered_on_both_streams_is_dispatched_once() {
+    const EVENT: &str = concat!(
+        "id: evt-note\n",
+        "data: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/message\",\"params\":{\"level\":\"info\",\"data\":\"once\"}}\n\n"
+    );
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let recorded = Arc::clone(&requests);
+
+    std::thread::spawn(move || {
+        let mut open_streams: Vec<TcpStream> = Vec::new();
+        for mut stream in listener.incoming().flatten() {
+            let request = read_request(&mut stream);
+            recorded.lock().unwrap().push(request.clone());
+
+            if is_get(&request) {
+                stream
+                    .write_all(
+                        format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: keep-alive\r\n\r\n{EVENT}"
+                        )
+                        .as_bytes(),
+                    )
+                    .unwrap();
+                stream.flush().unwrap();
+                open_streams.push(stream);
+            } else if request.contains("\"method\":\"initialize\"") {
+                let body = r#"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2024-11-05"}}"#;
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nMcp-Session-Id: session-note\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                stream.write_all(response.as_bytes()).unwrap();
+            } else if request.contains("\"method\":\"initialized\"") {
+                write_response(&mut stream, "202 Accepted", "application/json", "");
+            } else if request.contains("\"method\":\"tools/list\"") {
+                // The duplicate rides the response stream, with the same id.
+                write_response(
+                    &mut stream,
+                    "200 OK",
+                    "text/event-stream",
+                    &format!(
+                        "{EVENT}data: {{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{{\"tools\":[]}}}}\n\n"
+                    ),
+                );
+            } else {
+                write_response(&mut stream, "200 OK", "application/json", "{}");
+            }
+        }
+    });
+
+    let notifications = Arc::new(CountingNotifications::default());
+    let mut channel =
+        JsonRpcChannel::new_http(&format!("http://{address}/mcp"), HashMap::new()).unwrap();
+    channel.set_notification_handler(notifications.clone());
+    channel.spawn().await.unwrap();
+    channel.initialize().await.unwrap();
+    channel.list_tools().await.unwrap();
+
+    // Give both copies time to arrive and be (wrongly) dispatched.
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+    assert_eq!(
+        notifications.seen.load(Ordering::SeqCst),
+        1,
+        "a notification with a repeated event id must be dispatched once"
+    );
+
+    channel.terminate().await.unwrap();
+}
+
+/// A server request replayed after the event stream reconnects must not be
+/// asked a second time: the resume point advances past the events that were
+/// actually processed, and the bounded dedup catches the replay itself.
+#[tokio::test]
+async fn a_replayed_server_request_after_reconnect_is_not_asked_again() {
+    const EVENT: &str = concat!(
+        "id: evt-req\n",
+        "data: {\"jsonrpc\":\"2.0\",\"id\":77,\"method\":\"elicitation/create\",\"params\":{\"message\":\"ask once\"}}\n\n"
+    );
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let gets = Arc::new(AtomicUsize::new(0));
+    let counted = Arc::clone(&gets);
+    let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let recorded = Arc::clone(&requests);
+
+    std::thread::spawn(move || {
+        let mut held: Vec<TcpStream> = Vec::new();
+        for mut stream in listener.incoming().flatten() {
+            let request = read_request(&mut stream);
+            recorded.lock().unwrap().push(request.clone());
+
+            if is_get(&request) {
+                let attempt = counted.fetch_add(1, Ordering::SeqCst);
+                if attempt == 0 {
+                    // Deliver the request, then end the body so the client
+                    // reconnects and resumes.
+                    write_response(&mut stream, "200 OK", "text/event-stream", EVENT);
+                } else {
+                    // The reconnect replays the same event id.
+                    stream
+                        .write_all(
+                            format!(
+                                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: keep-alive\r\n\r\n{EVENT}"
+                            )
+                            .as_bytes(),
+                        )
+                        .unwrap();
+                    stream.flush().unwrap();
+                    held.push(stream);
+                }
+            } else if request.contains("\"method\":\"initialize\"") {
+                let body = r#"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2024-11-05"}}"#;
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nMcp-Session-Id: session-replay\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                stream.write_all(response.as_bytes()).unwrap();
+            } else {
+                write_response(&mut stream, "202 Accepted", "application/json", "");
+            }
+        }
+    });
+
+    let handler = Arc::new(CountingHandler::default());
+    let mut channel =
+        JsonRpcChannel::new_http(&format!("http://{address}/mcp"), HashMap::new()).unwrap();
+    channel.set_inbound_handler(handler.clone());
+    channel.set_event_stream_retry_policy(EventStreamRetryPolicy {
+        max_attempts: 5,
+        base_delay: std::time::Duration::from_millis(10),
+        max_delay: std::time::Duration::from_millis(20),
+        max_duration: std::time::Duration::from_secs(10),
+    });
+    channel.spawn().await.unwrap();
+    channel.initialize().await.unwrap();
+
+    wait_until(|| gets.load(Ordering::SeqCst) >= 2).await;
+    // Let the replayed event arrive and be (wrongly) answered.
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+    assert_eq!(
+        handler.answers.load(Ordering::SeqCst),
+        1,
+        "the replayed server request must be asked once"
+    );
+
+    let recorded = requests.lock().unwrap();
+    let gets_recorded: Vec<&String> = recorded.iter().filter(|request| is_get(request)).collect();
+    assert_eq!(
+        header_value(gets_recorded[1], "last-event-id").as_deref(),
+        Some("evt-req"),
+        "the reconnect must resume from the event that was processed: {}",
+        gets_recorded[1]
+    );
+    let answers: Vec<&String> = recorded
+        .iter()
+        .filter(|request| !is_get(request) && request.contains("\"id\":77"))
+        .collect();
+    assert_eq!(
+        answers.len(),
+        1,
+        "the replayed request must be answered exactly once: {answers:?}"
     );
 
     drop(recorded);

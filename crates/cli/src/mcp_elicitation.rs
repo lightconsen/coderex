@@ -4,8 +4,9 @@
 //! and block until the answer arrives. The TUI already has a path for exactly
 //! that shape of question — a request sent to the event loop, an answer read
 //! from the input line — so this module reuses it rather than adding a second
-//! way to prompt. A non-interactive session has nobody to ask, and says so
-//! instead of leaving the server waiting.
+//! way to prompt. A non-interactive session has nobody to ask; it answers
+//! according to [`HeadlessElicitation`] (cancel by default) instead of leaving
+//! the server waiting.
 
 use coderex_core::elicitation::{
     ElicitationHandler, ElicitationQuestion, ElicitationResponse, ElicitationResult,
@@ -175,30 +176,106 @@ fn default_text(field: &FormField) -> String {
     }
 }
 
+/// How a session with no one at the terminal answers an MCP elicitation.
+///
+/// Selected by the `CODEREX_HEADLESS_ELICITATION` environment variable. An
+/// unset or unrecognized value keeps the historical, safe behaviour: cancel.
+/// This only affects the non-interactive fallback — a running TUI or an
+/// interactive terminal always prompts the person.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HeadlessElicitation {
+    /// Refuse with a reason. The default.
+    Deny,
+    /// Accept a form when its schema supplies defaults for the required
+    /// fields, so the answer is complete without a person.
+    Allow,
+    /// Accept a form only when every declared field has a default.
+    Defaults,
+}
+
+/// The environment variable that selects [`HeadlessElicitation`].
+pub const HEADLESS_ELICITATION_ENV: &str = "CODEREX_HEADLESS_ELICITATION";
+
+impl HeadlessElicitation {
+    /// Read the policy from the environment, defaulting to [`Self::Deny`].
+    #[must_use]
+    pub fn from_env() -> Self {
+        std::env::var(HEADLESS_ELICITATION_ENV).map_or(Self::Deny, |value| {
+            Self::parse(&value).unwrap_or_else(|| {
+                tracing::warn!(
+                    value = %value,
+                    "unrecognized {HEADLESS_ELICITATION_ENV}; a headless session will cancel \
+                     MCP elicitation (expected deny, allow, or defaults)"
+                );
+                Self::Deny
+            })
+        })
+    }
+
+    /// Parse a policy name; `None` for anything unrecognized.
+    #[must_use]
+    fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "deny" => Some(Self::Deny),
+            "allow" => Some(Self::Allow),
+            "defaults" => Some(Self::Defaults),
+            _ => None,
+        }
+    }
+
+    /// The `content` a headless session should submit for `form`, or `None` to
+    /// cancel. Every accepted answer is validated against the schema first, so
+    /// a declared default that breaks its own constraint is a cancel.
+    fn answer(self, form: &FormSpec) -> Option<Map<String, Value>> {
+        match self {
+            Self::Deny => None,
+            Self::Allow | Self::Defaults => {
+                if self == Self::Defaults && form.fields.iter().any(|field| field.default.is_none())
+                {
+                    return None;
+                }
+                let mut content = Map::new();
+                form.apply_defaults(&mut content);
+                form.validate_values(&content).ok().map(|()| content)
+            }
+        }
+    }
+}
+
 /// The session's answer to server-initiated elicitation requests.
 ///
 /// The TUI registers a sender at startup; until then — and in a session with
 /// no TUI — an interactive session falls back to prompting on the terminal,
-/// and a non-interactive one declines.
+/// and a non-interactive one applies [`HeadlessElicitation`].
 #[derive(Debug)]
 pub struct SessionElicitationHandler {
     /// Where to send a question when the full-screen TUI is running.
     tui: Mutex<Option<tokio::sync::mpsc::Sender<TuiElicitationRequest>>>,
     /// Whether this session has a person at a terminal at all.
     interactive: bool,
+    /// What to do when there is no TUI and no terminal.
+    headless: HeadlessElicitation,
 }
 
 impl SessionElicitationHandler {
     /// Create the session handler.
     ///
     /// `interactive` is false for `--print`, a piped prompt, and any session
-    /// whose stdin is not a terminal: those answer `cancel` rather than read
-    /// from a stream that is not a keyboard.
+    /// whose stdin is not a terminal: those answer according to
+    /// [`HeadlessElicitation::from_env`] rather than read from a stream that is
+    /// not a keyboard.
     #[must_use]
     pub fn new(interactive: bool) -> Arc<Self> {
+        Self::with_headless_policy(interactive, HeadlessElicitation::from_env())
+    }
+
+    /// Create the session handler with an explicit headless policy.
+    #[must_use]
+    pub fn with_headless_policy(interactive: bool, headless: HeadlessElicitation) -> Arc<Self> {
         Arc::new(Self {
             tui: Mutex::new(None),
             interactive,
+            headless,
         })
     }
 
@@ -292,8 +369,19 @@ impl FormElicitationHandler for SessionElicitationHandler {
             };
         }
 
+        // No TUI and no terminal: apply the headless policy instead of waiting
+        // on input that is not coming.
+        if let Some(content) = self.headless.answer(form) {
+            tracing::info!(
+                message = %form.message,
+                policy = ?self.headless,
+                "a headless session accepted an MCP form from its declared defaults"
+            );
+            return FormResult::Submitted(content);
+        }
         tracing::warn!(
             message = %form.message,
+            policy = ?self.headless,
             "an MCP server asked for form input, but this session is non-interactive; answering cancel"
         );
         FormResult::Cancelled
@@ -332,8 +420,11 @@ impl ElicitationHandler for SessionElicitationHandler {
             return ReplElicitationHandler::default().request(questions).await;
         }
 
+        // A free-text question carries no schema, so there is nothing the
+        // headless policy could answer on the person's behalf.
         tracing::warn!(
             message = %question.question,
+            policy = ?self.headless,
             "an MCP server asked for user input, but this session is non-interactive; answering cancel"
         );
         ElicitationResult::Cancelled
@@ -555,6 +646,171 @@ mod tests {
             .await
             .expect("the session answered");
         assert_eq!(answer["action"], "cancel");
+    }
+
+    /// The policy names parse; anything else is the safe default.
+    #[test]
+    fn headless_policy_parses_known_names() {
+        assert_eq!(
+            HeadlessElicitation::parse("deny"),
+            Some(HeadlessElicitation::Deny)
+        );
+        assert_eq!(
+            HeadlessElicitation::parse(" ALLOW "),
+            Some(HeadlessElicitation::Allow)
+        );
+        assert_eq!(
+            HeadlessElicitation::parse("defaults"),
+            Some(HeadlessElicitation::Defaults)
+        );
+        assert_eq!(HeadlessElicitation::parse("yes"), None);
+    }
+
+    fn form_with_defaults() -> FormSpec {
+        FormSpec::parse(&serde_json::json!({
+            "type": "object",
+            "properties": {
+                "environment": {"type": "string", "default": "staging"},
+                "port": {"type": "integer", "default": 8080}
+            },
+            "required": ["environment", "port"]
+        }))
+        .expect("a flat schema")
+    }
+
+    /// Every declared field has a default.
+    fn form_all_defaulted() -> FormSpec {
+        FormSpec::parse(&serde_json::json!({
+            "type": "object",
+            "properties": {
+                "environment": {"type": "string", "default": "staging"},
+                "note": {"type": "string", "default": ""}
+            },
+            "required": ["environment"]
+        }))
+        .expect("a flat schema")
+    }
+
+    /// A required field carries no default, so it cannot be answered without a
+    /// person.
+    fn form_missing_a_required_default() -> FormSpec {
+        FormSpec::parse(&serde_json::json!({
+            "type": "object",
+            "properties": {
+                "environment": {"type": "string", "default": "staging"},
+                "port": {"type": "integer"}
+            },
+            "required": ["environment", "port"]
+        }))
+        .expect("a flat schema")
+    }
+
+    /// Only an optional field lacks a default.
+    fn form_with_an_optional_field_without_a_default() -> FormSpec {
+        FormSpec::parse(&serde_json::json!({
+            "type": "object",
+            "properties": {
+                "environment": {"type": "string", "default": "staging"},
+                "note": {"type": "string"}
+            },
+            "required": ["environment"]
+        }))
+        .expect("a flat schema")
+    }
+
+    /// `deny` is the default policy and always cancels, even when the schema
+    /// could have been answered from its defaults.
+    #[tokio::test]
+    async fn headless_deny_cancels_even_with_defaults() {
+        let handler =
+            SessionElicitationHandler::with_headless_policy(false, HeadlessElicitation::Deny);
+        assert!(matches!(
+            handler.request_form(&form_with_defaults()).await,
+            FormResult::Cancelled
+        ));
+    }
+
+    /// `allow` accepts a form whose required fields all have defaults.
+    #[tokio::test]
+    async fn headless_allow_accepts_required_defaults() {
+        let handler =
+            SessionElicitationHandler::with_headless_policy(false, HeadlessElicitation::Allow);
+        match handler.request_form(&form_with_defaults()).await {
+            FormResult::Submitted(content) => {
+                assert_eq!(content["environment"], "staging");
+                assert_eq!(content["port"], 8080);
+            }
+            other => panic!("expected the defaults to be accepted, got {other:?}"),
+        }
+    }
+
+    /// `allow` still cancels when a required field has no default to supply.
+    #[tokio::test]
+    async fn headless_allow_cancels_when_a_required_field_has_no_default() {
+        let handler =
+            SessionElicitationHandler::with_headless_policy(false, HeadlessElicitation::Allow);
+        assert!(matches!(
+            handler
+                .request_form(&form_missing_a_required_default())
+                .await,
+            FormResult::Cancelled
+        ));
+    }
+
+    /// A default that breaks its own constraint is never submitted.
+    #[tokio::test]
+    async fn headless_allow_refuses_a_default_that_breaks_its_constraint() {
+        let form = FormSpec::parse(&serde_json::json!({
+            "type": "object",
+            "properties": {"port": {"type": "integer", "default": 999, "maximum": 10}},
+            "required": ["port"]
+        }))
+        .expect("a flat schema");
+        let handler =
+            SessionElicitationHandler::with_headless_policy(false, HeadlessElicitation::Allow);
+        assert!(matches!(
+            handler.request_form(&form).await,
+            FormResult::Cancelled
+        ));
+    }
+
+    /// `defaults` is stricter than `allow`: an optional field with no default
+    /// is enough to cancel.
+    #[tokio::test]
+    async fn headless_defaults_is_stricter_than_allow() {
+        let allow =
+            SessionElicitationHandler::with_headless_policy(false, HeadlessElicitation::Allow);
+        assert!(matches!(
+            allow
+                .request_form(&form_with_an_optional_field_without_a_default())
+                .await,
+            FormResult::Submitted(_)
+        ));
+
+        let defaults =
+            SessionElicitationHandler::with_headless_policy(false, HeadlessElicitation::Defaults);
+        assert!(matches!(
+            defaults
+                .request_form(&form_with_an_optional_field_without_a_default())
+                .await,
+            FormResult::Cancelled
+        ));
+        assert!(matches!(
+            defaults.request_form(&form_all_defaulted()).await,
+            FormResult::Submitted(_)
+        ));
+    }
+
+    /// A free-text question has no schema to default, so every policy cancels
+    /// it rather than inventing an answer.
+    #[tokio::test]
+    async fn headless_allow_still_cancels_a_free_text_question() {
+        let handler =
+            SessionElicitationHandler::with_headless_policy(false, HeadlessElicitation::Allow);
+        assert!(matches!(
+            handler.request(vec![question()]).await,
+            ElicitationResult::Cancelled
+        ));
     }
 
     fn sample_form() -> FormSpec {

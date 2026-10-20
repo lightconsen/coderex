@@ -172,36 +172,93 @@ impl Default for EventStreamRetryPolicy {
     }
 }
 
-/// The identity of a server request: a request id is only unique within one
-/// session, and a session can be re-initialized.
-type RequestKey = (String, u64);
+/// One identity of a server-to-client message, for duplicate suppression.
+///
+/// A replayed message can arrive with the same SSE event id (the server tells
+/// us it is the same event) or with the same shape. A request's shape is
+/// `(session_id, request_id)`; a notification's is `(method, params)`. Both
+/// identities are claimed together — see [`dedup_keys_for_request`].
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum DedupKey {
+    /// An SSE event id, which names one delivered event across both streams
+    /// and across reconnects.
+    Event(String),
+    /// A server request with no event id: a request id is only unique within
+    /// one session, and a session can be re-initialized.
+    Request(String, u64),
+    /// A notification with no event id: its method and params.
+    Notification(String, String),
+}
 
-/// Whether a server request is being answered or was answered recently.
+/// Every key a server request is recognised by.
+///
+/// The shape key is always present: the same request can be delivered once on
+/// the POST response stream and once on the standalone stream, and the server
+/// may label only one of the two copies with an SSE event id. The event id is
+/// added when the server supplies one, so a replay after a reconnect — which
+/// may re-initialize the session and change the shape key — is still caught.
+fn dedup_keys_for_request(
+    session_id: String,
+    request_id: u64,
+    event_id: Option<&str>,
+) -> Vec<DedupKey> {
+    let mut keys = Vec::with_capacity(2);
+    keys.push(DedupKey::Request(session_id, request_id));
+    if let Some(id) = event_id {
+        keys.push(DedupKey::Event(id.to_string()));
+    }
+    keys
+}
+
+/// Every key a server notification is recognised by.
+///
+/// A notification has no request id, so its shape is the method plus its
+/// params compared as JSON text — the only identity a redelivered copy
+/// carries. An SSE event id, when present, is claimed as well.
+fn dedup_keys_for_notification(
+    method: &str,
+    params: Option<&Value>,
+    event_id: Option<&str>,
+) -> Vec<DedupKey> {
+    let mut keys = Vec::with_capacity(2);
+    keys.push(DedupKey::Notification(
+        method.to_string(),
+        params.map_or_else(String::new, Value::to_string),
+    ));
+    if let Some(id) = event_id {
+        keys.push(DedupKey::Event(id.to_string()));
+    }
+    keys
+}
+
+/// Whether a server-to-client message is being handled or was handled
+/// recently.
 #[derive(Debug, Clone, Copy)]
 enum DedupEntry {
     /// A handler is running right now.
     Pending,
-    /// The answer was delivered; a redelivery must not ask again.
+    /// The message was handled; a redelivery must not act on it again.
     Answered,
 }
 
-/// Recent server-request keys, used to answer each request exactly once even
-/// when the same message arrives on both the POST and the standalone stream.
+/// Recent server-message keys, used to act on each message exactly once even
+/// when it is redelivered after a reconnect or arrives on both the POST and
+/// the standalone stream.
 #[derive(Debug, Default)]
-struct RequestDedup {
+struct MessageDedup {
     inner: Mutex<DedupInner>,
 }
 
 #[derive(Debug, Default)]
 struct DedupInner {
-    entries: HashMap<RequestKey, (DedupEntry, Instant)>,
-    order: VecDeque<RequestKey>,
+    entries: HashMap<DedupKey, (DedupEntry, Instant)>,
+    order: VecDeque<DedupKey>,
 }
 
-impl RequestDedup {
-    /// Claim `key` for this attempt. Returns false for a pending or recent
-    /// duplicate.
-    fn begin(&self, key: &RequestKey) -> bool {
+impl MessageDedup {
+    /// Claim every key for this message. Returns false for a pending or recent
+    /// duplicate, in which case nothing is claimed.
+    fn begin(&self, keys: &[DedupKey]) -> bool {
         let now = Instant::now();
         let mut inner = self
             .inner
@@ -221,42 +278,49 @@ impl RequestDedup {
             }
         }
 
-        if inner.entries.contains_key(key) {
+        if keys.iter().any(|key| inner.entries.contains_key(key)) {
             return false;
         }
-        while inner.entries.len() >= DEDUP_CAPACITY {
-            let Some(oldest) = inner.order.pop_front() else {
-                break;
-            };
-            inner.entries.remove(&oldest);
+        for key in keys {
+            while inner.entries.len() >= DEDUP_CAPACITY {
+                let Some(oldest) = inner.order.pop_front() else {
+                    break;
+                };
+                inner.entries.remove(&oldest);
+            }
+            inner
+                .entries
+                .insert(key.clone(), (DedupEntry::Pending, now));
+            inner.order.push_back(key.clone());
         }
-        inner
-            .entries
-            .insert(key.clone(), (DedupEntry::Pending, now));
-        inner.order.push_back(key.clone());
         true
     }
 
-    /// Mark a claimed request as answered.
-    fn complete(&self, key: &RequestKey) {
+    /// Mark a claimed message as handled.
+    fn complete(&self, keys: &[DedupKey]) {
+        let now = Instant::now();
         let mut inner = self
             .inner
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        inner
-            .entries
-            .insert(key.clone(), (DedupEntry::Answered, Instant::now()));
+        for key in keys {
+            inner
+                .entries
+                .insert(key.clone(), (DedupEntry::Answered, now));
+        }
     }
 
     /// Release a claim whose answer could not be delivered, so a retry can
     /// answer it.
-    fn fail(&self, key: &RequestKey) {
+    fn fail(&self, keys: &[DedupKey]) {
         let mut inner = self
             .inner
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        inner.entries.remove(key);
-        inner.order.retain(|entry| entry != key);
+        for key in keys {
+            inner.entries.remove(key);
+            inner.order.retain(|entry| entry != key);
+        }
     }
 
     #[cfg(test)]
@@ -320,8 +384,8 @@ struct RequestContext {
     session_id: Arc<RwLock<Option<String>>>,
     /// The protocol revision the server negotiated in its initialize result.
     protocol_version: Arc<RwLock<Option<String>>>,
-    /// Server requests already answered (or being answered) over either stream.
-    dedup: Arc<RequestDedup>,
+    /// Server messages already handled (or being handled) over either stream.
+    dedup: Arc<MessageDedup>,
     /// The POST message endpoint announced by a legacy-SSE `endpoint` event.
     ///
     /// Always `None` for streamable HTTP, whose requests go to `url`. A
@@ -627,19 +691,23 @@ impl RequestContext {
     }
 
     /// Answer a server request unless this exact request has already been
-    /// answered (or is being answered) for the current session.
+    /// answered (or is being answered).
     ///
     /// The same request can arrive twice — once carried by the POST response
     /// stream and once by the standalone GET stream, or again after a
-    /// reconnect. The key is `(session_id, request_id)`; the handler is run
-    /// once and the duplicate is dropped.
+    /// reconnect. It is recognised by both its `(session_id, request_id)`
+    /// shape and, when the carrying SSE event has an id, that id, so a replay
+    /// after a reconnect (which may re-initialize the session) is still caught.
+    /// The handler is run once and the duplicate is dropped.
     async fn answer_once(
         &self,
         request: &JsonRpcServerRequest,
         handler: Option<&dyn InboundRequestHandler>,
+        event_id: Option<&str>,
     ) -> Result<(), String> {
-        let key = (self.session_id().unwrap_or_default(), request.id);
-        if !self.dedup.begin(&key) {
+        let keys =
+            dedup_keys_for_request(self.session_id().unwrap_or_default(), request.id, event_id);
+        if !self.dedup.begin(&keys) {
             tracing::debug!(
                 id = request.id,
                 method = %request.method,
@@ -650,16 +718,39 @@ impl RequestContext {
 
         match self.answer_server_request(request, handler).await {
             Ok(()) => {
-                self.dedup.complete(&key);
+                self.dedup.complete(&keys);
                 Ok(())
             }
             Err(error) => {
                 // The answer was not delivered, so a retry must be allowed to
                 // try again rather than being mistaken for a duplicate.
-                self.dedup.fail(&key);
+                self.dedup.fail(&keys);
                 Err(error)
             }
         }
+    }
+
+    /// Hand a notification to the session's sink unless this exact
+    /// notification was already delivered.
+    ///
+    /// A notification has no answer, so the only harm a redelivery does is a
+    /// repeated side effect (a re-discovery, a cache invalidation). It is
+    /// recognised by its method and params, and by the carrying SSE event id
+    /// when there is one; a redelivered notification is dropped.
+    async fn dispatch_notification_once(
+        &self,
+        notifications: &Arc<RwLock<Option<Arc<dyn ServerNotificationHandler>>>>,
+        method: &str,
+        params: Option<&Value>,
+        event_id: Option<&str>,
+    ) {
+        let keys = dedup_keys_for_notification(method, params, event_id);
+        if !self.dedup.begin(&keys) {
+            tracing::debug!(method, "skipping a duplicate server notification");
+            return;
+        }
+        dispatch_notification(notifications, method, params).await;
+        self.dedup.complete(&keys);
     }
 
     async fn send_notification(&self, notification: &JsonRpcNotification) -> Result<(), String> {
@@ -763,7 +854,7 @@ impl HttpChannel {
                 token_provider: None,
                 session_id: Arc::new(RwLock::new(None)),
                 protocol_version: Arc::new(RwLock::new(None)),
-                dedup: Arc::new(RequestDedup::default()),
+                dedup: Arc::new(MessageDedup::default()),
                 message_url: Arc::new(message_url),
             },
             mode,
@@ -1844,7 +1935,10 @@ async fn process_legacy_message(
                     .read()
                     .ok()
                     .and_then(|slot| slot.as_ref().map(Arc::clone));
-                if let Err(error) = context.answer_once(&request, handler.as_deref()).await {
+                if let Err(error) = context
+                    .answer_once(&request, handler.as_deref(), None)
+                    .await
+                {
                     tracing::warn!(
                         method = %request.method,
                         "could not answer a request from the MCP SSE stream: {error}"
@@ -1858,7 +1952,9 @@ async fn process_legacy_message(
         // A notification, which may invalidate discovery or cached resources.
         (true, false) => {
             let method = value.get("method").and_then(Value::as_str).unwrap_or("");
-            dispatch_notification(notifications, method, value.get("params")).await;
+            context
+                .dispatch_notification_once(notifications, method, value.get("params"), None)
+                .await;
         }
         // A response: hand it to the request waiting on that id.
         (false, true) => {
@@ -2000,10 +2096,14 @@ async fn read_event_stream_once(
             .await;
             if handled {
                 processed += 1;
-            }
-            if let Some(id) = event_id {
-                if let Ok(mut slot) = worker_last_id.lock() {
-                    *slot = Some(id);
+                // The resume point is the last event actually processed, not
+                // merely the last one read: an event the worker could not
+                // handle (a keep-alive, an unparseable payload) must not move
+                // `Last-Event-ID` past it, or a reconnect could skip it.
+                if let Some(id) = event_id {
+                    if let Ok(mut slot) = worker_last_id.lock() {
+                        *slot = Some(id);
+                    }
                 }
             }
         }
@@ -2082,7 +2182,9 @@ async fn read_event_stream_once(
 ///
 /// Server requests are answered over a POST (with the session id attached by
 /// [`RequestContext`]); notifications are logged. Responses have no requester
-/// on this stream, so they are only noted.
+/// on this stream, so they are only noted. The event id, when the server
+/// assigned one, is the dedup key, so a replay after a reconnect is recognised
+/// as the same message.
 async fn process_stream_event(
     context: &RequestContext,
     handler: &Arc<RwLock<Option<Arc<dyn InboundRequestHandler>>>>,
@@ -2102,6 +2204,8 @@ async fn process_stream_event(
         return false;
     };
 
+    let event_id = sse_event_id(event);
+    let event_id = event_id.as_deref();
     let has_method = value.get("method").is_some();
     let has_id = value.get("id").is_some();
 
@@ -2115,7 +2219,10 @@ async fn process_stream_event(
                     .read()
                     .ok()
                     .and_then(|slot| slot.as_ref().map(Arc::clone));
-                if let Err(error) = context.answer_once(&request, handler.as_deref()).await {
+                if let Err(error) = context
+                    .answer_once(&request, handler.as_deref(), event_id)
+                    .await
+                {
                     tracing::warn!(
                         method = %request.method,
                         "could not answer a request from the GET stream: {error}"
@@ -2130,7 +2237,9 @@ async fn process_stream_event(
         // re-discovery or invalidate a cached resource.
         (true, false) => {
             let method = value.get("method").and_then(Value::as_str).unwrap_or("");
-            dispatch_notification(notifications, method, value.get("params")).await;
+            context
+                .dispatch_notification_once(notifications, method, value.get("params"), event_id)
+                .await;
         }
         // A response with no request waiting on this stream.
         (false, true) => {
@@ -2148,7 +2257,8 @@ async fn process_stream_event(
     }
 
     // The caller records the resume point only after this returns, so a
-    // reconnect cannot skip a request that was not answered.
+    // reconnect cannot skip a message that was not handled. A deduplicated
+    // redelivery still returns true: it was handled, just not acted on again.
     true
 }
 
@@ -2308,14 +2418,16 @@ async fn route_message(
         (true, true) => {
             let request: JsonRpcServerRequest = serde_json::from_value(value.clone())
                 .map_err(|error| format!("failed to parse a server request: {error}"))?;
-            context.answer_once(&request, handler).await?;
+            context.answer_once(&request, handler, None).await?;
             Ok(None)
         }
         // A notification: no answer is expected, but it may ask us to refresh
         // discovery or invalidate a cached resource.
         (true, false) => {
             let method = value.get("method").and_then(Value::as_str).unwrap_or("");
-            dispatch_notification(notifications, method, value.get("params")).await;
+            context
+                .dispatch_notification_once(notifications, method, value.get("params"), None)
+                .await;
             Ok(None)
         }
         (false, true) => {
