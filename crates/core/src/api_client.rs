@@ -1,6 +1,6 @@
 //! Anthropic API client with retry and model routing.
 
-use crate::provider::{ProviderApiStyle, ResolvedProviderProfile};
+use crate::provider::{ProviderApiStyle, ReasoningEffortSupport, ResolvedProviderProfile};
 use crate::tool_executor::ToolInfo;
 use crate::types::{ModelId, ToolCall, UsageSummary};
 use futures::Stream;
@@ -388,6 +388,76 @@ impl From<reqwest::Error> for ApiError {
     }
 }
 
+/// How much reasoning a provider should spend on a request.
+///
+/// The value is provider-neutral: each provider maps it onto whatever control
+/// its API actually exposes (an Anthropic thinking budget, an OpenAI-compatible
+/// `reasoning_effort` field). A provider with no equivalent omits it and says
+/// so rather than silently dropping the request — see
+/// [`ResolvedProviderProfile::reasoning_effort_support`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ReasoningEffort {
+    /// Spend as little as possible.
+    Low,
+    /// The provider's middle setting.
+    Medium,
+    /// Spend as much as the provider allows.
+    High,
+}
+
+impl ReasoningEffort {
+    /// The wire spelling accepted by the CLI and by OpenAI-style APIs.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+        }
+    }
+
+    /// Parse the CLI spelling, case-insensitively.
+    #[must_use]
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "low" => Some(Self::Low),
+            "medium" => Some(Self::Medium),
+            "high" => Some(Self::High),
+            _ => None,
+        }
+    }
+
+    /// The Anthropic extended-thinking budget for this level.
+    ///
+    /// Anthropic requires a budget of at least 1024 tokens, so `Low` is the
+    /// floor rather than something smaller.
+    #[must_use]
+    pub const fn anthropic_thinking_budget(self) -> u32 {
+        match self {
+            Self::Low => 1024,
+            Self::Medium => 4096,
+            Self::High => 16_384,
+        }
+    }
+}
+
+impl std::fmt::Display for ReasoningEffort {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for ReasoningEffort {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Self::parse(value).ok_or_else(|| {
+            format!("invalid reasoning effort '{value}': expected one of low, medium, high")
+        })
+    }
+}
+
 /// Configuration for the API client.
 #[derive(Debug, Clone)]
 pub struct ApiConfig {
@@ -418,6 +488,11 @@ pub struct ApiConfig {
     pub client_name: String,
     /// Per-request context propagated from the engine.
     pub request_context: Option<RequestContext>,
+    /// Default reasoning effort for requests made with this client.
+    ///
+    /// A per-request value on [`RequestContext`] wins over this default; see
+    /// [`ApiConfig::effective_reasoning_effort`].
+    pub reasoning_effort: Option<ReasoningEffort>,
 }
 
 /// Controls how request metadata is attached to provider requests.
@@ -446,6 +521,31 @@ pub struct RequestContext {
     pub provider_hints: BTreeMap<String, String>,
 }
 
+/// The `provider_hints` key that carries [`ReasoningEffort`].
+///
+/// The effort rides in the existing hint map so it reaches providers through
+/// the plumbing that already propagates [`RequestContext`] end to end, without
+/// widening the struct (and every literal that builds it).
+pub const REASONING_EFFORT_HINT: &str = "reasoning_effort";
+
+impl RequestContext {
+    /// The reasoning effort requested for this turn, if any.
+    #[must_use]
+    pub fn reasoning_effort(&self) -> Option<ReasoningEffort> {
+        self.provider_hints
+            .get(REASONING_EFFORT_HINT)
+            .and_then(|value| ReasoningEffort::parse(value))
+    }
+
+    /// Request a reasoning effort for this turn.
+    pub fn set_reasoning_effort(&mut self, effort: ReasoningEffort) {
+        self.provider_hints.insert(
+            REASONING_EFFORT_HINT.to_string(),
+            effort.as_str().to_string(),
+        );
+    }
+}
+
 impl ApiConfig {
     /// Create a config with the given API key and defaults.
     #[must_use]
@@ -464,6 +564,7 @@ impl ApiConfig {
             device_id: std::env::var("CODEREX_DEVICE_ID").ok(),
             client_name: "cli".into(),
             request_context: None,
+            reasoning_effort: None,
         }
     }
 
@@ -522,6 +623,26 @@ impl ApiConfig {
     pub fn with_request_context(mut self, context: RequestContext) -> Self {
         self.request_context = Some(context);
         self
+    }
+
+    /// Set the default reasoning effort for this client.
+    #[must_use]
+    pub const fn with_reasoning_effort(mut self, effort: ReasoningEffort) -> Self {
+        self.reasoning_effort = Some(effort);
+        self
+    }
+
+    /// The reasoning effort to apply to a request.
+    ///
+    /// A value carried on the per-request [`RequestContext`] wins over the
+    /// client default, because the caller that built the context is the one
+    /// that knows about *this* turn.
+    #[must_use]
+    pub fn effective_reasoning_effort(&self) -> Option<ReasoningEffort> {
+        self.request_context
+            .as_ref()
+            .and_then(RequestContext::reasoning_effort)
+            .or(self.reasoning_effort)
     }
 }
 
@@ -610,6 +731,98 @@ pub trait ApiClient: Send + Sync {
         max_tokens: u32,
         tools: &[ToolInfo],
     ) -> Pin<Box<dyn Stream<Item = StreamEvent> + Send + 'static>>;
+}
+
+/// An [`ApiClient`] that stamps a reasoning effort onto every request context.
+///
+/// The engine builds a fresh [`RequestContext`] per turn and knows nothing
+/// about `--effort`; this wrapper sits in front of the provider router and adds
+/// the effort to each context as it goes past. It does not overwrite an effort
+/// a caller already set, so a future per-turn override still wins.
+pub struct EffortClient {
+    inner: Box<dyn ApiClient>,
+    effort: ReasoningEffort,
+}
+
+impl EffortClient {
+    /// Wrap `inner` so every request carries `effort`.
+    #[must_use]
+    pub fn new(inner: Box<dyn ApiClient>, effort: ReasoningEffort) -> Self {
+        Self { inner, effort }
+    }
+
+    /// The effort this client stamps onto requests.
+    #[must_use]
+    pub const fn effort(&self) -> ReasoningEffort {
+        self.effort
+    }
+
+    /// The context handed to the inner client.
+    fn context_with_effort(&self, mut context: RequestContext) -> RequestContext {
+        if context.reasoning_effort().is_none() {
+            context.set_reasoning_effort(self.effort);
+        }
+        context
+    }
+}
+
+impl Clone for EffortClient {
+    fn clone(&self) -> Self {
+        Self {
+            inner: self.inner.clone_box(),
+            effort: self.effort,
+        }
+    }
+}
+
+impl std::fmt::Debug for EffortClient {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EffortClient")
+            .field("effort", &self.effort)
+            .finish_non_exhaustive()
+    }
+}
+
+#[async_trait::async_trait]
+impl ApiClient for EffortClient {
+    fn clone_box(&self) -> Box<dyn ApiClient> {
+        Box::new(self.clone())
+    }
+
+    fn with_request_context(&self, context: RequestContext) -> Box<dyn ApiClient> {
+        Box::new(Self {
+            inner: self
+                .inner
+                .with_request_context(self.context_with_effort(context)),
+            effort: self.effort,
+        })
+    }
+
+    async fn create_message(
+        &self,
+        system: &str,
+        messages: &[serde_json::Value],
+        model: &ModelId,
+        max_tokens: u32,
+        tools: &[ToolInfo],
+    ) -> Result<ApiResponse, ApiError> {
+        self.inner
+            .create_message(system, messages, model, max_tokens, tools)
+            .await
+    }
+
+    async fn create_message_streaming(
+        &self,
+        system: &str,
+        messages: &[serde_json::Value],
+        model: &ModelId,
+        max_tokens: u32,
+        tools: &[ToolInfo],
+    ) -> Pin<Box<dyn Stream<Item = StreamEvent> + Send + 'static>> {
+        self.inner
+            .create_message_streaming(system, messages, model, max_tokens, tools)
+            .await
+    }
 }
 
 /// Anthropic API client implementation.
@@ -723,6 +936,54 @@ impl AnthropicApiClient {
             }
         }
         let _ = model_name;
+    }
+
+    /// How this endpoint can express a reasoning effort.
+    ///
+    /// A cloud deployment is its own case: Bedrock, Vertex, and the other cloud
+    /// kinds all speak the Anthropic Messages shape here, so they take the
+    /// extended-thinking budget even though their host name resolves to a
+    /// profile CodeRex does not otherwise know.
+    fn reasoning_effort_support(&self) -> ReasoningEffortSupport {
+        if self.config.cloud.is_some() {
+            return ReasoningEffortSupport::AnthropicThinking;
+        }
+        self.resolved_profile().reasoning_effort_support()
+    }
+
+    /// Apply a reasoning effort to the request body, when this endpoint has an
+    /// equivalent for it.
+    ///
+    /// Anthropic-style endpoints express effort as extended thinking: a
+    /// `thinking.budget_tokens` value. Anthropic rejects a body whose
+    /// `max_tokens` is not above that budget, so the ceiling is raised when the
+    /// caller's is too low. An endpoint with no equivalent is left untouched
+    /// and a warning says so — the request is not silently reshaped.
+    fn apply_reasoning_effort(&self, body: &mut serde_json::Value, max_tokens: u32) {
+        let Some(effort) = self.config.effective_reasoning_effort() else {
+            return;
+        };
+        match self.reasoning_effort_support() {
+            ReasoningEffortSupport::AnthropicThinking => {
+                let budget = effort.anthropic_thinking_budget();
+                if let Some(object) = body.as_object_mut() {
+                    object.insert(
+                        "thinking".into(),
+                        serde_json::json!({"type": "enabled", "budget_tokens": budget}),
+                    );
+                    if max_tokens <= budget {
+                        object.insert("max_tokens".into(), serde_json::json!(budget + 1024));
+                    }
+                }
+            }
+            ReasoningEffortSupport::OpenAiReasoningEffort | ReasoningEffortSupport::Unsupported => {
+                tracing::warn!(
+                    provider = self.profile_name(),
+                    effort = %effort,
+                    "provider has no reasoning-effort control; the request omits it"
+                );
+            }
+        }
     }
 
     /// Apply the endpoint's authentication to a request.
@@ -1056,6 +1317,7 @@ impl ApiClient for AnthropicApiClient {
         });
         self.attach_metadata(&mut body, &request_id);
         self.shape_body(&mut body, model_name);
+        self.apply_reasoning_effort(&mut body, max_tokens);
 
         let capabilities = self.resolved_profile().capabilities;
         let tool_fallback = !tools.is_empty() && !capabilities.tool_use;
@@ -1235,6 +1497,7 @@ impl ApiClient for AnthropicApiClient {
         });
         self.attach_metadata(&mut body, &request_id);
         self.shape_body(&mut body, &model_name);
+        self.apply_reasoning_effort(&mut body, max_tokens);
 
         let capabilities = self.resolved_profile().capabilities;
         let tool_fallback = !tools.is_empty() && !capabilities.tool_use;
@@ -1702,6 +1965,98 @@ fn parse_custom_headers_env() -> BTreeMap<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reasoning_effort_parses_and_round_trips() {
+        assert_eq!(ReasoningEffort::parse("low"), Some(ReasoningEffort::Low));
+        assert_eq!(ReasoningEffort::parse("HIGH"), Some(ReasoningEffort::High));
+        assert_eq!(
+            ReasoningEffort::parse(" medium "),
+            Some(ReasoningEffort::Medium)
+        );
+        assert_eq!(ReasoningEffort::parse("maximum"), None);
+        assert_eq!(ReasoningEffort::High.as_str(), "high");
+        assert_eq!(
+            "medium".parse::<ReasoningEffort>(),
+            Ok(ReasoningEffort::Medium)
+        );
+
+        // The enum is serde-friendly, so a plugin or config file can carry it.
+        let json = serde_json::to_string(&ReasoningEffort::Low).expect("serializes");
+        assert_eq!(json, "\"low\"");
+        let parsed: ReasoningEffort = serde_json::from_str("\"high\"").expect("deserializes");
+        assert_eq!(parsed, ReasoningEffort::High);
+    }
+
+    #[test]
+    fn anthropic_effort_becomes_a_thinking_budget() {
+        let config = ApiConfig::new("k".into()).with_reasoning_effort(ReasoningEffort::High);
+        let client = AnthropicApiClient::new(config);
+        let mut body = serde_json::json!({"max_tokens": 1024});
+        client.apply_reasoning_effort(&mut body, 1024);
+
+        assert_eq!(body["thinking"]["type"], "enabled");
+        assert_eq!(body["thinking"]["budget_tokens"], 16_384);
+        // Anthropic rejects max_tokens <= budget_tokens, so the ceiling moves.
+        assert_eq!(body["max_tokens"], 16_384 + 1024);
+    }
+
+    #[test]
+    fn anthropic_keeps_a_max_tokens_above_the_budget() {
+        let config = ApiConfig::new("k".into()).with_reasoning_effort(ReasoningEffort::Low);
+        let client = AnthropicApiClient::new(config);
+        let mut body = serde_json::json!({"max_tokens": 8192});
+        client.apply_reasoning_effort(&mut body, 8192);
+        assert_eq!(body["thinking"]["budget_tokens"], 1024);
+        assert_eq!(
+            body["max_tokens"], 8192,
+            "a ceiling above the budget is left alone"
+        );
+    }
+
+    #[test]
+    fn effort_is_omitted_when_the_profile_has_no_equivalent() {
+        let config = ApiConfig::new("k".into())
+            .with_provider_profile("kimi")
+            .with_reasoning_effort(ReasoningEffort::High);
+        let client = AnthropicApiClient::new(config);
+        let mut body = serde_json::json!({"max_tokens": 1024});
+        client.apply_reasoning_effort(&mut body, 1024);
+        // The field is omitted rather than sent to a provider that would
+        // reject it; the warning is what makes that honest.
+        assert!(body.get("thinking").is_none());
+        assert_eq!(body["max_tokens"], 1024);
+    }
+
+    #[test]
+    fn request_context_effort_wins_over_the_client_default() {
+        let mut context = RequestContext::default();
+        context.set_reasoning_effort(ReasoningEffort::Low);
+        let config = ApiConfig::new("k".into())
+            .with_reasoning_effort(ReasoningEffort::High)
+            .with_request_context(context);
+        assert_eq!(
+            config.effective_reasoning_effort(),
+            Some(ReasoningEffort::Low),
+            "the per-turn context is more specific than the client default"
+        );
+    }
+
+    #[test]
+    fn effort_client_stamps_the_context_and_respects_an_existing_value() {
+        let inner = AnthropicApiClient::new(ApiConfig::new("k".into()));
+        let client = EffortClient::new(Box::new(inner), ReasoningEffort::High);
+
+        let stamped = client.with_request_context(RequestContext::default());
+        assert_eq!(client.effort(), ReasoningEffort::High);
+        drop(stamped);
+
+        // A caller that already chose an effort keeps it.
+        let mut context = RequestContext::default();
+        context.set_reasoning_effort(ReasoningEffort::Low);
+        let unchanged = client.context_with_effort(context);
+        assert_eq!(unchanged.reasoning_effort(), Some(ReasoningEffort::Low));
+    }
 
     #[tokio::test]
     async fn missing_api_key_returns_auth_error() {

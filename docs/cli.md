@@ -90,7 +90,7 @@ main() → parse_args() → StartupOrchestrator::run()
 | `--json-schema SCHEMA` | | JSON schema for structured output (passed to `SubmitOptions`) |
 | `--replay-user-messages` | | Replay user messages from most recent session transcript |
 | `--include-partial-messages` | | Include partial assistant messages in context |
-| `--effort LEVEL` | | Accepted for CLI compatibility; this build rejects it at startup because no reasoning-effort field exists in the request layer. It is never silently ignored |
+| `--effort LEVEL` | | Reasoning effort: `low`, `medium`, or `high` (case-insensitive). Any other value is rejected at startup. The level is carried on every request context and mapped per provider — see "Reasoning effort" below |
 | `--betas FLAGS` | | Comma-separated feature flags (`+name`, `-name`, or bare `name`) applied to the session |
 | `--chrome` | | Enable browser / web integration |
 | `--no-chrome` | | Disable browser / web integration (removes `ChromeClient` from dispatcher) |
@@ -121,6 +121,25 @@ main() → parse_args() → StartupOrchestrator::run()
 | `plugin update` | Update all plugins |
 | `auto-mode` | Show auto-mode settings (reads `dream_config.json`) |
 | `telemetry preview-crash [FILE]` | Print the JSON that would be uploaded for a pending crash (never uploads) |
+
+### Reasoning effort
+
+`--effort low|medium|high` asks the provider to spend a matching amount of
+reasoning on each turn. The value is stamped onto every request context by an
+`EffortClient` that wraps the provider router, so it reaches whichever provider
+serves the turn, and each provider maps it onto the control its API actually
+exposes:
+
+| Provider profile | Mapping |
+|---|---|
+| Anthropic (`anthropic`, and cloud endpoints such as Bedrock/Vertex that use the Anthropic Messages shape) | `thinking: {"type": "enabled", "budget_tokens": N}` — `low` = 1024, `medium` = 4096, `high` = 16384. `max_tokens` is raised above the budget when the caller's ceiling is lower, because Anthropic rejects a body where it is not. |
+| OpenAI and Groq | `reasoning_effort: "<level>"` on Chat Completions; `reasoning: {"effort": "<level>"}` on the Responses API. |
+| Kimi, DashScope, and unnamed OpenAI-compatible endpoints | No verified equivalent. The field is **omitted** and a warning names the provider — the request is never silently reshaped, and the choice is not silently dropped. |
+
+The effort is carried on `RequestContext` under the `reasoning_effort` provider
+hint, and a per-turn value on the context wins over a client-level default. An
+unknown level (`--effort maximum`) is rejected at startup with the accepted
+values.
 
 ### Telemetry inspection
 

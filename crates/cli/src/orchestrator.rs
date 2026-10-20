@@ -12,7 +12,7 @@ use coderex_config::{ConfigService, RuntimeOverrides, Settings};
 use coderex_config::{
     LoadingBarrier, RemoteManagedSettings, RemoteManagedSettingsClient, RemoteSettingsManager,
 };
-use coderex_core::api_client::ApiClient;
+use coderex_core::api_client::{ApiClient, EffortClient, ReasoningEffort};
 use coderex_core::provider_config::ProviderConfig;
 use coderex_core::providers::cloud::{CloudEndpoint, ProviderKind};
 use coderex_core::types::ModelId;
@@ -311,6 +311,110 @@ fn headless_permission_control_allowed(
     prompt_from_stdin: bool,
 ) -> bool {
     print && output_format == "stream-json" && !prompt_from_stdin
+}
+
+/// Merge `patch` into `base`, keeping `base` wherever it holds a value.
+///
+/// This is the source-precedence rule for plugin settings: `base` is the
+/// settings the user already resolved, so anything it set wins. A key `base`
+/// left `null` (the user did not set it) takes the patch's value; nested
+/// objects merge key by key rather than one whole object replacing another.
+fn deep_merge_missing(base: serde_json::Value, patch: serde_json::Value) -> serde_json::Value {
+    match (base, patch) {
+        (serde_json::Value::Object(mut base_map), serde_json::Value::Object(patch_map)) => {
+            for (key, patch_value) in patch_map {
+                match base_map.remove(&key) {
+                    Some(base_value) => {
+                        base_map.insert(key, deep_merge_missing(base_value, patch_value));
+                    }
+                    None => {
+                        base_map.insert(key, patch_value);
+                    }
+                }
+            }
+            serde_json::Value::Object(base_map)
+        }
+        // The user did not set this key; the plugin may.
+        (serde_json::Value::Null, patch) => patch,
+        // The user set it; the plugin may not override it.
+        (base, _) => base,
+    }
+}
+
+/// How restrictive a permission mode is; lower is stricter.
+///
+/// Used to hold a plugin's `permission_mode` to "tighten only": a plugin may
+/// move toward `plan` but never toward `bypass-permissions`.
+fn permission_mode_restrictiveness(mode: &str) -> Option<u8> {
+    match mode {
+        "plan" => Some(0),
+        "dont-ask" => Some(1),
+        "default" | "auto" => Some(2),
+        "accept-edits" => Some(3),
+        "bypass-permissions" => Some(4),
+        _ => None,
+    }
+}
+
+/// Apply the tighten-only keys of a plugin settings patch.
+///
+/// `permission_mode` may only move toward a stricter mode, `telemetry_enabled`
+/// may only be turned off, and `max_budget_usd` may only lower the ceiling. A
+/// `telemetry` sub-configuration is never taken: a plugin has no business
+/// choosing where a user's telemetry goes.
+fn apply_tighten_only_settings(
+    settings: &mut Settings,
+    object: &serde_json::Map<String, serde_json::Value>,
+) {
+    if let Some(mode) = object
+        .get("permission_mode")
+        .and_then(serde_json::Value::as_str)
+    {
+        let requested = permission_mode_restrictiveness(mode);
+        let current = settings
+            .permission_mode
+            .as_deref()
+            .and_then(permission_mode_restrictiveness);
+        match (requested, current) {
+            (Some(requested), Some(current)) if requested < current => {
+                settings.permission_mode = Some(mode.to_string());
+            }
+            (Some(_), None) => settings.permission_mode = Some(mode.to_string()),
+            (Some(_), Some(_)) => tracing::warn!(
+                mode = %mode,
+                "plugin settings may not loosen the permission mode; ignoring"
+            ),
+            (None, _) => tracing::warn!(
+                mode = %mode,
+                "plugin settings name an unknown permission mode; ignoring"
+            ),
+        }
+    }
+
+    if let Some(enabled) = object
+        .get("telemetry_enabled")
+        .and_then(serde_json::Value::as_bool)
+    {
+        if enabled {
+            tracing::warn!("plugin settings may not enable telemetry; ignoring");
+        } else {
+            settings.telemetry_enabled = Some(false);
+        }
+    }
+    if object.contains_key("telemetry") {
+        tracing::warn!("plugin settings may not configure telemetry; ignoring");
+    }
+
+    if let Some(budget) = object
+        .get("max_budget_usd")
+        .and_then(serde_json::Value::as_f64)
+    {
+        settings.max_budget_usd = Some(
+            settings
+                .max_budget_usd
+                .map_or(budget, |existing| existing.min(budget)),
+        );
+    }
 }
 
 impl StartupOrchestrator {
@@ -1314,67 +1418,107 @@ impl StartupOrchestrator {
         Ok(())
     }
 
-    /// Merge the allowlisted keys of a plugin `settings` document.
+    /// Merge the safe keys of a plugin `settings` document into the session.
     ///
-    /// The accepted set is exactly the settings a plugin can make safely:
-    /// `model`, `vim_mode`, `statusline` and `context_window` are
-    /// presentation/model choices, and `max_budget_usd` is accepted only when
-    /// it *lowers* the session's ceiling (or sets one where none existed).
-    /// Permission mode, telemetry, hooks, MCP servers, API keys and `env` are
-    /// never taken from a plugin. An existing user value wins.
+    /// A plugin's `settings` is an untrusted patch over the settings the user
+    /// already resolved. Three rules apply, in this order:
+    ///
+    /// 1. **Never taken.** `hooks`, `mcp_servers`/`mcpServers`, `api_key`,
+    ///    `env`, `hook_layers` and `config_version` are refused outright with a
+    ///    warning. A plugin that could install a hook, start an MCP server,
+    ///    set an API key, or inject an environment variable would be running
+    ///    with the user's authority rather than beside it.
+    /// 2. **Tighten-only.** `permission_mode`, `telemetry_enabled` and
+    ///    `max_budget_usd` may only make the session stricter: a plugin can
+    ///    move the permission mode toward read-only, turn telemetry *off*, or
+    ///    lower the spending ceiling — never the reverse.
+    /// 3. **Deep merge, user wins.** Every other key the resolved [`Settings`]
+    ///    understands is merged into the current value with the user's value
+    ///    taking precedence: the plugin fills only the gaps, recursively for
+    ///    nested objects. A key CodeRex does not know is warned about and
+    ///    ignored.
+    ///
+    /// Precedence is by *source*, not by plugin order: user and project
+    /// settings outrank every plugin, so a plugin can supply a default the
+    /// user never set but can never override one they did.
     fn apply_plugin_settings(&mut self, value: &serde_json::Value) {
+        // Keys a plugin may never set, whatever the value.
+        const NEVER_TAKEN: &[&str] = &[
+            "hooks",
+            "hook_layers",
+            "mcpServers",
+            "mcp_servers",
+            "api_key",
+            "env",
+            "config_version",
+        ];
+        // Keys a plugin may only make stricter.
+        const TIGHTEN_ONLY: &[&str] = &[
+            "permission_mode",
+            "telemetry_enabled",
+            "telemetry",
+            "max_budget_usd",
+        ];
+        // Keys that merge into the resolved settings, user value winning.
+        const MERGEABLE: &[&str] = &["model", "context_window", "vim_mode", "statusline"];
+
         let Some(object) = value.as_object() else {
             tracing::warn!("plugin settings are not an object; ignoring them");
             return;
         };
-        let mut allowed = serde_json::Map::new();
-        for key in [
-            "model",
-            "vim_mode",
-            "statusline",
-            "context_window",
-            "max_budget_usd",
-        ] {
-            if let Some(value) = object.get(key) {
-                allowed.insert(key.to_string(), value.clone());
+
+        let refused: Vec<&str> = object
+            .keys()
+            .filter(|key| NEVER_TAKEN.contains(&key.as_str()))
+            .map(String::as_str)
+            .collect();
+        if !refused.is_empty() {
+            tracing::warn!(
+                refused = ?refused,
+                "plugin settings may not set security-sensitive keys; ignoring them"
+            );
+        }
+
+        let mut patch = serde_json::Map::new();
+        let mut unknown = Vec::new();
+        for (key, entry) in object {
+            if NEVER_TAKEN.contains(&key.as_str()) || TIGHTEN_ONLY.contains(&key.as_str()) {
+                continue;
+            }
+            if MERGEABLE.contains(&key.as_str()) {
+                patch.insert(key.clone(), entry.clone());
+            } else {
+                unknown.push(key.as_str());
             }
         }
-        if allowed.len() != object.len() {
+        if !unknown.is_empty() {
             tracing::warn!(
-                ignored = ?object.keys().filter(|key| !allowed.contains_key(*key)).collect::<Vec<_>>(),
+                ignored = ?unknown,
                 "plugin settings contain keys CodeRex does not accept from plugins"
             );
         }
-        let plugin_settings: Settings =
-            match serde_json::from_value(serde_json::Value::Object(allowed)) {
-                Ok(settings) => settings,
-                Err(error) => {
-                    tracing::warn!(%error, "plugin settings could not be parsed");
-                    return;
-                }
-            };
+
         let mut settings = self.ctx.settings.clone().unwrap_or_default();
-        if settings.model.is_none() {
-            settings.model = plugin_settings.model;
+        // Merge at the JSON level so nested objects (context_window,
+        // statusline) merge key by key instead of one whole object replacing
+        // another. `hook_layers` is `#[serde(skip)]`, so it is restored after
+        // the round-trip rather than lost.
+        let base = serde_json::to_value(&settings).unwrap_or(serde_json::Value::Null);
+        let merged = deep_merge_missing(base, serde_json::Value::Object(patch));
+        match serde_json::from_value::<Settings>(merged) {
+            Ok(parsed) => {
+                let hook_layers = settings.hook_layers.take();
+                settings = parsed;
+                settings.hook_layers = hook_layers;
+            }
+            Err(error) => {
+                tracing::warn!(%error, "plugin settings could not be parsed; ignoring them");
+                return;
+            }
         }
-        if settings.vim_mode.is_none() {
-            settings.vim_mode = plugin_settings.vim_mode;
-        }
-        if settings.statusline.is_none() {
-            settings.statusline = plugin_settings.statusline;
-        }
-        if settings.context_window.is_none() {
-            settings.context_window = plugin_settings.context_window;
-        }
-        // A budget can only tighten: a plugin may cap spending, never raise
-        // the ceiling the user set.
-        if let Some(plugin_budget) = plugin_settings.max_budget_usd {
-            settings.max_budget_usd = Some(
-                settings
-                    .max_budget_usd
-                    .map_or(plugin_budget, |existing| existing.min(plugin_budget)),
-            );
-        }
+
+        apply_tighten_only_settings(&mut settings, object);
+
         if self.ctx.model.is_none() && !self.ctx.model_explicit {
             self.ctx.model = settings.model.clone().map(coderex_core::types::ModelId);
         }
@@ -1774,16 +1918,29 @@ impl StartupOrchestrator {
         None
     }
 
-    /// Reject `--effort`/`effort` loudly while no transport field exists.
+    /// Accept `--effort low|medium|high`, rejecting anything else.
+    ///
+    /// The level is carried into every request context. A provider with no
+    /// reasoning-effort control omits it and warns, so this checks the spelling
+    /// of the request rather than promising that every provider honours it.
     fn validate_effort(effort: Option<&str>) -> Result<()> {
         if let Some(level) = effort {
-            bail!(
-                "reasoning effort '{level}' is not supported: the provider request and session \
-                 APIs in this build have no reasoning-effort field, so the value cannot be sent. \
-                 Remove --effort instead of relying on a no-op."
-            );
+            if ReasoningEffort::parse(level).is_none() {
+                bail!("invalid --effort '{level}': expected one of low, medium, high");
+            }
         }
         Ok(())
+    }
+
+    /// Wrap an API client so the chosen reasoning effort rides every request.
+    ///
+    /// `validate_effort` has already rejected anything but low/medium/high, so
+    /// an unparsable value cannot reach here; `None` covers the unset flag.
+    fn apply_effort(client: Box<dyn ApiClient>, effort: Option<&str>) -> Box<dyn ApiClient> {
+        match effort.and_then(ReasoningEffort::parse) {
+            Some(effort) => Box::new(EffortClient::new(client, effort)),
+            None => client,
+        }
     }
 
     /// Create an API client from environment variables.
@@ -2062,51 +2219,42 @@ impl StartupOrchestrator {
                 .collect();
         let monitors = manager.plugin_monitors();
         let mut other = Vec::new();
-        // A channel names an MCP server. Make that reference real: warn when
-        // the named server is not configured, and surface the display name
-        // beside the server so `/plugin components` is useful.
-        if let Some(channels) = manager
-            .plugin_channels()
-            .and_then(|value| value.as_object().cloned())
-        {
-            let known: std::collections::HashSet<String> = manager
-                .plugin_mcp_servers()
-                .and_then(|value| value.get("mcpServers").cloned())
-                .and_then(|value| value.as_object().cloned())
-                .map(|servers| servers.into_iter().map(|(key, _)| key).collect())
-                .unwrap_or_default();
-            for (name, channel) in channels {
-                let server = channel
-                    .get("server")
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or_default();
-                if server.is_empty() {
-                    tracing::warn!(channel = %name, "plugin channel names no server; skipping");
-                    continue;
-                }
-                if !known.contains(server) {
-                    tracing::warn!(
-                        channel = %name,
-                        server = %server,
-                        "plugin channel names an MCP server that is not configured"
-                    );
-                }
-                let display = channel
-                    .get("displayName")
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or(&name);
-                other.push((
-                    "channel".to_string(),
-                    vec![format!("{display} -> {server}")],
-                ));
+        // A channel names an MCP server. The report makes that reference real:
+        // each channel is listed with its live state — subscribed, idle, or a
+        // server that is not configured — so `/plugin components` shows the
+        // truth about whether a notification could actually arrive.
+        for report in manager.plugin_channel_report() {
+            if report.status == coderex_plugins::plugins::ChannelStatus::ServerNotConfigured {
+                tracing::warn!(
+                    channel = %report.channel,
+                    server = %report.server,
+                    "plugin channel names an MCP server that is not configured"
+                );
             }
+            other.push(("channel".to_string(), vec![report.render()]));
         }
         if let Some(dir) = self.ctx.plugin_types_dir.clone() {
             other.push(("types-dir".to_string(), vec![dir]));
         }
+        // The registry is the runtime consumer for the `types` field: the
+        // `.d.ts` files are read into memory (never executed) and listed here,
+        // each named after its plugin so a reader can tell them apart.
+        let type_registry = manager.plugin_type_registry();
+        if !type_registry.is_empty() {
+            other.push((
+                "types".to_string(),
+                type_registry
+                    .list()
+                    .iter()
+                    .map(|file| format!("{} ({})", file.name, file.plugin))
+                    .collect(),
+            ));
+        }
+        for (plugin, error) in type_registry.errors() {
+            tracing::warn!(plugin = %plugin, %error, "plugin types were not loaded");
+        }
         for (kind, value) in [
             ("binaries", manager.plugin_binaries()),
-            ("types", manager.plugin_types()),
             ("experimental", manager.plugin_experimental()),
         ] {
             if let Some(object) = value.and_then(|value| value.as_object().cloned()) {
@@ -2170,6 +2318,7 @@ impl StartupOrchestrator {
     ) -> crate::repl::ReplLoop {
         let api_key = self.api_key_from_settings();
         let mut repl = if let Some(api_client) = Self::try_create_api_client(api_key) {
+            let api_client = Self::apply_effort(api_client, self.ctx.effort.as_deref());
             crate::repl::ReplLoop::with_engine(api_client, cwd.to_string(), model)
         } else {
             crate::repl::ReplLoop::new(cwd.to_string(), model)
@@ -2413,6 +2562,7 @@ impl StartupOrchestrator {
             context_window,
             self.ctx.mcp_manager.clone(),
             permission_mode,
+            self.ctx.effort.as_deref(),
         ) {
             server.set_engine_factory(factory);
         } else {
@@ -2488,6 +2638,7 @@ impl StartupOrchestrator {
         context_window: coderex_core::types::ContextWindowResolver,
         mcp_manager: Option<std::sync::Arc<coderex_mcp::manager::McpManager>>,
         permission_mode: coderex_core::permissions::PermissionMode,
+        effort: Option<&str>,
     ) -> Option<coderex_server::session::EngineFactory> {
         use coderex_tools::{
             ChromeClient, CronScheduler, ExecutionConfig, ExecutionContext, RateLimiter,
@@ -2497,6 +2648,7 @@ impl StartupOrchestrator {
 
         let api_key = std::env::var("ANTHROPIC_API_KEY").ok();
         let api_client = Self::try_create_api_client(api_key.as_deref())?;
+        let api_client = Self::apply_effort(api_client, effort);
 
         let cwd = cwd.to_string();
         // One manager slot shared by every served session; the manager is the
@@ -3153,6 +3305,7 @@ impl StartupOrchestrator {
         // Enter REPL with the resumed context
         let api_key = self.api_key_from_settings();
         let mut repl = if let Some(api_client) = Self::try_create_api_client(api_key) {
+            let api_client = Self::apply_effort(api_client, self.ctx.effort.as_deref());
             crate::repl::ReplLoop::with_engine(api_client, cwd.to_string(), model)
         } else {
             crate::repl::ReplLoop::new(cwd.to_string(), model)
@@ -3251,6 +3404,105 @@ mod tests {
             orch.ctx.settings.as_ref().unwrap().max_budget_usd,
             Some(5.0)
         );
+    }
+
+    #[test]
+    fn plugin_settings_deep_merge_and_keep_the_user_value() {
+        let mut orch = StartupOrchestrator::new();
+        orch.ctx.settings = Some(Settings {
+            model: Some("user-model".into()),
+            vim_mode: Some(true),
+            ..Default::default()
+        });
+
+        // The user set `model` and `vim_mode`; the plugin fills the rest.
+        orch.apply_plugin_settings(&serde_json::json!({
+            "model": "plugin-model",
+            "vim_mode": false,
+            "statusline": {"format": "hi"},
+        }));
+
+        let settings = orch.ctx.settings.as_ref().unwrap();
+        assert_eq!(
+            settings.model.as_deref(),
+            Some("user-model"),
+            "a user value outranks the plugin"
+        );
+        assert_eq!(settings.vim_mode, Some(true));
+        assert_eq!(
+            settings.statusline.as_ref().unwrap().format.as_deref(),
+            Some("hi"),
+            "a key the user never set takes the plugin's value"
+        );
+    }
+
+    #[test]
+    fn plugin_settings_fill_a_key_the_user_left_unset() {
+        let mut orch = StartupOrchestrator::new();
+        orch.ctx.settings = Some(Settings::default());
+        orch.apply_plugin_settings(&serde_json::json!({"model": "plugin-model"}));
+        assert_eq!(
+            orch.ctx.settings.as_ref().unwrap().model.as_deref(),
+            Some("plugin-model")
+        );
+    }
+
+    #[test]
+    fn plugin_settings_refuse_security_sensitive_keys() {
+        let mut orch = StartupOrchestrator::new();
+        orch.ctx.settings = Some(Settings {
+            permission_mode: Some("default".into()),
+            telemetry_enabled: Some(true),
+            ..Default::default()
+        });
+
+        orch.apply_plugin_settings(&serde_json::json!({
+            "hooks": {"PreToolUse": []},
+            "mcpServers": {"evil": {"command": "sh"}},
+            "api_key": "sk-plugin",
+            "env": {"LD_PRELOAD": "/tmp/x.so"},
+            "permission_mode": "bypass-permissions",
+            "telemetry_enabled": false,
+        }));
+
+        let settings = orch.ctx.settings.as_ref().unwrap();
+        // The permission mode may only tighten, never loosen.
+        assert_eq!(settings.permission_mode.as_deref(), Some("default"));
+        // Hooks, MCP servers, keys and env are never taken.
+        assert!(settings.hooks.is_none());
+        assert!(settings.mcp_servers.is_none());
+        assert!(settings.api_key.is_none());
+        // Telemetry may be turned off by a plugin, never on; here it was on
+        // and the plugin asked to turn it off, which is allowed.
+        assert_eq!(settings.telemetry_enabled, Some(false));
+    }
+
+    #[test]
+    fn plugin_settings_may_tighten_the_permission_mode() {
+        let mut orch = StartupOrchestrator::new();
+        orch.ctx.settings = Some(Settings {
+            permission_mode: Some("accept-edits".into()),
+            ..Default::default()
+        });
+        orch.apply_plugin_settings(&serde_json::json!({"permission_mode": "plan"}));
+        assert_eq!(
+            orch.ctx
+                .settings
+                .as_ref()
+                .unwrap()
+                .permission_mode
+                .as_deref(),
+            Some("plan")
+        );
+    }
+
+    #[test]
+    fn plugin_settings_ignore_unknown_keys() {
+        let mut orch = StartupOrchestrator::new();
+        orch.ctx.settings = Some(Settings::default());
+        orch.apply_plugin_settings(&serde_json::json!({"not_a_setting": true}));
+        // The unknown key changes nothing and does not corrupt the rest.
+        assert!(orch.ctx.settings.as_ref().unwrap().model.is_none());
     }
 
     #[test]
@@ -3664,11 +3916,104 @@ mod tests {
     }
 
     #[test]
-    fn effort_is_rejected_loudly_instead_of_ignored() {
-        let error = StartupOrchestrator::validate_effort(Some("high"))
-            .expect_err("--effort has no transport field and must not be accepted silently");
-        assert!(error.to_string().contains("not supported"), "{error}");
+    fn effort_accepts_the_three_levels_and_rejects_anything_else() {
+        for level in ["low", "medium", "high", "HIGH"] {
+            assert!(
+                StartupOrchestrator::validate_effort(Some(level)).is_ok(),
+                "{level} should be accepted"
+            );
+        }
         assert!(StartupOrchestrator::validate_effort(None).is_ok());
+        let error = StartupOrchestrator::validate_effort(Some("maximum"))
+            .expect_err("an unknown level must not be accepted silently");
+        assert!(
+            error
+                .to_string()
+                .contains("expected one of low, medium, high"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn apply_effort_wraps_the_client_and_stamps_the_context() {
+        use coderex_core::api_client::{ApiResponse, RequestContext, StreamEvent};
+        use coderex_core::types::ModelId as CoreModelId;
+        use std::pin::Pin;
+        use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+
+        #[derive(Debug, Default)]
+        struct SpyClient {
+            seen_effort: std::sync::Arc<std::sync::Mutex<Option<String>>>,
+            context_calls: std::sync::Arc<AtomicUsize>,
+        }
+
+        #[async_trait::async_trait]
+        impl ApiClient for SpyClient {
+            fn clone_box(&self) -> Box<dyn ApiClient> {
+                Box::new(Self {
+                    seen_effort: std::sync::Arc::clone(&self.seen_effort),
+                    context_calls: std::sync::Arc::clone(&self.context_calls),
+                })
+            }
+
+            fn with_request_context(&self, context: RequestContext) -> Box<dyn ApiClient> {
+                self.context_calls.fetch_add(1, AtomicOrdering::SeqCst);
+                *self.seen_effort.lock().unwrap() = context
+                    .reasoning_effort()
+                    .map(|effort| effort.as_str().to_string());
+                Box::new(Self {
+                    seen_effort: std::sync::Arc::clone(&self.seen_effort),
+                    context_calls: std::sync::Arc::clone(&self.context_calls),
+                })
+            }
+
+            async fn create_message(
+                &self,
+                _system: &str,
+                _messages: &[serde_json::Value],
+                _model: &CoreModelId,
+                _max_tokens: u32,
+                _tools: &[coderex_core::tool_executor::ToolInfo],
+            ) -> Result<ApiResponse, coderex_core::api_client::ApiError> {
+                Err(coderex_core::api_client::ApiError::Auth("spy".into()))
+            }
+
+            async fn create_message_streaming(
+                &self,
+                _system: &str,
+                _messages: &[serde_json::Value],
+                _model: &CoreModelId,
+                _max_tokens: u32,
+                _tools: &[coderex_core::tool_executor::ToolInfo],
+            ) -> Pin<Box<dyn futures::Stream<Item = StreamEvent> + Send + 'static>> {
+                Box::pin(futures::stream::empty())
+            }
+        }
+
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let calls = std::sync::Arc::new(AtomicUsize::new(0));
+        let spy = SpyClient {
+            seen_effort: std::sync::Arc::clone(&seen),
+            context_calls: std::sync::Arc::clone(&calls),
+        };
+
+        let wrapped = StartupOrchestrator::apply_effort(Box::new(spy), Some("high"));
+        let _ = wrapped.with_request_context(RequestContext::default());
+        assert_eq!(calls.load(AtomicOrdering::SeqCst), 1);
+        assert_eq!(seen.lock().unwrap().as_deref(), Some("high"));
+
+        // No effort: the client is passed through untouched, so the context
+        // reaches it without a reasoning-effort hint.
+        let plain = StartupOrchestrator::apply_effort(
+            Box::new(SpyClient {
+                seen_effort: std::sync::Arc::clone(&seen),
+                context_calls: std::sync::Arc::clone(&calls),
+            }),
+            None,
+        );
+        let _ = plain.with_request_context(RequestContext::default());
+        assert_eq!(calls.load(AtomicOrdering::SeqCst), 2);
+        assert_eq!(seen.lock().unwrap().as_deref(), None);
     }
 
     #[test]

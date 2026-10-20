@@ -110,6 +110,19 @@ pub struct ProviderCapabilities {
     pub vision: bool,
 }
 
+/// How a provider can express a reasoning-effort request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReasoningEffortSupport {
+    /// The Anthropic extended-thinking budget (`thinking.budget_tokens`).
+    AnthropicThinking,
+    /// The OpenAI-compatible `reasoning_effort` request field.
+    OpenAiReasoningEffort,
+    /// The provider exposes no equivalent control. The request omits it and a
+    /// warning names the provider, rather than dropping the user's choice in
+    /// silence.
+    Unsupported,
+}
+
 /// Resolved provider interaction profile.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ResolvedProviderProfile {
@@ -202,6 +215,23 @@ impl ResolvedProviderProfile {
                 api_style: style,
                 capabilities: Self::generic_capabilities(),
             },
+        }
+    }
+
+    /// How this profile carries a reasoning-effort request, if at all.
+    ///
+    /// Only endpoints whose reasoning control is verified are listed: Anthropic
+    /// takes an extended-thinking budget, OpenAI and Groq take
+    /// `reasoning_effort`. Everything else — Kimi, DashScope, and unnamed
+    /// OpenAI-compatible endpoints — reports
+    /// [`ReasoningEffortSupport::Unsupported`] so the caller omits the field and
+    /// warns, rather than sending something the provider may reject.
+    #[must_use]
+    pub fn reasoning_effort_support(&self) -> ReasoningEffortSupport {
+        match self.name {
+            "anthropic" => ReasoningEffortSupport::AnthropicThinking,
+            "openai" | "groq" => ReasoningEffortSupport::OpenAiReasoningEffort,
+            _ => ReasoningEffortSupport::Unsupported,
         }
     }
 }
@@ -333,6 +363,44 @@ mod tests {
         assert!(profile.capabilities.text_tool_fallback);
         assert!(!profile.capabilities.prompt_caching);
         assert!(!profile.capabilities.vision);
+    }
+
+    #[test]
+    fn reasoning_effort_support_is_per_profile() {
+        let anthropic = ResolvedProviderProfile::resolve(
+            Some("anthropic"),
+            "https://api.anthropic.com",
+            ProviderApiStyle::AnthropicMessages,
+        );
+        assert_eq!(
+            anthropic.reasoning_effort_support(),
+            ReasoningEffortSupport::AnthropicThinking
+        );
+
+        let openai = ResolvedProviderProfile::resolve(
+            Some("openai"),
+            "https://api.openai.com",
+            ProviderApiStyle::OpenAiChat,
+        );
+        assert_eq!(
+            openai.reasoning_effort_support(),
+            ReasoningEffortSupport::OpenAiReasoningEffort
+        );
+
+        // Kimi and DashScope expose no verified equivalent, so the caller
+        // omits the field and warns instead of guessing.
+        for profile in ["kimi", "dashscope", "custom"] {
+            let resolved = ResolvedProviderProfile::resolve(
+                Some(profile),
+                "https://example.invalid/v1",
+                ProviderApiStyle::OpenAiChat,
+            );
+            assert_eq!(
+                resolved.reasoning_effort_support(),
+                ReasoningEffortSupport::Unsupported,
+                "{profile} should report no reasoning-effort control"
+            );
+        }
     }
 
     #[test]

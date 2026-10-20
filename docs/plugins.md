@@ -10,9 +10,9 @@ Manages plugin lifecycle (discovery, loading, execution, unloading), marketplace
 
 - **`PluginState`** — Lifecycle enum: Discovered, Loading, Active, Error(String), Uninstalled, Installing.
 - **`PluginHandle`** — Runtime representation with name, version, state, path, commands, skills, retry_count, max_retries, **verified**.
-- **`PluginManifest`** — Deserialized from `plugin.json`. Identity/metadata (`name`, `displayName`, `version`, `description`, `author`, `homepage`, `repository`, `license`, `keywords`, `defaultEnabled`, `metadata`, `$schema`), CodeRex execution fields (`min_version`, `commands`, `skills`, `dependencies`, `signature`, `runtime`, `entrypoint`, `env`), `userConfig`, and the Claude component fields CodeRex accepts without acting on. See the field table below.
+- **`PluginManifest`** — Deserialized from `plugin.json`. Identity/metadata (`name`, `displayName`, `version`, `description`, `author`, `homepage`, `repository`, `license`, `keywords`, `defaultEnabled`, `metadata`, `$schema`), CodeRex execution fields (`min_version`, `commands`, `skills`, `dependencies`, `signature`, `runtime`, `entrypoint`, `env`), `userConfig`, and the Claude component fields CodeRex acts on. See the field table below.
 - **`PluginAuthor`** — `{name, email?}`; parses from either an object (Claude's shape) or a bare string.
-- **`UserConfigField`** — One `userConfig` entry: `type`, `title`, `description`, `required`, `default`, `sensitive`, `multiple`, plus `options`/`min`/`max` accepted but not enforced.
+- **`UserConfigField`** — One `userConfig` entry: `type`, `title`, `description`, `required`, `default`, `sensitive`, `multiple`, plus `options`/`min`/`max`, all enforced against a supplied value at resolution time.
 - **`PluginSource`** — Install source: `Marketplace { name }`, `LocalDir(path)`, `Git { url, rev }`, `Github { repo, rev, sha }`, `GitSubdir { url, path, rev, sha }`, `Archive { url, sha256 }`, and `Unsupported { kind }`; `PluginSource::detect()` classifies a CLI argument.
 - **`PluginPin` / `PluginPinStore`** — Trust-on-first-use record of what was installed (archive SHA-256, git commit), read from `.coderex-pins.json` in the install directory.
 - **`RuntimeType`** — Enum: `Process` (default), `Wasm`. Declares how the plugin executes.
@@ -308,7 +308,7 @@ The manifest is parsed with `deny_unknown_fields`: a field that is not in the ta
 |---|---|---|
 | `$schema`, `name`, `displayName`, `version`, `description`, `homepage`, `repository`, `license`, `keywords`, `defaultEnabled`, `metadata` | ✅ parsed | Identity and metadata. `author` accepts a string or `{name, email}`; an object used to fail the whole manifest. |
 | `min_version`, `commands`, `skills`, `dependencies`, `signature`, `runtime`, `entrypoint`, `env` | ✅ acted on | CodeRex execution fields (pre-existing). |
-| `userConfig` | ✅ implemented | See "userConfig injection". |
+| `userConfig` | ✅ implemented | Values are validated against the declared schema (`type`, `options`, `min`, `max`, `required`, `default`) before they reach a plugin. See "userConfig injection". |
 | `hooks` | ✅ implemented | Active plugins contribute their hooks to the `Plugin` tier. The value may be a bare array or `{"hooks":[...]}`; `PluginManager::plugin_hooks()` merges them in plugin-name order and logs malformed values. |
 | `agents` | ✅ implemented | Active plugins contribute definitions through `PluginManager::plugin_agents()`; the REPL registers them as custom agents. |
 | `outputStyles` | ✅ implemented | Name-keyed registry; `/style <name>` applies one as extra system instructions. |
@@ -317,10 +317,10 @@ The manifest is parsed with `deny_unknown_fields`: a field that is not in the ta
 | `monitors` | ✅ implemented | Persistent watch scripts armed with the session (`PluginMonitorSupervisor`). |
 | `mcpServers` | ✅ implemented | Active plugins contribute `{"mcpServers": {...}}` through `PluginManager::plugin_mcp_servers()`; the orchestrator loads them before `.mcp.json` (project file wins on name clashes). |
 | `lspServers` | ✅ implemented | The first configured server is the default for the `LSP` tool (the REPL fills the tool's shared default at startup). |
-| `channels` | ✅ implemented (data plane) | Each channel's `server` is validated against the configured MCP servers (`plugin_mcp_servers` plus the loaded set); an unknown server is warned about, and `/plugin components` lists `displayName -> server`. There is no channel transport product to connect them to. |
+| `channels` | ✅ implemented | A channel names a configured MCP server and routes that server's JSON-RPC notifications to subscribed sinks (`PluginManager::subscribe_channel` / `route_channel_notification`). `/plugin components` lists each channel with its live state — `subscribed`, `idle (no subscriber)`, or `server not configured`. See "Channels". |
 | `binaries` | ✅ implemented | SHA-256-pinned HTTPS fetch into `<plugin>/bin/` (`fetch_plugin_binaries`); `CODEREX_PLUGIN_NO_BINARIES=1` skips the fetch. |
-| `types` | ✅ implemented | Validated `.d.ts` files are exported at startup to `config_home()/plugin-types/<plugin>/` (`export_plugin_types`) so a plugin author has a stable include path; `/plugin components` lists the directory. CodeRex plugins themselves speak JSON-RPC, so nothing loads the declarations at runtime. |
-| `settings` | ✅ implemented (allowlisted) | The accepted keys are exactly those a plugin can safely set: `model`, `vim_mode`, `statusline`, `context_window`, and `max_budget_usd` (which may only lower the ceiling). Permission mode, telemetry, hooks, MCP servers, API keys and `env` are never accepted from a plugin, and an existing user value wins. |
+| `types` | ✅ implemented | Validated `.d.ts` files are exported at startup to `config_home()/plugin-types/<plugin>/` (`export_plugin_types`) so a plugin author has a stable include path, **and** read into a `PluginTypeRegistry` that `/plugin components` lists. CodeRex has no TypeScript runtime, so "loaded" means read into memory and exposed — never executed. See "Types". |
+| `settings` | ✅ implemented (allowlisted) | A typed patch deep-merges into the resolved settings, by source: user/project values win over every plugin, and a plugin only fills a key the user left unset. `permission_mode`, `telemetry` and `max_budget_usd` are tighten-only; `hooks`, `mcpServers`, `api_key` and `env` are never taken. Unknown keys warn and are ignored. See "Settings". |
 | `experimental` | ✅ implemented (raw) | Exposed per plugin; expansion (themes/monitors/outputStyles/…) is the caller's job. |
 
 All declared component fields now have a runtime surface. `PluginManifest::unimplemented_fields()` is empty and remains as the guard against a future field silently doing nothing.
@@ -344,6 +344,11 @@ A manifest declares options, and `spawn_plugin` turns them into the child's envi
 - Each resolved option becomes `CODEREX_PLUGIN_OPTION_<KEY>` in the plugin process (Claude's `CLAUDE_PLUGIN_OPTION_<KEY>`).
 - `${user_config.KEY}` is substituted in the manifest's `env` values and in the `entrypoint`. An unresolved placeholder is left as written and logged, so an author can see what did not resolve.
 - Values are resolved in order: what the host supplied via `PluginManager::set_plugin_option`, then CodeRex's own `CODEREX_PLUGIN_OPTION_<KEY>`, then the manifest's `default`.
+- A supplied value is checked against the declared schema before it is injected (`resolve_options` → `validate_option_value`):
+  - `options` (an array, or `{ "value": ..., "label": ... }` objects) is an allowlist; a value outside it is refused.
+  - `type: "number"` (or a declared `min`/`max`) requires a number, and `min`/`max` are enforced inclusively.
+  - `type: "boolean"` requires exactly `true` or `false`.
+  - Every rejection is an error naming the option, the value, and what was expected — the spawn stops rather than handing the plugin a value its own manifest rejects.
 - Option keys must be usable as environment variable names (`[A-Za-z_][A-Za-z0-9_]*`); anything else is refused, because a key with a dash or an `=` in it is a way to smuggle a second variable into the environment.
 - WASM plugins use the same resolution and the same validation errors, but the resolved values are encoded as one JSON object and served through the `coderex.user_config` import rather than an environment (see "`userConfig` ABI for WASM plugins"). A WASM plugin receives them only if it imports that function; a required option with no value still stops the spawn, even though there is no environment.
 
@@ -355,7 +360,44 @@ A manifest declares options, and `spawn_plugin` turns them into the child's envi
 - An optional option with no value is simply not injected (debug log).
 - Sensitive values travel by environment variable (process plugins) or through the resolved options object (WASM plugins). Either way they are visible to the plugin that asked for them; for process plugins they are also visible in the process table of the same user, which is Claude's design too.
 
-**Honest gap:** there is no interactive prompt and no plugin settings store, so options come from the host or from the environment — nothing writes a user's answers back to `settings.json` the way Claude does. There is also no option *validation* (`options`, `min`, `max`, `type` are parsed and ignored). For WASM plugins, options require an explicit import in the module; they are not delivered retroactively to existing plugins.
+**Honest gap:** there is no interactive prompt and no plugin settings store, so options come from the host or from the environment — nothing writes a user's answers back to `settings.json` the way Claude does. Values are validated against the declared schema (above), but there is still no prompt to *collect* a missing one. For WASM plugins, options require an explicit import in the module; they are not delivered retroactively to existing plugins.
+
+## `settings`
+
+A plugin's `settings` is a narrow allowlist, and it is a *patch*, not a replacement. The patch deep-merges into the session's resolved settings **by source**: user and project settings outrank every plugin, so a plugin can supply a default the user never set but can never override one they did.
+
+| Group | Keys | Rule |
+|---|---|---|
+| Mergeable | `model`, `context_window`, `vim_mode`, `statusline` | Fill only a key the user left unset; the user's value wins, recursively for nested objects. |
+| Tighten-only | `permission_mode`, `telemetry_enabled`, `telemetry`, `max_budget_usd` | May only make the session stricter. `permission_mode` moves only toward the more restrictive end (`plan` < `dont-ask` < `default`/`auto` < `accept-edits` < `bypass-permissions`); `telemetry_enabled` may only go to `false`; `max_budget_usd` may only lower the ceiling. A `telemetry` object is refused outright. |
+| Never taken | `hooks`, `hook_layers`, `mcpServers`, `mcp_servers`, `api_key`, `env`, `config_version` | Security-sensitive; ignored with a warning, whatever the value. |
+
+An unknown key is warned about and ignored. A refused or loosen-only value is warned about and ignored — never applied.
+
+## Channels
+
+A `channels` declaration names a configured MCP server and gives it a name:
+
+```json
+{ "channels": [ { "server": "slack", "displayName": "Team chat" } ] }
+```
+
+- `PluginManager::plugin_channel_report()` returns one entry per declared channel with its **live** state: `Subscribed` (a sink is attached), `Idle` (the server is configured but nothing is subscribed), or `ServerNotConfigured`. A channel naming an unconfigured server is reported as such rather than shown as working.
+- `subscribe_channel(server, sink)` attaches a `ChannelSink`; `route_channel_notification(server, method, params)` turns one JSON-RPC notification from that server into a `PluginChannelEvent` and hands it to every subscribed sink, returning how many received it. `0` is an honest answer — nothing is bound or nothing is subscribed — not an error.
+- `/plugin components` lists each channel as `displayName -> server [state]`.
+- **Honest limit:** this is the routing product, not a transport. Nothing in CodeRex yet calls `route_channel_notification` from a live MCP notification stream — the server-to-sink hop exists, is tested, and is exposed, but the MCP client does not drive it today. A channel whose server is not configured is reported as such.
+
+## Types
+
+A plugin may export TypeScript declarations:
+
+```json
+{ "types": ["./types/index.d.ts"] }
+```
+
+- Validated `.d.ts` files are exported at startup to `config_home()/plugin-types/<plugin>/` (`export_plugin_types`), so a plugin author has a stable include path.
+- They are also read into a `PluginTypeRegistry` (`PluginManager::plugin_type_registry()`), and `/plugin components` lists each file as `name (plugin)`.
+- **"Loaded" means exactly this:** the file text is read into memory and exposed through the registry, so the LSP/tool context and `/plugin` can enumerate and print it. CodeRex has no TypeScript runtime and does not execute, type-check, or evaluate the declarations. A file that cannot be read is recorded in the registry's error list (and warned about) rather than dropped.
 
 ## Install Sources
 
@@ -501,7 +543,7 @@ During REPL construction:
 ### Known Gaps
 
 - No keychain access in this crate, so sensitive options are host-supplied or environment-supplied; nothing prompts the user or writes answers back to settings (see "userConfig Injection").
-- `options`/`min`/`max`/`type` in `userConfig` are parsed and ignored: no validation.
+- Plugin channels route notifications from a named MCP server to subscribed sinks, but nothing in the MCP client drives `route_channel_notification` from a live notification stream yet (see "Channels").
 - Pin files are created by the first install; a user cannot pre-seed a pin before installing.
 - WASM plugins must import `coderex.user_config` to receive options; an existing module cannot be given `userConfig` without that ABI change.
 - WASM compilation always requires a host-injected compiler command (or a `coderex-wasm-compile` next to the executable); with neither, loads fail closed. On Darwin the memory bound is `RLIMIT_DATA`, which does not cap the full address space; the Windows Job Object path is untested, and the compiler sandbox degrades to rlimits plus process-group kill where `sandbox-exec`/`bwrap` cannot be applied (see "WASM Plugins").
@@ -510,7 +552,7 @@ During REPL construction:
 
 ### Tests
 
-- 159 tests in `plugins.rs` (manager ops, load/unload, marketplace, discovery, reconciler, URL validation, version checks, signature verification, dependency resolution, error recovery, custom endpoints, the manifest field table, `userConfig` resolution and injection end-to-end including the WASM required-option path, source detection and git URL validation, directory/git/git-subdir installs, structured source specs, the `npm`/`command` refusals, SHA-256 vectors and pin enforcement).
+- 169 tests in `plugins.rs` (manager ops, load/unload, marketplace, discovery, reconciler, URL validation, version checks, signature verification, dependency resolution, error recovery, custom endpoints, the manifest field table, `userConfig` resolution and injection end-to-end including the WASM required-option path, `userConfig` schema validation (`options`/`min`/`max`/`type`), plugin channels (live report states and notification routing), the plugin type registry, source detection and git URL validation, directory/git/git-subdir installs, structured source specs, the `npm`/`command` refusals, SHA-256 vectors and pin enforcement).
 - 14 tests in `skills.rs` (parsing, loader, plugin/MCP skills, repo dir, conflict resolution, precedence, quoted strings).
 - 7 tests in `runtime.rs` (spawn, initialize, terminate, invalid command).
 - 20 tests in `wasm_runtime.rs`, all run by the default `cargo test -p coderex-plugins`: 4 core/unit tests (the loader stub, the injected command's program/leading-argument shape, helper discovery, and the platform rlimit plan), 10 sandbox tests (fuel, memory growth, initial memory, shared memory, WASI import, the 3 size-cap cases, `userConfig` injection into an importing module, and an empty-import module still running), and 6 pre-scan tests (normal module, oversized code section, too many functions, too many operators, excessive nesting, nesting exactly at the cap).

@@ -9,7 +9,7 @@ use std::collections::HashMap;
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use tokio::sync::Mutex as TokioMutex;
 
 /// Plugin lifecycle state.
@@ -208,8 +208,9 @@ impl<'de> Deserialize<'de> for PluginAuthor {
 ///
 /// The keys of the map are the option names, which become
 /// `CODEREX_PLUGIN_OPTION_<KEY>` environment variables in the plugin process.
-/// Claude's schema also allows `options`, `min` and `max`; they are accepted
-/// so a Claude-shaped manifest parses, but CodeRex does not enforce them.
+/// [`PluginManifest::resolve_options`] enforces the declaration: a supplied
+/// value is checked against `type`, `options`, `min` and `max`, and a value
+/// that does not fit is refused by name.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct UserConfigField {
@@ -235,13 +236,13 @@ pub struct UserConfigField {
     /// Whether several values may be supplied.
     #[serde(default)]
     pub multiple: bool,
-    /// Allowed values for a `string` option (accepted, not enforced).
+    /// Allowed values for a `string` option; a value outside the list is refused.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub options: Option<Value>,
-    /// Minimum for a `number` option (accepted, not enforced).
+    /// Minimum for a `number` option; a value below it is refused.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub min: Option<Value>,
-    /// Maximum for a `number` option (accepted, not enforced).
+    /// Maximum for a `number` option; a value above it is refused.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max: Option<Value>,
 }
@@ -506,6 +507,8 @@ impl PluginManifest {
                 ));
             }
 
+            validate_option_value(key, field, &value)?;
+
             values.insert(key.clone(), value);
         }
 
@@ -572,6 +575,85 @@ fn value_to_env_string(value: &Value) -> Option<String> {
         Value::Bool(b) => Some(b.to_string()),
         Value::Null | Value::Array(_) | Value::Object(_) => None,
     }
+}
+
+/// Check a resolved `userConfig` value against the option's declared schema.
+///
+/// The manifest declares what a value must look like (`type`, `options`,
+/// `min`, `max`); the host is the only place that can enforce it, because the
+/// value arrives as an environment string from the user's configuration. A
+/// value that does not fit the declaration is refused with the option name and
+/// the constraint, so the user learns which key is wrong instead of watching
+/// the plugin fail on a value it never expected.
+///
+/// `type` is treated as advisory only in the sense that an unknown type
+/// (`directory`, `file`, or a value CodeRex does not know) is accepted as a
+/// string: the declaration still has to be a string to reach a plugin's
+/// environment. A `min`/`max` pair implies a numeric option even when `type`
+/// is absent, matching Claude's manifests, where `min`/`max` carry the numeric
+/// intent on their own.
+fn validate_option_value(key: &str, field: &UserConfigField, value: &str) -> Result<(), String> {
+    if let Some(allowed) = declared_options(field) {
+        if !allowed.is_empty() && !allowed.iter().any(|candidate| candidate == value) {
+            return Err(format!(
+                "userConfig option '{key}' value '{value}' is not one of the allowed options \
+                 ({}); update the plugin configuration",
+                allowed.join(", ")
+            ));
+        }
+    }
+
+    let declared_type = field.value_type.as_deref().map(str::to_ascii_lowercase);
+    let wants_number =
+        declared_type.as_deref() == Some("number") || field.min.is_some() || field.max.is_some();
+
+    if wants_number {
+        let parsed: f64 = value.parse().map_err(|_| {
+            format!("userConfig option '{key}' expects a number but the value '{value}' is not one")
+        })?;
+        if let Some(min) = field.min.as_ref().and_then(Value::as_f64) {
+            if parsed < min {
+                return Err(format!(
+                    "userConfig option '{key}' value {parsed} is below the declared minimum {min}"
+                ));
+            }
+        }
+        if let Some(max) = field.max.as_ref().and_then(Value::as_f64) {
+            if parsed > max {
+                return Err(format!(
+                    "userConfig option '{key}' value {parsed} is above the declared maximum {max}"
+                ));
+            }
+        }
+        return Ok(());
+    }
+
+    if declared_type.as_deref() == Some("boolean") && value != "true" && value != "false" {
+        return Err(format!(
+            "userConfig option '{key}' expects a boolean (true or false) but the value \
+             '{value}' is not one"
+        ));
+    }
+
+    Ok(())
+}
+
+/// The allowed values of an option's `options` list, as environment strings.
+///
+/// A malformed `options` (not an array, or holding a non-scalar) yields `None`
+/// and the constraint is not applied: the list cannot be checked, and refusing
+/// every value because the manifest is malformed would make the option
+/// unusable.
+fn declared_options(field: &UserConfigField) -> Option<Vec<String>> {
+    let Value::Array(items) = field.options.as_ref()? else {
+        return None;
+    };
+    Some(
+        items
+            .iter()
+            .filter_map(value_to_env_string)
+            .collect::<Vec<_>>(),
+    )
 }
 
 /// Substitute `${user_config.KEY}` references with resolved option values.
@@ -2052,6 +2134,36 @@ fn validate_types_declaration(value: &Value) -> Result<(), String> {
     }
 }
 
+/// The `(name, path)` pairs of a validated `types` declaration.
+///
+/// The object shape carries its own names; the string and array shapes do not,
+/// so a name is derived from the file name (falling back to the plugin name
+/// when even that fails). Used by [`PluginManager::plugin_type_registry`] so
+/// every declaration has a stable handle to list or print by.
+fn declared_type_paths(plugin: &str, value: &Value) -> Vec<(String, String)> {
+    match value {
+        Value::String(path) => vec![(
+            component_name_from_path(path).unwrap_or_else(|| plugin.to_string()),
+            path.clone(),
+        )],
+        Value::Array(paths) => paths
+            .iter()
+            .filter_map(|path| path.as_str())
+            .map(|path| {
+                (
+                    component_name_from_path(path).unwrap_or_else(|| plugin.to_string()),
+                    path.to_string(),
+                )
+            })
+            .collect(),
+        Value::Object(entries) => entries
+            .iter()
+            .filter_map(|(name, path)| path.as_str().map(|path| (name.clone(), path.to_string())))
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
 /// Insert a component into a merged map, refusing a duplicate name.
 ///
 /// Components merge in plugin-name order, so "first wins" is deterministic: a
@@ -2088,6 +2200,155 @@ fn is_loopback_host(host: Option<&str>) -> bool {
     matches!(host, Some("localhost" | "127.0.0.1" | "[::1]" | "::1"))
 }
 
+/// One notification routed from an MCP server to a plugin channel.
+///
+/// A channel declaration binds a channel name to a configured MCP server. When
+/// that server emits a JSON-RPC notification, [`PluginManager::route_channel_notification`]
+/// turns it into one of these and hands it to every sink subscribed to the
+/// channel. The shape is deliberately transport-free: it carries what the
+/// server said (method and params) and enough context (plugin, channel,
+/// server) for a consumer to act on it, but it is not a transport message.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PluginChannelEvent {
+    /// The channel name, as declared in the manifest.
+    pub channel: String,
+    /// The plugin that declared the channel.
+    pub plugin: String,
+    /// The MCP server the channel is bound to.
+    pub server: String,
+    /// The JSON-RPC notification method (for example
+    /// `notifications/resources/updated`).
+    pub method: String,
+    /// The notification parameters, as sent.
+    pub params: Option<Value>,
+    /// A monotonically increasing sequence number, per manager, so a consumer
+    /// can order and de-duplicate deliveries.
+    pub sequence: u64,
+}
+
+/// A consumer of channel notifications.
+///
+/// The manager owns the delivery decision; a sink only receives. A sink that
+/// has gone away is dropped on the next delivery, so a consumer that stops
+/// reading does not keep the manager alive.
+pub trait ChannelSink: Send + Sync + std::fmt::Debug {
+    /// Deliver one notification.
+    fn deliver(&self, event: PluginChannelEvent);
+}
+
+/// How a declared channel currently stands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ChannelStatus {
+    /// The channel's MCP server is configured and at least one sink is
+    /// subscribed, so a notification would be delivered.
+    Subscribed,
+    /// The channel's MCP server is configured but nothing is subscribed; a
+    /// notification would arrive and be dropped.
+    Idle,
+    /// The channel names an MCP server that is not configured. No notification
+    /// can arrive, and CodeRex says so instead of pretending the channel works.
+    ServerNotConfigured,
+}
+
+/// The live state of one declared plugin channel.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PluginChannelReport {
+    /// The channel name.
+    pub channel: String,
+    /// The plugin that declared it.
+    pub plugin: String,
+    /// The MCP server it names.
+    pub server: String,
+    /// The display name, when the declaration carried one.
+    pub display_name: Option<String>,
+    /// How the channel currently stands.
+    pub status: ChannelStatus,
+    /// How many sinks are subscribed.
+    pub subscribers: usize,
+}
+
+impl PluginChannelReport {
+    /// A short, human-readable line for `/plugin channels`.
+    #[must_use]
+    pub fn render(&self) -> String {
+        let label = self.display_name.as_deref().unwrap_or(&self.channel);
+        let state = match self.status {
+            ChannelStatus::Subscribed => format!("subscribed ({} sinks)", self.subscribers),
+            ChannelStatus::Idle => "idle (no subscriber)".to_string(),
+            ChannelStatus::ServerNotConfigured => "server not configured".to_string(),
+        };
+        format!("{label} -> {} [{state}]", self.server)
+    }
+}
+
+/// One `.d.ts` declaration made available to the session.
+///
+/// `source` is the file text. CodeRex has no TypeScript runtime, so "loaded"
+/// here means exactly this: the declaration is read into memory and exposed
+/// through [`PluginTypeRegistry`] so the LSP/tool context (and `/plugin`) can
+/// see it. It is never executed, type-checked, or compiled.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PluginTypeFile {
+    /// The plugin that exported the declaration.
+    pub plugin: String,
+    /// The declaration name (an object key, or derived from the file name).
+    pub name: String,
+    /// The path, relative to the plugin directory.
+    pub path: String,
+    /// The file text, read from disk.
+    pub source: String,
+}
+
+/// The `.d.ts` declarations of the active plugins, read into memory.
+///
+/// This is the runtime consumer for the manifest `types` field: the plugin
+/// crate validated the declaration, [`PluginManager::export_plugin_types`]
+/// writes it to a stable directory, and this registry reads the files back so
+/// a caller (the LSP/tool context) can list or print them. There is no
+/// TypeScript execution here — see [`PluginTypeFile`].
+#[derive(Debug, Clone, Default)]
+pub struct PluginTypeRegistry {
+    files: Vec<PluginTypeFile>,
+    errors: Vec<(String, String)>,
+}
+
+impl PluginTypeRegistry {
+    /// The declarations that were read, in plugin-name order.
+    #[must_use]
+    pub fn list(&self) -> &[PluginTypeFile] {
+        &self.files
+    }
+
+    /// The declaration with the given name, if any.
+    #[must_use]
+    pub fn get(&self, name: &str) -> Option<&PluginTypeFile> {
+        self.files.iter().find(|file| file.name == name)
+    }
+
+    /// The source text of a declaration, for printing.
+    #[must_use]
+    pub fn render(&self, name: &str) -> Option<&str> {
+        self.get(name).map(|file| file.source.as_str())
+    }
+
+    /// Whether any declaration was read.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.files.is_empty()
+    }
+
+    /// Declarations that could not be read, as `(plugin, error)`.
+    ///
+    /// A missing file is reported here rather than silently skipped: a plugin
+    /// whose types do not load is exactly the case a caller needs to know
+    /// about.
+    #[must_use]
+    pub fn errors(&self) -> &[(String, String)] {
+        &self.errors
+    }
+}
+
 /// Manages all loaded plugins and marketplace state.
 #[derive(Debug)]
 pub struct PluginManager {
@@ -2113,6 +2374,10 @@ pub struct PluginManager {
     public_key: Option<String>,
     /// `userConfig` values the host has resolved, per plugin.
     plugin_options: DashMap<String, HashMap<String, String>>,
+    /// Live sinks subscribed to plugin channels, keyed by channel name.
+    channel_sinks: DashMap<String, Vec<Arc<dyn ChannelSink>>>,
+    /// Sequence counter for channel notifications.
+    channel_sequence: AtomicU64,
     /// Callback that re-spawns a plugin a retry recovered, if the host set one.
     restart_handler: Option<PluginRestartHandler>,
 }
@@ -2139,6 +2404,8 @@ impl PluginManager {
             install_locks: DashMap::new(),
             public_key: None,
             plugin_options: DashMap::new(),
+            channel_sinks: DashMap::new(),
+            channel_sequence: AtomicU64::new(0),
             restart_handler: None,
         }
     }
@@ -3166,6 +3433,150 @@ impl PluginManager {
         )
     }
 
+    /// The channel declarations of active plugins, as bindings.
+    ///
+    /// Each binding is `(channel, plugin, server, display_name)`, in
+    /// plugin-name order. The same rules as the listing apply: a channel whose
+    /// entry names no server is warned about and skipped by
+    /// [`normalize_channel_component`].
+    fn channel_bindings(&self) -> Vec<(String, String, String, Option<String>)> {
+        let mut bindings = Vec::new();
+        for (plugin, _dir, value) in self.active_plugin_values(|handle| handle.channels.clone()) {
+            for (channel, entry) in normalize_channel_component(&plugin, &value) {
+                let server = entry
+                    .get("server")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                let display = entry
+                    .get("displayName")
+                    .and_then(Value::as_str)
+                    .map(str::to_string);
+                bindings.push((channel, plugin.clone(), server, display));
+            }
+        }
+        bindings
+    }
+
+    /// The names of every MCP server the active plugins declare.
+    fn configured_mcp_server_names(&self) -> std::collections::HashSet<String> {
+        self.plugin_mcp_servers()
+            .and_then(|value| value.get("mcpServers").cloned())
+            .and_then(|value| value.as_object().cloned())
+            .map(|servers| servers.into_iter().map(|(key, _)| key).collect())
+            .unwrap_or_default()
+    }
+
+    /// Subscribe a sink to a channel's notifications.
+    ///
+    /// The channel name is the one the manifest declared. Subscribing to a
+    /// channel that no active plugin declares is allowed — the declaration may
+    /// arrive later — but [`Self::plugin_channel_report`] will not list it, so
+    /// a caller that wants to be sure the channel exists should check the
+    /// report first.
+    pub fn subscribe_channel(&self, channel: &str, sink: Arc<dyn ChannelSink>) {
+        self.channel_sinks
+            .entry(channel.to_string())
+            .or_default()
+            .push(sink);
+    }
+
+    /// Remove every sink subscribed to a channel; returns how many were removed.
+    pub fn unsubscribe_channel(&self, channel: &str) -> usize {
+        self.channel_sinks
+            .remove(channel)
+            .map_or(0, |(_, sinks)| sinks.len())
+    }
+
+    /// How many sinks are subscribed to a channel.
+    #[must_use]
+    pub fn channel_subscribers(&self, channel: &str) -> usize {
+        self.channel_sinks
+            .get(channel)
+            .map_or(0, |sinks| sinks.len())
+    }
+
+    /// The live state of every declared channel, in plugin-name order.
+    ///
+    /// A channel whose MCP server is not configured is reported as
+    /// [`ChannelStatus::ServerNotConfigured`] rather than as idle: no
+    /// notification can arrive for it, and saying "idle" would suggest one
+    /// might.
+    #[must_use]
+    pub fn plugin_channel_report(&self) -> Vec<PluginChannelReport> {
+        let configured = self.configured_mcp_server_names();
+        self.channel_bindings()
+            .into_iter()
+            .map(|(channel, plugin, server, display_name)| {
+                let subscribers = self.channel_subscribers(&channel);
+                let status = if !configured.contains(&server) {
+                    ChannelStatus::ServerNotConfigured
+                } else if subscribers == 0 {
+                    ChannelStatus::Idle
+                } else {
+                    ChannelStatus::Subscribed
+                };
+                PluginChannelReport {
+                    channel,
+                    plugin,
+                    server,
+                    display_name,
+                    status,
+                    subscribers,
+                }
+            })
+            .collect()
+    }
+
+    /// Route one MCP-server notification to the channels bound to that server.
+    ///
+    /// Every channel whose declaration names `server` receives one
+    /// [`PluginChannelEvent`] per subscribed sink. Returns how many sinks
+    /// received the event; `0` is an honest answer, not an error: it means no
+    /// channel is bound to that server (or nothing is subscribed), and the
+    /// caller should say so rather than claim the notification was delivered.
+    ///
+    /// The sinks are cloned out of the map before delivery, so a sink that
+    /// subscribes or unsubscribes from within `deliver` cannot deadlock the
+    /// manager.
+    pub fn route_channel_notification(
+        &self,
+        server: &str,
+        method: &str,
+        params: Option<&Value>,
+    ) -> usize {
+        let mut delivered = 0;
+        for (channel, plugin, bound_server, _display) in self.channel_bindings() {
+            if bound_server != server {
+                continue;
+            }
+            let sinks: Vec<Arc<dyn ChannelSink>> = self
+                .channel_sinks
+                .get(&channel)
+                .map_or_else(Vec::new, |sinks| sinks.value().clone());
+            for sink in sinks {
+                let sequence = self.channel_sequence.fetch_add(1, Ordering::Relaxed);
+                sink.deliver(PluginChannelEvent {
+                    channel: channel.clone(),
+                    plugin: plugin.clone(),
+                    server: bound_server.clone(),
+                    method: method.to_string(),
+                    params: params.cloned(),
+                    sequence,
+                });
+                delivered += 1;
+            }
+        }
+        if delivered == 0 {
+            tracing::debug!(
+                server = %server,
+                method = %method,
+                "MCP notification had no subscribed plugin channel to route to"
+            );
+        }
+        delivered
+    }
+
     /// Merge the `binaries` declared by active plugins.
     ///
     /// The declaration is an object mapping each binary name to
@@ -3353,6 +3764,57 @@ impl PluginManager {
                 }
             },
         )
+    }
+
+    /// Read the `.d.ts` declarations of active plugins into a registry.
+    ///
+    /// This is the runtime consumer for the `types` field: where
+    /// [`Self::plugin_types`] only validates the declaration, this reads each
+    /// declared file (bounded by [`MAX_PLUGIN_COMPONENT_BYTES`], and confined
+    /// to the plugin directory) so the LSP/tool context and `/plugin` can list
+    /// or print it. The declaration name is the object key when the manifest
+    /// used the object shape, otherwise it is derived from the file name.
+    ///
+    /// There is no TypeScript execution: the file is text that is read and
+    /// exposed, never compiled or type-checked. A plugin whose declaration is
+    /// invalid is skipped with a warning, as in [`Self::plugin_types`]; a
+    /// declared file that cannot be read is recorded in
+    /// [`PluginTypeRegistry::errors`] rather than dropped silently.
+    #[must_use]
+    pub fn plugin_type_registry(&self) -> PluginTypeRegistry {
+        let mut registry = PluginTypeRegistry::default();
+        for (plugin, plugin_dir, types) in self.active_plugin_values(|handle| handle.types.clone())
+        {
+            if let Err(error) = validate_types_declaration(&types) {
+                tracing::warn!(
+                    plugin = %plugin,
+                    "plugin types declaration is invalid; skipping: {error}"
+                );
+                continue;
+            }
+            for (name, path) in declared_type_paths(&plugin, &types) {
+                match read_component_text(&plugin_dir, &path) {
+                    Ok(source) => registry.files.push(PluginTypeFile {
+                        plugin: plugin.clone(),
+                        name,
+                        path,
+                        source,
+                    }),
+                    Err(error) => {
+                        tracing::warn!(
+                            plugin = %plugin,
+                            path = %path,
+                            %error,
+                            "plugin types file is unreadable"
+                        );
+                        registry
+                            .errors
+                            .push((plugin.clone(), format!("{path}: {error}")));
+                    }
+                }
+            }
+        }
+        registry
     }
 
     /// Copy the validated `.d.ts` declarations of active plugins into
@@ -6763,6 +7225,158 @@ mod tests {
         assert_eq!(log.warnings().len(), 1, "{:?}", log.warnings());
     }
 
+    #[derive(Debug, Default)]
+    struct RecordingSink {
+        events: std::sync::Mutex<Vec<PluginChannelEvent>>,
+    }
+
+    impl RecordingSink {
+        fn events(&self) -> Vec<PluginChannelEvent> {
+            self.events.lock().unwrap().clone()
+        }
+    }
+
+    impl ChannelSink for RecordingSink {
+        fn deliver(&self, event: PluginChannelEvent) {
+            self.events.lock().unwrap().push(event);
+        }
+    }
+
+    #[test]
+    fn channel_report_distinguishes_idle_from_an_unconfigured_server() {
+        let mgr = PluginManager::new();
+        mgr.load_plugin(
+            serde_json::from_value(serde_json::json!({
+                "name": "chan",
+                "version": "1.0.0",
+                "mcpServers": {"chat": {"command": "chat-server"}},
+                "channels": [
+                    {"server": "chat", "displayName": "Team chat"},
+                    {"server": "missing", "displayName": "Nowhere"},
+                ],
+            }))
+            .unwrap(),
+            PathBuf::from("/plugins/chan"),
+        );
+
+        let report = mgr.plugin_channel_report();
+        assert_eq!(report.len(), 2, "{report:?}");
+        let chat = report
+            .iter()
+            .find(|entry| entry.server == "chat")
+            .expect("the configured channel is reported");
+        assert_eq!(chat.status, ChannelStatus::Idle);
+        assert_eq!(chat.subscribers, 0);
+        assert_eq!(chat.render(), "Team chat -> chat [idle (no subscriber)]");
+
+        let missing = report
+            .iter()
+            .find(|entry| entry.server == "missing")
+            .expect("a channel naming an unknown server is still reported");
+        assert_eq!(missing.status, ChannelStatus::ServerNotConfigured);
+        assert!(missing.render().contains("server not configured"));
+    }
+
+    #[test]
+    fn route_channel_notification_reaches_subscribed_sinks() {
+        let mgr = PluginManager::new();
+        mgr.load_plugin(
+            serde_json::from_value(serde_json::json!({
+                "name": "chan",
+                "version": "1.0.0",
+                "mcpServers": {"slack": {"command": "slack-server"}},
+                "channels": [{"server": "slack", "displayName": "Slack"}],
+            }))
+            .unwrap(),
+            PathBuf::from("/plugins/chan"),
+        );
+
+        let sink = Arc::new(RecordingSink::default());
+        mgr.subscribe_channel("slack", sink.clone());
+
+        let report = mgr.plugin_channel_report();
+        let slack = report
+            .iter()
+            .find(|entry| entry.channel == "slack")
+            .unwrap();
+        assert_eq!(slack.status, ChannelStatus::Subscribed);
+        assert_eq!(slack.subscribers, 1);
+
+        let delivered = mgr.route_channel_notification(
+            "slack",
+            "notifications/resources/updated",
+            Some(&serde_json::json!({"uri": "file:///x"})),
+        );
+        assert_eq!(delivered, 1);
+
+        let events = sink.events();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].channel, "slack");
+        assert_eq!(events[0].plugin, "chan");
+        assert_eq!(events[0].server, "slack");
+        assert_eq!(events[0].method, "notifications/resources/updated");
+        assert_eq!(events[0].params.as_ref().unwrap()["uri"], "file:///x");
+
+        // A notification from a server no channel names is not delivered, and
+        // the count says so rather than pretending it went somewhere.
+        assert_eq!(
+            mgr.route_channel_notification("nobody", "notifications/x", None),
+            0
+        );
+
+        assert_eq!(mgr.unsubscribe_channel("slack"), 1);
+        assert_eq!(mgr.channel_subscribers("slack"), 0);
+    }
+
+    #[test]
+    fn plugin_type_registry_reads_declared_dts_into_memory() {
+        let plugin_dir = tempfile::tempdir().unwrap();
+        let plugin_root = plugin_dir.path().join("typed");
+        std::fs::create_dir_all(plugin_root.join("types")).unwrap();
+        std::fs::write(
+            plugin_root.join("types/index.d.ts"),
+            "declare module 'coderex' { export const x: number }",
+        )
+        .unwrap();
+
+        let mgr = PluginManager::new();
+        mgr.load_plugin(
+            manifest_with_field(
+                "typed",
+                "types",
+                serde_json::json!({"main": "types/index.d.ts"}),
+            ),
+            plugin_root,
+        );
+
+        let registry = mgr.plugin_type_registry();
+        assert!(registry.errors().is_empty(), "{:?}", registry.errors());
+        let file = registry.get("main").expect("the declaration is loaded");
+        assert_eq!(file.plugin, "typed");
+        assert_eq!(file.path, "types/index.d.ts");
+        assert_eq!(
+            registry.render("main").unwrap(),
+            "declare module 'coderex' { export const x: number }"
+        );
+        assert_eq!(registry.list().len(), 1);
+    }
+
+    #[test]
+    fn plugin_type_registry_reports_an_unreadable_file_instead_of_dropping_it() {
+        let mgr = PluginManager::new();
+        // The declared file does not exist under the plugin directory.
+        mgr.load_plugin(
+            manifest_with_field("broken", "types", serde_json::json!("missing.d.ts")),
+            PathBuf::from("/plugins/broken"),
+        );
+
+        let registry = mgr.plugin_type_registry();
+        assert!(registry.is_empty());
+        assert_eq!(registry.errors().len(), 1, "{:?}", registry.errors());
+        assert_eq!(registry.errors()[0].0, "broken");
+        assert!(registry.errors()[0].1.contains("missing.d.ts"));
+    }
+
     #[test]
     fn plugin_binaries_require_url_and_a_64_hex_sha256() {
         let valid = "a".repeat(64);
@@ -7160,6 +7774,80 @@ mod tests {
             .resolve_options(&HashMap::new(), |_| None)
             .unwrap_err();
         assert!(err.contains("bad-key"), "{err}");
+    }
+
+    #[test]
+    fn a_number_option_outside_its_min_max_is_refused() {
+        let manifest: PluginManifest = serde_json::from_str(
+            r#"{"name":"n","userConfig":{"PORT":{"type":"number","min":1024,"max":65535}}}"#,
+        )
+        .unwrap();
+
+        let provided = HashMap::from([("PORT".to_string(), "80".to_string())]);
+        let err = manifest.resolve_options(&provided, |_| None).unwrap_err();
+        assert!(err.contains("PORT") && err.contains("minimum"), "{err}");
+
+        let provided = HashMap::from([("PORT".to_string(), "70000".to_string())]);
+        let err = manifest.resolve_options(&provided, |_| None).unwrap_err();
+        assert!(err.contains("PORT") && err.contains("maximum"), "{err}");
+
+        let provided = HashMap::from([("PORT".to_string(), "8080".to_string())]);
+        let values = manifest.resolve_options(&provided, |_| None).unwrap();
+        assert_eq!(values["PORT"], "8080");
+    }
+
+    #[test]
+    fn a_number_option_that_is_not_a_number_is_refused() {
+        let manifest: PluginManifest =
+            serde_json::from_str(r#"{"name":"n","userConfig":{"N":{"type":"number"}}}"#).unwrap();
+        let provided = HashMap::from([("N".to_string(), "not-a-number".to_string())]);
+        let err = manifest.resolve_options(&provided, |_| None).unwrap_err();
+        assert!(err.contains("N") && err.contains("number"), "{err}");
+    }
+
+    #[test]
+    fn a_boolean_option_that_is_not_a_boolean_is_refused() {
+        let manifest: PluginManifest =
+            serde_json::from_str(r#"{"name":"n","userConfig":{"ON":{"type":"boolean"}}}"#).unwrap();
+        let provided = HashMap::from([("ON".to_string(), "yes".to_string())]);
+        let err = manifest.resolve_options(&provided, |_| None).unwrap_err();
+        assert!(err.contains("ON") && err.contains("boolean"), "{err}");
+
+        let provided = HashMap::from([("ON".to_string(), "true".to_string())]);
+        let values = manifest.resolve_options(&provided, |_| None).unwrap();
+        assert_eq!(values["ON"], "true");
+    }
+
+    #[test]
+    fn a_string_option_outside_its_enum_is_refused() {
+        let manifest: PluginManifest = serde_json::from_str(
+            r#"{"name":"n","userConfig":{"MODE":{"type":"string","options":["fast","slow"]}}}"#,
+        )
+        .unwrap();
+        let provided = HashMap::from([("MODE".to_string(), "sideways".to_string())]);
+        let err = manifest.resolve_options(&provided, |_| None).unwrap_err();
+        assert!(
+            err.contains("MODE") && err.contains("fast, slow"),
+            "the error names the key and the allowed values: {err}"
+        );
+
+        let provided = HashMap::from([("MODE".to_string(), "fast".to_string())]);
+        assert!(manifest.resolve_options(&provided, |_| None).is_ok());
+    }
+
+    #[test]
+    fn a_default_value_is_held_to_the_same_schema_as_a_supplied_one() {
+        // The default is what a user who supplies nothing gets, so it must fit
+        // the declaration too; otherwise the plugin receives a value the
+        // manifest itself forbids.
+        let manifest: PluginManifest = serde_json::from_str(
+            r#"{"name":"n","userConfig":{"N":{"type":"number","min":10,"default":1}}}"#,
+        )
+        .unwrap();
+        let err = manifest
+            .resolve_options(&HashMap::new(), |_| None)
+            .unwrap_err();
+        assert!(err.contains("N") && err.contains("minimum"), "{err}");
     }
 
     /// WASM plugins resolve `userConfig` through the same code path as process

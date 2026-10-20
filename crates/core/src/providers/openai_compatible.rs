@@ -5,8 +5,8 @@
 
 use crate::api_client::{ApiError, ApiResponse, RequestContext, StreamEvent};
 use crate::provider::{
-    Provider, ProviderApiStyle, ProviderCapabilities, ProviderError, ResolvedProviderProfile,
-    classify_api_error,
+    Provider, ProviderApiStyle, ProviderCapabilities, ProviderError, ReasoningEffortSupport,
+    ResolvedProviderProfile, classify_api_error,
 };
 use crate::types::{ModelId, ToolCall, UsageSummary};
 use async_trait::async_trait;
@@ -304,6 +304,47 @@ impl OpenAiCompatibleProvider {
         }
     }
 
+    /// Apply a reasoning effort to the request body, when this endpoint has an
+    /// equivalent for it.
+    ///
+    /// OpenAI-style endpoints take `reasoning_effort` (Chat Completions) or
+    /// `reasoning.effort` (Responses). A provider with no verified equivalent
+    /// is left untouched and a warning names it, so the user's `--effort` is
+    /// never dropped in silence.
+    fn apply_reasoning_effort(&self, body: &mut serde_json::Value, style: ProviderApiStyle) {
+        let Some(effort) = self
+            .request_context()
+            .and_then(RequestContext::reasoning_effort)
+        else {
+            return;
+        };
+        match self.resolved_profile().reasoning_effort_support() {
+            ReasoningEffortSupport::OpenAiReasoningEffort => {
+                let Some(object) = body.as_object_mut() else {
+                    return;
+                };
+                if style == ProviderApiStyle::OpenAiResponses {
+                    object.insert(
+                        "reasoning".into(),
+                        serde_json::json!({ "effort": effort.as_str() }),
+                    );
+                } else {
+                    object.insert(
+                        "reasoning_effort".into(),
+                        serde_json::json!(effort.as_str()),
+                    );
+                }
+            }
+            ReasoningEffortSupport::AnthropicThinking | ReasoningEffortSupport::Unsupported => {
+                tracing::warn!(
+                    provider = %self.name,
+                    effort = %effort,
+                    "provider has no reasoning-effort control; the request omits it"
+                );
+            }
+        }
+    }
+
     fn build_chat_request_body(
         &self,
         system: &str,
@@ -360,6 +401,7 @@ impl OpenAiCompatibleProvider {
                 .insert("tool_choice".to_string(), "auto".into());
         }
 
+        self.apply_reasoning_effort(&mut body, ProviderApiStyle::OpenAiChat);
         body
     }
 
@@ -411,6 +453,7 @@ impl OpenAiCompatibleProvider {
                 .insert("tool_choice".to_string(), "auto".into());
         }
 
+        self.apply_reasoning_effort(&mut body, ProviderApiStyle::OpenAiResponses);
         body
     }
 
@@ -1294,6 +1337,65 @@ mod tests {
         assert!(headers.get("User-Agent").is_some());
         assert_eq!(headers.get("X-CodeRex-Client").unwrap(), "cli");
         assert_eq!(headers.get("X-CodeRex-Request-Id").unwrap(), "req-42");
+    }
+
+    #[test]
+    fn reasoning_effort_maps_to_the_openai_chat_field() {
+        let mut context = RequestContext::default();
+        context.set_reasoning_effort(crate::api_client::ReasoningEffort::High);
+        let provider = OpenAiCompatibleProvider::new("openai", "https://api.openai.com", "k")
+            .with_request_context(context);
+        let body = provider.build_chat_request_body(
+            "sys",
+            &[],
+            &ModelId("gpt-4o".into()),
+            64,
+            &[],
+            "req-1",
+            false,
+        );
+        assert_eq!(body["reasoning_effort"], "high");
+        assert!(body.get("reasoning").is_none(), "chat uses the flat field");
+    }
+
+    #[test]
+    fn reasoning_effort_maps_to_the_responses_nested_field() {
+        let mut context = RequestContext::default();
+        context.set_reasoning_effort(crate::api_client::ReasoningEffort::Low);
+        let provider = OpenAiCompatibleProvider::new("openai", "https://api.openai.com", "k")
+            .with_provider_profile("openai-responses")
+            .with_request_context(context);
+        let body = provider.build_responses_request_body(
+            "sys",
+            &[],
+            &ModelId("gpt-4o".into()),
+            64,
+            &[],
+            "req-1",
+            false,
+        );
+        assert_eq!(body["reasoning"]["effort"], "low");
+        assert!(body.get("reasoning_effort").is_none());
+    }
+
+    #[test]
+    fn reasoning_effort_is_omitted_for_a_provider_without_an_equivalent() {
+        let mut context = RequestContext::default();
+        context.set_reasoning_effort(crate::api_client::ReasoningEffort::High);
+        // Kimi is OpenAI-shaped but exposes no reasoning-effort control here.
+        let provider = OpenAiCompatibleProvider::new("kimi", "https://api.moonshot.cn/v1", "k")
+            .with_request_context(context);
+        let body = provider.build_chat_request_body(
+            "sys",
+            &[],
+            &ModelId("kimi-k2".into()),
+            64,
+            &[],
+            "req-1",
+            false,
+        );
+        assert!(body.get("reasoning_effort").is_none());
+        assert!(body.get("reasoning").is_none());
     }
 
     #[test]
