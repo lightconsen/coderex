@@ -7509,6 +7509,11 @@ mod tests {
     #[tokio::test]
     async fn elicitation_hooks_bracket_the_request() {
         let (mut engine, _rx, _session) = make_test_engine();
+        // The default handler reads stdin, which never reaches EOF under a CI
+        // runner. Use the SDK handler, which answers without a console.
+        engine.set_elicitation_handler(Box::new(
+            crate::elicitation::SdkElicitationHandler::default(),
+        ));
         let (hooks, recorded) = RecordingHooks::new();
         engine.set_hooks(Box::new(hooks));
         let mut turn = TurnRuntime::new(TokenBudget::with_defaults());
