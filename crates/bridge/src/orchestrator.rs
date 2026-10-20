@@ -8,6 +8,7 @@ use tokio::sync::Notify;
 
 use crate::archive::{BridgeArchiveWriter, BridgeCleanupManager, UsageStats};
 use crate::epoch::{StaleEpoch, WriteFence};
+use crate::gateway::PermissionFrameRelay;
 use crate::heartbeat::{
     HeartbeatConfig, HeartbeatLoop, HeartbeatStatus, SequenceCursor, SessionRecoveryState,
     WsReconnector,
@@ -184,6 +185,14 @@ pub struct Bridge {
     spawner: BridgeSessionSpawner,
     /// Permission router for tool call authorization.
     permission_router: BridgePermissionRouter,
+    /// Gateway-side relay for `permission_request`/`permission_response`.
+    ///
+    /// The bridge drives this on its own transport: an outbound request is
+    /// relayed before it goes on the wire, and an inbound response is relayed
+    /// before it resolves anything. The pending set is what makes an answer for
+    /// an id the worker never asked about — or a replay of one already
+    /// answered — refused instead of delivered twice.
+    permission_relay: PermissionFrameRelay,
     /// Confirmations the person has given, for relayed calls to match against.
     relay_approvals: RelayApprovalGate,
     /// Permission requests waiting to be sent to the gateway.
@@ -293,6 +302,7 @@ impl Bridge {
             poller,
             spawner,
             permission_router: BridgePermissionRouter::new(),
+            permission_relay: PermissionFrameRelay::new(),
             relay_approvals: RelayApprovalGate::new(),
             pending_permission_requests: Vec::new(),
             pending_session_writes: Vec::new(),
@@ -417,6 +427,11 @@ impl Bridge {
         let pending = self.permission_router.get_pending(&router_id).cloned();
         let resolved = self.permission_router.respond(&router_id, response);
         if resolved {
+            // First answer wins: the relay must stop expecting this id, so a
+            // second `permission_response` for it is refused rather than
+            // forwarded. This is a no-op when the answer arrived through
+            // `handle_transport_message`, which already removed the entry.
+            self.permission_relay.forget(request_id);
             if let Some(resp) = self.permission_router.get_response(&router_id) {
                 let allowed = matches!(resp, PermissionResponse::Allow { .. });
                 if allowed {
@@ -643,6 +658,26 @@ impl Bridge {
                     }
                 };
                 let (request_id, response) = response.into_response();
+                // Route the answer through the relay before it resolves
+                // anything: only a response for an outstanding request is
+                // forwarded. An answer for an id the worker never asked about,
+                // or a replay of one already answered, is refused here so the
+                // child is never handed a second decision.
+                if self
+                    .permission_relay
+                    .relay_host_frame(message.clone())
+                    .is_none()
+                {
+                    return Some(transport_reply(
+                        message,
+                        PERMISSION_RESULT_TYPE,
+                        serde_json::json!({
+                            "request_id": request_id,
+                            "resolved": false,
+                        })
+                        .to_string(),
+                    ));
+                }
                 let resolved = self.respond_to_permission(&request_id, response);
                 Some(transport_reply(
                     message,
@@ -890,6 +925,15 @@ impl Bridge {
         self.permission_router.pending_for_session(session_id).len()
     }
 
+    /// How many permission requests the relay is still waiting to see answered.
+    ///
+    /// This is the set an inbound `permission_response` is checked against, so
+    /// it is what makes an unknown or duplicate answer refusable.
+    #[must_use]
+    pub fn outstanding_relayed_permissions(&self) -> usize {
+        self.permission_relay.pending()
+    }
+
     /// Get the current transport connection ID.
     pub fn connection_id(&self) -> Option<&str> {
         self.transport.as_ref().map(|t| t.connection_id())
@@ -1113,6 +1157,11 @@ impl Bridge {
             .cloned()
             .unwrap_or_else(|| request_id.to_string());
 
+        // The worker has stopped waiting for this id either way, so the relay
+        // must stop expecting it: a gateway answer that arrives after the
+        // deadline is refused instead of relayed.
+        self.permission_relay.forget(request_id);
+
         if self.permission_router.is_resolved(&router_id) {
             return false;
         }
@@ -1137,11 +1186,13 @@ impl Bridge {
     /// The production caller is `bridge_launcher`: the child is started
     /// headless with `stream-json` and a positional prompt, `read_stdout`
     /// turns its `control_request` frame into this call, and an inbound
-    /// `permission_response` is written back to the child's stdin. The
-    /// gateway-side half of relaying `permission_request`/`permission_response`
-    /// between the bridge and the remote host is
-    /// [`crate::gateway::PermissionFrameRelay`]; the gateway itself supplies
-    /// authentication, fan-out, and the human UI around it.
+    /// `permission_response` is written back to the child's stdin. The frame
+    /// travels to the gateway through [`Self::send_pending_permission_requests`],
+    /// which relays it through [`crate::gateway::PermissionFrameRelay`] before
+    /// it goes on the wire; the answer comes back through
+    /// [`Self::handle_transport_message`], which relays it the other way. The
+    /// gateway service that owns the *host* connection supplies the rest:
+    /// authentication, fan-out, and the human UI.
     pub fn request_permission(&mut self, session_id: &str, tool: &str, args: &str) -> String {
         let request_id = self.permission_router.create_request(
             session_id.to_string(),
@@ -1216,15 +1267,44 @@ impl Bridge {
     /// Send the queued `permission_request` frames over the active transport.
     ///
     /// The serve loop owns the transport, so the launcher (or any other owner
-    /// of `&mut Bridge`) calls this when it next has control.
+    /// of `&mut Bridge`) calls this when it next has control. Each frame is
+    /// relayed through [`PermissionFrameRelay`] first: the relay records the
+    /// request as outstanding and refuses an id-less or repeated request, which
+    /// is dropped rather than sent.
     pub async fn send_pending_permission_requests(&mut self) -> Result<(), String> {
         // Send head-first and only drop a frame once the transport took it:
         // a failed send leaves the request queued for the next attempt
         // instead of losing the person's chance to answer it.
         while let Some(frame) = self.pending_permission_requests.first().cloned() {
-            let transport = self.transport.as_mut().ok_or("no transport configured")?;
-            transport.send(frame).await.map_err(|e| e.to_string())?;
-            self.pending_permission_requests.remove(0);
+            // The relay decides whether the host may be asked at all; a frame
+            // it refuses (no id, or an id already outstanding) never goes out.
+            let Some(relayed) = self.permission_relay.relay_worker_frame(frame.clone()) else {
+                self.pending_permission_requests.remove(0);
+                continue;
+            };
+            // The relay keys on this id. Permission requests always carry one
+            // (`permission_request_frame[_with_id]` sets it), so it is what the
+            // failure path has to undo.
+            let relayed_id = relayed.correlation_id.clone();
+
+            let sent = match self.transport.as_mut() {
+                Some(transport) => transport.send(relayed).await.map_err(|e| e.to_string()),
+                None => Err("no transport configured".to_string()),
+            };
+            match sent {
+                Ok(()) => {
+                    self.pending_permission_requests.remove(0);
+                }
+                Err(error) => {
+                    // The host never saw the request, so it is not outstanding:
+                    // forgetting the entry lets the retry relay it again
+                    // instead of refusing it as a repeat.
+                    if let Some(request_id) = relayed_id {
+                        self.permission_relay.forget(&request_id);
+                    }
+                    return Err(error);
+                }
+            }
         }
         Ok(())
     }
@@ -2059,6 +2139,8 @@ mod tests {
         assert_eq!(payload["request_id"], request_id);
         assert_eq!(payload["session_id"], "sess_1");
         assert_eq!(payload["tool"], "Bash");
+        // Sending relayed the request: the relay now expects an answer for it.
+        assert_eq!(bridge.outstanding_relayed_permissions(), 1);
 
         // The answer resolves the router, and an approval populates the gate
         // the relay endpoint checks.
@@ -2080,6 +2162,155 @@ mod tests {
         assert_eq!(payload["resolved"], true);
         assert!(bridge.is_permission_resolved(&request_id));
         assert_eq!(bridge.outstanding_relay_approvals(), 1);
+        assert_eq!(bridge.outstanding_relayed_permissions(), 0);
+    }
+
+    /// The answer to a request, in the shape the gateway sends it back.
+    fn permission_answer(request_id: &str, allowed: bool) -> TransportMessage {
+        TransportMessage {
+            r#type: PERMISSION_RESPONSE_TYPE.into(),
+            correlation_id: Some(request_id.to_string()),
+            payload: serde_json::json!({
+                "request_id": request_id,
+                "allowed": allowed,
+                "always": false,
+            })
+            .to_string(),
+            metadata: std::collections::HashMap::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_duplicate_permission_response_is_refused_after_the_first_answer() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (bridge_transport, mut gateway) =
+            InProcessTransport::create_pair("bridge".into(), "gateway".into());
+        gateway.connect().await.unwrap();
+        let mut bridge = Bridge::new(test_config(tmp.path()), Box::new(bridge_transport));
+        bridge.connect().await.unwrap();
+
+        let request_id = bridge.request_permission("sess_1", "Bash", "ls");
+        bridge.send_pending_permission_requests().await.unwrap();
+        let _ = gateway.receive().await.unwrap();
+        assert_eq!(bridge.outstanding_relayed_permissions(), 1);
+
+        let first = bridge
+            .handle_transport_message(&permission_answer(&request_id, true))
+            .unwrap();
+        let first_payload: serde_json::Value = serde_json::from_str(&first.payload).unwrap();
+        assert_eq!(first_payload["resolved"], true);
+        assert_eq!(bridge.outstanding_relayed_permissions(), 0);
+
+        // The replay has nothing left to answer: the relay refuses it, so the
+        // router is never asked a second time and the first decision stands.
+        let replay = bridge
+            .handle_transport_message(&permission_answer(&request_id, false))
+            .unwrap();
+        let replay_payload: serde_json::Value = serde_json::from_str(&replay.payload).unwrap();
+        assert_eq!(replay_payload["resolved"], false);
+        assert!(matches!(
+            bridge.get_permission_response(&request_id),
+            Some(PermissionResponse::Allow { always: false })
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_permission_response_after_the_timeout_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (bridge_transport, mut gateway) =
+            InProcessTransport::create_pair("bridge".into(), "gateway".into());
+        gateway.connect().await.unwrap();
+        let mut bridge = Bridge::new(test_config(tmp.path()), Box::new(bridge_transport));
+        bridge.connect().await.unwrap();
+
+        let request_id = bridge.request_permission("sess_1", "Bash", "rm -rf /tmp/x");
+        bridge.send_pending_permission_requests().await.unwrap();
+        let _ = gateway.receive().await.unwrap();
+        assert_eq!(bridge.outstanding_relayed_permissions(), 1);
+
+        // The bounded wait elapses: the request is denied locally and stops
+        // being outstanding.
+        assert!(bridge.expire_permission(&request_id));
+        assert_eq!(bridge.outstanding_relayed_permissions(), 0);
+
+        // A late answer is refused by the relay and cannot overwrite the
+        // denial the child already received.
+        let reply = bridge
+            .handle_transport_message(&permission_answer(&request_id, true))
+            .unwrap();
+        let payload: serde_json::Value = serde_json::from_str(&reply.payload).unwrap();
+        assert_eq!(payload["resolved"], false);
+        assert!(matches!(
+            bridge.get_permission_response(&request_id),
+            Some(PermissionResponse::Deny)
+        ));
+    }
+
+    #[tokio::test]
+    async fn an_outstanding_permission_survives_a_transport_reconnect() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (bridge_transport, mut gateway) =
+            InProcessTransport::create_pair("bridge".into(), "gateway".into());
+        gateway.connect().await.unwrap();
+        let mut bridge = Bridge::new(test_config(tmp.path()), Box::new(bridge_transport));
+        bridge.connect().await.unwrap();
+
+        let request_id = bridge.request_permission("sess_1", "Bash", "ls");
+        bridge.send_pending_permission_requests().await.unwrap();
+        let _ = gateway.receive().await.unwrap();
+
+        // A reconnect is not an answer. Skip the backoff wait (the reconnect
+        // itself is not what this test is about) and check the outstanding
+        // request is still the one an answer may resolve.
+        bridge.reconnect_deadline = Some(tokio::time::Instant::now());
+        bridge.reconnect_with_resume().await.unwrap();
+        assert_eq!(bridge.outstanding_relayed_permissions(), 1);
+
+        let reply = bridge
+            .handle_transport_message(&permission_answer(&request_id, false))
+            .unwrap();
+        let payload: serde_json::Value = serde_json::from_str(&reply.payload).unwrap();
+        assert_eq!(payload["resolved"], true);
+        assert_eq!(bridge.outstanding_relayed_permissions(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_repeated_permission_request_is_relayed_only_once() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (bridge_transport, mut gateway) =
+            InProcessTransport::create_pair("bridge".into(), "gateway".into());
+        gateway.connect().await.unwrap();
+        let mut bridge = Bridge::new(test_config(tmp.path()), Box::new(bridge_transport));
+        bridge.connect().await.unwrap();
+
+        // A producer bug queued the same request frame twice; the relay sends
+        // it to the host once and refuses the repeat.
+        let frame = TransportMessage {
+            r#type: PERMISSION_REQUEST_TYPE.into(),
+            correlation_id: Some("dup-1".into()),
+            payload: serde_json::json!({
+                "request_id": "dup-1",
+                "session_id": "s1",
+                "tool": "Bash",
+                "args": "ls",
+            })
+            .to_string(),
+            metadata: std::collections::HashMap::new(),
+        };
+        bridge.pending_permission_requests.push(frame.clone());
+        bridge.pending_permission_requests.push(frame);
+        bridge.send_pending_permission_requests().await.unwrap();
+
+        let first = gateway.receive().await.unwrap();
+        assert_eq!(first.correlation_id.as_deref(), Some("dup-1"));
+        assert_eq!(bridge.outstanding_relayed_permissions(), 1);
+        assert!(
+            gateway
+                .receive_timeout(std::time::Duration::from_millis(50))
+                .await
+                .is_err(),
+            "the repeated request must not reach the host"
+        );
     }
 
     #[tokio::test]

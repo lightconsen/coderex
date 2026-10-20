@@ -16,6 +16,16 @@
 //! `request_id` are the ids the bridge and the child already agreed on, so the
 //! message is forwarded verbatim and the bridge's id alias mapping keeps
 //! working.
+//!
+//! The bridge drives this relay on its own control-plane transport:
+//! [`crate::orchestrator::Bridge::send_pending_permission_requests`] relays
+//! each outbound `permission_request` before it goes on the wire, and
+//! [`crate::orchestrator::Bridge::handle_transport_message`] relays each
+//! inbound `permission_response` before it resolves anything, so a duplicate or
+//! unknown answer is refused on the worker side too. What remains genuinely
+//! outside this repository is the gateway service that owns the *host*
+//! connection: authenticating it, fanning frames out to the right human client,
+//! and presenting the approval UI.
 
 use std::collections::HashSet;
 
@@ -114,6 +124,17 @@ impl PermissionFrameRelay {
         // Forward the original frame: the correlation ID and payload ids are
         // the worker's own and must not be re-encoded.
         Some(message)
+    }
+
+    /// Stop waiting for a request without forwarding an answer.
+    ///
+    /// The worker calls this when it gives up on a question on its own — an
+    /// approval that timed out, or a request the worker resolved itself — so a
+    /// late answer for that id is refused by [`Self::relay_host_frame`] instead
+    /// of being relayed to a worker that has already moved on. Returns whether
+    /// the id was still outstanding.
+    pub fn forget(&mut self, request_id: &str) -> bool {
+        self.pending.remove(request_id)
     }
 
     /// How many requests are waiting for an answer.
@@ -349,6 +370,18 @@ mod tests {
                 .relay_host_frame(frame(PERMISSION_RESPONSE_TYPE, None, "not json"))
                 .is_none()
         );
+        assert_eq!(relay.pending(), 0);
+    }
+
+    #[test]
+    fn a_forgotten_request_is_no_longer_answerable() {
+        let mut relay = PermissionFrameRelay::new();
+        relay.relay_worker_frame(request_frame("perm_1")).unwrap();
+
+        // The worker gave up on the question, so a late answer is refused.
+        assert!(relay.forget("perm_1"));
+        assert!(!relay.forget("perm_1"));
+        assert!(relay.relay_host_frame(response_frame("perm_1")).is_none());
         assert_eq!(relay.pending(), 0);
     }
 

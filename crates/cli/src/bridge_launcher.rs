@@ -1887,7 +1887,7 @@ mod tests {
     use clap::Parser;
     use coderex_bridge::poller::{CapacityReport, SpawnMode, WorkAssignment};
     use coderex_bridge::state::BridgeSessionState;
-    use coderex_bridge::transport::InProcessTransport;
+    use coderex_bridge::transport::{InProcessTransport, TransportMessage};
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::Duration;
@@ -3485,6 +3485,107 @@ printf 'ECHO:%s\n' "$line""#;
         assert!(
             timeout_rx.try_recv().is_err(),
             "an answered request must not report a timeout"
+        );
+    }
+
+    /// A permission answer in the shape the gateway sends it back.
+    fn permission_answer(request_id: &str, allowed: bool) -> TransportMessage {
+        TransportMessage {
+            r#type: "permission_response".into(),
+            correlation_id: Some(request_id.to_string()),
+            payload: serde_json::json!({
+                "request_id": request_id,
+                "allowed": allowed,
+                "always": false,
+            })
+            .to_string(),
+            metadata: std::collections::HashMap::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_child_permission_round_trips_through_the_relay_exactly_once() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut config = worker_config(tmp.path()).bridge_config();
+        config.archive_base = tmp.path().join("archives");
+        let (transport, mut gateway) =
+            InProcessTransport::create_pair("bridge-perm".into(), "gateway-perm".into());
+        gateway.connect().await.unwrap();
+        let mut bridge = Bridge::with_control_plane(
+            config,
+            Box::new(transport),
+            Arc::new(FakeControlPlane::default()),
+        );
+        bridge.connect().await.unwrap();
+        spawn_permission_session(&mut bridge, tmp.path()).await;
+        let (running, mut decisions) = running_permission_session();
+
+        // No timeout: the relay is what decides whether an answer may resolve.
+        let (timeout_tx, _timeout_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        let mut tracker = PermissionTracker::new(None, timeout_tx);
+        let mut events = bridge.subscribe();
+
+        // The child asks; the launcher registers it under the child's own id
+        // and flushes it over the transport.
+        tracker
+            .register(&mut bridge, &running, child_request("child-req-1"))
+            .await;
+
+        // It reaches the gateway as a `permission_request`, carrying the
+        // child's id and the session it belongs to.
+        let request = tokio::time::timeout(Duration::from_secs(2), gateway.receive())
+            .await
+            .expect("the request reaches the gateway")
+            .unwrap();
+        assert_eq!(request.r#type, "permission_request");
+        assert_eq!(request.correlation_id.as_deref(), Some("child-req-1"));
+        let payload: Value = serde_json::from_str(&request.payload).unwrap();
+        assert_eq!(payload["request_id"], "child-req-1");
+        assert_eq!(payload["session_id"], "s1");
+
+        // The gateway answers; the bridge relays it, resolves the router and
+        // broadcasts the resolution, which the launcher turns into a decision.
+        let reply = bridge
+            .handle_transport_message(&permission_answer("child-req-1", true))
+            .unwrap();
+        assert_eq!(reply.r#type, "permission_result");
+        let resolved = loop {
+            let event = tokio::time::timeout(Duration::from_secs(2), events.recv())
+                .await
+                .expect("a resolution is broadcast")
+                .expect("the event channel stays open");
+            if let BridgeEvent::PermissionResolved { request_id, .. } = event {
+                break request_id;
+            }
+        };
+        assert_eq!(resolved, "child-req-1");
+        tracker.deliver(&mut bridge, &resolved);
+
+        let decision = decisions
+            .recv()
+            .await
+            .expect("the child receives its answer");
+        assert_eq!(decision.request_id, "child-req-1");
+        assert!(decision.allow);
+        assert!(
+            decisions.try_recv().is_err(),
+            "the child must receive exactly one answer"
+        );
+
+        // A replay of the same answer is refused by the relay: it resolves
+        // nothing and never reaches the child a second time.
+        let replay = bridge
+            .handle_transport_message(&permission_answer("child-req-1", true))
+            .unwrap();
+        let replay_payload: Value = serde_json::from_str(&replay.payload).unwrap();
+        assert_eq!(replay_payload["resolved"], false);
+        assert!(
+            events.try_recv().is_err(),
+            "a duplicate must not broadcast a second resolution"
+        );
+        assert!(
+            decisions.try_recv().is_err(),
+            "a duplicate must not reach the child"
         );
     }
 

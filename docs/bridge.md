@@ -68,7 +68,7 @@ Remote session orchestration for connecting to remote CodeRex instances or manag
 | `heartbeat.rs` | Heartbeat, HeartbeatLoop, WsReconnector, SequenceCursor | Connection health monitoring, exponential backoff reconnect, downstream resume point |
 | `epoch.rs` | WriteFence, StaleEpoch | Monotonic worker-epoch write fence |
 | `relay.rs` | RelayApprovalGate, RelayCallBody, RelayDecision, `forwardable_headers` | Relayed-call approval binding, header forwarding policy, gateway refusal shape |
-| `gateway.rs` | PermissionFrameRelay | Gateway-side relay of `permission_request`/`permission_response`, outstanding-request tracking |
+| `gateway.rs` | PermissionFrameRelay | Permission-frame relay the bridge drives on its transport: forwards `permission_request`/`permission_response`, tracks outstanding requests, refuses unknown/duplicate answers |
 | `state.rs` | BridgeSessionStateMachine | 11-state session lifecycle with validated transitions |
 | `permission.rs` | BridgePermissionRouter | Session-scoped Allow/Deny permission routing |
 | `poller.rs` | BridgeWorkPoller, SpawnMode | Control plane registration, capacity-aware assignment queue |
@@ -414,17 +414,31 @@ the transport immediately. When the gateway answers with `permission_response`,
 `control_response` line to the child's stdin; the turn then continues or
 records the denial. An unanswered request is denied after `CODEREX_BRIDGE_APPROVAL_TIMEOUT_SECS`
 (default 300; `0` disables the timeout) with a message saying the approval
-timed out — not that the user denied it. Shutdown drops the responders. The gateway-side half of relaying these two frame kinds
-is `PermissionFrameRelay` in `crates/bridge/src/gateway.rs`: it forwards a
-`permission_request` from the worker to the host connection, remembers its
-request id as pending, and forwards the matching `permission_response` back to
-the worker exactly once. An answer for an id that is not pending, or a replay
-of one already relayed, is dropped instead of forwarded; frames either side
-does not own are returned as `None` so the caller can pass them through
-unchanged. A gateway built on the relay still owns what surrounds it:
-authenticating the host connection, fanning frames out to the right human
-client, presenting the approval UI, and deciding what to do about a request
-that is never answered.
+timed out — not that the user denied it. Shutdown drops the responders.
+
+**The relay on the production path.** Both frame kinds are routed through
+`PermissionFrameRelay` (`crates/bridge/src/gateway.rs`) on the worker's own
+control-plane transport. `Bridge::send_pending_permission_requests` relays each
+outbound `permission_request` before it goes on the wire — the relay records
+the request id as outstanding and refuses an id-less or repeated request — and
+`Bridge::handle_transport_message` relays each inbound `permission_response`
+before it resolves anything. The frame is forwarded verbatim, so the
+correlation id, the payload `request_id` and the session id the child chose are
+all preserved. An answer for an id that is not outstanding, or a replay of one
+already answered, is refused: it resolves nothing and never reaches the child a
+second time. A request the worker stops waiting on — a timeout
+(`Bridge::expire_permission`) or an answer the worker resolved itself — is
+forgotten by the relay (`PermissionFrameRelay::forget`), so a late answer for
+it is refused too. The relay's pending set lives on the `Bridge`, so it
+survives a transport reconnect: a request the worker is still waiting on stays
+answerable across it. Frames the relay does not own are returned as `None` so
+the caller passes them through unchanged.
+
+**What remains outside this repository.** `PermissionFrameRelay` is the in-repo
+half of the gateway; the gateway *service* is not here. It still owns the host
+connection around the relay: authenticating it, fanning frames out to the right
+human client, presenting the approval UI, and deciding what to do about a
+request that is never answered.
 
 The turn's final `result` frame supplies `UsageStats`:
 `usage.input_tokens`, `usage.output_tokens`,
@@ -543,23 +557,24 @@ Control Plane                      Bridge                          Remote/Local
 | `heartbeat` | 19 | Healthy→Degraded→Lost transitions, backoff, recovery state, loop, sequence cursor |
 | `epoch` | 4 | Worker epoch write fence: newer epoch takes it, stale epoch refused |
 | `relay` | 13 | Approval binding, one-time consumption, forwarding policy, refusal shape |
-| `state` | 14 | All 11 state transitions, terminal guards, failure, history |
-| `permission` | 6 | Create/respond/query/prune, Allow/Deny, session scoping |
-| `poller` | 11 | Capacity limits, assignment queue, register, URL config, injected control-plane client, claim outcomes and path templates |
-| `spawner` | 12 | Worktree create/remove, single session, SSH variant, non-existent cleanup |
+| `state` | 17 | All 11 state transitions, terminal guards, failure, history |
+| `permission` | 7 | Create/respond/query/prune, Allow/Deny, session scoping |
+| `poller` | 15 | Capacity limits, assignment queue, register, URL config, injected control-plane client, claim outcomes and path templates |
+| `spawner` | 14 | Worktree create/remove, single session, SSH variant, non-existent cleanup |
 | `teleport` | 9 | Snapshot/restore, manifest, conflict handling |
-| `archive` | 9 | Versioning, list/load, metadata, process tracking, cleanup report |
+| `archive` | 10 | Versioning, list/load, metadata, process tracking, cleanup report |
 | `delta_sync` | 21 | Diff/apply, revision hash, JSON roundtrip, Lamport timestamps, conflict tracker, delta merge |
-| `orchestrator` | 19 | Connect/disconnect, spawn/complete lifecycle, permissions, events, recovery, relay endpoint, write fence, resume, stop handle |
-| `bridge_launcher` (cli) | 23 | Flag/env mapping, defaults, required-value errors, injectable transport/control plane/runner, registration, assignment claim success/lost/failure, spawn, session completion/failure and slot release, streaming stdout/stderr, usage and transcript capture, capacity reporting, graceful session shutdown and task cancellation |
+| `orchestrator` | 36 | Connect/disconnect, spawn/complete lifecycle, permissions, events, recovery, relay endpoint, relayed permission frames, write fence, resume, stop handle |
+| `gateway` | 13 | Permission-frame relay: worker→host and host→worker forwarding, unknown/duplicate refusal, forget, in-process transport round trip |
+| `bridge_launcher` (cli) | 31 | Flag/env mapping, defaults, required-value errors, injectable transport/control plane/runner, registration, assignment claim success/lost/failure, spawn, session completion/failure and slot release, streaming stdout/stderr, usage and transcript capture, child permission round trip through the relay, capacity reporting, graceful session shutdown and task cancellation |
 | `bridge_integration` (tests/) | 33 | Live relay call over WebSocket, refusal, stale epoch, resume cursor, end-to-end flows |
-| `control_plane` (server) | 15 | All 5 HTTP endpoints, state management, claim conflicts, 404 routing |
+| `control_plane` (server) | 16 | All 5 HTTP endpoints, state management, claim conflicts, 404 routing |
 | `filter` (server) | 7 | Remote/bridge shell whitelists, dangerous-command rejection |
 | `persistence` (server) | 6 | Session store roundtrip, salted fingerprints, legacy-token migration |
-| `session` (server) | 25 | Auth, roles, command resolution, rate limiting, idle cleanup, protocol |
+| `session` (server) | 26 | Auth, roles, command resolution, rate limiting, idle cleanup, protocol |
 | `server_integration` (server, tests/) | 24 | Full WS lifecycle, auth, roles, command whitelist over the protocol |
 
-**Total: 160 bridge unit + 23 CLI launcher unit + 33 bridge integration + 53 server unit + 24 server integration = 293 tests pass.**
+**Total: 201 bridge unit + 31 CLI launcher unit + 33 bridge integration + 55 server unit + 24 server integration = 344 tests pass.**
 
 ## Dependencies
 
