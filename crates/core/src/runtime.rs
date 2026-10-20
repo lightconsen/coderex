@@ -214,6 +214,11 @@ impl UiState {
             EngineEvent::CompactBoundary => {
                 self.transcript.push(TranscriptEntry::CompactBoundary);
             }
+            EngineEvent::Compaction(event) => {
+                // Advisory: compaction's own state lives in the transcript
+                // boundary; this records why it ran or stood down.
+                tracing::debug!("compaction event: {event:?}");
+            }
             EngineEvent::PermissionRequest { id, tool, args } => {
                 self.pending_permissions.push_back(PendingPermission {
                     id,

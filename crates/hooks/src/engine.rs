@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
@@ -269,6 +269,216 @@ impl HookConfig {
     }
 }
 
+// ─── Hook `if` condition ────────────────────────────────────────────────────
+
+/// A hook's `if` condition: when the hook is allowed to run.
+///
+/// The reference's `if` is a tool rule — `"Bash(git*)"` — or a bare matcher.
+/// Two forms are understood, and both are globs (`*` matches any run of
+/// characters, `?` matches exactly one):
+///
+/// - `name(pattern)` — a **tool rule**. It admits only a tool event
+///   ([`HookEvent::is_tool_event`]), and only when the tool's name matches
+///   `name` and the tool's input matches `pattern`. `name` may itself be a
+///   glob. The input is JSON, so `pattern` is tried against the serialized
+///   form *and* against every string inside it — `Bash(git*)` matches the
+///   command in `{"command":"git status"}`, not the braces.
+/// - anything else — a **string matcher** over the event's input: the tool
+///   name for a tool event, the prompt for `UserPromptSubmit`, and so on.
+///
+/// A condition that does not match is a *skip*, never an error: the hook
+/// simply does not run for that event.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HookCondition {
+    /// The configured spelling, kept for logging and round-tripping.
+    raw: String,
+    /// The tool name a `name(pattern)` rule requires, if this is a tool rule.
+    tool: Option<String>,
+    /// The glob a `name(pattern)` rule applies to the tool input.
+    pattern: Option<String>,
+}
+
+impl HookCondition {
+    /// Parse a configured `if` value.
+    ///
+    /// A value with no `name(...)` shape is a plain glob; a `name(...)` whose
+    /// name is empty is treated as a plain glob too, so a typo degrades to a
+    /// matcher rather than to a rule that silently never fires.
+    #[must_use]
+    pub fn parse(raw: &str) -> Self {
+        let trimmed = raw.trim();
+        if let Some(open) = trimmed.find('(') {
+            if trimmed.ends_with(')') && trimmed.len() > open + 2 {
+                let tool = trimmed[..open].trim();
+                if !tool.is_empty() {
+                    return Self {
+                        raw: trimmed.to_string(),
+                        tool: Some(tool.to_string()),
+                        pattern: Some(trimmed[open + 1..trimmed.len() - 1].to_string()),
+                    };
+                }
+            }
+        }
+        Self {
+            raw: trimmed.to_string(),
+            tool: None,
+            pattern: None,
+        }
+    }
+
+    /// The configured spelling.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.raw
+    }
+
+    /// Whether this condition admits `input` for `event`.
+    ///
+    /// `event` is `None` for an event name that does not parse; a tool rule
+    /// cannot be satisfied then, and a plain matcher still can.
+    #[must_use]
+    pub fn matches(&self, event: Option<HookEvent>, input: &HookInput) -> bool {
+        let subject = input.input.as_deref().unwrap_or("");
+        match (&self.tool, &self.pattern) {
+            (Some(tool), Some(pattern)) => {
+                event.is_some_and(HookEvent::is_tool_event)
+                    && glob_match(tool, subject)
+                    && matches_tool_input(pattern, input.context.as_deref())
+            }
+            _ => glob_match(&self.raw, subject),
+        }
+    }
+}
+
+/// Whether `pattern` matches a tool's input.
+///
+/// The input is a JSON value, so the pattern is tried against the whole
+/// serialized form and against every string it contains at any depth: a tool
+/// rule names what the tool is *doing* (`Bash(git*)`), and the command sits
+/// inside an object.
+fn matches_tool_input(pattern: &str, input: Option<&str>) -> bool {
+    let Some(raw) = input else {
+        return false;
+    };
+    if glob_match(pattern, raw) {
+        return true;
+    }
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(raw) else {
+        return false;
+    };
+    let mut strings = Vec::new();
+    collect_json_strings(&value, &mut strings);
+    strings.iter().any(|text| glob_match(pattern, text))
+}
+
+/// Collect every string in a JSON value, at any depth.
+fn collect_json_strings<'a>(value: &'a serde_json::Value, out: &mut Vec<&'a str>) {
+    match value {
+        serde_json::Value::String(text) => out.push(text),
+        serde_json::Value::Array(items) => {
+            for item in items {
+                collect_json_strings(item, out);
+            }
+        }
+        serde_json::Value::Object(fields) => {
+            for item in fields.values() {
+                collect_json_strings(item, out);
+            }
+        }
+        serde_json::Value::Null | serde_json::Value::Bool(_) | serde_json::Value::Number(_) => {}
+    }
+}
+
+impl Serialize for HookCondition {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&self.raw)
+    }
+}
+
+impl<'de> Deserialize<'de> for HookCondition {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let raw = String::deserialize(deserializer)?;
+        Ok(Self::parse(&raw))
+    }
+}
+
+/// Match `text` against a glob with `*` (any run) and `?` (one character).
+///
+/// Iterative with backtracking: `star` remembers the last `*` and `mark` the
+/// text it is currently trying to swallow, so the pattern never needs to
+/// recurse.
+fn glob_match(pattern: &str, text: &str) -> bool {
+    let pattern: Vec<char> = pattern.chars().collect();
+    let text: Vec<char> = text.chars().collect();
+    let (mut pi, mut ti) = (0usize, 0usize);
+    // `None` until the first `*` is seen; then the pattern index after it and
+    // the text position it must cover.
+    let mut star: Option<(usize, usize)> = None;
+
+    while ti < text.len() {
+        if pi < pattern.len() && (pattern[pi] == '?' || pattern[pi] == text[ti]) {
+            pi += 1;
+            ti += 1;
+        } else if pi < pattern.len() && pattern[pi] == '*' {
+            star = Some((pi + 1, ti));
+            pi += 1;
+        } else if let Some((after_star, mark)) = star {
+            pi = after_star;
+            ti = mark + 1;
+            star = Some((after_star, ti));
+        } else {
+            return false;
+        }
+    }
+    while pi < pattern.len() && pattern[pi] == '*' {
+        pi += 1;
+    }
+    pi == pattern.len()
+}
+
+// ─── Hook modifiers (settings-only behaviour) ───────────────────────────────
+
+/// The behaviour modifiers a hook carries beyond its kind: the reference's
+/// `if`, `once`, `statusMessage`, and `continueOnBlock`.
+///
+/// They live beside the [`HookConfig`] rather than inside it because they are
+/// execution policy, not identity, and because they are settings-only: the
+/// loader is the one place that can produce them, from a raw settings entry.
+#[derive(Debug, Clone, Default)]
+pub struct HookModifiers {
+    /// Only run this hook when the condition matches.
+    pub condition: Option<HookCondition>,
+    /// Run this hook at most once per session/process.
+    pub once: bool,
+    /// Message to surface while the hook runs.
+    pub status_message: Option<String>,
+    /// On a gating event, let a deliberate block continue the turn instead of
+    /// stopping it.
+    ///
+    /// This softens only an explicit `stop` from the hook. A hook that *could
+    /// not answer* still fails closed: a gate that cannot run must not read as
+    /// an allow, and `continueOnBlock` is about a decision, not about a
+    /// missing one.
+    pub continue_on_block: bool,
+}
+
+/// One configured hook: its identity and its execution policy.
+#[derive(Debug, Clone)]
+struct HookEntry {
+    config: HookConfig,
+    modifiers: HookModifiers,
+}
+
+impl HookEntry {
+    /// Whether this hook's `if` condition admits the event.
+    fn admits(&self, event: Option<HookEvent>, input: &HookInput) -> bool {
+        self.modifiers
+            .condition
+            .as_ref()
+            .is_none_or(|condition| condition.matches(event, input))
+    }
+}
+
 // ─── Hook Settings (from settings.json) ─────────────────────────────────────
 
 /// Parsed hook settings from the `hooks` field in settings.json.
@@ -354,16 +564,20 @@ pub struct RawHookConfig {
     /// The tool input an `mcp_tool` hook passes.
     #[serde(default)]
     pub input: Option<serde_json::Value>,
-    /// Accepted but not implemented — see `warn_about_unimplemented_fields`.
+    /// The condition that decides whether this hook runs.
+    ///
+    /// A string (`"Bash(git*)"`, `"Edit"`); see [`HookCondition`]. A value that
+    /// is not a string cannot be evaluated and is refused with a warning —
+    /// this is the one field that can still be impossible.
     #[serde(rename = "if", default)]
     pub if_condition: Option<serde_json::Value>,
-    /// Accepted but not implemented.
+    /// Run the hook at most once per session/process.
     #[serde(default)]
     pub once: Option<bool>,
-    /// Accepted but not implemented.
+    /// A message surfaced while the hook runs.
     #[serde(rename = "statusMessage", default)]
     pub status_message: Option<String>,
-    /// Accepted but not implemented.
+    /// Let a deliberate block on a gating event continue the turn.
     #[serde(rename = "continueOnBlock", default)]
     pub continue_on_block: Option<bool>,
     /// Environment variables to inject.
@@ -457,33 +671,32 @@ fn from_raw(raw: &RawHookConfig, timeout_ms: u64) -> HookConfig {
     }
 }
 
-/// Say which configured fields this build accepts but does not act on.
+/// Read the behaviour modifiers a raw settings entry carries.
 ///
 /// `if`, `once`, `statusMessage`, and `continueOnBlock` are a separate axis
-/// from the hook kind: no kind implements them, including `command` and
-/// `http`. They are accepted so a settings file written for the reference does
-/// not fail to load, but a person reading the output should not have to guess
-/// whether a configured `if` filtered anything.
-fn warn_about_unimplemented_fields(raw: &RawHookConfig) {
-    let mut declared = Vec::new();
-    if raw.if_condition.is_some() {
-        declared.push("if");
-    }
-    if raw.once.is_some() {
-        declared.push("once");
-    }
-    if raw.status_message.is_some() {
-        declared.push("statusMessage");
-    }
-    if raw.continue_on_block.is_some() {
-        declared.push("continueOnBlock");
-    }
-    if !declared.is_empty() {
-        tracing::warn!(
-            event = %raw.event,
-            fields = ?declared,
-            "hook sets fields CodeRex accepts but does not implement — they have no effect"
-        );
+/// from the hook kind: every kind honours them, `command` and `http` included.
+/// The only field that can still be impossible is a non-string `if` — a
+/// condition the engine cannot evaluate — which is refused here with a reason
+/// rather than silently dropped.
+fn modifiers_from_raw(raw: &RawHookConfig) -> HookModifiers {
+    let condition = match raw.if_condition.as_ref() {
+        None => None,
+        Some(serde_json::Value::String(condition)) => Some(HookCondition::parse(condition)),
+        Some(other) => {
+            tracing::warn!(
+                event = %raw.event,
+                value = %other,
+                "hook 'if' must be a string (a tool rule like \"Bash(git*)\" or a glob); \
+                 ignoring the condition"
+            );
+            None
+        }
+    };
+    HookModifiers {
+        condition,
+        once: raw.once.unwrap_or(false),
+        status_message: raw.status_message.clone(),
+        continue_on_block: raw.continue_on_block.unwrap_or(false),
     }
 }
 
@@ -502,6 +715,10 @@ pub struct HookExecutionResult {
     pub exit_code: i32,
     /// Progress events the hook emitted before its answer, in order.
     pub events: Vec<HookStreamEvent>,
+    /// The hook's configured `statusMessage`, if it set one: what the hook is
+    /// doing, for a log line or a status surface. The registry fills this in
+    /// when it runs the hook; the executor itself does not see the modifier.
+    pub status_message: Option<String>,
 }
 
 // ─── Hook Input (serialized to stdin) ───────────────────────────────────────
@@ -523,7 +740,13 @@ pub struct HookInput {
 
 /// Registry of configured hooks.
 pub struct HookRegistry {
-    hooks: Vec<HookConfig>,
+    hooks: Vec<HookEntry>,
+    /// Indices of the `once` hooks that have already run, so a `once` hook
+    /// fires at most once per registry — that is, per session/process.
+    ///
+    /// Interior mutability because firing takes `&self`: the executor trait is
+    /// shared, and the latch is bookkeeping rather than session state.
+    once_fired: Mutex<Vec<usize>>,
     /// Supplied by the session that owns a model client or the MCP registry;
     /// see [`HookActionRunner`].
     action_runner: Option<Arc<dyn HookActionRunner>>,
@@ -534,8 +757,10 @@ pub struct HookRegistry {
 
 impl std::fmt::Debug for HookRegistry {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let hooks: Vec<&HookConfig> = self.hooks.iter().map(|entry| &entry.config).collect();
         f.debug_struct("HookRegistry")
-            .field("hooks", &self.hooks)
+            .field("hooks", &hooks)
+            .field("once_fired", &self.once_fired)
             .field("action_runner", &self.action_runner.is_some())
             .field("request_handler", &self.request_handler.is_some())
             .finish()
@@ -552,6 +777,7 @@ impl HookRegistry {
     pub const fn new() -> Self {
         Self {
             hooks: Vec::new(),
+            once_fired: Mutex::new(Vec::new()),
             action_runner: None,
             request_handler: None,
         }
@@ -619,6 +845,7 @@ impl HookRegistry {
         Self::warn_about_inert_hooks(&hooks);
         Ok(Self {
             hooks,
+            once_fired: Mutex::new(Vec::new()),
             action_runner: None,
             request_handler: None,
         })
@@ -639,7 +866,7 @@ impl HookRegistry {
     fn parse_settings_hooks(
         value: &serde_json::Value,
         tier: HookTier,
-    ) -> Result<Vec<HookConfig>, HookError> {
+    ) -> Result<Vec<HookEntry>, HookError> {
         let raw_hooks = settings_hook_entries(value)?;
         let mut hooks = Vec::with_capacity(raw_hooks.len());
         for raw_value in raw_hooks {
@@ -655,7 +882,10 @@ impl HookRegistry {
                 }
             };
             match Self::hook_from_raw(&raw, tier) {
-                Ok(config) => hooks.push(config),
+                Ok(config) => hooks.push(HookEntry {
+                    config,
+                    modifiers: modifiers_from_raw(&raw),
+                }),
                 Err(error) => tracing::warn!(
                     tier = ?tier,
                     event = %raw.event,
@@ -672,7 +902,6 @@ impl HookRegistry {
     ///
     /// The caller skips an `Err` rather than failing the whole document.
     fn hook_from_raw(raw: &RawHookConfig, tier: HookTier) -> Result<HookConfig, HookError> {
-        warn_about_unimplemented_fields(raw);
         let mut config = match raw.kind {
             HookType::Command => {
                 let Some(command) = raw.command.clone() else {
@@ -870,6 +1099,7 @@ impl HookRegistry {
         Self::warn_about_inert_hooks(&hooks);
         Ok(Self {
             hooks,
+            once_fired: Mutex::new(Vec::new()),
             action_runner: None,
             request_handler: None,
         })
@@ -887,8 +1117,9 @@ impl HookRegistry {
     /// A hook on an event CodeRex does not fire matches nothing and runs
     /// never. That is indistinguishable from a working hook until someone
     /// notices it did not run, so it is said out loud at load.
-    fn warn_about_inert_hooks(hooks: &[HookConfig]) {
-        for hook in hooks {
+    fn warn_about_inert_hooks(hooks: &[HookEntry]) {
+        for entry in hooks {
+            let hook = &entry.config;
             if hook.event == "*" {
                 continue;
             }
@@ -909,15 +1140,23 @@ impl HookRegistry {
     }
 
     /// Register a hook configuration, in the tier the config carries.
+    ///
+    /// The settings-only modifiers (`if`, `once`, `statusMessage`,
+    /// `continueOnBlock`) are not part of [`HookConfig`]; a programmatically
+    /// registered hook has none, and a settings-loaded one keeps the ones its
+    /// entry declared.
     pub fn register(&mut self, config: HookConfig) {
-        self.hooks.push(config);
+        self.hooks.push(HookEntry {
+            config,
+            modifiers: HookModifiers::default(),
+        });
     }
 
     /// Register a hook configuration in an explicit tier, overriding the tier
     /// the config carries.
     pub fn register_in_tier(&mut self, tier: HookTier, mut config: HookConfig) {
         config.tier = tier;
-        self.hooks.push(config);
+        self.register(config);
     }
 
     /// Find hooks matching the given event, in chain order.
@@ -939,46 +1178,121 @@ impl HookRegistry {
     /// canonical `PostToolUseFailure` that is fired. Names that do not parse
     /// match nothing (except `"*"`): matching raw strings would make every
     /// alias and every typo silently inert.
+    ///
+    /// This is the *event* half of matching only. Whether a hook's `if`
+    /// condition admits this particular event is decided when it runs, because
+    /// the condition needs the event's input.
     fn matches_for_event_name(&self, event_name: &str) -> Vec<&HookConfig> {
+        self.matched_indices(event_name)
+            .into_iter()
+            .map(|index| &self.hooks[index].config)
+            .collect()
+    }
+
+    /// Indices of the hooks matching `event_name`, in chain order.
+    ///
+    /// Chain order is tier first — managed, then plugin, then core — and
+    /// priority (highest first) only within a tier. Insertion order breaks
+    /// remaining ties.
+    fn matched_indices(&self, event_name: &str) -> Vec<usize> {
         let fired = event_name.parse::<HookEvent>().ok();
-        let mut hooks: Vec<_> = self
+        let mut indices: Vec<usize> = self
             .hooks
             .iter()
-            .filter(|h| {
-                if h.event == "*" {
+            .enumerate()
+            .filter(|(_, entry)| {
+                if entry.config.event == "*" {
                     return true;
                 }
-                match (h.event.parse::<HookEvent>(), fired) {
+                match (entry.config.event.parse::<HookEvent>(), fired) {
                     (Ok(configured), Some(fired)) => configured == fired,
                     _ => false,
                 }
             })
+            .map(|(index, _)| index)
             .collect();
         // Stable sort: tier ascending, then priority descending. Equal keys
         // keep registration order.
-        hooks.sort_by_key(|h| (h.tier, std::cmp::Reverse(h.priority)));
-        hooks
+        indices.sort_by_key(|&index| {
+            let config = &self.hooks[index].config;
+            (config.tier, std::cmp::Reverse(config.priority))
+        });
+        indices
     }
 
-    /// Execute matching hooks synchronously for a named event.
-    async fn execute_sync_for_event(
+    /// Claim a `once` hook's one run: `true` the first time, `false` after.
+    fn claim_once(&self, index: usize) -> bool {
+        let mut fired = self
+            .once_fired
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if fired.contains(&index) {
+            false
+        } else {
+            fired.push(index);
+            true
+        }
+    }
+
+    /// Surface a hook's `statusMessage`, if it has one.
+    fn announce_status(entry: &HookEntry, event_name: &str) {
+        if let Some(message) = entry.modifiers.status_message.as_deref() {
+            tracing::info!(
+                hook = %entry.config.label(),
+                event = %event_name,
+                status = %message,
+                "hook running"
+            );
+        }
+    }
+
+    /// Run the hooks at `indices`, applying each one's modifiers.
+    ///
+    /// A hook is skipped — never failed — when its `if` condition does not
+    /// admit the event, or when a `once` hook has already run. The returned
+    /// [`FiredHook`] carries the two decisions the caller needs: whether a
+    /// `stop` counts as a block, and the hook's result.
+    async fn run_entries(
         &self,
+        indices: Vec<usize>,
         event_name: &str,
         input: &HookInput,
-    ) -> Vec<Result<HookExecutionResult, HookError>> {
-        let matching = self.matches_for_event_name(event_name);
-        let mut results = Vec::new();
-        for hook in matching {
-            let result = execute_hook_with_timeout(
-                hook,
+    ) -> Vec<FiredHook> {
+        let event = event_name.parse::<HookEvent>().ok();
+        let mut fired = Vec::new();
+        for index in indices {
+            let entry = &self.hooks[index];
+            if !entry.admits(event, input) {
+                continue;
+            }
+            if entry.modifiers.once && !self.claim_once(index) {
+                continue;
+            }
+            Self::announce_status(entry, event_name);
+            let mut result = execute_hook_with_timeout(
+                &entry.config,
                 input,
                 self.action_runner.as_deref(),
                 self.request_handler.as_deref(),
             )
             .await;
-            results.push(result);
+            if let Ok(execution) = result.as_mut() {
+                execution
+                    .status_message
+                    .clone_from(&entry.modifiers.status_message);
+            }
+            fired.push(FiredHook {
+                continue_on_block: entry.modifiers.continue_on_block,
+                result,
+            });
         }
-        results
+        fired
+    }
+
+    /// Execute matching hooks synchronously for a named event.
+    async fn execute_sync_for_event(&self, event_name: &str, input: &HookInput) -> Vec<FiredHook> {
+        self.run_entries(self.matched_indices(event_name), event_name, input)
+            .await
     }
 
     /// Execute matching hooks synchronously (sequential, collect results).
@@ -987,19 +1301,11 @@ impl HookRegistry {
         event: &HookEvent,
         input: &HookInput,
     ) -> Vec<Result<HookExecutionResult, HookError>> {
-        let matching = self.matches_for_event(event);
-        let mut results = Vec::new();
-        for hook in matching {
-            let result = execute_hook_with_timeout(
-                hook,
-                input,
-                self.action_runner.as_deref(),
-                self.request_handler.as_deref(),
-            )
-            .await;
-            results.push(result);
-        }
-        results
+        self.run_entries(self.matched_indices(event.as_str()), event.as_str(), input)
+            .await
+            .into_iter()
+            .map(|fired| fired.result)
+            .collect()
     }
 
     /// Execute matching hooks asynchronously (spawn tasks, collect results).
@@ -1008,16 +1314,34 @@ impl HookRegistry {
         event: &HookEvent,
         input: &HookInput,
     ) -> Vec<Result<HookExecutionResult, HookError>> {
-        let matching: Vec<_> = self.matches_for_event(event);
+        let event_name = event.as_str();
         let mut handles = Vec::new();
-        for hook in matching {
-            let hook = hook.clone();
+        for index in self.matched_indices(event_name) {
+            let entry = &self.hooks[index];
+            if !entry.admits(Some(*event), input) {
+                continue;
+            }
+            if entry.modifiers.once && !self.claim_once(index) {
+                continue;
+            }
+            Self::announce_status(entry, event_name);
+            let hook = entry.config.clone();
+            let status_message = entry.modifiers.status_message.clone();
             let input = input.clone();
             let runner = self.action_runner.clone();
             let requests = self.request_handler.clone();
             let handle = tokio::spawn(async move {
-                execute_hook_with_timeout(&hook, &input, runner.as_deref(), requests.as_deref())
-                    .await
+                let mut result = execute_hook_with_timeout(
+                    &hook,
+                    &input,
+                    runner.as_deref(),
+                    requests.as_deref(),
+                )
+                .await;
+                if let Ok(execution) = result.as_mut() {
+                    execution.status_message = status_message;
+                }
+                result
             });
             handles.push(handle);
         }
@@ -1030,6 +1354,14 @@ impl HookRegistry {
         }
         results
     }
+}
+
+/// One hook that ran for an event, with the decisions the caller needs.
+struct FiredHook {
+    /// Whether a deliberate `stop` from this hook must not stop the turn.
+    continue_on_block: bool,
+    /// The hook's result, or why it could not answer.
+    result: Result<HookExecutionResult, HookError>,
 }
 
 impl Default for HookRegistry {
@@ -1046,12 +1378,14 @@ impl HookExecutor for HookRegistry {
         input: &str,
         context: &HashMap<String, String>,
     ) -> HookFireResult {
-        // Build hook input
+        // Build hook input. The tool's arguments travel in `context`, so a
+        // hook's `if` rule can match on them (`Bash(git*)`); the scheduler
+        // puts them under `tool_input`.
         let hook_input = HookInput {
             event: event_name.to_string(),
             session_id: context.get("session_id").cloned(),
             input: Some(input.to_string()),
-            context: None,
+            context: context.get("tool_input").cloned(),
         };
 
         // Execute matching hooks for this event
@@ -1065,10 +1399,13 @@ impl HookExecutor for HookRegistry {
             .is_ok_and(HookEvent::is_gating);
 
         let mut combined = HookFireResult::default();
-        for exec_result in results {
-            match exec_result {
+        for fired in results {
+            match fired.result {
                 Ok(r) => {
-                    if matches!(r.hook_result.action, HookAction::Stop) {
+                    // A hook that set `continueOnBlock` blocks only itself: its
+                    // `stop` is recorded but does not stop the turn.
+                    if matches!(r.hook_result.action, HookAction::Stop) && !fired.continue_on_block
+                    {
                         combined.stop = true;
                     }
                     if r.hook_result.updated_input.is_some() {
@@ -1078,6 +1415,8 @@ impl HookExecutor for HookRegistry {
                 Err(e) => {
                     // Fail closed: a hook that could not answer is not an
                     // allow. Record the failure, and on a gating event deny.
+                    // `continueOnBlock` does not reach this arm: it softens a
+                    // decision, not the absence of one.
                     combined.failed = true;
                     combined.errors.push(format!("{e}"));
                 }
@@ -1413,6 +1752,7 @@ async fn execute_hook(
         stderr,
         exit_code,
         events,
+        status_message: None,
     })
 }
 
@@ -1554,6 +1894,7 @@ async fn execute_http_hook(
         stderr: String::new(),
         exit_code: 0,
         events: Vec::new(),
+        status_message: None,
     })
 }
 
@@ -1597,6 +1938,7 @@ async fn execute_prompt_hook(
         stderr: String::new(),
         exit_code: 0,
         events: Vec::new(),
+        status_message: None,
     })
 }
 
@@ -1630,6 +1972,7 @@ async fn execute_mcp_tool_hook(
         stderr: String::new(),
         exit_code: 0,
         events: Vec::new(),
+        status_message: None,
     })
 }
 
@@ -2650,19 +2993,254 @@ mod tests {
         assert_eq!(hook.timeout_ms, 1234);
     }
 
-    /// `if`, `once`, `statusMessage`, and `continueOnBlock` are accepted — a
-    /// settings file written for the reference still loads — and do nothing.
-    #[test]
-    fn unimplemented_hook_fields_are_accepted_and_inert() {
-        let value = serde_json::json!({
-            "hooks": [{
-                "event": "PreToolUse", "type": "prompt", "prompt": "ask",
-                "if": "Bash(git*)", "once": true, "statusMessage": "checking",
-                "continueOnBlock": true
-            }]
+    // ─── `if`, `once`, `statusMessage`, `continueOnBlock` ───────────────────
+
+    /// Build a registry whose single hook answers with `answer` on `event`.
+    fn registry_with(event: &str, command: &str, extra: serde_json::Value) -> HookRegistry {
+        let mut entry = serde_json::json!({
+            "event": event,
+            "type": "command",
+            "command": command,
         });
-        let registry = HookRegistry::load_from_settings(&value).unwrap();
-        assert_eq!(registry.matches_for_event(&HookEvent::PreToolUse).len(), 1);
+        if let (Some(entry), Some(extra)) = (entry.as_object_mut(), extra.as_object()) {
+            for (key, value) in extra {
+                entry.insert(key.clone(), value.clone());
+            }
+        }
+        HookRegistry::load_from_settings(&serde_json::json!({ "hooks": [entry] })).unwrap()
+    }
+
+    /// A tool-rule `if` admits the call it names and skips every other one —
+    /// a skip, not a failure, so a skipped gate does not deny.
+    #[tokio::test]
+    async fn a_tool_rule_condition_admits_only_matching_calls() {
+        let registry = registry_with(
+            "PreToolUse",
+            r#"echo '{"action":"stop"}'"#,
+            serde_json::json!({ "if": "Bash(git*)" }),
+        );
+
+        let mut matching = HashMap::new();
+        matching.insert(
+            "tool_input".to_string(),
+            r#"{"command":"git status"}"#.to_string(),
+        );
+        let admitted = registry.fire_hook("PreToolUse", "Bash", &matching).await;
+        assert!(admitted.stop, "Bash(git*) must admit `git status`");
+        assert!(!admitted.failed);
+
+        let mut other_tool = HashMap::new();
+        other_tool.insert(
+            "tool_input".to_string(),
+            r#"{"command":"git status"}"#.to_string(),
+        );
+        let skipped = registry.fire_hook("PreToolUse", "Read", &other_tool).await;
+        assert!(!skipped.stop, "a non-matching tool must skip the hook");
+
+        let mut other_input = HashMap::new();
+        other_input.insert("tool_input".to_string(), r#"{"command":"ls"}"#.to_string());
+        let skipped = registry.fire_hook("PreToolUse", "Bash", &other_input).await;
+        assert!(!skipped.stop, "a non-matching input must skip the hook");
+        assert!(!skipped.failed, "a skip is not a failure");
+    }
+
+    /// A bare `if` is a glob over the event's input, so it filters a prompt.
+    #[tokio::test]
+    async fn a_string_matcher_condition_filters_by_input() {
+        let registry = registry_with(
+            "UserPromptSubmit",
+            r#"echo '{"action":"stop"}'"#,
+            serde_json::json!({ "if": "deploy*" }),
+        );
+
+        let admitted = registry
+            .fire_hook("UserPromptSubmit", "deploy production", &HashMap::new())
+            .await;
+        assert!(admitted.stop);
+
+        let skipped = registry
+            .fire_hook("UserPromptSubmit", "write a test", &HashMap::new())
+            .await;
+        assert!(!skipped.stop);
+        assert!(!skipped.failed);
+    }
+
+    /// A tool rule cannot be satisfied by an event that carries no tool, so
+    /// it skips there too.
+    #[tokio::test]
+    async fn a_tool_rule_condition_skips_a_non_tool_event() {
+        let registry = registry_with(
+            "UserPromptSubmit",
+            r#"echo '{"action":"stop"}'"#,
+            serde_json::json!({ "if": "Bash(git*)" }),
+        );
+        let result = registry
+            .fire_hook("UserPromptSubmit", "git status", &HashMap::new())
+            .await;
+        assert!(!result.stop);
+        assert!(!result.failed);
+    }
+
+    /// An `if` that is not a string cannot be evaluated, so it is refused with
+    /// a warning rather than silently dropping the hook.
+    #[tokio::test]
+    async fn a_non_string_condition_is_ignored() {
+        let registry = registry_with(
+            "PreToolUse",
+            r#"echo '{"action":"stop"}'"#,
+            serde_json::json!({ "if": 5 }),
+        );
+        let result = registry
+            .fire_hook("PreToolUse", "Bash", &HashMap::new())
+            .await;
+        assert!(
+            result.stop,
+            "the hook still runs without a usable condition"
+        );
+    }
+
+    /// `once` runs the hook for the first matching event and skips the rest.
+    #[tokio::test]
+    async fn once_runs_a_hook_only_once() {
+        let registry = registry_with(
+            "PreToolUse",
+            r#"echo '{"action":"stop"}'"#,
+            serde_json::json!({ "once": true }),
+        );
+
+        let first = registry
+            .fire_hook("PreToolUse", "Bash", &HashMap::new())
+            .await;
+        assert!(first.stop, "the first event runs the hook");
+
+        let second = registry
+            .fire_hook("PreToolUse", "Bash", &HashMap::new())
+            .await;
+        assert!(!second.stop, "the second event skips it");
+        assert!(!second.failed, "a spent `once` is a skip, not a failure");
+    }
+
+    /// A hook without `once` keeps firing on every event.
+    #[tokio::test]
+    async fn a_hook_without_once_fires_every_time() {
+        let registry = registry_with(
+            "PreToolUse",
+            r#"echo '{"action":"stop"}'"#,
+            serde_json::json!({}),
+        );
+        for _ in 0..3 {
+            assert!(
+                registry
+                    .fire_hook("PreToolUse", "Bash", &HashMap::new())
+                    .await
+                    .stop
+            );
+        }
+    }
+
+    /// `statusMessage` travels on the execution result, so a caller can show
+    /// it while the hook runs.
+    #[tokio::test]
+    async fn a_status_message_is_carried_on_the_result() {
+        let registry = registry_with(
+            "PreToolUse",
+            r#"echo '{"action":"continue"}'"#,
+            serde_json::json!({ "statusMessage": "checking the branch" }),
+        );
+        let results = registry
+            .execute_sync(&HookEvent::PreToolUse, &action_input())
+            .await;
+        assert_eq!(results.len(), 1);
+        assert_eq!(
+            results[0].as_ref().unwrap().status_message.as_deref(),
+            Some("checking the branch")
+        );
+    }
+
+    /// `continueOnBlock` softens a deliberate block on a gating event: the
+    /// hook still runs and still says `stop`, but the turn is not stopped.
+    #[tokio::test]
+    async fn continue_on_block_softens_a_gating_block() {
+        let blocking = registry_with(
+            "PreToolUse",
+            r#"echo '{"action":"stop"}'"#,
+            serde_json::json!({}),
+        );
+        assert!(
+            blocking
+                .fire_hook("PreToolUse", "Bash", &HashMap::new())
+                .await
+                .stop
+        );
+
+        let continuing = registry_with(
+            "PreToolUse",
+            r#"echo '{"action":"stop"}'"#,
+            serde_json::json!({ "continueOnBlock": true }),
+        );
+        let result = continuing
+            .fire_hook("PreToolUse", "Bash", &HashMap::new())
+            .await;
+        assert!(!result.stop, "the turn continues past the block");
+        assert!(!result.failed, "the hook answered, so it did not fail");
+    }
+
+    /// `continueOnBlock` does not soften a hook that *could not answer*: a
+    /// gate that cannot run must still deny.
+    #[tokio::test]
+    async fn continue_on_block_does_not_soften_a_failure() {
+        let registry = registry_with(
+            "PreToolUse",
+            "exit 1",
+            serde_json::json!({ "continueOnBlock": true }),
+        );
+        let result = registry
+            .fire_hook("PreToolUse", "Bash", &HashMap::new())
+            .await;
+        assert!(result.failed);
+        assert!(result.stop, "a failed gate still denies");
+    }
+
+    #[test]
+    fn a_condition_parses_tool_rules_and_globs() {
+        let rule = HookCondition::parse("Bash(git*)");
+        assert_eq!(rule.as_str(), "Bash(git*)");
+        assert_eq!(rule, HookCondition::parse(" Bash(git*) "));
+
+        let input = |tool: &str, args: &str| HookInput {
+            event: "PreToolUse".to_string(),
+            session_id: None,
+            input: Some(tool.to_string()),
+            context: Some(args.to_string()),
+        };
+        assert!(rule.matches(
+            Some(HookEvent::PreToolUse),
+            &input("Bash", r#"{"c":"git x"}"#)
+        ));
+        assert!(!rule.matches(Some(HookEvent::PreToolUse), &input("Bash", r#"{"c":"ls"}"#)));
+        assert!(!rule.matches(
+            Some(HookEvent::PreToolUse),
+            &input("Read", r#"{"c":"git x"}"#)
+        ));
+        assert!(!rule.matches(Some(HookEvent::UserPromptSubmit), &input("Bash", "git x")));
+
+        // No tool event at all (unknown name) cannot satisfy a tool rule.
+        let glob = HookCondition::parse("git*");
+        assert!(glob.matches(None, &input("git status", "")));
+        assert!(!glob.matches(None, &input("ls", "")));
+    }
+
+    #[test]
+    fn glob_matching_handles_stars_and_questions() {
+        assert!(glob_match("*", ""));
+        assert!(glob_match("*", "anything"));
+        assert!(glob_match("git*", "git status"));
+        assert!(glob_match("*status", "git status"));
+        assert!(glob_match("g?t", "git"));
+        assert!(glob_match("a*b*c", "aXXbYYc"));
+        assert!(!glob_match("git*", "ls"));
+        assert!(!glob_match("g?t", "gt"));
+        assert!(!glob_match("", "x"));
     }
 
     // ─── Action kinds: prompt, agent, mcp_tool ──────────────────────────────

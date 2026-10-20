@@ -117,11 +117,34 @@ impl HookEvent {
 }
 
 impl HookEvent {
+    /// Whether this event carries a tool call, so its hook input names a tool.
+    ///
+    /// These are the events the scheduler fires around a single tool call: the
+    /// hook input's `input` field is the tool's name and its `context` field is
+    /// the tool's arguments. A hook's `if` condition is a *tool rule* on
+    /// exactly these events; on any other event there is no tool to match, so
+    /// the rule can only decline (see
+    /// [`HookCondition`](crate::engine::HookCondition)).
+    #[must_use]
+    pub const fn is_tool_event(self) -> bool {
+        matches!(
+            self,
+            Self::PreToolUse
+                | Self::PostToolUse
+                | Self::PostToolUseFailure
+                | Self::PermissionRequest
+                | Self::PermissionDenied
+        )
+    }
+}
+
+impl HookEvent {
     /// Whether CodeRex fires this event anywhere.
     ///
     /// The firing sites, so this list can be checked against the code:
     ///
-    /// - `UserPromptSubmit`, `TurnEnd`, `Stop`, `PreCompact`, `PostCompact` —
+    /// - `UserPromptSubmit`, `SessionStart`, `TurnEnd`, `Stop`, `PreCompact`,
+    ///   `PostCompact`, `Notification`, `Elicitation`, `ElicitationResult` —
     ///   `coderex_core::engine`
     /// - `PreToolUse`, `PostToolUse`, `PostToolUseFailure`,
     ///   `PermissionRequest`, `PermissionDenied` —
@@ -130,6 +153,12 @@ impl HookEvent {
     /// Everything else is a name CodeRex accepts but never fires. A hook
     /// configured on one of those would install and then never run, so
     /// [`HookRegistry`](crate::HookRegistry) warns about it at load.
+    ///
+    /// `Setup`, `SubagentStart`, `SubagentStop`, `CwdChanged`, `FileChanged`,
+    /// `WorktreeCreate`, `TaskCompleted`, and `TeammateIdle` are the reserved
+    /// names with no honest source in the engine: sub-agent lifecycle and task
+    /// completion belong to the agent manager, the working directory is never
+    /// changed inside a turn, and nothing watches files or creates worktrees.
     #[must_use]
     pub const fn is_triggered(self) -> bool {
         matches!(
@@ -138,11 +167,15 @@ impl HookEvent {
                 | Self::PostToolUse
                 | Self::PostToolUseFailure
                 | Self::UserPromptSubmit
+                | Self::SessionStart
+                | Self::Notification
                 | Self::PermissionRequest
                 | Self::PermissionDenied
                 | Self::PreCompact
                 | Self::PostCompact
                 | Self::Stop
+                | Self::Elicitation
+                | Self::ElicitationResult
                 | Self::TurnEnd
         )
     }
@@ -368,14 +401,71 @@ mod tests {
                 "PostToolUse",
                 "PostToolUseFailure",
                 "UserPromptSubmit",
+                "SessionStart",
+                "Notification",
                 "PermissionRequest",
                 "PermissionDenied",
                 "PreCompact",
                 "PostCompact",
                 "Stop",
+                "Elicitation",
+                "ElicitationResult",
                 "TurnEnd",
             ]
         );
+    }
+
+    /// The reserved names have no firing site: the engine does not know when a
+    /// sub-agent starts or stops, never changes directory mid-turn, and has no
+    /// file watcher or worktree creator. A hook on one of these must be warned
+    /// about, not silently inert.
+    #[test]
+    fn reserved_events_stay_untriggered() {
+        let untriggered: Vec<&str> = HookEvent::iter()
+            .filter(|event| !event.is_triggered())
+            .map(HookEvent::as_str)
+            .collect();
+
+        assert_eq!(
+            untriggered,
+            vec![
+                "Setup",
+                "SubagentStart",
+                "CwdChanged",
+                "FileChanged",
+                "WorktreeCreate",
+                "SubagentStop",
+                "TaskCompleted",
+                "TeammateIdle",
+            ]
+        );
+    }
+
+    /// Only the events the scheduler fires around one tool call carry a tool
+    /// name and its arguments.
+    #[test]
+    fn only_the_tool_events_carry_a_tool() {
+        let tool_events: Vec<&str> = HookEvent::iter()
+            .filter(|event| event.is_tool_event())
+            .map(HookEvent::as_str)
+            .collect();
+
+        assert_eq!(
+            tool_events,
+            vec![
+                "PreToolUse",
+                "PostToolUse",
+                "PostToolUseFailure",
+                "PermissionRequest",
+                "PermissionDenied",
+            ]
+        );
+        for event in HookEvent::iter().filter(|e| e.is_tool_event()) {
+            assert!(
+                event.is_triggered(),
+                "{event:?} carries a tool but never fires"
+            );
+        }
     }
 
     /// Only the events whose firing site reads `stop` as a gate may report as
@@ -419,11 +509,15 @@ mod tests {
             HookEvent::PostToolUse,
             HookEvent::PostToolUseFailure,
             HookEvent::UserPromptSubmit,
+            HookEvent::SessionStart,
+            HookEvent::Notification,
             HookEvent::PermissionRequest,
             HookEvent::PermissionDenied,
             HookEvent::PreCompact,
             HookEvent::PostCompact,
             HookEvent::Stop,
+            HookEvent::Elicitation,
+            HookEvent::ElicitationResult,
             HookEvent::TurnEnd,
         ];
         let expected = [
@@ -431,11 +525,15 @@ mod tests {
             core_events::POST_TOOL_USE,
             core_events::POST_TOOL_USE_FAILURE,
             core_events::USER_PROMPT_SUBMIT,
+            core_events::SESSION_START,
+            core_events::NOTIFICATION,
             core_events::PERMISSION_REQUEST,
             core_events::PERMISSION_DENIED,
             core_events::PRE_COMPACT,
             core_events::POST_COMPACT,
             core_events::STOP,
+            core_events::ELICITATION,
+            core_events::ELICITATION_RESULT,
             core_events::TURN_END,
         ];
         for (event, name) in fired.iter().zip(expected) {

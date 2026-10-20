@@ -13,7 +13,10 @@ pub use action::{
     AGENT_DEFAULT_MODEL, AGENT_DEFAULT_TIMEOUT_MS, ActionPrompt, HookActionRunner, McpToolHook,
     PROMPT_DEFAULT_TIMEOUT_MS, interpolate_tool_input, substitute_arguments,
 };
-pub use engine::{HookConfig, HookInput, HookMatcher, HookRegistry, HookTier, HookType, HttpHook};
+pub use engine::{
+    HookCondition, HookConfig, HookInput, HookMatcher, HookModifiers, HookRegistry, HookTier,
+    HookType, HttpHook,
+};
 pub use events::{
     HookAction, HookError, HookEvent, HookPermissionDecision, HookResult, UnknownHookEvent,
 };

@@ -26,6 +26,7 @@ pub fn engine_event_to_wire(event: &EngineEvent) -> Option<WireEvent> {
             result: WireToolResult::from(result.clone()),
         },
         EngineEvent::CompactBoundary => WireEvent::CompactBoundary,
+        EngineEvent::Compaction(event) => WireEvent::Compaction(event.clone()),
         EngineEvent::PermissionRequest { id, tool, args } => WireEvent::PermissionRequest {
             id: id.clone(),
             tool: tool.clone(),
@@ -84,6 +85,7 @@ pub fn wire_event_to_engine(event: &WireEvent) -> Option<EngineEvent> {
             result: ToolResult::from(result.clone()),
         },
         WireEvent::CompactBoundary => EngineEvent::CompactBoundary,
+        WireEvent::Compaction(event) => EngineEvent::Compaction(event.clone()),
         WireEvent::PermissionRequest { id, tool, args } => EngineEvent::PermissionRequest {
             id: id.clone(),
             tool: tool.clone(),

@@ -199,14 +199,44 @@ localhost or a private range. Both of those live in
 and `env_var_references` — which existed for this purpose and had no caller
 until now.
 
-### Fields accepted but not implemented
+### `if`, `once`, `statusMessage`, `continueOnBlock`
 
-`if`, `once`, `statusMessage`, and `continueOnBlock` are accepted in settings
-and have **no effect**; the loader logs a `warn!` naming them when a
-configuration sets one. They are a separate axis from the hook kind — `command`
-and `http` do not implement them either — so they are out of scope rather than
-half-wired per kind. A settings file written for the reference therefore still
-loads; it just does not get filtering, run-once, or the status line.
+These four fields are execution policy, a separate axis from the hook kind, so
+they apply to every kind — `command`, `http`, `prompt`, `agent`, and `mcp_tool`
+alike. They live beside the config rather than inside it (`HookModifiers`, built
+by the loader from a raw settings entry) because they are not part of a hook's
+identity.
+
+- **`if`** — a condition that decides whether the hook runs for this event.
+  Two forms are understood, and both are globs (`*` any run, `?` one character):
+
+  - `name(pattern)` — a **tool rule**. It admits only a tool event
+    (`PreToolUse`, `PostToolUse`, `PostToolUseFailure`, `PermissionRequest`,
+    `PermissionDenied`), and only when the tool's name matches `name` *and* the
+    tool's input matches `pattern`. `name` may itself be a glob. The input is
+    JSON, so the pattern is tried against the serialized form *and* against
+    every string inside it at any depth — `Bash(git*)` matches the command in
+    `{"command":"git status"}`.
+  - anything else — a **string matcher** over the event's input: the tool name
+    for a tool event, the prompt for `UserPromptSubmit`, and so on.
+
+  A condition that does not match is a **skip**, never an error: the hook does
+  not run, and nothing is denied. A `name(...)` whose name is empty degrades to
+  a plain glob rather than to a rule that silently never fires.
+
+- **`once`** — the hook runs at most once per session/process. The registry
+  latches each `once` hook the first time it runs and skips it afterwards.
+- **`statusMessage`** — surfaced while the hook runs: logged at `info` with the
+  hook label and event, and carried on `HookExecutionResult::status_message`
+  so a caller with a status line can display it.
+- **`continueOnBlock`** — when a gating hook (`PreToolUse`,
+  `UserPromptSubmit`) answers `{"action":"stop"}`, the turn continues instead of
+  stopping. It softens a *deliberate* `stop` only: a hook that **failed** still
+  fails closed, because a gate that could not answer must not read as an allow.
+
+The one remaining inert spelling is a **non-string `if`**. A settings file that
+writes, say, `{"if": 42}` still loads — the value is ignored — and the loader
+logs a `warn!` with that reason, since only a string can be interpreted.
 
 ## Fail-closed contract
 
@@ -250,13 +280,27 @@ prints non-JSON will deny the tool rather than silently allowing it.
 `HookEvent` has **22 names**, but a name is not a promise. `HookEvent::is_triggered()`
 is the single source of truth, and a test pins it.
 
-**Fired (10):** `PreToolUse`, `PostToolUse`, `PostToolUseFailure`,
-`UserPromptSubmit`, `PermissionRequest`, `PermissionDenied`, `PreCompact`,
-`PostCompact`, `Stop`, `TurnEnd`.
+**Fired (14):** `PreToolUse`, `PostToolUse`, `PostToolUseFailure`,
+`UserPromptSubmit`, `SessionStart`, `Notification`, `PermissionRequest`,
+`PermissionDenied`, `PreCompact`, `PostCompact`, `Stop`, `TurnEnd`,
+`Elicitation`, `ElicitationResult`.
 
-**Reserved, never fired (12):** `SessionStart`, `Setup`, `SubagentStart`,
-`Notification`, `CwdChanged`, `FileChanged`, `WorktreeCreate`, `SubagentStop`,
-`TaskCompleted`, `TeammateIdle`, `Elicitation`, `ElicitationResult`.
+`SessionStart` fires on the first turn the engine runs (`submit` /
+`submit_streaming`), since a session in this engine has no separate begin call.
+`Notification` fires where the engine raises one — a provider error the user is
+told about. `Elicitation` and `ElicitationResult` bracket an elicitation
+request: the ask, then its outcome (`responded`, `cancelled`, or `timed_out`).
+
+**Reserved, never fired (8):** `Setup`, `SubagentStart`, `SubagentStop`,
+`CwdChanged`, `FileChanged`, `WorktreeCreate`, `TaskCompleted`, `TeammateIdle`.
+
+These eight have no honest source in the engine: `Setup` has no setup phase;
+the agent lifecycle (`SubagentStart`/`SubagentStop`/`TaskCompleted`/
+`TeammateIdle`) belongs to the agent manager, which the turn loop only labels
+with an `agent_id`; a turn does not change directory, so `CwdChanged` has no
+moment; `FileChanged` would need a consumer of `HookResult.watch_paths`, and
+there is none; and worktree creation happens outside the turn loop. They stay
+inert rather than firing from a place that would not mean what the name says.
 
 A hook configured on a reserved event matches nothing and runs never. That is
 indistinguishable from a working hook until someone notices it did not run, so
@@ -479,14 +523,15 @@ tree is writable) and OS filesystem/network confinement for `command`
 subprocesses (with per-hook policy and explicit opt-outs); the
 `stream: true` protocol (events, logs, host-answered requests, best-effort
 cancel, bounded output); dry-run; fail-closed failure classification and the
-deny-on-gate behaviour; inert-event warnings; structured logging.
+deny-on-gate behaviour; the `if`, `once`, `statusMessage`, and
+`continueOnBlock` modifiers (see above); inert-event warnings; structured
+logging.
 
 **Not implemented:** Claude's `onFailure` knob (`continue` / `block`),
-`args`/exec form, `if` filters, `once`, `async`/`asyncRewake`, `statusMessage`,
-`continueOnBlock`, and per-event output schemas — the hook protocol here is the
-minimal one, and the fail-closed policy is fixed rather than configurable. The
-four settings fields among those that a configuration can write are accepted
-and inert, with a load-time warning (see above). The action kinds also have no
+`args`/exec form, `async`/`asyncRewake`, and per-event output schemas — the hook
+protocol here is the minimal one, and the fail-closed policy is fixed rather
+than configurable. A non-string `if` is accepted and inert, with a load-time
+warning naming the reason (see above). The action kinds also have no
 `cwd`/`env`/resource-limit application: those are subprocess knobs, and no
 subprocess runs. `agent` is the same one-shot call as `prompt` with different defaults and
 a verifier framing rather than a multi-turn tool loop.

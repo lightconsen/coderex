@@ -49,6 +49,8 @@ pub enum WireEvent {
     },
     /// A compact boundary marker was inserted.
     CompactBoundary,
+    /// Compaction was requested, ran, or stood down, and why.
+    Compaction(crate::types::CompactionEvent),
     /// A permission request needs user input.
     PermissionRequest {
         /// Unique request identifier.

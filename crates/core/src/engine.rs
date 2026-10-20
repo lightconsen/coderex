@@ -9,7 +9,9 @@
 //! 6. Finalize and emit events
 
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio::time::Instant;
 
@@ -30,7 +32,8 @@ use crate::stop_hook::{self, StopHookContext, StopHookDecision};
 use crate::tool_executor::{NoOpToolExecutor, ToolExecutor};
 use crate::tool_scheduler;
 use crate::types::{
-    ContextWindowResolver, EngineEvent, Message, ModelId, ToolCall, ToolResult, UsageSummary,
+    CompactionEvent, ContextWindowResolver, EngineEvent, Message, ModelId, ToolCall, ToolResult,
+    UsageSummary,
 };
 use std::path::PathBuf;
 
@@ -1147,6 +1150,105 @@ impl CompactOutcome {
     }
 }
 
+/// The wire name for a compaction trigger.
+#[must_use]
+const fn compact_trigger_name(trigger: CompactTrigger) -> &'static str {
+    match trigger {
+        CompactTrigger::TokenThreshold => "token_threshold",
+        CompactTrigger::CacheTtl => "cache_ttl",
+    }
+}
+
+/// Project a [`CompactOutcome`] onto the event stream's [`CompactionEvent`].
+///
+/// The strategies and triggers become strings because the event crosses the
+/// wire protocol; the outcome stays the engine's own typed vocabulary.
+#[must_use]
+fn compaction_event_from_outcome(outcome: &CompactOutcome) -> CompactionEvent {
+    match outcome {
+        CompactOutcome::Compacted {
+            strategy,
+            trigger,
+            tokens_removed,
+            messages_remaining,
+            summary: _,
+        } => CompactionEvent::Compacted {
+            strategy: format!("{strategy:?}"),
+            trigger: compact_trigger_name(*trigger).to_string(),
+            tokens_removed: *tokens_removed,
+            messages_remaining: *messages_remaining,
+        },
+        CompactOutcome::DeferredToThresholdPath { estimated_tokens } => {
+            CompactionEvent::DeferredToThresholdPath {
+                estimated_tokens: *estimated_tokens,
+            }
+        }
+        CompactOutcome::SkippedRecoveryBudget {
+            recovery_count,
+            max,
+        } => CompactionEvent::SkippedRecoveryBudget {
+            recovery_count: *recovery_count,
+            max: *max,
+        },
+        CompactOutcome::CircuitBreakerOpen {
+            consecutive_failures,
+            max,
+        } => CompactionEvent::CircuitBreakerOpen {
+            consecutive_failures: *consecutive_failures,
+            max: *max,
+        },
+        CompactOutcome::StopHookTerminated { reason } => CompactionEvent::StopHookTerminated {
+            reason: reason.clone(),
+        },
+        CompactOutcome::NoProgress {
+            tokens_before,
+            tokens_after,
+            summary: _,
+        } => CompactionEvent::NoProgress {
+            tokens_before: *tokens_before,
+            tokens_after: *tokens_after,
+        },
+    }
+}
+
+/// Whether the idle cache-TTL timer should ask for compaction.
+///
+/// Pure, so the timing rule can be tested without a clock: `true` when there
+/// has been a request, the session has been idle for at least `wake_after`,
+/// and the timer has not already asked for *this* idle window (its last
+/// request predates the last time the timer fired).
+#[must_use]
+fn cache_ttl_timer_should_request(
+    last_request: Option<Instant>,
+    last_fired: Option<Instant>,
+    wake_after: Duration,
+) -> bool {
+    let Some(last) = last_request else {
+        return false;
+    };
+    if last.elapsed() < wake_after {
+        return false;
+    }
+    last_fired.is_none_or(|fired| fired < last)
+}
+
+/// A running cache-TTL compaction timer.
+///
+/// Dropping the handle stops the timer; the session that owns the engine keeps
+/// it alive for as long as the engine should watch its cache.
+#[derive(Debug)]
+pub struct CacheTtlTimer {
+    cancel: Arc<AtomicBool>,
+    handle: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for CacheTtlTimer {
+    fn drop(&mut self) {
+        self.cancel.store(true, Ordering::SeqCst);
+        self.handle.abort();
+    }
+}
+
 /// How many provider-paused turns the loop will resume before it gives up.
 ///
 /// A provider that answers `pause_turn` forever must not spin the loop
@@ -1324,7 +1426,16 @@ pub struct QueryEngine {
     compaction_backend: Option<Arc<dyn crate::compaction_backend::CompactionBackend>>,
     /// When the last provider request started, for the prompt-cache TTL
     /// trigger: every request refreshes the cache, so the clock starts there.
-    last_request_at: Option<Instant>,
+    ///
+    /// Shared with the cache-TTL timer, which needs the same instant to tell
+    /// an idle session from a busy one.
+    last_request_at: Arc<Mutex<Option<Instant>>>,
+    /// Whether the `SessionStart` hook has run. The engine has no explicit
+    /// "the session begins" call, so the session's first turn fires it, once.
+    session_started: bool,
+    /// The background prompt-cache TTL timer, once a session has sent a turn
+    /// and a TTL is configured. Dropping the engine stops it.
+    cache_ttl_timer: Option<CacheTtlTimer>,
     /// Maximum output tokens requested from the provider per request.
     ///
     /// Defaults to [`Self::DEFAULT_MAX_TOKENS`]; a session selected with
@@ -1491,7 +1602,9 @@ impl QueryEngine {
             coordinator: None,
             session_memory: None,
             compaction_backend: None,
-            last_request_at: None,
+            last_request_at: Arc::new(Mutex::new(None)),
+            session_started: false,
+            cache_ttl_timer: None,
             max_tokens: Self::DEFAULT_MAX_TOKENS,
         }
     }
@@ -1556,7 +1669,11 @@ impl QueryEngine {
     }
 
     /// Classify a provider failure the way the turn loop expects.
-    fn turn_error_from_api_error(&self, error: ApiError) -> TurnError {
+    ///
+    /// A retry-exhausted provider failure is the one case that also raises an
+    /// advisory [`EngineEvent::Notification`], so the `Notification` hook fires
+    /// with the same message the UI is shown.
+    async fn turn_error_from_api_error(&self, error: ApiError) -> TurnError {
         match error {
             ApiError::RetryExhausted {
                 attempts,
@@ -1568,6 +1685,14 @@ impl QueryEngine {
                 let _ = self.event_tx.send(EngineEvent::Notification {
                     message: message.clone(),
                 });
+                let mut ctx = std::collections::HashMap::new();
+                ctx.insert("notification".to_string(), message.clone());
+                let result = self
+                    .fire_hook(hook_events::NOTIFICATION, &message, &ctx)
+                    .await;
+                if !result.errors.is_empty() {
+                    tracing::warn!("Notification hook errors: {:?}", result.errors);
+                }
                 TurnError::ApiUnavailable { message }
             }
             // A transport failure that ran out of retries is the same
@@ -1884,6 +2009,17 @@ impl QueryEngine {
             message: message.clone(),
         });
 
+        // The `Elicitation` hook runs with the question, before it is asked.
+        let mut ctx = std::collections::HashMap::new();
+        ctx.insert("elicitation_id".to_string(), request_id.clone());
+        ctx.insert("message".to_string(), message.clone());
+        let hook_result = self
+            .fire_hook(hook_events::ELICITATION, &request_id, &ctx)
+            .await;
+        if !hook_result.errors.is_empty() {
+            tracing::warn!("Elicitation hook errors: {:?}", hook_result.errors);
+        }
+
         // Use the elicitation handler
         let question = crate::elicitation::ElicitationQuestion {
             question: message,
@@ -1902,6 +2038,35 @@ impl QueryEngine {
         };
 
         let result = self.elicitation_handler.request(vec![question]).await;
+
+        // The `ElicitationResult` hook sees what came back, before it is
+        // stored on the turn.
+        let mut ctx = std::collections::HashMap::new();
+        ctx.insert("elicitation_id".to_string(), request_id.clone());
+        ctx.insert(
+            "outcome".to_string(),
+            match &result {
+                ElicitationResult::Responded(_) => "responded",
+                ElicitationResult::Cancelled => "cancelled",
+                ElicitationResult::TimedOut => "timed_out",
+            }
+            .to_string(),
+        );
+        if let ElicitationResult::Responded(resp) = &result {
+            if let Some(answer) = resp
+                .other_text
+                .clone()
+                .or_else(|| resp.selected.first().cloned())
+            {
+                ctx.insert("response".to_string(), answer);
+            }
+        }
+        let hook_result = self
+            .fire_hook(hook_events::ELICITATION_RESULT, &request_id, &ctx)
+            .await;
+        if !hook_result.errors.is_empty() {
+            tracing::warn!("ElicitationResult hook errors: {:?}", hook_result.errors);
+        }
 
         // Store the response
         match &result {
@@ -1965,6 +2130,29 @@ impl QueryEngine {
         self.hooks
             .fire_hook(hook_events::TURN_END, &format!("turn_{turn_number}"), &ctx)
             .await
+    }
+
+    /// Fire `SessionStart`, once, before the session's first turn.
+    ///
+    /// The engine has no explicit "the session begins" call — a session is
+    /// this engine plus the prompts submitted to it — so the first turn is the
+    /// earliest honest point at which a session hook can run. Its partner,
+    /// `SessionEnd`, is emitted by [`interrupt`](Self::interrupt).
+    async fn fire_session_start_hook(&mut self) {
+        if self.session_started {
+            return;
+        }
+        self.session_started = true;
+        let session_id = self.session.session_id.to_string();
+        let mut ctx = std::collections::HashMap::new();
+        ctx.insert("session_id".to_string(), session_id.clone());
+        ctx.insert("cwd".to_string(), self.session.cwd.display().to_string());
+        let result = self
+            .fire_hook(hook_events::SESSION_START, &session_id, &ctx)
+            .await;
+        if !result.errors.is_empty() {
+            tracing::warn!("SessionStart hook errors: {:?}", result.errors);
+        }
     }
 
     /// Set the JSON schema for structured output validation.
@@ -2034,6 +2222,13 @@ impl QueryEngine {
         let mut turn_number = self.current_turn + 1;
         let mut last_reason = TerminalReason::Completed;
         let mut provider_resumes: u32 = 0;
+
+        // A session that sits idle still has a cache to keep warm; the timer
+        // asks for compaction when the TTL is nearly up.
+        self.ensure_cache_ttl_timer();
+        // The session's first turn is where `SessionStart` fires: the engine
+        // has no earlier hook-capable point.
+        self.fire_session_start_hook().await;
 
         // Add user message
         self.session.messages.push(Message::user(prompt.clone()));
@@ -2151,6 +2346,13 @@ impl QueryEngine {
         let mut turn_number = self.current_turn + 1;
         let mut last_reason = TerminalReason::Completed;
         let mut provider_resumes: u32 = 0;
+
+        // A session that sits idle still has a cache to keep warm; the timer
+        // asks for compaction when the TTL is nearly up.
+        self.ensure_cache_ttl_timer();
+        // The session's first turn is where `SessionStart` fires: the engine
+        // has no earlier hook-capable point.
+        self.fire_session_start_hook().await;
 
         // Add user message
         self.session.messages.push(Message::user(prompt.clone()));
@@ -3111,8 +3313,27 @@ impl QueryEngine {
     /// Returns a named [`CompactOutcome`] for every path, including the ones
     /// that do nothing: "why compaction did not happen" is a question a caller
     /// and a test both need answered, and a log line answers it for neither.
-    #[allow(clippy::unused_async)]
+    /// Run compact recovery and report its outcome on the event stream.
+    ///
+    /// Every path through the recovery — including the ones that do nothing —
+    /// emits a [`CompactionEvent`], so a caller can observe why compaction did
+    /// or did not happen.
     async fn run_compact_recovery(
+        &self,
+        turn: &mut TurnRuntime,
+        options: &SubmitOptions,
+        turn_number: u32,
+        trigger: CompactTrigger,
+    ) -> CompactOutcome {
+        let outcome = self
+            .run_compact_recovery_inner(turn, options, turn_number, trigger)
+            .await;
+        self.emit_compaction(compaction_event_from_outcome(&outcome));
+        outcome
+    }
+
+    #[allow(clippy::unused_async)]
+    async fn run_compact_recovery_inner(
         &self,
         turn: &mut TurnRuntime,
         _options: &SubmitOptions,
@@ -3455,7 +3676,7 @@ impl QueryEngine {
 
     /// Whether the prompt cache has gone cold since the last request.
     fn cache_ttl_elapsed(&self) -> bool {
-        let Some(last) = self.last_request_at else {
+        let Some(last) = self.last_request_at() else {
             return false;
         };
         compact::should_compact_on_cache_ttl(
@@ -3465,20 +3686,104 @@ impl QueryEngine {
         )
     }
 
-    /// Compact proactively when the prompt cache has gone cold.
+    /// Note that a provider request has just started: the prompt cache is
+    /// fresh from this instant.
+    fn note_request_started(&self) {
+        *self
+            .last_request_at
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Instant::now());
+    }
+
+    /// The instant of the last provider request, if there has been one.
+    fn last_request_at(&self) -> Option<Instant> {
+        *self
+            .last_request_at
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Set the last-request instant directly (tests only).
+    #[cfg(test)]
+    fn set_last_request_at(&self, at: Instant) {
+        *self
+            .last_request_at
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(at);
+    }
+
+    /// Report a compaction lifecycle event to the event stream.
+    fn emit_compaction(&self, event: CompactionEvent) {
+        let _ = self.event_tx.send(EngineEvent::Compaction(event));
+    }
+
+    /// Start the idle cache-TTL timer on the session's first turn.
     ///
-    /// Every request refreshes the cache, so a session that sat idle past the
-    /// TTL pays a cache miss on its next request whatever happens — which is
-    /// the cheapest moment to rewrite the context. This runs *before* the
-    /// request, and only while the context is below the token line: at or
-    /// above it the threshold path owns compaction, and running both would
-    /// compact twice for one reason.
+    /// Started lazily rather than in [`new`](Self::new) because spawning needs
+    /// a tokio runtime, and an engine may be constructed outside one.
+    fn ensure_cache_ttl_timer(&mut self) {
+        if self.cache_ttl_timer.is_none() {
+            self.cache_ttl_timer = self.spawn_cache_ttl_timer();
+        }
+    }
+
+    /// Start the background prompt-cache TTL timer, or `None` when no cache
+    /// TTL is configured.
     ///
-    /// The reference implementation schedules this on a timer. The engine has
-    /// no background task, so the check happens at the turn boundary: a
-    /// session that never sends another request never compacts. That is the
-    /// honest limit of doing this inside the turn loop.
+    /// The reference schedules the cache-TTL trigger on a timer, so a session
+    /// that sits idle still compacts before its next request. The engine's
+    /// turn loop already checks the same condition at the turn boundary, but a
+    /// session that never sends another request never reaches that check —
+    /// this is the path that reaches it anyway.
     ///
+    /// The engine starts it on the session's first turn (see
+    /// [`ensure_cache_ttl_timer`](Self::ensure_cache_ttl_timer)), so a session
+    /// that runs one turn and then sits idle is covered.
+    ///
+    /// The timer cannot compact by itself: compaction rewrites the live
+    /// conversation and needs `&mut self`. What it can do is *request* it, by
+    /// emitting [`CompactionEvent::Requested`] on the event stream, which the
+    /// session that owns the engine observes. It fires once per idle window —
+    /// after a request refreshes the cache, it arms again.
+    ///
+    /// With `cache_ttl_secs` at zero there is no cache to keep warm and no
+    /// timer is started.
+    #[must_use]
+    pub fn spawn_cache_ttl_timer(&self) -> Option<CacheTtlTimer> {
+        let ttl = Duration::from_secs(self.compact_config.cache_ttl_secs);
+        if ttl.is_zero() {
+            return None;
+        }
+        let early_exit = Duration::from_secs(self.compact_config.cache_ttl_early_exit_secs);
+        let wake_after = compact::cache_ttl_wake_after(ttl, early_exit);
+
+        let last_request = Arc::clone(&self.last_request_at);
+        let events = self.event_tx.clone();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let cancel_task = Arc::clone(&cancel);
+        let handle = tokio::spawn(async move {
+            let mut last_fired: Option<Instant> = None;
+            loop {
+                tokio::time::sleep(wake_after).await;
+                if cancel_task.load(Ordering::SeqCst) {
+                    break;
+                }
+                let last = last_request
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .to_owned();
+                if !cache_ttl_timer_should_request(last, last_fired, wake_after) {
+                    continue;
+                }
+                last_fired = Some(Instant::now());
+                let _ = events.send(EngineEvent::Compaction(CompactionEvent::Requested {
+                    trigger: compact_trigger_name(CompactTrigger::CacheTtl).to_string(),
+                }));
+            }
+        });
+        Some(CacheTtlTimer { cancel, handle })
+    }
+
     /// Compact before a request when the estimated context has crossed a line.
     ///
     /// `CompactThresholds` answers "how full is the window"; until this call
@@ -3549,6 +3854,20 @@ impl QueryEngine {
         None
     }
 
+    /// Compact proactively when the prompt cache has gone cold.
+    ///
+    /// Every request refreshes the cache, so a session that sat idle past the
+    /// TTL pays a cache miss on its next request whatever happens — which is
+    /// the cheapest moment to rewrite the context. This runs *before* the
+    /// request, and only while the context is below the token line: at or
+    /// above it the threshold path owns compaction, and running both would
+    /// compact twice for one reason.
+    ///
+    /// The reference implementation schedules this on a timer, as does
+    /// [`spawn_cache_ttl_timer`](Self::spawn_cache_ttl_timer); this is the
+    /// turn-boundary check that catches the case where the timer is not
+    /// running, and it is what actually compacts when the next turn arrives.
+    ///
     /// On the compacting path the turn is left in `CompactRecovery` — the
     /// caller's next move to `StartRequest` is the one the graph already
     /// allows from there.
@@ -3568,14 +3887,18 @@ impl QueryEngine {
             thresholds.level(estimated_tokens),
             compact::ContextLevel::Compact | compact::ContextLevel::Blocked
         ) {
-            return Some(CompactOutcome::DeferredToThresholdPath { estimated_tokens });
+            let outcome = CompactOutcome::DeferredToThresholdPath { estimated_tokens };
+            self.emit_compaction(compaction_event_from_outcome(&outcome));
+            return Some(outcome);
         }
 
         if turn.recovery_count >= self.compact_config.max_recovery_retries {
-            return Some(CompactOutcome::SkippedRecoveryBudget {
+            let outcome = CompactOutcome::SkippedRecoveryBudget {
                 recovery_count: turn.recovery_count,
                 max: self.compact_config.max_recovery_retries,
-            });
+            };
+            self.emit_compaction(compaction_event_from_outcome(&outcome));
+            return Some(outcome);
         }
 
         turn.transition_to(TurnState::CompactRecovery);
@@ -3656,7 +3979,7 @@ impl QueryEngine {
             .with_request_context(self.build_request_context(self.current_turn, options));
         // Mark the request time: a successful response refreshes the provider's
         // prompt cache, and the TTL trigger measures idleness from here.
-        self.last_request_at = Some(Instant::now());
+        self.note_request_started();
         let response = match request_client
             .create_message(&system, &messages, &self.model, self.max_tokens, &tools)
             .await
@@ -3664,7 +3987,7 @@ impl QueryEngine {
             Ok(resp) => resp,
             Err(error) => {
                 let Some(fallback) = self.fallback_for_api_error(&error) else {
-                    return Err(self.turn_error_from_api_error(error));
+                    return Err(self.turn_error_from_api_error(error).await);
                 };
                 // One retry of the same request. Switching the engine's model
                 // means this turn and every later request stay on the fallback.
@@ -3674,7 +3997,7 @@ impl QueryEngine {
                     .await
                 {
                     Ok(resp) => resp,
-                    Err(error) => return Err(self.turn_error_from_api_error(error)),
+                    Err(error) => return Err(self.turn_error_from_api_error(error).await),
                 }
             }
         };
@@ -3739,7 +4062,7 @@ impl QueryEngine {
             let mut stream = request_client
                 .create_message_streaming(&system, &messages, &self.model, self.max_tokens, &tools)
                 .await;
-            self.last_request_at = Some(Instant::now());
+            self.note_request_started();
 
             // Per-attempt state. Text is merged into `stream_text` as it
             // arrives; tool calls are the attempt's own — a retry re-asks the
@@ -5399,6 +5722,23 @@ mod tests {
             "an unavailable provider came back as {reason:?}"
         );
         assert_closing_hooks_ran(&recorded, "api_unavailable");
+
+        // The user is told the provider is unavailable, and the Notification
+        // hook runs with the message that was shown.
+        let events = recorded
+            .lock()
+            .expect("the recording hook lock is not poisoned");
+        let notification = events
+            .iter()
+            .find(|(name, _)| name == hook_events::NOTIFICATION)
+            .unwrap_or_else(|| panic!("the Notification hook did not fire: {events:?}"));
+        assert!(
+            notification
+                .1
+                .get("notification")
+                .is_some_and(|message| message.contains("temporarily unavailable")),
+            "the Notification hook saw the wrong message: {notification:?}"
+        );
     }
 
     /// And a failure that is ours is not dressed up as a provider outage.
@@ -6202,7 +6542,7 @@ mod tests {
     /// neither happened.
     #[tokio::test]
     async fn a_finished_turn_runs_the_stop_hooks() {
-        let (mut engine, _rx, _session) = make_test_engine();
+        let (engine, _rx, _session) = make_test_engine();
         let budget = TokenBudget::with_defaults();
         let mut turn = TurnRuntime::new(budget);
 
@@ -7150,6 +7490,77 @@ mod tests {
         assert!(matches!(result, ElicitationResult::Cancelled));
         // Turn state should be AwaitElicitation
         assert_eq!(turn.state, TurnState::AwaitElicitation);
+    }
+
+    /// An elicitation is bracketed by its two hooks: the ask, then the outcome
+    /// that came back.
+    #[tokio::test]
+    async fn elicitation_hooks_bracket_the_request() {
+        let (mut engine, _rx, _session) = make_test_engine();
+        let (hooks, recorded) = RecordingHooks::new();
+        engine.set_hooks(Box::new(hooks));
+        let mut turn = TurnRuntime::new(TokenBudget::with_defaults());
+
+        engine
+            .handle_elicitation(&mut turn, "elic_1".into(), "Which approach?".into())
+            .await;
+
+        let events = recorded
+            .lock()
+            .expect("the recording hook lock is not poisoned");
+        let ask = events
+            .iter()
+            .find(|(name, _)| name == hook_events::ELICITATION)
+            .unwrap_or_else(|| panic!("the Elicitation hook did not fire: {events:?}"));
+        assert_eq!(
+            ask.1.get("elicitation_id").map(String::as_str),
+            Some("elic_1")
+        );
+        assert_eq!(
+            ask.1.get("message").map(String::as_str),
+            Some("Which approach?")
+        );
+
+        let outcome = events
+            .iter()
+            .find(|(name, _)| name == hook_events::ELICITATION_RESULT)
+            .unwrap_or_else(|| panic!("the ElicitationResult hook did not fire: {events:?}"));
+        assert_eq!(
+            outcome.1.get("elicitation_id").map(String::as_str),
+            Some("elic_1")
+        );
+        assert_eq!(
+            outcome.1.get("outcome").map(String::as_str),
+            Some("cancelled")
+        );
+    }
+
+    /// A session runs its `SessionStart` hook once, on its first turn, with the
+    /// session it is starting.
+    #[tokio::test]
+    async fn session_start_fires_once_with_the_session_it_starts() {
+        let (mut engine, recorded) = engine_with_recording_hooks(Box::new(MockApiClient));
+        let session_id = engine.session.session_id.to_string();
+
+        engine.fire_session_start_hook().await;
+        engine.fire_session_start_hook().await;
+
+        let events = recorded
+            .lock()
+            .expect("the recording hook lock is not poisoned");
+        let starts: Vec<_> = events
+            .iter()
+            .filter(|(name, _)| name == hook_events::SESSION_START)
+            .collect();
+        assert_eq!(starts.len(), 1, "SessionStart must fire once: {events:?}");
+        assert_eq!(
+            starts[0].1.get("session_id").map(String::as_str),
+            Some(session_id.as_str())
+        );
+        assert!(
+            starts[0].1.contains_key("cwd"),
+            "SessionStart should see the working directory: {starts:?}"
+        );
     }
 
     #[test]
@@ -8233,7 +8644,7 @@ mod tests {
     /// nothing has gone wrong, and the pass is skipped without a model call.
     #[tokio::test]
     async fn a_warm_cache_is_not_a_reason_to_compact() {
-        let (mut engine, _rx, _session) = make_test_engine();
+        let (engine, _rx, _session) = make_test_engine();
         let mut turn = TurnRuntime::new(TokenBudget::with_defaults());
         turn.messages = vec![Message::user("hello")];
 
@@ -8246,7 +8657,7 @@ mod tests {
         );
 
         // A request a moment ago leaves the cache warm.
-        engine.last_request_at = Some(Instant::now());
+        engine.set_last_request_at(Instant::now());
         assert!(
             engine
                 .maybe_compact_on_cache_ttl(&mut turn, &SubmitOptions::default(), 1)
@@ -8259,7 +8670,7 @@ mod tests {
     /// the TTL pass stands down rather than compacting twice for one reason.
     #[tokio::test]
     async fn the_cache_ttl_pass_stands_down_at_the_token_line() {
-        let (mut engine, _rx, _session) = make_test_engine();
+        let (engine, _rx, _session) = make_test_engine();
         let mut turn = TurnRuntime::new(TokenBudget::with_defaults());
 
         // A context past the compaction line for this model.
@@ -8271,7 +8682,7 @@ mod tests {
         );
 
         // The cache went cold while the session sat idle.
-        engine.last_request_at = Some(
+        engine.set_last_request_at(
             Instant::now()
                 - std::time::Duration::from_secs(engine.compact_config.cache_ttl_secs + 1),
         );
@@ -8292,12 +8703,12 @@ mod tests {
     /// nobody's recovery budget — tidying up must not starve a real recovery.
     #[tokio::test]
     async fn a_cold_cache_below_the_token_line_compacts_without_spending_a_retry() {
-        let (mut engine, _rx, _session) = make_test_engine();
+        let (engine, _rx, _session) = make_test_engine();
         let mut turn = TurnRuntime::new(TokenBudget::with_defaults());
         turn.messages = vec![Message::user("hello")];
         turn.recovery_count = 0;
 
-        engine.last_request_at = Some(
+        engine.set_last_request_at(
             Instant::now()
                 - std::time::Duration::from_secs(engine.compact_config.cache_ttl_secs + 1),
         );
@@ -8324,7 +8735,7 @@ mod tests {
         QueryEngine::write_transcript_replacement(&transcript, &[Message::user("earlier history")])
             .unwrap();
 
-        engine.last_request_at = Some(
+        engine.set_last_request_at(
             Instant::now()
                 - std::time::Duration::from_secs(engine.compact_config.cache_ttl_secs + 1),
         );
@@ -8344,5 +8755,169 @@ mod tests {
             .filter(|p| p.to_string_lossy().contains(".backup."))
             .collect();
         assert_eq!(backups.len(), 1, "the cold cache should have compacted");
+    }
+
+    /// The idle timer's rule, without a clock: nothing before a request has
+    /// been sent, nothing while the cache is warm, and nothing twice for the
+    /// same idle window.
+    #[test]
+    fn the_cache_ttl_timer_rule_fires_once_per_idle_window() {
+        let wake_after = Duration::from_secs(270);
+        let now = Instant::now();
+        let cold = now - Duration::from_secs(300);
+
+        assert!(
+            !cache_ttl_timer_should_request(None, None, wake_after),
+            "no request has been sent, so there is no cache to keep warm"
+        );
+        assert!(
+            !cache_ttl_timer_should_request(Some(now), None, wake_after),
+            "a request a moment ago leaves the cache warm"
+        );
+        assert!(
+            cache_ttl_timer_should_request(Some(cold), None, wake_after),
+            "a request past the TTL has left a cold cache behind it"
+        );
+        assert!(
+            cache_ttl_timer_should_request(
+                Some(cold),
+                Some(now - Duration::from_secs(400)),
+                wake_after
+            ),
+            "the request came after the last fire, so this is a new idle window"
+        );
+        assert!(
+            !cache_ttl_timer_should_request(
+                Some(cold),
+                Some(now - Duration::from_secs(200)),
+                wake_after
+            ),
+            "the timer already asked for this idle window"
+        );
+    }
+
+    /// With no cache TTL configured there is no cache to keep warm, so no
+    /// timer is started; with one, the timer starts.
+    #[tokio::test]
+    async fn no_cache_ttl_means_no_timer() {
+        let (mut engine, _rx, _session) = make_test_engine();
+        engine.compact_config.cache_ttl_secs = 0;
+        assert!(engine.spawn_cache_ttl_timer().is_none());
+
+        engine.compact_config.cache_ttl_secs = 1;
+        assert!(
+            engine.spawn_cache_ttl_timer().is_some(),
+            "a configured TTL should arm the timer"
+        );
+    }
+
+    /// The session's first turn starts the idle timer, so a session that goes
+    /// quiet is still watched.
+    #[tokio::test]
+    async fn the_first_turn_starts_the_idle_timer() {
+        let (mut engine, _rx, _session) = make_test_engine();
+        assert!(engine.cache_ttl_timer.is_none());
+
+        engine
+            .submit("hello".into(), SubmitOptions::default())
+            .await
+            .expect("the mock provider answers");
+
+        assert!(
+            engine.cache_ttl_timer.is_some(),
+            "the session should be watched for idleness after its first turn"
+        );
+    }
+
+    /// A session that sits idle past the cache TTL asks for compaction on its
+    /// own — no next request is needed to reach the turn-boundary check.
+    #[tokio::test]
+    async fn an_idle_session_requests_compaction_when_its_cache_goes_cold() {
+        let (mut engine, mut rx, _session) = make_test_engine();
+        // The shortest honest window: a 1s TTL wakes at 90% of it.
+        engine.compact_config.cache_ttl_secs = 1;
+        engine.set_last_request_at(Instant::now());
+
+        let _timer = engine.spawn_cache_ttl_timer().expect("a TTL is configured");
+
+        let event = tokio::time::timeout(Duration::from_secs(10), rx.recv())
+            .await
+            .expect("the idle timer should ask for compaction")
+            .expect("the event channel is open");
+
+        assert!(
+            matches!(
+                event,
+                EngineEvent::Compaction(CompactionEvent::Requested { ref trigger })
+                    if trigger == "cache_ttl"
+            ),
+            "got {event:?}"
+        );
+    }
+
+    /// The outcome of a compaction pass reaches the event stream, so a caller
+    /// can see that compaction ran and what it did.
+    #[tokio::test]
+    async fn a_compaction_outcome_reaches_the_event_stream() {
+        let (engine, mut rx, _session) = make_test_engine();
+        let mut turn = TurnRuntime::new(TokenBudget::with_defaults());
+        turn.messages = vec![Message::user("hello")];
+
+        engine.set_last_request_at(
+            Instant::now() - Duration::from_secs(engine.compact_config.cache_ttl_secs + 1),
+        );
+        let outcome = engine
+            .maybe_compact_on_cache_ttl(&mut turn, &SubmitOptions::default(), 1)
+            .await
+            .expect("a cold cache is acted on");
+
+        let expected = compaction_event_from_outcome(&outcome);
+        let mut seen = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            seen.push(event);
+        }
+        assert!(
+            seen.iter().any(
+                |event| matches!(event, EngineEvent::Compaction(reported) if *reported == expected)
+            ),
+            "the outcome {expected:?} should be on the stream, got {seen:?}"
+        );
+    }
+
+    /// The pass standing down is also reported: a caller that sees nothing
+    /// cannot tell "not needed" from "not reached".
+    #[tokio::test]
+    async fn a_compaction_pass_that_stands_down_is_reported() {
+        let (engine, mut rx, _session) = make_test_engine();
+        let mut turn = TurnRuntime::new(TokenBudget::with_defaults());
+
+        let auto = compact::CompactThresholds::resolve(&engine.model, &engine.compact_config).auto;
+        turn.messages = vec![Message::user("x".repeat(auto * 4 + 4_000))];
+        engine.set_last_request_at(
+            Instant::now() - Duration::from_secs(engine.compact_config.cache_ttl_secs + 1),
+        );
+
+        let outcome = engine
+            .maybe_compact_on_cache_ttl(&mut turn, &SubmitOptions::default(), 1)
+            .await;
+        assert!(
+            matches!(
+                outcome,
+                Some(CompactOutcome::DeferredToThresholdPath { .. })
+            ),
+            "{outcome:?}"
+        );
+
+        let mut seen = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            seen.push(event);
+        }
+        assert!(
+            seen.iter().any(|event| matches!(
+                event,
+                EngineEvent::Compaction(CompactionEvent::DeferredToThresholdPath { .. })
+            )),
+            "standing down should be on the stream, got {seen:?}"
+        );
     }
 }

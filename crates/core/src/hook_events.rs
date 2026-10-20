@@ -19,6 +19,14 @@ pub const POST_TOOL_USE: &str = "PostToolUse";
 pub const POST_TOOL_USE_FAILURE: &str = "PostToolUseFailure";
 /// Before a user prompt is submitted.
 pub const USER_PROMPT_SUBMIT: &str = "UserPromptSubmit";
+/// Once, before the session's first turn.
+pub const SESSION_START: &str = "SessionStart";
+/// When the engine emits an advisory notification.
+pub const NOTIFICATION: &str = "Notification";
+/// When the engine asks the person a question mid-turn.
+pub const ELICITATION: &str = "Elicitation";
+/// When the answer to an elicitation arrives.
+pub const ELICITATION_RESULT: &str = "ElicitationResult";
 /// Before context compaction.
 pub const PRE_COMPACT: &str = "PreCompact";
 /// After context compaction.
@@ -44,6 +52,10 @@ mod tests {
         assert_eq!(POST_TOOL_USE, "PostToolUse");
         assert_eq!(POST_TOOL_USE_FAILURE, "PostToolUseFailure");
         assert_eq!(USER_PROMPT_SUBMIT, "UserPromptSubmit");
+        assert_eq!(SESSION_START, "SessionStart");
+        assert_eq!(NOTIFICATION, "Notification");
+        assert_eq!(ELICITATION, "Elicitation");
+        assert_eq!(ELICITATION_RESULT, "ElicitationResult");
         assert_eq!(PRE_COMPACT, "PreCompact");
         assert_eq!(POST_COMPACT, "PostCompact");
         assert_eq!(TURN_END, "TurnEnd");
@@ -59,6 +71,10 @@ mod tests {
             POST_TOOL_USE,
             POST_TOOL_USE_FAILURE,
             USER_PROMPT_SUBMIT,
+            SESSION_START,
+            NOTIFICATION,
+            ELICITATION,
+            ELICITATION_RESULT,
             PRE_COMPACT,
             POST_COMPACT,
             TURN_END,

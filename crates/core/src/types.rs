@@ -772,6 +772,12 @@ pub enum EngineEvent {
     },
     /// A compact boundary marker was inserted.
     CompactBoundary,
+    /// Compaction was requested, ran, or stood down, and why.
+    ///
+    /// [`CompactBoundary`](Self::CompactBoundary) says a marker was written;
+    /// this says *why* compaction happened or did not, which a caller cannot
+    /// read off a boundary and a test cannot read off a log line.
+    Compaction(CompactionEvent),
     /// A permission request needs user input.
     PermissionRequest {
         /// Unique request identifier.
@@ -827,6 +833,67 @@ pub enum EngineEvent {
         partial_len: usize,
         /// Whether the engine will automatically re-request.
         will_retry: bool,
+    },
+}
+
+/// A compaction lifecycle event, carried by [`EngineEvent::Compaction`].
+///
+/// This is the wire-shaped mirror of the engine's `CompactOutcome`, plus the
+/// timer's *request*: the strategies and triggers are named as strings so the
+/// frame survives a round trip through the wire protocol.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum CompactionEvent {
+    /// The idle cache-TTL timer asked the session to compact.
+    ///
+    /// This is a request, not an outcome: the timer cannot compact an idle
+    /// session by itself, so it says why compaction would be worth running.
+    Requested {
+        /// What asked for it (`cache_ttl`).
+        trigger: String,
+    },
+    /// Compaction ran and removed tokens.
+    Compacted {
+        /// Which strategy ran.
+        strategy: String,
+        /// What triggered it.
+        trigger: String,
+        /// Estimated tokens removed.
+        tokens_removed: usize,
+        /// Messages left after compaction.
+        messages_remaining: usize,
+    },
+    /// The check ran but this trigger stood down: the other path owns it.
+    DeferredToThresholdPath {
+        /// Estimated tokens at the time.
+        estimated_tokens: usize,
+    },
+    /// The recovery retry budget is spent.
+    SkippedRecoveryBudget {
+        /// Recovery attempts already made.
+        recovery_count: u32,
+        /// The limit.
+        max: u32,
+    },
+    /// Auto-compaction is paused after consecutive failures.
+    CircuitBreakerOpen {
+        /// Consecutive failures so far.
+        consecutive_failures: u32,
+        /// The limit.
+        max: u32,
+    },
+    /// The Stop hook ended the turn instead of compacting.
+    StopHookTerminated {
+        /// The hook's reason.
+        reason: String,
+    },
+    /// Compaction ran but removed nothing.
+    NoProgress {
+        /// Tokens before.
+        tokens_before: usize,
+        /// Tokens after.
+        tokens_after: usize,
     },
 }
 
