@@ -1704,6 +1704,40 @@ mod seccomp_arch {
         libc::SYS_prlimit64,
         libc::SYS_getrandom,
         libc::SYS_execveat,
+        libc::SYS_openat2,
+        // Time, stat and file-metadata calls used by ordinary tools: `touch`
+        // creates the file with `openat` and then fails to set its times
+        // without `utimensat`, which is how a shell hook ended up exiting 1
+        // after doing its work.
+        libc::SYS_utimensat,
+        libc::SYS_statx,
+        libc::SYS_renameat2,
+        libc::SYS_linkat,
+        libc::SYS_symlinkat,
+        libc::SYS_truncate,
+        libc::SYS_ftruncate,
+        libc::SYS_fsync,
+        libc::SYS_fdatasync,
+        libc::SYS_fallocate,
+        libc::SYS_copy_file_range,
+        libc::SYS_sendfile,
+        libc::SYS_splice,
+        libc::SYS_clock_gettime,
+        libc::SYS_clock_nanosleep,
+        libc::SYS_ppoll,
+        libc::SYS_epoll_create1,
+        libc::SYS_epoll_ctl,
+        libc::SYS_epoll_pwait,
+        libc::SYS_eventfd2,
+        libc::SYS_pipe2,
+        libc::SYS_dup3,
+        libc::SYS_madvise,
+        libc::SYS_sigaltstack,
+        libc::SYS_restart_syscall,
+        libc::SYS_sched_getaffinity,
+        libc::SYS_gettid,
+        libc::SYS_tgkill,
+        libc::SYS_rseq,
     ];
 
     /// Network syscalls, allowed only when the config permits network access.
@@ -1793,6 +1827,37 @@ mod seccomp_arch {
         libc::SYS_prlimit64,
         libc::SYS_getrandom,
         libc::SYS_execveat,
+        libc::SYS_openat2,
+        // Time, stat and file-metadata calls used by ordinary tools: `touch`
+        // creates the file with `openat` and then fails to set its times
+        // without `utimensat`, which is how a shell hook ended up exiting 1
+        // after doing its work.
+        libc::SYS_utimensat,
+        libc::SYS_statx,
+        libc::SYS_renameat2,
+        libc::SYS_linkat,
+        libc::SYS_symlinkat,
+        libc::SYS_truncate,
+        libc::SYS_ftruncate,
+        libc::SYS_fsync,
+        libc::SYS_fdatasync,
+        libc::SYS_fallocate,
+        libc::SYS_copy_file_range,
+        libc::SYS_sendfile,
+        libc::SYS_splice,
+        libc::SYS_clock_gettime,
+        libc::SYS_clock_nanosleep,
+        libc::SYS_ppoll,
+        libc::SYS_epoll_create1,
+        libc::SYS_epoll_ctl,
+        libc::SYS_epoll_pwait,
+        libc::SYS_madvise,
+        libc::SYS_sigaltstack,
+        libc::SYS_restart_syscall,
+        libc::SYS_sched_getaffinity,
+        libc::SYS_gettid,
+        libc::SYS_tgkill,
+        libc::SYS_rseq,
     ];
 
     /// Network syscalls, allowed only when the config permits network access.
@@ -4386,6 +4451,35 @@ mod seccomp_arch_tests {
         assert_eq!(seccomp_arch::AUDIT_ARCH, 0xC000_003E);
         #[cfg(target_arch = "aarch64")]
         assert_eq!(seccomp_arch::AUDIT_ARCH, 0xC000_00B7);
+    }
+
+    /// `touch` creates its file and then needs `utimensat`; without it the
+    /// command exits non-zero after the side effect, which a hook gate then
+    /// reads as a failed hook.
+    #[test]
+    fn the_allowlist_permits_file_metadata_updates() {
+        for name in [
+            "utimensat",
+            "statx",
+            "renameat2",
+            "ftruncate",
+            "clock_gettime",
+            "ppoll",
+        ] {
+            let nr = match name {
+                "utimensat" => libc::SYS_utimensat,
+                "statx" => libc::SYS_statx,
+                "renameat2" => libc::SYS_renameat2,
+                "ftruncate" => libc::SYS_ftruncate,
+                "clock_gettime" => libc::SYS_clock_gettime,
+                "ppoll" => libc::SYS_ppoll,
+                _ => unreachable!(),
+            };
+            assert!(
+                seccomp_arch::ALLOWED.contains(&nr),
+                "{name} must be allowed or ordinary tools fail with EPERM"
+            );
+        }
     }
 
     #[test]
