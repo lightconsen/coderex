@@ -305,7 +305,7 @@ impl Bridge {
             archive_writer,
             cleanup_manager: BridgeCleanupManager::new(
                 config.worktree_base.clone(),
-                config.session_base.clone(),
+                config.session_base,
             ),
             sessions: std::collections::HashMap::new(),
             event_tx,
@@ -362,7 +362,7 @@ impl Bridge {
 
     /// Check if the bridge is currently running.
     #[must_use]
-    pub fn is_running(&self) -> bool {
+    pub const fn is_running(&self) -> bool {
         self.running
     }
 
@@ -568,19 +568,19 @@ impl Bridge {
     /// Returns the frame to send back, if the message expects one.
     pub fn handle_transport_message(
         &mut self,
-        message: TransportMessage,
+        message: &TransportMessage,
     ) -> Option<TransportMessage> {
         match message.r#type.as_str() {
             RELAY_CALL_TYPE => {
                 let body: RelayCallBody = match serde_json::from_str(&message.payload) {
                     Ok(body) => body,
                     Err(e) => {
-                        return Some(transport_error(&message, &format!("relay_call body: {e}")));
+                        return Some(transport_error(message, &format!("relay_call body: {e}")));
                     }
                 };
                 let decision = self.handle_relay_call(body, message.metadata.clone());
                 Some(transport_reply(
-                    &message,
+                    message,
                     RELAY_RESULT_TYPE,
                     serde_json::to_string(&decision).unwrap_or_default(),
                 ))
@@ -597,7 +597,7 @@ impl Bridge {
                     .and_then(|e| e.parse::<u64>().ok())
                 else {
                     return Some(transport_error(
-                        &message,
+                        message,
                         "session_write is missing its worker_epoch",
                     ));
                 };
@@ -605,7 +605,7 @@ impl Bridge {
                     Ok(write) => write,
                     Err(e) => {
                         return Some(transport_error(
-                            &message,
+                            message,
                             &format!("session_write body: {e}"),
                         ));
                     }
@@ -624,7 +624,7 @@ impl Bridge {
                     }),
                 };
                 Some(transport_reply(
-                    &message,
+                    message,
                     SESSION_WRITE_RESULT_TYPE,
                     payload.to_string(),
                 ))
@@ -637,7 +637,7 @@ impl Bridge {
                     Ok(response) => response,
                     Err(e) => {
                         return Some(transport_error(
-                            &message,
+                            message,
                             &format!("permission_response body: {e}"),
                         ));
                     }
@@ -645,7 +645,7 @@ impl Bridge {
                 let (request_id, response) = response.into_response();
                 let resolved = self.respond_to_permission(&request_id, response);
                 Some(transport_reply(
-                    &message,
+                    message,
                     PERMISSION_RESULT_TYPE,
                     serde_json::json!({
                         "request_id": request_id,
@@ -655,15 +655,19 @@ impl Bridge {
                 ))
             }
             "heartbeat" => {
-                if let Some(heartbeat) = self.heartbeat_loop.as_ref().map(|h| h.heartbeat()) {
+                if let Some(heartbeat) = self
+                    .heartbeat_loop
+                    .as_ref()
+                    .map(super::heartbeat::HeartbeatLoop::heartbeat)
+                {
                     if let Ok(mut beat) = heartbeat.lock() {
                         beat.record_success();
                     }
                 }
-                Some(transport_reply(&message, "heartbeat_ack", "{}".into()))
+                Some(transport_reply(message, "heartbeat_ack", "{}".into()))
             }
             other => Some(transport_error(
-                &message,
+                message,
                 &format!("unknown message type: {other}"),
             )),
         }
@@ -722,7 +726,7 @@ impl Bridge {
                 continue;
             }
 
-            if let Some(reply) = self.handle_transport_message(message) {
+            if let Some(reply) = self.handle_transport_message(&message) {
                 let transport = self.transport.as_mut().ok_or("no transport configured")?;
                 if transport.send(reply).await.is_err() {
                     break;
@@ -749,26 +753,25 @@ impl Bridge {
             // cancelled whenever the launcher's select takes another branch,
             // and restarting the backoff from zero would let a steady tick or
             // output stream postpone reconnection indefinitely.
-            let deadline = match self.reconnect_deadline {
-                Some(deadline) => deadline,
-                None => {
-                    let Some(delay) = self.reconnector.next_delay() else {
-                        self.reconnect_pending = false;
-                        return Err(format!(
-                            "transport reconnect exhausted after {} attempts: {}",
-                            self.reconnector.attempt_count(),
-                            self.reconnect_last_error,
-                        ));
-                    };
+            let deadline = if let Some(deadline) = self.reconnect_deadline {
+                deadline
+            } else {
+                let Some(delay) = self.reconnector.next_delay() else {
+                    self.reconnect_pending = false;
+                    return Err(format!(
+                        "transport reconnect exhausted after {} attempts: {}",
+                        self.reconnector.attempt_count(),
+                        self.reconnect_last_error,
+                    ));
+                };
 
-                    self.emit(BridgeEvent::TransportReconnecting {
-                        attempt: self.reconnector.attempt_count(),
-                    });
+                self.emit(BridgeEvent::TransportReconnecting {
+                    attempt: self.reconnector.attempt_count(),
+                });
 
-                    let deadline = tokio::time::Instant::now() + delay;
-                    self.reconnect_deadline = Some(deadline);
-                    deadline
-                }
+                let deadline = tokio::time::Instant::now() + delay;
+                self.reconnect_deadline = Some(deadline);
+                deadline
             };
 
             let stop_notify = Arc::clone(&self.stop_notify);
@@ -806,13 +809,13 @@ impl Bridge {
     /// Get the heartbeat status.
     #[must_use]
     pub fn heartbeat_status(&self) -> HeartbeatStatus {
-        if let Some(ref hb) = self.heartbeat_loop {
-            let state = hb.heartbeat();
-            let guard = state.lock().unwrap();
-            guard.status()
-        } else {
-            HeartbeatStatus::Lost
-        }
+        self.heartbeat_loop
+            .as_ref()
+            .map_or(HeartbeatStatus::Lost, |hb| {
+                let state = hb.heartbeat();
+                let guard = state.lock().unwrap();
+                guard.status()
+            })
     }
 
     /// List active session IDs.
@@ -877,7 +880,7 @@ impl Bridge {
     ///
     /// This is the skip path for a lost claim: no session was spawned, so it
     /// is not a session failure.
-    pub fn release_assignment_slot(&mut self) {
+    pub const fn release_assignment_slot(&mut self) {
         self.poller.session_completed();
     }
 
@@ -905,7 +908,6 @@ impl Bridge {
             mode: assignment.spawn_mode.clone(),
             branch: match assignment.spawn_mode {
                 SpawnMode::Worktree => Some("HEAD".into()),
-                SpawnMode::Ssh { .. } => None,
                 _ => None,
             },
         };
@@ -1127,7 +1129,7 @@ impl Bridge {
         resolved
     }
 
-    /// ─── Internal: Request permission for a tool call ───
+    // ─── Internal: Request permission for a tool call ───
 
     /// Create a pending permission request and queue the frame that tells the
     /// gateway about it.
@@ -1310,8 +1312,7 @@ impl Bridge {
         transport.send(frame).await.map_err(|e| e.to_string())
     }
 
-    /// ─── Internal: Check if a permission has been resolved ───
-
+    /// Whether the permission request has been resolved.
     #[must_use]
     pub fn is_permission_resolved(&self, request_id: &str) -> bool {
         let request_id = self
@@ -1321,8 +1322,7 @@ impl Bridge {
         self.permission_router.is_resolved(request_id)
     }
 
-    /// ─── Internal: Get the permission response ───
-
+    /// The response for a resolved permission request.
     #[must_use]
     pub fn get_permission_response(&self, request_id: &str) -> Option<&PermissionResponse> {
         let request_id = self
@@ -1332,7 +1332,7 @@ impl Bridge {
         self.permission_router.get_response(request_id)
     }
 
-    /// ─── Recovery state for a session ───
+    // ─── Recovery state for a session ───
 
     /// Snapshot a session for recovery, including where its stream had got to.
     #[must_use]
@@ -1390,10 +1390,12 @@ fn drive_to_running(
             BridgeSessionState::Preparing if worktree_created => {
                 BridgeSessionState::CreatingWorktree
             }
-            BridgeSessionState::Preparing => BridgeSessionState::Spawning,
-            BridgeSessionState::CreatingWorktree => BridgeSessionState::Spawning,
-            BridgeSessionState::Spawning => BridgeSessionState::Running,
-            BridgeSessionState::AwaitingPermission => BridgeSessionState::Running,
+            BridgeSessionState::Preparing | BridgeSessionState::CreatingWorktree => {
+                BridgeSessionState::Spawning
+            }
+            BridgeSessionState::Spawning | BridgeSessionState::AwaitingPermission => {
+                BridgeSessionState::Running
+            }
             BridgeSessionState::Running => break,
             other => {
                 return Err(format!("cannot reach running from session state '{other}'"));
@@ -2061,7 +2063,7 @@ mod tests {
         // The answer resolves the router, and an approval populates the gate
         // the relay endpoint checks.
         let reply = bridge
-            .handle_transport_message(TransportMessage {
+            .handle_transport_message(&TransportMessage {
                 r#type: PERMISSION_RESPONSE_TYPE.into(),
                 correlation_id: Some(request_id.clone()),
                 payload: serde_json::json!({
@@ -2086,7 +2088,7 @@ mod tests {
         let mut bridge = test_bridge(tmp.path());
 
         let reply = bridge
-            .handle_transport_message(TransportMessage {
+            .handle_transport_message(&TransportMessage {
                 r#type: "approval".into(),
                 correlation_id: None,
                 payload: serde_json::json!({

@@ -48,7 +48,7 @@ impl Tool for SyntheticOutputTool {
         let formatted = match format.as_str() {
             "json" => serde_json::json!({ "content": content }).to_string(),
             "display" => format!("=== Output ===\n{content}\n=== End ==="),
-            _ => content.clone(),
+            _ => content,
         };
 
         Ok(ToolOutput {

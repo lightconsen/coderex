@@ -166,6 +166,7 @@ impl McpToolProxy {
         });
 
         let result = ch.send_request("tools/call", Some(params)).await?;
+        drop(ch);
         Ok(result)
     }
 }

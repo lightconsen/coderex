@@ -265,7 +265,9 @@ impl RequestShape {
     #[must_use]
     pub fn for_provider(kind: ProviderKind) -> Self {
         match kind {
-            ProviderKind::FirstParty | ProviderKind::Gateway => Self::anthropic(),
+            ProviderKind::FirstParty
+            | ProviderKind::Gateway
+            | ProviderKind::AnthropicAws => Self::anthropic(),
             ProviderKind::Bedrock => Self {
                 // Bedrock takes the model in the path and streams on a
                 // different path, not through a `stream` flag.
@@ -310,7 +312,7 @@ impl RequestShape {
                 drop_query: Vec::new(),
                 model_in_path: false,
             },
-            ProviderKind::AnthropicGoogleCloud => Self {
+            ProviderKind::AnthropicGoogleCloud | ProviderKind::Foundry => Self {
                 path: "/v1/messages".to_string(),
                 body_extras: BTreeMap::new(),
                 extra_headers: BTreeMap::new(),
@@ -318,15 +320,6 @@ impl RequestShape {
                 drop_query: Vec::new(),
                 model_in_path: false,
             },
-            ProviderKind::Foundry => Self {
-                path: "/v1/messages".to_string(),
-                body_extras: BTreeMap::new(),
-                extra_headers: BTreeMap::new(),
-                header_to_body: BTreeMap::new(),
-                drop_query: Vec::new(),
-                model_in_path: false,
-            },
-            ProviderKind::AnthropicAws => Self::anthropic(),
         }
     }
 
@@ -346,6 +339,10 @@ impl RequestShape {
     }
 
     /// Render the path for a model and deployment.
+    ///
+    /// The braces in the path are placeholders for this method, not formatting
+    /// arguments, which is what the lint below would otherwise expect.
+    #[allow(clippy::literal_string_with_formatting_args)]
     #[must_use]
     pub fn render_path(&self, model: &str, project: &str, region: &str) -> String {
         self.path

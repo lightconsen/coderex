@@ -285,13 +285,8 @@ impl McpOAuthState {
     /// no way to tell a fresh token from a stale one, so it is treated as stale.
     #[must_use]
     pub fn is_expired(&self) -> bool {
-        match self.expires_at {
-            Some(exp) => {
-                let now = chrono::Utc::now().timestamp();
-                now >= exp
-            }
-            None => true,
-        }
+        self.expires_at
+            .is_none_or(|exp| chrono::Utc::now().timestamp() >= exp)
     }
 
     /// Check if the token is near expiry (within 5 minutes).
@@ -301,13 +296,8 @@ impl McpOAuthState {
     /// never receives one that is about to die mid-request.
     #[must_use]
     pub fn is_near_expiry(&self) -> bool {
-        match self.expires_at {
-            Some(exp) => {
-                let now = chrono::Utc::now().timestamp();
-                now >= exp - 300
-            }
-            None => true,
-        }
+        self.expires_at
+            .is_none_or(|exp| chrono::Utc::now().timestamp() >= exp - 300)
     }
 
     /// Check if authenticated.
@@ -534,7 +524,7 @@ pub struct OAuthDiscovery {
 }
 
 impl OAuthDiscovery {
-    fn is_empty(&self) -> bool {
+    const fn is_empty(&self) -> bool {
         self.authorization_endpoint.is_none() && self.token_endpoint.is_none()
     }
 
@@ -846,9 +836,10 @@ fn http_date_epoch(value: &str) -> Option<i64> {
 /// publish only endpoint fields; RFC 8414 requires the field, so servers that
 /// follow the RFC are still checked.
 fn issuer_matches(discovery: &OAuthDiscovery, requested: &str) -> bool {
-    discovery.issuer.as_deref().map_or(true, |advertised| {
-        normalize_issuer(advertised).as_deref() == Some(requested)
-    })
+    discovery
+        .issuer
+        .as_deref()
+        .is_none_or(|advertised| normalize_issuer(advertised).as_deref() == Some(requested))
 }
 
 struct FetchedDiscovery {
@@ -985,12 +976,12 @@ impl OAuthTokenProvider {
     /// Build a provider for `server_url` against a shared manager.
     #[must_use]
     pub fn new(
-        oauth: Arc<tokio::sync::Mutex<OAuthManager>>,
+        oauth: &Arc<tokio::sync::Mutex<OAuthManager>>,
         server_url: impl Into<String>,
         client: reqwest::Client,
     ) -> Self {
         Self {
-            oauth: Arc::downgrade(&oauth),
+            oauth: Arc::downgrade(oauth),
             server_url: server_url.into(),
             client,
         }
@@ -1211,12 +1202,14 @@ impl OAuthManager {
     pub fn token_path() -> std::path::PathBuf {
         std::env::var("HOME")
             .or_else(|_| std::env::var("USERPROFILE"))
-            .map(|h| {
-                std::path::PathBuf::from(h)
-                    .join(".coderex")
-                    .join("mcp_tokens.json")
-            })
-            .unwrap_or_else(|_| std::path::PathBuf::from(".coderex/mcp_tokens.json"))
+            .map_or_else(
+                |_| std::path::PathBuf::from(".coderex/mcp_tokens.json"),
+                |h| {
+                    std::path::PathBuf::from(h)
+                        .join(".coderex")
+                        .join("mcp_tokens.json")
+                },
+            )
     }
 
     /// Register a server for OAuth.
@@ -1240,7 +1233,8 @@ impl OAuthManager {
     /// Check if a server is authenticated.
     #[must_use]
     pub fn is_authenticated(&self, server_url: &str) -> bool {
-        self.get(server_url).is_some_and(|s| s.is_authenticated())
+        self.get(server_url)
+            .is_some_and(McpOAuthState::is_authenticated)
     }
 
     /// List all registered server URLs.
@@ -1323,10 +1317,11 @@ impl OAuthManager {
                     .await?
             }
         };
-        let max_age = match cache.expires_at {
-            Some(expires_at) => u64::try_from(expires_at.saturating_sub(now)).unwrap_or(0),
-            None => DEFAULT_DISCOVERY_TTL_SECONDS,
-        };
+        let max_age = cache
+            .expires_at
+            .map_or(DEFAULT_DISCOVERY_TTL_SECONDS, |expires_at| {
+                u64::try_from(expires_at.saturating_sub(now)).unwrap_or(0)
+            });
         self.issuer_metadata.insert(issuer.clone(), cache);
 
         if self.get(server_url).is_none() {
@@ -1628,7 +1623,7 @@ impl OAuthManager {
             .map(String::from);
 
         if let Some(state) = self.get_mut(server_url) {
-            state.client_id = client_id.clone();
+            state.client_id.clone_from(&client_id);
             state.client_secret.clone_from(&client_secret);
             state.token_endpoint_auth_method = Some(
                 select_client_auth_method(

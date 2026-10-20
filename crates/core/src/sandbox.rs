@@ -289,7 +289,7 @@ pub fn filesystem_isolation() -> FilesystemIsolation {
 /// Always `false` off Windows. Callers use it to decide whether a missing
 /// confinement layer is a refusal or an environment they should report.
 #[must_use]
-pub fn app_container_available() -> bool {
+pub const fn app_container_available() -> bool {
     #[cfg(target_os = "windows")]
     {
         crate::sandbox_windows::app_container_available()
@@ -532,9 +532,11 @@ pub const LANDLOCK_ENV: &str = "CODEREX_LANDLOCK";
 
 /// System roots a confined process needs just to start: the loader, its
 /// libraries, name-service configuration, and the pseudo-filesystems most
-/// programs touch. These are read-only. They are added to every Landlock plan
-/// because a path-beneath allowlist that named only the workspace would leave
-/// `execve` unable to load libc.
+/// programs touch.
+///
+/// These are read-only. They are added to every Landlock plan because a
+/// path-beneath allowlist that named only the workspace would leave `execve`
+/// unable to load libc.
 pub const LANDLOCK_SYSTEM_READ_PATHS: &[&str] = &[
     "/usr", "/lib", "/lib64", "/bin", "/sbin", "/etc", "/proc", "/dev", "/sys", "/run",
 ];
@@ -1039,6 +1041,8 @@ impl SandboxHandle {
     ///   the handle.
     /// - **Other platforms**: a no-op. Unix callers that need a tree kill own
     ///   the process group (`coderex_core::process_tree::ProcessTree`).
+    // `const` on Unix; Windows terminates a job, which is not a const call.
+    #[allow(clippy::missing_const_for_fn)]
     pub fn terminate(&self) -> Result<(), SandboxError> {
         self.inner.terminate()
     }
@@ -1122,6 +1126,8 @@ impl PlatformSandbox {
         }
     }
 
+    // `const` on macOS; the Windows arm attaches a token.
+    #[allow(clippy::missing_const_for_fn)]
     fn post_spawn(&self, child: &std::process::Child) -> Result<(), SandboxError> {
         match self {
             #[cfg(target_os = "linux")]
@@ -1134,7 +1140,9 @@ impl PlatformSandbox {
         }
     }
 
+    // `const` on macOS; Linux attaches the cgroup.
     #[cfg(unix)]
+    #[allow(clippy::missing_const_for_fn)]
     fn post_spawn_pid(&self, pid: u32) -> Result<(), SandboxError> {
         match self {
             #[cfg(target_os = "linux")]
@@ -1157,7 +1165,9 @@ impl PlatformSandbox {
         }
     }
 
-    fn terminate(&self) -> Result<(), SandboxError> {
+    // Windows can fail; the other arms are no-ops.
+    #[allow(clippy::unnecessary_wraps)]
+    const fn terminate(&self) -> Result<(), SandboxError> {
         match self {
             #[cfg(target_os = "windows")]
             Self::Windows(s) => s.terminate(),
@@ -2068,6 +2078,9 @@ mod macos_impl {
         /// deliberately ignored: an unsupported limit must not turn a spawn
         /// into a failure. Where the kernel honours it, the limit is in place
         /// before the wrapper and the program it execs.
+        // The result is always `Ok`: Darwin's rejection of the limit is
+        // deliberately ignored. The signature matches the other backends.
+        #[allow(clippy::unnecessary_wraps)]
         pub fn prepare(&self, cmd: &mut std::process::Command) -> Result<(), SandboxError> {
             use std::os::unix::process::CommandExt;
 
@@ -2084,11 +2097,15 @@ mod macos_impl {
             Ok(())
         }
 
-        pub fn post_spawn(&self, _child: &std::process::Child) -> Result<(), SandboxError> {
+        // No-op on macOS; the signature matches the other backends.
+        #[allow(clippy::unused_self, clippy::unnecessary_wraps)]
+        pub const fn post_spawn(&self, _child: &std::process::Child) -> Result<(), SandboxError> {
             Ok(())
         }
 
-        pub fn post_spawn_pid(&self, _pid: u32) -> Result<(), SandboxError> {
+        // No-op on macOS; the signature matches the other backends.
+        #[allow(clippy::unused_self, clippy::unnecessary_wraps)]
+        pub const fn post_spawn_pid(&self, _pid: u32) -> Result<(), SandboxError> {
             Ok(())
         }
 

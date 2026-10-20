@@ -58,15 +58,15 @@ pub struct Harness {
     pub timeout_s: u64,
 }
 
-fn default_reps() -> u32 {
+const fn default_reps() -> u32 {
     1
 }
 
-fn default_concurrency() -> usize {
+const fn default_concurrency() -> usize {
     4
 }
 
-fn default_timeout() -> u64 {
+const fn default_timeout() -> u64 {
     300
 }
 
@@ -160,7 +160,10 @@ impl Harness {
     }
 
     /// The command for one case, with the placeholders filled in.
+    // `{variant}` and `{cwd}` are placeholders the command may carry, not
+    // format arguments — they happen to share a name with the parameters here.
     #[must_use]
+    #[allow(clippy::literal_string_with_formatting_args)]
     pub fn command_for(&self, case: &Case, variant: &str, flow_dir: &Path, cwd: &Path) -> String {
         self.command
             .replace("{id}", &case.id)

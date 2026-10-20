@@ -202,7 +202,7 @@ pub const fn prompt_profile_spec(profile: PromptProfile) -> PromptProfileSpec {
 
 /// Get the system prompt for a given profile.
 #[must_use]
-pub fn system_prompt_for_profile(profile: PromptProfile) -> &'static str {
+pub const fn system_prompt_for_profile(profile: PromptProfile) -> &'static str {
     prompt_profile_spec(profile).system_prompt
 }
 

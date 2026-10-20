@@ -17,7 +17,7 @@ use tracing::{debug, info, warn};
 
 use crate::filter::{CommandFilter, SafetyLevel};
 
-/// ─── Structured JSON Protocol Types ──────────────────────────────────────
+// ─── Structured JSON Protocol Types ──────────────────────────────────────
 
 /// Client → Server request message.
 #[derive(Debug, Serialize, Deserialize)]
@@ -143,7 +143,7 @@ impl TokenBucket {
     fn new(capacity: u32, refill_rate: f64) -> Self {
         Self {
             capacity,
-            tokens: capacity as f64,
+            tokens: f64::from(capacity),
             refill_rate,
             last_refill: Instant::now(),
         }
@@ -153,7 +153,9 @@ impl TokenBucket {
     fn refill(&mut self) {
         let now = Instant::now();
         let elapsed = now.duration_since(self.last_refill).as_secs_f64();
-        self.tokens = (self.tokens + elapsed * self.refill_rate).min(self.capacity as f64);
+        self.tokens = elapsed
+            .mul_add(self.refill_rate, self.tokens)
+            .min(f64::from(self.capacity));
         self.last_refill = now;
     }
 
@@ -418,7 +420,7 @@ impl Connection {
             .lock()
             .sessions
             .get(session_id)
-            .map_or(SessionRole::default(), |session| session.role)
+            .map_or_else(SessionRole::default, |session| session.role)
     }
 
     /// Resolve a command a remote or bridge session asked for.
@@ -445,13 +447,18 @@ impl Connection {
                 level == SafetyLevel::Remote,
                 level == SafetyLevel::Bridge,
             );
-            return match available.iter().find(|command| command.name == name) {
-                Some(command) => Ok((command.name.to_string(), command.description.to_string())),
-                None => Err((
-                    "command_not_allowed".to_string(),
-                    format!("/{name} is not available to a {} session", role.name()),
-                )),
-            };
+            return available
+                .iter()
+                .find(|command| command.name == name)
+                .map_or_else(
+                    || {
+                        Err((
+                            "command_not_allowed".to_string(),
+                            format!("/{name} is not available to a {} session", role.name()),
+                        ))
+                    },
+                    |command| Ok((command.name.to_string(), command.description.to_string())),
+                );
         }
 
         let allowed = match level {
@@ -537,18 +544,20 @@ impl Connection {
         };
 
         // Parse auth JSON: {"token":"...", "role":"bridge"}
-        let (token, role) = match serde_json::from_str::<serde_json::Value>(&auth_msg) {
-            Ok(v) => (
-                v.get("token")
-                    .and_then(|t| t.as_str())
-                    .unwrap_or("")
-                    .to_string(),
-                v.get("role")
-                    .and_then(|r| serde_json::from_value::<SessionRole>(r.clone()).ok())
-                    .unwrap_or_default(),
-            ),
-            Err(_) => (auth_msg.to_string(), SessionRole::default()), // fallback: raw token
-        };
+        let (token, role) = serde_json::from_str::<serde_json::Value>(&auth_msg).map_or_else(
+            |_| (auth_msg.to_string(), SessionRole::default()), // fallback: raw token
+            |v| {
+                (
+                    v.get("token")
+                        .and_then(|t| t.as_str())
+                        .unwrap_or("")
+                        .to_string(),
+                    v.get("role")
+                        .and_then(|r| serde_json::from_value::<SessionRole>(r.clone()).ok())
+                        .unwrap_or_default(),
+                )
+            },
+        );
 
         let session_id = match self.authenticate(&token, role) {
             Ok(id) => id,
@@ -573,7 +582,7 @@ impl Connection {
         );
 
         // Per-connection rate limiter
-        let refill_rate = self.config.rate_limit_per_minute as f64 / 60.0;
+        let refill_rate = f64::from(self.config.rate_limit_per_minute) / 60.0;
         let mut limiter = TokenBucket::new(self.config.rate_limit_per_minute, refill_rate);
 
         // Send session-ready event
@@ -718,7 +727,7 @@ impl Connection {
 
                 let (mut engine, mut events) = factory();
                 let handle = engine.interrupt_handle();
-                running_queries.insert(session_id.to_string(), handle.clone());
+                running_queries.insert(session_id.to_string(), handle);
 
                 let id = req.id.clone();
                 let out = out.clone();
@@ -855,15 +864,18 @@ impl DaemonServer {
     /// Create a new daemon server with the given config.
     #[must_use]
     pub fn with_config(config: ServerConfig) -> Self {
+        // Take the path out first so the config itself can move into `server`
+        // instead of being cloned.
+        let persist_path = config.persist_path.clone();
         let server = Self {
-            config: config.clone(),
+            config,
             shared: Arc::new(parking_lot::Mutex::new(Shared::default())),
             session_count_atomic: Arc::new(AtomicUsize::new(0)),
             engine_factory: None,
         };
 
         // Initialize persistence if configured
-        if let Some(ref path) = config.persist_path {
+        if let Some(ref path) = persist_path {
             match crate::persistence::SessionStore::open(path) {
                 Ok(store) => {
                     // Restore previous sessions
@@ -1066,20 +1078,18 @@ async fn handle_health_request(
     let request = String::from_utf8_lossy(&buf[..n]);
     let first_line = request.lines().next().unwrap_or("");
 
-    let status: u16;
-    let body: serde_json::Value;
-
-    if first_line.starts_with("GET /health") {
-        status = 200;
-        body = serde_json::json!({
-            "status": "ok",
-            "version": env!("CARGO_PKG_VERSION"),
-            "sessions": session_count.load(Ordering::Relaxed),
-        });
+    let (status, body) = if first_line.starts_with("GET /health") {
+        (
+            200,
+            serde_json::json!({
+                "status": "ok",
+                "version": env!("CARGO_PKG_VERSION"),
+                "sessions": session_count.load(Ordering::Relaxed),
+            }),
+        )
     } else {
-        status = 404;
-        body = serde_json::json!({ "error": "not found" });
-    }
+        (404, serde_json::json!({ "error": "not found" }))
+    };
 
     let body_str = serde_json::to_string(&body).unwrap();
     let response = format!(

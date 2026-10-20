@@ -40,7 +40,7 @@ impl SessionStore {
 
     /// Open the store at an explicit path (useful for tests).
     #[must_use]
-    pub fn at(path: PathBuf) -> Self {
+    pub const fn at(path: PathBuf) -> Self {
         Self { path }
     }
 

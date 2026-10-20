@@ -93,12 +93,10 @@ impl WorktreeManager {
     /// and silently got the checkout is the failure this avoids.
     pub fn create_worktree(
         &mut self,
-        cwd: &PathBuf,
+        cwd: &std::path::Path,
         branch_name: Option<&str>,
     ) -> Result<WorktreeResult, WorktreeError> {
-        let branch = branch_name
-            .map(String::from)
-            .unwrap_or_else(|| self.next_branch_name());
+        let branch = branch_name.map_or_else(|| self.next_branch_name(), String::from);
 
         let worktree_path = self.config.base_dir.join(&branch);
 
@@ -136,7 +134,7 @@ impl WorktreeManager {
         }
 
         // Get the current branch as the base
-        let base_branch = self.current_branch(cwd)?;
+        let base_branch = Self::current_branch(cwd)?;
 
         let result = WorktreeResult {
             path: worktree_path.clone(),
@@ -169,7 +167,7 @@ impl WorktreeManager {
         }
 
         // Check for uncommitted changes before removing
-        let has_changes = self.has_uncommitted_changes(path)?;
+        let has_changes = Self::has_uncommitted_changes(path)?;
         if has_changes {
             tracing::warn!(
                 "worktree {} has uncommitted changes, skipping removal",
@@ -210,15 +208,15 @@ impl WorktreeManager {
         let mut cleaned = 0;
 
         for wt in worktrees {
-            let has_changes = self.has_uncommitted_changes(&wt.path)?;
-            if !has_changes {
-                let _ = self.remove_worktree(&wt.path);
-                cleaned += 1;
-            } else {
+            let has_changes = Self::has_uncommitted_changes(&wt.path)?;
+            if has_changes {
                 tracing::debug!(
                     "skipping cleanup of {} (has uncommitted changes)",
                     wt.path.display()
                 );
+            } else {
+                let _ = self.remove_worktree(&wt.path);
+                cleaned += 1;
             }
         }
 
@@ -226,7 +224,7 @@ impl WorktreeManager {
     }
 
     /// Check if a worktree path has uncommitted changes.
-    fn has_uncommitted_changes(&self, path: &PathBuf) -> Result<bool, WorktreeError> {
+    fn has_uncommitted_changes(path: &std::path::Path) -> Result<bool, WorktreeError> {
         let output = crate::git_hardening::git_command()
             .args(["-C", path.to_str().unwrap_or("."), "status", "--porcelain"])
             .output()
@@ -237,7 +235,7 @@ impl WorktreeManager {
     }
 
     /// Get the current branch name for a git repo.
-    fn current_branch(&self, cwd: &PathBuf) -> Result<String, WorktreeError> {
+    fn current_branch(cwd: &std::path::Path) -> Result<String, WorktreeError> {
         let output = crate::git_hardening::git_command()
             .args([
                 "-C",
@@ -280,10 +278,10 @@ impl WorktreeManager {
 ///
 /// Returns the worktree path and original directory for exit.
 pub fn enter_worktree(
-    cwd: &PathBuf,
+    cwd: &std::path::Path,
     manager: &mut WorktreeManager,
 ) -> Result<(PathBuf, PathBuf), WorktreeError> {
-    let original = cwd.clone();
+    let original = cwd.to_path_buf();
     let result = manager.create_worktree(cwd, None)?;
     Ok((result.path, original))
 }

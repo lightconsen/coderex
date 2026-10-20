@@ -50,12 +50,12 @@ impl Tool for CronCreateTool {
         let recurring = input
             .arguments
             .get("recurring")
-            .and_then(|v| v.as_bool())
+            .and_then(serde_json::Value::as_bool)
             .unwrap_or(true);
         let durable = input
             .arguments
             .get("durable")
-            .and_then(|v| v.as_bool())
+            .and_then(serde_json::Value::as_bool)
             .unwrap_or(false);
 
         let scheduler = get_scheduler(&ctx).ok_or_else(|| ToolError::InvalidInput {

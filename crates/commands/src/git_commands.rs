@@ -2,6 +2,7 @@
 
 use crate::registry::{CommandContext, CommandRegistry, CommandResult, SlashCommand};
 use coderex_core::query_profiles::PromptProfile;
+use std::fmt::Write as _;
 use std::sync::Arc;
 
 /// Run a git command in the given directory.
@@ -188,9 +189,9 @@ pub fn register(registry: &mut CommandRegistry) {
                     if failing.is_empty() {
                         output.push_str("All PR checks passing.\n");
                     } else {
-                        output.push_str(&format!("Found {} failing check(s):\n", failing.len()));
+                        let _ = writeln!(output, "Found {} failing check(s):", failing.len());
                         for check in &failing {
-                            output.push_str(&format!("  - {check}\n"));
+                            let _ = writeln!(output, "  - {check}");
                         }
                     }
                 }
@@ -204,7 +205,7 @@ pub fn register(registry: &mut CommandRegistry) {
                 Ok(diff) if !diff.is_empty() => {
                     output.push_str("\nUncommitted changes:\n");
                     for line in diff.lines().take(10) {
-                        output.push_str(&format!("  {line}\n"));
+                        let _ = writeln!(output, "  {line}");
                     }
                 }
                 _ => {
@@ -225,21 +226,26 @@ pub fn register(registry: &mut CommandRegistry) {
         true,
         Arc::new(|ctx: &CommandContext, args: &[String]| {
             let dir = std::path::Path::new(&ctx.cwd);
-            if let Ok(comments) = run_gh(dir, &["pr", "view", "--json", "comments"]) {
-                let count = comments.matches('"').count() / 2;
-                CommandResult::success(format!(
-                    "PR Comments\n───────────\nFound {count} comment(s):\n{comments}"
-                ))
-            } else if !args.is_empty() {
-                CommandResult::success(format!(
-                    "Replying to PR comment(s): {}\n(Use gh pr comment to interact)",
-                    args.join(" ")
-                ))
-            } else {
-                CommandResult::success(
-                    "PR Comments\n───────────\nNo PR found.\nCreate a PR first with /commit-push-pr"
-                )
-            }
+            run_gh(dir, &["pr", "view", "--json", "comments"]).map_or_else(
+                |_| {
+                    if args.is_empty() {
+                        CommandResult::success(
+                            "PR Comments\n───────────\nNo PR found.\nCreate a PR first with /commit-push-pr"
+                        )
+                    } else {
+                        CommandResult::success(format!(
+                            "Replying to PR comment(s): {}\n(Use gh pr comment to interact)",
+                            args.join(" ")
+                        ))
+                    }
+                },
+                |comments| {
+                    let count = comments.matches('"').count() / 2;
+                    CommandResult::success(format!(
+                        "PR Comments\n───────────\nFound {count} comment(s):\n{comments}"
+                    ))
+                },
+            )
         }),
     ));
 
@@ -266,7 +272,9 @@ pub fn register(registry: &mut CommandRegistry) {
                         .join("\n")
                 ))
             } else if args[0] == "create" {
-                let name = args.get(1).map(|s| s.as_str()).unwrap_or("new-branch");
+                let name = args
+                    .get(1)
+                    .map_or("new-branch", std::string::String::as_str);
                 match run_git(dir, &["checkout", "-b", name]) {
                     Ok(_) => {
                         CommandResult::success(format!("Branch '{name}' created and checked out"))

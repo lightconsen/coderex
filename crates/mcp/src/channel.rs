@@ -120,10 +120,7 @@ impl SharedInboundHandler {
     /// Whether a handler is currently installed.
     #[must_use]
     pub fn has_handler(&self) -> bool {
-        self.inner
-            .read()
-            .map(|slot| slot.is_some())
-            .unwrap_or(false)
+        self.inner.read().is_ok_and(|slot| slot.is_some())
     }
 }
 
@@ -328,7 +325,10 @@ impl JsonRpcChannel {
     /// How hard the standalone GET stream retries before it degrades.
     ///
     /// A stdio channel has no such stream, so this is a no-op there.
-    pub fn set_event_stream_retry_policy(&mut self, policy: crate::http::EventStreamRetryPolicy) {
+    pub const fn set_event_stream_retry_policy(
+        &mut self,
+        policy: crate::http::EventStreamRetryPolicy,
+    ) {
         if let Some(http) = self.http.as_mut() {
             http.set_event_stream_retry_policy(policy);
         }
@@ -338,7 +338,7 @@ impl JsonRpcChannel {
     ///
     /// `None` leaves a degraded stream stopped. A stdio channel has no such
     /// stream, so this is a no-op there.
-    pub fn set_event_stream_probe_interval(&mut self, interval: Option<std::time::Duration>) {
+    pub const fn set_event_stream_probe_interval(&mut self, interval: Option<std::time::Duration>) {
         if let Some(http) = self.http.as_mut() {
             http.set_event_stream_probe_interval(interval);
         }
@@ -361,13 +361,14 @@ impl JsonRpcChannel {
 
     /// Hand a notification to the installed sink.
     async fn dispatch_notification(&self, method: &str, params: Option<&Value>) {
-        match &self.notification_handler {
-            Some(handler) => handler.handle_notification(method, params).await,
-            None => tracing::debug!(
+        if let Some(handler) = &self.notification_handler {
+            handler.handle_notification(method, params).await;
+        } else {
+            tracing::debug!(
                 server = %self.command,
                 method,
                 "ignoring a notification from the server"
-            ),
+            );
         }
     }
 
@@ -383,6 +384,10 @@ impl JsonRpcChannel {
     }
 
     /// Spawn the subprocess and capture stdio handles.
+    ///
+    /// The body has nothing to await, but every transport's spawn is a future
+    /// to its callers, so the `async` signature stays.
+    #[allow(clippy::unused_async, clippy::unused_async_trait_impl)]
     pub async fn spawn(&mut self) -> Result<(), String> {
         if let Some(http) = self.http.as_ref() {
             // Legacy SSE has no request channel until its GET stream announces
@@ -819,7 +824,7 @@ impl JsonRpcChannel {
 
     /// Check if the process is still running.
     #[must_use]
-    pub fn is_running(&self) -> bool {
+    pub const fn is_running(&self) -> bool {
         self.process.is_some() || self.http.is_some()
     }
 

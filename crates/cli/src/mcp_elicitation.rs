@@ -61,13 +61,13 @@ impl McpFormState {
 
     /// The schema being filled.
     #[must_use]
-    pub fn form(&self) -> &FormSpec {
+    pub const fn form(&self) -> &FormSpec {
         &self.form
     }
 
     /// The index of the focused field.
     #[must_use]
-    pub fn focused(&self) -> usize {
+    pub const fn focused(&self) -> usize {
         self.focused
     }
 
@@ -84,6 +84,8 @@ impl McpFormState {
     }
 
     /// Move focus by `delta`, wrapping around.
+    // Field counts are small, so the usize/isize round-trip cannot overflow.
+    #[allow(clippy::cast_possible_wrap)]
     pub fn move_focus(&mut self, delta: isize) {
         let count = self.form.fields.len();
         if count == 0 {
@@ -251,10 +253,10 @@ impl FormElicitationHandler for SessionElicitationHandler {
                     {
                         return FormResult::Cancelled;
                     }
-                    match value.get("content").and_then(Value::as_object) {
-                        Some(content) => FormResult::Submitted(content.clone()),
-                        None => FormResult::Cancelled,
-                    }
+                    value.get("content").and_then(Value::as_object).map_or_else(
+                        || FormResult::Cancelled,
+                        |content| FormResult::Submitted(content.clone()),
+                    )
                 }
                 Err(_) => FormResult::Cancelled,
             };
@@ -279,12 +281,11 @@ impl FormElicitationHandler for SessionElicitationHandler {
             {
                 ElicitationResult::Responded(response) => {
                     let text = response.other_text.unwrap_or_default();
-                    match serde_json::from_str::<Value>(&text) {
-                        Ok(Value::Object(content)) => FormResult::Submitted(content),
-                        _ => {
-                            tracing::warn!("an MCP form answer was not a JSON object; declining");
-                            FormResult::Cancelled
-                        }
+                    if let Ok(Value::Object(content)) = serde_json::from_str::<Value>(&text) {
+                        FormResult::Submitted(content)
+                    } else {
+                        tracing::warn!("an MCP form answer was not a JSON object; declining");
+                        FormResult::Cancelled
                     }
                 }
                 _ => FormResult::Cancelled,
@@ -320,10 +321,11 @@ impl ElicitationHandler for SessionElicitationHandler {
             if tx.send(request).await.is_err() {
                 return ElicitationResult::Cancelled;
             }
-            return match response_rx.await {
-                Ok(value) => answer_from(value, question),
-                Err(_) => ElicitationResult::Cancelled,
-            };
+            return response_rx
+                .await
+                .map_or(ElicitationResult::Cancelled, |value| {
+                    answer_from(&value, question)
+                });
         }
 
         if self.interactive {
@@ -339,7 +341,7 @@ impl ElicitationHandler for SessionElicitationHandler {
 }
 
 /// Turn the TUI's `{"answer": "..."}` into the engine's response type.
-fn answer_from(value: serde_json::Value, question: &ElicitationQuestion) -> ElicitationResult {
+fn answer_from(value: &serde_json::Value, question: &ElicitationQuestion) -> ElicitationResult {
     value
         .get("answer")
         .and_then(serde_json::Value::as_str)

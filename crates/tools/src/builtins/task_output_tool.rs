@@ -61,12 +61,12 @@ impl Tool for TaskOutputTool {
         let block = input
             .arguments
             .get("block")
-            .and_then(|v| v.as_bool())
+            .and_then(serde_json::Value::as_bool)
             .unwrap_or(false);
         let timeout_secs = input
             .arguments
             .get("timeout")
-            .and_then(|v| v.as_f64())
+            .and_then(serde_json::Value::as_f64)
             .unwrap_or(60.0);
 
         let store = get_store(&ctx).ok_or_else(|| ToolError::InvalidInput {

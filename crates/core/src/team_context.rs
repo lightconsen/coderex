@@ -35,7 +35,7 @@ const fn default_activity_limit() -> usize {
 impl TeamContext {
     /// Create a new empty team context.
     #[must_use]
-    pub fn new(team_id: String) -> Self {
+    pub const fn new(team_id: String) -> Self {
         Self {
             team_id,
             shared_notes: Vec::new(),
@@ -54,8 +54,7 @@ impl TeamContext {
             author_id,
             created_at: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_secs())
-                .unwrap_or(0),
+                .map_or(0, |d| d.as_secs()),
         });
     }
 
@@ -71,8 +70,7 @@ impl TeamContext {
                 description,
                 timestamp: std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_secs())
-                    .unwrap_or(0),
+                    .map_or(0, |d| d.as_secs()),
             },
         );
 
@@ -168,7 +166,7 @@ pub struct SessionPointer {
 impl SessionPointer {
     /// Whether this session was in a worktree.
     #[must_use]
-    pub fn is_worktree(&self) -> bool {
+    pub const fn is_worktree(&self) -> bool {
         self.worktree_path.is_some()
     }
 }
@@ -199,6 +197,7 @@ impl SessionPointerStore {
     }
 
     /// Set the maximum pointers per project.
+    #[must_use]
     pub const fn with_max_per_project(mut self, n: usize) -> Self {
         self.max_per_project = n;
         self
@@ -219,8 +218,8 @@ impl SessionPointerStore {
             existing.last_active_at = pointer.last_active_at;
             existing.message_count = pointer.message_count;
             existing.cwd = pointer.cwd;
-            existing.branch = pointer.branch.clone();
-            existing.worktree_path = pointer.worktree_path.clone();
+            existing.branch.clone_from(&pointer.branch);
+            existing.worktree_path.clone_from(&pointer.worktree_path);
         } else {
             entries.push(pointer);
             // Sort by last_active_at descending (most recent first)
@@ -245,7 +244,7 @@ impl SessionPointerStore {
             .get(project_hash)
             .into_iter()
             .flat_map(|v| v.iter())
-            .find(|s| worktree_filter.map_or(true, |wp| s.worktree_path.as_ref() == Some(wp)))
+            .find(|s| worktree_filter.is_none_or(|wp| s.worktree_path.as_ref() == Some(wp)))
     }
 
     /// Get all recent sessions for a project.

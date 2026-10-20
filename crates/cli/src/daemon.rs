@@ -52,7 +52,9 @@ fn read_pid_at(path: &std::path::Path) -> Option<u32> {
 }
 
 /// Check if a process with the given PID is running.
+// PIDs fit in i32 on all supported platforms; the cast cannot wrap in practice.
 #[cfg(unix)]
+#[allow(clippy::cast_possible_wrap)]
 pub fn is_process_running(pid: u32) -> bool {
     // SAFETY: kill with sig=0 checks if process exists, doesn't send a signal
     unsafe { libc::kill(pid as i32, 0) == 0 }
@@ -65,8 +67,10 @@ pub fn is_process_running(_pid: u32) -> bool {
 }
 
 /// Stop the daemon by sending SIGTERM to the running process.
+// PIDs fit in i32 on all supported platforms; the cast cannot wrap in practice.
+#[allow(clippy::cast_possible_wrap)]
 pub fn stop_daemon() -> Result<String, String> {
-    let pid = read_pid().ok_or("No PID file found. Is the server running?".to_string())?;
+    let pid = read_pid().ok_or_else(|| "No PID file found. Is the server running?".to_string())?;
 
     if !is_process_running(pid) {
         let _ = remove_pid_file();
@@ -108,9 +112,8 @@ pub fn stop_daemon() -> Result<String, String> {
 /// Get the status of the running daemon.
 #[must_use]
 pub fn serve_status() -> String {
-    let pid = match read_pid() {
-        Some(p) => p,
-        None => return "No running daemon (no PID file found).".to_string(),
+    let Some(pid) = read_pid() else {
+        return "No running daemon (no PID file found).".to_string();
     };
 
     if is_process_running(pid) {

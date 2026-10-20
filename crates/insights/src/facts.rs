@@ -56,6 +56,8 @@ impl SessionFacts {
 
     /// The share of tool calls that failed, or `None` when nothing ran.
     #[must_use]
+    // Display ratio; call counts are far below 2^53.
+    #[allow(clippy::cast_precision_loss)]
     pub fn error_rate(&self) -> Option<f64> {
         let calls = self.total_tool_calls();
         (calls > 0).then(|| self.total_tool_errors() as f64 / calls as f64)
@@ -74,10 +76,10 @@ impl SessionFacts {
     /// Fails only when the file cannot be opened; unreadable lines inside it
     /// are counted in `unreadable_lines` instead.
     pub fn read(path: &Path) -> Result<Self, std::io::Error> {
-        let session_id = path
-            .file_stem()
-            .map(|stem| stem.to_string_lossy().to_string())
-            .unwrap_or_else(|| path.display().to_string());
+        let session_id = path.file_stem().map_or_else(
+            || path.display().to_string(),
+            |stem| stem.to_string_lossy().to_string(),
+        );
 
         let text = std::fs::read_to_string(path)?;
         Ok(Self::from_jsonl(&session_id, &text, last_active(path)))
@@ -130,14 +132,12 @@ impl SessionFacts {
                     *facts.tool_calls.entry(call.name.clone()).or_insert(0) += 1;
                     call_names.insert(call.id.clone(), call.name.clone());
                 }
-                MessageContent::ToolResult(result) => {
-                    if result.is_error {
-                        let name = call_names
-                            .get(&result.tool_call_id)
-                            .cloned()
-                            .unwrap_or_else(|| "unknown".to_string());
-                        *facts.tool_errors.entry(name).or_insert(0) += 1;
-                    }
+                MessageContent::ToolResult(result) if result.is_error => {
+                    let name = call_names
+                        .get(&result.tool_call_id)
+                        .cloned()
+                        .unwrap_or_else(|| "unknown".to_string());
+                    *facts.tool_errors.entry(name).or_insert(0) += 1;
                 }
                 // The content enum is open: a transcript written by a newer
                 // CodeRex may hold something this one does not know. It still
@@ -186,7 +186,7 @@ pub fn read_dir(dir: &Path) -> Result<Vec<SessionFacts>, std::io::Error> {
     Ok(sessions)
 }
 
-fn role_name(message: &Message) -> &'static str {
+const fn role_name(message: &Message) -> &'static str {
     match message.role {
         coderex_core::types::Role::User => "user",
         coderex_core::types::Role::Assistant => "assistant",

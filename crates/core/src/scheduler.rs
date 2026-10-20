@@ -51,12 +51,11 @@ impl CronRunner {
     /// Remove a job by id. Returns `true` if the job was found and removed.
     pub async fn remove_job(&self, id: &str) -> bool {
         let mut jobs = self.jobs.write().await;
-        if let Some(pos) = jobs.iter().position(|j| j.id == id) {
-            jobs.remove(pos);
-            true
-        } else {
-            false
-        }
+        let Some(pos) = jobs.iter().position(|j| j.id == id) else {
+            return false;
+        };
+        jobs.remove(pos);
+        true
     }
 
     /// List all jobs.
@@ -90,19 +89,14 @@ impl CronRunner {
                             if !job.enabled {
                                 continue;
                             }
-                            let should_run = match last_run.get(&job.id) {
-                                None => {
-                                    // First time seeing this job — seed last_run
-                                    // so it doesn't fire immediately on startup.
-                                    false
-                                }
-                                Some(last) => {
-                                    match job.schedule.next_after(last) {
-                                        Ok(next) => next <= now,
-                                        Err(_) => false,
-                                    }
-                                }
-                            };
+                            // A job with no `last_run` entry is being seen for
+                            // the first time; seeding it avoids firing
+                            // immediately on startup.
+                            let should_run = last_run.get(&job.id).is_some_and(|last| {
+                                job.schedule
+                                    .next_after(last)
+                                    .is_ok_and(|next| next <= now)
+                            });
                             if should_run {
                                 let cmd = job.command.clone();
                                 let id = job.id.clone();
@@ -118,11 +112,11 @@ impl CronRunner {
                                     command.args(&parts[1..]);
                                     match command.output().await {
                                         Ok(output) => {
-                                            if !output.status.success() {
+                                            if output.status.success() {
+                                                tracing::info!(job_id = %job_id_spawn, "cron job completed");
+                                            } else {
                                                 let stderr = String::from_utf8_lossy(&output.stderr);
                                                 tracing::warn!(job_id = %job_id_spawn, stderr = %stderr, "cron job failed");
-                                            } else {
-                                                tracing::info!(job_id = %job_id_spawn, "cron job completed");
                                             }
                                         }
                                         Err(e) => {

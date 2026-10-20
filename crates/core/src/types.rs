@@ -100,38 +100,45 @@ impl ToolCall {
     #[must_use]
     pub fn summarize_activity(name: &str, input: &serde_json::Value) -> String {
         match name.to_ascii_lowercase().as_str() {
-            "read" => extract_tool_string(input, &["file_path", "path", "file"])
-                .map(|path| format!("Reading {}...", summarize_tool_text(path)))
-                .unwrap_or_else(|| "Reading files...".into()),
-            "grep" | "rg" => extract_tool_string(input, &["pattern"])
-                .map(|pattern| format!("Searching for {}...", summarize_tool_text(pattern)))
-                .unwrap_or_else(|| "Searching code...".into()),
-            "glob" => extract_tool_string(input, &["pattern"])
-                .map(|pattern| {
-                    format!("Finding files matching {}...", summarize_tool_text(pattern))
-                })
-                .unwrap_or_else(|| "Discovering files...".into()),
+            "read" => extract_tool_string(input, &["file_path", "path", "file"]).map_or_else(
+                || "Reading files...".into(),
+                |path| format!("Reading {}...", summarize_tool_text(path)),
+            ),
+            "grep" | "rg" => extract_tool_string(input, &["pattern"]).map_or_else(
+                || "Searching code...".into(),
+                |pattern| format!("Searching for {}...", summarize_tool_text(pattern)),
+            ),
+            "glob" => extract_tool_string(input, &["pattern"]).map_or_else(
+                || "Discovering files...".into(),
+                |pattern| format!("Finding files matching {}...", summarize_tool_text(pattern)),
+            ),
             "currentdir" | "current_dir" => "Checking current directory...".into(),
-            "listdir" | "list_dir" => extract_tool_string(input, &["path"])
-                .map(|path| format!("Listing files in {}...", summarize_tool_text(path)))
-                .unwrap_or_else(|| "Listing files in current directory...".into()),
-            "bash" | "shell" => extract_tool_string(input, &["command", "cmd"])
-                .map(|command| format!("Running {}...", summarize_tool_text(command)))
-                .unwrap_or_else(|| "Running shell command...".into()),
-            "write" => extract_tool_string(input, &["file_path", "path", "file"])
-                .map(|path| format!("Writing {}...", summarize_tool_text(path)))
-                .unwrap_or_else(|| "Writing file...".into()),
-            "edit" => extract_tool_string(input, &["file_path", "path", "file"])
-                .map(|path| format!("Updating {}...", summarize_tool_text(path)))
-                .unwrap_or_else(|| "Applying changes...".into()),
+            "listdir" | "list_dir" => extract_tool_string(input, &["path"]).map_or_else(
+                || "Listing files in current directory...".into(),
+                |path| format!("Listing files in {}...", summarize_tool_text(path)),
+            ),
+            "bash" | "shell" => extract_tool_string(input, &["command", "cmd"]).map_or_else(
+                || "Running shell command...".into(),
+                |command| format!("Running {}...", summarize_tool_text(command)),
+            ),
+            "write" => extract_tool_string(input, &["file_path", "path", "file"]).map_or_else(
+                || "Writing file...".into(),
+                |path| format!("Writing {}...", summarize_tool_text(path)),
+            ),
+            "edit" => extract_tool_string(input, &["file_path", "path", "file"]).map_or_else(
+                || "Applying changes...".into(),
+                |path| format!("Updating {}...", summarize_tool_text(path)),
+            ),
             "apply_patch" => "Applying changes...".into(),
             "task" => "Delegating task...".into(),
-            "web_fetch" => extract_tool_string(input, &["url"])
-                .map(|url| format!("Fetching {}...", summarize_tool_text(url)))
-                .unwrap_or_else(|| "Fetching from the web...".into()),
-            "web_search" => extract_tool_string(input, &["query"])
-                .map(|query| format!("Searching the web for {}...", summarize_tool_text(query)))
-                .unwrap_or_else(|| "Searching the web...".into()),
+            "web_fetch" => extract_tool_string(input, &["url"]).map_or_else(
+                || "Fetching from the web...".into(),
+                |url| format!("Fetching {}...", summarize_tool_text(url)),
+            ),
+            "web_search" => extract_tool_string(input, &["query"]).map_or_else(
+                || "Searching the web...".into(),
+                |query| format!("Searching the web for {}...", summarize_tool_text(query)),
+            ),
             _ => format!("Running {name}..."),
         }
     }
@@ -143,8 +150,9 @@ fn extract_tool_string<'a>(input: &'a serde_json::Value, keys: &[&str]) -> Optio
 }
 
 fn summarize_tool_text(text: &str) -> String {
-    let collapsed = text.split_whitespace().collect::<Vec<_>>().join(" ");
     const MAX_CHARS: usize = 60;
+
+    let collapsed = text.split_whitespace().collect::<Vec<_>>().join(" ");
     if collapsed.chars().count() <= MAX_CHARS {
         collapsed
     } else {
@@ -491,7 +499,7 @@ pub struct ContextWindowResolver {
 impl ContextWindowResolver {
     /// Build a resolver from all four override sources.
     #[must_use]
-    pub fn new(
+    pub const fn new(
         env: ContextWindowOverrides,
         settings: ContextWindowOverrides,
         client_data: ContextWindowOverrides,

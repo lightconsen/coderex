@@ -231,7 +231,7 @@ mod tests {
     #[async_trait::async_trait]
     impl ApiClient for FailingApi {
         fn clone_box(&self) -> Box<dyn ApiClient> {
-            Box::new(FailingApi)
+            Box::new(Self)
         }
 
         async fn create_message(

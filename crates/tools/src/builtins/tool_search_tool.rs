@@ -42,7 +42,8 @@ impl Tool for ToolSearchTool {
         ctx: ToolContext<'_>,
     ) -> Result<ToolOutput, ToolError> {
         let query = extract_string(&input.arguments, "query")?;
-        let limit = extract_number(&input.arguments, "limit").unwrap_or(10) as usize;
+        let limit =
+            usize::try_from(extract_number(&input.arguments, "limit").unwrap_or(10)).unwrap_or(0);
 
         let query_lower = query.to_lowercase();
 

@@ -114,10 +114,10 @@ impl StateDelta {
 /// Returns a `StateDelta` containing only the entries that differ
 /// between `old_state` and `new_state`.
 #[must_use]
-pub fn compute_delta(
+pub fn compute_delta<S: std::hash::BuildHasher>(
     base_revision: &str,
-    old_state: &HashMap<String, String>,
-    new_state: &HashMap<String, String>,
+    old_state: &HashMap<String, String, S>,
+    new_state: &HashMap<String, String, S>,
 ) -> StateDelta {
     let mut delta = StateDelta::new(base_revision);
 
@@ -148,7 +148,9 @@ pub fn compute_delta(
 ///
 /// The hash is deterministic: same state always produces the same hash.
 #[must_use]
-pub fn compute_revision_hash(state: &HashMap<String, String>) -> String {
+pub fn compute_revision_hash<S: std::hash::BuildHasher>(
+    state: &HashMap<String, String, S>,
+) -> String {
     use sha2::{Digest, Sha256};
     let mut hasher = Sha256::new();
 
@@ -164,7 +166,7 @@ pub fn compute_revision_hash(state: &HashMap<String, String>) -> String {
     }
 
     let result = hasher.finalize();
-    format!("{:x}", result)
+    format!("{result:x}")
 }
 
 // ─── Conflict Resolution with Lamport Timestamps ─────────────────────────
@@ -185,13 +187,13 @@ pub struct LamportTimestamp {
 impl LamportTimestamp {
     /// Create a new timestamp for the given origin.
     #[must_use]
-    pub fn new(counter: u64, origin_id: u32) -> Self {
+    pub const fn new(counter: u64, origin_id: u32) -> Self {
         Self { counter, origin_id }
     }
 
     /// Increment the counter, producing a new timestamp for the same origin.
     #[must_use]
-    pub fn tick(self) -> Self {
+    pub const fn tick(self) -> Self {
         Self {
             counter: self.counter + 1,
             origin_id: self.origin_id,
@@ -201,7 +203,7 @@ impl LamportTimestamp {
     /// Merge two timestamps: return the one that "wins" per
     /// last-writer-wins with origin ID tie-breaking.
     #[must_use]
-    pub fn merge(a: Self, b: Self) -> Self {
+    pub const fn merge(a: Self, b: Self) -> Self {
         if a.counter > b.counter {
             a
         } else if b.counter > a.counter {
@@ -215,7 +217,7 @@ impl LamportTimestamp {
 
     /// Check if this timestamp is strictly greater than the other.
     #[must_use]
-    pub fn happens_after(self, other: Self) -> bool {
+    pub const fn happens_after(self, other: Self) -> bool {
         self.counter > other.counter
             || (self.counter == other.counter && self.origin_id > other.origin_id)
     }
@@ -264,8 +266,7 @@ impl ConcurrentStateTracker {
         let ts = self
             .timestamps
             .get(key)
-            .map(|ts| ts.tick())
-            .unwrap_or_else(|| LamportTimestamp::new(1, local_origin));
+            .map_or_else(|| LamportTimestamp::new(1, local_origin), |ts| ts.tick());
         self.timestamps.insert(key.to_string(), ts);
         ts
     }
@@ -322,7 +323,7 @@ impl ConcurrentStateTracker {
 
     /// Get all tracked timestamps.
     #[must_use]
-    pub fn timestamps(&self) -> &HashMap<String, LamportTimestamp> {
+    pub const fn timestamps(&self) -> &HashMap<String, LamportTimestamp> {
         &self.timestamps
     }
 }

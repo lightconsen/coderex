@@ -122,7 +122,7 @@ pub struct ResolvedProviderProfile {
 }
 
 impl ResolvedProviderProfile {
-    fn generic_capabilities() -> ProviderCapabilities {
+    const fn generic_capabilities() -> ProviderCapabilities {
         ProviderCapabilities {
             streaming: true,
             tool_use: true,
@@ -134,7 +134,7 @@ impl ResolvedProviderProfile {
         }
     }
 
-    fn anthropic_capabilities() -> ProviderCapabilities {
+    const fn anthropic_capabilities() -> ProviderCapabilities {
         ProviderCapabilities {
             prompt_caching: true,
             vision: true,
@@ -174,12 +174,7 @@ impl ResolvedProviderProfile {
         };
 
         match (name, style) {
-            ("anthropic", ProviderApiStyle::AnthropicMessages) => Self {
-                name,
-                api_style: ProviderApiStyle::AnthropicMessages,
-                capabilities: Self::anthropic_capabilities(),
-            },
-            ("dashscope", ProviderApiStyle::AnthropicMessages) => Self {
+            ("anthropic" | "dashscope", ProviderApiStyle::AnthropicMessages) => Self {
                 name,
                 api_style: ProviderApiStyle::AnthropicMessages,
                 capabilities: Self::anthropic_capabilities(),
@@ -264,7 +259,7 @@ pub trait Provider: Send + Sync {
 
 /// Convert an [`ApiError`] to a [`ProviderError`] with classification.
 #[must_use]
-pub fn classify_api_error(provider: &str, err: ApiError) -> ProviderError {
+pub fn classify_api_error(provider: &str, err: &ApiError) -> ProviderError {
     let kind = match &err {
         ApiError::Auth(_) => ProviderErrorKind::Auth,
         ApiError::AccessPolicy(_) => ProviderErrorKind::AccessPolicy,
@@ -344,7 +339,7 @@ mod tests {
     fn classify_access_policy_errors() {
         let err = classify_api_error(
             "anthropic",
-            ApiError::Response {
+            &ApiError::Response {
                 status: 403,
                 message: "This API is only available for Coding Agents".into(),
             },

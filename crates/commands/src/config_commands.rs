@@ -18,7 +18,7 @@ fn config_home_for_commands() -> std::path::PathBuf {
     TEST_CONFIG_HOME.with(|h| {
         h.borrow()
             .clone()
-            .unwrap_or_else(|| coderex_config::settings::config_home())
+            .unwrap_or_else(coderex_config::settings::config_home)
     })
 }
 
@@ -81,21 +81,25 @@ pub fn register(registry: &mut CommandRegistry) {
                 let key = &args[1];
                 let value_str = args[2..].join(" ");
                 // Parse the value
-                let value = if let Ok(v) = value_str.parse::<i64>() {
-                    serde_json::Value::Number(v.into())
-                } else if let Ok(v) = value_str.parse::<f64>() {
-                    serde_json::Number::from_f64(v)
-                        .map(serde_json::Value::Number)
-                        .unwrap_or_else(|| serde_json::Value::String(value_str.clone()))
-                } else if value_str == "true" {
-                    serde_json::Value::Bool(true)
-                } else if value_str == "false" {
-                    serde_json::Value::Bool(false)
-                } else if value_str == "null" {
-                    serde_json::Value::Null
-                } else {
-                    serde_json::Value::String(value_str)
-                };
+                let value = value_str.parse::<i64>().map_or_else(
+                    |_| {
+                        value_str.parse::<f64>().map_or_else(
+                            |_| match value_str.as_str() {
+                                "true" => serde_json::Value::Bool(true),
+                                "false" => serde_json::Value::Bool(false),
+                                "null" => serde_json::Value::Null,
+                                _ => serde_json::Value::String(value_str.clone()),
+                            },
+                            |v| {
+                                serde_json::Number::from_f64(v).map_or_else(
+                                    || serde_json::Value::String(value_str.clone()),
+                                    serde_json::Value::Number,
+                                )
+                            },
+                        )
+                    },
+                    |v| serde_json::Value::Number(v.into()),
+                );
                 let mut settings = read_user_settings().unwrap_or_default();
                 settings.insert(key.clone(), value);
                 match write_user_settings(&settings) {
@@ -106,10 +110,10 @@ pub fn register(registry: &mut CommandRegistry) {
             } else if args.len() == 2 && args[0] == "get" {
                 let key = &args[1];
                 let settings = read_user_settings().unwrap_or_default();
-                match settings.get(key) {
-                    Some(v) => CommandResult::success(format!("{key}: {v}")),
-                    None => CommandResult::error(format!("Key '{key}' not found in settings")),
-                }
+                settings.get(key).map_or_else(
+                    || CommandResult::error(format!("Key '{key}' not found in settings")),
+                    |v| CommandResult::success(format!("{key}: {v}")),
+                )
             } else if args.len() == 1 && args[0] == "list" {
                 let settings = read_user_settings().unwrap_or_default();
                 if settings.is_empty() {

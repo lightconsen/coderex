@@ -31,7 +31,7 @@ async fn e2e_slash_clear_resets_session() {
         .await
         .expect_err("should fail without engine");
     let result = repl.run_headless("/clear").await.unwrap();
-    assert!(!result.is_empty());
+    assert_ne!(result, "");
 }
 
 // E2E: Slash command /help → shows available commands
@@ -39,7 +39,7 @@ async fn e2e_slash_clear_resets_session() {
 async fn e2e_slash_help_shows_commands() {
     let mut repl = coderex_cli::ReplLoop::new("/src".into(), ModelId::sonnet());
     let result = repl.run_headless("/help").await.unwrap();
-    assert!(!result.is_empty());
+    assert_ne!(result, "");
 }
 
 // E2E: Slash command /status → system status
@@ -57,7 +57,7 @@ async fn e2e_slash_status_shows_info() {
 async fn e2e_slash_compact() {
     let mut repl = coderex_cli::ReplLoop::new("/src".into(), ModelId::sonnet());
     let result = repl.run_headless("/compact").await.unwrap();
-    assert!(!result.is_empty());
+    assert_ne!(result, "");
 }
 
 // E2E: Slash command /tokens → shows token usage
@@ -65,7 +65,7 @@ async fn e2e_slash_compact() {
 async fn e2e_slash_tokens() {
     let mut repl = coderex_cli::ReplLoop::new("/src".into(), ModelId::sonnet());
     let result = repl.run_headless("/tokens").await.unwrap();
-    assert!(!result.is_empty());
+    assert_ne!(result, "");
 }
 
 // E2E: Model switching → /model sonnet → /model opus
@@ -126,7 +126,7 @@ async fn e2e_clear_after_messages() {
         .expect_err("should fail without engine");
 
     let result = repl.run_headless("/clear").await.unwrap();
-    assert!(!result.is_empty());
+    assert_ne!(result, "");
 }
 
 // E2E: Multi-turn conversation history — fails fast without engine

@@ -370,7 +370,7 @@ impl Runtime {
         mpsc::UnboundedSender<EngineEvent>,
         mpsc::UnboundedReceiver<UiIntent>,
         RuntimeHandle,
-        Runtime,
+        Self,
     ) {
         let (ui_tx, ui_rx) = mpsc::unbounded_channel();
         let (engine_tx, engine_rx) = mpsc::unbounded_channel();
@@ -394,7 +394,7 @@ impl Runtime {
             .await;
         });
 
-        let runtime = Runtime {
+        let runtime = Self {
             task,
             state,
             cron_runner: None,

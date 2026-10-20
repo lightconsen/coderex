@@ -113,8 +113,7 @@ impl<S: ExperimentSource> CachedExperimentSource<S> {
         self.cache_path.exists()
             && std::fs::metadata(&self.cache_path)
                 .and_then(|m| m.modified())
-                .map(|mtime| mtime.elapsed().is_ok_and(|age| age < self.max_age))
-                .unwrap_or(false)
+                .is_ok_and(|mtime| mtime.elapsed().is_ok_and(|age| age < self.max_age))
     }
 }
 

@@ -131,7 +131,7 @@ impl RegistryToolDispatcher {
     ///
     /// Lets callers add tools discovered after construction (MCP servers).
     #[must_use]
-    pub fn registry(&self) -> &Arc<ToolRegistry> {
+    pub const fn registry(&self) -> &Arc<ToolRegistry> {
         &self.registry
     }
 
@@ -165,7 +165,7 @@ impl RegistryToolDispatcher {
     }
 
     /// Enable or disable sandbox injection for dispatched tools.
-    pub fn set_sandbox_enabled(&mut self, enabled: bool) {
+    pub const fn set_sandbox_enabled(&mut self, enabled: bool) {
         self.sandbox_enabled = enabled;
     }
 
@@ -190,7 +190,7 @@ impl RegistryToolDispatcher {
     /// This is the same store the tools see in their context, so a caller can
     /// read what a session wrote without building a `ToolContext` itself.
     #[must_use]
-    pub fn todo_store(&self) -> &Arc<TodoStore> {
+    pub const fn todo_store(&self) -> &Arc<TodoStore> {
         &self.todo_store
     }
 
@@ -322,18 +322,15 @@ impl CoreToolExecutor for RegistryToolDispatcher {
         tool_name: &str,
         input: &Value,
     ) -> ToolDispatchOutcome {
-        let tool = match self.registry.get_tool_arc(tool_name) {
-            Some(tool) => tool,
-            None => {
-                return ToolDispatchOutcome {
-                    result: ToolResult {
-                        tool_call_id: tool_call_id.to_string(),
-                        output: format!("tool '{tool_name}' not found in registry"),
-                        is_error: true,
-                        images: Vec::new(),
-                    },
-                };
-            }
+        let Some(tool) = self.registry.get_tool_arc(tool_name) else {
+            return ToolDispatchOutcome {
+                result: ToolResult {
+                    tool_call_id: tool_call_id.to_string(),
+                    output: format!("tool '{tool_name}' not found in registry"),
+                    is_error: true,
+                    images: Vec::new(),
+                },
+            };
         };
 
         // The listing and the execute path must agree: a tool whose own flag
@@ -680,7 +677,7 @@ pub fn path_arguments(input: &Value) -> Vec<std::path::PathBuf> {
     if paths.is_empty() {
         for value in map.values() {
             if let Value::String(text) = value {
-                if text.starts_with('/') || text.starts_with("~") || text.contains('/') {
+                if text.starts_with('/') || text.starts_with('~') || text.contains('/') {
                     paths.push(std::path::PathBuf::from(text));
                 }
             }

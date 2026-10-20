@@ -51,6 +51,9 @@ pub const MCP_STREAM_PROBE_ENV: &str = "CODEREX_MCP_STREAM_PROBE_SECS";
 /// The probe interval used when [`MCP_STREAM_PROBE_ENV`] is unset.
 pub const DEFAULT_STREAM_PROBE_INTERVAL: Duration = Duration::from_secs(60);
 
+/// Senders waiting for the response to a legacy-SSE POST, keyed by JSON-RPC id.
+type PendingRequests = Arc<Mutex<HashMap<u64, oneshot::Sender<Result<Value, String>>>>>;
+
 /// Read the degraded-stream probe interval from the environment.
 ///
 /// `None` means recovery is disabled. A malformed value is logged and treated
@@ -368,14 +371,16 @@ impl RequestContext {
 
     /// Wait until the legacy-SSE stream has announced its POST endpoint.
     async fn wait_for_message_url(&self) -> Result<Url, String> {
-        if let Some(url) = self.message_url.borrow().clone() {
+        let current = self.message_url.borrow().clone();
+        if let Some(url) = current {
             return Ok(url);
         }
 
         let mut receiver = self.message_url.subscribe();
         let wait = async {
             loop {
-                if let Some(url) = receiver.borrow().clone() {
+                let current = receiver.borrow().clone();
+                if let Some(url) = current {
                     return Ok(url);
                 }
                 receiver.changed().await.map_err(|_| {
@@ -541,7 +546,7 @@ impl RequestContext {
     }
 
     /// POST one JSON-RPC message, remembering any session id the answer sets.
-    async fn post<T: Serialize>(
+    async fn post<T: Serialize + Sync>(
         &self,
         body: &T,
         accept: &'static str,
@@ -702,7 +707,7 @@ pub struct HttpChannel {
     /// `None` leaves it `Degraded` until the process restarts.
     stream_probe_interval: Option<Duration>,
     /// Legacy SSE responses waiting for their JSON-RPC id on the event stream.
-    pending: Arc<Mutex<HashMap<u64, oneshot::Sender<Result<Value, String>>>>>,
+    pending: PendingRequests,
     /// Keeps the legacy message-endpoint watch channel open while no request
     /// is waiting on it.
     _message_url_receiver: watch::Receiver<Option<Url>>,
@@ -783,7 +788,7 @@ impl HttpChannel {
     ///
     /// Exposed mainly so tests can exercise the cap without waiting out the
     /// production policy.
-    pub fn set_event_stream_retry_policy(&mut self, policy: EventStreamRetryPolicy) {
+    pub const fn set_event_stream_retry_policy(&mut self, policy: EventStreamRetryPolicy) {
         self.retry_policy = policy;
     }
 
@@ -793,12 +798,12 @@ impl HttpChannel {
     /// restarted. The value is read by the task when it enters the degraded
     /// state, so setting it before [`Self::start_event_stream`] is what
     /// matters. The default comes from [`MCP_STREAM_PROBE_ENV`].
-    pub fn set_event_stream_probe_interval(&mut self, interval: Option<Duration>) {
+    pub const fn set_event_stream_probe_interval(&mut self, interval: Option<Duration>) {
         self.stream_probe_interval = interval;
     }
 
     /// Install the sink for server notifications.
-    pub fn set_notification_handler(&mut self, handler: Arc<dyn ServerNotificationHandler>) {
+    pub fn set_notification_handler(&self, handler: Arc<dyn ServerNotificationHandler>) {
         if let Ok(mut slot) = self.notification_handler.write() {
             *slot = Some(handler);
         }
@@ -1081,8 +1086,7 @@ impl HttpChannel {
     pub fn event_stream_state(&self) -> EventStreamState {
         self.event_state
             .read()
-            .map(|state| *state)
-            .unwrap_or(EventStreamState::Stopped)
+            .map_or(EventStreamState::Stopped, |state| *state)
     }
 
     /// Start the standalone GET stream, replacing any previous one.
@@ -1196,7 +1200,7 @@ impl HttpChannel {
                 EventStreamState::Active if self.context.message_url.borrow().is_some() => {
                     return Ok(());
                 }
-                EventStreamState::Active => {}
+                EventStreamState::Active | EventStreamState::Starting => {}
                 EventStreamState::Unsupported => {
                     return Err(format!(
                         "the MCP server at {} answered 405 to the SSE GET; `type: \"sse\"` requires a classic SSE endpoint",
@@ -1215,7 +1219,6 @@ impl HttpChannel {
                         self.context.url
                     ));
                 }
-                EventStreamState::Starting => {}
             }
 
             if Instant::now() >= deadline {
@@ -1539,7 +1542,7 @@ async fn run_legacy_event_stream(
     context: RequestContext,
     handler: Arc<RwLock<Option<Arc<dyn InboundRequestHandler>>>>,
     notifications: Arc<RwLock<Option<Arc<dyn ServerNotificationHandler>>>>,
-    pending: Arc<Mutex<HashMap<u64, oneshot::Sender<Result<Value, String>>>>>,
+    pending: PendingRequests,
     policy: EventStreamRetryPolicy,
     probe_interval: Option<Duration>,
     cancel: CancellationToken,
@@ -1643,7 +1646,7 @@ async fn read_legacy_event_stream_once(
     context: &RequestContext,
     handler: &Arc<RwLock<Option<Arc<dyn InboundRequestHandler>>>>,
     notifications: &Arc<RwLock<Option<Arc<dyn ServerNotificationHandler>>>>,
-    pending: &Arc<Mutex<HashMap<u64, oneshot::Sender<Result<Value, String>>>>>,
+    pending: &PendingRequests,
     cancel: &CancellationToken,
     state: &Arc<RwLock<EventStreamState>>,
 ) -> Result<StreamAttempt, String> {
@@ -1709,8 +1712,8 @@ async fn read_legacy_event_stream_once(
     let mut overflow = false;
 
     'read: loop {
-        let mut events = take_events(&mut buffer);
-        for event in events.drain(..) {
+        let events = take_events(&mut buffer);
+        for event in events {
             let Some(data) = sse_event_data(&event) else {
                 continue;
             };
@@ -1783,7 +1786,7 @@ async fn process_legacy_event(
     context: &RequestContext,
     handler: &Arc<RwLock<Option<Arc<dyn InboundRequestHandler>>>>,
     notifications: &Arc<RwLock<Option<Arc<dyn ServerNotificationHandler>>>>,
-    pending: &Arc<Mutex<HashMap<u64, oneshot::Sender<Result<Value, String>>>>>,
+    pending: &PendingRequests,
     event_type: &str,
     data: &str,
 ) -> bool {
@@ -1818,7 +1821,7 @@ async fn process_legacy_message(
     context: &RequestContext,
     handler: &Arc<RwLock<Option<Arc<dyn InboundRequestHandler>>>>,
     notifications: &Arc<RwLock<Option<Arc<dyn ServerNotificationHandler>>>>,
-    pending: &Arc<Mutex<HashMap<u64, oneshot::Sender<Result<Value, String>>>>>,
+    pending: &PendingRequests,
     data: &str,
 ) -> bool {
     if data.trim().is_empty() || data.trim() == "[DONE]" {
@@ -1870,21 +1873,20 @@ async fn process_legacy_message(
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .remove(&response.id);
-            match waiter {
-                Some(sender) => {
-                    let outcome = match response.error {
-                        Some(error) => Err(format!(
-                            "JSON-RPC error (code {}): {}",
-                            error.code, error.message
-                        )),
-                        None => Ok(response.result.unwrap_or(Value::Null)),
-                    };
-                    let _ = sender.send(outcome);
-                }
-                None => tracing::debug!(
+            if let Some(sender) = waiter {
+                let outcome = match response.error {
+                    Some(error) => Err(format!(
+                        "JSON-RPC error (code {}): {}",
+                        error.code, error.message
+                    )),
+                    None => Ok(response.result.unwrap_or(Value::Null)),
+                };
+                let _ = sender.send(outcome);
+            } else {
+                tracing::debug!(
                     id = response.id,
                     "a response arrived on the MCP SSE stream with no request waiting on it"
-                ),
+                );
             }
         }
         (false, false) => {
@@ -1900,7 +1902,8 @@ async fn process_legacy_message(
 
 /// The exponential part of the retry delay, capped by the policy.
 fn backoff_delay(policy: &EventStreamRetryPolicy, failures: usize) -> Duration {
-    let shift = failures.saturating_sub(1).min(16) as u32;
+    // Capped at 16 above, so the conversion cannot truncate anything.
+    let shift = u32::try_from(failures.saturating_sub(1).min(16)).unwrap_or(16);
     policy
         .base_delay
         .saturating_mul(1_u32 << shift)
@@ -1911,9 +1914,10 @@ fn backoff_delay(policy: &EventStreamRetryPolicy, failures: usize) -> Duration {
 fn jittered_delay(base: Duration) -> Duration {
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|elapsed| elapsed.subsec_nanos() as u64)
-        .unwrap_or(0);
-    let jitter = (base.as_millis() as u64 / 4).max(1);
+        .map_or(0, |elapsed| u64::from(elapsed.subsec_nanos()));
+    // A duration too long for `u64` milliseconds is unreachable in practice;
+    // saturate instead of truncating.
+    let jitter = (u64::try_from(base.as_millis()).unwrap_or(u64::MAX) / 4).max(1);
     base + Duration::from_millis(nanos % jitter)
 }
 
@@ -2011,8 +2015,8 @@ async fn read_event_stream_once(
     let mut overflow = false;
 
     'read: loop {
-        let mut events = take_events(&mut buffer);
-        for event in events.drain(..) {
+        let events = take_events(&mut buffer);
+        for event in events {
             let event_id = sse_event_id(&event);
             if tx.try_send((event, event_id)).is_err() {
                 overflow = true;
@@ -2158,12 +2162,13 @@ async fn dispatch_notification(
         .read()
         .ok()
         .and_then(|slot| slot.as_ref().map(Arc::clone));
-    match handler {
-        Some(handler) => handler.handle_notification(method, params).await,
-        None => tracing::debug!(
+    if let Some(handler) = handler {
+        handler.handle_notification(method, params).await;
+    } else {
+        tracing::debug!(
             method,
             "notification from the server (no notification handler installed)"
-        ),
+        );
     }
 }
 

@@ -67,6 +67,8 @@ fn extract_string_opt(args: &serde_json::Value, key: &str) -> Option<String> {
 }
 
 fn generate_summary(session_id: &str, messages: &[coderex_core::types::Message]) -> String {
+    use std::fmt::Write as _;
+
     if messages.is_empty() {
         return format!("No messages found for session '{session_id}'.");
     }
@@ -100,15 +102,16 @@ fn generate_summary(session_id: &str, messages: &[coderex_core::types::Message])
         });
 
     let mut output = format!("Session Brief: {session_id}\n");
-    output.push_str(&format!("Total messages: {total}\n"));
-    output.push_str(&format!(
-        "  User: {user_count} | Assistant: {assistant_count} | Tool: {tool_count}\n"
-    ));
+    let _ = writeln!(output, "Total messages: {total}");
+    let _ = writeln!(
+        output,
+        "  User: {user_count} | Assistant: {assistant_count} | Tool: {tool_count}"
+    );
     if compact_count > 0 {
-        output.push_str(&format!("  Compactions: {compact_count}\n"));
+        let _ = writeln!(output, "  Compactions: {compact_count}");
     }
     if let Some(p) = preview {
-        output.push_str(&format!("Last user message: {p}..."));
+        let _ = write!(output, "Last user message: {p}...");
     }
 
     output

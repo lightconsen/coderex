@@ -16,8 +16,11 @@ pub struct MockApiClient {
     /// Queue of streaming events to return in order.
     stream_events: Arc<Mutex<VecDeque<Vec<StreamEvent>>>>,
     /// Log of all calls made (system, messages, model, max_tokens).
-    call_log: Arc<Mutex<Vec<(String, Vec<serde_json::Value>, String, u32)>>>,
+    call_log: Arc<Mutex<Vec<CallLogEntry>>>,
 }
+
+/// One recorded call: system prompt, messages, model, and max tokens.
+type CallLogEntry = (String, Vec<serde_json::Value>, String, u32);
 
 impl Clone for MockApiClient {
     fn clone(&self) -> Self {

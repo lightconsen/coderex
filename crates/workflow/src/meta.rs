@@ -126,7 +126,7 @@ fn find_meta_start(script: &str) -> Option<usize> {
 ///
 /// Quotes and comments are respected: a `}` inside a string is a character,
 /// not the end of the object.
-fn matching_brace(script: &str, open: usize) -> Option<usize> {
+const fn matching_brace(script: &str, open: usize) -> Option<usize> {
     let bytes = script.as_bytes();
     let mut depth = 0usize;
     let mut index = open;
@@ -266,8 +266,8 @@ enum Literal {
     Text(String),
     Bool(bool),
     Number(f64),
-    Array(Vec<Literal>),
-    Object(Vec<(String, Literal)>),
+    Array(Vec<Self>),
+    Object(Vec<(String, Self)>),
 }
 
 fn read_value(text: &str) -> Result<Literal, MetaError> {
@@ -431,7 +431,7 @@ fn as_text(value: &Literal) -> Option<String> {
 mod tests {
     use super::*;
 
-    const SCRIPT: &str = r#"export const meta = {
+    const SCRIPT: &str = r"export const meta = {
   name: 'review-changes',
   description: 'Review the pending diff and verify each finding.',
   title: 'Review',
@@ -444,7 +444,7 @@ mod tests {
 
 phase('Review')
 const found = await parallel([() => agent('look')])
-"#;
+";
 
     #[test]
     fn a_script_yields_its_metadata_and_its_body() {
@@ -518,8 +518,8 @@ const found = await parallel([() => agent('look')])
 
     #[test]
     fn a_brace_inside_a_string_does_not_end_the_object() {
-        let script = r#"export const meta = { name: 'a', description: 'ends with }' }
-body()"#;
+        let script = r"export const meta = { name: 'a', description: 'ends with }' }
+body()";
         let (meta, body) = read(script).unwrap();
         assert_eq!(meta.description, "ends with }");
         assert_eq!(body, "body()");
@@ -557,7 +557,7 @@ body()"#;
 
     #[test]
     fn escapes_in_a_string_are_read() {
-        let script = r#"export const meta = { name: 'a', description: 'line\nquote\'s' }"#;
+        let script = r"export const meta = { name: 'a', description: 'line\nquote\'s' }";
         let (meta, _) = read(script).unwrap();
         assert_eq!(meta.description, "line\nquote's");
     }

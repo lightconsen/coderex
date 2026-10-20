@@ -14,7 +14,7 @@ pub struct MessageSelector {
 impl MessageSelector {
     /// Create a new message selector.
     #[must_use]
-    pub fn new(total: usize) -> Self {
+    pub const fn new(total: usize) -> Self {
         Self {
             total,
             selected: Vec::new(),
@@ -23,14 +23,14 @@ impl MessageSelector {
     }
 
     /// Move focus up.
-    pub fn focus_up(&mut self) {
+    pub const fn focus_up(&mut self) {
         if self.focus > 0 {
             self.focus -= 1;
         }
     }
 
     /// Move focus down.
-    pub fn focus_down(&mut self) {
+    pub const fn focus_down(&mut self) {
         if self.focus + 1 < self.total {
             self.focus += 1;
         }
@@ -43,7 +43,7 @@ impl MessageSelector {
         } else {
             self.selected.push(self.focus);
         }
-        self.selected.sort();
+        self.selected.sort_unstable();
     }
 
     /// Select all messages.
@@ -76,7 +76,7 @@ impl MessageSelector {
 
     /// Get the current focus index.
     #[must_use]
-    pub fn focus_index(&self) -> usize {
+    pub const fn focus_index(&self) -> usize {
         self.focus
     }
 }

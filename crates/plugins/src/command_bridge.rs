@@ -17,7 +17,7 @@ impl PluginCommandBridge {
     /// Command names are namespaced as `{plugin_name}/{command_name}`.
     pub fn register_commands(plugin_manager: &Arc<PluginManager>, registry: &mut CommandRegistry) {
         // Process plugins
-        for entry in plugin_manager.active_processes.iter() {
+        for entry in &plugin_manager.active_processes {
             let plugin_name = entry.key().clone();
             let process = entry.value();
 
@@ -59,7 +59,7 @@ impl PluginCommandBridge {
         }
 
         // WASM plugins
-        for entry in plugin_manager.active_wasm_instances.iter() {
+        for entry in &plugin_manager.active_wasm_instances {
             let plugin_name = entry.key().clone();
             let instance = entry.value();
 

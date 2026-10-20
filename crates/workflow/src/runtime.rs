@@ -43,9 +43,7 @@ pub const MAX_LOG_LINE_CHARS: usize = 400;
 /// The concurrency gate: never more than this many agents at once.
 #[must_use]
 pub fn default_max_concurrent() -> usize {
-    let parallelism = std::thread::available_parallelism()
-        .map(std::num::NonZeroUsize::get)
-        .unwrap_or(4);
+    let parallelism = std::thread::available_parallelism().map_or(4, std::num::NonZeroUsize::get);
     parallelism.saturating_sub(2).clamp(2, 16)
 }
 
@@ -118,7 +116,7 @@ impl AgentOutput {
 
     /// No answer.
     #[must_use]
-    pub fn empty() -> Self {
+    pub const fn empty() -> Self {
         Self {
             text: None,
             tokens: 0,
@@ -136,7 +134,7 @@ pub trait AgentRunner: Send + Sync {
 }
 
 /// What happened while a workflow ran.
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Progress {
     /// Lines the script logged.
     pub log: Vec<String>,
@@ -198,7 +196,7 @@ pub enum WorkflowError {
 }
 
 /// What a run produced.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Outcome {
     /// The run's id.
     pub run_id: String,
@@ -347,10 +345,9 @@ fn drive(
         let results = handle.block_on(run_agents(state, pending))?;
 
         for (id, result) in results {
-            let value = match &result {
-                Some(text) => json_to_js(&mut context, &serde_json::Value::String(text.clone())),
-                None => JsValue::null(),
-            };
+            let value = result.as_ref().map_or_else(JsValue::null, |text| {
+                json_to_js(&mut context, &serde_json::Value::String(text.clone()))
+            });
             resolve_agent(&mut context, &id, value)?;
         }
         // The next round's `budget.remaining()` must see what this round
@@ -404,6 +401,9 @@ fn read_strings(context: &mut Context, name: &str) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// One completed agent call: its id, journal key, label, and outcome.
+type JournalEntry = (String, String, Option<String>, Result<AgentOutput, String>);
+
 /// Run the agents a script is waiting on, at the concurrency it is allowed.
 async fn run_agents(
     state: &mut State,
@@ -438,7 +438,7 @@ async fn run_agents(
         }
 
         let key = key_for(&state.last_key, &request.prompt, &request.call_options());
-        state.last_key = key.clone();
+        state.last_key.clone_from(&key);
         state.keys.push(key.clone());
 
         // A replay: the key is in the journal, so the agent does not run.
@@ -463,7 +463,7 @@ async fn run_agents(
 
     let runner = Arc::clone(&state.runner);
     let limit = state.limits.max_concurrent;
-    let jounal_entries: Vec<(String, String, Option<String>, Result<AgentOutput, String>)> =
+    let jounal_entries: Vec<JournalEntry> =
         stream::iter(to_run.into_iter().map(|(id, key, request)| {
             let runner = Arc::clone(&runner);
             async move {
@@ -531,7 +531,7 @@ async fn run_agents(
 /// in keeps one implementation of the semantics rather than two.
 fn build_prelude() -> String {
     format!(
-        r#"
+        r"
 'use strict';
 const __pending = new Map();
 let __workflow_done = false;
@@ -549,7 +549,7 @@ function __to_options(value) {{
 }}
 
 function __log_push(message) {{
-  if (__log.length < {max_log_lines}) {{
+  if (__log.length < {MAX_LOG_LINES}) {{
     __log.push(__to_text(message));
   }}
   return undefined;
@@ -604,7 +604,7 @@ globalThis.__workflow_finished = () => __workflow_done;
 // own slot and the call itself never rejects.
 async function parallel(thunks) {{
   if (!Array.isArray(thunks)) throw new Error('parallel() takes an array of functions');
-  if (thunks.length > {max_items}) throw new Error('parallel() takes at most {max_items} items, got ' + thunks.length);
+  if (thunks.length > {MAX_ITEMS_PER_CALL}) throw new Error('parallel() takes at most {MAX_ITEMS_PER_CALL} items, got ' + thunks.length);
   const started = thunks.map((thunk) => {{
     try {{ return Promise.resolve(thunk()).catch(() => null); }}
     catch (error) {{ return Promise.resolve(null); }}
@@ -616,7 +616,7 @@ async function parallel(thunks) {{
 // item: each item walks the stages on its own.
 async function pipeline(items, ...stages) {{
   if (!Array.isArray(items)) throw new Error('pipeline() takes an array of items');
-  if (items.length > {max_items}) throw new Error('pipeline() takes at most {max_items} items, got ' + items.length);
+  if (items.length > {MAX_ITEMS_PER_CALL}) throw new Error('pipeline() takes at most {MAX_ITEMS_PER_CALL} items, got ' + items.length);
   const chains = items.map(async (item, index) => {{
     let value = item;
     for (const stage of stages) {{
@@ -631,9 +631,7 @@ async function pipeline(items, ...stages) {{
 async function workflow(name) {{
   throw new Error('running another workflow from inside one is not supported (' + name + ')');
 }}
-"#,
-        max_items = MAX_ITEMS_PER_CALL,
-        max_log_lines = MAX_LOG_LINES
+"
     )
 }
 
@@ -739,7 +737,7 @@ fn call_helper(context: &mut Context, name: &str, args: &[JsValue]) -> JsResult<
 /// Replace the ways a script could read the world outside itself.
 fn install_shims(context: &mut Context) -> Result<(), boa_engine::JsError> {
     context.eval(Source::from_bytes(
-        r#"
+        r"
 'use strict';
 const __real_date = Date;
 Math.random = function random() {
@@ -766,7 +764,7 @@ globalThis.__phases = [];
 // No token budget is attached yet; the host sets these when one is.
 globalThis.__budget_total = null;
 globalThis.__budget_remaining = Infinity;
-"#,
+",
     ))?;
     Ok(())
 }
@@ -842,7 +840,7 @@ pub fn pending_requests(context: &mut Context) -> Vec<(String, AgentRequest)> {
 }
 
 fn json_to_js(context: &mut Context, value: &serde_json::Value) -> JsValue {
-    let source = format!("({})", value);
+    let source = format!("({value})");
     context
         .eval(Source::from_bytes(source.as_bytes()))
         .unwrap_or(JsValue::undefined())

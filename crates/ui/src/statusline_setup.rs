@@ -25,23 +25,21 @@ pub enum SetupStep {
 impl SetupStep {
     /// Next step in the wizard.
     #[must_use]
-    pub fn next(self) -> Self {
+    pub const fn next(self) -> Self {
         match self {
             Self::Welcome => Self::ModelSelect,
             Self::ModelSelect => Self::TokenTracking,
             Self::TokenTracking => Self::CostDisplay,
             Self::CostDisplay => Self::GitBranch,
-            Self::GitBranch => Self::Complete,
-            Self::Complete => Self::Complete,
+            Self::GitBranch | Self::Complete => Self::Complete,
         }
     }
 
     /// Previous step in the wizard.
     #[must_use]
-    pub fn prev(self) -> Self {
+    pub const fn prev(self) -> Self {
         match self {
-            Self::Welcome => Self::Welcome,
-            Self::ModelSelect => Self::Welcome,
+            Self::Welcome | Self::ModelSelect => Self::Welcome,
             Self::TokenTracking => Self::ModelSelect,
             Self::CostDisplay => Self::TokenTracking,
             Self::GitBranch => Self::CostDisplay,
@@ -51,7 +49,7 @@ impl SetupStep {
 
     /// Prompt text for the current step.
     #[must_use]
-    pub fn prompt(&self) -> &'static str {
+    pub const fn prompt(&self) -> &'static str {
         match self {
             Self::Welcome => "Welcome! Configure your statusline.",
             Self::ModelSelect => "Preferred model: sonnet/opus/haiku?",
@@ -111,12 +109,12 @@ impl StatuslineSetup {
     }
 
     /// Go back to the previous step.
-    pub fn back_step(&mut self) {
+    pub const fn back_step(&mut self) {
         self.current_step = self.current_step.prev();
     }
 
     /// Toggle the option for the current step.
-    pub fn toggle_current(&mut self) {
+    pub const fn toggle_current(&mut self) {
         match self.current_step {
             SetupStep::TokenTracking => self.show_tokens = !self.show_tokens,
             SetupStep::CostDisplay => self.show_cost = !self.show_cost,
@@ -137,13 +135,13 @@ impl StatuslineSetup {
 
     /// Check if setup is complete.
     #[must_use]
-    pub fn is_complete(&self) -> bool {
+    pub const fn is_complete(&self) -> bool {
         self.completed
     }
 
     /// Get the prompt text for the current step.
     #[must_use]
-    pub fn render_prompt(&self) -> &str {
+    pub const fn render_prompt(&self) -> &str {
         self.current_step.prompt()
     }
 }

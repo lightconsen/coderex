@@ -131,7 +131,7 @@ impl McpConfig {
     /// Load from a file path.
     pub fn load(path: &Path) -> Result<Self, std::io::Error> {
         let content = std::fs::read_to_string(path)?;
-        let config: McpConfig = serde_json::from_str(&content)
+        let config: Self = serde_json::from_str(&content)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
         Ok(config)
     }

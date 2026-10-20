@@ -106,7 +106,7 @@ impl ArtifactServer {
 async fn serve_connection(mut stream: TcpStream, store: &ArtifactStore) -> std::io::Result<()> {
     let request = read_head(&mut stream).await?;
     let response = match request {
-        Some(Request { method, path }) => respond(&method, &path, store).await,
+        Some(Request { method, path }) => respond(&method, &path, store),
         None => Response::status(400, "malformed request"),
     };
     stream.write_all(&response.render()).await?;
@@ -186,7 +186,7 @@ impl Response {
     }
 }
 
-fn reason_for(status: u16) -> &'static str {
+const fn reason_for(status: u16) -> &'static str {
     match status {
         200 => "OK",
         400 => "Bad Request",
@@ -196,7 +196,7 @@ fn reason_for(status: u16) -> &'static str {
     }
 }
 
-async fn respond(method: &str, path: &str, store: &ArtifactStore) -> Response {
+fn respond(method: &str, path: &str, store: &ArtifactStore) -> Response {
     if method != "GET" && method != "HEAD" {
         return Response::status(405, "artifacts are read with GET");
     }
@@ -205,9 +205,8 @@ async fn respond(method: &str, path: &str, store: &ArtifactStore) -> Response {
         return Response::status(404, "not found");
     };
 
-    let manifest = match store.manifest(&slug) {
-        Ok(manifest) => manifest,
-        Err(_) => return Response::status(404, "no such artifact"),
+    let Ok(manifest) = store.manifest(&slug) else {
+        return Response::status(404, "no such artifact");
     };
 
     // `/artifact/<slug>` and `/artifact/<slug>/` both open the entry page.
@@ -229,9 +228,8 @@ async fn respond(method: &str, path: &str, store: &ArtifactStore) -> Response {
         return Response::status(404, "not found");
     };
 
-    let body = match std::fs::read(&target) {
-        Ok(body) => body,
-        Err(_) => return Response::status(404, "not found"),
+    let Ok(body) = std::fs::read(&target) else {
+        return Response::status(404, "not found");
     };
 
     Response {

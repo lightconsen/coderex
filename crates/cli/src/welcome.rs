@@ -2,14 +2,14 @@
 
 use std::io::Write;
 
-const T_REX: &str = r#"
+const T_REX: &str = r"
                       __
                      / _)
             _.----._/ /
            /         /
         __/ (  | (  |
        /__.-'|_|--|_|
-"#;
+";
 
 /// Print the welcome screen with ASCII T-Rex logo and session information.
 pub fn print_welcome_screen<W: Write>(

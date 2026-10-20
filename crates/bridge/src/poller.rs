@@ -57,12 +57,12 @@ pub enum SpawnMode {
 impl SpawnMode {
     /// Convert to the string format expected by the control plane server.
     #[must_use]
-    pub fn as_str(&self) -> &str {
+    pub const fn as_str(&self) -> &str {
         match self {
-            SpawnMode::SingleSession => "single_session",
-            SpawnMode::SameDir => "same_dir",
-            SpawnMode::Worktree => "worktree",
-            SpawnMode::Ssh { .. } => "ssh",
+            Self::SingleSession => "single_session",
+            Self::SameDir => "same_dir",
+            Self::Worktree => "worktree",
+            Self::Ssh { .. } => "ssh",
         }
     }
 
@@ -72,6 +72,9 @@ impl SpawnMode {
     /// falls back to a local single session rather than spawning an SSH
     /// session to `""`. Use [`SpawnMode::from_str_with_ssh`] when the
     /// assignment carries its target.
+    // Named like the trait method on purpose: this is the assignment's wire
+    // vocabulary, not a `FromStr` conversion.
+    #[allow(clippy::should_implement_trait)]
     #[must_use]
     pub fn from_str(s: &str) -> Self {
         Self::from_str_with_ssh(s, None)
@@ -82,17 +85,16 @@ impl SpawnMode {
     #[must_use]
     pub fn from_str_with_ssh(s: &str, ssh: Option<SshTarget>) -> Self {
         match (s, ssh) {
-            ("single_session", _) => SpawnMode::SingleSession,
-            ("same_dir", _) => SpawnMode::SameDir,
-            ("worktree", _) => SpawnMode::Worktree,
-            ("ssh", Some(target)) => SpawnMode::Ssh {
+            ("same_dir", _) => Self::SameDir,
+            ("worktree", _) => Self::Worktree,
+            ("ssh", Some(target)) => Self::Ssh {
                 host: target.host,
                 remote_path: target.remote_path,
                 identity_file: target.identity_file,
             },
             // `"ssh"` with no target, and every unknown spelling, degrades to
             // the local mode instead of inventing an unreachable host.
-            _ => SpawnMode::SingleSession,
+            _ => Self::SingleSession,
         }
     }
 }
@@ -219,6 +221,9 @@ impl HttpControlPlaneClient {
     }
 
     /// The claim path for one assignment.
+    ///
+    /// The braces are placeholders for `replace`, not formatting arguments.
+    #[allow(clippy::literal_string_with_formatting_args)]
     #[must_use]
     pub fn claim_url(&self, env_id: &str, assignment_id: &str) -> String {
         let path = self
@@ -267,7 +272,7 @@ fn worker_epoch_from_response(body: &str) -> u64 {
 /// assignment. 404 and 422 are accepted too, so a load balancer, a proxy, or a
 /// compatible server that spells "gone"/"not claimable" differently still
 /// results in a skip rather than an error.
-fn claim_status_is_lost(status: reqwest::StatusCode) -> bool {
+const fn claim_status_is_lost(status: reqwest::StatusCode) -> bool {
     matches!(status.as_u16(), 404 | 409 | 422)
 }
 
@@ -504,17 +509,15 @@ impl BridgeWorkPoller {
 
     /// Take the next pending assignment.
     pub fn take_assignment(&mut self) -> Option<WorkAssignment> {
-        if self.active_sessions < self.max_concurrent {
-            if !self.pending.is_empty() {
-                self.active_sessions += 1;
-                return Some(self.pending.remove(0));
-            }
+        if self.active_sessions < self.max_concurrent && !self.pending.is_empty() {
+            self.active_sessions += 1;
+            return Some(self.pending.remove(0));
         }
         None
     }
 
     /// Mark a session as completed, freeing capacity.
-    pub fn session_completed(&mut self) {
+    pub const fn session_completed(&mut self) {
         if self.active_sessions > 0 {
             self.active_sessions -= 1;
         }

@@ -65,11 +65,12 @@ impl ProviderConfig {
     /// Load configuration from environment variables.
     #[must_use]
     pub fn from_env() -> Self {
-        let mut config = Self::default();
-
         // A cloud provider is selected, not detected: the deployment says
         // which one it is, and that choice outranks the plain API key.
-        config.cloud = cloud_endpoint_from_env();
+        let mut config = Self {
+            cloud: cloud_endpoint_from_env(),
+            ..Self::default()
+        };
 
         if let Ok(key) = std::env::var("ANTHROPIC_API_KEY") {
             config.anthropic = Some(ProviderEndpoint {
@@ -149,7 +150,7 @@ impl ProviderConfig {
         } else if let Some(ref ep) = self.anthropic {
             let mut config = ApiConfig::new(ep.api_key.clone());
             if let Some(ref url) = ep.base_url {
-                config.base_url = url.clone();
+                config.base_url.clone_from(url);
             }
             if let Some(ref profile) = ep.provider_profile {
                 config = config.with_provider_profile(profile.clone());
@@ -218,9 +219,8 @@ impl ProviderConfig {
 
 fn parse_custom_headers_env() -> BTreeMap<String, String> {
     let mut out = BTreeMap::new();
-    let raw = match std::env::var("CODEREX_CUSTOM_HEADERS") {
-        Ok(v) => v,
-        Err(_) => return out,
+    let Ok(raw) = std::env::var("CODEREX_CUSTOM_HEADERS") else {
+        return out;
     };
     for line in raw.lines() {
         let trimmed = line.trim();
@@ -245,7 +245,7 @@ fn parse_fallback_providers_env() -> Vec<String> {
             raw.split([',', '\n'])
                 .map(str::trim)
                 .filter(|item| !item.is_empty())
-                .map(|item| item.to_ascii_lowercase())
+                .map(str::to_ascii_lowercase)
                 .collect()
         })
         .unwrap_or_default()

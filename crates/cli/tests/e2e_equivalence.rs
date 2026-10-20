@@ -133,10 +133,7 @@ fn run_with_args(
     extra_args: &[&str],
     timeout_secs: u64,
 ) -> CoderexOutput {
-    eprintln!(
-        "DEBUG run_with_args: prompt={:?}, extra_args={:?}",
-        prompt, extra_args
-    );
+    eprintln!("DEBUG run_with_args: prompt={prompt:?}, extra_args={extra_args:?}");
     let mut cmd = Command::new(binary_path());
     cmd.arg("-p")
         .args(extra_args)
@@ -263,8 +260,7 @@ fn assert_response_contains(stdout: &str, keywords: &[&str], label: &str) {
     }
     assert!(
         found > 0,
-        "{label}: expected at least one of {:?} in response, got:\n{stdout}",
-        keywords
+        "{label}: expected at least one of {keywords:?} in response, got:\n{stdout}"
     );
 }
 
@@ -281,7 +277,7 @@ name = "target_lib"
 version = "0.1.0"
 edition = "2021"
 "#;
-    let lib_rs = r#"pub fn add(a: i32, b: i32) -> i32 {
+    let lib_rs = r"pub fn add(a: i32, b: i32) -> i32 {
     a + b
 }
 
@@ -294,7 +290,7 @@ mod tests {
         assert_eq!(add(2, 3), 5);
     }
 }
-"#;
+";
     std::fs::create_dir_all(dir.join("src")).unwrap();
     std::fs::write(dir.join("Cargo.toml"), cargo_toml).unwrap();
     std::fs::write(dir.join("src/lib.rs"), lib_rs).unwrap();
@@ -307,7 +303,7 @@ name = "review_target"
 version = "0.1.0"
 edition = "2021"
 "#;
-    let lib_rs = r#"use std::fs;
+    let lib_rs = r"use std::fs;
 
 pub fn read_config(path: &str) -> String {
     fs::read_to_string(path).unwrap()
@@ -316,7 +312,7 @@ pub fn read_config(path: &str) -> String {
 pub fn div(a: i32, b: i32) -> i32 {
     a / b
 }
-"#;
+";
     std::fs::create_dir_all(dir.join("src")).unwrap();
     std::fs::write(dir.join("Cargo.toml"), cargo_toml).unwrap();
     std::fs::write(dir.join("src/lib.rs"), lib_rs).unwrap();
@@ -571,7 +567,7 @@ fn engine_structured_output() {
 
     // Should produce valid JSON containing the required field
     assert!(
-        out.stdout.contains("\"greeting\"") || out.stdout.contains("{"),
+        out.stdout.contains("\"greeting\"") || out.stdout.contains('{'),
         "expected JSON output matching schema, got: {}",
         out.stdout
     );

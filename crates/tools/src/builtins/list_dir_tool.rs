@@ -48,8 +48,7 @@ impl Tool for ListDirTool {
             .arguments
             .get("path")
             .and_then(serde_json::Value::as_str)
-            .map(|path| resolve_path(path, ctx.cwd))
-            .unwrap_or_else(|| ctx.cwd.to_path_buf());
+            .map_or_else(|| ctx.cwd.to_path_buf(), |path| resolve_path(path, ctx.cwd));
 
         let metadata = std::fs::metadata(&dir).map_err(|e| ToolError::InvalidInput {
             message: format!("failed to access directory: {e}"),
@@ -73,9 +72,8 @@ impl Tool for ListDirTool {
                 let suffix = entry
                     .metadata()
                     .ok()
-                    .filter(|m| m.is_dir())
-                    .map(|_| "/")
-                    .unwrap_or("");
+                    .filter(std::fs::Metadata::is_dir)
+                    .map_or("", |_| "/");
                 Some(format!("{name}{suffix}"))
             })
             .collect::<Vec<_>>();

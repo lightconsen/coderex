@@ -17,7 +17,7 @@ pub struct PluginToolExecutor {
 impl PluginToolExecutor {
     /// Create a new plugin tool executor backed by the given manager.
     #[must_use]
-    pub fn new(manager: Arc<PluginManager>) -> Self {
+    pub const fn new(manager: Arc<PluginManager>) -> Self {
         Self { manager }
     }
 }
@@ -30,28 +30,26 @@ impl ToolExecutor for PluginToolExecutor {
         tool_name: &str,
         input: &Value,
     ) -> ToolDispatchOutcome {
-        let plugin_name = match self.manager.find_plugin_for_command(tool_name) {
-            Some(name) => name,
-            None => {
-                return ToolDispatchOutcome {
-                    result: ToolResult {
-                        tool_call_id: tool_call_id.to_string(),
-                        output: format!("Plugin tool '{tool_name}' not found"),
-                        is_error: true,
-                        images: Vec::new(),
-                    },
-                };
-            }
+        let Some(plugin_name) = self.manager.find_plugin_for_command(tool_name) else {
+            return ToolDispatchOutcome {
+                result: ToolResult {
+                    tool_call_id: tool_call_id.to_string(),
+                    output: format!("Plugin tool '{tool_name}' not found"),
+                    is_error: true,
+                    images: Vec::new(),
+                },
+            };
         };
 
         // Convert JSON input to string arguments for the plugin command.
-        let args = if let Some(arr) = input.as_array() {
-            arr.iter()
-                .filter_map(|v| v.as_str().map(String::from))
-                .collect()
-        } else {
-            vec![input.to_string()]
-        };
+        let args = input.as_array().map_or_else(
+            || vec![input.to_string()],
+            |arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect()
+            },
+        );
 
         match self
             .manager

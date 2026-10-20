@@ -24,7 +24,7 @@ pub fn have_live_env() -> bool {
 
 /// Skip message when env is missing.
 #[must_use]
-pub fn skip_msg() -> &'static str {
+pub const fn skip_msg() -> &'static str {
     "ANTHROPIC_API_KEY+ANTHROPIC_BASE_URL or OPENAI_API_KEY+OPENAI_BASE_URL not set"
 }
 

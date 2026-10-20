@@ -221,6 +221,9 @@ pub struct PromptContext<'a> {
 
 // ─── Prompt Compiler ────────────────────────────────────────────────────────
 
+/// A named block whose text is produced from the current context.
+type DynamicBlock = (String, Box<dyn Fn(&PromptContext) -> String + Send + Sync>);
+
 /// Assembles system prompts from static and dynamic blocks.
 ///
 /// The static/dynamic split is designed to maximize Anthropic API prompt cache
@@ -229,7 +232,7 @@ pub struct PromptContext<'a> {
 #[allow(missing_debug_implementations)]
 pub struct PromptCompiler {
     static_blocks: Vec<PromptBlock>,
-    dynamic_blocks: Vec<(String, Box<dyn Fn(&PromptContext) -> String + Send + Sync>)>,
+    dynamic_blocks: Vec<DynamicBlock>,
     config: CompactConfig,
 }
 

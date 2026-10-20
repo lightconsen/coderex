@@ -1,6 +1,7 @@
 //! Advanced commands: /bridge, /bridge-kick, /teleport, /ultraplan, /insights, /thinkback, /thinkback-play, /statusline.
 
 use crate::registry::{CommandContext, CommandRegistry, CommandResult, SlashCommand};
+use std::fmt::Write as _;
 use std::sync::Arc;
 
 thread_local! {
@@ -16,7 +17,7 @@ fn config_home() -> std::path::PathBuf {
     TEST_CONFIG_HOME.with(|h| {
         h.borrow()
             .clone()
-            .unwrap_or_else(|| coderex_config::settings::config_home())
+            .unwrap_or_else(coderex_config::settings::config_home)
     })
 }
 
@@ -56,7 +57,7 @@ pub fn register(registry: &mut CommandRegistry) {
         true,
         Arc::new(|_ctx: &CommandContext, _args: &[String]| {
             let bridge_url = std::env::var("CODEREX_BRIDGE_URL").ok();
-            let status = if bridge_url.as_ref().map(|s| !s.is_empty()).unwrap_or(false) {
+            let status = if bridge_url.as_ref().is_some_and(|s| !s.is_empty()) {
                 format!(
                     "Status: Configured\nURL: {}\nNo remote environments connected yet.",
                     bridge_url.unwrap()
@@ -77,7 +78,7 @@ pub fn register(registry: &mut CommandRegistry) {
         false,
         Arc::new(|_ctx: &CommandContext, _args: &[String]| {
             let bridge_url = std::env::var("CODEREX_BRIDGE_URL").ok();
-            if bridge_url.as_ref().map(|s| !s.is_empty()).unwrap_or(false) {
+            if bridge_url.as_ref().is_some_and(|s| !s.is_empty()) {
                 CommandResult::success(
                     "Bridge kick requested.\n(Actual connection management is handled by the REPL or Bridge daemon.)"
                 ).with_state_change(true)
@@ -151,10 +152,10 @@ pub fn register(registry: &mut CommandRegistry) {
                         outcome.report.stable.display()
                     );
                     for finding in outcome.findings.iter().take(5) {
-                        report.push_str(&format!("\n• {} — {}", finding.title, finding.detail));
+                        let _ = write!(report, "\n• {} — {}", finding.title, finding.detail);
                     }
                     for unreadable in &outcome.unreadable {
-                        report.push_str(&format!("\n(could not read {unreadable})"));
+                        let _ = write!(report, "\n(could not read {unreadable})");
                     }
                     CommandResult::success(report)
                 }
@@ -182,26 +183,28 @@ pub fn register(registry: &mut CommandRegistry) {
                         if let Ok(content) = std::fs::read_to_string(&session_file) {
                             let lines: Vec<&str> = content.lines().collect();
                             total_msgs = lines.len();
-                            let _total = total_msgs;
-                            output.push_str(&format!(
+                            let _ = write!(
+                                output,
                                 "Session {}: {} messages\n\n",
                                 ctx.session_id, total_msgs
-                            ));
+                            );
                             for line in lines.iter().take(10) {
                                 if let Ok(msg) = serde_json::from_str::<serde_json::Value>(line) {
                                     if let Some(role) = msg.get("role").and_then(|r| r.as_str()) {
                                         let preview = msg
                                             .get("content")
                                             .and_then(|c| c.as_str())
-                                            .map(|s| {
-                                                let s = s.trim();
-                                                if s.len() > 60 {
-                                                    format!("{}...", &s[..57])
-                                                } else {
-                                                    s.to_string()
-                                                }
-                                            })
-                                            .unwrap_or_else(|| "(non-text)".to_string());
+                                            .map_or_else(
+                                                || "(non-text)".to_string(),
+                                                |s| {
+                                                    let s = s.trim();
+                                                    if s.len() > 60 {
+                                                        format!("{}...", &s[..57])
+                                                    } else {
+                                                        s.to_string()
+                                                    }
+                                                },
+                                            );
                                         let role_label = match role {
                                             "user" => "User",
                                             "assistant" => "Assistant",
@@ -209,16 +212,13 @@ pub fn register(registry: &mut CommandRegistry) {
                                             "system" => "System",
                                             _ => role,
                                         };
-                                        output
-                                            .push_str(&format!("  [{}] {}\n", role_label, preview));
+                                        let _ = writeln!(output, "  [{role_label}] {preview}");
                                     }
                                 }
                             }
                             if total_msgs > 10 {
-                                output.push_str(&format!(
-                                    "  ... and {} more messages\n",
-                                    total_msgs - 10
-                                ));
+                                let _ =
+                                    writeln!(output, "  ... and {} more messages", total_msgs - 10);
                             }
                         }
                     } else {

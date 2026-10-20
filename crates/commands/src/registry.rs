@@ -82,24 +82,28 @@ impl CommandResult {
     }
 
     /// Mark the result as having changed session state.
-    pub fn with_state_change(mut self, changed: bool) -> Self {
+    #[must_use]
+    pub const fn with_state_change(mut self, changed: bool) -> Self {
         self.state_changed = changed;
         self
     }
 
     /// Suppress the output display.
-    pub fn with_suppressed(mut self) -> Self {
+    #[must_use]
+    pub const fn with_suppressed(mut self) -> Self {
         self.suppress_output = true;
         self
     }
 
     /// Add extra context to the session.
+    #[must_use]
     pub fn with_context(mut self, ctx: impl Into<String>) -> Self {
         self.extra_context = Some(ctx.into());
         self
     }
 
     /// Set a system prompt to append (for mode switching).
+    #[must_use]
     pub fn with_append_system_prompt(mut self, prompt: impl Into<String>) -> Self {
         self.append_system_prompt = Some(prompt.into());
         self
@@ -110,34 +114,39 @@ impl CommandResult {
     /// When set, this replaces the default base system prompt instead of
     /// appending to it. This is useful for commands that want to switch
     /// the agent into a completely different behavior mode.
+    #[must_use]
     pub fn with_override_system_prompt(mut self, prompt: impl Into<String>) -> Self {
         self.override_system_prompt = Some(prompt.into());
         self
     }
 
     /// Set the prompt profile to switch agent behavior.
-    pub fn with_prompt_profile(mut self, profile: PromptProfile) -> Self {
+    #[must_use]
+    pub const fn with_prompt_profile(mut self, profile: PromptProfile) -> Self {
         self.prompt_profile = Some(profile);
         self
     }
 
     /// Override the allowed tool set for this session.
+    #[must_use]
     pub fn with_allowed_tools_override(mut self, tools: Vec<String>) -> Self {
         self.allowed_tools_override = Some(tools);
         self
     }
 
     /// Mark the output as scrollable (rendered as a full message).
-    pub fn with_scrollable(mut self) -> Self {
+    #[must_use]
+    pub const fn with_scrollable(mut self) -> Self {
         self.scrollable = true;
         self
     }
 }
 
 /// Command argument specification for validation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum CommandArgs {
     /// No specific argument validation — any number of arguments accepted.
+    #[default]
     None,
     /// At least N arguments required.
     AtLeast(usize),
@@ -145,12 +154,6 @@ pub enum CommandArgs {
     AtMost(usize),
     /// Exactly N arguments required.
     Exactly(usize),
-}
-
-impl Default for CommandArgs {
-    fn default() -> Self {
-        CommandArgs::None
-    }
 }
 
 // ─── CommandHandler ─────────────────────────────────────────────────────────
@@ -410,18 +413,21 @@ impl SlashCommand {
     }
 
     /// Mark this command to be executed via a sub-agent backend.
+    #[must_use]
     pub const fn with_agent_backend(mut self) -> Self {
         self.uses_agent_backend = true;
         self
     }
 
     /// Mark this command as destructive, requiring confirmation in TUI mode.
+    #[must_use]
     pub const fn with_destructive(mut self) -> Self {
         self.destructive = true;
         self
     }
 
     /// Set the argument validation spec for this command.
+    #[must_use]
     pub const fn with_args(mut self, args: CommandArgs) -> Self {
         self.args = args;
         self
@@ -471,13 +477,13 @@ fn validate_args(spec: &CommandArgs, args: &[String], name: &str) -> Option<Comm
             }
         }
         CommandArgs::Exactly(n) => {
-            if args.len() != *n {
+            if args.len() == *n {
+                None
+            } else {
                 Some(CommandResult::error(format!(
                     "Command /{name} requires exactly {n} argument(s). Got {}.",
                     args.len()
                 )))
-            } else {
-                None
             }
         }
     }

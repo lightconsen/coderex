@@ -17,23 +17,21 @@ const REPO_NAME: &str = "coderex";
 pub async fn check_for_updates() -> Option<String> {
     let url = format!("https://api.github.com/repos/{REPO_OWNER}/{REPO_NAME}/releases/latest");
 
-    let client = match reqwest::Client::builder()
+    let Ok(client) = reqwest::Client::builder()
         .timeout(Duration::from_secs(5))
         .build()
-    {
-        Ok(c) => c,
-        Err(_) => return None,
+    else {
+        return None;
     };
 
-    let response = match client
+    let Ok(response) = client
         .get(&url)
         .header("User-Agent", "coderex-cli")
         .header("Accept", "application/vnd.github.v3+json")
         .send()
         .await
-    {
-        Ok(r) => r,
-        Err(_) => return None,
+    else {
+        return None;
     };
 
     if !response.status().is_success() {
@@ -90,9 +88,8 @@ pub fn should_check(cwd: &Path) -> bool {
         return true;
     }
 
-    let content = match std::fs::read_to_string(&marker) {
-        Ok(c) => c,
-        Err(_) => return true,
+    let Ok(content) = std::fs::read_to_string(&marker) else {
+        return true;
     };
 
     let last_check: u64 = content.trim().parse().unwrap_or(0);

@@ -17,20 +17,15 @@
 use std::collections::HashSet;
 
 /// Classification of a command's destructive potential.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
 pub enum DestructiveLevel {
     /// Read-only operations (ls, cat, echo, grep).
+    #[default]
     Safe = 0,
     /// Potentially destructive but common (cp, mv, mkdir -p).
     Caution = 1,
     /// Definitely destructive (rm -rf, > overwrite, dd, mkfs).
     Dangerous = 2,
-}
-
-impl Default for DestructiveLevel {
-    fn default() -> Self {
-        Self::Safe
-    }
 }
 
 impl DestructiveLevel {
@@ -245,7 +240,7 @@ fn parse_single_command(stage: &str) -> BashCommand {
     }
 
     if let Some(prog) = tokens.first() {
-        cmd.program = prog.clone();
+        cmd.program.clone_from(prog);
         cmd.args = tokens.into_iter().skip(1).collect();
     }
 
@@ -297,8 +292,8 @@ fn try_parse_redirect(tokens: &[String], idx: usize) -> Option<ParsedRedirect> {
         || token == ">>"
         || token == "<"
         || token.starts_with(">>")
-        || token.starts_with(">")
-        || token.starts_with("<")
+        || token.starts_with('>')
+        || token.starts_with('<')
     {
         let (kind, prefix_len) = if token.starts_with(">>") {
             (RedirectKind::Append, 2)
@@ -341,10 +336,9 @@ fn try_parse_redirect(tokens: &[String], idx: usize) -> Option<ParsedRedirect> {
 
     // << or <<< (here-doc / here-string)
     if token.starts_with("<<") {
-        let target = if token.len() > 2 {
-            token[2..].to_string()
-        } else {
-            tokens.get(idx + 1)?.clone()
+        let target = match token.strip_prefix("<<") {
+            Some(rest) if !rest.is_empty() => rest.to_string(),
+            _ => tokens.get(idx + 1)?.clone(),
         };
         return Some(ParsedRedirect {
             redirect: Redirect {
@@ -367,10 +361,10 @@ fn classify_command(cmd: &mut BashCommand) {
     // Check program against known dangerous commands
     match prog.as_str() {
         "rm" => {
-            if args_set.iter().any(|a| a.starts_with("-")) {
+            if args_set.iter().any(|a| a.starts_with('-')) {
                 let flags: String = args_set
                     .iter()
-                    .filter(|a| a.starts_with("-"))
+                    .filter(|a| a.starts_with('-'))
                     .cloned()
                     .collect();
                 if flags.contains('r') && flags.contains('f') {
@@ -415,7 +409,7 @@ fn classify_command(cmd: &mut BashCommand) {
         }
         "chown" | "chgrp" => {
             cmd.level = DestructiveLevel::Caution;
-            cmd.reasons.push(format!("{} (ownership change)", prog));
+            cmd.reasons.push(format!("{prog} (ownership change)"));
         }
         "mv" => {
             if args_set.contains("-f") || args_set.contains("--force") {
@@ -443,13 +437,13 @@ fn classify_command(cmd: &mut BashCommand) {
         "truncate" | "shred" => {
             cmd.level = DestructiveLevel::Dangerous;
             cmd.reasons
-                .push(format!("{} (destructive file operation)", prog));
+                .push(format!("{prog} (destructive file operation)"));
         }
         "wget" | "curl" => {
             if args_set.contains("-o") || args_set.contains("--output") || args_set.contains("-O") {
                 cmd.level = DestructiveLevel::Caution;
                 cmd.reasons
-                    .push(format!("{} with output file (overwrite risk)", prog));
+                    .push(format!("{prog} with output file (overwrite risk)"));
             }
         }
         "sudo" | "su" => {

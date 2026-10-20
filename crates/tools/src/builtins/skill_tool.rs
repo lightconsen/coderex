@@ -41,6 +41,8 @@ impl Tool for SkillTool {
         input: ToolInput,
         ctx: ToolContext<'_>,
     ) -> Result<ToolOutput, ToolError> {
+        use std::fmt::Write as _;
+
         let skill = extract_string(&input.arguments, "skill")?;
         let args = extract_string_opt(&input.arguments, "args");
 
@@ -56,10 +58,11 @@ impl Tool for SkillTool {
             if path.exists() {
                 match std::fs::read_to_string(&path) {
                     Ok(content) => {
-                        let mut output = format!("Skill '{skill}' loaded from {path:?}\n\n");
+                        let mut output =
+                            format!("Skill '{skill}' loaded from {}\n\n", path.display());
                         output.push_str(&content);
                         if let Some(a) = args {
-                            output.push_str(&format!("\n\nArguments: {a}"));
+                            let _ = write!(output, "\n\nArguments: {a}");
                         }
                         return Ok(ToolOutput {
                             output,
@@ -82,7 +85,10 @@ impl Tool for SkillTool {
             if let Ok(entries) = std::fs::read_dir(dir) {
                 for entry in entries.flatten() {
                     let name = entry.file_name().to_string_lossy().to_string();
-                    if name.ends_with(".md") {
+                    if std::path::Path::new(&name)
+                        .extension()
+                        .is_some_and(|ext| ext.eq_ignore_ascii_case("md"))
+                    {
                         available.push(name.trim_end_matches(".md").to_string());
                     }
                 }
@@ -90,10 +96,10 @@ impl Tool for SkillTool {
         }
 
         let mut msg = format!("Skill '{skill}' not found.");
-        if !available.is_empty() {
-            msg.push_str(&format!("\nAvailable skills: {}", available.join(", ")));
-        } else {
+        if available.is_empty() {
             msg.push_str("\nNo skills found in .coderex/skills/ or ~/.coderex/skills/");
+        } else {
+            let _ = write!(msg, "\nAvailable skills: {}", available.join(", "));
         }
         Err(ToolError::InvalidInput { message: msg })
     }

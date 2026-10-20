@@ -102,10 +102,7 @@ pub fn is_path_allowed(path: &std::path::Path, allowed: &[std::path::PathBuf]) -
     if allowed.is_empty() {
         return true;
     }
-    let canonical = match std::fs::canonicalize(path) {
-        Ok(p) => p,
-        Err(_) => path.to_path_buf(),
-    };
+    let canonical = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
     allowed
         .iter()
         .any(|allowed_path| canonical.starts_with(allowed_path))

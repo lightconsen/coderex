@@ -57,10 +57,14 @@ impl Tool for SleepTool {
             });
         }
 
-        let capped = duration_secs > MAX_SLEEP_SECS as f64;
-        let duration_secs = duration_secs.min(MAX_SLEEP_SECS as f64);
+        let max_sleep_secs = f64::from(u32::try_from(MAX_SLEEP_SECS).unwrap_or(u32::MAX));
+        let capped = duration_secs > max_sleep_secs;
+        let duration_secs = duration_secs.min(max_sleep_secs);
 
         if !capped {
+            // f64 -> u64 has no checked conversion; the value is finite and
+            // bounded by `max_sleep_secs` above.
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
             let dur = std::time::Duration::from_millis((duration_secs * 1000.0) as u64);
             tokio::time::sleep(dur).await;
         }

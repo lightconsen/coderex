@@ -8,6 +8,7 @@
 
 use crate::aggregate::{Aggregate, Finding, FindingKind};
 use crate::facts::SessionFacts;
+use std::fmt::Write as _;
 
 /// How many sessions the report names in its tables.
 const SESSIONS_SHOWN: usize = 25;
@@ -49,12 +50,13 @@ pub fn render(aggregate: &Aggregate, findings: &[Finding], sessions: &[SessionFa
     );
 
     html.push_str("<h1>CodeRex Insights</h1>");
-    html.push_str(&format!(
+    let _ = write!(
+        html,
         "<p class=\"muted\">{} session(s), {} message(s). Generated {}.</p>",
         aggregate.sessions,
         aggregate.messages,
         chrono::Utc::now().format("%Y-%m-%d %H:%M UTC")
-    ));
+    );
 
     if aggregate.sessions == 0 {
         html.push_str(
@@ -74,10 +76,11 @@ pub fn render(aggregate: &Aggregate, findings: &[Finding], sessions: &[SessionFa
             "tool failures",
         ),
     ] {
-        html.push_str(&format!(
+        let _ = write!(
+            html,
             "<div class=\"stat\"><div class=\"stat-value\">{value}</div>\
              <div class=\"stat-label\">{label}</div></div>"
-        ));
+        );
     }
     html.push_str("</div>");
 
@@ -89,22 +92,24 @@ pub fn render(aggregate: &Aggregate, findings: &[Finding], sessions: &[SessionFa
     html.push_str("<div class=\"at-a-glance\"><h2 style=\"margin-top:0\">At a glance</h2>");
     html.push_str("<h3>What's happening</h3><ul>");
     for finding in &working {
-        html.push_str(&format!(
+        let _ = write!(
+            html,
             "<li><strong>{}</strong> — {}</li>",
             escape(&finding.title),
             escape(&finding.detail)
-        ));
+        );
     }
     html.push_str("</ul>");
 
     if !hindering.is_empty() {
         html.push_str("<h3>Worth a look</h3>");
         for finding in &hindering {
-            html.push_str(&format!(
+            let _ = write!(
+                html,
                 "<div class=\"suggestion\"><strong>{}</strong><br>{}</div>",
                 escape(&finding.title),
                 escape(&finding.detail)
-            ));
+            );
         }
     }
     html.push_str("</div>");
@@ -116,15 +121,15 @@ pub fn render(aggregate: &Aggregate, findings: &[Finding], sessions: &[SessionFa
     );
     for (tool, calls) in aggregate.busiest_tools(15) {
         let errors = aggregate.tool_errors.get(tool).copied().unwrap_or(0);
-        let rate = match aggregate.tool_error_rate(tool) {
-            Some(rate) => format!("{:.0}%", rate * 100.0),
-            None => "—".to_string(),
-        };
-        html.push_str(&format!(
+        let rate = aggregate
+            .tool_error_rate(tool)
+            .map_or_else(|| "—".to_string(), |rate| format!("{:.0}%", rate * 100.0));
+        let _ = write!(
+            html,
             "<tr><td><code>{}</code></td><td class=\"num\">{calls}</td>\
              <td class=\"num\">{errors}</td><td class=\"num\">{rate}</td></tr>",
             escape(tool)
-        ));
+        );
     }
     html.push_str("</tbody></table>");
 
@@ -135,7 +140,8 @@ pub fn render(aggregate: &Aggregate, findings: &[Finding], sessions: &[SessionFa
          <th class=\"num\">Failures</th></tr></thead><tbody>",
     );
     for session in sessions.iter().take(SESSIONS_SHOWN) {
-        html.push_str(&format!(
+        let _ = write!(
+            html,
             "<tr><td><code>{}</code></td><td>{}</td><td class=\"num\">{}</td>\
              <td class=\"num\">{}</td><td class=\"num\">{}</td></tr>",
             escape(&session.session_id),
@@ -143,14 +149,15 @@ pub fn render(aggregate: &Aggregate, findings: &[Finding], sessions: &[SessionFa
             session.messages,
             session.total_tool_calls(),
             session.total_tool_errors()
-        ));
+        );
     }
     html.push_str("</tbody></table>");
     if sessions.len() > SESSIONS_SHOWN {
-        html.push_str(&format!(
+        let _ = write!(
+            html,
             "<p class=\"muted\">… and {} more.</p>",
             sessions.len() - SESSIONS_SHOWN
-        ));
+        );
     }
 
     html.push_str(

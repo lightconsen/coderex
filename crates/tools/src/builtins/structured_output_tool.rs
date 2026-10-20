@@ -81,7 +81,7 @@ fn jsonschema_validation(
     schema: &serde_json::Value,
     value: &serde_json::Value,
 ) -> ValidationResult {
-    validate_node(schema, value, &"$".to_string())
+    validate_node(schema, value, "$")
 }
 
 fn validate_node(
@@ -137,7 +137,7 @@ fn validate_node(
             if let Some(arr) = req.as_array() {
                 for r in arr {
                     if let Some(key) = r.as_str() {
-                        if !value.get(key).is_some() {
+                        if value.get(key).is_none() {
                             return ValidationResult {
                                 is_valid: false,
                                 error: format!("{path}: missing required field '{key}'"),

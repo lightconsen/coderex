@@ -62,7 +62,7 @@ impl TeleportSnapshot {
         if let Ok(id) = self.session_id.parse() {
             state.session_id = id;
         }
-        state.title = self.title.clone();
+        state.title.clone_from(&self.title);
         state.messages.clone_from(&self.messages);
         state.usage = self.usage;
         state.cost_usd = self.cost_usd;
@@ -100,7 +100,7 @@ impl TeleportSnapshot {
 
     /// Compute a `StateDelta` from `old` to `self`.
     #[must_use]
-    pub fn delta_from(&self, old: &TeleportSnapshot) -> StateDelta {
+    pub fn delta_from(&self, old: &Self) -> StateDelta {
         let old_state = Self::to_state_map(&old.to_session_state());
         let new_state = Self::to_state_map(&self.to_session_state());
         compute_delta(&old.revision, &old_state, &new_state)
@@ -148,7 +148,7 @@ impl TeleportManager {
 
     /// Create a manager with a custom share base.
     #[must_use]
-    pub fn with_share_base(share_base: PathBuf) -> Self {
+    pub const fn with_share_base(share_base: PathBuf) -> Self {
         Self { share_base }
     }
 

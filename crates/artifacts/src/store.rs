@@ -213,7 +213,7 @@ impl ArtifactStore {
             created_at: now.clone(),
             updated_at: now.clone(),
         });
-        manifest.title = page.title.clone();
+        manifest.title.clone_from(&page.title);
         manifest.current_version = label;
         manifest.versions.push(version);
         manifest.updated_at = now;
@@ -263,7 +263,7 @@ impl ArtifactStore {
         let mut manifests = Vec::new();
         for entry in entries {
             let entry = entry.map_err(|e| StoreError::Io(e.to_string()))?;
-            if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+            if !entry.file_type().is_ok_and(|t| t.is_dir()) {
                 continue;
             }
             let name = entry.file_name().to_string_lossy().to_string();

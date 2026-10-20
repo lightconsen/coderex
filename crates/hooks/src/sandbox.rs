@@ -66,7 +66,7 @@ use tokio::process::Command;
 pub const HOOK_SANDBOX_ENV: &str = "CODEREX_HOOK_SANDBOX";
 
 /// The result of deciding how a command hook will be confined.
-pub(crate) enum SandboxPlan {
+pub enum SandboxPlan {
     /// A sandbox exists and the command must run through its wrapper.
     Apply(SandboxHandle),
     /// Confinement was explicitly switched off; resource limits still apply.
@@ -85,7 +85,7 @@ fn sandbox_disabled_by_env(value: Option<&str>) -> bool {
 }
 
 /// Decide what confinement a hook gets, reading the process environment.
-pub(crate) fn plan_for_hook(hook: &HookConfig) -> SandboxPlan {
+pub fn plan_for_hook(hook: &HookConfig) -> SandboxPlan {
     plan_with(
         hook,
         sandbox_disabled_by_env(std::env::var(HOOK_SANDBOX_ENV).ok().as_deref()),
@@ -125,7 +125,7 @@ fn plan_with(
 /// non-gating hook has nowhere to deny, so the failure to confine is said out
 /// loud and the hook runs with resource limits only — exactly the existing
 /// failure semantics for the event.
-pub(crate) fn enforce(plan: SandboxPlan, gating: bool) -> Result<Option<SandboxHandle>, HookError> {
+pub fn enforce(plan: SandboxPlan, gating: bool) -> Result<Option<SandboxHandle>, HookError> {
     match plan {
         SandboxPlan::Apply(handle) => Ok(Some(handle)),
         SandboxPlan::Disabled(reason) => {
@@ -220,7 +220,7 @@ fn confinement_availability() -> Result<(), String> {
 /// [`HookSandboxConfig`] extend these sets rather than replacing them, so
 /// naming one extra path cannot accidentally *remove* the workspace.
 #[must_use]
-pub(crate) fn sandbox_config(hook: &HookConfig) -> SandboxConfig {
+pub fn sandbox_config(hook: &HookConfig) -> SandboxConfig {
     let workspace = workspace_dir(hook);
     #[cfg(not(target_os = "windows"))]
     let temp = canonicalize_lenient(&std::env::temp_dir());
@@ -334,7 +334,7 @@ pub(crate) fn sandbox_config(hook: &HookConfig) -> SandboxConfig {
 /// The wrapper (`sandbox-exec -f <profile>` or `bwrap …`) takes the shell as
 /// its argument. stdin/stdout/stderr stay inherited, so the one-way and
 /// streaming line protocols are unchanged.
-pub(crate) fn sandboxed_command(command: &str, sandbox: Option<&SandboxHandle>) -> Command {
+pub fn sandboxed_command(command: &str, sandbox: Option<&SandboxHandle>) -> Command {
     if let Some((wrapper, prefix_args)) = sandbox.and_then(SandboxHandle::sandboxed_program) {
         let mut wrapped = Command::new(wrapper);
         wrapped.args(&prefix_args).arg("sh").arg("-c").arg(command);
@@ -541,7 +541,7 @@ impl HookSandboxConfig {
 ///
 /// On Linux a cgroup with `memory.max` is applied after spawn in addition to
 /// these limits — see [`prepare_cgroup_limits`] and [`attach_cgroup_limits`].
-pub(crate) fn apply_resource_limits(command: &mut Command, config: &HookConfig) {
+pub fn apply_resource_limits(command: &mut Command, config: &HookConfig) {
     #[cfg(unix)]
     {
         apply_unix_limits(command, config);

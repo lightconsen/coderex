@@ -13,8 +13,10 @@ use thiserror::Error;
 /// Status of a team member.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum MemberStatus {
     /// Member is actively working.
+    #[default]
     Active,
     /// Member is idle, waiting for work.
     Idle,
@@ -22,12 +24,6 @@ pub enum MemberStatus {
     Done,
     /// Member encountered an error.
     Errored,
-}
-
-impl Default for MemberStatus {
-    fn default() -> Self {
-        Self::Active
-    }
 }
 
 /// A member of a team (agent or session).
@@ -46,7 +42,7 @@ pub struct TeamMember {
 impl TeamMember {
     /// Create a new team member.
     #[must_use]
-    pub fn new(id: String, name: String) -> Self {
+    pub const fn new(id: String, name: String) -> Self {
         Self {
             id,
             name,
@@ -74,7 +70,7 @@ pub struct SharedTask {
 impl SharedTask {
     /// Create a new shared task.
     #[must_use]
-    pub fn new(id: String, subject: String) -> Self {
+    pub const fn new(id: String, subject: String) -> Self {
         Self {
             id,
             subject,
@@ -89,7 +85,7 @@ impl SharedTask {
     }
 
     /// Mark the task as done.
-    pub fn mark_done(&mut self) {
+    pub const fn mark_done(&mut self) {
         self.done = true;
     }
 }
@@ -114,7 +110,7 @@ pub struct Team {
 impl Team {
     /// Create a new team with the given name and ID.
     #[must_use]
-    pub fn new(id: String, name: String) -> Self {
+    pub const fn new(id: String, name: String) -> Self {
         Self {
             id,
             name,

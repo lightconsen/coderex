@@ -64,6 +64,7 @@ impl MockApiClient {
         let responses = self.responses.lock().unwrap();
         let idx = *count;
         *count += 1;
+        drop(count);
         responses.get(idx).cloned()
     }
 

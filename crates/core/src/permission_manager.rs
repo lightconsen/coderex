@@ -117,7 +117,7 @@ impl std::fmt::Debug for PermissionManager {
         f.debug_struct("PermissionManager")
             .field("config", &self.config)
             .field("config_path", &self.config_path)
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
@@ -152,24 +152,24 @@ impl PermissionManager {
 
     /// Get the current permission mode.
     #[must_use]
-    pub fn mode(&self) -> PermissionMode {
+    pub const fn mode(&self) -> PermissionMode {
         self.checker.mode()
     }
 
     /// Set the permission mode.
-    pub fn set_mode(&mut self, mode: PermissionMode) {
+    pub const fn set_mode(&mut self, mode: PermissionMode) {
         self.config.default_mode = mode;
         self.checker.set_mode(mode);
     }
 
     /// Get the underlying permission checker.
     #[must_use]
-    pub fn checker(&self) -> &PermissionChecker {
+    pub const fn checker(&self) -> &PermissionChecker {
         &self.checker
     }
 
     /// Get a mutable reference to the underlying checker.
-    pub fn checker_mut(&mut self) -> &mut PermissionChecker {
+    pub const fn checker_mut(&mut self) -> &mut PermissionChecker {
         &mut self.checker
     }
 
@@ -190,11 +190,7 @@ impl PermissionManager {
             if !r.tool_name.eq_ignore_ascii_case(tool_name) {
                 return true;
             }
-            if let Some(pattern) = path_pattern {
-                !r.paths.iter().any(|p| p == pattern)
-            } else {
-                false
-            }
+            path_pattern.is_some_and(|pattern| !r.paths.iter().any(|p| p == pattern))
         });
         // Rebuild checker from config
         self.checker = Self::build_checker(&self.config);
@@ -261,13 +257,14 @@ impl PermissionManager {
 
     /// Persist current config to the configured path.
     pub fn persist(&self) -> Result<(), PermissionManagerError> {
-        if let Some(ref path) = self.config_path {
-            self.save_to_toml(path)
-        } else {
-            Err(PermissionManagerError::SaveFailed(
-                "no config path set".into(),
-            ))
-        }
+        self.config_path.as_ref().map_or_else(
+            || {
+                Err(PermissionManagerError::SaveFailed(
+                    "no config path set".into(),
+                ))
+            },
+            |path| self.save_to_toml(path),
+        )
     }
 
     /// Check for conflicting rules.
@@ -355,9 +352,11 @@ impl PermissionManager {
     /// Only read-only tools are allowed. Everything else is denied.
     #[must_use]
     pub fn strict_preset() -> Self {
-        let mut config = PermissionManagerConfig::default();
-        // Plan mode naturally allows read-only tools and denies everything else
-        config.default_mode = PermissionMode::Plan;
+        let config = PermissionManagerConfig {
+            // Plan mode naturally allows read-only tools and denies everything else.
+            default_mode: PermissionMode::Plan,
+            ..PermissionManagerConfig::default()
+        };
         Self::from_config(config)
     }
 
@@ -366,8 +365,10 @@ impl PermissionManager {
     /// Most operations are allowed. Only the most dangerous ones require approval.
     #[must_use]
     pub fn permissive_preset() -> Self {
-        let mut config = PermissionManagerConfig::default();
-        config.default_mode = PermissionMode::AcceptEdits;
+        let mut config = PermissionManagerConfig {
+            default_mode: PermissionMode::AcceptEdits,
+            ..PermissionManagerConfig::default()
+        };
 
         // Allow all dangerous tools except bash (which still requires approval)
         for tool in &config.dangerous_tools {

@@ -20,7 +20,7 @@ const NOTABLE_ERROR_RATE: f64 = 0.15;
 const LONG_SESSION_MESSAGES: usize = 200;
 
 /// What many sessions add up to.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Aggregate {
     /// How many sessions were read.
     pub sessions: usize,
@@ -148,6 +148,8 @@ impl Aggregate {
 
     /// The error rate for one tool, if it has been called enough to have one.
     #[must_use]
+    // Display ratio; call counts are far below 2^53.
+    #[allow(clippy::cast_precision_loss)]
     pub fn tool_error_rate(&self, tool: &str) -> Option<f64> {
         let calls = self.tool_calls.get(tool).copied().unwrap_or(0);
         if calls < MIN_CALLS_FOR_A_RATE {
@@ -159,6 +161,8 @@ impl Aggregate {
 
 /// What the sessions suggest, in the order the report shows them.
 #[must_use]
+// Session counts feed display percentages; they are far below 2^53.
+#[allow(clippy::cast_precision_loss)]
 pub fn findings(aggregate: &Aggregate) -> Vec<Finding> {
     let mut findings = Vec::new();
 

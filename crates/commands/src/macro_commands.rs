@@ -43,7 +43,7 @@ impl MacroRegistry {
     /// Get the commands for a macro, if it exists.
     #[must_use]
     pub fn get(&self, name: &str) -> Option<&[String]> {
-        self.macros.get(name).map(|v| v.as_slice())
+        self.macros.get(name).map(std::vec::Vec::as_slice)
     }
 
     /// List all macro names.

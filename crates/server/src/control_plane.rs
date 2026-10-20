@@ -91,11 +91,11 @@ pub struct CapacityReport {
 #[derive(Debug, Clone)]
 pub struct Environment {
     /// Registration info.
-    pub _register: RegisterRequest,
+    pub register: RegisterRequest,
     /// Current capacity report.
     pub capacity: Option<CapacityReport>,
     /// Registered at (Unix timestamp seconds).
-    pub _registered_at: u64,
+    pub registered_at: u64,
 }
 
 /// Shared state for the control plane server.
@@ -117,9 +117,9 @@ impl ControlPlaneState {
         self.environments.insert(
             req.env_id.clone(),
             Environment {
-                _register: req,
+                register: req,
                 capacity: None,
-                _registered_at: now,
+                registered_at: now,
             },
         );
     }
@@ -147,10 +147,7 @@ impl ControlPlaneState {
                 if a.claimed {
                     return false;
                 }
-                match &a.assigned_to {
-                    None => true,
-                    Some(id) => id == env_id,
-                }
+                a.assigned_to.as_ref().is_none_or(|id| id == env_id)
             })
             .collect()
     }
@@ -169,7 +166,10 @@ impl ControlPlaneState {
 
     /// List all registered environment IDs.
     pub fn list_environments(&self) -> Vec<&str> {
-        self.environments.keys().map(|k| k.as_str()).collect()
+        self.environments
+            .keys()
+            .map(std::string::String::as_str)
+            .collect()
     }
 }
 
@@ -194,7 +194,7 @@ impl ControlPlaneServer {
 
     /// Create a server with pre-existing state.
     #[must_use]
-    pub fn with_state(port: u16, state: Arc<Mutex<ControlPlaneState>>) -> Self {
+    pub const fn with_state(port: u16, state: Arc<Mutex<ControlPlaneState>>) -> Self {
         Self { port, state }
     }
 
@@ -450,17 +450,19 @@ async fn handle_capacity(
 async fn handle_list_environments(
     state: &Arc<Mutex<ControlPlaneState>>,
 ) -> (u16, serde_json::Value) {
-    let guard = state.lock().await;
-    let envs = guard.list_environments();
-    let count = envs.len();
-    let envs_vec: Vec<&str> = envs.into_iter().collect();
-    (
-        200,
-        serde_json::json!({
+    let response = {
+        let guard = state.lock().await;
+        let envs = guard.list_environments();
+        let count = envs.len();
+        let envs_vec: Vec<&str> = envs.into_iter().collect();
+        let response = serde_json::json!({
             "environments": envs_vec,
             "count": count,
-        }),
-    )
+        });
+        drop(guard);
+        response
+    };
+    (200, response)
 }
 
 /// Write an HTTP response.

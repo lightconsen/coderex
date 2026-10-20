@@ -138,6 +138,8 @@ impl Tool for WebFetchTool {
         input: ToolInput,
         _ctx: ToolContext<'_>,
     ) -> Result<ToolOutput, ToolError> {
+        use std::fmt::Write as _;
+
         let url = extract_string(&input.arguments, "url")?;
         let max_chars = extract_max_chars(&input.arguments)?;
 
@@ -230,14 +232,16 @@ impl Tool for WebFetchTool {
             "Status: {status}\nContent-Type: {content_type}\nFinal URL: {final_url}\n\n{shown}"
         );
         if capped_by_size {
-            output.push_str(&format!(
+            let _ = write!(
+                output,
                 "\n\n[body truncated at {MAX_BODY_BYTES} bytes while reading]"
-            ));
+            );
         }
         if truncated_by_chars {
-            output.push_str(&format!(
+            let _ = write!(
+                output,
                 "\n\n[body truncated at {max_chars} characters; {char_count} characters available]"
-            ));
+            );
         }
 
         Ok(ToolOutput {

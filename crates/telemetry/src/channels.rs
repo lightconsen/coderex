@@ -284,7 +284,7 @@ impl TelemetryChannels {
             .send()
             .await
             .map_err(|e| TelemetryError::Upload(format!("request failed: {e}")))?;
-        ensure_success(response, "OTLP")
+        ensure_success(&response, "OTLP")
     }
 
     async fn send_datadog(
@@ -303,11 +303,11 @@ impl TelemetryChannels {
             .send()
             .await
             .map_err(|e| TelemetryError::Upload(format!("request failed: {e}")))?;
-        ensure_success(response, "Datadog")
+        ensure_success(&response, "Datadog")
     }
 }
 
-fn ensure_success(response: reqwest::Response, channel: &str) -> Result<(), TelemetryError> {
+fn ensure_success(response: &reqwest::Response, channel: &str) -> Result<(), TelemetryError> {
     let status = response.status();
     if status.is_success() {
         return Ok(());
@@ -390,10 +390,9 @@ fn json_to_otlp_attribute(key: &str, value: &serde_json::Value) -> Option<serde_
                 serde_json::json!({ "intValue": integer.to_string() })
             } else if let Some(integer) = number.as_u64() {
                 serde_json::json!({ "intValue": integer.to_string() })
-            } else if let Some(float) = number.as_f64() {
-                serde_json::json!({ "doubleValue": float })
             } else {
-                return None;
+                let float = number.as_f64()?;
+                serde_json::json!({ "doubleValue": float })
             }
         }
         // Composite values have no OTLP scalar AnyValue; keep them inspectable

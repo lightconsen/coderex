@@ -67,7 +67,7 @@ impl WireTransport for InMemoryTransport {
 
     async fn recv_request(&mut self) -> std::io::Result<Option<WireRequest>> {
         let mut rx = self.event_rx.lock().await;
-        Ok(rx.recv().await.map(|e| WireRequest::from_event(e)))
+        Ok(rx.recv().await.map(WireRequest::from_event))
     }
 
     async fn close(&mut self) -> std::io::Result<()> {
@@ -81,7 +81,7 @@ impl InMemoryTransport {
     /// Events sent via the server end are received by the client end.
     /// Requests sent via the client end are received by the server end.
     #[must_use]
-    pub fn new_pair() -> (InMemoryTransportServer, InMemoryTransport) {
+    pub fn new_pair() -> (InMemoryTransportServer, Self) {
         let (event_tx, event_rx) = mpsc::unbounded_channel();
         let (request_tx, request_rx) = mpsc::unbounded_channel();
 
@@ -89,7 +89,7 @@ impl InMemoryTransport {
             event_tx,
             request_rx: Arc::new(Mutex::new(request_rx)),
         };
-        let client = InMemoryTransport {
+        let client = Self {
             event_rx: Arc::new(Mutex::new(event_rx)),
             request_tx,
         };
@@ -128,12 +128,12 @@ impl WireRequest {
         // This is a test-only conversion for the in-memory transport
         // where the client "receives" events as if they were requests
         match event {
-            WireEvent::TextDelta { delta } => WireRequest::Submit {
+            WireEvent::TextDelta { delta } => Self::Submit {
                 prompt: delta,
                 system_prompt: None,
                 max_turns: None,
             },
-            _ => WireRequest::Interrupt,
+            _ => Self::Interrupt,
         }
     }
 }

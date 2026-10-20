@@ -37,21 +37,16 @@ pub enum ViewMode {
 }
 
 /// Layout mode for the main content area.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum LayoutMode {
     /// Single pane: full width for messages.
+    #[default]
     SinglePane,
     /// Horizontal split: left pane shows file/content, right pane shows chat.
     HorizontalSplit {
         /// Width percentage for the left pane (10-90).
         left_percent: u16,
     },
-}
-
-impl Default for LayoutMode {
-    fn default() -> Self {
-        Self::SinglePane
-    }
 }
 
 /// A single visible plan step in the interactive TUI.

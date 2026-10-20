@@ -127,16 +127,14 @@ impl Notification {
     /// Check if this notification should auto-dismiss.
     #[must_use]
     pub fn is_expired(&self) -> bool {
-        if let Some(duration) = self.auto_dismiss {
+        self.auto_dismiss.is_some_and(|duration| {
             let elapsed = Utc::now().signed_duration_since(self.created_at);
             elapsed > chrono::TimeDelta::from_std(duration).unwrap_or(chrono::TimeDelta::zero())
-        } else {
-            false
-        }
+        })
     }
 
     /// Dismiss this notification.
-    pub fn dismiss(&mut self) {
+    pub const fn dismiss(&mut self) {
         self.dismissed = true;
     }
 
@@ -172,7 +170,7 @@ impl Default for NotificationCenter {
 impl NotificationCenter {
     /// Create a new notification center.
     #[must_use]
-    pub fn new() -> Self {
+    pub const fn new() -> Self {
         Self {
             notifications: Vec::new(),
             max_history: 50,
@@ -233,12 +231,13 @@ impl NotificationCenter {
 
     /// Dismiss a notification by ID.
     pub fn dismiss(&mut self, id: &str) -> bool {
-        if let Some(n) = self.notifications.iter_mut().find(|n| n.id == id) {
-            n.dismiss();
-            true
-        } else {
-            false
-        }
+        self.notifications
+            .iter_mut()
+            .find(|n| n.id == id)
+            .is_some_and(|n| {
+                n.dismiss();
+                true
+            })
     }
 
     /// Dismiss all notifications.
@@ -249,19 +248,19 @@ impl NotificationCenter {
     }
 
     /// Mark all notifications as seen.
-    pub fn mark_seen(&mut self) {
+    pub const fn mark_seen(&mut self) {
         self.unseen_count = 0;
     }
 
     /// Get the count of unseen notifications.
     #[must_use]
-    pub fn unseen_count(&self) -> usize {
+    pub const fn unseen_count(&self) -> usize {
         self.unseen_count
     }
 
     /// Clean up expired and dismissed notifications.
     pub fn cleanup(&mut self) {
-        self.notifications.retain(|n| n.is_active());
+        self.notifications.retain(Notification::is_active);
     }
 
     /// Get the number of active notifications.
@@ -274,7 +273,7 @@ impl NotificationCenter {
     #[must_use]
     pub fn history(&self) -> Vec<&Notification> {
         let mut hist: Vec<&Notification> = self.notifications.iter().collect();
-        hist.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+        hist.sort_by_key(|n| std::cmp::Reverse(n.created_at));
         hist
     }
 

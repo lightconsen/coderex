@@ -6,6 +6,7 @@
 //! change is made against evidence rather than memory.
 
 use std::collections::BTreeMap;
+use std::fmt::Write as _;
 
 use crate::harness::Harness;
 use crate::run::Record;
@@ -20,10 +21,7 @@ pub fn render(harness: &Harness, records: &[Record], harness_sha256: &str, flow:
         "<!DOCTYPE html>\n<html lang=\"en\"><head><meta charset=\"utf-8\">\
          <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">",
     );
-    html.push_str(&format!(
-        "<title>{} · hillclimb</title>",
-        escape(&harness.name)
-    ));
+    let _ = write!(html, "<title>{} · hillclimb</title>", escape(&harness.name));
     html.push_str(
         "<style>\
          :root{--bg:#f8fafc;--ink:#1e293b;--muted:#64748b;--line:#e2e8f0;\
@@ -44,21 +42,23 @@ pub fn render(harness: &Harness, records: &[Record], harness_sha256: &str, flow:
          </style></head><body><main>",
     );
 
-    html.push_str(&format!("<h1>{}</h1>", escape(&harness.name)));
+    let _ = write!(html, "<h1>{}</h1>", escape(&harness.name));
     if !harness.description.is_empty() {
-        html.push_str(&format!(
+        let _ = write!(
+            html,
             "<p class=\"muted\">{}</p>",
             escape(&harness.description)
-        ));
+        );
     }
     let short_hash = &harness_sha256[..12.min(harness_sha256.len())];
-    html.push_str(&format!(
+    let _ = write!(
+        html,
         "<p class=\"muted\">flow <code>{}</code> · {} case(s) · harness <code>{short_hash}</code> \
          · {} record(s)</p>",
         escape(flow),
         harness.cases.len(),
         records.len()
-    ));
+    );
 
     if records.is_empty() {
         html.push_str("</main></body></html>");
@@ -79,12 +79,12 @@ pub fn render(harness: &Harness, records: &[Record], harness_sha256: &str, flow:
     for (variant, records) in &variants {
         let rate = pass_rate(records);
         let delta = match (baseline_rate, variant.as_str()) {
-            (Some(_), "baseline") => "—".to_string(),
+            (Some(_), "baseline") | (None, _) => "—".to_string(),
             (Some(baseline), _) => format!("{:+.1} pt", (rate - baseline) * 100.0),
-            (None, _) => "—".to_string(),
         };
 
-        html.push_str(&format!(
+        let _ = write!(
+            html,
             "<tr><td><code>{}</code></td><td class=\"num\">{}</td>\
              <td class=\"num\">{}</td><td class=\"num {}\">{:.0}%</td>\
              <td class=\"num\">{}</td><td class=\"num\">{}</td></tr>",
@@ -95,24 +95,25 @@ pub fn render(harness: &Harness, records: &[Record], harness_sha256: &str, flow:
             rate * 100.0,
             format_duration(mean_duration(records)),
             delta
-        ));
+        );
     }
     html.push_str("</tbody></table>");
 
     // The per-case grid is the part that says *which* change helped.
     html.push_str("<h2>Cases</h2><table><thead><tr><th>Case</th>");
     for (variant, _) in &variants {
-        html.push_str(&format!("<th class=\"num\">{}</th>", escape(variant)));
+        let _ = write!(html, "<th class=\"num\">{}</th>", escape(variant));
     }
     html.push_str("</tr></thead><tbody>");
 
     for case in &harness.cases {
-        html.push_str(&format!("<tr><td><code>{}</code>", escape(&case.id)));
+        let _ = write!(html, "<tr><td><code>{}</code>", escape(&case.id));
         if !case.description.is_empty() {
-            html.push_str(&format!(
+            let _ = write!(
+                html,
                 "<br><span class=\"muted\">{}</span>",
                 escape(&case.description)
-            ));
+            );
         }
         html.push_str("</td>");
 
@@ -127,18 +128,22 @@ pub fn render(harness: &Harness, records: &[Record], harness_sha256: &str, flow:
                 continue;
             }
             let passed = for_case.iter().filter(|record| record.passed).count();
+            // A display ratio over a handful of records, far below the range
+            // where an f64 loses integer precision.
+            #[allow(clippy::cast_precision_loss)]
             let rate = passed as f64 / for_case.len() as f64;
             let ungraded = if case.expect == crate::harness::Expectations::default() {
                 " (ungraded)"
             } else {
                 ""
             };
-            html.push_str(&format!(
+            let _ = write!(
+                html,
                 "<td class=\"num {}\">{}/{} {ungraded}</td>",
                 if rate >= 0.999 { "pass" } else { "fail" },
                 passed,
                 for_case.len()
-            ));
+            );
         }
         html.push_str("</tr>");
     }
@@ -148,24 +153,26 @@ pub fn render(harness: &Harness, records: &[Record], harness_sha256: &str, flow:
     if !failures.is_empty() {
         html.push_str("<h2>Failures</h2>");
         for record in failures.iter().take(50) {
-            html.push_str(&format!(
+            let _ = write!(
+                html,
                 "<p><code>{}</code> on <code>{}</code> (rep {}):<br>\
                  <span class=\"failures\">{}</span></p>",
                 escape(&record.case_id),
                 escape(&record.variant),
                 record.rep,
                 escape(&record.failures.join("; "))
-            ));
+            );
             if !record.output_tail.trim().is_empty() {
-                html.push_str(&format!("<pre>{}</pre>", escape(record.output_tail.trim())));
+                let _ = write!(html, "<pre>{}</pre>", escape(record.output_tail.trim()));
             }
         }
     }
 
-    html.push_str(&format!(
+    let _ = write!(
+        html,
         "<h2>How to reproduce</h2><p class=\"muted\">Command per case: <code>{}</code></p>",
         escape(&harness.command)
-    ));
+    );
 
     html.push_str("</main></body></html>");
     html
@@ -198,6 +205,9 @@ fn variant_order(name: &str) -> (u8, u32, String) {
     (2, 0, name.to_string())
 }
 
+// A display ratio over a handful of records, far below the range where an
+// f64 loses integer precision.
+#[allow(clippy::cast_precision_loss)]
 fn pass_rate(records: &[Record]) -> f64 {
     if records.is_empty() {
         return 0.0;
@@ -212,6 +222,9 @@ fn mean_duration(records: &[Record]) -> u64 {
     records.iter().map(|record| record.duration_ms).sum::<u64>() / records.len() as u64
 }
 
+// A human-readable duration; a millisecond count this large is not reachable,
+// and sub-millisecond precision is not wanted anyway.
+#[allow(clippy::cast_precision_loss)]
 fn format_duration(millis: u64) -> String {
     if millis < 1000 {
         return format!("{millis} ms");
@@ -278,7 +291,7 @@ mod tests {
             rep: 0,
             passed,
             graded: true,
-            exit_code: Some(if passed { 0 } else { 1 }),
+            exit_code: Some(i32::from(!passed)),
             duration_ms: 120,
             failures: if passed {
                 Vec::new()

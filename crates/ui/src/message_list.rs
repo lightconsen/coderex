@@ -97,7 +97,7 @@ impl MessageView {
     }
 
     /// Scroll up by n rendered lines.
-    pub fn scroll_up(&mut self, n: usize) {
+    pub const fn scroll_up(&mut self, n: usize) {
         self.start = self.start.saturating_sub(n);
         self.scroll_offset = self.scroll_offset.saturating_add(n);
     }
@@ -142,7 +142,7 @@ impl MessageView {
 
     /// Check if the view is scrolled to the bottom.
     #[must_use]
-    pub fn is_at_bottom(&self) -> bool {
+    pub const fn is_at_bottom(&self) -> bool {
         self.scroll_offset == 0
     }
 }

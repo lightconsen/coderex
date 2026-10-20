@@ -1,6 +1,7 @@
 //! Content & context commands: /copy, /init, /summary, /files, /open, /context, /ctx_viz, /add-dir.
 
 use crate::registry::{CommandArgs, CommandContext, CommandRegistry, CommandResult, SlashCommand};
+use std::fmt::Write as _;
 use std::sync::Arc;
 
 /// Copy text to system clipboard.
@@ -159,28 +160,21 @@ pub fn register(registry: &mut CommandRegistry) {
             let max_files = 100;
 
             let mut entries = Vec::new();
-            for entry in walkdir::WalkDir::new(dir)
+            for e in walkdir::WalkDir::new(dir)
                 .max_depth(max_depth)
                 .into_iter()
                 .filter_entry(|e| {
-                    e.file_name()
-                        .to_str()
-                        .map(|n| {
-                            !n.starts_with('.')
-                                && n != "node_modules"
-                                && n != "target"
-                                && n != ".git"
-                        })
-                        .unwrap_or(false)
+                    e.file_name().to_str().is_some_and(|n| {
+                        !n.starts_with('.') && n != "node_modules" && n != "target" && n != ".git"
+                    })
                 })
                 .take(max_files)
+                .flatten()
             {
-                if let Ok(e) = entry {
-                    let path = e.path();
-                    if let Ok(rel) = path.strip_prefix(dir) {
-                        let suffix = if e.file_type().is_dir() { "/" } else { "" };
-                        entries.push(format!("  {}{suffix}", rel.display()));
-                    }
+                let path = e.path();
+                if let Ok(rel) = path.strip_prefix(dir) {
+                    let suffix = if e.file_type().is_dir() { "/" } else { "" };
+                    entries.push(format!("  {}{suffix}", rel.display()));
                 }
             }
 
@@ -222,7 +216,7 @@ pub fn register(registry: &mut CommandRegistry) {
                     content.lines().take(40).collect::<Vec<_>>().join("\n")
                 ))
                 .with_state_change(true),
-                Err(err) => CommandResult::error(format!("Failed to open {}: {}", path_arg, err)),
+                Err(err) => CommandResult::error(format!("Failed to open {path_arg}: {err}")),
             }
         }),
     ));
@@ -257,19 +251,19 @@ pub fn register(registry: &mut CommandRegistry) {
         Arc::new(|ctx: &CommandContext, _args: &[String]| {
             if ctx.is_feature_enabled("ctx_viz") {
                 let mut output = String::from("Context Visualization\n──────────────────\n");
-                output.push_str(&format!("Working Directory: {}\n", ctx.cwd));
-                output.push_str(&format!("Model: {}\n", ctx.model.0));
-                output.push_str(&format!("Session: {}\n", ctx.session_id));
-                output.push_str(&format!("Messages: {}\n", ctx.message_count));
-                output.push_str(&format!("Input Tokens: {}\n", ctx.input_tokens));
-                output.push_str(&format!("Output Tokens: {}\n", ctx.output_tokens));
-                output.push_str(&format!("Cache Read: {}\n", ctx.cache_read_tokens));
-                output.push_str(&format!("Cache Creation: {}\n", ctx.cache_creation_tokens));
-                output.push_str(&format!("Cost: ${:.4}\n", ctx.cost_usd));
-                output.push_str(&format!("Permission Mode: {:?}\n", ctx.permission_mode));
-                output.push_str(&format!("Elapsed: {}s\n", ctx.elapsed_secs));
+                let _ = writeln!(output, "Working Directory: {}", ctx.cwd);
+                let _ = writeln!(output, "Model: {}", ctx.model.0);
+                let _ = writeln!(output, "Session: {}", ctx.session_id);
+                let _ = writeln!(output, "Messages: {}", ctx.message_count);
+                let _ = writeln!(output, "Input Tokens: {}", ctx.input_tokens);
+                let _ = writeln!(output, "Output Tokens: {}", ctx.output_tokens);
+                let _ = writeln!(output, "Cache Read: {}", ctx.cache_read_tokens);
+                let _ = writeln!(output, "Cache Creation: {}", ctx.cache_creation_tokens);
+                let _ = writeln!(output, "Cost: ${:.4}", ctx.cost_usd);
+                let _ = writeln!(output, "Permission Mode: {:?}", ctx.permission_mode);
+                let _ = writeln!(output, "Elapsed: {}s", ctx.elapsed_secs);
                 if !ctx.git_branch.is_empty() {
-                    output.push_str(&format!("Git Branch: {}\n", ctx.git_branch));
+                    let _ = writeln!(output, "Git Branch: {}", ctx.git_branch);
                 }
                 CommandResult::success(output)
             } else {
@@ -296,21 +290,17 @@ pub fn register(registry: &mut CommandRegistry) {
                     let file_count = walkdir::WalkDir::new(&full_path)
                         .into_iter()
                         .filter_entry(|e| {
-                            e.file_name()
-                                .to_str()
-                                .map(|n| {
-                                    !n.starts_with('.')
-                                        && n != "node_modules"
-                                        && n != "target"
-                                        && n != ".git"
-                                })
-                                .unwrap_or(false)
+                            e.file_name().to_str().is_some_and(|n| {
+                                !n.starts_with('.')
+                                    && n != "node_modules"
+                                    && n != "target"
+                                    && n != ".git"
+                            })
                         })
-                        .filter(|e| e.as_ref().map(|e| e.file_type().is_file()).unwrap_or(false))
+                        .filter(|e| e.as_ref().is_ok_and(|e| e.file_type().is_file()))
                         .count();
                     CommandResult::success(format!(
-                        "Directory '{}' added to project context ({} files found)",
-                        path, file_count
+                        "Directory '{path}' added to project context ({file_count} files found)"
                     ))
                     .with_state_change(true)
                 } else {

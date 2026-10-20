@@ -1,6 +1,7 @@
 //! Integration commands: /ide, /chrome, /desktop, /mobile, /voice, /vim, /remote-env, /remote-setup.
 
 use crate::registry::{CommandContext, CommandRegistry, CommandResult, SlashCommand};
+use std::fmt::Write as _;
 use std::sync::Arc;
 
 thread_local! {
@@ -16,7 +17,7 @@ fn config_home() -> std::path::PathBuf {
     TEST_CONFIG_HOME.with(|h| {
         h.borrow()
             .clone()
-            .unwrap_or_else(|| coderex_config::settings::config_home())
+            .unwrap_or_else(coderex_config::settings::config_home)
     })
 }
 
@@ -160,10 +161,7 @@ chrome_get_content    — Extract page HTML as markdown"
         true,
         true,
         Arc::new(|_ctx: &CommandContext, _args: &[String]| {
-            let has_desktop = std::env::var("CODEREX_DESKTOP")
-                .ok()
-                .map(|s| !s.is_empty())
-                .unwrap_or(false);
+            let has_desktop = std::env::var("CODEREX_DESKTOP").is_ok_and(|s| !s.is_empty());
             if has_desktop {
                 CommandResult::success("Desktop App: Connected\nRunning with desktop integration.")
             } else {
@@ -180,10 +178,7 @@ chrome_get_content    — Extract page HTML as markdown"
         true,
         true,
         Arc::new(|_ctx: &CommandContext, _args: &[String]| {
-            let has_mobile = std::env::var("CODEREX_MOBILE")
-                .ok()
-                .map(|s| !s.is_empty())
-                .unwrap_or(false);
+            let has_mobile = std::env::var("CODEREX_MOBILE").is_ok_and(|s| !s.is_empty());
             if has_mobile {
                 CommandResult::success("Mobile: Active\nMobile client connected via Bridge.")
             } else {
@@ -254,7 +249,7 @@ chrome_get_content    — Extract page HTML as markdown"
                     let mut entries: Vec<_> = env.iter().collect();
                     entries.sort_by_key(|(key, _)| key.as_str());
                     for (k, v) in entries {
-                        output.push_str(&format!("  {k}={v}\n"));
+                        let _ = writeln!(output, "  {k}={v}");
                     }
                 }
                 CommandResult::success(output)
@@ -303,14 +298,8 @@ chrome_get_content    — Extract page HTML as markdown"
         true,
         Arc::new(|_ctx: &CommandContext, _args: &[String]| {
             let bridge_url = std::env::var("CODEREX_BRIDGE_URL").ok();
-            let api_key_set = std::env::var("ANTHROPIC_API_KEY")
-                .ok()
-                .map(|s| !s.is_empty())
-                .unwrap_or(false)
-                || std::env::var("OPENAI_API_KEY")
-                    .ok()
-                    .map(|s| !s.is_empty())
-                    .unwrap_or(false);
+            let api_key_set = std::env::var("ANTHROPIC_API_KEY").is_ok_and(|s| !s.is_empty())
+                || std::env::var("OPENAI_API_KEY").is_ok_and(|s| !s.is_empty());
             let mut lines = vec!["Remote Setup".to_string(), "───────────".to_string()];
             if api_key_set {
                 lines.push("API key: configured".to_string());

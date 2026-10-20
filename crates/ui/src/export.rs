@@ -2,6 +2,7 @@
 
 use crate::selector::MessageSelector;
 use coderex_core::types::Message;
+use std::fmt::Write as _;
 
 /// Export format for messages.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -33,7 +34,7 @@ pub fn export_messages(
     }
 }
 
-fn role_label(role: &coderex_core::types::Role) -> &'static str {
+const fn role_label(role: coderex_core::types::Role) -> &'static str {
     use coderex_core::types::Role;
     match role {
         Role::User => "User",
@@ -44,7 +45,7 @@ fn role_label(role: &coderex_core::types::Role) -> &'static str {
     }
 }
 
-fn role_json(role: &coderex_core::types::Role) -> &'static str {
+const fn role_json(role: coderex_core::types::Role) -> &'static str {
     use coderex_core::types::Role;
     match role {
         Role::User => "user",
@@ -76,7 +77,7 @@ fn format_messages(messages: &[&Message], format: ExportFormat) -> String {
 fn format_plain(messages: &[&Message]) -> String {
     let mut out = String::new();
     for msg in messages {
-        out.push_str(&format!("--- {} ---\n", role_label(&msg.role)));
+        let _ = writeln!(out, "--- {} ---", role_label(msg.role));
         out.push_str(&content_text(&msg.content));
         out.push_str("\n\n");
     }
@@ -86,23 +87,25 @@ fn format_plain(messages: &[&Message]) -> String {
 fn format_markdown(messages: &[&Message]) -> String {
     let mut out = String::new();
     for msg in messages {
-        out.push_str(&format!("\n### {}\n\n", role_label(&msg.role)));
+        let _ = write!(out, "\n### {}\n\n", role_label(msg.role));
         match &msg.content {
             coderex_core::types::MessageContent::Text(text) => {
                 out.push_str(text);
                 out.push('\n');
             }
             coderex_core::types::MessageContent::ToolCall(tc) => {
-                out.push_str(&format!(
+                let _ = write!(
+                    out,
                     "```json\n{{\"tool\": \"{}\", \"id\": \"{}\"}}\n```\n",
                     tc.name, tc.id
-                ));
+                );
             }
             coderex_core::types::MessageContent::ToolResult(tr) => {
-                out.push_str(&format!(
+                let _ = write!(
+                    out,
                     "```json\n{{\"result\": \"{}\", \"id\": \"{}\"}}\n```\n",
                     tr.output, tr.tool_call_id
-                ));
+                );
             }
             _ => out.push_str("[unknown]\n"),
         }
@@ -120,7 +123,7 @@ fn format_json(messages: &[&Message]) -> String {
     let export_msgs: Vec<ExportMessage> = messages
         .iter()
         .map(|m| ExportMessage {
-            role: role_json(&m.role).into(),
+            role: role_json(m.role).into(),
             content: content_text(&m.content),
         })
         .collect();

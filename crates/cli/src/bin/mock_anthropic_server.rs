@@ -80,7 +80,7 @@ fn handle_connection(mut stream: TcpStream) {
     if !has_tool_result {
         eprintln!(
             "[mock] body snippet: {}",
-            &body_str.chars().take(500).collect::<String>()
+            body_str.chars().take(500).collect::<String>()
         );
     }
 
@@ -107,9 +107,7 @@ fn handle_connection(mut stream: TcpStream) {
         } else if has_json_schema {
             // Structured output mode — return JSON matching the schema
             build_json_sse_response(r#"{"greeting": "Hello!"}"#)
-        } else if !has_tool_result && should_stream_text_response(&prompt) {
-            build_text_response(&prompt)
-        } else if has_tool_result {
+        } else if has_tool_result || should_stream_text_response(&prompt) {
             build_text_response(&prompt)
         } else {
             build_tool_response(&prompt)
@@ -121,7 +119,6 @@ fn handle_connection(mut stream: TcpStream) {
              Connection: close\r\n\r\n{sse}"
         );
         let _ = stream.write_all(response.as_bytes());
-        let _ = stream.flush();
     } else {
         let json = build_json_response(&prompt, has_tool_result);
         let response = format!(
@@ -132,8 +129,8 @@ fn handle_connection(mut stream: TcpStream) {
             json.len()
         );
         let _ = stream.write_all(response.as_bytes());
-        let _ = stream.flush();
     }
+    let _ = stream.flush();
 }
 
 fn extract_last_user_prompt(body: &str) -> String {
@@ -152,20 +149,19 @@ fn extract_last_user_prompt(body: &str) -> String {
 
 fn count_tool_results(body: &str) -> usize {
     let value: serde_json::Value = serde_json::from_str(body).unwrap_or_default();
-    if let Some(messages) = value.get("messages").and_then(|m| m.as_array()) {
-        messages
-            .iter()
-            .filter(|msg| {
-                if let Some(content) = msg.get("content") {
-                    content.to_string().contains("\"type\":\"tool_result\"")
-                } else {
-                    false
-                }
-            })
-            .count()
-    } else {
-        0
-    }
+    value
+        .get("messages")
+        .and_then(|m| m.as_array())
+        .map_or(0, |messages| {
+            messages
+                .iter()
+                .filter(|msg| {
+                    msg.get("content").is_some_and(|content| {
+                        content.to_string().contains("\"type\":\"tool_result\"")
+                    })
+                })
+                .count()
+        })
 }
 
 fn resolve_text_response(prompt: &str) -> &str {
@@ -301,6 +297,8 @@ fn build_json_response(prompt: &str, has_tool_result: bool) -> String {
 }
 
 fn build_tool_response(prompt: &str) -> String {
+    use std::fmt::Write as _;
+
     let tools = select_tools(prompt);
     let mut sse = String::new();
 
@@ -308,14 +306,15 @@ fn build_tool_response(prompt: &str) -> String {
         let (tool_name, input_json) = tool_to_json(tool);
         let input_json_escaped = json_escape_string(&input_json);
         let id = format!("tool_{:02}", idx + 1);
-        sse.push_str(&format!(
+        let _ = write!(
+            sse,
             "event: content_block_start\n\
              data: {{\"type\":\"content_block_start\",\"index\":{idx},\"content_block\":{{\"type\":\"tool_use\",\"id\":\"{id}\",\"name\":\"{tool_name}\",\"input\":{{}}}}}}\n\n\
              event: content_block_delta\n\
              data: {{\"type\":\"content_block_delta\",\"index\":{idx},\"delta\":{{\"type\":\"input_json_delta\",\"partial_json\":\"{input_json_escaped}\"}}}}\n\n\
              event: content_block_stop\n\
              data: {{\"type\":\"content_block_stop\",\"index\":{idx}}}\n\n"
-        ));
+        );
     }
 
     sse.push_str(
@@ -441,7 +440,7 @@ fn select_tools(prompt: &str) -> Vec<Tool> {
     if p.contains("fibonacci") {
         vec![Tool::Write {
             file: "src/lib.rs".into(),
-            content: r#"pub fn add(a: i32, b: i32) -> i32 {
+            content: r"pub fn add(a: i32, b: i32) -> i32 {
     a + b
 }
 
@@ -465,13 +464,13 @@ mod tests {
         assert_eq!(fibonacci(5), 5);
     }
 }
-"#
+"
             .into(),
         }]
     } else if p.contains("factorial") || p.contains("bug") {
         vec![Tool::Write {
             file: "src/lib.rs".into(),
-            content: r#"pub fn factorial(n: u64) -> u64 {
+            content: r"pub fn factorial(n: u64) -> u64 {
     if n <= 1 { 1 } else { n * factorial(n - 1) }
 }
 
@@ -484,7 +483,7 @@ mod tests {
         assert_eq!(factorial(5), 120);
     }
 }
-"#
+"
             .into(),
         }]
     } else if p.contains("multiply") {
@@ -495,7 +494,7 @@ mod tests {
     } else if p.contains("max") {
         vec![Tool::Write {
             file: "src/lib.rs".into(),
-            content: r#"pub fn max(a: i32, b: i32) -> i32 {
+            content: r"pub fn max(a: i32, b: i32) -> i32 {
     if a > b { a } else { b }
 }
 
@@ -509,7 +508,7 @@ mod tests {
         assert_eq!(max(2, 10), 10);
     }
 }
-"#
+"
             .into(),
         }]
     } else if p.contains("palindrome") {
@@ -540,7 +539,7 @@ mod tests {
     } else if p.contains("stack") {
         vec![Tool::Write {
             file: "src/lib.rs".into(),
-            content: r#"pub fn add(a: i32, b: i32) -> i32 {
+            content: r"pub fn add(a: i32, b: i32) -> i32 {
     a + b
 }
 
@@ -581,7 +580,7 @@ mod tests {
         assert!(!s.is_empty());
     }
 }
-"#
+"
             .into(),
         }]
     } else if p.contains("format_user_label") || p.contains("refactor") {

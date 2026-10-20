@@ -16,7 +16,7 @@ async fn bash_tool_lists_files() {
     let reason = rig
         .submit("List the files in the current directory using the bash tool and tell me how many files/directories you see. Just give a number.")
         .await;
-    assert!(reason.is_ok(), "submit failed: {:?}", reason);
+    assert!(reason.is_ok(), "submit failed: {reason:?}");
     assert_eq!(
         reason.unwrap(),
         TerminalReason::Completed,
@@ -34,11 +34,10 @@ async fn bash_tool_lists_files() {
     // The response should contain some digits (file count)
     assert!(
         text.chars().any(|c| c.is_ascii_digit()),
-        "expected response to contain a number, got: {}",
-        text
+        "expected response to contain a number, got: {text}"
     );
 
-    eprintln!("Response: {}", text);
+    eprintln!("Response: {text}");
 }
 
 #[tokio::test]
@@ -53,7 +52,7 @@ async fn bash_tool_echo_test() {
     let reason = rig
         .submit("Use the bash tool to echo 'hello-from-live-test'. Then report back exactly what was echoed.")
         .await;
-    assert!(reason.is_ok(), "submit failed: {:?}", reason);
+    assert!(reason.is_ok(), "submit failed: {reason:?}");
 
     let events = rig.collect_events().await;
 
@@ -65,7 +64,6 @@ async fn bash_tool_echo_test() {
     let text = live::collect_text(&events);
     assert!(
         text.contains("hello-from-live-test"),
-        "expected echoed text in response, got: {}",
-        text
+        "expected echoed text in response, got: {text}"
     );
 }

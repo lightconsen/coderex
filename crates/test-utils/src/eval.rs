@@ -101,7 +101,7 @@ pub struct EvalResult {
 }
 
 /// Result of a single assertion.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AssertionResult {
     /// The assertion that was checked.
     pub assertion: EvalAssertion,
@@ -118,11 +118,12 @@ pub async fn run_eval(scenario: EvalScenario) -> EvalResult {
         .into_iter()
         .map(|r| {
             // Try to parse as a JSON array of ToolCall first
-            if let Ok(tool_calls) = serde_json::from_str::<Vec<ToolCall>>(&r) {
-                MockResponseType::Static(mock_response_with_tool_calls("", tool_calls))
-            } else {
-                MockResponseType::Static(mock_response(r))
-            }
+            serde_json::from_str::<Vec<ToolCall>>(&r).map_or_else(
+                |_| MockResponseType::Static(mock_response(r)),
+                |tool_calls| {
+                    MockResponseType::Static(mock_response_with_tool_calls("", tool_calls))
+                },
+            )
         })
         .collect();
 
@@ -141,12 +142,12 @@ pub async fn run_eval(scenario: EvalScenario) -> EvalResult {
     let reason = rig.submit("eval prompt").await;
     let events = rig.drain_events();
 
-    let terminal_reason = reason.as_ref().ok().map(|r| r.to_string());
+    let terminal_reason = reason.as_ref().ok().map(std::string::ToString::to_string);
 
     let assertion_results: Vec<AssertionResult> = scenario
         .assertions
         .iter()
-        .map(|a| check_assertion(a, &events, &reason, &terminal_reason))
+        .map(|a| check_assertion(a, &events, &reason))
         .collect();
 
     let passed = assertion_results.iter().all(|r| r.passed);
@@ -164,7 +165,6 @@ fn check_assertion(
     assertion: &EvalAssertion,
     events: &[EngineEvent],
     reason: &Result<coderex_core::engine::TerminalReason, String>,
-    _terminal_reason: &Option<String>,
 ) -> AssertionResult {
     match assertion {
         EvalAssertion::ToolCalled { name } => {
@@ -194,10 +194,10 @@ fn check_assertion(
             AssertionResult {
                 assertion: assertion.clone(),
                 passed: !found,
-                message: if !found {
-                    format!("tool '{name}' was not called (as expected)")
-                } else {
+                message: if found {
                     format!("tool '{name}' was called unexpectedly")
+                } else {
+                    format!("tool '{name}' was not called (as expected)")
                 },
             }
         }
@@ -226,10 +226,10 @@ fn check_assertion(
             AssertionResult {
                 assertion: assertion.clone(),
                 passed: !found,
-                message: if !found {
-                    format!("output does not contain '{text}' (as expected)")
-                } else {
+                message: if found {
                     format!("output unexpectedly contains '{text}'")
+                } else {
+                    format!("output does not contain '{text}' (as expected)")
                 },
             }
         }
@@ -274,8 +274,7 @@ fn check_assertion(
         EvalAssertion::TerminalReason { reason: expected } => {
             let actual = reason
                 .as_ref()
-                .map(|r| r.to_string())
-                .unwrap_or_else(|e| format!("error: {e}"));
+                .map_or_else(|e| format!("error: {e}"), std::string::ToString::to_string);
             let passed = actual == *expected;
             AssertionResult {
                 assertion: assertion.clone(),

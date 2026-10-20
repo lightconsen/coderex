@@ -3,6 +3,7 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
+use std::str::FromStr;
 
 /// A hierarchical memory key, e.g. `project/backend/auth`.
 ///
@@ -14,31 +15,9 @@ pub struct MemoryKey {
 }
 
 impl MemoryKey {
-    /// Create a key from a slash-separated string.
-    ///
-    /// Empty segments and leading/trailing slashes are ignored.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use coderex_memory::long_term::MemoryKey;
-    /// let key = MemoryKey::from_str("project/backend/auth");
-    /// assert_eq!(key.segments(), vec!["project", "backend", "auth"]);
-    /// ```
-    #[must_use]
-    pub fn from_str(s: &str) -> Self {
-        let segments: Vec<String> = s
-            .split('/')
-            .map(|s| s.trim())
-            .filter(|s| !s.is_empty())
-            .map(String::from)
-            .collect();
-        Self { segments }
-    }
-
     /// Create a key from pre-split segments.
     #[must_use]
-    pub fn from_segments(segments: Vec<String>) -> Self {
+    pub const fn from_segments(segments: Vec<String>) -> Self {
         Self { segments }
     }
 
@@ -58,7 +37,7 @@ impl MemoryKey {
     ///
     /// `project/backend` is a prefix of `project/backend/auth`.
     #[must_use]
-    pub fn is_prefix_of(&self, other: &MemoryKey) -> bool {
+    pub fn is_prefix_of(&self, other: &Self) -> bool {
         if self.segments.is_empty() {
             return true;
         }
@@ -86,6 +65,31 @@ impl MemoryKey {
     #[must_use]
     pub fn name(&self) -> Option<&str> {
         self.segments.last().map(String::as_str)
+    }
+}
+
+impl FromStr for MemoryKey {
+    type Err = std::convert::Infallible;
+
+    /// Create a key from a slash-separated string.
+    ///
+    /// Empty segments and leading/trailing slashes are ignored.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use coderex_memory::long_term::MemoryKey;
+    /// let key = "project/backend/auth".parse::<MemoryKey>().unwrap();
+    /// assert_eq!(key.segments(), vec!["project", "backend", "auth"]);
+    /// ```
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let segments: Vec<String> = s
+            .split('/')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(String::from)
+            .collect();
+        Ok(Self { segments })
     }
 }
 
@@ -143,19 +147,19 @@ impl LongTermStore {
     /// Read a memory topic. Increments access count on read.
     pub fn read(&self, topic: &str) -> std::io::Result<Option<MemoryEntry>> {
         let path = self.entry_path(topic);
-        self.read_at_path(&path)
+        Self::read_at_path(&path)
     }
 
     /// Read a memory by its hierarchical key.
     pub fn read_by_key(&self, key: &MemoryKey) -> std::io::Result<Option<MemoryEntry>> {
         let path = self.key_path(key);
-        self.read_at_path(&path)
+        Self::read_at_path(&path)
     }
 
     /// Write a memory topic. Creates new or updates existing.
     pub fn write(&self, topic: &str, content: &str) -> std::io::Result<()> {
         let path = self.entry_path(topic);
-        self.write_at_path(&path, topic, None, content)
+        Self::write_at_path(&path, topic, None, content)
     }
 
     /// Write a memory with a hierarchical key.
@@ -169,7 +173,7 @@ impl LongTermStore {
         content: &str,
     ) -> std::io::Result<()> {
         let path = self.key_path(key);
-        self.write_at_path(&path, topic, Some(key.to_path()), content)
+        Self::write_at_path(&path, topic, Some(key.to_path()), content)
     }
 
     /// Search memories by query string.
@@ -178,14 +182,13 @@ impl LongTermStore {
     pub fn search(&self, query: &str) -> std::io::Result<Vec<MemoryEntry>> {
         let query_lower = query.to_lowercase();
         let mut results = Vec::new();
-        self.scan_dir(&self.base_path, &mut |entry| {
+        Self::scan_dir(&self.base_path, &mut |entry| {
             if entry.topic.to_lowercase().contains(&query_lower)
                 || entry.content.to_lowercase().contains(&query_lower)
                 || entry
                     .key
                     .as_ref()
-                    .map(|k| k.to_lowercase().contains(&query_lower))
-                    .unwrap_or(false)
+                    .is_some_and(|k| k.to_lowercase().contains(&query_lower))
             {
                 results.push(entry);
             }
@@ -196,7 +199,7 @@ impl LongTermStore {
 
     /// Read all memories whose key starts with the given prefix.
     ///
-    /// For example, `read_by_prefix(MemoryKey::from_str("project/backend"))`
+    /// For example, `read_by_prefix("project/backend".parse::<MemoryKey>().unwrap())`
     /// returns all entries with keys like `project/backend/auth`,
     /// `project/backend/routes`, etc.
     pub fn read_by_prefix(&self, prefix: &MemoryKey) -> std::io::Result<Vec<MemoryEntry>> {
@@ -211,9 +214,9 @@ impl LongTermStore {
             return Ok(results);
         }
 
-        self.scan_dir(&search_dir, &mut |entry| {
+        Self::scan_dir(&search_dir, &mut |entry| {
             if let Some(ref key) = entry.key {
-                let entry_key = MemoryKey::from_str(key);
+                let entry_key = MemoryKey::from_str(key).unwrap();
                 if prefix.is_prefix_of(&entry_key) {
                     results.push(entry);
                 }
@@ -231,9 +234,9 @@ impl LongTermStore {
     /// not included.
     pub fn list_keys(&self) -> std::io::Result<Vec<MemoryKey>> {
         let mut keys = Vec::new();
-        self.scan_dir(&self.base_path, &mut |entry| {
+        Self::scan_dir(&self.base_path, &mut |entry| {
             if let Some(ref key) = entry.key {
-                keys.push(MemoryKey::from_str(key));
+                keys.push(MemoryKey::from_str(key).unwrap());
             }
         })?;
         Ok(keys)
@@ -244,7 +247,7 @@ impl LongTermStore {
     /// Returns all entries sorted by access count (most accessed first).
     pub fn list_all(&self) -> std::io::Result<Vec<MemoryEntry>> {
         let mut results = Vec::new();
-        self.scan_dir(&self.base_path, &mut |entry| {
+        Self::scan_dir(&self.base_path, &mut |entry| {
             results.push(entry);
         })?;
         results.sort_by_key(|m| std::cmp::Reverse(m.access_count));
@@ -271,7 +274,7 @@ impl LongTermStore {
 
     // ─── Internal helpers ──────────────────────────────────────────────────
 
-    fn read_at_path(&self, path: &Path) -> std::io::Result<Option<MemoryEntry>> {
+    fn read_at_path(path: &Path) -> std::io::Result<Option<MemoryEntry>> {
         if !path.exists() {
             return Ok(None);
         }
@@ -286,7 +289,6 @@ impl LongTermStore {
     }
 
     fn write_at_path(
-        &self,
         path: &Path,
         topic: &str,
         key: Option<String>,
@@ -298,7 +300,7 @@ impl LongTermStore {
         let now = Utc::now();
 
         let entry = if path.exists() {
-            if let Ok(Some(existing)) = self.read_raw_path(path) {
+            if let Ok(Some(existing)) = Self::read_raw_path(path) {
                 MemoryEntry {
                     content: content.into(),
                     key: key.or(existing.key),
@@ -334,7 +336,7 @@ impl LongTermStore {
         std::fs::write(path, serialized)
     }
 
-    fn read_raw_path(&self, path: &Path) -> std::io::Result<Option<MemoryEntry>> {
+    fn read_raw_path(path: &Path) -> std::io::Result<Option<MemoryEntry>> {
         if !path.exists() {
             return Ok(None);
         }
@@ -366,7 +368,7 @@ impl LongTermStore {
     }
 
     /// Recursively scan a directory for `.json` memory entries.
-    fn scan_dir(&self, dir: &Path, callback: &mut dyn FnMut(MemoryEntry)) -> std::io::Result<()> {
+    fn scan_dir(dir: &Path, callback: &mut dyn FnMut(MemoryEntry)) -> std::io::Result<()> {
         if !dir.exists() {
             return Ok(());
         }
@@ -374,7 +376,7 @@ impl LongTermStore {
             let entry = entry?;
             let path = entry.path();
             if path.is_dir() {
-                self.scan_dir(&path, callback)?;
+                Self::scan_dir(&path, callback)?;
             } else if path.extension().and_then(|e| e.to_str()) == Some("json") {
                 if let Ok(content) = std::fs::read_to_string(&path) {
                     if let Ok(memory) = serde_json::from_str::<MemoryEntry>(&content) {
@@ -462,7 +464,7 @@ mod tests {
 
     #[test]
     fn memory_key_parsing() {
-        let key = MemoryKey::from_str("project/backend/auth");
+        let key = MemoryKey::from_str("project/backend/auth").unwrap();
         assert_eq!(key.segments(), vec!["project", "backend", "auth"]);
         assert_eq!(key.to_path(), "project/backend/auth");
         assert_eq!(key.name(), Some("auth"));
@@ -471,10 +473,10 @@ mod tests {
 
     #[test]
     fn memory_key_prefix_matching() {
-        let prefix = MemoryKey::from_str("project/backend");
-        let child = MemoryKey::from_str("project/backend/auth");
-        let sibling = MemoryKey::from_str("project/frontend/auth");
-        let parent = MemoryKey::from_str("project");
+        let prefix = MemoryKey::from_str("project/backend").unwrap();
+        let child = MemoryKey::from_str("project/backend/auth").unwrap();
+        let sibling = MemoryKey::from_str("project/frontend/auth").unwrap();
+        let parent = MemoryKey::from_str("project").unwrap();
 
         assert!(prefix.is_prefix_of(&child));
         assert!(!prefix.is_prefix_of(&sibling));
@@ -485,7 +487,7 @@ mod tests {
     #[test]
     fn write_with_key_creates_nested_path() {
         let (store, tmp) = temp_store();
-        let key = MemoryKey::from_str("project/backend/auth");
+        let key = MemoryKey::from_str("project/backend/auth").unwrap();
         store
             .write_with_key("Auth module", &key, "JWT-based authentication")
             .unwrap();
@@ -506,35 +508,35 @@ mod tests {
         store
             .write_with_key(
                 "Auth",
-                &MemoryKey::from_str("project/backend/auth"),
+                &MemoryKey::from_str("project/backend/auth").unwrap(),
                 "JWT auth",
             )
             .unwrap();
         store
             .write_with_key(
                 "Routes",
-                &MemoryKey::from_str("project/backend/routes"),
+                &MemoryKey::from_str("project/backend/routes").unwrap(),
                 "REST routes",
             )
             .unwrap();
         store
             .write_with_key(
                 "Components",
-                &MemoryKey::from_str("project/frontend/components"),
+                &MemoryKey::from_str("project/frontend/components").unwrap(),
                 "React components",
             )
             .unwrap();
         store.write("flat-topic", "no hierarchy").unwrap();
 
         let backend = store
-            .read_by_prefix(&MemoryKey::from_str("project/backend"))
+            .read_by_prefix(&MemoryKey::from_str("project/backend").unwrap())
             .unwrap();
         assert_eq!(backend.len(), 2);
         assert!(backend.iter().any(|m| m.topic == "Auth"));
         assert!(backend.iter().any(|m| m.topic == "Routes"));
 
         let project = store
-            .read_by_prefix(&MemoryKey::from_str("project"))
+            .read_by_prefix(&MemoryKey::from_str("project").unwrap())
             .unwrap();
         assert_eq!(project.len(), 3);
     }
@@ -543,24 +545,28 @@ mod tests {
     fn list_keys_returns_all_hierarchical_keys() {
         let (store, _tmp) = temp_store();
         store
-            .write_with_key("A", &MemoryKey::from_str("x/y"), "content a")
+            .write_with_key("A", &MemoryKey::from_str("x/y").unwrap(), "content a")
             .unwrap();
         store
-            .write_with_key("B", &MemoryKey::from_str("x/z"), "content b")
+            .write_with_key("B", &MemoryKey::from_str("x/z").unwrap(), "content b")
             .unwrap();
         store.write("flat", "no key").unwrap();
 
         let keys = store.list_keys().unwrap();
         assert_eq!(keys.len(), 2);
-        assert!(keys.contains(&MemoryKey::from_str("x/y")));
-        assert!(keys.contains(&MemoryKey::from_str("x/z")));
+        assert!(keys.contains(&MemoryKey::from_str("x/y").unwrap()));
+        assert!(keys.contains(&MemoryKey::from_str("x/z").unwrap()));
     }
 
     #[test]
     fn search_includes_key_field() {
         let (store, _tmp) = temp_store();
         store
-            .write_with_key("Auth", &MemoryKey::from_str("project/backend/auth"), "JWT")
+            .write_with_key(
+                "Auth",
+                &MemoryKey::from_str("project/backend/auth").unwrap(),
+                "JWT",
+            )
             .unwrap();
 
         let results = store.search("backend").unwrap();
@@ -573,7 +579,7 @@ mod tests {
         let (store, _tmp) = temp_store();
         store.write("flat-topic", "flat content").unwrap();
         store
-            .write_with_key("Hier", &MemoryKey::from_str("a/b"), "hier content")
+            .write_with_key("Hier", &MemoryKey::from_str("a/b").unwrap(), "hier content")
             .unwrap();
 
         let all = store.search("content").unwrap();
@@ -593,7 +599,7 @@ mod tests {
     #[test]
     fn delete_by_key_removes_entry() {
         let (store, _tmp) = temp_store();
-        let key = MemoryKey::from_str("project/test");
+        let key = MemoryKey::from_str("project/test").unwrap();
         store.write_with_key("Test", &key, "content").unwrap();
         assert!(store.read_by_key(&key).unwrap().is_some());
 

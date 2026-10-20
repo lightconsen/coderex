@@ -1065,7 +1065,7 @@ impl HookExecutor for HookRegistry {
             .is_ok_and(HookEvent::is_gating);
 
         let mut combined = HookFireResult::default();
-        for exec_result in results.into_iter() {
+        for exec_result in results {
             match exec_result {
                 Ok(r) => {
                     if matches!(r.hook_result.action, HookAction::Stop) {
@@ -1126,7 +1126,7 @@ async fn execute_hook_with_timeout(
     };
     let result = tokio::time::timeout(std::time::Duration::from_millis(timeout_ms), execution)
         .await
-        .map_or(Err(HookError::Timeout(timeout_ms)), |r| r);
+        .unwrap_or(Err(HookError::Timeout(timeout_ms)));
 
     let elapsed = start.elapsed();
 

@@ -110,7 +110,8 @@ pub fn register(registry: &mut CommandRegistry) {
             if ctx.elapsed_secs > 3600 {
                 findings.push(format!(
                     "[!] Long session: {:.1} hours",
-                    ctx.elapsed_secs as f64 / 3600.0
+                    u32::try_from(ctx.elapsed_secs).map_or_else(|_| f64::from(u32::MAX), f64::from)
+                        / 3600.0
                 ));
             } else {
                 findings.push(format!("[✓] Session duration: {}s", ctx.elapsed_secs));

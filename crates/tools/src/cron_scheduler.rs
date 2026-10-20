@@ -91,6 +91,7 @@ impl CronScheduler {
     }
 
     /// Set the filesystem path used for `load` / `save`.
+    #[must_use]
     pub fn with_storage(self, path: PathBuf) -> Self {
         *self.storage_path.write().unwrap() = Some(path);
         self
@@ -101,6 +102,7 @@ impl CronScheduler {
     /// Only durable jobs are recorded: a non-durable definition dies with the
     /// process, so claiming it is resumable in the next session would be a
     /// lie. The session id attributes the record for adoption.
+    #[must_use]
     pub fn with_job_records(self, cwd: PathBuf, session_id: impl Into<String>) -> Self {
         self.set_job_records(cwd, session_id);
         self
@@ -118,24 +120,26 @@ impl CronScheduler {
 
     /// Load durable jobs from disk if the storage file exists.
     pub fn load(&self) -> Result<(), String> {
-        let guard = self.storage_path.read().unwrap();
-        let path = guard
-            .as_ref()
-            .ok_or_else(|| "no storage path set".to_string())?;
+        let path = {
+            let guard = self.storage_path.read().unwrap();
+            guard
+                .as_ref()
+                .cloned()
+                .ok_or_else(|| "no storage path set".to_string())?
+        };
         if !path.exists() {
             return Ok(());
         }
-        let content = fs::read_to_string(path).map_err(|e| format!("failed to read: {e}"))?;
+        let content = fs::read_to_string(&path).map_err(|e| format!("failed to read: {e}"))?;
         let jobs: Vec<CronJob> =
             serde_json::from_str(&content).map_err(|e| format!("failed to parse: {e}"))?;
-        let mut map = self.jobs.write().unwrap();
         for job in jobs {
             if job.durable {
                 // The definition survived the restart and is being scheduled
                 // again, so its record is Running and fresh — regardless of
                 // what the previous process left behind.
                 self.refresh_job_record(&job);
-                map.insert(job.id.clone(), job);
+                self.jobs.write().unwrap().insert(job.id.clone(), job);
             }
         }
         Ok(())
@@ -143,18 +147,23 @@ impl CronScheduler {
 
     /// Persist durable jobs to disk.
     pub fn save(&self) -> Result<(), String> {
-        let guard = self.storage_path.read().unwrap();
-        let path = guard
-            .as_ref()
-            .ok_or_else(|| "no storage path set".to_string())?;
-        let map = self.jobs.read().unwrap();
-        let durable: Vec<&CronJob> = map.values().filter(|j| j.durable).collect();
+        let path = {
+            let guard = self.storage_path.read().unwrap();
+            guard
+                .as_ref()
+                .cloned()
+                .ok_or_else(|| "no storage path set".to_string())?
+        };
+        let durable: Vec<CronJob> = {
+            let map = self.jobs.read().unwrap();
+            map.values().filter(|j| j.durable).cloned().collect()
+        };
         let content = serde_json::to_string_pretty(&durable)
             .map_err(|e| format!("failed to serialize: {e}"))?;
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).map_err(|e| format!("failed to create dir: {e}"))?;
         }
-        fs::write(path, content).map_err(|e| format!("failed to write: {e}"))?;
+        fs::write(&path, content).map_err(|e| format!("failed to write: {e}"))?;
         Ok(())
     }
 
@@ -194,8 +203,9 @@ impl CronScheduler {
 
     /// Check if a job should fire now based on its cron expression.
     pub fn should_fire(&self, id: &str) -> bool {
-        let guard = self.jobs.read().unwrap();
-        let Some(job) = guard.get(id) else {
+        let job = self.jobs.read().unwrap().get(id).cloned();
+
+        let Some(job) = job else {
             return false;
         };
 
@@ -215,7 +225,7 @@ impl CronScheduler {
         let mut map = self.jobs.write().unwrap();
         let mut recurring = true;
         if let Some(job) = map.get_mut(id) {
-            job.last_fire = Some(now.clone());
+            job.last_fire = Some(now);
             recurring = job.recurring;
             // One-shot jobs are deleted after firing
             if !job.recurring {
@@ -381,11 +391,11 @@ fn match_cron_expr(expr: &str) -> bool {
     }
 
     let now = Local::now();
-    let minute = now.minute() as i64;
-    let hour = now.hour() as i64;
-    let day = now.day() as i64;
-    let month = now.month() as i64;
-    let weekday = now.weekday().num_days_from_sunday() as i64; // 0=Sun
+    let minute = i64::from(now.minute());
+    let hour = i64::from(now.hour());
+    let day = i64::from(now.day());
+    let month = i64::from(now.month());
+    let weekday = i64::from(now.weekday().num_days_from_sunday()); // 0=Sun
 
     let fields = [
         (minute, 0, 59),

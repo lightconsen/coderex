@@ -386,6 +386,9 @@ impl StartupOrchestrator {
     }
 
     /// Run the full startup sequence.
+    // The future borrows the non-`Sync` REPL loop, so it is not `Send`; `main`
+    // awaits it on the current task and never spawns it onto another thread.
+    #[allow(clippy::future_not_send)]
     pub async fn run(&mut self, args: Cli) -> Result<()> {
         // `--tmux` runs before any startup work. Outside tmux this replaces
         // the process with a tmux session running the same binary; inside
@@ -410,32 +413,34 @@ impl StartupOrchestrator {
         });
 
         // Store CLI-derived context
-        self.ctx.session_name = args.name.clone();
+        self.ctx.session_name.clone_from(&args.name);
         self.ctx.skip_permissions = args.dangerously_skip_permissions;
-        self.ctx.add_dir = args.add_dir.clone();
-        self.ctx.file = args.file.clone();
-        self.ctx.system_prompt = args.system_prompt.clone();
-        self.ctx.append_system_prompt = args.append_system_prompt.clone();
+        self.ctx.add_dir.clone_from(&args.add_dir);
+        self.ctx.file.clone_from(&args.file);
+        self.ctx.system_prompt.clone_from(&args.system_prompt);
+        self.ctx
+            .append_system_prompt
+            .clone_from(&args.append_system_prompt);
         self.ctx.no_persistence = args.no_session_persistence;
         self.ctx.no_slash_commands = args.disable_slash_commands;
-        self.ctx.output_format = args.output_format.clone();
-        self.ctx.debug_file = args.debug_file.clone();
-        self.ctx.settings_path = args.settings.clone();
-        self.ctx.mcp_config_path = args.mcp_config.clone();
+        self.ctx.output_format.clone_from(&args.output_format);
+        self.ctx.debug_file.clone_from(&args.debug_file);
+        self.ctx.settings_path.clone_from(&args.settings);
+        self.ctx.mcp_config_path.clone_from(&args.mcp_config);
         self.ctx.mcp_debug = args.mcp_debug;
         self.ctx.strict_mcp_config = args.strict_mcp_config;
-        self.ctx.plugin_dir = args.plugin_dir.clone();
-        self.ctx.input_format = args.input_format.clone();
-        self.ctx.json_schema = args.json_schema.clone();
+        self.ctx.plugin_dir.clone_from(&args.plugin_dir);
+        self.ctx.input_format.clone_from(&args.input_format);
+        self.ctx.json_schema.clone_from(&args.json_schema);
         self.ctx.max_turns = args.max_turns;
         self.ctx.replay_user_messages = args.replay_user_messages;
         self.ctx.include_partial_messages = args.include_partial_messages;
-        self.ctx.effort = args.effort.clone();
-        self.ctx.betas = args.betas.clone();
+        self.ctx.effort.clone_from(&args.effort);
+        self.ctx.betas.clone_from(&args.betas);
         self.ctx.chrome = args.chrome;
         self.ctx.no_chrome = args.no_chrome;
         self.ctx.tmux = args.tmux;
-        self.ctx.agent = args.agent.clone();
+        self.ctx.agent.clone_from(&args.agent);
         // Resolve the name before any startup phase runs. A typo must fail
         // loudly with the configured names, not start a default session that
         // silently ignores the flag.
@@ -444,10 +449,10 @@ impl StartupOrchestrator {
                 bail!("{error}");
             }
         }
-        self.ctx.ide = args.ide.clone();
+        self.ctx.ide.clone_from(&args.ide);
         self.ctx.worktree = args.worktree;
-        self.ctx.fork_session = args.fork_session.clone();
-        self.ctx.from_pr = args.from_pr.clone();
+        self.ctx.fork_session.clone_from(&args.fork_session);
+        self.ctx.from_pr.clone_from(&args.from_pr);
         // Fetch once, before the REPL exists: the headless path prepends the
         // block to the prompt, the interactive path adds it as extra context,
         // and either way a failure stops startup with `gh`'s message instead
@@ -582,19 +587,19 @@ impl StartupOrchestrator {
         // Route based on CLI args
         if args.print || !args.prompt.is_empty() {
             // Non-interactive: read from stdin or use positional prompt
-            let prompt = if !args.prompt.is_empty() {
-                args.prompt.join(" ")
-            } else {
+            let prompt = if args.prompt.is_empty() {
                 let mut stdin = String::new();
                 std::io::stdin().read_line(&mut stdin)?;
                 stdin.trim().to_string()
+            } else {
+                args.prompt.join(" ")
             };
             if prompt.is_empty() {
                 bail!("No input provided");
             }
             self.run_headless_with_prompt(&self.ctx.cwd, model, &prompt)
                 .await?;
-            return Ok(());
+            Ok(())
         } else if let Some(cmd) = args.command {
             match cmd {
                 crate::cli::Command::Repl => self.run_repl(&self.ctx.cwd, model).await,
@@ -644,6 +649,9 @@ impl StartupOrchestrator {
     }
 
     /// Bootstrap: initialize tracing, signal handlers, and core subsystems.
+    // Retained `async`: the startup/dispatch pipeline awaits these on the current
+    // task, and removing it cascades into unnecessary_wraps/unused_self.
+    #[allow(clippy::unused_async, clippy::unused_async_trait_impl)]
     async fn phase_bootstrap(&self) -> Result<()> {
         // Build log level from CLI flags: --debug → debug, --verbose → debug, default → info
         let log_level = if self.ctx.debug || self.ctx.verbose {
@@ -687,6 +695,9 @@ impl StartupOrchestrator {
 
     /// LoadSettings: load user + project config, resolve with overrides,
     /// and initialize telemetry with settings.json integration.
+    // Retained `async`: the startup/dispatch pipeline awaits these on the current
+    // task, and removing it cascades into unnecessary_wraps/unused_self.
+    #[allow(clippy::unused_async, clippy::unused_async_trait_impl)]
     async fn phase_load_settings(&mut self, args: &Cli) -> Result<()> {
         let config_dir = coderex_config::config_home();
 
@@ -702,14 +713,15 @@ impl StartupOrchestrator {
         // The managed-settings file carrier (enterprise). Defaults to
         // <config_dir>/managed_settings.json; deployments can point it at an
         // admin-controlled location via the env var.
-        let managed_path = std::env::var("CODEREX_MANAGED_SETTINGS_PATH")
-            .map(std::path::PathBuf::from)
-            .unwrap_or_else(|_| config_dir.join("managed_settings.json"));
+        let managed_path = std::env::var("CODEREX_MANAGED_SETTINGS_PATH").map_or_else(
+            |_| config_dir.join("managed_settings.json"),
+            std::path::PathBuf::from,
+        );
 
         // Platform carriers are attached after the file carrier: an explicit
         // `--settings`/environment file path keeps precedence, and the OS
         // policy carrier is added only when it was not explicitly configured.
-        let config_service = ConfigService::new(user_path.clone(), project_path.clone())
+        let config_service = ConfigService::new(user_path.clone(), project_path)
             .with_local_config_path(Self::local_config_path(&self.ctx.cwd))
             .with_managed_settings_path(managed_path)
             .with_platform_managed_settings();
@@ -954,7 +966,7 @@ impl StartupOrchestrator {
             })
         };
 
-        let (handle, uploader) = coderex_telemetry::TelemetryHandle::new(store, telemetry_config);
+        let (handle, uploader) = coderex_telemetry::TelemetryHandle::new(&store, telemetry_config);
         // `TelemetryUploader::new` derives channels from the environment; the
         // settings file is the host's own configuration and must be able to
         // supply (or override) OTLP/Datadog values too.
@@ -1087,6 +1099,9 @@ impl StartupOrchestrator {
     }
 
     /// BuildCapabilities: derive feature flags and capabilities from resolved settings.
+    // Retained `async`: the startup/dispatch pipeline awaits these on the current
+    // task, and removing it cascades into unnecessary_wraps/unused_self.
+    #[allow(clippy::unused_async, clippy::unused_async_trait_impl)]
     async fn phase_build_capabilities(&mut self) -> Result<()> {
         // Resolve model from settings
         if let Some(ref settings) = self.ctx.settings {
@@ -1100,6 +1115,9 @@ impl StartupOrchestrator {
     }
 
     /// LoadCommands: discover and register custom commands from `.coderex/commands/`.
+    // Retained `async`: the startup/dispatch pipeline awaits these on the current
+    // task, and removing it cascades into unnecessary_wraps/unused_self.
+    #[allow(clippy::unused_async, clippy::unused_async_trait_impl)]
     async fn phase_load_commands(&self) -> Result<()> {
         let commands_dir = std::path::Path::new(&self.ctx.cwd).join(".coderex/commands");
         if commands_dir.exists() {
@@ -1127,12 +1145,13 @@ impl StartupOrchestrator {
     }
 
     /// LoadSkills: discover and register skills from .coderex/skills/.
+    // Retained `async`: the startup/dispatch pipeline awaits these on the current
+    // task, and removing it cascades into unnecessary_wraps/unused_self.
+    #[allow(clippy::unused_async, clippy::unused_async_trait_impl)]
     async fn phase_load_skills(&self) -> Result<()> {
         let skills_dir = std::path::Path::new(&self.ctx.cwd).join(".coderex/skills");
         if skills_dir.exists() {
-            let count = std::fs::read_dir(&skills_dir)
-                .map(|d| d.count())
-                .unwrap_or(0);
+            let count = std::fs::read_dir(&skills_dir).map_or(0, std::iter::Iterator::count);
             tracing::info!("skills loaded: {count} from {skills_dir:?}");
         } else {
             tracing::debug!("no skills directory found");
@@ -1350,10 +1369,11 @@ impl StartupOrchestrator {
         // A budget can only tighten: a plugin may cap spending, never raise
         // the ceiling the user set.
         if let Some(plugin_budget) = plugin_settings.max_budget_usd {
-            settings.max_budget_usd = Some(match settings.max_budget_usd {
-                Some(existing) => existing.min(plugin_budget),
-                None => plugin_budget,
-            });
+            settings.max_budget_usd = Some(
+                settings
+                    .max_budget_usd
+                    .map_or(plugin_budget, |existing| existing.min(plugin_budget)),
+            );
         }
         if self.ctx.model.is_none() && !self.ctx.model_explicit {
             self.ctx.model = settings.model.clone().map(coderex_core::types::ModelId);
@@ -1676,6 +1696,9 @@ impl StartupOrchestrator {
     }
 
     /// InitMemory: initialize memory subsystem (auto dream, team memory).
+    // Retained `async`: the startup/dispatch pipeline awaits these on the current
+    // task, and removing it cascades into unnecessary_wraps/unused_self.
+    #[allow(clippy::unused_async, clippy::unused_async_trait_impl)]
     async fn phase_init_memory(&mut self) -> Result<()> {
         let memory_dir = std::path::Path::new(&self.ctx.cwd).join(".coderex");
 
@@ -1689,6 +1712,9 @@ impl StartupOrchestrator {
     }
 
     /// InitRemoteServices: initialize remote service connections.
+    // Retained `async`: the startup/dispatch pipeline awaits these on the current
+    // task, and removing it cascades into unnecessary_wraps/unused_self.
+    #[allow(clippy::unused_async, clippy::unused_async_trait_impl)]
     async fn phase_init_remote_services(&mut self) -> Result<()> {
         // Bridge transport initialization — best-effort, failures don't block startup
         if let Ok(bridge_url) = std::env::var("CODEREX_BRIDGE_URL") {
@@ -1709,15 +1735,14 @@ impl StartupOrchestrator {
     }
 
     /// Ready: final verification that all critical subsystems are up.
+    // Retained `async`: the startup/dispatch pipeline awaits these on the current
+    // task, and removing it cascades into unnecessary_wraps/unused_self.
+    #[allow(clippy::unused_async, clippy::unused_async_trait_impl)]
     async fn phase_ready(&self) -> Result<()> {
         tracing::info!(
             "startup complete: cwd={}, model={}, mcp={}, memory={}, remote={}",
             self.ctx.cwd,
-            self.ctx
-                .model
-                .as_ref()
-                .map(|m| m.0.as_str())
-                .unwrap_or("default"),
+            self.ctx.model.as_ref().map_or("default", |m| m.0.as_str()),
             self.ctx.mcp_ready,
             self.ctx.memory_ready,
             self.ctx.remote_services_ready,
@@ -1815,9 +1840,7 @@ impl StartupOrchestrator {
     }
 
     fn env_non_empty(get_env: &impl Fn(&str) -> Option<String>, name: &str) -> bool {
-        get_env(name)
-            .map(|value| !value.trim().is_empty())
-            .unwrap_or(false)
+        get_env(name).is_some_and(|value| !value.trim().is_empty())
     }
 
     /// Whether a provider configuration has credentials the transport can use.
@@ -1861,11 +1884,7 @@ impl StartupOrchestrator {
         cloud: &CloudEndpoint,
         get_env: &impl Fn(&str) -> Option<String>,
     ) -> bool {
-        let present = |name: &str| {
-            get_env(name)
-                .map(|value| !value.trim().is_empty())
-                .unwrap_or(false)
-        };
+        let present = |name: &str| get_env(name).is_some_and(|value| !value.trim().is_empty());
         let api_key = present("ANTHROPIC_API_KEY");
         match cloud.kind {
             ProviderKind::Bedrock | ProviderKind::AnthropicAws | ProviderKind::Mantle => {
@@ -2161,12 +2180,15 @@ impl StartupOrchestrator {
         self.configure_repl(&mut repl, interactive);
         if streaming_protocol {
             repl.with_protocol_sink(Some(coderex_events::MessageSink::new(
-                Box::new(std::io::stdout()) as Box<dyn std::io::Write + Send>,
+                Box::new(std::io::stdout()) as Box<dyn std::io::Write + Send + Sync>,
             )));
         }
         repl
     }
 
+    // The future borrows the non-`Sync` REPL loop, so it is not `Send`; it is
+    // awaited from `run` on the current task and never spawned.
+    #[allow(clippy::future_not_send)]
     #[allow(clippy::unused_async)]
     async fn run_repl(&self, cwd: &str, model: ModelId) -> Result<()> {
         if !std::io::stdin().is_terminal() {
@@ -2177,6 +2199,9 @@ impl StartupOrchestrator {
         repl.run_tui().await
     }
 
+    // The future borrows the non-`Sync` REPL loop, so it is not `Send`; it is
+    // awaited from `run` on the current task and never spawned.
+    #[allow(clippy::future_not_send)]
     #[allow(clippy::unused_async)]
     async fn run_headless_with_prompt(
         &self,
@@ -2186,14 +2211,15 @@ impl StartupOrchestrator {
     ) -> Result<()> {
         // Parse input based on --input-format
         let user_prompt = if self.ctx.input_format == "json" {
-            match serde_json::from_str::<serde_json::Value>(prompt) {
-                Ok(val) => val
-                    .get("prompt")
-                    .and_then(|p| p.as_str())
-                    .unwrap_or(prompt)
-                    .to_string(),
-                Err(_) => prompt.to_string(),
-            }
+            serde_json::from_str::<serde_json::Value>(prompt).map_or_else(
+                |_| prompt.to_string(),
+                |val| {
+                    val.get("prompt")
+                        .and_then(|p| p.as_str())
+                        .unwrap_or(prompt)
+                        .to_string()
+                },
+            )
         } else {
             prompt.to_string()
         };
@@ -2228,6 +2254,8 @@ impl StartupOrchestrator {
     /// prompt before any instruction the user typed, then the system prompt,
     /// included files, and finally the user's own words.
     fn build_headless_prompt(&self, user_prompt: &str) -> String {
+        use std::fmt::Write as _;
+
         let mut final_prompt = String::new();
 
         if let Some(ref context) = self.ctx.from_pr_context {
@@ -2257,11 +2285,12 @@ impl StartupOrchestrator {
         for file_path in &self.ctx.file {
             match std::fs::read_to_string(file_path) {
                 Ok(content) => {
-                    final_prompt.push_str(&format!(
+                    let _ = write!(
+                        final_prompt,
                         "--- {} ---\n{}\n\n",
                         file_path.display(),
                         content
-                    ));
+                    );
                 }
                 Err(e) => {
                     tracing::warn!("failed to read file {}: {e}", file_path.display());
@@ -2332,11 +2361,10 @@ impl StartupOrchestrator {
         let persist_path = if Self::env_flag("CODEREX_SERVER_NO_PERSIST") {
             None
         } else {
-            Some(
-                std::env::var_os("CODEREX_SERVER_PERSIST_PATH")
-                    .map(std::path::PathBuf::from)
-                    .unwrap_or_else(|| coderex_config::config_home().join("server-sessions.db")),
-            )
+            Some(std::env::var_os("CODEREX_SERVER_PERSIST_PATH").map_or_else(
+                || coderex_config::config_home().join("server-sessions.db"),
+                std::path::PathBuf::from,
+            ))
         };
         if let Some(ref path) = persist_path {
             tracing::info!("server session store: {}", path.display());
@@ -2373,23 +2401,24 @@ impl StartupOrchestrator {
                 self.ctx
                     .settings
                     .as_ref()
-                    .map(|settings| settings.context_window_overrides())
+                    .map(coderex_config::Settings::context_window_overrides)
                     .unwrap_or_default(),
             )
             .with_experiment(
                 coderex_config::flags::FeatureFlags::from_env().experiment_context_windows(),
             );
-        match Self::serve_engine_factory(
+        if let Some(factory) = Self::serve_engine_factory(
             cwd,
             self.ctx.model.clone().unwrap_or_else(ModelId::sonnet),
             context_window,
             self.ctx.mcp_manager.clone(),
             permission_mode,
         ) {
-            Some(factory) => server.set_engine_factory(factory),
-            None => tracing::warn!(
+            server.set_engine_factory(factory);
+        } else {
+            tracing::warn!(
                 "no API key configured: served sessions will refuse queries with 'no_engine'"
-            ),
+            );
         }
 
         tracing::info!("CodeRex server initialized: cwd={cwd}");
@@ -2411,9 +2440,8 @@ impl StartupOrchestrator {
 
     /// Whether a boolean-ish environment variable is set to true.
     fn env_flag(name: &str) -> bool {
-        std::env::var(name).ok().is_some_and(|value| {
-            matches!(value.to_ascii_lowercase().as_str(), "1" | "true" | "yes")
-        })
+        std::env::var(name)
+            .is_ok_and(|value| matches!(value.to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
     }
 
     /// Whether marketplace reconciliation may install new plugins.
@@ -2546,7 +2574,9 @@ impl StartupOrchestrator {
         }))
     }
 
-    #[allow(clippy::unused_async)]
+    // Retained `async`: the startup/dispatch pipeline awaits these on the current
+    // task, and removing it cascades into unnecessary_wraps/unused_self.
+    #[allow(clippy::unused_async, clippy::unused_async_trait_impl)]
     async fn run_serve_stop(&self) -> Result<()> {
         match daemon::stop_daemon() {
             Ok(msg) => {
@@ -2557,13 +2587,17 @@ impl StartupOrchestrator {
         }
     }
 
-    #[allow(clippy::unused_async)]
+    // Retained `async`: the startup/dispatch pipeline awaits these on the current
+    // task, and removing it cascades into unnecessary_wraps/unused_self.
+    #[allow(clippy::unused_async, clippy::unused_async_trait_impl)]
     async fn run_serve_status(&self) -> Result<()> {
         println!("{}", daemon::serve_status());
         Ok(())
     }
 
-    #[allow(clippy::unused_async)]
+    // Retained `async`: the startup/dispatch pipeline awaits these on the current
+    // task, and removing it cascades into unnecessary_wraps/unused_self.
+    #[allow(clippy::unused_async, clippy::unused_async_trait_impl)]
     async fn run_agents(&self, detailed: bool) -> Result<()> {
         println!("Built-in agents:");
         if detailed {
@@ -2606,7 +2640,9 @@ impl StartupOrchestrator {
         Ok(())
     }
 
-    #[allow(clippy::unused_async)]
+    // Retained `async`: the startup/dispatch pipeline awaits these on the current
+    // task, and removing it cascades into unnecessary_wraps/unused_self.
+    #[allow(clippy::unused_async, clippy::unused_async_trait_impl)]
     async fn run_auth(&self) -> Result<()> {
         let mut config = coderex_core::provider_config::ProviderConfig::from_env();
         // Apply CLI --api-key override if present
@@ -2635,7 +2671,9 @@ impl StartupOrchestrator {
         Ok(())
     }
 
-    #[allow(clippy::unused_async)]
+    // Retained `async`: the startup/dispatch pipeline awaits these on the current
+    // task, and removing it cascades into unnecessary_wraps/unused_self.
+    #[allow(clippy::unused_async, clippy::unused_async_trait_impl)]
     async fn run_doctor(&self) -> Result<()> {
         println!("CodeRex Doctor");
         println!("==============");
@@ -2713,7 +2751,7 @@ impl StartupOrchestrator {
                         Err(e) => println!("  Error loading config: {e}"),
                     }
                 } else {
-                    println!("  No MCP config found at {mcp_path:?}");
+                    println!("  No MCP config found at {}", mcp_path.display());
                 }
             }
             Some(crate::cli::McpAction::Add {
@@ -2754,7 +2792,7 @@ impl StartupOrchestrator {
                 };
                 match added {
                     Ok(()) => match config.save(&mcp_path) {
-                        Ok(()) => println!("Added MCP server '{name}' to {mcp_path:?}"),
+                        Ok(()) => println!("Added MCP server '{name}' to {}", mcp_path.display()),
                         Err(e) => println!("Error saving config: {e}"),
                     },
                     Err(e) => println!("Error: {e}"),
@@ -2769,7 +2807,9 @@ impl StartupOrchestrator {
                 };
                 if config.remove_server(&name).is_some() {
                     match config.save(&mcp_path) {
-                        Ok(()) => println!("Removed MCP server '{name}' from {mcp_path:?}"),
+                        Ok(()) => {
+                            println!("Removed MCP server '{name}' from {}", mcp_path.display());
+                        }
                         Err(e) => println!("Error saving config: {e}"),
                     }
                 } else {
@@ -2778,7 +2818,7 @@ impl StartupOrchestrator {
             }
             Some(crate::cli::McpAction::Test { name }) => {
                 if !mcp_path.exists() {
-                    println!("No MCP config found at {mcp_path:?}");
+                    println!("No MCP config found at {}", mcp_path.display());
                     return Ok(());
                 }
                 let config = match coderex_mcp::config::McpConfig::load(&mcp_path) {
@@ -2808,10 +2848,10 @@ impl StartupOrchestrator {
                     .into_iter()
                     .filter(|tool| tool.server == name)
                     .collect();
-                let status = manager
-                    .get_server(&name)
-                    .map(|server| format!("{:?}", server.status))
-                    .unwrap_or_else(|| "not registered".to_string());
+                let status = manager.get_server(&name).map_or_else(
+                    || "not registered".to_string(),
+                    |server| format!("{:?}", server.status),
+                );
 
                 // Always tear the connection down, including on failure.
                 manager.stop_all().await;
@@ -2912,7 +2952,7 @@ impl StartupOrchestrator {
                     manager.install_plugin(&plugin, &install_dir).await
                 };
                 match result {
-                    Ok(path) => println!("Plugin installed to: {path:?}"),
+                    Ok(path) => println!("Plugin installed to: {}", path.display()),
                     Err(e) => println!("Installation failed: {e}"),
                 }
             }
@@ -2962,7 +3002,9 @@ impl StartupOrchestrator {
         Ok(())
     }
 
-    #[allow(clippy::unused_async)]
+    // Retained `async`: the startup/dispatch pipeline awaits these on the current
+    // task, and removing it cascades into unnecessary_wraps/unused_self.
+    #[allow(clippy::unused_async, clippy::unused_async_trait_impl)]
     async fn run_auto_mode(&self) -> Result<()> {
         println!("Auto-mode settings:");
         let memory_dir = std::path::Path::new(&self.ctx.cwd).join(".coderex/memory");
@@ -2970,7 +3012,7 @@ impl StartupOrchestrator {
         if dream_config_path.exists() {
             match std::fs::read_to_string(&dream_config_path) {
                 Ok(content) => {
-                    println!("  Config file: {dream_config_path:?}");
+                    println!("  Config file: {}", dream_config_path.display());
                     println!("  {content}");
                 }
                 Err(e) => println!("  Config exists but unreadable: {e}"),
@@ -2983,10 +3025,12 @@ impl StartupOrchestrator {
     }
 
     /// Inspect telemetry state without uploading anything.
-    #[allow(clippy::unused_async)]
+    // Retained `async`: the startup/dispatch pipeline awaits these on the current
+    // task, and removing it cascades into unnecessary_wraps/unused_self.
+    #[allow(clippy::unused_async, clippy::unused_async_trait_impl)]
     async fn run_telemetry(&self, action: Option<crate::cli::TelemetryAction>) -> Result<()> {
         match action {
-            Some(crate::cli::TelemetryAction::PreviewCrash { file }) => self.preview_crash(file),
+            Some(crate::cli::TelemetryAction::PreviewCrash { file }) => Self::preview_crash(file),
             None => {
                 println!("Usage: coderex telemetry preview-crash [FILE]");
                 Ok(())
@@ -2999,7 +3043,7 @@ impl StartupOrchestrator {
     /// The pending file is read but not removed or ingested, and nothing is
     /// uploaded. `CODEREX_CRASH_VERBOSE` / `CODEREX_HIPAA` are resolved by the
     /// same code paths the uploader uses.
-    fn preview_crash(&self, file: Option<std::path::PathBuf>) -> Result<()> {
+    fn preview_crash(file: Option<std::path::PathBuf>) -> Result<()> {
         let pending_dir = coderex_config::config_home()
             .join("crashes")
             .join("pending");
@@ -3063,6 +3107,9 @@ impl StartupOrchestrator {
         Ok(newest.map(|(_, path)| path))
     }
 
+    // The future borrows the non-`Sync` REPL loop, so it is not `Send`; it is
+    // awaited from `run` on the current task and never spawned.
+    #[allow(clippy::future_not_send)]
     #[allow(clippy::unused_async)]
     async fn run_resume(&self, cwd: &str, session_id: &str, model: ModelId) -> Result<()> {
         let resolved_session_id = if session_id.eq_ignore_ascii_case("latest") {
@@ -3186,8 +3233,10 @@ mod tests {
     #[test]
     fn a_plugin_budget_can_only_tighten_the_ceiling() {
         let mut orch = StartupOrchestrator::new();
-        let mut settings = Settings::default();
-        settings.max_budget_usd = Some(10.0);
+        let settings = Settings {
+            max_budget_usd: Some(10.0),
+            ..Default::default()
+        };
         orch.ctx.settings = Some(settings);
 
         orch.apply_plugin_settings(&serde_json::json!({"max_budget_usd": 5.0}));
@@ -3296,7 +3345,7 @@ mod tests {
         let ctx = SessionContext::default();
         assert!(ctx.settings.is_none());
         assert!(ctx.model.is_none());
-        assert!(ctx.cwd.is_empty());
+        assert_eq!(ctx.cwd, "");
     }
 
     #[test]
@@ -3499,7 +3548,7 @@ mod tests {
         let file_path = tmp.path().join("notes.txt");
         std::fs::write(&file_path, "remember this").unwrap();
         let mut orch = StartupOrchestrator::new();
-        orch.ctx.file = vec![file_path.clone()];
+        orch.ctx.file = vec![file_path];
 
         let interactive = orch
             .interactive_context(true)
@@ -3739,8 +3788,10 @@ mod tests {
             }),
             ..Settings::defaults()
         };
-        let channels =
-            StartupOrchestrator::apply_telemetry_channel_settings(Default::default(), &settings);
+        let channels = StartupOrchestrator::apply_telemetry_channel_settings(
+            coderex_telemetry::ChannelConfig::default(),
+            &settings,
+        );
         assert_eq!(
             channels.otlp_endpoint.as_deref(),
             Some("https://collector.example/v1/logs")
@@ -3762,7 +3813,7 @@ mod tests {
         let disabled_store =
             coderex_telemetry::TelemetryStore::open(&dir.path().join("off.db")).unwrap();
         let (_handle, uploader) = coderex_telemetry::TelemetryHandle::new(
-            disabled_store,
+            &disabled_store,
             Some(coderex_telemetry::TelemetryConfig {
                 enabled: false,
                 ..Default::default()
@@ -3776,7 +3827,7 @@ mod tests {
         let enabled_store =
             coderex_telemetry::TelemetryStore::open(&dir.path().join("on.db")).unwrap();
         let (_handle, uploader) = coderex_telemetry::TelemetryHandle::new(
-            enabled_store,
+            &enabled_store,
             Some(coderex_telemetry::TelemetryConfig {
                 enabled: true,
                 upload_interval_secs: 3600,
@@ -3794,7 +3845,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("telemetry.db");
         let store = coderex_telemetry::TelemetryStore::open(&db_path).unwrap();
-        let (handle, _uploader) = coderex_telemetry::TelemetryHandle::new(store, None);
+        let (handle, _uploader) = coderex_telemetry::TelemetryHandle::new(&store, None);
         {
             let _session = TelemetrySessionGuard::start(handle);
         }

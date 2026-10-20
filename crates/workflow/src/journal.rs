@@ -38,7 +38,7 @@ pub enum RestoreState {
 }
 
 /// One line of the journal.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Entry {
     /// An agent call started.
@@ -90,7 +90,7 @@ impl Entry {
 }
 
 /// What a loaded journal holds.
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Loaded {
     /// Results by key.
     pub results: BTreeMap<String, Option<String>>,
@@ -201,13 +201,11 @@ impl Journal {
             match serde_json::from_str::<Entry>(line) {
                 Ok(Entry::Restoring) if first.is_none() => first = Some(Entry::Restoring),
                 Ok(Entry::Restored) => restored = true,
-                Ok(_) => {}
-                Err(_) => {}
+                Ok(_) | Err(_) => {}
             }
         }
 
         Ok(match (first, restored) {
-            (Some(_), true) => RestoreState::Complete,
             (Some(_), false) => RestoreState::Partial,
             _ => RestoreState::Complete,
         })

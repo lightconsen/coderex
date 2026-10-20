@@ -81,9 +81,9 @@ pub fn resolve_agent(name: &str) -> Result<ResolvedAgent, UnknownAgent> {
 /// Resolve a name against an explicit definition map.
 ///
 /// Used by tests and embedders that supply their own agent set.
-pub fn resolve_agent_in(
+pub fn resolve_agent_in<S: std::hash::BuildHasher>(
     name: &str,
-    agents: &HashMap<String, CustomAgentDef>,
+    agents: &HashMap<String, CustomAgentDef, S>,
 ) -> Result<ResolvedAgent, UnknownAgent> {
     agents
         .get(name)
@@ -144,7 +144,7 @@ mod tests {
     #[test]
     fn no_configured_agents_explains_where_to_add_them() {
         let error = resolve_agent_in("missing", &HashMap::new()).unwrap_err();
-        assert!(error.available.is_empty());
+        assert_eq!(error.available, [] as [std::string::String; 0]);
         let message = error.to_string();
         assert!(message.contains("~/.coderex/agents/"), "{message}");
     }

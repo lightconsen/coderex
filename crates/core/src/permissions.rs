@@ -304,7 +304,7 @@ impl PermissionChecker {
     /// Save the current mode and switch to Plan mode.
     ///
     /// Use before entering PlanMode; pair with `exit_plan_mode()` to restore.
-    pub fn enter_plan_mode(&mut self) {
+    pub const fn enter_plan_mode(&mut self) {
         self.saved_mode = Some(self.mode);
         self.mode = PermissionMode::Plan;
     }
@@ -312,7 +312,7 @@ impl PermissionChecker {
     /// Restore the mode saved before entering Plan mode.
     ///
     /// Returns the restored mode, or `None` if no mode was saved.
-    pub fn exit_plan_mode(&mut self) -> Option<PermissionMode> {
+    pub const fn exit_plan_mode(&mut self) -> Option<PermissionMode> {
         let prev = self.saved_mode.take();
         if let Some(saved) = prev {
             self.mode = saved;

@@ -351,6 +351,7 @@ mod tests {
             seen[0].1.contains("is this ok?"),
             "the prompt did not reach the model"
         );
+        drop(seen);
     }
 
     /// A `prompt` hook may name a model, and that name wins.
@@ -392,6 +393,7 @@ mod tests {
             seen[0].0.contains("verifying"),
             "an agent hook should be framed as a verifier"
         );
+        drop(seen);
     }
 
     /// A hook names a server and a tool; the registry knows the qualified name.

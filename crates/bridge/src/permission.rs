@@ -108,7 +108,7 @@ impl BridgePermissionRouter {
     /// Check if a request was resolved.
     #[must_use]
     pub fn is_resolved(&self, request_id: &str) -> bool {
-        self.pending.get(request_id).map_or(false, |p| p.resolved)
+        self.pending.get(request_id).is_some_and(|p| p.resolved)
     }
 
     /// Get all pending (unresolved) requests for a session.

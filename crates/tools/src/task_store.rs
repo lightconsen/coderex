@@ -45,8 +45,10 @@ pub struct TaskRecord {
 /// Status of a task.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum TaskStatus {
     /// Not yet started.
+    #[default]
     Pending,
     /// Currently being worked on.
     InProgress,
@@ -54,12 +56,6 @@ pub enum TaskStatus {
     Completed,
     /// Removed from the store.
     Deleted,
-}
-
-impl Default for TaskStatus {
-    fn default() -> Self {
-        Self::Pending
-    }
 }
 
 impl TaskRecord {
@@ -100,6 +96,7 @@ impl TaskStore {
     }
 
     /// Set the filesystem path used for `load` / `save`.
+    #[must_use]
     pub fn with_storage(self, path: PathBuf) -> Self {
         *self.storage_path.lock() = Some(path);
         self
@@ -107,14 +104,17 @@ impl TaskStore {
 
     /// Load tasks from a JSONL file if the storage path is set and the file exists.
     pub fn load(&self) -> Result<(), String> {
-        let guard = self.storage_path.lock();
-        let path = guard
-            .as_ref()
-            .ok_or_else(|| "no storage path set".to_string())?;
+        let path = {
+            let guard = self.storage_path.lock();
+            guard
+                .as_ref()
+                .cloned()
+                .ok_or_else(|| "no storage path set".to_string())?
+        };
         if !path.exists() {
             return Ok(());
         }
-        let file = fs::File::open(path).map_err(|e| format!("failed to open: {e}"))?;
+        let file = fs::File::open(&path).map_err(|e| format!("failed to open: {e}"))?;
         let reader = std::io::BufReader::new(file);
         for line in reader.lines() {
             let line = line.map_err(|e| format!("failed to read line: {e}"))?;
@@ -130,15 +130,19 @@ impl TaskStore {
 
     /// Persist all non-deleted tasks to the JSONL file.
     pub fn save(&self) -> Result<(), String> {
-        let guard = self.storage_path.lock();
-        let path = guard
-            .as_ref()
-            .ok_or_else(|| "no storage path set".to_string())?;
+        let path = {
+            let guard = self.storage_path.lock();
+            guard
+                .as_ref()
+                .cloned()
+                .ok_or_else(|| "no storage path set".to_string())?
+        };
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).map_err(|e| format!("failed to create dir: {e}"))?;
         }
-        let mut file = fs::File::create(path).map_err(|e| format!("failed to create file: {e}"))?;
-        for record in self.tasks.iter() {
+        let mut file =
+            fs::File::create(&path).map_err(|e| format!("failed to create file: {e}"))?;
+        for record in &self.tasks {
             if record.value().status == TaskStatus::Deleted {
                 continue;
             }
@@ -171,7 +175,7 @@ impl TaskStore {
     pub fn list(&self, status_filter: Option<TaskStatus>) -> Vec<TaskRecord> {
         self.tasks
             .iter()
-            .filter(|r| status_filter.map_or(true, |s| r.value().status == s))
+            .filter(|r| status_filter.is_none_or(|s| r.value().status == s))
             .map(|r| r.value().clone())
             .collect()
     }

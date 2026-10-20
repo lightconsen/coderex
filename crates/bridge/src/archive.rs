@@ -54,12 +54,12 @@ pub struct BridgeArchiveWriter {
 impl BridgeArchiveWriter {
     /// Create a new archive writer.
     #[must_use]
-    pub fn new(archive_dir: PathBuf) -> Self {
+    pub const fn new(archive_dir: PathBuf) -> Self {
         Self { archive_dir }
     }
 
     /// Archive a session's transcript and metadata.
-    #[allow(clippy::unused_async)]
+    #[allow(clippy::unused_async, clippy::unused_async_trait_impl)]
     pub async fn archive(
         &self,
         session_id: &str,
@@ -78,7 +78,7 @@ impl BridgeArchiveWriter {
         let archive = SessionArchive {
             version: CURRENT_ARCHIVE_VERSION,
             session_id: session_id.to_string(),
-            transcript_path: transcript_path.clone(),
+            transcript_path,
             usage,
             status: status.to_string(),
             archived_at: chrono::Utc::now().to_rfc3339(),
@@ -103,7 +103,7 @@ impl BridgeArchiveWriter {
             .ok()
             .map(|entries| {
                 entries
-                    .filter_map(|e| e.ok())
+                    .filter_map(std::result::Result::ok)
                     .filter(|e| e.path().is_dir())
                     .filter_map(|e| e.file_name().to_str().map(String::from))
                     .collect()

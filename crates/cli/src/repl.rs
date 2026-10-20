@@ -138,6 +138,7 @@ impl WorktreeToolState {
         let created = manager
             .create_worktree(&self.base, branch)
             .map_err(|error| error.to_string())?;
+        drop(manager);
         *self
             .active
             .lock()
@@ -529,7 +530,7 @@ impl coderex_tools::Tool for LspWithPluginDefaults {
                     )
                 });
             }
-            if let Some(root) = defaults.root_uri.clone() {
+            if let Some(root) = defaults.root_uri {
                 object
                     .entry("root_uri")
                     .or_insert_with(|| serde_json::Value::String(root));
@@ -749,9 +750,10 @@ fn apply_agent_event(
         AgentLifecycleEvent::Failed { error } => {
             ui_state.notifications.err(format!("{label}: {error}"));
         }
-        // A tool call or an idle note is activity, not something to interrupt for.
-        AgentLifecycleEvent::ToolCall { .. } | AgentLifecycleEvent::Idle { .. } => {}
-        AgentLifecycleEvent::TextDelta(_) => {}
+        // A tool call, idle note, or text delta is activity, not something to interrupt for.
+        AgentLifecycleEvent::ToolCall { .. }
+        | AgentLifecycleEvent::Idle { .. }
+        | AgentLifecycleEvent::TextDelta(_) => {}
     }
 }
 
@@ -904,11 +906,10 @@ fn control_response_from_line(
     let frame = ControlResponseFrame::parse_line(line).ok()?;
     let request_id = frame.response.request_id.clone();
     let response = match frame.decision().ok()? {
-        ControlDecision::Allow => ConfirmationResponse::Approved,
         ControlDecision::AllowSession if request_allows_session => {
             ConfirmationResponse::ApproveSession
         }
-        ControlDecision::AllowSession => ConfirmationResponse::Approved,
+        ControlDecision::Allow | ControlDecision::AllowSession => ConfirmationResponse::Approved,
         ControlDecision::Deny | ControlDecision::Error(_) => ConfirmationResponse::Denied,
     };
     Some((request_id, response))
@@ -938,8 +939,7 @@ fn spawn_headless_control_reader(
             let request_id = &frame.response.request_id;
             let allowed = approvals
                 .lock()
-                .map(|approvals| approvals.get(request_id).copied().unwrap_or(false))
-                .unwrap_or(false);
+                .is_ok_and(|approvals| approvals.get(request_id).copied().unwrap_or(false));
             if let Some((request_id, response)) = control_response_from_line(&line, allowed) {
                 bus.respond(&request_id, response).await;
             }
@@ -1063,8 +1063,11 @@ fn apply_interactive_snapshot(
         })
         .collect();
     ui_state.plan.current_step = snapshot.plan.current_step;
-    ui_state.plan.current_label = snapshot.plan.current_label.clone();
-    ui_state.activity_log = snapshot.activity_log.clone();
+    ui_state
+        .plan
+        .current_label
+        .clone_from(&snapshot.plan.current_label);
+    ui_state.activity_log.clone_from(&snapshot.activity_log);
 }
 
 fn build_interactive_snapshot(
@@ -1114,13 +1117,13 @@ struct TuiElicitationHandler {
 }
 
 impl TuiElicitationHandler {
-    fn new(tx: tokio::sync::mpsc::Sender<TuiElicitationRequest>) -> Self {
+    const fn new(tx: tokio::sync::mpsc::Sender<TuiElicitationRequest>) -> Self {
         Self { tx }
     }
 }
 
 /// How a form field's type reads in the transcript.
-fn field_type_label(field: &coderex_mcp::elicitation::FormField) -> &'static str {
+const fn field_type_label(field: &coderex_mcp::elicitation::FormField) -> &'static str {
     match field.field_type {
         coderex_mcp::elicitation::FormFieldType::String => "text",
         coderex_mcp::elicitation::FormFieldType::Integer => "integer",
@@ -1150,8 +1153,9 @@ impl ElicitationHandler for TuiElicitationHandler {
             return ElicitationResult::Cancelled;
         }
 
-        match response_rx.await {
-            Ok(value) => {
+        response_rx
+            .await
+            .map_or(ElicitationResult::Cancelled, |value| {
                 let answer = value
                     .get("answer")
                     .and_then(serde_json::Value::as_str)
@@ -1159,18 +1163,14 @@ impl ElicitationHandler for TuiElicitationHandler {
                     .filter(|text| !text.is_empty())
                     .map(ToString::to_string);
 
-                if let Some(other_text) = answer {
+                answer.map_or(ElicitationResult::Cancelled, |other_text| {
                     ElicitationResult::Responded(ElicitationResponse {
                         request_id: question.header.clone(),
                         selected: Vec::new(),
                         other_text: Some(other_text),
                     })
-                } else {
-                    ElicitationResult::Cancelled
-                }
-            }
-            Err(_) => ElicitationResult::Cancelled,
-        }
+                })
+            })
     }
 }
 
@@ -1221,7 +1221,7 @@ impl coderex_workflow::AgentRunner for WorkflowAgentRunner {
                 thoroughness: Thoroughness::Medium,
             },
             Some("plan") => AgentType::Plan,
-            Some("verification") | Some("verify") => AgentType::Verification,
+            Some("verification" | "verify") => AgentType::Verification,
             Some("claude_code_guide") => AgentType::ClaudeCodeGuide,
             _ => AgentType::GeneralPurpose,
         };
@@ -1251,6 +1251,7 @@ impl coderex_workflow::AgentRunner for WorkflowAgentRunner {
             .wait_for_completion(&agent_id)
             .await
             .map_err(|error| format!("the agent did not finish: {error}"))?;
+        drop(manager);
 
         Ok(coderex_workflow::AgentOutput {
             text: Some(result.output),
@@ -1363,13 +1364,12 @@ fn org_memory_service(
     memory_base: &std::path::Path,
     org_id: Option<String>,
 ) -> Option<Arc<TeamMemorySyncService>> {
-    org_id.map(|org_id| {
-        Arc::new(TeamMemorySyncService::new_with_org(
-            "default".to_string(),
-            memory_base.join("org"),
-            org_id,
-        ))
-    })
+    let org_id = org_id?;
+    Some(Arc::new(TeamMemorySyncService::new_with_org(
+        "default".to_string(),
+        memory_base.join("org"),
+        org_id,
+    )))
 }
 
 /// How many hook entries a settings document declares.
@@ -1510,7 +1510,7 @@ pub struct ReplLoop {
     /// One writer, one consumer outside the process — not a bus. The writer is
     /// boxed rather than pinned to `Stdout` so a test can read back what a turn
     /// emitted.
-    protocol_sink: Option<coderex_events::MessageSink<Box<dyn std::io::Write + Send>>>,
+    protocol_sink: Option<coderex_events::MessageSink<Box<dyn std::io::Write + Send + Sync>>>,
     /// Whether a headless turn negotiates tool approvals over stdin.
     ///
     /// Enabled only when the host can answer (see
@@ -1643,6 +1643,14 @@ pub struct ReplLoop {
     settings_statusline_theme: Option<String>,
     /// Session id to resume into the current interactive loop.
     resume_session: Option<String>,
+}
+
+// Manual impl: many fields (trait objects, channels, locks) are not `Debug`,
+// so we print only the type name rather than deriving.
+impl std::fmt::Debug for ReplLoop {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ReplLoop").finish_non_exhaustive()
+    }
 }
 
 /// Wrapper that implements `ToolExecutor` for `Arc<dyn ToolExecutor>`.
@@ -2077,7 +2085,7 @@ impl ReplLoop {
         let primary_executor: Arc<dyn coderex_core::tool_executor::ToolExecutor + Send + Sync> =
             dispatcher.clone();
         let arc_exec = ArcToolExecutor(Arc::clone(&primary_executor));
-        engine.set_tool_executor(Box::new(arc_exec.clone()));
+        engine.set_tool_executor(Box::new(arc_exec));
         engine.recover_orphaned_permissions();
 
         // Start cron background runner
@@ -2238,8 +2246,7 @@ impl ReplLoop {
             store,
             server.origin(),
             self.session_id
-                .map(|id| id.to_string())
-                .unwrap_or_else(|| "local".to_string()),
+                .map_or_else(|| "local".to_string(), |id| id.to_string()),
         ));
 
         for tool in coderex_artifacts::ArtifactTools::new(service).all() {
@@ -2325,11 +2332,11 @@ impl ReplLoop {
 
     // ─── CLI Configuration Builder Methods ──────────────────────────────────
 
-    pub fn with_skip_permissions(&mut self, skip: bool) {
+    pub const fn with_skip_permissions(&mut self, skip: bool) {
         self.skip_permissions = skip;
     }
 
-    pub fn with_permission_mode(&mut self, mode: Option<PermissionMode>) {
+    pub const fn with_permission_mode(&mut self, mode: Option<PermissionMode>) {
         self.permission_mode = mode;
     }
 
@@ -2358,7 +2365,7 @@ impl ReplLoop {
     /// hand it to, and there is not meant to be one.
     pub fn with_protocol_sink(
         &mut self,
-        sink: Option<coderex_events::MessageSink<Box<dyn std::io::Write + Send>>>,
+        sink: Option<coderex_events::MessageSink<Box<dyn std::io::Write + Send + Sync>>>,
     ) {
         self.protocol_sink = sink;
     }
@@ -2369,7 +2376,7 @@ impl ReplLoop {
     /// `control_response` lines: in practice, `--print --output-format
     /// stream-json` with the prompt given positionally. Interactive sessions
     /// and a prompt read from stdin keep it off.
-    pub fn with_headless_permission_control(&mut self, enabled: bool) {
+    pub const fn with_headless_permission_control(&mut self, enabled: bool) {
         self.headless_permission_control = enabled;
     }
 
@@ -2377,15 +2384,15 @@ impl ReplLoop {
     /// [`with_headless_permission_control`](Self::with_headless_permission_control)
     /// sets.
     #[cfg(test)]
-    pub(crate) fn headless_permission_control(&self) -> bool {
+    pub(crate) const fn headless_permission_control(&self) -> bool {
         self.headless_permission_control
     }
 
-    pub fn with_no_persistence(&mut self, no_persist: bool) {
+    pub const fn with_no_persistence(&mut self, no_persist: bool) {
         self.no_persistence = no_persist;
     }
 
-    pub fn with_no_slash_commands(&mut self, no_slash: bool) {
+    pub const fn with_no_slash_commands(&mut self, no_slash: bool) {
         self.no_slash_commands = no_slash;
     }
 
@@ -2393,11 +2400,11 @@ impl ReplLoop {
         self.json_schema = schema;
     }
 
-    pub fn with_max_budget_usd(&mut self, budget: Option<f64>) {
+    pub const fn with_max_budget_usd(&mut self, budget: Option<f64>) {
         self.max_budget_usd = budget;
     }
 
-    pub fn with_max_turns(&mut self, turns: Option<u32>) {
+    pub const fn with_max_turns(&mut self, turns: Option<u32>) {
         self.max_turns = turns;
     }
 
@@ -2407,7 +2414,7 @@ impl ReplLoop {
     /// unavailable, then continues the turn and session on the fallback.
     /// Works for interactive and headless sessions alike.
     pub fn with_fallback_model(&mut self, fallback: Option<ModelId>) {
-        self.fallback_model = fallback.clone();
+        self.fallback_model.clone_from(&fallback);
         if let Some(ref mut engine) = self.engine {
             engine.set_fallback_model(fallback);
         }
@@ -2415,15 +2422,15 @@ impl ReplLoop {
 
     /// Test accessor for the configured fallback model.
     #[cfg(test)]
-    pub(crate) fn fallback_model(&self) -> Option<&ModelId> {
+    pub(crate) const fn fallback_model(&self) -> Option<&ModelId> {
         self.fallback_model.as_ref()
     }
 
-    pub fn with_replay_user_messages(&mut self, replay: bool) {
+    pub const fn with_replay_user_messages(&mut self, replay: bool) {
         self.replay_user_messages = replay;
     }
 
-    pub fn with_include_partial_messages(&mut self, include: bool) {
+    pub const fn with_include_partial_messages(&mut self, include: bool) {
         self.include_partial_messages = include;
     }
 
@@ -2550,7 +2557,7 @@ impl ReplLoop {
 
     /// The feature flags resolved for this session.
     #[must_use]
-    pub fn feature_flags(&self) -> &coderex_config::flags::FeatureFlags {
+    pub const fn feature_flags(&self) -> &coderex_config::flags::FeatureFlags {
         &self.feature_flags
     }
 
@@ -2564,13 +2571,15 @@ impl ReplLoop {
     /// The hook documents split by source tier, as installed.
     #[cfg(test)]
     #[must_use]
-    pub(crate) fn hook_layers_for_test(&self) -> Option<&coderex_config::settings::HookLayers> {
+    pub(crate) const fn hook_layers_for_test(
+        &self,
+    ) -> Option<&coderex_config::settings::HookLayers> {
         self.hook_layers.as_ref()
     }
 
     /// The capability set derived from the session's feature flags.
     #[must_use]
-    pub fn capabilities(&self) -> coderex_config::flags::CapabilitySet {
+    pub const fn capabilities(&self) -> coderex_config::flags::CapabilitySet {
         self.capabilities
     }
 
@@ -2594,7 +2603,7 @@ impl ReplLoop {
         self.ide_status = Some(status);
     }
 
-    pub fn with_chrome_enabled(&mut self, enabled: bool) {
+    pub const fn with_chrome_enabled(&mut self, enabled: bool) {
         self.chrome_enabled = enabled;
     }
 
@@ -2606,7 +2615,7 @@ impl ReplLoop {
     ///
     /// A named custom agent supplies a default model, but an explicit CLI
     /// choice is more specific and must win.
-    pub fn with_explicit_model_override(&mut self, explicit: bool) {
+    pub const fn with_explicit_model_override(&mut self, explicit: bool) {
         self.explicit_model_override = explicit;
     }
 
@@ -2614,7 +2623,7 @@ impl ReplLoop {
         self.ide = ide;
     }
 
-    pub fn with_worktree(&mut self, worktree: bool) {
+    pub const fn with_worktree(&mut self, worktree: bool) {
         self.worktree = worktree;
     }
 
@@ -2642,7 +2651,7 @@ impl ReplLoop {
         self.input_format = format;
     }
 
-    pub fn with_tmux_enabled(&mut self, tmux: bool) {
+    pub const fn with_tmux_enabled(&mut self, tmux: bool) {
         self.tmux_enabled = tmux;
     }
 
@@ -2778,7 +2787,7 @@ impl ReplLoop {
                 let listing = Self::list_directory_contents(path);
                 self.session_effects
                     .extra_context
-                    .push(format!("Directory listing for {}:\n{}", dir, listing));
+                    .push(format!("Directory listing for {dir}:\n{listing}"));
             }
         }
 
@@ -2978,7 +2987,7 @@ impl ReplLoop {
     /// should already have succeeded in the orchestrator; a failure here is
     /// logged rather than silently running the default agent.
     /// Register agent definitions contributed by active plugins.
-    fn apply_plugin_agents(&mut self) {
+    fn apply_plugin_agents(&self) {
         if self.plugin_agents.is_empty() {
             return;
         }
@@ -2997,13 +3006,16 @@ impl ReplLoop {
                 }
             }
             match serde_json::from_value::<coderex_agents::CustomAgentDef>(value) {
-                Ok(definition) => match manager.try_lock() {
-                    Ok(mut manager) => manager.register_custom_agent(definition),
-                    Err(_) => tracing::warn!(
-                        agent = %name,
-                        "plugin agent definition skipped: the agent manager is busy"
-                    ),
-                },
+                Ok(definition) => {
+                    if let Ok(mut manager) = manager.try_lock() {
+                        manager.register_custom_agent(definition);
+                    } else {
+                        tracing::warn!(
+                            agent = %name,
+                            "plugin agent definition skipped: the agent manager is busy"
+                        );
+                    }
+                }
                 Err(error) => tracing::warn!(
                     agent = %name,
                     %error,
@@ -3112,7 +3124,7 @@ impl ReplLoop {
             // The engine builds the model's prompt context from `session.cwd`,
             // so leaving it at the original checkout would tell the model to
             // work there while the tools ran in the worktree.
-            session.cwd = created.path.clone();
+            session.cwd.clone_from(&created.path);
             engine.set_session(session);
         }
 
@@ -3179,7 +3191,7 @@ impl ReplLoop {
                     session.session_id = parsed;
                 }
             }
-            session.messages = messages.clone();
+            session.messages.clone_from(&messages);
             if session.title.is_none() {
                 session.title = snapshot
                     .as_ref()
@@ -3304,7 +3316,7 @@ impl ReplLoop {
         }
     }
 
-    fn reset_restored_ui(&self, ui_state: &mut coderex_ui::state::UiState) {
+    fn reset_restored_ui(ui_state: &mut coderex_ui::state::UiState) {
         ui_state.overlays.clear();
         ui_state.notifications.dismiss_all();
         ui_state.input = coderex_ui::input::InputBuffer::new();
@@ -3321,12 +3333,11 @@ impl ReplLoop {
     }
 
     fn restore_session_into_ui(
-        &self,
         ui_state: &mut coderex_ui::state::UiState,
         messages: &[coderex_core::types::Message],
         snapshot: Option<&session_resume::InteractiveResumeSnapshot>,
     ) {
-        self.reset_restored_ui(ui_state);
+        Self::reset_restored_ui(ui_state);
         restore_transcript_messages(ui_state, messages);
         if let Some(snapshot) = snapshot {
             apply_interactive_snapshot(ui_state, snapshot);
@@ -3385,7 +3396,7 @@ impl ReplLoop {
     ) -> std::result::Result<String, String> {
         let session_id = self.resolve_resume_session_id(requested_session)?;
         let (messages, snapshot) = self.load_session_state(&session_id, true)?;
-        self.restore_session_into_ui(ui_state, &messages, snapshot.as_ref());
+        Self::restore_session_into_ui(ui_state, &messages, snapshot.as_ref());
 
         let mut message = format!(
             "Resumed session: {session_id}\nLoaded {} messages from transcript.",
@@ -3393,7 +3404,7 @@ impl ReplLoop {
         );
         if let Some(summary) = snapshot
             .as_ref()
-            .and_then(|state| state.unfinished_context())
+            .and_then(super::session_resume::InteractiveResumeSnapshot::unfinished_context)
         {
             message.push_str("\n\n");
             message.push_str(&summary);
@@ -3415,7 +3426,7 @@ impl ReplLoop {
     fn init_command_persistence(&mut self) {
         let config_dir = coderex_config::settings::config_home();
         let history_path = config_dir.join("command_history.jsonl");
-        self.command_history.set_file_path(history_path.clone());
+        self.command_history.set_file_path(history_path);
         if let Err(e) = self.command_history.load() {
             tracing::warn!("Failed to load command history: {e}");
         }
@@ -3454,13 +3465,6 @@ impl ReplLoop {
 
     /// Run the interactive REPL with full ratatui TUI.
     pub async fn run_tui(&mut self) -> Result<()> {
-        // A configuration failure that happened during `apply_cli_config`
-        // (`--betas` typo, `--from-pr` fetch, `--worktree`) must stop the
-        // interactive path too, not only the headless one.
-        if let Some(error) = self.setup_error.as_deref() {
-            return Err(anyhow::anyhow!("{error}"));
-        }
-
         use coderex_ui::input::{InputAction, InputBuffer};
         use coderex_ui::message_list::{Message, MessageRole};
         use coderex_ui::overlay::Overlay;
@@ -3469,7 +3473,15 @@ impl ReplLoop {
         use coderex_ui::vim::{VimAction, VimMode, VimState};
         use crossterm::event::{Event, KeyCode, KeyModifiers, MouseEventKind};
         use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
+        use std::fmt::Write as _;
         use std::time::{Duration, Instant};
+
+        // A configuration failure that happened during `apply_cli_config`
+        // (`--betas` typo, `--from-pr` fetch, `--worktree`) must stop the
+        // interactive path too, not only the headless one.
+        if let Some(error) = self.setup_error.as_deref() {
+            return Err(anyhow::anyhow!("{error}"));
+        }
 
         // Artifacts are published to a local origin, so the server has to be
         // up before the model can publish anything. It is started here rather
@@ -3518,12 +3530,26 @@ impl ReplLoop {
         };
 
         if let Some(ref engine) = self.engine {
-            if !engine.session().messages.is_empty() {
+            if engine.session().messages.is_empty() {
+                ui_state.messages.push(Message {
+                    role: MessageRole::System,
+                    content: format!(
+                        "CodeRex v{} | model: {} | cwd: {} | Type /help for commands, Ctrl+C to clear, Ctrl+D to exit",
+                        env!("CARGO_PKG_VERSION"),
+                        self.model.0,
+                        self.cwd
+                    )
+                    .into(),
+                    tool_name: None,
+                    streaming: false,
+                    folded: false,
+                });
+            } else {
                 let snapshot = session_resume::load_snapshot(
                     &self.cwd,
                     &engine.session().session_id.to_string(),
                 );
-                self.restore_session_into_ui(
+                Self::restore_session_into_ui(
                     &mut ui_state,
                     &engine.session().messages,
                     snapshot.as_ref(),
@@ -3546,20 +3572,6 @@ impl ReplLoop {
                         folded: false,
                     });
                 }
-            } else {
-                ui_state.messages.push(Message {
-                    role: MessageRole::System,
-                    content: format!(
-                        "CodeRex v{} | model: {} | cwd: {} | Type /help for commands, Ctrl+C to clear, Ctrl+D to exit",
-                        env!("CARGO_PKG_VERSION"),
-                        self.model.0,
-                        self.cwd
-                    )
-                    .into(),
-                    tool_name: None,
-                    streaming: false,
-                    folded: false,
-                });
             }
         } else {
             ui_state.messages.push(Message {
@@ -3599,7 +3611,7 @@ impl ReplLoop {
                             }
                         }
                     }
-                    Ok(false) => continue,
+                    Ok(false) => {}
                     Err(_) => break,
                 }
             }
@@ -3670,7 +3682,7 @@ impl ReplLoop {
                         }
                     }
                     BackgroundFeatureKind::SessionMemoryUpdate => {
-                        self.handle_memory_update_result(&result).await;
+                        Self::handle_memory_update_result(&result);
                         ui_state.messages.push(coderex_ui::message_list::Message {
                             role: coderex_ui::message_list::MessageRole::System,
                             content: if result.success {
@@ -3684,7 +3696,7 @@ impl ReplLoop {
                         });
                     }
                     BackgroundFeatureKind::MemoryExtraction => {
-                        self.handle_memory_extraction_result(&result).await;
+                        Self::handle_memory_extraction_result(&result);
                         ui_state.messages.push(coderex_ui::message_list::Message {
                             role: coderex_ui::message_list::MessageRole::System,
                             content: if result.success {
@@ -3803,13 +3815,13 @@ impl ReplLoop {
                             // Handle Confirm overlay for destructive commands
                             if matches!(ui_state.overlays.top(), Some(coderex_ui::overlay::Overlay::Confirm { .. })) {
                                 match key.code {
-                                    KeyCode::Char('y') | KeyCode::Char('Y') => {
+                                    KeyCode::Char('y' | 'Y') => {
                                         ui_state.overlays.pop();
                                         if let Some((cmd, args)) = self.pending_destructive_cmd.take() {
-                                            self.execute_and_display_command(&cmd, &args, &mut ui_state).await;
+                                            self.execute_and_display_command(&cmd, &args, &mut ui_state);
                                         }
                                     }
-                                    KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                                    KeyCode::Char('n' | 'N') | KeyCode::Esc => {
                                         ui_state.overlays.pop();
                                         self.pending_destructive_cmd = None;
                                         ui_state.messages.push(coderex_ui::message_list::Message {
@@ -3852,7 +3864,7 @@ impl ReplLoop {
                                             .await;
                                         }
                                     }
-                                    KeyCode::Char('d') | KeyCode::Char('D') | KeyCode::Esc => {
+                                    KeyCode::Char('d' | 'D') | KeyCode::Esc => {
                                         if let Some(request) = pending_confirmation.take() {
                                             self.respond_to_confirmation(
                                                 request,
@@ -3945,7 +3957,7 @@ impl ReplLoop {
                                             &mut elicit_rx,
                                             &mut tui_elicit_rx,
                                             &mut queued_prompts,
-                                        ).await;
+                                        );
                                     }
                                 }
                                 VimAction::Escape => {
@@ -3977,7 +3989,6 @@ impl ReplLoop {
                                             KeyCode::Char(c) if !c.is_control() => {
                                                 ui_state.input.apply(&InputAction::InsertChar(c));
                                             }
-                                            KeyCode::Char(_) => {}
                                             KeyCode::Backspace => {
                                                 ui_state.input.apply(&InputAction::Backspace);
                                             }
@@ -4247,12 +4258,11 @@ impl ReplLoop {
                                 _ => {}
                             }
                         }
-                        Event::Resize(_, _) => {}
                         _ => {}
                     }
                 }
 
-                _ = tokio::time::sleep(Duration::from_millis(100)), if thinking => {
+                () = tokio::time::sleep(Duration::from_millis(100)), if thinking => {
                     self.drain_agent_observable_events();
                 }
 
@@ -4339,7 +4349,7 @@ impl ReplLoop {
                         EngineEvent::PermissionExplanation { tool, explanation } => {
                             if let Some(detail) = ui_state.permission_detail.as_mut() {
                                 if detail.tool.eq_ignore_ascii_case(&tool) {
-                                    detail.risk_summary = explanation.clone();
+                                    detail.risk_summary.clone_from(&explanation);
                                 }
                             }
                             if matches!(
@@ -4395,7 +4405,7 @@ impl ReplLoop {
                     // ToolCall rows may still be queued. Choosing this branch
                     // first reported a healthy tool turn as "no visible
                     // response".
-                    && event_rx.as_ref().is_none_or(|rx| rx.is_empty()) => {
+                    && event_rx.as_ref().is_none_or(tokio::sync::mpsc::UnboundedReceiver::is_empty) => {
                     self.engine = Some(engine);
                     self.running_query = None;
                     query_done_rx = None;
@@ -4466,7 +4476,7 @@ impl ReplLoop {
                             ui_state.notifications.success("Turn completed");
                             // Trigger background features after successful turn
                             let prompt_text = self.history.last().cloned().unwrap_or_default();
-                            self.trigger_background_features(&prompt_text).await;
+                            self.trigger_background_features(&prompt_text);
                         }
                         Err(e) => {
                             ui_state.notifications.err("Turn failed");
@@ -4537,7 +4547,7 @@ impl ReplLoop {
                                 ) {
                                     ui_state.messages.push(Message {
                                         role: MessageRole::System,
-                                        content: format!("  {} — {}", label, desc).into(),
+                                        content: format!("  {label} — {desc}").into(),
                                         tool_name: None,
                                         streaming: false,
                                         folded: false,
@@ -4598,10 +4608,10 @@ impl ReplLoop {
                                 field_type_label(field)
                             );
                             if let Some(default) = &field.default {
-                                line.push_str(&format!(" [default: {default}]"));
+                                let _ = write!(line, " [default: {default}]");
                             }
                             if let Some(description) = &field.description {
-                                line.push_str(&format!(" — {description}"));
+                                let _ = write!(line, " — {description}");
                             }
                             ui_state.messages.push(Message {
                                 role: MessageRole::System,
@@ -4972,7 +4982,6 @@ impl ReplLoop {
                 self.session_effects
                     .extra_context
                     .iter()
-                    .cloned()
                     .map(|ctx| Message::user(format!("Additional context: {ctx}")))
                     .collect(),
             );
@@ -4981,13 +4990,11 @@ impl ReplLoop {
         // Apply CLI flag overrides
         if let Some(ref schema) = self.json_schema {
             let schema_val: Result<serde_json::Value, _> =
-                if let Ok(val) = serde_json::from_str::<serde_json::Value>(schema) {
-                    Ok(val)
-                } else if let Ok(contents) = std::fs::read_to_string(schema) {
+                serde_json::from_str::<serde_json::Value>(schema).or_else(|_| {
+                    let contents = std::fs::read_to_string(schema)
+                        .map_err(|_| serde_json::from_str::<serde_json::Value>("").unwrap_err())?;
                     serde_json::from_str(&contents)
-                } else {
-                    Err(serde_json::from_str::<serde_json::Value>("").unwrap_err())
-                };
+                });
             if let Ok(val) = schema_val {
                 options.json_schema = Some(val.clone());
                 // Configure the engine's structured output validator
@@ -4999,6 +5006,9 @@ impl ReplLoop {
         if let Some(budget_usd) = self.max_budget_usd {
             if budget_usd > 0.0 {
                 // Convert USD to tokens using a conservative rate ($3 per 1M tokens)
+                // `budget_usd > 0.0` and `.max(1.0)` guarantee a positive value,
+                // and the cast saturates for very large budgets, so this is safe.
+                #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
                 let tokens = ((budget_usd / 3.0) * 1_000_000.0).max(1.0) as u64;
                 options.task_budget_tokens = tokens;
             }
@@ -5050,7 +5060,7 @@ impl ReplLoop {
     ///
     /// Tasks are tracked in `self.background_tasks` with cancellation tokens.
     /// Results are delivered asynchronously via `self.background_results_rx`.
-    async fn trigger_background_features(&mut self, _user_prompt: &str) {
+    fn trigger_background_features(&mut self, _user_prompt: &str) {
         let client = match &self.api_client {
             Some(c) => c.clone_box(),
             None => return,
@@ -5111,13 +5121,13 @@ impl ReplLoop {
         self.background_tasks.push(BackgroundTask {
             id: task_id.clone(),
             kind,
-            cancel_token: cancel_token.clone(),
+            cancel_token,
         });
 
         tokio::spawn(async move {
             let result = tokio::select! {
                 biased;
-                _ = task_cancel.cancelled() => {
+                () = task_cancel.cancelled() => {
                     Err(coderex_core::orchestrator::OrchestratorError::Config(
                         "Cancelled by user".into()
                     ))
@@ -5168,7 +5178,7 @@ impl ReplLoop {
     }
 
     /// Run agent generation synchronously and return the result.
-    async fn run_agent_generation(&mut self, description: &str) -> String {
+    async fn run_agent_generation(&self, description: &str) -> String {
         let Some(ref client) = self.api_client else {
             return "No API client configured.".into();
         };
@@ -5180,8 +5190,7 @@ impl ReplLoop {
                 spec.model_profile,
                 spec.allowed_tools
                     .as_ref()
-                    .map(|t| t.join(", "))
-                    .unwrap_or_else(|| "all".into()),
+                    .map_or_else(|| "all".into(), |t| t.join(", ")),
                 spec.system_prompt
             ),
             Err(e) => format!("Agent generation failed: {e}"),
@@ -5191,7 +5200,7 @@ impl ReplLoop {
     /// Compact the session context by truncating older messages.
     /// Keeps the first user message and the most recent 3 turns.
     #[allow(dead_code)]
-    async fn compact_context(&mut self, ui_state: &mut coderex_ui::state::UiState) -> String {
+    fn compact_context(&mut self, ui_state: &mut coderex_ui::state::UiState) -> String {
         let Some(engine) = self.engine.as_mut() else {
             return "No engine configured.".into();
         };
@@ -5210,7 +5219,7 @@ impl ReplLoop {
     }
 
     /// Compact context in non-TUI mode.
-    async fn compact_context_non_tui(&mut self) -> String {
+    fn compact_context_non_tui(&mut self) -> String {
         let Some(ref mut engine) = self.engine else {
             return "No engine configured.".into();
         };
@@ -5226,7 +5235,7 @@ impl ReplLoop {
     }
 
     /// Spawn a background task that updates session memory via ai_workflow.
-    async fn spawn_memory_update_task(&mut self) -> String {
+    fn spawn_memory_update_task(&mut self) -> String {
         let client = match &self.api_client {
             Some(c) => c.clone_box(),
             None => return "No API client configured.".into(),
@@ -5239,9 +5248,8 @@ impl ReplLoop {
             Some(s) => Arc::clone(s),
             None => return "Session memory store not available.".into(),
         };
-        let session_id = match self.session_id {
-            Some(s) => s,
-            None => return "Session ID not available.".into(),
+        let Some(session_id) = self.session_id else {
+            return "Session ID not available.".into();
         };
         let conversation = self
             .history
@@ -5265,14 +5273,14 @@ impl ReplLoop {
         self.background_tasks.push(BackgroundTask {
             id: task_id.clone(),
             kind: BackgroundFeatureKind::SessionMemoryUpdate,
-            cancel_token: cancel_token.clone(),
+            cancel_token,
         });
 
         let task_id_clone = task_id.clone();
         tokio::spawn(async move {
             let result = tokio::select! {
                 biased;
-                _ = task_cancel.cancelled() => {
+                () = task_cancel.cancelled() => {
                     Err(coderex_core::orchestrator::OrchestratorError::Config(
                         "Cancelled by user".into()
                     ))
@@ -5296,7 +5304,7 @@ impl ReplLoop {
     }
 
     /// Spawn a background task that extracts long-term memories via ai_workflow.
-    async fn spawn_memory_extraction_task(&mut self) -> String {
+    fn spawn_memory_extraction_task(&mut self) -> String {
         let client = match &self.api_client {
             Some(c) => c.clone_box(),
             None => return "No API client configured.".into(),
@@ -5325,14 +5333,14 @@ impl ReplLoop {
         self.background_tasks.push(BackgroundTask {
             id: task_id.clone(),
             kind: BackgroundFeatureKind::MemoryExtraction,
-            cancel_token: cancel_token.clone(),
+            cancel_token,
         });
 
         let task_id_clone = task_id.clone();
         tokio::spawn(async move {
             let result = tokio::select! {
                 biased;
-                _ = task_cancel.cancelled() => {
+                () = task_cancel.cancelled() => {
                     Err(coderex_core::orchestrator::OrchestratorError::Config(
                         "Cancelled by user".into()
                     ))
@@ -5356,10 +5364,10 @@ impl ReplLoop {
     }
 
     /// Handle a completed session-memory-update result (no-op: already persisted in task).
-    async fn handle_memory_update_result(&mut self, _result: &BackgroundTaskResult) {}
+    const fn handle_memory_update_result(_result: &BackgroundTaskResult) {}
 
     /// Handle a completed memory-extraction result (no-op: already persisted in task).
-    async fn handle_memory_extraction_result(&mut self, _result: &BackgroundTaskResult) {}
+    const fn handle_memory_extraction_result(_result: &BackgroundTaskResult) {}
 
     /// Spawn a background feature by kind with a sensible default request.
     fn spawn_background_feature_by_kind(
@@ -5673,7 +5681,7 @@ impl ReplLoop {
                                 opt.get("label").and_then(|v| v.as_str()),
                                 opt.get("description").and_then(|v| v.as_str()),
                             ) {
-                                println!("     {} — {}", label, desc);
+                                println!("     {label} — {desc}");
                             }
                         }
                     }
@@ -5709,46 +5717,44 @@ impl ReplLoop {
                 }
             }
             received = engine_rx.recv() => {
-                match received {
-                    Some(handoff) => break handoff,
+                let Some(handoff) = received else {
                     // The task is gone and took the engine with it. Say so
                     // rather than waiting for a handoff that cannot come.
-                    None => {
-                        if let Some(handle) = permission_forwarder.take() {
-                            handle.abort();
-                        }
-                        if let Some(handle) = permission_reader.take() {
-                            handle.abort();
-                        }
-                        if permission_bus.is_some() {
-                            self.confirmation_bus = None;
-                        }
-                        // The turn never reached its normal closing path; a
-                        // stream-json consumer still needs exactly one
-                        // `result`, and the sink has to survive for the next
-                        // turn instead of being dropped with this task.
-                        let message = "the query task ended without returning its engine";
-                        if let Some(mut sink) = protocol.take() {
-                            let turn = sink.begin_turn(session_id.clone());
-                            let mut frame = coderex_events::ResultFrame::error(
-                                session_id.clone(),
-                                coderex_events::protocol::result_subtype::ERROR_DURING_EXECUTION,
-                                u64::try_from(turn_started.elapsed().as_millis())
-                                    .unwrap_or(u64::MAX),
-                                1,
-                            );
-                            frame.data.insert(
-                                "error".to_string(),
-                                serde_json::Value::String(message.to_string()),
-                            );
-                            if let Err(error) = turn.emit_turn_complete(frame) {
-                                tracing::warn!("could not close the protocol turn: {error}");
-                            }
-                            self.protocol_sink = Some(sink);
-                        }
-                        return message.to_string();
+                    if let Some(handle) = permission_forwarder.take() {
+                        handle.abort();
                     }
-                }
+                    if let Some(handle) = permission_reader.take() {
+                        handle.abort();
+                    }
+                    if permission_bus.is_some() {
+                        self.confirmation_bus = None;
+                    }
+                    // The turn never reached its normal closing path; a
+                    // stream-json consumer still needs exactly one
+                    // `result`, and the sink has to survive for the next
+                    // turn instead of being dropped with this task.
+                    let message = "the query task ended without returning its engine";
+                    if let Some(mut sink) = protocol.take() {
+                        let turn = sink.begin_turn(session_id.clone());
+                        let mut frame = coderex_events::ResultFrame::error(
+                            session_id.clone(),
+                            coderex_events::protocol::result_subtype::ERROR_DURING_EXECUTION,
+                            u64::try_from(turn_started.elapsed().as_millis())
+                                .unwrap_or(u64::MAX),
+                            1,
+                        );
+                        frame.data.insert(
+                            "error".to_string(),
+                            serde_json::Value::String(message.to_string()),
+                        );
+                        if let Err(error) = turn.emit_turn_complete(frame) {
+                            tracing::warn!("could not close the protocol turn: {error}");
+                        }
+                        self.protocol_sink = Some(sink);
+                    }
+                    return message.to_string();
+                };
+                break handoff;
             }            }
         };
 
@@ -5806,7 +5812,7 @@ impl ReplLoop {
                     // The reason goes in the detail field, not the discriminant.
                     frame.data.insert(
                         "error".to_string(),
-                        serde_json::Value::String(format!("{error}")),
+                        serde_json::Value::String(error.clone()),
                     );
                     frame
                 }
@@ -5819,7 +5825,7 @@ impl ReplLoop {
 
         // Trigger background features on successful turn
         if result.is_ok() {
-            self.trigger_background_features(prompt).await;
+            self.trigger_background_features(prompt);
         }
 
         if !self.session_effects.title_generated {
@@ -5833,10 +5839,10 @@ impl ReplLoop {
                             engine.set_session(session);
                         }
                     }
-                    if !output.is_empty() {
-                        output.insert_str(0, &format!("[Session title: {title}]\n"));
-                    } else {
+                    if output.is_empty() {
                         output = format!("[Session title: {title}]");
+                    } else {
+                        output.insert_str(0, &format!("[Session title: {title}]\n"));
                     }
                 }
             }
@@ -5878,7 +5884,7 @@ impl ReplLoop {
 
     /// Sync REPL state into the TUI statusline.
     fn sync_statusline(&self, statusline: &mut coderex_ui::statusline::Statusline) {
-        statusline.model = self.model.0.clone();
+        statusline.model.clone_from(&self.model.0);
         statusline.session_title = if self.session_effects.title_generated {
             "Active".into()
         } else {
@@ -6031,7 +6037,7 @@ impl ReplLoop {
     }
 
     /// Process a line of input in the TUI context.
-    async fn process_tui_input(
+    fn process_tui_input(
         &mut self,
         text: &str,
         ui_state: &mut coderex_ui::state::UiState,
@@ -6088,7 +6094,10 @@ impl ReplLoop {
         if text.starts_with('/') {
             let parts: Vec<&str> = text.split_whitespace().collect();
             let cmd_name = parts[0].trim_start_matches('/');
-            let args: Vec<String> = parts[1..].iter().map(|s| s.to_string()).collect();
+            let args: Vec<String> = parts[1..]
+                .iter()
+                .map(std::string::ToString::to_string)
+                .collect();
 
             // Record here rather than in `execute_and_display_command`: the
             // built-ins below return before reaching it, so a history that
@@ -6106,12 +6115,11 @@ impl ReplLoop {
                         return;
                     }
                     "tokens" => {
-                        self.execute_and_display_command("usage", &[], ui_state)
-                            .await;
+                        self.execute_and_display_command("usage", &[], ui_state);
                         return;
                     }
                     "compact" => {
-                        let msg = self.compact_context(ui_state).await;
+                        let msg = self.compact_context(ui_state);
                         ui_state.notifications.info(&msg);
                         ui_state.messages.push(coderex_ui::message_list::Message {
                             role: coderex_ui::message_list::MessageRole::System,
@@ -6132,8 +6140,7 @@ impl ReplLoop {
                             };
                             self.model = mapped;
                         }
-                        self.execute_and_display_command(cmd_name, &args, ui_state)
-                            .await;
+                        self.execute_and_display_command(cmd_name, &args, ui_state);
                         return;
                     }
                     "vim" => {
@@ -6227,7 +6234,7 @@ impl ReplLoop {
                         match std::fs::read_to_string(&path) {
                             Ok(content) => {
                                 ui_state.left_pane_content = content;
-                                ui_state.left_pane_title = args[0].clone();
+                                ui_state.left_pane_title.clone_from(&args[0]);
                                 ui_state.layout_mode =
                                     coderex_ui::state::LayoutMode::HorizontalSplit {
                                         left_percent: 50,
@@ -6277,10 +6284,7 @@ impl ReplLoop {
                             }
                             MacroCommandOutcome::Run(commands) => {
                                 for command in commands {
-                                    // Recursive because a macro expands into
-                                    // the same command path; box the future.
-                                    Box::pin(self.execute_single_command(&command, &mut *ui_state))
-                                        .await;
+                                    self.execute_single_command(&command, &mut *ui_state);
                                 }
                             }
                         }
@@ -6296,7 +6300,7 @@ impl ReplLoop {
                 if let Some(commands) = self.macro_registry.get(cmd_name) {
                     let cmds: Vec<String> = commands.to_vec();
                     for macro_cmd in cmds {
-                        self.execute_single_command(&macro_cmd, ui_state).await;
+                        self.execute_single_command(&macro_cmd, ui_state);
                     }
                     return;
                 }
@@ -6304,7 +6308,7 @@ impl ReplLoop {
 
             // Check for pipe operator
             if text.contains('|') {
-                self.execute_piped_commands(text, ui_state).await;
+                self.execute_piped_commands(text, ui_state);
                 return;
             }
 
@@ -6325,9 +6329,7 @@ impl ReplLoop {
             }
 
             // Execute the command directly
-            self.execute_and_display_command(cmd_name, &args, ui_state)
-                .await;
-            return;
+            self.execute_and_display_command(cmd_name, &args, ui_state);
         } else if self.engine.is_some() {
             self.start_tui_query(
                 text.to_string(),
@@ -6439,9 +6441,7 @@ impl ReplLoop {
         };
 
         clear_permission_overlay(ui_state);
-        ui_state
-            .permission_bar
-            .set_resolution(approved, activity.clone());
+        ui_state.permission_bar.set_resolution(approved, activity);
         push_activity_row(ui_state, &resolution);
         phase.note_tool_end();
 
@@ -6499,7 +6499,7 @@ impl ReplLoop {
     }
 
     /// Execute a single command through the registry and display the result in the TUI.
-    async fn execute_and_display_command(
+    fn execute_and_display_command(
         &mut self,
         cmd_name: &str,
         args: &[String],
@@ -6592,11 +6592,7 @@ impl ReplLoop {
     }
 
     /// Execute piped commands: split on `|`, run sequentially, pass output as pipe_input.
-    async fn execute_piped_commands(
-        &mut self,
-        text: &str,
-        ui_state: &mut coderex_ui::state::UiState,
-    ) {
+    fn execute_piped_commands(&mut self, text: &str, ui_state: &mut coderex_ui::state::UiState) {
         let segments: Vec<&str> = text.trim_start_matches('/').split('|').collect();
         let mut pipe_input: Option<String> = None;
         let mut outputs = Vec::new();
@@ -6611,7 +6607,10 @@ impl ReplLoop {
             // line was trimmed once, not per segment, so `/version | /env`
             // splits into "/version" and "/env".
             let cmd_name = parts[0].trim_start_matches('/');
-            let args: Vec<String> = parts[1..].iter().map(|s| s.to_string()).collect();
+            let args: Vec<String> = parts[1..]
+                .iter()
+                .map(std::string::ToString::to_string)
+                .collect();
 
             self.command_history.append(cmd_name, &args);
 
@@ -6635,16 +6634,15 @@ impl ReplLoop {
     }
 
     /// Execute a single command string (from macro expansion) in the TUI.
-    async fn execute_single_command(
-        &mut self,
-        cmd_str: &str,
-        ui_state: &mut coderex_ui::state::UiState,
-    ) {
+    fn execute_single_command(&mut self, cmd_str: &str, ui_state: &mut coderex_ui::state::UiState) {
         let trimmed = cmd_str.trim();
         if trimmed.starts_with('/') {
             let parts: Vec<&str> = trimmed.split_whitespace().collect();
             let cmd_name = parts[0].trim_start_matches('/');
-            let args: Vec<String> = parts[1..].iter().map(|s| s.to_string()).collect();
+            let args: Vec<String> = parts[1..]
+                .iter()
+                .map(std::string::ToString::to_string)
+                .collect();
             self.command_history.append(cmd_name, &args);
             let ctx = self.build_context();
             let result = self.commands.execute(cmd_name, &ctx, &args);
@@ -6682,7 +6680,7 @@ impl ReplLoop {
     async fn execute_command(
         &mut self,
         line: &str,
-        stdout: &mut impl Write,
+        stdout: &mut (impl Write + Send),
     ) -> std::io::Result<()> {
         // Check for pipe operator
         if line.contains('|') {
@@ -6691,7 +6689,10 @@ impl ReplLoop {
 
         let parts: Vec<&str> = line.split_whitespace().collect();
         let cmd_name = parts[0].trim_start_matches('/');
-        let args: Vec<String> = parts[1..].iter().map(|s| s.to_string()).collect();
+        let args: Vec<String> = parts[1..]
+            .iter()
+            .map(std::string::ToString::to_string)
+            .collect();
 
         // Record before dispatch: the built-in arms below return early, and a
         // history that only recorded registry commands was missing them.
@@ -6733,7 +6734,7 @@ impl ReplLoop {
                     return Ok(());
                 }
                 "compact" => {
-                    let msg = self.compact_context_non_tui().await;
+                    let msg = self.compact_context_non_tui();
                     writeln!(stdout, "{msg}")?;
                     return Ok(());
                 }
@@ -6778,12 +6779,12 @@ impl ReplLoop {
                     return Ok(());
                 }
                 "update-memory" => {
-                    let msg = self.spawn_memory_update_task().await;
+                    let msg = self.spawn_memory_update_task();
                     writeln!(stdout, "{msg}")?;
                     return Ok(());
                 }
                 "extract-memories" => {
-                    let msg = self.spawn_memory_extraction_task().await;
+                    let msg = self.spawn_memory_extraction_task();
                     writeln!(stdout, "{msg}")?;
                     return Ok(());
                 }
@@ -6803,7 +6804,7 @@ impl ReplLoop {
                     return Ok(());
                 }
                 "team-memory" => {
-                    let msg = self.handle_team_memory_command(&args).await;
+                    let msg = self.handle_team_memory_command(&args);
                     writeln!(stdout, "{msg}")?;
                     return Ok(());
                 }
@@ -6828,7 +6829,7 @@ impl ReplLoop {
                     return Ok(());
                 }
                 "teleport" => {
-                    let msg = self.handle_teleport_command(&args).await;
+                    let msg = self.handle_teleport_command(&args);
                     writeln!(stdout, "{msg}")?;
                     return Ok(());
                 }
@@ -7041,7 +7042,10 @@ impl ReplLoop {
             // `/diff | /env` splits into "/diff" and "/env", and the name is
             // what the registry is asked for.
             let cmd_name = parts[0].trim_start_matches('/');
-            let args: Vec<String> = parts[1..].iter().map(|s| s.to_string()).collect();
+            let args: Vec<String> = parts[1..]
+                .iter()
+                .map(std::string::ToString::to_string)
+                .collect();
 
             self.command_history.append(cmd_name, &args);
 
@@ -7175,10 +7179,12 @@ impl ReplLoop {
                 let Some(name) = args.get(1) else {
                     return MacroCommandOutcome::Message(USAGE.into());
                 };
-                match self.macro_registry.get(name.trim_start_matches('/')) {
-                    Some(commands) => MacroCommandOutcome::Run(commands.to_vec()),
-                    None => MacroCommandOutcome::Message(format!("No macro named '{name}'.")),
-                }
+                self.macro_registry
+                    .get(name.trim_start_matches('/'))
+                    .map_or_else(
+                        || MacroCommandOutcome::Message(format!("No macro named '{name}'.")),
+                        |commands| MacroCommandOutcome::Run(commands.to_vec()),
+                    )
             }
             Some(other) => MacroCommandOutcome::Message(format!(
                 "Unknown /macro subcommand '{other}'.\n{USAGE}"
@@ -7187,9 +7193,8 @@ impl ReplLoop {
     }
 
     fn handle_auto_dream_command(&mut self, args: &[String]) -> String {
-        let dream = match &self.auto_dream {
-            Some(d) => d,
-            None => return "Auto-dream is not initialized.".into(),
+        let Some(dream) = &self.auto_dream else {
+            return "Auto-dream is not initialized.".into();
         };
 
         if args.is_empty() {
@@ -7259,14 +7264,13 @@ impl ReplLoop {
                     "Auto-dream requires an API client and memory store.".into()
                 }
             }
-            "disable" => {
-                if let Some(tx) = self.dream_shutdown_tx.take() {
+            "disable" => self.dream_shutdown_tx.take().map_or_else(
+                || "Auto-dream is not running.".into(),
+                |tx| {
                     let _ = tx.send(());
                     "Auto-dream disabled.".into()
-                } else {
-                    "Auto-dream is not running.".into()
-                }
-            }
+                },
+            ),
             "status" => {
                 let config = &dream.config;
                 let running = self.dream_shutdown_tx.is_some();
@@ -7293,10 +7297,9 @@ impl ReplLoop {
     }
 
     /// Handle /team-memory command.
-    async fn handle_team_memory_command(&mut self, args: &[String]) -> String {
-        let svc = match &self.team_memory_service {
-            Some(s) => s,
-            None => return "Team memory sync is not initialized.".into(),
+    fn handle_team_memory_command(&self, args: &[String]) -> String {
+        let Some(svc) = &self.team_memory_service else {
+            return "Team memory sync is not initialized.".into();
         };
 
         if args.is_empty() {
@@ -7376,14 +7379,14 @@ impl ReplLoop {
             return format!("Current workspace: {}", self.cwd);
         }
         let path = &args[0];
-        let expanded = if path.starts_with('~') {
+        let expanded = if let Some(stripped) = path.strip_prefix('~') {
             if let Some(home) = home::home_dir() {
-                home.join(&path[1..]).to_string_lossy().to_string()
+                home.join(stripped).to_string_lossy().to_string()
             } else {
                 return "Could not expand ~ path.".into();
             }
         } else {
-            path.to_string()
+            path.clone()
         };
         let target = std::path::Path::new(&expanded);
         if !target.exists() {
@@ -7392,7 +7395,9 @@ impl ReplLoop {
         if !target.is_dir() {
             return format!("Path is not a directory: {expanded}");
         }
-        let abs = target.canonicalize().unwrap_or(target.to_path_buf());
+        let abs = target
+            .canonicalize()
+            .unwrap_or_else(|_| target.to_path_buf());
         let old = std::mem::replace(&mut self.cwd, abs.to_string_lossy().to_string());
         format!("Workspace switched: {old} → {}", self.cwd)
     }
@@ -7410,13 +7415,14 @@ impl ReplLoop {
 
     /// Handle /update-check command — check for new versions.
     async fn handle_update_check_command(&self) -> String {
-        match crate::version::check_for_updates().await {
-            Some(msg) => msg,
-            None => format!(
-                "You are running the latest version ({})",
-                crate::version::CURRENT_VERSION
-            ),
-        }
+        crate::version::check_for_updates()
+            .await
+            .unwrap_or_else(|| {
+                format!(
+                    "You are running the latest version ({})",
+                    crate::version::CURRENT_VERSION
+                )
+            })
     }
 
     /// Handle /feedback command — generate a title for user feedback.
@@ -7435,7 +7441,7 @@ impl ReplLoop {
     }
 
     /// Handle the /teleport command: directory switching, share, join, list, revoke.
-    async fn handle_teleport_command(&mut self, args: &[String]) -> String {
+    fn handle_teleport_command(&mut self, args: &[String]) -> String {
         let mgr = match self.teleport_manager {
             Some(ref mgr) => mgr.clone(),
             None => return "Teleport manager not initialized.".into(),
@@ -7448,13 +7454,13 @@ impl ReplLoop {
         match args[0].as_str() {
             "--share" => {
                 let session = self.engine.as_ref().map(|e| e.session().clone());
-                match session {
-                    Some(session) => match mgr.share_session(&session) {
+                session.map_or_else(
+                    || "No active session to share.".into(),
+                    |session| match mgr.share_session(&session) {
                         Ok(token) => format!("Share token: {token}"),
                         Err(e) => format!("Failed to share session: {e}"),
                     },
-                    None => "No active session to share.".into(),
-                }
+                )
             }
             "--join" => {
                 if args.len() < 2 {
@@ -7464,7 +7470,7 @@ impl ReplLoop {
                 match mgr.join_session(token) {
                     Ok(state) => {
                         let new_cwd = state.cwd.to_string_lossy().to_string();
-                        self.cwd = new_cwd.clone();
+                        self.cwd.clone_from(&new_cwd);
                         let _ = std::env::set_current_dir(&new_cwd);
                         if let Some(ref mut engine) = self.engine {
                             engine.set_session(state);
@@ -7523,7 +7529,7 @@ impl ReplLoop {
                     .unwrap_or(target_dir)
                     .to_string_lossy()
                     .to_string();
-                self.cwd = new_cwd.clone();
+                self.cwd.clone_from(&new_cwd);
                 let _ = std::env::set_current_dir(&new_cwd);
 
                 if let Some(ref mut engine) = self.engine {
@@ -7552,35 +7558,40 @@ impl ReplLoop {
         };
         let servers = manager.list_servers();
         let connected = servers.iter().any(|name| manager.is_running(name));
-        (connected, servers, manager.tool_conflicts())
+        let conflicts = manager.tool_conflicts();
+        drop(slot);
+        (connected, servers, conflicts)
     }
 
     fn build_context(&self) -> CommandContext {
         let (session_id, session_title, message_count, permission_mode) =
-            if let Some(ref engine) = self.engine {
-                let session = engine.session();
-                let permission_mode = engine
-                    .permission_checker()
-                    .lock()
-                    .map(|checker| checker.mode())
-                    .unwrap_or_default();
-                (
-                    session.session_id.to_string(),
-                    session
-                        .title
-                        .clone()
-                        .unwrap_or_else(|| "REPL Session".to_string()),
-                    session.messages.len(),
-                    permission_mode,
-                )
-            } else {
-                (
-                    "repl_session".to_string(),
-                    "REPL Session".to_string(),
-                    self.history.len(),
-                    PermissionMode::default(),
-                )
-            };
+            self.engine.as_ref().map_or_else(
+                || {
+                    (
+                        "repl_session".to_string(),
+                        "REPL Session".to_string(),
+                        self.history.len(),
+                        PermissionMode::default(),
+                    )
+                },
+                |engine| {
+                    let session = engine.session();
+                    let permission_mode = engine
+                        .permission_checker()
+                        .lock()
+                        .map(|checker| checker.mode())
+                        .unwrap_or_default();
+                    (
+                        session.session_id.to_string(),
+                        session
+                            .title
+                            .clone()
+                            .unwrap_or_else(|| "REPL Session".to_string()),
+                        session.messages.len(),
+                        permission_mode,
+                    )
+                },
+            );
 
         let mut ctx = CommandContext::new(
             self.cwd.clone(),
@@ -7591,7 +7602,7 @@ impl ReplLoop {
         ctx.message_count = message_count;
         ctx.permission_mode = permission_mode;
         ctx.vim_mode = self.vim_mode_enabled;
-        ctx.theme = self.current_theme.clone();
+        ctx.theme.clone_from(&self.current_theme);
         ctx.git_branch = current_git_branch(&self.cwd);
         ctx.version = env!("CARGO_PKG_VERSION").to_string();
         // Commands gate themselves by name (`is_feature_enabled`), so the
@@ -7650,10 +7661,7 @@ impl ReplLoop {
             })
             .collect();
         ctx.api_key_set = self.api_client.is_some();
-        ctx.elapsed_secs = self
-            .query_start_time
-            .map(|t| t.elapsed().as_secs())
-            .unwrap_or(0);
+        ctx.elapsed_secs = self.query_start_time.map_or(0, |t| t.elapsed().as_secs());
         if let Some(ref engine) = self.engine {
             ctx.cost_summary = engine.cost_summary();
             let usage = engine.total_usage();
@@ -7700,7 +7708,7 @@ pub struct ReplSession {
 impl ReplSession {
     /// Create a new session.
     #[must_use]
-    pub fn new(id: String, title: String) -> Self {
+    pub const fn new(id: String, title: String) -> Self {
         Self {
             id,
             title,
@@ -7720,7 +7728,10 @@ pub fn parse_input(line: &str) -> Option<(&str, Vec<String>)> {
     if trimmed.starts_with('/') {
         let parts: Vec<&str> = trimmed.split_whitespace().collect();
         let cmd = parts[0].trim_start_matches('/');
-        let args: Vec<String> = parts[1..].iter().map(|s| s.to_string()).collect();
+        let args: Vec<String> = parts[1..]
+            .iter()
+            .map(std::string::ToString::to_string)
+            .collect();
         Some((cmd, args))
     } else {
         Some(("message", vec![trimmed.to_string()]))
@@ -7796,7 +7807,7 @@ mod tests {
     fn tool_events_are_recorded_in_telemetry() {
         let file = tempfile::NamedTempFile::new().unwrap();
         let store = coderex_telemetry::TelemetryStore::open(file.path()).unwrap();
-        let (handle, _uploader) = coderex_telemetry::TelemetryHandle::new(store, None);
+        let (handle, _uploader) = coderex_telemetry::TelemetryHandle::new(&store, None);
 
         let mut repl = ReplLoop::new("/tmp".into(), ModelId::sonnet());
         repl.with_telemetry_handle(Some(handle.clone()));
@@ -8138,7 +8149,7 @@ mod tests {
     fn parse_command() {
         let result = parse_input("/clear").unwrap();
         assert_eq!(result.0, "clear");
-        assert!(result.1.is_empty());
+        assert_eq!(result.1, [] as [std::string::String; 0]);
     }
 
     #[test]
@@ -8308,10 +8319,13 @@ mod tests {
     #[test]
     fn session_effects_default() {
         let effects = SessionEffects::default();
-        assert!(effects.prompt_profiles.is_empty());
+        assert_eq!(
+            effects.prompt_profiles,
+            [] as [coderex_core::PromptProfile; 0]
+        );
         assert!(effects.append_system_prompt.is_none());
         assert!(effects.allowed_tools_override.is_none());
-        assert!(effects.extra_context.is_empty());
+        assert_eq!(effects.extra_context, [] as [std::string::String; 0]);
         assert!(!effects.title_generated);
     }
 
@@ -8350,7 +8364,7 @@ mod tests {
     #[test]
     fn current_git_branch_falls_back() {
         let branch = current_git_branch("/nonexistent");
-        assert!(branch.is_empty());
+        assert_eq!(branch, "");
     }
 
     #[test]
@@ -8525,6 +8539,7 @@ mod tests {
     /// The hook is told which prompt it is gating. It used to be handed
     /// `custom_system_prompt`, which is almost always empty.
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // ENV_LOCK keeps a PATH-mutating test out for the whole run; held across the await on purpose.
     async fn the_prompt_hook_is_given_the_prompt() {
         // The hook runs through `sh` from PATH; a concurrent test that
         // temporarily replaces PATH would break it.
@@ -8649,7 +8664,7 @@ mod tests {
             ModelId::sonnet(),
         );
         repl.with_protocol_sink(Some(coderex_events::MessageSink::new(
-            Box::new(buffer.clone()) as Box<dyn std::io::Write + Send>,
+            Box::new(buffer.clone()) as Box<dyn std::io::Write + Send + Sync>,
         )));
 
         repl.run_headless("Hello").await.unwrap();
@@ -9178,6 +9193,7 @@ mod tests {
                 .unwrap();
             let agent_id = instance.task_handle.id.clone();
             mgr.mark_idle(&agent_id, "waiting for work").await.unwrap();
+            drop(mgr);
             agent_id
         };
 
@@ -9246,7 +9262,7 @@ mod tests {
 
         let expected_model = repl.model.0.clone();
         let options = repl.build_submit_options();
-        let expected_prompt = options.custom_system_prompt.clone().unwrap_or_default();
+        let expected_prompt = options.custom_system_prompt.unwrap_or_default();
         let snapshot = repl
             .parent_context_snapshot
             .lock()

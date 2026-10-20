@@ -47,7 +47,6 @@ impl Tool for TaskListTool {
 
         let status_filter =
             extract_string_opt(&input.arguments, "status").map(|s| match s.as_str() {
-                "pending" => TaskStatus::Pending,
                 "in_progress" => TaskStatus::InProgress,
                 "completed" => TaskStatus::Completed,
                 "deleted" => TaskStatus::Deleted,

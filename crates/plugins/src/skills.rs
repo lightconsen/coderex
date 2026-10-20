@@ -51,13 +51,13 @@ impl SkillSource {
     /// Precedence for conflict resolution.
     /// Higher value = higher priority.
     #[must_use]
-    pub fn precedence(self) -> u8 {
+    pub const fn precedence(self) -> u8 {
         match self {
-            SkillSource::UserDir => 5,
-            SkillSource::RepoDir => 4,
-            SkillSource::Bundled => 3,
-            SkillSource::Plugin => 2,
-            SkillSource::Mcp => 1,
+            Self::UserDir => 5,
+            Self::RepoDir => 4,
+            Self::Bundled => 3,
+            Self::Plugin => 2,
+            Self::Mcp => 1,
         }
     }
 }
@@ -65,11 +65,11 @@ impl SkillSource {
 impl std::fmt::Display for SkillSource {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            SkillSource::Bundled => write!(f, "bundled"),
-            SkillSource::UserDir => write!(f, "user"),
-            SkillSource::RepoDir => write!(f, "repo"),
-            SkillSource::Plugin => write!(f, "plugin"),
-            SkillSource::Mcp => write!(f, "mcp"),
+            Self::Bundled => write!(f, "bundled"),
+            Self::UserDir => write!(f, "user"),
+            Self::RepoDir => write!(f, "repo"),
+            Self::Plugin => write!(f, "plugin"),
+            Self::Mcp => write!(f, "mcp"),
         }
     }
 }
@@ -134,7 +134,7 @@ struct SkillFrontmatter {
     enabled: bool,
 }
 
-fn default_true() -> bool {
+const fn default_true() -> bool {
     true
 }
 
@@ -197,7 +197,7 @@ pub struct SkillLoader {
 impl SkillLoader {
     /// Create a new skill loader.
     #[must_use]
-    pub fn new(bundled_path: PathBuf, user_path: PathBuf) -> Self {
+    pub const fn new(bundled_path: PathBuf, user_path: PathBuf) -> Self {
         Self {
             bundled_path,
             user_path,
@@ -341,14 +341,14 @@ impl SkillLoader {
     ) -> Result<String, String> {
         let skill = self
             .get(name)
-            .ok_or_else(|| format!("skill '{}' not found", name))?;
+            .ok_or_else(|| format!("skill '{name}' not found"))?;
 
         match skill.source {
             SkillSource::Plugin => {
                 let plugin_name = skill
                     .plugin_name
                     .as_deref()
-                    .ok_or_else(|| format!("skill '{}' has no associated plugin", name))?;
+                    .ok_or_else(|| format!("skill '{name}' has no associated plugin"))?;
                 plugin_manager
                     .execute_skill(plugin_name, name, context)
                     .await
@@ -394,7 +394,7 @@ mod tests {
     use super::*;
 
     fn skill_content() -> String {
-        r#"---
+        r"---
 name: test-skill
 hooks: [pre-query]
 agent: general
@@ -403,7 +403,7 @@ description: A test skill
 enabled: true
 ---
 This is the script content.
-"#
+"
         .to_string()
     }
 
@@ -416,7 +416,7 @@ This is the script content.
         assert_eq!(parsed.metadata.agent, Some("general".into()));
         assert_eq!(parsed.metadata.allowed_tools, vec!["Bash", "Read"]);
         assert!(parsed.metadata.enabled);
-        assert!(!parsed.script.is_empty());
+        assert_ne!(parsed.script, "");
     }
 
     #[test]

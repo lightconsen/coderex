@@ -31,7 +31,7 @@ impl McpResultAdapter {
     pub fn adapt(tool_call_id: &str, mcp_result: &Value) -> ToolResult {
         let is_error = mcp_result
             .get("isError")
-            .and_then(|v| v.as_bool())
+            .and_then(serde_json::Value::as_bool)
             .unwrap_or(false);
 
         let content = mcp_result.get("content");
@@ -74,8 +74,9 @@ impl McpResultAdapter {
                     let data = item.get("data").and_then(|d| d.as_str()).unwrap_or("");
                     push_image(mime, data, &mut images)
                 }
-                Some("resource") => {
-                    if let Some(resource) = item.get("resource") {
+                Some("resource") => item.get("resource").map_or_else(
+                    || "[Resource: unknown]".to_string(),
+                    |resource| {
                         let uri = resource.get("uri").and_then(|u| u.as_str()).unwrap_or("");
                         let text = resource.get("text").and_then(|t| t.as_str()).unwrap_or("");
                         let blob = resource.get("blob").and_then(|b| b.as_str()).unwrap_or("");
@@ -94,10 +95,8 @@ impl McpResultAdapter {
                         } else {
                             format!("[Resource: {uri}]")
                         }
-                    } else {
-                        "[Resource: unknown]".to_string()
-                    }
-                }
+                    },
+                ),
                 Some(other) => format!("[Unknown content type: {other}]"),
                 None => item.to_string(),
             };
@@ -173,7 +172,7 @@ fn normalize_base64(data: &str) -> Option<String> {
     if without_padding.len() % 4 == 1 {
         return None;
     }
-    while !cleaned.len().is_multiple_of(4) {
+    while cleaned.len() % 4 != 0 {
         cleaned.push('=');
     }
     Some(cleaned)
@@ -186,6 +185,9 @@ fn decoded_len(data: &str) -> usize {
 }
 
 /// A size a person reads at a glance.
+// A display ratio: byte counts are far below 2^53 in practice and the result is
+// rounded to a single decimal place anyway.
+#[allow(clippy::cast_precision_loss)]
 fn human_size(bytes: usize) -> String {
     const KB: usize = 1024;
     const MB: usize = KB * 1024;

@@ -97,6 +97,7 @@ impl NotificationSink {
                 input_schema,
             });
         }
+        drop(registry);
         tracing::info!(
             server = server_name,
             count = tools.len(),
@@ -112,19 +113,17 @@ impl NotificationSink {
             .resource_cache
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        match uri {
-            Some(uri) => {
-                cache.remove(&(server_name.to_string(), uri.to_string()));
-                tracing::debug!(server = server_name, uri, "invalidated a cached resource");
-            }
-            None => {
-                cache.retain(|(server, _), _| server != server_name);
-                tracing::debug!(
-                    server = server_name,
-                    "invalidated every cached resource for the server"
-                );
-            }
+        if let Some(uri) = uri {
+            cache.remove(&(server_name.to_string(), uri.to_string()));
+            tracing::debug!(server = server_name, uri, "invalidated a cached resource");
+        } else {
+            cache.retain(|(server, _), _| server != server_name);
+            tracing::debug!(
+                server = server_name,
+                "invalidated every cached resource for the server"
+            );
         }
+        drop(cache);
     }
 }
 
@@ -266,7 +265,7 @@ impl McpManager {
                         server_config.args.clone(),
                         server_config.env.clone(),
                     );
-                    server.cwd = server_config.cwd.clone();
+                    server.cwd.clone_from(&server_config.cwd);
                     server.sandbox = server_config.sandbox.clone();
                     server
                 }
@@ -335,7 +334,7 @@ impl McpManager {
 
         for (name, url) in remote {
             let provider: Arc<dyn crate::http::TokenProvider> = Arc::new(
-                crate::oauth::OAuthTokenProvider::new(Arc::clone(&self.oauth), url, client.clone()),
+                crate::oauth::OAuthTokenProvider::new(&self.oauth, url, client.clone()),
             );
             if let Some(mut server) = self.servers.get_mut(&name) {
                 server.set_token_provider(provider);
@@ -524,7 +523,8 @@ impl McpManager {
 
     /// Cancel the health monitor background task.
     fn cancel_health_monitor(&self) {
-        if let Some(tx) = self.health_cancel.lock().unwrap().take() {
+        let cancel = self.health_cancel.lock().unwrap().take();
+        if let Some(tx) = cancel {
             let _ = tx.send(true);
         }
     }
@@ -546,8 +546,7 @@ impl McpManager {
     pub fn is_running(&self, name: &str) -> bool {
         self.servers
             .get(name)
-            .map(|e| e.value().status == ServerStatus::Running)
-            .unwrap_or(false)
+            .is_some_and(|e| e.value().status == ServerStatus::Running)
     }
 
     /// Register a discovered tool in the registry.
@@ -577,6 +576,7 @@ impl McpManager {
             .iter()
             .map(|conflict| conflict.name.clone())
             .collect();
+        drop(registry);
         names.sort();
         names.dedup();
         names
@@ -676,21 +676,27 @@ impl McpManager {
         let (server_name, tool_name_owned) = {
             let tools = self.tools.lock().unwrap();
             let info = tools.get(tool_name)?;
-            (info.server.clone(), info.name.clone())
+            let pair = (info.server.clone(), info.name.clone());
+            drop(tools);
+            pair
         };
 
-        let server_entry = self.servers.get(&server_name)?;
-        let server = server_entry.value();
+        let (running, channel) = {
+            let server_entry = self.servers.get(&server_name)?;
+            let server = server_entry.value();
+            let state = (server.status == ServerStatus::Running, server.channel());
+            drop(server_entry);
+            state
+        };
 
-        if server.status != ServerStatus::Running {
+        if !running {
             return None;
         }
 
-        let channel = server.channel()?;
         Some(McpToolProxy::with_channel(
             &server_name,
             &tool_name_owned,
-            channel,
+            channel?,
         ))
     }
 
@@ -829,13 +835,13 @@ impl McpManager {
 
     /// Access the elicitation manager.
     #[must_use]
-    pub fn elicitation(&self) -> &ElicitationManager {
+    pub const fn elicitation(&self) -> &ElicitationManager {
         &self.elicitation
     }
 
     /// Mutable access to the elicitation manager.
     #[must_use]
-    pub fn elicitation_mut(&mut self) -> &mut ElicitationManager {
+    pub const fn elicitation_mut(&mut self) -> &mut ElicitationManager {
         &mut self.elicitation
     }
 

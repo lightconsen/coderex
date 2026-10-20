@@ -40,7 +40,7 @@ pub struct McpResourceRegistry {
 impl McpResourceRegistry {
     /// Create a new empty registry.
     #[must_use]
-    pub fn new() -> Self {
+    pub const fn new() -> Self {
         Self {
             resources: Vec::new(),
         }

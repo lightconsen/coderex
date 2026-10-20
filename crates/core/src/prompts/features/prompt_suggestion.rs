@@ -98,7 +98,7 @@ fn parse_string_array(content: &str) -> Vec<String> {
             // Fallback: treat each non-empty line as a suggestion
             return content
                 .lines()
-                .map(|l| l.trim())
+                .map(str::trim)
                 .filter(|l| !l.is_empty())
                 .map(String::from)
                 .collect();

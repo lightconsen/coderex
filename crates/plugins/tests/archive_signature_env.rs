@@ -62,7 +62,7 @@ fn a_correct_detached_signature_installs_with_the_environment_key() {
     assert!(
         status.status.success(),
         "a correct detached signature was refused; output:\n{}",
-        status_text(status)
+        status_text(&status)
     );
     assert!(
         dir.path()
@@ -121,7 +121,7 @@ fn run_child(
     command.output().unwrap()
 }
 
-fn status_text(output: std::process::Output) -> String {
+fn status_text(output: &std::process::Output) -> String {
     format!(
         "status: {:?}\nstdout:\n{}\nstderr:\n{}",
         output.status,

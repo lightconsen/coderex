@@ -262,7 +262,7 @@ impl ProcessSessionRunner {
 
     /// Create a runner with an explicit shutdown grace period.
     #[must_use]
-    pub fn with_grace(grace: Duration) -> Self {
+    pub const fn with_grace(grace: Duration) -> Self {
         Self { grace }
     }
 }
@@ -513,7 +513,7 @@ where
         .map_err(|err| format!("failed to read session stdout: {err}"))?
     {
         tracing::debug!(session_id = %session_id, stream = "stdout", "{}", line);
-        forward_output(&output, &session_id, "stdout", &line);
+        forward_output(output.as_ref(), &session_id, "stdout", &line);
         capture.transcript.push_str(&line);
         capture.transcript.push('\n');
 
@@ -582,7 +582,7 @@ where
         .map_err(|err| format!("failed to read session stderr: {err}"))?
     {
         tracing::warn!(session_id = %session_id, stream = "stderr", "{}", line);
-        forward_output(&output, &session_id, "stderr", &line);
+        forward_output(output.as_ref(), &session_id, "stderr", &line);
         text.push_str(&line);
         text.push('\n');
     }
@@ -595,7 +595,7 @@ where
 /// A closed channel means the worker is gone; the local transcript is still
 /// written, so this is not an error.
 fn forward_output(
-    output: &Option<tokio::sync::mpsc::UnboundedSender<SessionOutputLine>>,
+    output: Option<&tokio::sync::mpsc::UnboundedSender<SessionOutputLine>>,
     session_id: &str,
     stream: &'static str,
     line: &str,
@@ -617,10 +617,13 @@ fn forward_output(
 fn usage_from_result(frame: &Value) -> UsageStats {
     let usage = frame.get("usage");
     let tokens = |keys: &[&str]| -> usize {
-        usage
-            .and_then(|usage| keys.iter().find_map(|key| usage.get(*key)))
-            .and_then(Value::as_u64)
-            .unwrap_or(0) as usize
+        usize::try_from(
+            usage
+                .and_then(|usage| keys.iter().find_map(|key| usage.get(*key)))
+                .and_then(Value::as_u64)
+                .unwrap_or(0),
+        )
+        .unwrap_or(usize::MAX)
     };
 
     UsageStats {
@@ -699,17 +702,14 @@ async fn terminate_child(child: &mut Child, grace: Duration) -> Result<ExitStatu
         let _ = child.start_kill();
     }
 
-    match tokio::time::timeout(grace, child.wait()).await {
-        Ok(status) => {
-            status.map_err(|err| format!("failed to wait for the session process: {err}"))
-        }
-        Err(_) => {
-            let _ = child.start_kill();
-            child
-                .wait()
-                .await
-                .map_err(|err| format!("failed to kill the session process: {err}"))
-        }
+    if let Ok(status) = tokio::time::timeout(grace, child.wait()).await {
+        status.map_err(|err| format!("failed to wait for the session process: {err}"))
+    } else {
+        let _ = child.start_kill();
+        child
+            .wait()
+            .await
+            .map_err(|err| format!("failed to kill the session process: {err}"))
     }
 }
 
@@ -971,13 +971,15 @@ impl PermissionTracker {
         };
         self.release_session(bridge, &entry.session_id);
 
-        let message = match self.timeout {
-            Some(timeout) => format!(
-                "approval timed out after {timeout:?}; no decision was received, so the \
-                 tool was not run"
-            ),
-            None => "approval timed out; no decision was received".to_string(),
-        };
+        let message = self.timeout.map_or_else(
+            || "approval timed out; no decision was received".to_string(),
+            |timeout| {
+                format!(
+                    "approval timed out after {timeout:?}; no decision was received, so the \
+                     tool was not run"
+                )
+            },
+        );
         tracing::warn!(
             session_id = %entry.session_id,
             request_id = %request_id,
@@ -3301,7 +3303,7 @@ printf 'ECHO:%s\n' "$line""#;
                 Err(TransportError::NotConnected)
             }
 
-            fn connection_id(&self) -> &str {
+            fn connection_id(&self) -> &'static str {
                 "refusing"
             }
         }

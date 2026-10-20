@@ -73,7 +73,7 @@ impl CircuitBreaker {
     const FAILURE_THRESHOLD: usize = 5;
     const COOLDOWN_SECS: u64 = 60;
 
-    fn new() -> Self {
+    const fn new() -> Self {
         Self {
             state: AtomicUsize::new(Self::CLOSED),
             consecutive_failures: AtomicUsize::new(0),
@@ -84,13 +84,14 @@ impl CircuitBreaker {
     /// Whether the next upload attempt should proceed.
     fn allow(&self) -> bool {
         match self.state.load(Ordering::Relaxed) {
-            Self::CLOSED => true,
             Self::OPEN => {
                 let last = self.last_failure_ms.load(Ordering::Relaxed);
                 let now = SystemTime::now()
                     .duration_since(UNIX_EPOCH)
                     .unwrap_or_default()
-                    .as_millis() as u64;
+                    .as_millis()
+                    .try_into()
+                    .unwrap_or(u64::MAX);
                 if now.saturating_sub(last) >= Self::COOLDOWN_SECS * 1000 {
                     self.state.store(Self::HALF_OPEN, Ordering::Relaxed);
                     true
@@ -98,7 +99,6 @@ impl CircuitBreaker {
                     false
                 }
             }
-            Self::HALF_OPEN => true,
             _ => true,
         }
     }
@@ -115,7 +115,9 @@ impl CircuitBreaker {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
-            .as_millis() as u64;
+            .as_millis()
+            .try_into()
+            .unwrap_or(u64::MAX);
         self.last_failure_ms.store(now, Ordering::Relaxed);
 
         if count >= Self::FAILURE_THRESHOLD {
@@ -382,7 +384,7 @@ impl TelemetryUploader {
             self.rate.record();
 
             match self.upload_pending().await {
-                Ok(_) => self.circuit.on_success(),
+                Ok(()) => self.circuit.on_success(),
                 Err(TelemetryError::Rejected { status }) => {
                     // The endpoint told us to back off. Suppress uploads for the
                     // suppression window instead of retrying into the limit.
@@ -731,7 +733,7 @@ fn encode_json(value: &serde_json::Value) -> Result<EncodedBody, TelemetryError>
     let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
     encoder.write_all(&json)?;
     Ok(EncodedBody {
-        bytes: encoder.finish().map_err(|e| TelemetryError::Io(e.into()))?,
+        bytes: encoder.finish().map_err(TelemetryError::Io)?,
         gzipped: true,
     })
 }

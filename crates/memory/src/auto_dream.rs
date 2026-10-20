@@ -6,6 +6,7 @@
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use std::fmt::Write as _;
 use std::path::PathBuf;
 
 /// Configuration for auto dream triggering.
@@ -72,7 +73,7 @@ pub struct AutoDream {
 }
 
 /// Persisted dream state for crash recovery.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 struct DreamState {
     /// When the last successful dream completed.
     last_dream_completed: Option<DateTime<Utc>>,
@@ -82,23 +83,13 @@ struct DreamState {
     dream_history: Vec<DreamSession>,
 }
 
-impl Default for DreamState {
-    fn default() -> Self {
-        Self {
-            last_dream_completed: None,
-            sessions_since_last_dream: 0,
-            dream_history: Vec::new(),
-        }
-    }
-}
-
 impl AutoDream {
     /// Create a new auto dream manager.
     #[must_use]
     pub fn new(memory_dir: PathBuf, config: DreamConfig) -> Self {
         let state_path = memory_dir.join(".dream_state.json");
         Self {
-            memory_dir: memory_dir.clone(),
+            memory_dir,
             config,
             state_path,
         }
@@ -146,8 +137,7 @@ impl AutoDream {
         let sessions_since = state.sessions_since_last_dream;
         let hours_since = state
             .last_dream_completed
-            .map(|t| now.signed_duration_since(t).num_hours())
-            .unwrap_or(i64::MAX);
+            .map_or(i64::MAX, |t| now.signed_duration_since(t).num_hours());
 
         let session_met = sessions_since >= self.config.session_threshold;
         let time_met = hours_since >= self.config.time_threshold_hours;
@@ -328,7 +318,7 @@ impl AutoDream {
                                 }
                             };
 
-                            let summaries: Vec<&str> = recent_sessions.iter().map(|s| s.as_str()).collect();
+                            let summaries: Vec<&str> = recent_sessions.iter().map(std::string::String::as_str).collect();
                             let prompt = self.generate_dream_prompt(&summaries);
 
                             // Call LLM
@@ -357,7 +347,6 @@ impl AutoDream {
                                 }
                                 Err(e) => {
                                     tracing::error!("dream LLM call failed: {e}");
-                                    continue;
                                 }
                             }
                         }
@@ -386,7 +375,7 @@ impl AutoDream {
 
         prompt.push_str("Here are the recent session summaries:\n\n");
         for (i, summary) in session_summaries.iter().enumerate() {
-            prompt.push_str(&format!("## Session {}\n{}\n\n", i + 1, summary));
+            let _ = write!(prompt, "## Session {}\n{}\n\n", i + 1, summary);
         }
 
         prompt

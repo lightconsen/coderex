@@ -463,7 +463,7 @@ pub struct PendingCrash {
 /// This is an internal ingestion shape; it exists so the crash module can hand
 /// every column to the store in one value.
 #[derive(Debug, Clone, Default)]
-pub(crate) struct CrashRecord {
+pub struct CrashRecord {
     /// Structured summary, or raw text in verbose mode.
     pub panic_info: String,
     /// Raw backtrace in verbose mode only.
@@ -549,11 +549,11 @@ pub enum TelemetryEvent {
 impl TelemetryEvent {
     fn to_db(&self) -> (String, String, String) {
         let (event_type, timestamp) = match self {
-            TelemetryEvent::SessionStart { timestamp, .. } => ("session_start", *timestamp),
-            TelemetryEvent::ToolUsed { timestamp, .. } => ("tool_used", *timestamp),
-            TelemetryEvent::ApiCall { timestamp, .. } => ("api_call", *timestamp),
-            TelemetryEvent::Error { timestamp, .. } => ("error", *timestamp),
-            TelemetryEvent::SessionEnd { timestamp, .. } => ("session_end", *timestamp),
+            Self::SessionStart { timestamp, .. } => ("session_start", *timestamp),
+            Self::ToolUsed { timestamp, .. } => ("tool_used", *timestamp),
+            Self::ApiCall { timestamp, .. } => ("api_call", *timestamp),
+            Self::Error { timestamp, .. } => ("error", *timestamp),
+            Self::SessionEnd { timestamp, .. } => ("session_end", *timestamp),
         };
         let payload = serde_json::to_string(self).unwrap_or_default();
         let created_at = timestamp.to_rfc3339();

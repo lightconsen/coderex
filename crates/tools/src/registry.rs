@@ -353,8 +353,9 @@ impl ToolRegistry {
             return tool.descriptor().interrupt_behavior;
         }
         self.get_tool(tool_name)
-            .map(|t| t.descriptor().interrupt_behavior)
-            .unwrap_or(InterruptBehavior::RunToCompletion)
+            .map_or(InterruptBehavior::RunToCompletion, |t| {
+                t.descriptor().interrupt_behavior
+            })
     }
 
     /// What a named tool's rule exemptions are for this call.

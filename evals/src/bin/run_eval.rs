@@ -50,18 +50,17 @@ fn main_result() -> Result<(), HarnessError> {
                     value()?
                         .parse()
                         .map_err(|_| HarnessError::Invalid("--reps needs a number".to_string()))?,
-                )
+                );
             }
             "--concurrency" => {
                 options.concurrency = Some(value()?.parse().map_err(|_| {
                     HarnessError::Invalid("--concurrency needs a number".to_string())
-                })?)
+                })?);
             }
             "--timeout-s" => {
-                options.timeout_s =
-                    Some(value()?.parse().map_err(|_| {
-                        HarnessError::Invalid("--timeout-s needs a number".to_string())
-                    })?)
+                options.timeout_s = Some(value()?.parse().map_err(|_| {
+                    HarnessError::Invalid("--timeout-s needs a number".to_string())
+                })?);
             }
             "--approve-harness" => options.approve_harness = true,
             "--force" => options.force = true,
@@ -81,18 +80,17 @@ fn main_result() -> Result<(), HarnessError> {
     }
 
     if options.approve_harness {
-        println!(
-            "Approving the harness for flow '{}'.",
-            if options.flow.is_empty() {
-                options
-                    .flow_dir
-                    .as_ref()
-                    .map(|dir| dir.display().to_string())
-                    .unwrap_or_default()
-            } else {
-                options.flow.clone()
-            }
-        );
+        let dir_label = options
+            .flow_dir
+            .as_ref()
+            .map(|dir| dir.display().to_string())
+            .unwrap_or_default();
+        let label = if options.flow.is_empty() {
+            dir_label.as_str()
+        } else {
+            options.flow.as_str()
+        };
+        println!("Approving the harness for flow '{label}'.");
     }
 
     let outcome = tokio::runtime::Builder::new_multi_thread()

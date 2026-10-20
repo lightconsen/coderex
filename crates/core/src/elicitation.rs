@@ -117,7 +117,7 @@ impl ReplElicitationHandler {
 impl ElicitationHandler for ReplElicitationHandler {
     async fn request(&self, questions: Vec<ElicitationQuestion>) -> ElicitationResult {
         let mut stderr = std::io::stderr();
-        for q in &questions {
+        if let Some(q) = questions.first() {
             let _ = writeln!(stderr, "\n[{}] {}", q.header, q.question);
             for (i, opt) in q.options.iter().enumerate() {
                 let _ = writeln!(stderr, "  {}. {} — {}", i + 1, opt.label, opt.description);
@@ -176,21 +176,17 @@ impl ElicitationHandler for ReplElicitationHandler {
 /// This handler serializes elicitation questions into a structured format
 /// suitable for SDK consumers (e.g., JSON-RPC notifications) and awaits
 /// a response via a oneshot channel.
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct SdkElicitationHandler {
     event_tx: Option<tokio::sync::mpsc::UnboundedSender<crate::types::EngineEvent>>,
-}
-
-impl Default for SdkElicitationHandler {
-    fn default() -> Self {
-        Self { event_tx: None }
-    }
 }
 
 impl SdkElicitationHandler {
     /// Create a new handler with an event sender.
     #[must_use]
-    pub fn new(event_tx: tokio::sync::mpsc::UnboundedSender<crate::types::EngineEvent>) -> Self {
+    pub const fn new(
+        event_tx: tokio::sync::mpsc::UnboundedSender<crate::types::EngineEvent>,
+    ) -> Self {
         Self {
             event_tx: Some(event_tx),
         }

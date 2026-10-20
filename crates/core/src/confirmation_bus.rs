@@ -130,11 +130,18 @@ impl ConfirmationBus {
     ///
     /// This is called from the UI side. Returns `None` if the bus is closed.
     pub async fn next_request(&self) -> Option<ConfirmationRequest> {
-        let mut rx = self.rx.lock().await;
-        let msg = rx.recv().await?;
-        // Store the responder so respond() can find it
-        let mut pending = self.pending.lock().await;
-        pending.insert(msg.request.id.clone(), msg.responder);
+        // Each guard is scoped so its lock is released before the next one is
+        // taken: holding both would make a responder wait behind a receiver
+        // that is itself waiting for a message.
+        let msg = {
+            let mut rx = self.rx.lock().await;
+            rx.recv().await?
+        };
+        {
+            // Store the responder so respond() can find it.
+            let mut pending = self.pending.lock().await;
+            pending.insert(msg.request.id.clone(), msg.responder);
+        }
         Some(msg.request)
     }
 
@@ -144,11 +151,9 @@ impl ConfirmationBus {
     /// Returns `true` if the response was successfully delivered.
     pub async fn respond(&self, request_id: &str, response: ConfirmationResponse) -> bool {
         let mut pending = self.pending.lock().await;
-        if let Some(responder) = pending.remove(request_id) {
-            responder.send(response).is_ok()
-        } else {
-            false
-        }
+        pending
+            .remove(request_id)
+            .is_some_and(|responder| responder.send(response).is_ok())
     }
 
     /// Check if there are pending requests waiting for a response.
@@ -172,6 +177,10 @@ pub struct AutoApproveBus;
 
 impl AutoApproveBus {
     /// Auto-approve all requests with the given response type.
+    //
+    // Kept `async` so it can stand in for `ConfirmationBus` at every call
+    // site; there is no work to await.
+    #[allow(clippy::unused_async, clippy::unused_async_trait_impl)]
     pub async fn request(&self, _req: ConfirmationRequest) -> Option<ConfirmationResponse> {
         Some(ConfirmationResponse::Approved)
     }
@@ -183,6 +192,9 @@ pub struct AutoDenyBus;
 
 impl AutoDenyBus {
     /// Auto-deny all requests.
+    //
+    // Kept `async` for the same reason as `AutoApproveBus`.
+    #[allow(clippy::unused_async, clippy::unused_async_trait_impl)]
     pub async fn request(&self, _req: ConfirmationRequest) -> Option<ConfirmationResponse> {
         Some(ConfirmationResponse::Denied)
     }

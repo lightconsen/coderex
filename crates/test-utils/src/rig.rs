@@ -153,7 +153,7 @@ impl TestRigBuilder {
 
     /// Set the permission mode.
     #[must_use]
-    pub fn with_permission_mode(mut self, mode: PermissionMode) -> Self {
+    pub const fn with_permission_mode(mut self, mode: PermissionMode) -> Self {
         self.permission_mode = mode;
         self
     }
@@ -166,10 +166,14 @@ impl TestRigBuilder {
     }
 
     /// Build the TestRig.
+    // `build` is async as part of the public test-rig API: callers in the
+    // `cli` crate's integration tests await it, so it cannot become
+    // synchronous without changing those out-of-crate callers.
+    #[allow(clippy::unused_async, clippy::unused_async_trait_impl)]
     pub async fn build(self) -> TestRig {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let cwd = temp_dir.path().to_path_buf();
-        let session = SessionState::new(cwd.clone());
+        let session = SessionState::new(cwd);
 
         let (event_tx, event_rx) = mpsc::unbounded_channel();
 

@@ -114,7 +114,7 @@ impl OpenAiCompatibleProvider {
         self
     }
 
-    fn request_context(&self) -> Option<&RequestContext> {
+    const fn request_context(&self) -> Option<&RequestContext> {
         self.request_context.as_ref()
     }
 
@@ -486,9 +486,9 @@ impl OpenAiCompatibleProvider {
         }
     }
 
-    fn parse_response_json(&self, json: serde_json::Value) -> ApiResponse {
+    fn parse_response_json(&self, json: &serde_json::Value) -> ApiResponse {
         if self.effective_api_style() == ProviderApiStyle::OpenAiResponses {
-            return self.parse_responses_response_json(json);
+            return Self::parse_responses_response_json(json);
         }
         let choice = json["choices"].as_array().and_then(|arr| arr.first());
         let message = choice.and_then(|c| c["message"].as_object());
@@ -531,7 +531,7 @@ impl OpenAiCompatibleProvider {
         }
     }
 
-    fn parse_responses_response_json(&self, json: serde_json::Value) -> ApiResponse {
+    fn parse_responses_response_json(json: &serde_json::Value) -> ApiResponse {
         let mut content = String::new();
         let mut tool_calls = Vec::new();
 
@@ -567,8 +567,10 @@ impl OpenAiCompatibleProvider {
         }
 
         let usage = crate::types::UsageSummary {
-            input_tokens: json["usage"]["input_tokens"].as_u64().unwrap_or(0) as usize,
-            output_tokens: json["usage"]["output_tokens"].as_u64().unwrap_or(0) as usize,
+            input_tokens: usize::try_from(json["usage"]["input_tokens"].as_u64().unwrap_or(0))
+                .unwrap_or(usize::MAX),
+            output_tokens: usize::try_from(json["usage"]["output_tokens"].as_u64().unwrap_or(0))
+                .unwrap_or(usize::MAX),
             cache_read_tokens: 0,
             cache_creation_tokens: 0,
         };
@@ -614,24 +616,25 @@ impl OpenAiCompatibleProvider {
     }
 
     fn format_error_message(
-        &self,
         request_id: &str,
         server_request_id: Option<&str>,
-        message: String,
+        message: &str,
         fallback_reason: Option<&str>,
     ) -> String {
+        use std::fmt::Write as _;
+
         let mut diagnostics = format!("request_id={request_id}");
         if let Some(server_request_id) = server_request_id.filter(|id| !id.is_empty()) {
-            diagnostics.push_str(&format!(", server_request_id={server_request_id}"));
+            let _ = write!(diagnostics, ", server_request_id={server_request_id}");
         }
         if let Some(fallback_reason) = fallback_reason {
-            diagnostics.push_str(&format!(", fallback_reason={fallback_reason}"));
+            let _ = write!(diagnostics, ", fallback_reason={fallback_reason}");
         }
         format!("{message} [{diagnostics}]")
     }
 }
 
-fn is_retryable(err: &ApiError) -> bool {
+const fn is_retryable(err: &ApiError) -> bool {
     matches!(
         err,
         ApiError::Http(_)
@@ -698,7 +701,7 @@ impl Provider for OpenAiCompatibleProvider {
                 .client
                 .post(&url)
                 .header("content-type", "application/json")
-                .header("Authorization", format!("Bearer {}", &self.api_key));
+                .header("Authorization", format!("Bearer {}", self.api_key));
             let req = self.apply_standard_headers(req, &request_id);
 
             let resp = req.json(&body).send().await.map_err(ApiError::from)?;
@@ -712,10 +715,10 @@ impl Provider for OpenAiCompatibleProvider {
 
             if status >= 400 {
                 let err_text = resp.text().await.unwrap_or_default();
-                let err_text = self.format_error_message(
+                let err_text = Self::format_error_message(
                     &request_id,
                     server_request_id.as_deref(),
-                    err_text,
+                    &err_text,
                     None,
                 );
                 if err_text.to_ascii_lowercase().contains("coding agent")
@@ -739,10 +742,10 @@ impl Provider for OpenAiCompatibleProvider {
                 tool_fallback,
                 "provider response received"
             );
-            Ok(self.parse_response_json(json))
+            Ok(self.parse_response_json(&json))
         })
         .await
-        .map_err(|e| classify_api_error(self.name(), e))
+        .map_err(|e| classify_api_error(self.name(), &e))
     }
 
     async fn create_message_streaming(
@@ -784,7 +787,7 @@ impl Provider for OpenAiCompatibleProvider {
                 .client
                 .post(&url)
                 .header("content-type", "application/json")
-                .header("Authorization", format!("Bearer {}", &provider.api_key));
+                .header("Authorization", format!("Bearer {}", provider.api_key));
             let req = provider.apply_standard_headers(req, &request_id);
 
             let response = req.json(&body).send().await;
@@ -1006,7 +1009,7 @@ fn handle_openai_chat_tool_delta(
     let Some(index) = tool_delta
         .get("index")
         .and_then(serde_json::Value::as_u64)
-        .map(|v| v as usize)
+        .and_then(|v| usize::try_from(v).ok())
     else {
         return Vec::new();
     };
@@ -1208,13 +1211,7 @@ fn parse_openai_responses_sse_message(
                     .unwrap_or_default()
                     .to_string();
                 if let Some((_, buffered, _)) = tool_state.get(&id) {
-                    if !buffered.is_empty() {
-                        events.push(StreamEvent::ToolCallBlockEnd {
-                            id: id.clone(),
-                            input: serde_json::from_str(buffered)
-                                .unwrap_or(serde_json::Value::Null),
-                        });
-                    } else {
+                    if buffered.is_empty() {
                         let input = item["arguments"]
                             .as_str()
                             .and_then(|args| serde_json::from_str(args).ok())
@@ -1222,6 +1219,12 @@ fn parse_openai_responses_sse_message(
                         events.push(StreamEvent::ToolCallBlockEnd {
                             id: id.clone(),
                             input,
+                        });
+                    } else {
+                        events.push(StreamEvent::ToolCallBlockEnd {
+                            id: id.clone(),
+                            input: serde_json::from_str(buffered)
+                                .unwrap_or(serde_json::Value::Null),
                         });
                     }
                 }
@@ -1234,8 +1237,10 @@ fn parse_openai_responses_sse_message(
                 .and_then(|response| response.get("usage"))
             {
                 events.push(StreamEvent::UsageSummary(UsageSummary {
-                    input_tokens: usage["input_tokens"].as_u64().unwrap_or(0) as usize,
-                    output_tokens: usage["output_tokens"].as_u64().unwrap_or(0) as usize,
+                    input_tokens: usize::try_from(usage["input_tokens"].as_u64().unwrap_or(0))
+                        .unwrap_or(usize::MAX),
+                    output_tokens: usize::try_from(usage["output_tokens"].as_u64().unwrap_or(0))
+                        .unwrap_or(usize::MAX),
                     cache_read_tokens: 0,
                     cache_creation_tokens: 0,
                 }));

@@ -25,7 +25,7 @@ pub enum ModelProfile {
 }
 
 impl ModelProfile {
-    fn runtime_env_keys(&self) -> &'static [&'static str] {
+    const fn runtime_env_keys(self) -> &'static [&'static str] {
         match self {
             Self::Main => &["CODEREX_MAIN_MODEL", "ANTHROPIC_MODEL", "OPENAI_MODEL"],
             Self::Lightweight => &[
@@ -47,23 +47,21 @@ impl ModelProfile {
         }
     }
 
-    fn resolve_with_lookup(&self, mut lookup: impl FnMut(&str) -> Option<String>) -> ModelId {
+    fn resolve_with_lookup(self, mut lookup: impl FnMut(&str) -> Option<String>) -> ModelId {
         self.runtime_env_keys()
             .iter()
             .find_map(|key| lookup(key))
             .map(|value| value.trim().to_string())
             .filter(|value| !value.is_empty())
-            .map(ModelId)
-            .unwrap_or_else(|| self.resolve())
+            .map_or_else(|| self.resolve(), ModelId)
     }
 
     /// Resolve the model profile to a concrete ModelId.
     #[must_use]
     pub fn resolve(&self) -> ModelId {
         match self {
-            Self::Main => ModelId::sonnet(),
+            Self::Main | Self::Background => ModelId::sonnet(),
             Self::Lightweight => ModelId::haiku(),
-            Self::Background => ModelId::sonnet(),
         }
     }
 

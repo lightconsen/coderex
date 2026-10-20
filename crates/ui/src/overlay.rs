@@ -64,7 +64,7 @@ pub struct OverlayStack {
 impl OverlayStack {
     /// Create a new empty overlay stack.
     #[must_use]
-    pub fn new() -> Self {
+    pub const fn new() -> Self {
         Self {
             overlays: Vec::new(),
         }
@@ -103,6 +103,12 @@ impl OverlayStack {
         self.overlays.len()
     }
 
+    /// Check if there are no active overlays.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.overlays.is_empty()
+    }
+
     /// Update the command palette query and filter commands.
     pub fn update_palette_query(&mut self, _query: &str) {
         if let Some(Overlay::CommandPalette {
@@ -123,8 +129,9 @@ impl OverlayStack {
             if commands.is_empty() {
                 return;
             }
-            let len = commands.len() as isize;
-            *selected = ((*selected as isize + delta).rem_euclid(len)) as usize;
+            let len = isize::try_from(commands.len()).unwrap_or(isize::MAX);
+            let pos = isize::try_from(*selected).unwrap_or(isize::MAX);
+            *selected = usize::try_from((pos + delta).rem_euclid(len)).unwrap_or(0);
         }
     }
 }

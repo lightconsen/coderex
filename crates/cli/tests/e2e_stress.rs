@@ -90,7 +90,7 @@ fn stress_command_registry_many_lookups() {
     // Execute 1000 commands
     for _ in 0..1000 {
         let result = reg.execute("status", &ctx, &[]);
-        assert!(!result.output.is_empty());
+        assert_ne!(result.output, "");
     }
 }
 
@@ -103,7 +103,7 @@ fn stress_notification_center_many() {
 
     // Add 1000 notifications
     for i in 0..1000 {
-        center.info(&format!("Notification {i}"));
+        center.info(format!("Notification {i}"));
     }
 
     // Should not exceed max history
@@ -329,9 +329,9 @@ fn stress_export_many_messages() {
     let messages: Vec<Message> = (0..1000)
         .map(|i| {
             if i % 2 == 0 {
-                Message::user(&format!("User message {i}"))
+                Message::user(format!("User message {i}"))
             } else {
-                Message::assistant(&format!("Assistant message {i}"))
+                Message::assistant(format!("Assistant message {i}"))
             }
         })
         .collect();

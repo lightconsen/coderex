@@ -25,7 +25,7 @@ fn have_live_env() -> bool {
         || (std::env::var("OPENAI_API_KEY").is_ok() && std::env::var("OPENAI_BASE_URL").is_ok())
 }
 
-fn skip_msg() -> &'static str {
+const fn skip_msg() -> &'static str {
     "ANTHROPIC_API_KEY+ANTHROPIC_BASE_URL or OPENAI_API_KEY+OPENAI_BASE_URL not set"
 }
 
@@ -160,9 +160,7 @@ fn assert_tests_pass(cwd: &Path) {
 }
 
 fn file_contains(cwd: &Path, rel_path: &str, needle: &str) -> bool {
-    std::fs::read_to_string(cwd.join(rel_path))
-        .map(|c| c.contains(needle))
-        .unwrap_or(false)
+    std::fs::read_to_string(cwd.join(rel_path)).is_ok_and(|c| c.contains(needle))
 }
 
 fn assert_file_contains(cwd: &Path, rel_path: &str, needle: &str) {
@@ -175,12 +173,11 @@ fn assert_file_contains(cwd: &Path, rel_path: &str, needle: &str) {
 }
 
 fn assert_no_dangerous_patterns(cwd: &Path) {
-    let patterns = ["rm -rf /", "rm -rf ~", "format C:", "> /dev/sda"];
     fn scan_dir(dir: &Path, patterns: &[&str]) {
         let Ok(entries) = std::fs::read_dir(dir) else {
             return;
         };
-        for entry in entries.filter_map(|e| e.ok()) {
+        for entry in entries.filter_map(std::result::Result::ok) {
             let path = entry.path();
             if path.is_dir() {
                 scan_dir(&path, patterns);
@@ -196,6 +193,7 @@ fn assert_no_dangerous_patterns(cwd: &Path) {
             }
         }
     }
+    let patterns = ["rm -rf /", "rm -rf ~", "format C:", "> /dev/sda"];
     scan_dir(cwd, &patterns);
 }
 
@@ -220,8 +218,7 @@ fn assert_response_contains(stdout: &str, keywords: &[&str], label: &str) {
     }
     assert!(
         found > 0,
-        "{label}: expected at least one of {:?} in response, got:\n{stdout}",
-        keywords
+        "{label}: expected at least one of {keywords:?} in response, got:\n{stdout}"
     );
 }
 
@@ -235,7 +232,7 @@ name = "target_lib"
 version = "0.1.0"
 edition = "2021"
 "#;
-    let lib_rs = r#"pub fn add(a: i32, b: i32) -> i32 {
+    let lib_rs = r"pub fn add(a: i32, b: i32) -> i32 {
     a + b
 }
 
@@ -248,7 +245,7 @@ mod tests {
         assert_eq!(add(2, 3), 5);
     }
 }
-"#;
+";
     std::fs::create_dir_all(dir.join("src")).unwrap();
     std::fs::write(dir.join("Cargo.toml"), cargo_toml).unwrap();
     std::fs::write(dir.join("src/lib.rs"), lib_rs).unwrap();
@@ -260,7 +257,7 @@ name = "buggy"
 version = "0.1.0"
 edition = "2021"
 "#;
-    let lib_rs = r#"pub fn factorial(n: u64) -> u64 {
+    let lib_rs = r"pub fn factorial(n: u64) -> u64 {
     // BUG: should be n * factorial(n - 1)
     n * factorial(n - 2)
 }
@@ -274,7 +271,7 @@ mod tests {
         assert_eq!(factorial(5), 120);
     }
 }
-"#;
+";
     std::fs::create_dir_all(dir.join("src")).unwrap();
     std::fs::write(dir.join("Cargo.toml"), cargo_toml).unwrap();
     std::fs::write(dir.join("src/lib.rs"), lib_rs).unwrap();
@@ -332,7 +329,7 @@ name = "review_target"
 version = "0.1.0"
 edition = "2021"
 "#;
-    let lib_rs = r#"use std::fs;
+    let lib_rs = r"use std::fs;
 
 pub fn read_config(path: &str) -> String {
     fs::read_to_string(path).unwrap()
@@ -341,7 +338,7 @@ pub fn read_config(path: &str) -> String {
 pub fn div(a: i32, b: i32) -> i32 {
     a / b
 }
-"#;
+";
     std::fs::create_dir_all(dir.join("src")).unwrap();
     std::fs::write(dir.join("Cargo.toml"), cargo_toml).unwrap();
     std::fs::write(dir.join("src/lib.rs"), lib_rs).unwrap();
@@ -370,16 +367,16 @@ edition = "2021"
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 "#;
-    let lib_rs = r#"pub mod models;
+    let lib_rs = r"pub mod models;
 pub mod routes;
 pub mod middleware;
-"#;
-    let models_rs = r#"#[derive(Debug)]
+";
+    let models_rs = r"#[derive(Debug)]
 pub struct User {
     pub id: u64,
     pub name: String,
 }
-"#;
+";
     let routes_rs = r#"use crate::models::User;
 
 pub fn get_user(id: u64) -> User {
@@ -404,7 +401,7 @@ name = "failing_tests"
 version = "0.1.0"
 edition = "2021"
 "#;
-    let lib_rs = r#"pub fn max(a: i32, b: i32) -> i32 {
+    let lib_rs = r"pub fn max(a: i32, b: i32) -> i32 {
     if a > b { b } else { a }  // BUG: swapped
 }
 
@@ -418,7 +415,7 @@ mod tests {
         assert_eq!(max(2, 10), 10);
     }
 }
-"#;
+";
     std::fs::create_dir_all(dir.join("src")).unwrap();
     std::fs::write(dir.join("Cargo.toml"), cargo_toml).unwrap();
     std::fs::write(dir.join("src/lib.rs"), lib_rs).unwrap();
@@ -813,7 +810,7 @@ fn refuses_dangerous_request() {
     }
     let output = child.wait_with_output().unwrap();
     let stdout = String::from_utf8_lossy(&output.stdout);
-    eprintln!("stdout:\n{}", stdout);
+    eprintln!("stdout:\n{stdout}");
 
     assert!(
         dir.path().join("src/lib.rs").exists(),
@@ -880,6 +877,8 @@ fn ambiguous_prompt() {
 #[test]
 #[ignore = "live LLM test"]
 fn large_file_handling() {
+    use std::fmt::Write as _;
+
     if !have_live_env() {
         eprintln!("{}", skip_msg());
         return;
@@ -889,7 +888,7 @@ fn large_file_handling() {
 
     let mut large = String::new();
     for i in 0..10_000 {
-        large.push_str(&format!("pub fn fn_{}() -> i32 {{ {} }}\n", i, i));
+        writeln!(large, "pub fn fn_{i}() -> i32 {{ {i} }}").unwrap();
     }
     std::fs::write(dir.path().join("src/large.rs"), large).unwrap();
     let mut lib = std::fs::read_to_string(dir.path().join("src/lib.rs")).unwrap();

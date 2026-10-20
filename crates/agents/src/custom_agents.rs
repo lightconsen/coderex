@@ -33,10 +33,9 @@ pub struct CustomAgentDef {
 /// in a definition does not make the agent vanish without explanation.
 #[must_use]
 pub fn load_custom_agents() -> HashMap<String, CustomAgentDef> {
-    match home::home_dir() {
-        Some(home) => load_custom_agents_from_dir(&home.join(".coderex").join("agents")),
-        None => HashMap::new(),
-    }
+    home::home_dir().map_or_else(HashMap::new, |home| {
+        load_custom_agents_from_dir(&home.join(".coderex").join("agents"))
+    })
 }
 
 /// Load custom agent definitions from an explicit directory.
@@ -51,9 +50,8 @@ pub fn load_custom_agents() -> HashMap<String, CustomAgentDef> {
 pub fn load_custom_agents_from_dir(agents_dir: &Path) -> HashMap<String, CustomAgentDef> {
     let mut agents = HashMap::new();
 
-    let entries = match std::fs::read_dir(agents_dir) {
-        Ok(entries) => entries,
-        Err(_) => return agents,
+    let Ok(entries) = std::fs::read_dir(agents_dir) else {
+        return agents;
     };
 
     for entry in entries.flatten() {
@@ -118,9 +116,9 @@ fn validate_custom_agent(def: &CustomAgentDef) -> Result<(), String> {
 
 /// Resolve a custom agent definition by name.
 #[must_use]
-pub fn get_custom_agent<'a>(
+pub fn get_custom_agent<'a, S: std::hash::BuildHasher>(
     name: &str,
-    agents: &'a HashMap<String, CustomAgentDef>,
+    agents: &'a HashMap<String, CustomAgentDef, S>,
 ) -> Option<&'a CustomAgentDef> {
     agents.get(name)
 }

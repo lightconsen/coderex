@@ -167,7 +167,7 @@ impl WorkflowTool {
         self.root.join("runs").join(run_id)
     }
 
-    fn limits(&self) -> Limits {
+    fn limits() -> Limits {
         let mut limits = Limits::default();
         if let Ok(value) = std::env::var(MAX_CONCURRENT_ENV) {
             if let Ok(parsed) = value.parse::<usize>() {
@@ -218,13 +218,13 @@ impl WorkflowTool {
         } else if let Some(inline) = string_argument(arguments, "script") {
             inline
         } else if let Some(name) = string_argument(arguments, "name") {
-            if let Some(script) = self
+            let registered = self
                 .named_scripts
                 .read()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .get(&name)
-                .cloned()
-            {
+                .cloned();
+            if let Some(script) = registered {
                 script
             } else {
                 self.find_named(&name)?
@@ -260,6 +260,8 @@ impl WorkflowTool {
 
     /// Read a script by name, from the project first and then the user.
     fn find_named(&self, name: &str) -> Result<String, ToolError> {
+        use std::fmt::Write as _;
+
         if !is_workflow_name(name) {
             return Err(invalid(&format!("'{name}' is not a workflow name")));
         }
@@ -293,8 +295,9 @@ impl WorkflowTool {
                 // Sorted so the message does not depend on hash iteration order.
                 let mut names: Vec<&str> = scripts.keys().map(String::as_str).collect();
                 names.sort_unstable();
-                message.push_str(&format!("; registered names: {}", names.join(", ")));
+                let _ = write!(message, "; registered names: {}", names.join(", "));
             }
+            drop(scripts);
         }
         Err(invalid(&message))
     }
@@ -354,6 +357,8 @@ impl Tool for WorkflowTool {
         input: ToolInput,
         _ctx: ToolContext<'_>,
     ) -> Result<ToolOutput, ToolError> {
+        use std::fmt::Write as _;
+
         if !self.enabled {
             return Err(ToolError::InvalidInput {
                 message: format!(
@@ -378,7 +383,7 @@ impl Tool for WorkflowTool {
             args,
             Arc::clone(&self.runner),
             resolved.run_dir.clone(),
-            self.limits(),
+            Self::limits(),
         )
         .await
         .map_err(|error| execution(&error.to_string()))?;
@@ -386,13 +391,12 @@ impl Tool for WorkflowTool {
         // The run *is* the directory it lives in — that is what a resume names
         // and where the journal is. The runtime's own id is for callers that
         // drive it directly, without a directory.
-        outcome.run_id = resolved.run_id.clone();
+        outcome.run_id.clone_from(&resolved.run_id);
 
-        let result = outcome
-            .result
-            .as_ref()
-            .map(|value| truncate(&value.to_string(), MAX_RESULT_CHARS))
-            .unwrap_or_else(|| "(the script returned nothing)".to_string());
+        let result = outcome.result.as_ref().map_or_else(
+            || "(the script returned nothing)".to_string(),
+            |value| truncate(&value.to_string(), MAX_RESULT_CHARS),
+        );
 
         let mut report = format!(
             "Workflow {} {}\nrun {}\nagents: {} ran, {} replayed, {} produced nothing\n",
@@ -408,19 +412,17 @@ impl Tool for WorkflowTool {
             outcome.progress.agents_empty,
         );
         if !outcome.progress.phases.is_empty() {
-            report.push_str(&format!(
-                "phases: {}\n",
-                outcome.progress.phases.join(" → ")
-            ));
+            let _ = writeln!(report, "phases: {}", outcome.progress.phases.join(" → "));
         }
         if !outcome.progress.log.is_empty() {
-            report.push_str(&format!("log:\n{}\n", outcome.progress.log.join("\n")));
+            let _ = write!(report, "log:\n{}\n", outcome.progress.log.join("\n"));
         }
-        report.push_str(&format!(
-            "script: {}\n",
+        let _ = writeln!(
+            report,
+            "script: {}",
             resolved.run_dir.join("script.js").display()
-        ));
-        report.push_str(&format!("result:\n{result}"));
+        );
+        let _ = write!(report, "result:\n{result}");
 
         Ok(ToolOutput {
             output: report,
@@ -789,6 +791,7 @@ mod tests {
             let scripts = tool.named_scripts.read().unwrap();
             assert_eq!(scripts.len(), 1);
             assert!(scripts.contains_key("good-name"));
+            drop(scripts);
         }
 
         // The refused names are not resolvable, and paths are still rejected.

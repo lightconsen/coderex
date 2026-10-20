@@ -42,7 +42,7 @@ pub struct BridgeSessionSpawner {
 impl BridgeSessionSpawner {
     /// Create a new spawner.
     #[must_use]
-    pub fn new(repo_root: PathBuf, worktree_base: PathBuf, session_base: PathBuf) -> Self {
+    pub const fn new(repo_root: PathBuf, worktree_base: PathBuf, session_base: PathBuf) -> Self {
         Self {
             repo_root,
             worktree_base,
@@ -71,9 +71,10 @@ impl BridgeSessionSpawner {
         }
     }
 
+    #[allow(clippy::unused_async, clippy::unused_async_trait_impl)]
     async fn spawn_single(&self, config: SpawnConfig) -> Result<SpawnResult, String> {
         let work_dir = config.work_dir;
-        self.prepare_session_dir(&config.session_id).await?;
+        self.prepare_session_dir(&config.session_id)?;
         Ok(SpawnResult {
             session_id: config.session_id,
             work_dir,
@@ -81,9 +82,10 @@ impl BridgeSessionSpawner {
         })
     }
 
+    #[allow(clippy::unused_async, clippy::unused_async_trait_impl)]
     async fn spawn_same_dir(&self, config: SpawnConfig) -> Result<SpawnResult, String> {
         let work_dir = config.work_dir;
-        self.prepare_session_dir(&config.session_id).await?;
+        self.prepare_session_dir(&config.session_id)?;
         Ok(SpawnResult {
             session_id: config.session_id,
             work_dir,
@@ -91,6 +93,7 @@ impl BridgeSessionSpawner {
         })
     }
 
+    #[allow(clippy::unused_async, clippy::unused_async_trait_impl)]
     async fn spawn_worktree(&self, config: SpawnConfig) -> Result<SpawnResult, String> {
         let branch = config.branch.as_deref().unwrap_or("main");
         let worktree_path = self.worktree_base.join(&config.session_id);
@@ -109,7 +112,7 @@ impl BridgeSessionSpawner {
             }
         }
 
-        self.prepare_session_dir(&config.session_id).await?;
+        self.prepare_session_dir(&config.session_id)?;
 
         Ok(SpawnResult {
             session_id: config.session_id,
@@ -119,7 +122,7 @@ impl BridgeSessionSpawner {
     }
 
     /// Prepare the session data directory.
-    async fn prepare_session_dir(&self, session_id: &str) -> Result<(), String> {
+    fn prepare_session_dir(&self, session_id: &str) -> Result<(), String> {
         let session_dir = self.session_base.join(session_id);
         std::fs::create_dir_all(&session_dir)
             .map_err(|e| format!("failed to create session dir: {e}"))?;

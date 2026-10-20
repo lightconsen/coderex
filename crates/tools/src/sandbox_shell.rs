@@ -67,12 +67,8 @@ pub fn sandboxed_shell(
         return Ok((cmd, None));
     };
 
-    let handle = SandboxHandle::create(config.clone()).map_err(|error| {
-        ToolError::Io(std::io::Error::new(
-            std::io::ErrorKind::Other,
-            format!("sandbox: {error}"),
-        ))
-    })?;
+    let handle = SandboxHandle::create(config.clone())
+        .map_err(|error| ToolError::Io(std::io::Error::other(format!("sandbox: {error}"))))?;
 
     // A wrapper, where the platform has one: `sandbox-exec` on macOS, `bwrap` on
     // Linux. The shell becomes its argument. Without a wrapper the shell *is*
@@ -95,12 +91,9 @@ pub fn sandboxed_shell(
     // `finish_spawn` can attach the AppContainer token; no-op on macOS. On
     // Linux with `bwrap` this installs the rlimits and deliberately skips the
     // syscall table (see `sandbox.rs`).
-    handle.prepare(&mut std_cmd).map_err(|error| {
-        ToolError::Io(std::io::Error::new(
-            std::io::ErrorKind::Other,
-            format!("sandbox: {error}"),
-        ))
-    })?;
+    handle
+        .prepare(&mut std_cmd)
+        .map_err(|error| ToolError::Io(std::io::Error::other(format!("sandbox: {error}"))))?;
 
     Ok((Command::from(std_cmd), Some(handle)))
 }
@@ -125,7 +118,10 @@ pub fn sandboxed_shell(
 ///
 /// Returns an error when the container token could not be attached or the
 /// child could not be assigned to its Job Object.
-pub fn finish_spawn(
+// The Windows implementation propagates a failure to attach the AppContainer
+// token; other targets have nothing to report, so the `Result` is kept.
+#[allow(clippy::unnecessary_wraps)]
+pub const fn finish_spawn(
     handle: Option<&SandboxHandle>,
     child: &tokio::process::Child,
 ) -> Result<(), ToolError> {

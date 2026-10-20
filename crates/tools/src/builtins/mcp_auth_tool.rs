@@ -377,7 +377,7 @@ async fn authenticate_with(
     // depend on discovery succeeding again.
     let expires_in = token_resp
         .get("expires_in")
-        .and_then(|v| v.as_i64())
+        .and_then(serde_json::Value::as_i64)
         .unwrap_or(3600);
     let refresh_token = token_resp
         .get("refresh_token")
@@ -699,7 +699,7 @@ impl IssuerMetadataEntry {
         self.expires_at.is_some_and(|expires_at| now < expires_at)
     }
 
-    fn has_endpoints(&self) -> bool {
+    const fn has_endpoints(&self) -> bool {
         self.authorization_endpoint.is_some() || self.token_endpoint.is_some()
     }
 
@@ -887,9 +887,7 @@ fn issuer_matches(value: &serde_json::Value, requested: &str) -> bool {
     value
         .get("issuer")
         .and_then(|issuer| issuer.as_str())
-        .map_or(true, |advertised| {
-            normalize_issuer(advertised).as_deref() == Some(requested)
-        })
+        .is_none_or(|advertised| normalize_issuer(advertised).as_deref() == Some(requested))
 }
 
 /// Fresh discovery metadata already persisted for `server_url`, if any.
@@ -915,9 +913,7 @@ fn load_cached_discovery(
     if entry.authorization_endpoint.is_none() && entry.token_endpoint.is_none() {
         return None;
     }
-    if entry.issuer.is_none() {
-        return None;
-    }
+    entry.issuer.as_ref()?;
     Some(DiscoveredEndpoints::from_entry(&entry))
 }
 
@@ -1302,11 +1298,12 @@ async fn send_http_response(
     status: u16,
     body: &str,
 ) -> std::io::Result<()> {
+    use tokio::io::AsyncWriteExt;
+
     let response = format!(
         "HTTP/1.1 {status} OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
         body.len()
     );
-    use tokio::io::AsyncWriteExt;
     stream.write_all(response.as_bytes()).await?;
     stream.flush().await?;
     Ok(())
@@ -1635,11 +1632,14 @@ fn record_discovery_fields(entry: &mut TokenEntry, discovery: &DiscoveredEndpoin
         entry.registration_endpoint = Some(endpoint.clone());
     }
     if !discovery.scopes_supported.is_empty() {
-        entry.scopes_supported = discovery.scopes_supported.clone();
+        entry
+            .scopes_supported
+            .clone_from(&discovery.scopes_supported);
     }
     if !discovery.token_endpoint_auth_methods_supported.is_empty() {
-        entry.token_endpoint_auth_methods_supported =
-            discovery.token_endpoint_auth_methods_supported.clone();
+        entry
+            .token_endpoint_auth_methods_supported
+            .clone_from(&discovery.token_endpoint_auth_methods_supported);
         entry.token_endpoint_auth_method = Some(
             select_client_auth_method(
                 &entry.token_endpoint_auth_methods_supported,
@@ -1650,10 +1650,14 @@ fn record_discovery_fields(entry: &mut TokenEntry, discovery: &DiscoveredEndpoin
         );
     }
     if !discovery.grant_types_supported.is_empty() {
-        entry.grant_types_supported = discovery.grant_types_supported.clone();
+        entry
+            .grant_types_supported
+            .clone_from(&discovery.grant_types_supported);
     }
     if !discovery.code_challenge_methods_supported.is_empty() {
-        entry.code_challenge_methods_supported = discovery.code_challenge_methods_supported.clone();
+        entry
+            .code_challenge_methods_supported
+            .clone_from(&discovery.code_challenge_methods_supported);
     }
     if let Some(metadata) = &discovery.protected_resource {
         entry.protected_resource = Some(metadata.clone());
@@ -1857,7 +1861,7 @@ async fn register_client(
         message: format!("the registered client could not be stored: {error}"),
     })?;
     let entry = entry_for(&mut store, server_url, &client_id);
-    entry.client_id = client_id.clone();
+    entry.client_id.clone_from(&client_id);
     entry.client_secret.clone_from(&client_secret);
     entry.token_endpoint_auth_method = Some(
         select_client_auth_method(advertised, client_secret.is_some())

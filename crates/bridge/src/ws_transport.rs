@@ -65,9 +65,9 @@ pub struct WebSocketTransport {
     /// Sender from the write loop (internal -> WS).
     write_tx: tokio::sync::mpsc::UnboundedSender<TransportMessage>,
     /// Handle to the spawned reader task.
-    _reader_handle: Option<tokio::task::JoinHandle<()>>,
+    reader_handle: Option<tokio::task::JoinHandle<()>>,
     /// Handle to the spawned writer task.
-    _writer_handle: Option<tokio::task::JoinHandle<()>>,
+    writer_handle: Option<tokio::task::JoinHandle<()>>,
     /// Keep self !Unpinned for safety.
     _pinned: PhantomPinned,
 }
@@ -77,7 +77,7 @@ impl std::fmt::Debug for WebSocketTransport {
         f.debug_struct("WebSocketTransport")
             .field("connection_id", &self.connection_id)
             .field("connected", &self.connected)
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
@@ -95,8 +95,8 @@ impl WebSocketTransport {
             tx,
             rx,
             write_tx,
-            _reader_handle: None,
-            _writer_handle: None,
+            reader_handle: None,
+            writer_handle: None,
             _pinned: PhantomPinned,
         }
     }
@@ -107,7 +107,7 @@ impl WebSocketTransport {
         // Keep the configuration so `Transport::connect` can re-establish the
         // same endpoint (with the same credentials) after a stream ends.
         self.config = config.clone();
-        self.connection_id = config.connection_id.clone();
+        self.connection_id.clone_from(&config.connection_id);
 
         // Build request with auth header
         let mut request = url
@@ -196,8 +196,8 @@ impl WebSocketTransport {
             }
         });
 
-        self._reader_handle = Some(reader_handle);
-        self._writer_handle = Some(writer_handle);
+        self.reader_handle = Some(reader_handle);
+        self.writer_handle = Some(writer_handle);
         self.connected = true;
 
         Ok(())
@@ -212,11 +212,11 @@ impl Transport for WebSocketTransport {
     }
 
     async fn disconnect(&mut self) -> Result<(), TransportError> {
-        if let Some(handle) = self._reader_handle.take() {
+        if let Some(handle) = self.reader_handle.take() {
             handle.abort();
             let _ = handle.await;
         }
-        if let Some(handle) = self._writer_handle.take() {
+        if let Some(handle) = self.writer_handle.take() {
             handle.abort();
             let _ = handle.await;
         }
@@ -308,8 +308,7 @@ impl BridgeTokenStore {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let content = serde_json::to_string_pretty(&self.tokens)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        let content = serde_json::to_string_pretty(&self.tokens).map_err(std::io::Error::other)?;
         std::fs::write(path, content)
     }
 
@@ -332,7 +331,10 @@ impl BridgeTokenStore {
     /// List token names.
     #[must_use]
     pub fn names(&self) -> Vec<&str> {
-        self.tokens.keys().map(|k| k.as_str()).collect()
+        self.tokens
+            .keys()
+            .map(std::string::String::as_str)
+            .collect()
     }
 
     /// Number of tokens.

@@ -17,7 +17,7 @@ async fn basic_chat_responds() {
     let reason = rig
         .submit("Say exactly the word 'pong' and nothing else.")
         .await;
-    assert!(reason.is_ok(), "submit failed: {:?}", reason);
+    assert!(reason.is_ok(), "submit failed: {reason:?}");
     assert_eq!(
         reason.unwrap(),
         TerminalReason::Completed,
@@ -29,8 +29,7 @@ async fn basic_chat_responds() {
 
     assert!(
         text.to_lowercase().contains("pong"),
-        "expected response to contain 'pong', got: {}",
-        text
+        "expected response to contain 'pong', got: {text}"
     );
 
     assert!(
@@ -55,25 +54,23 @@ async fn multi_turn_remembers_context() {
     let r1 = rig
         .submit("Remember the secret word is 'apple'. Just say 'ok'.")
         .await;
-    assert!(r1.is_ok(), "turn 1 failed: {:?}", r1);
+    assert!(r1.is_ok(), "turn 1 failed: {r1:?}");
     let events1 = rig.collect_events().await;
     let text1 = live::collect_text(&events1);
     assert!(
         text1.to_lowercase().contains("ok"),
-        "turn 1 should say ok, got: {}",
-        text1
+        "turn 1 should say ok, got: {text1}"
     );
 
     // Turn 2: ask what the word was
     let r2 = rig
         .submit("What was the secret word I asked you to remember? Reply with just the word.")
         .await;
-    assert!(r2.is_ok(), "turn 2 failed: {:?}", r2);
+    assert!(r2.is_ok(), "turn 2 failed: {r2:?}");
     let events2 = rig.collect_events().await;
     let text2 = live::collect_text(&events2);
     assert!(
         text2.to_lowercase().contains("apple"),
-        "expected 'apple' in turn 2 response, got: {}",
-        text2
+        "expected 'apple' in turn 2 response, got: {text2}"
     );
 }

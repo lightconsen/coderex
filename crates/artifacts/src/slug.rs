@@ -75,6 +75,12 @@ pub struct ArtifactUrl {
 /// optional `<vanity>-` in front of the slug, and a bare UUID.
 #[must_use]
 pub fn parse_artifact_url(input: &str) -> Option<ArtifactUrl> {
+    // A slug is a hyphenated UUID, which is exactly 36 characters. A vanity
+    // prefix sits in front of it as `<vanity>-<uuid>`, so the boundary is
+    // found from the end rather than by splitting on a dash — the UUID has
+    // four dashes of its own.
+    const UUID_LEN: usize = 36;
+
     let trimmed = input.trim();
     if trimmed.is_empty() {
         return None;
@@ -100,11 +106,6 @@ pub fn parse_artifact_url(input: &str) -> Option<ArtifactUrl> {
         })
     });
 
-    // A slug is a hyphenated UUID, which is exactly 36 characters. A vanity
-    // prefix sits in front of it as `<vanity>-<uuid>`, so the boundary is
-    // found from the end rather than by splitting on a dash — the UUID has
-    // four dashes of its own.
-    const UUID_LEN: usize = 36;
     let last = path.trim_end_matches('/').rsplit('/').next()?;
     let (vanity, candidate) =
         if last.len() > UUID_LEN + 1 && last.as_bytes()[last.len() - UUID_LEN - 1] == b'-' {
@@ -142,10 +143,9 @@ pub fn canonicalize_url(input: &str) -> String {
         return trimmed.to_string();
     };
 
-    let (authority, path) = match after_scheme.find('/') {
-        Some(index) => (&after_scheme[..index], &after_scheme[index..]),
-        None => (after_scheme, ""),
-    };
+    let (authority, path) = after_scheme.find('/').map_or((after_scheme, ""), |index| {
+        (&after_scheme[..index], &after_scheme[index..])
+    });
 
     let host = authority.trim_end_matches('.').to_ascii_lowercase();
     let host = host

@@ -109,7 +109,7 @@ async fn wait_for_server(port: u16, max_attempts: u32) {
         }
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
-    panic!("server did not start within {} attempts", max_attempts);
+    panic!("server did not start within {max_attempts} attempts");
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

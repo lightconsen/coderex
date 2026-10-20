@@ -67,7 +67,7 @@ impl std::fmt::Debug for ModelRouter {
             .field("routes", &self.routes)
             .field("max_fallbacks", &self.max_fallbacks)
             .field("fallback_providers", &self.fallback_providers)
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
@@ -105,7 +105,7 @@ impl ModelRouter {
     pub fn add_provider(&mut self, provider: Box<dyn Provider>) {
         self.routes.push(RouteEntry {
             provider,
-            priority: self.routes.len() as u32,
+            priority: u32::try_from(self.routes.len()).unwrap_or(u32::MAX),
             models: None,
         });
         self.routes.sort_by_key(|r| r.priority);
@@ -125,7 +125,7 @@ impl ModelRouter {
     pub fn add_provider_for_models(&mut self, provider: Box<dyn Provider>, models: Vec<String>) {
         self.routes.push(RouteEntry {
             provider,
-            priority: self.routes.len() as u32,
+            priority: u32::try_from(self.routes.len()).unwrap_or(u32::MAX),
             models: Some(models),
         });
         self.routes.sort_by_key(|r| r.priority);
@@ -136,7 +136,7 @@ impl ModelRouter {
     pub fn clone_box_router(&self) -> Self {
         let mut router = Self::new(self.name.clone()).with_max_fallbacks(self.max_fallbacks);
         router = router.with_fallback_providers(self.fallback_providers.clone());
-        router.request_context = self.request_context.clone();
+        router.request_context.clone_from(&self.request_context);
         for entry in &self.routes {
             router.routes.push(RouteEntry {
                 provider: entry.provider.clone_box(),
@@ -161,11 +161,12 @@ impl ModelRouter {
         self.routes
             .iter()
             .filter(|entry| {
-                if let Some(ref allowed) = entry.models {
-                    allowed.contains(&model.0) || allowed.iter().any(|m| model.0.starts_with(m))
-                } else {
-                    entry.provider.supports_model(model)
-                }
+                entry.models.as_ref().map_or_else(
+                    || entry.provider.supports_model(model),
+                    |allowed| {
+                        allowed.contains(&model.0) || allowed.iter().any(|m| model.0.starts_with(m))
+                    },
+                )
             })
             .map(|entry| entry.provider.clone_box())
             .collect()
@@ -238,13 +239,11 @@ impl ModelRouter {
         }
 
         let mut last_error = None;
-        let mut attempts = 0;
 
-        for provider in providers {
-            if attempts > self.max_fallbacks {
+        for (attempt, provider) in providers.into_iter().enumerate() {
+            if attempt > usize::try_from(self.max_fallbacks).unwrap_or(usize::MAX) {
                 break;
             }
-            attempts += 1;
 
             tracing::debug!(
                 "router '{}' trying provider '{}' for model '{}'",
@@ -324,6 +323,8 @@ impl ApiClient for ModelRouter {
         max_tokens: u32,
         tools: &[ToolInfo],
     ) -> Pin<Box<dyn Stream<Item = StreamEvent> + Send + 'static>> {
+        use futures::StreamExt as _;
+
         // For streaming, we try the first provider that succeeds in starting the stream
         let providers = self.providers_for_request(model);
 
@@ -378,7 +379,6 @@ impl ApiClient for ModelRouter {
                     },
                 ).await;
 
-                use futures::StreamExt;
                 let mut pinned = stream;
                 let mut had_error = false;
 

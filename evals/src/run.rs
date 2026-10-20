@@ -75,7 +75,7 @@ impl RunOptions {
 }
 
 /// One case, one repetition, and how it went.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Record {
     /// The case this is for.
     pub case_id: String,
@@ -124,7 +124,10 @@ impl RunOutcome {
     }
 
     /// The pass rate across this run's records.
+    // A display ratio over a handful of records, far below the range where an
+    // f64 loses integer precision.
     #[must_use]
+    #[allow(clippy::cast_precision_loss)]
     pub fn pass_rate(&self) -> f64 {
         if self.records.is_empty() {
             return 1.0;
@@ -198,9 +201,11 @@ pub async fn run(options: &RunOptions) -> Result<RunOutcome, HarnessError> {
     let cases: Vec<Case> = harness
         .cases
         .iter()
-        .filter(|case| match &options.only_case {
-            Some(only) => &case.id == only,
-            None => true,
+        .filter(|case| {
+            options
+                .only_case
+                .as_ref()
+                .is_none_or(|only| &case.id == only)
         })
         .cloned()
         .collect();
@@ -344,10 +349,14 @@ async fn run_case(
     }
 
     let command = harness.command_for(case, variant, flow_dir, run_dir);
+    // `{model}` is a placeholder the command may carry, not a format argument.
+    #[allow(clippy::literal_string_with_formatting_args)]
     let command = command.replace("{model}", model.unwrap_or("default"));
 
     let started = Instant::now();
     let (exit_code, output, timed_out) = spawn(&command, run_dir, repo, timeout_s).await;
+    // A case would have to run for ~584 million years to overflow this.
+    #[allow(clippy::cast_possible_truncation)]
     let duration_ms = started.elapsed().as_millis() as u64;
 
     let run_output = RunOutput {

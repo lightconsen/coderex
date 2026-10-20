@@ -277,35 +277,26 @@ fn execute_step(session: &mut PtySession, step: &Step) -> Result<()> {
 fn assert_region_clean(session: &PtySession, region: Region) -> Result<()> {
     let snapshot = session.region_text(region);
     if snapshot.contains('\u{fffd}') {
-        bail!(
-            "region {:?} contains replacement characters\n--- region ---\n{}",
-            region,
-            snapshot
-        );
+        bail!("region {region:?} contains replacement characters\n--- region ---\n{snapshot}");
     }
     if let Some(ch) = snapshot
         .chars()
         .find(|ch| ch.is_control() && !matches!(ch, '\n' | '\r' | '\t'))
     {
-        bail!(
-            "region {:?} contains control character {:?}\n--- region ---\n{}",
-            region,
-            ch,
-            snapshot
-        );
+        bail!("region {region:?} contains control character {ch:?}\n--- region ---\n{snapshot}");
     }
     Ok(())
 }
 
-fn default_rows() -> u16 {
+const fn default_rows() -> u16 {
     40
 }
 
-fn default_cols() -> u16 {
+const fn default_cols() -> u16 {
     120
 }
 
-fn default_timeout_ms() -> u64 {
+const fn default_timeout_ms() -> u64 {
     15_000
 }
 
@@ -518,7 +509,7 @@ impl PtySession {
             let mut buf = [0_u8; 4096];
             loop {
                 match reader.read(&mut buf) {
-                    Ok(0) => break,
+                    Ok(0) | Err(_) => break,
                     Ok(n) => {
                         if let Ok(mut parser) = parser_bg.lock() {
                             parser.process(&buf[..n]);
@@ -527,7 +518,6 @@ impl PtySession {
                             raw.extend_from_slice(&buf[..n]);
                         }
                     }
-                    Err(_) => break,
                 }
             }
         });
@@ -633,7 +623,7 @@ impl PtySession {
         self.send_bytes(b"\x1b[C")
     }
 
-    fn resize(&mut self, rows: u16, cols: u16) -> Result<()> {
+    fn resize(&self, rows: u16, cols: u16) -> Result<()> {
         self.master
             .resize(PtySize {
                 rows,

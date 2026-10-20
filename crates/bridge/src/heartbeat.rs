@@ -57,7 +57,7 @@ pub struct Heartbeat {
 impl Heartbeat {
     /// Create a new heartbeat with the given config.
     #[must_use]
-    pub fn new(config: HeartbeatConfig) -> Self {
+    pub const fn new(config: HeartbeatConfig) -> Self {
         Self {
             config,
             consecutive_failures: 0,
@@ -74,13 +74,13 @@ impl Heartbeat {
     }
 
     /// Record a failed heartbeat.
-    pub fn record_failure(&mut self) {
+    pub const fn record_failure(&mut self) {
         self.consecutive_failures += 1;
     }
 
     /// Get the current health status.
     #[must_use]
-    pub fn status(&self) -> HeartbeatStatus {
+    pub const fn status(&self) -> HeartbeatStatus {
         if self.consecutive_failures >= self.config.lost_threshold {
             HeartbeatStatus::Lost
         } else if self.consecutive_failures >= self.config.degraded_threshold {
@@ -104,24 +104,31 @@ impl Heartbeat {
 
     /// Get the total number of successful beats.
     #[must_use]
+    // The comparison above makes the narrowing cast safe; `try_from` is not
+    // usable in a const fn.
+    #[allow(clippy::cast_possible_truncation)]
     pub const fn total_beats(&self) -> usize {
-        self.total_beats as usize
+        if self.total_beats > usize::MAX as u64 {
+            usize::MAX
+        } else {
+            self.total_beats as usize
+        }
     }
 
     /// Get the interval as a Duration.
     #[must_use]
-    pub fn interval(&self) -> Duration {
+    pub const fn interval(&self) -> Duration {
         Duration::from_secs(self.config.interval_secs)
     }
 
     /// Get the timeout as a Duration.
     #[must_use]
-    pub fn timeout(&self) -> Duration {
+    pub const fn timeout(&self) -> Duration {
         Duration::from_secs(self.config.timeout_secs)
     }
 
     /// Reset the heartbeat (after reconnection).
-    pub fn reset(&mut self) {
+    pub const fn reset(&mut self) {
         self.consecutive_failures = 0;
         self.last_success = None;
     }
@@ -200,7 +207,7 @@ impl HeartbeatLoop {
                         hb.record_failure();
                     }
                 }
-                _ = stop.notified() => {
+                () = stop.notified() => {
                     running.store(false, Ordering::SeqCst);
                     break;
                 }
@@ -255,7 +262,9 @@ impl WsReconnector {
         self.attempt += 1;
 
         // Exponential backoff: base_delay * 2^(attempt-1), capped at max_delay
-        let shift = (self.attempt as u32).saturating_sub(1);
+        let shift = u32::try_from(self.attempt)
+            .unwrap_or(u32::MAX)
+            .saturating_sub(1);
         let multiplier = 1u64.checked_shl(shift).unwrap_or(u64::MAX);
         let delay_ms = self.base_delay_ms.saturating_mul(multiplier);
         let delay_ms = delay_ms.min(self.max_delay_ms);
@@ -264,13 +273,13 @@ impl WsReconnector {
     }
 
     /// Reset the reconnection counter (after successful reconnect).
-    pub fn reset(&mut self) {
+    pub const fn reset(&mut self) {
         self.attempt = 0;
     }
 
     /// Check if more reconnection attempts are available.
     #[must_use]
-    pub fn can_reconnect(&self) -> bool {
+    pub const fn can_reconnect(&self) -> bool {
         self.attempt < self.max_attempts
     }
 
@@ -305,7 +314,7 @@ impl SequenceCursor {
     ///
     /// A frame that arrives out of order never rewinds the cursor: the point
     /// is the furthest point the stream has reached.
-    pub fn deliver(&mut self, seq: u64) {
+    pub const fn deliver(&mut self, seq: u64) {
         let ahead = match self.last_delivered {
             None => true,
             Some(last) => seq > last,
@@ -383,7 +392,7 @@ impl SessionRecoveryState {
     }
 
     /// Record the last downstream sequence number the session had seen.
-    pub fn record_sequence(&mut self, seq: u64) {
+    pub const fn record_sequence(&mut self, seq: u64) {
         let ahead = match self.last_sequence_num {
             None => true,
             Some(last) => seq > last,

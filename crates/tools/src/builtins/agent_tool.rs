@@ -178,7 +178,7 @@ impl Tool for AgentTool {
         let background = input
             .arguments
             .get("run_in_background")
-            .and_then(|v| v.as_bool())
+            .and_then(serde_json::Value::as_bool)
             .unwrap_or(false);
         let subagent_type = input
             .arguments
@@ -203,12 +203,12 @@ impl Tool for AgentTool {
         let writable = input
             .arguments
             .get("writable")
-            .and_then(|v| v.as_bool())
+            .and_then(serde_json::Value::as_bool)
             .unwrap_or(true)
             && !input
                 .arguments
                 .get("read_only")
-                .and_then(|v| v.as_bool())
+                .and_then(serde_json::Value::as_bool)
                 .unwrap_or(false);
         let retry_policy = parse_retry_policy(&input.arguments)?;
 
@@ -314,6 +314,7 @@ impl Tool for AgentTool {
                     .map_err(|e| ToolError::InvalidInput {
                         message: format!("agent execution failed: {e}"),
                     })?;
+            drop(mgr);
 
             return Ok(ToolOutput {
                 output: serde_json::json!({

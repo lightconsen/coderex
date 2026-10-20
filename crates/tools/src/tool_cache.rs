@@ -105,12 +105,13 @@ impl ToolCache {
         }
 
         let (file_path, file_mtime) = if tool_name == "Read" {
-            if let Some(path) = arguments.get("file_path").and_then(Value::as_str) {
-                let mtime = std::fs::metadata(path).and_then(|m| m.modified()).ok();
-                (Some(path.to_string()), mtime)
-            } else {
-                (None, None)
-            }
+            arguments
+                .get("file_path")
+                .and_then(Value::as_str)
+                .map_or((None, None), |path| {
+                    let mtime = std::fs::metadata(path).and_then(|m| m.modified()).ok();
+                    (Some(path.to_string()), mtime)
+                })
         } else {
             (None, None)
         };

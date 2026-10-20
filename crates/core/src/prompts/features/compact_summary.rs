@@ -56,9 +56,8 @@ pub async fn generate_compact_summary(
         }
     }
 
-    Err(last_err.unwrap_or(OrchestratorError::Config(
-        "no summarization profile available".into(),
-    )))
+    Err(last_err
+        .unwrap_or_else(|| OrchestratorError::Config("no summarization profile available".into())))
 }
 
 /// Generates a compact summary from a list of messages.

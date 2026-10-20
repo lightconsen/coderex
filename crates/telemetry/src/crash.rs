@@ -41,22 +41,22 @@ use crate::store::CrashRecord;
 /// A summary carrying this prefix contains only panic metadata (type, thread,
 /// location), the panic template and message length/hash — never the free-form
 /// panic payload or backtrace.
-pub(crate) const CRASH_SUMMARY_PREFIX: &str = "[strict-crash-summary]";
+pub const CRASH_SUMMARY_PREFIX: &str = "[strict-crash-summary]";
 
 /// Payload value written under `redaction_status` when only structured panic
 /// metadata is sent.
-pub(crate) const CRASH_STRUCTURED_MARKER: &str = "structured";
+pub const CRASH_STRUCTURED_MARKER: &str = "structured";
 
 /// Payload value written under `redaction_status` when the payload carries a
 /// symbol-only backtrace (`backtrace_frames`) and no free-form text.
-pub(crate) const CRASH_SYMBOLIZED_MARKER: &str = "symbolized";
+pub const CRASH_SYMBOLIZED_MARKER: &str = "symbolized";
 
 /// Payload value written under `redaction_status` when free-form panic text is
 /// sent after pattern scrubbing.
 ///
 /// This deliberately does *not* claim the payload is clean: the scrubber
 /// removes shapes, not meaning.
-pub(crate) const CRASH_PATTERN_MARKER: &str = "pattern";
+pub const CRASH_PATTERN_MARKER: &str = "pattern";
 
 /// Environment variable that opts a crash report into free-form diagnostics.
 ///
@@ -173,7 +173,7 @@ pub enum PanicTemplate {
 impl PanicTemplate {
     /// Stable wire/database identifier.
     #[must_use]
-    pub fn as_str(self) -> &'static str {
+    pub const fn as_str(self) -> &'static str {
         match self {
             Self::UnwrapErr => "unwrap_err",
             Self::UnwrapNone => "unwrap_none",
@@ -214,7 +214,7 @@ impl PanicTemplate {
 
     /// Whether the template carries safe parsed fields.
     #[must_use]
-    pub fn is_known(self) -> bool {
+    pub const fn is_known(self) -> bool {
         !matches!(self, Self::Unknown)
     }
 }
@@ -225,7 +225,7 @@ impl PanicTemplate {
 /// shapes (`panic_index`, `panic_container_len`, `panic_range_start`,
 /// `panic_range_end`, `panic_slice_len`, `panic_operation`,
 /// `panic_error_type`). No free-form text is stored.
-#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct PanicClassification {
     /// The recognised template, or [`PanicTemplate::Unknown`].
     pub template: PanicTemplate,
@@ -245,7 +245,7 @@ impl PanicClassification {
     /// The length is zero and the hash is empty: no message existed, so there
     /// is nothing to fingerprint.
     #[must_use]
-    pub(crate) fn empty() -> Self {
+    pub(crate) const fn empty() -> Self {
         Self {
             template: PanicTemplate::Unknown,
             fields: BTreeMap::new(),
@@ -256,7 +256,7 @@ impl PanicClassification {
 }
 
 /// Lowercase hex SHA-256 of `bytes`.
-pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
+pub fn sha256_hex(bytes: &[u8]) -> String {
     use std::fmt::Write as _;
     let digest = Sha256::digest(bytes);
     let mut out = String::with_capacity(digest.len() * 2);
@@ -661,7 +661,7 @@ fn panic_location_from_text(text: &str) -> Option<String> {
 /// are retained. The panic payload (which may contain conversation text) and
 /// the backtrace (which may contain paths and source lines) are replaced by the
 /// literal `omitted`.
-pub(crate) fn structured_summary(report: &CrashReport) -> String {
+pub fn structured_summary(report: &CrashReport) -> String {
     let location = report
         .panic_location
         .as_deref()
@@ -671,21 +671,18 @@ pub(crate) fn structured_summary(report: &CrashReport) -> String {
                 .map(|location| structured_field(&location, 200))
         })
         .unwrap_or_else(|| "unknown".to_string());
-    let thread = report
-        .thread_name
-        .as_deref()
-        .map(|value| structured_field(value, 100))
-        .unwrap_or_else(|| "unknown".to_string());
-    let panic_type = report
-        .panic_type
-        .as_deref()
-        .map(|value| structured_field(value, 50))
-        .unwrap_or_else(|| "unknown".to_string());
-    let template = report
-        .panic_template
-        .as_deref()
-        .map(|value| structured_field(value, 50))
-        .unwrap_or_else(|| "unknown".to_string());
+    let thread = report.thread_name.as_deref().map_or_else(
+        || "unknown".to_string(),
+        |value| structured_field(value, 100),
+    );
+    let panic_type = report.panic_type.as_deref().map_or_else(
+        || "unknown".to_string(),
+        |value| structured_field(value, 50),
+    );
+    let template = report.panic_template.as_deref().map_or_else(
+        || "unknown".to_string(),
+        |value| structured_field(value, 50),
+    );
     let message_len = report.panic_message_len.unwrap_or(0);
 
     // The message hash lives in its own column. Keeping it out of the summary
@@ -698,7 +695,7 @@ pub(crate) fn structured_summary(report: &CrashReport) -> String {
 
 /// Structured panic metadata extracted from a stored crash row.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct CrashMetadata {
+pub struct CrashMetadata {
     /// Panic payload type (`&str`, `String`, or `unknown`).
     pub panic_type: String,
     /// Name of the panicking thread, or `unknown`.
@@ -725,28 +722,29 @@ impl CrashMetadata {
 /// legacy row ingested before structured capture was the default holds
 /// free-form text, for which only the panic location can be recovered; the
 /// free-form text itself is never returned.
-pub(crate) fn crash_metadata_from_stored(stored: &str) -> CrashMetadata {
+pub fn crash_metadata_from_stored(stored: &str) -> CrashMetadata {
+    static RE: OnceLock<regex::Regex> = OnceLock::new();
+
     if !stored.starts_with(CRASH_SUMMARY_PREFIX) {
         return CrashMetadata::legacy_from_text(stored);
     }
 
-    static RE: OnceLock<regex::Regex> = OnceLock::new();
     let re = RE.get_or_init(|| {
         regex::Regex::new(r"type=([^;]*); thread=([^;]*); location=([^;]*)")
             .expect("structured crash summary regex is valid")
     });
-    match re.captures(stored) {
-        Some(caps) => CrashMetadata {
+    re.captures(stored).map_or_else(
+        || CrashMetadata::legacy_from_text(stored),
+        |caps| CrashMetadata {
             panic_type: structured_field(caps.get(1).map_or("", |m| m.as_str()), 50),
             thread_name: structured_field(caps.get(2).map_or("", |m| m.as_str()), 100),
             panic_location: structured_field(caps.get(3).map_or("", |m| m.as_str()), 200),
         },
-        None => CrashMetadata::legacy_from_text(stored),
-    }
+    )
 }
 
 /// Whether a stored crash row already holds a structured summary.
-pub(crate) fn is_structured(stored: &str) -> bool {
+pub fn is_structured(stored: &str) -> bool {
     stored.starts_with(CRASH_SUMMARY_PREFIX)
 }
 
@@ -756,44 +754,55 @@ pub(crate) fn is_structured(stored: &str) -> bool {
 /// New rows carry the classification in dedicated columns. A legacy row (no
 /// template column) is classified from its raw text on the fly; the text is
 /// never returned and never uploaded by the default path.
-pub(crate) fn stored_crash_view(
+pub fn stored_crash_view(
     crash: &crate::PendingCrash,
 ) -> (PanicClassification, Option<BacktraceSymbols>) {
-    let classification = if let Some(template) = crash.panic_template.as_deref() {
-        let fields = crash
-            .panic_fields
-            .as_deref()
-            .and_then(|json| serde_json::from_str::<BTreeMap<String, serde_json::Value>>(json).ok())
-            .map(sanitize_fields)
-            .unwrap_or_default();
-        PanicClassification {
-            template: PanicTemplate::from_identifier(template),
-            fields,
-            message_len: crash.panic_message_len.unwrap_or(0).max(0) as usize,
-            message_sha256: safe_sha256(crash.panic_message_sha256.as_deref()),
-        }
-    } else if is_structured(&crash.panic_info) {
-        // An old structured row has no message to classify or fingerprint.
-        PanicClassification::empty()
-    } else {
-        classify_panic_message(panic_message_text(&crash.panic_info))
-    };
+    let classification = crash.panic_template.as_deref().map_or_else(
+        || {
+            if is_structured(&crash.panic_info) {
+                // An old structured row has no message to classify or fingerprint.
+                PanicClassification::empty()
+            } else {
+                classify_panic_message(panic_message_text(&crash.panic_info))
+            }
+        },
+        |template| {
+            let fields = crash
+                .panic_fields
+                .as_deref()
+                .and_then(|json| {
+                    serde_json::from_str::<BTreeMap<String, serde_json::Value>>(json).ok()
+                })
+                .map(sanitize_fields)
+                .unwrap_or_default();
+            PanicClassification {
+                template: PanicTemplate::from_identifier(template),
+                fields,
+                message_len: usize::try_from(crash.panic_message_len.unwrap_or(0).max(0))
+                    .unwrap_or(usize::MAX),
+                message_sha256: safe_sha256(crash.panic_message_sha256.as_deref()),
+            }
+        },
+    );
 
-    let symbols = if let Some(json) = crash.backtrace_symbols.as_deref() {
-        let frames = serde_json::from_str::<Vec<String>>(json).unwrap_or_default();
-        rebuild_symbols(
-            &frames,
+    let symbols = crash.backtrace_symbols.as_deref().map_or_else(
+        || {
             crash
-                .backtrace_frame_count
-                .map(|count| count.max(0) as usize),
-        )
-    } else {
-        crash
-            .backtrace
-            .as_deref()
-            .map(symbolize_backtrace)
-            .filter(|symbols| !symbols.frames.is_empty())
-    };
+                .backtrace
+                .as_deref()
+                .map(symbolize_backtrace)
+                .filter(|symbols| !symbols.frames.is_empty())
+        },
+        |json| {
+            let frames = serde_json::from_str::<Vec<String>>(json).unwrap_or_default();
+            rebuild_symbols(
+                &frames,
+                crash
+                    .backtrace_frame_count
+                    .and_then(|count| usize::try_from(count.max(0)).ok()),
+            )
+        },
+    );
 
     (classification, symbols)
 }
@@ -908,7 +917,8 @@ impl CrashReporter {
     }
 
     /// Set the maximum allowed size of the pending crash directory.
-    pub fn with_max_pending_bytes(mut self, bytes: u64) -> Self {
+    #[must_use]
+    pub const fn with_max_pending_bytes(mut self, bytes: u64) -> Self {
         self.max_pending_bytes = bytes;
         self
     }
@@ -918,7 +928,8 @@ impl CrashReporter {
     /// Production callers use [`Self::new`], which resolves `CODEREX_HIPAA`.
     /// Tests use this so they do not have to mutate process-wide environment
     /// variables.
-    pub fn with_strict(mut self, strict: bool) -> Self {
+    #[must_use]
+    pub const fn with_strict(mut self, strict: bool) -> Self {
         self.strict = strict;
         self
     }
@@ -928,7 +939,8 @@ impl CrashReporter {
     /// Production callers use [`Self::new`], which resolves
     /// `CODEREX_CRASH_VERBOSE`. Tests use this so they do not have to mutate
     /// process-wide environment variables. Strict mode still wins.
-    pub fn with_verbose(mut self, verbose: bool) -> Self {
+    #[must_use]
+    pub const fn with_verbose(mut self, verbose: bool) -> Self {
         self.verbose = verbose;
         self
     }
@@ -937,7 +949,7 @@ impl CrashReporter {
     ///
     /// The check happens where the panic payload exists (the hook) and again at
     /// ingestion, rather than only at upload.
-    fn include_free_form(&self) -> bool {
+    const fn include_free_form(&self) -> bool {
         self.verbose && !self.strict
     }
 
@@ -983,8 +995,7 @@ impl CrashReporter {
             let message = panic_payload_message(info);
             let classification = message
                 .as_deref()
-                .map(classify_panic_message)
-                .unwrap_or_else(PanicClassification::empty);
+                .map_or_else(PanicClassification::empty, classify_panic_message);
 
             let mut report = CrashReport {
                 panic_info: String::new(),
@@ -1061,9 +1072,9 @@ impl CrashReporter {
 
         let scrubber = crate::Scrubber::new();
         let mut count = 0;
-        let entries = match std::fs::read_dir(&self.pending_dir) {
-            Ok(entries) => entries,
-            Err(_) => return Ok(0), // Directory may not exist yet
+        // The directory may not exist yet.
+        let Ok(entries) = std::fs::read_dir(&self.pending_dir) else {
+            return Ok(0);
         };
 
         for entry in entries.flatten() {
@@ -1072,17 +1083,14 @@ impl CrashReporter {
                 continue;
             }
 
-            match std::fs::read_to_string(&path) {
-                Ok(content) => {
-                    if let Ok(report) = serde_json::from_str::<CrashReport>(&content) {
-                        let record = self.crash_record(&report, &scrubber);
-                        if store.insert_crash_record(&record).is_ok() {
-                            let _ = std::fs::remove_file(&path);
-                            count += 1;
-                        }
+            if let Ok(content) = std::fs::read_to_string(&path) {
+                if let Ok(report) = serde_json::from_str::<CrashReport>(&content) {
+                    let record = self.crash_record(&report, &scrubber);
+                    if store.insert_crash_record(&record).is_ok() {
+                        let _ = std::fs::remove_file(&path);
+                        count += 1;
                     }
                 }
-                Err(_) => continue,
             }
         }
 
@@ -1163,13 +1171,17 @@ impl CrashReporter {
             backtrace,
             panic_template: Some(classification.template.as_str().to_string()),
             panic_fields: serde_json::to_string(&classification.fields).ok(),
-            panic_message_len: Some(classification.message_len as i64),
+            panic_message_len: Some(i64::try_from(classification.message_len).unwrap_or(i64::MAX)),
             panic_message_sha256: Some(classification.message_sha256),
             backtrace_symbols: symbols
                 .as_ref()
                 .and_then(|symbols| serde_json::to_string(&symbols.frames).ok()),
-            backtrace_frame_count: symbols.as_ref().map(|symbols| symbols.frame_count as i64),
-            backtrace_symbols_len: symbols.as_ref().map(|symbols| symbols.symbols_len as i64),
+            backtrace_frame_count: symbols
+                .as_ref()
+                .map(|symbols| i64::try_from(symbols.frame_count).unwrap_or(i64::MAX)),
+            backtrace_symbols_len: symbols
+                .as_ref()
+                .map(|symbols| i64::try_from(symbols.symbols_len).unwrap_or(i64::MAX)),
             backtrace_symbols_sha256: symbols.map(|symbols| symbols.symbols_sha256),
         }
     }
@@ -1209,7 +1221,7 @@ impl CrashReporter {
         }
 
         // Sort by mtime ascending (oldest first).
-        files.sort_by(|a, b| a.2.cmp(&b.2));
+        files.sort_by_key(|a| a.2);
 
         let mut to_free = total_size - self.max_pending_bytes;
         for (path, size, _) in files {

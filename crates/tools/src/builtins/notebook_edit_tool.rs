@@ -121,8 +121,7 @@ impl Tool for NotebookEditTool {
                             .iter()
                             .position(|c| c.id.as_deref() == Some(cid))
                     })
-                    .map(|i| i + 1)
-                    .unwrap_or(notebook.cells.len());
+                    .map_or(notebook.cells.len(), |i| i + 1);
                 notebook.cells.insert(idx, new_cell);
             }
             "delete" => {

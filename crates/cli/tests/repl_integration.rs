@@ -396,7 +396,7 @@ fn parse_input_empty_returns_none() {
 fn parse_input_slash_command_no_args() {
     let result = parse_input("/clear").unwrap();
     assert_eq!(result.0, "clear");
-    assert!(result.1.is_empty());
+    assert_eq!(result.1, [] as [std::string::String; 0]);
 }
 
 #[test]
@@ -457,7 +457,7 @@ fn run_headless_records_command_history() {
     // Run history command to verify it was recorded
     let result = rt.block_on(repl.run_headless("/history 3")).unwrap();
     assert!(
-        result.contains("3") || result.contains("commands"),
+        result.contains('3') || result.contains("commands"),
         "expected history output, got: {result}"
     );
 }

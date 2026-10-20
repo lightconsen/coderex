@@ -250,6 +250,11 @@ fn high_entropy_regex() -> &'static Regex {
 }
 
 /// Shannon entropy per character over the token's bytes.
+///
+/// The counts are token lengths (at most a few kilobytes), so the `usize` to
+/// `f64` conversion is exact in practice; the lint guards a range this code
+/// never reaches.
+#[allow(clippy::cast_precision_loss)]
 fn shannon_entropy(token: &str) -> f64 {
     let mut counts = [0usize; 256];
     let mut total = 0usize;

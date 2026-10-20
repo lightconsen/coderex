@@ -116,7 +116,7 @@ pub fn stdio_sandbox_config(
 /// On Windows that means a system root or a `PATH` directory: `acl_plan`
 /// grants both best-effort. Those directories are frequently owned by the
 /// system (TrustedInstaller), so a required grant would fail.
-fn platform_covers(path: &Path) -> bool {
+const fn platform_covers(path: &Path) -> bool {
     #[cfg(target_os = "windows")]
     {
         let roots = [

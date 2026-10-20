@@ -216,10 +216,10 @@ impl PermissionEngine {
     ///
     /// Falls back to the checker's static table when no resolver is installed.
     fn exemptions_for(&self, tool_name: &str, arguments: &serde_json::Value) -> ToolRuleExemptions {
-        match self.rule_exemptions.as_ref() {
-            Some(resolve) => resolve(tool_name, arguments),
-            None => self.checker.lock().unwrap().tool_exemptions(tool_name),
-        }
+        self.rule_exemptions.as_ref().map_or_else(
+            || self.checker.lock().unwrap().tool_exemptions(tool_name),
+            |resolve| resolve(tool_name, arguments),
+        )
     }
 
     /// Set the confirmation bus for async permission requests.
@@ -379,7 +379,7 @@ impl PermissionEngine {
                             PermissionResult::Allow
                         }
                         Some(ConfirmationResponse::Denied) => PermissionResult::Deny {
-                            reason: format!("tool '{}' denied by user", tool_name),
+                            reason: format!("tool '{tool_name}' denied by user"),
                         },
                         // A closed channel is not a decision. The elevation
                         // path already tells these apart (`abandon_pending_elevation`);

@@ -24,7 +24,7 @@ fn syntax_highlighter() -> &'static coderex_core::syntax::SyntaxHighlighter {
 }
 
 /// ASCII T-Rex welcome art (larger variant).
-const T_REX: &str = r#"
+const T_REX: &str = r"
                               .-.
                     ,        ( {o\
                     {\    /   ~o   }
@@ -48,7 +48,7 @@ const T_REX: &str = r#"
                    \____________/
                     \__________/
                      \________/
-"#;
+";
 
 /// The main terminal UI.
 #[allow(missing_debug_implementations)]
@@ -177,12 +177,12 @@ fn frame_constraints(
     show_perm_bar: bool,
 ) -> Vec<Constraint> {
     vec![
-        Constraint::Min(1),                                      // message area
-        Constraint::Length(inline_palette_height),               // inline command hint
-        Constraint::Length(if show_notif { 1 } else { 0 }),      // notification bar
-        Constraint::Length(if show_statusline { 1 } else { 0 }), // statusline (thinking)
-        Constraint::Length(1),                                   // input line
-        Constraint::Length(if show_perm_bar { 1 } else { 0 }),   // permission bar
+        Constraint::Min(1),                             // message area
+        Constraint::Length(inline_palette_height),      // inline command hint
+        Constraint::Length(u16::from(show_notif)),      // notification bar
+        Constraint::Length(u16::from(show_statusline)), // statusline (thinking)
+        Constraint::Length(1),                          // input line
+        Constraint::Length(u16::from(show_perm_bar)),   // permission bar
     ]
 }
 
@@ -227,7 +227,7 @@ fn render_frame(frame: &mut Frame, state: &mut UiState) {
     // Message area (index 0) — may be split horizontally
     let msg_area = chunks[0];
     if let crate::state::LayoutMode::HorizontalSplit { left_percent } = state.layout_mode {
-        let pct = left_percent.clamp(10, 90) as u16;
+        let pct = left_percent.clamp(10, 90);
         let split_chunks = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([
@@ -300,7 +300,7 @@ fn inline_palette_height(state: &UiState) -> u16 {
         } if query.starts_with('/') => {
             // Header line + up to 5 visible commands, capped at remaining terminal space
             let count = commands.len().min(5);
-            ((count + 1) as u16).min(6)
+            u16::try_from(count + 1).map_or(6, |height| height.min(6))
         }
         _ => 0,
     }
@@ -309,8 +309,7 @@ fn inline_palette_height(state: &UiState) -> u16 {
 /// Check whether the active overlay is an inline `/` palette.
 fn is_inline_palette(state: &UiState) -> bool {
     use crate::overlay::Overlay;
-    state.overlays.top().map_or(
-        false,
+    state.overlays.top().is_some_and(
         |o| matches!(o, Overlay::CommandPalette { query, .. } if query.starts_with('/')),
     )
 }
@@ -326,7 +325,7 @@ fn wrap_text(text: &str, width: usize) -> Vec<String> {
         let mut current_width: usize = 0;
         for word in paragraph.split_whitespace() {
             let word_width = unicode_width::UnicodeWidthStr::width(word);
-            let space = if current.is_empty() { 0 } else { 1 };
+            let space = usize::from(!current.is_empty());
             if current_width + space + word_width > width {
                 result.push(std::mem::take(&mut current));
                 current_width = 0;
@@ -383,7 +382,7 @@ fn wrapped_line_count(text: &str, width: usize) -> usize {
         let mut current_empty = true;
         for word in paragraph.split_whitespace() {
             let word_width = unicode_width::UnicodeWidthStr::width(word);
-            let space = if current_empty { 0 } else { 1 };
+            let space = usize::from(!current_empty);
             if current_width + space + word_width > width {
                 lines += 1;
                 current_width = 0;
@@ -403,7 +402,7 @@ fn wrapped_line_count(text: &str, width: usize) -> usize {
     lines.max(1)
 }
 
-fn message_prefix(role: crate::message_list::MessageRole) -> &'static str {
+const fn message_prefix(role: crate::message_list::MessageRole) -> &'static str {
     match role {
         crate::message_list::MessageRole::User => "● ",
         crate::message_list::MessageRole::Assistant => "◆ ",
@@ -663,10 +662,10 @@ fn message_render_signature(messages: &[Message], theme: &Theme) -> u64 {
         signature = signature
             .wrapping_mul(16_777_619)
             .wrapping_add(idx as u64)
-            .wrapping_add((msg.role as u8) as u64)
+            .wrapping_add(u64::from(msg.role as u8))
             .wrapping_add((msg.content.len() as u64) << 8)
-            .wrapping_add((msg.streaming as u64) << 48)
-            .wrapping_add((msg.folded as u64) << 49);
+            .wrapping_add(u64::from(msg.streaming) << 48)
+            .wrapping_add(u64::from(msg.folded) << 49);
         if let Some(tool) = &msg.tool_name {
             signature = signature
                 .wrapping_mul(16_777_619)
@@ -714,8 +713,7 @@ fn append_message_lines(
         MessageRole::Assistant => Style::default()
             .fg(theme.assistant)
             .add_modifier(Modifier::BOLD),
-        MessageRole::ToolResult => Style::default().fg(theme.tool),
-        MessageRole::ToolCall => Style::default().fg(theme.tool),
+        MessageRole::ToolResult | MessageRole::ToolCall => Style::default().fg(theme.tool),
         MessageRole::System => Style::default().fg(theme.dim),
     };
     let body_style = Style::default().fg(theme.foreground);
@@ -751,7 +749,7 @@ fn append_message_lines(
             let span_text = span.content.to_string();
             for word in span_text.split_whitespace() {
                 let word_width = unicode_width::UnicodeWidthStr::width(word);
-                let space = if line_spans.is_empty() { 0 } else { 1 };
+                let space = usize::from(!line_spans.is_empty());
                 if line_width + space + word_width > width && !line_spans.is_empty() {
                     // Flush current line
                     let mut final_spans = if is_first_line {
@@ -1028,7 +1026,10 @@ fn render_input(
     let paragraph = Paragraph::new(line);
     frame.render_widget(paragraph, area);
     // Position cursor
-    frame.set_cursor_position((area.x + 2 + cursor as u16, area.y));
+    frame.set_cursor_position((
+        area.x + 2 + u16::try_from(cursor).unwrap_or(u16::MAX),
+        area.y,
+    ));
 }
 
 /// Render the inline command palette just above the statusline / input line.
@@ -1071,7 +1072,7 @@ fn render_inline_palette(frame: &mut Frame, area: ratatui::layout::Rect, state: 
         .saturating_sub(visible_count - 1)
         .min(commands.len().saturating_sub(visible_count));
 
-    for i in start..(start + visible_count).min(commands.len()) {
+    for (i, command) in commands.iter().enumerate().skip(start).take(visible_count) {
         let style = if i == *selected {
             Style::default()
                 .fg(state.theme.selection_fg)
@@ -1079,7 +1080,7 @@ fn render_inline_palette(frame: &mut Frame, area: ratatui::layout::Rect, state: 
         } else {
             Style::default().fg(state.theme.foreground)
         };
-        lines.push(Line::from(Span::styled(commands[i].clone(), style)));
+        lines.push(Line::from(Span::styled(command.clone(), style)));
     }
 
     let paragraph = Paragraph::new(lines).block(

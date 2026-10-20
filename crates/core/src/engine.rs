@@ -271,7 +271,7 @@ impl StreamingToolCallAssembler {
                             );
                             self.malformed_count += 1;
                             self.malformed_ids.push(id.clone());
-                            serde_json::Value::Object(Default::default())
+                            serde_json::Value::Object(serde_json::Map::default())
                         }
                     }
                 } else {
@@ -299,7 +299,7 @@ impl StreamingToolCallAssembler {
                             let call = ToolCall {
                                 id: id.clone(),
                                 name,
-                                input: serde_json::Value::Object(Default::default()),
+                                input: serde_json::Value::Object(serde_json::Map::default()),
                             };
                             self.completed.push(call.clone());
                             calls.push(call);
@@ -462,9 +462,8 @@ impl TurnState {
                 matches!(next, Self::StartRequest | Self::StopHooks | Self::Finalize)
             }
             Self::StopHooks => matches!(next, Self::Finalize),
-            Self::Finalize => matches!(next, Self::Terminated),
             // Terminating an ended turn is a no-op, not a mistake.
-            Self::Terminated => matches!(next, Self::Terminated),
+            Self::Finalize | Self::Terminated => matches!(next, Self::Terminated),
         }
     }
 
@@ -1170,7 +1169,7 @@ enum LoopStep {
 /// every other reason resets it to zero. A counter that only ever increments
 /// would eventually stop resuming after a handful of unrelated turns, even
 /// though the cap is meant to bound one run of provider pauses.
-fn track_provider_resumes(reason: &TerminalReason, resumes: &mut u32) {
+const fn track_provider_resumes(reason: &TerminalReason, resumes: &mut u32) {
     if matches!(reason, TerminalReason::Resume) {
         *resumes += 1;
     } else {
@@ -1519,7 +1518,7 @@ impl QueryEngine {
 
     /// The model used for provider requests.
     #[must_use]
-    pub fn model(&self) -> &ModelId {
+    pub const fn model(&self) -> &ModelId {
         &self.model
     }
 
@@ -1533,7 +1532,7 @@ impl QueryEngine {
 
     /// The configured fallback model, if any.
     #[must_use]
-    pub fn fallback_model(&self) -> Option<&ModelId> {
+    pub const fn fallback_model(&self) -> Option<&ModelId> {
         self.fallback_model.as_ref()
     }
 
@@ -1584,13 +1583,13 @@ impl QueryEngine {
     }
 
     /// Set the maximum output tokens requested from the provider.
-    pub fn set_max_tokens(&mut self, max_tokens: u32) {
+    pub const fn set_max_tokens(&mut self, max_tokens: u32) {
         self.max_tokens = max_tokens;
     }
 
     /// The maximum output tokens requested from the provider.
     #[must_use]
-    pub fn max_tokens(&self) -> u32 {
+    pub const fn max_tokens(&self) -> u32 {
         self.max_tokens
     }
 
@@ -1661,7 +1660,7 @@ impl QueryEngine {
     }
 
     /// Replace the compaction configuration (thresholds, reserves, retries).
-    pub fn set_compact_config(&mut self, config: CompactConfig) {
+    pub const fn set_compact_config(&mut self, config: CompactConfig) {
         self.compact_config = config;
     }
 
@@ -1677,14 +1676,16 @@ impl QueryEngine {
 
     /// Compaction thresholds for this engine's model and override chain.
     fn compact_thresholds(&self) -> compact::CompactThresholds {
-        match &self.context_window_resolver {
-            Some(resolver) => compact::CompactThresholds::resolve_with(
-                &self.model,
-                &self.compact_config,
-                resolver,
-            ),
-            None => compact::CompactThresholds::resolve(&self.model, &self.compact_config),
-        }
+        self.context_window_resolver.as_ref().map_or_else(
+            || compact::CompactThresholds::resolve(&self.model, &self.compact_config),
+            |resolver| {
+                compact::CompactThresholds::resolve_with(
+                    &self.model,
+                    &self.compact_config,
+                    resolver,
+                )
+            },
+        )
     }
 
     /// Refresh the session-memory document at compaction time and return the
@@ -1696,13 +1697,12 @@ impl QueryEngine {
     /// returned unchanged — compaction always succeeds, and stale memory is
     /// never injected as if current.
     async fn refresh_session_memory(&self, summary_text: &str, summary_input: &[String]) -> String {
-        let backend = match self
+        let Some(backend) = self
             .session_memory
             .as_ref()
             .filter(|_| self.compact_config.session_memory_enabled)
-        {
-            Some(b) => b,
-            None => return summary_text.to_string(),
+        else {
+            return summary_text.to_string();
         };
 
         let excerpt = summary_input.join("\n\n");
@@ -1733,7 +1733,7 @@ impl QueryEngine {
     }
 
     /// Micro-compact parameters derived from `CompactConfig`.
-    fn micro_params(&self) -> compact::MicroCompactParams {
+    const fn micro_params(&self) -> compact::MicroCompactParams {
         compact::MicroCompactParams {
             keep_recent: 5,
             min_result_tokens: self.compact_config.micro_min_result_tokens,
@@ -1758,7 +1758,7 @@ impl QueryEngine {
 
     /// Get a reference to the current session state.
     #[must_use]
-    pub fn session(&self) -> &SessionState {
+    pub const fn session(&self) -> &SessionState {
         &self.session
     }
 
@@ -1779,7 +1779,7 @@ impl QueryEngine {
     /// refuses a whole-tool allow rule for a publish and honours it for a read
     /// — and the engine is where the call's arguments are, so the resolver has
     /// to be installed here rather than copied into the checker's table.
-    pub fn permission_engine_mut(&mut self) -> &mut PermissionEngine {
+    pub const fn permission_engine_mut(&mut self) -> &mut PermissionEngine {
         &mut self.permission_engine
     }
 
@@ -1813,10 +1813,7 @@ impl QueryEngine {
             let _ = self.event_tx.send(EngineEvent::PermissionRequest {
                 id: req.id,
                 tool: req.tool_name,
-                args: req
-                    .arguments
-                    .parse()
-                    .unwrap_or_else(|_| serde_json::Value::Null),
+                args: req.arguments.parse().unwrap_or(serde_json::Value::Null),
             });
         }
     }
@@ -1825,9 +1822,7 @@ impl QueryEngine {
     ///
     /// Returns `Some(TerminalReason::LoopDetected)` if a loop is detected.
     fn record_and_check_loop(&mut self, tool_calls: &[PendingToolCall]) -> Option<TerminalReason> {
-        let Some(ref mut detector) = self.loop_detector else {
-            return None;
-        };
+        let detector = self.loop_detector.as_mut()?;
 
         let calls: Vec<ToolCall> = tool_calls
             .iter()
@@ -1876,7 +1871,7 @@ impl QueryEngine {
     /// Transitions the turn to `AwaitElicitation`, sends the elicitation via
     /// the handler, and stores the response.
     async fn handle_elicitation(
-        &mut self,
+        &self,
         turn: &mut TurnRuntime,
         request_id: String,
         message: String,
@@ -2081,8 +2076,7 @@ impl QueryEngine {
                         .session
                         .messages
                         .last()
-                        .map(|m| matches!(m.role, crate::types::Role::Tool))
-                        .unwrap_or(false);
+                        .is_some_and(|m| matches!(m.role, crate::types::Role::Tool));
                     let step = next_loop_step(&reason, last_is_tool_result, provider_resumes);
                     // Update only after deciding the step: the cap is checked
                     // against the number of resumes that have already run.
@@ -2201,8 +2195,7 @@ impl QueryEngine {
                         .session
                         .messages
                         .last()
-                        .map(|m| matches!(m.role, crate::types::Role::Tool))
-                        .unwrap_or(false);
+                        .is_some_and(|m| matches!(m.role, crate::types::Role::Tool));
                     let step = next_loop_step(&reason, last_is_tool_result, provider_resumes);
                     // Update only after deciding the step: the cap is checked
                     // against the number of resumes that have already run.
@@ -3138,21 +3131,25 @@ impl QueryEngine {
         let stop_reason = turn.last_stop_reason.as_deref().unwrap_or("end_turn");
         let strategy = match trigger {
             CompactTrigger::CacheTtl => CompactStrategy::Micro,
-            CompactTrigger::TokenThreshold => match &self.context_window_resolver {
-                Some(resolver) => compact::select_compact_strategy_with(
-                    stop_reason,
-                    estimated_tokens,
-                    &self.model,
-                    &self.compact_config,
-                    resolver,
-                ),
-                None => compact::select_compact_strategy(
-                    stop_reason,
-                    estimated_tokens,
-                    &self.model,
-                    &self.compact_config,
-                ),
-            },
+            CompactTrigger::TokenThreshold => self.context_window_resolver.as_ref().map_or_else(
+                || {
+                    compact::select_compact_strategy(
+                        stop_reason,
+                        estimated_tokens,
+                        &self.model,
+                        &self.compact_config,
+                    )
+                },
+                |resolver| {
+                    compact::select_compact_strategy_with(
+                        stop_reason,
+                        estimated_tokens,
+                        &self.model,
+                        &self.compact_config,
+                        resolver,
+                    )
+                },
+            ),
         };
 
         // Execute Stop hook with dead loop protection
@@ -3446,8 +3443,7 @@ impl QueryEngine {
         }
         let stamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0);
+            .map_or(0, |d| d.as_nanos());
         let name = path
             .file_name()
             .and_then(|n| n.to_str())
@@ -3492,7 +3488,7 @@ impl QueryEngine {
     /// Returns `Some(reason)` only when the context is still blocked after a
     /// compaction attempt; at the compact line the turn continues.
     async fn maybe_compact_on_threshold(
-        &mut self,
+        &self,
         turn: &mut TurnRuntime,
         options: &SubmitOptions,
         turn_number: u32,
@@ -3603,8 +3599,7 @@ impl QueryEngine {
         let temp_path = path.with_extension("jsonl.tmp");
         let mut file = std::fs::File::create(&temp_path)?;
         for msg in messages {
-            let line = serde_json::to_string(msg)
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+            let line = serde_json::to_string(msg).map_err(std::io::Error::other)?;
             writeln!(file, "{line}")?;
         }
         std::fs::rename(&temp_path, path)
@@ -3615,8 +3610,7 @@ impl QueryEngine {
         use std::io::Write;
 
         let boundary = compact::compact_boundary_message();
-        let line = serde_json::to_string(&boundary)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        let line = serde_json::to_string(&boundary).map_err(std::io::Error::other)?;
 
         let mut file = std::fs::OpenOptions::new()
             .create(true)
@@ -3778,21 +3772,21 @@ impl QueryEngine {
                             let _ = self.event_tx.send(EngineEvent::TextDelta(new_text));
                         }
                     }
-                    StreamEvent::ToolCallBlockStart { .. } => {}
-                    StreamEvent::ToolCallBlockEnd { .. } => {
-                        // Completion handled below via assembler.process_event
-                    }
+                    // Tool-call blocks are assembled elsewhere: the start is
+                    // ignored and completion is handled below via
+                    // assembler.process_event. Pending tool calls are
+                    // finalized after the loop.
+                    StreamEvent::ToolCallBlockStart { .. }
+                    | StreamEvent::ToolCallBlockEnd { .. }
+                    | StreamEvent::StreamEnd => {}
                     StreamEvent::ToolCallInputDelta { ref id, ref delta } => {
                         tracing::trace!("tool call input delta for {id}: {} bytes", delta.len());
                     }
                     StreamEvent::UsageSummary(ref u) => {
-                        usage = u.clone();
+                        usage = *u;
                     }
                     StreamEvent::StopReason(ref r) => {
                         stop_reason = Some(r.clone());
-                    }
-                    StreamEvent::StreamEnd => {
-                        // Finalize pending tool calls — handled after loop
                     }
                     StreamEvent::Error(ref e) => {
                         // A retry re-asks the model and re-runs what it

@@ -30,47 +30,40 @@ pub enum BridgeSessionState {
 impl BridgeSessionState {
     /// Check if a transition from `self` to `target` is valid.
     #[must_use]
-    pub fn can_transition_to(&self, target: &Self) -> bool {
+    pub const fn can_transition_to(&self, target: &Self) -> bool {
         matches!(
             (self, target),
             // Assigned → Preparing | Failed
-            (Self::Assigned, Self::Preparing)
-            | (Self::Assigned, Self::Failed(_))
-            // Preparing → CreatingWorktree | Spawning | Failed
-            | (Self::Preparing, Self::CreatingWorktree)
-            | (Self::Preparing, Self::Spawning)
-            | (Self::Preparing, Self::Failed(_))
-            // CreatingWorktree → Spawning | Failed
-            | (Self::CreatingWorktree, Self::Spawning)
-            | (Self::CreatingWorktree, Self::Failed(_))
-            // Spawning → Running | Failed
-            | (Self::Spawning, Self::Running)
-            | (Self::Spawning, Self::Failed(_))
-            // Running → AwaitingPermission | Archiving | Failed
-            | (Self::Running, Self::AwaitingPermission)
-            | (Self::Running, Self::Archiving)
-            | (Self::Running, Self::Failed(_))
-            // AwaitingPermission → Running | Failed
-            | (Self::AwaitingPermission, Self::Running)
-            | (Self::AwaitingPermission, Self::Failed(_))
-            // Archiving → CleaningUp | Failed
-            | (Self::Archiving, Self::CleaningUp)
-            | (Self::Archiving, Self::Failed(_))
-            // CleaningUp → Completed | Failed
-            | (Self::CleaningUp, Self::Completed)
-            | (Self::CleaningUp, Self::Failed(_))
+            (Self::Assigned, Self::Preparing | Self::Failed(_))
+                | (
+                    Self::Preparing,
+                    Self::CreatingWorktree | Self::Spawning | Self::Failed(_)
+                )
+                | (Self::CreatingWorktree, Self::Spawning | Self::Failed(_))
+                | (Self::Spawning | Self::AwaitingPermission, Self::Running)
+                | (
+                    Self::Spawning
+                        | Self::Running
+                        | Self::AwaitingPermission
+                        | Self::Archiving
+                        | Self::CleaningUp,
+                    Self::Failed(_)
+                )
+                | (Self::Running, Self::AwaitingPermission | Self::Archiving)
+                | (Self::Archiving, Self::CleaningUp)
+                | (Self::CleaningUp, Self::Completed)
         )
     }
 
     /// Check if this is a terminal state.
     #[must_use]
-    pub fn is_terminal(&self) -> bool {
+    pub const fn is_terminal(&self) -> bool {
         matches!(self, Self::Completed | Self::Failed(_))
     }
 
     /// Human-readable label.
     #[must_use]
-    pub fn label(&self) -> &str {
+    pub const fn label(&self) -> &str {
         match self {
             Self::Assigned => "assigned",
             Self::Preparing => "preparing",
@@ -144,7 +137,7 @@ impl BridgeSessionStateMachine {
 
     /// Check if the session is in a terminal state.
     #[must_use]
-    pub fn is_terminal(&self) -> bool {
+    pub const fn is_terminal(&self) -> bool {
         self.current.is_terminal()
     }
 

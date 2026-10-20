@@ -4,7 +4,7 @@
 //! verifying end-to-end behavior without hitting real LLM APIs.
 
 use coderex_core::api_client::StreamEvent;
-use coderex_core::engine::TerminalReason;
+use coderex_core::engine::{SubmitOptions, TerminalReason};
 use coderex_core::types::EngineEvent;
 use coderex_core::types::ToolCall;
 use coderex_core::types::UsageSummary;
@@ -137,7 +137,7 @@ async fn a_read_only_shell_command_runs_and_the_turn_takes_the_answer() {
 
     let reason = rig
         .engine
-        .submit_streaming("list files in this dir".into(), Default::default())
+        .submit_streaming("list files in this dir".into(), SubmitOptions::default())
         .await
         .unwrap();
 
@@ -201,7 +201,7 @@ async fn a_model_that_repeats_one_tool_call_is_stopped() {
 
     let reason = rig
         .engine
-        .submit_streaming("list files in this dir".into(), Default::default())
+        .submit_streaming("list files in this dir".into(), SubmitOptions::default())
         .await
         .unwrap();
 

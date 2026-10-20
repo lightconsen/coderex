@@ -30,7 +30,7 @@ fn strip_ansi(text: &str) -> String {
         if ch == '\u{1b}' {
             if matches!(chars.peek(), Some('[')) {
                 let _ = chars.next();
-                while let Some(next) = chars.next() {
+                for next in chars.by_ref() {
                     if ('@'..='~').contains(&next) {
                         break;
                     }
@@ -234,7 +234,7 @@ impl PtySession {
             let mut buf = [0_u8; 4096];
             loop {
                 match reader.read(&mut buf) {
-                    Ok(0) => break,
+                    Ok(0) | Err(_) => break,
                     Ok(n) => {
                         if let Ok(mut parser) = parser_bg.lock() {
                             parser.process(&buf[..n]);
@@ -243,7 +243,6 @@ impl PtySession {
                             raw.extend_from_slice(&buf[..n]);
                         }
                     }
-                    Err(_) => break,
                 }
             }
         });
@@ -328,7 +327,7 @@ impl PtySession {
         self.send_bytes(b"\x1b[C");
     }
 
-    fn resize(&mut self, rows: u16, cols: u16) {
+    fn resize(&self, rows: u16, cols: u16) {
         self.master
             .resize(PtySize {
                 rows,
@@ -356,14 +355,13 @@ impl PtySession {
             if squeeze_whitespace(&raw).contains(&needle) {
                 return raw;
             }
-            if Instant::now() >= deadline {
-                panic!(
-                    "timed out waiting for raw text {:?}\n--- screen ---\n{}\n--- raw ---\n{}",
-                    needle,
-                    self.screen_text(),
-                    raw
-                );
-            }
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for raw text {:?}\n--- screen ---\n{}\n--- raw ---\n{}",
+                needle,
+                self.screen_text(),
+                raw
+            );
             thread::sleep(Duration::from_millis(50));
         }
     }
@@ -375,14 +373,13 @@ impl PtySession {
             if needles.iter().any(|needle| screen.contains(needle)) {
                 return screen;
             }
-            if Instant::now() >= deadline {
-                panic!(
-                    "timed out waiting for any of {:?}\n--- screen ---\n{}\n--- raw ---\n{}",
-                    needles,
-                    screen,
-                    self.raw_text()
-                );
-            }
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for any of {:?}\n--- screen ---\n{}\n--- raw ---\n{}",
+                needles,
+                screen,
+                self.raw_text()
+            );
             thread::sleep(Duration::from_millis(50));
         }
     }
@@ -394,14 +391,13 @@ impl PtySession {
             if !screen.contains(needle) {
                 return;
             }
-            if Instant::now() >= deadline {
-                panic!(
-                    "timed out waiting for absence of {:?}\n--- screen ---\n{}\n--- raw ---\n{}",
-                    needle,
-                    screen,
-                    self.raw_text()
-                );
-            }
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for absence of {:?}\n--- screen ---\n{}\n--- raw ---\n{}",
+                needle,
+                screen,
+                self.raw_text()
+            );
             thread::sleep(Duration::from_millis(50));
         }
     }
@@ -414,13 +410,12 @@ impl PtySession {
                 Ok(None) => {}
                 Err(err) => panic!("failed to poll child exit: {err}"),
             }
-            if Instant::now() >= deadline {
-                panic!(
-                    "timed out waiting for coderex to exit\n--- screen ---\n{}\n--- raw ---\n{}",
-                    self.screen_text(),
-                    self.raw_text()
-                );
-            }
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for coderex to exit\n--- screen ---\n{}\n--- raw ---\n{}",
+                self.screen_text(),
+                self.raw_text()
+            );
             thread::sleep(Duration::from_millis(50));
         }
     }
@@ -524,7 +519,7 @@ struct InteractionStep<'a> {
 }
 
 impl<'a> InteractionStep<'a> {
-    fn prompt(input: &'a str, expect_any: &'a [&'a str]) -> Self {
+    const fn prompt(input: &'a str, expect_any: &'a [&'a str]) -> Self {
         Self {
             input,
             expect_any,
@@ -532,7 +527,7 @@ impl<'a> InteractionStep<'a> {
         }
     }
 
-    fn slash(input: &'a str, expect_any: &'a [&'a str]) -> Self {
+    const fn slash(input: &'a str, expect_any: &'a [&'a str]) -> Self {
         Self {
             input,
             expect_any,
@@ -610,9 +605,7 @@ fn live_model() -> Option<String> {
 }
 
 fn provider_env_matches(expected: &str) -> bool {
-    live_model()
-        .map(|model| model.to_lowercase().contains(expected))
-        .unwrap_or(false)
+    live_model().is_some_and(|model| model.to_lowercase().contains(expected))
 }
 
 #[test]
@@ -625,6 +618,7 @@ fn startup_renders_prompt_and_default_regions() {
     assert!(screen.contains("Permissions: default"));
     assert!(session.raw_text().contains("❯"));
     assert!(!session.raw_text().contains("[DEBUG] args.print"));
+    drop(session);
 }
 
 /// A piped command's later segments arrive with their slash still on; the
@@ -639,6 +633,7 @@ fn piped_commands_work_in_the_tui() {
     // entries of an unordered environment listing. CODEREX_LOG is set by this
     // harness, so it is present regardless of the developer's environment.
     let screen = session.wait_for_text("CODEREX_LOG=off", SCREEN_TIMEOUT);
+    drop(session);
     assert!(
         !screen.contains("Unknown command"),
         "the later piped segment was not recognised:\n{screen}"
@@ -652,6 +647,7 @@ fn help_command_renders_in_tui() {
     session.wait_for_text("CodeRex v", SCREEN_TIMEOUT);
     session.send_line("/help");
     let screen = session.wait_for_any_text(&["/clear", "Available"], SCREEN_TIMEOUT);
+    drop(session);
     assert!(screen.contains("/clear"));
 }
 
@@ -662,6 +658,7 @@ fn status_command_renders_in_tui() {
     session.wait_for_text("CodeRex v", SCREEN_TIMEOUT);
     session.send_line("/status");
     let screen = session.wait_for_text("System Status", SCREEN_TIMEOUT);
+    drop(session);
     assert!(screen.contains("System Status"));
 }
 
@@ -672,6 +669,7 @@ fn tokens_command_renders_in_tui() {
     session.wait_for_text("CodeRex v", SCREEN_TIMEOUT);
     session.send_line("/tokens");
     let screen = session.wait_for_text("Token Usage", SCREEN_TIMEOUT);
+    drop(session);
     assert!(screen.contains("Token Usage"));
 }
 
@@ -685,6 +683,7 @@ fn model_command_updates_interactive_state() {
         &["Model switched to:", "claude-haiku-4-5-20251001"],
         SCREEN_TIMEOUT,
     );
+    drop(session);
     assert!(screen.contains("haiku") || screen.contains("claude-haiku-4-5-20251001"));
 }
 
@@ -699,6 +698,7 @@ fn clear_command_clears_transcript_state() {
     session.wait_for_text("Are you sure you want to run /clear?", SCREEN_TIMEOUT);
     session.send_line("y");
     let screen = session.wait_for_text("cleared", SCREEN_TIMEOUT);
+    drop(session);
     assert!(screen.contains("cleared"));
     assert!(!screen.contains("Available commands"));
 }
@@ -713,6 +713,7 @@ fn unknown_command_keeps_repl_usable() {
     assert!(screen.contains("Unknown command"));
     session.send_line("/status");
     let screen = session.wait_for_text("System Status", SCREEN_TIMEOUT);
+    drop(session);
     assert!(screen.contains("System Status"));
 }
 
@@ -726,6 +727,7 @@ fn ctrl_c_clears_current_input() {
     session.ctrl_c();
     session.wait_for_text_absent("temporary input", SCREEN_TIMEOUT);
     let screen = session.screen_text();
+    drop(session);
     assert!(screen.contains("❯ "));
 }
 
@@ -964,6 +966,7 @@ fn history_recall_restores_previous_input() {
     session.wait_for_text("System Status", SCREEN_TIMEOUT);
     session.up();
     let raw = session.wait_for_raw_text("/status", SCREEN_TIMEOUT);
+    drop(session);
     assert!(raw.contains("/status"));
 }
 
@@ -987,6 +990,7 @@ fn cursor_left_and_backspace_edit_input_before_submit() {
     session.backspace();
     session.enter();
     let screen = session.wait_for_text("Available Commands", SCREEN_TIMEOUT);
+    drop(session);
     assert!(screen.contains("Available Commands"));
 }
 
@@ -998,6 +1002,7 @@ fn open_command_shows_split_pane_file_viewer() {
     session.send_line("/open src/lib.rs");
     let screen =
         session.wait_for_any_text(&["File Viewer", "src/lib.rs", "pub fn add"], SCREEN_TIMEOUT);
+    drop(session);
     assert!(screen.contains("src/lib.rs") || screen.contains("pub fn add"));
 }
 
@@ -1085,6 +1090,7 @@ fn resize_keeps_tui_alive() {
     // And it still takes input.
     session.send_line("/status");
     let screen = session.wait_for_text("System Status", SCREEN_TIMEOUT);
+    drop(session);
     assert!(screen.contains("System Status"), "{screen}");
 }
 
@@ -1102,6 +1108,7 @@ fn vim_command_enables_normal_mode_editing() {
     session.send_text("!");
     session.enter();
     let raw = session.wait_for_raw_text("abc!", SCREEN_TIMEOUT);
+    drop(session);
     assert!(raw.contains("abc!"));
 }
 
@@ -1130,6 +1137,7 @@ fn vim_visual_mode_selects_and_deletes_input() {
     session.send_text("vbd");
     session.send_text("A!");
     let screen = session.wait_for_text("❯ hello !", SCREEN_TIMEOUT);
+    drop(session);
     assert!(screen.contains("❯ hello !"), "{screen}");
     assert!(
         !screen.contains("world"),
@@ -1528,6 +1536,7 @@ fn extension_slash_sequence_matrix_stays_usable() {
             "Plugin tool 'Skill' not found",
         ],
     );
+    drop(session);
 }
 
 #[test]
@@ -1575,6 +1584,7 @@ fn theme_command_switches_interactive_theme_and_stays_usable() {
     session.wait_for_text("Theme changed to: tokyo-night", SCREEN_TIMEOUT);
     session.send_line("/status");
     let screen = session.wait_for_text("System Status", SCREEN_TIMEOUT);
+    drop(session);
     assert!(screen.contains("System Status"));
 }
 
@@ -1666,6 +1676,7 @@ fn interactive_kimi_live_smoke() {
         &session,
         &["provider returned no visible response", "Query failed"],
     );
+    drop(session);
 }
 
 #[test]
@@ -1687,6 +1698,7 @@ fn interactive_kimi_directory_listing_smoke() {
 
     session.send_line("list the files in this dir");
     let screen = session.wait_for_any_text(&["Cargo.toml", "src", ".coderex"], LIVE_TIMEOUT);
+    drop(session);
     assert!(screen.contains("Cargo.toml") || screen.contains("src") || screen.contains(".coderex"));
 }
 
@@ -1714,4 +1726,5 @@ fn interactive_qwen_live_smoke() {
         &session,
         &["provider returned no visible response", "Query failed"],
     );
+    drop(session);
 }

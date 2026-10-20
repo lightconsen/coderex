@@ -139,7 +139,7 @@ impl Default for InputBuffer {
 impl InputBuffer {
     /// Create a new empty input buffer.
     #[must_use]
-    pub fn new() -> Self {
+    pub const fn new() -> Self {
         Self {
             text: String::new(),
             cursor: 0,
@@ -227,15 +227,15 @@ impl InputBuffer {
             InputAction::Submit => {
                 self.suggestion = None;
                 self.clear_visual_selection();
-                if !self.text.is_empty() {
+                if self.text.is_empty() {
+                    None
+                } else {
                     let submitted = self.text.clone();
                     self.history.push(self.text.clone());
                     self.text.clear();
                     self.cursor = 0;
                     self.history_pos = 0;
                     Some(submitted)
-                } else {
-                    None
                 }
             }
             InputAction::HistoryUp => {
@@ -280,7 +280,7 @@ impl InputBuffer {
                     // Find word boundary: skip whitespace backward, then skip non-whitespace
                     let trimmed = before.trim_end();
                     let last_space = trimmed.rfind(char::is_whitespace);
-                    let new_end = last_space.map(|i| i + 1).unwrap_or(0);
+                    let new_end = last_space.map_or(0, |i| i + 1);
                     self.text.drain(new_end..self.cursor);
                     self.cursor = new_end;
                 }
@@ -357,7 +357,7 @@ impl InputBuffer {
     }
 
     /// Drop the Visual selection without editing the buffer.
-    pub fn clear_visual_selection(&mut self) {
+    pub const fn clear_visual_selection(&mut self) {
         self.visual_anchor = None;
         self.visual_linewise = false;
     }

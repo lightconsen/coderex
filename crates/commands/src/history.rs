@@ -24,7 +24,7 @@ pub struct CommandHistory {
 impl CommandHistory {
     /// Create a new command history with the given max entries.
     #[must_use]
-    pub fn new(max_entries: usize) -> Self {
+    pub const fn new(max_entries: usize) -> Self {
         Self {
             entries: Vec::new(),
             max_entries,

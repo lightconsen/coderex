@@ -12,6 +12,7 @@ use chrono::Utc;
 use coderex_memory::long_term::{LongTermStore, MemoryKey};
 use coderex_memory::session_index::{SessionIndex, SessionMeta};
 use coderex_memory::session_memory::{FactCategory, SessionFact, SessionMemoryStore};
+use std::str::FromStr;
 use uuid::Uuid;
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -93,7 +94,7 @@ fn long_term_memory_survives_store_restart() {
         .unwrap();
 
     // Write hierarchical-key memory
-    let key = MemoryKey::from_str("project/backend/auth");
+    let key = MemoryKey::from_str("project/backend/auth").unwrap();
     store
         .write_with_key(
             "auth_flow",
@@ -288,7 +289,7 @@ fn long_term_memory_keyed_storage_path_is_correct() {
     let tmp = tempfile::tempdir().unwrap();
     let store = LongTermStore::new(tmp.path().to_path_buf());
 
-    let key = MemoryKey::from_str("project/frontend/components");
+    let key = MemoryKey::from_str("project/frontend/components").unwrap();
     store
         .write_with_key("component_lib", &key, "Button, Modal, Input components.")
         .unwrap();
@@ -375,7 +376,7 @@ fn new_long_term_store_loads_previous_entries() {
         old_store
             .write_with_key(
                 "db_pool",
-                &MemoryKey::from_str("infra/database"),
+                &MemoryKey::from_str("infra/database").unwrap(),
                 "deadpool-postgres, max 20 connections.",
             )
             .unwrap();
@@ -389,7 +390,7 @@ fn new_long_term_store_loads_previous_entries() {
     assert!(api.unwrap().content.contains("HATEOAS"));
 
     let db = new_store
-        .read_by_key(&MemoryKey::from_str("infra/database"))
+        .read_by_key(&MemoryKey::from_str("infra/database").unwrap())
         .unwrap();
     assert!(db.is_some());
     assert!(db.unwrap().content.contains("deadpool"));

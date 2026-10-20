@@ -29,14 +29,14 @@ impl AnthropicProvider {
 
     /// Create from an existing API client.
     #[must_use]
-    pub fn from_client(client: AnthropicApiClient) -> Self {
+    pub const fn from_client(client: AnthropicApiClient) -> Self {
         Self { client }
     }
 }
 
 #[async_trait]
 impl Provider for AnthropicProvider {
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "anthropic"
     }
 
@@ -61,7 +61,7 @@ impl Provider for AnthropicProvider {
         self.client
             .create_message(system, messages, model, max_tokens, tools)
             .await
-            .map_err(|e| classify_api_error(self.name(), e))
+            .map_err(|e| classify_api_error(self.name(), &e))
     }
 
     async fn create_message_streaming(

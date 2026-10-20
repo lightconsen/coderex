@@ -49,7 +49,7 @@ pub struct ElicitationManager {
 impl ElicitationManager {
     /// Create a new elicitation manager.
     #[must_use]
-    pub fn new() -> Self {
+    pub const fn new() -> Self {
         Self {
             pending: Vec::new(),
             responses: Vec::new(),
@@ -492,7 +492,7 @@ impl FormField {
         if let Some(choice) = self
             .choices
             .iter()
-            .find(|choice| choice.as_str() == Some(answer) || choice.to_string() == answer)
+            .find(|choice| choice.as_str() == Some(answer) || *choice == answer)
         {
             return choice.clone();
         }
@@ -596,7 +596,7 @@ impl FormField {
 }
 
 /// The JSON type name of a value, for validation messages.
-fn type_name(value: &Value) -> &'static str {
+const fn type_name(value: &Value) -> &'static str {
     match value {
         Value::Null => "null",
         Value::Bool(_) => "a boolean",
@@ -645,7 +645,9 @@ impl std::fmt::Debug for McpElicitationHandler {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("McpElicitationHandler")
             .field("form_capable", &self.form_prompt.is_some())
-            .finish()
+            // `prompt` is a trait object without `Debug`; name the omission
+            // rather than pretend the struct has only one field.
+            .finish_non_exhaustive()
     }
 }
 
@@ -732,7 +734,7 @@ impl McpElicitationHandler {
                     };
                 }
             };
-            return finish(spec, &mut content);
+            return finish(&spec, &mut content);
         }
 
         // Ask for every property, in the order the schema declares them. A
@@ -757,24 +759,21 @@ impl McpElicitationHandler {
                 }
             };
 
-            match answer_text(&response) {
-                Some(answer) => {
-                    if let Ok(Value::Object(form)) = serde_json::from_str::<Value>(&answer) {
-                        // A JSON object is a complete form: it is what a
-                        // headless (interactive stdin) caller provides, so do
-                        // not keep asking property by property afterwards.
-                        merge_form(&mut content, &form, &spec.fields);
-                        break;
-                    }
-                    content.insert(field.name.clone(), field.coerce_text(&answer));
+            // No value was supplied: a default may fill it; otherwise
+            // validation decides whether it was required.
+            if let Some(answer) = answer_text(&response) {
+                if let Ok(Value::Object(form)) = serde_json::from_str::<Value>(&answer) {
+                    // A JSON object is a complete form: it is what a
+                    // headless (interactive stdin) caller provides, so do
+                    // not keep asking property by property afterwards.
+                    merge_form(&mut content, &form, &spec.fields);
+                    break;
                 }
-                // No value was supplied: a default may fill it; otherwise
-                // validation decides whether it was required.
-                None => {}
+                content.insert(field.name.clone(), field.coerce_text(&answer));
             }
         }
 
-        finish(spec, &mut content)
+        finish(&spec, &mut content)
     }
 }
 
@@ -783,7 +782,7 @@ impl McpElicitationHandler {
 ///
 /// Validation is the last word: a wrong type, a missing required field, a
 /// range or pattern violation never becomes an `accept`.
-fn finish(spec: FormSpec, content: &mut Map<String, Value>) -> McpElicitationResult {
+fn finish(spec: &FormSpec, content: &mut Map<String, Value>) -> McpElicitationResult {
     spec.apply_defaults(content);
     match spec.validate_values(content) {
         Ok(()) => McpElicitationResult {
@@ -852,12 +851,14 @@ fn question_for_message(params: &ElicitationParams) -> ElicitationQuestion {
 /// A form-capable prompt does not use this; it is the fallback for prompts
 /// that only implement [`ElicitationHandler`].
 fn question_for_field(spec: &FormSpec, field: &FormField, index: usize) -> ElicitationQuestion {
+    use std::fmt::Write as _;
+
     let count = spec.fields.len();
     let mut question = spec.message.clone();
     if count > 1 {
-        question.push_str(&format!(" ({}/{})", index + 1, count));
+        let _ = write!(question, " ({}/{})", index + 1, count);
     }
-    question.push_str(&format!(" [{}]", field.label()));
+    let _ = write!(question, " [{}]", field.label());
     if field.required {
         question.push_str(" (required)");
     }
@@ -865,13 +866,13 @@ fn question_for_field(spec: &FormSpec, field: &FormField, index: usize) -> Elici
     match field.field_type {
         FormFieldType::String => {
             if let Some(minimum) = field.min_length {
-                question.push_str(&format!(" (min {minimum} chars)"));
+                let _ = write!(question, " (min {minimum} chars)");
             }
             if let Some(maximum) = field.max_length {
-                question.push_str(&format!(" (max {maximum} chars)"));
+                let _ = write!(question, " (max {maximum} chars)");
             }
             if let Some(pattern) = &field.pattern {
-                question.push_str(&format!(" (pattern: {pattern})"));
+                let _ = write!(question, " (pattern: {pattern})");
             }
         }
         FormFieldType::Boolean => question.push_str(" (true/false)"),
@@ -879,7 +880,8 @@ fn question_for_field(spec: &FormSpec, field: &FormField, index: usize) -> Elici
         FormFieldType::Number => question.push_str(" (number)"),
     }
     if field.minimum.is_some() || field.maximum.is_some() {
-        question.push_str(&format!(
+        let _ = write!(
+            question,
             " (range: {}..={})",
             field
                 .minimum
@@ -887,13 +889,13 @@ fn question_for_field(spec: &FormSpec, field: &FormField, index: usize) -> Elici
             field
                 .maximum
                 .map_or_else(|| "+inf".to_string(), |value| value.to_string()),
-        ));
+        );
     }
     if let Some(description) = &field.description {
-        question.push_str(&format!(" — {description}"));
+        let _ = write!(question, " — {description}");
     }
     if let Some(default) = &field.default {
-        question.push_str(&format!(" (default: {default})"));
+        let _ = write!(question, " (default: {default})");
     }
 
     let options = field
@@ -943,9 +945,10 @@ fn header_for(message: &str) -> String {
 /// caller fill a schema by hand.
 fn content_from_answer(schema: &Value, answer: Option<&str>) -> Value {
     match answer {
-        Some(answer) => match serde_json::from_str::<Value>(answer) {
-            Ok(Value::Object(object)) => Value::Object(object),
-            _ => {
+        Some(answer) => {
+            if let Ok(Value::Object(object)) = serde_json::from_str::<Value>(answer) {
+                Value::Object(object)
+            } else {
                 // There is no property to type the answer as.
                 let Some(name) = schema
                     .get("properties")
@@ -958,7 +961,7 @@ fn content_from_answer(schema: &Value, answer: Option<&str>) -> Value {
                 object.insert(name.clone(), Value::String(answer.to_string()));
                 Value::Object(object)
             }
-        },
+        }
         None => Value::Object(Map::new()),
     }
 }

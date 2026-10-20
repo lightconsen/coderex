@@ -14,16 +14,12 @@ struct SessionMeta {
 }
 
 /// Find the session data directory for a session ID.
-fn session_dir(base: &Path, session_id: &str) -> std::io::Result<Option<std::path::PathBuf>> {
+fn session_dir(base: &Path, session_id: &str) -> Option<std::path::PathBuf> {
     if !base.is_dir() {
-        return Ok(None);
+        return None;
     }
     let dir = base.join(session_id);
-    if dir.is_dir() {
-        Ok(Some(dir))
-    } else {
-        Ok(None)
-    }
+    if dir.is_dir() { Some(dir) } else { None }
 }
 
 /// Find the most recent session in the session base directory.
@@ -32,7 +28,7 @@ fn most_recent_session(base: &Path) -> std::io::Result<Option<(String, String)>>
         return Ok(None);
     }
     let mut entries: Vec<_> = std::fs::read_dir(base)?
-        .filter_map(|e| e.ok())
+        .filter_map(std::result::Result::ok)
         .filter(|e| e.path().is_dir())
         .filter_map(|e| {
             let meta_path = e.path().join("meta.json");
@@ -103,21 +99,14 @@ pub fn register(registry: &mut CommandRegistry) {
             } else {
                 let session_id = &args[0];
                 let base = default_session_base();
-                match session_dir(&base, session_id) {
-                    Ok(Some(dir)) => {
-                        CommandResult::success(format!(
-                            "Resuming session: {session_id} (data at: {})",
-                            dir.display()
-                        ))
-                        .with_state_change(true)
-                    }
-                    Ok(None) => {
+                session_dir(&base, session_id).map_or_else(
+                    || {
                         // Check for sessions with matching prefix
                         if base.is_dir() {
                             let matches: Vec<_> = std::fs::read_dir(&base)
                                 .into_iter()
                                 .flatten()
-                                .filter_map(|e| e.ok())
+                                .filter_map(std::result::Result::ok)
                                 .filter(|e| {
                                     e.path().is_dir() && e.file_name().to_string_lossy().contains(session_id)
                                 })
@@ -131,9 +120,15 @@ pub fn register(registry: &mut CommandRegistry) {
                             }
                         }
                         CommandResult::error(format!("Session '{session_id}' not found. Sessions are stored in ~/.coderex/sessions/"))
-                    }
-                    Err(e) => CommandResult::error(format!("Failed to find session: {e}")),
-                }
+                    },
+                    |dir| {
+                        CommandResult::success(format!(
+                            "Resuming session: {session_id} (data at: {})",
+                            dir.display()
+                        ))
+                        .with_state_change(true)
+                    },
+                )
             }
         }),
         )

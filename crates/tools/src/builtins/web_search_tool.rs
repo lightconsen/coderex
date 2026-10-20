@@ -45,6 +45,8 @@ impl Tool for WebSearchTool {
         input: ToolInput,
         _ctx: ToolContext<'_>,
     ) -> Result<ToolOutput, ToolError> {
+        use std::fmt::Write as _;
+
         let query = extract_string(&input.arguments, "query")?;
         let allowed_domains = extract_string_array(&input.arguments, "allowed_domains");
         let blocked_domains = extract_string_array(&input.arguments, "blocked_domains");
@@ -90,13 +92,14 @@ impl Tool for WebSearchTool {
 
         let mut output = format!("Search results for: \"{query}\"\n\n");
         for (i, r) in results.iter().take(MAX_RESULTS).enumerate() {
-            output.push_str(&format!(
+            let _ = write!(
+                output,
                 "{}. [{}]({})\n   {}\n\n",
                 i + 1,
                 r.title,
                 r.url,
                 r.snippet
-            ));
+            );
         }
 
         if results.is_empty() {

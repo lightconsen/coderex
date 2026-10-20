@@ -146,7 +146,7 @@ impl Default for VimState {
 impl VimState {
     /// Create a new VimState in normal mode.
     #[must_use]
-    pub fn new() -> Self {
+    pub const fn new() -> Self {
         Self {
             mode: VimMode::Normal,
             yank_register: String::new(),
@@ -178,7 +178,7 @@ impl VimState {
     }
 
     /// Handle keys in insert mode.
-    fn handle_insert(&mut self, event: KeyEvent) -> VimAction {
+    const fn handle_insert(&mut self, event: KeyEvent) -> VimAction {
         match event.code {
             KeyCode::Esc => {
                 self.mode = VimMode::Normal;
@@ -240,14 +240,10 @@ impl VimState {
             KeyCode::PageDown => VimAction::PageDown,
 
             // Insert mode entry
-            KeyCode::Char('i') | KeyCode::Char('I')
-                if event.modifiers.contains(KeyModifiers::SHIFT) =>
-            {
+            KeyCode::Char('i' | 'I') if event.modifiers.contains(KeyModifiers::SHIFT) => {
                 VimAction::InsertAtStart
             }
-            KeyCode::Char('a') | KeyCode::Char('A')
-                if event.modifiers.contains(KeyModifiers::SHIFT) =>
-            {
+            KeyCode::Char('a' | 'A') if event.modifiers.contains(KeyModifiers::SHIFT) => {
                 VimAction::InsertAtEnd
             }
             KeyCode::Char('I') => VimAction::InsertAtStart,
@@ -282,7 +278,7 @@ impl VimState {
                 }
             }
             KeyCode::Char('D') => VimAction::DeleteToEnd,
-            KeyCode::Char('x') => VimAction::DeleteChar,
+            KeyCode::Char('x') | KeyCode::Backspace => VimAction::DeleteChar,
             KeyCode::Char('X') => {
                 self.pending_op = None;
                 self.count = None;
@@ -303,8 +299,7 @@ impl VimState {
             }
 
             // Paste
-            KeyCode::Char('p') => VimAction::Paste,
-            KeyCode::Char('P') => VimAction::Paste, // simplified
+            KeyCode::Char('p' | 'P') => VimAction::Paste, // simplified
 
             // Undo
             KeyCode::Char('u') => VimAction::Undo,
@@ -328,9 +323,6 @@ impl VimState {
 
             // Enter in normal mode = submit
             KeyCode::Enter => VimAction::Submit,
-
-            // Backspace in normal mode = delete char before
-            KeyCode::Backspace => VimAction::DeleteChar,
 
             _ => {
                 self.pending_op = None;
@@ -423,7 +415,7 @@ impl VimState {
     }
 
     /// Return to normal mode and drop any pending count/operator state.
-    fn leave_visual(&mut self) {
+    const fn leave_visual(&mut self) {
         self.mode = VimMode::Normal;
         self.count = None;
         self.pending_op = None;
@@ -468,13 +460,13 @@ impl VimState {
 
     /// Check if currently in either Visual mode.
     #[must_use]
-    pub fn is_visual(&self) -> bool {
+    pub const fn is_visual(&self) -> bool {
         matches!(self.mode, VimMode::Visual | VimMode::VisualLine)
     }
 
     /// Toggle between normal and insert mode. Visual modes return to normal:
     /// there is no insert equivalent to toggle into.
-    pub fn toggle_mode(&mut self) {
+    pub const fn toggle_mode(&mut self) {
         self.mode = match self.mode {
             VimMode::Normal => VimMode::Insert,
             VimMode::Insert | VimMode::Visual | VimMode::VisualLine => VimMode::Normal,
@@ -484,7 +476,7 @@ impl VimState {
 
 /// Vim mode indicator for the statusline.
 #[must_use]
-pub fn mode_indicator(mode: VimMode) -> &'static str {
+pub const fn mode_indicator(mode: VimMode) -> &'static str {
     match mode {
         VimMode::Normal => "NORMAL",
         VimMode::Insert => "INSERT",

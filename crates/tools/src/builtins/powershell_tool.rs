@@ -55,10 +55,15 @@ impl Tool for PowerShellTool {
         input: ToolInput,
         ctx: ToolContext<'_>,
     ) -> Result<ToolOutput, ToolError> {
+        use std::fmt::Write as _;
+
         let command = extract_string(&input.arguments, "command")?;
+        let default_timeout = i64::try_from(DEFAULT_TIMEOUT_SECS).unwrap_or(i64::MAX);
+        let max_timeout = i64::try_from(MAX_TIMEOUT_SECS).unwrap_or(i64::MAX);
         let timeout_secs = extract_number(&input.arguments, "timeout")
-            .unwrap_or(DEFAULT_TIMEOUT_SECS as i64)
-            .clamp(1, MAX_TIMEOUT_SECS as i64) as u64;
+            .unwrap_or(default_timeout)
+            .clamp(1, max_timeout);
+        let timeout_secs = u64::try_from(timeout_secs).unwrap_or(0);
 
         // Build under the session's sandbox policy, exactly as the Bash tool
         // does. This used to spawn `pwsh` directly and never look at
@@ -121,7 +126,7 @@ impl Tool for PowerShellTool {
             output.push_str(&stderr);
         }
 
-        output.push_str(&format!("\n\n[Exit code: {exit_code}]"));
+        let _ = write!(output, "\n\n[Exit code: {exit_code}]");
 
         Ok(ToolOutput {
             output,

@@ -94,7 +94,7 @@ impl ChromeClient {
             .await
             .map_err(|e| ChromeError::Http(format!("failed to parse new tab: {e}")))?;
 
-        tab.ws_url.ok_or_else(|| ChromeError::NoWsUrl)
+        tab.ws_url.ok_or(ChromeError::NoWsUrl)
     }
 
     /// Execute JavaScript in the given tab and return the result.

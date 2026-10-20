@@ -42,7 +42,7 @@ pub struct Statusline {
 impl Statusline {
     /// Create a new statusline.
     #[must_use]
-    pub fn new() -> Self {
+    pub const fn new() -> Self {
         Self {
             model: String::new(),
             total_tokens: 0,
@@ -84,25 +84,33 @@ impl Statusline {
                 .map(|s| Self::fmt_duration(s.elapsed()))
                 .unwrap_or_default();
 
-            let label = if let Some(ref active) = self.thinking_label {
-                if elapsed.is_empty() {
-                    active.clone()
-                } else {
-                    format!("{active}  ({elapsed})")
-                }
-            } else if let Some(ref plan) = self.plan_status {
-                if elapsed.is_empty() {
-                    plan.clone()
-                } else {
-                    format!("{plan}  ({elapsed})")
-                }
-            } else {
-                if elapsed.is_empty() {
-                    "Thinking...".into()
-                } else {
-                    format!("Thinking...  ({elapsed})")
-                }
-            };
+            let label = self.thinking_label.as_ref().map_or_else(
+                || {
+                    self.plan_status.as_ref().map_or_else(
+                        || {
+                            if elapsed.is_empty() {
+                                "Thinking...".into()
+                            } else {
+                                format!("Thinking...  ({elapsed})")
+                            }
+                        },
+                        |plan| {
+                            if elapsed.is_empty() {
+                                plan.clone()
+                            } else {
+                                format!("{plan}  ({elapsed})")
+                            }
+                        },
+                    )
+                },
+                |active| {
+                    if elapsed.is_empty() {
+                        active.clone()
+                    } else {
+                        format!("{active}  ({elapsed})")
+                    }
+                },
+            );
 
             let text = format!("{spinner} {label}");
             let display_width = UnicodeWidthStr::width(text.as_str());
@@ -155,9 +163,10 @@ impl Default for Statusline {
 /// Truncate a string to fit within `max_width` display columns,
 /// respecting grapheme boundaries.
 fn truncate_to_width(s: &str, max_width: usize) -> String {
+    use unicode_segmentation::UnicodeSegmentation;
+
     let mut width = 0;
     let mut result = String::new();
-    use unicode_segmentation::UnicodeSegmentation;
     for grapheme in s.graphemes(true) {
         let gw = UnicodeWidthStr::width(grapheme);
         if width + gw > max_width {

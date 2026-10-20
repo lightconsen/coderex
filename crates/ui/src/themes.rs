@@ -105,31 +105,31 @@ impl From<&Theme> for ThemeData {
     fn from(t: &Theme) -> Self {
         Self {
             name: t.name.clone(),
-            background: color_to_string(&t.background),
-            foreground: color_to_string(&t.foreground),
-            dim: color_to_string(&t.dim),
-            accent: color_to_string(&t.accent),
-            accent_secondary: color_to_string(&t.accent_secondary),
-            user: Some(color_to_string(&t.user)),
-            assistant: Some(color_to_string(&t.assistant)),
-            tool: Some(color_to_string(&t.tool)),
-            statusbar_bg: color_to_string(&t.statusbar_bg),
-            statusbar_fg: color_to_string(&t.statusbar_fg),
-            error: color_to_string(&t.error),
-            warning: color_to_string(&t.warning),
-            success: color_to_string(&t.success),
-            border: color_to_string(&t.border),
-            selection_bg: color_to_string(&t.selection_bg),
-            selection_fg: color_to_string(&t.selection_fg),
-            input_bg: color_to_string(&t.input_bg),
-            input_fg: color_to_string(&t.input_fg),
-            overlay_bg: color_to_string(&t.overlay_bg),
-            overlay_border: color_to_string(&t.overlay_border),
-            vim_normal: color_to_string(&t.vim_normal),
-            vim_insert: color_to_string(&t.vim_insert),
-            notif_info: color_to_string(&t.notif_info),
-            notif_warning: color_to_string(&t.notif_warning),
-            notif_error: color_to_string(&t.notif_error),
+            background: color_to_string(t.background),
+            foreground: color_to_string(t.foreground),
+            dim: color_to_string(t.dim),
+            accent: color_to_string(t.accent),
+            accent_secondary: color_to_string(t.accent_secondary),
+            user: Some(color_to_string(t.user)),
+            assistant: Some(color_to_string(t.assistant)),
+            tool: Some(color_to_string(t.tool)),
+            statusbar_bg: color_to_string(t.statusbar_bg),
+            statusbar_fg: color_to_string(t.statusbar_fg),
+            error: color_to_string(t.error),
+            warning: color_to_string(t.warning),
+            success: color_to_string(t.success),
+            border: color_to_string(t.border),
+            selection_bg: color_to_string(t.selection_bg),
+            selection_fg: color_to_string(t.selection_fg),
+            input_bg: color_to_string(t.input_bg),
+            input_fg: color_to_string(t.input_fg),
+            overlay_bg: color_to_string(t.overlay_bg),
+            overlay_border: color_to_string(t.overlay_border),
+            vim_normal: color_to_string(t.vim_normal),
+            vim_insert: color_to_string(t.vim_insert),
+            notif_info: color_to_string(t.notif_info),
+            notif_warning: color_to_string(t.notif_warning),
+            notif_error: color_to_string(t.notif_error),
         }
     }
 }
@@ -144,9 +144,9 @@ impl TryFrom<ThemeData> for Theme {
             dim: parse_color_or(&d.dim, Color::DarkGray, "dim")?,
             accent: parse_color_or(&d.accent, Color::Blue, "accent")?,
             accent_secondary: parse_color_or(&d.accent_secondary, Color::Cyan, "accent_secondary")?,
-            user: parse_optional_color_or(&d.user, Color::Blue, "user")?,
-            assistant: parse_optional_color_or(&d.assistant, Color::Green, "assistant")?,
-            tool: parse_optional_color_or(&d.tool, Color::Magenta, "tool")?,
+            user: parse_optional_color_or(d.user.as_ref(), Color::Blue, "user")?,
+            assistant: parse_optional_color_or(d.assistant.as_ref(), Color::Green, "assistant")?,
+            tool: parse_optional_color_or(d.tool.as_ref(), Color::Magenta, "tool")?,
             statusbar_bg: parse_color_or(&d.statusbar_bg, Color::DarkGray, "statusbar_bg")?,
             statusbar_fg: parse_color_or(&d.statusbar_fg, Color::White, "statusbar_fg")?,
             error: parse_color_or(&d.error, Color::Red, "error")?,
@@ -168,9 +168,8 @@ impl TryFrom<ThemeData> for Theme {
     }
 }
 
-fn color_to_string(c: &Color) -> String {
+fn color_to_string(c: Color) -> String {
     match c {
-        Color::Reset => "reset".into(),
         Color::Black => "black".into(),
         Color::Red => "red".into(),
         Color::Green => "green".into(),
@@ -194,14 +193,11 @@ fn parse_color_or(s: &str, default: Color, _field: &str) -> Result<Color, String
 }
 
 fn parse_optional_color_or(
-    s: &Option<String>,
+    s: Option<&String>,
     default: Color,
     field: &str,
 ) -> Result<Color, String> {
-    match s {
-        Some(value) => parse_color_or(value, default, field),
-        None => Ok(default),
-    }
+    s.map_or(Ok(default), |value| parse_color_or(value, default, field))
 }
 
 impl Default for Theme {
@@ -346,7 +342,7 @@ impl Theme {
     /// Parse a theme from JSON string.
     pub fn from_json(json: &str) -> Result<Self, String> {
         let data: ThemeData = serde_json::from_str(json).map_err(|e| e.to_string())?;
-        Theme::try_from(data)
+        Self::try_from(data)
     }
 
     /// Serialize the theme to JSON string.
@@ -377,7 +373,7 @@ impl Theme {
         ];
         let mut signature = 14_695_981_039_346_656_037_u64;
         for color in colors {
-            for byte in color_to_string(color).as_bytes() {
+            for byte in color_to_string(*color).as_bytes() {
                 signature ^= u64::from(*byte);
                 signature = signature.wrapping_mul(1_099_511_628_211);
             }
@@ -487,9 +483,8 @@ impl ThemeManager {
     ///
     /// Reads all `.json` files in the directory as theme configs.
     pub fn load_custom_themes(&mut self) -> std::io::Result<usize> {
-        let dir = match &self.theme_dir {
-            Some(d) => d,
-            None => return Ok(0),
+        let Some(dir) = &self.theme_dir else {
+            return Ok(0);
         };
         if !dir.exists() {
             return Ok(0);
@@ -526,7 +521,7 @@ impl ThemeManager {
 
     /// Get the currently active theme.
     #[must_use]
-    pub fn active(&self) -> &Theme {
+    pub const fn active(&self) -> &Theme {
         &self.active
     }
 
@@ -539,7 +534,10 @@ impl ThemeManager {
     /// List all available theme names.
     #[must_use]
     pub fn list_themes(&self) -> Vec<&str> {
-        self.themes.keys().map(|k| k.as_str()).collect()
+        self.themes
+            .keys()
+            .map(std::string::String::as_str)
+            .collect()
     }
 
     /// Get a theme by name.
@@ -618,12 +616,13 @@ impl ThemeManager {
         };
 
         thread::spawn(move || {
+            use notify::{EventKind, RecursiveMode, Watcher as _};
+
             let Some(dir) = dir else { return };
             if !dir.exists() {
                 return;
             }
 
-            use notify::{EventKind, RecursiveMode, Watcher as _};
             let mut watcher =
                 match notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
                     if let Ok(event) = res {
@@ -659,13 +658,13 @@ impl ThemeManager {
         });
 
         // Also do an initial reload
-        self.reload_and_notify(&on_reload);
+        Self::reload_and_notify(&on_reload);
 
         handle
     }
 
     /// Reload themes from directory and notify.
-    fn reload_and_notify<F>(&self, on_reload: &F)
+    fn reload_and_notify<F>(on_reload: &F)
     where
         F: Fn(usize),
     {

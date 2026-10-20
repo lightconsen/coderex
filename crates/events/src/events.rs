@@ -229,7 +229,8 @@ impl PermissionTracker {
         self.pending
             .values()
             .filter(|p| {
-                p.timeout_secs > 0 && (now - p.created_at).num_seconds() > p.timeout_secs as i64
+                let timeout_secs = i64::try_from(p.timeout_secs).unwrap_or(i64::MAX);
+                p.timeout_secs > 0 && (now - p.created_at).num_seconds() > timeout_secs
             })
             .collect()
     }
@@ -363,7 +364,8 @@ impl ElicitationTracker {
         self.pending
             .values()
             .filter(|e| {
-                e.timeout_secs > 0 && (now - e.created_at).num_seconds() > e.timeout_secs as i64
+                let timeout_secs = i64::try_from(e.timeout_secs).unwrap_or(i64::MAX);
+                e.timeout_secs > 0 && (now - e.created_at).num_seconds() > timeout_secs
             })
             .collect()
     }
@@ -416,6 +418,7 @@ impl SessionState {
             if let Ok((perms, elics)) = store.load().await {
                 let mut p = session.permissions.lock().await;
                 *p = perms;
+                drop(p);
                 let mut e = session.elicitations.lock().await;
                 *e = elics;
             }

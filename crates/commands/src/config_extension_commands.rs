@@ -1,6 +1,7 @@
 //! Config extension commands: /theme, /hooks, /mcp, /plugin, /memory, /skills, /tasks, /plan.
 
 use crate::registry::{CommandArgs, CommandContext, CommandRegistry, CommandResult, SlashCommand};
+use std::fmt::Write as _;
 use std::sync::Arc;
 
 thread_local! {
@@ -16,7 +17,7 @@ fn config_home() -> std::path::PathBuf {
     TEST_CONFIG_HOME.with(|h| {
         h.borrow()
             .clone()
-            .unwrap_or_else(|| coderex_config::settings::config_home())
+            .unwrap_or_else(coderex_config::settings::config_home)
     })
 }
 
@@ -53,11 +54,8 @@ fn list_dir_items(path: &std::path::Path) -> Vec<String> {
     std::fs::read_dir(path)
         .into_iter()
         .flatten()
-        .filter_map(|e| e.ok())
-        .filter_map(|e| {
-            let name = e.file_name().to_string_lossy().to_string();
-            Some(name)
-        })
+        .filter_map(std::result::Result::ok)
+        .map(|e| e.file_name().to_string_lossy().to_string())
         .collect()
 }
 
@@ -65,10 +63,16 @@ fn list_dir_items(path: &std::path::Path) -> Vec<String> {
 fn read_memory_entries() -> Vec<String> {
     let memory_path = config_home().join("memory").join("MEMORY.md");
     if memory_path.exists() {
-        match std::fs::read_to_string(&memory_path) {
-            Ok(content) => content.lines().map(|l| l.to_string()).take(20).collect(),
-            Err(_) => Vec::new(),
-        }
+        std::fs::read_to_string(&memory_path).map_or_else(
+            |_| Vec::new(),
+            |content| {
+                content
+                    .lines()
+                    .map(std::string::ToString::to_string)
+                    .take(20)
+                    .collect()
+            },
+        )
     } else {
         Vec::new()
     }
@@ -92,7 +96,8 @@ pub fn register(registry: &mut CommandRegistry) {
                     available.extend(ctx.plugin_themes.iter().cloned());
                     let mut output = format!("Current theme: {}", ctx.theme);
                     if !available.is_empty() {
-                        output.push_str(&format!(
+                        let _ = write!(
+                            output,
                             "\nAvailable themes:\n{}",
                             available
                                 .iter()
@@ -100,7 +105,7 @@ pub fn register(registry: &mut CommandRegistry) {
                                 .map(|t| format!("  {t}"))
                                 .collect::<Vec<_>>()
                                 .join("\n")
-                        ));
+                        );
                     }
                     CommandResult::success(output)
                 } else {
@@ -142,7 +147,9 @@ pub fn register(registry: &mut CommandRegistry) {
                     } else {
                         let mut available = list_dir_items(&themes_path);
                         available.extend(ctx.plugin_themes.iter().cloned());
-                        let hint = if !available.is_empty() {
+                        let hint = if available.is_empty() {
+                            "\nNo custom themes installed in ~/.coderex/themes/".to_string()
+                        } else {
                             format!(
                                 "\nAvailable themes:\n{}",
                                 available
@@ -151,8 +158,6 @@ pub fn register(registry: &mut CommandRegistry) {
                                     .collect::<Vec<_>>()
                                     .join("\n")
                             )
-                        } else {
-                            "\nNo custom themes installed in ~/.coderex/themes/".to_string()
                         };
                         CommandResult::error(format!("Theme not found: {new_theme}{hint}"))
                     }
@@ -177,14 +182,15 @@ pub fn register(registry: &mut CommandRegistry) {
             if args.is_empty() {
                 let mut output = format!("Active hooks: {}", ctx.active_hooks);
                 if !available.is_empty() {
-                    output.push_str(&format!(
+                    let _ = write!(
+                        output,
                         "\nInstalled hooks:\n{}",
                         available
                             .iter()
                             .map(|h| format!("  {h}"))
                             .collect::<Vec<_>>()
                             .join("\n")
-                    ));
+                    );
                 }
                 CommandResult::success(output)
             } else {
@@ -234,16 +240,16 @@ pub fn register(registry: &mut CommandRegistry) {
                 // Read MCP config if available
                 let settings_path = config_home().join("settings.json");
                 let mcp_info = if settings_path.exists() {
-                    match std::fs::read_to_string(&settings_path) {
-                        Ok(content) => {
+                    std::fs::read_to_string(&settings_path).map_or_else(
+                        |_| "Unable to read settings.json.".to_string(),
+                        |content| {
                             if content.contains("mcpServers") {
                                 "MCP servers configured in settings.json but not connected.\nCheck server URLs and authentication.".to_string()
                             } else {
                                 "No MCP servers configured.\nAdd mcpServers to settings.json.".to_string()
                             }
-                        }
-                        Err(_) => "Unable to read settings.json.".to_string()
-                    }
+                        },
+                    )
                 } else {
                     "No settings.json found.\nAdd mcpServers to configure MCP.".to_string()
                 };
@@ -282,7 +288,7 @@ pub fn register(registry: &mut CommandRegistry) {
                         }
                     }
                     "install" => {
-                        let name = args.get(1).map(|s| s.as_str()).unwrap_or("<name>");
+                        let name = args.get(1).map_or("<name>", std::string::String::as_str);
                         CommandResult::error(format!("Plugin installation requires marketplace access. Use: /plugin install {name}"))
                     }
                     "components" => {
@@ -296,7 +302,7 @@ pub fn register(registry: &mut CommandRegistry) {
                         }
                         let mut output = String::from("Plugin components:");
                         for (kind, names) in by_kind {
-                            output.push_str(&format!("\n  {kind}: {}", names.join(", ")));
+                            let _ = write!(output, "\n  {kind}: {}", names.join(", "));
                         }
                         CommandResult::success(output)
                     }
@@ -323,8 +329,7 @@ pub fn register(registry: &mut CommandRegistry) {
                 let count = entries.len();
                 if count == 0 {
                     CommandResult::success(format!(
-                        "Memory: 0 entries\nMemory files found: {:?}\nUse /memory search <query> to search.\nMemory stored in ~/.coderex/memory/",
-                        memory_files
+                        "Memory: 0 entries\nMemory files found: {memory_files:?}\nUse /memory search <query> to search.\nMemory stored in ~/.coderex/memory/"
                     ))
                 } else {
                     CommandResult::success(format!(
@@ -448,36 +453,34 @@ pub fn register(registry: &mut CommandRegistry) {
         true,
         true,
         Arc::new(|ctx: &CommandContext, _args: &[String]| {
+            // Try to find and read the plan file
+            let home = config_home();
+            let plans_path = home.join("plans");
+            let plan_files = list_dir_items(&plans_path);
             if ctx.has_plan {
-                // Try to find and read the plan file
-                let home = config_home();
-                let plans_path = home.join("plans");
-                let plan_files = list_dir_items(&plans_path);
                 let mut output = "Plan loaded.\n\n".to_string();
                 if !plan_files.is_empty() {
-                    output.push_str(&format!(
+                    let _ = write!(
+                        output,
                         "Available plans:\n{}\n",
                         plan_files
                             .iter()
                             .map(|p| format!("  {p}"))
                             .collect::<Vec<_>>()
                             .join("\n")
-                    ));
+                    );
                 }
                 output.push_str("(Use the Read tool to view plan details)");
                 CommandResult::success(output)
             } else {
                 // Check if any plan files exist
-                let home = config_home();
-                let plans_path = home.join("plans");
-                let plan_files = list_dir_items(&plans_path);
-                if !plan_files.is_empty() {
+                if plan_files.is_empty() {
+                    CommandResult::success("No active plan.\nUse /plan create to generate one.")
+                } else {
                     CommandResult::success(format!(
                         "Plan files found in ~/.coderex/plans/:\n{}",
                         plan_files.join("\n")
                     ))
-                } else {
-                    CommandResult::success("No active plan.\nUse /plan create to generate one.")
                 }
             }
         }),

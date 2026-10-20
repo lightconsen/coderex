@@ -1,6 +1,7 @@
 //! Content & integration commands: /compact, /help, /version.
 
 use crate::registry::{CommandContext, CommandRegistry, CommandResult, SlashCommand};
+use std::fmt::Write as _;
 use std::sync::Arc;
 
 /// Register content & integration commands.
@@ -39,7 +40,7 @@ pub fn register(registry: &mut CommandRegistry) {
         Arc::new(|ctx: &CommandContext, args: &[String]| {
             if args.is_empty() {
                 let mut output = String::from("Available Commands:\n");
-                output.push_str(&format!("  Working Dir: {}\n\n", ctx.cwd));
+                let _ = write!(output, "  Working Dir: {}\n\n", ctx.cwd);
                 output.push_str("Commands (use /<command>):\n");
                 output.push_str("  Session:  /clear, /exit, /session, /resume, /rename, /rewind\n");
                 output.push_str("  Config:   /config, /model, /permissions, /theme, /hooks, /mcp, /plugin, /memory, /skills, /tasks, /plan\n");

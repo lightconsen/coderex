@@ -23,7 +23,7 @@ pub struct StoreSessionMemoryBackend {
 impl StoreSessionMemoryBackend {
     /// Create a backend over the given store.
     #[must_use]
-    pub fn new(store: Arc<SessionMemoryStore>) -> Self {
+    pub const fn new(store: Arc<SessionMemoryStore>) -> Self {
         Self { store }
     }
 }

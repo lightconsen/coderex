@@ -556,7 +556,7 @@ impl CompactThresholds {
     /// Useful when a caller has a provider-reported window or a resolved value
     /// in hand and does not want a second lookup.
     #[must_use]
-    pub fn resolve_for_window(config: &CompactConfig, window: usize) -> Self {
+    pub const fn resolve_for_window(config: &CompactConfig, window: usize) -> Self {
         Self {
             auto: config.resolve_auto_threshold(window),
             warn: config.resolve_warning_threshold(window),
@@ -814,10 +814,11 @@ pub fn assemble_summary_result(
 /// with the result (tail is signal); the middle is where redundancy lives.
 #[must_use]
 pub fn truncate_middle(text: &str, max_chars: usize) -> String {
+    const ELIDER_EXTRA: usize = 40; // "\n[... N chars elided ...]\n" headroom
+
     if text.chars().count() <= max_chars {
         return text.to_string();
     }
-    const ELIDER_EXTRA: usize = 40; // "\n[... N chars elided ...]\n" headroom
     let budget = max_chars.saturating_sub(ELIDER_EXTRA);
     let head = budget * 2 / 3;
     let tail = budget - head;

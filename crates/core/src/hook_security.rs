@@ -350,10 +350,8 @@ impl EnvInterpolator {
                     }
 
                     // Skip to closing brace if we were reading default
-                    if default_value.is_some() {
-                        if chars.peek() == Some(&'}') {
-                            chars.next();
-                        }
+                    if default_value.is_some() && chars.peek() == Some(&'}') {
+                        chars.next();
                     }
 
                     let value = std::env::var(&var_name)

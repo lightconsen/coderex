@@ -17,7 +17,6 @@ use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 ///
 /// # async fn example() {
 /// let mut client = WireTestClient::spawn("cargo", &["run", "--bin", "coderex"])
-///     .await
 ///     .expect("spawn failed");
 ///
 /// client.submit("Hello, world!").await.unwrap();
@@ -40,7 +39,7 @@ impl WireTestClient {
     /// # Errors
     /// Returns an error if the subprocess cannot be spawned or if
     /// stdin/stdout pipes are not available.
-    pub async fn spawn(program: &str, args: &[&str]) -> std::io::Result<Self> {
+    pub fn spawn(program: &str, args: &[&str]) -> std::io::Result<Self> {
         let mut child = Command::new(program)
             .args(args)
             .stdin(std::process::Stdio::piped())
@@ -51,11 +50,11 @@ impl WireTestClient {
         let stdin = child
             .stdin
             .take()
-            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::Other, "no stdin"))?;
+            .ok_or_else(|| std::io::Error::other("no stdin"))?;
         let stdout = child
             .stdout
             .take()
-            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::Other, "no stdout"))?;
+            .ok_or_else(|| std::io::Error::other("no stdout"))?;
 
         Ok(Self {
             child,
@@ -137,9 +136,8 @@ impl WireTestClient {
                 Ok(Err(e)) => return Err(e),
                 Err(_) => {
                     // Timeout — check if process is still alive
-                    match self.child.try_wait()? {
-                        Some(_) => break,
-                        None => continue,
+                    if self.child.try_wait()?.is_some() {
+                        break;
                     }
                 }
             }
@@ -199,8 +197,8 @@ impl WireTestClientBuilder {
     ///
     /// # Errors
     /// Returns an error if the subprocess cannot be spawned.
-    pub async fn spawn(self) -> std::io::Result<WireTestClient> {
+    pub fn spawn(self) -> std::io::Result<WireTestClient> {
         let args: Vec<&str> = self.args.iter().map(String::as_str).collect();
-        WireTestClient::spawn(&self.program, &args).await
+        WireTestClient::spawn(&self.program, &args)
     }
 }

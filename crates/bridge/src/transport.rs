@@ -106,7 +106,7 @@ pub struct InProcessTransport {
 impl InProcessTransport {
     /// Create a new in-process transport.
     #[must_use]
-    pub fn new(connection_id: String) -> Self {
+    pub const fn new(connection_id: String) -> Self {
         Self {
             connected: false,
             connection_id,
@@ -165,12 +165,13 @@ impl Transport for InProcessTransport {
             return Err(TransportError::NotConnected);
         }
 
-        if let Some(ref tx) = self.tx {
-            tx.send(message)
-                .map_err(|e| TransportError::SendFailed(e.to_string()))
-        } else {
-            Err(TransportError::SendFailed("no sender channel".into()))
-        }
+        self.tx.as_ref().map_or_else(
+            || Err(TransportError::SendFailed("no sender channel".into())),
+            |tx| {
+                tx.send(message)
+                    .map_err(|e| TransportError::SendFailed(e.to_string()))
+            },
+        )
     }
 
     async fn receive(&mut self) -> Result<TransportMessage, TransportError> {
@@ -237,17 +238,14 @@ impl TransportConfig {
 /// Transport factory for creating transport instances.
 ///
 /// Allows runtime selection of transport type (WebSocket, in-process, mock).
+/// Builds a transport from one configuration.
+type TransportConstructor = Box<dyn Fn(&TransportConfig) -> Box<dyn Transport> + Send + Sync>;
+
+/// Builds transports by registered type name.
+#[derive(Default)]
 pub struct TransportFactory {
     /// Registered transport constructors.
-    transports: HashMap<String, Box<dyn Fn(&TransportConfig) -> Box<dyn Transport> + Send + Sync>>,
-}
-
-impl Default for TransportFactory {
-    fn default() -> Self {
-        Self {
-            transports: HashMap::new(),
-        }
-    }
+    transports: HashMap<String, TransportConstructor>,
 }
 
 impl std::fmt::Debug for TransportFactory {
@@ -294,14 +292,17 @@ impl TransportFactory {
 
     /// List registered transport types.
     pub fn registered_types(&self) -> Vec<&str> {
-        self.transports.keys().map(|k| k.as_str()).collect()
+        self.transports
+            .keys()
+            .map(std::string::String::as_str)
+            .collect()
     }
 }
 
 /// Construct a WebSocket transport from a factory config.
 fn websocket_transport(config: &TransportConfig) -> Box<dyn Transport> {
     let mut ws_config = crate::ws_transport::WsTransportConfig::new(config.endpoint.clone());
-    ws_config.connection_id = config.connection_id.clone();
+    ws_config.connection_id.clone_from(&config.connection_id);
     if let Some(ref token) = config.auth_token {
         ws_config = ws_config.with_auth(token.clone());
     }

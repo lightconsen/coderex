@@ -26,8 +26,7 @@ use thiserror::Error;
 pub fn now_ms() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
-        .unwrap_or(0)
+        .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
 }
 
 // ─── TaskKind ───────────────────────────────────────────────────────────────
@@ -166,7 +165,7 @@ pub struct TaskHandle {
 impl TaskHandle {
     /// Create a new TaskHandle in Pending state.
     #[must_use]
-    pub fn new(id: String, kind: TaskKind) -> Self {
+    pub const fn new(id: String, kind: TaskKind) -> Self {
         Self {
             id,
             kind,
@@ -196,7 +195,7 @@ impl TaskHandle {
     }
 
     /// Mark the task as started.
-    pub fn start(&mut self) -> Result<(), TaskError> {
+    pub const fn start(&mut self) -> Result<(), TaskError> {
         self.transition_to(TaskState::Running)
     }
 
@@ -240,7 +239,7 @@ impl TaskHandle {
     }
 
     /// Transition to a new state, validating the transition.
-    fn transition_to(&mut self, new_state: TaskState) -> Result<(), TaskError> {
+    const fn transition_to(&mut self, new_state: TaskState) -> Result<(), TaskError> {
         if !is_valid_transition(self.state, new_state) {
             return Err(TaskError::InvalidTransition {
                 from: self.state,
@@ -268,14 +267,14 @@ impl TaskHandle {
 
 /// Validate whether a state transition is allowed.
 const fn is_valid_transition(from: TaskState, to: TaskState) -> bool {
-    match (from, to) {
-        (TaskState::Pending, TaskState::Running) => true,
-        (TaskState::Pending, TaskState::Stopped) => true,
-        (TaskState::Running, TaskState::Completed) => true,
-        (TaskState::Running, TaskState::Failed) => true,
-        (TaskState::Running, TaskState::Stopped) => true,
-        _ => false,
-    }
+    matches!(
+        (from, to),
+        (TaskState::Pending, TaskState::Running | TaskState::Stopped)
+            | (
+                TaskState::Running,
+                TaskState::Completed | TaskState::Failed | TaskState::Stopped
+            )
+    )
 }
 
 // ─── TaskManager ────────────────────────────────────────────────────────────
@@ -355,7 +354,7 @@ impl TaskManager {
     pub fn list_tasks(&self, state_filter: Option<TaskState>) -> Vec<&TaskHandle> {
         self.tasks
             .values()
-            .filter(|h| state_filter.map_or(true, |s| h.state == s))
+            .filter(|h| state_filter.is_none_or(|s| h.state == s))
             .collect()
     }
 
@@ -397,7 +396,7 @@ impl TaskManager {
         if !self.tasks.contains_key(id) {
             return Err(TaskError::NotFound(id.to_string()));
         }
-        if let Some(ref handle) = self.tasks.get(id) {
+        if let Some(handle) = self.tasks.get(id) {
             if handle.is_terminal() {
                 return Err(TaskError::AlreadyTerminated(id.to_string()));
             }

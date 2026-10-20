@@ -28,7 +28,7 @@ async fn read_tool_reads_file() {
             test_file.display()
         ))
         .await;
-    assert!(reason.is_ok(), "submit failed: {:?}", reason);
+    assert!(reason.is_ok(), "submit failed: {reason:?}");
     assert_eq!(
         reason.unwrap(),
         TerminalReason::Completed,
@@ -45,11 +45,10 @@ async fn read_tool_reads_file() {
     let text = live::collect_text(&events);
     assert!(
         text.to_lowercase().contains("xyzzy"),
-        "expected magic phrase in response, got: {}",
-        text
+        "expected magic phrase in response, got: {text}"
     );
 
-    eprintln!("Response: {}", text);
+    eprintln!("Response: {text}");
 }
 
 #[tokio::test]
@@ -75,7 +74,7 @@ async fn read_then_bash_combined() {
             test_file.display()
         ))
         .await;
-    assert!(reason.is_ok(), "submit failed: {:?}", reason);
+    assert!(reason.is_ok(), "submit failed: {reason:?}");
 
     let events = rig.collect_events().await;
 
@@ -91,9 +90,8 @@ async fn read_then_bash_combined() {
     let text = live::collect_text(&events);
     assert!(
         text.contains("the-answer-is-42"),
-        "expected combined result in response, got: {}",
-        text
+        "expected combined result in response, got: {text}"
     );
 
-    eprintln!("Response: {}", text);
+    eprintln!("Response: {text}");
 }

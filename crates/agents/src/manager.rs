@@ -744,7 +744,7 @@ impl AgentManager {
 
     /// Enable test mode — spawn_agent will write a placeholder instead of
     /// requiring a real API client. Used by integration tests.
-    pub fn enable_test_mode(&mut self) {
+    pub const fn enable_test_mode(&mut self) {
         self.test_mode = true;
     }
 
@@ -823,7 +823,7 @@ impl AgentManager {
 
     /// Emit a teammate event (notifies callback if registered).
     fn emit_event(&self, event: TeammateEvent) {
-        emit_teammate_event(&self.event_callback, event);
+        emit_teammate_event(self.event_callback.as_ref(), event);
     }
 
     /// Spawn a new agent.
@@ -1011,8 +1011,7 @@ impl AgentManager {
             let model = options
                 .model_override
                 .as_ref()
-                .map(|m| ModelId(m.clone()))
-                .unwrap_or_else(|| self.model.clone());
+                .map_or_else(|| self.model.clone(), |m| ModelId(m.clone()));
             let max_tokens = options.max_tokens.unwrap_or(4096);
             let max_duration = options.max_duration_seconds.unwrap_or(600);
             let max_turns = options.max_turns.unwrap_or(50);
@@ -1169,6 +1168,10 @@ impl AgentManager {
     }
 
     /// Send a message to a running agent.
+    //
+    // Kept `async` so callers have one manager surface; delivery is a
+    // best-effort channel send today.
+    #[allow(clippy::unused_async, clippy::unused_async_trait_impl)]
     pub async fn send_message(&self, agent_id: &str, content: &str) -> Result<(), AgentError> {
         let agent = self
             .agents
@@ -1179,20 +1182,19 @@ impl AgentManager {
             return Err(AgentError::NotRunning(agent_id.to_string()));
         }
 
-        if let Some(ref tx) = agent.message_tx {
-            let msg = AgentMessage {
-                agent_id: agent_id.to_string(),
-                content: content.to_string(),
-                message_id: None,
-            };
-            // Best-effort send — in a real implementation the receiver
-            // would be held by the agent process. For now, we ignore
-            // closed-channel errors (receiver may not yet be connected).
-            let _ = tx.send(msg);
-            Ok(())
-        } else {
-            Err(AgentError::NotRunning(agent_id.to_string()))
-        }
+        let Some(tx) = agent.message_tx.as_ref() else {
+            return Err(AgentError::NotRunning(agent_id.to_string()));
+        };
+        let msg = AgentMessage {
+            agent_id: agent_id.to_string(),
+            content: content.to_string(),
+            message_id: None,
+        };
+        // Best-effort send — in a real implementation the receiver would be
+        // held by the agent process. For now, we ignore closed-channel errors
+        // (the receiver may not yet be connected).
+        let _ = tx.send(msg);
+        Ok(())
     }
 
     /// Mark an agent as completed and emit a TaskCompleted event.
@@ -1227,6 +1229,9 @@ impl AgentManager {
     }
 
     /// Mark an agent as idle and emit an Idle event.
+    //
+    // Kept `async` for the same reason as `send_message`.
+    #[allow(clippy::unused_async, clippy::unused_async_trait_impl)]
     pub async fn mark_idle(&self, agent_id: &str, reason: &str) -> Result<(), AgentError> {
         if !self.agents.contains_key(agent_id) {
             return Err(AgentError::NotFound(agent_id.to_string()));
@@ -1595,8 +1600,15 @@ async fn run_agent_task(
     agent_subject: String,
     msg_rx: &mut mpsc::UnboundedReceiver<AgentMessage>,
 ) -> Result<AgentResult, AgentError> {
+    use std::fmt::Write as _;
+    use tokio::io::AsyncWriteExt as _;
+
     // Notify parent that the agent started
-    emit_lifecycle(&parent_event_tx, &agent_id, AgentLifecycleEvent::Started);
+    emit_lifecycle(
+        parent_event_tx.as_ref(),
+        &agent_id,
+        AgentLifecycleEvent::Started,
+    );
 
     // `on_failure` decides whether a failed attempt is retried at all.
     // `retry` re-runs the attempt up to `max_retries`; `escalate_to_parent`
@@ -1635,7 +1647,7 @@ async fn run_agent_task(
     for attempt in 0..=max_retries {
         // Drain any messages sent by the parent before this attempt
         while let Ok(msg) = msg_rx.try_recv() {
-            attempt_prompt.push_str(&format!("\n\n[Message from parent]: {}", msg.content));
+            let _ = write!(attempt_prompt, "\n\n[Message from parent]: {}", msg.content);
         }
 
         // Seed the child session with the parent's conversation prefix. The
@@ -1703,17 +1715,19 @@ async fn run_agent_task(
             }
         }
 
-        let mut options = SubmitOptions::default();
         // Only an agent the person is not watching is a background run. A
         // synchronous sub-agent waits on its parent's turn, so its permission
         // requests stay in the interactive path; tagging every child with an
         // id made `permission_context_for` call them all background and the
         // deny hook refused even read-only tools.
-        options.agent_id = run_in_background.then(|| agent_id.clone());
-        options.custom_system_prompt = Some(system_prompt.clone());
-        options.allowed_tools_override = effective_allowed_tools(allowed_tools.clone(), writable);
-        options.max_turns = max_turns;
-        options.task_budget_tokens = u64::from(max_tokens);
+        let options = SubmitOptions {
+            agent_id: run_in_background.then(|| agent_id.clone()),
+            custom_system_prompt: Some(system_prompt.clone()),
+            allowed_tools_override: effective_allowed_tools(allowed_tools.clone(), writable),
+            max_turns,
+            task_budget_tokens: u64::from(max_tokens),
+            ..SubmitOptions::default()
+        };
 
         let timeout = Duration::from_secs(max_duration);
         let engine_result =
@@ -1734,7 +1748,7 @@ async fn run_agent_task(
         {
             // Also drain any messages from parent while collecting events
             while let Ok(msg) = msg_rx.try_recv() {
-                attempt_prompt.push_str(&format!("\n\n[Message from parent]: {}", msg.content));
+                let _ = write!(attempt_prompt, "\n\n[Message from parent]: {}", msg.content);
             }
 
             match &event {
@@ -1744,7 +1758,7 @@ async fn run_agent_task(
                     // produced, rather than only in the final Completed
                     // summary.
                     emit_lifecycle(
-                        &parent_event_tx,
+                        parent_event_tx.as_ref(),
                         &agent_id,
                         AgentLifecycleEvent::TextDelta(text.clone()),
                     );
@@ -1755,7 +1769,7 @@ async fn run_agent_task(
                     // engine as a standalone event). Surface the summary here
                     // so a subscriber still gets a usable payload.
                     emit_lifecycle(
-                        &parent_event_tx,
+                        parent_event_tx.as_ref(),
                         &agent_id,
                         AgentLifecycleEvent::ToolCall {
                             name: name.clone(),
@@ -1780,12 +1794,12 @@ async fn run_agent_task(
                 if let Ok(json) = serde_json::to_string(&wire_event) {
                     let _ = async {
                         let _ = tokio::fs::create_dir_all(&log_dir).await;
+
                         let mut file = tokio::fs::OpenOptions::new()
                             .create(true)
                             .append(true)
                             .open(&log_path)
                             .await?;
-                        use tokio::io::AsyncWriteExt;
                         file.write_all(json.as_bytes()).await?;
                         file.write_all(b"\n").await?;
                         Ok::<(), std::io::Error>(())
@@ -1799,7 +1813,7 @@ async fn run_agent_task(
         // drained. Report idleness before the terminal Completed/Failed event
         // so observers can distinguish "waiting for more work" from "finished".
         emit_lifecycle(
-            &parent_event_tx,
+            parent_event_tx.as_ref(),
             &agent_id,
             AgentLifecycleEvent::Idle {
                 reason: "turn complete".to_string(),
@@ -1808,7 +1822,7 @@ async fn run_agent_task(
         // The same real idle point feeds the manager-level teammate callback,
         // so observers registered through `set_event_callback` see it too.
         emit_teammate_event(
-            &event_callback,
+            event_callback.as_ref(),
             TeammateEvent::Idle {
                 agent_id: agent_id.clone(),
                 reason: "turn complete".to_string(),
@@ -1832,7 +1846,7 @@ async fn run_agent_task(
                             }
                             let err_msg = format!("validation failed: {error}");
                             let (output, error) = final_failure_output(
-                                attempt_output,
+                                &attempt_output,
                                 &err_msg,
                                 on_failure,
                                 max_retries,
@@ -1856,13 +1870,13 @@ async fn run_agent_task(
                     let mut retry_note =
                         format!("\n\n[Previous attempt failed: {err_msg}. Retrying...]");
                     if let Some(ref ep) = escalation_prompt {
-                        retry_note.push_str(&format!("\n{ep}"));
+                        let _ = write!(retry_note, "\n{ep}");
                     }
                     attempt_prompt.push_str(&retry_note);
                     continue;
                 }
                 let (output, error) =
-                    final_failure_output(attempt_output, &err_msg, on_failure, max_retries);
+                    final_failure_output(&attempt_output, &err_msg, on_failure, max_retries);
                 final_output = output;
                 final_error = Some(error);
                 final_status = AgentStatus::Failed;
@@ -1874,13 +1888,13 @@ async fn run_agent_task(
                         "\n\n[Previous attempt timed out after {max_duration}s. Retrying...]"
                     );
                     if let Some(ref ep) = escalation_prompt {
-                        retry_note.push_str(&format!("\n{ep}"));
+                        let _ = write!(retry_note, "\n{ep}");
                     }
                     attempt_prompt.push_str(&retry_note);
                     continue;
                 }
                 let (output, error) =
-                    final_failure_output(attempt_output, &err_msg, on_failure, max_retries);
+                    final_failure_output(&attempt_output, &err_msg, on_failure, max_retries);
                 final_output = output;
                 final_error = Some(error);
                 final_status = AgentStatus::Failed;
@@ -1891,21 +1905,20 @@ async fn run_agent_task(
     let (status, error) = (final_status, final_error);
 
     // Notify parent of completion/failure
-    let lifecycle = if let Some(ref err) = error {
-        AgentLifecycleEvent::Failed { error: err.clone() }
-    } else {
-        AgentLifecycleEvent::Completed {
+    let lifecycle = error.as_ref().map_or_else(
+        || AgentLifecycleEvent::Completed {
             summary: final_output.clone(),
-        }
-    };
-    emit_lifecycle(&parent_event_tx, &agent_id, lifecycle);
+        },
+        |err| AgentLifecycleEvent::Failed { error: err.clone() },
+    );
+    emit_lifecycle(parent_event_tx.as_ref(), &agent_id, lifecycle);
 
     // A normally completing agent is the production completion path: report
     // it through the manager's teammate callback in addition to the parent
     // engine event stream.
     if status == AgentStatus::Completed {
         emit_teammate_event(
-            &event_callback,
+            event_callback.as_ref(),
             TeammateEvent::TaskCompleted {
                 agent_id: agent_id.clone(),
                 subject: agent_subject,
@@ -1948,7 +1961,7 @@ async fn run_agent_task(
 }
 
 /// Invoke a teammate callback, if one is registered.
-fn emit_teammate_event(callback: &Option<TeammateEventCallback>, event: TeammateEvent) {
+fn emit_teammate_event(callback: Option<&TeammateEventCallback>, event: TeammateEvent) {
     if let Some(callback) = callback {
         callback(event);
     }
@@ -1960,7 +1973,7 @@ fn emit_teammate_event(callback: &Option<TeammateEventCallback>, event: Teammate
 /// attempts, while `escalate_to_parent` stopped and leaves the decision to
 /// the caller.
 fn final_failure_output(
-    attempt_output: String,
+    attempt_output: &str,
     error: &str,
     on_failure: FailureAction,
     max_retries: u32,
@@ -2134,7 +2147,7 @@ fn blocks_text(blocks: &[serde_json::Value]) -> Option<String> {
 
 /// Send a lifecycle event to the parent engine, if one is attached.
 fn emit_lifecycle(
-    tx: &Option<mpsc::UnboundedSender<EngineEvent>>,
+    tx: Option<&mpsc::UnboundedSender<EngineEvent>>,
     agent_id: &str,
     event: AgentLifecycleEvent,
 ) {
@@ -2164,8 +2177,14 @@ fn effective_allowed_tools(
         return allowed_tools;
     }
 
-    match allowed_tools {
-        Some(tools) => Some(
+    Some(allowed_tools.map_or_else(
+        || {
+            READ_ONLY_TOOLS
+                .iter()
+                .map(|tool| (*tool).to_string())
+                .collect()
+        },
+        |tools| {
             tools
                 .into_iter()
                 .filter(|tool| {
@@ -2173,15 +2192,9 @@ fn effective_allowed_tools(
                         .iter()
                         .any(|allowed| allowed.eq_ignore_ascii_case(tool))
                 })
-                .collect(),
-        ),
-        None => Some(
-            READ_ONLY_TOOLS
-                .iter()
-                .map(|tool| (*tool).to_string())
-                .collect(),
-        ),
-    }
+                .collect()
+        },
+    ))
 }
 
 /// Get the string name of an agent type.

@@ -74,20 +74,19 @@ impl SessionStore {
             [],
         )?;
 
-        let salt = match conn.query_row(
+        let salt = if let Ok(salt) = conn.query_row(
             "SELECT value FROM store_meta WHERE key = 'fingerprint_salt'",
             [],
             |row| row.get::<_, String>(0),
         ) {
-            Ok(salt) => salt,
-            Err(_) => {
-                let salt = uuid::Uuid::new_v4().simple().to_string();
-                conn.execute(
-                    "INSERT OR REPLACE INTO store_meta (key, value) VALUES ('fingerprint_salt', ?1)",
-                    [&salt],
-                )?;
-                salt
-            }
+            salt
+        } else {
+            let salt = uuid::Uuid::new_v4().simple().to_string();
+            conn.execute(
+                "INSERT OR REPLACE INTO store_meta (key, value) VALUES ('fingerprint_salt', ?1)",
+                [&salt],
+            )?;
+            salt
         };
 
         debug!("Session store opened at {:?}", path);

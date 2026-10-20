@@ -140,7 +140,7 @@ impl PluginProcess {
     }
 
     /// Spawn the subprocess and capture stdio handles.
-    pub async fn spawn(&mut self) -> Result<(), String> {
+    pub fn spawn(&mut self) -> Result<(), String> {
         let mut cmd = Command::new(&self.command);
         cmd.args(&self.args);
         cmd.envs(&self.env);
@@ -192,7 +192,7 @@ impl PluginProcess {
         let result = self.send_request("coderex/commands/list", None).await?;
         let commands: Vec<PluginCommandInfo> = serde_json::from_value(result)
             .map_err(|e| format!("failed to parse commands/list response: {e}"))?;
-        self.commands = commands.clone();
+        self.commands.clone_from(&commands);
         Ok(commands)
     }
 
@@ -216,7 +216,7 @@ impl PluginProcess {
         let result = self.send_request("coderex/skills/list", None).await?;
         let skills: Vec<PluginSkillInfo> = serde_json::from_value(result)
             .map_err(|e| format!("failed to parse skills/list response: {e}"))?;
-        self.skills = skills.clone();
+        self.skills.clone_from(&skills);
         Ok(skills)
     }
 
@@ -350,7 +350,7 @@ impl PluginProcess {
 
     /// Check if the process is still running.
     #[must_use]
-    pub fn is_running(&self) -> bool {
+    pub const fn is_running(&self) -> bool {
         self.process.is_some()
     }
 
@@ -406,7 +406,7 @@ mod tests {
     async fn spawn_valid_process() {
         let mut process =
             PluginProcess::new("cat", vec![], HashMap::new(), std::path::PathBuf::from("/"));
-        let result = process.spawn().await;
+        let result = process.spawn();
         assert!(result.is_ok(), "spawn failed: {result:?}");
         assert!(process.is_running());
         let _ = process.terminate().await;
@@ -420,7 +420,7 @@ mod tests {
             HashMap::new(),
             std::path::PathBuf::from("/"),
         );
-        let result = process.spawn().await;
+        let result = process.spawn();
         assert!(result.is_err());
     }
 
@@ -428,7 +428,7 @@ mod tests {
     async fn terminate_clears_state() {
         let mut process =
             PluginProcess::new("cat", vec![], HashMap::new(), std::path::PathBuf::from("/"));
-        process.spawn().await.unwrap();
+        process.spawn().unwrap();
         assert!(process.is_running());
         process.terminate().await.unwrap();
         assert!(!process.is_running());

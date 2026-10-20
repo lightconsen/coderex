@@ -138,11 +138,11 @@ impl ConfigDiff {
             let default_str = entry
                 .default
                 .as_ref()
-                .map_or("null".to_string(), |v| v.to_string());
+                .map_or_else(|| "null".to_string(), std::string::ToString::to_string);
             let current_str = entry
                 .current
                 .as_ref()
-                .map_or("null".to_string(), |v| v.to_string());
+                .map_or_else(|| "null".to_string(), std::string::ToString::to_string);
             lines.push(format!(
                 "  {}  (default: {}, current: {} [from: {}])",
                 entry.key, default_str, current_str, entry.source,

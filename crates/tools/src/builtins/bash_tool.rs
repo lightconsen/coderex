@@ -55,6 +55,7 @@ impl BashTool {
     }
 
     /// Restrict execution to a list of permitted command names.
+    #[must_use]
     pub fn with_allowed_commands(mut self, commands: Vec<String>) -> Self {
         self.allowed_commands = Some(commands);
         self
@@ -67,9 +68,9 @@ impl BashTool {
     /// (or failure/timeout) is observed by a tokio task that settles the
     /// record atomically; closing the process leaves it `Running`, which the
     /// adopt path reports as interrupted.
-    async fn spawn_background(
+    fn spawn_background(
         ctx: &ToolContext<'_>,
-        command: String,
+        command: &str,
         timeout_secs: u64,
         mut cmd: Command,
         sandbox_handle: Option<coderex_core::sandbox::SandboxHandle>,
@@ -96,7 +97,7 @@ impl BashTool {
         let mut record = JobRecord::new(
             id.clone(),
             JobKind::Shell,
-            job_description(&command),
+            job_description(command),
             ctx.cwd,
             session_id,
             started_at_ms,
@@ -115,7 +116,7 @@ impl BashTool {
         }
 
         let output_path = store.root().join(format!("{id}.out"));
-        let store_for_task = store.clone();
+        let store_for_task = store;
         let id_for_task = id.clone();
         let output_path_for_task = output_path.clone();
         tokio::spawn(async move {
@@ -247,10 +248,15 @@ impl Tool for BashTool {
         input: ToolInput,
         ctx: ToolContext<'_>,
     ) -> Result<ToolOutput, ToolError> {
+        use std::fmt::Write as _;
+
         let command = extract_string(&input.arguments, "command")?;
+        let default_timeout = i64::try_from(DEFAULT_TIMEOUT_SECS).unwrap_or(i64::MAX);
+        let max_timeout = i64::try_from(MAX_TIMEOUT_SECS).unwrap_or(i64::MAX);
         let timeout_secs = extract_number(&input.arguments, "timeout")
-            .unwrap_or(DEFAULT_TIMEOUT_SECS as i64)
-            .clamp(1, MAX_TIMEOUT_SECS as i64) as u64;
+            .unwrap_or(default_timeout)
+            .clamp(1, max_timeout);
+        let timeout_secs = u64::try_from(timeout_secs).unwrap_or(0);
         let run_in_background = input
             .arguments
             .get("run_in_background")
@@ -277,7 +283,7 @@ impl Tool for BashTool {
         }
 
         if run_in_background {
-            return Self::spawn_background(&ctx, command, timeout_secs, cmd, sandbox_handle).await;
+            return Self::spawn_background(&ctx, &command, timeout_secs, cmd, sandbox_handle);
         }
 
         // Spawned rather than `output()`ed because Windows has to place the
@@ -335,7 +341,7 @@ impl Tool for BashTool {
             output.push_str(&stderr);
         }
 
-        output.push_str(&format!("\n\n[Exit code: {exit_code}]"));
+        let _ = write!(output, "\n\n[Exit code: {exit_code}]");
 
         Ok(ToolOutput {
             output,
@@ -362,10 +368,10 @@ fn extract_number(args: &serde_json::Value, key: &str) -> Option<i64> {
 /// the child pid plus the start time distinguishes two commands.
 fn background_job_id(pid: Option<u32>, started_at_ms: i64) -> String {
     let started_at_ms = started_at_ms.max(0);
-    match pid {
-        Some(pid) => format!("shell-{pid}-{started_at_ms}"),
-        None => format!("shell-{started_at_ms}"),
-    }
+    pid.map_or_else(
+        || format!("shell-{started_at_ms}"),
+        |pid| format!("shell-{pid}-{started_at_ms}"),
+    )
 }
 
 /// A bounded, human-readable description for a job record.

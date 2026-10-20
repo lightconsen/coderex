@@ -45,7 +45,7 @@ impl PermissionBar {
     }
 
     /// Cycle to the next permission mode (Shift+Tab behaviour).
-    pub fn cycle_mode(&mut self) {
+    pub const fn cycle_mode(&mut self) {
         self.mode = match self.mode {
             PermissionMode::Default => PermissionMode::AcceptEdits,
             PermissionMode::AcceptEdits => PermissionMode::BypassPermissions,
@@ -58,7 +58,7 @@ impl PermissionBar {
 
     /// Human-readable label for the current mode.
     #[must_use]
-    pub fn label(&self) -> &'static str {
+    pub const fn label(&self) -> &'static str {
         match self.mode {
             PermissionMode::Default => "default",
             PermissionMode::AcceptEdits => "accept-edits",
@@ -71,7 +71,7 @@ impl PermissionBar {
 
     /// Short label (used when width is tight).
     #[must_use]
-    pub fn short_label(&self) -> &'static str {
+    pub const fn short_label(&self) -> &'static str {
         match self.mode {
             PermissionMode::Default => "def",
             PermissionMode::AcceptEdits => "edits",
@@ -84,7 +84,7 @@ impl PermissionBar {
 
     /// Foreground colour for the current mode.
     #[must_use]
-    pub fn color(&self, theme: &Theme) -> Color {
+    pub const fn color(&self, theme: &Theme) -> Color {
         if let Some(status) = &self.status {
             return match status.kind {
                 PermissionStatusKind::Pending => theme.warning,
@@ -159,16 +159,17 @@ impl PermissionBar {
             format!("{text}{}", " ".repeat(pad))
         } else {
             let short = self.short_label();
-            let text = if let Some(status) = &self.status {
-                let short_status = match status.kind {
-                    PermissionStatusKind::Pending => "wait",
-                    PermissionStatusKind::Approved => "ok",
-                    PermissionStatusKind::Denied => "deny",
-                };
-                format!("Permissions: {short} | {short_status}")
-            } else {
-                format!("Permissions: {short}")
-            };
+            let text = self.status.as_ref().map_or_else(
+                || format!("Permissions: {short}"),
+                |status| {
+                    let short_status = match status.kind {
+                        PermissionStatusKind::Pending => "wait",
+                        PermissionStatusKind::Approved => "ok",
+                        PermissionStatusKind::Denied => "deny",
+                    };
+                    format!("Permissions: {short} | {short_status}")
+                },
+            );
             let text_width = unicode_width::UnicodeWidthStr::width(text.as_str());
             let pad = width.saturating_sub(text_width);
             format!("{text}{}", " ".repeat(pad))

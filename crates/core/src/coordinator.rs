@@ -96,7 +96,7 @@ impl Default for CoordinatorState {
 impl CoordinatorState {
     /// Create a new coordinator starting at the Research phase.
     #[must_use]
-    pub fn new() -> Self {
+    pub const fn new() -> Self {
         Self {
             current_phase: CoordinatorPhase::Research,
             is_complete: false,
@@ -106,7 +106,7 @@ impl CoordinatorState {
     }
 
     /// Start the coordinator workflow.
-    pub fn start(&mut self) {
+    pub const fn start(&mut self) {
         self.is_running = true;
     }
 
@@ -119,25 +119,22 @@ impl CoordinatorState {
         self.phase_summaries
             .push((self.current_phase, summary.to_string()));
 
-        match self.current_phase.next() {
-            Some(next_phase) => {
-                self.current_phase = next_phase;
-                Ok(next_phase)
-            }
-            None => {
-                self.is_complete = true;
-                Err(CoordinatorError::AlreadyComplete)
-            }
+        if let Some(next_phase) = self.current_phase.next() {
+            self.current_phase = next_phase;
+            Ok(next_phase)
+        } else {
+            self.is_complete = true;
+            Err(CoordinatorError::AlreadyComplete)
         }
     }
 
     /// Manually set the current phase (useful for recovery/jump).
-    pub fn set_phase(&mut self, phase: CoordinatorPhase) {
+    pub const fn set_phase(&mut self, phase: CoordinatorPhase) {
         self.current_phase = phase;
     }
 
     /// Mark the coordinator as stopped (not completed).
-    pub fn stop(&mut self) {
+    pub const fn stop(&mut self) {
         self.is_running = false;
     }
 
@@ -199,7 +196,7 @@ pub fn coordinator_tool_whitelist() -> Vec<&'static str> {
 /// Check if a tool name is available in CoordinatorMode.
 #[must_use]
 pub fn is_coordinator_tool(tool_name: &str) -> bool {
-    coordinator_tool_whitelist().iter().any(|&t| t == tool_name)
+    coordinator_tool_whitelist().contains(&tool_name)
 }
 
 #[cfg(test)]

@@ -74,9 +74,12 @@ impl Tool for ReadTool {
         ctx: ToolContext<'_>,
     ) -> Result<ToolOutput, ToolError> {
         let file_path = extract_file_path(&input.arguments)?;
-        let offset = extract_number(&input.arguments, "offset").unwrap_or(0) as usize;
+        let offset =
+            usize::try_from(extract_number(&input.arguments, "offset").unwrap_or(0)).unwrap_or(0);
+        let default_limit = i64::try_from(DEFAULT_LINE_LIMIT).unwrap_or(i64::MAX);
         let limit =
-            extract_number(&input.arguments, "limit").unwrap_or(DEFAULT_LINE_LIMIT as i64) as usize;
+            usize::try_from(extract_number(&input.arguments, "limit").unwrap_or(default_limit))
+                .unwrap_or(0);
 
         let path = resolve_path(&file_path, ctx.cwd);
         let path_buf = PathBuf::from(&path);

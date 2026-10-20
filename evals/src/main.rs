@@ -39,15 +39,15 @@ async fn main() {
             }
         );
 
-        if !result.passed {
+        if result.passed {
+            passed += 1;
+        } else {
             failed += 1;
             for ar in &result.assertion_results {
                 if !ar.passed {
                     println!("    ✗ {} — {}", format_assertion(&ar.assertion), ar.message);
                 }
             }
-        } else {
-            passed += 1;
         }
     }
 

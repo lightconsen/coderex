@@ -33,7 +33,7 @@ impl Default for MockServer {
 impl MockServer {
     /// Create a new mock server.
     #[must_use]
-    pub fn new() -> Self {
+    pub const fn new() -> Self {
         Self {
             responses: VecDeque::new(),
             call_history: Vec::new(),

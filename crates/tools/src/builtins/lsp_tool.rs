@@ -58,22 +58,17 @@ impl LspConnection {
             .stderr(Stdio::null())
             .spawn()
             .map_err(|e| {
-                ToolError::Io(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    format!("failed to spawn language server: {e}"),
-                ))
+                ToolError::Io(std::io::Error::other(format!(
+                    "failed to spawn language server: {e}"
+                )))
             })?;
 
         let stdin = process.stdin.take().ok_or_else(|| {
-            ToolError::Io(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                "failed to capture stdin".to_string(),
-            ))
+            ToolError::Io(std::io::Error::other("failed to capture stdin".to_string()))
         })?;
 
         let stdout = process.stdout.take().ok_or_else(|| {
-            ToolError::Io(std::io::Error::new(
-                std::io::ErrorKind::Other,
+            ToolError::Io(std::io::Error::other(
                 "failed to capture stdout".to_string(),
             ))
         })?;
@@ -104,15 +99,15 @@ impl LspConnection {
             "capabilities": {}
         });
 
-        let response = self.send_request_raw("initialize", params)?;
+        let response = self.send_request_raw("initialize", &params)?;
         let _server_info = response.get("serverInfo");
 
-        self.send_notification("initialized", serde_json::json!({}))?;
+        self.send_notification("initialized", &serde_json::json!({}))?;
         Ok(())
     }
 
     /// Send a JSON-RPC request and return the result as JSON.
-    fn send_request_raw(&mut self, method: &str, params: Value) -> Result<Value, ToolError> {
+    fn send_request_raw(&mut self, method: &str, params: &Value) -> Result<Value, ToolError> {
         self.request_id += 1;
         let id = self.request_id;
 
@@ -136,7 +131,7 @@ impl LspConnection {
     }
 
     /// Send a JSON-RPC notification.
-    fn send_notification(&mut self, method: &str, params: Value) -> Result<(), ToolError> {
+    fn send_notification(&mut self, method: &str, params: &Value) -> Result<(), ToolError> {
         let notification = serde_json::json!({
             "jsonrpc": "2.0",
             "method": method,
@@ -265,26 +260,29 @@ impl Tool for LspTool {
 
         let server_cmd = extract_string(&input.arguments, "server_command")
             .unwrap_or_else(|_| "typescript-language-server".into());
-        let server_args: Vec<String> = input.arguments["server_args"]
-            .as_array()
-            .map(|arr| {
+        let server_args: Vec<String> = input.arguments["server_args"].as_array().map_or_else(
+            || vec!["--stdio".into()],
+            |arr| {
                 arr.iter()
                     .filter_map(|v| v.as_str().map(String::from))
                     .collect()
-            })
-            .unwrap_or_else(|| vec!["--stdio".into()]);
+            },
+        );
         let root_uri = extract_string(&input.arguments, "root_uri")
             .unwrap_or_else(|_| format!("file://{}", ctx.cwd.display()));
 
-        let args: Vec<&str> = server_args.iter().map(|s| s.as_str()).collect();
+        let args: Vec<&str> = server_args
+            .iter()
+            .map(std::string::String::as_str)
+            .collect();
 
         let mut conn = LspConnection::spawn(&server_cmd, &args, &root_uri)?;
 
         let result = match operation {
-            LspOperation::WorkspaceSymbol => self.workspace_symbols(&mut conn, &input.arguments),
-            LspOperation::Hover => self.hover(&mut conn, &input.arguments),
-            LspOperation::Definition => self.definition(&mut conn, &input.arguments),
-            LspOperation::References => self.references(&mut conn, &input.arguments),
+            LspOperation::WorkspaceSymbol => Self::workspace_symbols(&mut conn, &input.arguments),
+            LspOperation::Hover => Self::hover(&mut conn, &input.arguments),
+            LspOperation::Definition => Self::definition(&mut conn, &input.arguments),
+            LspOperation::References => Self::references(&mut conn, &input.arguments),
         };
 
         conn.terminate();
@@ -293,22 +291,18 @@ impl Tool for LspTool {
 }
 
 impl LspTool {
-    fn workspace_symbols(
-        &self,
-        conn: &mut LspConnection,
-        args: &Value,
-    ) -> Result<ToolOutput, ToolError> {
+    fn workspace_symbols(conn: &mut LspConnection, args: &Value) -> Result<ToolOutput, ToolError> {
         let query = extract_string(args, "query").unwrap_or_default();
 
         let params = serde_json::json!({
             "query": query,
         });
 
-        let response = conn.send_request_raw("workspace/symbol", params)?;
+        let response = conn.send_request_raw("workspace/symbol", &params)?;
 
         let symbols = response.as_array().map_or(vec![], |arr| {
             arr.iter()
-                .filter_map(|s| {
+                .map(|s| {
                     let name = s["name"].as_str().unwrap_or("?").to_string();
                     let kind = s["kind"]
                         .as_u64()
@@ -320,9 +314,7 @@ impl LspTool {
                     let start_col = loc["range"]["start"]["character"]
                         .as_u64()
                         .map_or(0, |c| c + 1);
-                    Some(format!(
-                        "  {name} ({kind}) — {uri}:{start_line}:{start_col}"
-                    ))
+                    format!("  {name} ({kind}) — {uri}:{start_line}:{start_col}")
                 })
                 .collect()
         });
@@ -341,17 +333,17 @@ impl LspTool {
         })
     }
 
-    fn hover(&self, conn: &mut LspConnection, args: &Value) -> Result<ToolOutput, ToolError> {
+    fn hover(conn: &mut LspConnection, args: &Value) -> Result<ToolOutput, ToolError> {
         let file = extract_string(args, "file")?;
-        let line = extract_number(args, "line").unwrap_or(0) as u32;
-        let column = extract_number(args, "column").unwrap_or(0) as u32;
+        let line = u32::try_from(extract_number(args, "line").unwrap_or(0)).unwrap_or(0);
+        let column = u32::try_from(extract_number(args, "column").unwrap_or(0)).unwrap_or(0);
 
         let params = serde_json::json!({
             "textDocument": { "uri": file },
             "position": { "line": line, "character": column }
         });
 
-        let response = conn.send_request_raw("textDocument/hover", params)?;
+        let response = conn.send_request_raw("textDocument/hover", &params)?;
 
         if response.is_null() {
             return Ok(ToolOutput {
@@ -362,23 +354,28 @@ impl LspTool {
         }
 
         let contents = &response["contents"];
-        let text = if let Some(value) = contents["value"].as_str() {
-            value.to_string()
-        } else if let Some(value) = contents.as_str() {
-            value.to_string()
-        } else if let Some(arr) = contents.as_array() {
-            arr.iter()
-                .filter_map(|v| {
-                    v.get("value")
-                        .and_then(Value::as_str)
-                        .map(String::from)
-                        .or_else(|| v.as_str().map(String::from))
-                })
-                .collect::<Vec<_>>()
-                .join("\n")
-        } else {
-            response.to_string()
-        };
+        let text = contents["value"]
+            .as_str()
+            .or_else(|| contents.as_str())
+            .map_or_else(
+                || {
+                    contents.as_array().map_or_else(
+                        || response.to_string(),
+                        |arr| {
+                            arr.iter()
+                                .filter_map(|v| {
+                                    v.get("value")
+                                        .and_then(Value::as_str)
+                                        .map(String::from)
+                                        .or_else(|| v.as_str().map(String::from))
+                                })
+                                .collect::<Vec<_>>()
+                                .join("\n")
+                        },
+                    )
+                },
+                std::string::ToString::to_string,
+            );
 
         Ok(ToolOutput {
             output: text,
@@ -387,41 +384,46 @@ impl LspTool {
         })
     }
 
-    fn definition(&self, conn: &mut LspConnection, args: &Value) -> Result<ToolOutput, ToolError> {
+    fn definition(conn: &mut LspConnection, args: &Value) -> Result<ToolOutput, ToolError> {
+        use std::fmt::Write as _;
+
         let file = extract_string(args, "file")?;
-        let line = extract_number(args, "line").unwrap_or(0) as u32;
-        let column = extract_number(args, "column").unwrap_or(0) as u32;
+        let line = u32::try_from(extract_number(args, "line").unwrap_or(0)).unwrap_or(0);
+        let column = u32::try_from(extract_number(args, "column").unwrap_or(0)).unwrap_or(0);
 
         let params = serde_json::json!({
             "textDocument": { "uri": file },
             "position": { "line": line, "character": column }
         });
 
-        let response = conn.send_request_raw("textDocument/definition", params)?;
+        let response = conn.send_request_raw("textDocument/definition", &params)?;
 
-        let locations: Vec<(&str, u64, u64)> = if let Some(arr) = response.as_array() {
-            arr.iter()
-                .filter_map(|loc| {
-                    let uri = loc["uri"].as_str()?;
-                    let start_line = loc["range"]["start"]["line"].as_u64()?;
-                    let start_col = loc["range"]["start"]["character"].as_u64()?;
-                    Some((uri, start_line + 1, start_col + 1))
+        let locations: Vec<(&str, u64, u64)> = response.as_array().map_or_else(
+            || {
+                response["uri"].as_str().map_or_else(Vec::new, |uri| {
+                    let start_line = response["range"]["start"]["line"].as_u64().unwrap_or(0);
+                    let start_col = response["range"]["start"]["character"]
+                        .as_u64()
+                        .unwrap_or(0);
+                    vec![(uri, start_line + 1, start_col + 1)]
                 })
-                .collect()
-        } else if let Some(uri) = response["uri"].as_str() {
-            let start_line = response["range"]["start"]["line"].as_u64().unwrap_or(0);
-            let start_col = response["range"]["start"]["character"]
-                .as_u64()
-                .unwrap_or(0);
-            vec![(uri, start_line + 1, start_col + 1)]
-        } else {
-            vec![]
-        };
+            },
+            |arr| {
+                arr.iter()
+                    .filter_map(|loc| {
+                        let uri = loc["uri"].as_str()?;
+                        let start_line = loc["range"]["start"]["line"].as_u64()?;
+                        let start_col = loc["range"]["start"]["character"].as_u64()?;
+                        Some((uri, start_line + 1, start_col + 1))
+                    })
+                    .collect()
+            },
+        );
 
         let count = locations.len();
         let mut output = format!("Found {count} definition(s):\n");
         for (uri, line, col) in &locations {
-            output.push_str(&format!("  {uri}:{line}:{col}\n"));
+            let _ = writeln!(output, "  {uri}:{line}:{col}");
         }
 
         Ok(ToolOutput {
@@ -431,10 +433,12 @@ impl LspTool {
         })
     }
 
-    fn references(&self, conn: &mut LspConnection, args: &Value) -> Result<ToolOutput, ToolError> {
+    fn references(conn: &mut LspConnection, args: &Value) -> Result<ToolOutput, ToolError> {
+        use std::fmt::Write as _;
+
         let file = extract_string(args, "file")?;
-        let line = extract_number(args, "line").unwrap_or(0) as u32;
-        let column = extract_number(args, "column").unwrap_or(0) as u32;
+        let line = u32::try_from(extract_number(args, "line").unwrap_or(0)).unwrap_or(0);
+        let column = u32::try_from(extract_number(args, "column").unwrap_or(0)).unwrap_or(0);
 
         let params = serde_json::json!({
             "textDocument": { "uri": file },
@@ -442,7 +446,7 @@ impl LspTool {
             "context": { "includeDeclaration": true }
         });
 
-        let response = conn.send_request_raw("textDocument/references", params)?;
+        let response = conn.send_request_raw("textDocument/references", &params)?;
 
         let locations: Vec<(&str, u64, u64)> = response.as_array().map_or(vec![], |arr| {
             arr.iter()
@@ -458,7 +462,7 @@ impl LspTool {
         let count = locations.len();
         let mut output = format!("Found {count} reference(s):\n");
         for (uri, line, col) in &locations {
-            output.push_str(&format!("  {uri}:{line}:{col}\n"));
+            let _ = writeln!(output, "  {uri}:{line}:{col}");
         }
 
         Ok(ToolOutput {

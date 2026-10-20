@@ -436,7 +436,7 @@ async fn an_expiring_token_is_refreshed_before_the_second_request() {
 
     let mut channel = JsonRpcChannel::new_http(&server_url, HashMap::new()).unwrap();
     channel.set_token_provider(Arc::new(OAuthTokenProvider::new(
-        Arc::clone(&oauth),
+        &oauth,
         server_url.clone(),
         reqwest::Client::new(),
     )));
@@ -648,7 +648,7 @@ async fn an_invalid_token_401_without_a_refresh_token_reauthorizes_and_retries()
 
     let mut channel = JsonRpcChannel::new_http(&server_url, HashMap::new()).unwrap();
     channel.set_token_provider(Arc::new(OAuthTokenProvider::new(
-        Arc::clone(&oauth),
+        &oauth,
         server_url.clone(),
         reqwest::Client::new(),
     )));

@@ -164,6 +164,7 @@ fn cached_index(cwd: &str) -> Option<SharedSessionIndex> {
         Ok(index) => {
             let index = std::sync::Arc::new(parking_lot::Mutex::new(index));
             cache.insert(cwd.to_string(), std::sync::Arc::clone(&index));
+            drop(cache);
             Some(index)
         }
         Err(error) => {
@@ -222,6 +223,7 @@ fn try_index_saved_session(
     if !content.is_empty() {
         index.index_content(session_id, &content)?;
     }
+    drop(index);
     Ok(())
 }
 
@@ -230,19 +232,18 @@ fn try_index_saved_session(
 /// `index_saved_session` writes the searchable row (and resets usage to
 /// zero), so call this after it. Best-effort, like every index write.
 pub fn index_session_usage(cwd: &str, session_id: &str, cost: f64, tokens: i64) {
-    let result = match cached_index(cwd) {
-        Some(index) => index
+    let result = if let Some(index) = cached_index(cwd) {
+        index
             .lock()
             .update_cost_and_tokens(session_id, cost, tokens)
-            .map_err(|error| error.to_string()),
-        None => {
-            tracing::warn!(
-                session_id,
-                db = %sessions_db_path(cwd).display(),
-                "session usage was not indexed: no index"
-            );
-            return;
-        }
+            .map_err(|error| error.to_string())
+    } else {
+        tracing::warn!(
+            session_id,
+            db = %sessions_db_path(cwd).display(),
+            "session usage was not indexed: no index"
+        );
+        return;
     };
     if let Err(error) = result {
         tracing::warn!(
@@ -309,7 +310,7 @@ pub fn search_sessions(cwd: &str, query: &str, limit: usize) -> Vec<SessionMeta>
         }
     }
 
-    results.sort_by(|a, b| b.last_active_at.cmp(&a.last_active_at));
+    results.sort_by_key(|a| std::cmp::Reverse(a.last_active_at));
     results.truncate(limit);
     results
 }
@@ -324,8 +325,9 @@ pub fn list_recent_sessions(cwd: &str, limit: usize) -> Vec<SessionMeta> {
         return Vec::new();
     }
 
-    let mut sessions = match cached_index(cwd) {
-        Some(index) => match index.lock().list_by_project(cwd) {
+    let mut sessions = cached_index(cwd).map_or_else(Vec::new, |index| {
+        let rows = index.lock().list_by_project(cwd);
+        match rows {
             Ok(rows) => rows,
             Err(error) => {
                 tracing::warn!(
@@ -334,9 +336,8 @@ pub fn list_recent_sessions(cwd: &str, limit: usize) -> Vec<SessionMeta> {
                 );
                 Vec::new()
             }
-        },
-        None => Vec::new(),
-    };
+        }
+    });
 
     for meta in transcript_metas(cwd) {
         if !sessions
@@ -347,7 +348,7 @@ pub fn list_recent_sessions(cwd: &str, limit: usize) -> Vec<SessionMeta> {
         }
     }
 
-    sessions.sort_by(|a, b| b.last_active_at.cmp(&a.last_active_at));
+    sessions.sort_by_key(|a| std::cmp::Reverse(a.last_active_at));
     sessions.truncate(limit);
     sessions
 }
@@ -417,7 +418,7 @@ fn transcript_files(cwd: &str) -> Vec<(PathBuf, SystemTime)> {
             Some((path, modified))
         })
         .collect::<Vec<_>>();
-    files.sort_by(|a, b| b.1.cmp(&a.1));
+    files.sort_by_key(|a| std::cmp::Reverse(a.1));
     files
 }
 

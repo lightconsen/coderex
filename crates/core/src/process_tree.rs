@@ -87,6 +87,9 @@ impl ProcessTree {
     /// Used where the pid is all that was recorded (bridge cleanup). On Unix
     /// the tree then signals that single pid, not a group: the process was not
     /// necessarily started as a group leader.
+    // The Windows backend creates a Job Object here, so this cannot be `const`
+    // even though the Unix backend is.
+    #[allow(clippy::missing_const_for_fn)]
     pub fn from_pid(pid: u32) -> io::Result<Self> {
         Ok(Self {
             inner: imp::Inner::from_pid(pid),
@@ -143,6 +146,8 @@ impl ProcessTree {
 
     /// How many processes are currently in the tree, when the platform can
     /// report it (Windows). `None` elsewhere.
+    // On Unix the answer is a constant; Windows queries the job.
+    #[allow(clippy::missing_const_for_fn)]
     #[must_use]
     pub fn active_processes(&self) -> Option<u32> {
         self.inner.active_processes()
@@ -174,14 +179,16 @@ mod imp {
     }
 
     impl Inner {
-        pub(super) fn create(_limits: JobLimits) -> io::Result<Self> {
+        // Fallible to match the Windows backend, which creates a Job Object.
+        #[allow(clippy::unnecessary_wraps)]
+        pub(super) const fn create(_limits: JobLimits) -> io::Result<Self> {
             Ok(Self {
                 target: Mutex::new(Target::None),
                 prepared: std::sync::atomic::AtomicBool::new(false),
             })
         }
 
-        pub(super) fn from_pid(pid: u32) -> Self {
+        pub(super) const fn from_pid(pid: u32) -> Self {
             Self {
                 target: Mutex::new(Target::Pid(pid)),
                 prepared: std::sync::atomic::AtomicBool::new(false),
@@ -200,6 +207,9 @@ mod imp {
             self.attach_pid(child.id())
         }
 
+        // Fallible to match the Windows backend, which opens and assigns the
+        // process.
+        #[allow(clippy::unnecessary_wraps)]
         pub(super) fn attach_pid(&self, pid: u32) -> io::Result<()> {
             *lock(&self.target) = if self.prepared.load(std::sync::atomic::Ordering::SeqCst) {
                 Target::Group(pid)
@@ -237,7 +247,9 @@ mod imp {
             *lock(&self.target) = Target::None;
         }
 
-        pub(super) fn active_processes(&self) -> Option<u32> {
+        // An inherent method to match the Windows backend's query.
+        #[allow(clippy::unused_self)]
+        pub(super) const fn active_processes(&self) -> Option<u32> {
             None
         }
     }
@@ -423,6 +435,9 @@ mod imp {
             Ok(())
         }
 
+        // Fallible to match the Windows backend, which opens and assigns the
+        // process.
+        #[allow(clippy::unnecessary_wraps)]
         pub(super) fn attach_pid(&self, pid: u32) -> io::Result<()> {
             if self.job.is_null() {
                 return Err(io::Error::other("process tree has no job object"));

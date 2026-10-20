@@ -69,7 +69,7 @@ impl TelemetryHandle {
     /// Spins up a dedicated SQLite worker thread and returns a handle
     /// plus an optional uploader task (if `config` is `Some` and `enabled`).
     pub fn new(
-        store: TelemetryStore,
+        store: &TelemetryStore,
         config: Option<TelemetryConfig>,
     ) -> (Self, Option<TelemetryUploader>) {
         let (sender, receiver) = mpsc::channel::<WorkerCommand>();
@@ -78,7 +78,7 @@ impl TelemetryHandle {
         // Spawn the SQLite worker thread with panic recovery
         spawn_worker_with_recovery(receiver, db_path.clone());
 
-        let sample_rate = config.as_ref().map(|c| c.sample_rate).unwrap_or(1.0);
+        let sample_rate = config.as_ref().map_or(1.0, |c| c.sample_rate);
         let handle = Self {
             sender,
             sample_rate,
@@ -184,9 +184,10 @@ fn spawn_worker_with_recovery(
     db_path: std::path::PathBuf,
 ) {
     std::thread::spawn(move || {
-        let mut respawn_count = 0;
         const MAX_RESPAWNS: usize = 3;
         const COOLDOWN: std::time::Duration = std::time::Duration::from_secs(10);
+
+        let mut respawn_count = 0;
 
         loop {
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -195,33 +196,31 @@ fn spawn_worker_with_recovery(
                 run_store_worker(&receiver, &store);
             }));
 
-            match result {
-                Ok(()) => break, // Clean exit (FlushAndExit or Disconnected)
-                Err(_) => {
-                    respawn_count += 1;
-                    if respawn_count > MAX_RESPAWNS {
-                        tracing::error!(
-                            "telemetry worker panicked {respawn_count} times — giving up"
-                        );
-                        break;
-                    }
-                    tracing::warn!(
-                        "telemetry worker panicked; respawning in {}s (attempt {respawn_count}/{MAX_RESPAWNS})",
-                        COOLDOWN.as_secs()
-                    );
-                    std::thread::sleep(COOLDOWN);
-                }
+            // `Ok(())` is a clean exit (FlushAndExit or Disconnected).
+            if matches!(result, Ok(())) {
+                break;
             }
+            respawn_count += 1;
+            if respawn_count > MAX_RESPAWNS {
+                tracing::error!("telemetry worker panicked {respawn_count} times — giving up");
+                break;
+            }
+            tracing::warn!(
+                "telemetry worker panicked; respawning in {}s (attempt {respawn_count}/{MAX_RESPAWNS})",
+                COOLDOWN.as_secs()
+            );
+            std::thread::sleep(COOLDOWN);
         }
     });
 }
 
 /// Run the SQLite worker loop.
 fn run_store_worker(receiver: &mpsc::Receiver<WorkerCommand>, store: &TelemetryStore) {
-    let mut batch = Vec::with_capacity(32);
-    let mut last_flush = std::time::Instant::now();
     const FLUSH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
     const BATCH_SIZE: usize = 32;
+
+    let mut batch = Vec::with_capacity(BATCH_SIZE);
+    let mut last_flush = std::time::Instant::now();
 
     loop {
         match receiver.recv_timeout(std::time::Duration::from_millis(100)) {
@@ -260,7 +259,7 @@ fn flush_batch(store: &TelemetryStore, batch: &mut Vec<TelemetryEvent>) {
     if batch.is_empty() {
         return;
     }
-    let to_flush: Vec<TelemetryEvent> = batch.drain(..).collect();
+    let to_flush: Vec<TelemetryEvent> = std::mem::take(batch);
     if let Err(e) = store.insert_batch(&to_flush) {
         tracing::warn!("failed to flush telemetry batch: {e}");
     }
@@ -270,6 +269,10 @@ fn flush_batch(store: &TelemetryStore, batch: &mut Vec<TelemetryEvent>) {
 ///
 /// Uses a deterministic hash of the serialized event so the same event
 /// always yields the same decision.
+///
+/// The hash is mapped to a fraction; exact `f64` precision is irrelevant to a
+/// sampling decision, and the lint guards a range that does not matter here.
+#[allow(clippy::cast_precision_loss)]
 fn should_sample(sample_rate: f64, event: &TelemetryEvent) -> bool {
     if sample_rate >= 1.0 {
         return true;
@@ -277,9 +280,10 @@ fn should_sample(sample_rate: f64, event: &TelemetryEvent) -> bool {
     if sample_rate <= 0.0 {
         return false;
     }
-    let json = serde_json::to_string(event).unwrap_or_default();
     let mut hasher = DefaultHasher::new();
-    json.hash(&mut hasher);
+    serde_json::to_string(event)
+        .unwrap_or_default()
+        .hash(&mut hasher);
     let hash = hasher.finish();
     (hash as f64 / u64::MAX as f64) < sample_rate
 }
@@ -301,7 +305,7 @@ mod tests {
             enabled: false,
             ..TelemetryConfig::default()
         };
-        let (_handle, uploader) = TelemetryHandle::new(store, Some(config));
+        let (_handle, uploader) = TelemetryHandle::new(&store, Some(config));
         assert!(
             uploader.is_none(),
             "an opted-out session must not spawn an uploader"
@@ -315,7 +319,7 @@ mod tests {
             enabled: true,
             ..TelemetryConfig::default()
         };
-        let (_handle, uploader) = TelemetryHandle::new(store, Some(config));
+        let (_handle, uploader) = TelemetryHandle::new(&store, Some(config));
         assert!(
             uploader.is_some(),
             "an opted-in session must expose the uploader task for the host to spawn"

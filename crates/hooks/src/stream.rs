@@ -31,7 +31,7 @@ use serde_json::Value;
 use tokio::io::{AsyncBufRead, AsyncBufReadExt};
 
 /// A progress message a hook emitted before its answer.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HookStreamEvent {
     /// The event name the hook chose.
     pub event: String,
@@ -40,7 +40,7 @@ pub struct HookStreamEvent {
 }
 
 /// A request a hook makes of the host while it runs.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HookHostRequest {
     /// The id the answer must carry back.
     pub id: u64,
@@ -74,7 +74,7 @@ pub trait HookRequestHandler: Send + Sync + std::fmt::Debug {
 }
 
 /// One parsed stdout message.
-pub(crate) enum HookMessage {
+pub enum HookMessage {
     /// Progress, collected by the caller.
     Event(HookStreamEvent),
     /// A note for the log.
@@ -92,7 +92,7 @@ pub(crate) enum HookMessage {
 /// control message must carry the fields its type names. A line without a
 /// recognised control `type` is the final answer, which keeps the historical
 /// one-line contract working unchanged.
-pub(crate) fn parse_message(line: &str) -> Result<Option<HookMessage>, String> {
+pub fn parse_message(line: &str) -> Result<Option<HookMessage>, String> {
     let trimmed = line.trim();
     if trimmed.is_empty() {
         return Ok(None);
@@ -145,7 +145,7 @@ pub(crate) fn parse_message(line: &str) -> Result<Option<HookMessage>, String> {
 ///
 /// Serialization cannot fail for a `Value`, so this returns a `String` rather
 /// than a `Result`; a request always gets an answer.
-pub(crate) fn response_line(
+pub fn response_line(
     request: &HookHostRequest,
     handler: Option<&dyn HookRequestHandler>,
 ) -> String {
@@ -179,17 +179,14 @@ pub(crate) fn response_line(
 }
 
 /// The host's message asking a hook to stop.
-pub(crate) const CANCEL_LINE: &str = r#"{"type":"cancel","reason":"timeout"}"#;
+pub const CANCEL_LINE: &str = r#"{"type":"cancel","reason":"timeout"}"#;
 
 /// Read one line, refusing to grow past `max` bytes.
 ///
 /// A line that exceeds the cap is an error rather than a truncated message: a
 /// protocol message cut in half is not a smaller message, it is a different
 /// one. The caller kills the hook when this returns an error.
-pub(crate) async fn read_line_capped<R>(
-    reader: &mut R,
-    max: usize,
-) -> std::io::Result<Option<Vec<u8>>>
+pub async fn read_line_capped<R>(reader: &mut R, max: usize) -> std::io::Result<Option<Vec<u8>>>
 where
     R: AsyncBufRead + Unpin,
 {
@@ -205,23 +202,20 @@ where
                 };
             }
 
-            match available.iter().position(|byte| *byte == b'\n') {
-                Some(newline) => {
-                    let take = newline + 1;
-                    if line.len() + take > max {
-                        return Err(too_long(max));
-                    }
-                    line.extend_from_slice(&available[..take]);
-                    (take, true)
+            if let Some(newline) = available.iter().position(|byte| *byte == b'\n') {
+                let take = newline + 1;
+                if line.len() + take > max {
+                    return Err(too_long(max));
                 }
-                None => {
-                    let take = available.len();
-                    if line.len() + take > max {
-                        return Err(too_long(max));
-                    }
-                    line.extend_from_slice(available);
-                    (take, false)
+                line.extend_from_slice(&available[..take]);
+                (take, true)
+            } else {
+                let take = available.len();
+                if line.len() + take > max {
+                    return Err(too_long(max));
                 }
+                line.extend_from_slice(available);
+                (take, false)
             }
         };
 

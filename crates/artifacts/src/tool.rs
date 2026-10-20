@@ -89,10 +89,10 @@ pub fn resolve_action(called_on: &str, action: &str) -> ResolvedAction {
         // addressing it elsewhere is named as the mistake it is. Actions two
         // tools share (`list`, `delete`, `read`) stay with the tool they were
         // addressed to.
-        other => match owning_family(other) {
-            Some(owner) => (owner, other, false),
-            None => (family_of(called_on), other, false),
-        },
+        other => owning_family(other).map_or_else(
+            || (family_of(called_on), other, false),
+            |owner| (owner, other, false),
+        ),
     };
 
     ResolvedAction {
@@ -135,7 +135,7 @@ const COMMENTS_ACTIONS: [&str; 6] = ["comments", "read", "list", "reply", "add",
 /// The actions the check tool answers.
 const CHECK_ACTIONS: [&str; 1] = ["verify"];
 
-fn actions_of(family: Family) -> &'static [&'static str] {
+const fn actions_of(family: Family) -> &'static [&'static str] {
     match family {
         Family::Artifact => &ARTIFACT_ACTIONS,
         Family::Data => &DATA_ACTIONS,
@@ -215,7 +215,7 @@ pub struct ArtifactTools {
 impl ArtifactTools {
     /// Build the family over a service.
     #[must_use]
-    pub fn new(service: Arc<ArtifactService>) -> Self {
+    pub const fn new(service: Arc<ArtifactService>) -> Self {
         Self { service }
     }
 
@@ -332,13 +332,7 @@ impl ArtifactTool {
         let manifest = self
             .service
             .store()
-            .publish(
-                slug,
-                &Page {
-                    title: title.to_string(),
-                    files,
-                },
-            )
+            .publish(slug, &Page { title, files })
             .map_err(store_error)?;
 
         let slug = Slug::parse(&manifest.slug).ok_or_else(|| internal("bad slug"))?;
@@ -354,6 +348,8 @@ impl ArtifactTool {
     }
 
     fn list(&self) -> Result<String, ToolError> {
+        use std::fmt::Write as _;
+
         let artifacts = self.service.store().list().map_err(store_error)?;
         if artifacts.is_empty() {
             return Ok("No artifacts have been published.".into());
@@ -364,19 +360,20 @@ impl ArtifactTool {
             let Some(slug) = Slug::parse(&manifest.slug) else {
                 continue;
             };
-            out.push_str(&format!(
-                "{}\t{}\t{} file(s)\t{}\n",
+            let _ = writeln!(
+                out,
+                "{}\t{}\t{} file(s)\t{}",
                 self.service.url(&slug),
                 manifest.title,
                 manifest.current().map_or(0, |version| version.files.len()),
                 manifest.current_version
-            ));
+            );
         }
         Ok(out.trim_end().to_string())
     }
 
     fn read(&self, arguments: &Value) -> Result<String, ToolError> {
-        let slug = self.slug_arg(arguments)?;
+        let slug = Self::slug_arg(arguments)?;
         let manifest = self.service.store().manifest(&slug).map_err(store_error)?;
         let url = self.service.url(&slug);
 
@@ -406,7 +403,9 @@ impl ArtifactTool {
     }
 
     fn versions(&self, arguments: &Value) -> Result<String, ToolError> {
-        let slug = self.slug_arg(arguments)?;
+        use std::fmt::Write as _;
+
+        let slug = Self::slug_arg(arguments)?;
         let manifest = self.service.store().manifest(&slug).map_err(store_error)?;
 
         if let Some(label) = string_arg(arguments, "version") {
@@ -433,18 +432,19 @@ impl ArtifactTool {
             manifest.title, manifest.current_version
         );
         for version in &manifest.versions {
-            out.push_str(&format!(
-                "{}\t{}\t{} file(s)\n",
+            let _ = writeln!(
+                out,
+                "{}\t{}\t{} file(s)",
                 version.label,
                 version.created_at,
                 version.files.len()
-            ));
+            );
         }
         Ok(out.trim_end().to_string())
     }
 
     fn delete(&self, arguments: &Value) -> Result<String, ToolError> {
-        let slug = self.slug_arg(arguments)?;
+        let slug = Self::slug_arg(arguments)?;
         let url = self.service.url(&slug);
         let removed = self.service.store().delete(&slug).map_err(store_error)?;
 
@@ -459,7 +459,9 @@ impl ArtifactTool {
     }
 
     fn list_files(&self, arguments: &Value) -> Result<String, ToolError> {
-        let slug = self.slug_arg(arguments)?;
+        use std::fmt::Write as _;
+
+        let slug = Self::slug_arg(arguments)?;
         let manifest = self.service.store().manifest(&slug).map_err(store_error)?;
         let version = manifest
             .current()
@@ -467,13 +469,13 @@ impl ArtifactTool {
 
         let mut out = String::new();
         for file in &version.files {
-            out.push_str(&format!("{}\t{} bytes\n", file.path, file.bytes));
+            let _ = writeln!(out, "{}\t{} bytes", file.path, file.bytes);
         }
         Ok(out.trim_end().to_string())
     }
 
     fn read_file(&self, arguments: &Value) -> Result<String, ToolError> {
-        let slug = self.slug_arg(arguments)?;
+        let slug = Self::slug_arg(arguments)?;
         let path = string_arg(arguments, "path").unwrap_or_else(|| ENTRY_FILE.to_string());
         let version = string_arg(arguments, "version");
 
@@ -490,7 +492,7 @@ impl ArtifactTool {
     }
 
     fn upload_asset(&self, arguments: &Value, ctx: &ToolContext<'_>) -> Result<String, ToolError> {
-        let slug = self.slug_arg(arguments)?;
+        let slug = Self::slug_arg(arguments)?;
 
         let contents = if let Some(path) = string_arg(arguments, "path") {
             std::fs::read(ctx.cwd.join(&path)).map_err(|error| ToolError::InvalidInput {
@@ -513,7 +515,7 @@ impl ArtifactTool {
     }
 
     fn list_assets(&self, arguments: &Value) -> Result<String, ToolError> {
-        let slug = self.slug_arg(arguments)?;
+        let slug = Self::slug_arg(arguments)?;
         let assets = self.service.list_assets(&slug).map_err(store_error)?;
         if assets.is_empty() {
             return Ok("This artifact has no assets.".into());
@@ -522,7 +524,7 @@ impl ArtifactTool {
     }
 
     fn read_asset(&self, arguments: &Value) -> Result<String, ToolError> {
-        let slug = self.slug_arg(arguments)?;
+        let slug = Self::slug_arg(arguments)?;
         let asset_id = string_arg(arguments, "asset_id")
             .ok_or_else(|| invalid("read_asset needs an asset_id"))?;
         let contents = self
@@ -542,7 +544,7 @@ impl ArtifactTool {
     }
 
     fn delete_asset(&self, arguments: &Value) -> Result<String, ToolError> {
-        let slug = self.slug_arg(arguments)?;
+        let slug = Self::slug_arg(arguments)?;
         let asset_id = string_arg(arguments, "asset_id")
             .ok_or_else(|| invalid("delete_asset needs an asset_id"))?;
         let removed = self
@@ -557,13 +559,15 @@ impl ArtifactTool {
     }
 
     fn data_action(&self, action: &str, arguments: &Value) -> Result<String, ToolError> {
-        let slug = self.slug_arg(arguments)?;
+        let slug = Self::slug_arg(arguments)?;
         let db = self.service.db(&slug);
 
         match action {
             "get" => {
-                let (collection, doc_id) = self.doc_args(arguments)?;
-                let document = db.get(&collection, &doc_id).map_err(db_error)?;
+                let (collection, doc_id) = Self::doc_args(arguments)?;
+                let document = db
+                    .get(&collection, &doc_id)
+                    .map_err(|error| db_error(&error))?;
                 Ok(truncate(
                     &serde_json::to_string_pretty(&json!({
                         "id": document.id,
@@ -575,15 +579,15 @@ impl ArtifactTool {
                 ))
             }
             "list" => {
-                let collection = self.collection_arg(arguments)?;
+                let collection = Self::collection_arg(arguments)?;
                 let limit = arguments
                     .get("limit")
                     .and_then(Value::as_u64)
-                    .map(|n| n as usize);
+                    .map(|n| usize::try_from(n).unwrap_or(usize::MAX));
                 let cursor = string_arg(arguments, "cursor");
                 let page = db
                     .list(&collection, limit, cursor.as_deref())
-                    .map_err(db_error)?;
+                    .map_err(|error| db_error(&error))?;
                 Ok(serde_json::to_string_pretty(&json!({
                     "documents": page.documents,
                     "next_cursor": page.next_cursor,
@@ -591,7 +595,7 @@ impl ArtifactTool {
                 .unwrap_or_default())
             }
             "query" => {
-                let collection = self.collection_arg(arguments)?;
+                let collection = Self::collection_arg(arguments)?;
                 let mut equals = Vec::new();
                 if let Some(where_clause) = arguments.get("where").and_then(Value::as_object) {
                     for (field, value) in where_clause {
@@ -604,15 +608,17 @@ impl ArtifactTool {
                         .ok_or_else(|| invalid("query with a field needs a value"))?;
                     equals.push((field, value));
                 }
-                let documents = db.query(&collection, &equals).map_err(db_error)?;
+                let documents = db
+                    .query(&collection, &equals)
+                    .map_err(|error| db_error(&error))?;
                 Ok(truncate(
                     &serde_json::to_string_pretty(&documents).unwrap_or_default(),
                     DB_READ_MAX_RESULT_SIZE_CHARS,
                 ))
             }
             "set" | "update" | "delete" | "str_replace" => {
-                let write = self.write_arg(action, arguments)?;
-                let entry = db.apply(&write).map_err(db_error)?;
+                let write = Self::write_arg(action, arguments)?;
+                let entry = db.apply(&write).map_err(|error| db_error(&error))?;
                 Ok(serde_json::to_string_pretty(&json!({
                     "collection": entry.collection,
                     "doc_id": entry.doc_id,
@@ -629,10 +635,10 @@ impl ArtifactTool {
                 let mut parsed = Vec::with_capacity(writes.len());
                 for write in writes {
                     let op = string_arg(write, "op").unwrap_or_else(|| "set".to_string());
-                    parsed.push(self.write_arg(&op, write)?);
+                    parsed.push(Self::write_arg(&op, write)?);
                 }
 
-                let outcome = db.batch(&parsed).map_err(db_error)?;
+                let outcome = db.batch(&parsed).map_err(|error| db_error(&error))?;
                 Ok(serde_json::to_string_pretty(&json!({
                     "results": outcome.results,
                 }))
@@ -643,7 +649,7 @@ impl ArtifactTool {
     }
 
     fn comment_action(&self, action: &str, arguments: &Value) -> Result<String, ToolError> {
-        let slug = self.slug_arg(arguments)?;
+        let slug = Self::slug_arg(arguments)?;
 
         match action {
             "comments" | "read" | "list" => {
@@ -684,7 +690,7 @@ impl ArtifactTool {
         if action != "verify" {
             return Err(unknown_action(action, CHECK_TOOL));
         }
-        let slug = self.slug_arg(arguments)?;
+        let slug = Self::slug_arg(arguments)?;
         let report = self.service.verify(&slug).map_err(store_error)?;
 
         if report.is_intact() {
@@ -703,7 +709,7 @@ impl ArtifactTool {
         ))
     }
 
-    fn slug_arg(&self, arguments: &Value) -> Result<Slug, ToolError> {
+    fn slug_arg(arguments: &Value) -> Result<Slug, ToolError> {
         let reference = string_arg(arguments, "url")
             .or_else(|| string_arg(arguments, "slug"))
             .or_else(|| string_arg(arguments, "artifact"))
@@ -712,22 +718,22 @@ impl ArtifactTool {
             .ok_or_else(|| invalid(&format!("'{reference}' is not an artifact url")))
     }
 
-    fn collection_arg(&self, arguments: &Value) -> Result<String, ToolError> {
+    fn collection_arg(arguments: &Value) -> Result<String, ToolError> {
         string_arg(arguments, "collection")
             .or_else(|| string_arg(arguments, "path"))
             .ok_or_else(|| invalid("this action needs a collection"))
     }
 
-    fn doc_args(&self, arguments: &Value) -> Result<(String, String), ToolError> {
-        let collection = self.collection_arg(arguments)?;
+    fn doc_args(arguments: &Value) -> Result<(String, String), ToolError> {
+        let collection = Self::collection_arg(arguments)?;
         let doc_id = string_arg(arguments, "doc_id")
             .or_else(|| string_arg(arguments, "document"))
             .ok_or_else(|| invalid("this action needs a doc_id"))?;
         Ok((collection, doc_id))
     }
 
-    fn write_arg(&self, op: &str, arguments: &Value) -> Result<DbWrite, ToolError> {
-        let collection = self.collection_arg(arguments)?;
+    fn write_arg(op: &str, arguments: &Value) -> Result<DbWrite, ToolError> {
+        let collection = Self::collection_arg(arguments)?;
         let doc_id = string_arg(arguments, "doc_id")
             .or_else(|| string_arg(arguments, "document"))
             .ok_or_else(|| invalid("a write needs a doc_id"))?;
@@ -853,7 +859,7 @@ fn action_of(arguments: &Value) -> String {
     string_arg(arguments, "action").unwrap_or_default()
 }
 
-fn tool_for(family: Family) -> &'static str {
+const fn tool_for(family: Family) -> &'static str {
     match family {
         Family::Artifact => ARTIFACT_TOOL,
         Family::Data => DATA_TOOL,
@@ -887,7 +893,7 @@ fn unknown_action(action: &str, tool: &str) -> ToolError {
     invalid(&format!("'{action}' is not an action {tool} has"))
 }
 
-fn db_error(error: crate::db::DbError) -> ToolError {
+fn db_error(error: &crate::db::DbError) -> ToolError {
     invalid(&error.to_string())
 }
 

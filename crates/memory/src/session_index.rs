@@ -240,6 +240,8 @@ impl SessionIndex {
     /// Tokenizes the content, stores term frequencies in the `tfidf` table.
     /// On subsequent `search_semantic` calls, query tokens are compared
     /// against stored term frequencies using cosine similarity.
+    // TF-IDF weights; token counts are far below 2^53.
+    #[allow(clippy::cast_precision_loss)]
     pub fn index_content(&self, session_id: &str, content: &str) -> Result<(), SessionIndexError> {
         self.conn.execute(
             "DELETE FROM session_tfidf WHERE session_id = ?1",
@@ -281,6 +283,8 @@ impl SessionIndex {
     /// Computes TF-IDF cosine similarity between query tokens and stored
     /// session term frequencies. Returns the top `limit` sessions ordered
     /// by similarity score.
+    // TF-IDF weights; token and document counts are far below 2^53.
+    #[allow(clippy::cast_precision_loss)]
     pub fn search_semantic(
         &self,
         query: &str,
@@ -326,7 +330,7 @@ impl SessionIndex {
             let df: i64 = row.get(1)?;
             Ok((term, df))
         })?;
-        let idf_map: HashMap<String, i64> = idf_rows.filter_map(|r| r.ok()).collect();
+        let idf_map: HashMap<String, i64> = idf_rows.filter_map(std::result::Result::ok).collect();
 
         // Compute IDF for query terms
         let query_idf: HashMap<String, f64> = query_terms
@@ -366,7 +370,7 @@ impl SessionIndex {
 
                     if let Some(&qtf_count) = query_terms.get(term) {
                         let qtf = qtf_count as f64 / total_query;
-                        dot += (*tf * idf) * (qtf * idf);
+                        dot = (*tf * idf).mul_add(qtf * idf, dot);
                     }
                 }
 

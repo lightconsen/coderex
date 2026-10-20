@@ -501,11 +501,11 @@ fn compile_timeout() -> std::time::Duration {
 /// `CODEREX_WASM_CACHE_DIR` environment variable, and the platform default.
 #[cfg(feature = "wasm-runtime")]
 fn resolved_cache_dir() -> PathBuf {
-    if let Some(dir) = CACHE_DIR_OVERRIDE
+    let override_dir = CACHE_DIR_OVERRIDE
         .read()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .clone()
-    {
+        .clone();
+    if let Some(dir) = override_dir {
         return dir;
     }
     if let Some(dir) = std::env::var_os(WASM_CACHE_DIR_ENV) {
@@ -652,7 +652,10 @@ fn decode_cache_entry<'a>(
     if entry[44..76] != module_hash[..] {
         return Err("cache entry does not match the module file's SHA-256".into());
     }
-    let len = u64::from_le_bytes(entry[76..84].try_into().expect("8 bytes")) as usize;
+    let len = usize::try_from(u64::from_le_bytes(
+        entry[76..84].try_into().expect("8 bytes"),
+    ))
+    .map_err(|_| "cache entry payload length does not fit in memory".to_string())?;
     let payload = &entry[WASM_CACHE_HEADER_LEN..];
     if payload.len() != len {
         return Err(format!(
@@ -922,7 +925,7 @@ fn run_compile_helper(
     #[allow(unused_mut)]
     let mut program: OsString = command.program().as_os_str().to_os_string();
     let mut args: Vec<OsString> = command.args().to_vec();
-    args.push(input_path.clone().into_os_string());
+    args.push(input_path.into_os_string());
     args.push(output_path.clone().into_os_string());
 
     #[cfg(target_os = "linux")]
@@ -1786,7 +1789,7 @@ impl PluginWasmInstance {
     }
 
     /// Perform the coderex initialize handshake.
-    pub async fn initialize(&mut self) -> Result<serde_json::Value, String> {
+    pub fn initialize(&mut self) -> Result<serde_json::Value, String> {
         let config = serde_json::json!({
             "protocolVersion": "1.0",
             "capabilities": {},
@@ -1795,38 +1798,34 @@ impl PluginWasmInstance {
                 "version": env!("CARGO_PKG_VERSION")
             }
         });
-        let result = self
-            .call_with_json("coderex_initialize", Some(&config.to_string()))
-            .await?;
+        let result = self.call_with_json("coderex_initialize", Some(&config.to_string()))?;
         self.initialized = true;
         Ok(result)
     }
 
     /// Discover commands from the plugin.
-    pub async fn list_commands(&mut self) -> Result<Vec<PluginCommandInfo>, String> {
-        let result = self.call_with_json("coderex_commands_list", None).await?;
+    pub fn list_commands(&mut self) -> Result<Vec<PluginCommandInfo>, String> {
+        let result = self.call_with_json("coderex_commands_list", None)?;
         let commands: Vec<PluginCommandInfo> = serde_json::from_value(result)
             .map_err(|e| format!("failed to parse commands/list response: {e}"))?;
-        self.commands = commands.clone();
+        self.commands.clone_from(&commands);
         Ok(commands)
     }
 
     /// Discover skills from the plugin.
-    pub async fn list_skills(&mut self) -> Result<Vec<PluginSkillInfo>, String> {
-        let result = self.call_with_json("coderex_skills_list", None).await?;
+    pub fn list_skills(&mut self) -> Result<Vec<PluginSkillInfo>, String> {
+        let result = self.call_with_json("coderex_skills_list", None)?;
         let skills: Vec<PluginSkillInfo> = serde_json::from_value(result)
             .map_err(|e| format!("failed to parse skills/list response: {e}"))?;
-        self.skills = skills.clone();
+        self.skills.clone_from(&skills);
         Ok(skills)
     }
 
     /// Execute a plugin command.
-    pub async fn execute_command(&mut self, name: &str, args: &[String]) -> Result<String, String> {
+    pub fn execute_command(&mut self, name: &str, args: &[String]) -> Result<String, String> {
         let args_json =
             serde_json::to_string(args).map_err(|e| format!("failed to serialize args: {e}"))?;
-        let result = self
-            .call_with_two_strings("coderex_command_execute", name, &args_json)
-            .await?;
+        let result = self.call_with_two_strings("coderex_command_execute", name, &args_json)?;
         match result {
             serde_json::Value::String(s) => Ok(s),
             other => Ok(other.to_string()),
@@ -1834,15 +1833,13 @@ impl PluginWasmInstance {
     }
 
     /// Execute a plugin skill.
-    pub async fn execute_skill(
+    pub fn execute_skill(
         &mut self,
         name: &str,
         context: &serde_json::Value,
     ) -> Result<String, String> {
         let ctx_json = context.to_string();
-        let result = self
-            .call_with_two_strings("coderex_skill_execute", name, &ctx_json)
-            .await?;
+        let result = self.call_with_two_strings("coderex_skill_execute", name, &ctx_json)?;
         match result {
             serde_json::Value::String(s) => Ok(s),
             other => Ok(other.to_string()),
@@ -1851,7 +1848,7 @@ impl PluginWasmInstance {
 
     /// Internal helper: call a guest function that takes an optional JSON
     /// string and returns a JSON string pointer.
-    async fn call_with_json(
+    fn call_with_json(
         &self,
         method: &str,
         params_json: Option<&str>,
@@ -1892,7 +1889,9 @@ impl PluginWasmInstance {
             };
 
             let result_json = read_cstring(&memory, &store, result_ptr)?;
-            let _ = dealloc.call(&mut store, (result_ptr, result_json.len() as i32));
+            let result_len = i32::try_from(result_json.len())
+                .map_err(|_| "WASM result exceeds i32 length".to_string())?;
+            let _ = dealloc.call(&mut store, (result_ptr, result_len));
 
             serde_json::from_str(&result_json)
                 .map_err(|e| format!("failed to parse WASM JSON result: {e}"))
@@ -1901,7 +1900,7 @@ impl PluginWasmInstance {
 
     /// Internal helper: call a guest function that takes two strings
     /// `(ptr1, len1, ptr2, len2) -> i32`.
-    async fn call_with_two_strings(
+    fn call_with_two_strings(
         &self,
         method: &str,
         s1: &str,
@@ -1938,7 +1937,9 @@ impl PluginWasmInstance {
             let _ = dealloc.call(&mut store, (p2, l2));
 
             let result_json = read_cstring(&memory, &store, result_ptr)?;
-            let _ = dealloc.call(&mut store, (result_ptr, result_json.len() as i32));
+            let result_len = i32::try_from(result_json.len())
+                .map_err(|_| "WASM result exceeds i32 length".to_string())?;
+            let _ = dealloc.call(&mut store, (result_ptr, result_len));
 
             serde_json::from_str(&result_json)
                 .map_err(|e| format!("failed to parse WASM JSON result: {e}"))
@@ -1972,31 +1973,27 @@ impl PluginWasmInstance {
     }
 
     /// Returns an error when the feature is disabled.
-    pub async fn initialize(&mut self) -> Result<serde_json::Value, String> {
+    pub fn initialize(&mut self) -> Result<serde_json::Value, String> {
         Err("WASM runtime not enabled".into())
     }
 
     /// Returns an error when the feature is disabled.
-    pub async fn list_commands(&mut self) -> Result<Vec<PluginCommandInfo>, String> {
+    pub fn list_commands(&mut self) -> Result<Vec<PluginCommandInfo>, String> {
         Err("WASM runtime not enabled".into())
     }
 
     /// Returns an error when the feature is disabled.
-    pub async fn list_skills(&mut self) -> Result<Vec<PluginSkillInfo>, String> {
+    pub fn list_skills(&mut self) -> Result<Vec<PluginSkillInfo>, String> {
         Err("WASM runtime not enabled".into())
     }
 
     /// Returns an error when the feature is disabled.
-    pub async fn execute_command(
-        &mut self,
-        _name: &str,
-        _args: &[String],
-    ) -> Result<String, String> {
+    pub fn execute_command(&mut self, _name: &str, _args: &[String]) -> Result<String, String> {
         Err("WASM runtime not enabled".into())
     }
 
     /// Returns an error when the feature is disabled.
-    pub async fn execute_skill(
+    pub fn execute_skill(
         &mut self,
         _name: &str,
         _context: &serde_json::Value,
@@ -2013,16 +2010,19 @@ fn write_to_memory(
     data: &str,
 ) -> Result<(i32, i32), String> {
     let bytes = data.as_bytes();
+    let len =
+        i32::try_from(bytes.len()).map_err(|_| "WASM string exceeds i32 length".to_string())?;
     let ptr = alloc
-        .call(&mut *store, bytes.len() as i32)
+        .call(&mut *store, len)
         .map_err(|e| format!("alloc failed: {e}"))?;
     let mem_data = memory.data_mut(store);
-    let offset = ptr as usize;
+    let offset =
+        usize::try_from(ptr).map_err(|_| "WASM alloc returned a negative pointer".to_string())?;
     if offset + bytes.len() > mem_data.len() {
         return Err("WASM alloc returned pointer outside memory bounds".into());
     }
     mem_data[offset..offset + bytes.len()].copy_from_slice(bytes);
-    Ok((ptr, bytes.len() as i32))
+    Ok((ptr, len))
 }
 
 #[cfg(feature = "wasm-runtime")]
@@ -2034,7 +2034,8 @@ fn read_cstring(
     if ptr == 0 {
         return Err("WASM returned null pointer".into());
     }
-    let offset = ptr as usize;
+    let offset =
+        usize::try_from(ptr).map_err(|_| "WASM returned a negative pointer".to_string())?;
     let mem_data = memory.data(store);
     if offset >= mem_data.len() {
         return Err("WASM pointer out of bounds".into());
@@ -2235,7 +2236,6 @@ mod sandbox_tests {
 
         let value = instance
             .initialize()
-            .await
             .expect("initialize must return the injected options JSON");
 
         assert_eq!(value["FILE_TOKEN"], "s3cret");
@@ -2272,7 +2272,6 @@ mod sandbox_tests {
         let mut instance = load(&path).expect("a module with no imports must load");
         let value = instance
             .initialize()
-            .await
             .expect("a module with no imports must still initialize");
         assert_eq!(value, serde_json::json!("ok"));
     }
@@ -2349,7 +2348,6 @@ mod sandbox_tests {
         let mut instance = load(&path).unwrap();
         let err = instance
             .initialize()
-            .await
             .expect_err("a module that loops forever must not complete");
         assert!(
             err.contains("fuel"),
@@ -2386,7 +2384,6 @@ mod sandbox_tests {
         let mut instance = load(&path).unwrap();
         let err = instance
             .initialize()
-            .await
             .expect_err("memory growth past the ceiling must be denied");
         assert!(
             err.contains("null pointer"),
@@ -2415,7 +2412,6 @@ mod sandbox_tests {
         let mut instance = load(&path).unwrap();
         let err = instance
             .initialize()
-            .await
             .expect_err("a module declaring 128 MiB must not instantiate");
         assert!(
             err.contains("memory"),
@@ -2466,7 +2462,6 @@ mod sandbox_tests {
         let mut instance = load(&path).unwrap();
         let err = instance
             .initialize()
-            .await
             .expect_err("a module importing WASI must not instantiate");
         assert!(
             err.contains("instantiate"),

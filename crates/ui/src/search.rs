@@ -37,7 +37,7 @@ impl Default for SearchState {
 impl SearchState {
     /// Create a new search state.
     #[must_use]
-    pub fn new() -> Self {
+    pub const fn new() -> Self {
         Self {
             query: String::new(),
             regex: None,

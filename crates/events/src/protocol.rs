@@ -506,7 +506,7 @@ impl ControlResponseFrame {
 
     /// Mark a successful allow as session-wide.
     #[must_use]
-    pub fn with_allow_session(mut self, allow_session: bool) -> Self {
+    pub const fn with_allow_session(mut self, allow_session: bool) -> Self {
         if let Some(body) = self.response.response.as_mut() {
             body.allow_session = allow_session;
         }
@@ -605,7 +605,9 @@ impl ControlResponseFrame {
 }
 
 /// `serde` helper: omit a `false` boolean from the wire form.
-fn is_false(value: &bool) -> bool {
+// `skip_serializing_if` requires the predicate to take its field by reference.
+#[allow(clippy::trivially_copy_pass_by_ref)]
+const fn is_false(value: &bool) -> bool {
     !*value
 }
 

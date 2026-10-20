@@ -56,7 +56,7 @@ impl ArtifactService {
 
     /// The store pages live in.
     #[must_use]
-    pub fn store(&self) -> &ArtifactStore {
+    pub const fn store(&self) -> &ArtifactStore {
         &self.store
     }
 

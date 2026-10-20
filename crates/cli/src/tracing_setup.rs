@@ -11,9 +11,7 @@ use tracing_subscriber::{EnvFilter, fmt, layer::SubscriberExt, util::SubscriberI
 pub fn init_tracing() {
     let filter = EnvFilter::try_from_env("CODEREX_LOG").unwrap_or_else(|_| EnvFilter::new("off"));
 
-    let format_json = std::env::var("CODEREX_LOG_FORMAT")
-        .map(|v| v == "json")
-        .unwrap_or(false);
+    let format_json = std::env::var("CODEREX_LOG_FORMAT").is_ok_and(|v| v == "json");
 
     if format_json {
         tracing_subscriber::registry()

@@ -120,12 +120,12 @@ impl Orchestrator {
     }
 
     /// Set the default model profile.
-    pub fn set_default_model(&mut self, profile: ModelProfile) {
+    pub const fn set_default_model(&mut self, profile: ModelProfile) {
         self.default_model = profile;
     }
 
     /// Set the default prompt profile.
-    pub fn set_default_prompt(&mut self, profile: PromptProfile) {
+    pub const fn set_default_prompt(&mut self, profile: PromptProfile) {
         self.default_prompt = profile;
     }
 
@@ -165,7 +165,7 @@ impl Orchestrator {
         &self,
         request: &QueryRequest,
     ) -> Result<QueryResult, OrchestratorError> {
-        let model = self.resolve_model(&request.model_profile);
+        let model = Self::resolve_model(request.model_profile);
         let system = request.custom_system_prompt.clone().unwrap_or_else(|| {
             crate::prompts::compose_system_prompt_for_profiles(&[request.prompt_profile])
         });
@@ -247,7 +247,7 @@ impl Orchestrator {
         &self,
         request: &QueryRequest,
     ) -> Result<QueryResult, OrchestratorError> {
-        let system = self.build_system_prompt(request);
+        let system = Self::build_system_prompt(request);
         let parent_context = if request.inherit_session {
             Some("Inherited parent-session context is available for this sub-task.")
         } else {
@@ -260,7 +260,7 @@ impl Orchestrator {
             &request.user_prompt,
             parent_context,
             request.allowed_tools.as_deref(),
-            &self.resolve_model(&request.model_profile),
+            &Self::resolve_model(request.model_profile),
             request.max_tokens,
             true,
         )
@@ -268,12 +268,12 @@ impl Orchestrator {
     }
 
     /// Resolve a model profile to a concrete model.
-    fn resolve_model(&self, profile: &ModelProfile) -> ModelId {
+    fn resolve_model(profile: ModelProfile) -> ModelId {
         profile.resolve_runtime()
     }
 
     /// Build the system prompt for a request.
-    fn build_system_prompt(&self, request: &QueryRequest) -> String {
+    fn build_system_prompt(request: &QueryRequest) -> String {
         if let Some(ref override_prompt) = request.custom_system_prompt {
             return override_prompt.clone();
         }
@@ -345,10 +345,12 @@ fn build_options_from_request(request: &QueryRequest) -> SubmitOptions {
             request.prompt_profile,
         ]));
     }
-    options.append_system_prompt = request.append_system_prompt.clone();
+    options
+        .append_system_prompt
+        .clone_from(&request.append_system_prompt);
     // A sub-agent's identity is what makes the background-agent permission
     // hook fire; dropping it here made the hook unreachable in production.
-    options.agent_id = request.agent_id.clone();
+    options.agent_id.clone_from(&request.agent_id);
     options.allowed_tools_override = request
         .allowed_tools
         .clone()
@@ -427,22 +429,26 @@ pub async fn run_forked_agent(
     max_tokens: u32,
     writable: bool,
 ) -> Result<QueryResult, OrchestratorError> {
-    let mut full_system = match parent_context {
-        Some(ctx) => format!(
-            "{system_prompt}\n\n\
-             You are a sub-agent working on a sub-task. Parent session context:\n\
-             {ctx}\n\n\
-             Focus only on your assigned task. Use only the tools explicitly allowed to you."
-        ),
-        None => format!(
-            "{system_prompt}\n\n\
-             You are a sub-agent working on an isolated task. Focus only on \
-             your assigned assignment."
-        ),
-    };
+    let mut full_system = parent_context.map_or_else(
+        || {
+            format!(
+                "{system_prompt}\n\n\
+                 You are a sub-agent working on an isolated task. Focus only on \
+                 your assigned assignment."
+            )
+        },
+        |ctx| {
+            format!(
+                "{system_prompt}\n\n\
+                 You are a sub-agent working on a sub-task. Parent session context:\n\
+                 {ctx}\n\n\
+                 Focus only on your assigned task. Use only the tools explicitly allowed to you."
+            )
+        },
+    );
 
     let effective_tools: Option<Vec<String>> = if writable {
-        allowed_tools.map(|t| t.to_vec())
+        allowed_tools.map(<[std::string::String]>::to_vec)
     } else {
         // Enforce read-only tool set when not writable
         let read_only: Vec<String> = vec!["Read".into(), "Grep".into(), "Glob".into()];
@@ -640,7 +646,7 @@ async fn collect_text_output(event_rx: &mut mpsc::UnboundedReceiver<EngineEvent>
 }
 
 /// Return a snake_case label for a background feature kind.
-pub fn background_feature_label(kind: BackgroundFeatureKind) -> &'static str {
+pub const fn background_feature_label(kind: BackgroundFeatureKind) -> &'static str {
     match kind {
         BackgroundFeatureKind::AgentSummary => "agent_summary",
         BackgroundFeatureKind::AwaySummary => "away_summary",

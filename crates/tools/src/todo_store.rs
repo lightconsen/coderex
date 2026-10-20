@@ -21,8 +21,10 @@ pub struct TodoItem {
 /// Status of a todo item.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum TodoStatus {
     /// Not yet started.
+    #[default]
     Pending,
     /// Currently being worked on.
     InProgress,
@@ -33,16 +35,10 @@ pub enum TodoStatus {
 impl std::fmt::Display for TodoStatus {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            TodoStatus::Pending => write!(f, "pending"),
-            TodoStatus::InProgress => write!(f, "in_progress"),
-            TodoStatus::Completed => write!(f, "completed"),
+            Self::Pending => write!(f, "pending"),
+            Self::InProgress => write!(f, "in_progress"),
+            Self::Completed => write!(f, "completed"),
         }
-    }
-}
-
-impl Default for TodoStatus {
-    fn default() -> Self {
-        Self::Pending
     }
 }
 
@@ -66,7 +62,7 @@ pub struct TodoStore {
 
 impl TodoStore {
     /// Create an empty todo store.
-    pub fn new() -> Self {
+    pub const fn new() -> Self {
         Self {
             items: Mutex::new(Vec::new()),
         }

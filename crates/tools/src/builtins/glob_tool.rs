@@ -47,6 +47,8 @@ impl Tool for GlobTool {
         input: ToolInput,
         ctx: ToolContext<'_>,
     ) -> Result<ToolOutput, ToolError> {
+        use std::fmt::Write as _;
+
         let pattern = extract_string(&input.arguments, "pattern")?;
         let path = input
             .arguments
@@ -82,7 +84,10 @@ impl Tool for GlobTool {
             })?;
 
             if entry.file_type().is_file() {
-                let relative = entry.path().strip_prefix(&root).unwrap_or(entry.path());
+                let relative = entry
+                    .path()
+                    .strip_prefix(&root)
+                    .unwrap_or_else(|_| entry.path());
                 if matcher.is_match(relative) {
                     matches.push(relative.to_string_lossy().to_string());
                 }
@@ -95,7 +100,7 @@ impl Tool for GlobTool {
 
         let mut output = matches.join("\n");
         if matches.len() >= MAX_RESULTS {
-            output.push_str(&format!("\n\n... (truncated to {MAX_RESULTS} results)"));
+            let _ = write!(output, "\n\n... (truncated to {MAX_RESULTS} results)");
         }
 
         Ok(ToolOutput {

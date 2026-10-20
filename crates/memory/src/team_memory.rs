@@ -8,6 +8,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
 /// Checksum of memory content for incremental sync.
@@ -26,7 +27,12 @@ impl MemoryChecksum {
     /// Hex-encoded checksum string.
     #[must_use]
     pub fn to_hex(&self) -> String {
-        self.0.iter().map(|b| format!("{b:02x}")).collect()
+        self.0
+            .iter()
+            .fold(String::with_capacity(self.0.len() * 2), |mut out, byte| {
+                let _ = write!(out, "{byte:02x}");
+                out
+            })
     }
 }
 
@@ -184,6 +190,7 @@ impl InMemoryRelay {
                 entry.updated_at,
             );
         }
+        drop(guard);
         state
     }
 
@@ -206,7 +213,7 @@ pub struct RelayTransport {
 impl RelayTransport {
     /// Create a new transport adapter for the given relay.
     #[must_use]
-    pub fn new(relay: InMemoryRelay) -> Self {
+    pub const fn new(relay: InMemoryRelay) -> Self {
         Self { relay }
     }
 }
@@ -231,7 +238,9 @@ impl TeamSyncTransport for RelayTransport {
 
 /// Memories are stored in `<repo_memory_dir>/<org_id>/<encoded-topic>.json`,
 /// where the topic is percent-encoded by [`encode_topic`] so that every topic
-/// owns exactly one file: `backend/auth` and `backend_auth` no longer collide.
+/// owns exactly one file.
+///
+/// `backend/auth` and `backend_auth` no longer collide.
 /// Files written by the old lossy mapping are still read (only when the topic
 /// recorded inside them matches) and are migrated to the encoded name on the
 /// next write. Sync uses checksums to detect changes and only transfers deltas.
@@ -249,7 +258,7 @@ pub struct TeamMemorySyncService {
 impl TeamMemorySyncService {
     /// Create a new team memory sync service.
     #[must_use]
-    pub fn new(repo_id: String, memory_dir: PathBuf) -> Self {
+    pub const fn new(repo_id: String, memory_dir: PathBuf) -> Self {
         Self {
             repo_id,
             memory_dir,
@@ -259,7 +268,7 @@ impl TeamMemorySyncService {
 
     /// Create a new team memory sync service scoped to an organization.
     #[must_use]
-    pub fn new_with_org(repo_id: String, memory_dir: PathBuf, org_id: String) -> Self {
+    pub const fn new_with_org(repo_id: String, memory_dir: PathBuf, org_id: String) -> Self {
         Self {
             repo_id,
             memory_dir,
@@ -276,13 +285,13 @@ impl TeamMemorySyncService {
 
     /// Get the effective memory directory (includes org subdirectory if scoped).
     fn effective_memory_dir(&self) -> PathBuf {
-        match &self.org_id {
-            Some(org) => {
+        self.org_id.as_ref().map_or_else(
+            || self.memory_dir.clone(),
+            |org| {
                 let safe_org = org.replace(['/', '\\', ':', ' '], "_");
                 self.memory_dir.join(&safe_org)
-            }
-            None => self.memory_dir.clone(),
-        }
+            },
+        )
     }
 
     /// Upsert a memory entry.
@@ -394,7 +403,7 @@ impl TeamMemorySyncService {
 
         // Find remote entries that need to be received
         let mut to_receive = Vec::new();
-        for (topic, (checksum, tombstoned, updated_at)) in remote.entries.iter() {
+        for (topic, (checksum, tombstoned, updated_at)) in &remote.entries {
             if *tombstoned {
                 continue;
             }
@@ -411,18 +420,16 @@ impl TeamMemorySyncService {
                     });
                 }
                 Some(local) => {
-                    if local.checksum != *checksum {
-                        if *updated_at > local.updated_at {
-                            to_receive.push(TeamMemoryEntry {
-                                topic: topic.clone(),
-                                content: String::new(),
-                                checksum: *checksum,
-                                created_at: local.created_at,
-                                updated_at: *updated_at,
-                                tombstoned: false,
-                                version: 0,
-                            });
-                        }
+                    if local.checksum != *checksum && *updated_at > local.updated_at {
+                        to_receive.push(TeamMemoryEntry {
+                            topic: topic.clone(),
+                            content: String::new(),
+                            checksum: *checksum,
+                            created_at: local.created_at,
+                            updated_at: *updated_at,
+                            tombstoned: false,
+                            version: 0,
+                        });
                     }
                 }
             }

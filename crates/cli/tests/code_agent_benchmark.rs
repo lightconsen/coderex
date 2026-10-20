@@ -253,8 +253,7 @@ fn live_timeout() -> Duration {
         .ok()
         .and_then(|value| value.parse::<u64>().ok())
         .filter(|seconds| *seconds > 0)
-        .map(Duration::from_secs)
-        .unwrap_or(LIVE_TIMEOUT)
+        .map_or(LIVE_TIMEOUT, Duration::from_secs)
 }
 
 fn read_to_string<R: Read>(reader: R) -> String {
@@ -450,7 +449,7 @@ fn write_basic_rust_lib(cwd: &Path) {
     .expect("write Cargo.toml");
     std::fs::write(
         cwd.join("src/lib.rs"),
-        r#"pub fn add(a: i32, b: i32) -> i32 {
+        r"pub fn add(a: i32, b: i32) -> i32 {
     a + b
 }
 
@@ -463,7 +462,7 @@ mod tests {
         assert_eq!(add(2, 3), 5);
     }
 }
-"#,
+",
     )
     .expect("write src/lib.rs");
 }
@@ -477,7 +476,7 @@ fn write_failing_max_project(cwd: &Path) {
     .expect("write Cargo.toml");
     std::fs::write(
         cwd.join("src/lib.rs"),
-        r#"pub fn max(a: i32, b: i32) -> i32 {
+        r"pub fn max(a: i32, b: i32) -> i32 {
     if a > b { b } else { a }
 }
 
@@ -491,7 +490,7 @@ mod tests {
         assert_eq!(max(2, 10), 10);
     }
 }
-"#,
+",
     )
     .expect("write src/lib.rs");
 }
@@ -605,6 +604,8 @@ mod tests {
 }
 
 fn write_large_context_project(cwd: &Path) {
+    use std::fmt::Write as _;
+
     std::fs::create_dir_all(cwd.join("src")).expect("create src");
     std::fs::write(
         cwd.join("Cargo.toml"),
@@ -618,7 +619,7 @@ fn write_large_context_project(cwd: &Path) {
     .expect("write src/lib.rs");
     let mut large = String::new();
     for i in 0..10_000 {
-        large.push_str(&format!("pub fn fn_{i}() -> i32 {{ {i} }}\n"));
+        let _ = writeln!(large, "pub fn fn_{i}() -> i32 {{ {i} }}");
     }
     std::fs::write(cwd.join("src/large.rs"), large).expect("write large.rs");
 }

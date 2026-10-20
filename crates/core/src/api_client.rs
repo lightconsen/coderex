@@ -197,8 +197,11 @@ impl ErrorClass {
             Self::Dns | Self::Connection => TransportError::Connect,
             // A certificate the server will reject again, a body that will
             // not decode, an unclassified failure: none of them are "connect".
-            Self::Ssl | Self::Stream | Self::Decode | Self::Unknown => TransportError::Other,
-            Self::RateLimit
+            Self::Ssl
+            | Self::Stream
+            | Self::Decode
+            | Self::Unknown
+            | Self::RateLimit
             | Self::Server
             | Self::Auth
             | Self::AccessPolicy
@@ -266,7 +269,7 @@ pub struct TransportFacts {
 /// a body that failed after a response arrived is a stream failure rather
 /// than a connect failure.
 #[must_use]
-pub fn classify_transport_facts(facts: TransportFacts) -> ErrorClass {
+pub const fn classify_transport_facts(facts: TransportFacts) -> ErrorClass {
     if facts.timeout {
         return ErrorClass::Timeout;
     }
@@ -305,7 +308,7 @@ fn io_error_kind(error: &(dyn std::error::Error + 'static)) -> Option<std::io::E
 
 /// Classify an [`ApiError`].
 #[must_use]
-pub fn classify_error(error: &ApiError) -> ErrorClass {
+pub const fn classify_error(error: &ApiError) -> ErrorClass {
     match error {
         // The class was settled when the error was built, from the facts the
         // HTTP client reported about itself.
@@ -327,7 +330,7 @@ pub fn classify_error(error: &ApiError) -> ErrorClass {
 
 /// The triage decision for a failure: its class, and whether to try again.
 #[must_use]
-pub fn triage(error: &ApiError) -> ErrorTriage {
+pub const fn triage(error: &ApiError) -> ErrorTriage {
     let class = classify_error(error);
     let action = match class {
         ErrorClass::Timeout
@@ -645,7 +648,7 @@ impl AnthropicApiClient {
     /// This enables connection pooling when multiple `AnthropicApiClient`
     /// instances share the same underlying `reqwest::Client`.
     #[must_use]
-    pub fn new_with_client(config: ApiConfig, client: Client) -> Self {
+    pub const fn new_with_client(config: ApiConfig, client: Client) -> Self {
         Self { config, client }
     }
 
@@ -739,7 +742,7 @@ impl AnthropicApiClient {
                 req.header("x-api-key", &self.config.api_key)
                     .header("anthropic-version", "2023-06-01")
             } else {
-                req.header("Authorization", format!("Bearer {}", &self.config.api_key))
+                req.header("Authorization", format!("Bearer {}", self.config.api_key))
             };
         };
 
@@ -782,14 +785,14 @@ impl AnthropicApiClient {
                     // Bedrock and Mantle take a bearer token instead, which is
                     // what makes them usable without an AWS SDK.
                     None if cloud.kind.accepts_bearer() => {
-                        req.header("Authorization", format!("Bearer {}", &self.config.api_key))
+                        req.header("Authorization", format!("Bearer {}", self.config.api_key))
                     }
-                    None => req.header("Authorization", format!("Bearer {}", &self.config.api_key)),
+                    None => req.header("Authorization", format!("Bearer {}", self.config.api_key)),
                 }
             }
             AuthStyle::AzureApiKey => req.header("api-key", &self.config.api_key),
             AuthStyle::GoogleAccessToken | AuthStyle::Bearer => {
-                req.header("Authorization", format!("Bearer {}", &self.config.api_key))
+                req.header("Authorization", format!("Bearer {}", self.config.api_key))
             }
             AuthStyle::AnthropicApiKey => req.header("x-api-key", &self.config.api_key),
         }
@@ -848,18 +851,19 @@ impl AnthropicApiClient {
     }
 
     fn format_error_message(
-        &self,
         request_id: &str,
         server_request_id: Option<&str>,
-        message: String,
+        message: &str,
         fallback_reason: Option<&str>,
     ) -> String {
+        use std::fmt::Write as _;
+
         let mut diagnostics = format!("request_id={request_id}");
         if let Some(server_request_id) = server_request_id.filter(|id| !id.is_empty()) {
-            diagnostics.push_str(&format!(", server_request_id={server_request_id}"));
+            let _ = write!(diagnostics, ", server_request_id={server_request_id}");
         }
         if let Some(fallback_reason) = fallback_reason {
-            diagnostics.push_str(&format!(", fallback_reason={fallback_reason}"));
+            let _ = write!(diagnostics, ", fallback_reason={fallback_reason}");
         }
         format!("{message} [{diagnostics}]")
     }
@@ -983,7 +987,7 @@ impl AnthropicApiClient {
                         class: ErrorClass::Unknown,
                         action: RetryAction::Retry,
                     },
-                    |e| triage(e),
+                    triage,
                 );
                 let backoff = retry_backoff_for(attempt, self.config.retry_backoff, &previous);
                 tracing::debug!(
@@ -1016,7 +1020,7 @@ impl AnthropicApiClient {
 #[async_trait::async_trait]
 impl ApiClient for AnthropicApiClient {
     fn clone_box(&self) -> Box<dyn ApiClient> {
-        Box::new(AnthropicApiClient {
+        Box::new(Self {
             config: self.config.clone(),
             client: self.client.clone(),
         })
@@ -1057,7 +1061,7 @@ impl ApiClient for AnthropicApiClient {
         let tool_fallback = !tools.is_empty() && !capabilities.tool_use;
         self.log_request_start(
             &request_id,
-            &model_name,
+            model_name,
             false,
             if capabilities.tool_use {
                 tools.len()
@@ -1114,10 +1118,11 @@ impl ApiClient for AnthropicApiClient {
                     .and_then(|v| v.to_str().ok())
                     .map(str::to_string);
                 if status >= 400 {
-                    let err_text = self.format_error_message(
+                    let body = resp.text().await.unwrap_or_default();
+                    let err_text = Self::format_error_message(
                         &request_id,
                         server_request_id.as_deref(),
-                        resp.text().await.unwrap_or_default(),
+                        &body,
                         None,
                     );
                     if err_text.to_ascii_lowercase().contains("coding agent")
@@ -1266,7 +1271,7 @@ impl ApiClient for AnthropicApiClient {
 
         Box::pin(
             futures::stream::once(async move {
-                let temp_client = AnthropicApiClient {
+                let temp_client = Self {
                     config,
                     client: client.clone(),
                 };
@@ -1312,10 +1317,11 @@ impl ApiClient for AnthropicApiClient {
                             .and_then(|v| v.to_str().ok())
                             .map(str::to_string);
                         if status >= 400 {
-                            let err_text = temp_client.format_error_message(
+                            let body = resp.text().await.unwrap_or_default();
+                            let err_text = Self::format_error_message(
                                 &request_id,
                                 server_request_id.as_deref(),
-                                resp.text().await.unwrap_or_default(),
+                                &body,
                                 None,
                             );
                             if err_text.to_ascii_lowercase().contains("coding agent")
@@ -1407,10 +1413,11 @@ fn header_value(name: &str) -> String {
 fn split_url(url: &str) -> (String, String, String) {
     let without_scheme = url.split_once("://").map_or(url, |(_, rest)| rest);
 
-    let (authority, rest) = match without_scheme.find('/') {
-        Some(index) => (&without_scheme[..index], &without_scheme[index..]),
-        None => (without_scheme, ""),
-    };
+    let (authority, rest) = without_scheme
+        .find('/')
+        .map_or((without_scheme, ""), |index| {
+            (&without_scheme[..index], &without_scheme[index..])
+        });
 
     let (path, query) = match rest.split_once('?') {
         Some((path, query)) => (path.to_string(), query.to_string()),
@@ -1505,7 +1512,7 @@ fn parse_sse_message(message: &str, state: &mut SseParserState) -> Vec<StreamEve
     else {
         return Vec::new();
     };
-    let Some(json_str) = data_line.strip_prefix("data:").map(|s| s.trim_start()) else {
+    let Some(json_str) = data_line.strip_prefix("data:").map(str::trim_start) else {
         return Vec::new();
     };
     let Ok(value) = serde_json::from_str::<serde_json::Value>(json_str) else {
@@ -1520,7 +1527,7 @@ fn parse_sse_message(message: &str, state: &mut SseParserState) -> Vec<StreamEve
             let Some(index) = value
                 .get("index")
                 .and_then(serde_json::Value::as_u64)
-                .map(|i| i as usize)
+                .and_then(|i| usize::try_from(i).ok())
             else {
                 return Vec::new();
             };
@@ -1560,7 +1567,7 @@ fn parse_sse_message(message: &str, state: &mut SseParserState) -> Vec<StreamEve
             let Some(index) = value
                 .get("index")
                 .and_then(serde_json::Value::as_u64)
-                .map(|i| i as usize)
+                .and_then(|i| usize::try_from(i).ok())
             else {
                 return Vec::new();
             };
@@ -1589,17 +1596,16 @@ fn parse_sse_message(message: &str, state: &mut SseParserState) -> Vec<StreamEve
                         return Vec::new();
                     };
                     let partial_json = partial_json.to_string();
-                    match state.index_to_id.get(&index) {
-                        Some(id) => vec![StreamEvent::ToolCallInputDelta {
+                    if let Some(id) = state.index_to_id.get(&index) {
+                        vec![StreamEvent::ToolCallInputDelta {
                             id: id.clone(),
                             delta: partial_json,
-                        }],
-                        None => {
-                            // Mapping not yet established: buffer the delta
-                            // until `content_block_start` registers the index.
-                            state.deferred_deltas.push((index, partial_json));
-                            Vec::new()
-                        }
+                        }]
+                    } else {
+                        // Mapping not yet established: buffer the delta
+                        // until `content_block_start` registers the index.
+                        state.deferred_deltas.push((index, partial_json));
+                        Vec::new()
                     }
                 }
                 _ => Vec::new(),
@@ -1609,7 +1615,7 @@ fn parse_sse_message(message: &str, state: &mut SseParserState) -> Vec<StreamEve
             let Some(index) = value
                 .get("index")
                 .and_then(serde_json::Value::as_u64)
-                .map(|i| i as usize)
+                .and_then(|i| usize::try_from(i).ok())
             else {
                 return Vec::new();
             };
@@ -1666,7 +1672,7 @@ fn parse_sse_message(message: &str, state: &mut SseParserState) -> Vec<StreamEve
 /// This is the triage table's decision — there is one place that decides, so
 /// the retry rule and the backoff rule cannot drift apart.
 #[must_use]
-pub fn is_retryable(error: &ApiError) -> bool {
+pub const fn is_retryable(error: &ApiError) -> bool {
     triage(error).is_retry()
 }
 
@@ -1689,10 +1695,8 @@ fn parse_custom_headers(raw: &str) -> BTreeMap<String, String> {
 }
 
 fn parse_custom_headers_env() -> BTreeMap<String, String> {
-    match std::env::var("CODEREX_CUSTOM_HEADERS") {
-        Ok(v) => parse_custom_headers(&v),
-        Err(_) => BTreeMap::new(),
-    }
+    std::env::var("CODEREX_CUSTOM_HEADERS")
+        .map_or_else(|_| BTreeMap::new(), |value| parse_custom_headers(&value))
 }
 
 #[cfg(test)]

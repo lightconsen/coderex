@@ -277,7 +277,7 @@ pub async fn run_tool_calls(
     let outcomes: Vec<ToolDispatchOutcome> = futures::future::join_all(exec_futures).await;
 
     // ─── Phase 3: Post-execution hooks & events ────────────────────────────
-    for ((idx, call), outcome) in approved.iter().zip(outcomes.into_iter()) {
+    for ((idx, call), outcome) in approved.iter().zip(outcomes) {
         let result = outcome.result;
 
         let mut ctx = HashMap::new();

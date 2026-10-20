@@ -284,7 +284,7 @@ impl McpServer {
             self.status = ServerStatus::Errored;
             McpServerError::Spawn {
                 name: self.name.clone(),
-                source: std::io::Error::new(std::io::ErrorKind::Other, error),
+                source: std::io::Error::other(error),
             }
         })?;
 
@@ -292,7 +292,7 @@ impl McpServer {
             self.status = ServerStatus::Errored;
             McpServerError::Spawn {
                 name: self.name.clone(),
-                source: std::io::Error::new(std::io::ErrorKind::Other, e.clone()),
+                source: std::io::Error::other(e),
             }
         })?;
 
@@ -310,7 +310,7 @@ impl McpServer {
                     self.status = ServerStatus::Errored;
                     return Err(McpServerError::Spawn {
                         name: self.name.clone(),
-                        source: std::io::Error::new(std::io::ErrorKind::Other, e),
+                        source: std::io::Error::other(e),
                     });
                 }
                 // Some other servers may not support full MCP initialize — log
@@ -341,6 +341,7 @@ impl McpServer {
                     name: self.name.clone(),
                     reason: e,
                 })?;
+            drop(ch);
         } else {
             return Err(McpServerError::HealthCheckFailed {
                 name: self.name.clone(),
@@ -352,7 +353,7 @@ impl McpServer {
     }
 
     /// Update server status (for health monitor).
-    pub fn set_status(&mut self, status: ServerStatus) {
+    pub const fn set_status(&mut self, status: ServerStatus) {
         self.status = status;
     }
 
@@ -471,6 +472,7 @@ impl McpServer {
         if let Some(ref channel) = self.channel {
             let mut ch = channel.lock().await;
             let _ = ch.terminate().await;
+            drop(ch);
         }
         self.channel = None;
 
@@ -479,7 +481,7 @@ impl McpServer {
             self.status = ServerStatus::Errored;
             McpServerError::Spawn {
                 name: self.name.clone(),
-                source: std::io::Error::new(std::io::ErrorKind::Other, error),
+                source: std::io::Error::other(error),
             }
         })?;
 
@@ -487,7 +489,7 @@ impl McpServer {
             self.status = ServerStatus::Errored;
             McpServerError::Spawn {
                 name: self.name.clone(),
-                source: std::io::Error::new(std::io::ErrorKind::Other, e.clone()),
+                source: std::io::Error::other(e),
             }
         })?;
 
@@ -499,7 +501,7 @@ impl McpServer {
                 self.status = ServerStatus::Errored;
                 return Err(McpServerError::Spawn {
                     name: self.name.clone(),
-                    source: std::io::Error::new(std::io::ErrorKind::Other, error),
+                    source: std::io::Error::other(error),
                 });
             }
             Err(error) => {
@@ -519,6 +521,7 @@ impl McpServer {
         if let Some(ref channel) = self.channel {
             let mut ch = channel.lock().await;
             let _ = ch.terminate().await;
+            drop(ch);
         }
         self.channel = None;
         self.status = ServerStatus::Stopped;
@@ -531,7 +534,7 @@ impl McpServer {
 
     /// Check if the server can attempt another reconnection.
     #[must_use]
-    pub fn can_reconnect(&self) -> bool {
+    pub const fn can_reconnect(&self) -> bool {
         self.reconnect_count < self.max_reconnects
     }
 }

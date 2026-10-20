@@ -56,6 +56,7 @@
 //! choice rather than a silent skip.
 
 use std::path::Path;
+use std::str::FromStr;
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use chrono::{DateTime, Utc};
@@ -342,7 +343,7 @@ impl MemoryService {
                 let prefix = store.long_term_prefix().unwrap_or(PERSONAL_PREFIX);
                 let entries = self
                     .long_term
-                    .read_by_prefix(&MemoryKey::from_str(prefix))
+                    .read_by_prefix(&MemoryKey::from_str(prefix).unwrap())
                     .map_err(|error| MemoryServiceError::Io(error.to_string()))?;
                 let mut records: Vec<MemoryRecord> = entries
                     .into_iter()
@@ -394,7 +395,7 @@ impl MemoryService {
                 let namespaced = namespaced_key(store, &key);
                 let entry = self
                     .long_term
-                    .read_by_key(&MemoryKey::from_str(&namespaced))
+                    .read_by_key(&MemoryKey::from_str(&namespaced).unwrap())
                     .map_err(|error| MemoryServiceError::Io(error.to_string()))?
                     .ok_or_else(|| MemoryServiceError::NotFound {
                         store,
@@ -502,15 +503,13 @@ impl MemoryService {
             MemoryStore::Personal | MemoryStore::Project => {
                 let namespaced = namespaced_key(store, &key);
                 self.long_term
-                    .write_with_key(&key, &MemoryKey::from_str(&namespaced), content)
+                    .write_with_key(&key, &MemoryKey::from_str(&namespaced).unwrap(), content)
                     .map_err(|error| MemoryServiceError::Io(error.to_string()))?;
-                self.read(store, &key)
             }
             MemoryStore::Shared => {
                 self.team
                     .upsert(&key, content)
                     .map_err(|error| MemoryServiceError::Io(error.to_string()))?;
-                self.read(store, &key)
             }
             MemoryStore::Org => {
                 let org = self
@@ -519,9 +518,9 @@ impl MemoryService {
                     .ok_or(MemoryServiceError::StoreUnavailable(store))?;
                 org.upsert(&key, content)
                     .map_err(|error| MemoryServiceError::Io(error.to_string()))?;
-                self.read(store, &key)
             }
         }
+        self.read(store, &key)
     }
 
     /// Delete a memory, optionally pinning the version it must be at.
@@ -561,7 +560,7 @@ impl MemoryService {
         match store {
             MemoryStore::Personal | MemoryStore::Project => self
                 .long_term
-                .delete_by_key(&MemoryKey::from_str(&namespaced_key(store, &key)))
+                .delete_by_key(&MemoryKey::from_str(&namespaced_key(store, &key)).unwrap())
                 .map_err(|error| MemoryServiceError::Io(error.to_string())),
             MemoryStore::Shared => self
                 .team

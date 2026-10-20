@@ -53,6 +53,8 @@ impl Tool for GrepTool {
         input: ToolInput,
         ctx: ToolContext<'_>,
     ) -> Result<ToolOutput, ToolError> {
+        use std::fmt::Write as _;
+
         let pattern = extract_string(&input.arguments, "pattern")?;
         let path = input
             .arguments
@@ -62,11 +64,16 @@ impl Tool for GrepTool {
         let output_mode =
             extract_string_opt(&input.arguments, "output_mode").unwrap_or_else(|| "content".into());
         let glob_pattern = extract_string_opt(&input.arguments, "glob");
-        let context = extract_number(&input.arguments, "-C").unwrap_or(0) as usize;
-        let after = extract_number(&input.arguments, "-A").unwrap_or(context as i64) as usize;
-        let before = extract_number(&input.arguments, "-B").unwrap_or(context as i64) as usize;
-        let head_limit =
-            extract_number(&input.arguments, "head_limit").unwrap_or(MAX_RESULTS as i64) as usize;
+        let context = extract_number(&input.arguments, "-C").unwrap_or(0);
+        let context = usize::try_from(context).unwrap_or(0);
+        let context_i64 = i64::try_from(context).unwrap_or(i64::MAX);
+        let after = extract_number(&input.arguments, "-A").unwrap_or(context_i64);
+        let after = usize::try_from(after).unwrap_or(0);
+        let before = extract_number(&input.arguments, "-B").unwrap_or(context_i64);
+        let before = usize::try_from(before).unwrap_or(0);
+        let head_limit = extract_number(&input.arguments, "head_limit")
+            .unwrap_or_else(|| i64::try_from(MAX_RESULTS).unwrap_or(i64::MAX));
+        let head_limit = usize::try_from(head_limit).unwrap_or(0);
 
         let regex = Regex::new(&pattern).map_err(|e| ToolError::InvalidInput {
             message: format!("invalid regex pattern: {e}"),
@@ -99,9 +106,8 @@ impl Tool for GrepTool {
         });
 
         for entry in walker {
-            let entry = match entry {
-                Ok(e) => e,
-                Err(_) => continue,
+            let Ok(entry) = entry else {
+                continue;
             };
 
             if !entry.file_type().is_file() {
@@ -115,9 +121,9 @@ impl Tool for GrepTool {
                 }
             }
 
-            let content = match std::fs::read_to_string(entry.path()) {
-                Ok(c) => c,
-                Err(_) => continue, // skip binary files
+            // Skip binary files.
+            let Ok(content) = std::fs::read_to_string(entry.path()) else {
+                continue;
             };
 
             let lines: Vec<&str> = content.lines().collect();
@@ -131,11 +137,14 @@ impl Tool for GrepTool {
                         let start = i.saturating_sub(before);
                         let end = (i + 1 + after).min(lines.len());
 
-                        let rel = entry.path().strip_prefix(&root).unwrap_or(entry.path());
+                        let rel = entry
+                            .path()
+                            .strip_prefix(&root)
+                            .unwrap_or_else(|_| entry.path());
 
-                        for j in start..end {
+                        for (j, line) in lines.iter().enumerate().take(end).skip(start) {
                             let prefix = if j == i { ">" } else { " " };
-                            results.push(format!("{}:{j}:{prefix} {}", rel.display(), lines[j]));
+                            results.push(format!("{}:{j}:{prefix} {}", rel.display(), line));
                         }
                     }
                 }
@@ -146,12 +155,18 @@ impl Tool for GrepTool {
             }
 
             if file_matched && matches!(output_mode.as_str(), "files_with_matches") {
-                let rel = entry.path().strip_prefix(&root).unwrap_or(entry.path());
+                let rel = entry
+                    .path()
+                    .strip_prefix(&root)
+                    .unwrap_or_else(|_| entry.path());
                 results.push(rel.display().to_string());
             }
 
             if file_matched && matches!(output_mode.as_str(), "count") {
-                let rel = entry.path().strip_prefix(&root).unwrap_or(entry.path());
+                let rel = entry
+                    .path()
+                    .strip_prefix(&root)
+                    .unwrap_or_else(|_| entry.path());
                 let count = regex.find_iter(&content).count();
                 results.push(format!("{}:{count}", rel.display()));
             }
@@ -163,7 +178,7 @@ impl Tool for GrepTool {
 
         let mut output = results.join("\n");
         if head_limit > 0 && results.len() >= head_limit {
-            output.push_str(&format!("\n\n... (truncated to {head_limit} results)"));
+            let _ = write!(output, "\n\n... (truncated to {head_limit} results)");
         }
 
         Ok(ToolOutput {

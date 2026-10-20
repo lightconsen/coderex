@@ -58,18 +58,14 @@ impl Tool for RemoteTriggerTool {
             .send()
             .await
             .map_err(|e| {
-                ToolError::Io(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    format!("HTTP request failed: {e}"),
-                ))
+                ToolError::Io(std::io::Error::other(format!("HTTP request failed: {e}")))
             })?;
 
         let status = response.status();
         let body = response.text().await.map_err(|e| {
-            ToolError::Io(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                format!("failed to read response: {e}"),
-            ))
+            ToolError::Io(std::io::Error::other(format!(
+                "failed to read response: {e}"
+            )))
         })?;
 
         if status.is_success() {

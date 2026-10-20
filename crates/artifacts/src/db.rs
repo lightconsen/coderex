@@ -77,7 +77,7 @@ pub enum DbError {
 }
 
 /// A stored document.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Document {
     /// Document id within its collection.
     pub id: String,
@@ -108,7 +108,7 @@ pub struct Page {
 }
 
 /// A write to apply in a batch.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Write {
     /// Replace a document's body.
     Set {
@@ -227,7 +227,7 @@ impl ArtifactDb {
     /// Read a document.
     pub fn get(&self, collection: &str, doc_id: &str) -> Result<Document, DbError> {
         let path = self.document_path(collection, doc_id)?;
-        self.read_document(&path, collection, doc_id)
+        Self::read_document(&path, collection, doc_id)
     }
 
     /// List a collection's documents, one page at a time.
@@ -238,21 +238,20 @@ impl ArtifactDb {
         cursor: Option<&str>,
     ) -> Result<Page, DbError> {
         let dir = self.collection_dir(collection)?;
-        let mut ids = self.document_ids(&dir)?;
+        let mut ids = Self::document_ids(&dir)?;
         ids.sort();
 
         // The cursor names the first document of the next page, so a page
         // starts at it rather than after it.
-        let skip = match cursor {
-            Some(cursor) => ids.iter().position(|id| id == cursor).unwrap_or(ids.len()),
-            None => 0,
-        };
+        let skip = cursor.map_or(0, |cursor| {
+            ids.iter().position(|id| id == cursor).unwrap_or(ids.len())
+        });
 
         let limit = limit.unwrap_or(DEFAULT_PAGE_LIMIT).min(MAX_PAGE_LIMIT);
         let mut documents = Vec::new();
         for id in ids.iter().skip(skip).take(limit) {
             let path = dir.join(format!("{id}.json"));
-            let document = self.read_document(&path, collection, id)?;
+            let document = Self::read_document(&path, collection, id)?;
             documents.push(DocumentSummary {
                 id: id.clone(),
                 version: document.version,
@@ -273,13 +272,13 @@ impl ArtifactDb {
         equals: &[(String, Value)],
     ) -> Result<Vec<Document>, DbError> {
         let dir = self.collection_dir(collection)?;
-        let mut ids = self.document_ids(&dir)?;
+        let mut ids = Self::document_ids(&dir)?;
         ids.sort();
 
         let mut matches = Vec::new();
         for id in ids {
             let path = dir.join(format!("{id}.json"));
-            let document = self.read_document(&path, collection, &id)?;
+            let document = Self::read_document(&path, collection, &id)?;
             if equals
                 .iter()
                 .all(|(field, expected)| document.data.get(field) == Some(expected))
@@ -356,7 +355,7 @@ impl ArtifactDb {
         let path = self.document_path(collection, doc_id)?;
 
         if let Some(expected) = pinned_version(write) {
-            let found = match self.read_document(&path, collection, doc_id) {
+            let found = match Self::read_document(&path, collection, doc_id) {
                 Ok(document) => document.version,
                 Err(DbError::NotFound { .. }) => 0,
                 Err(other) => return Err(other),
@@ -373,8 +372,8 @@ impl ArtifactDb {
 
         match write {
             Write::Set { data, .. } => {
-                let version = self.next_version(&path, collection, doc_id)?;
-                self.write_document(
+                let version = Self::next_version(&path, collection, doc_id)?;
+                Self::write_document(
                     &path,
                     &Document {
                         id: doc_id.to_string(),
@@ -390,17 +389,17 @@ impl ArtifactDb {
                 })
             }
             Write::Update { data, .. } => {
-                let mut document =
-                    self.read_document(&path, collection, doc_id)
-                        .or_else(|error| match error {
-                            DbError::NotFound { .. } => Ok(Document {
-                                id: doc_id.to_string(),
-                                collection: collection.to_string(),
-                                version: 0,
-                                data: Value::Object(serde_json::Map::new()),
-                            }),
-                            other => Err(other),
-                        })?;
+                let mut document = Self::read_document(&path, collection, doc_id).or_else(
+                    |error| match error {
+                        DbError::NotFound { .. } => Ok(Document {
+                            id: doc_id.to_string(),
+                            collection: collection.to_string(),
+                            version: 0,
+                            data: Value::Object(serde_json::Map::new()),
+                        }),
+                        other => Err(other),
+                    },
+                )?;
                 let incoming = data.as_object().ok_or_else(|| {
                     DbError::InvalidArgument("update data must be an object".into())
                 })?;
@@ -419,7 +418,7 @@ impl ArtifactDb {
                     version += 1;
                 }
                 document.version = version;
-                self.write_document(&path, &document)?;
+                Self::write_document(&path, &document)?;
                 Ok(BatchEntry {
                     collection: collection.to_string(),
                     doc_id: doc_id.to_string(),
@@ -445,7 +444,7 @@ impl ArtifactDb {
                 replace_all,
                 ..
             } => {
-                let mut document = self.read_document(&path, collection, doc_id)?;
+                let mut document = Self::read_document(&path, collection, doc_id)?;
                 let target = document.data.get_mut(field).ok_or_else(|| {
                     DbError::InvalidArgument(format!(
                         "field '{field}' is missing on '{collection}/{doc_id}'"
@@ -476,7 +475,7 @@ impl ArtifactDb {
                 *target = Value::String(replaced);
                 document.version += 1;
                 let version = document.version;
-                self.write_document(&path, &document)?;
+                Self::write_document(&path, &document)?;
                 Ok(BatchEntry {
                     collection: collection.to_string(),
                     doc_id: doc_id.to_string(),
@@ -546,20 +545,15 @@ impl ArtifactDb {
         Ok(segments)
     }
 
-    fn next_version(&self, path: &Path, collection: &str, doc_id: &str) -> Result<u64, DbError> {
-        match self.read_document(path, collection, doc_id) {
+    fn next_version(path: &Path, collection: &str, doc_id: &str) -> Result<u64, DbError> {
+        match Self::read_document(path, collection, doc_id) {
             Ok(document) => Ok(document.version + 1),
             Err(DbError::NotFound { .. }) => Ok(1),
             Err(other) => Err(other),
         }
     }
 
-    fn read_document(
-        &self,
-        path: &Path,
-        collection: &str,
-        doc_id: &str,
-    ) -> Result<Document, DbError> {
+    fn read_document(path: &Path, collection: &str, doc_id: &str) -> Result<Document, DbError> {
         let bytes = match std::fs::read(path) {
             Ok(bytes) => bytes,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -578,7 +572,7 @@ impl ArtifactDb {
         })
     }
 
-    fn write_document(&self, path: &Path, document: &Document) -> Result<(), DbError> {
+    fn write_document(path: &Path, document: &Document) -> Result<(), DbError> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).map_err(|e| DbError::Store(e.to_string()))?;
         }
@@ -587,7 +581,7 @@ impl ArtifactDb {
         std::fs::write(path, bytes).map_err(|e| DbError::Store(e.to_string()))
     }
 
-    fn document_ids(&self, dir: &Path) -> Result<Vec<String>, DbError> {
+    fn document_ids(dir: &Path) -> Result<Vec<String>, DbError> {
         let entries = match std::fs::read_dir(dir) {
             Ok(entries) => entries,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
@@ -605,7 +599,7 @@ impl ArtifactDb {
     }
 }
 
-fn pinned_version(write: &Write) -> Option<u64> {
+const fn pinned_version(write: &Write) -> Option<u64> {
     match write {
         Write::Set { if_version, .. }
         | Write::Update { if_version, .. }
@@ -662,7 +656,7 @@ fn validate_doc_id(doc_id: &str) -> Result<(), DbError> {
             "'{doc_id}' has characters a document id cannot carry: \" \\ . / [ ]"
         )));
     }
-    if doc_id.chars().any(|c| c.is_control()) {
+    if doc_id.chars().any(char::is_control) {
         return Err(DbError::InvalidArgument(
             "a document id cannot carry control characters".into(),
         ));

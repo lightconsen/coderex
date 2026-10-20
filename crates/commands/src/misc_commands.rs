@@ -2,6 +2,7 @@
 
 use crate::registry::{CommandArgs, CommandContext, CommandRegistry, CommandResult, SlashCommand};
 use coderex_core::query_profiles::PromptProfile;
+use std::fmt::Write as _;
 use std::sync::Arc;
 
 /// Register miscellaneous commands.
@@ -112,7 +113,7 @@ pub fn register(registry: &mut CommandRegistry) {
                     }
                     Ok(out) => {
                         let err = String::from_utf8_lossy(&out.stderr);
-                        CommandResult::success(format!("Issue prepared: {title}\n(gh CLI: {err})",))
+                        CommandResult::success(format!("Issue prepared: {title}\n(gh CLI: {err})"))
                             .with_state_change(true)
                     }
                     Err(e) => CommandResult::success(format!(
@@ -160,21 +161,19 @@ pub fn register(registry: &mut CommandRegistry) {
                     output.push_str("  (none set)");
                 } else {
                     for (k, v) in vars.iter().take(50) {
-                        output.push_str(&format!("  {k}={v}\n"));
+                        let _ = writeln!(output, "  {k}={v}");
                     }
                     if vars.len() > 50 {
-                        output.push_str(&format!("  ... and {} more\n", vars.len() - 50));
+                        let _ = writeln!(output, "  ... and {} more", vars.len() - 50);
                     }
                 }
                 CommandResult::success(output)
             } else {
                 let key = &args[0];
-                match std::env::var(key) {
-                    Ok(value) => CommandResult::success(format!("{key}={value}")),
-                    Err(_) => {
-                        CommandResult::error(format!("Environment variable '{key}' not set."))
-                    }
-                }
+                std::env::var(key).map_or_else(
+                    |_| CommandResult::error(format!("Environment variable '{key}' not set.")),
+                    |value| CommandResult::success(format!("{key}={value}")),
+                )
             }
         }),
     ));
@@ -270,11 +269,7 @@ pub fn register(registry: &mut CommandRegistry) {
             let present: Vec<&str> = key_vars
                 .iter()
                 .copied()
-                .filter(|name| {
-                    std::env::var(name)
-                        .map(|value| !value.is_empty())
-                        .unwrap_or(false)
-                })
+                .filter(|name| std::env::var(name).is_ok_and(|value| !value.is_empty()))
                 .collect();
 
             let aws = coderex_core::providers::AwsCredentials::from_env().is_some();
@@ -290,7 +285,7 @@ pub fn register(registry: &mut CommandRegistry) {
             if present.is_empty() {
                 report.push_str("  (no provider API key is set in the environment)\n");
             } else {
-                report.push_str(&format!("  keys set: {}\n", present.join(", ")));
+                let _ = writeln!(report, "  keys set: {}", present.join(", "));
             }
             if aws {
                 report.push_str("  AWS credentials present (signed requests available)\n");
@@ -413,14 +408,14 @@ pub fn register(registry: &mut CommandRegistry) {
                         CommandResult::success(format_entries(&matches))
                     }
                 }
-                Some(raw) => match raw.parse::<usize>() {
-                    Ok(n) => {
+                Some(raw) => raw.parse::<usize>().map_or_else(
+                    |_| CommandResult::error("Usage: /history [n] | /history search <query>"),
+                    |n| {
                         let start = ctx.recent_commands.len().saturating_sub(n);
                         let entries: Vec<&String> = ctx.recent_commands[start..].iter().collect();
                         CommandResult::success(format_entries(&entries))
-                    }
-                    Err(_) => CommandResult::error("Usage: /history [n] | /history search <query>"),
-                },
+                    },
+                ),
             }
         }),
     ));
