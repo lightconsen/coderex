@@ -311,7 +311,7 @@ mod imp {
     use std::sync::{Mutex, OnceLock};
 
     use windows_sys::Win32::Foundation::{
-        CloseHandle, ERROR_ALREADY_EXISTS, HANDLE, HLOCAL, LocalFree, WAIT_OBJECT_0,
+        CloseHandle, ERROR_ALREADY_EXISTS, HANDLE, HLOCAL, LocalFree, WAIT_OBJECT_0, WAIT_TIMEOUT,
     };
     use windows_sys::Win32::Security::Authorization::{
         ConvertStringSecurityDescriptorToSecurityDescriptorW, EXPLICIT_ACCESS_W, GRANT_ACCESS,
@@ -903,8 +903,15 @@ mod imp {
         /// Wait for the process to exit and return its exit code.
         #[allow(dead_code)] // test-only: only the Windows confinement test waits
         pub(crate) fn wait(&self) -> Result<u32, SandboxError> {
+            // Bounded: a test-only helper must fail with a message, not hang
+            // the whole job when a contained process never exits.
             // SAFETY: `process` is a live handle owned by this value.
-            let wait = unsafe { WaitForSingleObject(self.process, u32::MAX) };
+            let wait = unsafe { WaitForSingleObject(self.process, 30_000) };
+            if wait == WAIT_TIMEOUT {
+                return Err(SandboxError::CreationError(
+                    "the contained process did not exit within 30 seconds".into(),
+                ));
+            }
             if wait != WAIT_OBJECT_0 {
                 return Err(last_error("WaitForSingleObject"));
             }

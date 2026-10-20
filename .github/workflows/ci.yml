@@ -99,7 +99,24 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - name: Core sandbox tests (AppContainer)
         timeout-minutes: 20
-        run: cargo test --no-fail-fast -p coderex-core --lib sandbox -- --nocapture
+        run: >
+          cargo test --no-fail-fast -p coderex-core --lib sandbox -- --nocapture
+          --skip windows_sandbox_confines_a_suspended_child
+          --skip spawn_in_container_confines_a_real_process
+      - name: AppContainer confinement (suspended child)
+        if: always()
+        timeout-minutes: 10
+        run: >
+          cargo test --no-fail-fast -p coderex-core --lib
+          sandbox::tests::windows_sandbox_confines_a_suspended_child
+          -- --exact --nocapture
+      - name: AppContainer confinement (STARTUPINFOEX)
+        if: always()
+        timeout-minutes: 10
+        run: >
+          cargo test --no-fail-fast -p coderex-core --lib
+          sandbox_windows::tests::windows::spawn_in_container_confines_a_real_process
+          -- --exact --nocapture
       - name: Process tree tests (Job Objects)
         if: always()
         timeout-minutes: 10

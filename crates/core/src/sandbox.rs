@@ -3593,12 +3593,15 @@ mod tests {
             .arg(script)
             .current_dir(&allowed)
             .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped());
+            // Inherited, not piped: a contained cmd.exe can leave a helper
+            // holding the pipe open, and `wait_with_output` would then wait
+            // forever even after cmd itself exited.
+            .stdout(std::process::Stdio::inherit())
+            .stderr(std::process::Stdio::inherit());
         handle.prepare(&mut cmd).unwrap();
-        let child = cmd.spawn().unwrap();
+        let mut child = cmd.spawn().unwrap();
         handle.post_spawn(&child).unwrap();
-        let output = child.wait_with_output().unwrap();
+        let status = wait_bounded(&mut child, std::time::Duration::from_secs(30));
 
         // The runtime job can only be debugged from its logs, so the failure
         // carries what the DACL and the mandatory label actually look like,
@@ -3614,7 +3617,7 @@ mod tests {
                 |error| format!("<icacls failed: {error}>"),
                 |out| String::from_utf8_lossy(&out.stdout).into_owned(),
             );
-        let groups = run_in_container(&handle, "whoami /groups");
+        let groups = run_in_container(&handle, &allowed, "whoami /groups");
         let probe = String::from_utf8_lossy(&output.stdout)
             .lines()
             .find_map(|line| line.strip_prefix("TEMP=").map(str::to_string))
@@ -3628,43 +3631,73 @@ mod tests {
         assert!(
             inside.exists(),
             "the granted workspace was not writable (exit={:?})\n{detail}\n\
-             temp probe: {probe}\ncommand stderr: {}\ncommand stdout: {}\n\
-             icacls:\n{acl}\ncontainer identity:\n{groups}",
-            output.status.code(),
-            String::from_utf8_lossy(&output.stderr),
-            String::from_utf8_lossy(&output.stdout)
+             temp probe: {probe}\nicacls:\n{acl}\ncontainer identity:\n{groups}",
+            status.map(|s| s.code())
         );
         assert!(!outside.exists(), "a path outside the policy was writable");
 
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// Wait for a child, killing it and returning `None` after `limit`.
+    #[cfg(target_os = "windows")]
+    fn wait_bounded(
+        child: &mut std::process::Child,
+        limit: std::time::Duration,
+    ) -> Option<std::process::ExitStatus> {
+        let deadline = std::time::Instant::now() + limit;
+        loop {
+            if let Ok(Some(status)) = child.try_wait() {
+                return Some(status);
+            }
+            if std::time::Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+    }
+
     /// Run `command` inside the sandbox and return its combined output.
     #[cfg(target_os = "windows")]
-    fn run_in_container(handle: &SandboxHandle, command: &str) -> String {
+    fn run_in_container(handle: &SandboxHandle, cwd: &std::path::Path, command: &str) -> String {
+        let path = std::env::temp_dir().join(format!(
+            "coderex-whoami-{}-{}.txt",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |elapsed| elapsed.as_nanos())
+        ));
+        let Ok(file) = std::fs::File::create(&path) else {
+            return "<could not create the diagnostic file>".to_string();
+        };
+        let diagnostics_file = file.try_clone().expect("the file was just created");
         let mut cmd = std::process::Command::new("cmd.exe");
         cmd.arg("/C")
             .arg(command)
+            .current_dir(cwd)
             .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped());
+            // A file, not a pipe: a contained helper cannot keep this open
+            // past the child's exit.
+            .stdout(std::process::Stdio::from(file))
+            .stderr(std::process::Stdio::from(diagnostics_file));
         let Ok(()) = handle.prepare(&mut cmd) else {
             return "<prepare failed>".to_string();
         };
-        let Ok(child) = cmd.spawn() else {
+        let Ok(mut child) = cmd.spawn() else {
             return "<spawn failed>".to_string();
         };
         if let Err(error) = handle.post_spawn(&child) {
             return format!("<post_spawn failed: {error}>");
         }
-        match child.wait_with_output() {
-            Ok(output) => format!(
-                "{}{}",
-                String::from_utf8_lossy(&output.stdout),
-                String::from_utf8_lossy(&output.stderr)
-            ),
-            Err(error) => format!("<wait failed: {error}>"),
-        }
+        let text = if wait_bounded(&mut child, std::time::Duration::from_secs(15)).is_some() {
+            std::fs::read_to_string(&path).unwrap_or_default()
+        } else {
+            "<the diagnostic command timed out>".to_string()
+        };
+        let _ = std::fs::remove_file(&path);
+        text
     }
 }
 
