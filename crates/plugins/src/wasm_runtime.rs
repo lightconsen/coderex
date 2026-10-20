@@ -1497,16 +1497,59 @@ fn compile_sandbox_config(
         allowed_read_paths.push(parent.to_path_buf());
     }
     let mut allowed_exec_paths = vec![compiler];
+    // A host may inject a wrapper script (`compile.sh`) that execs the real
+    // helper. Landlock does not follow that indirection, so the helper next
+    // to this executable must be explicitly executable.
+    if let Ok(exe) = std::env::current_exe() {
+        let exe = std::fs::canonicalize(&exe).unwrap_or(exe);
+        allowed_read_paths.push(exe.clone());
+        if let Some(parent) = exe.parent() {
+            allowed_read_paths.push(parent.to_path_buf());
+            allowed_exec_paths.push(parent.to_path_buf());
+            if let Some(grandparent) = parent.parent() {
+                allowed_read_paths.push(grandparent.to_path_buf());
+                allowed_exec_paths.push(grandparent.to_path_buf());
+            }
+        }
+        for candidate in [
+            exe.parent().map(|p| p.join("coderex-wasm-compile")),
+            exe.parent()
+                .and_then(std::path::Path::parent)
+                .map(|p| p.join("coderex-wasm-compile")),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if candidate.is_file() {
+                allowed_read_paths.push(candidate.clone());
+                allowed_exec_paths.push(candidate);
+            }
+        }
+    }
+    let mut allowed_write_paths = vec![work_dir.to_path_buf()];
     // Debug builds add the orchestrator's child-spawn test hook (`sleep`).
     #[cfg(debug_assertions)]
     {
         allowed_exec_paths.push(PathBuf::from("/bin/sleep"));
         allowed_exec_paths.push(PathBuf::from("/usr/bin/sleep"));
+        // The test hooks record their observation files outside the staging
+        // directory; grant exactly those directories instead of disabling the
+        // sandbox for the test.
+        for key in [
+            "CODEREX_WASM_COMPILE_TEST_COUNT_FILE",
+            "CODEREX_WASM_COMPILE_TEST_CHILD_PID_FILE",
+        ] {
+            if let Some(path) = std::env::var_os(key) {
+                if let Some(parent) = std::path::Path::new(&path).parent() {
+                    allowed_write_paths.push(parent.to_path_buf());
+                }
+            }
+        }
     }
 
     SandboxConfig {
         allowed_read_paths,
-        allowed_write_paths: vec![work_dir.to_path_buf()],
+        allowed_write_paths,
         allowed_exec_paths,
         additional_working_dirs: vec![work_dir.to_path_buf()],
         max_cpu_seconds: Some(WASM_COMPILE_CPU_SECONDS),
