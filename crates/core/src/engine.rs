@@ -2473,6 +2473,13 @@ impl QueryEngine {
             .fire_hook(hook_events::USER_PROMPT_SUBMIT, &user_prompt, &ctx)
             .await;
         if hook_result.stop {
+            // Say why a gate closed the turn: without this the only symptom is
+            // "no request was made".
+            tracing::warn!(
+                errors = ?hook_result.errors,
+                failed = hook_result.failed,
+                "UserPromptSubmit hook stopped the turn before a request"
+            );
             // The hook stopped the turn before a request. Close it like any
             // other turn so Stop/TurnEnd and the bookkeeping run; the closing
             // path enters StopHooks from `CompactRecovery`, the graph-legal
@@ -2781,6 +2788,11 @@ impl QueryEngine {
             .fire_hook(hook_events::USER_PROMPT_SUBMIT, &user_prompt, &ctx)
             .await;
         if hook_result.stop {
+            tracing::warn!(
+                errors = ?hook_result.errors,
+                failed = hook_result.failed,
+                "UserPromptSubmit hook stopped the turn before a request"
+            );
             // See `execute_turn`: a stopped pre-submit turn still closes
             // through Stop/TurnEnd and the bookkeeping.
             if !matches!(turn.state, TurnState::CompactRecovery) {
