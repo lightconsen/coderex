@@ -178,18 +178,26 @@ A comma-separated list applied on top of `CODEREX_FEATURE_FLAGS`:
 - Every name must be one this build knows: `streaming_tool_execution`,
   `tool_use_summaries`, `fast_mode`, `coordinator_mode`, `history_snip`,
   `agent_triggers`, `bridge_mode`, `daemon`, `voice_mode`, `buddy`,
-  `workflow_scripts`, `web_browser_tool`, `context_collapse`,
-  `terminal_panel`, `kairos`, `team_collaboration`, `auto_dream`.
+  `workflow_scripts`, `web_browser_tool`, `team_collaboration`, `auto_dream`.
 - An unknown name is a startup error listing the unknown names and the known
   set; it is never dropped silently.
 - Some names are accepted for configuration compatibility but have no effect in
   this build: `streaming_tool_execution`, `tool_use_summaries`, `fast_mode`,
-  `coordinator_mode`, `history_snip`, `bridge_mode`, `daemon`, `buddy`,
-  `context_collapse`, `terminal_panel`, `kairos`, and `team_collaboration`.
-  Enabling any of them logs a warning at startup instead of implying behavior.
-  Several of these describe behavior that lives in `core::engine` (streaming
-  tool execution, tool-use summaries, compact-strategy selection), which this
-  build does not wire to a flag; the rest have no product at all.
+  `coordinator_mode`, `history_snip`, `bridge_mode`, `daemon`, `buddy`, and
+  `team_collaboration`. Enabling any of them logs a warning at startup instead
+  of implying behavior. Each names a real surface this build has not wired to
+  the flag: streaming tool execution and snip compaction already run
+  unconditionally in `core::engine`; the lightweight model profile exists but
+  the session model never resolves through it; the coordinator state machine
+  and team context exist but nothing reads them; the bridge and the daemon are
+  subcommands rather than session capabilities; and the companion lives behind
+  the compile-time `buddy` feature, which this workspace does not enable. The
+  `INERT_FLAGS` doc comment in `crates/config/src/flags.rs` records the exact
+  reason and what building each one would take.
+- Three names that used to be accepted — `context_collapse`, `terminal_panel`,
+  and `kairos` — were removed. No code in the workspace could ever be their
+  product surface, so accepting them promised behavior that did not exist; they
+  are now rejected as unknown flags.
 - These names do have consumers: `web_browser_tool` (gates the `WebFetch`
   tool), `agent_triggers` (gates the agent-kind hook path — with it off a
   configured `agent` hook is dropped at startup with a warning), `auto_dream`

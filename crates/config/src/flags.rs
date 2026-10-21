@@ -22,9 +22,6 @@ pub const KNOWN_FLAGS: &[&str] = &[
     "buddy",
     "workflow_scripts",
     "web_browser_tool",
-    "context_collapse",
-    "terminal_panel",
-    "kairos",
     "team_collaboration",
     "auto_dream",
     // Commands whose availability is decided by a flag. They are separate
@@ -53,18 +50,55 @@ pub const KNOWN_FLAGS: &[&str] = &[
 /// `agent_triggers` gates the agent-kind hook path, and `auto_dream` gates the
 /// auto-dream manager; all three now do something, so they are no longer here.
 ///
-/// The remainder stay inert for one of two honest reasons:
+/// A name is deleted outright when no code in the workspace could ever be its
+/// product surface. `context_collapse`, `terminal_panel`, and `kairos` were
+/// removed for that reason: nothing here implements a context-collapse pass, a
+/// terminal panel, or a proactive/Kairos mode, so accepting them only promised
+/// behavior that did not exist.
 ///
-/// - The behavior lives in `core::engine` (streaming tool execution, tool-use
-///   summaries, compact strategy selection), which is owned by another
-///   workstream in this build: `streaming_tool_execution`, `tool_use_summaries`,
-///   `history_snip`, `context_collapse`, `coordinator_mode`.
-/// - There is no product in this build at all: `fast_mode` (no separate fast
-///   model is wired), `bridge_mode` (the bridge worker is a subcommand, not a
-///   flag), `daemon` (the server is the `serve` subcommand), `buddy` (the
-///   module is behind the compile-time `buddy` cargo feature, which is off),
-///   `terminal_panel`, `kairos`, and `team_collaboration` (the engine accepts a
-///   team context but never reads it).
+/// Each name that remains is kept for a specific, checkable reason: the artifact
+/// it would gate already exists, but no flag reads it. The reference's behavior
+/// and what building the flag would take are recorded per name:
+///
+/// - `streaming_tool_execution`: the reference lets a beta turn on executing
+///   tool calls as they arrive in a streamed response. `core::engine` already
+///   does this (`execute_early_tool_call`, driven by
+///   `StreamingToolCallAssembler`), unconditionally. Making the flag the switch
+///   needs a `QueryEngine` setter that the streaming loop consults.
+/// - `tool_use_summaries`: the reference has the model write a one-line summary
+///   of each tool use. CodeRex emits only the fixed `ToolCall::activity_summary()`
+///   label. Building it takes a `ModelProfile::Lightweight` summarizer call and
+///   a surface to render the result.
+/// - `fast_mode`: the reference runs the session on a smaller, faster model.
+///   CodeRex has `ModelProfile::Lightweight` (haiku, overridable through
+///   `CODEREX_LIGHTWEIGHT_MODEL`) but uses it only for side queries; wiring the
+///   flag means resolving the session model through that profile when `--model`
+///   was not given.
+/// - `coordinator_mode`: the reference makes the main agent a coordinator over
+///   sub-agents. `core::coordinator::CoordinatorState` and
+///   `QueryEngine::set_coordinator` exist, but nothing sets a coordinator and
+///   the engine only records phase summaries without acting on the phase, so the
+///   flag would gate an inert path. Building it takes a caller plus engine logic
+///   that reads the current phase.
+/// - `history_snip`: the reference snips history at a token boundary. CodeRex's
+///   `core::compact::snip_compact` and `CompactStrategy::Snip` are built and
+///   chosen automatically under context pressure; forcing that strategy from a
+///   flag needs an override on the engine's compact configuration.
+/// - `bridge_mode`: the reference gates a session-side bridge capability.
+///   CodeRex's bridge is the `bridge` subcommand (a separate entry point), so
+///   the flag has nothing distinct to gate. Wiring it means either aliasing the
+///   subcommand or gating a session-side bridge transport.
+/// - `daemon`: the reference runs CodeRex as a background daemon. CodeRex's
+///   daemon is the `serve` subcommand, which writes a PID file and runs the
+///   server in the foreground; there is no detach path. Wiring the flag means
+///   adding one (fork/`setsid`, log redirection) that `serve` does not have.
+/// - `buddy`: the reference ships a companion sprite. `crates/ui/src/buddy.rs`
+///   is real but sits behind the compile-time `buddy` cargo feature, which this
+///   workspace never enables, so a runtime flag cannot reach it.
+/// - `team_collaboration`: the reference coordinates an in-process team. The
+///   `TeamCreate`/`TeamDelete` tools, `core::team_context::TeamContext`, and the
+///   `/team-memory` sync command all exist, but the flag gates none of them and
+///   the engine stores a team context without ever reading it.
 const INERT_FLAGS: &[&str] = &[
     "streaming_tool_execution",
     "tool_use_summaries",
@@ -74,9 +108,6 @@ const INERT_FLAGS: &[&str] = &[
     "bridge_mode",
     "daemon",
     "buddy",
-    "context_collapse",
-    "terminal_panel",
-    "kairos",
     "team_collaboration",
 ];
 
@@ -127,12 +158,6 @@ pub struct FeatureFlags {
     pub workflow_scripts: bool,
     /// Enable web browser tool.
     pub web_browser_tool: bool,
-    /// Enable context collapse.
-    pub context_collapse: bool,
-    /// Enable terminal panel.
-    pub terminal_panel: bool,
-    /// Enable Kairos mode.
-    pub kairos: bool,
     /// Enable team collaboration.
     pub team_collaboration: bool,
     /// Enable auto dream mode.
@@ -185,8 +210,6 @@ bitflags! {
         const TEAM = 1 << 8;
         /// Dream mode capability.
         const DREAM = 1 << 9;
-        /// Kairos mode capability.
-        const KAIROS = 1 << 10;
     }
 }
 
@@ -306,9 +329,6 @@ impl FeatureFlags {
         if self.auto_dream {
             caps.insert(CapabilitySet::DREAM);
         }
-        if self.kairos {
-            caps.insert(CapabilitySet::KAIROS);
-        }
         caps
     }
 
@@ -360,9 +380,6 @@ impl FeatureFlags {
             "buddy" => self.buddy,
             "workflow_scripts" => self.workflow_scripts,
             "web_browser_tool" => self.web_browser_tool,
-            "context_collapse" => self.context_collapse,
-            "terminal_panel" => self.terminal_panel,
-            "kairos" => self.kairos,
             "team_collaboration" => self.team_collaboration,
             "auto_dream" => self.auto_dream,
             "ultraplan" => self.ultraplan,
@@ -495,9 +512,6 @@ impl FeatureFlags {
             "buddy" => self.buddy = enable,
             "workflow_scripts" => self.workflow_scripts = enable,
             "web_browser_tool" => self.web_browser_tool = enable,
-            "context_collapse" => self.context_collapse = enable,
-            "terminal_panel" => self.terminal_panel = enable,
-            "kairos" => self.kairos = enable,
             "team_collaboration" => self.team_collaboration = enable,
             "auto_dream" => self.auto_dream = enable,
             "ultraplan" => self.ultraplan = enable,
@@ -712,9 +726,9 @@ mod tests {
         let parsed = FeatureFlags::parse_checked(&KNOWN_FLAGS.join(","))
             .expect("the documented names must all be accepted");
         assert!(parsed.capabilities().bits() > 0);
-        // 23 flags: 17 runtime capabilities/experiments plus the six
+        // 20 flags: 14 runtime capabilities/experiments plus the six
         // command-availability gates.
-        assert_eq!(KNOWN_FLAGS.len(), 23);
+        assert_eq!(KNOWN_FLAGS.len(), 20);
     }
 
     #[test]
@@ -745,12 +759,11 @@ mod tests {
     }
 
     #[test]
-    fn feature_flags_all_17_flags_from_parse() {
+    fn feature_flags_all_runtime_flags_from_parse() {
         let flags = FeatureFlags::parse(
             "streaming_tool_execution,tool_use_summaries,fast_mode,coordinator_mode,\
              history_snip,agent_triggers,bridge_mode,daemon,voice_mode,buddy,\
-             workflow_scripts,web_browser_tool,context_collapse,terminal_panel,\
-             kairos,team_collaboration,auto_dream",
+             workflow_scripts,web_browser_tool,team_collaboration,auto_dream",
         );
         assert!(flags.streaming_tool_execution);
         assert!(flags.tool_use_summaries);
@@ -764,11 +777,44 @@ mod tests {
         assert!(flags.buddy);
         assert!(flags.workflow_scripts);
         assert!(flags.web_browser_tool);
-        assert!(flags.context_collapse);
-        assert!(flags.terminal_panel);
-        assert!(flags.kairos);
         assert!(flags.team_collaboration);
         assert!(flags.auto_dream);
+    }
+
+    #[test]
+    fn deleted_names_are_no_longer_known() {
+        // `context_collapse`, `terminal_panel`, and `kairos` named no product
+        // surface, so they were removed from `KNOWN_FLAGS` entirely. Parsing
+        // them must now report them as unknown rather than accept a no-op.
+        let error = FeatureFlags::parse_checked("+context_collapse,terminal_panel,kairos")
+            .expect_err("the deleted names are not flags this build knows");
+        assert_eq!(
+            error.names,
+            vec!["context_collapse", "terminal_panel", "kairos"]
+        );
+        let map = FeatureFlags::default().as_map();
+        for name in ["context_collapse", "terminal_panel", "kairos"] {
+            assert!(!map.contains_key(name), "{name} is still advertised");
+            assert!(!FeatureFlags::default().is_enabled(name));
+        }
+    }
+
+    #[test]
+    fn every_inert_flag_is_known_and_parses() {
+        // The two lists must agree: an inert name that `KNOWN_FLAGS` does not
+        // advertise would be a flag nobody could set, and one that does not
+        // parse would be a name the parser rejects while `inert_flags()`
+        // reports it.
+        for name in INERT_FLAGS {
+            assert!(
+                KNOWN_FLAGS.contains(name),
+                "{name} is inert but not advertised in KNOWN_FLAGS"
+            );
+            let flags = FeatureFlags::parse_checked(name)
+                .unwrap_or_else(|_| panic!("inert flag {name} does not parse"));
+            assert!(flags.is_enabled(name), "{name} parsed but is not enabled");
+            assert_eq!(flags.inert_flags(), vec![*name]);
+        }
     }
 
     #[test]
@@ -968,17 +1014,17 @@ mod tests {
 
     #[test]
     fn inert_flags_reports_exactly_the_enabled_names() {
-        let flags = FeatureFlags::parse("+streaming_tool_execution,+daemon,+kairos,-fast_mode");
+        let flags = FeatureFlags::parse("+streaming_tool_execution,+daemon,+buddy,-fast_mode");
         assert_eq!(
             flags.inert_flags(),
-            vec!["streaming_tool_execution", "daemon", "kairos"]
+            vec!["streaming_tool_execution", "daemon", "buddy"]
         );
 
         // Disabling one of the enabled names removes it from the report.
-        let fewer = FeatureFlags::parse("+streaming_tool_execution,+daemon,+kairos,-daemon");
+        let fewer = FeatureFlags::parse("+streaming_tool_execution,+daemon,+buddy,-daemon");
         assert_eq!(
             fewer.inert_flags(),
-            vec!["streaming_tool_execution", "kairos"]
+            vec!["streaming_tool_execution", "buddy"]
         );
     }
 
@@ -1027,9 +1073,6 @@ mod tests {
                 "bridge_mode",
                 "daemon",
                 "buddy",
-                "context_collapse",
-                "terminal_panel",
-                "kairos",
                 "team_collaboration",
             ]
         );

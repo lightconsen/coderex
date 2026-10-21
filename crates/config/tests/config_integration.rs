@@ -320,12 +320,11 @@ fn feature_flags_parse_plus_minus_syntax() {
 }
 
 #[test]
-fn feature_flags_parse_all_17_flags() {
+fn feature_flags_parse_all_runtime_flags() {
     let flags = FeatureFlags::parse(
         "streaming_tool_execution,tool_use_summaries,fast_mode,coordinator_mode,\
          history_snip,agent_triggers,bridge_mode,daemon,voice_mode,buddy,\
-         workflow_scripts,web_browser_tool,context_collapse,terminal_panel,\
-         kairos,team_collaboration,auto_dream",
+         workflow_scripts,web_browser_tool,team_collaboration,auto_dream",
     );
     assert!(flags.streaming_tool_execution);
     assert!(flags.tool_use_summaries);
@@ -339,9 +338,6 @@ fn feature_flags_parse_all_17_flags() {
     assert!(flags.buddy);
     assert!(flags.workflow_scripts);
     assert!(flags.web_browser_tool);
-    assert!(flags.context_collapse);
-    assert!(flags.terminal_panel);
-    assert!(flags.kairos);
     assert!(flags.team_collaboration);
     assert!(flags.auto_dream);
 }
