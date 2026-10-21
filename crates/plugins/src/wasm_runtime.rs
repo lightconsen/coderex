@@ -1155,6 +1155,50 @@ fn load_module(
 
 // ─── Out-of-process compilation ─────────────────────────────────────────────
 
+/// Give the compiler child a minimal environment instead of the host's.
+///
+/// The compiler runs attacker-controlled module bytes through wasmtime, so it
+/// must not inherit this session's environment: `HOME`, proxies, and any secret
+/// whose name the credential classifier does not recognize would otherwise be
+/// handed to it. `env_clear` drops the lot, then exactly what the child
+/// genuinely needs is put back:
+///
+/// * `PATH` — so a host-injected compiler named without a path, and the
+///   debug-build test hooks' `sleep`/`cmd.exe` descendant, still resolve.
+/// * `SystemRoot` and `windir` (Windows) — the loader and the Win32 APIs read
+///   the system root from the environment, and a child without it fails to
+///   start.
+/// * The `CODEREX_WASM_COMPILE_TEST_*` hooks (debug builds) — the subprocess
+///   tests drive the child through them.
+#[cfg(feature = "wasm-runtime")]
+fn apply_compiler_child_env(child_command: &mut std::process::Command) {
+    child_command.env_clear();
+
+    if let Some(path) = std::env::var_os("PATH") {
+        child_command.env("PATH", path);
+    }
+
+    #[cfg(target_os = "windows")]
+    for key in ["SystemRoot", "windir"] {
+        if let Some(value) = std::env::var_os(key) {
+            child_command.env(key, value);
+        }
+    }
+
+    // Read by the child (`compile_helper_main` -> `compiler_test_hooks`), so the
+    // subprocess tests' observation files and sleep must reach it.
+    #[cfg(debug_assertions)]
+    for key in [
+        "CODEREX_WASM_COMPILE_TEST_COUNT_FILE",
+        "CODEREX_WASM_COMPILE_TEST_CHILD_PID_FILE",
+        "CODEREX_WASM_COMPILE_TEST_SLEEP_MS",
+    ] {
+        if let Some(value) = std::env::var_os(key) {
+            child_command.env(key, value);
+        }
+    }
+}
+
 /// Run the compiler command in a killable child and return its serialized
 /// module.
 ///
@@ -1215,11 +1259,9 @@ fn run_compile_helper(
 
     // The compiler is a separate process that runs untrusted module bytes
     // through wasmtime and never talks to a provider. It has no use for this
-    // session's provider credentials, so they are removed from its inherited
-    // environment rather than handed down.
-    for key in coderex_core::sandbox::credential_scrub_keys() {
-        child_command.env_remove(key);
-    }
+    // session's environment, so it gets a minimal one instead of the host's;
+    // see `apply_compiler_child_env`.
+    apply_compiler_child_env(&mut child_command);
 
     // macOS: `sandbox-exec` wraps the command, and `prepare` adds the
     // best-effort rlimit plus the resident-memory watchdog from the core
@@ -3050,6 +3092,69 @@ mod sandbox_tests {
         assert!(
             err.contains("instantiate"),
             "expected an unresolved-import error, got: {err}"
+        );
+    }
+}
+
+/// The compiler child's environment. These pin `apply_compiler_child_env`
+/// without running a compilation, so the minimal-environment guarantee cannot
+/// silently regress.
+#[cfg(all(test, feature = "wasm-runtime", unix))]
+mod compiler_child_env_tests {
+    use super::apply_compiler_child_env;
+
+    /// Run `apply_compiler_child_env` on `/usr/bin/env`, which prints exactly
+    /// the environment it is handed: its output is the child's environment.
+    fn child_environment() -> Vec<(String, String)> {
+        let mut command = std::process::Command::new("/usr/bin/env");
+        apply_compiler_child_env(&mut command);
+        let output = command.output().expect("failed to run /usr/bin/env");
+        assert!(output.status.success(), "/usr/bin/env failed: {output:?}");
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .filter_map(|line| {
+                line.split_once('=')
+                    .map(|(key, value)| (key.to_string(), value.to_string()))
+            })
+            .collect()
+    }
+
+    /// The child gets a minimal environment: nothing from the host reaches it
+    /// except the handful of variables it genuinely needs.
+    #[test]
+    fn compiler_child_does_not_inherit_the_host_environment() {
+        for (key, _) in child_environment() {
+            let allowed = key == "PATH" || key.starts_with("CODEREX_WASM_COMPILE_TEST_");
+            assert!(
+                allowed,
+                "the compiler child inherited a variable it does not need: {key}"
+            );
+        }
+    }
+
+    /// `PATH` is one of the few variables the child keeps, so a compiler named
+    /// without a path and the test hooks' `sleep` still resolve.
+    #[test]
+    fn compiler_child_keeps_path() {
+        assert!(
+            child_environment().iter().any(|(key, _)| key == "PATH"),
+            "the compiler child must keep PATH"
+        );
+    }
+
+    /// A variable the host process has, and that is not on the allowlist, is
+    /// absent from the child: the host's private state (`HOME` and any secret
+    /// the credential classifier misses) must not reach the compiler.
+    #[test]
+    fn compiler_child_drops_host_only_variables() {
+        let host_only = std::env::vars_os()
+            .map(|(key, _)| key.to_string_lossy().into_owned())
+            .find(|key| key != "PATH" && !key.starts_with("CODEREX_WASM_COMPILE_TEST_"))
+            .expect("the host process must set at least one non-allowlisted variable");
+        let inherited = child_environment().iter().any(|(key, _)| key == &host_only);
+        assert!(
+            !inherited,
+            "the compiler child inherited the host-only variable {host_only:?}"
         );
     }
 }
