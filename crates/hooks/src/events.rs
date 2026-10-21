@@ -481,13 +481,7 @@ mod tests {
             .map(HookEvent::as_str)
             .collect();
 
-        assert_eq!(
-            untriggered,
-            vec![
-                "Setup",
-                "FileChanged",
-            ]
-        );
+        assert_eq!(untriggered, vec!["Setup", "FileChanged",]);
     }
 
     /// Only the events the scheduler fires around one tool call carry a tool
