@@ -2286,8 +2286,11 @@ impl PluginChannelReport {
 ///
 /// `source` is the file text. CodeRex has no TypeScript runtime, so "loaded"
 /// here means exactly this: the declaration is read into memory and exposed
-/// through [`PluginTypeRegistry`] so the LSP/tool context (and `/plugin`) can
-/// see it. It is never executed, type-checked, or compiled.
+/// through [`PluginTypeRegistry`] so `/plugin components` can list it and
+/// [`PluginManager::export_plugin_types`] can write it to a stable directory.
+/// There is no LSP or tool that consumes the declaration at runtime — CodeRex
+/// does not run a TypeScript language server against it — and it is never
+/// executed, type-checked, or compiled.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PluginTypeFile {
     /// The plugin that exported the declaration.
@@ -2305,8 +2308,8 @@ pub struct PluginTypeFile {
 /// This is the runtime consumer for the manifest `types` field: the plugin
 /// crate validated the declaration, [`PluginManager::export_plugin_types`]
 /// writes it to a stable directory, and this registry reads the files back so
-/// a caller (the LSP/tool context) can list or print them. There is no
-/// TypeScript execution here — see [`PluginTypeFile`].
+/// `/plugin components` can list them. There is no TypeScript execution here —
+/// see [`PluginTypeFile`] for what "loaded" means.
 #[derive(Debug, Clone, Default)]
 pub struct PluginTypeRegistry {
     files: Vec<PluginTypeFile>,
@@ -3771,9 +3774,10 @@ impl PluginManager {
     /// This is the runtime consumer for the `types` field: where
     /// [`Self::plugin_types`] only validates the declaration, this reads each
     /// declared file (bounded by [`MAX_PLUGIN_COMPONENT_BYTES`], and confined
-    /// to the plugin directory) so the LSP/tool context and `/plugin` can list
-    /// or print it. The declaration name is the object key when the manifest
-    /// used the object shape, otherwise it is derived from the file name.
+    /// to the plugin directory) so `/plugin components` can list it. There is
+    /// no LSP or tool consumer of the declaration. The declaration name is the
+    /// object key when the manifest used the object shape, otherwise it is
+    /// derived from the file name.
     ///
     /// There is no TypeScript execution: the file is text that is read and
     /// exposed, never compiled or type-checked. A plugin whose declaration is
@@ -7802,7 +7806,7 @@ mod tests {
             serde_json::from_str(r#"{"name":"n","userConfig":{"N":{"type":"number"}}}"#).unwrap();
         let provided = HashMap::from([("N".to_string(), "not-a-number".to_string())]);
         let err = manifest.resolve_options(&provided, |_| None).unwrap_err();
-        assert!(err.contains("N") && err.contains("number"), "{err}");
+        assert!(err.contains('N') && err.contains("number"), "{err}");
     }
 
     #[test]
@@ -7847,7 +7851,7 @@ mod tests {
         let err = manifest
             .resolve_options(&HashMap::new(), |_| None)
             .unwrap_err();
-        assert!(err.contains("N") && err.contains("minimum"), "{err}");
+        assert!(err.contains('N') && err.contains("minimum"), "{err}");
     }
 
     /// WASM plugins resolve `userConfig` through the same code path as process

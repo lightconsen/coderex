@@ -95,6 +95,48 @@ impl Drop for TelemetrySessionGuard {
     }
 }
 
+/// How many recent channel notifications the production subscriber keeps.
+const PLUGIN_CHANNEL_EVENT_LOG: usize = 64;
+
+/// The CLI's subscriber to plugin channel notifications.
+///
+/// A channel binds a plugin to a configured MCP server. The MCP manager routes
+/// every notification that server emits into
+/// [`PluginManager::route_channel_notification`](coderex_plugins::plugins::PluginManager::route_channel_notification),
+/// which fans it out to the sinks subscribed to the channel. This is the
+/// production sink: it records each delivery (bounded, oldest first out) and
+/// reports it through `tracing`, so a notification a channel's server emits is
+/// consumed rather than dropped. It is deliberately not a no-op — an
+/// unsubscribed channel is exactly what makes `plugin_channel_report()` report
+/// `Idle`.
+#[derive(Debug)]
+struct PluginChannelSink {
+    log: Arc<
+        std::sync::Mutex<std::collections::VecDeque<coderex_plugins::plugins::PluginChannelEvent>>,
+    >,
+}
+
+impl coderex_plugins::plugins::ChannelSink for PluginChannelSink {
+    fn deliver(&self, event: coderex_plugins::plugins::PluginChannelEvent) {
+        tracing::info!(
+            channel = %event.channel,
+            plugin = %event.plugin,
+            server = %event.server,
+            method = %event.method,
+            sequence = event.sequence,
+            "plugin channel notification delivered"
+        );
+        let mut log = self
+            .log
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if log.len() == PLUGIN_CHANNEL_EVENT_LOG {
+            log.pop_front();
+        }
+        log.push_back(event);
+    }
+}
+
 /// Resolved settings and state passed between startup phases.
 #[derive(Debug, Default)]
 pub struct SessionContext {
@@ -140,6 +182,14 @@ pub struct SessionContext {
     pub plugin_settings: Option<serde_json::Value>,
     /// Where plugin `.d.ts` declarations were exported, when any were.
     pub plugin_types_dir: Option<String>,
+    /// Recent plugin channel notifications, recorded by the production
+    /// subscriber ([`StartupOrchestrator::subscribe_plugin_channels`]).
+    ///
+    /// Bounded, oldest first out. Kept so a session can inspect what its
+    /// channels actually delivered rather than only knowing a sink exists.
+    pub plugin_channel_events: Arc<
+        std::sync::Mutex<std::collections::VecDeque<coderex_plugins::plugins::PluginChannelEvent>>,
+    >,
     /// Marketplaces configured in settings.
     pub marketplaces: Vec<coderex_config::MarketplaceSetting>,
     /// Telemetry handle (initialized during LoadSettings).
@@ -417,6 +467,108 @@ fn apply_tighten_only_settings(
     }
 }
 
+/// Plugin `settings` keys a plugin may never set, whatever the value.
+///
+/// A plugin that could install a hook, start an MCP server, set an API key, or
+/// inject an environment variable would run with the user's authority rather
+/// than beside it.
+const PLUGIN_SETTINGS_NEVER_TAKEN: &[&str] = &[
+    "hooks",
+    "hook_layers",
+    "mcpServers",
+    "mcp_servers",
+    "api_key",
+    "env",
+    "config_version",
+];
+
+/// Plugin `settings` keys a plugin may only make stricter.
+const PLUGIN_SETTINGS_TIGHTEN_ONLY: &[&str] = &[
+    "permission_mode",
+    "telemetry_enabled",
+    "telemetry",
+    "max_budget_usd",
+];
+
+/// A [`Settings`] with every optional field populated.
+///
+/// Used only to enumerate the keys the resolved settings understands. A default
+/// value would not do: `context_window`, `vim_mode` and `statusline` are
+/// `skip_serializing_if = "Option::is_none"`, so they are absent from a default
+/// serialization and would be missed by the enumeration.
+fn settings_with_every_key() -> Settings {
+    Settings {
+        model: Some(String::new()),
+        permission_mode: Some(String::new()),
+        max_budget_usd: Some(0.0),
+        telemetry_enabled: Some(false),
+        telemetry: Some(coderex_config::settings::TelemetrySubConfig::default()),
+        hooks: Some(serde_json::Value::Null),
+        mcp_servers: Some(serde_json::Value::Null),
+        api_key: Some(String::new()),
+        context_window: Some(coderex_config::settings::ContextWindowSettings::default()),
+        vim_mode: Some(false),
+        statusline: Some(coderex_config::settings::StatuslineSettings::default()),
+        ..Settings::default()
+    }
+}
+
+/// The keys a plugin `settings` document may merge into the resolved settings:
+/// every key [`Settings`] understands, less the ones the never-taken and
+/// tighten-only rules already govern.
+///
+/// Derived from `Settings` rather than listed by hand so the rule "every other
+/// key the resolved settings understands is merged" stays true when the struct
+/// gains a field. The two policy sets are applied first, so a key they govern
+/// is never merged even though it appears here.
+fn mergeable_settings_keys() -> std::collections::HashSet<String> {
+    serde_json::to_value(settings_with_every_key())
+        .ok()
+        .and_then(|value| value.as_object().cloned())
+        .map(|object| {
+            object
+                .keys()
+                .filter(|key| {
+                    !PLUGIN_SETTINGS_NEVER_TAKEN.contains(&key.as_str())
+                        && !PLUGIN_SETTINGS_TIGHTEN_ONLY.contains(&key.as_str())
+                })
+                .cloned()
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Routes MCP server notifications into the plugin channel layer.
+///
+/// The MCP crate does not depend on the plugin crate, so the two meet here:
+/// installed on the MCP manager through
+/// [`McpManager::set_notification_router`](coderex_mcp::manager::McpManager::set_notification_router),
+/// this hands every notification a configured server emits to
+/// [`PluginManager::route_channel_notification`](coderex_plugins::plugins::PluginManager::route_channel_notification),
+/// which delivers it to the sinks subscribed to a channel bound to that
+/// server. Without it an MCP notification stops at the MCP manager and the
+/// channel layer never sees it.
+#[derive(Debug)]
+struct PluginChannelRouter {
+    manager: Arc<coderex_plugins::plugins::PluginManager>,
+}
+
+impl coderex_mcp::manager::ServerNotificationRouter for PluginChannelRouter {
+    fn route(&self, server: &str, method: &str, params: Option<&serde_json::Value>) {
+        let delivered = self
+            .manager
+            .route_channel_notification(server, method, params);
+        if delivered > 0 {
+            tracing::debug!(
+                server = %server,
+                method = %method,
+                delivered,
+                "MCP notification routed to plugin channels"
+            );
+        }
+    }
+}
+
 impl StartupOrchestrator {
     /// Create a new orchestrator.
     #[must_use]
@@ -441,6 +593,9 @@ impl StartupOrchestrator {
                 plugin_manager: None,
                 plugin_settings: None,
                 plugin_types_dir: None,
+                plugin_channel_events: Arc::new(std::sync::Mutex::new(
+                    std::collections::VecDeque::new(),
+                )),
                 marketplaces: Vec::new(),
                 telemetry_handle: None,
                 telemetry_uploader: None,
@@ -1414,6 +1569,11 @@ impl StartupOrchestrator {
         // handle is detached deliberately.
         let _retry_loop =
             Self::spawn_plugin_restart_loop(&manager, std::time::Duration::from_secs(1));
+        // The channel layer needs a production subscriber, or every channel
+        // would report `Idle` forever and a routed notification would reach
+        // nobody. Subscribe one sink to every declared channel and keep the log
+        // it records into.
+        self.ctx.plugin_channel_events = Self::subscribe_plugin_channels(&manager);
         self.ctx.plugin_manager = Some(manager);
         Ok(())
     }
@@ -1438,29 +1598,17 @@ impl StartupOrchestrator {
     ///    nested objects. A key CodeRex does not know is warned about and
     ///    ignored.
     ///
+    /// The mergeable set is [`mergeable_settings_keys`], derived from
+    /// [`Settings`] itself: it is every key the resolved settings understands
+    /// except the two policy sets above, so a key added to `Settings` is
+    /// mergeable the day it lands rather than the day someone remembers to add
+    /// it to a hand-written list.
+    ///
     /// Precedence is by *source*, not by plugin order: user and project
     /// settings outrank every plugin, so a plugin can supply a default the
     /// user never set but can never override one they did.
     fn apply_plugin_settings(&mut self, value: &serde_json::Value) {
-        // Keys a plugin may never set, whatever the value.
-        const NEVER_TAKEN: &[&str] = &[
-            "hooks",
-            "hook_layers",
-            "mcpServers",
-            "mcp_servers",
-            "api_key",
-            "env",
-            "config_version",
-        ];
-        // Keys a plugin may only make stricter.
-        const TIGHTEN_ONLY: &[&str] = &[
-            "permission_mode",
-            "telemetry_enabled",
-            "telemetry",
-            "max_budget_usd",
-        ];
-        // Keys that merge into the resolved settings, user value winning.
-        const MERGEABLE: &[&str] = &["model", "context_window", "vim_mode", "statusline"];
+        let mergeable = mergeable_settings_keys();
 
         let Some(object) = value.as_object() else {
             tracing::warn!("plugin settings are not an object; ignoring them");
@@ -1469,7 +1617,7 @@ impl StartupOrchestrator {
 
         let refused: Vec<&str> = object
             .keys()
-            .filter(|key| NEVER_TAKEN.contains(&key.as_str()))
+            .filter(|key| PLUGIN_SETTINGS_NEVER_TAKEN.contains(&key.as_str()))
             .map(String::as_str)
             .collect();
         if !refused.is_empty() {
@@ -1482,10 +1630,12 @@ impl StartupOrchestrator {
         let mut patch = serde_json::Map::new();
         let mut unknown = Vec::new();
         for (key, entry) in object {
-            if NEVER_TAKEN.contains(&key.as_str()) || TIGHTEN_ONLY.contains(&key.as_str()) {
+            if PLUGIN_SETTINGS_NEVER_TAKEN.contains(&key.as_str())
+                || PLUGIN_SETTINGS_TIGHTEN_ONLY.contains(&key.as_str())
+            {
                 continue;
             }
-            if MERGEABLE.contains(&key.as_str()) {
+            if mergeable.contains(key.as_str()) {
                 patch.insert(key.clone(), entry.clone());
             } else {
                 unknown.push(key.as_str());
@@ -1575,6 +1725,28 @@ impl StartupOrchestrator {
                 }
             }
         })
+    }
+
+    /// Subscribe the production sink to every channel the active plugins
+    /// declare, returning the shared log it records into.
+    ///
+    /// Subscribing is what moves a configured channel from `Idle` to
+    /// `Subscribed`: a channel with no sink has nowhere for a notification to
+    /// go, and `plugin_channel_report()` says so. This is the production
+    /// subscriber — the one place the channel layer is actually consumed.
+    fn subscribe_plugin_channels(
+        manager: &Arc<coderex_plugins::plugins::PluginManager>,
+    ) -> Arc<
+        std::sync::Mutex<std::collections::VecDeque<coderex_plugins::plugins::PluginChannelEvent>>,
+    > {
+        let log = Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new()));
+        let sink: Arc<dyn coderex_plugins::plugins::ChannelSink> = Arc::new(PluginChannelSink {
+            log: Arc::clone(&log),
+        });
+        for report in manager.plugin_channel_report() {
+            manager.subscribe_channel(&report.channel, Arc::clone(&sink));
+        }
+        log
     }
 
     /// Marketplaces configured in settings plus the legacy environment pair.
@@ -1683,6 +1855,15 @@ impl StartupOrchestrator {
                 self.ctx.cwd.clone(),
             )));
         let manager = Arc::new(manager);
+
+        // Notifications from a configured server must reach the plugin channel
+        // layer, which the MCP crate cannot name. Install the router before any
+        // server starts so a notification emitted early is not missed.
+        if let Some(plugin_manager) = self.ctx.plugin_manager.clone() {
+            manager.set_notification_router(Arc::new(PluginChannelRouter {
+                manager: plugin_manager,
+            }));
+        }
 
         // A server may ask the person a question mid-tool-call. Install the
         // session's answerer before any server is spawned; the TUI attaches
@@ -3505,6 +3686,84 @@ mod tests {
         assert!(orch.ctx.settings.as_ref().unwrap().model.is_none());
     }
 
+    /// Every key the resolved `Settings` understands is governed by one of the
+    /// three plugin-settings rules, so none of them is ever warned about as
+    /// "unknown". This is the invariant the merge doc comment claims.
+    #[test]
+    fn every_settings_key_is_governed_by_a_plugin_settings_rule() {
+        let mergeable = mergeable_settings_keys();
+        let governed: std::collections::HashSet<&str> = PLUGIN_SETTINGS_NEVER_TAKEN
+            .iter()
+            .copied()
+            .chain(PLUGIN_SETTINGS_TIGHTEN_ONLY.iter().copied())
+            .chain(mergeable.iter().map(String::as_str))
+            .collect();
+
+        let keys: Vec<String> = serde_json::to_value(settings_with_every_key())
+            .unwrap()
+            .as_object()
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect();
+        assert!(keys.contains(&"context_window".to_string()), "{keys:?}");
+        for key in &keys {
+            assert!(
+                governed.contains(key.as_str()),
+                "settings key `{key}` is neither refused, tightened nor merged"
+            );
+        }
+    }
+
+    /// Widening the merge covers every non-policy key `Settings` understands —
+    /// not just a hand-written four — while the never-taken and tighten-only
+    /// keys stay out of it.
+    #[test]
+    fn plugin_settings_merge_covers_every_non_policy_key() {
+        let mergeable = mergeable_settings_keys();
+        let keys: Vec<String> = serde_json::to_value(settings_with_every_key())
+            .unwrap()
+            .as_object()
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect();
+        for key in &keys {
+            let policy = PLUGIN_SETTINGS_NEVER_TAKEN.contains(&key.as_str())
+                || PLUGIN_SETTINGS_TIGHTEN_ONLY.contains(&key.as_str());
+            assert_eq!(
+                mergeable.contains(key),
+                !policy,
+                "`{key}` should {} merge",
+                if policy { "not" } else { "" }
+            );
+        }
+        // A plugin can still only tighten the policy keys; they are not merged.
+        for key in PLUGIN_SETTINGS_TIGHTEN_ONLY {
+            assert!(!mergeable.contains(*key), "{key} must not merge");
+        }
+    }
+
+    /// A key a plugin supplies that `Settings` understands and the policy does
+    /// not govern is merged into the session.
+    #[test]
+    fn plugin_settings_merge_a_non_policy_key_the_user_left_unset() {
+        let mut orch = StartupOrchestrator::new();
+        orch.ctx.settings = Some(Settings::default());
+        orch.apply_plugin_settings(&serde_json::json!({
+            "context_window": {"default": 1234},
+        }));
+        let settings = orch.ctx.settings.as_ref().unwrap();
+        assert_eq!(
+            settings
+                .context_window
+                .as_ref()
+                .and_then(|window| window.default),
+            Some(1234),
+            "a non-policy key the user never set takes the plugin's value"
+        );
+    }
+
     #[test]
     fn plugin_channels_are_validated_and_listed() {
         let manager = coderex_plugins::plugins::PluginManager::new();
@@ -3540,6 +3799,129 @@ mod tests {
                 .iter()
                 .any(|(kind, name)| kind == "channel" && name.contains("Nowhere -> missing")),
             "a channel naming an unknown server is still listed: {components:?}"
+        );
+    }
+
+    /// The production subscriber moves a configured channel off `Idle` and
+    /// records what a routed notification delivers.
+    #[test]
+    fn subscribing_channels_consumes_a_configured_channels_notifications() {
+        let manager = coderex_plugins::plugins::PluginManager::new();
+        let manifest: coderex_plugins::plugins::PluginManifest =
+            serde_json::from_value(serde_json::json!({
+                "name": "chan",
+                "version": "1.0.0",
+                "mcpServers": {"chat": {"command": "chat-server"}},
+                "channels": [{"server": "chat", "displayName": "Team chat"}]
+            }))
+            .expect("the manifest should parse");
+        manager.load_plugin(manifest, std::path::PathBuf::from("/tmp/chan"));
+
+        let manager = Arc::new(manager);
+        // With no subscriber the channel is honestly idle.
+        assert_eq!(
+            manager.plugin_channel_report()[0].status,
+            coderex_plugins::plugins::ChannelStatus::Idle
+        );
+
+        let log = StartupOrchestrator::subscribe_plugin_channels(&manager);
+        let report = manager.plugin_channel_report();
+        assert_eq!(
+            report[0].status,
+            coderex_plugins::plugins::ChannelStatus::Subscribed,
+            "a configured channel with a subscriber is no longer idle"
+        );
+        assert_eq!(report[0].subscribers, 1);
+
+        let delivered = manager.route_channel_notification(
+            "chat",
+            "notifications/message",
+            Some(&serde_json::json!({"level": "info"})),
+        );
+        assert_eq!(delivered, 1);
+
+        let events = log.lock().unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].channel, "chat");
+        assert_eq!(events[0].plugin, "chan");
+        assert_eq!(events[0].server, "chat");
+        assert_eq!(events[0].method, "notifications/message");
+        assert_eq!(events[0].params.as_ref().unwrap()["level"], "info");
+    }
+
+    /// The CLI's router hands an MCP notification to the channel layer, and a
+    /// server no channel names delivers to nobody.
+    #[test]
+    fn the_channel_router_delivers_to_subscribed_channels_only() {
+        let manager = coderex_plugins::plugins::PluginManager::new();
+        let manifest: coderex_plugins::plugins::PluginManifest =
+            serde_json::from_value(serde_json::json!({
+                "name": "chan",
+                "version": "1.0.0",
+                "mcpServers": {"chat": {"command": "chat-server"}},
+                "channels": [{"server": "chat"}]
+            }))
+            .expect("the manifest should parse");
+        manager.load_plugin(manifest, std::path::PathBuf::from("/tmp/chan"));
+
+        let manager = Arc::new(manager);
+        let log = StartupOrchestrator::subscribe_plugin_channels(&manager);
+        let router = PluginChannelRouter {
+            manager: Arc::clone(&manager),
+        };
+
+        coderex_mcp::manager::ServerNotificationRouter::route(
+            &router,
+            "chat",
+            "notifications/message",
+            Some(&serde_json::json!({"level": "info"})),
+        );
+        assert_eq!(log.lock().unwrap().len(), 1);
+
+        // A notification from a server no channel binds to goes nowhere.
+        coderex_mcp::manager::ServerNotificationRouter::route(
+            &router,
+            "unbound",
+            "notifications/message",
+            None,
+        );
+        assert_eq!(log.lock().unwrap().len(), 1);
+    }
+
+    /// The registry's real consumer: `/plugin components` lists a declared
+    /// `.d.ts`, so the session's component view is what reads it back.
+    #[test]
+    fn plugin_type_declarations_are_listed_in_the_components() {
+        let dir = tempfile::tempdir().unwrap();
+        let plugin_root = dir.path().join("typed");
+        std::fs::create_dir_all(plugin_root.join("types")).unwrap();
+        std::fs::write(
+            plugin_root.join("types/index.d.ts"),
+            "declare module 'coderex' { export const x: number }",
+        )
+        .unwrap();
+
+        let manager = coderex_plugins::plugins::PluginManager::new();
+        let manifest: coderex_plugins::plugins::PluginManifest =
+            serde_json::from_value(serde_json::json!({
+                "name": "typed",
+                "version": "1.0.0",
+                "types": {"main": "types/index.d.ts"}
+            }))
+            .expect("the manifest should parse");
+        manager.load_plugin(manifest, plugin_root);
+
+        let mut orch = StartupOrchestrator::new();
+        orch.ctx.plugin_manager = Some(Arc::new(manager));
+        let mut repl = crate::repl::ReplLoop::new("/tmp".into(), ModelId::sonnet());
+        orch.configure_plugin_components(&mut repl, orch.ctx.plugin_manager.as_ref().unwrap());
+
+        let components = repl.command_context_for_test().plugin_components;
+        assert!(
+            components
+                .iter()
+                .any(|(kind, name)| kind == "types" && name.contains("main (typed)")),
+            "the declared declaration is listed: {components:?}"
         );
     }
 

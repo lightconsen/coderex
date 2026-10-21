@@ -11,8 +11,30 @@ use coderex_tools::ToolRegistry;
 use dashmap::DashMap;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
+
+/// A consumer outside this crate that wants every server notification.
+///
+/// The MCP crate has no dependency on the plugin crate, so the layer that
+/// turns a notification into a plugin channel delivery cannot be named here.
+/// The CLI installs a router instead: [`McpManager::set_notification_router`]
+/// records it, and the per-server notification handler offers it every
+/// notification a configured server emits — the same ones the manager already
+/// acts on internally (`tools/list_changed`, `resources/updated`) and every
+/// other method too.
+///
+/// The call is synchronous and must not block: it runs on the stream task that
+/// received the notification.
+pub trait ServerNotificationRouter: Send + Sync + std::fmt::Debug {
+    /// Route one notification. `server` is the configured server name, `method`
+    /// the JSON-RPC method, and `params` the notification parameters as sent.
+    fn route(&self, server: &str, method: &str, params: Option<&serde_json::Value>);
+}
+
+/// The router as installed, shared so the manager can swap it without touching
+/// the per-server handlers already handed out.
+type SharedNotificationRouter = Arc<RwLock<Option<Arc<dyn ServerNotificationRouter>>>>;
 
 /// Cached resource entry with TTL.
 #[derive(Debug, Clone)]
@@ -29,6 +51,8 @@ struct NotificationSink {
     servers: Arc<DashMap<String, McpServer>>,
     tools: Arc<Mutex<McpToolRegistry>>,
     resource_cache: Arc<Mutex<HashMap<(String, String), CachedResource>>>,
+    /// Offered every notification, including the two acted on above.
+    router: SharedNotificationRouter,
 }
 
 impl NotificationSink {
@@ -125,6 +149,21 @@ impl NotificationSink {
         }
         drop(cache);
     }
+
+    /// Offer one notification to the installed router, if any.
+    ///
+    /// The router is cloned out of the lock before it is called so a router
+    /// that swaps itself out cannot deadlock the manager.
+    fn route(&self, server: &str, method: &str, params: Option<&serde_json::Value>) {
+        let router = self
+            .router
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        if let Some(router) = router {
+            router.route(server, method, params);
+        }
+    }
 }
 
 /// The notification sink as installed on one server.
@@ -153,6 +192,11 @@ impl crate::channel::ServerNotificationHandler for PerServerNotificationHandler 
                 "server notification"
             ),
         }
+        // Every notification is also offered to the installed router. The two
+        // methods handled above are the manager's own bookkeeping; a plugin
+        // channel bound to this server may care about any method, so the router
+        // sees all of them rather than only the two this crate understands.
+        self.sink.route(&self.server, method, params);
     }
 }
 
@@ -192,6 +236,12 @@ pub struct McpManager {
     needs_refresh: Arc<AtomicBool>,
     /// Health monitor cancellation sender.
     health_cancel: Mutex<Option<tokio::sync::watch::Sender<bool>>>,
+    /// Offered every server notification, for a consumer outside this crate
+    /// (the CLI installs one that routes into the plugin channel layer).
+    ///
+    /// Shared behind a lock so it can be installed after servers are created
+    /// and swapped at runtime: every per-server handler holds the same handle.
+    notification_router: SharedNotificationRouter,
 }
 
 impl Default for McpManager {
@@ -215,6 +265,7 @@ impl McpManager {
             inbound_handler: crate::channel::SharedInboundHandler::new(),
             needs_refresh: Arc::new(AtomicBool::new(false)),
             health_cancel: Mutex::new(None),
+            notification_router: Arc::new(RwLock::new(None)),
         }
     }
 
@@ -246,6 +297,7 @@ impl McpManager {
             servers: Arc::clone(&self.servers),
             tools: Arc::clone(&self.tools),
             resource_cache: Arc::clone(&self.resource_cache),
+            router: Arc::clone(&self.notification_router),
         }
     }
 
@@ -827,6 +879,28 @@ impl McpManager {
         self.inbound_handler.clear();
     }
 
+    /// Install the router that sees every server notification.
+    ///
+    /// This covers servers already created by [`McpManager::load_config`] and
+    /// any created later: they all hold the same shared handle. Calling it
+    /// again replaces the router. Without one, notifications are handled by the
+    /// manager alone and dropped after that, as before.
+    pub fn set_notification_router(&self, router: Arc<dyn ServerNotificationRouter>) {
+        *self
+            .notification_router
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(router);
+    }
+
+    /// Remove the notification router; later notifications reach only the
+    /// manager.
+    pub fn clear_notification_router(&self) {
+        *self
+            .notification_router
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+    }
+
     /// Whether a handler is installed for server requests.
     #[must_use]
     pub fn has_inbound_handler(&self) -> bool {
@@ -934,7 +1008,7 @@ mod tests {
     #[test]
     fn new_manager_is_empty() {
         let mgr = McpManager::new();
-        assert!(mgr.list_servers().is_empty());
+        assert_eq!(mgr.list_servers().len(), 0);
         assert!(!mgr.needs_refresh());
     }
 
@@ -1040,7 +1114,7 @@ mod tests {
         use crate::proxy::{clear_mcp_prefix_override, set_mcp_prefix_enabled};
 
         let mgr = McpManager::new();
-        assert!(mgr.tool_conflicts().is_empty());
+        assert_eq!(mgr.tool_conflicts().len(), 0);
 
         // Without the server prefix two servers cannot both register a raw
         // name; the later registration is recorded as a conflict.
@@ -1172,5 +1246,68 @@ mod tests {
             .token_provider()
             .expect("a remote server needs a token provider");
         assert!(provider.access_token().await.is_none());
+    }
+
+    /// Records every notification the router is offered.
+    #[derive(Debug, Default)]
+    struct RecordingRouter {
+        seen: std::sync::Mutex<Vec<(String, String, Option<serde_json::Value>)>>,
+    }
+
+    impl ServerNotificationRouter for RecordingRouter {
+        fn route(&self, server: &str, method: &str, params: Option<&serde_json::Value>) {
+            self.seen.lock().unwrap().push((
+                server.to_string(),
+                method.to_string(),
+                params.cloned(),
+            ));
+        }
+    }
+
+    /// A notification reaches an installed router — the seam the CLI uses to
+    /// hand MCP notifications to the plugin channel layer. Both a method the
+    /// manager acts on itself and one it does not understand are routed.
+    #[tokio::test]
+    async fn notifications_reach_an_installed_router() {
+        let mgr = McpManager::new();
+        let router = Arc::new(RecordingRouter::default());
+        mgr.set_notification_router(router.clone());
+
+        let handler = PerServerNotificationHandler {
+            server: "remote".to_string(),
+            sink: mgr.notification_sink(),
+        };
+
+        crate::channel::ServerNotificationHandler::handle_notification(
+            &handler,
+            "notifications/resources/updated",
+            Some(&serde_json::json!({"uri": "file:///a"})),
+        )
+        .await;
+        crate::channel::ServerNotificationHandler::handle_notification(
+            &handler,
+            "notifications/message",
+            Some(&serde_json::json!({"level": "info"})),
+        )
+        .await;
+
+        let seen = router.seen.lock().unwrap().clone();
+        assert_eq!(seen.len(), 2, "{seen:?}");
+        assert_eq!(seen[0].0, "remote");
+        assert_eq!(seen[0].1, "notifications/resources/updated");
+        assert_eq!(seen[0].2.as_ref().unwrap()["uri"], "file:///a");
+        assert_eq!(seen[1].1, "notifications/message");
+        assert_eq!(seen[1].2.as_ref().unwrap()["level"], "info");
+
+        // Removing the router stops delivery rather than leaving a stale one
+        // installed.
+        mgr.clear_notification_router();
+        crate::channel::ServerNotificationHandler::handle_notification(
+            &handler,
+            "notifications/message",
+            None,
+        )
+        .await;
+        assert_eq!(router.seen.lock().unwrap().len(), 2);
     }
 }
