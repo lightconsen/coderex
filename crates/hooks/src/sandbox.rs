@@ -917,7 +917,13 @@ mod policy_tests {
     /// and config, and denies the network.
     #[test]
     fn default_policy_confines_writes_and_denies_network() {
-        let hook = hook_config();
+        let mut hook = hook_config();
+        // `hook_config()` uses the shared temp directory as its cwd, which
+        // makes the Windows assertion below self-contradictory: the workspace
+        // is always writable, so `temp_dir()` would be in `allowed_write_paths`
+        // either way. Point the cwd at a subdirectory so "the shared temp tree
+        // was not added on its own" is a statement the test can actually make.
+        hook.cwd = Some(std::env::temp_dir().join("coderex-hook-policy-fixture"));
         let workspace = canonicalize_lenient(hook.cwd.as_deref().unwrap());
         let policy = sandbox_config(&hook);
 
