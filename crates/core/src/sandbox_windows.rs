@@ -298,11 +298,61 @@ pub(crate) fn build_command_line(program: &str, args: &[String]) -> String {
     line
 }
 
+/// Whether an ACE mask grants every requested bit.
+///
+/// ACEs commonly store the generic bits (`GENERIC_READ`, `GENERIC_EXECUTE`,
+/// `GENERIC_ALL`) rather than the specific rights they stand for. Comparing the
+/// raw mask against `FILE_TRAVERSE | FILE_READ_ATTRIBUTES` therefore said "not
+/// granted" for directories that already grant the container access, and every
+/// sandbox creation rewrote them. `C:\` alone cost 238 seconds of
+/// `SetNamedSecurityInfoW` on the Windows CI runner.
+///
+/// Pure, so the expansion is tested on every platform.
+#[must_use]
+pub(crate) fn mask_covers(mask: u32, needed: u32) -> bool {
+    const GENERIC_READ: u32 = 0x8000_0000;
+    const GENERIC_WRITE: u32 = 0x4000_0000;
+    const GENERIC_EXECUTE: u32 = 0x2000_0000;
+    const GENERIC_ALL: u32 = 0x1000_0000;
+    const READ_CONTROL: u32 = 0x0002_0000;
+    const SYNCHRONIZE: u32 = 0x0010_0000;
+    const FILE_READ_DATA: u32 = 0x0000_0001;
+    const FILE_WRITE_DATA: u32 = 0x0000_0002;
+    const FILE_APPEND_DATA: u32 = 0x0000_0004;
+    const FILE_READ_EA: u32 = 0x0000_0008;
+    const FILE_WRITE_EA: u32 = 0x0000_0010;
+    const FILE_EXECUTE: u32 = 0x0000_0020;
+    const FILE_READ_ATTRIBUTES: u32 = 0x0000_0080;
+    const FILE_WRITE_ATTRIBUTES: u32 = 0x0000_0100;
+
+    if mask & needed == needed || mask & GENERIC_ALL != 0 {
+        return true;
+    }
+    let mut effective = mask;
+    if mask & GENERIC_READ != 0 {
+        effective |=
+            FILE_READ_DATA | FILE_READ_EA | FILE_READ_ATTRIBUTES | READ_CONTROL | SYNCHRONIZE;
+    }
+    if mask & GENERIC_WRITE != 0 {
+        effective |= FILE_WRITE_DATA
+            | FILE_APPEND_DATA
+            | FILE_WRITE_EA
+            | FILE_WRITE_ATTRIBUTES
+            | READ_CONTROL
+            | SYNCHRONIZE;
+    }
+    if mask & GENERIC_EXECUTE != 0 {
+        // `FILE_EXECUTE` is the directory form of `FILE_TRAVERSE`.
+        effective |= FILE_EXECUTE | FILE_READ_ATTRIBUTES | READ_CONTROL | SYNCHRONIZE;
+    }
+    effective & needed == needed
+}
+
 // ─── Win32 implementation ───────────────────────────────────────────────────
 
 #[cfg(target_os = "windows")]
 mod imp {
-    use super::{AclAccess, acl_plan, capability_names};
+    use super::{AclAccess, acl_plan, capability_names, mask_covers};
     use crate::sandbox::{SandboxConfig, SandboxError};
     use std::ffi::{OsStr, OsString, c_void};
     use std::os::windows::ffi::OsStrExt;
@@ -1059,7 +1109,7 @@ mod imp {
             // SAFETY: all three are valid SIDs for the duration of the calls.
             let grants_us = unsafe { EqualSid(ace_sid, sid) } != 0
                 || (!any_package.is_null() && unsafe { EqualSid(ace_sid, any_package) } != 0);
-            if grants_us && allowed.Mask & permissions == permissions {
+            if grants_us && mask_covers(allowed.Mask, permissions) {
                 return true;
             }
         }
@@ -1638,6 +1688,32 @@ mod tests {
             assert!(!grant.recursive);
             assert!(grant.best_effort, "{path} should be best-effort");
         }
+    }
+
+    /// The generic bits stand for specific rights, so an ACE that grants
+    /// `GENERIC_EXECUTE` already grants traverse and read-attributes.
+    #[test]
+    fn generic_ace_bits_cover_the_specific_rights_they_stand_for() {
+        const GENERIC_READ: u32 = 0x8000_0000;
+        const GENERIC_EXECUTE: u32 = 0x2000_0000;
+        const GENERIC_ALL: u32 = 0x1000_0000;
+        const FILE_TRAVERSE: u32 = 0x0000_0020;
+        const FILE_READ_ATTRIBUTES: u32 = 0x0000_0080;
+        let traverse = FILE_TRAVERSE | FILE_READ_ATTRIBUTES;
+
+        assert!(mask_covers(traverse, traverse), "the specific bits match");
+        assert!(mask_covers(GENERIC_EXECUTE, traverse));
+        assert!(
+            !mask_covers(GENERIC_READ, traverse),
+            "GENERIC_READ covers read-attributes but not FILE_TRAVERSE, \
+             which is the directory form of FILE_EXECUTE"
+        );
+        assert!(mask_covers(GENERIC_ALL, traverse));
+        assert!(!mask_covers(0, traverse));
+        assert!(
+            !mask_covers(FILE_TRAVERSE, traverse),
+            "traverse alone does not grant read-attributes"
+        );
     }
 
     /// A path named by the policy is required even when it is also on `PATH`.
