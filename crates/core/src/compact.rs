@@ -620,6 +620,10 @@ pub fn select_compact_strategy_with(
     match thresholds.level(estimated_tokens) {
         // The window is spent: keep only what still fits.
         ContextLevel::Blocked => CompactStrategy::Snip,
+        // `history_snip` asks for the snip strategy as soon as compaction is
+        // warranted, not only when the window is spent. With the flag off this
+        // arm is unreachable and selection is unchanged.
+        ContextLevel::Compact if config.prefer_snip => CompactStrategy::Snip,
         ContextLevel::Compact => CompactStrategy::Auto,
         // Claude warns at this level rather than compacting. When a caller has
         // asked for recovery anyway, the lightest pass is the right floor —
@@ -1341,6 +1345,47 @@ mod tests {
             &CompactConfig::default(),
         );
         assert!(matches!(strategy, CompactStrategy::Snip));
+    }
+
+    #[test]
+    fn history_snip_prefers_snip_over_the_compaction_line() {
+        let model = ModelId::sonnet();
+        // 170_000 is over the 167_000 compaction line but under the 197_000
+        // blocked line: the level where the flag changes the outcome.
+        let off = select_compact_strategy("end_turn", 170_000, &model, &CompactConfig::default());
+        assert!(
+            matches!(off, CompactStrategy::Auto),
+            "with history_snip off the strategy must be unchanged: {off:?}"
+        );
+
+        let on = select_compact_strategy(
+            "end_turn",
+            170_000,
+            &model,
+            &CompactConfig {
+                prefer_snip: true,
+                ..CompactConfig::default()
+            },
+        );
+        assert!(
+            matches!(on, CompactStrategy::Snip),
+            "with history_snip on compaction must snip earlier: {on:?}"
+        );
+
+        // The flag does not disturb the lines below or above the compaction
+        // line: still the lightest pass, and still snip once spent.
+        let below = CompactConfig {
+            prefer_snip: true,
+            ..CompactConfig::default()
+        };
+        assert!(matches!(
+            select_compact_strategy("end_turn", 50_000, &model, &below),
+            CompactStrategy::Micro
+        ));
+        assert!(matches!(
+            select_compact_strategy("end_turn", 198_000, &model, &below),
+            CompactStrategy::Snip
+        ));
     }
 
     /// An unrecognised model must not be assumed to have the largest window we

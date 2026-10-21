@@ -15,6 +15,7 @@ use coderex_config::{
 use coderex_core::api_client::{ApiClient, EffortClient, ReasoningEffort};
 use coderex_core::provider_config::ProviderConfig;
 use coderex_core::providers::cloud::{CloudEndpoint, ProviderKind};
+use coderex_core::query_profiles::ModelProfile;
 use coderex_core::types::ModelId;
 use std::io::IsTerminal;
 use std::sync::Arc;
@@ -822,14 +823,21 @@ impl StartupOrchestrator {
 
         tracing::info!("CodeRex ready");
 
-        // Determine model: ANTHROPIC_MODEL / OPENAI_MODEL env → settings → default
-        let model = std::env::var("ANTHROPIC_MODEL")
+        // Determine model: ANTHROPIC_MODEL / OPENAI_MODEL env → --model/settings → default.
+        // `fast_mode` only changes the default: an explicitly configured model
+        // (`--model`, `ANTHROPIC_MODEL`/`OPENAI_MODEL`, or a settings `model`
+        // value) always wins, so the flag is what you get when nothing else
+        // chose one.
+        let explicit_model = std::env::var("ANTHROPIC_MODEL")
             .or_else(|_| std::env::var("OPENAI_MODEL"))
             .ok()
             .filter(|m| !m.is_empty())
             .map(ModelId)
-            .or_else(|| self.ctx.model.clone())
-            .unwrap_or_else(ModelId::sonnet);
+            .or_else(|| self.ctx.model.clone());
+        let model = Self::resolve_session_model(
+            explicit_model,
+            coderex_config::flags::FeatureFlags::from_env().fast_mode,
+        );
 
         // Handle --resume flag (resume last or specific session)
         if let Some(ref session_id) = args.resume {
@@ -2739,7 +2747,10 @@ impl StartupOrchestrator {
             );
         if let Some(factory) = Self::serve_engine_factory(
             cwd,
-            self.ctx.model.clone().unwrap_or_else(ModelId::sonnet),
+            Self::resolve_session_model(
+                self.ctx.model.clone(),
+                coderex_config::flags::FeatureFlags::from_env().fast_mode,
+            ),
             context_window,
             self.ctx.mcp_manager.clone(),
             permission_mode,
@@ -2773,6 +2784,25 @@ impl StartupOrchestrator {
     fn env_flag(name: &str) -> bool {
         std::env::var(name)
             .is_ok_and(|value| matches!(value.to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
+    }
+
+    /// Choose the session model from an explicitly configured one and
+    /// `fast_mode`.
+    ///
+    /// Precedence: an explicit model always wins — `--model`,
+    /// `ANTHROPIC_MODEL`/`OPENAI_MODEL`, or a settings `model` value. `fast_mode`
+    /// only changes the default used when nothing else chose one: on, the
+    /// session resolves through [`ModelProfile::Lightweight`] (haiku,
+    /// overridable via `CODEREX_LIGHTWEIGHT_MODEL`); off, it is
+    /// [`ModelId::sonnet`].
+    fn resolve_session_model(explicit: Option<ModelId>, fast_mode: bool) -> ModelId {
+        explicit.unwrap_or_else(|| {
+            if fast_mode {
+                ModelProfile::Lightweight.resolve_runtime()
+            } else {
+                ModelId::sonnet()
+            }
+        })
     }
 
     /// Whether marketplace reconciliation may install new plugins.
@@ -2865,7 +2895,8 @@ impl StartupOrchestrator {
                 ExecutionContext::Normal,
                 std::path::PathBuf::from(&cwd),
             );
-            dispatcher.set_feature_flags(coderex_config::flags::FeatureFlags::from_env());
+            let flags = coderex_config::flags::FeatureFlags::from_env();
+            dispatcher.set_feature_flags(flags.clone());
             dispatcher.set_task_store(task_store);
             dispatcher.set_cron_scheduler(cron_scheduler);
             dispatcher.set_rate_limiter(std::sync::Arc::new(RateLimiter::new()));
@@ -2903,6 +2934,9 @@ impl StartupOrchestrator {
             );
             engine.set_tool_executor(Box::new(dispatcher));
             engine.set_context_window_resolver(context_window.clone());
+            // The same flag behaviours the REPL installs: a served session
+            // honours `coordinator_mode` and `history_snip` too.
+            crate::repl::apply_engine_flag_behaviours(&mut engine, &flags);
             (engine, rx)
         }))
     }
@@ -4405,6 +4439,30 @@ mod tests {
         let prompt = orch.build_headless_prompt("hello");
         assert!(prompt.contains("Additional system instructions: be terse"));
         assert!(!prompt.contains("System: be terse"));
+    }
+
+    /// `fast_mode` changes the *default* session model: with nothing explicitly
+    /// configured it resolves through `ModelProfile::Lightweight`, and with the
+    /// flag off the default is sonnet. An explicit model always wins.
+    #[test]
+    fn fast_mode_selects_the_lightweight_default_only_when_nothing_is_explicit() {
+        assert_eq!(
+            StartupOrchestrator::resolve_session_model(None, false),
+            ModelId::sonnet(),
+            "without fast_mode the default session model is sonnet"
+        );
+        assert_eq!(
+            StartupOrchestrator::resolve_session_model(None, true),
+            ModelProfile::Lightweight.resolve_runtime(),
+            "fast_mode resolves the default through the lightweight profile"
+        );
+
+        let explicit = ModelId::sonnet();
+        assert_eq!(
+            StartupOrchestrator::resolve_session_model(Some(explicit.clone()), true),
+            explicit,
+            "an explicit model wins over fast_mode"
+        );
     }
 
     #[test]

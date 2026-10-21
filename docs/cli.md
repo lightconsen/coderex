@@ -182,18 +182,16 @@ A comma-separated list applied on top of `CODEREX_FEATURE_FLAGS`:
 - An unknown name is a startup error listing the unknown names and the known
   set; it is never dropped silently.
 - Some names are accepted for configuration compatibility but have no effect in
-  this build: `streaming_tool_execution`, `tool_use_summaries`, `fast_mode`,
-  `coordinator_mode`, `history_snip`, `bridge_mode`, `daemon`, `buddy`, and
-  `team_collaboration`. Enabling any of them logs a warning at startup instead
-  of implying behavior. Each names a real surface this build has not wired to
-  the flag: streaming tool execution and snip compaction already run
-  unconditionally in `core::engine`; the lightweight model profile exists but
-  the session model never resolves through it; the coordinator state machine
-  and team context exist but nothing reads them; the bridge and the daemon are
-  subcommands rather than session capabilities; and the companion lives behind
-  the compile-time `buddy` feature, which this workspace does not enable. The
-  `INERT_FLAGS` doc comment in `crates/config/src/flags.rs` records the exact
-  reason and what building each one would take.
+  this build: `streaming_tool_execution`, `tool_use_summaries`, `bridge_mode`,
+  `daemon`, `buddy`, and `team_collaboration`. Enabling any of them logs a
+  warning at startup instead of implying behavior. Each names a real surface
+  this build has not wired to the flag: streaming tool execution already runs
+  unconditionally in `core::engine`; the tool-use summary surface does not
+  exist; the bridge and the daemon are subcommands rather than session
+  capabilities; the companion lives behind the compile-time `buddy` feature,
+  which this workspace does not enable; and the team context exists but nothing
+  reads it. The `INERT_FLAGS` doc comment in `crates/config/src/flags.rs`
+  records the exact reason and what building each one would take.
 - Three names that used to be accepted — `context_collapse`, `terminal_panel`,
   and `kairos` — were removed. No code in the workspace could ever be their
   product surface, so accepting them promised behavior that did not exist; they
@@ -202,8 +200,13 @@ A comma-separated list applied on top of `CODEREX_FEATURE_FLAGS`:
   tool), `agent_triggers` (gates the agent-kind hook path — with it off a
   configured `agent` hook is dropped at startup with a warning), `auto_dream`
   (gates the auto-dream manager — with it off `/auto-dream` reports as
-  uninitialized), `workflow_scripts`, `voice_mode`, and the six
-  command-availability flags.
+  uninitialized), `fast_mode` (resolves the session model through the
+  lightweight profile when nothing else chose one — an explicit `--model`,
+  `ANTHROPIC_MODEL`/`OPENAI_MODEL`, or settings `model` still wins),
+  `coordinator_mode` (installs a `CoordinatorState` on the session engine so
+  its per-turn phase advance runs), `history_snip` (makes compaction prefer the
+  snip strategy as soon as it is warranted), `workflow_scripts`, `voice_mode`,
+  and the six command-availability flags.
 
 ### `--from-pr URL`
 

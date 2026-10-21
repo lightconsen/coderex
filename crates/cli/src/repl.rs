@@ -1751,6 +1751,27 @@ fn primary_tool_was_missing(output: &str, tool_name: &str) -> bool {
         ))
 }
 
+/// Install the engine behaviours gated by a session's feature flags.
+///
+/// `coordinator_mode` installs a started [`CoordinatorState`] so the engine's
+/// existing per-turn phase advance runs; `history_snip` makes compaction prefer
+/// the snip strategy as soon as it is warranted. Both are read from the final
+/// flag set, so `--betas` participates. Shared with the `serve` engine factory
+/// so both production engine-construction paths honour the flags.
+///
+/// [`CoordinatorState`]: coderex_core::coordinator::CoordinatorState
+pub(crate) fn apply_engine_flag_behaviours(
+    engine: &mut QueryEngine,
+    flags: &coderex_config::flags::FeatureFlags,
+) {
+    if flags.coordinator_mode {
+        let mut coordinator = coderex_core::coordinator::CoordinatorState::new();
+        coordinator.start();
+        engine.set_coordinator(coordinator);
+    }
+    engine.set_history_snip(flags.history_snip);
+}
+
 impl ReplLoop {
     /// Create a new REPL loop without a QueryEngine.
     /// Use `with_engine` to wire up the QueryEngine for full conversation support.
@@ -2894,7 +2915,14 @@ impl ReplLoop {
             engine.set_context_window_resolver(resolver);
         }
 
-        // 9c. Auto-dream. The manager is built at construction, before `--betas`
+        // 9c. Engine flag behaviours. `coordinator_mode` and `history_snip`
+        // are engine behaviours the engine exposes setters for; the session's
+        // flag set is only final here, after `--betas` has been applied.
+        if let Some(ref mut engine) = self.engine {
+            apply_engine_flag_behaviours(engine, &self.feature_flags);
+        }
+
+        // 9d. Auto-dream. The manager is built at construction, before `--betas`
         // is resolved, so the flag is applied here. With `auto_dream` off there
         // is no dream manager and `/auto-dream` reports as much instead of
         // starting a background consolidation the user did not ask for.
@@ -9851,6 +9879,73 @@ mod tests {
         assert!(
             on.auto_dream.is_some(),
             "enabling auto_dream must keep the dream manager"
+        );
+    }
+
+    /// `coordinator_mode` installs a started `CoordinatorState` on the session
+    /// engine, so the engine's per-turn phase advance actually runs. Without
+    /// the flag there is no coordinator and the whole mechanism stays dead.
+    #[tokio::test]
+    async fn coordinator_mode_flag_installs_a_coordinator_on_the_engine() {
+        let mut off = ReplLoop::with_engine(
+            Box::new(CountingApi::new()),
+            "/tmp".into(),
+            ModelId::sonnet(),
+        );
+        off.apply_cli_config();
+        assert!(
+            off.engine.as_ref().expect("engine").coordinator().is_none(),
+            "no coordinator is installed while coordinator_mode is off"
+        );
+
+        let mut on = ReplLoop::with_engine(
+            Box::new(CountingApi::new()),
+            "/tmp".into(),
+            ModelId::sonnet(),
+        );
+        on.with_betas(vec!["+coordinator_mode".into()]);
+        on.apply_cli_config();
+        let coordinator = on
+            .engine
+            .as_ref()
+            .expect("engine")
+            .coordinator()
+            .expect("coordinator_mode must install a coordinator");
+        assert!(
+            coordinator.is_running,
+            "the installed coordinator is started"
+        );
+        assert!(
+            coordinator.current_phase.is_first(),
+            "a fresh coordinator begins in the first phase"
+        );
+    }
+
+    /// `history_snip` reaches the engine's compaction configuration, where it
+    /// makes compaction prefer the snip strategy as soon as it is warranted.
+    #[tokio::test]
+    async fn history_snip_flag_reaches_the_engine_compaction_config() {
+        let mut off = ReplLoop::with_engine(
+            Box::new(CountingApi::new()),
+            "/tmp".into(),
+            ModelId::sonnet(),
+        );
+        off.apply_cli_config();
+        assert!(
+            !off.engine.as_ref().expect("engine").history_snip(),
+            "snip preference is off by default"
+        );
+
+        let mut on = ReplLoop::with_engine(
+            Box::new(CountingApi::new()),
+            "/tmp".into(),
+            ModelId::sonnet(),
+        );
+        on.with_betas(vec!["+history_snip".into()]);
+        on.apply_cli_config();
+        assert!(
+            on.engine.as_ref().expect("engine").history_snip(),
+            "history_snip must reach the engine's compaction config"
         );
     }
 

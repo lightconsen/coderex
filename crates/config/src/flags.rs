@@ -49,6 +49,11 @@ pub const KNOWN_FLAGS: &[&str] = &[
 /// gates the `WebFetch` tool (see `coderex_tools::required_feature_flag`),
 /// `agent_triggers` gates the agent-kind hook path, and `auto_dream` gates the
 /// auto-dream manager; all three now do something, so they are no longer here.
+/// `fast_mode` now resolves the session model through
+/// `ModelProfile::Lightweight` when nothing else chose one, `coordinator_mode`
+/// installs a `CoordinatorState` on the session engine, and `history_snip`
+/// makes compaction prefer the snip strategy as soon as it is warranted; all
+/// three are read by the CLI and the engine, so they are no longer here either.
 ///
 /// A name is deleted outright when no code in the workspace could ever be its
 /// product surface. `context_collapse`, `terminal_panel`, and `kairos` were
@@ -69,21 +74,6 @@ pub const KNOWN_FLAGS: &[&str] = &[
 ///   of each tool use. CodeRex emits only the fixed `ToolCall::activity_summary()`
 ///   label. Building it takes a `ModelProfile::Lightweight` summarizer call and
 ///   a surface to render the result.
-/// - `fast_mode`: the reference runs the session on a smaller, faster model.
-///   CodeRex has `ModelProfile::Lightweight` (haiku, overridable through
-///   `CODEREX_LIGHTWEIGHT_MODEL`) but uses it only for side queries; wiring the
-///   flag means resolving the session model through that profile when `--model`
-///   was not given.
-/// - `coordinator_mode`: the reference makes the main agent a coordinator over
-///   sub-agents. `core::coordinator::CoordinatorState` and
-///   `QueryEngine::set_coordinator` exist, but nothing sets a coordinator and
-///   the engine only records phase summaries without acting on the phase, so the
-///   flag would gate an inert path. Building it takes a caller plus engine logic
-///   that reads the current phase.
-/// - `history_snip`: the reference snips history at a token boundary. CodeRex's
-///   `core::compact::snip_compact` and `CompactStrategy::Snip` are built and
-///   chosen automatically under context pressure; forcing that strategy from a
-///   flag needs an override on the engine's compact configuration.
 /// - `bridge_mode`: the reference gates a session-side bridge capability.
 ///   CodeRex's bridge is the `bridge` subcommand (a separate entry point), so
 ///   the flag has nothing distinct to gate. Wiring it means either aliasing the
@@ -102,9 +92,6 @@ pub const KNOWN_FLAGS: &[&str] = &[
 const INERT_FLAGS: &[&str] = &[
     "streaming_tool_execution",
     "tool_use_summaries",
-    "fast_mode",
-    "coordinator_mode",
-    "history_snip",
     "bridge_mode",
     "daemon",
     "buddy",
@@ -138,11 +125,21 @@ pub struct FeatureFlags {
     pub streaming_tool_execution: bool,
     /// Show tool use summaries.
     pub tool_use_summaries: bool,
-    /// Enable fast mode.
+    /// Run the session on the lightweight model profile.
+    ///
+    /// When on and no model was explicitly configured (`--model`,
+    /// `ANTHROPIC_MODEL`/`OPENAI_MODEL`, or a settings `model` value), the
+    /// session model resolves through `ModelProfile::Lightweight`.
     pub fast_mode: bool,
-    /// Enable coordinator mode.
+    /// Make the main agent coordinate sub-agents.
+    ///
+    /// When on, the CLI installs a `CoordinatorState` on the session engine, so
+    /// its per-turn phase advance runs.
     pub coordinator_mode: bool,
-    /// Enable history snipping.
+    /// Snip history at a token boundary.
+    ///
+    /// When on, compaction prefers the `Snip` strategy as soon as it is
+    /// warranted rather than only when the context window is spent.
     pub history_snip: bool,
     /// Enable agent triggers.
     pub agent_triggers: bool,
@@ -1067,14 +1064,34 @@ mod tests {
             vec![
                 "streaming_tool_execution",
                 "tool_use_summaries",
-                "fast_mode",
-                "coordinator_mode",
-                "history_snip",
                 "bridge_mode",
                 "daemon",
                 "buddy",
                 "team_collaboration",
             ]
         );
+    }
+
+    #[test]
+    fn newly_wired_flags_are_no_longer_inert() {
+        // `fast_mode`, `coordinator_mode`, and `history_snip` now have product
+        // paths (the session model, the engine coordinator, and compaction
+        // strategy selection), so enabling any of them must not be reported as
+        // a compatibility-only no-op.
+        let flags = FeatureFlags::parse("fast_mode,coordinator_mode,history_snip");
+        assert!(flags.fast_mode);
+        assert!(flags.coordinator_mode);
+        assert!(flags.history_snip);
+        assert!(
+            flags.inert_flags().is_empty(),
+            "wired flags were still reported as inert: {:?}",
+            flags.inert_flags()
+        );
+        for name in ["fast_mode", "coordinator_mode", "history_snip"] {
+            assert!(
+                !INERT_FLAGS.contains(&name),
+                "{name} is still listed in INERT_FLAGS"
+            );
+        }
     }
 }

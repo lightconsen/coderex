@@ -1008,9 +1008,9 @@ Feature flags 不能只是本地 bool map，必须支持：
 
 - streaming_tool_execution
 - tool_use_summaries
-- fast_mode
-- coordinator_mode
-- history_snip
+- fast_mode（已接线：未显式配置模型时会话经 ModelProfile::Lightweight 解析）
+- coordinator_mode（已接线：CLI 在会话引擎上安装 CoordinatorState）
+- history_snip（已接线：压缩在有需要时优先选择 Snip 策略）
 - agent_triggers
 - bridge_mode
 - daemon

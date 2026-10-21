@@ -104,6 +104,13 @@ pub struct CompactConfig {
     /// The reference implementation wakes at 90% of the TTL and exits 30s
     /// early, which for a 5-minute cache are the same instant.
     pub cache_ttl_early_exit_secs: u64,
+    /// Prefer the snip strategy as soon as compaction is warranted, rather than
+    /// only once the context window is spent.
+    ///
+    /// Set by the `history_snip` feature flag through
+    /// `QueryEngine::set_history_snip`. Off (the default) leaves strategy
+    /// selection byte-for-byte identical to the pre-flag behaviour.
+    pub prefer_snip: bool,
 }
 
 impl Default for CompactConfig {
@@ -126,6 +133,7 @@ impl Default for CompactConfig {
             session_memory_enabled: true,
             cache_ttl_secs: 300,
             cache_ttl_early_exit_secs: 30,
+            prefer_snip: false,
         }
     }
 }

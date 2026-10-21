@@ -1923,6 +1923,29 @@ impl QueryEngine {
         self.coordinator = Some(coordinator);
     }
 
+    /// The installed coordinator state, if any.
+    ///
+    /// Installed by the CLI when `coordinator_mode` is on, which is what makes
+    /// the engine's per-turn phase advance run.
+    #[must_use]
+    pub const fn coordinator(&self) -> Option<&crate::coordinator::CoordinatorState> {
+        self.coordinator.as_ref()
+    }
+
+    /// Prefer the snip strategy as soon as compaction is warranted.
+    ///
+    /// Set by the CLI when `history_snip` is on. Off leaves strategy selection
+    /// byte-for-byte identical to the pre-flag behaviour.
+    pub const fn set_history_snip(&mut self, enabled: bool) {
+        self.compact_config.prefer_snip = enabled;
+    }
+
+    /// Whether compaction prefers the snip strategy as soon as it is warranted.
+    #[must_use]
+    pub const fn history_snip(&self) -> bool {
+        self.compact_config.prefer_snip
+    }
+
     /// Set the structured output validator from a JSON schema.
     pub fn set_structured_output(&mut self, schema: serde_json::Value) {
         self.structured_output = Some(StructuredOutputValidator::new(schema));
@@ -5301,6 +5324,48 @@ mod tests {
         assert!(opts.json_schema.is_none());
         assert!(opts.custom_system_prompt.is_none());
         assert!(opts.handle_elicitation);
+    }
+
+    /// `coordinator_mode` installs a `CoordinatorState` on the session engine;
+    /// the engine's per-turn advance then moves the phase. Without an
+    /// installed coordinator nothing runs, which is what made the flag inert.
+    #[tokio::test]
+    async fn coordinator_advances_a_phase_per_turn_when_installed() {
+        let (mut engine, _rx, _session) = make_test_engine();
+        assert!(
+            engine.coordinator().is_none(),
+            "no coordinator is installed by default"
+        );
+
+        let mut coordinator = crate::coordinator::CoordinatorState::new();
+        coordinator.start();
+        engine.set_coordinator(coordinator);
+
+        let reason = engine
+            .submit("hello".into(), SubmitOptions::default())
+            .await
+            .expect("the mock turn completes");
+        assert!(matches!(reason, TerminalReason::Completed), "{reason:?}");
+
+        let coordinator = engine
+            .coordinator()
+            .expect("the coordinator stays installed after the turn");
+        assert_eq!(
+            coordinator.current_phase,
+            crate::coordinator::CoordinatorPhase::Synthesis,
+            "one completed turn advances Research → Synthesis"
+        );
+        assert_eq!(coordinator.phases_completed(), 1);
+    }
+
+    #[test]
+    fn history_snip_setter_toggles_the_compact_config() {
+        let (mut engine, _rx, _session) = make_test_engine();
+        assert!(!engine.history_snip(), "snip preference is off by default");
+        engine.set_history_snip(true);
+        assert!(engine.history_snip());
+        engine.set_history_snip(false);
+        assert!(!engine.history_snip());
     }
 
     #[test]
