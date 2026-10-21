@@ -1018,9 +1018,9 @@ Feature flags 不能只是本地 bool map，必须支持：
 - buddy
 - workflow_scripts
 - web_browser_tool
-- context_collapse
-- terminal_panel
-- kairos / proactive
+- ~~context_collapse~~（已移除：工作区里没有任何产物面）
+- ~~terminal_panel~~（已移除：工作区里没有任何产物面）
+- ~~kairos / proactive~~（已移除：工作区里没有任何产物面）
 - team_collaboration
 - auto_dream
 
