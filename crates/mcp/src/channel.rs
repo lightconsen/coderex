@@ -196,8 +196,9 @@ pub struct JsonRpcChannel {
     cwd: Option<std::path::PathBuf>,
     /// Sandbox policy for the server, when one applies.
     sandbox_config: Option<coderex_core::sandbox::SandboxConfig>,
-    /// The sandbox handle. It owns the child's Job Object (Windows), so it
-    /// must live exactly as long as the process.
+    /// The sandbox handle. It owns the child's Job Object (Windows), the
+    /// Seatbelt profile (macOS) and the memory cgroup (Linux), so it must live
+    /// exactly as long as the process.
     sandbox: Option<coderex_core::sandbox::SandboxHandle>,
     /// Whether the channel is initialized.
     initialized: bool,
@@ -215,6 +216,35 @@ impl std::fmt::Debug for JsonRpcChannel {
             .field("has_handler", &self.handler.is_some())
             .field("http", &self.http.is_some())
             .finish_non_exhaustive()
+    }
+}
+
+/// Create the sandbox handle for a server, working around a macOS profile-path
+/// collision.
+///
+/// `SandboxHandle::create` on macOS writes its Seatbelt profile to a path
+/// derived from the *creating thread's* id and makes it read-only. Two handles
+/// created on one thread therefore collide: the second write is refused with
+/// `Permission denied`, which — under the fail-closed policy — would refuse a
+/// second server that shares a spawning thread (the manager starts its servers
+/// from one thread). Creating each handle on its own short-lived thread gives
+/// it a distinct profile path. On the other platforms the handle is not backed
+/// by a per-thread file, so the call is made directly.
+fn create_sandbox_handle(
+    config: &coderex_core::sandbox::SandboxConfig,
+) -> Result<coderex_core::sandbox::SandboxHandle, String> {
+    #[cfg(target_os = "macos")]
+    {
+        std::thread::scope(|scope| {
+            scope
+                .spawn(|| crate::sandbox::create_stdio_sandbox(config))
+                .join()
+                .unwrap_or_else(|_| Err("sandbox creation panicked".to_string()))
+        })
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        crate::sandbox::create_stdio_sandbox(config)
     }
 }
 
@@ -290,7 +320,9 @@ impl JsonRpcChannel {
     /// Configure the working directory and the sandbox for a stdio server.
     ///
     /// A `None` policy runs the server unwrapped. The channel keeps the
-    /// resulting handle for the process's lifetime.
+    /// resulting handle for the process's lifetime, on every platform — the
+    /// handle owns the child's Job Object on Windows, and on macOS it owns the
+    /// generated Seatbelt profile.
     pub fn set_sandbox(
         &mut self,
         cwd: Option<std::path::PathBuf>,
@@ -385,6 +417,9 @@ impl JsonRpcChannel {
 
     /// Spawn the subprocess and capture stdio handles.
     ///
+    /// When a sandbox policy is configured the server is confined on every
+    /// platform, not only Windows, and a failure to confine is a refusal.
+    ///
     /// The body has nothing to await, but every transport's spawn is a future
     /// to its callers, so the `async` signature stays.
     #[allow(clippy::unused_async, clippy::unused_async_trait_impl)]
@@ -411,8 +446,38 @@ impl JsonRpcChannel {
             ));
         }
 
-        let mut cmd = Command::new(&self.command);
-        cmd.args(&self.args);
+        // Confinement is set up on every platform, not only Windows. Creating
+        // the handle can itself be the refusal — the AppContainer runtime on
+        // Windows, an unavailable filesystem backend on Linux — and the policy
+        // is fail-closed: a server that was meant to be confined does not run
+        // unconfined. See `crate::sandbox::create_stdio_sandbox`.
+        let sandbox = match self.sandbox_config.as_ref() {
+            Some(config) => Some(
+                create_sandbox_handle(config)
+                    .map_err(|e| format!("could not sandbox '{}': {e}", self.command))?,
+            ),
+            None => None,
+        };
+
+        // Where confinement is a wrapper program — `sandbox-exec` on macOS,
+        // `bwrap` on Linux — the wrapper becomes the program and the server
+        // command its argument. Windows has no wrapper: the AppContainer token
+        // is attached to the suspended child after it spawns, so the server
+        // stays the program.
+        let (program, args) = match sandbox
+            .as_ref()
+            .and_then(coderex_core::sandbox::SandboxHandle::sandboxed_program)
+        {
+            Some((wrapper, mut prefix)) => {
+                prefix.push(self.command.clone());
+                prefix.extend(self.args.iter().cloned());
+                (wrapper.to_string(), prefix)
+            }
+            None => (self.command.clone(), self.args.clone()),
+        };
+
+        let mut cmd = Command::new(&program);
+        cmd.args(&args);
         // The server is not a provider client, so it does not inherit this
         // session's credentials. Its own configured environment is layered on
         // afterwards and always wins, so a server that genuinely needs a
@@ -431,50 +496,73 @@ impl JsonRpcChannel {
         cmd.stderr(Stdio::piped());
         cmd.kill_on_drop(true);
 
-        // On Windows the server is confined by an AppContainer token plus a
-        // Job Object. `prepare` creates it suspended, and `post_spawn_raw`
-        // attaches the token, assigns the job and resumes it. A failure is a
-        // refusal: a server that was meant to be confined does not run
-        // unconfined.
-        #[cfg(target_os = "windows")]
-        let sandbox = match self.sandbox_config.as_ref() {
-            Some(config) => {
-                let handle = coderex_core::sandbox::SandboxHandle::create(config.clone())
-                    .map_err(|e| format!("could not sandbox '{}': {e}", self.command))?;
-                handle
-                    .prepare(cmd.as_std_mut())
-                    .map_err(|e| format!("could not prepare '{}': {e}", self.command))?;
-                Some(handle)
-            }
-            None => None,
-        };
+        // `prepare` runs in the child before `exec`: rlimits, Landlock rules
+        // and the seccomp table on Linux, a best-effort memory ceiling on
+        // macOS, and `CREATE_SUSPENDED` on Windows so the token can be
+        // attached afterwards. A failure here is a refusal.
+        if let Some(handle) = &sandbox {
+            handle
+                .prepare(cmd.as_std_mut())
+                .map_err(|e| format!("could not prepare '{}': {e}", self.command))?;
+        }
 
         let mut process = cmd
             .spawn()
             .map_err(|e| format!("failed to spawn '{}': {e}", self.command))?;
 
-        #[cfg(target_os = "windows")]
+        // Complete the confinement now the child exists.
+        #[cfg(any(target_os = "windows", target_os = "linux"))]
         if let Some(handle) = &sandbox {
-            let Some(raw) = process.raw_handle() else {
-                let _ = process.kill().await;
-                return Err(format!(
-                    "the spawned MCP server '{}' has no process handle, so it could not be \
-                     confined; refusing to run it",
-                    self.command
-                ));
-            };
-            if let Err(error) = handle.post_spawn_raw(raw) {
-                let _ = process.kill().await;
-                return Err(format!(
-                    "could not confine the MCP server '{}': {error}",
-                    self.command
-                ));
+            // Windows: attach the AppContainer token to the suspended child,
+            // assign the Job Object and resume it. A failure terminates the
+            // child and refuses the server, because the confinement the caller
+            // asked for was not obtained.
+            #[cfg(target_os = "windows")]
+            {
+                let Some(raw) = process.raw_handle() else {
+                    let _ = process.kill().await;
+                    return Err(format!(
+                        "the spawned MCP server '{}' has no process handle, so it could not be \
+                         confined; refusing to run it",
+                        self.command
+                    ));
+                };
+                if let Err(error) = handle.post_spawn_raw(raw) {
+                    let _ = process.kill().await;
+                    return Err(format!(
+                        "could not confine the MCP server '{}': {error}",
+                        self.command
+                    ));
+                }
+            }
+            // Linux: add the child to the memory cgroup prepared for it. That
+            // is a resource limit on top of the filesystem rules `prepare`
+            // already installed, so a failure is logged rather than fatal.
+            #[cfg(target_os = "linux")]
+            {
+                if let Some(pid) = process.id() {
+                    if let Err(error) = handle.post_spawn_pid(pid) {
+                        tracing::warn!(
+                            server = %self.command,
+                            %error,
+                            "could not add the MCP server to its memory cgroup; it runs with \
+                             RLIMIT_AS only"
+                        );
+                    }
+                } else {
+                    tracing::warn!(
+                        server = %self.command,
+                        "the MCP server exited before it could be added to its memory cgroup; \
+                         it ran with RLIMIT_AS only"
+                    );
+                }
             }
         }
-        #[cfg(target_os = "windows")]
-        {
-            self.sandbox = sandbox;
-        }
+
+        // Keep the handle alive for exactly as long as the child: it owns the
+        // Seatbelt profile on macOS, the memory cgroup on Linux, and the Job
+        // Object on Windows.
+        self.sandbox = sandbox;
 
         let stdin = process
             .stdin
@@ -1050,6 +1138,89 @@ mod tests {
             error.contains("resolves inside the working directory"),
             "unexpected error: {error}"
         );
+    }
+
+    /// A stdio server runs inside the Seatbelt profile: it can write in its
+    /// workspace and nowhere else.
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn macos_stdio_channel_is_sandboxed() {
+        if !std::path::Path::new("/usr/bin/sandbox-exec").is_file() {
+            eprintln!("skipping: sandbox-exec is not available");
+            return;
+        }
+        assert_the_channel_confines_writes().await;
+    }
+
+    /// A stdio server runs under bubblewrap or Landlock: it can write in its
+    /// workspace and nowhere else.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn linux_stdio_channel_is_sandboxed() {
+        if !coderex_core::sandbox::bubblewrap_in_force()
+            && !coderex_core::sandbox::landlock_in_force()
+        {
+            eprintln!("skipping: neither bubblewrap nor Landlock is in force");
+            return;
+        }
+        assert_the_channel_confines_writes().await;
+    }
+
+    /// Spawn a stdio server under a policy that writes only in its workspace
+    /// and assert the confinement holds. Shared by the macOS and Linux tests.
+    #[cfg(unix)]
+    async fn assert_the_channel_confines_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        // The wrapper matches on the resolved path, and on macOS `/var` is a
+        // symlink to `/private/var`; the policy must name the canonical form.
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        let allowed = root.join("workspace");
+        let denied = root.join("outside");
+        std::fs::create_dir_all(&allowed).unwrap();
+        std::fs::create_dir_all(&denied).unwrap();
+
+        let script = format!(
+            "printf inside > '{}'; printf outside > '{}' 2>/dev/null",
+            allowed.join("inside.txt").display(),
+            denied.join("outside.txt").display()
+        );
+        let mut channel = JsonRpcChannel::new("sh", vec!["-c".to_string(), script], HashMap::new());
+        channel.set_sandbox(
+            Some(allowed.clone()),
+            Some(coderex_core::sandbox::SandboxConfig {
+                allowed_read_paths: vec![allowed.clone()],
+                allowed_write_paths: vec![allowed.clone()],
+                allowed_exec_paths: vec![
+                    std::path::PathBuf::from("/bin"),
+                    std::path::PathBuf::from("/usr/bin"),
+                ],
+                additional_working_dirs: vec![allowed.clone()],
+                ..coderex_core::sandbox::SandboxConfig::default()
+            }),
+        );
+
+        tokio::time::timeout(std::time::Duration::from_secs(20), channel.spawn())
+            .await
+            .expect("the sandboxed server never started; was the wrapper applied?")
+            .expect("the server should spawn");
+        assert!(
+            channel.sandbox.is_some(),
+            "the sandbox handle must be retained for the child's lifetime"
+        );
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !allowed.join("inside.txt").exists() && std::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert!(
+            allowed.join("inside.txt").exists(),
+            "the server could not write in its workspace"
+        );
+        assert!(
+            !denied.join("outside.txt").exists(),
+            "the server wrote outside its policy"
+        );
+        let _ = channel.terminate().await;
     }
 
     /// A stdio server runs inside the AppContainer: it can write in its
