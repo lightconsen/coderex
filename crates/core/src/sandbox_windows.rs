@@ -326,7 +326,7 @@ mod imp {
         CreateWellKnownSid, EqualSid, FreeSid, GetAce, GetAclInformation, GetSidSubAuthority,
         GetSidSubAuthorityCount, PSECURITY_DESCRIPTOR, PSID, SECURITY_CAPABILITIES,
         SECURITY_MAX_SID_SIZE, SID_AND_ATTRIBUTES, SYSTEM_MANDATORY_LABEL_ACE,
-        WinCapabilityInternetClientSid,
+        WinBuiltinAnyPackageSid, WinCapabilityInternetClientSid,
     };
     use windows_sys::Win32::Security::{
         DACL_SECURITY_INFORMATION, LABEL_SECURITY_INFORMATION, SetFileSecurityW,
@@ -678,6 +678,7 @@ mod imp {
                     continue;
                 }
 
+                let started = std::time::Instant::now();
                 let result = set_grant(&grant.path, self.sid, grant.access).and_then(|()| {
                     if grant.access == AclAccess::Modify {
                         set_mandatory_label(&grant.path)
@@ -685,6 +686,18 @@ mod imp {
                         Ok(())
                     }
                 });
+                // A cold plan used to spend minutes here without saying which
+                // path was responsible; the Windows runtime log is the only
+                // place this is observable.
+                #[cfg(test)]
+                if started.elapsed() > std::time::Duration::from_secs(1) {
+                    eprintln!(
+                        "[acl] {} {:?} took {:.1}s",
+                        grant.path.display(),
+                        grant.access,
+                        started.elapsed().as_secs_f64()
+                    );
+                }
 
                 if let Err(error) = result {
                     if grant.best_effort {
@@ -709,7 +722,16 @@ mod imp {
                 }
 
                 if grant.recursive {
+                    let walked = std::time::Instant::now();
                     walk_and_grant(&grant.path, self.sid, grant.access);
+                    #[cfg(test)]
+                    if walked.elapsed() > std::time::Duration::from_secs(1) {
+                        eprintln!(
+                            "[acl] walk {} took {:.1}s",
+                            grant.path.display(),
+                            walked.elapsed().as_secs_f64()
+                        );
+                    }
                 }
                 applied.push(key);
             }
@@ -970,6 +992,41 @@ mod imp {
 
     /// Whether `dacl` already grants `permissions` to `sid` on the object
     /// itself (an inherit-only ACE does not count).
+    /// The `ALL APPLICATION PACKAGES` SID (`S-1-15-2-1`).
+    ///
+    /// Every AppContainer token is a member of this group, so a directory that
+    /// already grants it the access we need does not need our own ACE. That
+    /// matters because `SetNamedSecurityInfoW` is hooked by Defender on
+    /// managed machines: a cold ACL plan that rewrote every system root took
+    /// over eight minutes on the Windows CI runner.
+    ///
+    /// The SID is created once and kept for the process; it is a tiny, fixed
+    /// allocation.
+    fn any_package_sid() -> PSID {
+        static SID: OnceLock<usize> = OnceLock::new();
+        let value = *SID.get_or_init(|| {
+            let mut buffer: Box<[u8; SECURITY_MAX_SID_SIZE as usize]> =
+                Box::new([0; SECURITY_MAX_SID_SIZE as usize]);
+            let mut size = SECURITY_MAX_SID_SIZE;
+            // SAFETY: the buffer is `SECURITY_MAX_SID_SIZE` bytes and suitably
+            // aligned for a SID, and `size` is a valid in/out parameter.
+            let ok = unsafe {
+                CreateWellKnownSid(
+                    WinBuiltinAnyPackageSid,
+                    ptr::null_mut(),
+                    buffer.as_mut_ptr().cast(),
+                    &mut size,
+                )
+            };
+            if ok == 0 {
+                return 0;
+            }
+            let leaked: &'static mut [u8; SECURITY_MAX_SID_SIZE as usize] = Box::leak(buffer);
+            leaked.as_mut_ptr() as usize
+        });
+        value as PSID
+    }
+
     fn dacl_grants(dacl: *const ACL, sid: PSID, permissions: u32) -> bool {
         let mut size: ACL_SIZE_INFORMATION = unsafe { std::mem::zeroed() };
         // SAFETY: `dacl` is a live ACL and `size` is a valid out pointer.
@@ -998,8 +1055,11 @@ mod imp {
             }
             let allowed = unsafe { &*(ace.cast::<ACCESS_ALLOWED_ACE>()) };
             let ace_sid = std::ptr::from_ref(&allowed.SidStart).cast::<c_void>() as PSID;
-            // SAFETY: both are valid SIDs for the duration of the call.
-            if unsafe { EqualSid(ace_sid, sid) } != 0 && allowed.Mask & permissions == permissions {
+            let any_package = any_package_sid();
+            // SAFETY: all three are valid SIDs for the duration of the calls.
+            let grants_us = unsafe { EqualSid(ace_sid, sid) } != 0
+                || (!any_package.is_null() && unsafe { EqualSid(ace_sid, any_package) } != 0);
+            if grants_us && allowed.Mask & permissions == permissions {
                 return true;
             }
         }
