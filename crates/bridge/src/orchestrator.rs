@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::Notify;
 
-use crate::archive::{BridgeArchiveWriter, BridgeCleanupManager, UsageStats};
+use crate::archive::{BridgeArchiveWriter, BridgeCleanupManager, ProcessRegistry, UsageStats};
 use crate::epoch::{StaleEpoch, WriteFence};
 use crate::gateway::PermissionFrameRelay;
 use crate::heartbeat::{
@@ -348,6 +348,16 @@ impl Bridge {
     /// Broadcast an event to all subscribers.
     pub fn emit(&self, event: BridgeEvent) {
         let _ = self.event_tx.send(event);
+    }
+
+    /// The shared registry a session's spawn site registers its child in.
+    ///
+    /// The launcher hands this to the session runner, so the process a real
+    /// session starts is visible to [`Self::complete_session`]'s cleanup
+    /// instead of the cleanup manager's map staying empty.
+    #[must_use]
+    pub fn process_registry(&self) -> ProcessRegistry {
+        self.cleanup_manager.process_registry()
     }
 
     /// Connect the transport layer.
@@ -1074,6 +1084,10 @@ impl Bridge {
                     .transition(BridgeSessionState::Failed(reason.clone()));
             }
         }
+        // A failed session never reaches `complete_session`, so its process
+        // entry has to be dropped here or it would stay in the registry
+        // forever. A clean session's entry is removed by cleanup instead.
+        self.cleanup_manager.untrack_process(session_id);
         self.emit(BridgeEvent::SessionFailed {
             session_id: session_id.to_string(),
             reason,

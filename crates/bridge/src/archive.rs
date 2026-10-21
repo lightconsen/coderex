@@ -4,7 +4,7 @@ use coderex_core::process_tree::ProcessTree;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 /// Current archive format version.
 ///
@@ -142,6 +142,82 @@ enum TrackedProcess {
     Pid(u32),
 }
 
+/// The shared registry of a session's live process.
+///
+/// The cleanup manager owns one and hands out clones, so the place that
+/// actually spawns a session's child — the CLI's session runner — registers
+/// the child in the same map that [`BridgeCleanupManager::cleanup`] reads.
+/// Without that, the map is always empty for a real session and cleanup
+/// terminates nothing.
+#[derive(Debug, Clone, Default)]
+pub struct ProcessRegistry {
+    entries: Arc<Mutex<HashMap<String, TrackedProcess>>>,
+}
+
+impl ProcessRegistry {
+    /// Create an empty registry.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Register a session's process tree.
+    pub fn track_tree(&self, session_id: &str, tree: Arc<ProcessTree>) {
+        lock_entries(&self.entries).insert(session_id.to_string(), TrackedProcess::Tree(tree));
+    }
+
+    /// Register a session's bare pid.
+    ///
+    /// Prefer [`Self::track_tree`] where the spawn site has one: a pid alone
+    /// cannot reach descendants on Unix and only reaches them best-effort on
+    /// Windows.
+    pub fn track_process(&self, session_id: &str, pid: u32) {
+        lock_entries(&self.entries).insert(session_id.to_string(), TrackedProcess::Pid(pid));
+    }
+
+    /// Remove a session's process. Returns whether one was registered.
+    pub fn untrack(&self, session_id: &str) -> bool {
+        lock_entries(&self.entries).remove(session_id).is_some()
+    }
+
+    /// The number of processes currently registered.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        lock_entries(&self.entries).len()
+    }
+
+    /// Whether nothing is registered.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        lock_entries(&self.entries).is_empty()
+    }
+
+    /// Whether a session's process is registered.
+    #[must_use]
+    pub fn contains(&self, session_id: &str) -> bool {
+        lock_entries(&self.entries).contains_key(session_id)
+    }
+
+    /// Remove and return a session's tracked process, for the manager to
+    /// terminate.
+    fn take(&self, session_id: &str) -> Option<TrackedProcess> {
+        lock_entries(&self.entries).remove(session_id)
+    }
+}
+
+/// Lock the registry map, recovering from a poisoned lock.
+///
+/// A panic while holding the lock cannot leave the map in a half-written
+/// state that matters here, so a poisoned lock is not a reason to fail
+/// cleanup.
+fn lock_entries(
+    entries: &Mutex<HashMap<String, TrackedProcess>>,
+) -> std::sync::MutexGuard<'_, HashMap<String, TrackedProcess>> {
+    entries
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 /// Manages cleanup of bridge session resources including process termination.
 #[derive(Debug)]
 pub struct BridgeCleanupManager {
@@ -152,7 +228,7 @@ pub struct BridgeCleanupManager {
     /// Whether to confirm stopWork after cleanup.
     pub confirm_stop_work: bool,
     /// Tracked processes for active sessions.
-    process_map: HashMap<String, TrackedProcess>,
+    processes: ProcessRegistry,
 }
 
 impl BridgeCleanupManager {
@@ -163,8 +239,14 @@ impl BridgeCleanupManager {
             worktree_base,
             session_base,
             confirm_stop_work: true,
-            process_map: HashMap::new(),
+            processes: ProcessRegistry::new(),
         }
+    }
+
+    /// The shared registry a spawn site registers a session's child in.
+    #[must_use]
+    pub fn process_registry(&self) -> ProcessRegistry {
+        self.processes.clone()
     }
 
     /// Register a session's process for tracking.
@@ -173,19 +255,17 @@ impl BridgeCleanupManager {
     /// cannot reach descendants on Unix and only reaches them best-effort on
     /// Windows.
     pub fn track_process(&mut self, session_id: &str, pid: u32) {
-        self.process_map
-            .insert(session_id.to_string(), TrackedProcess::Pid(pid));
+        self.processes.track_process(session_id, pid);
     }
 
     /// Register a session's process tree for tracking.
     pub fn track_tree(&mut self, session_id: &str, tree: Arc<ProcessTree>) {
-        self.process_map
-            .insert(session_id.to_string(), TrackedProcess::Tree(tree));
+        self.processes.track_tree(session_id, tree);
     }
 
     /// Unregister a session's process.
     pub fn untrack_process(&mut self, session_id: &str) {
-        self.process_map.remove(session_id);
+        self.processes.untrack(session_id);
     }
 
     /// Clean up all resources for a session.
@@ -198,7 +278,7 @@ impl BridgeCleanupManager {
         };
 
         // Terminate session process if tracked
-        if let Some(tracked) = self.process_map.remove(session_id) {
+        if let Some(tracked) = self.processes.take(session_id) {
             report.process_terminated = Self::terminate_process(&tracked);
         }
 
@@ -244,13 +324,13 @@ impl BridgeCleanupManager {
     /// Get the number of tracked processes.
     #[must_use]
     pub fn tracked_process_count(&self) -> usize {
-        self.process_map.len()
+        self.processes.len()
     }
 
     /// Check if a session has a tracked process.
     #[must_use]
     pub fn has_tracked_process(&self, session_id: &str) -> bool {
-        self.process_map.contains_key(session_id)
+        self.processes.contains(session_id)
     }
 }
 

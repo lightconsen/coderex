@@ -9,7 +9,7 @@
 //! real bridge over an in-process transport without a network.
 
 use anyhow::{Context, Result};
-use coderex_bridge::archive::UsageStats;
+use coderex_bridge::archive::{ProcessRegistry, UsageStats};
 use coderex_bridge::heartbeat::HeartbeatConfig;
 use coderex_bridge::orchestrator::{Bridge, BridgeConfig, BridgeEvent, BridgeStopHandle};
 use coderex_bridge::permission::PermissionResponse;
@@ -17,6 +17,7 @@ use coderex_bridge::poller::{
     ClaimOutcome, ControlPlaneClient, DEFAULT_CLAIM_PATH_TEMPLATE, HttpControlPlaneClient,
 };
 use coderex_bridge::transport::{Transport, TransportConfig, default_factory};
+use coderex_core::process_tree::{JobLimits, ProcessTree};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::future::Future;
@@ -208,6 +209,13 @@ pub struct SessionContext<'a> {
     pub permission_requests: Option<tokio::sync::mpsc::UnboundedSender<ChildPermissionRequest>>,
     /// Answers the launcher routed to this session.
     pub permission_decisions: Option<PermissionDecisionSlot>,
+    /// The bridge's registry of live session processes.
+    ///
+    /// The runner registers the child it spawns here, so the bridge's cleanup
+    /// terminates the process tree it owns rather than an empty map. `None`
+    /// when the runner is driven outside the worker loop (a test, or a
+    /// standalone runner), where there is no cleanup to register for.
+    pub process_registry: Option<ProcessRegistry>,
 }
 
 /// What a successful session produced.
@@ -303,9 +311,15 @@ impl SessionRunner for ProcessSessionRunner {
         context: &SessionContext<'_>,
         stop: SessionStop,
     ) -> Result<SessionOutput, String> {
-        let child = session_command(context.prompt, context.work_dir)?
-            .spawn()
-            .map_err(|err| format!("failed to start the session process: {err}"))?;
+        let mut command = session_command(context.prompt, context.work_dir)?;
+        // Spawn inside a process tree and register it with the bridge, so the
+        // cleanup that runs when the session ends terminates the child (and
+        // anything it started) instead of an empty map.
+        let (child, _tree) = spawn_registered_child(
+            &mut command,
+            context.session_id,
+            context.process_registry.as_ref(),
+        )?;
         // A shared reference cannot move the receiver out, so the launcher
         // leaves it in the slot and the one runner that owns the child takes
         // it here.
@@ -325,6 +339,48 @@ impl SessionRunner for ProcessSessionRunner {
         )
         .await
     }
+}
+
+/// Spawn a session child inside a process tree and register it for cleanup.
+///
+/// The tree is created and armed before the spawn, so on Windows the child is
+/// created suspended and joined to the Job Object before it runs. When a
+/// registry is supplied the tree is registered under `session_id`, which is
+/// what lets [`coderex_bridge::orchestrator::Bridge::complete_session`]'s
+/// cleanup terminate the whole tree. Without a registry (a standalone runner)
+/// the child is spawned normally.
+fn spawn_registered_child(
+    command: &mut Command,
+    session_id: &str,
+    registry: Option<&ProcessRegistry>,
+) -> Result<(Child, Option<Arc<ProcessTree>>), String> {
+    let Some(registry) = registry else {
+        let child = command
+            .spawn()
+            .map_err(|err| format!("failed to start the session process: {err}"))?;
+        return Ok((child, None));
+    };
+
+    let tree = Arc::new(
+        ProcessTree::create(JobLimits::default())
+            .map_err(|err| format!("cannot create a process tree for the session: {err}"))?,
+    );
+    tree.prepare(command.as_std_mut());
+    let mut child = command
+        .spawn()
+        .map_err(|err| format!("failed to start the session process: {err}"))?;
+    if let Some(pid) = child.id() {
+        if let Err(err) = tree.attach_pid(pid) {
+            // The child is not in the tree it was promised; it must not run
+            // outside the job that would have owned it.
+            let _ = child.start_kill();
+            return Err(format!(
+                "cannot attach the session process to its tree: {err}"
+            ));
+        }
+    }
+    registry.track_tree(session_id, Arc::clone(&tree));
+    Ok((child, Some(tree)))
 }
 
 /// Captured stdout for one session.
@@ -1483,6 +1539,7 @@ async fn run_worker(
                         &completion_tx,
                         &output_tx,
                         &permission_request_tx,
+                        &bridge.process_registry(),
                         &mut running,
                     );
                 }
@@ -1514,6 +1571,7 @@ fn spawn_session_tasks(
     completion_tx: &tokio::sync::mpsc::UnboundedSender<SessionCompletion>,
     output_tx: &tokio::sync::mpsc::UnboundedSender<SessionOutputLine>,
     permission_request_tx: &tokio::sync::mpsc::UnboundedSender<ChildPermissionRequest>,
+    process_registry: &ProcessRegistry,
     running: &mut HashMap<String, RunningSession>,
 ) {
     for session in sessions {
@@ -1522,6 +1580,9 @@ fn spawn_session_tasks(
         let output_tx = output_tx.clone();
         let permission_request_tx = permission_request_tx.clone();
         let runner = Arc::clone(runner);
+        // The bridge's own registry, so the runner's child is visible to the
+        // cleanup that runs when the session ends.
+        let process_registry = process_registry.clone();
         let stop = SessionStop::new();
         let task_stop = stop.clone();
         // One decision channel per child. The task owns the receiving end
@@ -1540,6 +1601,7 @@ fn spawn_session_tasks(
                 output: Some(output_tx),
                 permission_requests: Some(permission_request_tx),
                 permission_decisions: Some(decision_slot),
+                process_registry: Some(process_registry),
             };
             let outcome = runner.run(&context, task_stop).await;
             let _ = completion_tx.send(SessionCompletion {
@@ -3694,5 +3756,126 @@ printf 'ECHO:%s\n' "$line""#;
             vec!["completed".to_string()],
             "the final write is Completed, not Failed"
         );
+    }
+
+    /// Build a real, long-lived session child command, as the runner would.
+    #[cfg(unix)]
+    fn long_lived_child() -> Command {
+        let mut command = Command::new("sh");
+        command
+            .args(["-c", "sleep 60"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+        command
+    }
+
+    /// Whether `pid` names a live process, via the POSIX `kill -0` probe the
+    /// workspace uses elsewhere instead of `libc::kill`.
+    #[cfg(unix)]
+    fn process_is_alive(pid: u32) -> bool {
+        std::process::Command::new("kill")
+            .arg("-0")
+            .arg(pid.to_string())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .expect("run kill -0")
+            .success()
+    }
+
+    /// A session child spawned through the runner's registration path is
+    /// registered with the bridge and killed by the cleanup that ends the
+    /// session — not merely forgotten.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_spawned_session_process_is_registered_and_killed_by_cleanup() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut bridge = permission_test_bridge(tmp.path(), 0).await;
+        spawn_permission_session(&mut bridge, tmp.path()).await;
+
+        // The registry the bridge's cleanup reads from.
+        let registry = bridge.process_registry();
+
+        let mut command = long_lived_child();
+        let (child, tree) = spawn_registered_child(&mut command, "s1", Some(&registry))
+            .expect("the session child should spawn");
+        let pid = child.id().expect("the child should have a pid");
+        assert!(tree.is_some(), "a registered child owns a process tree");
+        assert!(
+            registry.contains("s1"),
+            "the spawned session child must be registered for cleanup"
+        );
+        assert!(
+            process_is_alive(pid),
+            "the session child should be running before cleanup"
+        );
+
+        // Drive the child the way the worker's runner does, so this is a real
+        // running session rather than a bare process.
+        let session_dir = tmp.path().join("sessions/s1");
+        let handle = tokio::spawn(async move {
+            run_child_streaming(
+                child,
+                "s1",
+                &session_dir,
+                None,
+                None,
+                None,
+                SessionStop::new(),
+                Duration::from_secs(5),
+            )
+            .await
+        });
+
+        // Ending the session runs cleanup, which must terminate the process it
+        // registered.
+        bridge
+            .complete_session("s1", "", UsageStats::default())
+            .await
+            .unwrap();
+        assert!(
+            !registry.contains("s1"),
+            "cleanup deregisters the session's process"
+        );
+
+        let outcome = tokio::time::timeout(Duration::from_secs(5), handle)
+            .await
+            .expect("the killed child should stop the reader")
+            .unwrap();
+        assert!(outcome.is_err(), "a killed session is not a success");
+
+        // The process is gone, not merely removed from the map.
+        assert!(
+            !process_is_alive(pid),
+            "the session child should not be left running after cleanup"
+        );
+    }
+
+    /// A failed session never reaches `complete_session`, so it must be
+    /// deregistered directly or the registry would grow without bound.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn fail_session_deregisters_the_session_process() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut bridge = permission_test_bridge(tmp.path(), 0).await;
+        spawn_permission_session(&mut bridge, tmp.path()).await;
+        let registry = bridge.process_registry();
+
+        let mut command = long_lived_child();
+        let (mut child, _tree) = spawn_registered_child(&mut command, "s1", Some(&registry))
+            .expect("the session child should spawn");
+        assert!(registry.contains("s1"));
+
+        bridge.fail_session("s1", "child exited 1".into());
+
+        assert!(
+            !registry.contains("s1"),
+            "a failed session must be deregistered"
+        );
+
+        let _ = child.start_kill();
+        let _ = child.wait().await;
     }
 }
