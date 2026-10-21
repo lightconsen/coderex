@@ -1,7 +1,7 @@
 {
   "name": "live",
   "description": "Opt-in real-provider flow: a text turn and a Read tool turn against the Anthropic-compatible endpoint configured by ANTHROPIC_API_KEY / ANTHROPIC_BASE_URL.",
-  "command": "sh \"{flow}/run-case.sh\" \"{prompt}\"",
+  "command": "bash \"{flow}/run-case.sh\" \"{prompt}\"",
   "reps": 1,
   "concurrency": 1,
   "timeout_s": 180,
