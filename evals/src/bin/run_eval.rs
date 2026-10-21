@@ -116,6 +116,16 @@ fn main_result() -> Result<(), HarnessError> {
             record.rep,
             record.failures.join("; ")
         );
+        // The child's own error only exists in its output. Without this a
+        // failing case reports "exit code 2" and nothing else, which is
+        // exactly what happened to the live flow in CI.
+        let tail = record.output_tail.trim();
+        if !tail.is_empty() {
+            let lines: Vec<&str> = tail.lines().collect();
+            for line in lines.iter().skip(lines.len().saturating_sub(20)) {
+                println!("        | {line}");
+            }
+        }
     }
 
     println!("report: {}", outcome.report_path.display());
