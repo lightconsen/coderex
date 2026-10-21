@@ -834,10 +834,16 @@ impl StartupOrchestrator {
             .filter(|m| !m.is_empty())
             .map(ModelId)
             .or_else(|| self.ctx.model.clone());
-        let model = Self::resolve_session_model(
-            explicit_model,
-            coderex_config::flags::FeatureFlags::from_env().fast_mode,
-        );
+        // `--betas` is a real overlay on the environment-provided flags, and
+        // the session model is resolved here — before the REPL applies it —
+        // so it has to be folded in for `--betas +fast_mode` to mean anything.
+        // A malformed list is the REPL's own `--betas` handling's problem; here
+        // a failure just leaves the environment-provided flags in place.
+        let mut flags = coderex_config::flags::FeatureFlags::from_env();
+        if !args.betas.is_empty() {
+            let _ = flags.apply_comma_list(&args.betas.join(","));
+        }
+        let model = Self::resolve_session_model(explicit_model, flags.fast_mode);
 
         // Handle --resume flag (resume last or specific session)
         if let Some(ref session_id) = args.resume {
