@@ -55,14 +55,18 @@ pub enum VimAction {
     HalfPageDown,
     /// Delete the current line (content under cursor to end).
     DeleteToEnd,
-    /// Delete entire line (input buffer).
-    DeleteLine,
-    /// Delete word from cursor, `count` times.
-    DeleteWord(usize),
+    /// Delete `count` whole lines starting at the current one (`dd`).
+    DeleteLine(usize),
+    /// Delete from the cursor to the start of the next word, `count` times
+    /// (`dw`).
+    DeleteWordForward(usize),
+    /// Delete from the start of the previous word to the cursor, `count` times
+    /// (`db`).
+    DeleteWordBackward(usize),
     /// Delete character under cursor, `count` times.
     DeleteChar(usize),
-    /// Yank (copy) the entire line content.
-    YankLine,
+    /// Yank (copy) `count` whole lines starting at the current one (`yy`).
+    YankLine(usize),
     /// Paste from yank register at cursor, `count` times.
     Paste(usize),
     /// Enter insert mode (before cursor).
@@ -116,14 +120,13 @@ pub enum VimAction {
     PasteOverSelection,
     /// Delete the Visual selection and enter insert mode (Visual `c`/`s`).
     ChangeSelection,
-    /// Open a line below and enter insert mode (`o`). The input buffer is a
-    /// single line, so the cursor lands at the end of the current line.
+    /// Open a line below the current one and enter insert mode (`o`).
     OpenLineBelow,
-    /// Open a line above and enter insert mode (`O`). Single-line, so the
-    /// cursor lands at the start of the current line.
+    /// Open a line above the current one and enter insert mode (`O`).
     OpenLineAbove,
-    /// Change the whole line and enter insert mode (`cc`, `S`).
-    ChangeLine,
+    /// Clear `count` whole lines starting at the current one and enter insert
+    /// mode (`cc`, `S`).
+    ChangeLine(usize),
     /// Change from the cursor to the end of the current word (`cw`).
     ChangeWord,
     /// Change from the cursor to the end of the line (`C`, `c$`).
@@ -145,6 +148,10 @@ pub struct VimState {
     pub mode: VimMode,
     /// Yank register (single for now).
     pub yank_register: String,
+    /// Whether the register holds whole lines (`yy`, `dd`, linewise Visual)
+    /// rather than a character range. A linewise paste inserts new lines
+    /// instead of splicing text at the cursor.
+    pub yank_linewise: bool,
     /// Number prefix (for repeated actions like 3j).
     pub count: Option<usize>,
     /// Pending operator (e.g., 'd' waiting for motion).
@@ -179,6 +186,7 @@ impl VimState {
         Self {
             mode: VimMode::Normal,
             yank_register: String::new(),
+            yank_linewise: false,
             count: None,
             pending_op: None,
             undo_stack: Vec::new(),
@@ -272,8 +280,6 @@ impl VimState {
             KeyCode::Char('A') => VimAction::InsertAtEnd,
             KeyCode::Char('i') => VimAction::Insert,
             KeyCode::Char('a') => VimAction::Append,
-            // `o`/`O` open a line; the input buffer is a single line, so they
-            // land at its end/start and enter insert mode.
             KeyCode::Char('o') => VimAction::OpenLineBelow,
             KeyCode::Char('O') => VimAction::OpenLineAbove,
 
@@ -297,7 +303,7 @@ impl VimState {
                     // dd — delete line
                     self.pending_op = None;
                     self.count = None;
-                    VimAction::DeleteLine
+                    VimAction::DeleteLine(count)
                 } else {
                     self.pending_op = Some(VimOperator::Delete);
                     VimAction::Ignore
@@ -310,18 +316,21 @@ impl VimState {
                 self.count = None;
                 VimAction::DeleteChar(count) // simplified backspace-delete
             }
-            KeyCode::Char('w') => {
-                // `cw` changes the word; plain `w` deletes it (this codebase's
-                // long-standing simplification of the motion).
-                if self.pending_op == Some(VimOperator::Change) {
-                    VimAction::ChangeWord
-                } else {
-                    VimAction::DeleteWord(count)
-                }
-            }
+            // Word motions. `cw` is a change, `dw`/`db` are deletes, and a bare
+            // motion is a motion — as in Vim.
+            KeyCode::Char('w') => match self.pending_op {
+                Some(VimOperator::Change) => VimAction::ChangeWord,
+                Some(VimOperator::Delete) => VimAction::DeleteWordForward(count),
+                _ => VimAction::WordForward(count),
+            },
+            KeyCode::Char('b') => match self.pending_op {
+                Some(VimOperator::Delete) => VimAction::DeleteWordBackward(count),
+                _ => VimAction::WordBackward(count),
+            },
+            KeyCode::Char('e') => VimAction::WordEnd(count),
             // `s` substitutes characters; `S` changes the whole line.
             KeyCode::Char('s') => VimAction::Substitute(count),
-            KeyCode::Char('S') => VimAction::ChangeLine,
+            KeyCode::Char('S') => VimAction::ChangeLine(count),
 
             // Change operator
             KeyCode::Char('c') => {
@@ -329,7 +338,7 @@ impl VimState {
                     // cc — change the whole line.
                     self.pending_op = None;
                     self.count = None;
-                    VimAction::ChangeLine
+                    VimAction::ChangeLine(count)
                 } else {
                     self.pending_op = Some(VimOperator::Change);
                     VimAction::Ignore
@@ -337,7 +346,7 @@ impl VimState {
             }
             KeyCode::Char('C') => VimAction::ChangeToEnd,
 
-            // Indent / outdent (`>>` / `<<` on a single line).
+            // Indent / outdent (`>>` / `<<` on the current line).
             KeyCode::Char('>') => VimAction::Indent(count),
             KeyCode::Char('<') => VimAction::Outdent(count),
 
@@ -346,7 +355,7 @@ impl VimState {
                 if self.pending_op == Some(VimOperator::Yank) {
                     self.pending_op = None;
                     self.count = None;
-                    VimAction::YankLine
+                    VimAction::YankLine(count)
                 } else {
                     self.pending_op = Some(VimOperator::Yank);
                     VimAction::Ignore
@@ -651,7 +660,7 @@ mod tests {
         assert_eq!(state.handle_key(key('d')), VimAction::Ignore);
         assert_eq!(state.pending_op, Some(VimOperator::Delete));
         // Second d — executes delete line
-        assert_eq!(state.handle_key(key('d')), VimAction::DeleteLine);
+        assert_eq!(state.handle_key(key('d')), VimAction::DeleteLine(1));
         // Pending cleared
         assert!(state.pending_op.is_none());
     }
@@ -661,7 +670,7 @@ mod tests {
         let mut state = VimState::new();
         assert_eq!(state.handle_key(key('y')), VimAction::Ignore);
         assert_eq!(state.pending_op, Some(VimOperator::Yank));
-        assert_eq!(state.handle_key(key('y')), VimAction::YankLine);
+        assert_eq!(state.handle_key(key('y')), VimAction::YankLine(1));
         assert!(state.pending_op.is_none());
     }
 
@@ -756,7 +765,7 @@ mod tests {
 
         // Counted word motions and paste too.
         assert_eq!(state.handle_key(key('2')), VimAction::Ignore);
-        assert_eq!(state.handle_key(key('w')), VimAction::DeleteWord(2));
+        assert_eq!(state.handle_key(key('w')), VimAction::WordForward(2));
         assert_eq!(state.handle_key(key('4')), VimAction::Ignore);
         assert_eq!(state.handle_key(key('p')), VimAction::Paste(4));
     }
@@ -787,7 +796,7 @@ mod tests {
         // `cc` changes the line.
         assert_eq!(state.handle_key(key('c')), VimAction::Ignore);
         assert_eq!(state.pending_op, Some(VimOperator::Change));
-        assert_eq!(state.handle_key(key('c')), VimAction::ChangeLine);
+        assert_eq!(state.handle_key(key('c')), VimAction::ChangeLine(1));
         assert!(state.pending_op.is_none());
 
         // `cw` changes the word.
@@ -804,7 +813,7 @@ mod tests {
         assert_eq!(state.handle_key(key('s')), VimAction::Substitute(1));
         assert_eq!(state.handle_key(key('3')), VimAction::Ignore);
         assert_eq!(state.handle_key(key('s')), VimAction::Substitute(3));
-        assert_eq!(state.handle_key(key('S')), VimAction::ChangeLine);
+        assert_eq!(state.handle_key(key('S')), VimAction::ChangeLine(1));
     }
 
     #[test]
@@ -993,7 +1002,7 @@ mod tests {
     #[test]
     fn visual_w_is_a_motion_not_delete_word() {
         let mut normal = VimState::new();
-        assert_eq!(normal.handle_key(key('w')), VimAction::DeleteWord(1));
+        assert_eq!(normal.handle_key(key('w')), VimAction::WordForward(1));
 
         let mut visual = visual_state();
         assert_eq!(visual.handle_key(key('w')), VimAction::WordForward(1));
@@ -1033,12 +1042,92 @@ mod tests {
         let mut normal = VimState::new();
         assert_eq!(normal.handle_key(key('x')), VimAction::DeleteChar(1));
         assert_eq!(normal.handle_key(key('y')), VimAction::Ignore);
-        assert_eq!(normal.handle_key(key('y')), VimAction::YankLine);
+        assert_eq!(normal.handle_key(key('y')), VimAction::YankLine(1));
     }
 
     #[test]
     fn visual_mode_indicator_strings() {
         assert_eq!(super::mode_indicator(VimMode::Visual), "VISUAL");
         assert_eq!(super::mode_indicator(VimMode::VisualLine), "VISUAL LINE");
+    }
+
+    /// `w`, `b` and `e` are motions in normal mode, not edits. `w` used to
+    /// delete the word before the cursor, which made it impossible to move
+    /// through the buffer without changing it.
+    #[test]
+    fn normal_word_motions_are_motions() {
+        let mut state = VimState::new();
+        assert_eq!(state.handle_key(key('w')), VimAction::WordForward(1));
+        assert_eq!(state.handle_key(key('b')), VimAction::WordBackward(1));
+        assert_eq!(state.handle_key(key('e')), VimAction::WordEnd(1));
+
+        assert_eq!(state.handle_key(key('2')), VimAction::Ignore);
+        assert_eq!(state.handle_key(key('w')), VimAction::WordForward(2));
+        assert_eq!(state.handle_key(key('3')), VimAction::Ignore);
+        assert_eq!(state.handle_key(key('b')), VimAction::WordBackward(3));
+        assert_eq!(state.handle_key(key('4')), VimAction::Ignore);
+        assert_eq!(state.handle_key(key('e')), VimAction::WordEnd(4));
+    }
+
+    /// The operator still applies to the word motions it can complete: `dw`
+    /// deletes forwards, `db` backwards, `cw` changes the word.
+    #[test]
+    fn delete_and_change_operators_take_word_motions() {
+        let mut delete_forward = VimState::new();
+        assert_eq!(delete_forward.handle_key(key('d')), VimAction::Ignore);
+        assert_eq!(
+            delete_forward.handle_key(key('w')),
+            VimAction::DeleteWordForward(1)
+        );
+        assert_eq!(delete_forward.handle_key(key('2')), VimAction::Ignore);
+        assert_eq!(delete_forward.handle_key(key('d')), VimAction::Ignore);
+        assert_eq!(
+            delete_forward.handle_key(key('w')),
+            VimAction::DeleteWordForward(2)
+        );
+
+        let mut delete_backward = VimState::new();
+        assert_eq!(delete_backward.handle_key(key('d')), VimAction::Ignore);
+        assert_eq!(
+            delete_backward.handle_key(key('b')),
+            VimAction::DeleteWordBackward(1)
+        );
+
+        let mut change = VimState::new();
+        assert_eq!(change.handle_key(key('c')), VimAction::Ignore);
+        assert_eq!(change.handle_key(key('w')), VimAction::ChangeWord);
+    }
+
+    /// `3dd`, `3yy` and `3cc` carry the count into the action so the buffer can
+    /// remove or copy three lines.
+    #[test]
+    fn line_operators_carry_the_count() {
+        let mut state = VimState::new();
+        assert_eq!(state.handle_key(key('3')), VimAction::Ignore);
+        assert_eq!(state.handle_key(key('d')), VimAction::Ignore);
+        assert_eq!(state.handle_key(key('d')), VimAction::DeleteLine(3));
+
+        assert_eq!(state.handle_key(key('2')), VimAction::Ignore);
+        assert_eq!(state.handle_key(key('y')), VimAction::Ignore);
+        assert_eq!(state.handle_key(key('y')), VimAction::YankLine(2));
+
+        assert_eq!(state.handle_key(key('4')), VimAction::Ignore);
+        assert_eq!(state.handle_key(key('c')), VimAction::Ignore);
+        assert_eq!(state.handle_key(key('c')), VimAction::ChangeLine(4));
+
+        // A bare `S` changes exactly the one line.
+        assert_eq!(state.handle_key(key('S')), VimAction::ChangeLine(1));
+    }
+
+    /// A linewise register is recorded so `p` can insert whole lines rather
+    /// than splice text at the cursor.
+    #[test]
+    fn yank_linewise_flag_defaults_off_and_is_settable() {
+        let mut state = VimState::new();
+        assert!(!state.yank_linewise);
+        state.yank("one\ntwo\n");
+        state.yank_linewise = true;
+        assert_eq!(state.yanked(), "one\ntwo\n");
+        assert!(state.yank_linewise);
     }
 }

@@ -170,10 +170,13 @@ const PERMISSION_IDX: usize = 5;
 /// The vertical pane stack, top to bottom.
 ///
 /// Shared with the layout tests so both sides agree on what each index means.
+/// `input_height` is the number of terminal rows the input buffer needs: one
+/// for an empty or single-line buffer, more once the buffer has lines or wraps.
 fn frame_constraints(
     inline_palette_height: u16,
     show_notif: bool,
     show_statusline: bool,
+    input_height: u16,
     show_perm_bar: bool,
 ) -> Vec<Constraint> {
     vec![
@@ -181,9 +184,21 @@ fn frame_constraints(
         Constraint::Length(inline_palette_height),      // inline command hint
         Constraint::Length(u16::from(show_notif)),      // notification bar
         Constraint::Length(u16::from(show_statusline)), // statusline (thinking)
-        Constraint::Length(1),                          // input line
+        Constraint::Length(input_height.max(1)),        // input lines
         Constraint::Length(u16::from(show_perm_bar)),   // permission bar
     ]
+}
+
+/// Display columns available to input text: the pane minus the two-cell
+/// prompt. Shared by the layout and the renderer so both wrap identically.
+fn input_wrap_width(pane_width: u16) -> usize {
+    (pane_width as usize).saturating_sub(2).max(1)
+}
+
+/// How many terminal rows the input buffer occupies at `pane_width`.
+fn input_display_height(input: &crate::input::InputBuffer, pane_width: u16) -> u16 {
+    let rows = input.display_rows(input_wrap_width(pane_width)).len();
+    u16::try_from(rows).map_or(u16::MAX, |height| height.max(1))
 }
 
 /// Lay out and paint one frame.
@@ -205,12 +220,17 @@ fn render_frame(frame: &mut Frame, state: &mut UiState) {
     let show_notif = state.notifications.active_count() > 0 && !is_compact;
 
     let show_perm_bar = !is_compact;
+    // A long or multi-line input grows its own pane rather than being clipped
+    // to one row. It is capped so the transcript keeps most of the screen.
+    let max_input_height = area.height.saturating_sub(3).max(1);
+    let input_height = input_display_height(&state.input, area.width).min(max_input_height);
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints(frame_constraints(
             inline_palette_height,
             show_notif,
             show_statusline,
+            input_height,
             show_perm_bar,
         ))
         .split(area);
@@ -994,59 +1014,83 @@ fn render_input(
     input: &crate::input::InputBuffer,
     theme: &Theme,
 ) {
-    // Byte offsets are not columns: a CJK character occupies two cells. Place
-    // the terminal cursor by display width so it lines up while selecting.
-    let cursor = input.cursor_display_column();
+    // Byte offsets are not columns: a CJK character occupies two cells. The
+    // buffer reports its rows and the cursor's row/column in display units, so
+    // a wrapped or multi-line buffer places the cursor on the right cell.
+    let wrap = input_wrap_width(area.width);
+    let rows = input.display_rows(wrap);
+    let (cursor_row, cursor_col) = input.display_cursor(wrap);
+    let height = (area.height as usize).max(1);
+    // Normally every row fits; when the pane is capped, keep the cursor row
+    // visible by scrolling the window.
+    let first = cursor_row
+        .saturating_sub(height - 1)
+        .min(rows.len().saturating_sub(height));
+
     let text_style = Style::default().fg(theme.input_fg);
-    let mut spans: Vec<Span> = vec![Span::styled("❯ ", Style::default().fg(theme.accent))];
-    match input.selection_range() {
-        Some((start, end)) if start < end => {
-            if start > 0 {
-                spans.push(Span::styled(input.text[..start].to_string(), text_style));
+    let selection_style = Style::default()
+        .fg(theme.selection_fg)
+        .bg(theme.selection_bg);
+    let selection = input.selection_range();
+
+    let mut lines: Vec<Line> = Vec::with_capacity(rows.len());
+    for (index, &(start, end)) in rows.iter().enumerate().skip(first).take(height) {
+        // The prompt occupies two cells on the first row and is blanked on the
+        // continuation rows, so every row's text starts at the same column.
+        let prompt = if index == 0 { "❯ " } else { "  " };
+        let text = &input.text[start..end];
+        let mut spans: Vec<Span> = vec![Span::styled(prompt, Style::default().fg(theme.accent))];
+        match selection {
+            Some((sel_start, sel_end)) if sel_start < end && sel_end > start => {
+                let local_start = sel_start.max(start) - start;
+                let local_end = sel_end.min(end) - start;
+                if local_start > 0 {
+                    spans.push(Span::styled(text[..local_start].to_string(), text_style));
+                }
+                spans.push(Span::styled(
+                    text[local_start..local_end].to_string(),
+                    selection_style,
+                ));
+                if local_end < text.len() {
+                    spans.push(Span::styled(text[local_end..].to_string(), text_style));
+                }
             }
-            spans.push(Span::styled(
-                input.text[start..end].to_string(),
-                Style::default()
-                    .fg(theme.selection_fg)
-                    .bg(theme.selection_bg),
-            ));
-            if end < input.text.len() {
-                spans.push(Span::styled(input.text[end..].to_string(), text_style));
-            }
+            _ => spans.push(Span::styled(text.to_string(), text_style)),
         }
-        _ => spans.push(Span::styled(input.text.clone(), text_style)),
+        lines.push(Line::from(spans));
     }
-    if let Some(ref sug) = input.suggestion {
-        spans.push(Span::styled(
-            format!("  {sug}"),
-            Style::default().fg(theme.dim),
-        ));
+
+    // Trailing annotations go after the last visible row's text so they never
+    // shift the text the cursor column was measured against.
+    if let Some(last) = lines.last_mut() {
+        if let Some(ref sug) = input.suggestion {
+            last.spans.push(Span::styled(
+                format!("  {sug}"),
+                Style::default().fg(theme.dim),
+            ));
+        }
+        // Vim's mode line. `visual_anchor` is set the instant `v`/`V` is
+        // pressed, so the badge appears before any motion, matching Vim.
+        if input.visual_anchor.is_some() {
+            let label = if input.visual_linewise {
+                "-- VISUAL LINE --"
+            } else {
+                "-- VISUAL --"
+            };
+            last.spans.push(Span::styled(
+                format!("  {label}"),
+                Style::default()
+                    .fg(theme.accent)
+                    .add_modifier(Modifier::BOLD),
+            ));
+        }
     }
-    // Vim's mode line. The input line is single-row, so the badge is appended
-    // after the text rather than replacing the prompt: the prompt width stays
-    // two cells and the cursor math below is unchanged. `visual_anchor` is set
-    // the instant `v`/`V` is pressed, so the badge appears before any motion,
-    // matching Vim.
-    if input.visual_anchor.is_some() {
-        let label = if input.visual_linewise {
-            "-- VISUAL LINE --"
-        } else {
-            "-- VISUAL --"
-        };
-        spans.push(Span::styled(
-            format!("  {label}"),
-            Style::default()
-                .fg(theme.accent)
-                .add_modifier(Modifier::BOLD),
-        ));
-    }
-    let line = Line::from(spans);
-    let paragraph = Paragraph::new(line);
+
+    let paragraph = Paragraph::new(lines);
     frame.render_widget(paragraph, area);
-    // Position cursor
     frame.set_cursor_position((
-        area.x + 2 + u16::try_from(cursor).unwrap_or(u16::MAX),
-        area.y,
+        area.x + 2 + u16::try_from(cursor_col).unwrap_or(u16::MAX),
+        area.y + u16::try_from(cursor_row.saturating_sub(first)).unwrap_or(u16::MAX),
     ));
 }
 
@@ -1438,11 +1482,12 @@ mod layout_tests {
         palette: u16,
         notif: bool,
         statusline: bool,
+        input: u16,
         perm: bool,
     ) -> Vec<ratatui::layout::Rect> {
         Layout::default()
             .direction(Direction::Vertical)
-            .constraints(frame_constraints(palette, notif, statusline, perm))
+            .constraints(frame_constraints(palette, notif, statusline, input, perm))
             .split(ratatui::layout::Rect::new(0, 0, 80, height))
             .to_vec()
     }
@@ -1459,7 +1504,7 @@ mod layout_tests {
         let buffer = render_to_buffer(80, 30, &mut state);
         let rows: Vec<String> = (0..30).map(|y| row_text(&buffer, y)).collect();
 
-        let chunks = chunks_for(30, 0, false, true, true);
+        let chunks = chunks_for(30, 0, false, true, 1, true);
         let statusline_y = chunks[STATUSLINE_IDX].y;
         let input_y = chunks[INPUT_IDX].y;
 
@@ -1490,7 +1535,7 @@ mod layout_tests {
         let buffer = render_to_buffer(80, 12, &mut state);
         let rows: Vec<String> = (0..12).map(|y| row_text(&buffer, y)).collect();
 
-        let chunks = chunks_for(12, 0, false, false, false);
+        let chunks = chunks_for(12, 0, false, false, 1, false);
         let input_y = chunks[INPUT_IDX].y;
         assert!(
             chunks[INPUT_IDX].height > 0,
@@ -1512,7 +1557,7 @@ mod layout_tests {
         state.input.cursor = 5;
         state.input.start_visual(false);
         let buffer = render_to_buffer(80, 12, &mut state);
-        let input_y = chunks_for(12, 0, false, false, false)[INPUT_IDX].y;
+        let input_y = chunks_for(12, 0, false, false, 1, false)[INPUT_IDX].y;
         let row = row_text(&buffer, input_y);
         assert!(
             row.contains("-- VISUAL --"),
@@ -1549,7 +1594,7 @@ mod layout_tests {
     /// Every index the renderer uses must name the constraint it claims to.
     #[test]
     fn pane_indices_follow_the_constraint_order() {
-        let chunks = chunks_for(30, 4, true, true, true);
+        let chunks = chunks_for(30, 4, true, true, 1, true);
         assert_eq!(chunks.len(), PERMISSION_IDX + 1, "one rect per constraint");
         assert_eq!(chunks[PALETTE_IDX].height, 4, "palette");
         assert_eq!(chunks[NOTIFICATION_IDX].height, 1, "notification");
@@ -1561,5 +1606,80 @@ mod layout_tests {
         for pair in chunks.windows(2) {
             assert_eq!(pair[0].y + pair[0].height, pair[1].y);
         }
+    }
+
+    /// A multi-line buffer renders one row per line, with the continuation
+    /// rows aligned under the text rather than under the prompt.
+    #[test]
+    fn multi_line_input_renders_every_line() {
+        let mut state = UiState::default();
+        state.input.text = "first\nsecond".into();
+        state.input.cursor = 12;
+        let buffer = render_to_buffer(80, 12, &mut state);
+        let input_y = chunks_for(12, 0, false, false, 2, false)[INPUT_IDX].y;
+        let rows: Vec<String> = (0..2).map(|i| row_text(&buffer, input_y + i)).collect();
+        assert!(rows[0].contains("first"), "{rows:?}");
+        assert!(rows[1].contains("second"), "{rows:?}");
+        assert!(
+            rows[1].starts_with("  second"),
+            "continuation not aligned: {rows:?}"
+        );
+    }
+
+    /// The input pane grows with the buffer, so the transcript above it is
+    /// pushed up rather than the input being clipped.
+    #[test]
+    fn multi_line_input_grows_its_pane() {
+        let mut state = UiState::default();
+        state.input.text = "a\nb\nc".into();
+        state.input.cursor = 5;
+        let buffer = render_to_buffer(80, 20, &mut state);
+        let chunks = chunks_for(20, 0, false, true, 3, true);
+        assert_eq!(chunks[INPUT_IDX].height, 3);
+        let rows: Vec<String> = (0..3)
+            .map(|i| row_text(&buffer, chunks[INPUT_IDX].y + i))
+            .collect();
+        assert!(rows[0].contains('a'), "{rows:?}");
+        assert!(rows[1].contains('b'), "{rows:?}");
+        assert!(rows[2].contains('c'), "{rows:?}");
+    }
+
+    /// A linewise Visual selection has to be visible on every line it covers.
+    #[test]
+    fn multi_line_linewise_selection_highlights_every_line() {
+        let mut state = UiState::default();
+        state.input.text = "one\ntwo".into();
+        state.input.cursor = 0;
+        state.input.start_visual(true);
+        state.input.cursor = 7;
+        let buffer = render_to_buffer(80, 12, &mut state);
+        let input_y = chunks_for(12, 0, false, false, 2, false)[INPUT_IDX].y;
+        let selected = state.theme.selection_bg;
+        for i in 0..2 {
+            let has_selection = (0..buffer.area.width).any(|x| {
+                buffer
+                    .cell((x, input_y + i))
+                    .is_some_and(|cell| cell.bg == selected)
+            });
+            assert!(
+                has_selection,
+                "row {i} of the linewise selection is not highlighted"
+            );
+        }
+    }
+
+    /// A buffer whose text fits on one row must still occupy exactly one row,
+    /// so nothing about the single-line layout changes.
+    #[test]
+    fn single_line_input_still_occupies_one_row() {
+        let mut state = UiState::default();
+        state.input.text = "hello world".into();
+        state.input.cursor = 11;
+        assert_eq!(input_display_height(&state.input, 80), 1);
+
+        let buffer = render_to_buffer(80, 12, &mut state);
+        let input_y = chunks_for(12, 0, false, false, 1, false)[INPUT_IDX].y;
+        let row = row_text(&buffer, input_y);
+        assert!(row.contains("❯ hello world"), "{row:?}");
     }
 }
