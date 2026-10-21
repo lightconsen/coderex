@@ -2772,7 +2772,14 @@ printf 'ECHO:%s\n' "$line""#;
 
     #[cfg(unix)]
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // ENV_LOCK keeps a PATH-mutating test out for the whole run; held across the await on purpose.
     async fn shutdown_kills_a_child_that_ignores_sigterm() {
+        // Both `sh` (to spawn the child) and `kill` (to probe for it) come from
+        // PATH; a concurrent test that temporarily replaces PATH would make
+        // them unresolvable and fail this test spuriously.
+        let _guard = crate::ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let tmp = tempfile::tempdir().unwrap();
         let script = "trap '' TERM; echo ready; while :; do sleep 0.05; done";
         let child = Command::new("sh")
