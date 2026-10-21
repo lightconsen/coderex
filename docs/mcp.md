@@ -114,9 +114,14 @@ Without the prefix a shared raw name cannot address both servers, so the second 
 ### Stdio server sandbox
 
 A stdio server is a program named by repository-writable configuration, so it
-runs under the platform sandbox where one exists (Windows AppContainer today;
-the policy is compiled everywhere and `stdio_sandbox_config` is unit-tested on
-the host).
+runs under the platform sandbox: the AppContainer token on Windows, a Seatbelt
+profile (`sandbox-exec`) on macOS, bubblewrap or Landlock on Linux. Confinement
+is applied on every platform, not only Windows — on a platform where the
+command would otherwise be a wrapper (`sandbox-exec`, `bwrap`), the wrapper
+becomes the program and the server command its argument, so a command that does
+not exist is resolved and refused *before* the wrapper is built (otherwise it
+would spawn the wrapper fine and only fail inside it, which reads as a protocol
+error rather than a start failure).
 
 Configuration, per server:
 
@@ -151,11 +156,22 @@ best-effort (system roots and `PATH`) are not repeated as required grants. Extra
 validated at load time; a relative path is skipped with a warning rather than
 resolved against whatever directory the client happens to be in.
 
-`CODEREX_MCP_SANDBOX=0` (or `false`/`no`) disables sandboxing for every server.
-On Windows a missing AppContainer runtime is a **refusal**: the server does not
-start, rather than starting unconfined. The channel keeps the sandbox handle
-for the process lifetime, and `terminate` kills the whole tree before the
-direct child.
+`CODEREX_MCP_SANDBOX=0` (or `false`/`no`) disables sandboxing for every server,
+and a single server opts out with `"sandbox": {"enabled": false}`.
+
+The policy is **fail-closed on every platform**, deliberately. An MCP server is
+arbitrary code named by repository-writable configuration whose tools the agent
+then calls, so it is held to the *gating* branch of the hook engine's
+degradation policy: when a policy is in force and the platform cannot provide
+confinement — no AppContainer runtime on Windows, no `sandbox-exec` on macOS,
+neither bubblewrap nor Landlock on Linux — the server is **refused** rather than
+started unconfined. The error names both escape hatches. This is a deliberate
+choice, not an oversight: it means MCP is unavailable by default on a Linux host
+with neither bubblewrap nor a Landlock-capable kernel, and the fix there is to
+install bubblewrap or set `CODEREX_MCP_SANDBOX=0` knowingly.
+
+The channel keeps the sandbox handle for the process lifetime, and `terminate`
+kills the whole tree before the direct child.
 
 `CODEREX_HEADLESS_ELICITATION` selects how a session with no terminal answers
 `elicitation/create`: `deny` (the default, and the fallback for an unrecognized

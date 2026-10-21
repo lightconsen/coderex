@@ -202,8 +202,15 @@ compiler command from its host: a program plus leading arguments
 argument *before* clap parsing. The runtime appends `<input> <output>` and runs
 the result as a child. Because the host re-executes itself, `cargo run`,
 packaged builds with only the `coderex` binary, and the separate
-`coderex-wasm-compile` helper (kept for tests and other hosts) all use the same
-path.
+`coderex-wasm-compile` helper all use the same path.
+
+The helper binary is **deliberately kept**, not a leftover. The production CLI
+path no longer needs it, but `crates/plugins/tests/wasm_compile_subprocess.rs`
+drives a real compiler subprocess through `CARGO_BIN_EXE_coderex-wasm-compile`,
+and `coderex-cli` depends on `coderex-plugins` — so the plugin crate cannot
+dev-depend on the CLI to exercise its own `--internal-wasm-compile` path.
+Removing the `[[bin]]` would mean deleting the only test that runs the compiler
+as a separate process, so it stays and is built by default.
 
 **Fail closed.** When no command is configured *and* no helper is found next to
 the executable, the load is refused with an actionable error naming
