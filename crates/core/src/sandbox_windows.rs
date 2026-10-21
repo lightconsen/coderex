@@ -172,6 +172,18 @@ fn push_path(
     best_effort: bool,
 ) {
     push_grant(grants, path.to_path_buf(), access, recursive, best_effort);
+    // Best-effort roots (the system directories and `PATH` entries) already
+    // assume the platform grants the container access — that is what
+    // "best-effort" means here, and it is true because those directories grant
+    // ALL APPLICATION PACKAGES. Their ancestors are no different, and granting
+    // each one costs a `SetNamedSecurityInfoW`; on the Windows CI runner `C:\`
+    // alone took 252 seconds, plus 46s for `C:\hostedtoolcache` and 24s for
+    // Chocolatey. Policy paths (the workspace and the private temp directory)
+    // are the ones the container cannot otherwise reach, so only those get
+    // their ancestor chain.
+    if best_effort {
+        return;
+    }
     for ancestor in path.ancestors().skip(1) {
         // A relative path's last ancestor is the empty path; there is nothing
         // to grant there.
@@ -1121,6 +1133,7 @@ mod imp {
         let wide_path = wide_os(path.as_os_str());
         let mut old_dacl: *mut ACL = ptr::null_mut();
         let mut descriptor: PSECURITY_DESCRIPTOR = ptr::null_mut();
+        let read_started = std::time::Instant::now();
         // SAFETY: the path is NUL-terminated and every out pointer is valid.
         let err = unsafe {
             GetNamedSecurityInfoW(
@@ -1134,6 +1147,16 @@ mod imp {
                 &mut descriptor,
             )
         };
+        #[cfg(test)]
+        {
+            if read_started.elapsed() > std::time::Duration::from_secs(1) {
+                eprintln!(
+                    "[acl] read {} took {:.1}s",
+                    path.display(),
+                    read_started.elapsed().as_secs_f64()
+                );
+            }
+        }
         if err != windows_sys::Win32::Foundation::ERROR_SUCCESS {
             return Err(win32_error("GetNamedSecurityInfoW", err));
         }
@@ -1186,6 +1209,7 @@ mod imp {
             return Err(win32_error("SetEntriesInAclW", err));
         }
 
+        let write_started = std::time::Instant::now();
         // SAFETY: both ACLs are live and correctly sized for the calls.
         let err = unsafe {
             SetNamedSecurityInfoW(
@@ -1198,6 +1222,16 @@ mod imp {
                 ptr::null_mut(),
             )
         };
+        #[cfg(test)]
+        {
+            if write_started.elapsed() > std::time::Duration::from_secs(1) {
+                eprintln!(
+                    "[acl] write {} took {:.1}s",
+                    path.display(),
+                    write_started.elapsed().as_secs_f64()
+                );
+            }
+        }
         unsafe {
             LocalFree(new_dacl as HLOCAL);
             LocalFree(descriptor as HLOCAL);
@@ -1687,6 +1721,36 @@ mod tests {
             assert_eq!(grant.access, AclAccess::ReadExecute);
             assert!(!grant.recursive);
             assert!(grant.best_effort, "{path} should be best-effort");
+        }
+    }
+
+    /// Best-effort roots already rely on the platform granting the container
+    /// access, so they do not spend a DACL write on every ancestor. On the CI
+    /// runner those ancestor writes were where the 480 seconds went.
+    #[test]
+    fn best_effort_roots_do_not_grant_their_ancestors() {
+        let plan = plan();
+        for ancestor in [
+            "C:/Windows/System32/WindowsPowerShell",
+            "C:/Windows/System32",
+        ] {
+            assert!(
+                !plan
+                    .iter()
+                    .any(|grant| grant.path == PathBuf::from(ancestor)),
+                "{ancestor} is an ancestor of a search path and should not be granted"
+            );
+        }
+    }
+
+    /// Policy paths are the ones the container cannot otherwise reach, so
+    /// their ancestor chain is still granted.
+    #[test]
+    fn policy_paths_still_get_their_ancestor_traverse_grants() {
+        let plan = plan();
+        for ancestor in ["C:/work", "C:/"] {
+            let grant = grant_for(&plan, ancestor);
+            assert_eq!(grant.access, AclAccess::Traverse, "{ancestor}");
         }
     }
 
