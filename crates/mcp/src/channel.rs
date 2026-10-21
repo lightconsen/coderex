@@ -446,6 +446,19 @@ impl JsonRpcChannel {
             ));
         }
 
+        // A command that does not exist has to fail here, while the server is
+        // still "not started". Where confinement is a wrapper program the
+        // wrapper becomes the program, so it spawns fine and the missing
+        // binary only fails inside it — the protocol error that surfaces then
+        // reads as "the server started but exposed no tools", which hides the
+        // real problem.
+        if coderex_core::sandbox::resolve_program(&self.command, &cwd).is_none() {
+            return Err(format!(
+                "'{}' could not be started: no such command on PATH or at that path",
+                self.command
+            ));
+        }
+
         // Confinement is set up on every platform, not only Windows. Creating
         // the handle can itself be the refusal — the AppContainer runtime on
         // Windows, an unavailable filesystem backend on Linux — and the policy
@@ -976,7 +989,11 @@ mod tests {
     async fn spawn_invalid_command_fails() {
         let mut channel = JsonRpcChannel::new("nonexistent_command_xyz", vec![], HashMap::new());
         let result = channel.spawn().await;
-        assert!(result.is_err());
+        let error = result.expect_err("a missing command must fail to start");
+        assert!(
+            error.contains("could not be started"),
+            "a missing command has to read as a start failure, not a protocol one: {error}"
+        );
     }
 
     #[tokio::test]
