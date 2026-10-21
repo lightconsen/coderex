@@ -190,6 +190,13 @@ fn push_path(
         if ancestor.as_os_str().is_empty() {
             continue;
         }
+        // A drive root (`C:\`) grants ALL APPLICATION PACKAGES read and execute
+        // on every supported Windows installation, and rewriting its DACL is
+        // pathologically slow: one write took 194.7 seconds on the CI runner,
+        // the single largest cost in creating a sandbox.
+        if is_root_like(ancestor) {
+            continue;
+        }
         // Ancestors get traverse rights only, and are always best-effort: a
         // user cannot rewrite the DACL of `C:\` or another user's directory,
         // and failing the whole sandbox because of that would be wrong.
@@ -308,6 +315,16 @@ pub(crate) fn build_command_line(program: &str, args: &[String]) -> String {
         line.push_str(&quote_windows_arg(arg));
     }
     line
+}
+
+/// Whether `path` is a filesystem root (`/`, `C:\`, or the `C:/` spelling the
+/// cross-platform tests use).
+///
+/// `file_name()` is enough on Windows (a drive root has none) but not on a Unix
+/// host, where `C:/` is an ordinary one-component relative path.
+#[must_use]
+fn is_root_like(path: &std::path::Path) -> bool {
+    path.file_name().is_none() || path.components().count() <= 1
 }
 
 /// Whether an ACE mask grants every requested bit.
@@ -1081,6 +1098,11 @@ mod imp {
                 )
             };
             if ok == 0 {
+                #[cfg(test)]
+                eprintln!(
+                    "[acl] CreateWellKnownSid(AnyPackage) failed: {}",
+                    std::io::Error::last_os_error()
+                );
                 return 0;
             }
             let leaked: &'static mut [u8; SECURITY_MAX_SID_SIZE as usize] = Box::leak(buffer);
@@ -1744,14 +1766,17 @@ mod tests {
     }
 
     /// Policy paths are the ones the container cannot otherwise reach, so
-    /// their ancestor chain is still granted.
+    /// their ancestor chain is still granted — except a drive root, which
+    /// already grants ALL APPLICATION PACKAGES and costs minutes to rewrite.
     #[test]
     fn policy_paths_still_get_their_ancestor_traverse_grants() {
         let plan = plan();
-        for ancestor in ["C:/work", "C:/"] {
-            let grant = grant_for(&plan, ancestor);
-            assert_eq!(grant.access, AclAccess::Traverse, "{ancestor}");
-        }
+        let grant = grant_for(&plan, "C:/work");
+        assert_eq!(grant.access, AclAccess::Traverse);
+        assert!(
+            !plan.iter().any(|grant| grant.path == PathBuf::from("C:/")),
+            "a drive root must never be rewritten"
+        );
     }
 
     /// The generic bits stand for specific rights, so an ACE that grants
