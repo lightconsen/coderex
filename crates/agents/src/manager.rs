@@ -9,6 +9,7 @@ use coderex_core::elicitation::SdkElicitationHandler;
 use coderex_core::engine::{
     QueryEngine, StructuredOutputValidator, SubmitOptions, ValidationResult,
 };
+use coderex_core::hook_executor::HookExecutor;
 use coderex_core::job_record::{JobKind, JobRecord, JobState, JobStore};
 use coderex_core::orchestrator::{BackgroundFeatureRequest, QueryResult, run_background_feature};
 use coderex_core::permission_engine::{BackgroundAgentDenyHook, PermissionEngine};
@@ -651,6 +652,11 @@ pub struct AgentManager {
     agent_event_broadcast: Option<broadcast::Sender<AgentObservableEvent>>,
     /// Custom agent definitions loaded from config files.
     custom_agents: HashMap<String, crate::custom_agents::CustomAgentDef>,
+    /// Lifecycle hooks fired for sub-agent events (`SubagentStart`,
+    /// `SubagentStop`, `TeammateIdle`). Absent until the session that owns the
+    /// hook registry installs one with [`AgentManager::set_hooks`], in which
+    /// case those events simply do not fire.
+    hooks: Option<Arc<dyn HookExecutor>>,
     /// When true, spawn_agent writes a placeholder instead of requiring an API client.
     test_mode: bool,
     /// Durable records for background agents this manager has already
@@ -684,6 +690,7 @@ impl AgentManager {
             tool_executor_factory: None,
             agent_event_broadcast: Some(agent_event_broadcast),
             custom_agents: crate::custom_agents::load_custom_agents(),
+            hooks: None,
             test_mode: false,
             background_jobs: Vec::new(),
         }
@@ -716,6 +723,31 @@ impl AgentManager {
     /// Set the event sender for forwarding agent events to the parent engine.
     pub fn set_event_sender(&mut self, tx: mpsc::UnboundedSender<EngineEvent>) {
         self.event_tx = Some(tx);
+    }
+
+    /// Install the session's hook executor.
+    ///
+    /// The manager fires the sub-agent lifecycle hooks — `SubagentStart`,
+    /// `SubagentStop` and `TeammateIdle` — through this executor. Without one
+    /// those events never fire; the session that owns the hook registry (the
+    /// CLI) shares it here so a hook configured on those events runs when a
+    /// sub-agent is spawned, finishes, or goes idle.
+    pub fn set_hooks(&mut self, hooks: Arc<dyn HookExecutor>) {
+        self.hooks = Some(hooks);
+    }
+
+    /// Fire one hook event if an executor is installed.
+    ///
+    /// Non-gating: a failure is logged, never turned into a denial. The
+    /// sub-agent has already started or stopped by the time the hook runs.
+    async fn fire_hook(&self, event: &str, input: &str, context: &HashMap<String, String>) {
+        let Some(hooks) = &self.hooks else {
+            return;
+        };
+        let result = hooks.fire_hook(event, input, context).await;
+        if !result.errors.is_empty() {
+            tracing::warn!(event, errors = ?result.errors, "sub-agent hook errors");
+        }
     }
 
     /// Inherit the parent's current permission mode for each new agent.
@@ -1040,6 +1072,10 @@ impl AgentManager {
             // its real completion without borrowing the manager.
             let forked_context = instance.context.clone();
             let event_callback = self.event_callback.clone();
+            // Same reason as the teammate callback: the hook executor belongs
+            // to the manager, but the idle/stop events fire from inside the
+            // spawned task, so clone the handle into it.
+            let hooks = self.hooks.clone();
 
             let handle = tokio::spawn(async move {
                 let result = run_agent_task(
@@ -1066,6 +1102,7 @@ impl AgentManager {
                     run_in_background,
                     forked_context,
                     event_callback,
+                    hooks,
                     agent_subject,
                     &mut msg_rx,
                 )
@@ -1150,7 +1187,18 @@ impl AgentManager {
             return Err(AgentError::Configuration(error.into()));
         }
 
+        let start_cwd = instance.working_directory.to_string_lossy().to_string();
         self.agents.insert(agent_id.clone(), instance);
+
+        // The sub-agent is created and running (or, in test mode, has already
+        // completed). This is the `SubagentStart` firing point: a hook sees the
+        // id, type and working directory of the agent that just started.
+        let mut start_ctx = HashMap::new();
+        start_ctx.insert("agent_id".to_string(), agent_id.clone());
+        start_ctx.insert("agent_type".to_string(), agent_type_name_str.clone());
+        start_ctx.insert("session_id".to_string(), parent_session_id.to_string());
+        start_ctx.insert("cwd".to_string(), start_cwd);
+        self.fire_hook("SubagentStart", &agent_id, &start_ctx).await;
 
         tracing::info!(
             "agent spawned: task_id={agent_id}, type={agent_type_name_str}, prompt_len={}",
@@ -1226,6 +1274,14 @@ impl AgentManager {
             summary: summary.to_string(),
         });
 
+        // This explicit completion is a lifecycle end, so the sub-agent's
+        // `SubagentStop` hook fires here too. A normally-completing spawned
+        // agent fires it from inside its task instead.
+        let mut ctx = HashMap::new();
+        ctx.insert("agent_id".to_string(), agent_id.to_string());
+        ctx.insert("status".to_string(), "Completed".to_string());
+        self.fire_hook("SubagentStop", agent_id, &ctx).await;
+
         Ok(())
     }
 
@@ -1242,6 +1298,12 @@ impl AgentManager {
             agent_id: agent_id.to_string(),
             reason: reason.to_string(),
         });
+
+        // The `TeammateIdle` hook fires alongside the teammate idle event.
+        let mut ctx = HashMap::new();
+        ctx.insert("agent_id".to_string(), agent_id.to_string());
+        ctx.insert("reason".to_string(), reason.to_string());
+        self.fire_hook("TeammateIdle", agent_id, &ctx).await;
 
         Ok(())
     }
@@ -1281,6 +1343,14 @@ impl AgentManager {
         if let Some(handle) = instance.task_join_handle.take() {
             handle.abort();
         }
+
+        // Cancellation ends the sub-agent's lifecycle, so `SubagentStop`
+        // fires here too. An agent that ran to completion fires it from
+        // inside its own task instead.
+        let mut ctx = HashMap::new();
+        ctx.insert("agent_id".to_string(), agent_id.to_string());
+        ctx.insert("status".to_string(), "Stopped".to_string());
+        self.fire_hook("SubagentStop", agent_id, &ctx).await;
 
         Ok(())
     }
@@ -1673,6 +1743,7 @@ async fn run_agent_task(
     run_in_background: bool,
     forked_context: Option<ForkedContext>,
     event_callback: Option<TeammateEventCallback>,
+    hooks: Option<Arc<dyn HookExecutor>>,
     agent_subject: String,
     msg_rx: &mut mpsc::UnboundedReceiver<AgentMessage>,
 ) -> Result<AgentResult, AgentError> {
@@ -1902,6 +1973,12 @@ async fn run_agent_task(
                 reason: "turn complete".to_string(),
             },
         );
+        // And the `TeammateIdle` hook, fired where the teammate really goes
+        // idle rather than only through the `mark_idle` API.
+        let mut idle_ctx = HashMap::new();
+        idle_ctx.insert("agent_id".to_string(), agent_id.clone());
+        idle_ctx.insert("reason".to_string(), "turn complete".to_string());
+        fire_agent_hook(hooks.as_ref(), "TeammateIdle", &agent_id, &idle_ctx).await;
 
         match engine_result {
             Ok(Ok(_)) => {
@@ -2001,6 +2078,18 @@ async fn run_agent_task(
         );
     }
 
+    // The sub-agent has stopped: the engine returned and its event stream is
+    // drained. This is the `SubagentStop` firing point for a normally
+    // completing (or failing) agent. A cancelled agent is aborted before it
+    // reaches here, so `AgentManager::stop_agent` fires the event instead.
+    let mut stop_ctx = HashMap::new();
+    stop_ctx.insert("agent_id".to_string(), agent_id.clone());
+    stop_ctx.insert("status".to_string(), format!("{status:?}"));
+    if let Some(err) = &error {
+        stop_ctx.insert("error".to_string(), err.clone());
+    }
+    fire_agent_hook(hooks.as_ref(), "SubagentStop", &agent_id, &stop_ctx).await;
+
     // Write output to file
     let _ = tokio::fs::write(&output_file, &final_output).await;
 
@@ -2038,6 +2127,26 @@ async fn run_agent_task(
 fn emit_teammate_event(callback: Option<&TeammateEventCallback>, event: TeammateEvent) {
     if let Some(callback) = callback {
         callback(event);
+    }
+}
+
+/// Fire one sub-agent lifecycle hook from inside the agent task, if an
+/// executor was installed on the manager.
+///
+/// The counterpart of [`AgentManager::fire_hook`] for the spawned task, which
+/// cannot borrow the manager. Failures are logged, never fatal.
+async fn fire_agent_hook(
+    hooks: Option<&Arc<dyn HookExecutor>>,
+    event: &str,
+    input: &str,
+    context: &HashMap<String, String>,
+) {
+    let Some(hooks) = hooks else {
+        return;
+    };
+    let result = hooks.fire_hook(event, input, context).await;
+    if !result.errors.is_empty() {
+        tracing::warn!(event, errors = ?result.errors, "sub-agent hook errors");
     }
 }
 
@@ -2290,6 +2399,59 @@ mod tests {
 
     fn make_manager() -> AgentManager {
         AgentManager::standalone()
+    }
+
+    /// One recorded fire: event name, input, and context.
+    type FiredHook = (String, String, std::collections::HashMap<String, String>);
+
+    /// Records every hook the manager fires, so a test can assert on it.
+    #[derive(Default)]
+    struct RecordingHooks {
+        fired: std::sync::Mutex<Vec<FiredHook>>,
+    }
+
+    impl RecordingHooks {
+        fn events(&self) -> Vec<String> {
+            self.fired
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|(event, _, _)| event.clone())
+                .collect()
+        }
+
+        fn context_for(&self, event: &str) -> Option<std::collections::HashMap<String, String>> {
+            self.fired
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|(name, _, _)| name == event)
+                .map(|(_, _, context)| context.clone())
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl HookExecutor for RecordingHooks {
+        async fn fire_hook(
+            &self,
+            event_name: &str,
+            input: &str,
+            context: &std::collections::HashMap<String, String>,
+        ) -> coderex_core::hook_executor::HookFireResult {
+            self.fired.lock().unwrap().push((
+                event_name.to_string(),
+                input.to_string(),
+                context.clone(),
+            ));
+            coderex_core::hook_executor::HookFireResult::default()
+        }
+    }
+
+    fn install_hooks(mgr: &mut AgentManager) -> Arc<RecordingHooks> {
+        let hooks = Arc::new(RecordingHooks::default());
+        let typed: Arc<dyn HookExecutor> = hooks.clone();
+        mgr.set_hooks(typed);
+        hooks
     }
 
     #[tokio::test]
@@ -2605,6 +2767,143 @@ mod tests {
         mgr.stop_agent(&agent_id).await.unwrap();
 
         assert_eq!(mgr.list_agents()[0].status(), AgentStatus::Stopped);
+    }
+
+    /// Spawning a sub-agent is the lifecycle moment `SubagentStart` names, and
+    /// nothing else in the engine sees it.
+    #[tokio::test]
+    async fn spawn_agent_fires_subagent_start() {
+        let mut mgr = make_manager();
+        let hooks = install_hooks(&mut mgr);
+
+        let instance = mgr
+            .spawn_agent(
+                AgentType::GeneralPurpose,
+                "test",
+                SpawnOptions::default(),
+                "sess_1",
+                "/tmp",
+                0,
+            )
+            .await
+            .unwrap();
+
+        let events = hooks.events();
+        assert!(events.iter().any(|e| e == "SubagentStart"), "{events:?}");
+        let ctx = hooks.context_for("SubagentStart").unwrap();
+        assert_eq!(
+            ctx.get("agent_id").map(String::as_str),
+            Some(instance.task_handle.id.as_str())
+        );
+        assert_eq!(ctx.get("session_id").map(String::as_str), Some("sess_1"));
+        assert_eq!(
+            ctx.get("agent_type").map(String::as_str),
+            Some("general_purpose")
+        );
+    }
+
+    /// A sub-agent that runs to completion reports it through the same hooks a
+    /// real lifecycle does: idle when the turn ends, stop when the agent stops.
+    #[tokio::test]
+    async fn a_completing_subagent_fires_subagent_stop_and_teammate_idle() {
+        let mut mgr = make_manager();
+        mgr.set_api_client(Box::new(ScriptedApi {
+            calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        }));
+        let hooks = install_hooks(&mut mgr);
+
+        let options = SpawnOptions {
+            run_in_background: true,
+            ..SpawnOptions::default()
+        };
+        let (_agent_id, _result, _cwd) = spawn_and_wait(&mut mgr, "do the thing", options).await;
+
+        let events = hooks.events();
+        assert!(events.iter().any(|e| e == "SubagentStart"), "{events:?}");
+        assert!(events.iter().any(|e| e == "TeammateIdle"), "{events:?}");
+        assert!(events.iter().any(|e| e == "SubagentStop"), "{events:?}");
+    }
+
+    /// Cancelling a sub-agent is a lifecycle end too: `stop_agent` has to fire
+    /// `SubagentStop`, because the aborted task never reaches its own.
+    #[tokio::test]
+    async fn stop_agent_fires_subagent_stop() {
+        let mut mgr = make_manager();
+        let hooks = install_hooks(&mut mgr);
+
+        mgr.spawn_agent(
+            AgentType::GeneralPurpose,
+            "test",
+            SpawnOptions::default(),
+            "sess_1",
+            "/tmp",
+            0,
+        )
+        .await
+        .unwrap();
+
+        let agent_id = mgr.list_agents()[0].task_handle.id.clone();
+        mgr.stop_agent(&agent_id).await.unwrap();
+
+        let events = hooks.events();
+        assert!(events.iter().any(|e| e == "SubagentStop"), "{events:?}");
+        let ctx = hooks.context_for("SubagentStop").unwrap();
+        assert_eq!(ctx.get("status").map(String::as_str), Some("Stopped"));
+    }
+
+    /// The explicit completion API is a lifecycle end, so it fires
+    /// `SubagentStop` as well.
+    #[tokio::test]
+    async fn complete_agent_fires_subagent_stop() {
+        let mut mgr = make_manager();
+        let hooks = install_hooks(&mut mgr);
+
+        mgr.spawn_agent(
+            AgentType::GeneralPurpose,
+            "test",
+            SpawnOptions::default(),
+            "sess_1",
+            "/tmp",
+            0,
+        )
+        .await
+        .unwrap();
+
+        let agent_id = mgr.list_agents()[0].task_handle.id.clone();
+        mgr.complete_agent(&agent_id, "test task", "done")
+            .await
+            .unwrap();
+
+        let events = hooks.events();
+        assert!(events.iter().any(|e| e == "SubagentStop"), "{events:?}");
+        let ctx = hooks.context_for("SubagentStop").unwrap();
+        assert_eq!(ctx.get("status").map(String::as_str), Some("Completed"));
+    }
+
+    /// Going idle through the explicit API fires `TeammateIdle`.
+    #[tokio::test]
+    async fn mark_idle_fires_teammate_idle() {
+        let mut mgr = make_manager();
+        let hooks = install_hooks(&mut mgr);
+
+        mgr.spawn_agent(
+            AgentType::GeneralPurpose,
+            "test",
+            SpawnOptions::default(),
+            "sess_1",
+            "/tmp",
+            0,
+        )
+        .await
+        .unwrap();
+
+        let agent_id = mgr.list_agents()[0].task_handle.id.clone();
+        mgr.mark_idle(&agent_id, "no more work").await.unwrap();
+
+        let events = hooks.events();
+        assert!(events.iter().any(|e| e == "TeammateIdle"), "{events:?}");
+        let ctx = hooks.context_for("TeammateIdle").unwrap();
+        assert_eq!(ctx.get("reason").map(String::as_str), Some("no more work"));
     }
 
     /// Create a git repository with one commit so `git worktree add` can run.

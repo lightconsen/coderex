@@ -61,7 +61,16 @@ impl Tool for TaskUpdateTool {
             message: "task store not available".into(),
         })?;
 
+        let marking_completed = status == Some(TaskStatus::Completed);
         let ok = store.update(&task_id, status, subject, description, active_form);
+
+        // Completing a task is a lifecycle moment the engine never sees — it
+        // happens inside this tool — so the tool fires `TaskCompleted`.
+        if ok && marking_completed {
+            let mut hook_context = std::collections::HashMap::new();
+            hook_context.insert("task_id".to_string(), task_id.clone());
+            crate::tool::fire_tool_hook(&ctx, "TaskCompleted", &task_id, &hook_context).await;
+        }
 
         Ok(ToolOutput {
             output: if ok { "true" } else { "false" }.to_string(),
@@ -97,8 +106,10 @@ mod tests {
     use crate::context::ExecutionContext;
     use crate::task_store::{TaskRecord, TaskStore};
     use crate::tool::ToolContext;
+    use coderex_core::hook_executor::{HookExecutor, HookFireResult};
     use std::collections::HashMap;
     use std::path::Path;
+    use std::sync::Mutex;
 
     fn test_ctx() -> ToolContext<'static> {
         let store = Arc::new(TaskStore::new());
@@ -111,6 +122,42 @@ mod tests {
             cwd: Path::new("/tmp"),
             extra: Arc::new(extra),
         }
+    }
+
+    /// Records every hook the tool fires, so a test can assert on the event.
+    #[derive(Default)]
+    struct RecordingHooks {
+        fired: Mutex<Vec<String>>,
+    }
+
+    #[async_trait]
+    impl HookExecutor for RecordingHooks {
+        async fn fire_hook(
+            &self,
+            event_name: &str,
+            _input: &str,
+            _context: &HashMap<String, String>,
+        ) -> HookFireResult {
+            self.fired.lock().unwrap().push(event_name.to_string());
+            HookFireResult::default()
+        }
+    }
+
+    fn ctx_with_hooks() -> (ToolContext<'static>, Arc<RecordingHooks>) {
+        let store = Arc::new(TaskStore::new());
+        store.create(TaskRecord::new("1", "task1"));
+        let hooks = Arc::new(RecordingHooks::default());
+        let typed: Arc<dyn HookExecutor> = hooks.clone();
+        let mut extra = HashMap::<String, crate::tool::SharedState>::new();
+        extra.insert(TASK_STORE_KEY.to_string(), Box::new(store));
+        extra.insert(crate::tool::HOOK_EXECUTOR_KEY.to_string(), Box::new(typed));
+        let ctx = ToolContext {
+            elicit_tx: None,
+            execution_context: ExecutionContext::Normal,
+            cwd: Path::new("/tmp"),
+            extra: Arc::new(extra),
+        };
+        (ctx, hooks)
     }
 
     #[tokio::test]
@@ -143,5 +190,60 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(output.output, "false");
+    }
+
+    /// Completing a task is the lifecycle moment `TaskCompleted` names, and
+    /// nothing else in the engine sees it — so the tool has to fire it.
+    #[tokio::test]
+    async fn completing_a_task_fires_task_completed() {
+        let (ctx, hooks) = ctx_with_hooks();
+        TaskUpdateTool
+            .execute(
+                ToolInput {
+                    call_id: "1".into(),
+                    name: "TaskUpdate".into(),
+                    arguments: serde_json::json!({ "taskId": "1", "status": "completed" }),
+                },
+                ctx,
+            )
+            .await
+            .unwrap();
+        assert_eq!(*hooks.fired.lock().unwrap(), vec!["TaskCompleted"]);
+    }
+
+    /// An update that is not a completion is not a `TaskCompleted`.
+    #[tokio::test]
+    async fn a_non_completing_update_does_not_fire_task_completed() {
+        let (ctx, hooks) = ctx_with_hooks();
+        TaskUpdateTool
+            .execute(
+                ToolInput {
+                    call_id: "1".into(),
+                    name: "TaskUpdate".into(),
+                    arguments: serde_json::json!({ "taskId": "1", "status": "in_progress" }),
+                },
+                ctx,
+            )
+            .await
+            .unwrap();
+        assert!(hooks.fired.lock().unwrap().is_empty());
+    }
+
+    /// A completion that changed nothing (no such task) must not fire.
+    #[tokio::test]
+    async fn a_failed_completion_does_not_fire_task_completed() {
+        let (ctx, hooks) = ctx_with_hooks();
+        TaskUpdateTool
+            .execute(
+                ToolInput {
+                    call_id: "1".into(),
+                    name: "TaskUpdate".into(),
+                    arguments: serde_json::json!({ "taskId": "999", "status": "completed" }),
+                },
+                ctx,
+            )
+            .await
+            .unwrap();
+        assert!(hooks.fired.lock().unwrap().is_empty());
     }
 }

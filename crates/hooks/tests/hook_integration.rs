@@ -297,8 +297,9 @@ async fn hook_postcompact_fires_after_compaction() {
 // ═══════════════════════════════════════════════════════════════════════════
 //  5.9 CwdChanged — the registry runs a configured hook
 //
-// CwdChanged is a reserved name: the engine never fires it. This test
-// exercises `execute_sync` on the registry, not a firing site.
+// CwdChanged is fired by `RegistryToolDispatcher::set_cwd` when a session is
+// moved (e.g. into a worktree); this test exercises `execute_sync` on the
+// registry, not the firing site.
 // ═══════════════════════════════════════════════════════════════════════════
 
 #[tokio::test]

@@ -20,22 +20,50 @@ pub enum HookEvent {
     /// Before a user prompt is submitted.
     UserPromptSubmit,
     /// When a session starts.
+    ///
+    /// Fired once by `coderex_core::engine` before the session's first turn.
     SessionStart,
     /// During initial setup.
+    ///
+    /// **Not fired.** The reference fires this for an explicit setup /
+    /// maintenance invocation (`--init`, `--init-only`, `--maintenance`).
+    /// CodeRex has no such invocation mode, and the engine has no one-time
+    /// setup method — its first `submit` is an ordinary user turn. Firing it
+    /// there would run a setup hook on every session, which is a different
+    /// event than the one the reference means, so it stays inert.
     Setup,
     /// When a sub-agent starts.
+    ///
+    /// Fired by `coderex_agents::manager::AgentManager::spawn_agent` once the
+    /// sub-agent is created and about to run.
     SubagentStart,
     /// When a notification is emitted.
+    ///
+    /// Fired by `coderex_core::engine` when the agent surfaces an advisory
+    /// notification to the person, such as a provider outage.
     Notification,
     /// When permission is requested.
     PermissionRequest,
     /// When permission is denied.
     PermissionDenied,
     /// When the working directory changes.
+    ///
+    /// Fired by `coderex_tools::RegistryToolDispatcher::set_cwd` when the
+    /// session's working directory moves (for example into a worktree).
     CwdChanged,
     /// When a file changes.
+    ///
+    /// **Not fired.** The reference fires this from a file watcher watching
+    /// the paths hooks asked for. CodeRex's only watchers live in the `ui`
+    /// (themes) and `config` (settings hot-reload) crates and are not wired to
+    /// hooks; there is no file-change signal in the crates that own a hook
+    /// executor. Firing it after one of our own `Write`/`Edit` calls would
+    /// report the tool's own action, not the external change the reference
+    /// means, so it stays inert.
     FileChanged,
     /// When a worktree is created.
+    ///
+    /// Fired by the `EnterWorktree` tool after the worktree is created.
     WorktreeCreate,
     /// Before context compaction.
     PreCompact,
@@ -44,10 +72,21 @@ pub enum HookEvent {
     /// When the user requests a stop.
     Stop,
     /// When a sub-agent stops.
+    ///
+    /// Fired by `coderex_agents::manager::AgentManager` when a sub-agent
+    /// finishes (or is stopped / completed) — the counterpart to
+    /// [`SubagentStart`](Self::SubagentStart).
     SubagentStop,
     /// When a task is completed.
+    ///
+    /// Fired by the `TaskUpdate` tool when a task's status becomes
+    /// `completed`. This is the task-store lifecycle, not the sub-agent
+    /// teammate event of the same name.
     TaskCompleted,
     /// When a teammate goes idle.
+    ///
+    /// Fired by `coderex_agents::manager::AgentManager` where a teammate
+    /// reports idleness — after a turn completes, and via `mark_idle`.
     TeammateIdle,
     /// When an elicitation is requested.
     Elicitation,
@@ -149,16 +188,21 @@ impl HookEvent {
     /// - `PreToolUse`, `PostToolUse`, `PostToolUseFailure`,
     ///   `PermissionRequest`, `PermissionDenied` —
     ///   `coderex_core::tool_scheduler`
+    /// - `SubagentStart`, `SubagentStop`, `TeammateIdle` —
+    ///   `coderex_agents::manager`
+    /// - `WorktreeCreate` — the `EnterWorktree` tool
+    /// - `TaskCompleted` — the `TaskUpdate` tool
+    /// - `CwdChanged` — `coderex_tools::RegistryToolDispatcher::set_cwd`
     ///
     /// Everything else is a name CodeRex accepts but never fires. A hook
     /// configured on one of those would install and then never run, so
     /// [`HookRegistry`](crate::HookRegistry) warns about it at load.
     ///
-    /// `Setup`, `SubagentStart`, `SubagentStop`, `CwdChanged`, `FileChanged`,
-    /// `WorktreeCreate`, `TaskCompleted`, and `TeammateIdle` are the reserved
-    /// names with no honest source in the engine: sub-agent lifecycle and task
-    /// completion belong to the agent manager, the working directory is never
-    /// changed inside a turn, and nothing watches files or creates worktrees.
+    /// `Setup` and `FileChanged` are the only reserved names left, and neither
+    /// has an honest source in this engine: there is no one-time setup
+    /// invocation mode, and nothing watches files for external changes —
+    /// firing after our own `Write`/`Edit` would report the tool's own action,
+    /// not a change made elsewhere.
     #[must_use]
     pub const fn is_triggered(self) -> bool {
         matches!(
@@ -177,6 +221,12 @@ impl HookEvent {
                 | Self::Elicitation
                 | Self::ElicitationResult
                 | Self::TurnEnd
+                | Self::SubagentStart
+                | Self::SubagentStop
+                | Self::TeammateIdle
+                | Self::WorktreeCreate
+                | Self::TaskCompleted
+                | Self::CwdChanged
         )
     }
 }
@@ -402,12 +452,18 @@ mod tests {
                 "PostToolUseFailure",
                 "UserPromptSubmit",
                 "SessionStart",
+                "SubagentStart",
                 "Notification",
                 "PermissionRequest",
                 "PermissionDenied",
+                "CwdChanged",
+                "WorktreeCreate",
                 "PreCompact",
                 "PostCompact",
                 "Stop",
+                "SubagentStop",
+                "TaskCompleted",
+                "TeammateIdle",
                 "Elicitation",
                 "ElicitationResult",
                 "TurnEnd",
@@ -415,12 +471,11 @@ mod tests {
         );
     }
 
-    /// The reserved names have no firing site: the engine does not know when a
-    /// sub-agent starts or stops, never changes directory mid-turn, and has no
-    /// file watcher or worktree creator. A hook on one of these must be warned
-    /// about, not silently inert.
+    /// The names CodeRex accepts but never fires, and only those. Each one has
+    /// a per-variant note explaining why it has no honest firing site; this
+    /// test makes adding or removing one a deliberate change.
     #[test]
-    fn reserved_events_stay_untriggered() {
+    fn the_untriggered_events_are_the_documented_reserved_names() {
         let untriggered: Vec<&str> = HookEvent::iter()
             .filter(|event| !event.is_triggered())
             .map(HookEvent::as_str)
@@ -430,13 +485,7 @@ mod tests {
             untriggered,
             vec![
                 "Setup",
-                "SubagentStart",
-                "CwdChanged",
                 "FileChanged",
-                "WorktreeCreate",
-                "SubagentStop",
-                "TaskCompleted",
-                "TeammateIdle",
             ]
         );
     }

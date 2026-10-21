@@ -17,10 +17,11 @@ use crate::sandbox_policy;
 use crate::task_store::{TASK_STORE_KEY, TaskStore};
 use crate::todo_store::{TODO_STORE_KEY, TodoStore};
 use crate::tool::{
-    Backgrounding, JOB_SESSION_ID_KEY, RuleContentField, SharedState, ToolCapabilities,
-    ToolContext, ToolInput,
+    Backgrounding, HOOK_EXECUTOR_KEY, JOB_SESSION_ID_KEY, RuleContentField, SharedState,
+    ToolCapabilities, ToolContext, ToolInput,
 };
 use coderex_config::FeatureFlags;
+use coderex_core::hook_executor::HookExecutor;
 use coderex_core::tool_executor::{ToolDispatchOutcome, ToolExecutor as CoreToolExecutor};
 use coderex_core::types::ToolResult;
 use serde_json::Value;
@@ -70,6 +71,13 @@ pub struct RegistryToolDispatcher {
     /// Session that owns work started by these tools, when known. Tools that
     /// write durable job records use it to attribute the record.
     session_id: Option<String>,
+    /// The session's hook executor, when a session has installed one.
+    ///
+    /// Shared across clones (the agent manager holds one) so a session that
+    /// installs hooks after the clones were made is still seen by all of them.
+    /// Tools that own a lifecycle moment the engine cannot see fire through
+    /// it, and [`Self::set_cwd`] fires `CwdChanged`.
+    hooks: Arc<parking_lot::RwLock<Option<Arc<dyn HookExecutor>>>>,
 }
 
 impl RegistryToolDispatcher {
@@ -116,9 +124,47 @@ impl RegistryToolDispatcher {
     /// Move the working directory tools run in.
     ///
     /// Used when the session is given a checkout of its own — a worktree — so
-    /// the tools work where the session says it is.
+    /// the tools work where the session says it is. Moving the session fires
+    /// the `CwdChanged` hook with the old and new directories.
     pub fn set_cwd(&self, cwd: PathBuf) {
-        *self.cwd.write() = cwd;
+        let previous = std::mem::replace(&mut *self.cwd.write(), cwd.clone());
+        if previous == cwd {
+            return;
+        }
+        // The setter is synchronous — the CLI calls it while moving the
+        // session into a worktree — so the fire is spawned onto the current
+        // runtime. With no runtime (a bare test context) there is nothing to
+        // fire on.
+        let Some(hooks) = self.hooks.read().clone() else {
+            return;
+        };
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        handle.spawn(async move {
+            let mut context = HashMap::new();
+            context.insert("cwd".to_string(), cwd.to_string_lossy().to_string());
+            context.insert(
+                "previous_cwd".to_string(),
+                previous.to_string_lossy().to_string(),
+            );
+            let result = hooks
+                .fire_hook("CwdChanged", &cwd.to_string_lossy(), &context)
+                .await;
+            if !result.errors.is_empty() {
+                tracing::warn!(errors = ?result.errors, "CwdChanged hook errors");
+            }
+        });
+    }
+
+    /// Give the dispatcher the session's hook executor.
+    ///
+    /// The engine holds its own reference for the hooks it fires; this lets
+    /// the tools it dispatches fire the lifecycle hooks that belong to them
+    /// (`WorktreeCreate`, `TaskCompleted`) and lets [`Self::set_cwd`] fire
+    /// `CwdChanged`.
+    pub fn set_hooks(&self, hooks: Arc<dyn HookExecutor>) {
+        *self.hooks.write() = Some(hooks);
     }
 
     /// The working directory tools run in.
@@ -161,6 +207,7 @@ impl RegistryToolDispatcher {
             chrome_enabled: Arc::new(std::sync::atomic::AtomicBool::new(true)),
             elicit_tx: Arc::new(std::sync::Mutex::new(None)),
             session_id: None,
+            hooks: Arc::new(parking_lot::RwLock::new(None)),
         }
     }
 
@@ -486,6 +533,17 @@ impl CoreToolExecutor for RegistryToolDispatcher {
             extra.insert(
                 CHROME_CLIENT_KEY.to_string(),
                 Box::new(client.clone()) as SharedState,
+            );
+        }
+
+        // Inject the session's hook executor, so a tool that owns a lifecycle
+        // moment the engine cannot see (`WorktreeCreate`, `TaskCompleted`)
+        // fires it through the same executor the engine uses.
+        let session_hooks = self.hooks.read().clone();
+        if let Some(hooks) = session_hooks {
+            extra.insert(
+                HOOK_EXECUTOR_KEY.to_string(),
+                Box::new(hooks) as SharedState,
             );
         }
 
@@ -1599,5 +1657,89 @@ mod tests {
             assert!(!outcome.result.is_error, "{:?}", outcome.result);
             assert_eq!(outcome.result.output, "hi");
         }
+    }
+
+    /// One recorded fire: event name, input, and context.
+    type FiredHook = (String, String, HashMap<String, String>);
+
+    /// Records every hook the dispatcher fires, so a test can assert on it.
+    #[derive(Default)]
+    struct RecordingHooks {
+        fired: std::sync::Mutex<Vec<FiredHook>>,
+    }
+
+    #[async_trait::async_trait]
+    impl coderex_core::hook_executor::HookExecutor for RecordingHooks {
+        async fn fire_hook(
+            &self,
+            event_name: &str,
+            input: &str,
+            context: &HashMap<String, String>,
+        ) -> coderex_core::hook_executor::HookFireResult {
+            self.fired.lock().unwrap().push((
+                event_name.to_string(),
+                input.to_string(),
+                context.clone(),
+            ));
+            coderex_core::hook_executor::HookFireResult::default()
+        }
+    }
+
+    /// Moving the session's working directory is the moment `CwdChanged`
+    /// names, and the setter is the only place it happens — so the dispatcher
+    /// has to fire it. The fire is spawned, so the test yields before reading.
+    #[tokio::test]
+    async fn set_cwd_fires_cwd_changed() {
+        let dispatcher = dispatcher_with_webfetch_and_echo();
+        let hooks = Arc::new(RecordingHooks::default());
+        let typed: Arc<dyn coderex_core::hook_executor::HookExecutor> = hooks.clone();
+        dispatcher.set_hooks(typed);
+
+        dispatcher.set_cwd(PathBuf::from("/tmp/moved"));
+
+        // The hook runs on a spawned task; give it a chance to land.
+        for _ in 0..50 {
+            if !hooks.fired.lock().unwrap().is_empty() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+
+        let (input, context) = {
+            let fired = hooks.fired.lock().unwrap();
+            let event = fired
+                .iter()
+                .find(|(name, _, _)| name == "CwdChanged")
+                .expect("CwdChanged should have fired");
+            (event.1.clone(), event.2.clone())
+        };
+        assert_eq!(input, "/tmp/moved");
+        assert_eq!(context.get("cwd").map(String::as_str), Some("/tmp/moved"));
+        assert_eq!(
+            context.get("previous_cwd").map(String::as_str),
+            Some("/tmp")
+        );
+    }
+
+    /// Setting the same directory is not a change, so no hook fires.
+    #[tokio::test]
+    async fn set_cwd_to_the_same_directory_fires_nothing() {
+        let dispatcher = dispatcher_with_webfetch_and_echo();
+        let hooks = Arc::new(RecordingHooks::default());
+        let typed: Arc<dyn coderex_core::hook_executor::HookExecutor> = hooks.clone();
+        dispatcher.set_hooks(typed);
+
+        dispatcher.set_cwd(PathBuf::from("/tmp"));
+        tokio::task::yield_now().await;
+
+        assert!(hooks.fired.lock().unwrap().is_empty());
+    }
+
+    /// A dispatcher with no hooks installed simply does not fire.
+    #[tokio::test]
+    async fn set_cwd_without_hooks_is_a_no_op() {
+        let dispatcher = dispatcher_with_webfetch_and_echo();
+        dispatcher.set_cwd(PathBuf::from("/tmp/moved"));
+        assert_eq!(dispatcher.cwd(), PathBuf::from("/tmp/moved"));
     }
 }

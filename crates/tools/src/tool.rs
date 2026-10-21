@@ -2,6 +2,7 @@
 
 use crate::context::{ExecutionContext, ToolError, ToolOutput};
 use async_trait::async_trait;
+use coderex_core::hook_executor::HookExecutor;
 use coderex_core::permissions::ToolRuleExemptions;
 use serde_json::Value;
 use std::collections::HashMap;
@@ -18,6 +19,47 @@ pub type SharedState = Box<dyn std::any::Any + Send + Sync>;
 /// record is written with no owner, which adoption treats as belonging to
 /// whoever is adopting.
 pub const JOB_SESSION_ID_KEY: &str = "job_session_id";
+
+/// Key in `ToolContext.extra` holding the session's hook executor as an
+/// `Arc<dyn HookExecutor>`.
+///
+/// The engine fires the hooks it can see (prompt, tool, permission, compact,
+/// stop). A few lifecycle moments belong to a tool instead — entering a
+/// worktree, completing a task — and the tool fires those through this
+/// executor. Absent (as in a bare test context) the tool simply does not
+/// fire.
+pub const HOOK_EXECUTOR_KEY: &str = "hook_executor";
+
+/// Borrow the session's hook executor out of a tool context, if one is
+/// installed.
+#[must_use]
+pub fn hook_executor_from(ctx: &ToolContext<'_>) -> Option<Arc<dyn HookExecutor>> {
+    ctx.extra
+        .get(HOOK_EXECUTOR_KEY)
+        .and_then(|state| state.downcast_ref::<Arc<dyn HookExecutor>>())
+        .cloned()
+}
+
+/// Fire a lifecycle hook through the session's executor, if one is installed.
+///
+/// A tool that owns a lifecycle moment the engine cannot see (`WorktreeCreate`
+/// on entering a worktree, `TaskCompleted` on completing a task) calls this
+/// after the moment has happened. With no executor in the context — a bare
+/// test context — it is a no-op, so a tool keeps working without hooks.
+pub async fn fire_tool_hook(
+    ctx: &ToolContext<'_>,
+    event: &str,
+    input: &str,
+    context: &HashMap<String, String>,
+) {
+    let Some(hooks) = hook_executor_from(ctx) else {
+        return;
+    };
+    let result = hooks.fire_hook(event, input, context).await;
+    if !result.errors.is_empty() {
+        tracing::warn!(event, errors = ?result.errors, "tool hook errors");
+    }
+}
 
 /// How a tool should behave when interrupted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
