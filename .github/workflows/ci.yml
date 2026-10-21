@@ -50,6 +50,17 @@ jobs:
       - uses: taiki-e/install-action@nextest
       - run: cargo nextest run --workspace
 
+  # The plist managed-settings carrier is `#[cfg(target_os = "macos")]`, so no
+  # Linux or Windows job ever compiles it. Without this job those tests never
+  # run anywhere.
+  test-macos:
+    name: Test (macOS plist carrier)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo test -p coderex-config
+
   # Compilation and linking for Windows are required, and are checked from
   # ubuntu-latest with the mingw-w64 toolchain below. This matters because the
   # Unix jobs never compile the `cfg(target_os = "windows")` paths; a break in
