@@ -1415,7 +1415,24 @@ pub struct QueryEngine {
     /// Last successful response content and usage (for graceful degradation).
     last_successful_response: Option<(String, UsageSummary)>,
     /// Optional team context for multi-agent collaboration.
+    ///
+    /// Installed by the CLI when `team_collaboration` is on. Each turn reads
+    /// its shared notes, in-progress work and recent activity into the request
+    /// context. Absent (the default) → no team context is injected.
     team_context: Option<Arc<std::sync::Mutex<crate::team_context::TeamContext>>>,
+    /// Execute tool calls while the streaming response is still arriving.
+    ///
+    /// Off (the default, matching the reference) → calls are assembled during
+    /// the stream and executed once it completes. On → `execute_early_tool_call`
+    /// runs each completed call while the stream is open.
+    streaming_tool_execution: bool,
+    /// Ask the lightweight model for a one-line summary of each tool use.
+    ///
+    /// Off (the default) → `ToolCallStart.summary` is the fixed
+    /// `ToolCall::activity_summary()` label. On → the engine emits
+    /// [`EngineEvent::ToolUseSummary`] and uses that summary as the label,
+    /// falling back to `activity_summary()` when summarization fails.
+    tool_use_summaries: bool,
     /// Optional coordinator state for multi-phase workflows.
     coordinator: Option<crate::coordinator::CoordinatorState>,
     /// Optional persistent session memory that survives compaction.
@@ -1599,6 +1616,8 @@ impl QueryEngine {
             loop_detector: Some(LoopDetector::new()),
             last_successful_response: None,
             team_context: None,
+            streaming_tool_execution: false,
+            tool_use_summaries: false,
             coordinator: None,
             session_memory: None,
             compaction_backend: None,
@@ -1868,11 +1887,52 @@ impl QueryEngine {
     }
 
     /// Set the team context for multi-agent collaboration.
+    ///
+    /// Installed by the CLI when `team_collaboration` is on. The engine reads
+    /// the context in [`Self::build_context`] and injects its shared notes,
+    /// in-progress work and recent activity into the request each turn.
     pub fn set_team_context(
         &mut self,
         context: Arc<std::sync::Mutex<crate::team_context::TeamContext>>,
     ) {
         self.team_context = Some(context);
+    }
+
+    /// The installed team context, if any.
+    #[must_use]
+    pub const fn team_context(
+        &self,
+    ) -> Option<&Arc<std::sync::Mutex<crate::team_context::TeamContext>>> {
+        self.team_context.as_ref()
+    }
+
+    /// Execute tool calls while the response stream is still arriving.
+    ///
+    /// Set by the CLI from `streaming_tool_execution`. Off (the default,
+    /// matching the reference) assembles calls during the stream and executes
+    /// them after it completes.
+    pub const fn set_streaming_tool_execution(&mut self, enabled: bool) {
+        self.streaming_tool_execution = enabled;
+    }
+
+    /// Whether tool calls execute as they arrive in a streamed response.
+    #[must_use]
+    pub const fn streaming_tool_execution(&self) -> bool {
+        self.streaming_tool_execution
+    }
+
+    /// Ask the lightweight model for a one-line summary of each tool use.
+    ///
+    /// Set by the CLI from `tool_use_summaries`. Off leaves the fixed
+    /// `ToolCall::activity_summary()` label byte-for-byte unchanged.
+    pub const fn set_tool_use_summaries(&mut self, enabled: bool) {
+        self.tool_use_summaries = enabled;
+    }
+
+    /// Whether the lightweight model summarizes each tool use.
+    #[must_use]
+    pub const fn tool_use_summaries(&self) -> bool {
+        self.tool_use_summaries
     }
 
     /// Get a formatted cost summary from the cost tracker.
@@ -3196,6 +3256,58 @@ impl QueryEngine {
         self.session.messages.push(assistant_msg);
     }
 
+    /// Format the installed team context for injection into the request.
+    ///
+    /// Returns `None` when no context is installed or it carries no notes,
+    /// work items, or activity, so an empty context never changes the prompt.
+    /// The lists are bounded: a long-lived team can accumulate hundreds of
+    /// entries, and the point of the injection is shared working state, not a
+    /// full audit log.
+    fn team_context_block(&self) -> Option<String> {
+        use std::fmt::Write as _;
+
+        const MAX_NOTES: usize = 20;
+        const MAX_WORK_ITEMS: usize = 10;
+        const MAX_ACTIVITY: usize = 10;
+
+        let context = self.team_context.as_ref()?.lock().ok()?;
+        if context.shared_notes.is_empty()
+            && context.in_progress.is_empty()
+            && context.recent_activity.is_empty()
+        {
+            return None;
+        }
+
+        let mut block = format!("Team context (team {}):", context.team_id);
+        if !context.shared_notes.is_empty() {
+            block.push_str("\nShared notes:");
+            for note in context.shared_notes.iter().take(MAX_NOTES) {
+                let _ = write!(
+                    block,
+                    "\n- {} (by {}): {}",
+                    note.title, note.author_id, note.content
+                );
+            }
+        }
+        if !context.in_progress.is_empty() {
+            block.push_str("\nIn progress:");
+            for item in context.in_progress.iter().take(MAX_WORK_ITEMS) {
+                let _ = write!(
+                    block,
+                    "\n- {} (worker {}, {} steps remaining)",
+                    item.description, item.worker_id, item.remaining_steps
+                );
+            }
+        }
+        if !context.recent_activity.is_empty() {
+            block.push_str("\nRecent activity:");
+            for entry in context.recent_activity.iter().take(MAX_ACTIVITY) {
+                let _ = write!(block, "\n- {}: {}", entry.member_id, entry.description);
+            }
+        }
+        Some(block)
+    }
+
     /// Build the prompt context from session state.
     /// The prompt this turn is answering.
     ///
@@ -3239,6 +3351,14 @@ impl QueryEngine {
 
         // Add system prompt
         turn.messages.push(Message::system(assembled.system_prompt));
+
+        // Team collaboration: the CLI installs a `TeamContext` only when the
+        // flag is on. Reading it here makes the shared notes, in-progress work
+        // and recent activity part of every request. With no context installed
+        // (the default) this adds nothing, so the prompt is unchanged.
+        if let Some(team_context) = self.team_context_block() {
+            turn.messages.push(Message::system(team_context));
+        }
 
         // Add session conversation messages (after system context)
         turn.messages.extend(self.session.messages.iter().cloned());
@@ -4201,9 +4321,16 @@ impl QueryEngine {
                     }
                 }
 
-                // Process event through assembler and execute completed tool
-                // calls immediately while the stream is still running.
+                // Process event through assembler and, when
+                // `streaming_tool_execution` is on, execute completed tool
+                // calls immediately while the stream is still running. With
+                // it off the assembler still records the calls; they flow
+                // through `take_completed` below and execute once the stream
+                // has finished.
                 for call in assembler.process_event(event) {
+                    if !self.streaming_tool_execution {
+                        continue;
+                    }
                     let recorded = call.clone();
                     match self.execute_early_tool_call(turn, call, options).await {
                         Ok(Some(result)) => {
@@ -4230,8 +4357,15 @@ impl QueryEngine {
             }
 
             if !retry_requested {
-                // Stream ended — finalize any remaining pending calls.
-                for call in assembler.process_event(StreamEvent::StreamEnd) {
+                // Stream ended — finalize any remaining pending calls. The
+                // assembler must see `StreamEnd` either way; whether the
+                // finalized calls execute now or after the stream is what
+                // `streaming_tool_execution` decides.
+                let finalized = assembler.process_event(StreamEvent::StreamEnd);
+                for call in finalized {
+                    if !self.streaming_tool_execution {
+                        continue;
+                    }
                     let recorded = call.clone();
                     match self.execute_early_tool_call(turn, call, options).await {
                         Ok(Some(result)) => {
@@ -4408,10 +4542,21 @@ impl QueryEngine {
             return Ok(Some(result));
         }
 
+        // `tool_use_summaries` asks the lightweight model for a one-line
+        // label. Failure (including no usable client) falls back to the
+        // deterministic activity summary, so a turn never fails over a label.
+        let summary = self.tool_use_summary(&call.name, &call.input).await;
+        if self.tool_use_summaries {
+            let _ = self.event_tx.send(EngineEvent::ToolUseSummary {
+                id: call.id.clone(),
+                name: call.name.clone(),
+                summary: summary.clone(),
+            });
+        }
         let _ = self.event_tx.send(EngineEvent::ToolCallStart {
             id: call.id.clone(),
             name: call.name.clone(),
-            summary: call.activity_summary(),
+            summary,
         });
 
         // 3. Permission check
@@ -4545,6 +4690,34 @@ impl QueryEngine {
         }
     }
 
+    /// Produce a display label for one tool call.
+    ///
+    /// With `tool_use_summaries` on, asks the lightweight model for a
+    /// one-line description. Any failure — an unavailable client, an API
+    /// error, or an empty response — falls back to
+    /// [`ToolCall::activity_summary`](crate::types::ToolCall::activity_summary).
+    /// This method never returns an error: a summary is a display nicety and
+    /// must not fail the turn.
+    async fn tool_use_summary(&self, name: &str, input: &serde_json::Value) -> String {
+        let fallback = crate::types::ToolCall::summarize_activity(name, input);
+        if !self.tool_use_summaries {
+            return fallback;
+        }
+        match crate::prompts::generate_tool_use_summary(self.api_client.as_ref(), name, input).await
+        {
+            Ok(summary) if !summary.is_empty() => summary,
+            Ok(_) => fallback,
+            Err(error) => {
+                tracing::debug!(
+                    %error,
+                    tool = name,
+                    "tool use summary unavailable; using activity summary"
+                );
+                fallback
+            }
+        }
+    }
+
     /// Execute pending tool calls with permission checks.
     async fn execute_tool_calls(
         &mut self,
@@ -4567,6 +4740,23 @@ impl QueryEngine {
                 .collect());
         }
 
+        // Generate labels before the scheduler emits `ToolCallStart`, so the
+        // start event and the preceding `ToolUseSummary` agree. When the flag
+        // is off this loop is skipped and the scheduler falls back to its
+        // deterministic activity summary.
+        let mut summaries = std::collections::HashMap::new();
+        if self.tool_use_summaries {
+            for call in &turn.pending_tool_calls {
+                let summary = self.tool_use_summary(&call.name, &call.input).await;
+                let _ = self.event_tx.send(EngineEvent::ToolUseSummary {
+                    id: call.id.clone(),
+                    name: call.name.clone(),
+                    summary: summary.clone(),
+                });
+                summaries.insert(call.id.clone(), summary);
+            }
+        }
+
         let outcome = tool_scheduler::run_tool_calls(
             &turn.pending_tool_calls,
             self.tools.as_ref(),
@@ -4575,6 +4765,7 @@ impl QueryEngine {
             options,
             &self.event_tx,
             &mut self.denied_tools,
+            &summaries,
         )
         .await?;
 
@@ -9000,6 +9191,305 @@ mod tests {
                 EngineEvent::Compaction(CompactionEvent::DeferredToThresholdPath { .. })
             )),
             "standing down should be on the stream, got {seen:?}"
+        );
+    }
+
+    // ─── Wired feature flags ───────────────────────────────────────────────
+
+    fn test_engine_with_api(
+        api: Box<dyn ApiClient>,
+    ) -> (QueryEngine, mpsc::UnboundedReceiver<EngineEvent>) {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let checker = PermissionChecker::new(PermissionMode::BypassPermissions);
+        let session = SessionState::new(std::path::PathBuf::from("/tmp/test"));
+        let mut engine = QueryEngine::new(
+            api,
+            ModelId::sonnet(),
+            session,
+            PermissionEngine::new(checker),
+            tx,
+        );
+        engine.set_tool_executor(Box::new(StubOkToolExecutor));
+        (engine, rx)
+    }
+
+    fn drain_events(rx: &mut mpsc::UnboundedReceiver<EngineEvent>) -> Vec<EngineEvent> {
+        let mut events = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            events.push(event);
+        }
+        events
+    }
+
+    #[test]
+    fn team_context_block_reads_the_installed_context() {
+        let (mut engine, _rx, _session) = make_test_engine();
+        assert!(
+            engine.team_context_block().is_none(),
+            "no installed context must leave the prompt unchanged"
+        );
+
+        let mut context = crate::team_context::TeamContext::new("team_alpha".into());
+        context.add_note(
+            "Storage".into(),
+            "Use Postgres for durable state".into(),
+            "alice".into(),
+        );
+        context.add_work_item(crate::team_context::WorkItem {
+            id: "w1".into(),
+            description: "Wire the remaining flags".into(),
+            worker_id: "bob".into(),
+            remaining_steps: 2,
+        });
+        context.record_activity("carol".into(), "opened a pull request".into());
+        engine.set_team_context(std::sync::Arc::new(std::sync::Mutex::new(context)));
+
+        let block = engine.team_context_block().expect("the installed context");
+        assert!(block.contains("team_alpha"), "{block}");
+        assert!(block.contains("Use Postgres for durable state"), "{block}");
+        assert!(block.contains("Wire the remaining flags"), "{block}");
+        assert!(block.contains("opened a pull request"), "{block}");
+    }
+
+    struct StreamingToolCallApi;
+
+    #[async_trait::async_trait]
+    impl ApiClient for StreamingToolCallApi {
+        fn clone_box(&self) -> Box<dyn ApiClient> {
+            Box::new(StreamingToolCallApi)
+        }
+
+        async fn create_message(
+            &self,
+            _system: &str,
+            _messages: &[serde_json::Value],
+            _model: &ModelId,
+            _max_tokens: u32,
+            _tools: &[crate::tool_executor::ToolInfo],
+        ) -> Result<ApiResponse, ApiError> {
+            Ok(ApiResponse {
+                content: String::new(),
+                tool_calls: vec![ToolCall {
+                    id: "tc_stream".into(),
+                    name: "bash".into(),
+                    input: serde_json::json!({"command": "true"}),
+                }],
+                usage: UsageSummary {
+                    input_tokens: 10,
+                    output_tokens: 5,
+                    cache_read_tokens: 0,
+                    cache_creation_tokens: 0,
+                },
+                stop_reason: "tool_use".into(),
+            })
+        }
+
+        async fn create_message_streaming(
+            &self,
+            _system: &str,
+            _messages: &[serde_json::Value],
+            _model: &ModelId,
+            _max_tokens: u32,
+            _tools: &[crate::tool_executor::ToolInfo],
+        ) -> std::pin::Pin<Box<dyn futures::Stream<Item = StreamEvent> + Send + 'static>> {
+            Box::pin(futures::stream::iter(vec![
+                StreamEvent::ToolCallBlockStart {
+                    id: "tc_stream".into(),
+                    name: "bash".into(),
+                },
+                StreamEvent::ToolCallBlockEnd {
+                    id: "tc_stream".into(),
+                    input: serde_json::json!({"command": "true"}),
+                },
+                StreamEvent::StopReason("tool_use".into()),
+                StreamEvent::StreamEnd,
+            ]))
+        }
+    }
+
+    #[tokio::test]
+    async fn streaming_tool_execution_flag_gates_early_execution() {
+        let (mut engine, _rx) = test_engine_with_api(Box::new(StreamingToolCallApi));
+        let options = SubmitOptions::default();
+
+        // Default: off, matching the reference. The call is assembled during
+        // the stream but returned for execution after it completes.
+        assert!(!engine.streaming_tool_execution());
+        let mut turn = TurnRuntime::new(TokenBudget::with_defaults());
+        let deferred = engine
+            .send_request_streaming(&mut turn, &options)
+            .await
+            .unwrap();
+        assert!(deferred.early_calls.is_empty());
+        assert_eq!(deferred.tool_calls.len(), 1);
+        assert_eq!(deferred.tool_calls[0].id, "tc_stream");
+
+        // On: the call executes while the stream is still open and comes
+        // back as an early result rather than a deferred call.
+        engine.set_streaming_tool_execution(true);
+        let mut turn = TurnRuntime::new(TokenBudget::with_defaults());
+        let early = engine
+            .send_request_streaming(&mut turn, &options)
+            .await
+            .unwrap();
+        assert_eq!(early.early_calls.len(), 1);
+        assert_eq!(early.early_calls[0].id, "tc_stream");
+        assert_eq!(early.early_results.len(), 1);
+        assert_eq!(early.early_results[0].tool_call_id, "tc_stream");
+        assert!(early.tool_calls.is_empty());
+    }
+
+    /// Returns a fixed summary on `create_message`, or an error when
+    /// `summary` is `None`, to exercise the fallback path.
+    struct SummaryApi {
+        summary: Option<&'static str>,
+    }
+
+    #[async_trait::async_trait]
+    impl ApiClient for SummaryApi {
+        fn clone_box(&self) -> Box<dyn ApiClient> {
+            Box::new(Self {
+                summary: self.summary,
+            })
+        }
+
+        async fn create_message(
+            &self,
+            _system: &str,
+            _messages: &[serde_json::Value],
+            _model: &ModelId,
+            _max_tokens: u32,
+            _tools: &[crate::tool_executor::ToolInfo],
+        ) -> Result<ApiResponse, ApiError> {
+            match self.summary {
+                Some(summary) => Ok(ApiResponse {
+                    content: summary.into(),
+                    tool_calls: Vec::new(),
+                    usage: UsageSummary::default(),
+                    stop_reason: "end_turn".into(),
+                }),
+                None => Err(ApiError::Http("no lightweight client available".into())),
+            }
+        }
+
+        async fn create_message_streaming(
+            &self,
+            _system: &str,
+            _messages: &[serde_json::Value],
+            _model: &ModelId,
+            _max_tokens: u32,
+            _tools: &[crate::tool_executor::ToolInfo],
+        ) -> std::pin::Pin<Box<dyn futures::Stream<Item = StreamEvent> + Send + 'static>> {
+            Box::pin(futures::stream::empty())
+        }
+    }
+
+    #[tokio::test]
+    async fn tool_use_summaries_flag_emits_a_model_written_label() {
+        let (mut engine, mut rx) = test_engine_with_api(Box::new(SummaryApi {
+            summary: Some("Running a shell command"),
+        }));
+        engine.set_tool_use_summaries(true);
+        let mut turn = TurnRuntime::new(TokenBudget::with_defaults());
+        let call = ToolCall {
+            id: "tc_summary".into(),
+            name: "bash".into(),
+            input: serde_json::json!({"command": "true"}),
+        };
+        let result = engine
+            .execute_early_tool_call(&mut turn, call, &SubmitOptions::default())
+            .await
+            .unwrap();
+        assert!(result.is_some(), "the tool call still executed");
+
+        let events = drain_events(&mut rx);
+        let summary = events
+            .iter()
+            .find_map(|event| match event {
+                EngineEvent::ToolUseSummary { summary, .. } => Some(summary.clone()),
+                _ => None,
+            })
+            .expect("a ToolUseSummary event");
+        assert_eq!(summary, "Running a shell command");
+        let start = events
+            .iter()
+            .find_map(|event| match event {
+                EngineEvent::ToolCallStart { summary, .. } => Some(summary.clone()),
+                _ => None,
+            })
+            .expect("a ToolCallStart event");
+        assert_eq!(
+            start, summary,
+            "the start label must be the model-written summary"
+        );
+    }
+
+    #[tokio::test]
+    async fn tool_use_summaries_flag_off_keeps_the_deterministic_label() {
+        let (mut engine, mut rx) = test_engine_with_api(Box::new(SummaryApi {
+            summary: Some("this text must never be requested"),
+        }));
+        assert!(!engine.tool_use_summaries());
+        let mut turn = TurnRuntime::new(TokenBudget::with_defaults());
+        let call = ToolCall {
+            id: "tc_summary".into(),
+            name: "bash".into(),
+            input: serde_json::json!({"command": "true"}),
+        };
+        engine
+            .execute_early_tool_call(&mut turn, call, &SubmitOptions::default())
+            .await
+            .unwrap();
+
+        let events = drain_events(&mut rx);
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, EngineEvent::ToolUseSummary { .. })),
+            "the summary event is gated by the flag: {events:?}"
+        );
+        let start = events
+            .iter()
+            .find_map(|event| match event {
+                EngineEvent::ToolCallStart { summary, .. } => Some(summary.clone()),
+                _ => None,
+            })
+            .expect("a ToolCallStart event");
+        assert_eq!(
+            start,
+            ToolCall::summarize_activity("bash", &serde_json::json!({"command": "true"}))
+        );
+    }
+
+    #[tokio::test]
+    async fn tool_use_summary_failure_falls_back_without_failing_the_turn() {
+        let (mut engine, mut rx) = test_engine_with_api(Box::new(SummaryApi { summary: None }));
+        engine.set_tool_use_summaries(true);
+        let mut turn = TurnRuntime::new(TokenBudget::with_defaults());
+        let call = ToolCall {
+            id: "tc_summary".into(),
+            name: "bash".into(),
+            input: serde_json::json!({"command": "true"}),
+        };
+        let result = engine
+            .execute_early_tool_call(&mut turn, call, &SubmitOptions::default())
+            .await;
+        assert!(
+            result.unwrap().is_some(),
+            "a failed summary must not fail the tool call"
+        );
+
+        let events = drain_events(&mut rx);
+        let summary = events
+            .iter()
+            .find_map(|event| match event {
+                EngineEvent::ToolUseSummary { summary, .. } => Some(summary.clone()),
+                _ => None,
+            })
+            .expect("a ToolUseSummary event with the fallback label");
+        assert_eq!(
+            summary,
+            ToolCall::summarize_activity("bash", &serde_json::json!({"command": "true"}))
         );
     }
 }

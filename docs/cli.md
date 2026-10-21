@@ -177,25 +177,22 @@ A comma-separated list applied on top of `CODEREX_FEATURE_FLAGS`:
   `CapabilitySet` is derived from it.
 - Every name must be one this build knows: `streaming_tool_execution`,
   `tool_use_summaries`, `fast_mode`, `coordinator_mode`, `history_snip`,
-  `agent_triggers`, `bridge_mode`, `daemon`, `voice_mode`, `buddy`,
-  `workflow_scripts`, `web_browser_tool`, `team_collaboration`, `auto_dream`.
+  `agent_triggers`, `voice_mode`, `workflow_scripts`, `web_browser_tool`,
+  `team_collaboration`, `auto_dream`, and the six command-availability flags
+  (`ultraplan`, `thinkback`, `heapdump`, `mock_limits`, `ctx_viz`, `stickers`).
 - An unknown name is a startup error listing the unknown names and the known
   set; it is never dropped silently.
-- Some names are accepted for configuration compatibility but have no effect in
-  this build: `streaming_tool_execution`, `tool_use_summaries`, `bridge_mode`,
-  `daemon`, `buddy`, and `team_collaboration`. Enabling any of them logs a
-  warning at startup instead of implying behavior. Each names a real surface
-  this build has not wired to the flag: streaming tool execution already runs
-  unconditionally in `core::engine`; the tool-use summary surface does not
-  exist; the bridge and the daemon are subcommands rather than session
-  capabilities; the companion lives behind the compile-time `buddy` feature,
-  which this workspace does not enable; and the team context exists but nothing
-  reads it. The `INERT_FLAGS` doc comment in `crates/config/src/flags.rs`
-  records the exact reason and what building each one would take.
-- Three names that used to be accepted — `context_collapse`, `terminal_panel`,
-  and `kairos` — were removed. No code in the workspace could ever be their
-  product surface, so accepting them promised behavior that did not exist; they
-  are now rejected as unknown flags.
+- `INERT_FLAGS` is empty: every known name now has a consumer. A name that
+  cannot be gated at runtime should be deleted rather than accepted, because
+  accepting it promises behavior that does not exist.
+- Six names that used to be accepted were removed. `context_collapse`,
+  `terminal_panel`, and `kairos` had no product surface anywhere in the
+  workspace. `bridge_mode`, `daemon`, and `buddy` were removed after review
+  for a related reason — no runtime-gateable surface: the bridge and the daemon
+  are separate subcommand
+  entry points (`bridge`, `serve`) with no session-level behavior a flag could
+  gate, and the companion lives behind the compile-time `buddy` cargo feature,
+  which a runtime flag cannot reach. All six are rejected as unknown flags.
 - These names do have consumers: `web_browser_tool` (gates the `WebFetch`
   tool), `agent_triggers` (gates the agent-kind hook path — with it off a
   configured `agent` hook is dropped at startup with a warning), `auto_dream`
@@ -205,8 +202,14 @@ A comma-separated list applied on top of `CODEREX_FEATURE_FLAGS`:
   `ANTHROPIC_MODEL`/`OPENAI_MODEL`, or settings `model` still wins),
   `coordinator_mode` (installs a `CoordinatorState` on the session engine so
   its per-turn phase advance runs), `history_snip` (makes compaction prefer the
-  snip strategy as soon as it is warranted), `workflow_scripts`, `voice_mode`,
-  and the six command-availability flags.
+  snip strategy as soon as it is warranted), `streaming_tool_execution`
+  (on: tool calls execute while the stream is open; off, the default: they
+  execute after the stream completes), `tool_use_summaries` (asks the
+  lightweight model for a one-line label per tool use and emits it as an
+  engine event, falling back to the deterministic activity summary on
+  failure), `team_collaboration` (installs a `TeamContext` built from stored
+  team-memory entries, whose notes the engine injects into each request),
+  `workflow_scripts`, `voice_mode`, and the six command-availability flags.
 
 ### `--from-pr URL`
 

@@ -25,6 +25,10 @@ pub fn engine_event_to_wire(event: &EngineEvent) -> Option<WireEvent> {
             id: id.clone(),
             result: WireToolResult::from(result.clone()),
         },
+        // The summary is a local display hint for the interactive renderer;
+        // it rides in front of a `ToolCallStart` whose `summary` field already
+        // carries the same text, so the wire protocol needs no new frame.
+        EngineEvent::ToolUseSummary { .. } => return None,
         EngineEvent::CompactBoundary => WireEvent::CompactBoundary,
         EngineEvent::Compaction(event) => WireEvent::Compaction(event.clone()),
         EngineEvent::PermissionRequest { id, tool, args } => WireEvent::PermissionRequest {

@@ -770,6 +770,21 @@ pub enum EngineEvent {
         /// Execution result.
         result: ToolResult,
     },
+    /// A one-line, model-written description of a tool use.
+    ///
+    /// Emitted only when the `tool_use_summaries` flag is on, before the
+    /// matching [`ToolCallStart`](Self::ToolCallStart). The UI can use it as
+    /// the display label; the engine falls back to
+    /// [`ToolCall::activity_summary`](crate::types::ToolCall::activity_summary)
+    /// when summarization is unavailable, so this event is advisory.
+    ToolUseSummary {
+        /// The tool call this summary describes.
+        id: String,
+        /// Tool name.
+        name: String,
+        /// One-line summary, already trimmed to a single line.
+        summary: String,
+    },
     /// A compact boundary marker was inserted.
     CompactBoundary,
     /// Compaction was requested, ran, or stood down, and why.

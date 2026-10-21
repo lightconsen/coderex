@@ -2942,7 +2942,10 @@ impl StartupOrchestrator {
             engine.set_context_window_resolver(context_window.clone());
             // The same flag behaviours the REPL installs: a served session
             // honours `coordinator_mode` and `history_snip` too.
-            crate::repl::apply_engine_flag_behaviours(&mut engine, &flags);
+            let memory_base = std::path::PathBuf::from(&cwd)
+                .join(".coderex")
+                .join("memory");
+            crate::repl::apply_engine_flag_behaviours(&mut engine, &flags, Some(&memory_base));
             (engine, rx)
         }))
     }

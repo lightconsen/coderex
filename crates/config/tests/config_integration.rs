@@ -306,24 +306,24 @@ fn config_service_diff_detects_changes() {
 
 #[test]
 fn feature_flags_parse_enables_single_flag() {
-    let flags = FeatureFlags::parse("daemon");
-    assert!(flags.daemon);
-    assert!(!flags.buddy);
+    let flags = FeatureFlags::parse("voice_mode");
+    assert!(flags.voice_mode);
+    assert!(!flags.workflow_scripts);
     assert!(!flags.coordinator_mode);
 }
 
 #[test]
 fn feature_flags_parse_plus_minus_syntax() {
-    let flags = FeatureFlags::parse("+daemon,+buddy,-daemon");
-    assert!(!flags.daemon);
-    assert!(flags.buddy);
+    let flags = FeatureFlags::parse("+voice_mode,+workflow_scripts,-voice_mode");
+    assert!(!flags.voice_mode);
+    assert!(flags.workflow_scripts);
 }
 
 #[test]
 fn feature_flags_parse_all_runtime_flags() {
     let flags = FeatureFlags::parse(
         "streaming_tool_execution,tool_use_summaries,fast_mode,coordinator_mode,\
-         history_snip,agent_triggers,bridge_mode,daemon,voice_mode,buddy,\
+         history_snip,agent_triggers,voice_mode,\
          workflow_scripts,web_browser_tool,team_collaboration,auto_dream",
     );
     assert!(flags.streaming_tool_execution);
@@ -332,10 +332,7 @@ fn feature_flags_parse_all_runtime_flags() {
     assert!(flags.coordinator_mode);
     assert!(flags.history_snip);
     assert!(flags.agent_triggers);
-    assert!(flags.bridge_mode);
-    assert!(flags.daemon);
     assert!(flags.voice_mode);
-    assert!(flags.buddy);
     assert!(flags.workflow_scripts);
     assert!(flags.web_browser_tool);
     assert!(flags.team_collaboration);
@@ -343,9 +340,16 @@ fn feature_flags_parse_all_runtime_flags() {
 }
 
 #[test]
+fn deleted_flags_are_rejected() {
+    let error = FeatureFlags::parse_checked("bridge_mode,daemon,buddy")
+        .expect_err("deleted names are no longer known");
+    assert_eq!(error.names, vec!["bridge_mode", "daemon", "buddy"]);
+}
+
+#[test]
 fn feature_flags_unknown_flag_no_panic() {
-    let flags = FeatureFlags::parse("nonexistent_flag,+daemon,unknown");
-    assert!(flags.daemon);
+    let flags = FeatureFlags::parse("nonexistent_flag,+voice_mode,unknown");
+    assert!(flags.voice_mode);
     // Unknown flags should be silently ignored (with a warning)
 }
 
@@ -357,15 +361,13 @@ fn feature_flags_unknown_flag_no_panic() {
 #[test]
 fn capability_set_derives_from_flags() {
     let mut flags = FeatureFlags::default();
-    flags.daemon = true;
-    flags.bridge_mode = true;
     flags.voice_mode = true;
+    flags.web_browser_tool = true;
     flags.auto_dream = true;
 
     let caps = flags.capabilities();
-    assert!(caps.contains(CapabilitySet::DAEMON));
-    assert!(caps.contains(CapabilitySet::BRIDGE));
     assert!(caps.contains(CapabilitySet::VOICE));
+    assert!(caps.contains(CapabilitySet::WEB_BROWSER));
     assert!(caps.contains(CapabilitySet::DREAM));
     assert!(!caps.contains(CapabilitySet::COORDINATOR));
     assert!(!caps.contains(CapabilitySet::TEAM));
@@ -381,14 +383,14 @@ fn capability_set_empty_by_default() {
 #[test]
 fn flag_registry_read_write() {
     let registry = FlagRegistry::new();
-    assert!(!registry.has_capability(CapabilitySet::DAEMON));
+    assert!(!registry.has_capability(CapabilitySet::VOICE));
 
-    registry.set_flag("daemon", true);
-    assert!(registry.has_capability(CapabilitySet::DAEMON));
+    registry.set_flag("voice_mode", true);
+    assert!(registry.has_capability(CapabilitySet::VOICE));
 
     let flags = registry.flags();
-    assert!(flags.daemon);
-    assert!(!flags.buddy);
+    assert!(flags.voice_mode);
+    assert!(!flags.workflow_scripts);
 }
 
 #[test]
@@ -401,7 +403,7 @@ fn flag_registry_capabilities_update_after_set() {
 
     assert!(registry.has_capability(CapabilitySet::COORDINATOR));
     assert!(registry.has_capability(CapabilitySet::TEAM));
-    assert!(!registry.has_capability(CapabilitySet::DAEMON));
+    assert!(!registry.has_capability(CapabilitySet::VOICE));
 }
 
 // Note: FlagRegistry::from_env() is a thin wrapper around
@@ -415,31 +417,31 @@ fn flag_registry_capabilities_update_after_set() {
 fn experiments_override_base_flags() {
     let flags = FeatureFlags::default();
     let mut experiments = HashMap::new();
-    experiments.insert("daemon".into(), true);
-    experiments.insert("buddy".into(), true);
+    experiments.insert("voice_mode".into(), true);
+    experiments.insert("workflow_scripts".into(), true);
     experiments.insert("coordinator_mode".into(), false);
 
     let result = flags.with_experiments(&experiments);
-    assert!(result.daemon);
-    assert!(result.buddy);
+    assert!(result.voice_mode);
+    assert!(result.workflow_scripts);
     assert!(!result.coordinator_mode);
-    assert!(!result.bridge_mode);
+    assert!(!result.web_browser_tool);
 }
 
 #[test]
 fn experiments_merged_with_existing_flags() {
     let mut flags = FeatureFlags::default();
-    flags.daemon = true;
+    flags.voice_mode = true;
     flags.coordinator_mode = true;
 
     let mut experiments = HashMap::new();
     experiments.insert("coordinator_mode".into(), false);
-    experiments.insert("buddy".into(), true);
+    experiments.insert("workflow_scripts".into(), true);
 
     let result = flags.with_experiments(&experiments);
-    assert!(result.daemon); // preserved
+    assert!(result.voice_mode); // preserved
     assert!(!result.coordinator_mode); // overridden by experiment
-    assert!(result.buddy); // added by experiment
+    assert!(result.workflow_scripts); // added by experiment
 }
 
 #[test]
@@ -471,11 +473,11 @@ fn percentage_rollout_different_sessions_may_differ() {
 fn flag_registry_apply_experiments() {
     let registry = FlagRegistry::new();
     let mut experiments = HashMap::new();
-    experiments.insert("daemon".into(), true);
+    experiments.insert("workflow_scripts".into(), true);
     experiments.insert("voice_mode".into(), true);
 
     registry.apply_experiments(&experiments);
-    assert!(registry.has_capability(CapabilitySet::DAEMON));
+    assert!(registry.has_capability(CapabilitySet::WORKFLOW));
     assert!(registry.has_capability(CapabilitySet::VOICE));
 }
 

@@ -20,6 +20,7 @@ pub mod features {
     pub mod prompt_suggestion;
     pub mod session_memory;
     pub mod session_title;
+    pub mod tool_use_summary;
 }
 
 pub use features::agent_generation::{AgentSpec, generate_agent, generate_agent_prompt};
@@ -38,6 +39,9 @@ pub use features::prompt_suggestion::{suggest_next_action, suggest_prompts};
 pub use features::session_memory::{create_session_memory, update_session_memory};
 pub use features::session_title::{
     generate_session_title, generate_session_title_from_messages, parse_title,
+};
+pub use features::tool_use_summary::{
+    generate_tool_use_summary, sanitize_tool_use_summary, tool_use_summary_user_prompt,
 };
 
 // ─── Session Title ──────────────────────────────────────────────────────────

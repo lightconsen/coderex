@@ -54,7 +54,7 @@ pub struct SchedulerOutcome {
 }
 
 /// Execute pending tool calls with permission checks and hooks.
-pub async fn run_tool_calls(
+pub async fn run_tool_calls<S: std::hash::BuildHasher + Sync>(
     calls: &[PendingToolCall],
     tools: &dyn ToolExecutor,
     permission_engine: &mut PermissionEngine,
@@ -62,6 +62,7 @@ pub async fn run_tool_calls(
     options: &SubmitOptions,
     event_tx: &mpsc::UnboundedSender<EngineEvent>,
     denied_tools: &mut Vec<DeniedToolCall>,
+    summaries: &std::collections::HashMap<String, String, S>,
 ) -> Result<SchedulerOutcome, String> {
     let mut results: Vec<Option<ToolResult>> = vec![None; calls.len()];
     let mut approved: Vec<(usize, ApprovedCall)> = Vec::new();
@@ -98,7 +99,12 @@ pub async fn run_tool_calls(
         let _ = event_tx.send(EngineEvent::ToolCallStart {
             id: call.id.clone(),
             name: call.name.clone(),
-            summary: ToolCall::summarize_activity(&call.name, &call.input),
+            // `tool_use_summaries` supplies a model-written label; without
+            // it (or when summarization failed) use the deterministic one.
+            summary: summaries
+                .get(&call.id)
+                .cloned()
+                .unwrap_or_else(|| ToolCall::summarize_activity(&call.name, &call.input)),
         });
 
         // 3. PreToolUse hook
@@ -417,6 +423,7 @@ mod tests {
             &SubmitOptions::default(),
             &tx,
             &mut denied,
+            &std::collections::HashMap::new(),
         )
         .await
         .unwrap();
@@ -459,6 +466,7 @@ mod tests {
             &SubmitOptions::default(),
             &tx,
             &mut denied,
+            &std::collections::HashMap::new(),
         )
         .await
         .unwrap();
@@ -505,6 +513,7 @@ mod tests {
             &options,
             &tx,
             &mut denied,
+            &std::collections::HashMap::new(),
         )
         .await
         .unwrap();
@@ -555,6 +564,7 @@ mod tests {
             &options,
             &tx,
             &mut denied,
+            &std::collections::HashMap::new(),
         )
         .await
         .unwrap();

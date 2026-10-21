@@ -211,6 +211,15 @@ impl UiState {
             EngineEvent::ToolCallEnd { id, result } => {
                 self.complete_tool_call(&id, &result);
             }
+            EngineEvent::ToolUseSummary { id, summary, .. } => {
+                // Advisory and ordered before `ToolCallStart`, whose summary
+                // field carries the same text. If a renderer already made the
+                // call active, upgrade its label; otherwise the start event
+                // that follows will use the summary itself.
+                if let Some(call) = self.active_tool_calls.iter_mut().find(|call| call.id == id) {
+                    call.summary = summary;
+                }
+            }
             EngineEvent::CompactBoundary => {
                 self.transcript.push(TranscriptEntry::CompactBoundary);
             }

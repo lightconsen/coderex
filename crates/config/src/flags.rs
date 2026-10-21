@@ -16,10 +16,7 @@ pub const KNOWN_FLAGS: &[&str] = &[
     "coordinator_mode",
     "history_snip",
     "agent_triggers",
-    "bridge_mode",
-    "daemon",
     "voice_mode",
-    "buddy",
     "workflow_scripts",
     "web_browser_tool",
     "team_collaboration",
@@ -38,65 +35,35 @@ pub const KNOWN_FLAGS: &[&str] = &[
 /// Flags accepted for configuration compatibility that have no effect in
 /// this build.
 ///
-/// These names are deliberately kept in [`KNOWN_FLAGS`]: configuration,
-/// experiment payloads, and per-project files written by other builds may
-/// mention them, and rejecting them would turn a compatibility name into a
-/// parse error. Nothing in this build reads them, so [`FeatureFlags`] stores
-/// their parsed state but no behavior depends on it. See
-/// [`FeatureFlags::inert_flags`].
+/// A name belongs here only when it stays in [`KNOWN_FLAGS`] so configuration
+/// written by another build still parses, yet no production code reads it.
+/// [`FeatureFlags`] stores the state and [`FeatureFlags::inert_flags`] reports
+/// it. The list is empty: every name that used to be here has either been
+/// wired to a product path or deleted.
 ///
-/// A name leaves this list only when a product path reads it. `web_browser_tool`
-/// gates the `WebFetch` tool (see `coderex_tools::required_feature_flag`),
-/// `agent_triggers` gates the agent-kind hook path, and `auto_dream` gates the
-/// auto-dream manager; all three now do something, so they are no longer here.
-/// `fast_mode` now resolves the session model through
-/// `ModelProfile::Lightweight` when nothing else chose one, `coordinator_mode`
-/// installs a `CoordinatorState` on the session engine, and `history_snip`
-/// makes compaction prefer the snip strategy as soon as it is warranted; all
-/// three are read by the CLI and the engine, so they are no longer here either.
+/// Wiring history for the six names this list last held:
+///
+/// - `streaming_tool_execution` is now the switch between executing tool calls
+///   as they arrive in a streamed response (`execute_early_tool_call`) and
+///   executing them after the stream completes. It is off by default, matching
+///   the reference; the CLI installs it on the session engine.
+/// - `tool_use_summaries` now makes the engine ask a
+///   `ModelProfile::Lightweight` model for a one-line summary of each tool use
+///   and emit it as [`coderex_core::types::EngineEvent::ToolUseSummary`],
+///   falling back to `ToolCall::activity_summary()` when the summarizer fails.
+/// - `team_collaboration` now makes the CLI install a
+///   `core::team_context::TeamContext` on the session engine, which reads its
+///   notes and activity into the request context each turn.
+/// - `bridge_mode`, `daemon`, and `buddy` were deleted. The bridge and the
+///   daemon are separate CLI entry points (`bridge`, `serve`), which a session
+///   flag cannot gate; `buddy` lives behind the compile-time `buddy` cargo
+///   feature, which a runtime flag cannot reach.
 ///
 /// A name is deleted outright when no code in the workspace could ever be its
 /// product surface. `context_collapse`, `terminal_panel`, and `kairos` were
-/// removed for that reason: nothing here implements a context-collapse pass, a
-/// terminal panel, or a proactive/Kairos mode, so accepting them only promised
-/// behavior that did not exist.
-///
-/// Each name that remains is kept for a specific, checkable reason: the artifact
-/// it would gate already exists, but no flag reads it. The reference's behavior
-/// and what building the flag would take are recorded per name:
-///
-/// - `streaming_tool_execution`: the reference lets a beta turn on executing
-///   tool calls as they arrive in a streamed response. `core::engine` already
-///   does this (`execute_early_tool_call`, driven by
-///   `StreamingToolCallAssembler`), unconditionally. Making the flag the switch
-///   needs a `QueryEngine` setter that the streaming loop consults.
-/// - `tool_use_summaries`: the reference has the model write a one-line summary
-///   of each tool use. CodeRex emits only the fixed `ToolCall::activity_summary()`
-///   label. Building it takes a `ModelProfile::Lightweight` summarizer call and
-///   a surface to render the result.
-/// - `bridge_mode`: the reference gates a session-side bridge capability.
-///   CodeRex's bridge is the `bridge` subcommand (a separate entry point), so
-///   the flag has nothing distinct to gate. Wiring it means either aliasing the
-///   subcommand or gating a session-side bridge transport.
-/// - `daemon`: the reference runs CodeRex as a background daemon. CodeRex's
-///   daemon is the `serve` subcommand, which writes a PID file and runs the
-///   server in the foreground; there is no detach path. Wiring the flag means
-///   adding one (fork/`setsid`, log redirection) that `serve` does not have.
-/// - `buddy`: the reference ships a companion sprite. `crates/ui/src/buddy.rs`
-///   is real but sits behind the compile-time `buddy` cargo feature, which this
-///   workspace never enables, so a runtime flag cannot reach it.
-/// - `team_collaboration`: the reference coordinates an in-process team. The
-///   `TeamCreate`/`TeamDelete` tools, `core::team_context::TeamContext`, and the
-///   `/team-memory` sync command all exist, but the flag gates none of them and
-///   the engine stores a team context without ever reading it.
-const INERT_FLAGS: &[&str] = &[
-    "streaming_tool_execution",
-    "tool_use_summaries",
-    "bridge_mode",
-    "daemon",
-    "buddy",
-    "team_collaboration",
-];
+/// removed for that reason, and now so were `bridge_mode`, `daemon`, and
+/// `buddy`.
+const INERT_FLAGS: &[&str] = &[];
 
 /// One or more feature flag names that this build does not know.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -121,9 +88,18 @@ impl std::error::Error for UnknownFeatureFlags {}
 /// All feature flags supported by CodeRex.
 #[derive(Debug, Clone, Default)]
 pub struct FeatureFlags {
-    /// Enable streaming tool execution.
+    /// Execute tool calls as they arrive in a streamed response.
+    ///
+    /// On: a completed tool call is executed while the stream is still open.
+    /// Off (the default, matching the reference): calls execute after the
+    /// stream completes. The CLI installs this on the session engine.
     pub streaming_tool_execution: bool,
-    /// Show tool use summaries.
+    /// Ask the lightweight model for a one-line summary of each tool use.
+    ///
+    /// When on, the engine emits an
+    /// [`EngineEvent::ToolUseSummary`](coderex_core::types::EngineEvent::ToolUseSummary)
+    /// before each tool call and uses that summary as the activity label. A
+    /// failed summarization falls back to `ToolCall::activity_summary()`.
     pub tool_use_summaries: bool,
     /// Run the session on the lightweight model profile.
     ///
@@ -143,19 +119,17 @@ pub struct FeatureFlags {
     pub history_snip: bool,
     /// Enable agent triggers.
     pub agent_triggers: bool,
-    /// Enable bridge mode.
-    pub bridge_mode: bool,
-    /// Enable daemon mode.
-    pub daemon: bool,
     /// Enable voice mode.
     pub voice_mode: bool,
-    /// Enable buddy/companion mode.
-    pub buddy: bool,
     /// Enable workflow scripts.
     pub workflow_scripts: bool,
     /// Enable web browser tool.
     pub web_browser_tool: bool,
     /// Enable team collaboration.
+    ///
+    /// When on, the CLI installs a `TeamContext` on the session engine, which
+    /// reads its shared notes, in-progress work and recent activity into the
+    /// request context each turn.
     pub team_collaboration: bool,
     /// Enable auto dream mode.
     pub auto_dream: bool,
@@ -191,22 +165,16 @@ bitflags! {
         const STREAMING_TOOLS = 1 << 0;
         /// Coordinator mode capability.
         const COORDINATOR = 1 << 1;
-        /// Bridge mode capability.
-        const BRIDGE = 1 << 2;
-        /// Daemon mode capability.
-        const DAEMON = 1 << 3;
         /// Voice mode capability.
-        const VOICE = 1 << 4;
-        /// Buddy mode capability.
-        const BUDDY = 1 << 5;
+        const VOICE = 1 << 2;
         /// Workflow scripts capability.
-        const WORKFLOW = 1 << 6;
+        const WORKFLOW = 1 << 3;
         /// Web browser tool capability.
-        const WEB_BROWSER = 1 << 7;
+        const WEB_BROWSER = 1 << 4;
         /// Team collaboration capability.
-        const TEAM = 1 << 8;
+        const TEAM = 1 << 5;
         /// Dream mode capability.
-        const DREAM = 1 << 9;
+        const DREAM = 1 << 6;
     }
 }
 
@@ -214,7 +182,7 @@ impl FeatureFlags {
     /// Parse feature flags from a comma-separated string.
     ///
     /// Format: `+flag_name` enables, `-flag_name` disables. Bare names default to enable.
-    /// Example: `"+streaming_tool_execution,-daemon"`
+    /// Example: `"+streaming_tool_execution,-voice_mode"`
     ///
     /// Unknown names are logged and skipped. Use [`Self::parse_checked`] when
     /// a person supplied the list and a typo must be reported rather than
@@ -302,17 +270,8 @@ impl FeatureFlags {
         if self.coordinator_mode {
             caps.insert(CapabilitySet::COORDINATOR);
         }
-        if self.bridge_mode {
-            caps.insert(CapabilitySet::BRIDGE);
-        }
-        if self.daemon {
-            caps.insert(CapabilitySet::DAEMON);
-        }
         if self.voice_mode {
             caps.insert(CapabilitySet::VOICE);
-        }
-        if self.buddy {
-            caps.insert(CapabilitySet::BUDDY);
         }
         if self.workflow_scripts {
             caps.insert(CapabilitySet::WORKFLOW);
@@ -337,7 +296,7 @@ impl FeatureFlags {
     /// changes no behavior. They are reported here so tooling and tests can
     /// distinguish a flag that is merely stored from one that does something,
     /// without removing the names from configuration files that mention them.
-    /// See [`INERT_FLAGS`] for why each remaining name is still inert.
+    /// The list is currently empty; see [`INERT_FLAGS`] for the history.
     #[must_use]
     pub fn inert_flags(&self) -> Vec<&'static str> {
         INERT_FLAGS
@@ -371,10 +330,7 @@ impl FeatureFlags {
             "coordinator_mode" => self.coordinator_mode,
             "history_snip" => self.history_snip,
             "agent_triggers" => self.agent_triggers,
-            "bridge_mode" => self.bridge_mode,
-            "daemon" => self.daemon,
             "voice_mode" => self.voice_mode,
-            "buddy" => self.buddy,
             "workflow_scripts" => self.workflow_scripts,
             "web_browser_tool" => self.web_browser_tool,
             "team_collaboration" => self.team_collaboration,
@@ -424,7 +380,7 @@ impl FeatureFlags {
     /// Load per-project feature flags from a JSON file at the given path.
     ///
     /// Returns an empty map if the file doesn't exist or can't be parsed.
-    /// The file format is `{"daemon": true, "bridge_mode": false, ...}`.
+    /// The file format is `{"voice_mode": true, "workflow_scripts": false, ...}`.
     pub fn load_project_flags(path: &std::path::Path) -> HashMap<String, bool> {
         std::fs::read_to_string(path)
             .ok()
@@ -503,10 +459,7 @@ impl FeatureFlags {
             "coordinator_mode" => self.coordinator_mode = enable,
             "history_snip" => self.history_snip = enable,
             "agent_triggers" => self.agent_triggers = enable,
-            "bridge_mode" => self.bridge_mode = enable,
-            "daemon" => self.daemon = enable,
             "voice_mode" => self.voice_mode = enable,
-            "buddy" => self.buddy = enable,
             "workflow_scripts" => self.workflow_scripts = enable,
             "web_browser_tool" => self.web_browser_tool = enable,
             "team_collaboration" => self.team_collaboration = enable,
@@ -653,67 +606,67 @@ mod tests {
 
     #[test]
     fn feature_flags_from_parse_enables_flag() {
-        let flags = FeatureFlags::parse("daemon");
-        assert!(flags.daemon);
-        assert!(!flags.buddy);
+        let flags = FeatureFlags::parse("voice_mode");
+        assert!(flags.voice_mode);
+        assert!(!flags.workflow_scripts);
     }
 
     #[test]
     fn feature_flags_from_parse_enables_and_disables() {
         let flags =
-            FeatureFlags::parse("+daemon,+streaming_tool_execution,-streaming_tool_execution");
-        assert!(flags.daemon);
+            FeatureFlags::parse("+voice_mode,+streaming_tool_execution,-streaming_tool_execution");
+        assert!(flags.voice_mode);
         assert!(!flags.streaming_tool_execution);
     }
 
     #[test]
     fn feature_flags_unknown_flag_no_panic() {
         let flags = FeatureFlags::parse("nonexistent_flag");
-        assert!(!flags.daemon);
+        assert!(!flags.voice_mode);
     }
 
     #[test]
     fn checked_parse_reports_every_unknown_name() {
-        let error = FeatureFlags::parse_checked("+daemon,not_a_flag,-also_missing")
+        let error = FeatureFlags::parse_checked("+voice_mode,not_a_flag,-also_missing")
             .expect_err("unknown flags must be reported");
         assert_eq!(error.names, vec!["not_a_flag", "also_missing"]);
         let rendered = error.to_string();
         assert!(rendered.contains("not_a_flag"), "{rendered}");
         assert!(rendered.contains("known flags:"), "{rendered}");
-        assert!(rendered.contains("daemon"), "{rendered}");
+        assert!(rendered.contains("voice_mode"), "{rendered}");
     }
 
     #[test]
     fn checked_parse_accepts_plus_minus_and_bare_names() {
-        let flags = FeatureFlags::parse_checked("+daemon,-buddy,voice_mode")
+        let flags = FeatureFlags::parse_checked("+voice_mode,-workflow_scripts,history_snip")
             .expect("all three spellings are valid");
-        assert!(flags.daemon);
-        assert!(!flags.buddy);
         assert!(flags.voice_mode);
+        assert!(!flags.workflow_scripts);
+        assert!(flags.history_snip);
     }
 
     #[test]
     fn apply_comma_list_overlays_existing_flags() {
         let mut flags = FeatureFlags::default();
-        flags.daemon = true;
-        flags.buddy = true;
+        flags.voice_mode = true;
+        flags.workflow_scripts = true;
 
         flags
-            .apply_comma_list("-daemon,+voice_mode")
+            .apply_comma_list("-voice_mode,+history_snip")
             .expect("known flags");
-        assert!(!flags.daemon, "a '-' token must disable");
-        assert!(flags.buddy, "untouched flags keep their value");
-        assert!(flags.voice_mode, "a '+' token must enable");
+        assert!(!flags.voice_mode, "a '-' token must disable");
+        assert!(flags.workflow_scripts, "untouched flags keep their value");
+        assert!(flags.history_snip, "a '+' token must enable");
     }
 
     #[test]
     fn apply_comma_list_applies_known_tokens_even_with_an_unknown_one() {
         let mut flags = FeatureFlags::default();
         let error = flags
-            .apply_comma_list("daemon,nope")
+            .apply_comma_list("voice_mode,nope")
             .expect_err("the typo must be reported");
         assert_eq!(error.names, vec!["nope"]);
-        assert!(flags.daemon, "known tokens must not be dropped");
+        assert!(flags.voice_mode, "known tokens must not be dropped");
     }
 
     #[test]
@@ -723,22 +676,22 @@ mod tests {
         let parsed = FeatureFlags::parse_checked(&KNOWN_FLAGS.join(","))
             .expect("the documented names must all be accepted");
         assert!(parsed.capabilities().bits() > 0);
-        // 20 flags: 14 runtime capabilities/experiments plus the six
+        // 17 flags: 11 runtime capabilities/experiments plus the six
         // command-availability gates.
-        assert_eq!(KNOWN_FLAGS.len(), 20);
+        assert_eq!(KNOWN_FLAGS.len(), 17);
     }
 
     #[test]
     fn capability_set_derives_correctly_from_flags() {
         let mut flags = FeatureFlags::default();
-        flags.daemon = true;
-        flags.bridge_mode = true;
         flags.voice_mode = true;
+        flags.web_browser_tool = true;
+        flags.workflow_scripts = true;
 
         let caps = flags.capabilities();
-        assert!(caps.contains(CapabilitySet::DAEMON));
-        assert!(caps.contains(CapabilitySet::BRIDGE));
         assert!(caps.contains(CapabilitySet::VOICE));
+        assert!(caps.contains(CapabilitySet::WEB_BROWSER));
+        assert!(caps.contains(CapabilitySet::WORKFLOW));
         assert!(!caps.contains(CapabilitySet::DREAM));
     }
 
@@ -746,12 +699,12 @@ mod tests {
     fn feature_flags_with_experiments_overrides() {
         let flags = FeatureFlags::default();
         let mut experiments = HashMap::new();
-        experiments.insert("daemon".into(), true);
-        experiments.insert("buddy".into(), true);
+        experiments.insert("voice_mode".into(), true);
+        experiments.insert("workflow_scripts".into(), true);
 
         let result = flags.with_experiments(&experiments);
-        assert!(result.daemon);
-        assert!(result.buddy);
+        assert!(result.voice_mode);
+        assert!(result.workflow_scripts);
         assert!(!result.coordinator_mode);
     }
 
@@ -759,7 +712,7 @@ mod tests {
     fn feature_flags_all_runtime_flags_from_parse() {
         let flags = FeatureFlags::parse(
             "streaming_tool_execution,tool_use_summaries,fast_mode,coordinator_mode,\
-             history_snip,agent_triggers,bridge_mode,daemon,voice_mode,buddy,\
+             history_snip,agent_triggers,voice_mode,\
              workflow_scripts,web_browser_tool,team_collaboration,auto_dream",
         );
         assert!(flags.streaming_tool_execution);
@@ -768,10 +721,7 @@ mod tests {
         assert!(flags.coordinator_mode);
         assert!(flags.history_snip);
         assert!(flags.agent_triggers);
-        assert!(flags.bridge_mode);
-        assert!(flags.daemon);
         assert!(flags.voice_mode);
-        assert!(flags.buddy);
         assert!(flags.workflow_scripts);
         assert!(flags.web_browser_tool);
         assert!(flags.team_collaboration);
@@ -781,16 +731,23 @@ mod tests {
     #[test]
     fn deleted_names_are_no_longer_known() {
         // `context_collapse`, `terminal_panel`, and `kairos` named no product
-        // surface, so they were removed from `KNOWN_FLAGS` entirely. Parsing
-        // them must now report them as unknown rather than accept a no-op.
-        let error = FeatureFlags::parse_checked("+context_collapse,terminal_panel,kairos")
+        // surface, and `bridge_mode`, `daemon` and `buddy` named entry points
+        // or a compile-time feature a runtime flag cannot gate. All six were
+        // removed from `KNOWN_FLAGS` entirely. Parsing them must now report
+        // them as unknown rather than accept a no-op.
+        let deleted = [
+            "context_collapse",
+            "terminal_panel",
+            "kairos",
+            "bridge_mode",
+            "daemon",
+            "buddy",
+        ];
+        let error = FeatureFlags::parse_checked(&deleted.join(","))
             .expect_err("the deleted names are not flags this build knows");
-        assert_eq!(
-            error.names,
-            vec!["context_collapse", "terminal_panel", "kairos"]
-        );
+        assert_eq!(error.names, deleted);
         let map = FeatureFlags::default().as_map();
-        for name in ["context_collapse", "terminal_panel", "kairos"] {
+        for name in deleted {
             assert!(!map.contains_key(name), "{name} is still advertised");
             assert!(!FeatureFlags::default().is_enabled(name));
         }
@@ -817,25 +774,25 @@ mod tests {
     #[test]
     fn flag_registry_read_write() {
         let registry = FlagRegistry::new();
-        assert!(!registry.has_capability(CapabilitySet::DAEMON));
+        assert!(!registry.has_capability(CapabilitySet::VOICE));
 
-        registry.set_flag("daemon", true);
-        assert!(registry.has_capability(CapabilitySet::DAEMON));
+        registry.set_flag("voice_mode", true);
+        assert!(registry.has_capability(CapabilitySet::VOICE));
 
         let flags = registry.flags();
-        assert!(flags.daemon);
+        assert!(flags.voice_mode);
     }
 
     #[test]
     fn flag_registry_apply_experiments() {
         let registry = FlagRegistry::new();
         let mut experiments = HashMap::new();
-        experiments.insert("daemon".into(), true);
-        experiments.insert("buddy".into(), true);
+        experiments.insert("voice_mode".into(), true);
+        experiments.insert("workflow_scripts".into(), true);
 
         registry.apply_experiments(&experiments);
-        assert!(registry.has_capability(CapabilitySet::DAEMON));
-        assert!(registry.has_capability(CapabilitySet::BUDDY));
+        assert!(registry.has_capability(CapabilitySet::VOICE));
+        assert!(registry.has_capability(CapabilitySet::WORKFLOW));
     }
 
     #[test]
@@ -869,24 +826,24 @@ mod tests {
     fn feature_flags_with_project_overrides() {
         let flags = FeatureFlags::default();
         let mut overrides = HashMap::new();
-        overrides.insert("daemon".into(), true);
+        overrides.insert("voice_mode".into(), true);
         overrides.insert("coordinator_mode".into(), true);
 
         let result = flags.with_project_overrides(&overrides);
-        assert!(result.daemon);
+        assert!(result.voice_mode);
         assert!(result.coordinator_mode);
-        assert!(!result.buddy);
+        assert!(!result.workflow_scripts);
     }
 
     #[test]
     fn load_project_flags_from_file() {
         let tmp = std::env::temp_dir();
         let path = tmp.join("coderex_test_project_flags.json");
-        std::fs::write(&path, r#"{"daemon":true,"buddy":true}"#).unwrap();
+        std::fs::write(&path, r#"{"voice_mode":true,"workflow_scripts":true}"#).unwrap();
 
         let flags = FeatureFlags::load_project_flags(&path);
-        assert_eq!(flags.get("daemon"), Some(&true));
-        assert_eq!(flags.get("buddy"), Some(&true));
+        assert_eq!(flags.get("voice_mode"), Some(&true));
+        assert_eq!(flags.get("workflow_scripts"), Some(&true));
         assert!(!flags.contains_key("coordinator_mode"));
 
         let _ = std::fs::remove_file(&path);
@@ -902,12 +859,12 @@ mod tests {
     fn flag_registry_load_project_flags() {
         let tmp = std::env::temp_dir();
         let path = tmp.join("coderex_test_registry_flags.json");
-        std::fs::write(&path, r#"{"daemon":true,"voice_mode":true}"#).unwrap();
+        std::fs::write(&path, r#"{"voice_mode":true,"workflow_scripts":true}"#).unwrap();
 
         let registry = FlagRegistry::new();
         registry.load_project_flags(&path);
-        assert!(registry.has_capability(CapabilitySet::DAEMON));
         assert!(registry.has_capability(CapabilitySet::VOICE));
+        assert!(registry.has_capability(CapabilitySet::WORKFLOW));
 
         let _ = std::fs::remove_file(&path);
     }
@@ -1010,19 +967,19 @@ mod tests {
     }
 
     #[test]
-    fn inert_flags_reports_exactly_the_enabled_names() {
-        let flags = FeatureFlags::parse("+streaming_tool_execution,+daemon,+buddy,-fast_mode");
-        assert_eq!(
-            flags.inert_flags(),
-            vec!["streaming_tool_execution", "daemon", "buddy"]
+    fn final_inert_flags_are_empty() {
+        // Pin the final list: each of the six names that used to be here was
+        // either wired to a product path (streaming_tool_execution,
+        // tool_use_summaries, team_collaboration) or deleted because no runtime
+        // flag could gate it (bridge_mode, daemon, buddy). A name reappearing
+        // here is a regression.
+        assert!(
+            INERT_FLAGS.is_empty(),
+            "unexpected inert flags: {INERT_FLAGS:?}"
         );
-
-        // Disabling one of the enabled names removes it from the report.
-        let fewer = FeatureFlags::parse("+streaming_tool_execution,+daemon,+buddy,-daemon");
-        assert_eq!(
-            fewer.inert_flags(),
-            vec!["streaming_tool_execution", "buddy"]
-        );
+        let all = FeatureFlags::parse_checked(&KNOWN_FLAGS.join(","))
+            .expect("the documented names must all be accepted");
+        assert!(all.inert_flags().is_empty());
     }
 
     #[test]
@@ -1054,44 +1011,47 @@ mod tests {
     }
 
     #[test]
-    fn inert_flags_is_exactly_the_documented_remainder() {
-        // Every known flag enabled: the inert report must be exactly the
-        // compatibility-only names, in `KNOWN_FLAGS` order, and nothing else.
+    fn every_known_flag_has_a_product_path_or_a_consumer() {
+        // Every known flag enabled: no name may be reported as inert, because
+        // every remaining name is either read by production code or gates a
+        // command. The list that used to describe the compatibility-only
+        // remainder is now empty.
         let flags = FeatureFlags::parse_checked(&KNOWN_FLAGS.join(","))
             .expect("the documented names must all be accepted");
-        assert_eq!(
-            flags.inert_flags(),
-            vec![
-                "streaming_tool_execution",
-                "tool_use_summaries",
-                "bridge_mode",
-                "daemon",
-                "buddy",
-                "team_collaboration",
-            ]
+        assert!(
+            flags.inert_flags().is_empty(),
+            "a known flag is still inert: {:?}",
+            flags.inert_flags()
         );
     }
 
     #[test]
     fn newly_wired_flags_are_no_longer_inert() {
-        // `fast_mode`, `coordinator_mode`, and `history_snip` now have product
+        // `fast_mode`, `coordinator_mode`, and `history_snip` have product
         // paths (the session model, the engine coordinator, and compaction
-        // strategy selection), so enabling any of them must not be reported as
-        // a compatibility-only no-op.
-        let flags = FeatureFlags::parse("fast_mode,coordinator_mode,history_snip");
-        assert!(flags.fast_mode);
-        assert!(flags.coordinator_mode);
-        assert!(flags.history_snip);
-        assert!(
-            flags.inert_flags().is_empty(),
-            "wired flags were still reported as inert: {:?}",
-            flags.inert_flags()
-        );
-        for name in ["fast_mode", "coordinator_mode", "history_snip"] {
+        // strategy selection); `streaming_tool_execution`, `tool_use_summaries`
+        // and `team_collaboration` now reach the engine too. Enabling any of
+        // them must not be reported as a compatibility-only no-op.
+        let wired = [
+            "fast_mode",
+            "coordinator_mode",
+            "history_snip",
+            "streaming_tool_execution",
+            "tool_use_summaries",
+            "team_collaboration",
+        ];
+        let flags = FeatureFlags::parse(&wired.join(","));
+        for name in wired {
+            assert!(flags.is_enabled(name), "{name} did not parse as enabled");
             assert!(
                 !INERT_FLAGS.contains(&name),
                 "{name} is still listed in INERT_FLAGS"
             );
         }
+        assert!(
+            flags.inert_flags().is_empty(),
+            "wired flags were still reported as inert: {:?}",
+            flags.inert_flags()
+        );
     }
 }

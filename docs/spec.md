@@ -1006,22 +1006,22 @@ Feature flags 不能只是本地 bool map，必须支持：
 
 关键 flags 族：
 
-- streaming_tool_execution
-- tool_use_summaries
+- streaming_tool_execution（已接线：开=流未结束时即执行工具调用；关=默认，流结束后执行）
+- tool_use_summaries（已接线：经 ModelProfile::Lightweight 生成单行摘要并以 EngineEvent::ToolUseSummary 发出，失败回退到 activity_summary）
 - fast_mode（已接线：未显式配置模型时会话经 ModelProfile::Lightweight 解析）
 - coordinator_mode（已接线：CLI 在会话引擎上安装 CoordinatorState）
 - history_snip（已接线：压缩在有需要时优先选择 Snip 策略）
 - agent_triggers
-- bridge_mode
-- daemon
 - voice_mode
-- buddy
 - workflow_scripts
 - web_browser_tool
 - ~~context_collapse~~（已移除：工作区里没有任何产物面）
 - ~~terminal_panel~~（已移除：工作区里没有任何产物面）
 - ~~kairos / proactive~~（已移除：工作区里没有任何产物面）
-- team_collaboration
+- ~~bridge_mode~~（已移除：bridge 是独立子命令入口，没有会话级可门控面）
+- ~~daemon~~（已移除：serve 是独立子命令入口，没有可脱离进程的路径）
+- ~~buddy~~（已移除：编译期 cargo feature，运行时 flag 无法影响）
+- team_collaboration（已接线：CLI 从已存储的 team memory 构建 TeamContext 并安装，引擎每轮注入共享笔记）
 - auto_dream
 
 六、关键数据结构

@@ -1461,6 +1461,12 @@ pub struct ReplLoop {
     plugin_other_components: Vec<(String, Vec<String>)>,
     /// In-flight tool calls, keyed by call id, for duration/success events.
     tool_starts: std::collections::HashMap<String, (String, std::time::Instant)>,
+    /// Model-written labels from `ToolUseSummary`, keyed by tool-call id.
+    ///
+    /// `ToolCallStart` consumes the entry so the activity row shows the
+    /// summary the engine produced under `tool_use_summaries`; when the flag
+    /// is off the map stays empty and the start event's own label is used.
+    tool_use_summaries: std::collections::HashMap<String, String>,
     /// Session usage at the end of the previous turn, for per-turn deltas.
     last_usage: coderex_core::types::UsageSummary,
     /// Model to retry with once when the primary model is unavailable
@@ -1755,14 +1761,20 @@ fn primary_tool_was_missing(output: &str, tool_name: &str) -> bool {
 ///
 /// `coordinator_mode` installs a started [`CoordinatorState`] so the engine's
 /// existing per-turn phase advance runs; `history_snip` makes compaction prefer
-/// the snip strategy as soon as it is warranted. Both are read from the final
-/// flag set, so `--betas` participates. Shared with the `serve` engine factory
-/// so both production engine-construction paths honour the flags.
+/// the snip strategy as soon as it is warranted; `streaming_tool_execution`
+/// and `tool_use_summaries` reach the engine's own setters; and
+/// `team_collaboration` installs a [`TeamContext`] built from the stored team
+/// memory entries. All are read from the final flag set, so `--betas`
+/// participates. Shared with the `serve` engine factory so both production
+/// engine-construction paths honour the flags.
+///
+/// [`TeamContext`]: coderex_core::TeamContext
 ///
 /// [`CoordinatorState`]: coderex_core::coordinator::CoordinatorState
 pub(crate) fn apply_engine_flag_behaviours(
     engine: &mut QueryEngine,
     flags: &coderex_config::flags::FeatureFlags,
+    memory_base: Option<&std::path::Path>,
 ) {
     if flags.coordinator_mode {
         let mut coordinator = coderex_core::coordinator::CoordinatorState::new();
@@ -1770,6 +1782,36 @@ pub(crate) fn apply_engine_flag_behaviours(
         engine.set_coordinator(coordinator);
     }
     engine.set_history_snip(flags.history_snip);
+    // Both are engine behaviours with setters: the streaming loop consults
+    // the first, and the tool path consults the second.
+    engine.set_streaming_tool_execution(flags.streaming_tool_execution);
+    engine.set_tool_use_summaries(flags.tool_use_summaries);
+
+    if flags.team_collaboration {
+        // The team id names the collaboration; shared notes come from the
+        // same stored team-memory entries `/team-memory` reads. An empty
+        // context is still installed — the engine injects nothing from it,
+        // and a later write is visible without rebuilding the engine.
+        let team_id = std::env::var("CODEREX_TEAM_ID").unwrap_or_else(|_| "local".to_string());
+        let mut context = coderex_core::TeamContext::new(team_id);
+        if let Some(memory_base) = memory_base {
+            let service =
+                TeamMemorySyncService::new("default".to_string(), memory_base.join("team"));
+            match service.list() {
+                Ok(entries) => {
+                    for entry in entries {
+                        context.add_note(entry.topic, entry.content, "team-memory".to_string());
+                    }
+                }
+                Err(error) => {
+                    // Collaboration is additive: an unreadable store leaves
+                    // the context empty rather than failing startup.
+                    tracing::warn!(%error, "could not load team memory for team context");
+                }
+            }
+        }
+        engine.set_team_context(std::sync::Arc::new(std::sync::Mutex::new(context)));
+    }
 }
 
 impl ReplLoop {
@@ -1794,6 +1836,7 @@ impl ReplLoop {
             lsp_defaults: Arc::new(std::sync::RwLock::new(None)),
             plugin_other_components: Vec::new(),
             tool_starts: std::collections::HashMap::new(),
+            tool_use_summaries: std::collections::HashMap::new(),
             last_usage: coderex_core::types::UsageSummary::default(),
             max_tokens: QueryEngine::DEFAULT_MAX_TOKENS,
             explicit_model_override: false,
@@ -2175,6 +2218,7 @@ impl ReplLoop {
             lsp_defaults,
             plugin_other_components: Vec::new(),
             tool_starts: std::collections::HashMap::new(),
+            tool_use_summaries: std::collections::HashMap::new(),
             last_usage: coderex_core::types::UsageSummary::default(),
             max_tokens: QueryEngine::DEFAULT_MAX_TOKENS,
             explicit_model_override: false,
@@ -2855,8 +2899,8 @@ impl ReplLoop {
         // 9. Beta feature flags. `--betas` is a real overlay on the
         // environment-provided flags: it resolves into this session's
         // `FeatureFlags` and `CapabilitySet`. A typo is a startup failure, not
-        // a warning, because silently dropping `+daemon` looks identical to
-        // the flag not existing.
+        // a warning, because silently dropping a mistyped name looks identical
+        // to the flag not existing.
         if !self.betas.is_empty() {
             let raw = self.betas.join(",");
             let mut flags = coderex_config::flags::FeatureFlags::from_env();
@@ -2887,8 +2931,8 @@ impl ReplLoop {
                 flag,
                 "feature flag is accepted for compatibility but has no effect in this build"
             );
-            // Tracing defaults to `off`, so a user who just passed
-            // `--betas +daemon` would otherwise see nothing at all.
+            // Tracing defaults to `off`, so a user who just passed an inert
+            // flag would otherwise see nothing at all.
             eprintln!(
                 "warning: feature flag '{flag}' is accepted for compatibility but has no effect in this build"
             );
@@ -2919,7 +2963,10 @@ impl ReplLoop {
         // are engine behaviours the engine exposes setters for; the session's
         // flag set is only final here, after `--betas` has been applied.
         if let Some(ref mut engine) = self.engine {
-            apply_engine_flag_behaviours(engine, &self.feature_flags);
+            let memory_base = std::path::PathBuf::from(&self.cwd)
+                .join(".coderex")
+                .join("memory");
+            apply_engine_flag_behaviours(engine, &self.feature_flags, Some(&memory_base));
         }
 
         // 9d. Auto-dream. The manager is built at construction, before `--betas`
@@ -4524,7 +4571,15 @@ impl ReplLoop {
                                 last_stream_snapshot = Instant::now();
                             }
                         }
-                        EngineEvent::ToolCallStart { name, summary, .. } => {
+                        EngineEvent::ToolUseSummary { id, summary, .. } => {
+                            // Render with the matching `ToolCallStart`, which
+                            // also carries the summary. Holding it here keeps
+                            // the two events from producing duplicate rows
+                            // while still letting this event drive the label.
+                            self.tool_use_summaries.insert(id, summary);
+                        }
+                        EngineEvent::ToolCallStart { id, name, summary } => {
+                            let summary = self.tool_use_summaries.remove(&id).unwrap_or(summary);
                             phase.note_tool_start(&summary);
                             set_plan_step(&mut ui_state, &summary);
                             push_activity_row(&mut ui_state, &summary);
@@ -4537,7 +4592,10 @@ impl ReplLoop {
                             });
                             self.persist_interactive_snapshot(&ui_state);
                         }
-                        EngineEvent::ToolCallEnd { result, .. } => {
+                        EngineEvent::ToolCallEnd { id, result } => {
+                            // A call blocked before its start event never
+                            // consumed its label; drop it here.
+                            self.tool_use_summaries.remove(&id);
                             phase.note_tool_end();
                             complete_plan(&mut ui_state);
                             pending_confirmation = None;
@@ -9793,23 +9851,127 @@ mod tests {
     #[test]
     fn cli_betas_update_the_session_flags_and_capabilities() {
         let mut repl = ReplLoop::new("/tmp".into(), ModelId::sonnet());
-        repl.with_betas(vec!["+daemon".into(), "-buddy".into(), "voice_mode".into()]);
+        repl.with_betas(vec![
+            "+team_collaboration".into(),
+            "-web_browser_tool".into(),
+            "voice_mode".into(),
+        ]);
 
         repl.apply_cli_config();
 
         assert!(repl.setup_error.is_none(), "{:?}", repl.setup_error);
-        assert!(repl.feature_flags().daemon);
-        assert!(!repl.feature_flags().buddy);
+        assert!(repl.feature_flags().team_collaboration);
+        assert!(!repl.feature_flags().web_browser_tool);
         assert!(repl.feature_flags().voice_mode);
         assert!(
             repl.capabilities()
-                .contains(coderex_config::flags::CapabilitySet::DAEMON),
+                .contains(coderex_config::flags::CapabilitySet::TEAM),
             "an enabled beta did not reach the session capability set"
         );
         assert!(
             repl.capabilities()
                 .contains(coderex_config::flags::CapabilitySet::VOICE)
         );
+        assert!(
+            !repl
+                .capabilities()
+                .contains(coderex_config::flags::CapabilitySet::WEB_BROWSER)
+        );
+    }
+
+    #[tokio::test]
+    async fn engine_flag_behaviours_install_the_wired_flags() {
+        use coderex_config::flags::FeatureFlags;
+
+        struct FlagTestApi;
+
+        #[async_trait::async_trait]
+        impl ApiClient for FlagTestApi {
+            fn clone_box(&self) -> Box<dyn ApiClient> {
+                Box::new(FlagTestApi)
+            }
+
+            async fn create_message(
+                &self,
+                _system: &str,
+                _messages: &[serde_json::Value],
+                _model: &ModelId,
+                _max_tokens: u32,
+                _tools: &[ToolInfo],
+            ) -> Result<ApiResponse, ApiError> {
+                Ok(ApiResponse {
+                    content: String::new(),
+                    tool_calls: Vec::new(),
+                    usage: UsageSummary::default(),
+                    stop_reason: "end_turn".into(),
+                })
+            }
+
+            async fn create_message_streaming(
+                &self,
+                _system: &str,
+                _messages: &[serde_json::Value],
+                _model: &ModelId,
+                _max_tokens: u32,
+                _tools: &[ToolInfo],
+            ) -> std::pin::Pin<Box<dyn futures::Stream<Item = StreamEvent> + Send + 'static>>
+            {
+                Box::pin(futures::stream::empty())
+            }
+        }
+
+        fn engine() -> QueryEngine {
+            let (tx, _rx) = mpsc::unbounded_channel();
+            QueryEngine::new(
+                Box::new(FlagTestApi),
+                ModelId::sonnet(),
+                SessionState::new(std::path::PathBuf::from("/tmp/team-flag-test")),
+                PermissionEngine::new(PermissionChecker::new(PermissionMode::BypassPermissions)),
+                tx,
+            )
+        }
+
+        // A real stored team-memory entry is what the flag turns into context.
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos());
+        let dir =
+            std::env::temp_dir().join(format!("coderex-team-flag-{}-{unique}", std::process::id()));
+        let memory_base = dir.join("memory");
+        TeamMemorySyncService::new("default".to_string(), memory_base.join("team"))
+            .upsert("architecture", "Use Postgres for durable state")
+            .expect("the test writes a team memory");
+
+        let mut off = engine();
+        apply_engine_flag_behaviours(&mut off, &FeatureFlags::default(), Some(&memory_base));
+        assert!(off.team_context().is_none(), "off must install nothing");
+        assert!(!off.streaming_tool_execution());
+        assert!(!off.tool_use_summaries());
+
+        let mut on = engine();
+        let flags = FeatureFlags {
+            team_collaboration: true,
+            streaming_tool_execution: true,
+            tool_use_summaries: true,
+            ..FeatureFlags::default()
+        };
+        apply_engine_flag_behaviours(&mut on, &flags, Some(&memory_base));
+        assert!(on.streaming_tool_execution());
+        assert!(on.tool_use_summaries());
+        let context = on
+            .team_context()
+            .expect("the flag installs a team context")
+            .lock()
+            .unwrap();
+        assert_eq!(context.shared_notes.len(), 1);
+        assert_eq!(context.shared_notes[0].title, "architecture");
+        assert!(
+            context.shared_notes[0]
+                .content
+                .contains("Use Postgres for durable state")
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
