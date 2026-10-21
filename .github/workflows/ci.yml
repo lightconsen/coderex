@@ -91,9 +91,11 @@ jobs:
   # paths, the managed-settings (HKLM) code, and the CLI library tests on a
   # Windows host.
   #
-  # Compilation and linking are now required by `cross-check-windows`; this
-  # job remains advisory for runtime execution because AppContainer/HKLM
-  # behaviour has no stable passing history yet on a hosted Windows runner.
+  # Compilation and linking are required by `cross-check-windows`; this job
+  # runs the runtime tests and is required too. It was advisory while the
+  # AppContainer paths had no passing history — the intermittent 10-minute
+  # timeout turned out to be sandbox creation spending 488s rewriting every
+  # ancestor DACL, since fixed. It now takes about 39s.
   #
   # `--no-fail-fast` runs every remaining test binary in an invocation, and
   # `if: always()` keeps a failing crate from hiding the crates after it.
@@ -101,7 +103,6 @@ jobs:
     name: Test (Windows runtime)
     runs-on: windows-latest
     timeout-minutes: 45
-    continue-on-error: true
     env:
       CODEREX_REQUIRE_APP_CONTAINER: '1'
       CODEREX_REQUIRE_HKLM_TESTS: '1'
