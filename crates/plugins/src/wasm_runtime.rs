@@ -1968,16 +1968,34 @@ mod compiler_test_hooks {
 
         #[cfg(target_os = "windows")]
         if let Ok(path) = std::env::var("CODEREX_WASM_COMPILE_TEST_CHILD_PID_FILE") {
-            if let Ok(child) = std::process::Command::new("cmd.exe")
-                .args(["/C", "ping -n 60 127.0.0.1 > nul"])
+            // Spawn the helper binary itself as the descendant. It is already
+            // in the AppContainer's exec grant, whereas a shell (`cmd.exe`)
+            // depends on the best-effort system-root grant and can be refused
+            // under the restricted token. `before_compile` runs before argument
+            // parsing, so the child only has to sleep.
+            let mut descendant =
+                std::process::Command::new(std::env::current_exe().unwrap_or_default());
+            descendant
+                .env_clear()
+                .env("CODEREX_WASM_COMPILE_TEST_SLEEP_MS", "60000")
                 .stdin(std::process::Stdio::null())
                 .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .spawn()
-            {
-                let _ = std::fs::write(path, child.id().to_string());
-                // Dropping `Child` does not kill it; it runs until the job is
-                // terminated or its own `ping` ends.
+                .stderr(std::process::Stdio::null());
+            for key in ["PATH", "SystemRoot", "windir"] {
+                if let Some(value) = std::env::var_os(key) {
+                    descendant.env(key, value);
+                }
+            }
+            // Record the pid, or why there is none, so the test can say which.
+            match descendant.spawn() {
+                Ok(child) => {
+                    let _ = std::fs::write(path, child.id().to_string());
+                    // Dropping `Child` does not kill it; it runs until the job
+                    // is terminated or its own sleep ends.
+                }
+                Err(error) => {
+                    let _ = std::fs::write(path, format!("error: {error}"));
+                }
             }
         }
 

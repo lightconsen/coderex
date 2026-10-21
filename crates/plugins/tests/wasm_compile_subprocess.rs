@@ -268,11 +268,12 @@ fn slow_helper_is_killed_with_no_orphan_tree() {
         "the parent should have killed the helper promptly, took {elapsed:?}"
     );
 
-    let pid: u32 = std::fs::read_to_string(&child_pid_file)
-        .expect("the helper did not record its child's pid")
+    let recorded = std::fs::read_to_string(&child_pid_file)
+        .expect("the helper did not record its child's pid");
+    let pid: u32 = recorded
         .trim()
         .parse()
-        .expect("bad child pid");
+        .unwrap_or_else(|_| panic!("bad child pid record: {recorded:?}"));
     assert!(
         wait_until_process_gone_windows(pid, std::time::Duration::from_secs(5)),
         "descendant pid {pid} survived the timeout kill"
