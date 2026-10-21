@@ -256,6 +256,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      # `libdbus-sys` needs `dbus-1.pc` at build time.
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y lld libdbus-1-dev pkg-config
       - name: Run the live-provider eval flow
         run: scripts/test-live-eval.sh
       - name: Upload live eval report
