@@ -802,6 +802,44 @@ mod tests {
         assert!(leftovers.is_empty(), "temporary files were left behind");
     }
 
+    /// Windows counterpart of the unix owner-only test.
+    ///
+    /// The save path installs a protected DACL granting only the current user,
+    /// and `restrict_to_current_user` reads it back and fails if it grants
+    /// anyone else. Gated on Windows so the Win32 calls actually execute on the
+    /// Windows CI job — that is the only place they can run, and until this
+    /// test existed nothing exercised them there.
+    #[cfg(windows)]
+    #[test]
+    fn the_file_is_owner_only_after_a_save_on_windows() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mcp_tokens.json");
+        let persistence = TokenPersistence::file_only(&path);
+
+        persistence.save(r#"{"states":["first"]}"#).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            r#"{"states":["first"]}"#
+        );
+        // Re-tightening the file that is actually on disk exercises the
+        // independent read-back verification.
+        super::tighten_to_owner_only(&path).expect("the saved file has a user-only DACL");
+
+        persistence.save(r#"{"states":["second"]}"#).unwrap();
+        super::tighten_to_owner_only(&path).expect("the overwritten file has a user-only DACL");
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            r#"{"states":["second"]}"#
+        );
+
+        let leftovers: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_name() != std::ffi::OsStr::new("mcp_tokens.json"))
+            .collect();
+        assert!(leftovers.is_empty(), "temporary files were left behind");
+    }
+
     #[test]
     fn an_injected_backend_stores_and_retrieves_the_secret() {
         let dir = tempfile::tempdir().unwrap();
