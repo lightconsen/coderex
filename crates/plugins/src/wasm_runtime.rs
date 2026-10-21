@@ -1978,9 +1978,14 @@ mod compiler_test_hooks {
             descendant
                 .env_clear()
                 .env("CODEREX_WASM_COMPILE_TEST_SLEEP_MS", "60000")
-                .stdin(std::process::Stdio::null())
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null());
+                // Not `Stdio::null()`: opening `NUL` is denied to an
+                // AppContainer token (os error 5), which made the descendant
+                // impossible to spawn. Pipes are created by this process and
+                // need no device access. The child only sleeps, so closing
+                // them when `Child` is dropped is harmless.
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped());
             for key in ["PATH", "SystemRoot", "windir"] {
                 if let Some(value) = std::env::var_os(key) {
                     descendant.env(key, value);
