@@ -4387,6 +4387,9 @@ impl QueryEngine {
             let mut early_results: Vec<ToolResult> = Vec::new();
             let mut deferred_calls: Vec<ToolCall> = Vec::new();
             let mut stream_failed = false;
+            // The message is what turns a failed stream into a reported error
+            // instead of an empty, apparently successful turn.
+            let mut stream_error: Option<String> = None;
             let mut stop_reason: Option<String> = None;
             let mut retry_requested = false;
 
@@ -4470,6 +4473,7 @@ impl QueryEngine {
                             "streaming network error ({} bytes received so far): {e}",
                             stream_text.delivered().len()
                         );
+                        stream_error = Some(e.to_string());
                         stream_failed = true;
                         // Fail-open: stop consuming the stream but return
                         // whatever partial text and tool calls we have.
@@ -4625,8 +4629,23 @@ impl QueryEngine {
                 });
             }
 
+            let content = stream_text.into_delivered();
+            // A failed stream that produced nothing usable is an error, not an
+            // empty "end_turn". Reporting it as a finished turn let the caller
+            // start another request, which is why a non-retryable HTTP 400
+            // looked like a hang instead of failing the turn.
+            if stream_failed
+                && content.is_empty()
+                && deferred_calls.is_empty()
+                && early_results.is_empty()
+            {
+                return Err(TurnError::Fatal {
+                    message: stream_error
+                        .unwrap_or_else(|| "the provider returned no response".to_string()),
+                });
+            }
             return Ok(StreamedResponse {
-                content: stream_text.into_delivered(),
+                content,
                 tool_calls: deferred_calls,
                 early_calls,
                 early_results,
@@ -9583,6 +9602,69 @@ mod tests {
         assert_eq!(early.early_results.len(), 1);
         assert_eq!(early.early_results[0].tool_call_id, "tc_stream");
         assert!(early.tool_calls.is_empty());
+    }
+
+    /// A provider that rejects the request with a non-retryable 400 in both
+    /// the streaming and non-streaming paths.
+    struct NonRetryableApi;
+
+    #[async_trait::async_trait]
+    impl ApiClient for NonRetryableApi {
+        fn clone_box(&self) -> Box<dyn ApiClient> {
+            Box::new(NonRetryableApi)
+        }
+
+        async fn create_message(
+            &self,
+            _system: &str,
+            _messages: &[serde_json::Value],
+            _model: &ModelId,
+            _max_tokens: u32,
+            _tools: &[crate::tool_executor::ToolInfo],
+        ) -> Result<ApiResponse, crate::api_client::ApiError> {
+            Err(crate::api_client::ApiError::Response {
+                status: 400,
+                message: "bad request".into(),
+            })
+        }
+
+        async fn create_message_streaming(
+            &self,
+            _system: &str,
+            _messages: &[serde_json::Value],
+            _model: &ModelId,
+            _max_tokens: u32,
+            _tools: &[crate::tool_executor::ToolInfo],
+        ) -> std::pin::Pin<Box<dyn futures::Stream<Item = StreamEvent> + Send + 'static>> {
+            Box::pin(futures::stream::iter(vec![
+                StreamEvent::Error(crate::api_client::ApiError::Response {
+                    status: 400,
+                    message: "bad request".into(),
+                }),
+                StreamEvent::StreamEnd,
+            ]))
+        }
+    }
+
+    /// A non-retryable failure that produced nothing usable fails the turn.
+    ///
+    /// It used to fall through as `end_turn` with empty content, so the caller
+    /// started another request — which is why a 400 looked like a hang.
+    #[tokio::test]
+    async fn a_non_retryable_stream_failure_fails_the_turn() {
+        let (mut engine, _rx) = test_engine_with_api(Box::new(NonRetryableApi));
+        let options = SubmitOptions::default();
+        let mut turn = TurnRuntime::new(TokenBudget::with_defaults());
+        let error = engine
+            .send_request_streaming(&mut turn, &options)
+            .await
+            .expect_err("a 400 with no content must fail the turn");
+        assert!(matches!(error, TurnError::Fatal { .. }), "{error:?}");
+        assert!(
+            error.message().contains("bad request"),
+            "the provider message should reach the caller: {}",
+            error.message()
+        );
     }
 
     /// Returns a fixed summary on `create_message`, or an error when

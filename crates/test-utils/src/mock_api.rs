@@ -106,6 +106,7 @@ impl ApiClient for MockApiClient {
             _ => Ok(ApiResponse {
                 content: "mock fallback".into(),
                 tool_calls: Vec::new(),
+                thinking: None,
                 usage: UsageSummary {
                     input_tokens: 0,
                     output_tokens: 0,
@@ -146,6 +147,7 @@ pub fn mock_response(content: impl Into<String>) -> ApiResponse {
     ApiResponse {
         content: content.into(),
         tool_calls: Vec::new(),
+        thinking: None,
         usage: UsageSummary {
             input_tokens: 100,
             output_tokens: 50,
@@ -165,6 +167,7 @@ pub fn mock_response_with_tool_calls(
     ApiResponse {
         content: content.into(),
         tool_calls,
+        thinking: None,
         usage: UsageSummary {
             input_tokens: 100,
             output_tokens: 50,
