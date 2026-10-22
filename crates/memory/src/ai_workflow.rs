@@ -59,6 +59,7 @@ pub(crate) mod tests {
             Ok(ApiResponse {
                 content: self.response_content.clone(),
                 tool_calls: Vec::new(),
+                thinking: None,
                 usage: UsageSummary {
                     input_tokens: 100,
                     output_tokens: 50,

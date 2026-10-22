@@ -30,6 +30,7 @@ impl coderex_core::api_client::ApiClient for ScriptedModel {
         Ok(coderex_core::api_client::ApiResponse {
             content: self.0.to_string(),
             tool_calls: Vec::new(),
+            thinking: None,
             usage: coderex_core::types::UsageSummary {
                 input_tokens: 5,
                 output_tokens: 5,
@@ -139,6 +140,7 @@ impl coderex_core::api_client::ApiClient for SlowScriptedModel {
         Ok(coderex_core::api_client::ApiResponse {
             content: self.answer.to_string(),
             tool_calls: Vec::new(),
+            thinking: None,
             usage: coderex_core::types::UsageSummary {
                 input_tokens: 5,
                 output_tokens: 5,

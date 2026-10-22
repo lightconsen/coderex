@@ -594,6 +594,7 @@ impl ApiClient for BlockingApiClient {
         Ok(ApiResponse {
             content: "finished".into(),
             tool_calls: Vec::new(),
+            thinking: None,
             usage: UsageSummary {
                 input_tokens: 0,
                 output_tokens: 0,

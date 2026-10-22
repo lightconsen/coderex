@@ -8652,6 +8652,7 @@ mod tests {
                         name: "Read".into(),
                         input: serde_json::json!({"file_path": "note.txt"}),
                     }],
+                    thinking: None,
                     usage,
                     stop_reason: "tool_use".into(),
                 });
@@ -8668,6 +8669,7 @@ mod tests {
                 }
                 .into(),
                 tool_calls: Vec::new(),
+                thinking: None,
                 usage,
                 stop_reason: "end_turn".into(),
             })
@@ -8737,6 +8739,7 @@ mod tests {
             Ok(ApiResponse {
                 content: self.side_answer.into(),
                 tool_calls: Vec::new(),
+                thinking: None,
                 usage: UsageSummary {
                     input_tokens: 1,
                     output_tokens: 1,
@@ -10150,6 +10153,7 @@ mod tests {
                 Ok(ApiResponse {
                     content: String::new(),
                     tool_calls: Vec::new(),
+                    thinking: None,
                     usage: UsageSummary::default(),
                     stop_reason: "end_turn".into(),
                 })

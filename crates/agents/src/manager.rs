@@ -3324,6 +3324,7 @@ mod tests {
                         name: "Read".into(),
                         input: serde_json::json!({"file_path": "note.txt"}),
                     }],
+                    thinking: None,
                     usage,
                     stop_reason: "tool_use".into(),
                 })
@@ -3331,6 +3332,7 @@ mod tests {
                 Ok(ApiResponse {
                     content: "done from the mock".into(),
                     tool_calls: Vec::new(),
+                    thinking: None,
                     usage,
                     stop_reason: "end_turn".into(),
                 })
@@ -3379,6 +3381,7 @@ mod tests {
             Ok(coderex_core::api_client::ApiResponse {
                 content: "done".into(),
                 tool_calls: Vec::new(),
+                thinking: None,
                 usage: coderex_core::types::UsageSummary {
                     input_tokens: 1,
                     output_tokens: 1,

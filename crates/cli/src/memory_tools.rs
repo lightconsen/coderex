@@ -203,6 +203,7 @@ mod tests {
             Ok(ApiResponse {
                 content: self.answer.into(),
                 tool_calls: Vec::new(),
+                thinking: None,
                 usage: UsageSummary {
                     input_tokens: 1,
                     output_tokens: 1,
