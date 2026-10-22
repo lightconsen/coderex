@@ -1236,6 +1236,10 @@ impl StartupOrchestrator {
                     .and_then(|t| t.sample_rate)
                     .unwrap_or(defaults.sample_rate),
                 pinned_cert_pem: t.and_then(|t| t.pinned_cert_pem.clone()),
+                // Settings are a second trigger for the strict mode; the
+                // uploader ORs this with `CODEREX_HIPAA`, so neither source
+                // can turn the stricter redaction off.
+                strict: t.and_then(|t| t.strict).unwrap_or(false),
             })
         };
 
@@ -1687,6 +1691,26 @@ impl StartupOrchestrator {
             self.ctx.model = settings.model.clone().map(coderex_core::types::ModelId);
         }
         self.ctx.settings = Some(settings);
+    }
+
+    /// The redaction modes the uploader would resolve for this session.
+    ///
+    /// `strict` is the OR of the settings key and `CODEREX_HIPAA`, exactly as
+    /// `TelemetryUploader::new` resolves it, so `telemetry preview-crash`
+    /// prints the same payload a real upload would. `verbose` comes from
+    /// `CODEREX_CRASH_VERBOSE` and is ignored in strict mode.
+    fn telemetry_redaction_modes(&self) -> (bool, bool) {
+        let settings_strict = self
+            .plugin_host_config_service()
+            .resolve()
+            .ok()
+            .and_then(|settings| settings.telemetry)
+            .and_then(|telemetry| telemetry.strict)
+            .unwrap_or(false);
+        (
+            coderex_telemetry::crash_verbose(),
+            settings_strict || coderex_telemetry::hipaa_enabled(),
+        )
     }
 
     /// The settings service used to read host-only plugin configuration.
@@ -3406,7 +3430,10 @@ impl StartupOrchestrator {
     #[allow(clippy::unused_async, clippy::unused_async_trait_impl)]
     async fn run_telemetry(&self, action: Option<crate::cli::TelemetryAction>) -> Result<()> {
         match action {
-            Some(crate::cli::TelemetryAction::PreviewCrash { file }) => Self::preview_crash(file),
+            Some(crate::cli::TelemetryAction::PreviewCrash { file }) => {
+                let (verbose, strict) = self.telemetry_redaction_modes();
+                Self::preview_crash(file, verbose, strict)
+            }
             None => {
                 println!("Usage: coderex telemetry preview-crash [FILE]");
                 Ok(())
@@ -3417,9 +3444,10 @@ impl StartupOrchestrator {
     /// Print the exact wire payload the uploader would send for one crash.
     ///
     /// The pending file is read but not removed or ingested, and nothing is
-    /// uploaded. `CODEREX_CRASH_VERBOSE` / `CODEREX_HIPAA` are resolved by the
-    /// same code paths the uploader uses.
-    fn preview_crash(file: Option<std::path::PathBuf>) -> Result<()> {
+    /// uploaded. `verbose` and `strict` come from
+    /// [`telemetry_redaction_modes`](Self::telemetry_redaction_modes), which
+    /// resolves them the way the uploader does — settings included.
+    fn preview_crash(file: Option<std::path::PathBuf>, verbose: bool, strict: bool) -> Result<()> {
         let pending_dir = coderex_config::config_home()
             .join("crashes")
             .join("pending");
@@ -3439,7 +3467,7 @@ impl StartupOrchestrator {
         // row shape matches what a real ingestion would have stored.
         let reporter = coderex_telemetry::CrashReporter::new(pending_dir);
         let pending = reporter.pending_crash_from_report(&report);
-        let payload = coderex_telemetry::preview_crash_payload(&pending);
+        let payload = coderex_telemetry::preview_crash_payload_with(&pending, verbose, strict);
         println!("{}", serde_json::to_string_pretty(&payload)?);
         Ok(())
     }

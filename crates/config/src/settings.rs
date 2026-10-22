@@ -179,6 +179,14 @@ pub struct TelemetrySubConfig {
     pub datadog_site: Option<String>,
     /// Full Datadog Logs intake URL, overriding the site-derived endpoint.
     pub datadog_endpoint: Option<String>,
+    /// Enable the strict (HIPAA-style) redaction mode.
+    ///
+    /// Equivalent to setting `CODEREX_HIPAA=1`. Only ever *tightens* what is
+    /// sent, so a project settings file enabling it cannot leak more than the
+    /// user's own choice would; disabling it here does not override the
+    /// environment variable.
+    #[serde(default)]
+    pub strict: Option<bool>,
 }
 
 /// Per-model context-window overrides in settings.
@@ -1772,6 +1780,17 @@ mod tests {
         std::fs::write(&user_path, r#"{"telemetry_enabled":true}"#).unwrap();
         let service = ConfigService::new(user_path, None);
         assert_eq!(service.resolve().unwrap().telemetry_enabled, Some(true));
+    }
+
+    /// The strict (HIPAA-style) redaction mode has a settings entry, not only
+    /// the `CODEREX_HIPAA` environment variable.
+    #[test]
+    fn telemetry_strict_parses_from_settings() {
+        let settings: Settings = serde_json::from_str(r#"{"telemetry":{"strict":true}}"#).unwrap();
+        assert_eq!(
+            settings.telemetry.and_then(|telemetry| telemetry.strict),
+            Some(true)
+        );
     }
 
     // ── Local settings source (`/init`) ─────────────────────────────────

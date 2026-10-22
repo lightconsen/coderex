@@ -64,10 +64,17 @@ that cannot enumerate the sensitive set.
 
 ### Strict mode (confidentiality trigger)
 
-Strict mode is turned on by the environment variable **`CODEREX_HIPAA`** — present with any value
-other than `0`/`false`/`no`/empty (`hipaa_enabled`). It mirrors the reference's `hipaa`
-setting/lookup trigger. The reference also carries a settings key; CodeRex's settings layer is not
-reachable from this crate, so the environment variable is the whole trigger.
+Strict mode is turned on by either of two triggers:
+
+- the environment variable **`CODEREX_HIPAA`** — present with any value other than
+  `0`/`false`/`no`/empty (`hipaa_enabled`); and
+- **`telemetry.strict: true` in settings**, which the CLI resolves and passes to the uploader as
+  `TelemetryConfig::strict`.
+
+It mirrors the reference's `hipaa` setting/lookup trigger. The two are OR-ed at construction: a
+settings file can turn the stricter mode on, and neither source can turn it off. That direction is
+deliberate — `strict` only ever tightens what leaves the machine, so a repository-committed
+settings file enabling it cannot leak more than the user's own choice already would.
 
 When on, a payload must validate against `STRICT_ALLOWED_FIELDS` — the union of the event and crash
 schema fields (`type`, `session_id`, `tool_name`, `success`, `duration_ms`, `provider`, `model`,

@@ -167,6 +167,7 @@ fn settings_json_serde_roundtrip() {
             datadog_api_key: None,
             datadog_site: None,
             datadog_endpoint: None,
+            strict: None,
         }),
         hooks: None,
         hook_layers: None,

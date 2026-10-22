@@ -29,6 +29,12 @@ pub struct TelemetryConfig {
     pub sample_rate: f64,
     /// Optional pinned root certificate PEM for additional TLS trust.
     pub pinned_cert_pem: Option<String>,
+    /// Enable strict (HIPAA-style) redaction from configuration.
+    ///
+    /// The environment variable still wins: `strict` is on when either this
+    /// is set or `CODEREX_HIPAA` says so. Configuration can only add the
+    /// stricter mode, never remove it, because it is a tightening.
+    pub strict: bool,
 }
 
 impl Default for TelemetryConfig {
@@ -42,6 +48,7 @@ impl Default for TelemetryConfig {
             enabled: true,
             sample_rate: 1.0,
             pinned_cert_pem: None,
+            strict: false,
         }
     }
 }
@@ -304,6 +311,10 @@ impl TelemetryUploader {
             None
         };
 
+        // The environment variable and the settings file are both triggers;
+        // neither can turn the stricter mode off.
+        let strict = config.strict || hipaa_enabled();
+
         Self {
             db_path,
             config,
@@ -312,7 +323,7 @@ impl TelemetryUploader {
             rate: RateLimiter::new(),
             scrubber: Scrubber::new(),
             channels,
-            strict: hipaa_enabled(),
+            strict,
             verbose: crate::crash_verbose(),
         }
     }
@@ -330,6 +341,14 @@ impl TelemetryUploader {
             None
         };
         self
+    }
+
+    /// Whether strict (HIPAA-style) redaction is in force.
+    ///
+    /// True when the settings file asked for it or `CODEREX_HIPAA` is set.
+    #[must_use]
+    pub const fn is_strict(&self) -> bool {
+        self.strict
     }
 
     /// Override the resolved modes in tests without touching the environment.
@@ -754,6 +773,21 @@ mod tests {
             })
             .unwrap();
         (file, store)
+    }
+
+    /// Settings are a second trigger for strict redaction, alongside
+    /// `CODEREX_HIPAA`. Either one turns it on; neither can turn it off.
+    #[test]
+    fn a_strict_config_turns_on_strict_redaction() {
+        let dir = tempfile::tempdir().unwrap();
+        let uploader = TelemetryUploader::new(
+            dir.path().join("strict.db"),
+            TelemetryConfig {
+                strict: true,
+                ..Default::default()
+            },
+        );
+        assert!(uploader.is_strict());
     }
 
     #[tokio::test]
