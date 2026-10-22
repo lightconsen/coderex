@@ -1,8 +1,13 @@
-//! MCP manager — coordinates servers, tools, resources, OAuth, and elicitation.
+//! MCP manager — coordinates servers, tools, resources, prompts, OAuth, and
+//! elicitation.
 
 use crate::config::{McpConfig, McpTransport};
 use crate::elicitation::ElicitationManager;
 use crate::oauth::OAuthManager;
+use crate::prompts::{
+    McpPromptInfo, McpPromptRegistry, McpPromptResult, ServerPrompt, parse_prompt_list,
+    parse_prompt_result,
+};
 use crate::proxy::{McpToolInfo, McpToolProxy, McpToolRegistry};
 use crate::resources::{McpResource, McpResourceContent, McpResourceRegistry};
 use crate::server::{McpServer, ServerStatus};
@@ -21,8 +26,8 @@ use std::time::{Duration, Instant};
 /// The CLI installs a router instead: [`McpManager::set_notification_router`]
 /// records it, and the per-server notification handler offers it every
 /// notification a configured server emits — the same ones the manager already
-/// acts on internally (`tools/list_changed`, `resources/updated`) and every
-/// other method too.
+/// acts on internally (`tools/list_changed`, `resources/updated`,
+/// `prompts/list_changed`) and every other method too.
 ///
 /// The call is synchronous and must not block: it runs on the stream task that
 /// received the notification.
@@ -50,8 +55,9 @@ struct CachedResource {
 struct NotificationSink {
     servers: Arc<DashMap<String, McpServer>>,
     tools: Arc<Mutex<McpToolRegistry>>,
+    prompts: Arc<Mutex<McpPromptRegistry>>,
     resource_cache: Arc<Mutex<HashMap<(String, String), CachedResource>>>,
-    /// Offered every notification, including the two acted on above.
+    /// Offered every notification, including the methods acted on above.
     router: SharedNotificationRouter,
 }
 
@@ -130,6 +136,61 @@ impl NotificationSink {
         );
     }
 
+    /// Re-run `prompts/list` for one server and replace that server's prompts.
+    ///
+    /// A failure leaves the previous list in place: a transient error must not
+    /// make the prompts disappear.
+    async fn refresh_prompts(&self, server_name: &str) {
+        let Some(mut server) = self
+            .servers
+            .get(server_name)
+            .map(|entry| entry.value().clone())
+        else {
+            tracing::debug!(
+                server = server_name,
+                "prompts/list_changed for a server that is no longer registered"
+            );
+            return;
+        };
+        if server.status != ServerStatus::Running {
+            return;
+        }
+
+        let response = match server.discover_prompts().await {
+            Ok(response) => response,
+            Err(error) => {
+                tracing::warn!(
+                    server = server_name,
+                    "re-discovering prompts after prompts/list_changed failed: {error}"
+                );
+                return;
+            }
+        };
+        let prompts = match parse_prompt_list(&response) {
+            Ok(prompts) => prompts,
+            Err(error) => {
+                tracing::warn!(
+                    server = server_name,
+                    "prompts/list_changed returned an invalid prompt list: {error}"
+                );
+                return;
+            }
+        };
+
+        let count = prompts.len();
+        let mut registry = self
+            .prompts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        registry.replace_server(server_name, prompts);
+        drop(registry);
+        tracing::info!(
+            server = server_name,
+            count,
+            "Re-discovered MCP prompts after prompts/list_changed"
+        );
+    }
+
     /// Drop cached content for one resource, or every resource of a server
     /// when the notification names none.
     fn invalidate_resource(&self, server_name: &str, uri: Option<&str>) {
@@ -186,6 +247,9 @@ impl crate::channel::ServerNotificationHandler for PerServerNotificationHandler 
                     .and_then(serde_json::Value::as_str);
                 self.sink.invalidate_resource(&self.server, uri);
             }
+            "notifications/prompts/list_changed" => {
+                self.sink.refresh_prompts(&self.server).await;
+            }
             other => tracing::debug!(
                 server = %self.server,
                 method = other,
@@ -213,6 +277,12 @@ pub struct McpManager {
     tools: Arc<Mutex<McpToolRegistry>>,
     /// Discovered resources.
     resources: Arc<Mutex<McpResourceRegistry>>,
+    /// Discovered prompts.
+    ///
+    /// Shared for the same reason as the tool and resource registries: a
+    /// `prompts/list_changed` notification re-discovers them from the stream
+    /// task, where the manager itself is not borrowed.
+    prompts: Arc<Mutex<McpPromptRegistry>>,
     /// Resource read cache: (server_id, uri) -> content.
     resource_cache: Arc<Mutex<HashMap<(String, String), CachedResource>>>,
     /// Default cache TTL.
@@ -258,6 +328,7 @@ impl McpManager {
             servers: Arc::new(DashMap::new()),
             tools: Arc::new(Mutex::new(McpToolRegistry::new())),
             resources: Arc::new(Mutex::new(McpResourceRegistry::new())),
+            prompts: Arc::new(Mutex::new(McpPromptRegistry::new())),
             resource_cache: Arc::new(Mutex::new(HashMap::new())),
             cache_ttl: Duration::from_secs(60),
             oauth: Arc::new(tokio::sync::Mutex::new(OAuthManager::new())),
@@ -296,6 +367,7 @@ impl McpManager {
         NotificationSink {
             servers: Arc::clone(&self.servers),
             tools: Arc::clone(&self.tools),
+            prompts: Arc::clone(&self.prompts),
             resource_cache: Arc::clone(&self.resource_cache),
             router: Arc::clone(&self.notification_router),
         }
@@ -409,10 +481,11 @@ impl McpManager {
         self.discover_all().await;
     }
 
-    /// Discover tools and resources from all running servers.
+    /// Discover tools, resources, and prompts from all running servers.
     pub async fn discover_all(&self) {
         self.discover_all_tools().await;
         self.discover_all_resources().await;
+        self.discover_all_prompts().await;
     }
 
     /// Discover tools from all running servers.
@@ -517,6 +590,46 @@ impl McpManager {
                 }
                 Err(e) => {
                     tracing::warn!(server = %server.name, "Resource discovery failed: {e}");
+                }
+            }
+        }
+    }
+
+    /// Discover prompts from all running servers.
+    ///
+    /// Each server is queried independently: one that errors is logged under
+    /// its own name and leaves its previously discovered prompts untouched,
+    /// while the other servers are still discovered. A server with no prompts
+    /// is simply absent from the aggregate.
+    pub async fn discover_all_prompts(&self) {
+        let servers: Vec<McpServer> = self
+            .servers
+            .iter()
+            .filter(|entry| entry.value().status == crate::server::ServerStatus::Running)
+            .map(|entry| entry.value().clone())
+            .collect();
+        for mut server in servers {
+            match server.discover_prompts().await {
+                Ok(value) => match parse_prompt_list(&value) {
+                    Ok(prompts) => {
+                        let count = prompts.len();
+                        self.prompts
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .replace_server(&server.name, prompts);
+                        tracing::info!(
+                            server = %server.name,
+                            count,
+                            "Discovered MCP prompts"
+                        );
+                    }
+                    Err(error) => tracing::warn!(
+                        server = %server.name,
+                        "Prompt discovery returned an invalid response: {error}"
+                    ),
+                },
+                Err(error) => {
+                    tracing::warn!(server = %server.name, "Prompt discovery failed: {error}");
                 }
             }
         }
@@ -639,6 +752,14 @@ impl McpManager {
         self.resources.lock().unwrap().register(resource);
     }
 
+    /// Register a discovered prompt, tagged with the server that offered it.
+    pub fn register_prompt(&self, prompt: ServerPrompt) {
+        self.prompts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .register(prompt);
+    }
+
     /// Read one resource from a named server.
     ///
     /// Sends a live `resources/read` request, parses the first usable entry
@@ -709,6 +830,40 @@ impl McpManager {
             "no MCP server could read resource '{uri}': {}",
             failures.join("; ")
         ))
+    }
+
+    /// Resolve one prompt on a named server.
+    ///
+    /// Sends a live `prompts/get` request with `arguments` as its JSON object
+    /// and parses the response into [`McpPromptResult`]. `server_name` and
+    /// `prompt_name` are the configured server name and the raw prompt name the
+    /// server advertised; neither is sanitised.
+    ///
+    /// The error names the server and the prompt, so a caller that tried more
+    /// than one server can report each refusal separately.
+    pub async fn get_prompt(
+        &self,
+        server_name: &str,
+        prompt_name: &str,
+        arguments: serde_json::Map<String, serde_json::Value>,
+    ) -> Result<McpPromptResult, String> {
+        let mut server = self
+            .get_server(server_name)
+            .ok_or_else(|| format!("MCP server '{server_name}' is not attached"))?;
+
+        let response = server
+            .get_prompt(prompt_name, &arguments)
+            .await
+            .map_err(|error| {
+                format!("failed to get prompt '{prompt_name}' from server '{server_name}': {error}")
+            })?;
+
+        parse_prompt_result(&response).map_err(|error| {
+            format!(
+                "server '{server_name}' returned an invalid prompts/get response for \
+                 '{prompt_name}': {error}"
+            )
+        })
     }
 
     /// Register every discovered tool into `registry`.
@@ -808,6 +963,47 @@ impl McpManager {
     #[must_use]
     pub fn resource_count(&self) -> usize {
         self.resources.lock().unwrap().len()
+    }
+
+    /// All discovered prompts, each tagged with the server that offered it.
+    #[must_use]
+    pub fn list_prompts(&self) -> Vec<ServerPrompt> {
+        self.prompts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .list()
+            .to_vec()
+    }
+
+    /// Prompts offered by one server.
+    #[must_use]
+    pub fn prompts_for_server(&self, server: &str) -> Vec<McpPromptInfo> {
+        self.prompts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .for_server(server)
+            .into_iter()
+            .cloned()
+            .collect()
+    }
+
+    /// Look up one discovered prompt by server and name.
+    #[must_use]
+    pub fn prompt_info(&self, server: &str, name: &str) -> Option<McpPromptInfo> {
+        self.prompts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(server, name)
+            .map(|entry| entry.prompt.clone())
+    }
+
+    /// Number of registered prompts across every server.
+    #[must_use]
+    pub fn prompt_count(&self) -> usize {
+        self.prompts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .len()
     }
 
     /// Get a cached resource if present and not expired.
@@ -1004,6 +1200,120 @@ mod tests {
     use super::*;
     use crate::config::{McpServerConfig, McpTransport};
     use std::collections::HashMap;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static MOCK_PROMPT_ID: AtomicU64 = AtomicU64::new(0);
+
+    /// A stdio MCP server that advertises two prompts and resolves one.
+    ///
+    /// `MOCK_PROMPTS_BROKEN_LIST=1` makes `prompts/list` fail, which is how a
+    /// per-server discovery failure is exercised without a second script.
+    const MOCK_PROMPTS_SERVER: &str = r#"#!/usr/bin/env python3
+import json
+import os
+import sys
+
+BROKEN_LIST = os.environ.get("MOCK_PROMPTS_BROKEN_LIST") == "1"
+
+def send_response(req_id, result):
+    print(json.dumps({"jsonrpc": "2.0", "id": req_id, "result": result}), flush=True)
+
+def send_error(req_id, code, message):
+    print(json.dumps({"jsonrpc": "2.0", "id": req_id, "error": {"code": code, "message": message}}), flush=True)
+
+for line in sys.stdin:
+    line = line.strip()
+    if not line:
+        continue
+    try:
+        req = json.loads(line)
+    except json.JSONDecodeError:
+        continue
+
+    method = req.get("method", "")
+    req_id = req.get("id")
+
+    if method == "initialize":
+        send_response(req_id, {
+            "protocolVersion": "2024-11-05",
+            "capabilities": {"prompts": {}},
+            "serverInfo": {"name": "mock-prompts", "version": "1.0"}
+        })
+    elif method == "initialized":
+        pass
+    elif method == "tools/list":
+        send_response(req_id, {"tools": []})
+    elif method == "resources/list":
+        send_response(req_id, {"resources": []})
+    elif method == "prompts/list":
+        if BROKEN_LIST:
+            send_error(req_id, -32000, "prompt listing is unavailable")
+        else:
+            send_response(req_id, {"prompts": [
+                {
+                    "name": "review",
+                    "description": "Review a file",
+                    "arguments": [
+                        {"name": "path", "description": "File to review", "required": True},
+                        {"name": "style"}
+                    ]
+                },
+                {"name": "broken"}
+            ]})
+    elif method == "prompts/get":
+        params = req.get("params", {})
+        name = params.get("name", "")
+        args = params.get("arguments", {})
+        if name == "review":
+            path = args.get("path", "")
+            style = args.get("style", "default")
+            send_response(req_id, {
+                "description": "Review " + path,
+                "messages": [
+                    {"role": "user", "content": {"type": "text", "text": "Please review " + path}},
+                    {"role": "assistant", "content": {"type": "text", "text": "Style: " + style}}
+                ]
+            })
+        elif name == "broken":
+            send_error(req_id, -32000, "prompt backend failed")
+        else:
+            send_error(req_id, -32602, "unknown prompt: " + name)
+    else:
+        send_error(req_id, -32601, "Method " + method + " not found")
+"#;
+
+    fn mock_prompts_server_path() -> PathBuf {
+        let id = MOCK_PROMPT_ID.fetch_add(1, Ordering::SeqCst);
+        let path = std::env::temp_dir().join(format!("coderex_mock_prompts_{id}.py"));
+        std::fs::write(&path, MOCK_PROMPTS_SERVER).expect("write mock prompt server");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut permissions = std::fs::metadata(&path)
+                .expect("stat mock prompt server")
+                .permissions();
+            permissions.set_mode(0o755);
+            std::fs::set_permissions(&path, permissions).expect("chmod mock prompt server");
+        }
+        path
+    }
+
+    fn prompts_config(servers: &[(&str, &PathBuf, HashMap<String, String>)]) -> McpConfig {
+        let mut config = McpConfig::new();
+        for (name, script, env) in servers {
+            config.add_server(
+                *name,
+                McpServerConfig {
+                    command: script.to_str().expect("script path is utf-8").into(),
+                    args: Vec::new(),
+                    env: env.clone(),
+                    ..Default::default()
+                },
+            );
+        }
+        config
+    }
 
     #[test]
     fn new_manager_is_empty() {
@@ -1309,5 +1619,83 @@ mod tests {
         )
         .await;
         assert_eq!(router.seen.lock().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn prompts_are_discovered_and_resolved_through_the_manager() {
+        let script = mock_prompts_server_path();
+        let mgr = McpManager::new();
+        mgr.load_config(&prompts_config(&[("mock", &script, HashMap::new())]));
+        mgr.start_all().await;
+
+        assert_eq!(mgr.prompt_count(), 2, "prompts/list should be discovered");
+        let prompts = mgr.prompts_for_server("mock");
+        let review = prompts
+            .iter()
+            .find(|prompt| prompt.name == "review")
+            .expect("the mock advertises 'review'");
+        assert_eq!(review.description.as_deref(), Some("Review a file"));
+        assert_eq!(review.arguments.len(), 2);
+        assert!(review.arguments[0].required);
+
+        let mut arguments = serde_json::Map::new();
+        arguments.insert("path".into(), serde_json::json!("src/lib.rs"));
+        arguments.insert("style".into(), serde_json::json!("terse"));
+        let result = mgr
+            .get_prompt("mock", "review", arguments)
+            .await
+            .expect("prompts/get should answer");
+        assert_eq!(result.description.as_deref(), Some("Review src/lib.rs"));
+        assert_eq!(result.messages.len(), 2);
+        assert_eq!(result.messages[0].role, "user");
+        let rendered = result.render_text();
+        assert!(rendered.contains("Please review src/lib.rs"), "{rendered}");
+        assert!(rendered.contains("Style: terse"), "{rendered}");
+
+        mgr.stop_all().await;
+    }
+
+    #[tokio::test]
+    async fn a_failing_server_is_reported_without_hiding_the_others_prompts() {
+        let good = mock_prompts_server_path();
+        let bad = mock_prompts_server_path();
+        let mut broken = HashMap::new();
+        broken.insert("MOCK_PROMPTS_BROKEN_LIST".to_string(), "1".to_string());
+
+        let mgr = McpManager::new();
+        mgr.load_config(&prompts_config(&[
+            ("good", &good, HashMap::new()),
+            ("bad", &bad, broken),
+        ]));
+        mgr.start_all().await;
+
+        assert_eq!(
+            mgr.prompts_for_server("good").len(),
+            2,
+            "the healthy server's prompts must still be discovered"
+        );
+        assert!(
+            mgr.prompts_for_server("bad").is_empty(),
+            "a server that fails prompts/list contributes nothing"
+        );
+        assert!(mgr.prompt_info("good", "review").is_some());
+        assert!(mgr.prompt_info("bad", "review").is_none());
+
+        // A live refusal is reported against the server that gave it, not as a
+        // global "MCP is broken" failure.
+        let error = mgr
+            .get_prompt("good", "broken", serde_json::Map::new())
+            .await
+            .unwrap_err();
+        assert!(error.contains("'good'"), "{error}");
+        assert!(error.contains("prompt backend failed"), "{error}");
+
+        let error = mgr
+            .get_prompt("absent", "review", serde_json::Map::new())
+            .await
+            .unwrap_err();
+        assert!(error.contains("not attached"), "{error}");
+
+        mgr.stop_all().await;
     }
 }

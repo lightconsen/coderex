@@ -150,11 +150,12 @@ impl InboundRequestHandler for SharedInboundHandler {
 
 /// Receives notifications the server sends without waiting for an answer.
 ///
-/// Most notifications are informational, but two change what the client
+/// Most notifications are informational, but three change what the client
 /// knows: `notifications/tools/list_changed` means the tool list must be
-/// fetched again, and `notifications/resources/updated` means the content of a
-/// cached resource is stale. The manager installs a handler that acts on them
-/// rather than only logging them.
+/// fetched again, `notifications/resources/updated` means the content of a
+/// cached resource is stale, and `notifications/prompts/list_changed` means the
+/// prompt list must be fetched again. The manager installs a handler that acts
+/// on them rather than only logging them.
 #[async_trait::async_trait]
 pub trait ServerNotificationHandler: Send + Sync + std::fmt::Debug {
     /// Handle one notification. Errors are logged by the caller; a
@@ -671,6 +672,29 @@ impl JsonRpcChannel {
     pub async fn read_resource(&mut self, uri: &str) -> Result<Value, String> {
         self.send_request("resources/read", Some(serde_json::json!({"uri": uri})))
             .await
+    }
+
+    /// Discover prompts from the MCP server.
+    ///
+    /// Returns the raw `prompts/list` JSON response.
+    pub async fn list_prompts(&mut self) -> Result<Value, String> {
+        self.send_request("prompts/list", None).await
+    }
+
+    /// Resolve one prompt on the MCP server.
+    ///
+    /// `arguments` is sent as the JSON object `prompts/get` expects. It is
+    /// always present, empty when the prompt declares no arguments.
+    pub async fn get_prompt(
+        &mut self,
+        name: &str,
+        arguments: &serde_json::Map<String, Value>,
+    ) -> Result<Value, String> {
+        self.send_request(
+            "prompts/get",
+            Some(serde_json::json!({"name": name, "arguments": arguments})),
+        )
+        .await
     }
 
     /// Send a JSON-RPC request and wait for the response.

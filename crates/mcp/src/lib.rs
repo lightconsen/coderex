@@ -19,6 +19,7 @@ pub use http::MCP_STREAM_PROBE_ENV;
 pub use http::TokenProvider;
 pub mod manager;
 pub mod oauth;
+pub mod prompts;
 pub mod proxy;
 pub mod resources;
 pub mod result_adapter;

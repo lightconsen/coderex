@@ -6,7 +6,7 @@ use anyhow::Result;
 use coderex_agents::manager::{
     AgentManager, AgentSubscription, ParentContextSnapshot, TeammateEvent,
 };
-use coderex_commands::registry::{CommandContext, CommandRegistry, CommandResult};
+use coderex_commands::registry::{CommandContext, CommandRegistry, CommandResult, SlashCommand};
 use coderex_commands::{CommandHistory, MacroRegistry};
 use coderex_core::api_client::ApiClient;
 use coderex_core::confirmation_bus::{ConfirmationBus, ConfirmationRequest, ConfirmationResponse};
@@ -200,12 +200,70 @@ impl McpResourceToolState {
     }
 }
 
+/// One row from [`McpPromptToolState::list`]:
+/// `(server, name, description, arguments)` where each argument is
+/// `(name, description, required)`.
+type McpPromptRow = (
+    String,
+    String,
+    Option<String>,
+    Vec<(String, Option<String>, bool)>,
+);
+
+/// MCP prompt access backed by the session's live manager.
+///
+/// Discovery fills the manager's prompt registry; resolving a prompt issues a
+/// live `prompts/get` and renders its messages as text.
+pub(crate) struct McpPromptToolState {
+    slot: McpManagerSlot,
+}
+
+impl McpPromptToolState {
+    fn list(&self) -> Vec<McpPromptRow> {
+        let Some(manager) = self.slot.read().unwrap().as_ref().cloned() else {
+            return Vec::new();
+        };
+        manager
+            .list_prompts()
+            .into_iter()
+            .map(|entry| {
+                let arguments = entry
+                    .prompt
+                    .arguments
+                    .into_iter()
+                    .map(|argument| (argument.name, argument.description, argument.required))
+                    .collect();
+                (
+                    entry.server,
+                    entry.prompt.name,
+                    entry.prompt.description,
+                    arguments,
+                )
+            })
+            .collect()
+    }
+
+    async fn get(
+        &self,
+        server: &str,
+        name: &str,
+        arguments: serde_json::Map<String, serde_json::Value>,
+    ) -> Result<String, String> {
+        let Some(manager) = self.slot.read().unwrap().as_ref().cloned() else {
+            return Err("no MCP manager is attached to this session".to_string());
+        };
+        let result = manager.get_prompt(server, name, arguments).await?;
+        Ok(result.render_text())
+    }
+}
+
 /// Concrete handles for the baseline tools that need runtime state.
 #[derive(Clone)]
 pub(crate) struct RuntimeToolHandles {
     pub(crate) team: Arc<TeamToolState>,
     pub(crate) worktree: Arc<WorktreeToolState>,
     pub(crate) mcp: Arc<McpResourceToolState>,
+    pub(crate) mcp_prompts: Arc<McpPromptToolState>,
 }
 
 impl RuntimeToolHandles {
@@ -214,6 +272,9 @@ impl RuntimeToolHandles {
             team: Arc::new(TeamToolState::default()),
             worktree: Arc::new(WorktreeToolState::new(std::path::Path::new(cwd))),
             mcp: Arc::new(McpResourceToolState {
+                slot: Arc::clone(mcp_slot),
+            }),
+            mcp_prompts: Arc::new(McpPromptToolState {
                 slot: Arc::clone(mcp_slot),
             }),
         }
@@ -258,6 +319,18 @@ impl RuntimeToolHandles {
             Arc::new(ReadMcpResourceWithState {
                 original,
                 state: Arc::clone(&self.mcp),
+            })
+        });
+        Self::replace(registry, "ListMcpPrompts", |original| {
+            Arc::new(ListMcpPromptsWithState {
+                original,
+                state: Arc::clone(&self.mcp_prompts),
+            })
+        });
+        Self::replace(registry, "GetMcpPrompt", |original| {
+            Arc::new(GetMcpPromptWithState {
+                original,
+                state: Arc::clone(&self.mcp_prompts),
             })
         });
     }
@@ -591,6 +664,189 @@ impl coderex_tools::Tool for ReadMcpResourceWithState {
             images: Vec::new(),
         })
     }
+}
+
+struct ListMcpPromptsWithState {
+    original: Arc<dyn coderex_tools::Tool>,
+    state: Arc<McpPromptToolState>,
+}
+
+#[async_trait::async_trait]
+impl coderex_tools::Tool for ListMcpPromptsWithState {
+    fn descriptor(&self) -> coderex_tools::ToolDescriptor {
+        self.original.descriptor()
+    }
+
+    fn capabilities(&self) -> coderex_tools::ToolCapabilities {
+        self.original.capabilities()
+    }
+
+    fn rule_exemptions_for(&self, input: &serde_json::Value) -> coderex_tools::ToolRuleExemptions {
+        self.original.rule_exemptions_for(input)
+    }
+
+    async fn execute(
+        &self,
+        _input: coderex_tools::ToolInput,
+        _ctx: coderex_tools::ToolContext<'_>,
+    ) -> Result<coderex_tools::ToolOutput, coderex_tools::ToolError> {
+        let prompts: Vec<_> = self
+            .state
+            .list()
+            .into_iter()
+            .map(|(server, name, description, arguments)| {
+                let arguments: Vec<_> = arguments
+                    .into_iter()
+                    .map(|(name, description, required)| {
+                        serde_json::json!({
+                            "name": name,
+                            "description": description,
+                            "required": required,
+                        })
+                    })
+                    .collect();
+                serde_json::json!({
+                    "server": server,
+                    "name": name,
+                    "description": description,
+                    "arguments": arguments,
+                })
+            })
+            .collect();
+        Ok(coderex_tools::ToolOutput {
+            output: serde_json::to_string_pretty(&prompts).unwrap_or_else(|_| "[]".into()),
+            is_display: true,
+            images: Vec::new(),
+        })
+    }
+}
+
+struct GetMcpPromptWithState {
+    original: Arc<dyn coderex_tools::Tool>,
+    state: Arc<McpPromptToolState>,
+}
+
+#[async_trait::async_trait]
+impl coderex_tools::Tool for GetMcpPromptWithState {
+    fn descriptor(&self) -> coderex_tools::ToolDescriptor {
+        self.original.descriptor()
+    }
+
+    fn capabilities(&self) -> coderex_tools::ToolCapabilities {
+        self.original.capabilities()
+    }
+
+    fn rule_exemptions_for(&self, input: &serde_json::Value) -> coderex_tools::ToolRuleExemptions {
+        self.original.rule_exemptions_for(input)
+    }
+
+    async fn execute(
+        &self,
+        input: coderex_tools::ToolInput,
+        _ctx: coderex_tools::ToolContext<'_>,
+    ) -> Result<coderex_tools::ToolOutput, coderex_tools::ToolError> {
+        let server = input
+            .arguments
+            .get("server")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| coderex_tools::ToolError::InvalidInput {
+                message: "missing required field: server".into(),
+            })?;
+        let name = input
+            .arguments
+            .get("name")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| coderex_tools::ToolError::InvalidInput {
+                message: "missing required field: name".into(),
+            })?;
+        let arguments = match input.arguments.get("arguments") {
+            None | Some(serde_json::Value::Null) => serde_json::Map::new(),
+            Some(serde_json::Value::Object(arguments)) => arguments.clone(),
+            Some(_) => {
+                return Err(coderex_tools::ToolError::InvalidInput {
+                    message: "'arguments' must be an object".into(),
+                });
+            }
+        };
+        let content = self
+            .state
+            .get(server, name, arguments)
+            .await
+            .map_err(|message| coderex_tools::ToolError::InvalidInput { message })?;
+        Ok(coderex_tools::ToolOutput {
+            output: content,
+            is_display: true,
+            images: Vec::new(),
+        })
+    }
+}
+
+/// The slash-command name for a prompt: `mcp__<server>__<prompt>`.
+///
+/// The server and prompt components are sanitised; the raw names stay with the
+/// handler and are what `prompts/get` sends.
+fn prompt_command_name(server: &str, prompt: &str) -> String {
+    format!(
+        "mcp__{}__{}",
+        sanitize_prompt_component(server),
+        sanitize_prompt_component(prompt)
+    )
+}
+
+/// Replace every character that is not an ASCII letter, digit, or `_`.
+fn sanitize_prompt_component(value: &str) -> String {
+    value
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || character == '_' {
+                character
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+/// Run an `mcp__…` prompt command.
+///
+/// The registry's handler interface is synchronous, while `prompts/get` is a
+/// request over the live channel. The CLI runs on a multi-threaded Tokio
+/// runtime, so `block_in_place` keeps the worker's other tasks running while
+/// this one waits for the server.
+fn execute_mcp_prompt_command(
+    slot: &McpManagerSlot,
+    server: &str,
+    prompt: &str,
+    declared: &[coderex_mcp::prompts::McpPromptArgument],
+    args: &[String],
+) -> CommandResult {
+    let arguments = match coderex_mcp::prompts::parse_prompt_arguments(args, declared) {
+        Ok(arguments) => arguments,
+        Err(error) => return CommandResult::error(error),
+    };
+
+    let Some(manager) = slot
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .as_ref()
+        .cloned()
+    else {
+        return CommandResult::error("no MCP manager is attached to this session");
+    };
+
+    let result = tokio::task::block_in_place(|| {
+        tokio::runtime::Handle::current().block_on(manager.get_prompt(server, prompt, arguments))
+    });
+
+    match result {
+        Ok(result) => prompt_result_command(&result),
+        Err(error) => CommandResult::error(error),
+    }
+}
+
+/// The command result for a resolved prompt.
+fn prompt_result_command(result: &coderex_mcp::prompts::McpPromptResult) -> CommandResult {
+    CommandResult::success(result.render_text())
 }
 
 /// Translate a teammate callback event into the parent engine's lifecycle
@@ -1784,6 +2040,13 @@ pub struct ReplLoop {
     /// built before the MCP servers are attached, and reads this when it later
     /// builds a child registry.
     mcp_manager: Arc<std::sync::RwLock<Option<Arc<coderex_mcp::manager::McpManager>>>>,
+    /// Slash-command names already registered for discovered MCP prompts.
+    ///
+    /// The command registry is append-only, so a refresh records what it has
+    /// already added instead of registering the same prompt twice. A prompt
+    /// that disappears from a server keeps its command; invoking it fails with
+    /// that server's error.
+    mcp_prompt_commands: std::collections::HashSet<String>,
     /// Session handler for questions MCP servers ask, when one was installed.
     ///
     /// The manager already holds the inbound half; the TUI needs the same
@@ -2072,6 +2335,7 @@ impl ReplLoop {
             parent_context_snapshot: Arc::new(std::sync::Mutex::new(None)),
             agent_observable_rx: None,
             mcp_manager: Arc::new(std::sync::RwLock::new(None)),
+            mcp_prompt_commands: std::collections::HashSet::new(),
             mcp_elicitation: None,
             artifact_server: None,
             artifact_store_root: None,
@@ -2244,6 +2508,7 @@ impl ReplLoop {
         let runtime_handles = RuntimeToolHandles::new(&cwd, &mcp_slot);
         let subagent_team = Arc::clone(&runtime_handles.team);
         let subagent_mcp = Arc::clone(&runtime_handles.mcp);
+        let subagent_mcp_prompts = Arc::clone(&runtime_handles.mcp_prompts);
         // Background tools run inside a sub-agent's turn too, and a job record
         // written there must still name the session that owns it.
         let subagent_session_id = session_id.to_string();
@@ -2257,6 +2522,7 @@ impl ReplLoop {
                 team: Arc::clone(&subagent_team),
                 worktree: Arc::new(WorktreeToolState::new(&cwd)),
                 mcp: Arc::clone(&subagent_mcp),
+                mcp_prompts: Arc::clone(&subagent_mcp_prompts),
             }
             .install(&mut registry);
             let executor = Arc::new(ToolsExecutor::new(ExecutionConfig::default()));
@@ -2466,6 +2732,7 @@ impl ReplLoop {
             parent_context_snapshot: Arc::clone(&parent_context_snapshot),
             agent_observable_rx,
             mcp_manager: mcp_slot,
+            mcp_prompt_commands: std::collections::HashSet::new(),
             mcp_elicitation: None,
             artifact_server: None,
             artifact_store_root: None,
@@ -2603,6 +2870,142 @@ impl ReplLoop {
             mcp_manager.register_tools_into(dispatcher.registry());
         }
         *self.mcp_manager.write().expect("MCP slot poisoned") = Some(mcp_manager);
+        // The manager has already run `start_all` (and therefore discovery) by
+        // the time the session attaches it, so the first registration is free.
+        self.refresh_mcp_prompt_commands();
+    }
+
+    /// Register a slash command for every prompt the manager has discovered.
+    ///
+    /// Commands are named `mcp__<server>__<prompt>`, with any character that
+    /// is not an ASCII identifier character replaced by `_`. The raw server
+    /// and prompt names are captured for `prompts/get`; only the command name
+    /// is sanitised. Registration is idempotent.
+    ///
+    /// Called when the manager is attached and again, lazily, before an
+    /// `/mcp` or `mcp__…` command runs. A `prompts/list_changed` notification
+    /// updates the manager's registry from the stream task; the next such
+    /// command therefore picks up prompts added after connection. A prompt a
+    /// server stops offering keeps its command and reports the server's error
+    /// when invoked, because the command registry has no removal operation.
+    fn refresh_mcp_prompt_commands(&mut self) {
+        // `--disable-slash-commands` clears the registry; registering prompt
+        // commands here anyway would resurrect them behind the flag's back.
+        if self.no_slash_commands {
+            return;
+        }
+        let Some(manager) = self
+            .mcp_manager
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .cloned()
+        else {
+            return;
+        };
+
+        for entry in manager.list_prompts() {
+            let command_name = prompt_command_name(&entry.server, &entry.prompt.name);
+            if self.mcp_prompt_commands.contains(&command_name) {
+                continue;
+            }
+            if self.commands.find(&command_name).is_some() {
+                // Somebody else already owns this name; leave it alone but do
+                // not try to register it on every refresh.
+                self.mcp_prompt_commands.insert(command_name);
+                continue;
+            }
+
+            let description = entry.prompt.description.clone().unwrap_or_else(|| {
+                format!("MCP prompt '{}' from '{}'", entry.prompt.name, entry.server)
+            });
+            let name_static: &'static str = Box::leak(command_name.clone().into_boxed_str());
+            let description_static: &'static str = Box::leak(description.into_boxed_str());
+            let slot = Arc::clone(&self.mcp_manager);
+            let server = entry.server.clone();
+            let prompt_name = entry.prompt.name.clone();
+            let declared = entry.prompt.arguments.clone();
+            let handler = Arc::new(move |_ctx: &CommandContext, args: &[String]| {
+                execute_mcp_prompt_command(&slot, &server, &prompt_name, &declared, args)
+            });
+
+            self.commands.register(SlashCommand::local(
+                name_static,
+                description_static,
+                true,
+                true,
+                true,
+                handler,
+            ));
+            self.mcp_prompt_commands.insert(command_name);
+        }
+    }
+
+    /// The `/mcp` registry output with the discovered prompts appended under
+    /// the server that offers them.
+    fn run_mcp_command(&self, args: &[String]) -> CommandResult {
+        let ctx = self.build_context();
+        let mut result = self.commands.execute("mcp", &ctx, args);
+        let listing = self.mcp_prompt_listing();
+        if !listing.is_empty() {
+            if !result.output.is_empty() {
+                result.output.push('\n');
+            }
+            result.output.push_str(&listing);
+        }
+        result
+    }
+
+    /// Render discovered prompts grouped by server for `/mcp`.
+    fn mcp_prompt_listing(&self) -> String {
+        let Some(manager) = self
+            .mcp_manager
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .cloned()
+        else {
+            return String::new();
+        };
+
+        let mut by_server: std::collections::BTreeMap<String, Vec<_>> =
+            std::collections::BTreeMap::new();
+        for entry in manager.list_prompts() {
+            by_server
+                .entry(entry.server.clone())
+                .or_default()
+                .push(entry);
+        }
+        if by_server.is_empty() {
+            return String::new();
+        }
+
+        let mut output = String::from("Prompts:");
+        for (server, entries) in by_server {
+            output.push_str("\n  ");
+            output.push_str(&server);
+            output.push(':');
+            for entry in entries {
+                output.push_str("\n    /");
+                output.push_str(&prompt_command_name(&server, &entry.prompt.name));
+                if let Some(ref description) = entry.prompt.description {
+                    output.push_str(" - ");
+                    output.push_str(description);
+                }
+                if !entry.prompt.arguments.is_empty() {
+                    let names: Vec<String> = entry
+                        .prompt
+                        .arguments
+                        .iter()
+                        .map(coderex_mcp::prompts::McpPromptArgument::display)
+                        .collect();
+                    output.push_str(" (args: ");
+                    output.push_str(&names.join(", "));
+                    output.push(')');
+                }
+            }
+        }
+        output
     }
 
     /// Give the TUI a way to answer questions from MCP servers.
@@ -6696,6 +7099,13 @@ impl ReplLoop {
             // only saw registry commands left out half of what people type.
             self.command_history.append(cmd_name, &args);
 
+            // Servers can discover prompts after they connect (and push
+            // `prompts/list_changed`). Pick those up before resolving anything
+            // that could name one.
+            if cmd_name == "mcp" || cmd_name.starts_with("mcp__") {
+                self.refresh_mcp_prompt_commands();
+            }
+
             // Built-in REPL commands that bypass the registry. With slash
             // commands disabled none of these run either: they are still slash
             // commands, and executing them anyway made the flag only hide
@@ -6708,6 +7118,17 @@ impl ReplLoop {
                     }
                     "tokens" => {
                         self.execute_and_display_command("usage", &[], ui_state);
+                        return;
+                    }
+                    "mcp" => {
+                        let result = self.run_mcp_command(&args);
+                        ui_state.messages.push(coderex_ui::message_list::Message {
+                            role: coderex_ui::message_list::MessageRole::System,
+                            content: result.output.into(),
+                            tool_name: None,
+                            streaming: false,
+                            folded: false,
+                        });
                         return;
                     }
                     "compact" => {
@@ -7262,6 +7683,9 @@ impl ReplLoop {
                 .map(std::string::ToString::to_string)
                 .collect();
             self.command_history.append(cmd_name, &args);
+            if cmd_name.starts_with("mcp__") {
+                self.refresh_mcp_prompt_commands();
+            }
             let ctx = self.build_context();
             let result = self.commands.execute(cmd_name, &ctx, &args);
             self.sync_command_state(cmd_name, &result);
@@ -7361,6 +7785,12 @@ impl ReplLoop {
         // history that only recorded registry commands was missing them.
         self.command_history.append(cmd_name, &args);
 
+        // Pick up prompts discovered after the manager was attached (a fresh
+        // connection or a `prompts/list_changed` notification).
+        if cmd_name == "mcp" || cmd_name.starts_with("mcp__") {
+            self.refresh_mcp_prompt_commands();
+        }
+
         // Check for macro expansion. A macro expands into slash commands, so
         // it follows the same switch as the built-ins below.
         if !self.no_slash_commands && self.macro_registry.has(cmd_name) {
@@ -7389,6 +7819,11 @@ impl ReplLoop {
                 }
                 "help" => {
                     self.show_help(stdout)?;
+                    return Ok(());
+                }
+                "mcp" => {
+                    let result = self.run_mcp_command(&args);
+                    writeln!(stdout, "{}", result.output)?;
                     return Ok(());
                 }
                 "cancel" => {
@@ -7705,6 +8140,9 @@ impl ReplLoop {
                 .collect();
 
             self.command_history.append(cmd_name, &args);
+            if cmd_name == "mcp" || cmd_name.starts_with("mcp__") {
+                self.refresh_mcp_prompt_commands();
+            }
 
             let mut ctx = self.build_context();
             ctx.pipe_input = pipe_input.take();
@@ -11127,5 +11565,100 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(listed.output, "[]");
+    }
+
+    #[test]
+    fn prompt_command_names_keep_only_identifier_characters() {
+        assert_eq!(
+            prompt_command_name("my server", "review/file"),
+            "mcp__my_server__review_file"
+        );
+        assert_eq!(
+            prompt_command_name("srv-1", "ask.questions"),
+            "mcp__srv_1__ask_questions"
+        );
+        assert_eq!(sanitize_prompt_component("a-b c"), "a_b_c");
+        assert_eq!(sanitize_prompt_component("keep_1"), "keep_1");
+    }
+
+    fn sample_prompt() -> coderex_mcp::prompts::ServerPrompt {
+        coderex_mcp::prompts::ServerPrompt {
+            server: "my server".into(),
+            prompt: coderex_mcp::prompts::McpPromptInfo {
+                name: "review/file".into(),
+                description: Some("Review a file".into()),
+                arguments: vec![coderex_mcp::prompts::McpPromptArgument {
+                    name: "path".into(),
+                    description: None,
+                    required: true,
+                }],
+            },
+        }
+    }
+
+    #[test]
+    fn prompt_commands_are_registered_for_discovered_prompts() {
+        let mut repl = ReplLoop::new("/tmp".into(), ModelId::sonnet());
+        let manager = Arc::new(coderex_mcp::manager::McpManager::new());
+        manager.register_prompt(sample_prompt());
+        repl.with_mcp_manager(manager);
+
+        let command = repl
+            .commands
+            .find("mcp__my_server__review_file")
+            .expect("the sanitised prompt command is registered");
+        assert_eq!(command.description, "Review a file");
+
+        // A second refresh must not register the same command twice.
+        let before = repl.commands.len();
+        repl.refresh_mcp_prompt_commands();
+        assert_eq!(repl.commands.len(), before);
+    }
+
+    #[test]
+    fn refresh_registers_prompts_discovered_after_the_manager_was_attached() {
+        let mut repl = ReplLoop::new("/tmp".into(), ModelId::sonnet());
+        let manager = Arc::new(coderex_mcp::manager::McpManager::new());
+        repl.with_mcp_manager(Arc::clone(&manager));
+        assert!(repl.commands.find("mcp__my_server__review_file").is_none());
+
+        // A server that connects (or pushes prompts/list_changed) updates the
+        // manager's registry; the next refresh exposes the command.
+        manager.register_prompt(sample_prompt());
+        repl.refresh_mcp_prompt_commands();
+        assert!(repl.commands.find("mcp__my_server__review_file").is_some());
+    }
+
+    #[test]
+    fn prompt_result_renders_messages_for_the_transcript() {
+        use coderex_mcp::prompts::{McpPromptContent, McpPromptMessage, McpPromptResult};
+
+        let result = McpPromptResult {
+            description: Some("Resolved".into()),
+            messages: vec![
+                McpPromptMessage {
+                    role: "user".into(),
+                    content: McpPromptContent::Text {
+                        text: "hello".into(),
+                    },
+                },
+                McpPromptMessage {
+                    role: "assistant".into(),
+                    content: McpPromptContent::Image {
+                        data: "AAAA".into(),
+                        mime_type: "image/png".into(),
+                    },
+                },
+            ],
+        };
+        let command = prompt_result_command(&result);
+        assert!(!command.state_changed);
+        assert!(
+            command.output.starts_with("Resolved\n[user]\nhello"),
+            "{}",
+            command.output
+        );
+        assert!(command.output.contains("[assistant]\n[image: image/png]"));
+        assert!(!command.output.contains("AAAA"));
     }
 }
