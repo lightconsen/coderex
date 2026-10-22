@@ -196,6 +196,15 @@ pub enum HeadlessElicitation {
 /// The environment variable that selects [`HeadlessElicitation`].
 pub const HEADLESS_ELICITATION_ENV: &str = "CODEREX_HEADLESS_ELICITATION";
 
+/// The environment variable that supplies the answer to a headless free-text
+/// elicitation question.
+///
+/// It is read only when [`HEADLESS_ELICITATION_ENV`] selects
+/// [`HeadlessElicitation::Allow`] and the value is non-empty. `Deny` and
+/// `Defaults` never answer a free-text question: there is no schema to take a
+/// default from, and neither policy invents an answer.
+pub const HEADLESS_ELICITATION_ANSWER_ENV: &str = "CODEREX_HEADLESS_ELICITATION_ANSWER";
+
 impl HeadlessElicitation {
     /// Read the policy from the environment, defaulting to [`Self::Deny`].
     #[must_use]
@@ -291,6 +300,21 @@ impl SessionElicitationHandler {
         if let Ok(mut slot) = self.tui.lock() {
             *slot = None;
         }
+    }
+
+    /// The configured answer to a free-text question, when one is allowed.
+    ///
+    /// Only [`HeadlessElicitation::Allow`] has a policy that can answer text,
+    /// and only when `CODEREX_HEADLESS_ELICITATION_ANSWER` is set and
+    /// non-empty. An empty value is the same as unset: it would answer a
+    /// question with nothing, which is not an answer.
+    fn free_text_answer(&self) -> Option<String> {
+        if self.headless != HeadlessElicitation::Allow {
+            return None;
+        }
+        std::env::var(HEADLESS_ELICITATION_ANSWER_ENV)
+            .ok()
+            .filter(|answer| !answer.is_empty())
     }
 
     /// The handler to install on the MCP manager.
@@ -420,8 +444,23 @@ impl ElicitationHandler for SessionElicitationHandler {
             return ReplElicitationHandler::default().request(questions).await;
         }
 
-        // A free-text question carries no schema, so there is nothing the
-        // headless policy could answer on the person's behalf.
+        // A free-text question carries no schema, so `Defaults` has nothing to
+        // take an answer from and `Deny` refuses by construction. `Allow`
+        // answers only when a non-empty answer was configured; otherwise it
+        // cancels like the others rather than inventing text.
+        if let Some(text) = self.free_text_answer() {
+            tracing::info!(
+                message = %question.question,
+                policy = ?self.headless,
+                "a headless session answered an MCP free-text question from \
+                 {HEADLESS_ELICITATION_ANSWER_ENV}"
+            );
+            return ElicitationResult::Responded(ElicitationResponse {
+                request_id: question.header.clone(),
+                selected: Vec::new(),
+                other_text: Some(text),
+            });
+        }
         tracing::warn!(
             message = %question.question,
             policy = ?self.headless,
@@ -801,14 +840,78 @@ mod tests {
         ));
     }
 
-    /// A free-text question has no schema to default, so every policy cancels
-    /// it rather than inventing an answer.
+    /// Run one free-text request with `CODEREX_HEADLESS_ELICITATION_ANSWER`
+    /// set to `answer` (or unset), restoring the previous value afterwards.
+    ///
+    /// The handler reads the variable while the request is awaited, so the
+    /// lock is held for the whole test. Only these tests touch this name.
+    #[allow(unsafe_code)] // SAFETY: the environment mutation is serialised by ENV_LOCK.
+    #[allow(clippy::await_holding_lock)] // ENV_LOCK must stay held until the answer is read.
+    async fn request_free_text(
+        policy: HeadlessElicitation,
+        answer: Option<&str>,
+    ) -> ElicitationResult {
+        let guard = crate::ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let previous = std::env::var_os(HEADLESS_ELICITATION_ANSWER_ENV);
+        // SAFETY: ENV_LOCK is held for the whole request, and this module is
+        // the only test module that mutates this variable.
+        unsafe {
+            match answer {
+                Some(answer) => std::env::set_var(HEADLESS_ELICITATION_ANSWER_ENV, answer),
+                None => std::env::remove_var(HEADLESS_ELICITATION_ANSWER_ENV),
+            }
+        }
+        let handler = SessionElicitationHandler::with_headless_policy(false, policy);
+        let result = handler.request(vec![question()]).await;
+        // SAFETY: as above; ENV_LOCK is still held.
+        unsafe {
+            match previous {
+                Some(previous) => std::env::set_var(HEADLESS_ELICITATION_ANSWER_ENV, previous),
+                None => std::env::remove_var(HEADLESS_ELICITATION_ANSWER_ENV),
+            }
+        }
+        drop(guard);
+        result
+    }
+
+    /// A free-text question is answered only by `allow` with a non-empty
+    /// configured answer. Every other combination cancels rather than
+    /// inventing text.
     #[tokio::test]
-    async fn headless_allow_still_cancels_a_free_text_question() {
-        let handler =
-            SessionElicitationHandler::with_headless_policy(false, HeadlessElicitation::Allow);
+    async fn headless_free_text_answers_only_allow_with_a_configured_answer() {
+        // allow + configured answer: respond with exactly that text.
+        match request_free_text(HeadlessElicitation::Allow, Some("staging")).await {
+            ElicitationResult::Responded(response) => {
+                assert_eq!(response.other_text.as_deref(), Some("staging"));
+                assert_eq!(response.request_id, "Environment");
+                assert!(response.selected.is_empty());
+            }
+            other => panic!("expected the configured answer, got {other:?}"),
+        }
+
+        // allow + unset: cancel.
         assert!(matches!(
-            handler.request(vec![question()]).await,
+            request_free_text(HeadlessElicitation::Allow, None).await,
+            ElicitationResult::Cancelled
+        ));
+
+        // allow + empty: cancel — an empty value is not an answer.
+        assert!(matches!(
+            request_free_text(HeadlessElicitation::Allow, Some("")).await,
+            ElicitationResult::Cancelled
+        ));
+
+        // deny + configured answer: cancel.
+        assert!(matches!(
+            request_free_text(HeadlessElicitation::Deny, Some("staging")).await,
+            ElicitationResult::Cancelled
+        ));
+
+        // defaults + configured answer: cancel.
+        assert!(matches!(
+            request_free_text(HeadlessElicitation::Defaults, Some("staging")).await,
             ElicitationResult::Cancelled
         ));
     }

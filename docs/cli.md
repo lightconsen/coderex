@@ -44,7 +44,7 @@ main() → parse_args() → StartupOrchestrator::run()
     → On Enter: submit to QueryEngine.submit_streaming()
     → Engine events → UiState updates → TerminalUi::draw()
     → Background tasks polled: prompt suggestions, memory updates, agent summaries
-    → Config changes polled (hot-reload feature)
+    → ConfigWatcher reports settings-file changes → FileChanged hook (hot-reload, default)
 ```
 
 ## CLI Arguments
@@ -320,7 +320,7 @@ CLI flags are parsed by clap, stored in `SessionContext` during `StartupOrchestr
 - **Telemetry** — SQLite-backed crash telemetry store with pending crash report ingestion at startup.
 - **Crash recovery** — Session state snapshot (`.coderex/recovery.json`) written periodically, restored via `/recover`.
 - **Daemon management** — PID file (`~/.coderex/daemon.pid`) with `serve-stop`/`serve-status` subcommands.
-- **Config hot-reload** — `ConfigWatcher` under `hot-reload` feature, polls file changes in settings JSON.
+- **Config hot-reload** — `ConfigWatcher` (default `hot-reload` feature) publishes the changed settings-file paths; the TUI loop consumes them and fires the `FileChanged` hook.
 - **Update check** — GitHub Releases API comparison with `CARGO_PKG_VERSION`, 24h cadence, `/update-check` command.
 
 ## Implemented Features
@@ -340,7 +340,7 @@ CLI flags are parsed by clap, stored in `SessionContext` during `StartupOrchestr
 - WebSocket server daemon (`coderex serve`): writes PID file on start, removes on exit.
 - Daemon management: `coderex serve-stop` sends SIGTERM, `coderex serve-status` reports liveness.
 - Crash recovery: `.coderex/recovery.json` snapshot, `/recover` command.
-- Config hot-reload: `ConfigWatcher` under `hot-reload` feature (`cargo build --features hot-reload`).
+- Config hot-reload: `ConfigWatcher` is in the default feature set (`default = ["core", "hot-reload"]`); the TUI loop consumes its changed-path events and fires the `FileChanged` hook. A headless one-shot run does not drain the watcher.
 - Multi-workspace: `/workspace [path]` switches CWD, validates directory.
 - Update check: non-blocking GitHub release comparison on startup, `/update-check` command.
 - Signal handling: SIGTERM (graceful shutdown, cleanup PID/recovery), SIGHUP (config reload trigger).

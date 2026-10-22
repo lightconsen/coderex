@@ -90,7 +90,7 @@ futures.workspace = true
 #
 
 [features]
-default = ["core"]
+default = ["core", "hot-reload"]
 core = []
 full = ["core"]
 hot-reload = ["coderex-config/hot-reload", "dep:notify"]

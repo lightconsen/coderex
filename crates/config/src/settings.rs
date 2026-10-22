@@ -1179,14 +1179,29 @@ pub fn resolve_api_key(api_key: &str) -> String {
 
 /// File watcher for hot-reloading config files.
 ///
-/// Watches one or more config files and sends a notification
-/// through a watch channel whenever a change is detected.
+/// Watches one or more config files and sends the paths that changed through
+/// a watch channel whenever a change is detected. The paths come from the
+/// `notify` event, so a consumer can say which file changed (and a hook can
+/// name it) instead of only that something did.
 #[cfg(feature = "hot-reload")]
 pub struct ConfigWatcher {
     /// Watch channel that signals when a config file changed.
-    changed: tokio::sync::watch::Sender<()>,
+    ///
+    /// The payload is the changed paths as `notify` reported them. Keeping
+    /// the watcher alive keeps this sender alive; dropping it closes the
+    /// channel.
+    changed: tokio::sync::watch::Sender<Vec<String>>,
     /// The underlying notify watcher.
     _watcher: std::sync::Arc<std::sync::Mutex<notify::RecommendedWatcher>>,
+}
+
+#[cfg(feature = "hot-reload")]
+impl std::fmt::Debug for ConfigWatcher {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // The `notify` watcher has no useful representation; the type and its
+        // channel are the parts a caller can reason about.
+        f.debug_struct("ConfigWatcher").finish_non_exhaustive()
+    }
 }
 
 #[cfg(feature = "hot-reload")]
@@ -1197,7 +1212,7 @@ impl ConfigWatcher {
     pub fn new<P: AsRef<std::path::Path>>(paths: &[P]) -> Result<Self, notify::Error> {
         use notify::{EventKind, RecursiveMode, Watcher};
 
-        let (tx, _rx) = tokio::sync::watch::channel(());
+        let (tx, _rx) = tokio::sync::watch::channel(Vec::new());
         let tx_clone = tx.clone();
 
         let mut watcher =
@@ -1205,8 +1220,13 @@ impl ConfigWatcher {
                 if let Ok(event) = res {
                     match event.kind {
                         EventKind::Modify(_) | EventKind::Create(_) | EventKind::Remove(_) => {
-                            let _ = tx_clone.send(());
-                            tracing::debug!("config file change detected");
+                            let paths: Vec<String> = event
+                                .paths
+                                .iter()
+                                .map(|path| path.to_string_lossy().into_owned())
+                                .collect();
+                            tracing::debug!(?paths, "config file change detected");
+                            let _ = tx_clone.send(paths);
                         }
                         _ => {}
                     }
@@ -1229,9 +1249,10 @@ impl ConfigWatcher {
 
     /// Subscribe to config change events.
     ///
-    /// Returns a receiver that resolves when a config file changes.
+    /// Returns a receiver that resolves when a config file changes; its value
+    /// is the list of paths from the `notify` event.
     #[must_use]
-    pub fn subscribe(&self) -> tokio::sync::watch::Receiver<()> {
+    pub fn subscribe(&self) -> tokio::sync::watch::Receiver<Vec<String>> {
         self.changed.subscribe()
     }
 }

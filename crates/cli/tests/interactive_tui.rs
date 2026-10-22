@@ -1638,6 +1638,10 @@ fn resume_restores_persisted_plan_and_activity() {
         session.wait_for_text("CodeRex v", SCREEN_TIMEOUT);
         session.send_line("show content of file");
         session.wait_for_any_text(&["pub fn add", "a + b"], SCREEN_TIMEOUT);
+        // The transcript is written when the engine is returned at the end of
+        // the turn. Ctrl+D while the response is still streaming abandons the
+        // query and leaves nothing to resume, so wait for completion.
+        session.wait_for_text("Completed in", SCREEN_TIMEOUT);
         session.ctrl_d();
         session.wait_for_exit(SCREEN_TIMEOUT);
     }

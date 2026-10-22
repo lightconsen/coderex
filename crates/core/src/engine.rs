@@ -2183,6 +2183,24 @@ impl QueryEngine {
         self.hooks.fire_hook(event_name, input, context).await
     }
 
+    /// Fire a lifecycle hook on behalf of the session that owns this engine.
+    ///
+    /// Some lifecycle events are not part of a turn. The REPL owns their
+    /// triggers — `/init` is the product's setup action, and the settings
+    /// watcher reports files that changed — but only the engine owns the hook
+    /// executor. This is the supported bridge: the caller passes the event's
+    /// wire name (from `HookEvent::as_str`) plus the input and context the
+    /// hook should see, and receives the same aggregate the engine's own
+    /// firing sites read.
+    pub async fn fire_lifecycle_hook(
+        &self,
+        event_name: &str,
+        input: &str,
+        context: &std::collections::HashMap<String, String>,
+    ) -> HookFireResult {
+        self.fire_hook(event_name, input, context).await
+    }
+
     /// Run the stop hooks, and enter the state that names them.
     ///
     /// `TurnState::StopHooks` was declared and never entered, and `Stop` was

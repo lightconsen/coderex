@@ -1525,9 +1525,26 @@ pub struct ReplLoop {
     /// `--no-session-persistence`, which arrives after the tools are
     /// registered, so the tools read it at call time.
     memory_writable: Arc<std::sync::atomic::AtomicBool>,
-    /// Config watcher for hot-reloading settings.
+    /// The live settings watcher.
+    ///
+    /// The receiver alone is not enough: `notify` stops watching when its
+    /// watcher is dropped, so the session has to keep the watcher alive for
+    /// as long as it wants change events.
     #[cfg(feature = "hot-reload")]
-    config_changed_rx: Option<tokio::sync::watch::Receiver<()>>,
+    _config_watcher: Option<coderex_config::ConfigWatcher>,
+    /// Config watcher for hot-reloading settings.
+    ///
+    /// Drained by `run_tui`'s event loop, which fires `FileChanged` with the
+    /// paths the watcher reported.
+    #[cfg(feature = "hot-reload")]
+    config_changed_rx: Option<tokio::sync::watch::Receiver<Vec<String>>>,
+    /// A lifecycle hook queued by a synchronous command path.
+    ///
+    /// `/init` runs synchronously inside the registry, while firing a hook is
+    /// async. `sync_command_state` records a successful `/init` here and the
+    /// async entry points (`execute_command`, and `run_tui` after
+    /// `process_tui_input`) take and fire it exactly once.
+    pending_setup: Option<String>,
     /// Command history with persistence.
     command_history: CommandHistory,
     /// Macro registry for user-defined command sequences.
@@ -1887,7 +1904,10 @@ impl ReplLoop {
             cron_rx: None,
             teleport_manager: Some(coderex_bridge::teleport::TeleportManager::new()),
             #[cfg(feature = "hot-reload")]
+            _config_watcher: None,
+            #[cfg(feature = "hot-reload")]
             config_changed_rx: None,
+            pending_setup: None,
             skip_permissions: false,
             permission_mode: None,
             no_persistence: false,
@@ -2201,7 +2221,7 @@ impl ReplLoop {
         let (bg_tx, bg_rx) = mpsc::unbounded_channel::<BackgroundTaskResult>();
 
         #[cfg(feature = "hot-reload")]
-        let config_changed_rx = Self::init_config_watcher(&cwd);
+        let (config_watcher, config_changed_rx) = Self::init_config_watcher(&cwd);
 
         let mut this = Self {
             commands,
@@ -2267,7 +2287,10 @@ impl ReplLoop {
             cron_rx: Some(cron_rx),
             teleport_manager: Some(coderex_bridge::teleport::TeleportManager::new()),
             #[cfg(feature = "hot-reload")]
+            _config_watcher: config_watcher,
+            #[cfg(feature = "hot-reload")]
             config_changed_rx,
+            pending_setup: None,
             skip_permissions: false,
             permission_mode: None,
             no_persistence: false,
@@ -3592,8 +3615,22 @@ impl ReplLoop {
     }
 
     /// Initialize the ConfigWatcher if the hot-reload feature is enabled.
+    ///
+    /// Returns the watcher as well as its receiver: dropping the watcher stops
+    /// `notify` (and drops the sender), so the session must keep it alive for
+    /// the receiver to ever see a change.
+    ///
+    /// Only `run_tui` drains the receiver. A headless one-shot (`run_headless`)
+    /// has no long-lived loop to select on it, so `FileChanged` does not fire
+    /// there; blocking the single turn to watch settings would delay the
+    /// prompt for an event that has no consumer.
     #[cfg(feature = "hot-reload")]
-    fn init_config_watcher(cwd: &str) -> Option<tokio::sync::watch::Receiver<()>> {
+    fn init_config_watcher(
+        cwd: &str,
+    ) -> (
+        Option<coderex_config::ConfigWatcher>,
+        Option<tokio::sync::watch::Receiver<Vec<String>>>,
+    ) {
         use coderex_config::ConfigWatcher;
         let user_path = coderex_config::config_home().join("settings.json");
         let project_path = std::path::Path::new(cwd).join(".coderex/settings.json");
@@ -3605,13 +3642,16 @@ impl ReplLoop {
             paths.push(project_path);
         }
         if paths.is_empty() {
-            return None;
+            return (None, None);
         }
         match ConfigWatcher::new(&paths) {
-            Ok(watcher) => Some(watcher.subscribe()),
+            Ok(watcher) => {
+                let rx = watcher.subscribe();
+                (Some(watcher), Some(rx))
+            }
             Err(e) => {
                 tracing::warn!("Failed to initialize config watcher: {e}");
-                None
+                (None, None)
             }
         }
     }
@@ -3771,6 +3811,16 @@ impl ReplLoop {
         });
 
         let mut event_rx = self.event_rx.take();
+        // Take the config receiver out of `self` before the loop: the other
+        // `select!` branches borrow `self` mutably, so polling a receiver
+        // through `self` for the whole loop would fight them. The watcher
+        // itself stays in `self` so `notify` keeps running.
+        #[cfg(feature = "hot-reload")]
+        let mut config_changed_rx = self.config_changed_rx.take();
+        // Without the feature there is no watcher; keep the `select!` branch
+        // below compiled and permanently disabled rather than duplicating it.
+        #[cfg(not(feature = "hot-reload"))]
+        let mut config_changed_rx: Option<tokio::sync::watch::Receiver<Vec<String>>> = None;
         let mut vim = VimState::new_insert();
         let mut thinking = false;
         let mut phase = InteractivePhase::Idle;
@@ -4111,6 +4161,11 @@ impl ReplLoop {
                                             &mut tui_elicit_rx,
                                             &mut queued_prompts,
                                         );
+                                        // A successful `/init` queued `Setup`
+                                        // inside the synchronous dispatch;
+                                        // this is the async drain point for
+                                        // the TUI.
+                                        self.drain_pending_setup_hook().await;
                                     }
                                 }
                                 VimAction::Escape => {
@@ -4931,6 +4986,32 @@ impl ReplLoop {
                             .info("An MCP server is waiting for an answer");
                     }
                     self.pending_elicitation = Some(request.response_tx);
+                }
+
+                // Settings hot-reload: `ConfigWatcher` reports the paths that
+                // changed and `FileChanged` names them. This main loop is the
+                // only long-lived consumer of the receiver, so it is the only
+                // place the hook fires; a headless one-shot has no loop to
+                // drain and deliberately does not pretend to.
+                changed = async {
+                    match config_changed_rx.as_mut() {
+                        Some(rx) => rx.changed().await,
+                        None => std::future::pending().await,
+                    }
+                }, if config_changed_rx.is_some() => {
+                    match changed {
+                        Ok(()) => {
+                            let paths = config_changed_rx
+                                .as_mut()
+                                .map(|rx| rx.borrow_and_update().clone())
+                                .unwrap_or_default();
+                            self.fire_file_changed_hook(&paths).await;
+                        }
+                        // The watcher (and its sender) is gone. Drop the
+                        // closed receiver so the branch stops polling; a
+                        // ready `Err` would otherwise spin the loop.
+                        Err(_) => config_changed_rx = None,
+                    }
                 }
 
                 else => break Ok(()),
@@ -5764,6 +5845,13 @@ impl ReplLoop {
     fn sync_command_state(&mut self, cmd_name: &str, result: &CommandResult) -> bool {
         self.apply_command_effects(result);
 
+        // `/init` is the product's setup action. The registry dispatches it
+        // synchronously, while firing a hook is async, so record a successful
+        // run here; the async entry points drain it into `HookEvent::Setup`.
+        if cmd_name == "init" && !Self::command_result_is_error(result) {
+            self.pending_setup = Some(format!("/{cmd_name}"));
+        }
+
         if cmd_name == "vim" && result.state_changed {
             self.vim_mode_enabled = !self.vim_mode_enabled;
             return true;
@@ -5777,6 +5865,61 @@ impl ReplLoop {
         }
 
         false
+    }
+
+    /// Whether a command result is the registry's error shape.
+    ///
+    /// `CommandResult` has no `is_error` flag; `CommandResult::error` is
+    /// identified by its `Error: ` prefix, which is what the transcript and
+    /// the protocol already show.
+    fn command_result_is_error(result: &CommandResult) -> bool {
+        result.output.starts_with("Error: ")
+    }
+
+    /// Fire a lifecycle hook that a synchronous command path queued.
+    ///
+    /// The pending value is taken before the await, so a hook that fails is
+    /// not replayed on a later turn and a successful one fires exactly once.
+    async fn drain_pending_setup_hook(&mut self) {
+        let Some(command) = self.pending_setup.take() else {
+            return;
+        };
+        let Some(ref engine) = self.engine else {
+            return;
+        };
+        let mut context = std::collections::HashMap::new();
+        context.insert("command".to_string(), command.clone());
+        let result = engine
+            .fire_lifecycle_hook(coderex_hooks::HookEvent::Setup.as_str(), &command, &context)
+            .await;
+        if !result.errors.is_empty() {
+            tracing::warn!(errors = ?result.errors, "Setup hook errors");
+        }
+    }
+
+    /// Fire `FileChanged` for the settings files `ConfigWatcher` reported.
+    ///
+    /// The changed paths are both the hook input and a `paths` context entry
+    /// (newline-separated), so a hook can name what changed without parsing
+    /// an opaque payload out of the input.
+    async fn fire_file_changed_hook(&self, paths: &[String]) {
+        let Some(ref engine) = self.engine else {
+            return;
+        };
+        let joined = paths.join("\n");
+        let mut context = std::collections::HashMap::new();
+        context.insert("paths".to_string(), joined.clone());
+        context.insert("source".to_string(), "config_watcher".to_string());
+        let result = engine
+            .fire_lifecycle_hook(
+                coderex_hooks::HookEvent::FileChanged.as_str(),
+                &joined,
+                &context,
+            )
+            .await;
+        if !result.errors.is_empty() {
+            tracing::warn!(errors = ?result.errors, "FileChanged hook errors");
+        }
     }
 
     fn apply_tui_theme(&self, ui_state: &mut coderex_ui::state::UiState, theme_name: &str) -> bool {
@@ -6894,7 +7037,11 @@ impl ReplLoop {
     ) -> std::io::Result<()> {
         // Check for pipe operator
         if line.contains('|') {
-            return self.execute_piped_commands_non_tui(line, stdout);
+            let result = self.execute_piped_commands_non_tui(line, stdout);
+            // A pipe may end in `/init`; the drain is async and the piped
+            // helper is not, so it happens here.
+            self.drain_pending_setup_hook().await;
+            return result;
         }
 
         let parts: Vec<&str> = line.split_whitespace().collect();
@@ -7226,6 +7373,9 @@ impl ReplLoop {
         let result = self.commands.execute(cmd_name, &ctx, &args);
         self.sync_command_state(cmd_name, &result);
         writeln!(stdout, "{}", result.output)?;
+        // The registry dispatch is synchronous; fire anything it queued now,
+        // while this async entry point owns the engine.
+        self.drain_pending_setup_hook().await;
         Ok(())
     }
 
@@ -8052,6 +8202,104 @@ mod tests {
         ToolDispatchOutcome, ToolExecutor as CoreToolExecutor, ToolInfo,
     };
     use coderex_core::types::{ToolResult, UsageSummary};
+
+    /// A hook executor that records what fired, for the lifecycle tests.
+    #[derive(Clone, Default)]
+    struct RecordingHookExecutor {
+        events:
+            Arc<std::sync::Mutex<Vec<(String, String, std::collections::HashMap<String, String>)>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl coderex_core::hook_executor::HookExecutor for RecordingHookExecutor {
+        async fn fire_hook(
+            &self,
+            event_name: &str,
+            input: &str,
+            context: &std::collections::HashMap<String, String>,
+        ) -> coderex_core::hook_executor::HookFireResult {
+            self.events
+                .lock()
+                .expect("the recording hook lock is not poisoned")
+                .push((event_name.to_string(), input.to_string(), context.clone()));
+            coderex_core::hook_executor::HookFireResult::default()
+        }
+    }
+
+    /// `/init` is the product's setup action: a successful run queues
+    /// `Setup`, while an error result must not.
+    #[test]
+    fn setup_is_queued_only_for_a_successful_init() {
+        let mut repl = ReplLoop::new("/tmp".into(), ModelId::sonnet());
+
+        repl.sync_command_state("init", &CommandResult::success("Initialized project"));
+        assert_eq!(repl.pending_setup.as_deref(), Some("/init"));
+
+        repl.pending_setup = None;
+        repl.sync_command_state("init", &CommandResult::error("permission denied"));
+        assert!(
+            repl.pending_setup.is_none(),
+            "a failed /init must not queue the Setup hook"
+        );
+    }
+
+    /// Only `/init` queues setup; another successful command leaves the flag
+    /// alone.
+    #[test]
+    fn a_non_init_command_does_not_queue_setup() {
+        let mut repl = ReplLoop::new("/tmp".into(), ModelId::sonnet());
+        repl.sync_command_state("version", &CommandResult::success("CodeRex 0.1.0"));
+        assert!(repl.pending_setup.is_none());
+    }
+
+    /// The async drain fires the queued `Setup` hook exactly once and clears
+    /// the flag, so the next turn cannot replay it.
+    #[tokio::test]
+    async fn draining_setup_fires_the_hook_exactly_once_and_clears_it() {
+        let mut repl = ReplLoop::with_engine(
+            Box::new(CountingApi::new()),
+            "/tmp".into(),
+            ModelId::sonnet(),
+        );
+        let recorder = RecordingHookExecutor::default();
+        let events = Arc::clone(&recorder.events);
+        repl.engine
+            .as_mut()
+            .expect("with_engine installs an engine")
+            .set_hooks(Box::new(recorder));
+
+        repl.sync_command_state("init", &CommandResult::success("Initialized project"));
+        repl.drain_pending_setup_hook().await;
+
+        assert!(
+            repl.pending_setup.is_none(),
+            "the drain must clear the flag"
+        );
+        {
+            let recorded = events.lock().expect("the recording hook lock is clean");
+            assert_eq!(
+                recorded.len(),
+                1,
+                "Setup fired more than once: {recorded:?}"
+            );
+            assert_eq!(recorded[0].0, "Setup");
+            assert_eq!(recorded[0].1, "/init");
+            assert_eq!(
+                recorded[0].2.get("command").map(String::as_str),
+                Some("/init")
+            );
+        }
+
+        repl.drain_pending_setup_hook().await;
+        assert_eq!(
+            events
+                .lock()
+                .expect("the recording hook lock is clean")
+                .len(),
+            1,
+            "a second drain fired the hook again"
+        );
+    }
 
     #[test]
     fn command_context_carries_the_session_feature_flags() {

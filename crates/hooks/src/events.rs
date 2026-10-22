@@ -25,12 +25,11 @@ pub enum HookEvent {
     SessionStart,
     /// During initial setup.
     ///
-    /// **Not fired.** The reference fires this for an explicit setup /
-    /// maintenance invocation (`--init`, `--init-only`, `--maintenance`).
-    /// CodeRex has no such invocation mode, and the engine has no one-time
-    /// setup method — its first `submit` is an ordinary user turn. Firing it
-    /// there would run a setup hook on every session, which is a different
-    /// event than the one the reference means, so it stays inert.
+    /// Fired by the REPL when the `/init` slash command succeeds — the
+    /// product's setup action. The registry dispatch is synchronous, so the
+    /// REPL queues the command in `sync_command_state` and fires this hook
+    /// from its async entry points (`execute_command` and the TUI loop) via
+    /// [`QueryEngine::fire_lifecycle_hook`](coderex_core::engine::QueryEngine::fire_lifecycle_hook).
     Setup,
     /// When a sub-agent starts.
     ///
@@ -53,13 +52,11 @@ pub enum HookEvent {
     CwdChanged,
     /// When a file changes.
     ///
-    /// **Not fired.** The reference fires this from a file watcher watching
-    /// the paths hooks asked for. CodeRex's only watchers live in the `ui`
-    /// (themes) and `config` (settings hot-reload) crates and are not wired to
-    /// hooks; there is no file-change signal in the crates that own a hook
-    /// executor. Firing it after one of our own `Write`/`Edit` calls would
-    /// report the tool's own action, not the external change the reference
-    /// means, so it stays inert.
+    /// Fired by the REPL's TUI loop when `coderex_config::ConfigWatcher`
+    /// reports a change to the user or project settings file. The hook input
+    /// and its `paths` context entry name the changed paths. The watcher is
+    /// drained only by the long-lived TUI loop: a headless one-shot run has
+    /// no loop to select on it, so this event does not fire there.
     FileChanged,
     /// When a worktree is created.
     ///
@@ -193,16 +190,13 @@ impl HookEvent {
     /// - `WorktreeCreate` — the `EnterWorktree` tool
     /// - `TaskCompleted` — the `TaskUpdate` tool
     /// - `CwdChanged` — `coderex_tools::RegistryToolDispatcher::set_cwd`
+    /// - `Setup` — the REPL, when `/init` succeeds
+    /// - `FileChanged` — the REPL's TUI loop, when `ConfigWatcher` reports a
+    ///   settings-file change (not the headless one-shot path)
     ///
-    /// Everything else is a name CodeRex accepts but never fires. A hook
-    /// configured on one of those would install and then never run, so
-    /// [`HookRegistry`](crate::HookRegistry) warns about it at load.
-    ///
-    /// `Setup` and `FileChanged` are the only reserved names left, and neither
-    /// has an honest source in this engine: there is no one-time setup
-    /// invocation mode, and nothing watches files for external changes —
-    /// firing after our own `Write`/`Edit` would report the tool's own action,
-    /// not a change made elsewhere.
+    /// Every name CodeRex accepts is fired somewhere; there are no reserved
+    /// names left. A test pins the list so adding a variant without a firing
+    /// site is a deliberate change rather than a silently inert hook.
     #[must_use]
     pub const fn is_triggered(self) -> bool {
         matches!(
@@ -212,9 +206,12 @@ impl HookEvent {
                 | Self::PostToolUseFailure
                 | Self::UserPromptSubmit
                 | Self::SessionStart
+                | Self::Setup
                 | Self::Notification
                 | Self::PermissionRequest
                 | Self::PermissionDenied
+                | Self::CwdChanged
+                | Self::FileChanged
                 | Self::PreCompact
                 | Self::PostCompact
                 | Self::Stop
@@ -226,7 +223,6 @@ impl HookEvent {
                 | Self::TeammateIdle
                 | Self::WorktreeCreate
                 | Self::TaskCompleted
-                | Self::CwdChanged
         )
     }
 }
@@ -452,11 +448,13 @@ mod tests {
                 "PostToolUseFailure",
                 "UserPromptSubmit",
                 "SessionStart",
+                "Setup",
                 "SubagentStart",
                 "Notification",
                 "PermissionRequest",
                 "PermissionDenied",
                 "CwdChanged",
+                "FileChanged",
                 "WorktreeCreate",
                 "PreCompact",
                 "PostCompact",
@@ -471,17 +469,20 @@ mod tests {
         );
     }
 
-    /// The names CodeRex accepts but never fires, and only those. Each one has
-    /// a per-variant note explaining why it has no honest firing site; this
-    /// test makes adding or removing one a deliberate change.
+    /// Nothing is reserved: every name CodeRex accepts has a firing site.
+    /// Adding a variant without one must update this test deliberately rather
+    /// than shipping an inert hook name.
     #[test]
-    fn the_untriggered_events_are_the_documented_reserved_names() {
+    fn no_event_is_reserved() {
         let untriggered: Vec<&str> = HookEvent::iter()
             .filter(|event| !event.is_triggered())
             .map(HookEvent::as_str)
             .collect();
 
-        assert_eq!(untriggered, vec!["Setup", "FileChanged",]);
+        assert!(
+            untriggered.is_empty(),
+            "these events are accepted but never fire: {untriggered:?}"
+        );
     }
 
     /// Only the events the scheduler fires around one tool call carry a tool

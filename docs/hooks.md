@@ -277,13 +277,24 @@ prints non-JSON will deny the tool rather than silently allowing it.
 
 ## What actually fires
 
-`HookEvent` has **22 names**, but a name is not a promise. `HookEvent::is_triggered()`
-is the single source of truth, and a test pins it.
+`HookEvent` has **22 names**, and every one is wired to a firing site.
+`HookEvent::is_triggered()` is the single source of truth, and a test pins the
+list; the test that used to name reserved events now asserts that none is
+reserved.
 
-**Fired (14):** `PreToolUse`, `PostToolUse`, `PostToolUseFailure`,
-`UserPromptSubmit`, `SessionStart`, `Notification`, `PermissionRequest`,
-`PermissionDenied`, `PreCompact`, `PostCompact`, `Stop`, `TurnEnd`,
-`Elicitation`, `ElicitationResult`.
+- `PreToolUse`, `PostToolUse`, `PostToolUseFailure`, `PermissionRequest`,
+  `PermissionDenied` — `coderex_core::tool_scheduler`.
+- `UserPromptSubmit`, `SessionStart`, `TurnEnd`, `Stop`, `PreCompact`,
+  `PostCompact`, `Notification`, `Elicitation`, `ElicitationResult` —
+  `coderex_core::engine`.
+- `SubagentStart`, `SubagentStop`, `TeammateIdle` —
+  `coderex_agents::manager`.
+- `WorktreeCreate` — the `EnterWorktree` tool.
+- `TaskCompleted` — the `TaskUpdate` tool.
+- `CwdChanged` — `coderex_tools::RegistryToolDispatcher::set_cwd`.
+- `Setup` — the REPL when `/init` succeeds.
+- `FileChanged` — the REPL's TUI loop when `ConfigWatcher` reports a settings
+  change.
 
 `SessionStart` fires on the first turn the engine runs (`submit` /
 `submit_streaming`), since a session in this engine has no separate begin call.
@@ -291,23 +302,33 @@ is the single source of truth, and a test pins it.
 told about. `Elicitation` and `ElicitationResult` bracket an elicitation
 request: the ask, then its outcome (`responded`, `cancelled`, or `timed_out`).
 
-**Reserved, never fired (8):** `Setup`, `SubagentStart`, `SubagentStop`,
-`CwdChanged`, `FileChanged`, `WorktreeCreate`, `TaskCompleted`, `TeammateIdle`.
+`Setup` fires once for each successful `/init`: the registry dispatch is
+synchronous, so `sync_command_state` queues the command and the REPL's async
+entry points (`execute_command` in the non-TUI path, and `run_tui` immediately
+after processing input) fire the hook through `QueryEngine::fire_lifecycle_hook`.
+The hook input is the command (`/init`) and the context carries a `command`
+entry. A failed `/init` (an `Error:` result) queues nothing.
 
-These eight have no honest source in the engine: `Setup` has no setup phase;
-the agent lifecycle (`SubagentStart`/`SubagentStop`/`TaskCompleted`/
-`TeammateIdle`) belongs to the agent manager, which the turn loop only labels
-with an `agent_id`; a turn does not change directory, so `CwdChanged` has no
-moment; `FileChanged` would need a consumer of `HookResult.watch_paths`, and
-there is none; and worktree creation happens outside the turn loop. They stay
-inert rather than firing from a place that would not mean what the name says.
+`FileChanged` fires from the settings watcher. `ConfigWatcher` watches the user
+(`~/.coderex/settings.json`) and project (`.coderex/settings.json`) settings
+files and publishes the changed paths from the `notify` event. The TUI main
+loop takes the receiver out of the REPL before entering its `select!` and fires
+`FileChanged` with the paths as its input and a newline-separated `paths`
+context entry (plus `source = "config_watcher"`). The watcher object itself is
+kept alive on the REPL — dropping it would stop `notify`. `hot-reload` is a
+default feature of `coderex-cli`, so this is on unless the build disables
+default features.
 
-A hook configured on a reserved event matches nothing and runs never. That is
-indistinguishable from a working hook until someone notices it did not run, so
-the load path warns about each one (`warn_about_inert_hooks`). An unknown event
-name is warned about too. Event names come from `HookEvent::as_str`, which for
-the events core fires returns core's `hook_events` constants, so the firing side
-and the matching side cannot drift.
+**The headless one-shot path does not fire `FileChanged`.** `run_headless` runs
+a single turn and returns; it has no long-lived loop to select on the watcher
+receiver, and blocking that turn on a settings event with no consumer would
+delay the prompt for nothing. The receiver is created but not drained there,
+deliberately. `Setup` does fire in the headless path: `execute_command` is the
+async entry point that drains it.
+
+An unknown event name is warned about at load. Event names come from
+`HookEvent::as_str`; for the events core fires it returns core's `hook_events`
+constants, so the firing side and the matching side cannot drift.
 
 ## Execution model
 
