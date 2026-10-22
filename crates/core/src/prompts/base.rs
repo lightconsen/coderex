@@ -429,6 +429,9 @@ impl PromptCompiler {
                 let json = serde_json::to_string(tr).unwrap_or_default();
                 Self::estimate_tokens(&json)
             }
+            crate::types::MessageContent::Thinking(block) => {
+                Self::estimate_tokens(&block.thinking) + Self::estimate_tokens(&block.signature)
+            }
         }
     }
 

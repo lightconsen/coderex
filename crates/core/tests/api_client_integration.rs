@@ -208,6 +208,7 @@ impl Provider for MockProvider {
                 cache_creation_tokens: 0,
             },
             stop_reason: "end_turn".into(),
+            thinking: None,
         })
     }
 
@@ -801,6 +802,46 @@ async fn anthropic_client_sends_coderex_identity_headers_and_metadata() {
     assert_eq!(metadata_json["session_id"], "sess-test");
     assert_eq!(metadata_json["device_id"], "dev-test");
     assert_eq!(captured.body["messages"], serde_json::json!([]));
+}
+
+#[tokio::test]
+async fn anthropic_client_parses_thinking_block_with_signature() {
+    let (base_url, handle) = capture_single_request(serde_json::json!({
+        "content": [
+            {
+                "type": "thinking",
+                "thinking": "I should read the file first.",
+                "signature": "sig-abc"
+            },
+            {"type": "text", "text": "Reading it."},
+            {
+                "type": "tool_use",
+                "id": "toolu_think",
+                "name": "read",
+                "input": {"file_path": "a.txt"}
+            }
+        ],
+        "usage": {"input_tokens": 3, "output_tokens": 4},
+        "stop_reason": "tool_use"
+    }))
+    .await;
+
+    let mut config = ApiConfig::new("test-key".into());
+    config.base_url = base_url;
+    let client = AnthropicApiClient::new(config);
+    let response = client
+        .create_message("system", &[], &ModelId::sonnet(), 32, &[])
+        .await
+        .expect("thinking response should parse");
+
+    let thinking = response.thinking.expect("the thinking block is captured");
+    assert_eq!(thinking.thinking, "I should read the file first.");
+    assert_eq!(thinking.signature, "sig-abc");
+    assert_eq!(response.content, "Reading it.");
+    assert_eq!(response.tool_calls.len(), 1);
+    assert_eq!(response.tool_calls[0].id, "toolu_think");
+
+    let _ = handle.await.expect("server join");
 }
 
 #[tokio::test]

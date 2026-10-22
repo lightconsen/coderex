@@ -571,6 +571,7 @@ impl OpenAiCompatibleProvider {
             tool_calls,
             usage,
             stop_reason,
+            thinking: None,
         }
     }
 
@@ -623,11 +624,20 @@ impl OpenAiCompatibleProvider {
             tool_calls,
             usage,
             stop_reason: json["status"].as_str().unwrap_or("completed").to_string(),
+            thinking: None,
         }
     }
 
     fn response_to_stream_events(resp: ApiResponse) -> Vec<StreamEvent> {
         let mut events = Vec::new();
+        if let Some(block) = resp.thinking {
+            if !block.thinking.is_empty() {
+                events.push(StreamEvent::ThinkingDelta(block.thinking));
+            }
+            if !block.signature.is_empty() {
+                events.push(StreamEvent::SignatureDelta(block.signature));
+            }
+        }
         if !resp.content.is_empty() {
             events.push(StreamEvent::TextDelta(resp.content));
         }

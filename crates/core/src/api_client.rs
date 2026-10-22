@@ -2,7 +2,7 @@
 
 use crate::provider::{ProviderApiStyle, ReasoningEffortSupport, ResolvedProviderProfile};
 use crate::tool_executor::ToolInfo;
-use crate::types::{ModelId, ToolCall, UsageSummary};
+use crate::types::{ModelId, ThinkingBlock, ToolCall, UsageSummary};
 use futures::Stream;
 use futures::StreamExt;
 use reqwest::Client;
@@ -657,6 +657,8 @@ pub struct ApiResponse {
     pub usage: UsageSummary,
     /// Whether the response was stopped due to token limit.
     pub stop_reason: String,
+    /// A thinking block the provider requires to be passed back, if any.
+    pub thinking: Option<ThinkingBlock>,
 }
 
 /// Result from a streaming API call.
@@ -664,6 +666,10 @@ pub struct ApiResponse {
 pub enum StreamEvent {
     /// A text delta chunk.
     TextDelta(String),
+    /// A thinking delta chunk from an extended-thinking block.
+    ThinkingDelta(String),
+    /// A signature delta chunk for the current thinking block.
+    SignatureDelta(String),
     /// A tool call block start.
     ToolCallBlockStart {
         /// Tool call ID.
@@ -1403,6 +1409,7 @@ impl ApiClient for AnthropicApiClient {
                 let content_blocks = json["content"].as_array();
                 let mut text_parts = Vec::new();
                 let mut tool_calls = Vec::new();
+                let mut thinking = None;
                 if let Some(blocks) = content_blocks {
                     for block in blocks {
                         match block.get("type").and_then(|v| v.as_str()) {
@@ -1421,6 +1428,21 @@ impl ApiClient for AnthropicApiClient {
                                         input: block["input"].clone(),
                                     });
                                 }
+                            }
+                            Some("thinking") => {
+                                // Providers in thinking mode require the block
+                                // — including its opaque signature — to be
+                                // passed back on the next request.
+                                thinking = Some(ThinkingBlock {
+                                    thinking: block["thinking"]
+                                        .as_str()
+                                        .unwrap_or_default()
+                                        .to_string(),
+                                    signature: block["signature"]
+                                        .as_str()
+                                        .unwrap_or_default()
+                                        .to_string(),
+                                });
                             }
                             _ => {}
                         }
@@ -1460,6 +1482,7 @@ impl ApiClient for AnthropicApiClient {
                     tool_calls,
                     usage,
                     stop_reason,
+                    thinking,
                 })
             })
             .await?;
@@ -1797,34 +1820,57 @@ fn parse_sse_message(message: &str, state: &mut SseParserState) -> Vec<StreamEve
             let Some(block) = value.get("content_block") else {
                 return Vec::new();
             };
-            let Some("tool_use") = block.get("type").and_then(serde_json::Value::as_str) else {
-                return Vec::new();
-            };
-            let Some(id) = block.get("id").and_then(serde_json::Value::as_str) else {
-                return Vec::new();
-            };
-            let Some(name) = block.get("name").and_then(serde_json::Value::as_str) else {
-                return Vec::new();
-            };
-            let id = id.to_string();
-            state.index_to_id.insert(index, id.clone());
-            let mut out = vec![StreamEvent::ToolCallBlockStart {
-                id: id.clone(),
-                name: name.to_string(),
-            }];
-            // Flush any input deltas that arrived before the mapping existed.
-            let deferred = std::mem::take(&mut state.deferred_deltas);
-            for (didx, delta) in deferred {
-                if didx == index {
-                    out.push(StreamEvent::ToolCallInputDelta {
-                        id: id.clone(),
-                        delta,
-                    });
-                } else {
-                    state.deferred_deltas.push((didx, delta));
+            match block.get("type").and_then(serde_json::Value::as_str) {
+                // A thinking block may carry an initial fragment before the
+                // delta stream; emit it through the same channels so the
+                // assembler sees one ordered stream of thinking text.
+                Some("thinking") => {
+                    let mut out = Vec::new();
+                    if let Some(thinking) = block
+                        .get("thinking")
+                        .and_then(serde_json::Value::as_str)
+                        .filter(|t| !t.is_empty())
+                    {
+                        out.push(StreamEvent::ThinkingDelta(thinking.to_string()));
+                    }
+                    if let Some(signature) = block
+                        .get("signature")
+                        .and_then(serde_json::Value::as_str)
+                        .filter(|s| !s.is_empty())
+                    {
+                        out.push(StreamEvent::SignatureDelta(signature.to_string()));
+                    }
+                    out
                 }
+                Some("tool_use") => {
+                    let Some(id) = block.get("id").and_then(serde_json::Value::as_str) else {
+                        return Vec::new();
+                    };
+                    let Some(name) = block.get("name").and_then(serde_json::Value::as_str) else {
+                        return Vec::new();
+                    };
+                    let id = id.to_string();
+                    state.index_to_id.insert(index, id.clone());
+                    let mut out = vec![StreamEvent::ToolCallBlockStart {
+                        id: id.clone(),
+                        name: name.to_string(),
+                    }];
+                    // Flush any input deltas that arrived before the mapping existed.
+                    let deferred = std::mem::take(&mut state.deferred_deltas);
+                    for (didx, delta) in deferred {
+                        if didx == index {
+                            out.push(StreamEvent::ToolCallInputDelta {
+                                id: id.clone(),
+                                delta,
+                            });
+                        } else {
+                            state.deferred_deltas.push((didx, delta));
+                        }
+                    }
+                    out
+                }
+                _ => Vec::new(),
             }
-            out
         }
         "content_block_delta" => {
             let Some(index) = value
@@ -1849,6 +1895,29 @@ fn parse_sse_message(message: &str, state: &mut SseParserState) -> Vec<StreamEve
                         Vec::new()
                     } else {
                         vec![StreamEvent::TextDelta(text.to_string())]
+                    }
+                }
+                "thinking_delta" => {
+                    let Some(thinking) = delta.get("thinking").and_then(serde_json::Value::as_str)
+                    else {
+                        return Vec::new();
+                    };
+                    if thinking.is_empty() {
+                        Vec::new()
+                    } else {
+                        vec![StreamEvent::ThinkingDelta(thinking.to_string())]
+                    }
+                }
+                "signature_delta" => {
+                    let Some(signature) =
+                        delta.get("signature").and_then(serde_json::Value::as_str)
+                    else {
+                        return Vec::new();
+                    };
+                    if signature.is_empty() {
+                        Vec::new()
+                    } else {
+                        vec![StreamEvent::SignatureDelta(signature.to_string())]
                     }
                 }
                 "input_json_delta" => {
@@ -2639,6 +2708,41 @@ data: {"type":"message_stop"}
             matches!(&events[4], StreamEvent::UsageSummary(u) if u.input_tokens == 10 && u.output_tokens == 20)
         );
         assert!(matches!(&events[5], StreamEvent::StopReason(r) if r == "end_turn"));
+    }
+
+    #[tokio::test]
+    async fn parse_sse_stream_captures_thinking_and_signature_deltas() {
+        let sse = r#"event: content_block_start
+data: {"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":"","signature":""}}
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"I should "}}
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"read."}}
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"sig-abc"}}
+
+event: content_block_start
+data: {"type":"content_block_start","index":1,"content_block":{"type":"text","text":""}}
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"ok"}}
+
+event: message_stop
+data: {"type":"message_stop"}
+
+"#;
+
+        let stream = futures::stream::iter(vec![Ok(bytes::Bytes::from(sse))]);
+        let events: Vec<StreamEvent> = parse_sse_stream(stream).collect().await;
+
+        assert!(matches!(&events[0], StreamEvent::ThinkingDelta(t) if t == "I should "));
+        assert!(matches!(&events[1], StreamEvent::ThinkingDelta(t) if t == "read."));
+        assert!(matches!(&events[2], StreamEvent::SignatureDelta(s) if s == "sig-abc"));
+        assert!(matches!(&events[3], StreamEvent::TextDelta(t) if t == "ok"));
+        assert!(matches!(events.last(), Some(StreamEvent::StreamEnd)));
     }
 
     #[tokio::test]

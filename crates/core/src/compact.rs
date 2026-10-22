@@ -61,6 +61,12 @@ fn message_token_estimate(msg: &Message) -> usize {
             let json = serde_json::to_string(tr).unwrap_or_default();
             PromptCompiler::estimate_tokens(&json)
         }
+        MessageContent::Thinking(block) => {
+            // Thinking is round-tripped to the provider, so it occupies context
+            // even though it is never shown as assistant output.
+            PromptCompiler::estimate_tokens(&block.thinking)
+                + PromptCompiler::estimate_tokens(&block.signature)
+        }
     }
 }
 
@@ -743,6 +749,8 @@ fn render_message_for_summary(msg: &Message) -> String {
             tr.tool_call_id,
             truncate_middle(&tr.output, 1_500)
         ),
+        // Thinking is provider state, not conversation the summarizer needs.
+        MessageContent::Thinking(_) => String::new(),
     }
 }
 

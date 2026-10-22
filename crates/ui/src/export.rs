@@ -62,8 +62,18 @@ fn content_text(content: &coderex_core::types::MessageContent) -> String {
         MessageContent::Text(text) => text.clone(),
         MessageContent::ToolCall(tc) => format!("[tool_call: {}]", tc.name),
         MessageContent::ToolResult(tr) => format!("[tool_result: {}]", tr.output),
+        // Provider state, not conversation: never exported as visible text.
+        MessageContent::Thinking(_) => String::new(),
         _ => "[unknown content]".into(),
     }
+}
+
+/// Whether an exported transcript should show this message at all.
+const fn is_displayable(msg: &Message) -> bool {
+    !matches!(
+        msg.content,
+        coderex_core::types::MessageContent::Thinking(_)
+    )
 }
 
 fn format_messages(messages: &[&Message], format: ExportFormat) -> String {
@@ -76,7 +86,7 @@ fn format_messages(messages: &[&Message], format: ExportFormat) -> String {
 
 fn format_plain(messages: &[&Message]) -> String {
     let mut out = String::new();
-    for msg in messages {
+    for msg in messages.iter().filter(|m| is_displayable(m)) {
         let _ = writeln!(out, "--- {} ---", role_label(msg.role));
         out.push_str(&content_text(&msg.content));
         out.push_str("\n\n");
@@ -86,7 +96,7 @@ fn format_plain(messages: &[&Message]) -> String {
 
 fn format_markdown(messages: &[&Message]) -> String {
     let mut out = String::new();
-    for msg in messages {
+    for msg in messages.iter().filter(|m| is_displayable(m)) {
         let _ = write!(out, "\n### {}\n\n", role_label(msg.role));
         match &msg.content {
             coderex_core::types::MessageContent::Text(text) => {
@@ -107,6 +117,8 @@ fn format_markdown(messages: &[&Message]) -> String {
                     tr.output, tr.tool_call_id
                 );
             }
+            // Provider state, not conversation.
+            coderex_core::types::MessageContent::Thinking(_) => {}
             _ => out.push_str("[unknown]\n"),
         }
     }
@@ -122,6 +134,7 @@ fn format_json(messages: &[&Message]) -> String {
 
     let export_msgs: Vec<ExportMessage> = messages
         .iter()
+        .filter(|m| is_displayable(m))
         .map(|m| ExportMessage {
             role: role_json(m.role).into(),
             content: content_text(&m.content),

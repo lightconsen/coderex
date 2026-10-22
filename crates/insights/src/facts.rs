@@ -139,6 +139,7 @@ impl SessionFacts {
                         .unwrap_or_else(|| "unknown".to_string());
                     *facts.tool_errors.entry(name).or_insert(0) += 1;
                 }
+                // Thinking is provider state, not visible assistant output.
                 // The content enum is open: a transcript written by a newer
                 // CodeRex may hold something this one does not know. It still
                 // counts as a message; it just has nothing to add.

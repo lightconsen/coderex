@@ -18,6 +18,20 @@ pub enum Role {
     Tool,
 }
 
+/// A provider thinking block from an extended-thinking response.
+///
+/// Providers in thinking mode emit this block before the visible text and
+/// tool_use blocks and require it to be sent back unchanged on the next
+/// request. `signature` is an opaque provider token and must be round-tripped
+/// verbatim.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ThinkingBlock {
+    /// The reasoning text.
+    pub thinking: String,
+    /// Opaque provider signature for the block.
+    pub signature: String,
+}
+
 /// Content of a message.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[non_exhaustive]
@@ -28,6 +42,8 @@ pub enum MessageContent {
     ToolCall(ToolCall),
     /// A tool execution result.
     ToolResult(ToolResult),
+    /// A provider thinking block that must be round-tripped.
+    Thinking(ThinkingBlock),
 }
 
 /// A single message in a conversation.

@@ -202,6 +202,14 @@ impl ModelRouter {
 
     fn response_to_stream_events(resp: ApiResponse) -> Vec<StreamEvent> {
         let mut events = Vec::new();
+        if let Some(block) = resp.thinking {
+            if !block.thinking.is_empty() {
+                events.push(StreamEvent::ThinkingDelta(block.thinking));
+            }
+            if !block.signature.is_empty() {
+                events.push(StreamEvent::SignatureDelta(block.signature));
+            }
+        }
         if !resp.content.is_empty() {
             events.push(StreamEvent::TextDelta(resp.content));
         }
@@ -486,6 +494,7 @@ mod tests {
                     cache_creation_tokens: 0,
                 },
                 stop_reason: "end_turn".into(),
+                thinking: None,
             })
         }
         async fn create_message_streaming(

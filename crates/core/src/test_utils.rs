@@ -61,6 +61,7 @@ impl MockApiClient {
                 cache_creation_tokens: 0,
             },
             stop_reason: "end_turn".into(),
+            thinking: None,
         }));
     }
 

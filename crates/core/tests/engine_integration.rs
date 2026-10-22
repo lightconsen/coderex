@@ -14,7 +14,7 @@ use coderex_core::state::SessionState;
 use coderex_core::tool_executor::ToolInfo;
 use coderex_core::tool_executor::{ToolDispatchOutcome, ToolExecutor};
 use coderex_core::types::{
-    EngineEvent, MessageContent, ModelId, ToolCall, ToolResult, UsageSummary,
+    EngineEvent, MessageContent, ModelId, ThinkingBlock, ToolCall, ToolResult, UsageSummary,
 };
 use futures::Stream;
 use std::pin::Pin;
@@ -53,6 +53,7 @@ fn text_response(content: &str) -> ApiResponse {
         tool_calls: Vec::new(),
         usage: usage(content.len()),
         stop_reason: "end_turn".into(),
+        thinking: None,
     }
 }
 
@@ -62,6 +63,7 @@ fn tool_response(tool_calls: Vec<ToolCall>) -> ApiResponse {
         tool_calls,
         usage: usage(20),
         stop_reason: "end_turn".into(),
+        thinking: None,
     }
 }
 
@@ -191,6 +193,68 @@ impl ApiClient for SequenceMock {
             self.responses.last().unwrap().clone()
         };
         Ok(resp)
+    }
+
+    async fn create_message_streaming(
+        &self,
+        _system: &str,
+        _messages: &[serde_json::Value],
+        _model: &ModelId,
+        _max_tokens: u32,
+        _tools: &[ToolInfo],
+    ) -> Pin<Box<dyn Stream<Item = StreamEvent> + Send + 'static>> {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let _ = tx.send(StreamEvent::StreamEnd);
+        Box::pin(futures::stream::unfold(rx, |mut rx| async move {
+            rx.recv().await.map(|item| (item, rx))
+        }))
+    }
+}
+
+/// Returns a thinking + tool_use turn first, then a text answer, and records
+/// every request body so the follow-up can be inspected.
+struct ThinkingToolMock {
+    calls: std::sync::Arc<AtomicUsize>,
+    requests: std::sync::Arc<std::sync::Mutex<Vec<Vec<serde_json::Value>>>>,
+}
+
+#[async_trait]
+impl ApiClient for ThinkingToolMock {
+    fn clone_box(&self) -> Box<dyn ApiClient> {
+        Box::new(ThinkingToolMock {
+            calls: std::sync::Arc::clone(&self.calls),
+            requests: std::sync::Arc::clone(&self.requests),
+        })
+    }
+
+    async fn create_message(
+        &self,
+        _system: &str,
+        messages: &[serde_json::Value],
+        _model: &ModelId,
+        _max_tokens: u32,
+        _tools: &[ToolInfo],
+    ) -> Result<ApiResponse, ApiError> {
+        self.requests.lock().unwrap().push(messages.to_vec());
+        let idx = self.calls.fetch_add(1, Ordering::SeqCst);
+        if idx == 0 {
+            Ok(ApiResponse {
+                content: "I'll read it.".into(),
+                tool_calls: vec![ToolCall {
+                    id: "tc_think".into(),
+                    name: "read".into(),
+                    input: serde_json::json!({"file_path": "a.txt"}),
+                }],
+                usage: usage(10),
+                stop_reason: "tool_use".into(),
+                thinking: Some(ThinkingBlock {
+                    thinking: "I should read the file first.".into(),
+                    signature: "sig-abc".into(),
+                }),
+            })
+        } else {
+            Ok(text_response("done"))
+        }
     }
 
     async fn create_message_streaming(
@@ -604,6 +668,56 @@ async fn tool_call_loop_executes_and_continues() {
     assert!(tool_output.contains("executed glob"));
 }
 
+/// A provider that returned thinking in one turn requires the block back in
+/// the next request, before the text and tool_use of that same assistant turn.
+#[tokio::test]
+async fn thinking_block_is_round_tripped_in_the_follow_up_request() {
+    let requests = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let api = Box::new(ThinkingToolMock {
+        calls: std::sync::Arc::new(AtomicUsize::new(0)),
+        requests: std::sync::Arc::clone(&requests),
+    });
+    let tools = Box::new(EchoToolExecutor);
+    let (mut engine, _rx) = make_engine(api, tools);
+
+    let mut options = SubmitOptions::default();
+    options.handle_elicitation = false;
+    let reason = engine.submit("read a.txt".into(), options).await.unwrap();
+    assert_eq!(reason, TerminalReason::Completed);
+
+    let requests = requests.lock().unwrap();
+    assert!(
+        requests.len() >= 2,
+        "expected a follow-up request, got {}",
+        requests.len()
+    );
+    let follow_up = &requests[1];
+    let assistant = follow_up
+        .iter()
+        .find(|message| {
+            message["role"] == "assistant"
+                && message["content"]
+                    .as_array()
+                    .is_some_and(|blocks| blocks.iter().any(|block| block["type"] == "tool_use"))
+        })
+        .expect("the follow-up must carry the assistant tool_use turn");
+    let blocks = assistant["content"]
+        .as_array()
+        .expect("the assistant content must be a block array");
+
+    assert_eq!(
+        blocks
+            .iter()
+            .map(|b| b["type"].as_str())
+            .collect::<Vec<_>>(),
+        vec![Some("thinking"), Some("text"), Some("tool_use")],
+        "the assistant turn must be exactly [thinking, text, tool_use]"
+    );
+    assert_eq!(blocks[0]["thinking"], "I should read the file first.");
+    assert_eq!(blocks[0]["signature"], "sig-abc");
+    assert_eq!(blocks[2]["id"], "tc_think");
+}
+
 #[tokio::test]
 async fn tool_call_loop_multiple_tools_in_one_turn() {
     let responses = vec![
@@ -768,6 +882,7 @@ async fn termination_budget_exhausted() {
                     cache_creation_tokens: 0,
                 },
                 stop_reason: "end_turn".into(),
+                thinking: None,
             })
         }
         async fn create_message_streaming(
@@ -832,6 +947,7 @@ impl ApiClient for CountingMock {
                 cache_creation_tokens: 0,
             },
             stop_reason: "end_turn".into(),
+            thinking: None,
         })
     }
     async fn create_message_streaming(
@@ -1159,6 +1275,7 @@ fn budget_trigger_response() -> ApiResponse {
             cache_creation_tokens: 0,
         },
         stop_reason: "end_turn".into(),
+        thinking: None,
     }
 }
 

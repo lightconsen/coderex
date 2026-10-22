@@ -596,6 +596,39 @@ Implemented compatibility paths:
 - Kimi tool suppression with text-tool fallback
 - headless single-read normalization in the CLI for `Read ...` workflows
 
+### 14.6.1 Thinking Blocks (Anthropic-compatible thinking mode)
+
+A provider in thinking mode returns `{"type":"thinking","thinking":"…","signature":"…"}`
+before the text and tool_use blocks, and requires that block back on the next
+request. Omitting it fails with HTTP 400:
+
+```text
+The `content[].thinking` in the thinking mode must be passed back to the API.
+```
+
+CodeRex handles the block on both response paths:
+
+- **Non-streaming** — `ApiResponse.thinking` captures `thinking` and `signature`
+  from the content-block loop.
+- **Streaming** — `content_block_start` with `type: "thinking"` contributes any
+  initial fragment; `thinking_delta` and `signature_delta` are accumulated by
+  `StreamingToolCallAssembler` and surfaced as one `ThinkingBlock` on the
+  completed `StreamedResponse`. `StreamEvent::ThinkingDelta` /
+  `StreamEvent::SignatureDelta` carry them.
+- **Engine** — after either response the block is stored as
+  `MessageContent::Thinking(ThinkingBlock)` before the visible assistant text
+  and before tool_use persistence, so it belongs to the same assistant turn.
+- **Request building** — `provider_messages` never emits a thinking message on
+  its own. It holds the block and prepends it to the next assistant message's
+  content array, merging consecutive assistant messages so one provider turn is
+  one message: `[thinking, text, tool_use]`. If no assistant message follows,
+  the pending block is dropped. Blocks are never synthesized for providers that
+  did not return one.
+
+Thinking is provider state, not visible output: export, insights, compaction
+summaries, and the brief tool skip it as display text. It is still counted in
+token estimates because it is sent back to the provider.
+
 ### 14.7 Tool Execution Orchestration
 
 - Concurrency-safe (read-only) tools may run in parallel

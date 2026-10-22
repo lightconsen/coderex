@@ -32,8 +32,8 @@ use crate::stop_hook::{self, StopHookContext, StopHookDecision};
 use crate::tool_executor::{NoOpToolExecutor, ToolExecutor};
 use crate::tool_scheduler;
 use crate::types::{
-    CompactionEvent, ContextWindowResolver, EngineEvent, Message, ModelId, ToolCall, ToolResult,
-    UsageSummary,
+    CompactionEvent, ContextWindowResolver, EngineEvent, Message, ModelId, ThinkingBlock, ToolCall,
+    ToolResult, UsageSummary,
 };
 use std::path::PathBuf;
 
@@ -208,6 +208,12 @@ pub struct StreamingToolCallAssembler {
     malformed_ids: Vec<String>,
     /// Text content accumulated alongside tool calls.
     text_content: String,
+    /// Thinking text accumulated from an extended-thinking block.
+    thinking: String,
+    /// Signature accumulated for the thinking block.
+    thinking_signature: String,
+    /// Whether a thinking block was seen at all, even if empty.
+    has_thinking: bool,
     /// Whether any tool calls have been seen.
     has_tool_calls: bool,
 }
@@ -220,6 +226,9 @@ impl StreamingToolCallAssembler {
             pending: HashMap::new(),
             completed: Vec::new(),
             text_content: String::new(),
+            thinking: String::new(),
+            thinking_signature: String::new(),
+            has_thinking: false,
             has_tool_calls: false,
             completed_ids: HashSet::new(),
             malformed_count: 0,
@@ -235,6 +244,16 @@ impl StreamingToolCallAssembler {
         match event {
             StreamEvent::TextDelta(text) => {
                 self.text_content.push_str(&text);
+                Vec::new()
+            }
+            StreamEvent::ThinkingDelta(text) => {
+                self.has_thinking = true;
+                self.thinking.push_str(&text);
+                Vec::new()
+            }
+            StreamEvent::SignatureDelta(signature) => {
+                self.has_thinking = true;
+                self.thinking_signature.push_str(&signature);
                 Vec::new()
             }
             StreamEvent::ToolCallBlockStart { id, name } => {
@@ -325,6 +344,15 @@ impl StreamingToolCallAssembler {
     #[must_use]
     pub fn text(&self) -> &str {
         &self.text_content
+    }
+
+    /// The thinking block assembled from this stream, if one was seen.
+    #[must_use]
+    pub fn thinking(&self) -> Option<ThinkingBlock> {
+        self.has_thinking.then(|| ThinkingBlock {
+            thinking: self.thinking.clone(),
+            signature: self.thinking_signature.clone(),
+        })
     }
 
     /// Check if any tool calls have been seen.
@@ -874,6 +902,8 @@ struct StreamedResponse {
     early_results: Vec<ToolResult>,
     usage: UsageSummary,
     stop_reason: String,
+    /// A thinking block the provider requires to be passed back, if any.
+    thinking: Option<ThinkingBlock>,
 }
 
 /// Whether a provider's stop reason means "the answer was cut off".
@@ -1512,6 +1542,51 @@ pub fn fallback_after_model_error(
     is_model_unavailable_message(error_message).then(|| fallback.clone())
 }
 
+/// Normalize a provider content value into a block array.
+///
+/// A plain string is a single text block; an array is already a block list.
+fn content_blocks(value: serde_json::Value) -> Vec<serde_json::Value> {
+    match value {
+        serde_json::Value::Array(blocks) => blocks,
+        serde_json::Value::String(text) => {
+            if text.is_empty() {
+                Vec::new()
+            } else {
+                vec![serde_json::json!({"type": "text", "text": text})]
+            }
+        }
+        other => vec![other],
+    }
+}
+
+/// Prepend a thinking block to an assistant message's content.
+fn prepend_thinking_block(block: &ThinkingBlock, content: serde_json::Value) -> serde_json::Value {
+    let mut blocks = vec![serde_json::json!({
+        "type": "thinking",
+        "thinking": &block.thinking,
+        "signature": &block.signature,
+    })];
+    blocks.extend(content_blocks(content));
+    serde_json::Value::Array(blocks)
+}
+
+/// Append assistant content, merging consecutive assistant messages.
+///
+/// The engine stores one `Message` per content kind (text, then one per tool
+/// call), but a provider turn is a single assistant message whose content is
+/// `[thinking, text, tool_use, ...]`.
+fn push_assistant_content(out: &mut Vec<(String, serde_json::Value)>, content: serde_json::Value) {
+    if let Some((role, existing)) = out.last_mut() {
+        if role == "assistant" {
+            let mut blocks = content_blocks(std::mem::take(existing));
+            blocks.extend(content_blocks(content));
+            *existing = serde_json::Value::Array(blocks);
+            return;
+        }
+    }
+    out.push(("assistant".to_string(), content));
+}
+
 impl QueryEngine {
     fn persist_assistant_tool_calls(&mut self, turn: &mut TurnRuntime, tool_calls: &[ToolCall]) {
         for tool_call in tool_calls {
@@ -1525,50 +1600,83 @@ impl QueryEngine {
     }
 
     fn provider_messages(messages: &[Message]) -> Vec<serde_json::Value> {
-        messages
+        // Thinking is not a message of its own: it is the first block of the
+        // assistant turn that follows it. Hold it until that turn arrives.
+        let mut pending_thinking: Option<ThinkingBlock> = None;
+        let mut out: Vec<(String, serde_json::Value)> = Vec::new();
+
+        for m in messages
             .iter()
             .filter(|m| !matches!(m.role, crate::types::Role::System))
-            .filter_map(|m| {
-                let role_str = match (&m.role, &m.content) {
-                    (crate::types::Role::User, _)
-                    | (crate::types::Role::Tool, crate::types::MessageContent::ToolResult(_)) => {
-                        "user"
+        {
+            if let crate::types::MessageContent::Thinking(block) = &m.content {
+                pending_thinking =
+                    matches!(m.role, crate::types::Role::Assistant).then(|| block.clone());
+                continue;
+            }
+
+            let Some(role_str) = (match (&m.role, &m.content) {
+                (crate::types::Role::User, _)
+                | (crate::types::Role::Tool, crate::types::MessageContent::ToolResult(_)) => {
+                    Some("user")
+                }
+                (crate::types::Role::Assistant, _) => Some("assistant"),
+                _ => None,
+            }) else {
+                pending_thinking = None;
+                continue;
+            };
+
+            let content = match &m.content {
+                crate::types::MessageContent::Text(t) => serde_json::Value::String(t.clone()),
+                crate::types::MessageContent::ToolCall(tc) => serde_json::json!([
+                    {"type": "tool_use", "id": &tc.id, "name": &tc.name, "input": &tc.input}
+                ]),
+                crate::types::MessageContent::ToolResult(tr) if tr.images.is_empty() => {
+                    serde_json::json!([
+                        {"type": "tool_result", "tool_use_id": &tr.tool_call_id, "content": &tr.output}
+                    ])
+                }
+                crate::types::MessageContent::ToolResult(tr) => {
+                    let mut blocks: Vec<serde_json::Value> = Vec::new();
+                    if !tr.output.is_empty() {
+                        blocks.push(serde_json::json!({"type": "text", "text": &tr.output}));
                     }
-                    (crate::types::Role::Assistant, _) => "assistant",
-                    _ => return None,
-                };
-                let content = match &m.content {
-                    crate::types::MessageContent::Text(t) => serde_json::Value::String(t.clone()),
-                    crate::types::MessageContent::ToolCall(tc) => serde_json::json!([
-                        {"type": "tool_use", "id": &tc.id, "name": &tc.name, "input": &tc.input}
-                    ]),
-                    crate::types::MessageContent::ToolResult(tr) if tr.images.is_empty() => {
-                        serde_json::json!([
-                            {"type": "tool_result", "tool_use_id": &tr.tool_call_id, "content": &tr.output}
-                        ])
+                    for image in &tr.images {
+                        blocks.push(serde_json::json!({
+                            "type": "image",
+                            "source": {
+                                "type": "base64",
+                                "media_type": &image.media_type,
+                                "data": &image.data,
+                            }
+                        }));
                     }
-                    crate::types::MessageContent::ToolResult(tr) => {
-                        let mut blocks: Vec<serde_json::Value> = Vec::new();
-                        if !tr.output.is_empty() {
-                            blocks.push(serde_json::json!({"type": "text", "text": &tr.output}));
-                        }
-                        for image in &tr.images {
-                            blocks.push(serde_json::json!({
-                                "type": "image",
-                                "source": {
-                                    "type": "base64",
-                                    "media_type": &image.media_type,
-                                    "data": &image.data,
-                                }
-                            }));
-                        }
-                        serde_json::json!([
-                            {"type": "tool_result", "tool_use_id": &tr.tool_call_id, "content": blocks}
-                        ])
-                    }
-                };
-                Some(serde_json::json!({"role": role_str, "content": content}))
-            })
+                    serde_json::json!([
+                        {"type": "tool_result", "tool_use_id": &tr.tool_call_id, "content": blocks}
+                    ])
+                }
+                // Handled above; kept so the match stays exhaustive.
+                crate::types::MessageContent::Thinking(_) => unreachable!(),
+            };
+
+            if role_str == "assistant" {
+                if let Some(block) = pending_thinking.take() {
+                    let content = prepend_thinking_block(&block, content);
+                    push_assistant_content(&mut out, content);
+                } else {
+                    push_assistant_content(&mut out, content);
+                }
+            } else {
+                // Thinking can only belong to an assistant turn; a user or
+                // tool message means there is no turn to attach it to.
+                pending_thinking = None;
+                out.push((role_str.to_string(), content));
+            }
+        }
+
+        out.into_iter()
+            .map(|(role, content)| serde_json::json!({"role": role, "content": content}))
             .collect()
     }
 
@@ -2658,6 +2766,7 @@ impl QueryEngine {
 
         // Parse the response
         let content = self.validate_structured_output(api_response.content.clone());
+        self.push_thinking_message(turn, api_response.thinking.clone());
         self.push_visible_assistant_message(turn, content.clone());
 
         // Elicitation heuristic: if the assistant asks a short question, prompt the user
@@ -2679,6 +2788,7 @@ impl QueryEngine {
                         .record_usage(&api_response.usage, &self.model);
                     self.last_usage = Some(api_response.usage);
                     let new_content = self.validate_structured_output(api_response.content.clone());
+                    self.push_thinking_message(turn, api_response.thinking.clone());
                     self.push_visible_assistant_message(turn, new_content);
                 }
             }
@@ -2725,6 +2835,7 @@ impl QueryEngine {
                         .record_usage(&api_response.usage, &self.model);
                     self.last_usage = Some(api_response.usage);
                     let content = self.validate_structured_output(api_response.content.clone());
+                    self.push_thinking_message(turn, api_response.thinking.clone());
                     self.push_visible_assistant_message(turn, content);
 
                     // After recovery retry, check if we still need to compact
@@ -2958,6 +3069,7 @@ impl QueryEngine {
             mut early_results,
             mut usage,
             mut stop_reason,
+            thinking,
         } = self.send_request_streaming(turn, options).await?;
         turn.last_stop_reason = Some(stop_reason.clone());
 
@@ -2965,6 +3077,10 @@ impl QueryEngine {
         turn.budget.record_tokens(&usage);
         self.cost_tracker.record_usage(&usage, &self.model);
         self.last_usage = Some(usage);
+
+        // The thinking block belongs to the same assistant turn as the text
+        // that follows it and must precede the visible message.
+        self.push_thinking_message(turn, thinking);
 
         // Validate structured output if a schema is configured
         content = self.validate_structured_output(content);
@@ -2994,6 +3110,7 @@ impl QueryEngine {
                     early_results = answered.early_results;
                     usage = answered.usage;
                     stop_reason = answered.stop_reason;
+                    self.push_thinking_message(turn, answered.thinking);
                     turn.last_stop_reason = Some(stop_reason.clone());
                     self.push_visible_assistant_message(turn, content.clone());
                 }
@@ -3060,6 +3177,7 @@ impl QueryEngine {
                     turn.budget.record_tokens(&retried.usage);
                     self.cost_tracker.record_usage(&retried.usage, &self.model);
                     self.last_usage = Some(retried.usage);
+                    self.push_thinking_message(turn, retried.thinking);
                     self.push_visible_assistant_message(turn, retried.content);
                     let usage = retried.usage;
 
@@ -3263,6 +3381,23 @@ impl QueryEngine {
                 format!("{content}{warning}")
             }
         }
+    }
+
+    /// Record a provider thinking block as part of the assistant turn.
+    ///
+    /// It is stored as its own [`Message`] so the runtime keeps the block
+    /// intact; [`Self::provider_messages`] folds it into the next assistant
+    /// message when the request is built.
+    fn push_thinking_message(&mut self, turn: &mut TurnRuntime, thinking: Option<ThinkingBlock>) {
+        let Some(block) = thinking else {
+            return;
+        };
+        let msg = Message {
+            role: crate::types::Role::Assistant,
+            content: crate::types::MessageContent::Thinking(block),
+        };
+        turn.messages.push(msg.clone());
+        self.session.messages.push(msg);
     }
 
     fn push_visible_assistant_message(&mut self, turn: &mut TurnRuntime, content: String) {
@@ -4272,9 +4407,12 @@ impl QueryEngine {
                     // ignored and completion is handled below via
                     // assembler.process_event. Pending tool calls are
                     // finalized after the loop.
+                    // Thinking deltas are accumulated by the assembler below.
                     StreamEvent::ToolCallBlockStart { .. }
                     | StreamEvent::ToolCallBlockEnd { .. }
-                    | StreamEvent::StreamEnd => {}
+                    | StreamEvent::StreamEnd
+                    | StreamEvent::ThinkingDelta(_)
+                    | StreamEvent::SignatureDelta(_) => {}
                     StreamEvent::ToolCallInputDelta { ref id, ref delta } => {
                         tracing::trace!("tool call input delta for {id}: {} bytes", delta.len());
                     }
@@ -4443,6 +4581,7 @@ impl QueryEngine {
                         early_results: Vec::new(),
                         usage: resp.usage,
                         stop_reason: resp.stop_reason,
+                        thinking: resp.thinking,
                     });
                 }
             }
@@ -4466,6 +4605,7 @@ impl QueryEngine {
                     early_results,
                     usage,
                     stop_reason: stop_reason.unwrap_or_else(|| "interrupted".to_string()),
+                    thinking: assembler.thinking(),
                 });
             }
 
@@ -4492,6 +4632,7 @@ impl QueryEngine {
                 early_results,
                 usage,
                 stop_reason: stop_reason.unwrap_or_else(|| "end_turn".to_string()),
+                thinking: assembler.thinking(),
             });
         }
     }
@@ -5155,6 +5296,7 @@ mod tests {
                     cache_creation_tokens: 0,
                 },
                 stop_reason: "end_turn".into(),
+                thinking: None,
             })
         }
 
@@ -5230,6 +5372,7 @@ mod tests {
                     cache_creation_tokens: 0,
                 },
                 stop_reason: "end_turn".into(),
+                thinking: None,
             })
         }
 
@@ -5275,6 +5418,7 @@ mod tests {
                     cache_creation_tokens: 0,
                 },
                 stop_reason: "end_turn".into(),
+                thinking: None,
             })
         }
 
@@ -5473,6 +5617,7 @@ mod tests {
                             cache_creation_tokens: 0,
                         },
                         stop_reason: "end_turn".into(),
+                        thinking: None,
                     })
                 }
             }
@@ -5641,6 +5786,7 @@ mod tests {
                     cache_creation_tokens: 0,
                 },
                 stop_reason: "end_turn".into(),
+                thinking: None,
             })
         }
 
@@ -5699,6 +5845,7 @@ mod tests {
                         cache_creation_tokens: 0,
                     },
                     stop_reason: "max_tokens".into(),
+                    thinking: None,
                 })
             }
 
@@ -6228,6 +6375,7 @@ mod tests {
                         cache_creation_tokens: 0,
                     },
                     stop_reason: if call == 0 { "tool_use" } else { "end_turn" }.into(),
+                    thinking: None,
                 })
             }
 
@@ -6636,6 +6784,7 @@ mod tests {
                         cache_creation_tokens: 0,
                     },
                     stop_reason: if call == 0 { "tool_use" } else { "end_turn" }.into(),
+                    thinking: None,
                 })
             }
 
@@ -7487,6 +7636,19 @@ mod tests {
     }
 
     #[test]
+    fn streaming_assembler_accumulates_thinking_and_signature() {
+        let mut assembler = StreamingToolCallAssembler::new();
+        assembler.process_event(StreamEvent::ThinkingDelta("Let me ".into()));
+        assembler.process_event(StreamEvent::ThinkingDelta("think.".into()));
+        assembler.process_event(StreamEvent::SignatureDelta("sig-".into()));
+        assembler.process_event(StreamEvent::SignatureDelta("abc".into()));
+
+        let thinking = assembler.thinking().expect("a thinking block");
+        assert_eq!(thinking.thinking, "Let me think.");
+        assert_eq!(thinking.signature, "sig-abc");
+    }
+
+    #[test]
     fn streaming_assembler_assembles_tool_call_from_deltas() {
         let mut assembler = StreamingToolCallAssembler::new();
         assembler.process_event(StreamEvent::ToolCallBlockStart {
@@ -7547,6 +7709,66 @@ mod tests {
         assert_eq!(taken.len(), 1);
         // Second take is empty
         assert!(assembler.take_completed().is_empty());
+    }
+
+    #[test]
+    fn provider_messages_prepend_thinking_and_merge_the_assistant_turn() {
+        let thinking = ThinkingBlock {
+            thinking: "I should read the file.".into(),
+            signature: "sig-abc".into(),
+        };
+        let tool_call = ToolCall {
+            id: "tc_1".into(),
+            name: "Read".into(),
+            input: serde_json::json!({"file_path": "src/lib.rs"}),
+        };
+        let messages = QueryEngine::provider_messages(&[
+            Message::user("Read src/lib.rs"),
+            Message {
+                role: crate::types::Role::Assistant,
+                content: crate::types::MessageContent::Thinking(thinking),
+            },
+            Message::assistant("I'll read it."),
+            Message {
+                role: crate::types::Role::Assistant,
+                content: crate::types::MessageContent::ToolCall(tool_call),
+            },
+        ]);
+
+        assert_eq!(messages.len(), 2, "one user turn, one assistant turn");
+        let content = messages[1]["content"]
+            .as_array()
+            .expect("the assistant turn must be a block array");
+        assert_eq!(
+            content
+                .iter()
+                .map(|b| b["type"].as_str())
+                .collect::<Vec<_>>(),
+            vec![Some("thinking"), Some("text"), Some("tool_use")],
+            "thinking, text, and tool_use are one assistant turn in order"
+        );
+        assert_eq!(content[0]["thinking"], "I should read the file.");
+        assert_eq!(content[0]["signature"], "sig-abc");
+        assert_eq!(content[1]["text"], "I'll read it.");
+        assert_eq!(content[2]["id"], "tc_1");
+    }
+
+    #[test]
+    fn provider_messages_drop_pending_thinking_without_a_following_assistant() {
+        let messages = QueryEngine::provider_messages(&[
+            Message {
+                role: crate::types::Role::Assistant,
+                content: crate::types::MessageContent::Thinking(ThinkingBlock {
+                    thinking: "unfinished thought".into(),
+                    signature: "sig-abc".into(),
+                }),
+            },
+            Message::user("next request"),
+        ]);
+
+        assert_eq!(messages.len(), 1, "the thinking block is not a message");
+        assert_eq!(messages[0]["role"], "user");
+        assert_eq!(messages[0]["content"], "next request");
     }
 
     #[test]
@@ -7903,6 +8125,7 @@ mod tests {
                             cache_creation_tokens: 0,
                         },
                         stop_reason: "end_turn".into(),
+                        thinking: None,
                     })
                 } else {
                     Ok(ApiResponse {
@@ -7915,6 +8138,7 @@ mod tests {
                             cache_creation_tokens: 0,
                         },
                         stop_reason: "end_turn".into(),
+                        thinking: None,
                     })
                 }
             }
@@ -8248,6 +8472,7 @@ mod tests {
                     cache_creation_tokens: 0,
                 },
                 stop_reason: self.next_reason(),
+                thinking: None,
             })
         }
 
@@ -8580,6 +8805,7 @@ mod tests {
                         cache_creation_tokens: 0,
                     },
                     stop_reason: "end_turn".into(),
+                    thinking: None,
                 })
             }
 
@@ -8702,6 +8928,7 @@ mod tests {
                         cache_creation_tokens: 0,
                     },
                     stop_reason: "end_turn".into(),
+                    thinking: None,
                 })
             }
 
@@ -9299,6 +9526,7 @@ mod tests {
                     cache_creation_tokens: 0,
                 },
                 stop_reason: "tool_use".into(),
+                thinking: None,
             })
         }
 
@@ -9385,6 +9613,7 @@ mod tests {
                     tool_calls: Vec::new(),
                     usage: UsageSummary::default(),
                     stop_reason: "end_turn".into(),
+                    thinking: None,
                 }),
                 None => Err(ApiError::Http("no lightweight client available".into())),
             }

@@ -12,8 +12,8 @@ The foundational engine of CodeRex. Manages LLM API communication, conversation 
 - **`TurnState`** (`engine.rs`) — State machine: Initialize -> BuildContext -> RunPreSubmitHooks -> StartRequest -> StreamAssistant -> ExecuteTools -> AwaitPermission -> AwaitElicitation -> ApplyToolResults -> EvaluateContinuation -> CompactRecovery -> StopHooks -> Finalize -> Terminated.
 - **`TurnRuntime`** (`engine.rs`) — Per-turn mutable state: messages, pending tool calls, budget, recovery count, terminal reason.
 - **`ApiClient` trait** (`api_client.rs`) — Abstraction over LLM providers. `AnthropicApiClient` is the primary impl.
-- **`StreamEvent`** (`api_client.rs`) — SSE parsing results: TextDelta, ToolCallBlockStart/End, ToolCallInputDelta, UsageSummary, StreamEnd, Error.
-- **`StreamingToolCallAssembler`** (`engine.rs`) — Accumulates streaming tool call JSON fragments into complete `ToolCall`s.
+- **`StreamEvent`** (`api_client.rs`) — SSE parsing results: TextDelta, ThinkingDelta, SignatureDelta, ToolCallBlockStart/End, ToolCallInputDelta, UsageSummary, StopReason, StreamEnd, Error.
+- **`StreamingToolCallAssembler`** (`engine.rs`) — Accumulates streaming tool call JSON fragments into complete `ToolCall`s, and thinking/signature deltas into the turn's `ThinkingBlock`.
 - **`StructuredOutputValidator`** (`engine.rs`) — Custom JSON schema validator.
 - **`PermissionEngine`** (`permission_engine.rs`) — Evaluates whether tool calls are allowed, need approval, or denied. Supports hooks (`PermissionHook`, `ExplainPermissionHook`, `AutoApproveHook`, `BackgroundAgentDenyHook`).
 - **`PermissionManager`** (`permission_manager.rs`) — Higher-level permission rule management with rule groups and persistent rule storage.
@@ -56,6 +56,7 @@ Re-exports 50+ types from 44 submodules: `types`, `state`, `runtime`, `engine`, 
 
 - Anthropic API client with retry, Bearer auth for non-Anthropic endpoints.
 - Full SSE streaming parser with tool call assembly, stress-tested (50 concurrent tool calls, 100KB payloads, fragmented chunks).
+- Thinking-block round-tripping: `thinking` + `signature` are parsed from non-streaming responses and accumulated from streaming deltas, stored as `MessageContent::Thinking`, and prepended to the matching assistant turn when the next request is built. Nothing is sent unless the provider returned a block; none are synthesized.
 - Turn state machine with both blocking and streaming paths.
 - Permission engine with Allow/Deny/Ask/AllowForPath/Elevated results, hooks, and `PermissionManager` rule groups. Session-wide approval is recorded with `record_session_approval`.
 - Token budget tracking and cost estimation with `~/.coderex/pricing.json` loading.
